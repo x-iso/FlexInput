@@ -66,6 +66,10 @@ impl FlexInputApp {
                     self.set_subpatch_param_str(outer_id, inner, key_a, opts[0].1);
                     self.set_subpatch_param_str(outer_id, inner, key_b, opts[0].2);
                 }
+                // A JSM setting has no default worth resetting to — the config
+                // says what it should be, and writing 0 over a sensitivity would
+                // be a silent edit to the user's file, not a reset.
+                NavField::JsmValue { .. } => {}
             }
         }
 
@@ -96,6 +100,17 @@ impl FlexInputApp {
                     let next = if nav.is_rising("btn_south") || rt_rising { !cur }
                                else { edit_press > 0 };
                     self.set_subpatch_param_bool(outer_id, inner, key, next);
+                }
+            }
+            NavField::JsmValue { name } => {
+                let press = edit_press as f32;
+                let cont = if mag > 0.5 { nav.lstick.x } else { 0.0 };
+                if press != 0.0 || cont != 0.0 {
+                    // A fraction of the setting's own range, so one rate suits a
+                    // 0..1 deadzone and a 0..3600 unwind rate alike.
+                    let scale = if fine { 0.25 } else { 1.0 };
+                    let delta = (press * 0.02 + cont * 0.6 * dt) * scale;
+                    self.nav_adjust_jsm_knob(outer_id, inner, name, delta);
                 }
             }
             NavField::EnumPair { key_a, key_b, opts } => {
@@ -233,6 +248,16 @@ impl FlexInputApp {
                 self.get_subpatch_param_str(outer_id, inner, key).unwrap_or_default(),
             NavField::Toggle { key } =>
                 if self.get_subpatch_param_bool(outer_id, inner, key).unwrap_or(false) { "ON".into() } else { "OFF".into() },
+            NavField::JsmValue { name } => self
+                .nav_jsm_knobs(outer_id)
+                .into_iter()
+                .find(|k| k.name == *name)
+                .map(|k| if k.integral {
+                    format!("{}", k.value.round() as i64)
+                } else {
+                    format!("{:.2}", k.value)
+                })
+                .unwrap_or_default(),
         };
         // Find the item's screen rect (published by render_subpatch_body) to
         // anchor the HUD just above it.
@@ -396,7 +421,11 @@ impl FlexInputApp {
             // editor and the curve are not targets — there is nothing on either
             // a pad can usefully do, and a target you cannot act on just makes
             // the overlay harder to get through.
-            ("module.jsm", e) => crate::canvas::viewer::jsm_knob_name_of(e).is_some(),
+            // A fader pinned on its own is a Value widget; the whole editor is a
+            // multi-field one you step through. The curve is neither — nothing a
+            // pad can do there.
+            ("module.jsm", e) => crate::canvas::viewer::jsm_knob_name_of(e).is_some()
+                || e == "editor",
             // Everything else is a field row — targetable iff it has fields.
             _ => Self::elem_has_fields(mid, elem),
         }
@@ -408,7 +437,8 @@ impl FlexInputApp {
     pub(crate) fn elem_has_fields(mid: &str, elem: &str) -> bool {
         matches!(
             (mid, elem),
-            ("module.delay", "ms")
+            ("module.jsm", "editor")
+            | ("module.delay", "ms")
             | ("module.average", "samples") | ("module.average", "spike_mad")
             | ("module.dc_filter", "window_ms") | ("module.dc_filter", "decay_ms")
             | ("logic.delay", "time") | ("logic.delay", "mode")
@@ -638,7 +668,7 @@ impl FlexInputApp {
             ("World", "steering", "world"),
         ];
         let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
-        macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l, field: $field } }; }
+        macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l.into(), field: $field } }; }
         // RWS Mouse Scale steps in the unit the header shows it in: 1 dot/°
         // (fine 0.1), or 100 dots/360° (fine 10).
         let rws_scale_step = || {
@@ -647,6 +677,20 @@ impl FlexInputApp {
                 .as_deref() == Some("360");
             if per_360 { FixedScaled { coarse: 100.0, factor: 360.0 } } else { Fixed(1.0) }
         };
+        // JSM Config's editor pin: one field per numeric setting the config sets,
+        // discovered from the TEXT each frame rather than from a table — which is
+        // the whole point of the module, and means a setting added while the
+        // overlay is open is navigable straight away.
+        if mid == "module.jsm" && elem == "editor" {
+            return self
+                .nav_jsm_knobs(outer_id)
+                .into_iter()
+                .map(|k| NavFieldDef {
+                    label: k.name.clone().into(),
+                    field: NavField::JsmValue { name: k.name },
+                })
+                .collect();
+        }
         match (mid.as_str(), elem.as_str()) {
             // ── single-field elements (also driven by the unified editor) ──
             ("module.delay", "ms")            => vec![f!("ms", v("delay_ms",0.0,60_000.0,100.0,Decade))],
@@ -1072,6 +1116,38 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
     }
+    /// The numeric settings the selected JSM node's active tab sets.
+    ///
+    /// Read fresh from the config text every call — it is the source of truth,
+    /// and a setting typed into the editor while the overlay is open should be
+    /// navigable on the next frame without any registration step.
+    pub(crate) fn nav_jsm_knobs(
+        &self,
+        outer_id: egui_snarl::NodeId,
+    ) -> Vec<flexinput_engine::eval::JsmKnob> {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![] };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas
+            .snarl
+            .get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .map(crate::canvas::viewer::jsm_knobs_of)
+            .unwrap_or_default()
+    }
+
+    /// Nudge one JSM setting by a fraction of its range. Unlike every other nav
+    /// field this writes the config TEXT, since that is where the value lives.
+    pub(crate) fn nav_adjust_jsm_knob(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, name: &str, delta: f32)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            crate::canvas::viewer::jsm_nav_nudge_knob(node, name, delta);
+        }
+    }
+
     pub(crate) fn set_subpatch_param_f32(&mut self, outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, key: &str, val: f32)
     {

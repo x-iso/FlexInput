@@ -213,6 +213,31 @@ pub(crate) fn show_jsm_knob_sized(
     }
 }
 
+/// The numeric settings the node's active tab sets, in the order they are drawn.
+///
+/// Gamepad nav walks this list, so it has to be the same list — and in the same
+/// order — as the faders the body lays out, or the focus ring would point at one
+/// setting while the pad edited another.
+pub(crate) fn knobs_of(node: &NodeData) -> Vec<flexinput_engine::eval::JsmKnob> {
+    active_text_of(node)
+        .map(|(_, text)| flexinput_engine::eval::jsm_knobs(text))
+        .unwrap_or_default()
+}
+
+/// The index of the node's active tab and its text — the one thing both nav
+/// helpers need, so they can't disagree about which tab is being driven.
+fn active_text_of(node: &NodeData) -> Option<(usize, &str)> {
+    let arr = node.params.get("jsm_tabs")?.as_array()?;
+    let active = node
+        .params
+        .get("jsm_active_tab")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let active = if active >= arr.len() { 0 } else { active };
+    let text = arr.get(active)?.get("text")?.as_str()?;
+    Some((active, text))
+}
+
 /// Nudge one setting's fader from the gamepad, by a fraction of its range.
 ///
 /// Unlike every other pinnable value in the app, a JSM setting does not live in a
@@ -222,19 +247,9 @@ pub(crate) fn show_jsm_knob_sized(
 ///
 /// Returns whether anything moved (a setting already at its end does not).
 pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> bool {
-    let mut arr = match node.params.get("jsm_tabs").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => return false,
-    };
-    let active = node
-        .params
-        .get("jsm_active_tab")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    let active = if active >= arr.len() { 0 } else { active };
-    let Some(text) = arr.get(active).and_then(|t| t.get("text")).and_then(|v| v.as_str()) else {
-        return false;
-    };
+    // Resolved the same way `knobs_of` does it, so the list nav walks and the
+    // line nav rewrites can never be from different tabs.
+    let Some((active, text)) = active_text_of(node) else { return false };
     let knobs = flexinput_engine::eval::jsm_knobs(text);
     let Some(k) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
         return false;
@@ -244,6 +259,10 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
         return false;
     }
     let rewritten = flexinput_engine::eval::jsm_set_knob(text, k.line, next, k.integral);
+    let mut arr = match node.params.get("jsm_tabs").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return false,
+    };
     let Some(tab) = arr.get_mut(active) else { return false };
     tab["text"] = Value::String(rewritten);
     node.params.insert("jsm_tabs".into(), Value::Array(arr));
@@ -760,7 +779,10 @@ fn knob_rows(
         Some(_) => (width - ui.style().spacing.scroll.allocated_width()).max(24.0),
         None => width,
     };
-    let faders = |ui: &mut egui::Ui| {
+    // One rect per fader, in the order nav walks them, so the focused-field ring
+    // lands on the setting the pad is actually editing.
+    let mut field_rects: Vec<egui::Rect> = Vec::with_capacity(knobs.len());
+    let faders = |ui: &mut egui::Ui, field_rects: &mut Vec<egui::Rect>| {
         let mut edited = None;
         for knob in &knobs {
             let start = ui.cursor().min;
@@ -777,6 +799,7 @@ fn knob_rows(
             // of sight registers nothing: an overlay pick has to land on what the
             // pointer is actually over.
             let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(fader_w, 0.0));
+            field_rects.push(row);
             if ui.clip_rect().intersects(row) {
                 register_exposable_element(
                     ui,
@@ -789,16 +812,20 @@ fn knob_rows(
         edited
     };
 
-    match budget {
+    let edited = match budget {
         Some(h) => super::jsm_widgets::scrolling_faders(
             ui,
             node_id,
             width,
             (h - curve_h - ui.spacing().item_spacing.y).max(super::jsm_widgets::fader_height(ui)),
-            faders,
+            |ui| faders(ui, &mut field_rects),
         ),
-        None => faders(ui),
-    }
+        None => faders(ui, &mut field_rects),
+    };
+    // Keyed by (inner node, current element) — the pinned renderer stamps the
+    // element before dispatching, which is the same key the focus ring reads.
+    publish_nav_field_rects(ui, node_id, &field_rects);
+    edited
 }
 
 /// Bottom-right grip that drags the editor's size, like the 3D viewer's.
@@ -910,6 +937,51 @@ mod tests {
     // The strip's placement is saved on the node, so it has to survive the trip
     // through a param string — and an unknown one has to mean the default rather
     // than a panic or a blank body.
+    // Gamepad nav walks `knobs_of` while the body draws `jsm_knobs` of the same
+    // tab. If the two ever disagreed — about which tab, or about the order — the
+    // focus ring would point at one setting while the pad edited another, which
+    // is the kind of bug you don't notice until you've wrecked a config.
+    #[test]
+    fn the_list_nav_walks_is_the_list_the_body_draws() {
+        use crate::canvas::node::{NodeData, NodeExtra};
+        let mut node = NodeData {
+            module_id: "module.jsm".into(),
+            display_name: String::new(),
+            category: String::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            params: Default::default(),
+            subpatch: None,
+            extra: NodeExtra::default(),
+        };
+        node.params.insert(
+            "jsm_tabs".into(),
+            serde_json::json!([
+                { "name": "a", "text": "GYRO_SENS = 1\n" },
+                { "name": "b", "text": "FLICK_TIME = 0.1\nGYRO_SENS = 3\nSTICK_POWER = 2\n" },
+            ]),
+        );
+        node.params.insert("jsm_active_tab".into(), serde_json::json!(1));
+
+        let names: Vec<String> = super::knobs_of(&node).iter().map(|k| k.name.clone()).collect();
+        assert_eq!(names, ["FLICK_TIME", "GYRO_SENS", "STICK_POWER"], "the ACTIVE tab, in source order");
+
+        // An out-of-range active tab falls back to the first, and doesn't panic.
+        node.params.insert("jsm_active_tab".into(), serde_json::json!(9));
+        let names: Vec<String> = super::knobs_of(&node).iter().map(|k| k.name.clone()).collect();
+        assert_eq!(names, ["GYRO_SENS"]);
+
+        // ...and a nudge lands in that same tab, not in whichever one is first.
+        node.params.insert("jsm_active_tab".into(), serde_json::json!(1));
+        assert!(super::nav_nudge_knob(&mut node, "STICK_POWER", 0.1));
+        assert_eq!(
+            node.params["jsm_tabs"][0]["text"].as_str().unwrap(),
+            "GYRO_SENS = 1\n",
+            "the inactive tab is untouched"
+        );
+        assert!(node.params["jsm_tabs"][1]["text"].as_str().unwrap().contains("STICK_POWER = 2.4"));
+    }
+
     // A pad driving a pinned setting has to move the NUMBER IN THE TEXT, since
     // that is the only source of truth — not a param the engine would never read.
     #[test]

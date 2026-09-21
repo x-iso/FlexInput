@@ -3229,11 +3229,17 @@ pub(crate) enum NavField {
     /// — for the gyro mode rows that set family+axis together.
     EnumPair { key_a: &'static str, key_b: &'static str,
                opts: &'static [(&'static str, &'static str, &'static str)] },
+    /// A JSM Config setting, named at runtime because the fields come from the
+    /// config TEXT rather than from a fixed table of params — which is also why
+    /// it carries a name instead of a `&'static str` key: there is no param to
+    /// write, and editing goes back through the same text rewrite a drag uses.
+    JsmValue { name: String },
 }
 
 #[derive(Clone)]
 pub(crate) struct NavFieldDef {
-    label: &'static str,
+    /// Borrowed for the fixed tables; owned for fields discovered at runtime.
+    label: std::borrow::Cow<'static, str>,
     field: NavField,
 }
 

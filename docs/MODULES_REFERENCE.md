@@ -791,11 +791,17 @@ pub struct ModuleDescriptor {
   and channel 1 the fill; the editor takes background and outline (reserved as
   shape slots before the body is laid out, since its rect isn't known until
   after and the plate has to sit under what it contains).
-  A pinned fader is also a **gamepad-nav target**, driven like a Knob — but its
-  value lives in the config text, so nav edits it through `jsm_set_knob` exactly
-  as a drag does. The editor and the curve are deliberately *not* targets: there
-  is nothing a pad can do on either, and a target you can't act on only makes the
-  overlay longer to get through.
+  Both the **editor** pin and a single **fader** pin are gamepad-nav targets. A
+  lone fader is a `Value` widget; the editor is a multi-field one — left/right
+  steps between its settings, up/down (or the stick) edits the focused one, West
+  toggles fine, and the focus ring lands on that fader's row. The field list is
+  built from the config TEXT each frame (`knobs_of`), so a setting typed while the
+  overlay is open is navigable on the next frame with no registration step; both
+  it and the nudge resolve the active tab through one helper so they can't end up
+  walking one tab and writing another. North does **not** reset a JSM field: a
+  setting has no default worth resetting to, and writing 0 over a sensitivity
+  would be a silent edit to the user's file. The curve is deliberately not a
+  target — there is nothing a pad can do on it.
   Where text has to give way it is always the setting's **name** that truncates,
   never its value — a trimmed number can read as a different number. Beside the
   editor the layout falls back to stacking below the minimum width the two
