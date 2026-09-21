@@ -799,7 +799,14 @@ pub struct ModuleDescriptor {
   near a diagonal does not count as a step (`nav_axis_is_clear`, 1.6× margin
   above a 0.5 engage threshold) — slipping onto the next setting and then editing
   *that* is the failure worth preventing, and it leaves no trace on screen. West
-  toggles fine, and the focus ring lands on that fader's row.
+  toggles fine, and the focus ring lands on that fader's row. When the strip
+  scrolls, the focused fader is brought into view: the nav driver publishes the
+  focused index (`publish_nav_focus_field`) and the body scrolls to it, since the
+  scroll offset belongs to the body and the focus index to the nav state and
+  neither can do it alone. Only a CHANGE of focus scrolls, or holding focus on a
+  row would drag the strip back every frame and the wheel would feel stuck. Rows
+  are published clipped to the visible band, so one scrolled out rings nothing
+  (`nav_ring_is_worth_drawing`) rather than drawing across the container's edge.
   **North restores** the value the setting held before this tuning pass, not a
   default: JSM's own default for a gyro sensitivity is 0, and writing that over
   someone's config mid-game is a silent edit rather than a reset.
@@ -809,10 +816,13 @@ pub struct ModuleDescriptor {
   built from the config TEXT each frame (`knobs_of`), so a setting typed while the
   overlay is open is navigable on the next frame with no registration step; both
   it and the nudge resolve the active tab through one helper so they can't end up
-  walking one tab and writing another. North does **not** reset a JSM field: a
-  setting has no default worth resetting to, and writing 0 over a sensitivity
-  would be a silent edit to the user's file. The curve is deliberately not a
+  walking one tab and writing another. The curve is deliberately not a
   target — there is nothing a pad can do on it.
+  A fader pinned small enough to become a knob or a vertical slider puts its name
+  above and its value below, painted through a painter whose clip is **replaced**
+  (`Painter::set_clip_rect`) rather than narrowed — `with_clip_rect` intersects,
+  so the obvious-looking builder call is silently a no-op against the very
+  container clip it is trying to escape.
   Where text has to give way it is always the setting's **name** that truncates,
   never its value — a trimmed number can read as a different number. Beside the
   editor the layout falls back to stacking below the minimum width the two
