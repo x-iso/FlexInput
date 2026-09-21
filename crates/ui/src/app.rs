@@ -498,7 +498,7 @@ pub struct FlexInputApp {
     /// Per-device snap-back spike filter settings (enabled, sensitivity 0..100).
     /// Written by the UI (calibration window) when the user toggles or drags
     /// the slider; read by the I/O thread each tick and pushed to backends.
-    pub spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    pub spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>>,
     /// Per-device measured resting gyro drift, deg/s on the device's rate
     /// axes — see `DeviceBackend::set_gyro_drift`.
     pub gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
@@ -896,7 +896,7 @@ impl FlexInputApp {
 
         let device_rates = flexinput_engine::new_device_rates();
         let scope_taps   = flexinput_engine::new_scope_taps();
-        let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>> =
+        let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>> =
             Arc::new(RwLock::new(HashMap::new()));
         // ⭐ Seeded from the SAVED graph, not left empty for the calibration
         // window to fill.

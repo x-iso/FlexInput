@@ -9,6 +9,7 @@ use flexinput_core::Signal;
 use flexinput_joycon2::{Joycon2DongleHub, Joycon2Hub, Joycon2UsbHub, PadKey, PadState, Side};
 
 use crate::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
+use crate::spike::SpikeFilter;
 use crate::{layouts, ControllerKind, DeviceBackend, PhysicalDevice};
 
 /// Accelerometer scale, now measured from hardware rather than assumed: the
@@ -25,6 +26,11 @@ pub struct Joycon2Backend {
     hub: Joycon2Hub,
     usb: Joycon2UsbHub,
     dongle: Joycon2DongleHub,
+    /// Per-device outlier spike filter over the six IMU axes, keyed by device
+    /// id. Kept on the backend rather than on a pad because `all_pads()` hands
+    /// out `PadState` BY VALUE each poll — there is no per-pad struct here that
+    /// lives across polls to hang it on. Entries are pruned in `enumerate`.
+    spike: std::collections::HashMap<String, SpikeFilter>,
 }
 
 impl Joycon2Backend {
@@ -68,6 +74,7 @@ impl Joycon2Backend {
             // ~30 s and nothing we can do from a GATT client prevents it.
             usb: Joycon2UsbHub::new(),
             dongle,
+            spike: std::collections::HashMap::new(),
         }
     }
 
@@ -254,7 +261,12 @@ fn canonical_orientation(euler: [f32; 3]) -> glam::Quat {
         * glam::Quat::from_rotation_x(roll)
 }
 
-fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
+fn push_common(
+    out: &mut Vec<(String, String, Signal)>,
+    dev: &str,
+    pad: &PadState,
+    spike: &mut SpikeFilter,
+) {
     let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
 
     // Mouse deltas are relative and intentionally unnormalised (see layouts.rs).
@@ -288,12 +300,17 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
         GyroSource::Hybrid => pad.pin_rate,
     };
     let (gyro, accel) = canonical_imu(pad.snapshot.motion.accel, rate);
-    f("gyro_x", gyro[0]);
-    f("gyro_y", gyro[1]);
-    f("gyro_z", gyro[2]);
-    f("accel_x", accel[0]);
-    f("accel_y", accel[1]);
-    f("accel_z", accel[2]);
+    // Outlier suppression, applied to the six axes as one sample. This sits
+    // AFTER `canonical_imu` on purpose: the filter's thresholds are expressed
+    // in the shared normalized units every backend converges on, so it behaves
+    // identically here and on the raw-HID path.
+    let imu = spike.push([gyro[0], gyro[1], gyro[2], accel[0], accel[1], accel[2]]);
+    f("gyro_x", imu[0]);
+    f("gyro_y", imu[1]);
+    f("gyro_z", imu[2]);
+    f("accel_x", imu[3]);
+    f("accel_y", imu[4]);
+    f("accel_z", imu[5]);
 
     // Absolute orientation. Pushed here rather than beside the accel pins
     // because `f` above holds a unique borrow of `out` for its whole scope.
@@ -432,7 +449,23 @@ fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState
 }
 
 impl DeviceBackend for Joycon2Backend {
+    fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
+        // Create on demand: settings are pushed every I/O tick and may arrive
+        // before the pad's first poll. `set_config` is a no-op when unchanged.
+        self.spike
+            .entry(device_id.to_string())
+            .or_default()
+            .set_config(enabled, sensitivity_pct, window);
+    }
+
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
+        // Drop filter state for pads that are gone, so a reconnect starts with
+        // a fresh window instead of judging new samples against pre-disconnect
+        // ones — and so the map can't grow without bound across a session.
+        let live: std::collections::HashSet<String> =
+            self.all_pads().iter().map(|p| device_id(&p.key)).collect();
+        self.spike.retain(|dev, _| live.contains(dev));
+
         self.all_pads()
             .into_iter()
             // A pad mid-initialisation has no usable signals yet; surfacing it
@@ -466,7 +499,8 @@ impl DeviceBackend for Joycon2Backend {
         let mut out = Vec::with_capacity(pads.len() * 32);
         for pad in pads.iter().filter(|p| p.streaming) {
             let dev = device_id(&pad.key);
-            push_common(&mut out, &dev, pad);
+            let spike = self.spike.entry(dev.clone()).or_default();
+            push_common(&mut out, &dev, pad, spike);
             match pad.key.side {
                 Side::Left => push_left(&mut out, &dev, pad),
                 Side::Right => push_right(&mut out, &dev, pad),
@@ -570,7 +604,12 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
         events: 0,
     };
     let mut out = Vec::new();
-    push_common(&mut out, "dev", &pad);
+    // A throwaway filter per call: these helpers assert the pin VOCABULARY and
+    // routing, one snapshot at a time, so there is no stream for a window to
+    // span. A fresh filter is in warm-up and passes its sample through, which
+    // keeps these assertions about the mapping rather than about smoothing.
+    let mut spike = SpikeFilter::new();
+    push_common(&mut out, "dev", &pad, &mut spike);
     match side {
         Side::Left => push_left(&mut out, "dev", &pad),
         Side::Right => push_right(&mut out, "dev", &pad),

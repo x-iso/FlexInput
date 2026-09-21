@@ -9,6 +9,7 @@ pub mod layouts;
 pub mod midi;
 pub mod sdl_backend;
 pub mod spectrum;
+pub mod spike;
 
 #[cfg(feature = "joycon2")]
 pub mod joycon2_backend;
@@ -65,11 +66,22 @@ pub trait DeviceBackend: Send {
     /// thread to compute live per-device polling rates. Default: empty
     /// (backends that don't track events are reported as 0 Hz).
     fn take_event_counts(&mut self) -> Vec<(String, u32)> { Vec::new() }
-    /// Configure the snap-back outlier-spike filter for a specific
-    /// physical device. Called from the I/O loop each tick with the
-    /// current UI settings (cheap no-op if unchanged). Backends without
-    /// a raw IMU stream should ignore this.
-    fn set_spike_filter(&mut self, _device_id: &str, _enabled: bool, _sensitivity_pct: f32) {}
+    /// Configure the outlier-spike filter for a specific physical device.
+    /// Called from the I/O loop each tick with the current UI settings
+    /// (cheap no-op if unchanged). `window` is the judging window width in
+    /// samples — see `crate::spike`.
+    ///
+    /// Backends without a raw IMU stream should ignore this. Any backend
+    /// that DOES emit `gyro_*` / `accel_*` pins must implement it, or the
+    /// filter's UI controls silently do nothing for that device's prefix.
+    fn set_spike_filter(
+        &mut self,
+        _device_id: &str,
+        _enabled: bool,
+        _sensitivity_pct: f32,
+        _window: u8,
+    ) {
+    }
     /// Global "route every pad through SDL" switch, pushed from the I/O loop
     /// each tick (cheap no-op when unchanged). When on, the SDL backend claims
     /// ALL gamepads (not just the ones kind-detect calls `Generic`) and the

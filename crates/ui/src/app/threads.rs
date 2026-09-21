@@ -26,7 +26,7 @@ pub(crate) fn spawn_io_thread(
     polling_hz: Arc<AtomicU32>,
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
-    spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>>,
     // Per-device measured resting gyro drift, deg/s on the device's rate
     // axes. Pushed to backends every iteration, not once, so a controller
     // that reconnects gets its calibration back without the user reopening
@@ -185,9 +185,9 @@ pub(crate) fn spawn_io_thread(
                 {
                     puffin::profile_scope!("push_spike_filter");
                     let settings = spike_filter_settings.read().unwrap();
-                    for (dev_id, (on, sens)) in settings.iter() {
+                    for (dev_id, (on, sens, win)) in settings.iter() {
                         for backend in &mut backends {
-                            backend.set_spike_filter(dev_id, *on, *sens);
+                            backend.set_spike_filter(dev_id, *on, *sens, *win);
                         }
                     }
                 }

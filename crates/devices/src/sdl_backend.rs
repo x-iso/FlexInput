@@ -28,7 +28,9 @@ use flexinput_core::Signal;
 use crate::{
     gyro::{ACCEL_REF_G, GYRO_REF_DPS},
     identification::ControllerKind,
-    layouts, DeviceBackend, PhysicalDevice,
+    layouts,
+    spike::SpikeFilter,
+    DeviceBackend, PhysicalDevice,
 };
 
 use sdl3::gamepad::{Axis, Button, Gamepad};
@@ -156,6 +158,10 @@ struct OpenPad {
     /// Last-sent lightbar colour (r, g, b), to skip redundant `set_led` calls.
     /// SDL drives the DualSense/DS4 lightbar (and player LEDs on some pads).
     last_led: (u8, u8, u8),
+    /// Outlier spike filter over this pad's six IMU axes. Lives on the pad so
+    /// it is born and dropped with the connection — a reconnect gets a fresh
+    /// window rather than judging new samples against pre-disconnect ones.
+    spike: SpikeFilter,
 }
 
 pub struct SdlBackend {
@@ -401,6 +407,7 @@ impl SdlBackend {
                     num_touchpads,
                     last_rumble: (0, 0),
                     last_led: (0, 0, 0),
+                    spike: SpikeFilter::new(),
                 },
             );
         }
@@ -437,6 +444,16 @@ impl Default for SdlBackend {
 }
 
 impl DeviceBackend for SdlBackend {
+    fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
+        // Same lookup shape as `send`: pads are keyed by SDL joystick id, and
+        // the UI addresses them by the `sdl:<kind>:<inst>` string. Cheap to do
+        // every tick — `set_config` returns immediately when nothing changed.
+        let Some(state) = self.state.as_mut() else { return };
+        if let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) {
+            pad.spike.set_config(enabled, sensitivity_pct, window);
+        }
+    }
+
     fn set_sdl_all_pads(&mut self, on: bool) {
         if on == self.sdl_all_pads {
             return;
@@ -496,8 +513,11 @@ impl DeviceBackend for SdlBackend {
         // Collect the change-detection hashes to update after the borrow of pads ends.
         let mut sig_updates: Vec<(String, u64)> = Vec::new();
 
-        let Some(state) = self.state.as_ref() else { return out };
-        for (id, pad) in &state.pads {
+        // `as_mut` because each pad's spike filter is stepped in place below.
+        // Nothing else in this loop touches `self` — the change-detection
+        // hashes are deferred to `sig_updates` for exactly that reason.
+        let Some(state) = self.state.as_mut() else { return out };
+        for (id, pad) in &mut state.pads {
             let dev = &pad.dev_id;
             let g = &pad.gamepad;
             let start_len = out.len();
@@ -609,6 +629,15 @@ impl DeviceBackend for SdlBackend {
             // ── Gyro / accel via SDL sensor API. Normalized to the shared
             // ±reference (GYRO_REF_DPS / ACCEL_REF_G) so SDL gyro drops straight
             // into gyro→aim mappings authored for DS4/DualSense/Switch. ─────────
+            // Gyro and accel are ONE six-axis sample as far as the spike
+            // filter is concerned, so both are read and normalized before
+            // either is emitted. A pad with only one of the two still works:
+            // the absent half stays zero, which the filter reads as a
+            // perfectly quiet axis and leaves alone, and its pins are simply
+            // not pushed.
+            let mut imu = [0.0f32; 6];
+            let mut got_gyro = false;
+            let mut got_accel = false;
             if pad.has_gyro {
                 let mut d = [0.0f32; 3];
                 if g.sensor_get_data(SensorType::Gyroscope, &mut d).is_ok() {
@@ -616,9 +645,10 @@ impl DeviceBackend for SdlBackend {
                     // convert to deg/s and normalize to the ±ref scale.
                     let c = sdl_gyro_to_canonical(d);
                     let to_norm = |rad_s: f32| (rad_s.to_degrees() / GYRO_REF_DPS).clamp(-1.0, 1.0);
-                    out.push((dev.clone(), "gyro_x".into(), Signal::Float(to_norm(c[0]))));
-                    out.push((dev.clone(), "gyro_y".into(), Signal::Float(to_norm(c[1]))));
-                    out.push((dev.clone(), "gyro_z".into(), Signal::Float(to_norm(c[2]))));
+                    imu[0] = to_norm(c[0]);
+                    imu[1] = to_norm(c[1]);
+                    imu[2] = to_norm(c[2]);
+                    got_gyro = true;
                 }
             }
             if pad.has_accel {
@@ -629,9 +659,23 @@ impl DeviceBackend for SdlBackend {
                     let c = sdl_accel_to_canonical(d);
                     const G: f32 = 9.806_65;
                     let to_norm = |ms2: f32| ((ms2 / G) / ACCEL_REF_G).clamp(-1.0, 1.0);
-                    out.push((dev.clone(), "accel_x".into(), Signal::Float(to_norm(c[0]))));
-                    out.push((dev.clone(), "accel_y".into(), Signal::Float(to_norm(c[1]))));
-                    out.push((dev.clone(), "accel_z".into(), Signal::Float(to_norm(c[2]))));
+                    imu[3] = to_norm(c[0]);
+                    imu[4] = to_norm(c[1]);
+                    imu[5] = to_norm(c[2]);
+                    got_accel = true;
+                }
+            }
+            if got_gyro || got_accel {
+                let imu = pad.spike.push(imu);
+                if got_gyro {
+                    out.push((dev.clone(), "gyro_x".into(), Signal::Float(imu[0])));
+                    out.push((dev.clone(), "gyro_y".into(), Signal::Float(imu[1])));
+                    out.push((dev.clone(), "gyro_z".into(), Signal::Float(imu[2])));
+                }
+                if got_accel {
+                    out.push((dev.clone(), "accel_x".into(), Signal::Float(imu[3])));
+                    out.push((dev.clone(), "accel_y".into(), Signal::Float(imu[4])));
+                    out.push((dev.clone(), "accel_z".into(), Signal::Float(imu[5])));
                 }
             }
 

@@ -385,7 +385,10 @@ fn state_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_state", node)) }
 
 // ── Public entry: render all open windows ────────────────────────────────────
 
-pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32)>>>;
+/// Per-device spike-filter settings: (enabled, sensitivity %, window width).
+/// Shared with the device thread, which pushes them to every backend each
+/// tick — see `DeviceBackend::set_spike_filter`.
+pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32, u8)>>>;
 /// Per-device measured resting gyro drift, deg/s on the device's own rate
 /// axes. Shared with the device thread, which pushes it to the backend every
 /// tick — see `DeviceBackend::set_gyro_drift`.
@@ -1510,23 +1513,65 @@ fn gyro_section(
             let mut sens = canvas.snarl.get_node(node_id)
                 .and_then(|n| n.params.get("spike_sensitivity").and_then(|v| v.as_f64()))
                 .unwrap_or(50.0) as f32;
+            let mut window = canvas.snarl.get_node(node_id)
+                .and_then(|n| n.params.get("spike_window").and_then(|v| v.as_u64()))
+                .unwrap_or(3) as u8;
             let mut filter_changed = false;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Outlier spike filter")
                     .size(INSTRUCT_SIZE).strong());
                 if ui.checkbox(&mut enabled, "")
-                    .on_hover_text("Suppress single-packet outlier spikes at the HID polling layer.\n\
-                                    Spikes that get through still show on the scope above —\n\
-                                    tune sensitivity until the trace is clean.")
+                    .on_hover_text("Suppress outlier spikes at the device-poll layer — samples\n\
+                                    that jump off the local trajectory and snap straight back.\n\
+                                    Spikes that get through still show on the scope above, so\n\
+                                    tune against it until the trace is clean.")
                     .changed() { filter_changed = true; }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.label(egui::RichText::new("sensitivity").weak());
                     if ui.add(egui::Slider::new(&mut sens, 0.0..=100.0)
                         .suffix(" %").show_value(true))
-                        .on_hover_text("0 % = filter off (raw samples pass through).\n\
-                                        100 % = aggressive (catches near-noise excursions).")
+                        .on_hover_text("How far off a sample must sit to count as a spike, as a\n\
+                                        multiple of THIS device's own measured noise — so one\n\
+                                        setting means the same thing on a quiet pad and a noisy\n\
+                                        one.\n\
+                                        \n\
+                                        0 % = permissive (~24× noise; only gross excursions).\n\
+                                        100 % = aggressive (~3× noise; just clear of noise peaks).\n\
+                                        \n\
+                                        This does NOT turn the filter off — use the checkbox.")
                         .changed() { filter_changed = true; }
+                });
+            });
+            // Window width. Sets how long a burst the filter can repair, and
+            // costs latency in direct proportion — which is exactly why it is
+            // a control and not a constant.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_space(4.0);
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.label(egui::RichText::new("window").size(INSTRUCT_SIZE).weak());
+                    for (w, label, hint) in [
+                        (3_u8, "3", "Isolated single-sample spikes only. Lowest latency:\n\
+                                     the 1 sample the filter always costs, nothing more."),
+                        (5_u8, "5", "Bursts up to 2 samples long. One extra sample of\n\
+                                     delay — about 1 ms at 1000 Hz, 4 ms at 250 Hz."),
+                        (7_u8, "7", "Bursts up to 3 samples long. Two extra samples of\n\
+                                     delay — about 2 ms at 1000 Hz, 8 ms at 250 Hz."),
+                    ] {
+                        if ui.selectable_label(window == w, label)
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            window = w;
+                            filter_changed = true;
+                        }
+                    }
+                    ui.label(egui::RichText::new(match window {
+                        3 => "isolated spikes · lowest latency",
+                        5 => "bursts to 2 · +1 sample",
+                        _ => "bursts to 3 · +2 samples",
+                    }).size(INSTRUCT_SIZE - 2.0).weak());
                 });
             });
             if filter_changed {
@@ -1535,10 +1580,11 @@ fn gyro_section(
                     n.params.insert("spike_sensitivity".into(),
                         serde_json::Number::from_f64(sens as f64)
                             .map(Value::Number).unwrap_or(Value::Null));
+                    n.params.insert("spike_window".into(), Value::Number(window.into()));
                 }
             }
             if let Ok(mut map) = spike_settings.write() {
-                map.insert(dev_id.to_string(), (enabled, sens));
+                map.insert(dev_id.to_string(), (enabled, sens, window));
             }
 
             // Noise-floor deadzone row: zero out readings inside the measured
@@ -3084,3 +3130,4 @@ fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
     ui.ctx().data_mut(|d| d.insert_temp(key, handle.clone()));
     Some(handle)
 }
+
