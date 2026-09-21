@@ -254,7 +254,15 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
     let Some(k) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
         return false;
     };
-    let next = k.at(k.t() + delta);
+    let mut next = k.at(k.t() + delta);
+    // A fine step on a narrow range rounds straight back to where it started —
+    // `at` writes at most two decimals so the config stays readable — and the
+    // fine modifier then looked broken rather than fine. Force the smallest
+    // change the config can actually express.
+    if next == k.value && delta != 0.0 {
+        let least = if k.integral { 1.0 } else { 0.01 };
+        next = (k.value + least * delta.signum()).clamp(k.lo.min(k.value), k.hi.max(k.value));
+    }
     if (next - k.value).abs() < f32::EPSILON {
         return false;
     }
@@ -383,16 +391,22 @@ fn strip_column(
         return;
     }
     let mut edited = None;
+    // Only as wide as the column really is. Anything the editor column overran by
+    // comes out of this one, and drawing past it would clip the values — the one
+    // thing on a fader that must never be trimmed.
+    let width = width.min(ui.available_width().max(60.0));
+    let mut edited_w = None;
     ui.vertical(|ui| {
         ui.set_max_width(width);
         // Beside the editor the strip owns its column's full height, whether the
         // body is a node (which grows) or a pin (which does not) — either way it
         // has a column to fill rather than a leftover to squeeze into.
-        edited = knob_rows(
+        edited_w = knob_rows(
             node_id, ui, snarl, width, &tabs[active].text, live, parent, paint,
             Some(height),
         );
     });
+    edited = edited_w;
     if let Some(text) = edited {
         tabs[active].text = text;
         write_tabs(snarl, node_id, &tabs, active);
@@ -461,7 +475,10 @@ fn jsm_rows(
     });
 
     // ── name + load / save for the active tab ────────────────────────────────
-    ui.horizontal(|ui| {
+    // Wrapping, not a single row: these controls together are wider than a narrow
+    // editor column, and a row that overflows pushes whatever sits beside it off
+    // the body — which is what clipped the values off a right-hand tuning strip.
+    ui.horizontal_wrapped(|ui| {
         let mut name = tabs[active].name.clone();
         let resp = ui.add(
             egui::TextEdit::singleline(&mut name)
@@ -605,6 +622,12 @@ fn jsm_rows(
     // scroll area, so a long config scrolls instead of stretching the node.
     // `scrolling_body` is what makes the wheel work at all in here; see
     // `canvas/wheel.rs`.
+    // The editor paints its OWN background and frame, on top of anything drawn
+    // behind it — so styling the pin means styling the TextEdit, not laying a
+    // plate under it. `extreme_bg_color` is what a code editor fills with; the
+    // three widget strokes are its border in each state, set together so the
+    // frame doesn't change colour just because the pointer crossed it.
+    super::jsm_widgets::style_text_editor(ui, paint);
     let wheel_id = egui::Id::new(("jsm_wheel", node_id.0));
     let editor = crate::canvas::wheel::scrolling_body(
         ui,
@@ -937,6 +960,48 @@ mod tests {
     // The strip's placement is saved on the node, so it has to survive the trip
     // through a param string — and an unknown one has to mean the default rather
     // than a panic or a blank body.
+    // The fine modifier scales the nudge down, and on a narrow range that landed
+    // inside the two decimals a config is written with — so the value rounded
+    // straight back and fine looked broken. It has to move by the least the
+    // config can express instead.
+    #[test]
+    fn a_fine_nudge_too_small_to_round_still_moves_by_the_least_step() {
+        use crate::canvas::node::{NodeData, NodeExtra};
+        let node_with = |text: &str| {
+            let mut n = NodeData {
+                module_id: "module.jsm".into(),
+                display_name: String::new(),
+                category: String::new(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                params: Default::default(),
+                subpatch: None,
+                extra: NodeExtra::default(),
+            };
+            n.params.insert("jsm_tabs".into(), serde_json::json!([{ "name": "m", "text": text }]));
+            n
+        };
+        let text_of = |n: &NodeData| n.params["jsm_tabs"][0]["text"].as_str().unwrap().to_string();
+
+        // 0..1 range: a 0.005 nudge is half of what two decimals can hold.
+        let mut node = node_with("DECEL_BRAKE_STRENGTH = 0.5\n");
+        assert!(super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", 0.005));
+        assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 0.51\n", "up by the least step");
+        assert!(super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", -0.005));
+        assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 0.5\n", "and back down");
+
+        // A whole-numbered setting's least step is 1, not 0.01.
+        let mut node = node_with("HOLD_PRESS_TIME = 150\n");
+        assert!(super::nav_nudge_knob(&mut node, "HOLD_PRESS_TIME", 0.0001));
+        assert_eq!(text_of(&node), "HOLD_PRESS_TIME = 151\n");
+
+        // At the end of the range it genuinely cannot move, and says so — the
+        // caller leaves the text (and its undo history) alone.
+        let mut node = node_with("DECEL_BRAKE_STRENGTH = 1\n");
+        assert!(!super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", 0.005));
+        assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 1\n");
+    }
+
     // Gamepad nav walks `knobs_of` while the body draws `jsm_knobs` of the same
     // tab. If the two ever disagreed — about which tab, or about the order — the
     // focus ring would point at one setting while the pad edited another, which

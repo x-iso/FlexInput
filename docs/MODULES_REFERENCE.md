@@ -792,9 +792,20 @@ pub struct ModuleDescriptor {
   shape slots before the body is laid out, since its rect isn't known until
   after and the plate has to sit under what it contains).
   Both the **editor** pin and a single **fader** pin are gamepad-nav targets. A
-  lone fader is a `Value` widget; the editor is a multi-field one — left/right
-  steps between its settings, up/down (or the stick) edits the focused one, West
-  toggles fine, and the focus ring lands on that fader's row. The field list is
+  lone fader is a `Value` widget; the editor is a multi-field one — and unlike
+  every other multi-field element, which is one ROW of controls, it is one
+  COLUMN of faders, so its axes are swapped: **up/down steps between settings,
+  left/right adjusts** the focused one (`nav_fields_are_a_column`). A stick held
+  near a diagonal does not count as a step (`nav_axis_is_clear`, 1.6× margin
+  above a 0.5 engage threshold) — slipping onto the next setting and then editing
+  *that* is the failure worth preventing, and it leaves no trace on screen. West
+  toggles fine, and the focus ring lands on that fader's row.
+  **North restores** the value the setting held before this tuning pass, not a
+  default: JSM's own default for a gyro sensitivity is 0, and writing that over
+  someone's config mid-game is a silent edit rather than a reset.
+  A fine nudge too small to survive the two decimals a config is written with
+  moves by the least step the config can express (0.01, or 1 for a whole-numbered
+  setting) instead of rounding back and looking broken. The field list is
   built from the config TEXT each frame (`knobs_of`), so a setting typed while the
   overlay is open is navigable on the next frame with no registration step; both
   it and the nudge resolve the active tab through one helper so they can't end up

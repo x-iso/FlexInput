@@ -33,20 +33,38 @@ impl FlexInputApp {
         }
         let fine = self.gamepad_nav.fine_increment;
 
-        // Left/right: move field focus (when multiple). Up/down: edit value.
-        // For single-field elements, left/right also edit (no focus to move).
+        // Which axis walks the fields follows how they are actually laid out. Most
+        // pinned elements are one ROW of controls, so left/right walks and up/down
+        // edits. A JSM editor is one COLUMN of faders, where that would have you
+        // pressing left to move down — so there the axes swap. For single-field
+        // elements either axis edits, since there is no focus to move.
+        let column = self.nav_fields_are_a_column(outer_id);
         let multi = n > 1;
-        let mut edit_press = 0i32; // -1/+1 from dpad up/down or stick
+        let mut edit_press = 0i32; // -1/+1 from the dpad or the stick
         if let Some(dir) = step_dir {
+            // Walking is the destructive one: slipping onto the next setting and
+            // then editing THAT is the failure worth preventing, so a stick held
+            // near a diagonal doesn't count as a step along the walking axis.
+            let walk = |v: NavDir| matches!(
+                (column, v),
+                (true, NavDir::Up) | (true, NavDir::Down)
+                    | (false, NavDir::Left) | (false, NavDir::Right)
+            );
+            let clear = Self::nav_axis_is_clear(nav.lstick, column);
             match dir {
-                NavDir::Left if multi => {
-                    self.gamepad_nav.field_index = self.gamepad_nav.field_index.saturating_sub(1);
+                d if multi && walk(d) && clear => {
+                    let back = matches!(d, NavDir::Up | NavDir::Left);
+                    self.gamepad_nav.field_index = if back {
+                        self.gamepad_nav.field_index.saturating_sub(1)
+                    } else {
+                        (self.gamepad_nav.field_index + 1).min(n - 1)
+                    };
                 }
-                NavDir::Right if multi => {
-                    self.gamepad_nav.field_index = (self.gamepad_nav.field_index + 1).min(n - 1);
-                }
-                NavDir::Up   | NavDir::Right => edit_press = 1,
-                NavDir::Down | NavDir::Left  => edit_press = -1,
+                // A walking direction that wasn't clear enough is dropped, not
+                // turned into an edit — the pad was pointed between the two.
+                d if multi && walk(d) => {}
+                NavDir::Up | NavDir::Right => edit_press = 1,
+                NavDir::Down | NavDir::Left => edit_press = -1,
             }
         }
         let idx = self.gamepad_nav.field_index;
@@ -66,10 +84,10 @@ impl FlexInputApp {
                     self.set_subpatch_param_str(outer_id, inner, key_a, opts[0].1);
                     self.set_subpatch_param_str(outer_id, inner, key_b, opts[0].2);
                 }
-                // A JSM setting has no default worth resetting to — the config
-                // says what it should be, and writing 0 over a sensitivity would
-                // be a silent edit to the user's file, not a reset.
-                NavField::JsmValue { .. } => {}
+                // Back to the value this setting held before the pad started
+                // nudging it. See `GamepadNav::jsm_baseline` for why that, and
+                // not JSM's own default.
+                NavField::JsmValue { name } => self.nav_restore_jsm_baseline(outer_id, inner, name),
             }
         }
 
@@ -103,8 +121,16 @@ impl FlexInputApp {
                 }
             }
             NavField::JsmValue { name } => {
+                self.nav_note_jsm_baseline(outer_id, name);
                 let press = edit_press as f32;
-                let cont = if mag > 0.5 { nav.lstick.x } else { 0.0 };
+                // In a column the faders are walked with up/down, so the value is
+                // driven by the stick's X — and vice versa, or holding the stick
+                // to adjust would also be holding it to change focus.
+                let cont = if mag > 0.5 {
+                    if column { nav.lstick.x } else { nav.lstick.y }
+                } else {
+                    0.0
+                };
                 if press != 0.0 || cont != 0.0 {
                     // A fraction of the setting's own range, so one rate suits a
                     // 0..1 deadzone and a 0..3600 unwind rate alike.
@@ -1020,6 +1046,11 @@ impl FlexInputApp {
         let jsm_knob = self
             .nav_selected_element(outer_id)
             .and_then(|(_, e)| crate::canvas::viewer::jsm_knob_name_of(&e).map(str::to_string));
+        // Armed before the first change, so North can undo the whole tuning pass
+        // on this setting rather than just the last nudge.
+        if let Some(name) = &jsm_knob {
+            self.nav_note_jsm_baseline(outer_id, name);
+        }
         let canvas = &mut self.tabs[self.active_tab].canvas;
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
@@ -1116,6 +1147,68 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
     }
+    /// Are the selected element's fields stacked in a column rather than laid out
+    /// in a row? Decides which stick/dpad axis walks between them.
+    fn nav_fields_are_a_column(&self, outer_id: egui_snarl::NodeId) -> bool {
+        matches!(
+            self.nav_selected_element(outer_id).as_ref().map(|(m, e)| (m.as_str(), e.as_str())),
+            Some(("module.jsm", "editor"))
+        )
+    }
+
+    /// Is the stick pointed clearly enough along one axis to mean it?
+    ///
+    /// A stick pushed near a diagonal used to register on both axes, so adjusting
+    /// one setting could slip focus onto the next and carry on editing THAT —
+    /// with nothing to show it had happened until the config was wrong. Below the
+    /// engage threshold the direction came from the dpad, which is unambiguous.
+    fn nav_axis_is_clear(stick: egui::Vec2, column: bool) -> bool {
+        /// How much the walking axis must beat the other by.
+        const MARGIN: f32 = 1.6;
+        if stick.length() < 0.5 {
+            return true;
+        }
+        let (walk, cross) = if column {
+            (stick.y.abs(), stick.x.abs())
+        } else {
+            (stick.x.abs(), stick.y.abs())
+        };
+        walk >= cross * MARGIN
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nav_axis_is_clear_for_test(stick: egui::Vec2, column: bool) -> bool {
+        Self::nav_axis_is_clear(stick, column)
+    }
+
+    /// Remember what a JSM setting was worth before the pad started changing it,
+    /// so North can put it back. Re-armed whenever the focus moves to a different
+    /// setting.
+    fn nav_note_jsm_baseline(&mut self, outer_id: egui_snarl::NodeId, name: &str) {
+        if self.gamepad_nav.jsm_baseline.as_ref().is_some_and(|(n, _)| n == name) {
+            return;
+        }
+        let value = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.name == name).map(|k| k.value);
+        self.gamepad_nav.jsm_baseline = value.map(|v| (name.to_string(), v));
+    }
+
+    /// Put a JSM setting back to what it was before this tuning pass.
+    fn nav_restore_jsm_baseline(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, name: &str)
+    {
+        let Some((_, want)) = self.gamepad_nav.jsm_baseline.clone().filter(|(n, _)| n == name)
+        else { return; };
+        let Some(k) = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.name == name)
+        else { return; };
+        if (k.value - want).abs() < f32::EPSILON {
+            return;
+        }
+        // Expressed as a nudge, so it goes through the one path that rewrites the
+        // text — there is no second way to set a JSM value.
+        let span = (k.hi - k.lo).abs().max(f32::EPSILON);
+        self.nav_adjust_jsm_knob(outer_id, inner, name, (want - k.value) / span);
+    }
+
     /// The numeric settings the selected JSM node's active tab sets.
     ///
     /// Read fresh from the config text every call — it is the source of truth,
@@ -1225,6 +1318,18 @@ impl FlexInputApp {
     /// Reset the selected widget's value to its default (0.0 for knob/constant;
     /// the descriptor default for generic numeric widgets).
     pub(crate) fn nav_reset_selected(&mut self, outer_id: egui_snarl::NodeId) {
+        // A JSM setting pinned on its own: back to what it was before tuning.
+        if let Some(name) = self
+            .nav_selected_element(outer_id)
+            .and_then(|(m, e)| (m == "module.jsm")
+                .then(|| crate::canvas::viewer::jsm_knob_name_of(&e).map(str::to_string))
+                .flatten())
+        {
+            if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+                self.nav_restore_jsm_baseline(outer_id, inner, &name);
+            }
+            return;
+        }
         if let Some(spec) = self.nav_value_param(outer_id) {
             if let Some(inner) = self.nav_selected_inner_node(outer_id) {
                 self.set_subpatch_param_f32(outer_id, inner, spec.key, spec.default);
@@ -1238,5 +1343,37 @@ impl FlexInputApp {
         if matches!(node.module_id.as_str(), "module.knob" | "module.constant") {
             node.params.insert("value".to_string(), serde_json::Value::from(0.0f64));
         }
+    }
+}
+
+#[cfg(test)]
+mod nav_axis_tests {
+    use crate::app::FlexInputApp;
+    use eframe::egui;
+
+    fn clear(x: f32, y: f32, column: bool) -> bool {
+        FlexInputApp::nav_axis_is_clear_for_test(egui::vec2(x, y), column)
+    }
+
+    // The bug this exists to stop: adjusting one setting with a stick held a few
+    // degrees off the horizontal also counted as a step DOWN the list, so focus
+    // slipped to the next setting and kept editing that one — with nothing on
+    // screen to say it had happened until the config was wrong.
+    #[test]
+    fn a_stick_held_near_a_diagonal_does_not_walk_the_list() {
+        // A column (the JSM editor): up/down walks, so Y must dominate.
+        assert!(clear(0.0, 1.0, true), "straight down the list");
+        assert!(clear(0.2, 0.95, true), "a slight lean still means down");
+        assert!(!clear(0.75, 0.66, true), "a diagonal does not");
+        assert!(!clear(1.0, 0.0, true), "and sideways certainly does not");
+
+        // A row (every other multi-field element): left/right walks, so X must.
+        assert!(clear(1.0, 0.0, false));
+        assert!(!clear(0.66, 0.75, false));
+
+        // Below the engage threshold the direction came from the dpad, which is
+        // unambiguous — gating it there would make the dpad feel broken.
+        assert!(clear(0.0, 0.0, true), "the dpad");
+        assert!(clear(0.3, 0.3, true), "a barely-touched stick is the dpad's case");
     }
 }

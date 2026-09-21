@@ -84,6 +84,27 @@ pub(crate) fn fill_backdrop(
     }
 }
 
+/// Point the text editor's own frame at the pin's colours.
+///
+/// The editor is a `TextEdit`, and it fills and frames itself from the style —
+/// on top of whatever was painted behind it. So a background laid under the body
+/// never showed through where it mattered most. `extreme_bg_color` is the fill a
+/// code editor uses; the three widget strokes are its border, set together so the
+/// frame doesn't change colour just because the pointer crossed it.
+pub(crate) fn style_text_editor(ui: &mut egui::Ui, paint: JsmPaint<'_>) {
+    if let Some(bg) = col(paint.and_then(|p| p.background)) {
+        ui.visuals_mut().extreme_bg_color = bg;
+    }
+    let px = paint.and_then(|p| p.outline_px).unwrap_or(0.0);
+    if let (true, Some(c)) = (px > 0.0, col(paint.and_then(|p| p.outline))) {
+        let stroke = egui::Stroke::new(px, c);
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.bg_stroke = stroke;
+        w.hovered.bg_stroke = stroke;
+        w.active.bg_stroke = stroke;
+    }
+}
+
 /// The fader's colours from the same override: channel 1 tints the fill.
 fn knob_paint(paint: JsmPaint<'_>) -> super::simple_bodies::KnobPaint {
     super::simple_bodies::KnobPaint {
@@ -226,10 +247,16 @@ pub(crate) fn pinned_fader(
     }
 
     // The text grows with the pin, so a widget scaled up on a config overlay is
-    // readable from wherever the overlay is being used. It is painted through
-    // `ui.painter()` rather than the widget-clipped one, so a caption wider than
-    // the pin runs past its edge instead of being cut in half.
-    let text = ui.painter();
+    // readable from wherever the overlay is being used.
+    //
+    // The clip rect is widened deliberately. A pinned widget is clipped to its
+    // own container, so a caption drawn above a knob — or one wider than a narrow
+    // pin — was clipped away ENTIRELY, leaving a knob with no label at all. Rather
+    // than shrink the control to make room, let the text overhang: a caption you
+    // can read next to a knob you can grab beats both of them being too small.
+    let text = ui
+        .painter()
+        .with_clip_rect(rect.expand2(egui::vec2(rect.width(), rect.height() * 0.6 + 14.0)));
     let vis = ui.visuals();
     if label_h > 0.0 {
         let font = egui::FontId::proportional((label_h * 0.62).clamp(8.0, 20.0));

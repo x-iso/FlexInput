@@ -240,6 +240,15 @@ pub struct GamepadNav {
     pub active_dev: Option<String>,
     /// West toggles fine increments / lower stick sensitivity while editing.
     pub fine_increment: bool,
+    /// The JSM setting being tuned and the value it held before tuning started,
+    /// as `(name, value)`. North restores it.
+    ///
+    /// Every other value widget resets to a fixed default; a JSM setting has none
+    /// worth resetting to — JSM's own default for a gyro sensitivity is 0, and
+    /// writing that over someone's config mid-game would be a silent edit rather
+    /// than a reset. "Back to what it was before you started nudging it" is both
+    /// the useful thing while tuning and a thing that cannot be wrong.
+    pub jsm_baseline: Option<(String, f32)>,
     /// Pre-edit snarl snapshot, taken when entering Editing on a widget; pushed
     /// to undo as one entry when the edit gesture ends (if anything changed).
     pub edit_baseline: Option<Box<egui_snarl::Snarl<crate::canvas::NodeData>>>,
@@ -414,6 +423,7 @@ impl Default for GamepadNav {
             edit_level: EditLevel::Widget,
             active_dev: None,
             fine_increment: false,
+            jsm_baseline: None,
             edit_baseline: None,
             cursor_pos: egui::Pos2::ZERO,
             cursor_visible: false,
