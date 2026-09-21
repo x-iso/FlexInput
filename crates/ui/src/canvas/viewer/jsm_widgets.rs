@@ -28,12 +28,7 @@ pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&knob.name).small().weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let shown = if knob.integral {
-                format!("{}", knob.value.round() as i64)
-            } else {
-                format!("{:.2}", knob.value)
-            };
-            ui.label(egui::RichText::new(shown).small().monospace());
+            ui.label(egui::RichText::new(shown_value(knob)).small().monospace());
         });
     });
 
@@ -49,12 +44,11 @@ pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32
             let nt = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
             out = Some(knob.at(nt));
         }
-    } else if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll != 0.0 {
-            out = Some(knob.at(t + scroll * 0.002));
-        }
     }
+    // Deliberately no wheel adjustment here: the strip these sit in scrolls, and
+    // on the canvas the wheel pans the Scene. A fader that quietly changed a
+    // sensitivity while you were scrolling past it would be a nasty surprise.
+    // Pinned on its own there is nothing to fight, so `pinned_fader` keeps it.
     let active = resp.hovered() || resp.dragged();
     // The same fader the Knob module draws, laid on its side. Bipolar when the
     // setting can go negative, so the centre line means something.
@@ -81,6 +75,96 @@ pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32
     out
 }
 
+/// The same setting pinned on its own, filling the container it was given.
+///
+/// It takes the Knob module's shape: wide and it is a horizontal fader, tall and
+/// it is a vertical one, square and it is a rotary — so a tuning panel can be
+/// laid out however it reads best, and a pin dragged narrow stops being a
+/// stretched bar. Drags are relative, as the Knob's are.
+///
+/// Returns the new value while it is being dragged or scrolled.
+pub(crate) fn pinned_fader(ui: &mut egui::Ui, size: egui::Vec2, knob: &JsmKnob) -> Option<f32> {
+    let avail = egui::vec2(size.x.max(24.0), size.y.max(18.0));
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+
+    // A label row only where there is room for one — cramped, the name and value
+    // would leave the control a sliver, so they go to the tooltip instead.
+    let label_h = if avail.y >= 40.0 { (avail.y * 0.22).clamp(12.0, 26.0) } else { 0.0 };
+    let track = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, label_h), rect.max);
+    let aspect = track.width() / track.height().max(1.0);
+
+    let mut out = None;
+    let t = knob.t();
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        // Along whichever axis the control runs, a drag across it is the range.
+        let step = if aspect >= 2.0 {
+            d.x / track.width().max(1.0)
+        } else {
+            -d.y / track.height().max(1.0)
+        };
+        if step != 0.0 {
+            out = Some(knob.at(t + step));
+        }
+    } else if resp.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            out = Some(knob.at(t + scroll * 0.002));
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    let active = resp.hovered() || resp.dragged();
+    let bipolar = knob.lo < 0.0;
+    if aspect >= 2.0 {
+        super::simple_bodies::draw_knob_h_fader(&painter, track, t, bipolar, active);
+    } else if aspect <= 0.5 {
+        super::simple_bodies::draw_knob_v_fader(&painter, track, t, bipolar, active);
+    } else {
+        super::simple_bodies::draw_knob_rotary(&painter, track, t, bipolar, active);
+    }
+
+    if label_h > 0.0 {
+        // The text grows with the pin, so a widget scaled up on a config overlay
+        // is readable from where the overlay is actually being used.
+        let font = egui::FontId::proportional((label_h * 0.62).clamp(8.0, 20.0));
+        let vis = ui.visuals();
+        painter.text(
+            egui::pos2(rect.left() + 2.0, rect.top() + label_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            &knob.name,
+            font.clone(),
+            vis.weak_text_color(),
+        );
+        painter.text(
+            egui::pos2(rect.right() - 2.0, rect.top() + label_h * 0.5),
+            egui::Align2::RIGHT_CENTER,
+            shown_value(knob),
+            font,
+            vis.strong_text_color(),
+        );
+    }
+    if active {
+        resp.on_hover_text(format!(
+            "{} = {} — {} to {}",
+            knob.name,
+            shown_value(knob),
+            trim(knob.lo),
+            trim(knob.hi)
+        ));
+    }
+    out
+}
+
+/// A setting's value as the config would spell it.
+fn shown_value(knob: &JsmKnob) -> String {
+    if knob.integral {
+        format!("{}", knob.value.round() as i64)
+    } else {
+        format!("{:.2}", knob.value)
+    }
+}
+
 fn trim(v: f32) -> String {
     if v.fract() == 0.0 {
         format!("{}", v as i64)
@@ -89,8 +173,24 @@ fn trim(v: f32) -> String {
     }
 }
 
-/// The sensitivity curve the config describes: turn speed across, sensitivity up,
-/// with a marker showing how fast the pad is turning right now.
+/// Colour of the sensitivity curve, and of the output curve drawn against it.
+const SENS_COLOR: Color32 = Color32::from_rgb(96, 200, 128);
+const OUTPUT_COLOR: Color32 = Color32::from_rgb(91, 199, 215);
+
+/// The sensitivity curve the config describes, drawn the way the custom-curve
+/// fork's GUI draws it: turn speed across, sensitivity up, both axes anchored at
+/// zero with a labelled grid, so two configs can be compared by eye and a number
+/// can be read off.
+///
+/// Two curves, because sensitivity alone doesn't tell you how the aim feels:
+///
+/// * solid — the sensitivity the config gives at that turn speed;
+/// * dashed — the resulting camera speed (turn speed × sensitivity), normalised
+///   to the same axis. A flat sensitivity makes this a straight ramp. Where it
+///   sags or kinks, turning the pad faster moves the camera *less*, which is the
+///   fault worth catching and the reason the fork draws it.
+///
+/// Live dots mark where the pad is right now, and hovering reads off any speed.
 pub(crate) fn curve_graph(
     ui: &mut egui::Ui,
     width: f32,
@@ -98,91 +198,164 @@ pub(crate) fn curve_graph(
     points: &[flexinput_engine::eval::JsmCurvePoint],
     live_dps: Option<f32>,
 ) -> egui::Rect {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let vis = ui.visuals();
     painter.rect_filled(rect, 3.0, vis.extreme_bg_color);
 
+    let small = egui::FontId::proportional(9.0);
     if points.len() < 2 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "set a gyro sensitivity to preview its curve",
+            small,
+            vis.weak_text_color(),
+        );
         return rect;
     }
-    let max_dps = points.last().map(|p| p.dps).unwrap_or(1.0).max(1e-3);
-    let hi = points.iter().fold(0.0f32, |a, p| a.max(p.sens));
-    let lo = points.iter().fold(f32::MAX, |a, p| a.min(p.sens));
-    // A flat curve (both sensitivities equal, or both zero) still needs a band to
-    // draw in, or everything lands on one line and reads as broken.
-    let (lo, hi) = if hi - lo < 1e-4 { (lo - 0.5, hi + 0.5) } else { (lo, hi) };
-    let pad = 4.0;
-    let plot = rect.shrink(pad);
+
+    // Both axes start at zero, as the fork's do — a curve read against a floating
+    // band tells you the shape but never the numbers, and the numbers are what a
+    // sensitivity is.
+    let axis_x = points.last().map(|p| p.dps).unwrap_or(1.0).max(1e-3);
+    let axis_y = points.iter().fold(0.0f32, |a, p| a.max(p.sens)).max(2.0);
+
+    // The graph is drawn at anything from a node body's 110px to a full pinned
+    // panel, so the axis labels appear only where they would fit — cramped, they
+    // would cover the curve they are there to explain.
+    let labelled = width >= 200.0 && height >= 80.0;
+    let (pad_l, pad_b, pad_tr) = if labelled { (30.0, 13.0, 6.0) } else { (3.0, 3.0, 3.0) };
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(pad_l, pad_tr),
+        rect.max - egui::vec2(pad_tr, pad_b),
+    );
+    if plot.width() < 8.0 || plot.height() < 8.0 {
+        return rect;
+    }
     let to_pos = |dps: f32, sens: f32| {
         egui::pos2(
-            plot.left() + (dps / max_dps).clamp(0.0, 1.0) * plot.width(),
-            plot.bottom() - ((sens - lo) / (hi - lo)).clamp(0.0, 1.0) * plot.height(),
+            plot.left() + (dps / axis_x).clamp(0.0, 1.0) * plot.width(),
+            plot.bottom() - (sens / axis_y).clamp(0.0, 1.0) * plot.height(),
         )
     };
 
-    // A line at each end of the sensitivity range, so the curve has something to be
-    // read against.
-    for s in [lo, hi] {
-        let y = to_pos(0.0, s).y;
-        painter.line_segment(
-            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0, vis.weak_text_color().gamma_multiply(0.35)),
-        );
+    // ── grid ─────────────────────────────────────────────────────────────────
+    let grid = egui::Stroke::new(1.0, vis.weak_text_color().gamma_multiply(0.28));
+    for i in 0..=6 {
+        let y = plot.bottom() - plot.height() * i as f32 / 6.0;
+        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], grid);
+        if labelled {
+            painter.text(
+                egui::pos2(plot.left() - 4.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{:.2}", axis_y * i as f32 / 6.0),
+                small.clone(),
+                vis.weak_text_color(),
+            );
+        }
     }
-
-    let line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, p.sens)).collect();
-    painter.add(egui::Shape::line(
-        line,
-        egui::Stroke::new(1.6, Color32::from_rgb(80, 200, 120)),
-    ));
-
-    // Where the pad is right now. The dot is the point of drawing this live rather
-    // than as a static picture: you turn the pad and watch where on the curve you
-    // actually spend your time.
-    if let Some(dps) = live_dps {
-        if dps > 0.5 {
-            let at = points
-                .iter()
-                .min_by(|a, b| {
-                    (a.dps - dps).abs().total_cmp(&(b.dps - dps).abs())
-                })
-                .copied();
-            if let Some(p) = at {
-                let pos = to_pos(dps.min(max_dps), p.sens);
-                painter.circle_filled(pos, 3.5, Color32::WHITE);
-                painter.line_segment(
-                    [egui::pos2(pos.x, plot.top()), egui::pos2(pos.x, plot.bottom())],
-                    egui::Stroke::new(1.0, Color32::from_white_alpha(40)),
-                );
-            }
+    for i in 0..=10 {
+        let x = plot.left() + plot.width() * i as f32 / 10.0;
+        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], grid);
+        // Every other one: ten numbers along a node-width axis is a smear.
+        if labelled && i % 2 == 0 {
+            painter.text(
+                egui::pos2(x, plot.bottom() + 2.0),
+                egui::Align2::CENTER_TOP,
+                format!("{}", (axis_x * i as f32 / 10.0).round() as i64),
+                small.clone(),
+                vis.weak_text_color(),
+            );
         }
     }
 
-    // Corner labels: what the axes mean, without an axis apparatus that would not
-    // fit in a node body.
-    let small = egui::FontId::proportional(9.0);
-    painter.text(
-        plot.left_bottom() + egui::vec2(1.0, -1.0),
-        egui::Align2::LEFT_BOTTOM,
-        "0",
-        small.clone(),
-        vis.weak_text_color(),
-    );
-    painter.text(
-        plot.right_bottom() + egui::vec2(-1.0, -1.0),
-        egui::Align2::RIGHT_BOTTOM,
-        format!("{}°/s", max_dps.round() as i64),
-        small.clone(),
-        vis.weak_text_color(),
-    );
-    painter.text(
-        plot.left_top() + egui::vec2(1.0, 1.0),
-        egui::Align2::LEFT_TOP,
-        format!("sens {}", trim((hi * 100.0).round() / 100.0)),
-        small,
-        vis.weak_text_color(),
-    );
+    // ── the two curves ───────────────────────────────────────────────────────
+    let max_out = points.iter().fold(1e-6f32, |a, p| a.max(p.dps * p.sens));
+    let output_at = |p: &flexinput_engine::eval::JsmCurvePoint| p.dps * p.sens / max_out * axis_y;
+    let out_line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, output_at(p))).collect();
+    painter.extend(egui::Shape::dashed_line(
+        &out_line,
+        egui::Stroke::new(1.3, OUTPUT_COLOR),
+        5.0,
+        5.0,
+    ));
+    let line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, p.sens)).collect();
+    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8, SENS_COLOR)));
+
+    // ── where the pad is right now ───────────────────────────────────────────
+    // The dots are the point of drawing this live rather than as a static
+    // picture: you turn the pad and watch which part of the curve you actually
+    // spend your time on.
+    let sample_at = |dps: f32| {
+        points
+            .iter()
+            .min_by(|a, b| (a.dps - dps).abs().total_cmp(&(b.dps - dps).abs()))
+            .copied()
+    };
+    if let Some(dps) = live_dps.filter(|d| *d > 0.5) {
+        if let Some(p) = sample_at(dps) {
+            let x = dps.min(axis_x);
+            painter.line_segment(
+                [egui::pos2(to_pos(x, 0.0).x, plot.top()), egui::pos2(to_pos(x, 0.0).x, plot.bottom())],
+                egui::Stroke::new(1.0, Color32::from_white_alpha(36)),
+            );
+            painter.circle_filled(to_pos(x, p.sens), 3.5, SENS_COLOR);
+            painter.circle_filled(to_pos(x, output_at(&p)), 3.0, OUTPUT_COLOR);
+        }
+    }
+
+    // ── read off any speed ───────────────────────────────────────────────────
+    if let Some(pos) = resp.hover_pos().filter(|p| plot.contains(*p)) {
+        let dps = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0) * axis_x;
+        if let Some(p) = sample_at(dps) {
+            painter.line_segment(
+                [egui::pos2(pos.x, plot.top()), egui::pos2(pos.x, plot.bottom())],
+                egui::Stroke::new(1.0, vis.weak_text_color()),
+            );
+            painter.circle_filled(to_pos(p.dps, p.sens), 2.5, SENS_COLOR);
+            let text = format!("{:.0}°/s → {}", p.dps, trim((p.sens * 100.0).round() / 100.0));
+            // Flip the label to whichever side of the line has room for it.
+            let (anchor, dx) = if pos.x > plot.center().x {
+                (egui::Align2::RIGHT_TOP, -4.0)
+            } else {
+                (egui::Align2::LEFT_TOP, 4.0)
+            };
+            painter.text(
+                egui::pos2(pos.x + dx, plot.top() + 1.0),
+                anchor,
+                text,
+                small.clone(),
+                vis.strong_text_color(),
+            );
+        }
+    }
+
+    // ── what the axes are ────────────────────────────────────────────────────
+    if labelled {
+        painter.text(
+            egui::pos2(plot.center().x, rect.bottom() - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            "turn speed °/s",
+            small.clone(),
+            vis.weak_text_color(),
+        );
+    } else {
+        painter.text(
+            plot.right_bottom() + egui::vec2(-1.0, -1.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("{}°/s", axis_x.round() as i64),
+            small.clone(),
+            vis.weak_text_color(),
+        );
+        painter.text(
+            plot.left_top() + egui::vec2(1.0, 1.0),
+            egui::Align2::LEFT_TOP,
+            format!("sens {}", trim((axis_y * 100.0).round() / 100.0)),
+            small,
+            vis.weak_text_color(),
+        );
+    }
     rect
 }
 
@@ -240,6 +413,34 @@ pub(crate) fn scrolling_notes(
             add_contents(ui);
         },
     );
+}
+
+/// The fader strip, scrolling within the height a pinned container gives it.
+///
+/// Separate claimant from the diagnostics above it, or the two would fight over
+/// the same lifted wheel delta and one of them would never scroll.
+pub(crate) fn scrolling_faders<R>(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    width: f32,
+    max_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let claimant = ui.id().with(("jsm_faders", node_id.0));
+    crate::canvas::wheel::scrolling_body(
+        ui,
+        claimant,
+        egui::ScrollArea::vertical()
+            .id_salt(("jsm_faders", node_id.0))
+            .max_height(max_height)
+            .max_width(width)
+            .auto_shrink([false, true]),
+        |ui| {
+            ui.set_max_width(width);
+            add_contents(ui)
+        },
+    )
+    .inner
 }
 
 /// Room a slider takes, label included — the body needs it to budget its height.

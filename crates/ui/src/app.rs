@@ -1751,16 +1751,29 @@ impl eframe::App for FlexInputApp {
         // on) so the watcher can restrict nav-only shortcuts to them, even while
         // a game is focused. Read-only view of the per-device nav flags.
         {
+            // A nav switch clicked on a device node in the canvas (Advanced mode
+            // has no device card to carry it) arrives here, where the nav map is.
+            for (id, on) in crate::gamepad_nav::drain_nav_toggles() {
+                self.gamepad_nav.mode.insert(id, on);
+            }
             let nav_default = self.settings.gamepad_ui_nav_default;
             let own_virtual = self.own_virtual_device_ids();
-            let want: HashSet<String> = self.devices.iter()
+            let candidates: HashSet<String> = self.devices.iter()
                 .filter(|d| !matches!(d.kind,
                     flexinput_devices::ControllerKind::MidiIn
                     | flexinput_devices::ControllerKind::MidiOut))
+                .map(|d| d.id.clone())
+                .collect();
+            let want: HashSet<String> = self.devices.iter()
+                .filter(|d| candidates.contains(&d.id))
                 .filter(|d| !own_virtual.contains(&d.id))
                 .filter(|d| self.gamepad_nav.mode.get(&d.id).copied().unwrap_or(nav_default))
                 .map(|d| d.id.clone())
                 .collect();
+            // Read back by the device node header, which draws the same switch.
+            // Published here — ahead of the central panel — so a click and the
+            // state it shows are never a frame apart.
+            crate::gamepad_nav::publish_nav_state(&want, &own_virtual, &candidates);
             let stale = self.nav_enabled_devices.read().map(|s| *s != want).unwrap_or(true);
             if stale {
                 if let Ok(mut s) = self.nav_enabled_devices.write() { *s = want; }

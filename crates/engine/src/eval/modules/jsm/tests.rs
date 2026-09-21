@@ -5245,21 +5245,39 @@ fn the_curve_preview_matches_the_curve_the_config_chose() {
     assert!(linear.last().unwrap().dps > 100.0, "and runs past the top threshold");
 
     // Quadratic is below the straight line partway up, as it is in the engine.
+    // Sampled by SPEED, halfway up the threshold band — picking a fraction of the
+    // array instead would silently land past the top threshold (where every curve
+    // has saturated to the same value and the comparison proves nothing) the next
+    // time the speed axis changes.
     let quad = curve_of("ACCEL_CURVE = QUADRATIC");
-    let mid = linear.len() / 4;
+    let at = |c: &[super::knobs::CurvePoint], dps: f32| {
+        c.iter()
+            .min_by(|a, b| (a.dps - dps).abs().total_cmp(&(b.dps - dps).abs()))
+            .unwrap()
+            .sens
+    };
+    const HALFWAY: f32 = 50.0; // half of MAX_GYRO_THRESHOLD
     assert!(
-        quad[mid].sens < linear[mid].sens,
+        at(&quad, HALFWAY) < at(&linear, HALFWAY),
         "the preview shows the curve's shape: {} against {}",
-        quad[mid].sens,
-        linear[mid].sens
+        at(&quad, HALFWAY),
+        at(&linear, HALFWAY)
     );
 
-    // A curve whose interesting range is well past the threshold is still drawn
-    // over a span that shows it — otherwise the three that ignore the threshold
-    // would be drawn over an arbitrary window.
+    // The speed axis is the custom-curve fork's: a fixed 500°/s, so a curve drawn
+    // here and the same curve drawn there are the same picture.
+    assert!(
+        (linear.last().unwrap().dps - 500.0).abs() < 1e-3,
+        "the fork's axis: {}",
+        linear.last().unwrap().dps
+    );
+
+    // A curve whose interesting range is past that is still drawn over a span
+    // that shows it — otherwise the three that ignore the threshold would be
+    // drawn into an unreadable corner.
     let wide = curve_of("ACCEL_CURVE = NATURAL\nACCEL_NATURAL_VHALF = 600");
     assert!(
-        wide.last().unwrap().dps > 600.0,
+        wide.last().unwrap().dps >= 600.0,
         "the span follows the curve's own settings: {}",
         wide.last().unwrap().dps
     );

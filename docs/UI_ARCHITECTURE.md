@@ -362,6 +362,24 @@ Full node-based graph editor:
 
 ## Gamepad UI Navigation (`gamepad_nav.rs` + `app/nav/*.rs`)
 
+### Where the switch lives
+
+Turning nav on for a pad is a per-device flag (`GamepadNav::mode`, seeded from
+`settings.gamepad_ui_nav_default`). The switch is drawn by
+`easy::io_panel::nav_toggle_button` in **two** places: Easy mode's device card,
+and the **`device.source` node header** in Advanced mode. Both are needed because
+the config overlay can be summoned in either mode, and driving it takes a pad with
+nav on — in Advanced there is no device card to reach the flag from.
+
+The canvas viewer is handed a `Snarl`, not the app, so it has no route to the nav
+map. State goes out through a published snapshot and clicks come back through a
+queue the app drains (`publish_nav_state` / `nav_state_of` / `request_nav_toggle` /
+`drain_nav_toggles`) — the same shape as the XInput slot circles, and for the same
+reason. The publish happens ahead of the central panel so a click and the state it
+shows are never a frame apart. `nav_state_of` returns `None` where the switch would
+mean nothing (a MIDI port), and `(false, greyed)` for FlexInput's own virtual
+output shown as physical, where nav would feed our own mappings back into the UI.
+
 ### GamepadNav state + the EditLevel machine
 
 All nav state lives in one runtime-only (never serialized) struct, `GamepadNav`, on

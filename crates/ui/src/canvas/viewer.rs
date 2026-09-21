@@ -833,6 +833,25 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
             }
 
+            // UI navigation: lets this pad drive FlexInput's own UI, including the
+            // config overlay — which can be summoned in Advanced mode too, where
+            // there is no Easy-mode device card to reach the switch from. Same
+            // button, same state (`gamepad_nav::nav_state_of`).
+            if is_device_source {
+                if let Some((nav_on, nav_disabled)) =
+                    crate::gamepad_nav::nav_state_of(dev_id_str)
+                {
+                    ui.horizontal(|ui| {
+                        if let Some(v) = crate::easy::io_panel::nav_toggle_button(
+                            ui, nav_on, nav_disabled,
+                        ) {
+                            crate::gamepad_nav::request_nav_toggle(dev_id_str, v);
+                        }
+                        ui.label(egui::RichText::new("UI navigation").small().weak());
+                    });
+                }
+            }
+
             // Capacitive/auxiliary input mute — SDL pads only (see
             // `has_touch_misc_suppression`). Sits next to the digital-trigger
             // toggle because both are per-device input-conditioning opt-ins.

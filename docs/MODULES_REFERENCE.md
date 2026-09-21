@@ -755,13 +755,30 @@ pub struct ModuleDescriptor {
 - **Editor:** the body is the config text, each line tinted by what the parser
   made of it, with the lines worth explaining listed underneath (scrolling once
   they outgrow their room). A **Tune** toggle in the header adds, below them, the
-  sensitivity curve drawn live — with a marker showing how fast the pad is turning
-  right now — and a horizontal fader for every numeric setting the config sets.
+  sensitivity curve drawn live and a horizontal fader for every numeric setting
+  the config sets.
   A fader rewrites the number on its own line, so the text stays the source of
   truth and the parser sees a drag like any other edit; a setting that takes a
   *pair* of numbers gets none, since one control cannot honestly stand for two.
+  The faders carry no wheel adjustment on purpose — the strip they sit in scrolls,
+  and on the canvas the wheel pans the Scene, so a fader that changed a
+  sensitivity as you scrolled past it would be a nasty surprise. Pinned on its
+  own (where nothing else wants the wheel) a fader keeps it.
+  The **curve** is drawn the way the `JSM_custom_curve` fork's GUI draws it, so a
+  curve read here and the same curve read there are the same picture: both axes
+  anchored at zero over a labelled grid, the speed axis a fixed 500°/s unless a
+  setting puts the action further out. Two lines — solid is the sensitivity at
+  that turn speed, dashed is the resulting camera speed (turn speed ×
+  sensitivity) normalised to the same axis. The dashed one is the one that
+  catches a fault: where it sags, turning the pad *faster* aims *slower*. Dots
+  mark where the pad is right now, and hovering reads off any speed. The axis
+  labels drop out when the graph is too small for them to fit.
   The curve and each fader pin to the config overlay on their own, so a tuning
-  session can live there with the editor left on the canvas. While the editor
+  session can live there with the editor left on the canvas. Pinned, a fader
+  takes the Knob module's shape — wide is a horizontal fader, tall a vertical
+  one, square a rotary — and pinned the editor budgets its height between the
+  text and the tuning strip, which scrolls, so a config setting thirty numbers is
+  as reachable as one setting three. While the editor
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).

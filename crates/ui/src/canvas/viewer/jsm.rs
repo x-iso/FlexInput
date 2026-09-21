@@ -91,7 +91,9 @@ pub(crate) fn show_jsm_curve_sized(
     let active = active_tab(snarl, node_id, tabs.len());
     let text = tabs.get(active).map(|t| t.text.clone()).unwrap_or_default();
     let compiled = flexinput_engine::eval::jsm_compile(&text, &[]);
-    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 64);
+    // Pinned, this can be a large panel — sample it finely enough that the line
+    // reads as a curve rather than as the polygon it is.
+    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 160);
     let dev = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("_automap_device_id"))
@@ -129,7 +131,7 @@ pub(crate) fn show_jsm_knob_sized(
         );
         return;
     };
-    if let Some(v) = super::jsm_widgets::fader(ui, size.x, knob) {
+    if let Some(v) = super::jsm_widgets::pinned_fader(ui, size, knob) {
         let text = flexinput_engine::eval::jsm_set_knob(&tab.text, knob.line, v, knob.integral);
         tabs[active].text = text;
         write_tabs(snarl, node_id, &tabs, active);
@@ -301,13 +303,21 @@ fn jsm_rows(
     let used = ui.min_rect().height();
     // The sliders and the curve are laid out *after* the editor, so the editor has
     // to leave room for them up front or the body simply overflows its own size.
-    let reserved = if show_knobs(snarl, node_id) {
+    let knobs_on = show_knobs(snarl, node_id);
+    let strip_want = if knobs_on {
         let n = flexinput_engine::eval::jsm_knobs(&tabs[active].text).len() as f32;
         super::jsm_widgets::graph_height() + n * super::jsm_widgets::fader_height(ui)
     } else {
         0.0
     };
-    let rows = (((size.y - used - SUMMARY_H - reserved) / line_h).floor() as i32).max(3) as usize;
+    let body_left = (size.y - used - SUMMARY_H).max(0.0);
+    let (rows, strip_h) = split_body(body_left, line_h, strip_want);
+    // Pinned, the container's height is all there is — so whatever the editor
+    // leaves goes to the tuning strip, and the faders scroll inside it. Without a
+    // budget the strip simply ran off the bottom of the widget, which looked like
+    // a cap on how many settings a config could have. On the canvas the body grows
+    // to fit instead, so there every fader is just drawn.
+    let strip_budget = (!resizable && knobs_on).then_some(strip_h);
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = egui::text::LayoutJob::default();
@@ -397,8 +407,10 @@ fn jsm_rows(
     }
 
     // ── a slider per numeric setting, and the curve they shape ───────────────
-    if show_knobs(snarl, node_id) {
-        if let Some(text) = knob_rows(node_id, ui, snarl, size.x, &tabs[active].text, live) {
+    if knobs_on {
+        if let Some(text) =
+            knob_rows(node_id, ui, snarl, size.x, &tabs[active].text, live, strip_budget)
+        {
             tabs[active].text = text;
             changed = true;
         }
@@ -425,6 +437,21 @@ fn jsm_rows(
     }
 }
 
+/// Split the body's height between the editor and the tuning strip, as
+/// `(editor rows, strip height)`.
+///
+/// Pinned, the container's height is all there is. The editor gets what the strip
+/// doesn't want, never below three lines; everything left over goes to the strip,
+/// which scrolls — so a config setting thirty numbers is as reachable as one
+/// setting three. The strip keeps a floor of roughly one fader, or a short pin
+/// would show a curve with nothing under it to tune.
+fn split_body(body_left: f32, line_h: f32, strip_want: f32) -> (usize, f32) {
+    const MIN_ROWS: i32 = 3;
+    const MIN_STRIP: f32 = 56.0;
+    let rows = (((body_left - strip_want) / line_h.max(1.0)).floor() as i32).max(MIN_ROWS) as usize;
+    (rows, (body_left - rows as f32 * line_h).max(MIN_STRIP))
+}
+
 /// Is the slider strip switched on for this node? Off by default: a config with a
 /// dozen numeric settings would otherwise double the body's height before anyone
 /// asked for it.
@@ -440,6 +467,9 @@ fn show_knobs(snarl: &Snarl<NodeData>, node_id: NodeId) -> bool {
 ///
 /// Returns the rewritten config text when a slider moved — the text is the source
 /// of truth, so a drag is an edit like any other and the parser sees it at once.
+///
+/// `budget` is the height the strip has to live within (pinned), or `None` to
+/// draw every fader and let the body grow (on the canvas).
 fn knob_rows(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -447,12 +477,18 @@ fn knob_rows(
     width: f32,
     text: &str,
     live: &std::collections::HashMap<(String, String), Signal>,
+    budget: Option<f32>,
 ) -> Option<String> {
-    let mut edited = None;
-
-    // The curve first: it is what the sliders under it are shaping.
+    // The curve first, and it stays put while the faders scroll: it is the thing
+    // you are watching as you drag one.
+    let curve_h = match budget {
+        // Enough of the budget to read, but never so much that no fader is left
+        // visible under it.
+        Some(h) => (h * 0.45).clamp(44.0, super::jsm_widgets::graph_height()),
+        None => super::jsm_widgets::graph_height(),
+    };
     let compiled = flexinput_engine::eval::jsm_compile(text, &[]);
-    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 64);
+    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 96);
     let dev = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("_automap_device_id"))
@@ -461,7 +497,7 @@ fn knob_rows(
     let rect = super::jsm_widgets::curve_graph(
         ui,
         width,
-        super::jsm_widgets::graph_height(),
+        curve_h,
         &points,
         super::jsm_widgets::live_turn_speed(live, dev),
     );
@@ -474,24 +510,48 @@ fn knob_rows(
                 .small()
                 .weak(),
         );
-        return edited;
+        return None;
     }
-    for knob in &knobs {
-        let start = ui.cursor().min;
-        if let Some(v) = super::jsm_widgets::fader(ui, width, knob) {
-            edited = Some(flexinput_engine::eval::jsm_set_knob(
-                text,
-                knob.line,
-                v,
-                knob.integral,
-            ));
+
+    let faders = |ui: &mut egui::Ui| {
+        let mut edited = None;
+        for knob in &knobs {
+            let start = ui.cursor().min;
+            if let Some(v) = super::jsm_widgets::fader(ui, width, knob) {
+                edited = Some(flexinput_engine::eval::jsm_set_knob(
+                    text,
+                    knob.line,
+                    v,
+                    knob.integral,
+                ));
+            }
+            // Each slider pins on its own, so a tuning session can carry just the
+            // two or three that matter into the config overlay. A row scrolled out
+            // of sight registers nothing: an overlay pick has to land on what the
+            // pointer is actually over.
+            let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(width, 0.0));
+            if ui.clip_rect().intersects(row) {
+                register_exposable_element(
+                    ui,
+                    node_id,
+                    &super::jsm_widgets::knob_element_id(&knob.name),
+                    row,
+                );
+            }
         }
-        // Each slider pins on its own, so a tuning session can carry just the two
-        // or three that matter into the config overlay.
-        let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(width, 0.0));
-        register_exposable_element(ui, node_id, &super::jsm_widgets::knob_element_id(&knob.name), row);
+        edited
+    };
+
+    match budget {
+        Some(h) => super::jsm_widgets::scrolling_faders(
+            ui,
+            node_id,
+            width,
+            (h - curve_h - ui.spacing().item_spacing.y).max(super::jsm_widgets::fader_height(ui)),
+            faders,
+        ),
+        None => faders(ui),
     }
-    edited
 }
 
 /// Bottom-right grip that drags the editor's size, like the 3D viewer's.
@@ -596,7 +656,46 @@ fn write_tabs(snarl: &mut Snarl<NodeData>, node_id: NodeId, tabs: &[JsmTab], act
 
 #[cfg(test)]
 mod tests {
-    use super::{unique_name, JsmTab};
+    use super::{split_body, unique_name, JsmTab};
+
+    const LINE: f32 = 14.0;
+
+    // The bug this exists to stop: a pinned editor showed a fixed handful of
+    // sliders and making the widget taller changed nothing, because the editor
+    // grew to eat every extra pixel and the strip stayed the same size — so the
+    // faders past the first few simply ran off the bottom.
+    #[test]
+    fn a_taller_pinned_editor_gives_the_tuning_strip_more_room() {
+        // Nine settings' worth of faders, plus the curve: more than a short pin
+        // can show at once.
+        let want = 110.0 + 9.0 * 27.0;
+        let (_, short) = split_body(300.0, LINE, want);
+        let (_, tall) = split_body(600.0, LINE, want);
+        assert!(
+            tall > short + 100.0,
+            "the strip has to grow with the container: {short} then {tall}"
+        );
+    }
+
+    // ...and the editor is still an editor. Three lines is the floor whatever the
+    // strip asks for, so a config with a great many numeric settings can't leave
+    // you with nowhere to type.
+    #[test]
+    fn the_editor_keeps_three_lines_however_much_the_strip_wants() {
+        for want in [0.0, 200.0, 5_000.0] {
+            let (rows, strip) = split_body(120.0, LINE, want);
+            assert!(rows >= 3, "rows at want={want}: {rows}");
+            assert!(strip >= 56.0, "a fader's worth of strip at want={want}: {strip}");
+        }
+    }
+
+    // With nothing to tune the editor takes the lot — switching Tune off must not
+    // leave a gap where the strip used to be.
+    #[test]
+    fn with_no_strip_the_editor_takes_the_whole_body() {
+        let (rows, _) = split_body(280.0, LINE, 0.0);
+        assert_eq!(rows, 20, "280 / 14");
+    }
 
     // Adding tabs never collides with a name already in use — a binding that
     // loads a config by name has to land on exactly one tab.

@@ -756,6 +756,116 @@ pub fn stick_dir(v: egui::Vec2) -> Option<NavDir> {
     }
 }
 
+// ── the nav switch, reachable from outside Easy mode ─────────────────────────
+//
+// The config overlay can be summoned in Advanced mode, and driving it needs a pad
+// with nav on — but the only switch for that lived on Easy mode's device card. So
+// the Advanced-mode device node header carries it too.
+//
+// The nav map lives on `FlexInputApp`, which the canvas viewer has no route to
+// (it is handed a `Snarl`, not the app), so state goes out through a published
+// snapshot and clicks come back through a queue the app drains — the same shape
+// as the XInput slot circles, and for the same reason.
+
+/// What the device node header needs to draw the switch.
+#[derive(Clone, Default)]
+struct NavSnapshot {
+    /// Pads with nav currently on.
+    on: HashSet<String>,
+    /// FlexInput's own virtual output, shown as physical: nav there would feed
+    /// our own mappings back into the UI, so the switch is greyed.
+    excluded: HashSet<String>,
+    /// Every device the switch means anything for. A MIDI port is not one.
+    candidates: HashSet<String>,
+}
+
+static NAV_SNAPSHOT: std::sync::Mutex<Option<NavSnapshot>> = std::sync::Mutex::new(None);
+static NAV_TOGGLES: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Publish this frame's nav state (called by the app before the canvas draws).
+pub fn publish_nav_state(
+    on: &HashSet<String>,
+    excluded: &HashSet<String>,
+    candidates: &HashSet<String>,
+) {
+    if let Ok(mut g) = NAV_SNAPSHOT.lock() {
+        *g = Some(NavSnapshot {
+            on: on.clone(),
+            excluded: excluded.clone(),
+            candidates: candidates.clone(),
+        });
+    }
+}
+
+/// `(nav on, switch greyed)` for a device, or `None` where the switch would mean
+/// nothing — a MIDI port, or a device this frame has not heard of.
+pub fn nav_state_of(device_id: &str) -> Option<(bool, bool)> {
+    let g = NAV_SNAPSHOT.lock().ok()?;
+    let s = g.as_ref()?;
+    let excluded = s.excluded.contains(device_id);
+    if !excluded && !s.candidates.contains(device_id) {
+        return None;
+    }
+    Some((!excluded && s.on.contains(device_id), excluded))
+}
+
+/// Queue a nav switch clicked outside the panel that owns the nav map.
+pub fn request_nav_toggle(device_id: &str, on: bool) {
+    if let Ok(mut q) = NAV_TOGGLES.lock() {
+        q.push((device_id.to_string(), on));
+    }
+}
+
+/// Drain queued nav switches (called by the app each frame).
+pub fn drain_nav_toggles() -> Vec<(String, bool)> {
+    NAV_TOGGLES
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod nav_switch_tests {
+    use super::*;
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    // The switch has to be able to say three different things, and a pad that is
+    // simply off must not be confused with one that may not be switched on at all.
+    #[test]
+    fn the_nav_switch_tells_on_from_off_from_unavailable() {
+        publish_nav_state(
+            &set(&["gilrs:pad:0"]),
+            &set(&["gilrs:ourvirtual:0"]),
+            &set(&["gilrs:pad:0", "gilrs:pad:1", "gilrs:ourvirtual:0"]),
+        );
+        assert_eq!(nav_state_of("gilrs:pad:0"), Some((true, false)), "on");
+        assert_eq!(nav_state_of("gilrs:pad:1"), Some((false, false)), "off, can be turned on");
+        assert_eq!(
+            nav_state_of("gilrs:ourvirtual:0"),
+            Some((false, true)),
+            "our own output: off and greyed"
+        );
+        assert_eq!(nav_state_of("midi_in:0"), None, "no switch for a MIDI port");
+    }
+
+    // A click has to survive the trip to whoever owns the nav map, and be taken
+    // exactly once — draining twice would toggle it back.
+    #[test]
+    fn a_queued_nav_toggle_is_delivered_once() {
+        let _ = drain_nav_toggles();
+        request_nav_toggle("gilrs:pad:0", true);
+        request_nav_toggle("gilrs:pad:1", false);
+        assert_eq!(
+            drain_nav_toggles(),
+            vec![("gilrs:pad:0".to_string(), true), ("gilrs:pad:1".to_string(), false)]
+        );
+        assert!(drain_nav_toggles().is_empty(), "drained once, not twice");
+    }
+}
+
 #[cfg(test)]
 mod chord_fire_tests {
     use super::*;

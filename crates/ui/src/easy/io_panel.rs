@@ -494,59 +494,8 @@ fn input_card(
         // active-card selection hue used for the nav glow. Lives at the
         // right edge of the header row on every card (any pad can drive
         // the UI, not just the active source).
-        // Rasterize the controller-nav SVG once per (tint) and cache the texture
-        // in ctx memory. Tinted white when ON (against the accent fill), gray
-        // Render the SVG with its NATIVE colors (outlines/fills preserved) — a
-        // fully-transparent tint (alpha 0) makes rasterize_svg_recolored skip its
-        // recolor pass entirely. On/off state is conveyed by the button's fill +
-        // stroke below, not by tinting the glyph.
-        let tex: Option<egui::TextureHandle> = {
-            let key = egui::Id::new("controller_nav_icon_native");
-            let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
-            cached.or_else(|| {
-                const NAV_SVG: &str = include_str!("../../../../app/assets/controller_nav.svg");
-                crate::canvas::viewer::rasterize_svg_recolored(
-                    NAV_SVG, 32, 32, "override", egui::Color32::TRANSPARENT)
-                    .map(|img| {
-                        let t = ui.ctx().load_texture("controller_nav_icon", img,
-                            egui::TextureOptions::LINEAR);
-                        ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
-                        t
-                    })
-            })
-        };
-        let btn = match &tex {
-            Some(t) => egui::Button::image(
-                egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))
-                    // Dim the glyph when disabled so the grayed state reads.
-                    .tint(if nav_disabled {
-                        egui::Color32::from_gray(110)
-                    } else {
-                        egui::Color32::WHITE
-                    })),
-            None => egui::Button::new(egui::RichText::new("🎮").size(13.0)),
-        };
-        let nav_resp = ui.add_enabled(
-            !nav_disabled,
-            btn.fill(if nav_on {
-                    ui.visuals().selection.bg_fill
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .stroke(if nav_on {
-                    egui::Stroke::new(1.0, ui.visuals().selection.stroke.color)
-                } else {
-                    egui::Stroke::NONE
-                }),
-        ).on_hover_text(if nav_disabled {
-            "UI navigation unavailable — this is FlexInput's own virtual output (shown as physical). Driving the UI from it would feed back into your own mappings."
-        } else if nav_on {
-            "UI navigation ON — this gamepad drives FlexInput's UI while focused (mapped output suppressed). Click to disable."
-        } else {
-            "UI navigation OFF — click to let this gamepad drive FlexInput's UI while focused."
-        });
-        if nav_resp.clicked() && !nav_disabled {
-            *nav_toggle = Some(!nav_on);
+        if let Some(v) = nav_toggle_button(ui, nav_on, nav_disabled) {
+            *nav_toggle = Some(v);
         }
     });
 
@@ -1114,6 +1063,72 @@ pub fn canvas_node_xinput_slots(ui: &mut egui::Ui, device_id: &str) {
     {
         request_xinput_slot(device_id, slot);
     }
+}
+
+/// The UI-navigation toggle: accent-filled when on, matching the active-card
+/// selection hue used for the nav glow. Returns the state it was clicked to.
+///
+/// Shared by the Easy-mode input card and the Advanced-mode device node header —
+/// the config overlay can be summoned in either mode, so the switch that lets a
+/// pad drive it has to be reachable from either. One function so the two can't
+/// drift into disagreeing about what the icon means.
+#[must_use]
+pub(crate) fn nav_toggle_button(
+    ui: &mut egui::Ui,
+    nav_on: bool,
+    nav_disabled: bool,
+) -> Option<bool> {
+    // Rasterize the controller-nav SVG once and cache the texture in ctx memory.
+    // Render it with its NATIVE colors (outlines/fills preserved) — a
+    // fully-transparent tint makes rasterize_svg_recolored skip its recolor pass
+    // entirely. On/off state is conveyed by the button's fill + stroke below, not
+    // by tinting the glyph.
+    let tex: Option<egui::TextureHandle> = {
+        let key = egui::Id::new("controller_nav_icon_native");
+        let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
+        cached.or_else(|| {
+            const NAV_SVG: &str = include_str!("../../../../app/assets/controller_nav.svg");
+            crate::canvas::viewer::rasterize_svg_recolored(
+                NAV_SVG, 32, 32, "override", egui::Color32::TRANSPARENT)
+                .map(|img| {
+                    let t = ui.ctx().load_texture("controller_nav_icon", img,
+                        egui::TextureOptions::LINEAR);
+                    ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+                    t
+                })
+        })
+    };
+    let btn = match &tex {
+        Some(t) => egui::Button::image(
+            egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))
+                // Dim the glyph when disabled so the grayed state reads.
+                .tint(if nav_disabled {
+                    egui::Color32::from_gray(110)
+                } else {
+                    egui::Color32::WHITE
+                })),
+        None => egui::Button::new(egui::RichText::new("🎮").size(13.0)),
+    };
+    let nav_resp = ui.add_enabled(
+        !nav_disabled,
+        btn.fill(if nav_on {
+                ui.visuals().selection.bg_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            })
+            .stroke(if nav_on {
+                egui::Stroke::new(1.0, ui.visuals().selection.stroke.color)
+            } else {
+                egui::Stroke::NONE
+            }),
+    ).on_hover_text(if nav_disabled {
+        "UI navigation unavailable — this is FlexInput's own virtual output (shown as physical). Driving the UI from it would feed back into your own mappings."
+    } else if nav_on {
+        "UI navigation ON — this gamepad drives FlexInput's UI while focused (mapped output suppressed). Click to disable."
+    } else {
+        "UI navigation OFF — click to let this gamepad drive FlexInput's UI while focused."
+    });
+    (nav_resp.clicked() && !nav_disabled).then_some(!nav_on)
 }
 
 /// A `label` row with the four slot circles right-aligned to the dropdown width

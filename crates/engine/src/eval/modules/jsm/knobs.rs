@@ -146,15 +146,22 @@ pub fn sens_curve(cfg: &Compiled, samples: usize) -> Vec<CurvePoint> {
     let a = &cfg.aim;
     let c = &cfg.cc;
     let (lo, hi) = (a.min_sens.0, a.max_sens.0);
-    // A span that shows the shape: past the top threshold, and past whatever the
-    // chosen curve's own parameters put the action at — the three curves that
-    // ignore the threshold would otherwise be drawn over an arbitrary range.
-    let interest = a
-        .max_threshold
-        .max(c.natural_vhalf)
-        .max(c.sigmoid_mid + c.sigmoid_width * 2.0)
-        .max(c.power_vref * 4.0);
-    let span = (interest * 1.6).max(60.0);
+    // The same speed axis the custom-curve fork's graph uses: a fixed 500°/s
+    // unless a setting puts the action further out. Matching it means a curve
+    // drawn here and the same curve drawn there are the same picture — which is
+    // the point of drawing it at all, since the fork's graph is what people have
+    // been tuning against.
+    const MAX_OMEGA: f32 = 500.0;
+    let span = MAX_OMEGA
+        .max(a.max_threshold)
+        .max(c.power_vref)
+        .max(c.sigmoid_mid + c.sigmoid_width)
+        // The fork leaves NATURAL's half-speed out of its axis, which is fine
+        // while that is under 500 — as it is in any config anyone writes, since
+        // it is the speed you are half way to full sensitivity at. Past that its
+        // graph flattens into a useless corner, so this one keeps following it.
+        // Agrees with the fork everywhere the fork is readable.
+        .max(c.natural_vhalf);
     let n = samples.max(2);
     (0..n)
         .map(|i| {
