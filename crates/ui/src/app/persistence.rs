@@ -134,6 +134,27 @@ impl FlexInputApp {
             .then_some(self.gamepad_nav.remap_card)
     }
 
+    /// The JSM setting the pad is currently on, if the config overlay's selection
+    /// is a JSM pin — the editor (whose focused field says which) or one fader.
+    ///
+    /// Drives the tuning passthrough: which of the pad's inputs reaches the game
+    /// depends on which SETTING is in hand, not on the module.
+    pub(crate) fn config_jsm_focus(&self) -> Option<String> {
+        let (outer, _, elem) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        if self.nav_selected_module_id(*outer)? != "module.jsm" {
+            return None;
+        }
+        if let Some(name) = crate::canvas::viewer::jsm_knob_name_of(elem) {
+            return Some(name.to_string());
+        }
+        if elem != "editor" {
+            return None;
+        }
+        self.nav_jsm_knobs(*outer)
+            .get(self.gamepad_nav.field_index)
+            .map(|k| k.name.clone())
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

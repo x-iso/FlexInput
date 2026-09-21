@@ -39,6 +39,16 @@ impl FlexInputApp {
         // pressing left to move down — so there the axes swap. For single-field
         // elements either axis edits, since there is no focus to move.
         let column = self.nav_fields_are_a_column(outer_id);
+        // When the focused setting hands the left stick to the game, that stick
+        // can't walk the list either — pushing it would aim AND change which
+        // setting you were about to adjust. The dpad still walks.
+        let lstick_is_the_games = match &fields[self.gamepad_nav.field_index].field {
+            NavField::JsmValue { name } => self.nav_tuning_takes_lstick(outer_id, name),
+            _ => false,
+        };
+        let from_dpad = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"]
+            .iter()
+            .any(|p| nav.is_rising(p));
         let multi = n > 1;
         let mut edit_press = 0i32; // -1/+1 from the dpad or the stick
         if let Some(dir) = step_dir {
@@ -50,7 +60,8 @@ impl FlexInputApp {
                 (true, NavDir::Up) | (true, NavDir::Down)
                     | (false, NavDir::Left) | (false, NavDir::Right)
             );
-            let clear = Self::nav_axis_is_clear(nav.lstick, column);
+            let clear = Self::nav_axis_is_clear(nav.lstick, column)
+                && (from_dpad || !lstick_is_the_games);
             match dir {
                 d if multi && walk(d) && clear => {
                     let back = matches!(d, NavDir::Up | NavDir::Left);
@@ -130,11 +141,14 @@ impl FlexInputApp {
             NavField::JsmValue { name } => {
                 self.nav_note_jsm_baseline(outer_id, name);
                 let press = edit_press as f32;
+                // The stick this setting hands to the game is not one nav may
+                // use — you would be aiming and adjusting with the same thumb.
+                let stick = self.nav_free_stick(outer_id, name, nav);
                 // In a column the faders are walked with up/down, so the value is
                 // driven by the stick's X — and vice versa, or holding the stick
                 // to adjust would also be holding it to change focus.
-                let cont = if mag > 0.5 {
-                    if column { nav.lstick.x } else { nav.lstick.y }
+                let cont = if stick.length() > 0.5 {
+                    if column { stick.x } else { stick.y }
                 } else {
                     0.0
                 };
@@ -1181,6 +1195,45 @@ impl FlexInputApp {
             (stick.x.abs(), stick.y.abs())
         };
         walk >= cross * MARGIN
+    }
+
+    /// Does tuning this setting hand the LEFT stick to the game?
+    ///
+    /// If it does, that stick is not nav's to use — you would be aiming and
+    /// adjusting with the same thumb, and the adjustment would drive the game.
+    pub(crate) fn nav_tuning_takes_lstick(&self, outer_id: egui_snarl::NodeId, name: &str) -> bool {
+        use flexinput_engine::eval::{JsmFeel, JsmHand};
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let Some(node) = canvas
+            .snarl
+            .get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+        else {
+            return false;
+        };
+        let text = crate::canvas::viewer::jsm_active_text(node);
+        let cfg = flexinput_engine::eval::jsm_compile(&text, &[]);
+        matches!(
+            flexinput_engine::eval::jsm_feel_of(&cfg, name),
+            JsmFeel::Stick(JsmHand::Left)
+        )
+    }
+
+    /// The stick nav may use while `name` is being tuned — the one the setting is
+    /// not handing to the game.
+    fn nav_free_stick(
+        &self,
+        outer_id: egui_snarl::NodeId,
+        name: &str,
+        nav: &crate::gamepad_nav::NavInput,
+    ) -> egui::Vec2 {
+        if self.nav_tuning_takes_lstick(outer_id, name) {
+            nav.rstick
+        } else {
+            nav.lstick
+        }
     }
 
     /// Is there enough of this field left on screen to ring?

@@ -4028,9 +4028,20 @@ impl FlexInputApp {
                             };
                             delta += s * base_step;
                         }
-                        if mag > 0.5 {
+                        // A JSM setting that hands the left stick to the game so
+                        // you can feel it must be adjusted with the other one.
+                        let stick = self
+                            .nav_selected_element(outer_id)
+                            .and_then(|(m, e)| (m == "module.jsm")
+                                .then(|| crate::canvas::viewer::jsm_knob_name_of(&e)
+                                    .map(str::to_string))
+                                .flatten())
+                            .filter(|name| self.nav_tuning_takes_lstick(outer_id, name))
+                            .map(|_| nav.rstick)
+                            .unwrap_or(nav.lstick);
+                        if stick.length() > 0.5 {
                             let sens = if fine { 0.15 } else { 0.6 };
-                            delta += nav.lstick.x * sens * dt;
+                            delta += stick.x * sens * dt;
                         }
                         if delta != 0.0 {
                             self.nav_adjust_selected(outer_id, delta);

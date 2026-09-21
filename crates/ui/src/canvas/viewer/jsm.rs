@@ -224,6 +224,12 @@ pub(crate) fn knobs_of(node: &NodeData) -> Vec<flexinput_engine::eval::JsmKnob> 
         .unwrap_or_default()
 }
 
+/// The active tab's text, for callers outside the body (the config overlay's
+/// passthrough resolver needs to compile it to know what a setting affects).
+pub(crate) fn active_text(node: &NodeData) -> String {
+    active_text_of(node).map(|(_, t)| t.to_string()).unwrap_or_default()
+}
+
 /// The index of the node's active tab and its text — the one thing both nav
 /// helpers need, so they can't disagree about which tab is being driven.
 fn active_text_of(node: &NodeData) -> Option<(usize, &str)> {

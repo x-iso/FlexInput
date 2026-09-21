@@ -5344,3 +5344,62 @@ fn the_curve_preview_matches_the_curve_the_config_chose() {
         wide.last().unwrap().dps
     );
 }
+
+/// Tuning is done by feel, so while a setting is being adjusted the input it
+/// governs has to keep reaching the game. Several settings don't name that input
+/// — they act on "whichever stick aims", or on whatever was routed to a virtual
+/// stick — so the answer comes from the config, never from a guess.
+#[test]
+fn a_setting_says_which_input_you_need_to_feel_it() {
+    use super::knobs::{feel_of, Feel, Hand};
+
+    let plain = compile("");
+    assert_eq!(feel_of(&plain, "GYRO_SENS"), Feel::Gyro);
+    assert_eq!(feel_of(&plain, "REAL_WORLD_CALIBRATION"), Feel::Gyro);
+    assert_eq!(feel_of(&plain, "ACCEL_SIGMOID_WIDTH"), Feel::Gyro, "the fork's too");
+    assert_eq!(feel_of(&plain, "LEAN_THRESHOLD"), Feel::Gyro, "accel is the same wire");
+    assert_eq!(feel_of(&plain, "TRIGGER_THRESHOLD"), Feel::Triggers);
+    // Lower case reads the same as a config may spell it either way.
+    assert_eq!(feel_of(&plain, "gyro_sens"), Feel::Gyro);
+
+    // A setting that names its side means that side.
+    assert_eq!(feel_of(&plain, "LEFT_STICK_DEADZONE_INNER"), Feel::Stick(Hand::Left));
+    assert_eq!(feel_of(&plain, "RIGHT_STICK_DEADZONE_OUTER"), Feel::Stick(Hand::Right));
+
+    // ...and one that doesn't means whichever stick the CONFIG aims with.
+    let right_aims = compile("RIGHT_STICK_MODE = AIM\n");
+    assert_eq!(feel_of(&right_aims, "STICK_POWER"), Feel::Stick(Hand::Right));
+    let left_aims = compile("LEFT_STICK_MODE = AIM\n");
+    assert_eq!(
+        feel_of(&left_aims, "STICK_POWER"),
+        Feel::Stick(Hand::Left),
+        "the unusual way round is still read, not assumed"
+    );
+
+    // A virtual-pad OUTPUT setting shapes whatever drives that stick. With the
+    // gyro routed there, the gyro is what you need to feel — not the stick whose
+    // name is on the setting.
+    let gyro_to_left = compile("GYRO_OUTPUT = LEFT_STICK\n");
+    assert_eq!(feel_of(&gyro_to_left, "LEFT_STICK_UNDEADZONE_INNER"), Feel::Gyro);
+    assert_eq!(
+        feel_of(&gyro_to_left, "RIGHT_STICK_UNDEADZONE_INNER"),
+        Feel::Stick(Hand::Right),
+        "the stick the gyro was NOT routed to is still its own"
+    );
+    assert_eq!(
+        feel_of(&gyro_to_left, "LEFT_STICK_DEADZONE_INNER"),
+        Feel::Stick(Hand::Left),
+        "an INPUT deadzone on the same stick is still the stick"
+    );
+    assert_eq!(feel_of(&gyro_to_left, "WIND_STICK_RANGE"), Feel::Gyro);
+    assert_eq!(
+        feel_of(&right_aims, "WIND_STICK_RANGE"),
+        Feel::Stick(Hand::Right),
+        "with the gyro left on the mouse, winding is the stick's"
+    );
+
+    // A press timing has nothing to feel by holding an axis, and the buttons that
+    // would show it are the ones that must NOT reach a live game while you tune.
+    assert_eq!(feel_of(&plain, "HOLD_PRESS_TIME"), Feel::Nothing);
+    assert_eq!(feel_of(&plain, "NOT_A_SETTING"), Feel::Nothing);
+}

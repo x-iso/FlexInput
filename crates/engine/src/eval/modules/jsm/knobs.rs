@@ -182,6 +182,128 @@ pub fn sens_curve(cfg: &Compiled, samples: usize) -> Vec<CurvePoint> {
         .collect()
 }
 
+/// One of the pad's two sticks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hand {
+    Left,
+    Right,
+}
+
+/// Which of the pad's inputs a setting changes the feel of.
+///
+/// Tuning is done by feel: a sensitivity is right when the aim is right, and you
+/// cannot tell with the pad taken away. So while a setting is being adjusted, the
+/// input it governs should still reach the game — and, just as importantly,
+/// everything else should not, or you would be shooting while you tune.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Feel {
+    Gyro,
+    Stick(Hand),
+    Triggers,
+    /// Nothing to feel while dragging it — a press timing, a binding window.
+    /// Everything stays blocked.
+    Nothing,
+}
+
+/// Is this stick mode one that aims?
+fn aims(mode: super::analog::StickMode) -> bool {
+    use super::analog::StickMode as M;
+    matches!(mode, M::Aim | M::Flick | M::FlickOnly | M::RotateOnly | M::MouseArea)
+}
+
+/// The stick a config actually aims with, for the settings that don't say which
+/// they mean (`STICK_POWER`, the flick settings…). Right unless only the left is
+/// set up to aim — which is the way round almost every config has it, but read
+/// from the config rather than assumed.
+fn aiming_hand(cfg: &Compiled) -> Hand {
+    if aims(cfg.settings.right.mode) {
+        Hand::Right
+    } else if aims(cfg.settings.left.mode) {
+        Hand::Left
+    } else {
+        Hand::Right
+    }
+}
+
+/// What to let through to the game while this setting is being tuned.
+///
+/// `cfg` is the config as it currently stands, because several settings don't
+/// name the input they act on — `STICK_POWER` shapes whichever stick aims, and a
+/// virtual-pad setting shapes whatever was routed to that stick, which may be the
+/// gyro. Guessing would hand the game the wrong input at the exact moment the
+/// user is judging feel.
+pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
+    let upper = name.to_ascii_uppercase();
+    // A setting that names its side means that side.
+    if let Some(rest) = upper.strip_prefix("LEFT_STICK_") {
+        return virtual_or_stick(cfg, Hand::Left, rest);
+    }
+    if let Some(rest) = upper.strip_prefix("RIGHT_STICK_") {
+        return virtual_or_stick(cfg, Hand::Right, rest);
+    }
+    match upper.as_str() {
+        // The gyro, including everything the custom-curve fork added to it, and
+        // the motion settings — which are the accelerometer, on the same wire.
+        "GYRO_SENS" | "MIN_GYRO_SENS" | "MAX_GYRO_SENS" | "MIN_GYRO_THRESHOLD"
+        | "MAX_GYRO_THRESHOLD" | "GYRO_SMOOTH_THRESHOLD" | "GYRO_SMOOTH_TIME"
+        | "GYRO_CUTOFF_SPEED" | "GYRO_CUTOFF_RECOVERY" | "TRACKBALL_DECAY"
+        | "REAL_WORLD_CALIBRATION" | "IN_GAME_SENS"
+        | "ACCEL_NATURAL_VHALF" | "ACCEL_POWER_VREF" | "ACCEL_POWER_EXPONENT"
+        | "ACCEL_SIGMOID_MID" | "ACCEL_SIGMOID_WIDTH" | "ACCEL_JUMP_TAU"
+        | "ONE_EURO_MIN_CUTOFF" | "ONE_EURO_SPEED_COEFF" | "GYRO_ANGLE_SNAP"
+        | "DECEL_BRAKE_STRENGTH" | "DECEL_BRAKE_THRESHOLD" | "ROLL_CONTRIBUTION"
+        | "LEAN_THRESHOLD" | "MOTION_DEADZONE_INNER" | "MOTION_DEADZONE_OUTER" => Feel::Gyro,
+
+        // The winding settings shape whatever was routed to a virtual stick,
+        // which is usually the gyro — so ask the config rather than assume.
+        "WIND_STICK_RANGE" | "WIND_STICK_POWER" | "UNWIND_RATE"
+        | "ANGLE_TO_AXIS_DEADZONE_INNER" | "ANGLE_TO_AXIS_DEADZONE_OUTER"
+        | "VIRTUAL_STICK_CALIBRATION" => {
+            if cfg.pad.gyro_dest == super::pad::Dest::Mouse {
+                Feel::Stick(aiming_hand(cfg))
+            } else {
+                Feel::Gyro
+            }
+        }
+
+        "TRIGGER_THRESHOLD" | "TRIGGER_SKIP_DELAY" => Feel::Triggers,
+
+        // Aiming and flick settings that don't say which stick: the one aiming.
+        "STICK_DEADZONE_INNER" | "STICK_DEADZONE_OUTER" | "STICK_POWER"
+        | "STICK_ACCELERATION_RATE" | "STICK_ACCELERATION_CAP" | "SCROLL_SENS"
+        | "FLICK_TIME" | "FLICK_TIME_EXPONENT" | "FLICK_SNAP_STRENGTH"
+        | "FLICK_DEADZONE_ANGLE" | "ROTATE_SMOOTH_OVERRIDE" | "MOUSE_RING_RADIUS" => {
+            Feel::Stick(aiming_hand(cfg))
+        }
+
+        // A press timing has nothing to feel by holding an axis, and the buttons
+        // that would show it are the ones you must NOT send to a live game.
+        _ => Feel::Nothing,
+    }
+}
+
+/// A `LEFT_STICK_*` / `RIGHT_STICK_*` setting: its own stick, unless it shapes
+/// that stick as a virtual-pad OUTPUT, in which case what you want to feel is
+/// whatever drives it.
+fn virtual_or_stick(cfg: &Compiled, hand: Hand, rest: &str) -> Feel {
+    let is_output = matches!(
+        rest,
+        "UNDEADZONE_INNER" | "UNDEADZONE_OUTER" | "UNPOWER" | "VIRTUAL_SCALE"
+    );
+    if !is_output {
+        return Feel::Stick(hand);
+    }
+    let dest = match hand {
+        Hand::Left => super::pad::Dest::LeftStick,
+        Hand::Right => super::pad::Dest::RightStick,
+    };
+    if cfg.pad.gyro_dest == dest {
+        Feel::Gyro
+    } else {
+        Feel::Stick(hand)
+    }
+}
+
 /// The slider range for a setting, and whether it is whole-numbered.
 ///
 /// These are for a control to feel right in, not the parser's limits — the parser

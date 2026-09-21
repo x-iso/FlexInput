@@ -507,7 +507,27 @@ pub(crate) fn config_passthrough_pins_for(
     source_path: &[usize],
     inner_node_id: usize,
     card_edit: Option<usize>,
+    jsm_focus: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
+    // JSM Config: what passes through depends on WHICH setting is being tuned,
+    // not on the module — a gyro sensitivity wants the gyro out, a stick deadzone
+    // wants that stick. Nothing passes until a setting is focused, so merely
+    // having the editor pinned never drives the game.
+    if pin_module_id(tab_snarl, source_path, inner_node_id).as_deref() == Some("module.jsm") {
+        let device = config_passthrough_device(tab_snarl, source_path, inner_node_id)?;
+        let Some(name) = jsm_focus else {
+            return Some((device, vec![CONFIG_BLOCK_ALL_PIN.to_string()]));
+        };
+        let feel = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)
+            .and_then(|(snarl, node)| snarl.get_node(node))
+            .map(|n| {
+                let text = crate::canvas::viewer::jsm_active_text(n);
+                let cfg = flexinput_engine::eval::jsm_compile(&text, &[]);
+                flexinput_engine::eval::jsm_feel_of(&cfg, name)
+            })
+            .unwrap_or(flexinput_engine::eval::JsmFeel::Nothing);
+        return Some((device, jsm_tuning_passthrough(feel).0));
+    }
     let is_mapping = matches!(
         pin_module_id(tab_snarl, source_path, inner_node_id).as_deref(),
         Some("module.remapper") | Some("module.map_action")
@@ -582,6 +602,47 @@ fn config_card_in_pins(
 pub(crate) const GYRO_IMU_PINS: &[&str] = &[
     "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
 ];
+
+/// One stick's pins, all three forms — the Vec2 a sink prefers and the two
+/// floats. Passing only some of them would let a stick through on one axis.
+fn stick_pins(hand: flexinput_engine::eval::JsmHand) -> Vec<String> {
+    let base = match hand {
+        flexinput_engine::eval::JsmHand::Left => "left_stick",
+        flexinput_engine::eval::JsmHand::Right => "right_stick",
+    };
+    vec![base.to_string(), format!("{base}_x"), format!("{base}_y")]
+}
+
+/// The pins to let through while a JSM setting is being tuned, and the stick nav
+/// must therefore keep its hands off.
+///
+/// Tuning by feel only works if the input the setting governs still reaches the
+/// game. The rest stays blocked — including, crucially, the stick being used to
+/// do the adjusting, which is why the free hand is reported back.
+pub(crate) fn jsm_tuning_passthrough(
+    feel: flexinput_engine::eval::JsmFeel,
+) -> (Vec<String>, Option<flexinput_engine::eval::JsmHand>) {
+    use flexinput_engine::eval::{JsmFeel as F, JsmHand as H};
+    match feel {
+        F::Gyro => (GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect(), None),
+        // The setting's own stick goes to the game; the other one adjusts it.
+        F::Stick(h) => (
+            stick_pins(h),
+            Some(match h {
+                H::Left => H::Right,
+                H::Right => H::Left,
+            }),
+        ),
+        F::Triggers => (
+            vec!["left_trigger".to_string(), "right_trigger".to_string()],
+            None,
+        ),
+        // Nothing worth feeling, so nothing gets out — a press timing would have
+        // to be judged by pressing buttons, and those are the ones that must not
+        // reach a live game while you tune.
+        F::Nothing => (vec![CONFIG_BLOCK_ALL_PIN.to_string()], None),
+    }
+}
 
 fn config_consumed_pins(
     tab_snarl: &Snarl<NodeData>,
@@ -1702,4 +1763,41 @@ pub(crate) fn build_processing_graph_rec(
     }).collect();
 
     (ProcessingGraph { nodes }, dirty_uids)
+}
+
+#[cfg(test)]
+mod jsm_passthrough_tests {
+    use super::{jsm_tuning_passthrough, CONFIG_BLOCK_ALL_PIN, GYRO_IMU_PINS};
+    use flexinput_engine::eval::{JsmFeel as F, JsmHand as H};
+
+    // Whatever reaches the game must be the ONE input the setting governs, and
+    // the thumb doing the adjusting must be on the other stick — otherwise you
+    // are aiming and tuning with the same hand, and every adjustment drives the
+    // game as a side effect.
+    #[test]
+    fn tuning_passes_the_one_input_through_and_frees_the_other_hand() {
+        let (pins, free) = jsm_tuning_passthrough(F::Gyro);
+        assert_eq!(pins, GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(free, None, "both sticks stay nav's while you feel the gyro");
+
+        let (pins, free) = jsm_tuning_passthrough(F::Stick(H::Left));
+        assert_eq!(pins, ["left_stick", "left_stick_x", "left_stick_y"]);
+        assert_eq!(free, Some(H::Right), "adjust with the hand that isn't in the game");
+        // All three forms, or the stick leaks through on one axis only.
+        assert_eq!(pins.len(), 3);
+
+        let (pins, free) = jsm_tuning_passthrough(F::Stick(H::Right));
+        assert_eq!(pins, ["right_stick", "right_stick_x", "right_stick_y"]);
+        assert_eq!(free, Some(H::Left));
+
+        let (pins, _) = jsm_tuning_passthrough(F::Triggers);
+        assert_eq!(pins, ["left_trigger", "right_trigger"]);
+
+        // Nothing to feel means nothing gets out — and NOT an empty list, which
+        // the block filter reads as "the whole device passes".
+        let (pins, free) = jsm_tuning_passthrough(F::Nothing);
+        assert_eq!(pins, [CONFIG_BLOCK_ALL_PIN]);
+        assert_eq!(free, None);
+        assert!(!pins.is_empty(), "an empty list would pass the WHOLE pad");
+    }
 }

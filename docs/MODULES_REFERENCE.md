@@ -807,6 +807,19 @@ pub struct ModuleDescriptor {
   row would drag the strip back every frame and the wheel would feel stuck. Rows
   are published clipped to the visible band, so one scrolled out rings nothing
   (`nav_ring_is_worth_drawing`) rather than drawing across the container's edge.
+  **Tuning passthrough:** while a setting is focused, the input it governs keeps
+  reaching the game so you can judge it by feel — and nothing else does.
+  `jsm_feel_of` decides what that input is, reading the CONFIG rather than
+  guessing: a gyro setting passes the IMU pins, `LEFT_STICK_*` passes the left
+  stick, and the ones that don't name a side (`STICK_POWER`, the flick settings)
+  pass whichever stick that config actually aims with. A virtual-pad *output*
+  setting (`LEFT_STICK_UNDEADZONE_*`, `WIND_STICK_RANGE`…) passes whatever drives
+  that stick, which is the gyro when `GYRO_OUTPUT` is routed there. A setting with
+  nothing to feel (a press timing) passes the block-all sentinel, never an empty
+  list — the block filter reads empty as "the whole pad passes".
+  The stick handed to the game stops being nav's: a `LEFT_STICK_*` setting is
+  adjusted with the RIGHT stick, and the left no longer walks the list either
+  (the dpad still does), or you would be aiming and tuning with one thumb.
   **North restores** the value the setting held before this tuning pass, not a
   default: JSM's own default for a gyro sensitivity is 0, and writing that over
   someone's config mid-game is a silent edit rather than a reset.

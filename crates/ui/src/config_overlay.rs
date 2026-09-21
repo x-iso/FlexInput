@@ -253,6 +253,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // For a focused mapping-module pin: the card whose curve is being edited (so
     // its input passes through). `None` = block everything (default for mapping).
     let remapper_card_edit = app.config_remapper_card_edit();
+    let jsm_focus = app.config_jsm_focus();
     // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
     // the overlay draws the card glow (the selection now gates via nav_pass, so
     // no per-channel republish is needed — see the note in the closure below).
@@ -485,6 +486,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         let raw_passthrough = active_idx.and_then(|i| match &config_layout.items[i] {
             LayoutItem::Module(m) => crate::app::config_passthrough_pins_for(
                 tab_snarl, &m.source_path, m.inner_node_id, remapper_card_edit,
+                jsm_focus.as_deref(),
             ),
             _ => None,
         });

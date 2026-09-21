@@ -32,7 +32,8 @@ pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
 
 // The editor compiles the text it is showing to put a status on every line, so
 // the parser's surface is public — the run-time side stays crate-internal.
-pub use knobs::{knobs as jsm_knobs, sens_curve as jsm_sens_curve, set_knob as jsm_set_knob,
-    CurvePoint as JsmCurvePoint, Knob as JsmKnob};
+pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, sens_curve as jsm_sens_curve,
+    set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,
+    Knob as JsmKnob};
 pub use parse::{compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
     Compiled as JsmConfig, LineInfo as JsmLineInfo, LineStatus as JsmLineStatus};
