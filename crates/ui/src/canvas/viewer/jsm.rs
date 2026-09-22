@@ -141,6 +141,17 @@ fn upstream_device(
 /// The pins the pad feeding this node actually reports, so the editor can say
 /// which buttons a config asks for that this pad hasn't got. Empty when there is
 /// no device yet — nothing is claimed on a guess.
+/// This patch's FlexInput targets as a config names them, for the `@` tag.
+///
+/// From the per-frame registry the pickers use, so the editor and the running
+/// module resolve the same names — the graph stamps the same table onto the node.
+pub(crate) fn fi_ports() -> Vec<(String, String)> {
+    crate::macro_icons::registry()
+        .iter()
+        .map(|e| (e.name.clone(), e.pin.clone()))
+        .collect()
+}
+
 fn pins_this_pad_reports(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
@@ -649,7 +660,11 @@ fn jsm_rows(
     // one naming a tab that isn't there is an error saying which tabs there are.
     let tab_list: Vec<(String, String)> =
         tabs.iter().map(|t| (t.name.clone(), t.text.clone())).collect();
-    let mut compiled = flexinput_engine::eval::jsm_compile(&tabs[active].text, &tab_list);
+    // Compiled against this patch's own targets too, so a line that binds one
+     // with `@` resolves here exactly as it will when it runs — and one that
+     // names a port this patch hasn't got says so while you are looking at it.
+    let mut compiled = flexinput_engine::eval::jsm_compile_full(
+        &tabs[active].text, &tab_list, &fi_ports());
     // A button this pad hasn't got is the device's business, not the config's, so
     // it lands as a note on the line rather than changing its status.
     flexinput_engine::eval::jsm_note_missing_inputs(

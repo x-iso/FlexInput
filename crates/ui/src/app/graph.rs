@@ -1248,6 +1248,19 @@ pub(crate) fn build_processing_graph_rec(
         // RWS Aim: trace the Flick input (pin 1) to the physical stick feeding it
         // so the engine can source-block that stick downstream while still reading
         // it internally (from the pre-block snapshot).
+        // A JSM config can bind one of FlexInput's own targets by name with
+        // `@`, which JSM has no vocabulary for because they are ours. The names
+        // live in the patch, so the graph carries them to the node the way it
+        // carries the device id. Taken from the per-frame registry that exists
+        // for exactly this (the graph is rebuilt every frame, so a table that
+        // changed this frame is right by the next one).
+        if node.module_id == "module.jsm" {
+            let ports: Vec<serde_json::Value> = crate::macro_icons::registry()
+                .iter()
+                .map(|e| serde_json::json!({ "name": e.name, "pin": e.pin }))
+                .collect();
+            params.insert("_macro_ports".to_string(), serde_json::Value::Array(ports));
+        }
         if node.module_id == "processing.rws" {
             if let Some((dev, stick)) = trace_rws_flick_source(snarl, *node_id, parents) {
                 params.insert("_rws_flick_device".to_string(), serde_json::Value::String(dev));

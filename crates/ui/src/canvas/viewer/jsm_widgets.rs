@@ -921,6 +921,17 @@ pub(crate) fn command_list(
         .collect();
     if kinds.contains(&flexinput_engine::eval::JsmKind::Binding) {
         items.extend(flexinput_engine::eval::jsm_bindings());
+        // FlexInput's own targets, which JSM has no names for because they are
+        // ours: a Macro Output port or a Virtual Menu entry, under the `@` tag.
+        for e in crate::macro_icons::registry().iter() {
+            items.push(flexinput_engine::eval::JsmItem {
+                name: flexinput_engine::eval::jsm_fi_tag(&e.name),
+                kind: flexinput_engine::eval::JsmKind::Binding,
+                group: "FlexInput",
+                state: flexinput_engine::eval::JsmSupportState::Live,
+                help: None,
+            });
+        }
     }
     let mut picked = None;
     let mut close = false;

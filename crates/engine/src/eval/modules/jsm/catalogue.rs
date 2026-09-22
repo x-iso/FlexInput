@@ -153,6 +153,24 @@ pub(crate) const PUNCTUATION: &[&str] = &[
     ";", "'", ",", ".", "/", "\\", "[", "]", "+", "-", "`",
 ];
 
+/// How a FlexInput target's name is written in a config.
+///
+/// `@Name`, or `@"Name with spaces"` — quoted whenever the bare form couldn't
+/// be read back, which is anything outside letters, digits, `_`, `-` and `.`
+/// (the unquoted charset stops short of JSM's event modifiers so a name can't
+/// swallow one). The one place that decides this, so what a picker inserts is
+/// what the parser reads.
+pub fn fi_tag(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !name.ends_with('_');
+    if bare {
+        format!("@{name}")
+    } else {
+        format!("@\"{name}\"")
+    }
+}
+
 /// The JSM name for each of our bus pins a binding can write.
 ///
 /// Derived from the binding parser rather than kept as a second table: every

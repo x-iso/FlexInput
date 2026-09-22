@@ -41,7 +41,7 @@ pub use cursor::{clamped as jsm_cursor_clamped, delete as jsm_cursor_delete,
     moved as jsm_cursor_moved, replace as jsm_cursor_replace,
     selection as jsm_selection, tokens_at as jsm_tokens_at, Cursor as JsmCursor,
     Token as JsmToken, TokenKind as JsmTokenKind};
-pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue,
+pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue, fi_tag as jsm_fi_tag,
     names_by_pin as jsm_names_by_pin,
     insert_pick as jsm_insert_pick,
     kinds_at as jsm_kinds_at, Item as JsmItem, Kind as JsmKind,
@@ -51,5 +51,5 @@ pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, scrub as jsm_scrub_n
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,
     Knob as JsmKnob};
-pub use parse::{compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
+pub use parse::{compile_full as jsm_compile_full, compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
     Compiled as JsmConfig, LineInfo as JsmLineInfo, LineStatus as JsmLineStatus};

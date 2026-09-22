@@ -160,13 +160,13 @@ fn a_bare_action_modifier_is_an_error_not_a_crash() {
 #[test]
 fn a_quoted_command_is_instant() {
     // A name that isn't a config file stays a console command.
-    let (s, _) = parse_mapping("\"RECONNECT_CONTROLLERS\"", &[]).expect("parses");
+    let (s, _) = parse_mapping("\"RECONNECT_CONTROLLERS\"", &[], &[]).expect("parses");
     assert_eq!(s[0].action, ActionMod::Instant);
     assert_eq!(s[0].out, Out::Command("RECONNECT_CONTROLLERS".into()));
 
     // A config file name is a layer switch, and resolves to the tab of that name.
     let tabs = vec![("driving".to_string(), String::new())];
-    let (s, _) = parse_mapping("\"GyroConfigs/driving.txt\"", &tabs).expect("parses");
+    let (s, _) = parse_mapping("\"GyroConfigs/driving.txt\"", &tabs, &[]).expect("parses");
     assert_eq!(s[0].out, Out::Layer("driving".into()));
 
     let info = one("HOME = ^\"RESET_MAPPINGS\"");
@@ -485,6 +485,114 @@ fn naming_a_config_with_no_tab_says_which_tabs_there_are() {
             );
         }
         other => panic!("a missing tab should be an error, got {other:?}"),
+    }
+}
+
+// ── FlexInput's own targets, under the `@` tag ───────────────────────────────
+
+/// The patch's Macro Output ports and Virtual Menu entries, as the graph builder
+/// hands them over.
+fn ports() -> Vec<(String, String)> {
+    vec![
+        ("Reload".to_string(), "macro:aa11bb22".to_string()),
+        ("Reload sequence".to_string(), "macro:ccdd0011".to_string()),
+        ("Weapon wheel — Show".to_string(), "menu:m1_show".to_string()),
+    ]
+}
+
+/// A config can reach one of OUR targets, which JSM has no vocabulary for,
+/// because they are ours. By name, since a config is text a person reads.
+#[test]
+fn an_at_name_binds_one_of_flexinputs_own_targets() {
+    let c = super::parse::compile_full("S = @Reload", &[], &ports());
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert_eq!(c.bindings[0].steps[0].out, pin("macro:aa11bb22"));
+
+    // Quoted when the name has spaces in it.
+    let c = super::parse::compile_full(r#"S = @"Reload sequence""#, &[], &ports());
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert_eq!(c.bindings[0].steps[0].out, pin("macro:ccdd0011"));
+
+    // A menu entry is the same kind of target.
+    let c = super::parse::compile_full(r#"N = @"Weapon wheel — Show""#, &[], &ports());
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert_eq!(c.bindings[0].steps[0].out, pin("menu:m1_show"));
+
+    // Matched the way a person would: case and surrounding space don't count.
+    let c = super::parse::compile_full("S = @reload", &[], &ports());
+    assert_eq!(c.bindings[0].steps[0].out, pin("macro:aa11bb22"));
+}
+
+/// An `@` name that doesn't resolve is an ERROR on the line, not a note. The
+/// line does nothing, and saying so where you can still see the line is the
+/// whole point of this module.
+#[test]
+fn an_at_name_that_is_not_in_the_patch_says_so() {
+    let c = super::parse::compile_full("S = @Nope", &[], &ports());
+    match &c.lines[0].status {
+        LineStatus::Error(e) => {
+            assert!(e.contains("Nope"), "{e}");
+            assert!(e.contains("Macro Output") || e.contains("Menu"), "{e}");
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    // With no ports at all the reason is different, because the fix is.
+    let c = super::parse::compile_full("S = @Reload", &[], &[]);
+    match &c.lines[0].status {
+        LineStatus::Error(e) => assert!(e.contains("no Macro Output"), "{e}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    // And `@` on its own is not a name.
+    let c = super::parse::compile_full("S = @", &[], &ports());
+    assert!(matches!(c.lines[0].status, LineStatus::Error(_)));
+}
+
+/// The unquoted form must not swallow an event modifier: `@Reload/` is a target
+/// pressed on release, not a target called "Reload/".
+#[test]
+fn an_at_name_stops_before_an_event_modifier() {
+    for (line, want) in [
+        (r#"S = @Reload\"#, "on press"),
+        (r#"S = @Reload'"#, "on tap"),
+        (r#"S = @Reload_"#, "on hold"),
+        // Release needs an action modifier, which is JSM's own rule for any key.
+        (r#"S = !@Reload/"#, "instant, on release"),
+        (r#"S = ^@Reload"#, "as a toggle"),
+    ] {
+        let c = super::parse::compile_full(line, &[], &ports());
+        assert_eq!(c.lines[0].status, LineStatus::Ok, "{line} ({want})");
+        assert_eq!(c.bindings[0].steps[0].out, pin("macro:aa11bb22"), "{line}");
+    }
+}
+
+/// What a picker writes is what the parser reads. Every port name the patch can
+/// hand over goes in through `fi_tag` and comes back out as that port's pin.
+#[test]
+fn every_port_name_round_trips_through_the_tag_it_is_written_as() {
+    let awkward = vec![
+        ("Reload".to_string(), "macro:1".to_string()),
+        ("Reload sequence".to_string(), "macro:2".to_string()),
+        ("Weapon wheel — Show".to_string(), "macro:3".to_string()),
+        ("50% throttle".to_string(), "macro:4".to_string()),
+        ("trailing_".to_string(), "macro:5".to_string()),
+        ("dash-and.dot".to_string(), "macro:6".to_string()),
+        ("Quote\"inside".to_string(), "macro:7".to_string()),
+    ];
+    for (name, want_pin) in &awkward {
+        let tag = super::catalogue::fi_tag(name);
+        let text = format!("S = {tag}");
+        let c = super::parse::compile_full(&text, &[], &awkward);
+        // A name with a quote in it can't be written at all — say that out loud
+        // rather than pretending, since it is the one case the tag can't express.
+        if name.contains('"') {
+            assert!(
+                matches!(c.lines[0].status, LineStatus::Error(_)),
+                "{name}: a quote inside a name has no spelling, so it must not silently bind"
+            );
+            continue;
+        }
+        assert_eq!(c.lines[0].status, LineStatus::Ok, "{name} written as {tag}");
+        assert_eq!(c.bindings[0].steps[0].out, pin(want_pin), "{name}");
     }
 }
 
@@ -1969,6 +2077,65 @@ fn run_node(text: &str, strict: bool, held: &[&str], ticks: usize) -> HashMap<St
 }
 
 /// The same, with the pad reporting whatever these signals say.
+/// A `@` binding reaches a Macro Output port, and by the route the other mapping
+/// modules use — the reserved macro namespace, NOT the AutoMap bus.
+///
+/// This is the half that can't be seen from the parser: a macro pin published
+/// onto the bus would leak to sinks, and one published every tick would claim
+/// the port whether or not anything here binds it.
+#[test]
+fn an_at_binding_drives_a_macro_port_through_the_macro_namespace() {
+    let _guard = alone();
+    let uid = 909;
+    let mut snap = jsm_snap(uid, "S = @Reload", false);
+    snap.params.insert(
+        "_macro_ports".to_string(),
+        serde_json::json!([{ "name": "Reload", "pin": "macro:aa11bb22" }]),
+    );
+    let key = format!("collector:{uid}");
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+
+    // Nothing held: the port is not written at all. Absent IS released for a
+    // macro target, and writing "off" every tick would fight every other writer.
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    super::eval::jsm_publish(&snap, uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    assert!(
+        !collector.contains_key(&("macro".to_string(), "macro:aa11bb22".to_string())),
+        "an idle port must not be claimed: {collector:?}"
+    );
+
+    // Held: the port is asserted in the macro namespace.
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
+    assert_eq!(
+        collector
+            .get(&("macro".to_string(), "macro:aa11bb22".to_string()))
+            .map(|s| s.as_bool()),
+        Some(true),
+        "the port should be asserted: {collector:?}"
+    );
+    // And it never appears on the bus, where a sink would see it.
+    assert!(
+        !collector.keys().any(|(d, p)| *d == key && p.starts_with("macro:")),
+        "a macro pin leaked onto the bus: {collector:?}"
+    );
+}
+
+/// Without the patch's table the name can't resolve, and the line says so rather
+/// than the binding quietly doing nothing.
+#[test]
+fn an_at_binding_with_no_table_is_an_error_rather_than_a_silent_no_op() {
+    let c = compile("S = @Reload");
+    assert!(
+        matches!(c.lines[0].status, LineStatus::Error(_)),
+        "{:?}",
+        c.lines[0].status
+    );
+    assert!(c.bindings.is_empty(), "an unresolved line binds nothing");
+}
+
 fn run_node_with(
     text: &str,
     strict: bool,

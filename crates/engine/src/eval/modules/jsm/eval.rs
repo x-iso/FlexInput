@@ -147,12 +147,15 @@ pub(crate) fn jsm_publish(
             .unwrap_or_default()
     };
     let text = text_for(&selected);
+    // This patch's Macro Output ports and Virtual Menu entries, as the graph
+    // builder stamped them, so a line can bind one by name with `@`.
+    let ports = macro_ports(snap);
     let st = ns.jsm.get_or_insert_with(|| {
         Box::new(JsmState {
             gen,
             layer: selected.clone(),
             ever_claimed: HashSet::new(),
-            cfg: super::parse::compile_with(&text, &tabs),
+            cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
             analog: Analog::default(),
             aim: Aim::default(),
@@ -166,7 +169,7 @@ pub(crate) fn jsm_publish(
         // half-edited layer chain is not something to keep running.
         st.gen = gen;
         st.layer = selected.clone();
-        st.cfg = super::parse::compile_with(&text, &tabs);
+        st.cfg = super::parse::compile_full(&text, &tabs, &ports);
         st.rt = Runtime::default();
         st.analog = Analog::default();
         st.aim = Aim::default();
@@ -320,6 +323,19 @@ pub(crate) fn jsm_publish(
         // While an editor has focus the keys and mouse pause, and pause means
         // released — a binding under test shouldn't freeze mid-press.
         let on = held.contains(&pin) && !(typing && types_into_the_editor(&pin));
+        // A Macro Output port or Virtual Menu entry is NOT a bus pin: it routes
+        // into the reserved macro namespaces, where only asserted values are
+        // written and several writers merge by magnitude. Publishing "off" for
+        // one every tick would be this module claiming the port whether or not
+        // anything here binds it — which is the opposite of what the other
+        // mapping modules do, and would fight them.
+        if crate::eval::activation::is_macro_style_target(&pin) {
+            if on {
+                crate::eval::activation::merge_macro_scalar(
+                    collector_sigs, &pin, on_value(&pin));
+            }
+            continue;
+        }
         let sig = if on { on_value(&pin) } else { pin_off_value(&pin) };
         collector_sigs.insert((key.clone(), pin), sig);
     }
@@ -434,7 +450,7 @@ pub(crate) fn jsm_publish(
     if let Some(layer) = want {
         if reset || tabs.iter().any(|(n, _)| *n == layer) {
             st.layer = layer.clone();
-            st.cfg = super::parse::compile_with(&text_for(&layer), &tabs);
+            st.cfg = super::parse::compile_full(&text_for(&layer), &tabs, &ports);
             st.rt = Runtime::default();
             st.analog = Analog::default();
             st.aim = Aim::default();
@@ -735,6 +751,27 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
         }
     }
     (digital, analog)
+}
+
+/// This patch's FlexInput targets, as `(name, pin)`.
+///
+/// Stamped onto the node by the graph builder the way `_automap_device_id` is,
+/// because the names live in the patch rather than in the config text — and a
+/// config that binds `@Reload` has to be told which port that is.
+fn macro_ports(snap: &NodeSnap) -> Vec<(String, String)> {
+    snap.params
+        .get("_macro_ports")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let name = e.get("name")?.as_str()?.to_string();
+                    let pin = e.get("pin")?.as_str()?.to_string();
+                    Some((name, pin))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Every pin the compiled config could drive, whatever the event that would do

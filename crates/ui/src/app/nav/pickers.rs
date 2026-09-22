@@ -118,7 +118,7 @@ impl FlexInputApp {
         names: &std::collections::HashMap<String, String>,
     ) {
         use crate::gamepad_nav::PickerUse;
-        use crate::kbm_picker::{cell_typed, pin_as_bound, Typed};
+        use crate::kbm_picker::{cell_typed, Typed};
         if self.gamepad_nav.kbm_picker_use == PickerUse::JsmName {
             // A binding can carry an event modifier or be a chord (`\SPACE`,
             // `A+B`), and no single key expresses that — so the same board drops
@@ -135,8 +135,7 @@ impl FlexInputApp {
             // be spelled out letter by letter would be a worse list than the
             // list is.
             if nav.is_rising("btn_south") {
-                if let Some(name) = names.get(pin_as_bound(&cell.pin)) {
-                    let name = name.clone();
+                if let Some(name) = jsm_insert_for_cell(&cell.pin, names) {
                     self.finish_kbm_typing(name);
                 }
             }
@@ -392,12 +391,12 @@ impl FlexInputApp {
                 if purpose == crate::gamepad_nav::PickerUse::JsmName {
                     let focused = cells
                         .get(sel)
-                        .and_then(|c| names.get(crate::kbm_picker::pin_as_bound(&c.pin)));
+                        .and_then(|c| jsm_insert_for_cell(&c.pin, &names));
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Binds as:").small().weak());
                         match focused {
                             Some(n) => {
-                                ui.label(egui::RichText::new(n).monospace().strong());
+                                ui.label(egui::RichText::new(&n).monospace().strong());
                             }
                             None => {
                                 ui.label(
@@ -610,6 +609,23 @@ impl FlexInputApp {
     }
 }
 
+/// What inserting this cell writes into a JSM config, if anything.
+///
+/// A key or pad button goes in under the name JSM binds it by. One of OUR
+/// targets — a Macro Output port, a Virtual Menu entry — has no JSM name at all,
+/// so it goes in under the `@` tag instead. One function, so what the board
+/// offers, what it previews and what it inserts cannot disagree.
+pub(crate) fn jsm_insert_for_cell(
+    pin: &str,
+    names: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(n) = names.get(crate::kbm_picker::pin_as_bound(pin)) {
+        return Some(n.clone());
+    }
+    let entry = crate::macro_icons::registry_entry(pin)?;
+    Some(flexinput_engine::eval::jsm_fi_tag(&entry.name))
+}
+
 /// Does this cell do anything for what the picker is being used for?
 ///
 /// The chord purpose's own exclusions (analog-only cells, a menu's own targets)
@@ -625,6 +641,6 @@ pub(crate) fn cell_does_something(
         // `false` for the caps latch: whether a key types something doesn't
         // depend on which of its two characters it would give.
         PickerUse::Text => crate::kbm_picker::cell_typed(pin, false).is_some(),
-        PickerUse::JsmName => names.contains_key(crate::kbm_picker::pin_as_bound(pin)),
+        PickerUse::JsmName => jsm_insert_for_cell(pin, names).is_some(),
     }
 }

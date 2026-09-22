@@ -255,6 +255,25 @@ impl Compiled {
 /// from wherever they sit and then travel inside the patch.
 pub type Tabs<'a> = &'a [(String, String)];
 
+/// This patch's FlexInput targets, as `(name, pin)` — a Macro Output port or a
+/// Virtual Menu entry, which a config reaches with `@`.
+///
+/// By NAME, not by pin id, because a JSM config is text a person reads and
+/// shares. That is the same trade the tabs make: a name can be renamed out from
+/// under a config, and the line then says so, which is better than a config full
+/// of `@macro:aa11bb22`.
+pub type Ports<'a> = &'a [(String, String)];
+
+/// The pin for a FlexInput target named `name`, matched the way a person would:
+/// case-insensitively, ignoring surrounding space.
+pub(crate) fn port_pin(name: &str, ports: Ports) -> Option<String> {
+    let want = name.trim();
+    ports
+        .iter()
+        .find(|(n, _)| n.trim().eq_ignore_ascii_case(want))
+        .map(|(_, pin)| pin.clone())
+}
+
 /// The tab a JSM file name refers to: the base name, without directory or `.txt`.
 pub fn tab_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
@@ -273,6 +292,15 @@ pub fn compile(text: &str) -> Compiled {
 
 /// Compile a whole config against the tabs it can reach.
 pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
+    compile_full(text, tabs, &[])
+}
+
+/// Compile against this patch's FlexInput targets as well as its tabs.
+///
+/// Separate entry point rather than one more argument everywhere: almost
+/// nothing needs the ports, and a test that doesn't care shouldn't have to say
+/// so.
+pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
     let mut out = Compiled {
         lines: Vec::new(),
         bindings: Vec::new(),
@@ -289,7 +317,7 @@ pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
         mentioned: HashSet::new(),
     };
     for (n, line) in text.lines().enumerate() {
-        let info = compile_line(line, n, &mut out, tabs);
+        let info = compile_line(line, n, &mut out, tabs, ports);
         out.lines.push(info);
     }
     annotate_analog(&mut out);
@@ -458,7 +486,7 @@ fn annotate_analog(out: &mut Compiled) {
     }
 }
 
-fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs) -> LineInfo {
+fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Ports) -> LineInfo {
     // '#' starts a comment to end of line (JSM cuts it before parsing, so a '#'
     // inside a quoted command ends the line there too).
     let line = raw.split('#').next().unwrap_or("").trim();
@@ -501,7 +529,7 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs) -> LineInfo
     }
 
     // Everything else is a binding.
-    binding_line(&first, combo, rhs, n, out, tabs)
+    binding_line(&first, combo, rhs, n, out, tabs, ports)
 }
 
 // ── line kinds ───────────────────────────────────────────────────────────────
@@ -853,6 +881,7 @@ fn binding_line(
     line: usize,
     out: &mut Compiled,
     tabs: Tabs,
+    ports: Ports,
 ) -> LineInfo {
     let Some(btn) = Btn::from_name(first) else {
         return LineInfo::of(LineStatus::Error(format!(
@@ -878,7 +907,7 @@ fn binding_line(
         }
     };
 
-    let (steps, notes) = match parse_mapping(rhs, tabs) {
+    let (steps, notes) = match parse_mapping(rhs, tabs, ports) {
         Ok(v) => v,
         Err(e) => return LineInfo::of(LineStatus::Error(e)),
     };
@@ -1132,7 +1161,11 @@ fn read_token(chars: &[char], i: &mut usize) -> Option<String> {
 /// Event modifiers default the way JSM's parser does: the only key of a binding
 /// follows the press, the first of several is the tap and the second the hold,
 /// and a third needs saying which event it wants.
-pub(crate) fn parse_mapping(rhs: &str, tabs: Tabs) -> Result<(Vec<Step>, Vec<String>), String> {
+pub(crate) fn parse_mapping(
+    rhs: &str,
+    tabs: Tabs,
+    ports: Ports,
+) -> Result<(Vec<Step>, Vec<String>), String> {
     let chars: Vec<char> = rhs.chars().collect();
     let mut i = 0;
     let mut steps: Vec<Step> = Vec::new();
@@ -1171,7 +1204,53 @@ pub(crate) fn parse_mapping(rhs: &str, tabs: Tabs) -> Result<(Vec<Step>, Vec<Str
         // The key itself: a quoted command, a word, or a single punctuation mark.
         let key: String;
         let mut command = false;
-        if chars[i] == '"' {
+        // `@` names one of FlexInput's own targets — a Macro Output port or a
+        // Virtual Menu entry — which JSM has no vocabulary for because they are
+        // ours. Quoted when the name has spaces in it: `@"Reload sequence"`.
+        // JSM itself uses no `@`, in any position, so nothing is being taken.
+        let mut fi = false;
+        if chars[i] == '@' {
+            i += 1;
+            let quoted = chars.get(i) == Some(&'"');
+            if quoted {
+                i += 1;
+            }
+            let mut name = String::new();
+            while i < chars.len() {
+                let c = chars[i];
+                // Unquoted, the name is a conservative charset: anything else
+                // could be an event modifier, and swallowing one would make
+                // `@Reload\\` bind to a port called "Reload\\" instead of
+                // pressing on release. Quotes take the whole name, spaces and all.
+                let takes = if quoted {
+                    c != '"'
+                } else {
+                    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+                };
+                if !takes {
+                    break;
+                }
+                name.push(c);
+                i += 1;
+            }
+            // JSM's own word rule: a trailing `_` on a real word is the hold
+            // event modifier, not part of the name.
+            if !quoted && name.len() > 1 && name.ends_with('_') {
+                name.pop();
+                i -= 1;
+            }
+            if quoted {
+                if i >= chars.len() {
+                    return Err("a quoted @name is missing its closing quote".into());
+                }
+                i += 1;
+            }
+            if name.trim().is_empty() {
+                return Err("`@` needs the name of a macro port or menu entry after it".into());
+            }
+            key = name;
+            fi = true;
+        } else if chars[i] == '"' {
             let mut j = i + 1;
             let mut inner = String::new();
             while j < chars.len() && chars[j] != '"' {
@@ -1229,7 +1308,20 @@ pub(crate) fn parse_mapping(rhs: &str, tabs: Tabs) -> Result<(Vec<Step>, Vec<Str
         let rest_is_empty = chars[i..].iter().all(|c| c.is_whitespace());
 
         let mut action = action;
-        let out = if command {
+        let out = if fi {
+            // Resolved here rather than left for later: an unresolved target is
+            // a line that does nothing, and this module's whole job is to say so
+            // at the point you can still see the line.
+            match port_pin(&key, ports) {
+                Some(pin) => Out::Pin(pin),
+                None if ports.is_empty() => return Err(format!(
+                    "`@{key}` — this patch has no Macro Output ports or Virtual Menu entries to bind to"
+                )),
+                None => return Err(format!(
+                    "`@{key}` isn't a Macro Output port or Virtual Menu entry in this patch"
+                )),
+            }
+        } else if command {
             // A console command has no key to release, so it fires and is done.
             if action == ActionMod::None {
                 action = ActionMod::Instant;
