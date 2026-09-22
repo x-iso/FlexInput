@@ -1442,6 +1442,17 @@ fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
         "arrowleft"        => Key::LeftArrow,
         "arrowright"       => Key::RightArrow,
         "capslock"         => Key::CapsLock,
+        // Sided modifiers. The unsided `key_shift` / `key_ctrl` / `key_alt` /
+        // `key_win` are held in `KeysHeld` and pressed separately; these come
+        // through as learned keys, so both spellings reach the OS.
+        "lshift"           => Key::LShift,
+        "rshift"           => Key::RShift,
+        "lctrl" | "lcontrol"  => Key::LControl,
+        "rctrl" | "rcontrol"  => Key::RControl,
+        "lalt"             => Key::LMenu,
+        "ralt"             => Key::RMenu,
+        "lwin"             => Key::LWin,
+        "rwin"             => Key::RWin,
         "f1"  => Key::F1,  "f2"  => Key::F2,  "f3"  => Key::F3,  "f4"  => Key::F4,
         "f5"  => Key::F5,  "f6"  => Key::F6,  "f7"  => Key::F7,  "f8"  => Key::F8,
         "f9"  => Key::F9,  "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,

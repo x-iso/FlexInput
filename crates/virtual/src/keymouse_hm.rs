@@ -42,10 +42,38 @@ use crate::{layouts, SinkPin, VirtualDevice};
 
 /// Modifier bits of report byte 0 (left-hand variants).
 mod kbd_mod {
+    // The HID keyboard's modifier byte has always carried both sides; only the
+    // left half was ever set. A game that reads raw scancodes can tell them
+    // apart, and JSM configs name them apart (LSHIFT / RSHIFT), so we set the
+    // half that was asked for. Nothing about the report DESCRIPTOR changes —
+    // these are bits in a byte that was already there.
     pub const CTRL: u8 = 0x01;
     pub const SHIFT: u8 = 0x02;
     pub const ALT: u8 = 0x04;
     pub const WIN: u8 = 0x08;
+    pub const RCTRL: u8 = 0x10;
+    pub const RSHIFT: u8 = 0x20;
+    pub const RALT: u8 = 0x40;
+    pub const RWIN: u8 = 0x80;
+}
+
+/// The modifier byte for what is held.
+///
+/// Left and right are different bits of a byte the report always carried, so a
+/// game reading scancodes can tell them apart — which is the whole point of
+/// naming them apart. Pulled out of the report builder so the bit each one
+/// lands on can be tested; it is the kind of thing that is silently wrong.
+fn mods_byte(k: &KeysHeld) -> u8 {
+    let mut mods = 0u8;
+    if k.shift  { mods |= kbd_mod::SHIFT; }
+    if k.ctrl   { mods |= kbd_mod::CTRL; }
+    if k.alt    { mods |= kbd_mod::ALT; }
+    if k.win    { mods |= kbd_mod::WIN; }
+    if k.rshift { mods |= kbd_mod::RSHIFT; }
+    if k.rctrl  { mods |= kbd_mod::RCTRL; }
+    if k.ralt   { mods |= kbd_mod::RALT; }
+    if k.rwin   { mods |= kbd_mod::RWIN; }
+    mods
 }
 
 /// Map a learned-key pin name (egui key name, with or without the `key_`
@@ -139,13 +167,68 @@ impl MouseButtons {
     }
 }
 
+/// One of the eight modifiers the HID keyboard's first byte carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mod {
+    Shift,
+    Ctrl,
+    Alt,
+    Win,
+    RShift,
+    RCtrl,
+    RAlt,
+    RWin,
+}
+
+/// Which modifier a pin holds down, if it is one.
+///
+/// Unsided and left-sided are the same modifier: pressing "Shift" means the
+/// left one on every keyboard anyone has held. A modifier pin that fell through
+/// this would be treated as a learned key, looked up for a HID usage it hasn't
+/// got, and dropped in silence — so every pin here is checked against that
+/// lookup by a test.
+fn modifier_slot(pin: &str) -> Option<Mod> {
+    Some(match pin {
+        "key_shift" | "key_lshift" => Mod::Shift,
+        "key_ctrl" | "key_lctrl" => Mod::Ctrl,
+        "key_alt" | "key_lalt" => Mod::Alt,
+        "key_win" | "key_lwin" => Mod::Win,
+        "key_rshift" => Mod::RShift,
+        "key_rctrl" => Mod::RCtrl,
+        "key_ralt" => Mod::RAlt,
+        "key_rwin" => Mod::RWin,
+        _ => return None,
+    })
+}
+
 #[derive(Default, Clone, Copy)]
 struct KeysHeld {
     escape: bool,
+    // The left half doubles as the generic one: an unsided `key_shift` is what
+    // a keyboard sends when you press the shift most people mean.
     shift: bool,
     ctrl: bool,
     alt: bool,
     win: bool,
+    rshift: bool,
+    rctrl: bool,
+    ralt: bool,
+    rwin: bool,
+}
+
+impl KeysHeld {
+    fn set(&mut self, m: Mod, held: bool) {
+        match m {
+            Mod::Shift => self.shift = held,
+            Mod::Ctrl => self.ctrl = held,
+            Mod::Alt => self.alt = held,
+            Mod::Win => self.win = held,
+            Mod::RShift => self.rshift = held,
+            Mod::RCtrl => self.rctrl = held,
+            Mod::RAlt => self.ralt = held,
+            Mod::RWin => self.rwin = held,
+        }
+    }
 }
 
 /// Ticks (well, wall time) after our own emitted move during which a cursor
@@ -268,12 +351,7 @@ impl VirtualKeyMouseHm {
     fn build_kbd_report(&self) -> [u8; 8] {
         let mut rep = [0u8; 8];
         if !self.muted {
-            let mut mods = 0u8;
-            if self.keys.shift { mods |= kbd_mod::SHIFT; }
-            if self.keys.ctrl  { mods |= kbd_mod::CTRL; }
-            if self.keys.alt   { mods |= kbd_mod::ALT; }
-            if self.keys.win   { mods |= kbd_mod::WIN; }
-            rep[0] = mods;
+            rep[0] = mods_byte(&self.keys);
             let mut slot = 2;
             if self.keys.escape && slot < 8 {
                 rep[slot] = 0x29;
@@ -326,10 +404,13 @@ impl VirtualDevice for VirtualKeyMouseHm {
             "mouse_back"    => { if let Signal::Bool(b) = value { self.buttons.mb4 = b; } }
             "mouse_forward" => { if let Signal::Bool(b) = value { self.buttons.mb5 = b; } }
             "key_escape"    => { if let Signal::Bool(b) = value { self.keys.escape = b; } }
-            "key_shift"     => { if let Signal::Bool(b) = value { self.keys.shift  = b; } }
-            "key_ctrl"      => { if let Signal::Bool(b) = value { self.keys.ctrl   = b; } }
-            "key_alt"       => { if let Signal::Bool(b) = value { self.keys.alt    = b; } }
-            "key_win"       => { if let Signal::Bool(b) = value { self.keys.win    = b; } }
+            // The modifiers go to the report's first byte rather than into the
+            // key array — see `modifier_slot`.
+            p if modifier_slot(p).is_some() => {
+                if let (Some(m), Signal::Bool(b)) = (modifier_slot(p), value) {
+                    self.keys.set(m, b);
+                }
+            }
             _ => { if let Signal::Bool(b) = value { self.learned_keys.insert(pin.to_string(), b); } }
         }
     }
@@ -482,6 +563,62 @@ impl VirtualDevice for VirtualKeyMouseHm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every modifier pin reaches the modifier byte, and none of them is a
+    /// learned key. One that fell through would be looked up for a HID usage it
+    /// hasn't got and dropped without a word — which is how a Shift mapping
+    /// that used to work stops working and says nothing.
+    #[test]
+    fn every_modifier_pin_reaches_a_modifier() {
+        for (pin, want) in [
+            ("key_shift", Mod::Shift), ("key_lshift", Mod::Shift), ("key_rshift", Mod::RShift),
+            ("key_ctrl", Mod::Ctrl), ("key_lctrl", Mod::Ctrl), ("key_rctrl", Mod::RCtrl),
+            ("key_alt", Mod::Alt), ("key_lalt", Mod::Alt), ("key_ralt", Mod::RAlt),
+            ("key_win", Mod::Win), ("key_lwin", Mod::Win), ("key_rwin", Mod::RWin),
+        ] {
+            assert_eq!(modifier_slot(pin), Some(want), "{pin}");
+            assert_eq!(
+                key_name_to_hid_usage(pin), None,
+                "{pin} is a modifier AND a key usage, so which one wins is luck"
+            );
+            // And setting it shows up in the byte.
+            let mut k = KeysHeld::default();
+            k.set(want, true);
+            assert_ne!(mods_byte(&k), 0, "{pin} sets nothing");
+        }
+        assert_eq!(modifier_slot("key_a"), None, "an ordinary key is not a modifier");
+        assert_eq!(modifier_slot("key_capslock"), None, "nor is caps lock");
+    }
+
+    /// Each modifier is its own bit of the byte, in the order the HID keyboard
+    /// spec lays them out. A game that reads scancodes sees these directly, so
+    /// getting a bit wrong is a wrong key with no error anywhere.
+    #[test]
+    fn the_modifier_byte_carries_both_sides() {
+        let mut k = KeysHeld::default();
+        assert_eq!(mods_byte(&k), 0x00);
+        // Unsided means left — the shift most people mean.
+        k.shift = true;
+        assert_eq!(mods_byte(&k), 0x02);
+        k.rshift = true;
+        assert_eq!(mods_byte(&k), 0x22, "and the right one is a bit of its own");
+
+        // The spec's order: LCTRL, LSHIFT, LALT, LGUI, then the same on the right.
+        for (set, want) in [
+            ((|k: &mut KeysHeld| k.ctrl = true) as fn(&mut KeysHeld), 0x01u8),
+            (|k| k.shift = true, 0x02),
+            (|k| k.alt = true, 0x04),
+            (|k| k.win = true, 0x08),
+            (|k| k.rctrl = true, 0x10),
+            (|k| k.rshift = true, 0x20),
+            (|k| k.ralt = true, 0x40),
+            (|k| k.rwin = true, 0x80),
+        ] {
+            let mut one = KeysHeld::default();
+            set(&mut one);
+            assert_eq!(mods_byte(&one), want, "one modifier, one bit");
+        }
+    }
 
     /// The learned-key universe must map to the correct HID usages — same
     /// names `windows::egui_key_name_to_enigo` accepts, both bare ("A") and

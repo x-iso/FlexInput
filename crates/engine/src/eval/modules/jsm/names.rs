@@ -275,12 +275,16 @@ pub struct OutNote {
 }
 
 /// Parse an output name (already stripped of modifiers and quotes handled by the
-/// caller for commands). Returns the action plus a note when the mapping is
-/// lossy — JSM's left/right modifier variants become our generic modifier pins.
+/// caller for commands). Returns the action, plus a note for the line when a
+/// mapping is approximate.
+///
+/// Nothing is approximate today — the left/right modifiers were the only ones,
+/// and they now reach the OS as themselves — so nothing sets a note. The field
+/// stays because the next name we can only get close to will want it, and the
+/// line already knows how to show one.
 pub fn out_from_name(name: &str) -> Option<OutNote> {
     let plain = |p: &str| Some(OutNote { out: Out::Pin(p.to_string()), note: None });
     let pulse = |p: &str| Some(OutNote { out: Out::Pulse(p.to_string()), note: None });
-    let lossy = |p: &str, note: String| Some(OutNote { out: Out::Pin(p.to_string()), note: Some(note) });
     let unsupported = |why: &'static str| Some(OutNote {
         out: Out::Unsupported { name: name.to_string(), why },
         note: None,
@@ -335,14 +339,18 @@ pub fn out_from_name(name: &str) -> Option<OutNote> {
         "SHIFT" => return plain("key_shift"),
         "CONTROL" => return plain("key_ctrl"),
         "ALT" => return plain("key_alt"),
-        "LSHIFT" | "RSHIFT" => return lossy("key_shift",
-            format!("{upper} is sent as a generic Shift — our keyboard sink has no left/right variants")),
-        "LCONTROL" | "RCONTROL" => return lossy("key_ctrl",
-            format!("{upper} is sent as a generic Ctrl — our keyboard sink has no left/right variants")),
-        "LALT" | "RALT" => return lossy("key_alt",
-            format!("{upper} is sent as a generic Alt — our keyboard sink has no left/right variants")),
-        "LWINDOWS" | "RWINDOWS" => return lossy("key_win",
-            format!("{upper} is sent as a generic Windows key — our keyboard sink has no left/right variants")),
+        // Sided modifiers reach the OS as themselves: the HID keyboard sets the
+        // half of the modifier byte that was asked for, and the SendInput
+        // fallback has its own sided virtual keys. (They used to be flattened
+        // onto the generic ones, with a note on the line saying so.)
+        "LSHIFT" => return plain("key_lshift"),
+        "RSHIFT" => return plain("key_rshift"),
+        "LCONTROL" => return plain("key_lctrl"),
+        "RCONTROL" => return plain("key_rctrl"),
+        "LALT" => return plain("key_lalt"),
+        "RALT" => return plain("key_ralt"),
+        "LWINDOWS" => return plain("key_lwin"),
+        "RWINDOWS" => return plain("key_rwin"),
         "SCROLL_LOCK" | "NUM_LOCK" | "PAUSE" | "CONTEXT" => return unsupported(WHY_LOCKS),
         "ADD" | "SUBTRACT" | "SUBSTRACT" | "DIVIDE" | "MULTIPLY" | "DECIMAL" => return unsupported(WHY_NUMPAD),
         "VOLUME_UP" | "VOLUME_DOWN" | "MUTE" | "NEXT_TRACK" | "PREV_TRACK"

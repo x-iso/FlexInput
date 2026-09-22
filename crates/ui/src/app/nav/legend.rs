@@ -34,14 +34,15 @@ impl FlexInputApp {
                 ],
                 PickerUse::JsmName => vec![
                     (hint_move(), "Move"),
-                    (vec!["btn_south"], "Pick this key"),
+                    (vec!["btn_south"], "Insert name"),
                     (vec!["btn_west"], "Type instead"),
                     (vec!["btn_east"], "Cancel"),
                 ],
                 PickerUse::Text => vec![
                     (hint_move(), "Move"),
                     (vec!["btn_south"], "Type"),
-                    (vec!["btn_west", "btn_north"], "Done"),
+                    (vec!["btn_west"], "Caps"),
+                    (vec!["btn_north"], "Done"),
                     (vec!["btn_east"], "Cancel"),
                 ],
             };

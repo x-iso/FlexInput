@@ -86,16 +86,17 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     cw("key_enter", 12.75, 3.0, 2.25),
 
     // ── Bottom letter row (y=4) ───────────────────────────────────────────
-    cw("key_shift", 0.0, 4.0, 2.25),
+    cw("key_lshift", 0.0, 4.0, 2.25),
     c("key_z", 2.25, 4.0), c("key_x", 3.25, 4.0), c("key_c", 4.25, 4.0), c("key_v", 5.25, 4.0),
     c("key_b", 6.25, 4.0), c("key_n", 7.25, 4.0), c("key_m", 8.25, 4.0),
     c("key_comma", 9.25, 4.0), c("key_period", 10.25, 4.0), c("key_slash", 11.25, 4.0),
-    cw("key_shift", 12.25, 4.0, 2.75),
+    cw("key_rshift", 12.25, 4.0, 2.75),
 
     // ── Modifier / space row (y=5) ────────────────────────────────────────
-    cw("key_ctrl", 0.0, 5.0, 1.5), cw("key_win", 1.5, 5.0, 1.25), cw("key_alt", 2.75, 5.0, 1.25),
+    cw("key_lctrl", 0.0, 5.0, 1.5), cw("key_lwin", 1.5, 5.0, 1.25),
+    cw("key_lalt", 2.75, 5.0, 1.25),
     cw("key_space", 4.0, 5.0, 6.0),
-    cw("key_alt", 10.0, 5.0, 1.25), cw("key_ctrl", 11.25, 5.0, 1.5),
+    cw("key_ralt", 10.0, 5.0, 1.25), cw("key_rctrl", 11.25, 5.0, 1.5),
 
     // ── Nav cluster (right of the main block) ─────────────────────────────
     // System row (aligned with the function row): PrintScreen / Pause-Break,
@@ -154,6 +155,48 @@ impl From<&KbmCell> for PickerCell {
     }
 }
 
+// The gamepad cluster sits below the keyboard, to the right of where the macro
+// cluster grows, so neither can ever reach the other.
+const PAD_X: f32 = 15.5;
+const PAD_Y: f32 = 6.6;
+
+/// The gamepad, as a shape you can find a button on without reading it.
+///
+/// Offered only where a pad button is a legal TARGET — JSM's virtual pad
+/// output. The Remapper's picker leaves it out: there a pad button is an input
+/// being remapped, and offering it as an output would be offering a mapping to
+/// itself.
+pub const PAD_LAYOUT: &[KbmCell] = &[
+    // Triggers above bumpers, the way they sit under your fingers.
+    c("left_trigger", PAD_X, PAD_Y), c("right_trigger", PAD_X + 6.0, PAD_Y),
+    c("btn_lb", PAD_X, PAD_Y + 1.0), c("btn_rb", PAD_X + 6.0, PAD_Y + 1.0),
+    // Back / guide / start across the middle.
+    c("btn_back", PAD_X + 2.0, PAD_Y + 1.0),
+    c("btn_guide", PAD_X + 3.0, PAD_Y + 1.0),
+    c("btn_start", PAD_X + 4.0, PAD_Y + 1.0),
+    // D-pad as a plus on the left, face buttons as a diamond on the right.
+    c("dpad_up", PAD_X + 1.0, PAD_Y + 2.0), c("btn_north", PAD_X + 5.0, PAD_Y + 2.0),
+    c("dpad_left", PAD_X, PAD_Y + 3.0), c("dpad_right", PAD_X + 2.0, PAD_Y + 3.0),
+    c("btn_west", PAD_X + 4.0, PAD_Y + 3.0), c("btn_east", PAD_X + 6.0, PAD_Y + 3.0),
+    c("dpad_down", PAD_X + 1.0, PAD_Y + 4.0), c("btn_south", PAD_X + 5.0, PAD_Y + 4.0),
+    // Stick clicks at the bottom, under the hands they belong to.
+    c("btn_ls", PAD_X + 1.0, PAD_Y + 5.0), c("btn_rs", PAD_X + 5.0, PAD_Y + 5.0),
+];
+
+/// Where the gamepad cluster's caption goes, in grid units.
+pub fn pad_caption_at() -> (f32, f32) {
+    (PAD_X, PAD_Y - 0.42)
+}
+
+/// Is this one of the gamepad cluster's cells?
+///
+/// Used to draw it with a pad skin rather than the keyboard one — and the Xbox
+/// skin specifically, because the names this picker writes are JSM's `X_`
+/// family, and a board that shows a ✕ while writing `X_A` reads as a mistake.
+pub fn is_pad_cell(pin: &str) -> bool {
+    PAD_LAYOUT.iter().any(|c| c.pin == pin)
+}
+
 /// Grid Y where the macro cluster starts (one gap row below the keyboard).
 pub const MACRO_Y: f32 = 6.6;
 /// Macro cells per row before wrapping.
@@ -170,7 +213,11 @@ const MACRO_PER_ROW: usize = 14;
 ///
 /// `macros` is the patch's defined macro ports, laid out as an extra cluster
 /// BELOW the keyboard at [`MACRO_Y`].
-pub fn picker_cells(tz: bool, macros: &[crate::macro_icons::MacroDisplayEntry]) -> Vec<PickerCell> {
+pub fn picker_cells(
+    tz: bool,
+    pad: bool,
+    macros: &[crate::macro_icons::MacroDisplayEntry],
+) -> Vec<PickerCell> {
     let mut cells: Vec<PickerCell> = if !tz {
         KBM_LAYOUT.iter().map(PickerCell::from).collect()
     } else {
@@ -196,6 +243,9 @@ pub fn picker_cells(tz: bool, macros: &[crate::macro_icons::MacroDisplayEntry]) 
         cells.push((&ca("scroll_x", TOUCH_X + 1.0, 4.0)).into());
         cells
     };
+    if pad {
+        cells.extend(PAD_LAYOUT.iter().map(PickerCell::from));
+    }
     for (i, entry) in macros.iter().enumerate() {
         cells.push(PickerCell {
             pin: entry.pin.clone(),
@@ -328,8 +378,9 @@ pub fn cell_typed(pin: &str, caps: bool) -> Option<Typed> {
     Some(match pin {
         "key_space" => Typed::Char(' '),
         "key_backspace" => Typed::Backspace,
-        // Either of the keys a typist reaches for to change case.
-        "key_shift" | "key_capslock" => Typed::Caps,
+        // Any of the keys a typist reaches for to change case — either Shift,
+        // sided or not, and Caps Lock.
+        "key_shift" | "key_lshift" | "key_rshift" | "key_capslock" => Typed::Caps,
         "key_enter" => Typed::Commit,
         "key_escape" => Typed::Cancel,
         _ => return None,
@@ -372,7 +423,12 @@ mod typing_tests {
         // The keys a typist expects to mean something other than a character.
         assert_eq!(cell_typed("key_backspace", false), Some(Typed::Backspace));
         assert_eq!(cell_typed("key_shift", false), Some(Typed::Caps));
+        assert_eq!(cell_typed("key_lshift", false), Some(Typed::Caps), "sided too");
+        assert_eq!(cell_typed("key_rshift", false), Some(Typed::Caps));
         assert_eq!(cell_typed("key_capslock", false), Some(Typed::Caps));
+        // Ctrl, Alt and Win type nothing, sided or not.
+        assert_eq!(cell_typed("key_lctrl", false), None);
+        assert_eq!(cell_typed("key_rwin", false), None);
         assert_eq!(cell_typed("key_enter", false), Some(Typed::Commit));
         assert_eq!(cell_typed("key_escape", false), Some(Typed::Cancel));
         // And the ones with nothing to give, which is what greys them.
@@ -393,7 +449,9 @@ mod typing_tests {
                     cell.pin,
                     "key_f1" | "key_f2" | "key_f3" | "key_f4" | "key_f5" | "key_f6"
                         | "key_f7" | "key_f8" | "key_f9" | "key_f10" | "key_f11" | "key_f12"
-                        | "key_tab" | "key_ctrl" | "key_alt" | "key_win"
+                        | "key_tab"
+                        | "key_lctrl" | "key_rctrl" | "key_lalt" | "key_ralt"
+                        | "key_lwin" | "key_rwin"
                         | "key_printscreen" | "key_pause" | "key_insert" | "key_delete"
                         | "key_home" | "key_end" | "key_pageup" | "key_pagedown"
                         | "key_arrowup" | "key_arrowdown" | "key_arrowleft" | "key_arrowright"
@@ -427,5 +485,47 @@ mod typing_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pad_cluster_tests {
+    use super::*;
+
+    /// The gamepad cluster can't overlap anything else on the board, and every
+    /// cell it adds is one JSM can name — a key you can focus and press that
+    /// then does nothing is worse than one that isn't there.
+    #[test]
+    fn the_gamepad_cluster_sits_clear_of_the_rest_of_the_board() {
+        let with_pad = picker_cells(false, true, &[]);
+        let without = picker_cells(false, false, &[]);
+        assert_eq!(with_pad.len(), without.len() + PAD_LAYOUT.len());
+
+        let overlaps = |a: &PickerCell, b: &PickerCell| {
+            a.x < b.x + b.width && b.x < a.x + a.width && (a.y - b.y).abs() < 1.0
+        };
+        for (i, a) in with_pad.iter().enumerate() {
+            for b in with_pad.iter().skip(i + 1) {
+                assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
+            }
+        }
+        // And it stays out of the column the macro cluster grows down.
+        for cell in PAD_LAYOUT {
+            assert!(cell.x >= MACRO_PER_ROW as f32, "{} is where macros go", cell.pin);
+        }
+    }
+
+    #[test]
+    fn every_gamepad_cell_is_one_jsm_can_bind() {
+        let names = flexinput_engine::eval::jsm_names_by_pin();
+        for cell in PAD_LAYOUT {
+            assert!(
+                names.contains_key(pin_as_bound(cell.pin)),
+                "{} is on the board but JSM has no name for it",
+                cell.pin
+            );
+            assert!(is_pad_cell(cell.pin));
+        }
+        assert!(!is_pad_cell("key_a"), "and the keyboard is not the gamepad");
     }
 }

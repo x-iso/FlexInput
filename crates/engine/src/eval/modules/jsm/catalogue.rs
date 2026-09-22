@@ -162,10 +162,13 @@ pub(crate) const PUNCTUATION: &[&str] = &[
 ///
 /// Where several names write one pin (SHIFT, LSHIFT and RSHIFT all send our one
 /// generic shift), the shortest wins. That is JSM's own generic spelling, and
-/// the one that doesn't carry a note explaining what was lost on the way. Ties
-/// go alphabetically — deliberately, so the answer doesn't depend on the order
-/// the vocabulary happens to be listed in; the one pin where two names tie
-/// (`btn_guide`, X_GUIDE and PS_HOME) is not a key any keyboard shows.
+/// the one that doesn't carry a note explaining what was lost on the way.
+///
+/// Ties keep whichever the vocabulary lists first, which makes [`BINDINGS`]'s
+/// order load-bearing for exactly one pin: `btn_guide`, where X_GUIDE and
+/// PS_HOME are the same length. That one matters, because a picker showing a
+/// gamepad has to name the whole pad in one dialect — `PS_HOME` sitting between
+/// `X_START` and `X_BACK` reads as a mistake. A test pins both halves.
 pub fn names_by_pin() -> std::collections::HashMap<String, String> {
     let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for item in bindings() {
@@ -178,7 +181,7 @@ pub fn names_by_pin() -> std::collections::HashMap<String, String> {
             _ => continue,
         };
         let better = match out.get(&pin) {
-            Some(had) => (item.name.len(), item.name.as_str()) < (had.len(), had.as_str()),
+            Some(had) => item.name.len() < had.len(),
             None => true,
         };
         if better {
@@ -666,12 +669,10 @@ mod catalogue_tests {
         assert_eq!(name("key_shift"), Some("SHIFT"));
         assert_eq!(name("key_ctrl"), Some("CONTROL"));
         assert_eq!(name("btn_south"), Some("X_A"));
-        // The tie-break, which is the part that would otherwise depend on the
-        // order the vocabulary is written in: X_GUIDE and PS_HOME are the same
-        // length, so it goes alphabetically rather than to whichever was listed
-        // first. (No keyboard shows this pin, so which one wins is only a
-        // question of the answer being stable.)
-        assert_eq!(name("btn_guide"), Some("PS_HOME"));
+        // Same length, so the tie goes to whichever the vocabulary lists
+        // first — see the dialect test below for why that is the answer that
+        // matters.
+        assert_eq!(name("btn_guide"), Some("X_GUIDE"));
         // Every entry round-trips: the name filed under a pin really writes it.
         for (pin, n) in &by_pin {
             let o = super::out_from_name(n).expect("an offered name");
@@ -684,6 +685,39 @@ mod catalogue_tests {
         // A pin no binding writes has no name, which is what greys its key.
         assert!(name("touch_swipe_x").is_none());
         assert!(name("btn_misc1").is_none(), "a fork button our pad has, JSM does not bind");
+    }
+
+    /// A picker showing a gamepad names the whole pad in ONE dialect. `PS_HOME`
+    /// sitting between `X_BACK` and `X_START` reads as a mistake, whichever pad
+    /// the reader actually holds.
+    #[test]
+    fn the_pad_is_named_in_one_dialect() {
+        let by_pin = names_by_pin();
+        for pin in [
+            "btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb",
+            "btn_ls", "btn_rs", "btn_back", "btn_start", "btn_guide",
+            "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+            "left_trigger", "right_trigger",
+        ] {
+            let n = by_pin.get(pin).unwrap_or_else(|| panic!("{pin} has no name"));
+            assert!(n.starts_with("X_"), "{pin} is named {n}, which is the other family");
+        }
+    }
+
+    /// Ties go to whichever name the vocabulary lists first, so its order is
+    /// load-bearing. Said out loud here, rather than left for someone to
+    /// discover by alphabetising the list and changing what a picker inserts.
+    #[test]
+    fn the_vocabulary_lists_the_name_to_prefer_first() {
+        let at = |n: &str| {
+            BINDINGS.iter().position(|b| *b == n).unwrap_or_else(|| panic!("{n} is listed"))
+        };
+        for (prefer, over) in [
+            ("SHIFT", "LSHIFT"), ("CONTROL", "LCONTROL"), ("ALT", "LALT"),
+            ("X_GUIDE", "PS_HOME"),
+        ] {
+            assert!(at(prefer) < at(over), "{prefer} must be listed before {over}");
+        }
     }
 
     /// A key this module cannot send is offered greyed, with the reason, rather

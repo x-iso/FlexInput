@@ -444,10 +444,12 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
     // KBM pins are family-agnostic.
     match pin_id {
         // Modifiers + named special keys
-        "key_shift"       => return Some(KB_SHIFT),
-        "key_ctrl"        => return Some(KB_CTRL),
-        "key_alt"         => return Some(KB_ALT),
-        "key_win"         => return Some(KB_WIN),
+        // Sided and unsided share a face: which Shift it is belongs on the
+        // label under it, not in a second drawing of the same key.
+        "key_shift" | "key_lshift" | "key_rshift" => return Some(KB_SHIFT),
+        "key_ctrl" | "key_lctrl" | "key_rctrl"    => return Some(KB_CTRL),
+        "key_alt" | "key_lalt" | "key_ralt"       => return Some(KB_ALT),
+        "key_win" | "key_lwin" | "key_rwin"       => return Some(KB_WIN),
         "key_escape"      => return Some(KB_ESCAPE),
         "key_space"       => return Some(KB_SPACE),
         "key_enter"       => return Some(KB_ENTER),

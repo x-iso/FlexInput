@@ -22,7 +22,9 @@ impl FlexInputApp {
         // Spatial navigation over the cells actually shown for this mode (the
         // Touch-Zones variant hides the touchpad cluster and adds analog outputs),
         // so focus never lands on a hidden cell and the analog cells are reachable.
-        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, &self.macro_display_entries());
+        let pad = self.gamepad_nav.kbm_picker_use != crate::gamepad_nav::PickerUse::Chord;
+        let cells = picker_cells(
+            self.gamepad_nav.kbm_picker_touch_zones, pad, &self.macro_display_entries());
         // A cell is usable (focusable + mappable) unless it's an analog output on
         // a discrete target (analog not OK) or one of the target's own pins. Same
         // predicate the renderer uses to grey cells — so grey == unreachable.
@@ -140,7 +142,15 @@ impl FlexInputApp {
             }
             return;
         }
-        if nav.is_rising("btn_west") || nav.is_rising("btn_north") {
+        // West is the caps latch — held-shift rather than caps-lock, so it
+        // changes the digits into their symbols too. North finishes (it is the
+        // button that opened the board, and a toggle you close with a different
+        // button is one you close by guessing); East drops what was typed.
+        if nav.is_rising("btn_west") {
+            self.gamepad_nav.kbm_text_caps = !self.gamepad_nav.kbm_text_caps;
+            return;
+        }
+        if nav.is_rising("btn_north") {
             let typed = std::mem::take(&mut self.gamepad_nav.kbm_text);
             self.finish_kbm_typing(typed);
             return;
@@ -301,7 +311,8 @@ impl FlexInputApp {
         if !self.gamepad_nav.kbm_picker_open { return (None, false); }
         use crate::kbm_picker::{clamp_index, layout_extent, picker_cells, MACRO_Y};
         let macros = self.macro_display_entries();
-        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, &macros);
+        let pad = self.gamepad_nav.kbm_picker_use != crate::gamepad_nav::PickerUse::Chord;
+        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, pad, &macros);
         let sel = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
 
@@ -350,9 +361,9 @@ impl FlexInputApp {
                         crate::gamepad_nav::PickerUse::Chord =>
                             "Click or LS/D-pad: move   South: add   North: clear   East/Done: close",
                         crate::gamepad_nav::PickerUse::JsmName =>
-                            "Click or LS/D-pad: move   South: pick this key   West: type instead   East: cancel",
+                            "Click or LS/D-pad: move   South: insert this key's JSM name   West: type instead   East: cancel",
                         crate::gamepad_nav::PickerUse::Text =>
-                            "South: type   Shift: caps   Backspace   Enter or West: done   Esc or East: cancel",
+                            "South: type   West or Shift: caps   Backspace   North or Enter: done   East or Esc: cancel",
                     };
                     ui.label(egui::RichText::new(hints)
                         .small().color(egui::Color32::from_gray(150)));
@@ -426,6 +437,14 @@ impl FlexInputApp {
                 // individually clickable (mouse) AND highlight the gamepad focus.
                 let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
+                // "GAMEPAD" caption above its cluster (only when offered).
+                if cells.iter().any(|c| crate::kbm_picker::is_pad_cell(&c.pin)) {
+                    let (px, py) = crate::kbm_picker::pad_caption_at();
+                    ui.painter_at(board).text(
+                        board.min + egui::vec2(px * (UNIT + GAP), py * (UNIT + GAP)),
+                        egui::Align2::LEFT_TOP, "GAMEPAD",
+                        egui::FontId::proportional(9.0), egui::Color32::from_gray(130));
+                }
                 // "MACROS" caption above the dynamic cluster (only when present).
                 if cells.iter().any(|c| c.macro_meta.is_some()) {
                     ui.painter_at(board).text(
@@ -498,6 +517,15 @@ impl FlexInputApp {
                         }
                         continue;
                     }
+                    // The gamepad cluster in the Xbox dialect, which is the
+                    // one whose names this picker writes (`X_A`, `X_LB`): a
+                    // board showing a circle while inserting `X_B` reads as a
+                    // mistake, whichever pad you actually hold.
+                    let skin = if crate::kbm_picker::is_pad_cell(&cell.pin) {
+                        crate::canvas::remapper_icons::Skin::Xbox
+                    } else {
+                        skin
+                    };
                     if let Some(tex) = kbm_cell_texture(ctx, skin, &cell.pin) {
                         let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
                         let img_rect = egui::Rect::from_center_size(

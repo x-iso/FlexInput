@@ -490,17 +490,26 @@ fn naming_a_config_with_no_tab_says_which_tabs_there_are() {
 
 // ── name mapping caveats ─────────────────────────────────────────────────────
 
-// JSM's left/right modifier variants land on our generic pins, and the line says so.
+// JSM names the modifiers apart, and so does our keyboard now: the HID report's
+// modifier byte always had both halves and only the left one was ever set.
 #[test]
-fn left_right_modifiers_note_that_they_become_generic() {
-    let c = compile("E = LSHIFT");
-    assert_eq!(c.lines[0].status, LineStatus::Ok);
+fn left_and_right_modifiers_reach_the_os_as_themselves() {
+    for (name, want) in [
+        ("LSHIFT", "key_lshift"), ("RSHIFT", "key_rshift"),
+        ("LCONTROL", "key_lctrl"), ("RCONTROL", "key_rctrl"),
+        ("LALT", "key_lalt"), ("RALT", "key_ralt"),
+        ("LWINDOWS", "key_lwin"), ("RWINDOWS", "key_rwin"),
+    ] {
+        let c = compile(&format!("E = {name}"));
+        assert_eq!(c.lines[0].status, LineStatus::Ok, "{name}");
+        assert_eq!(c.bindings[0].steps[0].out, pin(want), "{name}");
+        // And no note: the line used to carry one saying the side was lost.
+        assert!(c.lines[0].notes.is_empty(), "{name}: {:?}", c.lines[0].notes);
+    }
+    // The unsided spelling stays unsided — it is what a keyboard sends when you
+    // press the shift most people mean.
+    let c = compile("E = SHIFT");
     assert_eq!(c.bindings[0].steps[0].out, pin("key_shift"));
-    assert!(
-        c.lines[0].notes[0].contains("generic Shift"),
-        "{:?}",
-        c.lines[0].notes
-    );
 }
 
 // Keys our sink can't send yet are reported, not silently dropped.
@@ -825,7 +834,9 @@ N,N = X";
 // instead of their own.
 #[test]
 fn a_simultaneous_press_replaces_both_bindings() {
-    let mut r = Rig::new("L = LSHIFT\nR = E\nL+R = Q");
+    // Unsided SHIFT deliberately: this test is about the window, and its
+    // "didn't fire" assertions have to be able to fail.
+    let mut r = Rig::new("L = SHIFT\nR = E\nL+R = Q");
     r.set(Btn::L, true);
     let pins = r.tick();
     assert!(!pins.contains("key_shift"), "L waits to see if R joins it");
@@ -841,7 +852,7 @@ fn a_simultaneous_press_replaces_both_bindings() {
 // after the window.
 #[test]
 fn a_lone_press_survives_the_simultaneous_window() {
-    let mut r = Rig::new("L = LSHIFT\nR = E\nL+R = Q");
+    let mut r = Rig::new("L = SHIFT\nR = E\nL+R = Q");
     r.set(Btn::L, true);
     assert!(
         r.seen_within(10, "key_shift"),

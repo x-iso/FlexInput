@@ -1215,6 +1215,19 @@ pub(crate) fn next_config_tab(cur: usize, step: i32, count: usize) -> usize {
     (cur as i32 + step).rem_euclid(count as i32) as usize
 }
 
+/// Is the cursor on prose rather than on part of a mapping?
+///
+/// A comment token, wherever it sits: a line that opens with `#` is one comment
+/// token, and so is the tail of `S = SPACE # jump`. Both are places where a key
+/// means its character; everywhere else in a config a key means its name.
+pub(crate) fn jsm_cursor_is_prose(text: &str, cur: flexinput_engine::eval::JsmCursor) -> bool {
+    use flexinput_engine::eval::JsmTokenKind;
+    matches!(
+        flexinput_engine::eval::jsm_selection(text, cur),
+        Some((tok, _, _)) if tok.kind == JsmTokenKind::Comment
+    )
+}
+
 /// What the virtual keyboard starts holding when it opens on this token.
 ///
 /// Seeded with what is already there, so a comment can be corrected rather than
@@ -1261,6 +1274,23 @@ pub(crate) fn jsm_typing_landing(
 mod typing_seed_tests {
     use super::{jsm_typing_landing, jsm_typing_seed};
     use flexinput_engine::eval::JsmCursor as Cur;
+
+    /// Which half of the board you get is decided by the line, not the token:
+    /// a config is mostly names, and typing those out letter by letter would be
+    /// the wrong default by a long way.
+    #[test]
+    fn only_a_comment_puts_the_keyboard_into_typing() {
+        use super::jsm_cursor_is_prose as prose;
+        let text = "S = SPACE # jump\n# a note of its own\nGYRO_SENS = 2\n\n";
+        assert!(prose(text, Cur { line: 0, token: 3 }), "the tail of a mapping line");
+        assert!(prose(text, Cur { line: 1, token: 0 }), "a line that opens with #");
+        // Everywhere else a key stands for its name.
+        assert!(!prose(text, Cur { line: 0, token: 0 }), "a button");
+        assert!(!prose(text, Cur { line: 0, token: 2 }), "what it is bound to");
+        assert!(!prose(text, Cur { line: 2, token: 0 }), "a setting");
+        assert!(!prose(text, Cur { line: 2, token: 2 }), "its value");
+        assert!(!prose(text, Cur { line: 3, token: 0 }), "a blank line");
+    }
 
     #[test]
     fn the_keyboard_opens_holding_what_is_already_there() {
@@ -1418,6 +1448,12 @@ impl crate::app::FlexInputApp {
             list.open = false;
         }
         crate::canvas::viewer::set_command_list_state(ctx, inner, list);
+        // Keep publishing the cursor even though this driver handles everything
+        // itself. The body treats a cursor it hasn't heard about for a few
+        // passes as gone, and a pick with no cursor lands at the END of the
+        // config — which is what "South inserts nothing" looked like, because
+        // the insertion was off the bottom of the editor.
+        crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
         true
     }
 
@@ -1435,8 +1471,12 @@ impl crate::app::FlexInputApp {
         cur: flexinput_engine::eval::JsmCursor,
     ) {
         use crate::gamepad_nav::PickerUse;
-        use flexinput_engine::eval::JsmKind;
-        let naming = flexinput_engine::eval::jsm_kinds_at(text, cur) == [JsmKind::Binding];
+        // A comment is the one place in a config where characters are the point;
+        // everywhere else a key stands for its NAME. Deciding by the line rather
+        // than by the position means the board behaves the same wherever you are
+        // on a line of mappings — and a config is mostly names, so typing them
+        // out letter by letter would be the wrong default by a long way.
+        let naming = !jsm_cursor_is_prose(text, cur);
         self.gamepad_nav.kbm_picker_use = if naming { PickerUse::JsmName } else { PickerUse::Text };
         self.gamepad_nav.kbm_text = jsm_typing_seed(text, cur);
         self.gamepad_nav.kbm_text_caps = false;
