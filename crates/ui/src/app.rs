@@ -3672,11 +3672,12 @@ impl FlexInputApp {
         let tz_editing = matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab
             | crate::gamepad_nav::EditLevel::TzCards)
-            // The JSM editor reserves the bumpers too: they switch between its
-            // two panes (the config text and the faders), and flipping tabs out
-            // from under an edit would be a rude surprise.
-            || (matches!(self.gamepad_nav.edit_level, crate::gamepad_nav::EditLevel::Editing)
-                && self.nav_active_subpatch_id().is_some_and(|o| self.nav_is_jsm_editor(o)));
+            // The JSM editor reserves the bumpers from the moment it is
+            // SELECTED, not just once entered: they choose which of its two
+            // panes you are about to work in, so they have to belong to it
+            // before you commit to one. Move the selection off the editor to get
+            // tab switching back.
+            || self.nav_jsm_editor_selected();
         if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
             self.set_active_tab(self.active_tab - 1);
         }
@@ -3996,9 +3997,13 @@ impl FlexInputApp {
             }
             EditLevel::Editing => {
                 let kind = self.nav_selected_kind(outer_id);
+                // The JSM editor spends LT on its own config tabs, so there LT
+                // does not also back out — East still does, and East is the
+                // button people reach for anyway.
+                let lt_exits = lt_rising && !self.nav_jsm_editor_selected();
                 // East / LT / back → exit to widget level, committing the edit
                 // as one undo entry if anything actually changed.
-                if nav.is_rising("btn_east") || lt_rising {
+                if nav.is_rising("btn_east") || lt_exits {
                     self.gamepad_nav.edit_level = EditLevel::Widget;
                     self.nav_set_dropdown_popup(ctx, outer_id, false);
                     if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
@@ -4007,7 +4012,7 @@ impl FlexInputApp {
                 } else if matches!(kind, NavWidgetKind::MultiField) {
                     // Unified multi-field editor: left/right pick a field, up/down
                     // & stick edit it, West=fine, North=reset, South=cycle/toggle.
-                    self.nav_drive_fields(ctx, outer_id, nav, dt, step_dir, rt_rising, mag);
+                    self.nav_drive_fields(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising, mag);
                 } else if matches!(kind, NavWidgetKind::Dropdown) {
                     // Real Dropdown (dynamic options param): up/down or South/RT
                     // cycles; South/RT also confirm-exits to widget level.

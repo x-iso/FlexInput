@@ -19,6 +19,7 @@ impl FlexInputApp {
         dt: f32,
         step_dir: Option<crate::gamepad_nav::NavDir>,
         rt_rising: bool,
+        lt_rising: bool,
         mag: f32,
     ) {
         use crate::gamepad_nav::NavDir;
@@ -28,6 +29,13 @@ impl FlexInputApp {
         if self.nav_is_jsm_editor(outer_id) {
             if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
                 self.gamepad_nav.jsm_pane = self.gamepad_nav.jsm_pane.other();
+            }
+            // LT/RT walk the editor's own config tabs. They are free here: in
+            // this widget RT confirms nothing and LT's usual "back out" is
+            // covered by East, which is the button people reach for anyway.
+            let tab_step = (rt_rising as i32) - (lt_rising as i32);
+            if tab_step != 0 {
+                self.nav_cycle_jsm_tab(outer_id, tab_step);
             }
             if let Some(inner) = self.nav_selected_inner_node(outer_id) {
                 crate::canvas::viewer::publish_jsm_pane(
@@ -1185,6 +1193,69 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
     }
+}
+
+/// The config tab `step` away from `cur`, wrapping.
+///
+/// Wrapping rather than stopping: there are usually two or three tabs and they
+/// are a ring you cycle, not a list you scroll to the end of. Fewer than two and
+/// there is nowhere to go, so the triggers do nothing rather than appearing
+/// broken by landing back where they started.
+pub(crate) fn next_config_tab(cur: usize, step: i32, count: usize) -> usize {
+    if count < 2 {
+        return cur.min(count.saturating_sub(1));
+    }
+    (cur as i32 + step).rem_euclid(count as i32) as usize
+}
+
+impl crate::app::FlexInputApp {
+    /// Move the JSM editor to the next or previous config tab, wrapping.
+    ///
+    /// Wrapping rather than stopping: there are usually two or three tabs and
+    /// they are a ring you cycle, not a list you scroll to the end of.
+    fn nav_cycle_jsm_tab(&mut self, outer_id: egui_snarl::NodeId, step: i32) {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        else { return };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+        let count = node
+            .params
+            .get("jsm_tabs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let cur = node.params.get("jsm_active_tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let next = next_config_tab(cur, step, count);
+        node.params.insert("jsm_active_tab".into(), serde_json::Value::from(next as u64));
+        // A different tab is a different config, so the cursor starts again
+        // rather than pointing at a token that may not exist there.
+        self.gamepad_nav.jsm_cursor = Default::default();
+    }
+
+    /// The sub-patch whose pin nav is driving: the config overlay's selection
+    /// when one is up, else the tab canvas's own sub-patch.
+    ///
+    /// The plain "first sub-patch on the canvas" answer is wrong whenever the
+    /// overlay is driving a pin from somewhere else, and a shortcut guard that
+    /// asks the wrong node simply never fires.
+    pub(crate) fn nav_driving_outer_id(&self) -> Option<egui_snarl::NodeId> {
+        if let Some((o, _, _)) = self.gamepad_nav.config_nav_sel.as_ref() {
+            return Some(*o);
+        }
+        self.nav_active_outer_id()
+    }
+
+    /// Is a JSM editor the current selection, at any level?
+    ///
+    /// Selection is enough — not "entered". The bumpers pick which of the
+    /// editor's two panes you are about to work in, so they have to belong to it
+    /// before you commit to one, and a shortcut that flips the app's tabs out
+    /// from under a selected editor is never what was meant.
+    pub(crate) fn nav_jsm_editor_selected(&self) -> bool {
+        self.nav_driving_outer_id().is_some_and(|o| self.nav_is_jsm_editor(o))
+    }
+
     /// Is the selection a pinned JSM editor (rather than one of its faders)?
     pub(crate) fn nav_is_jsm_editor(&self, outer_id: egui_snarl::NodeId) -> bool {
         matches!(
@@ -1534,5 +1605,26 @@ mod nav_axis_tests {
         assert!(!worth(&row_at(400.0)), "nor one below the fold");
         // Exactly flush with the edge is nothing to ring either.
         assert!(!worth(&row_at(76.0)), "a row ending on the band's top edge");
+    }
+}
+
+#[cfg(test)]
+mod jsm_tab_cycle_tests {
+    use super::next_config_tab;
+
+    /// Cycling the editor's config tabs wraps, and a config with one tab doesn't
+    /// move — the triggers only mean something when there is somewhere to go.
+    #[test]
+    fn config_tabs_cycle_round_and_stay_put_when_there_is_one() {
+        assert_eq!(next_config_tab(0, 1, 3), 1);
+        assert_eq!(next_config_tab(2, 1, 3), 0, "past the last is the first");
+        assert_eq!(next_config_tab(0, -1, 3), 2, "and before the first is the last");
+        assert_eq!(next_config_tab(1, -1, 3), 0);
+        assert_eq!(next_config_tab(0, 1, 1), 0, "one tab has nowhere to go");
+        assert_eq!(next_config_tab(0, -1, 0), 0, "nor has none");
+        // A stored index past the end (a tab was deleted) comes back in range
+        // rather than staying out of it.
+        assert_eq!(next_config_tab(9, 0, 1), 0);
+        assert_eq!(next_config_tab(9, 1, 3), 1, "wrapped into range");
     }
 }

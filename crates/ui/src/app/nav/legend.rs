@@ -76,13 +76,21 @@ impl FlexInputApp {
             ];
         }
 
+        // A selected JSM editor takes the bumpers for its own panes, so the bar
+        // must stop offering them as tab switching — a legend that names a
+        // shortcut the widget has taken is worse than no legend.
+        let jsm = self.nav_jsm_editor_selected();
         match self.gamepad_nav.edit_level {
             EditLevel::Widget => vec![
                 (hint_move(), "Navigate"),
                 (vec!["right_stick"], "Cursor"),
                 (vec!["btn_south", "right_trigger"], "Select / Edit"),
                 (vec!["btn_north"], "Show/Hide devices"),
-                (vec!["btn_lb", "btn_rb"], "Tab"),
+                if jsm {
+                    (vec!["btn_lb", "btn_rb"], "Edit / Tune")
+                } else {
+                    (vec!["btn_lb", "btn_rb"], "Tab")
+                },
                 (vec!["btn_start"], "Presets"),
                 (vec!["btn_start"], "Hold: Settings"),
                 (vec!["btn_back"], "Alt-Tab"),
@@ -97,7 +105,28 @@ impl FlexInputApp {
                     .map(|o| matches!(self.nav_selected_kind(o),
                         NavWidgetKind::MultiField))
                     .unwrap_or(false);
-                if multi {
+                if jsm {
+                    // Its own axes: the faders are a column, so up/down walks
+                    // them and left/right adjusts — the opposite of every other
+                    // multi-field row, which is a row.
+                    let pane = self.gamepad_nav.jsm_pane;
+                    let moving = match pane {
+                        crate::gamepad_nav::JsmPane::Text => "Move cursor",
+                        crate::gamepad_nav::JsmPane::Tune => "Pick setting",
+                    };
+                    vec![
+                        (hint_vert(), moving),
+                        (hint_horiz(), match pane {
+                            crate::gamepad_nav::JsmPane::Text => "Token",
+                            crate::gamepad_nav::JsmPane::Tune => "Adjust",
+                        }),
+                        (vec!["btn_lb", "btn_rb"], "Edit / Tune"),
+                        (vec!["left_trigger", "right_trigger"], "Config tab"),
+                        (vec!["btn_west"], "Fine"),
+                        (vec!["btn_north"], "Reset"),
+                        (vec!["btn_east"], "Back"),
+                    ]
+                } else if multi {
                     vec![
                         (hint_horiz(), "Select field"),
                         (hint_vert(), "Adjust"),
