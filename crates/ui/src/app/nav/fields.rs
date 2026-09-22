@@ -22,6 +22,23 @@ impl FlexInputApp {
         mag: f32,
     ) {
         use crate::gamepad_nav::NavDir;
+        // A pinned JSM editor is two panes sharing one dpad: the faders, and the
+        // config text walked a token at a time. LB/RB switch between them, and
+        // the text pane has its own driver from here on.
+        if self.nav_is_jsm_editor(outer_id) {
+            if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
+                self.gamepad_nav.jsm_pane = self.gamepad_nav.jsm_pane.other();
+            }
+            if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+                crate::canvas::viewer::publish_jsm_pane(
+                    ctx, inner, self.gamepad_nav.jsm_pane.label(),
+                );
+            }
+            if self.gamepad_nav.jsm_pane == crate::gamepad_nav::JsmPane::Text {
+                self.nav_drive_jsm_text(ctx, outer_id, nav, step_dir);
+                return;
+            }
+        }
         let fields = self.nav_element_fields(outer_id);
         if fields.is_empty() { return; }
         let n = fields.len();
@@ -1168,6 +1185,60 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
     }
+    /// Is the selection a pinned JSM editor (rather than one of its faders)?
+    pub(crate) fn nav_is_jsm_editor(&self, outer_id: egui_snarl::NodeId) -> bool {
+        matches!(
+            self.nav_selected_element(outer_id).as_ref().map(|(m, e)| (m.as_str(), e.as_str())),
+            Some(("module.jsm", "editor"))
+        )
+    }
+
+    /// Walk the config with the token cursor.
+    ///
+    /// Up/down is a line, left/right is a token — the shape of a JSM line is a
+    /// name, an `=` and a value, and every edit worth making from a pad replaces
+    /// one of those whole. A character cursor would turn each into a dozen
+    /// presses and leave you guessing which side of a word you were on.
+    fn nav_drive_jsm_text(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
+        let text = self.nav_jsm_text(outer_id);
+        let mut cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
+        if let Some(dir) = step_dir {
+            let (dx, dy) = match dir {
+                NavDir::Left => (-1, 0),
+                NavDir::Right => (1, 0),
+                NavDir::Up => (0, -1),
+                NavDir::Down => (0, 1),
+            };
+            cur = flexinput_engine::eval::jsm_cursor_moved(&text, cur, dx, dy);
+        }
+        self.gamepad_nav.jsm_cursor = cur;
+        let _ = (ctx, inner, nav);
+        // The body draws the highlight from this; publishing it here keeps the
+        // cursor in one place rather than a copy per viewport.
+        crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+    }
+
+    /// The active tab's text for the selected JSM node.
+    fn nav_jsm_text(&self, outer_id: egui_snarl::NodeId) -> String {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return String::new() };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas
+            .snarl
+            .get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .map(crate::canvas::viewer::jsm_active_text)
+            .unwrap_or_default()
+    }
+
     /// Are the selected element's fields stacked in a column rather than laid out
     /// in a row? Decides which stick/dpad axis walks between them.
     fn nav_fields_are_a_column(&self, outer_id: egui_snarl::NodeId) -> bool {

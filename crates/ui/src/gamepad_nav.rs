@@ -220,6 +220,31 @@ pub enum TzFocus {
     Seam,
 }
 
+/// Which half of a pinned JSM editor the pad drives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum JsmPane {
+    /// The faders. The default, because it is the one that needs no learning.
+    #[default]
+    Tune,
+    /// The config text, walked a token at a time.
+    Text,
+}
+
+impl JsmPane {
+    pub fn other(self) -> JsmPane {
+        match self {
+            JsmPane::Tune => JsmPane::Text,
+            JsmPane::Text => JsmPane::Tune,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            JsmPane::Tune => "Tune",
+            JsmPane::Text => "Edit",
+        }
+    }
+}
+
 /// All gamepad-nav runtime state. Runtime-only — never serialized. Lives on
 /// `FlexInputApp`.
 pub struct GamepadNav {
@@ -240,6 +265,14 @@ pub struct GamepadNav {
     pub active_dev: Option<String>,
     /// West toggles fine increments / lower stick sensitivity while editing.
     pub fine_increment: bool,
+    /// Which half of a pinned JSM editor the pad is driving. LB/RB switch.
+    ///
+    /// The editor pin is two things at once — a config to walk with the cursor,
+    /// and a strip of faders — and a pad has one dpad for both. A pane rather
+    /// than a modifier because tuning and editing are separate sittings.
+    pub jsm_pane: JsmPane,
+    /// Where the token cursor is in the config being edited.
+    pub jsm_cursor: flexinput_engine::eval::JsmCursor,
     /// The JSM setting being tuned and the value it held before tuning started,
     /// as `(name, value)`. North restores it.
     ///
@@ -423,6 +456,8 @@ impl Default for GamepadNav {
             edit_level: EditLevel::Widget,
             active_dev: None,
             fine_increment: false,
+            jsm_pane: JsmPane::default(),
+            jsm_cursor: Default::default(),
             jsm_baseline: None,
             edit_baseline: None,
             cursor_pos: egui::Pos2::ZERO,

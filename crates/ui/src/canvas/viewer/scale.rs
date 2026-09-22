@@ -46,6 +46,45 @@ pub(crate) fn nav_focus_field(ui: &egui::Ui, inner_id: NodeId) -> Option<usize> 
     (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(idx)
 }
 
+/// Where the pad's token cursor sits in a JSM config, published by the nav
+/// driver for the editor body to highlight.
+///
+/// One cursor, in one place. A copy per viewport would drift the moment the same
+/// node were open on the canvas and pinned at once.
+pub(crate) fn publish_jsm_cursor(
+    ctx: &egui::Context,
+    inner_id: NodeId,
+    cur: flexinput_engine::eval::JsmCursor,
+) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_cursor", inner_id.0)), (pass, cur)));
+}
+
+/// The pad's cursor for this node, if it put one there recently.
+///
+/// "Recently" rather than "this pass": nav runs early in the frame and the body
+/// draws later, so an exact match would never hold.
+pub(crate) fn jsm_nav_cursor(
+    ui: &egui::Ui,
+    inner_id: NodeId,
+) -> Option<flexinput_engine::eval::JsmCursor> {
+    let (pass, cur): (u64, flexinput_engine::eval::JsmCursor) =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_cursor", inner_id.0))))?;
+    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(cur)
+}
+
+/// Which pane of a JSM editor the pad is driving, for the body to show.
+pub(crate) fn publish_jsm_pane(ctx: &egui::Context, inner_id: NodeId, pane: &'static str) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_pane", inner_id.0)), (pass, pane)));
+}
+
+pub(crate) fn jsm_nav_pane(ui: &egui::Ui, inner_id: NodeId) -> Option<&'static str> {
+    let (pass, pane): (u64, &'static str) =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_pane", inner_id.0))))?;
+    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(pane)
+}
+
 pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui::Rect]) {
     if local_rects.is_empty() { return; }
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())

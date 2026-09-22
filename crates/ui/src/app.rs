@@ -3671,7 +3671,12 @@ impl FlexInputApp {
         // so they must not also flip tabs.
         let tz_editing = matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab
-            | crate::gamepad_nav::EditLevel::TzCards);
+            | crate::gamepad_nav::EditLevel::TzCards)
+            // The JSM editor reserves the bumpers too: they switch between its
+            // two panes (the config text and the faders), and flipping tabs out
+            // from under an edit would be a rude surprise.
+            || (matches!(self.gamepad_nav.edit_level, crate::gamepad_nav::EditLevel::Editing)
+                && self.nav_active_subpatch_id().is_some_and(|o| self.nav_is_jsm_editor(o)));
         if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
             self.set_active_tab(self.active_tab - 1);
         }

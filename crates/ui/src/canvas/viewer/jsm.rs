@@ -591,6 +591,17 @@ fn jsm_rows(
                 n.params.insert("jsm_show_knobs".into(), Value::Bool(knobs_on));
             }
         }
+        // Which pane the pad is driving, while it is. Without this the bumpers
+        // would switch between two halves that look identical until you press
+        // something and the wrong one moves.
+        if let Some(pane) = super::scale::jsm_nav_pane(ui, node_id) {
+            ui.label(
+                egui::RichText::new(format!("🎮 {pane}"))
+                    .small()
+                    .color(crate::widgets::NavHighlightStyle::of(ui.ctx()).accent),
+            )
+            .on_hover_text("LB / RB switch between the config text and the faders");
+        }
         // Where the strip goes. Beside the editor suits a wide node; above or
         // below suits a tall one.
         if knobs_on {
@@ -652,15 +663,40 @@ fn jsm_rows(
     // to fit instead, so there every fader is just drawn.
     let strip_budget = (!resizable && knobs_on).then_some(strip_h);
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
+    // Where the pad is, if it is driving this editor. A byte range rather than a
+    // line, so the highlight covers exactly the token the buttons would act on.
+    let nav_token: Option<(usize, usize)> = super::scale::jsm_nav_cursor(ui, node_id)
+        .and_then(|c| flexinput_engine::eval::jsm_selection(&tabs[active].text, c))
+        .map(|(_, s, e)| (s, e));
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = wrap_width;
         let font = egui::FontId::monospace(12.0);
         let plain = ui.visuals().text_color();
+        let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
         let raw = buf.as_str();
+        // One `append` per run, so the highlighted token can carry a background
+        // of its own without disturbing the per-line tinting around it.
+        let mut at = 0usize;
         for (i, line) in raw.split_inclusive('\n').enumerate() {
             let color = statuses.get(i).and_then(|s| status_color(ui, s)).unwrap_or(plain);
-            job.append(line, 0.0, egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+            let fmt = |bg: Color32| egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                background: bg,
+                ..Default::default()
+            };
+            let end = at + line.len();
+            match nav_token {
+                // The token is on this line: split it out of the run.
+                Some((ts, te)) if ts >= at && te <= end && te > ts => {
+                    job.append(&raw[at..ts], 0.0, fmt(Color32::TRANSPARENT));
+                    job.append(&raw[ts..te], 0.0, fmt(accent.gamma_multiply(0.45)));
+                    job.append(&raw[te..end], 0.0, fmt(Color32::TRANSPARENT));
+                }
+                _ => job.append(line, 0.0, fmt(Color32::TRANSPARENT)),
+            }
+            at = end;
         }
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
