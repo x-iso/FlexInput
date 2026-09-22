@@ -629,6 +629,11 @@ fn jsm_rows(
     let used = ui.min_rect().height();
     // The sliders and the curve are laid out *after* the editor, so the editor has
     // to leave room for them up front or the body simply overflows its own size.
+    // The command list is drawn under the editor too, so — pinned — the editor
+    // has to give up the room for it or the list opens below the bottom edge and
+    // you can't see what you asked for.
+    let list_open = super::jsm_widgets::command_list_state(ui, node_id).open;
+    let list_want = if list_open { super::jsm_widgets::LIST_H } else { 0.0 };
     let knobs_on = owns_strip && side == Side::Bottom;
     let strip_want = if knobs_on {
         let n = flexinput_engine::eval::jsm_knobs(&tabs[active].text).len() as f32;
@@ -638,7 +643,7 @@ fn jsm_rows(
     } else {
         0.0
     };
-    let body_left = (size.y - used - SUMMARY_H).max(0.0);
+    let body_left = (size.y - used - SUMMARY_H - list_want).max(0.0);
     let (rows, strip_h) = split_body(body_left, line_h, strip_want);
     // Pinned, the container's height is all there is — so whatever the editor
     // leaves goes to the tuning strip, and the faders scroll inside it. Without a
@@ -727,6 +732,7 @@ fn jsm_rows(
     // ── the command list, when it was asked for ──────────────────────────────
     if let Some(pick) = super::jsm_widgets::command_list(
         ui, node_id, size.x, &pins_this_pad_reports(snarl, node_id, live, parent),
+        (!resizable).then_some(list_want),
     ) {
         // Appended on a line of its own. Inserting at the caret would need the
         // TextEdit's cursor, which a `context_menu` click has already taken the

@@ -16,6 +16,7 @@ mod catalogue;
 mod cc;
 mod eval;
 mod feedback;
+mod help;
 mod knobs;
 mod motion;
 mod names;

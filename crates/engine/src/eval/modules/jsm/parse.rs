@@ -424,7 +424,8 @@ fn annotate_analog(out: &mut Compiled) {
                         (!cfg.mode.is_digital()).then(|| {
                             format!(
                                 "{side}_STICK_MODE isn't a digital mode, so `{}` never fires — \
-                         that mode arrives in a later phase",
+                         that stick is aiming, not acting as buttons. JSM does the same; \
+                         set the mode to NO_MOUSE to use its directions.",
                                 btn.name()
                             )
                         })
@@ -1521,8 +1522,8 @@ fn stick_mode(v: &str) -> Parsed<(StickMode, Option<RingMode>)> {
         "FLICK_ONLY" => (StickMode::FlickOnly, None),
         "ROTATE_ONLY" => (StickMode::RotateOnly, None),
         "MOUSE_AREA" => (StickMode::MouseArea, None),
-        "MOUSE_RING" => return Parsed::Later(PHASE_ABSOLUTE),
-        "HYBRID_AIM" => return Parsed::Later(PHASE_HYBRID),
+        "MOUSE_RING" => return Parsed::Later(WHY_ABSOLUTE),
+        "HYBRID_AIM" => return Parsed::Later(WHY_HYBRID),
         // ── the virtual pad's own sticks ──────────────────────────────────────
         "LEFT_STICK" => (StickMode::VirtualStick(0), None),
         "RIGHT_STICK" => (StickMode::VirtualStick(1), None),
@@ -1565,6 +1566,8 @@ pub(crate) enum AimId {
     MaxThreshold,
     /// The sign of one mouse axis (`GYRO_AXIS_X` / `GYRO_AXIS_Y`).
     AxisSign(bool),
+    /// The same for the mouse a stick in `AIM` drives (`STICK_AXIS_X` / `_Y`).
+    StickAxisSign(bool),
     /// Which gyro axes feed one mouse axis.
     FromAxis(bool),
     CutoffSpeed,
@@ -1686,15 +1689,16 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
             }
             ok
         }
-        AimId::AxisSign(is_y) => {
+        AimId::AxisSign(is_y) | AimId::StickAxisSign(is_y) => {
             let Some(inverted) = rhs.split_whitespace().next().and_then(axis_sign) else {
                 return wants("STANDARD or INVERTED (or 1 / -1)");
             };
             let sign = if inverted { -1.0 } else { 1.0 };
-            if is_y {
-                s.axis_y = sign;
-            } else {
-                s.axis_x = sign;
+            match (matches!(which, AimId::StickAxisSign(_)), is_y) {
+                (false, true) => s.axis_y = sign,
+                (false, false) => s.axis_x = sign,
+                (true, true) => s.stick_axis_y = sign,
+                (true, false) => s.stick_axis_x = sign,
             }
             ok
         }
@@ -2480,12 +2484,14 @@ const FORK_NOTE: &str = "from the JSM_custom_curve fork, not stock JoyShockMappe
 /// saying on the line rather than leaving someone to wonder.
 const PAD_NOTE: &str = "needs a virtual pad wired downstream to reach anything; `X_` and `PS_`                         names are the same pin (as in JSM), so wiring decides which pad it                         reaches";
 
-const PHASE_GYRO: &str = "gyro, flick stick and real-world calibration arrive in phase 3";
-/// Gravity-referenced gyro spaces land with the motion stick, which needs the
-/// same work: our accelerometer frame matched to the one JSM reasons in.
-const PHASE_ABSOLUTE: &str =
+/// Why something isn't live. These say what is MISSING, never when it might
+/// arrive: the module was built in phases and the messages used to name them, so
+/// a setting went on promising "arrives in phase 3" long after phase 3 shipped.
+/// A reason stays true; a schedule doesn't.
+const WHY_ABSOLUTE: &str =
     "placing the pointer outright needs an absolute mouse pin, which the bus doesn't have yet";
-const PHASE_HYBRID: &str = "HYBRID_AIM arrives after the rest of aiming";
+const WHY_HYBRID: &str =
+    "HYBRID_AIM blends a stick and the gyro through one shared aim state this module      doesn't keep yet; here the two aim independently";
 
 const WHY_DEVICE_CARD: &str = "the device card owns calibration in FlexInput";
 
@@ -2543,7 +2549,9 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "SCROLL_SENS" => Analog(AnalogId::ScrollSens),
         "CONTROLLER_ORIENTATION" => Analog(AnalogId::Orientation),
         // These invert the AIM mouse output, not the stick itself.
-        "STICK_AXIS_X" | "STICK_AXIS_Y" => Pending(PHASE_GYRO),
+        // The flag is "is this the Y axis", as it is for the gyro's pair above.
+        "STICK_AXIS_X" => Aim(AimId::StickAxisSign(false)),
+        "STICK_AXIS_Y" => Aim(AimId::StickAxisSign(true)),
 
         // Gyro, aim and flick.
         "GYRO_SENS" => Aim(AimId::GyroSens),
@@ -2577,13 +2585,13 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "ROTATE_SMOOTH_OVERRIDE" => Aim(AimId::RotateSmoothOverride),
         "MOUSE_RING_RADIUS" => Aim(AimId::MouseRingRadius),
         // The pointer-placing modes, and the aim hybrid, wait their turn.
-        "SCREEN_RESOLUTION_X" | "SCREEN_RESOLUTION_Y" => Pending(PHASE_ABSOLUTE),
+        "SCREEN_RESOLUTION_X" | "SCREEN_RESOLUTION_Y" => Pending(WHY_ABSOLUTE),
         "STICKLIKE_FACTOR"
         | "MOUSELIKE_FACTOR"
         | "RETURN_DEADZONE_IS_ACTIVE"
         | "RETURN_DEADZONE_ANGLE"
         | "RETURN_DEADZONE_ANGLE_CUTOFF"
-        | "EDGE_PUSH_IS_ACTIVE" => Pending(PHASE_HYBRID),
+        | "EDGE_PUSH_IS_ACTIVE" => Pending(WHY_HYBRID),
         // Flick and gyro can drive a virtual stick instead of the mouse.
         "FLICK_STICK_OUTPUT" => Pad(PadId::Dest(true)),
         "GYRO_OUTPUT" => Pad(PadId::Dest(false)),

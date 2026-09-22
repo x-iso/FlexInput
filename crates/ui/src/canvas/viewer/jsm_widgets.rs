@@ -799,6 +799,10 @@ pub(crate) struct CommandList {
     pub index: usize,
 }
 
+/// Room the command list needs: the filter row, the rows themselves, and the
+/// explanation under them.
+pub(crate) const LIST_H: f32 = 210.0;
+
 fn list_id(node_id: NodeId) -> egui::Id {
     egui::Id::new(("jsm_cmd_list", node_id.0))
 }
@@ -852,6 +856,7 @@ pub(crate) fn command_list(
     node_id: NodeId,
     width: f32,
     pad_pins: &std::collections::HashSet<String>,
+    budget: Option<f32>,
 ) -> Option<String> {
     use flexinput_engine::eval::JsmSupportState as S;
     let mut st = command_list_state(ui, node_id);
@@ -880,6 +885,12 @@ pub(crate) fn command_list(
         }
     });
 
+    // Pinned, the container's height is all there is and the list has to live
+    // inside what the editor gave up for it; on the canvas the body grows.
+    let rows_h = match budget {
+        Some(h) => (h - 56.0).max(48.0),
+        None => 160.0,
+    };
     let rows = filtered(&items, &st.filter);
     if rows.is_empty() {
         ui.label(egui::RichText::new("nothing by that name").small().weak());
@@ -892,7 +903,7 @@ pub(crate) fn command_list(
         claimant,
         egui::ScrollArea::vertical()
             .id_salt(("jsm_cmds", node_id.0))
-            .max_height(160.0)
+            .max_height(rows_h)
             .max_width(width)
             .auto_shrink([false, true]),
         |ui| {
@@ -910,8 +921,19 @@ pub(crate) fn command_list(
                 };
                 let label = egui::RichText::new(&item.name).small().monospace().color(tint);
                 let resp = ui.selectable_label(i == st.index, label);
-                if let Some(w) = why {
-                    resp.clone().on_hover_text(w);
+                // JSM's own words for what it does, plus our reason when we
+                // don't run it. Both, because "not live yet" without knowing
+                // what the setting IS tells you nothing.
+                let tip = match (item.help, why) {
+                    (Some(h), Some(w)) => Some(format!("{h}
+
+{w}")),
+                    (Some(h), None) => Some(h.to_string()),
+                    (None, Some(w)) => Some(w.to_string()),
+                    (None, None) => None,
+                };
+                if let Some(t) = tip {
+                    resp.clone().on_hover_text(t);
                 }
                 if resp.clicked() {
                     st.index = i;
@@ -922,9 +944,14 @@ pub(crate) fn command_list(
     );
 
     if let Some(row) = rows.get(st.index) {
-        // The reason in full under the list, so it is readable without hovering.
+        // The highlighted row explained under the list, so it is readable
+        // without hovering — and so a pad, which has no pointer to hover with,
+        // gets the same explanation when it walks the list.
+        if let Some(h) = row.help {
+            ui.label(egui::RichText::new(h).small());
+        }
         if let S::Pending(w) | S::Ignored(w) = row.state {
-            ui.label(egui::RichText::new(w).small().weak());
+            ui.label(egui::RichText::new(w).small().weak().italics());
         }
     }
     if picked.is_some() || close {

@@ -111,6 +111,11 @@ pub struct Settings {
     /// `GYRO_AXIS_X` / `GYRO_AXIS_Y`: 1.0 or -1.0.
     pub axis_x: f32,
     pub axis_y: f32,
+    /// `STICK_AXIS_X` / `STICK_AXIS_Y`: the same inversion for the mouse a stick
+    /// in `AIM` drives. Separate from the gyro's, as in JSM — plenty of people
+    /// want one inverted and not the other.
+    pub stick_axis_x: f32,
+    pub stick_axis_y: f32,
     pub mouse_x_from: AxisMask,
     pub mouse_y_from: AxisMask,
     pub cutoff_speed: f32,
@@ -145,6 +150,8 @@ impl Default for Settings {
             max_threshold: 0.0,
             axis_x: 1.0,
             axis_y: 1.0,
+            stick_axis_x: 1.0,
+            stick_axis_y: 1.0,
             mouse_x_from: AxisMask::Y,
             mouse_y_from: AxisMask::X,
             cutoff_speed: 0.0,
@@ -568,8 +575,8 @@ impl Aim {
                 let warped = len.powf(s.stick_power);
                 let cal = s.real_world_calibration / s.in_game_sens.max(1e-6);
                 let out = Vec2::new(
-                    st.x / len * warped * s.stick_sens.0 * cal * accel * dt,
-                    st.y / len * warped * s.stick_sens.1 * cal * accel * dt,
+                    st.x / len * warped * s.stick_sens.0 * cal * accel * dt * s.stick_axis_x,
+                    st.y / len * warped * s.stick_sens.1 * cal * accel * dt * s.stick_axis_y,
                 );
                 if st.pegged {
                     let a = accel + s.stick_accel_rate * dt;

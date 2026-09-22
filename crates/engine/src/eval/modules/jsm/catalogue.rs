@@ -12,6 +12,7 @@
 //! direction is the one that rots on its own, so it is checked against the
 //! parser's own source rather than a second hand-written list.
 
+use super::help::help_for;
 use super::names::Btn;
 use super::parse::{button_reaches, command_does_nothing, setting_support, Support};
 
@@ -44,6 +45,9 @@ pub struct Item {
     /// The group it belongs to, for a list worth reading: "Gyro", "Sticks"…
     pub group: &'static str,
     pub state: State,
+    /// JoyShockMapper's own description, where it has one. Absent rather than
+    /// invented — a made-up explanation of a setting is worse than silence.
+    pub help: Option<&'static str>,
 }
 
 /// Every setting name, in the order the parser lists them.
@@ -140,6 +144,7 @@ pub fn catalogue(pad_pins: &std::collections::HashSet<String>) -> Vec<Item> {
         out.push(Item {
             name: (*name).to_string(),
             kind: Kind::Setting,
+            help: help_for(name),
             group: group_of(&sup),
             state: state_of(&sup),
         });
@@ -148,6 +153,7 @@ pub fn catalogue(pad_pins: &std::collections::HashSet<String>) -> Vec<Item> {
         out.push(Item {
             name: (*name).to_string(),
             kind: Kind::Command,
+            help: help_for(name),
             group: "Commands",
             state: match command_does_nothing(name) {
                 Some(why) => State::Ignored(why),
@@ -163,9 +169,33 @@ pub fn catalogue(pad_pins: &std::collections::HashSet<String>) -> Vec<Item> {
                 State::Ignored("this controller doesn't report it"),
             _ => State::Live,
         };
-        out.push(Item { name, kind: Kind::Trigger, group: "Buttons", state });
+        let help = help_for(&name);
+        out.push(Item { name, kind: Kind::Trigger, group: "Buttons", state, help });
     }
+    // Grouped, so a reader sees each heading once. `sort_by_key` is stable, so
+    // within a group the parser's own order survives — which is roughly the
+    // order JSM's documentation introduces them in, and better than alphabetical
+    // for finding the setting next to the one you just read about.
+    out.sort_by_key(|i| group_order(i.group));
     out
+}
+
+/// Where a group sits in the list. Explicit rather than alphabetical: aiming is
+/// what most people open this list for, and "Ignored here" belongs at the bottom.
+fn group_order(group: &str) -> u8 {
+    match group {
+        "Gyro & aim" => 0,
+        "Custom-curve fork" => 1,
+        "Triggers & sticks" => 2,
+        "Virtual pad output" => 3,
+        "Motion & gravity" => 4,
+        "Rumble & lights" => 5,
+        "Timings" => 6,
+        "Buttons" => 7,
+        "Commands" => 8,
+        "Not live yet" => 9,
+        _ => 10,
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +336,65 @@ mod catalogue_tests {
         let f = |n: &str| on_pad.iter().find(|i| i.name == n).expect("still listed");
         assert_eq!(f("S").state, State::Live, "the pad reports it");
         assert!(matches!(f("N").state, State::Ignored(_)), "this pad hasn't got it");
+    }
+}
+
+#[cfg(test)]
+mod grouping_and_help_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Each heading appears once. The list is drawn by printing a group header
+    /// whenever the group changes, so an unsorted list showed "Gyro & aim" over
+    /// and over as the parser's order wandered between categories.
+    #[test]
+    fn the_list_shows_each_group_once() {
+        let all = catalogue(&HashSet::new());
+        let mut seen: Vec<&str> = Vec::new();
+        for item in &all {
+            match seen.last() {
+                Some(g) if *g == item.group => {}
+                _ => {
+                    assert!(
+                        !seen.contains(&item.group),
+                        "`{}` comes back after other groups — its heading would print twice",
+                        item.group
+                    );
+                    seen.push(item.group);
+                }
+            }
+        }
+        assert!(seen.len() > 4, "there really are several groups: {seen:?}");
+        assert_eq!(seen.first(), Some(&"Gyro & aim"), "what people open the list for");
+    }
+
+    /// Descriptions come from JoyShockMapper's own help, so they say what the
+    /// setting does — not what we guessed it does.
+    #[test]
+    fn settings_carry_jsms_own_description() {
+        let all = catalogue(&HashSet::new());
+        let find = |n: &str| all.iter().find(|i| i.name == n).expect("listed");
+
+        let sens = find("GYRO_SENS").help.expect("GYRO_SENS is described");
+        assert!(
+            sens.to_ascii_lowercase().contains("sensitivity"),
+            "reads like JSM's own text: {sens}"
+        );
+        // Flattened to one line: JSM writes its help with embedded newlines, and
+        // a tooltip with raw `\n` escapes in it would look broken.
+        assert!(!sens.contains("\n"), "escapes are resolved: {sens}");
+        assert!(!sens.trim().is_empty());
+
+        // The fork's own settings are described too, from the fork's source.
+        assert!(find("ACCEL_CURVE").help.is_some(), "the fork's settings are covered");
+
+        // Most of the vocabulary is described; the rest carries nothing rather
+        // than an invented sentence.
+        let described = all.iter().filter(|i| i.help.is_some()).count();
+        assert!(
+            described > all.len() / 3,
+            "only {described} of {} described",
+            all.len()
+        );
     }
 }

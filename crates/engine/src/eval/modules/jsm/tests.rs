@@ -5468,3 +5468,66 @@ fn stretching_the_speed_axis_samples_where_it_stretched() {
         assert!((a.dps - b.dps).abs() < 1e-3 && (a.sens - b.sens).abs() < 1e-3);
     }
 }
+
+/// `STICK_AXIS_X` / `STICK_AXIS_Y` invert the mouse a stick in `AIM` drives,
+/// separately from the gyro's own inversion — as in JSM, because wanting one
+/// inverted and not the other is the usual reason to set either.
+///
+/// These used to compile as "not live yet, arrives in phase 3" long after phase
+/// 3 had shipped, which is the sort of stale promise this module exists not to
+/// make.
+#[test]
+fn stick_axis_inversion_flips_the_stick_aim_and_leaves_the_gyro_alone() {
+    let base = "RIGHT_STICK_MODE = AIM\nSTICK_SENS = 100\nREAL_WORLD_CALIBRATION = 1";
+    let plain = Aiming::new(base).stick(1, 1.0, 0.0);
+    assert!(plain.x > 0.0, "right aims right by default");
+
+    let flipped = Aiming::new(&format!("{base}\nSTICK_AXIS_X = INVERTED")).stick(1, 1.0, 0.0);
+    assert!((flipped.x + plain.x).abs() < 1e-6, "inverted X mirrors it: {flipped:?}");
+
+    let up_plain = Aiming::new(base).stick(1, 0.0, 1.0);
+    let up_flip = Aiming::new(&format!("{base}\nSTICK_AXIS_Y = INVERTED")).stick(1, 0.0, 1.0);
+    assert!(up_plain.y > 0.0 && (up_flip.y + up_plain.y).abs() < 1e-6, "and Y: {up_flip:?}");
+
+    // One axis at a time: inverting X must not touch Y.
+    let only_x = Aiming::new(&format!("{base}\nSTICK_AXIS_X = INVERTED")).stick(1, 0.0, 1.0);
+    assert!((only_x.y - up_plain.y).abs() < 1e-6, "Y is untouched: {only_x:?}");
+
+    // It is the STICK's inversion, not the gyro's — setting the gyro's leaves
+    // the stick alone.
+    let gyro_only = Aiming::new(&format!("{base}\nGYRO_AXIS_X = INVERTED")).stick(1, 1.0, 0.0);
+    assert!((gyro_only.x - plain.x).abs() < 1e-6, "the gyro's setting isn't the stick's");
+
+    // And it compiles clean, rather than as a promise.
+    let cfg = compile("STICK_AXIS_X = INVERTED\nSTICK_AXIS_Y = STANDARD\n");
+    assert!(
+        cfg.lines.iter().all(|l| matches!(l.status, LineStatus::Ok)),
+        "both lines run: {:?}",
+        cfg.lines.iter().map(|l| &l.status).collect::<Vec<_>>()
+    );
+}
+
+/// Nothing tells the user to wait for a numbered phase.
+///
+/// The module was built in phases and its "not live yet" messages named them, so
+/// a setting could go on promising "arrives in phase 3" for months after phase 3
+/// shipped — a lie that ages into itself. A reason for something being missing
+/// stays true; a schedule does not, so no message may carry one.
+#[test]
+fn no_diagnostic_promises_a_numbered_phase() {
+    let src = include_str!("parse.rs");
+    for (n, line) in src.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if lower.trim_start().starts_with("//") {
+            continue;
+        }
+        assert!(
+            !(lower.contains("phase 1") || lower.contains("phase 2") || lower.contains("phase 3")
+                || lower.contains("phase 4") || lower.contains("phase 5")
+                || lower.contains("later phase") || lower.contains("a later phase")),
+            "parse.rs:{} tells the user to wait for a phase: {}",
+            n + 1,
+            line.trim()
+        );
+    }
+}
