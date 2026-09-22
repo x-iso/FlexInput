@@ -1079,6 +1079,7 @@ pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String
 pub(crate) fn pins_a_button_needs(btn: Btn) -> Option<Vec<&'static str>> {
     Some(match btn.source() {
         BtnSource::Pin(p) => vec![p],
+        BtnSource::Either(p, q) => vec![p, q],
         BtnSource::Trigger { analog, digital } => vec![analog, digital],
         BtnSource::TriggerFull { analog } => vec![analog],
         BtnSource::Stick { stick, .. } => match stick {

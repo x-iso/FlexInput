@@ -47,6 +47,16 @@ pub enum Btn {
 pub enum BtnSource {
     /// A Bool pin.
     Pin(&'static str),
+    /// One JSM button that different pads put in different places, so it reads
+    /// whichever of two pins the pad in hand actually has.
+    ///
+    /// `CAPTURE` is the only one, and JSM is explicit about it: its own help
+    /// calls the button "Touchpad click or Capture", and its SDL layer feeds it
+    /// from `SDL_GAMEPAD_BUTTON_TOUCHPAD` on PlayStation pads and from the
+    /// Capture / Share button on every other kind. One name, two pieces of
+    /// hardware — which is also what makes a config written on one pad work on
+    /// the other.
+    Either(&'static str, &'static str),
     /// An analog trigger, with the digital button some pads report instead.
     Trigger { analog: &'static str, digital: &'static str },
     /// Full pull of an analog trigger.
@@ -181,7 +191,7 @@ impl Btn {
             Minus => S::Pin("btn_back"), Plus => S::Pin("btn_start"), Home => S::Pin("btn_guide"),
             // JSM's CAPTURE is the touchpad click on PlayStation pads and the
             // Capture button on Switch ones; our pads expose both pins.
-            Capture => S::Pin("btn_touchpad"),
+            Capture => S::Either("btn_touchpad", "btn_capture"),
             N => S::Pin("btn_north"), E => S::Pin("btn_east"), S => S::Pin("btn_south"), W => S::Pin("btn_west"),
             L3 => S::Pin("btn_ls"), R3 => S::Pin("btn_rs"), Mic => S::Pin("btn_mute"),
             // JoyCon SL/SR sit where an Elite pad has its paddles.

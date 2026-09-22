@@ -545,6 +545,12 @@ impl FlexInputApp {
                             _ => None,
                         });
                     let face = match typed {
+                        // A letter wears the glyph the icon set drew for it —
+                        // `A` and `a` are the same key face — so only the
+                        // characters with no glyph at all get drawn.
+                        Some(c) if c.is_ascii_alphabetic() => {
+                            (kbm_cell_texture(ctx, skin, &cell.pin), None)
+                        }
                         Some(c) => match crate::canvas::remapper_icons::char_svg(c) {
                             Some(svg) => (kbm_svg_texture(ctx, svg), None),
                             None => (
@@ -566,12 +572,36 @@ impl FlexInputApp {
                                 tint,
                             );
                         }
+                        // Sized and weighted to sit beside the drawn glyphs
+                        // rather than shout over them, and always dark: the key
+                        // shape is white in every state, and painting the
+                        // character in the cell's own background made it vanish
+                        // on the focused key — which already has a ring round it
+                        // to say where it is.
+                        let glyph = egui::Color32::from_gray(40);
+                        let font = egui::FontId::proportional(UNIT * 0.42);
+                        // There is no bold face in the default font set, so the
+                        // weight comes from drawing the glyph over itself a
+                        // fraction of a pixel out. Cheap, and it matches the
+                        // drawn symbols' stroke closely enough to pass.
+                        for off in [
+                            egui::vec2(-0.45, 0.0), egui::vec2(0.45, 0.0),
+                            egui::vec2(0.0, -0.45), egui::vec2(0.0, 0.45),
+                        ] {
+                            painter.text(
+                                rect.center() + off,
+                                egui::Align2::CENTER_CENTER,
+                                c.to_string(),
+                                font.clone(),
+                                glyph,
+                            );
+                        }
                         painter.text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             c.to_string(),
-                            egui::FontId::proportional(UNIT * 0.55),
-                            bg,
+                            font,
+                            glyph,
                         );
                         continue;
                     }

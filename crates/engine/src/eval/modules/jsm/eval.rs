@@ -604,6 +604,8 @@ fn button_down(
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     match btn.source() {
         BtnSource::Pin(pin) => b(pin),
+        // Whichever of the two this pad has; a pad never has both asserted.
+        BtnSource::Either(p, q) => b(p) || b(q),
         BtnSource::Trigger { .. }
         | BtnSource::TriggerFull { .. }
         | BtnSource::Stick { .. }
@@ -669,6 +671,12 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
         match btn.source() {
             BtnSource::Pin(pin) => {
                 digital.insert(pin.to_string());
+            }
+            // Both, because either could be the one this pad has — and claiming
+            // a pin the pad hasn't got costs nothing.
+            BtnSource::Either(p, q) => {
+                digital.insert(p.to_string());
+                digital.insert(q.to_string());
             }
             BtnSource::Trigger {
                 analog: a,

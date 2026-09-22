@@ -181,6 +181,18 @@ pub const PAD_LAYOUT: &[KbmCell] = &[
     c("dpad_down", PAD_X + 1.0, PAD_Y + 4.0), c("btn_south", PAD_X + 5.0, PAD_Y + 4.0),
     // Stick clicks at the bottom, under the hands they belong to.
     c("btn_ls", PAD_X + 1.0, PAD_Y + 5.0), c("btn_rs", PAD_X + 5.0, PAD_Y + 5.0),
+    // The rear paddles, in the pairs a hand finds them in. JSM calls them after
+    // the JoyCon rail buttons that sit in the same place (LSL / LSR / RSL / RSR).
+    c("btn_paddle_l1", PAD_X, PAD_Y + 6.0), c("btn_paddle_l2", PAD_X + 1.0, PAD_Y + 6.0),
+    c("btn_paddle_r1", PAD_X + 5.0, PAD_Y + 6.0), c("btn_paddle_r2", PAD_X + 6.0, PAD_Y + 6.0),
+    // Capture / Share, and the extra buttons a pad may carry. JSM's CAPTURE is
+    // one name for "touchpad click or Capture" (its own words), so this cell and
+    // the touchpad's click cell both write it — as they should, since a config
+    // written on one pad has to run on the other.
+    c("btn_capture", PAD_X, PAD_Y + 7.0),
+    c("btn_misc1", PAD_X + 1.0, PAD_Y + 7.0), c("btn_misc2", PAD_X + 2.0, PAD_Y + 7.0),
+    c("btn_misc3", PAD_X + 3.0, PAD_Y + 7.0), c("btn_misc4", PAD_X + 4.0, PAD_Y + 7.0),
+    c("btn_misc5", PAD_X + 5.0, PAD_Y + 7.0), c("btn_misc6", PAD_X + 6.0, PAD_Y + 7.0),
 ];
 
 /// Where the gamepad cluster's caption goes, in grid units.
@@ -515,33 +527,48 @@ mod pad_cluster_tests {
         }
     }
 
-    /// A pad button has a name on BOTH sides of a JSM line, and they are
-    /// different names: `S` is the button you press, `X_A` is what a virtual pad
-    /// reports when something is bound to it. The board is the only place a
-    /// person picks either, so every cell has to have both.
+    /// Every cell on the gamepad cluster can START a line — that is what the
+    /// cluster is for. Only some of them can END one: a virtual Xbox pad has no
+    /// paddles and no Misc buttons, so nothing can be bound TO those, and the
+    /// board greys them where a value goes rather than offering a name that
+    /// doesn't exist.
     #[test]
-    fn every_gamepad_cell_is_one_jsm_can_bind_either_way() {
+    fn every_gamepad_cell_can_start_a_line_and_only_some_can_end_one() {
         let outputs = flexinput_engine::eval::jsm_names_by_pin();
         let inputs = flexinput_engine::eval::jsm_input_names_by_pin();
         for cell in PAD_LAYOUT {
             let pin = pin_as_bound(cell.pin);
             assert!(
-                outputs.contains_key(pin),
-                "{} is on the board but nothing can be bound TO it",
-                cell.pin
-            );
-            assert!(
                 inputs.contains_key(pin),
                 "{} is on the board but a line can't be started WITH it",
                 cell.pin
             );
-            assert_ne!(
-                inputs.get(pin),
-                outputs.get(pin),
-                "{}: the two sides of a line would read the same, which they don't",
-                cell.pin
-            );
+            if let Some(out) = outputs.get(pin) {
+                assert_ne!(
+                    inputs.get(pin),
+                    Some(out),
+                    "{}: the two sides of a line would read the same, which they don't",
+                    cell.pin
+                );
+            }
             assert!(is_pad_cell(cell.pin));
+        }
+        // What a virtual pad reports, and so what a binding can drive.
+        for pin in [
+            "btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb",
+            "btn_ls", "btn_rs", "btn_back", "btn_start", "btn_guide",
+            "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+            "left_trigger", "right_trigger",
+        ] {
+            assert!(outputs.contains_key(pin), "{pin} should be bindable TO");
+        }
+        // And what it hasn't got. These are inputs only, which is why the board
+        // has to know which side of the line it is inserting into.
+        for pin in ["btn_paddle_l1", "btn_paddle_r2", "btn_misc1", "btn_misc6", "btn_capture"] {
+            assert!(
+                !outputs.contains_key(pin),
+                "{pin} has an output name now, so it should be offered on both sides"
+            );
         }
         assert!(!is_pad_cell("key_a"), "and the keyboard is not the gamepad");
     }

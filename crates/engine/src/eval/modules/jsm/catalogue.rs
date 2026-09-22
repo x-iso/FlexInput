@@ -189,6 +189,8 @@ pub fn input_names_by_pin() -> std::collections::HashMap<String, String> {
         let name = b.name();
         let pins: Vec<&str> = match b.source() {
             S::Pin(p) => vec![p],
+            // One name, either pin — whichever this pad puts it on.
+            S::Either(p, q) => vec![p, q],
             // Both spellings of a trigger read the same line.
             S::Trigger { analog, digital } => vec![analog, digital],
             S::TriggerFull { analog } => vec![analog],
@@ -803,6 +805,12 @@ mod catalogue_tests {
         // an axis — one JSM button, either way the pad spells it.
         assert_eq!(name("btn_lt_dig"), Some("ZL"));
         assert_eq!(name("btn_rt_dig"), Some("ZR"));
+        // JSM has ONE name for "touchpad click or Capture" — its own words —
+        // and feeds it from whichever of the two a pad actually has. Both of
+        // our pins answer to it, which is what makes a config written on a
+        // DualSense work on a Switch pad.
+        assert_eq!(name("btn_touchpad"), Some("CAPTURE"));
+        assert_eq!(name("btn_capture"), Some("CAPTURE"));
 
         // Every input name here is one the parser reads back as that button.
         for (pin, n) in &by_pin {
