@@ -1,0 +1,784 @@
+{
+  "version": 1,
+  "sub_patch": {
+    "display_name": "Generic JSM-style setup",
+    "pins_in": [
+      {
+        "name": "Auto-Map",
+        "signal_type": "AutoMap"
+      }
+    ],
+    "pins_out": [
+      {
+        "name": "out",
+        "signal_type": "AutoMap"
+      }
+    ],
+    "snarl": {
+      "nodes": {
+        "0": {
+          "value": {
+            "module_id": "module.automap_selector",
+            "display_name": "AutoMap Selector",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_0",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 395.1203,
+            "y": -664.6218
+          },
+          "open": true
+        },
+        "1": {
+          "value": {
+            "module_id": "display.controller3d",
+            "display_name": "Controller 3D",
+            "category": "Display",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": true
+              },
+              {
+                "name": "Orientation",
+                "signal_type": "Vec4",
+                "optional": true
+              }
+            ],
+            "outputs": [],
+            "params": {}
+          },
+          "pos": {
+            "x": 749.6802,
+            "y": -212.17824
+          },
+          "open": true
+        },
+        "2": {
+          "value": {
+            "module_id": "processing.gyro_3dof",
+            "display_name": "3DOF to 2D",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "Reset",
+                "signal_type": "Bool",
+                "optional": true
+              },
+              {
+                "name": "Gyro X",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Gyro Y",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Gyro Z",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel X",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel Y",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel Z",
+                "signal_type": "Float",
+                "optional": true
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "X",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Y",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Lean",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Lean!",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "Orientation",
+                "signal_type": "Vec4",
+                "optional": false
+              },
+              {
+                "name": "Map",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "inv_pitch": false,
+              "orient_scale": 1.0,
+              "lean_threshold": 0.30000001192092896,
+              "_lean_right_phase": "idle",
+              "axis": "pitch_yaw",
+              "inv_accel_x": false,
+              "orient_drift": 0.0,
+              "steering_exclude_y": false,
+              "inv_accel_z": false,
+              "recenter_strength": 0.0,
+              "_lean_left_phase": "idle",
+              "orient_auto_recenter": true,
+              "_lean_right_draft": [],
+              "_lean_left_draft": [],
+              "inv_roll": false,
+              "_lean_right_pressed_prev": [],
+              "reset_ease_in": 0.25,
+              "family": "pointer",
+              "inv_yaw": false,
+              "inv_accel_y": false,
+              "orient_recenter_thresh": 0.004999999888241291,
+              "_lean_left_pressed_prev": []
+            }
+          },
+          "pos": {
+            "x": 143.53293,
+            "y": -178.41588
+          },
+          "open": true
+        },
+        "3": {
+          "value": {
+            "module_id": "module.macro",
+            "display_name": "Macro Output",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "Bypass JSM",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "macro_ports": [
+                {
+                  "icon": "detour",
+                  "id": "0c16f205",
+                  "name": "Bypass JSM",
+                  "type": "bool"
+                }
+              ],
+              "output_pin_ids": [
+                "macro:0c16f205"
+              ]
+            }
+          },
+          "pos": {
+            "x": -124.9812,
+            "y": -804.8077
+          },
+          "open": true
+        },
+        "4": {
+          "value": {
+            "module_id": "module.automap_combiner",
+            "display_name": "AutoMap Combiner",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "in_0",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 580.67773,
+            "y": -513.11334
+          },
+          "open": true
+        },
+        "5": {
+          "value": {
+            "module_id": "module.jsm",
+            "display_name": "JSM Config",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "AutoMap",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "jsm_active_tab": 1,
+              "jsm_editor_h": 734.8561401367188,
+              "jsm_curve_warp": 0.37755492329597473,
+              "jsm_editor_w": 395.0105285644531,
+              "jsm_strict": false,
+              "jsm_knob_side": "left",
+              "jsm_show_knobs": true,
+              "jsm_tabs": [
+                {
+                  "name": "_3Dmouse",
+                  "text": "# Aim settings\r\n# Gyro sens of 1 means you'll turn the same amount in game as in the real world\r\nMIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 2\r\n# Gyro thresholds are in degrees per second\r\nMIN_GYRO_THRESHOLD = 0\r\nMAX_GYRO_THRESHOLD = 75\r\n\r\n# Stick sensitivity is in degrees per second\r\nSTICK_SENS = 360\r\nSTICK_POWER = 4\r\nSTICK_ACCELERATION_RATE = 1\r\nSTICK_ACCELERATION_CAP = 2\r\nRIGHT_STICK_MODE = FLICK\r\n#RIGHT_STICK_MODE = AIM\n"
+                },
+                {
+                  "name": "CC stuff example",
+                  "text": "# Gyro Behavior\nREAL_WORLD_CALIBRATION = 10\nIN_GAME_SENS = 1\nACCEL_CURVE = natural \nMIN_GYRO_SENS = 5.01\nMAX_GYRO_SENS = 5\nDECEL_BRAKE_STRENGTH = 0.26\nDECEL_BRAKE_THRESHOLD = 33.84\nGYRO_CUTOFF_SPEED = 0.81\nGYRO_CUTOFF_RECOVERY = 6.96\nGYRO_SMOOTH_TIME = 0.14\nGYRO_SMOOTH_THRESHOLD = 14.09\nGYRO_ANGLE_SNAP = 2\n\n\n# Stick bindings\nLUP = W\nLDOWN = S\nLLEFT = A\nLRIGHT = D\n"
+                }
+              ]
+            }
+          },
+          "pos": {
+            "x": -372.7823,
+            "y": -680.56824
+          },
+          "open": true
+        },
+        "6": {
+          "value": {
+            "module_id": "module.automap_split",
+            "display_name": "AutoMap Splitter",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "AutoMap",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "Right Stick",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "Mouse: XY (delta)",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "Mouse: XY (move)",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "params": {
+              "output_pin_ids": [
+                "automap_pass",
+                "right_stick",
+                "mouse",
+                "mouse_move"
+              ]
+            }
+          },
+          "pos": {
+            "x": 661.4193,
+            "y": -762.2688
+          },
+          "open": true
+        },
+        "7": {
+          "value": {
+            "module_id": "module.remapper",
+            "display_name": "Remapper",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "_pressed_prev": [],
+              "_tp_click_mode": false,
+              "draft_input": [
+                "dpad_right"
+              ],
+              "ui_phase": "ready_to_learn",
+              "draft_output": []
+            }
+          },
+          "pos": {
+            "x": 287.46112,
+            "y": -357.22717
+          },
+          "open": true
+        },
+        "8": {
+          "value": {
+            "module_id": "subpatch.inlet",
+            "display_name": "Auto-Map",
+            "category": "SubPatch",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "Auto-Map",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "signal_type": "AutoMap",
+              "pin_index": 0
+            }
+          },
+          "pos": {
+            "x": -564.3391,
+            "y": -543.84766
+          },
+          "open": true
+        },
+        "9": {
+          "value": {
+            "module_id": "subpatch.outlet",
+            "display_name": "out",
+            "category": "SubPatch",
+            "inputs": [
+              {
+                "name": "out",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [],
+            "params": {
+              "pin_index": 0,
+              "signal_type": "AutoMap"
+            }
+          },
+          "pos": {
+            "x": 885.8109,
+            "y": -466.03714
+          },
+          "open": true
+        }
+      },
+      "wires": [
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 9,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 3,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 0,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 5
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 6,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 5,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 0,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 2,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 0
+          }
+        }
+      ]
+    },
+    "items": [
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              0.0,
+              0.0
+            ],
+            "size": [
+              784.0,
+              568.0
+            ],
+            "fill": [
+              60,
+              60,
+              60,
+              180
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 0.0
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 5,
+          "element_id": "editor",
+          "pos": [
+            0.0,
+            0.0
+          ],
+          "size": [
+            536.0,
+            536.0
+          ],
+          "graph_override": {
+            "background": [
+              16,
+              16,
+              16,
+              105
+            ],
+            "outline": null,
+            "outline_px": null,
+            "gridline": null,
+            "channel_colors": []
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 7,
+          "element_id": "whole_module",
+          "pos": [
+            544.0,
+            24.0
+          ],
+          "size": [
+            232.0,
+            488.0
+          ]
+        }
+      },
+      {
+        "Deco": {
+          "Text": {
+            "pos": [
+              544.0,
+              0.0
+            ],
+            "size": [
+              232.0,
+              24.0
+            ],
+            "text": "Extra Remapper",
+            "font_size": 16.0,
+            "fill": [
+              200,
+              200,
+              200,
+              220
+            ],
+            "outline": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "outline_px": 0.0,
+            "align": "Left",
+            "valign": "Center"
+          }
+        }
+      }
+    ],
+    "overlay_items": [
+      {
+        "Module": {
+          "inner_node_id": 1,
+          "element_id": "viewer",
+          "pos": [
+            884.57153,
+            501.14285
+          ],
+          "size": [
+            574.8571,
+            478.2857
+          ],
+          "iv_style_override": {
+            "bg": [
+              18,
+              18,
+              22,
+              0
+            ],
+            "accent": [
+              255,
+              196,
+              90,
+              255
+            ],
+            "tint": [
+              255,
+              255,
+              255,
+              255
+            ],
+            "outline": [
+              70,
+              70,
+              75,
+              255
+            ],
+            "outline_px": 0.0,
+            "c3d_composite": 0.74
+          }
+        }
+      }
+    ],
+    "config_items": [
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              884.5714,
+              136.0
+            ],
+            "size": [
+              504.57147,
+              650.2857
+            ],
+            "fill": [
+              60,
+              60,
+              60,
+              180
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 1.0,
+            "corner_radius": 4.0,
+            "anchor": {
+              "x": "End",
+              "y": "Start",
+              "stretch_x": true,
+              "stretch_y": true,
+              "id": 1
+            }
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 5,
+          "element_id": "editor",
+          "pos": [
+            897.9286,
+            146.08936
+          ],
+          "size": [
+            484.14282,
+            628.9643
+          ],
+          "graph_override": {
+            "background": [
+              16,
+              16,
+              16,
+              79
+            ],
+            "outline": [
+              175,
+              175,
+              175,
+              255
+            ],
+            "outline_px": 0.0,
+            "gridline": null,
+            "channel_colors": []
+          },
+          "anchor": {
+            "x": "End",
+            "y": "Start",
+            "stretch_x": true,
+            "stretch_y": true,
+            "to": 1
+          }
+        }
+      }
+    ],
+    "overlay_authored_size": [
+      1462.8438,
+      914.28125
+    ],
+    "config_authored_size": [
+      1462.8438,
+      914.28125
+    ],
+    "snap_enabled": true,
+    "snap_grid_px": 8
+  }
+}
