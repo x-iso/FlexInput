@@ -335,16 +335,26 @@ fn virtual_or_stick(cfg: &Compiled, hand: Hand, rest: &str) -> Feel {
 
 /// How far one deflection of the stick moves a setting.
 ///
-/// A flat step of 1 would put half of JSM's settings out of a pad's reach: a
-/// deadzone lives in 0..1, where whole numbers offer "off" and "all of it".
-/// Twenty steps across the setting's own range, rounded to a size a person
-/// would have picked (1, 2 or 5 of some power of ten), lands on numbers that
-/// read like numbers — 0.05 for a deadzone, 1 for gyro sensitivity, 50ms for a
-/// hold time.
+/// A whole unit per push, which is what anyone watching a number expects — but
+/// never MORE than one, and less where a whole unit is too blunt. A deadzone
+/// lives in 0..1, where stepping by 1 offers "off" and "all of it" and nothing
+/// between; so the floor is twenty steps across the setting's own range,
+/// rounded to a size a person would have picked (1, 2 or 5 of some power of
+/// ten). That gives 0.05 for a deadzone and 0.1 for a trigger threshold.
 ///
-/// Deliberately coarse. This gesture exists to get a number THERE; the moment
-/// one is, the setting has a fader in the Tune pane, and that is the tool for
-/// finding the value you actually want.
+/// The cap is the half that was missing. Twenty steps across
+/// `GYRO_CUTOFF_SPEED`'s 0..50 is a step of 2, walking 0, 2, 4 straight past
+/// every odd number — and that setting is the gyro's deadzone, so it is exactly
+/// the one somebody nudges while watching the curve. A stepper that skips half
+/// the numbers reads as a bug, whatever the reasoning behind it.
+///
+/// Whole-numbered settings keep the coarse step. They are millisecond timings
+/// in a 0..1000 range, where 1ms is below anything you can feel and stepping by
+/// it would be two hundred pushes to reach a hold time.
+///
+/// Even so this is the rough tool: it exists to get a number THERE, and the
+/// moment one is, the setting has a fader in the Tune pane for finding the
+/// value you actually want.
 fn step_for(lo: f32, hi: f32, integral: bool) -> f32 {
     let target = (hi - lo) / 20.0;
     let mut step = if integral { 1.0 } else { 0.01 };
@@ -356,7 +366,11 @@ fn step_for(lo: f32, hi: f32, integral: bool) -> f32 {
             }
         }
     }
-    step
+    if integral {
+        step
+    } else {
+        step.min(1.0)
+    }
 }
 
 /// Walk the number under the cursor, or put one there. `dir` is one deflection
@@ -395,15 +409,39 @@ pub fn scrub(text: &str, cur: Cursor, dir: i32) -> Option<String> {
     let name = name.rsplit([',', '+', '*']).next().unwrap_or(name);
     let bounds = range(&name.to_ascii_uppercase());
     let (lo, hi, integral) = bounds.unwrap_or((f32::MIN, f32::MAX, false));
-    let next = match current {
-        Some(v) => v + dir as f32 * if bounds.is_some() { step_for(lo, hi, integral) } else { 1.0 },
+    let step = if bounds.is_some() { step_for(lo, hi, integral) } else { 1.0 };
+    let (next, floor, ceiling) = match current {
+        Some(v) => {
+            // Land on multiples of the step. Walking a number should give 1, 2,
+            // 3 rather than 0.7, 1.7, 2.7 — so a value typed by hand is tidied
+            // onto the grid by the first push instead of carrying its offset
+            // through every one after it.
+            //
+            // The slack is float arithmetic, not taste. A grid value divided
+            // by its own step lands either side of the integer in f32:
+            // 0.65 / 0.05 is 12.999999, so `floor + 1` gives back 0.65 and the
+            // stick looks dead pushing UP; 0.18 / 0.02 is 9.0000009, so
+            // `ceil - 1` gives back 0.18 and it looks dead pushing DOWN. Both
+            // are ordinary numbers to find on a deadzone line.
+            const SLACK: f32 = 1e-4;
+            let n = v / step;
+            let stepped = if dir > 0 {
+                ((n + SLACK).floor() + 1.0) * step
+            } else {
+                ((n - SLACK).ceil() - 1.0) * step
+            };
+            // The range is a fence, but a config already sitting outside it is
+            // not dragged back over in one push: `GYRO_SENS = 99` walks down to
+            // 98 rather than snapping to 32 and swallowing what was written.
+            (stepped, lo.min(v), hi.max(v))
+        }
         // Nothing there yet, so the first deflection puts a number in the slot
         // rather than stepping one. Zero — pulled inside the setting's range,
         // because seeding a value the setting cannot take would be its own small
         // lie — and the direction steers it from there.
-        None => 0.0,
+        None => (0.0, lo, hi),
     };
-    Some(cursor::replace(text, cur, &shown(next.clamp(lo, hi), integral)))
+    Some(cursor::replace(text, cur, &shown(next.clamp(floor, ceiling), integral)))
 }
 
 /// The slider range for a setting, and whether it is whole-numbered.

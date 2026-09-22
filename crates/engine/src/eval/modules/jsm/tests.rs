@@ -5250,8 +5250,32 @@ fn a_deflection_puts_a_number_in_the_slot_and_then_walks_it() {
         scrub("LEFT_STICK_DEADZONE_INNER = 0", val, 1).unwrap(),
         "LEFT_STICK_DEADZONE_INNER = 0.05"
     );
-    // Milliseconds in a 0..1000 range walk in fifties, not in ones.
+    // Milliseconds in a 0..1000 range walk in fifties, not in ones — 1ms is
+    // below what anyone can feel, and 200 pushes is not a gesture.
     assert_eq!(scrub("HOLD_PRESS_TIME = 150", val, 1).unwrap(), "HOLD_PRESS_TIME = 200");
+    // But never coarser than a whole unit. Twenty steps across this setting's
+    // 0..50 would be a step of 2, walking straight past every odd number — and
+    // it is the gyro's deadzone, so it is the one people nudge while watching
+    // the curve.
+    assert_eq!(scrub("GYRO_CUTOFF_SPEED = 0", val, 1).unwrap(), "GYRO_CUTOFF_SPEED = 1");
+    assert_eq!(scrub("LEAN_THRESHOLD = 14", val, 1).unwrap(), "LEAN_THRESHOLD = 15");
+
+    // The steps land on multiples of themselves, so a number typed by hand is
+    // tidied onto the grid rather than carrying its offset through every push.
+    assert_eq!(scrub("GYRO_SENS = 3.7", val, 1).unwrap(), "GYRO_SENS = 4");
+    assert_eq!(scrub("GYRO_SENS = 3.7", val, -1).unwrap(), "GYRO_SENS = 3");
+    // The grid has to survive f32 division, in both directions. A value
+    // divided by its own step lands either side of the integer: 0.65 / 0.05 is
+    // 12.999999, and without slack pushing UP hands back 0.65 — a dead stick on
+    // an ordinary deadzone line. 0.18 / 0.02 is 9.0000009 and fails DOWNWARD.
+    assert_eq!(
+        scrub("LEFT_STICK_DEADZONE_OUTER = 0.65", val, 1).unwrap(),
+        "LEFT_STICK_DEADZONE_OUTER = 0.7"
+    );
+    assert_eq!(
+        scrub("GYRO_SMOOTH_TIME = 0.18", val, -1).unwrap(),
+        "GYRO_SMOOTH_TIME = 0.16"
+    );
 
     // The range is also the floor and ceiling: most settings stop at zero, and
     // the ones JSM lets go negative keep going.
@@ -5270,6 +5294,10 @@ fn a_deflection_puts_a_number_in_the_slot_and_then_walks_it() {
         "ZL,GYRO_SENS = 0",
         "and it stops where the setting stops, chord or no chord"
     );
+
+    // A config already outside the slider's range is not dragged back over it
+    // in one push — that would swallow a number somebody meant to write.
+    assert_eq!(scrub("GYRO_SENS = 99", val, -1).unwrap(), "GYRO_SENS = 98");
 
     // A setting with no range of its own still walks, in ones, unclamped.
     assert_eq!(scrub("S = 4", val, -1).unwrap(), "S = 3");
@@ -5309,11 +5337,11 @@ fn a_scrubbed_number_reaches_the_config_it_was_typed_into() {
     for _ in 0..4 {
         text = super::knobs::scrub(&text, val, 1).expect("a value to walk");
     }
-    assert_eq!(text, "MIN_GYRO_THRESHOLD = 30
-", "zero, then three steps of ten");
-    assert_eq!(compile(&text).aim.min_threshold, 30.0);
+    assert_eq!(text, "MIN_GYRO_THRESHOLD = 3
+", "zero, then three steps of one");
+    assert_eq!(compile(&text).aim.min_threshold, 3.0);
     // And the line the slider machinery sees agrees with it.
-    assert_eq!(super::knobs::knobs(&text)[0].value, 30.0);
+    assert_eq!(super::knobs::knobs(&text)[0].value, 3.0);
 }
 
 /// `GYRO_SENS` writes BOTH ends of the ramp (JSM's own help: "sets both
