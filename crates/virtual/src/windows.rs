@@ -1447,19 +1447,24 @@ fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
         "f9"  => Key::F9,  "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,
         "f13" => Key::F13, "f14" => Key::F14, "f15" => Key::F15, "f16" => Key::F16,
         "f17" => Key::F17, "f18" => Key::F18, "f19" => Key::F19, "f20" => Key::F20,
-        // Single letter → VK code (VK_A=0x41 … VK_Z=0x5A). Match on the
-        // lowercased form then send the uppercase VK scancode.
+        // One character: a letter (VK_A=0x41 … VK_Z=0x5A, matched lowercased and
+        // sent as the uppercase VK) or a top-row digit (VK_0=0x30 … VK_9=0x39).
+        //
+        // The digit case used to live in a later arm that THIS one shadowed, so
+        // it never ran: `key_7` reached here and was dropped without a word.
+        // Nothing in the Remapper produces that spelling (egui names its digits
+        // `Num7`), but a JSM config's `7` binding does.
         n if n.len() == 1 => {
             let c = n.chars().next()?;
             if c.is_ascii_alphabetic() {
                 Key::Other(c.to_ascii_uppercase() as u32)
-            } else { return None; }
+            } else if c.is_ascii_digit() {
+                Key::Other(c as u32)
+            } else {
+                return None;
+            }
         }
-        // Digits: bare "0".."9" or "num0".."num9".
-        n if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) => {
-            let c = n.chars().next()?;
-            Key::Other(c as u32)
-        }
+        // "num0".."num9" — egui's own name for the digit row.
         n if n.starts_with("num") && n.len() == 4 => {
             let c = n.chars().nth(3)?;
             if c.is_ascii_digit() { Key::Other(c as u32) } else { return None; }

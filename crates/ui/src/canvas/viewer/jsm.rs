@@ -619,7 +619,7 @@ fn jsm_rows(
                 .on_hover_text(
                     "LB / RB switch between the config text and the faders.
                      LT / RT change config tab.
-                     West lists what can stand where the cursor is; North lists every key,                      mouse button and pad output. South inserts, LT / RT jump by heading.
+                     West lists what can stand where the cursor is (South inserts, LT / RT                      jump by heading). North opens the virtual keyboard: one key where a                      binding goes, or typed characters for a comment or a quoted file name.
                      Hold South and tap West to delete what the cursor is on, left / right                      to open an empty slot beside it, or up / down to open a new line.
                      Hold South and push the left stick up or down to walk a number,                      one push at a time.",
                 );
@@ -665,8 +665,7 @@ fn jsm_rows(
     // The command list is drawn under the editor too, so — pinned — the editor
     // has to give up the room for it or the list opens below the bottom edge and
     // you can't see what you asked for.
-    let list_st = super::jsm_widgets::command_list_state(ui.ctx(), node_id);
-    let list_open = list_st.open;
+    let list_open = super::jsm_widgets::command_list_state(ui.ctx(), node_id).open;
     let list_want = if list_open { super::jsm_widgets::LIST_H } else { 0.0 };
     let knobs_on = owns_strip && side == Side::Bottom;
     let strip_want = if knobs_on {
@@ -837,18 +836,13 @@ fn jsm_rows(
     // What it offers depends on where it will land. A pad has a cursor, so the
     // list offers what can legally stand THERE; a mouse has none, so its pick
     // goes on a line of its own, where anything can.
-    let list_kinds: &[flexinput_engine::eval::JsmKind] = if list_st.values {
-        // North asked for the keys, wherever the cursor happens to be.
-        &[flexinput_engine::eval::JsmKind::Binding]
-    } else {
-        match nav_cur {
-            Some(c) => flexinput_engine::eval::jsm_kinds_at(&tabs[active].text, c),
-            None => &[
-                flexinput_engine::eval::JsmKind::Setting,
-                flexinput_engine::eval::JsmKind::Command,
-                flexinput_engine::eval::JsmKind::Trigger,
-            ],
-        }
+    let list_kinds: &[flexinput_engine::eval::JsmKind] = match nav_cur {
+        Some(c) => flexinput_engine::eval::jsm_kinds_at(&tabs[active].text, c),
+        None => &[
+            flexinput_engine::eval::JsmKind::Setting,
+            flexinput_engine::eval::JsmKind::Command,
+            flexinput_engine::eval::JsmKind::Trigger,
+        ],
     };
     if let Some((name, kind)) = super::jsm_widgets::command_list(
         ui, node_id, size.x, &pins_this_pad_reports(snarl, node_id, live, parent),

@@ -42,6 +42,7 @@ pub use cursor::{clamped as jsm_cursor_clamped, delete as jsm_cursor_delete,
     selection as jsm_selection, tokens_at as jsm_tokens_at, Cursor as JsmCursor,
     Token as JsmToken, TokenKind as JsmTokenKind};
 pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue,
+    names_by_pin as jsm_names_by_pin,
     insert_pick as jsm_insert_pick,
     kinds_at as jsm_kinds_at, Item as JsmItem, Kind as JsmKind,
     State as JsmSupportState};

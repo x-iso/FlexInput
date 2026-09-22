@@ -1215,6 +1215,110 @@ pub(crate) fn next_config_tab(cur: usize, step: i32, count: usize) -> usize {
     (cur as i32 + step).rem_euclid(count as i32) as usize
 }
 
+/// What the virtual keyboard starts holding when it opens on this token.
+///
+/// Seeded with what is already there, so a comment can be corrected rather than
+/// retyped — with two exceptions. A comment's `#` is the LINE's marker, not part
+/// of its prose, so it is left behind and put back on landing; and an empty slot
+/// is a placeholder rather than something to extend.
+pub(crate) fn jsm_typing_seed(text: &str, cur: flexinput_engine::eval::JsmCursor) -> String {
+    use flexinput_engine::eval::JsmTokenKind;
+    match flexinput_engine::eval::jsm_selection(text, cur) {
+        Some((tok, s, e)) => {
+            let whole = &text[s..e];
+            if tok.kind == JsmTokenKind::Comment {
+                whole.trim_start_matches('#').trim_start().to_string()
+            } else if whole == flexinput_engine::eval::JSM_SLOT {
+                String::new()
+            } else {
+                whole.to_string()
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// What lands on the token, or `None` when nothing should — typing nothing is
+/// how you back out by emptying the line, and it must not leave a bare `#` or a
+/// hole where a token was.
+pub(crate) fn jsm_typing_landing(
+    text: &str,
+    cur: flexinput_engine::eval::JsmCursor,
+    typed: &str,
+) -> Option<String> {
+    use flexinput_engine::eval::JsmTokenKind;
+    if typed.trim().is_empty() {
+        return None;
+    }
+    let comment = matches!(
+        flexinput_engine::eval::jsm_selection(text, cur),
+        Some((tok, _, _)) if tok.kind == JsmTokenKind::Comment
+    );
+    Some(if comment { format!("# {typed}") } else { typed.to_string() })
+}
+
+#[cfg(test)]
+mod typing_seed_tests {
+    use super::{jsm_typing_landing, jsm_typing_seed};
+    use flexinput_engine::eval::JsmCursor as Cur;
+
+    #[test]
+    fn the_keyboard_opens_holding_what_is_already_there() {
+        let text = "S = SPACE # jump, obviously\nGYRO_SENS = ?\n\n";
+        // A comment opens without its marker: that is the line's, and the
+        // typist is editing prose.
+        let seed = jsm_typing_seed(text, Cur { line: 0, token: 3 });
+        assert_eq!(seed, "jump, obviously");
+        // An ordinary token opens holding itself, so it can be corrected.
+        assert_eq!(jsm_typing_seed(text, Cur { line: 0, token: 2 }), "SPACE");
+        // An empty slot is a placeholder, not text to extend.
+        assert_eq!(jsm_typing_seed(text, Cur { line: 1, token: 2 }), "");
+        // And a blank line has nothing to hold.
+        assert_eq!(jsm_typing_seed(text, Cur { line: 2, token: 0 }), "");
+    }
+
+    #[test]
+    fn what_was_typed_lands_as_the_token_it_replaces() {
+        let text = "S = SPACE # jump, obviously\n";
+        let comment = Cur { line: 0, token: 3 };
+        // The marker goes back on, so the typist never has to type it.
+        assert_eq!(
+            jsm_typing_landing(text, comment, "jump").as_deref(),
+            Some("# jump")
+        );
+        // Anywhere else, what was typed IS the token.
+        assert_eq!(
+            jsm_typing_landing(text, Cur { line: 0, token: 2 }, "LMOUSE").as_deref(),
+            Some("LMOUSE")
+        );
+        // Typing nothing is not an edit: it must not leave a bare `#` behind,
+        // nor a hole where a token was.
+        assert!(jsm_typing_landing(text, comment, "").is_none());
+        assert!(jsm_typing_landing(text, comment, "   ").is_none());
+        assert!(jsm_typing_landing(text, Cur { line: 0, token: 2 }, "").is_none());
+    }
+
+    /// Opening the keyboard on a comment and landing it unchanged leaves the
+    /// line exactly as it was — the marker comes off and goes back on.
+    #[test]
+    fn a_comment_survives_a_round_trip_through_the_keyboard() {
+        for text in [
+            "S = SPACE # jump, obviously\n",
+            "# a whole line of note\n",
+            "GYRO_SENS = 2 #tight\n",
+        ] {
+            let line_tokens = flexinput_engine::eval::jsm_tokens_at(text, 0).len();
+            let at = Cur { line: 0, token: line_tokens - 1 };
+            let seed = jsm_typing_seed(text, at);
+            let landing = jsm_typing_landing(text, at, &seed).expect("a comment to land");
+            let out = flexinput_engine::eval::jsm_cursor_replace(text, at, &landing);
+            // `# tight` rather than `#tight`: one space after the marker is the
+            // spelling this side writes, and it is the only thing that may move.
+            assert_eq!(out.replace("# ", "#"), text.replace("# ", "#"), "{text:?}");
+        }
+    }
+}
+
 impl crate::app::FlexInputApp {
     /// Move the JSM editor to the next or previous config tab, wrapping.
     ///
@@ -1317,17 +1421,71 @@ impl crate::app::FlexInputApp {
         true
     }
 
-    /// Open the command list from the pad, on one vocabulary or the other.
-    fn nav_open_jsm_list(
+    /// Open the virtual keyboard on the cursor's token.
+    ///
+    /// The purpose comes from the grammar, the same way the command list's
+    /// contents do: where a binding is legal, a key stands for the name JSM
+    /// binds it by; everywhere else the keyboard types characters, seeded with
+    /// what the token already says so it can be edited rather than retyped.
+    fn nav_open_jsm_keyboard(
         &mut self,
         ctx: &egui::Context,
         inner: egui_snarl::NodeId,
-        values: bool,
+        text: &str,
+        cur: flexinput_engine::eval::JsmCursor,
     ) {
+        use crate::gamepad_nav::PickerUse;
+        use flexinput_engine::eval::JsmKind;
+        let naming = flexinput_engine::eval::jsm_kinds_at(text, cur) == [JsmKind::Binding];
+        self.gamepad_nav.kbm_picker_use = if naming { PickerUse::JsmName } else { PickerUse::Text };
+        self.gamepad_nav.kbm_text = jsm_typing_seed(text, cur);
+        self.gamepad_nav.kbm_text_caps = false;
+        self.gamepad_nav.kbm_text_done = None;
+        self.gamepad_nav.kbm_picker_node = Some(inner);
+        self.gamepad_nav.kbm_picker_path = Vec::new();
+        self.gamepad_nav.kbm_picker_touch_zones = false;
+        self.gamepad_nav.kbm_picker_exclude = None;
+        // Left over from whatever opened the picker last; they belong to the
+        // chord purpose, and a stale one would answer for this session.
+        self.gamepad_nav.kbm_picker_phase_key = None;
+        self.gamepad_nav.kbm_picker_draft_key = String::new();
+        self.gamepad_nav.kbm_picker_idx = 0;
+        self.gamepad_nav.kbm_picker_open = true;
+        // Where it renders is decided centrally (over the game while the config
+        // overlay is up, in the main window otherwise), so nothing to set here.
+        self.gamepad_nav.kbm_picker_viewport = None;
+        let _ = ctx;
+    }
+
+    /// Put what the keyboard typed under the cursor.
+    ///
+    /// A comment keeps its `#`: the typist edited the prose, and re-typing the
+    /// marker every time would be a marker they could also forget. Nothing typed
+    /// is no edit — that is how cancelling by emptying the line reads.
+    fn nav_apply_jsm_typed(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId,
+        typed: &str,
+    ) {
+        let text = self.nav_jsm_text(outer_id);
+        let cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
+        let Some(landing) = jsm_typing_landing(&text, cur, typed) else {
+            crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
+            return;
+        };
+        let edited = flexinput_engine::eval::jsm_cursor_replace(&text, cur, &landing);
+        self.nav_set_jsm_text(outer_id, &edited);
+        self.gamepad_nav.jsm_cursor = flexinput_engine::eval::jsm_cursor_clamped(&edited, cur);
+        crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
+    }
+
+    /// Open the command list from the pad.
+    fn nav_open_jsm_list(&mut self, ctx: &egui::Context, inner: egui_snarl::NodeId) {
         let mut list = crate::canvas::viewer::command_list_state(ctx, inner);
         list.open = true;
         list.index = 0;
-        list.values = values;
         // A filter left behind by the mouse would hide most of the list from a
         // pad, which has no way to see it or clear it.
         list.filter.clear();
@@ -1364,6 +1522,17 @@ impl crate::app::FlexInputApp {
         // the publish at the end of this function would drag it back.
         if let Some(at) = crate::canvas::viewer::take_jsm_cursor_request(ctx, inner) {
             self.gamepad_nav.jsm_cursor = at;
+        }
+        // And the keyboard may have finished typing something for us. Taken only
+        // when it is addressed to this node, so another consumer's result isn't
+        // swallowed on the way past.
+        let typed_for_us =
+            matches!(self.gamepad_nav.kbm_text_done.as_ref(), Some((n, _)) if *n == inner);
+        if typed_for_us {
+            if let Some((_, typed)) = self.gamepad_nav.kbm_text_done.take() {
+                self.nav_apply_jsm_typed(ctx, outer_id, inner, &typed);
+                return;
+            }
         }
         let text = self.nav_jsm_text(outer_id);
         let mut cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
@@ -1410,16 +1579,20 @@ impl crate::app::FlexInputApp {
         // West on its own opens the list of what can legally stand where the
         // cursor is. Held, the same button deletes — see below.
         if !holding && nav.is_rising("btn_west") {
-            self.nav_open_jsm_list(ctx, inner, false);
+            self.nav_open_jsm_list(ctx, inner);
             crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
             return;
         }
-        // North opens the same panel on the other vocabulary: every key, mouse
-        // button, pad output and JSM action, wherever the cursor is. West asks
-        // what can go here; North asks for the keys — and the cursor is often on
-        // the name of a line whose value is the part you came to write.
+        // North opens the virtual keyboard — the same grid the Remapper picks
+        // keys on, since a pad user already knows where its letters are.
+        //
+        // What a key MEANS there depends on the cursor. Where a binding goes, one
+        // key gives the name JSM binds it by (SPACE, LMOUSE) and that is the
+        // whole gesture. Anywhere else the keyboard types characters, which is
+        // the only way a pad can write a comment, a quoted config-file name, or
+        // one of the words a setting takes that no list here knows.
         if !holding && nav.is_rising("btn_north") {
-            self.nav_open_jsm_list(ctx, inner, true);
+            self.nav_open_jsm_keyboard(ctx, inner, &text, cur);
             crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
             return;
         }

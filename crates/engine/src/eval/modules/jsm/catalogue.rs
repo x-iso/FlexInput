@@ -153,6 +153,41 @@ pub(crate) const PUNCTUATION: &[&str] = &[
     ";", "'", ",", ".", "/", "\\", "[", "]", "+", "-", "`",
 ];
 
+/// The JSM name for each of our bus pins a binding can write.
+///
+/// Derived from the binding parser rather than kept as a second table: every
+/// name the list offers is asked what it writes, and the answer is indexed. So a
+/// key on a virtual keyboard gets the name JSM would accept for it, and a cell
+/// no binding can reach gets none — which is what greys it.
+///
+/// Where several names write one pin (SHIFT, LSHIFT and RSHIFT all send our one
+/// generic shift), the shortest wins. That is JSM's own generic spelling, and
+/// the one that doesn't carry a note explaining what was lost on the way. Ties
+/// go alphabetically — deliberately, so the answer doesn't depend on the order
+/// the vocabulary happens to be listed in; the one pin where two names tie
+/// (`btn_guide`, X_GUIDE and PS_HOME) is not a key any keyboard shows.
+pub fn names_by_pin() -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in bindings() {
+        let Some(o) = out_from_name(&item.name) else { continue };
+        let pin = match o.out {
+            Out::Pin(p) | Out::Pulse(p) => p,
+            // A gyro action, a rumble or NONE writes no pin, so no key on a
+            // keyboard stands for it. Those stay in the list, where they can be
+            // read and chosen by name.
+            _ => continue,
+        };
+        let better = match out.get(&pin) {
+            Some(had) => (item.name.len(), item.name.as_str()) < (had.len(), had.as_str()),
+            None => true,
+        };
+        if better {
+            out.insert(pin, item.name);
+        }
+    }
+    out
+}
+
 /// Which heading a binding belongs under. Grouped finely, because "Keyboard" as
 /// one heading is a hundred rows, and the triggers jump by heading.
 fn binding_group(name: &str) -> &'static str {
@@ -607,6 +642,48 @@ mod catalogue_tests {
                 item.name
             );
         }
+    }
+
+    /// Every key a virtual keyboard can show has the name JSM would accept for
+    /// it, so a picker built on our pins can speak JSM without a second table
+    /// of its own to keep in step.
+    #[test]
+    fn our_pins_carry_the_names_jsm_binds_them_by() {
+        let by_pin = names_by_pin();
+        let name = |p: &str| by_pin.get(p).map(String::as_str);
+        assert_eq!(name("key_space"), Some("SPACE"));
+        assert_eq!(name("key_a"), Some("A"));
+        // A digit's pin is `key_7`: JSM's own spelling, and one both keyboard
+        // sinks take. (A virtual keyboard laid out from egui's captures spells
+        // the same key `key_num7`, so it normalises before asking.)
+        assert_eq!(name("key_7"), Some("7"));
+        assert_eq!(name("key_f9"), Some("F9"));
+        assert_eq!(name("mouse_left"), Some("LMOUSE"));
+        assert_eq!(name("scroll_up"), Some("SCROLLUP"), "a pulse names its pin too");
+        assert_eq!(name("key_arrowup"), Some("UP"));
+        assert_eq!(name("key_quote"), Some("'"), "punctuation is named by itself");
+        // Where several names write one pin, the plain one wins.
+        assert_eq!(name("key_shift"), Some("SHIFT"));
+        assert_eq!(name("key_ctrl"), Some("CONTROL"));
+        assert_eq!(name("btn_south"), Some("X_A"));
+        // The tie-break, which is the part that would otherwise depend on the
+        // order the vocabulary is written in: X_GUIDE and PS_HOME are the same
+        // length, so it goes alphabetically rather than to whichever was listed
+        // first. (No keyboard shows this pin, so which one wins is only a
+        // question of the answer being stable.)
+        assert_eq!(name("btn_guide"), Some("PS_HOME"));
+        // Every entry round-trips: the name filed under a pin really writes it.
+        for (pin, n) in &by_pin {
+            let o = super::out_from_name(n).expect("an offered name");
+            let wrote = match o.out {
+                Out::Pin(p) | Out::Pulse(p) => p,
+                _ => panic!("`{n}` is filed under a pin but writes none"),
+            };
+            assert_eq!(&wrote, pin, "`{n}` is filed under the wrong pin");
+        }
+        // A pin no binding writes has no name, which is what greys its key.
+        assert!(name("touch_swipe_x").is_none());
+        assert!(name("btn_misc1").is_none(), "a fork button our pad has, JSM does not bind");
     }
 
     /// A key this module cannot send is offered greyed, with the reason, rather

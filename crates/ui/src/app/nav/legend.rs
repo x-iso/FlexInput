@@ -22,12 +22,29 @@ impl FlexInputApp {
 
         // Modal contexts take priority over the sub-patch edit level.
         if self.gamepad_nav.kbm_picker_open {
-            return vec![
-                (hint_move(), "Move"),
-                (vec!["btn_south"], "Add key"),
-                (vec!["btn_north"], "Clear chord"),
-                (vec!["btn_east"], "Done"),
-            ];
+            // One board, three jobs: appending to an output chord, naming a key
+            // for a config, or typing. The bar has to say which.
+            use crate::gamepad_nav::PickerUse;
+            return match self.gamepad_nav.kbm_picker_use {
+                PickerUse::Chord => vec![
+                    (hint_move(), "Move"),
+                    (vec!["btn_south"], "Add key"),
+                    (vec!["btn_north"], "Clear chord"),
+                    (vec!["btn_east"], "Done"),
+                ],
+                PickerUse::JsmName => vec![
+                    (hint_move(), "Move"),
+                    (vec!["btn_south"], "Pick this key"),
+                    (vec!["btn_west"], "Type instead"),
+                    (vec!["btn_east"], "Cancel"),
+                ],
+                PickerUse::Text => vec![
+                    (hint_move(), "Move"),
+                    (vec!["btn_south"], "Type"),
+                    (vec!["btn_west", "btn_north"], "Done"),
+                    (vec!["btn_east"], "Cancel"),
+                ],
+            };
         }
         if self.gamepad_nav.settings_open {
             // While a shortcut row is learning, the panel is listening for a
@@ -143,7 +160,8 @@ impl FlexInputApp {
                             // South is the editor's modifier, so its four verbs
                             // share a row each rather than a union nobody can
                             // read. The axis glyphs keep each to two icons.
-                            hints.push((vec!["btn_west", "btn_north"], "List: fits / keys"));
+                            hints.push((vec!["btn_west"], "List"));
+                            hints.push((vec!["btn_north"], "Keyboard"));
                             hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
                             hints.push((vec!["btn_south", "dpad"], "Hold: slot / line"));
                             hints.push((

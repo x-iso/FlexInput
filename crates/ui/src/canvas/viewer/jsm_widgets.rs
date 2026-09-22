@@ -811,13 +811,6 @@ pub(crate) struct CommandList {
     /// Scroll the highlighted row into view: set whenever the pad moves it,
     /// since a pad has no pointer and cannot scroll the list itself.
     pub follow: bool,
-    /// Show the binding vocabulary — every key, mouse button, pad output and
-    /// JSM action — rather than what fits where the cursor is.
-    ///
-    /// West asks "what can go here"; North asks "show me the keys". Two
-    /// questions worth asking separately, because the cursor is often on the
-    /// name of a line whose VALUE is the part you came to write.
-    pub values: bool,
 }
 
 /// Room the command list needs: the filter row, the rows themselves, and the

@@ -13,10 +13,10 @@ impl FlexInputApp {
         use crate::gamepad_nav::NavDir;
         use crate::kbm_picker::{clamp_index, nearest_in_dir, picker_cells};
 
-        // East closes the picker.
+        // East closes the picker. While typing that means cancel: what was
+        // typed is dropped, which is why Enter and West exist to keep it.
         if nav.is_rising("btn_east") {
-            self.gamepad_nav.kbm_picker_open = false;
-            self.gamepad_nav.kbm_picker_viewport = None;
+            self.close_kbm_picker();
             return;
         }
         // Spatial navigation over the cells actually shown for this mode (the
@@ -32,6 +32,16 @@ impl FlexInputApp {
             let self_target = excl.as_deref().is_some_and(|p| cell.pin.starts_with(p));
             !((cell.analog_only && !analog_ok) || self_target)
         };
+        // What a cell is worth depends on what the picker is for: a key with no
+        // character types nothing, and a key JSM has no name for can't be a
+        // binding. Both grey the same way the chord purpose greys its own.
+        let purpose = self.gamepad_nav.kbm_picker_use;
+        let names = (purpose == crate::gamepad_nav::PickerUse::JsmName)
+            .then(flexinput_engine::eval::jsm_names_by_pin)
+            .unwrap_or_default();
+        let usable = |cell: &crate::kbm_picker::PickerCell| {
+            usable(cell) && cell_does_something(purpose, &cell.pin, &names)
+        };
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         idx = match step_dir {
             Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
@@ -41,6 +51,13 @@ impl FlexInputApp {
             None => idx,
         };
         self.gamepad_nav.kbm_picker_idx = idx;
+
+        // Typing is the picker's other purpose: same grid, same navigation,
+        // but an activated cell gives a character or a name rather than a pin.
+        if purpose != crate::gamepad_nav::PickerUse::Chord {
+            self.drive_kbm_typing(nav, &cells[idx], &names);
+            return;
+        }
 
         // An empty path is valid (top-level node); only `inner` is required.
         let path = self.gamepad_nav.kbm_picker_path.clone();
@@ -62,6 +79,90 @@ impl FlexInputApp {
         if nav.is_rising("btn_south") && usable(&cells[idx]) {
             let pin = cells[idx].pin.clone();
             self.picker_append_pin(&pin);
+        }
+    }
+
+    /// Close the picker and forget whatever session it was running.
+    ///
+    /// One place, because a session left half-set is a picker that opens next
+    /// time still typing into the last thing that asked.
+    pub(crate) fn close_kbm_picker(&mut self) {
+        self.gamepad_nav.kbm_picker_open = false;
+        self.gamepad_nav.kbm_picker_viewport = None;
+        self.gamepad_nav.kbm_picker_use = crate::gamepad_nav::PickerUse::Chord;
+        self.gamepad_nav.kbm_text.clear();
+        self.gamepad_nav.kbm_text_caps = false;
+    }
+
+    /// Hand a finished session's text back to the node that asked for it, and
+    /// close. Whoever opened the session drains `kbm_text_done`.
+    fn finish_kbm_typing(&mut self, text: String) {
+        if let Some(node) = self.gamepad_nav.kbm_picker_node {
+            self.gamepad_nav.kbm_text_done = Some((node, text));
+        }
+        self.close_kbm_picker();
+    }
+
+    /// Drive the picker while it is typing rather than binding.
+    ///
+    /// South activates the focused key. West and North finish, keeping what was
+    /// typed — North because it is the button that opened the picker, and a
+    /// toggle you can only close with a different button is one you close by
+    /// guessing. East and the Escape key drop it instead.
+    fn drive_kbm_typing(
+        &mut self,
+        nav: &crate::gamepad_nav::NavInput,
+        cell: &crate::kbm_picker::PickerCell,
+        names: &std::collections::HashMap<String, String>,
+    ) {
+        use crate::gamepad_nav::PickerUse;
+        use crate::kbm_picker::{cell_typed, pin_as_bound, Typed};
+        if self.gamepad_nav.kbm_picker_use == PickerUse::JsmName {
+            // A binding can carry an event modifier or be a chord (`\SPACE`,
+            // `A+B`), and no single key expresses that — so the same board drops
+            // into typing, already holding whatever the token said.
+            if nav.is_rising("btn_west") {
+                self.gamepad_nav.kbm_picker_use = PickerUse::Text;
+                return;
+            }
+            if nav.is_rising("btn_north") {
+                self.close_kbm_picker();
+                return;
+            }
+            // Otherwise one key, one name, done — a keyboard whose keys had to
+            // be spelled out letter by letter would be a worse list than the
+            // list is.
+            if nav.is_rising("btn_south") {
+                if let Some(name) = names.get(pin_as_bound(&cell.pin)) {
+                    let name = name.clone();
+                    self.finish_kbm_typing(name);
+                }
+            }
+            return;
+        }
+        if nav.is_rising("btn_west") || nav.is_rising("btn_north") {
+            let typed = std::mem::take(&mut self.gamepad_nav.kbm_text);
+            self.finish_kbm_typing(typed);
+            return;
+        }
+        if !nav.is_rising("btn_south") {
+            return;
+        }
+        let caps = self.gamepad_nav.kbm_text_caps;
+        match cell_typed(&cell.pin, caps) {
+            Some(Typed::Char(c)) => self.gamepad_nav.kbm_text.push(c),
+            Some(Typed::Backspace) => {
+                self.gamepad_nav.kbm_text.pop();
+            }
+            Some(Typed::Caps) => self.gamepad_nav.kbm_text_caps = !caps,
+            Some(Typed::Commit) => {
+                let typed = std::mem::take(&mut self.gamepad_nav.kbm_text);
+                self.finish_kbm_typing(typed);
+            }
+            Some(Typed::Cancel) => self.close_kbm_picker(),
+            // A key with nothing to type is already greyed and unfocusable; this
+            // is only reachable by a click.
+            None => {}
         }
     }
 
@@ -213,6 +314,12 @@ impl FlexInputApp {
         };
         // Whether analog-only (swipe) cells are usable for this target.
         let analog_ok = self.picker_analog_input_ok();
+        // What this session is for, and — when it is naming a key for a config —
+        // the names JSM binds our pins by, so a key it can't name greys out.
+        let purpose = self.gamepad_nav.kbm_picker_use;
+        let names = (purpose == crate::gamepad_nav::PickerUse::JsmName)
+            .then(flexinput_engine::eval::jsm_names_by_pin)
+            .unwrap_or_default();
 
         const UNIT: f32 = 30.0; // px per grid unit
         const GAP: f32 = 3.0;   // gap between adjacent keys
@@ -237,18 +344,67 @@ impl FlexInputApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(
-                        "Click or LS/D-pad: move   South: add   North: clear   East/Done: close")
+                    // The hints are the session's, not the window's: the same
+                    // board means three different things to the buttons.
+                    let hints = match purpose {
+                        crate::gamepad_nav::PickerUse::Chord =>
+                            "Click or LS/D-pad: move   South: add   North: clear   East/Done: close",
+                        crate::gamepad_nav::PickerUse::JsmName =>
+                            "Click or LS/D-pad: move   South: pick this key   West: type instead   East: cancel",
+                        crate::gamepad_nav::PickerUse::Text =>
+                            "South: type   Shift: caps   Backspace   Enter or West: done   Esc or East: cancel",
+                    };
+                    ui.label(egui::RichText::new(hints)
                         .small().color(egui::Color32::from_gray(150)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(egui::RichText::new("Done").size(13.0)).clicked() { done = true; }
                     });
                 });
                 ui.add_space(4.0);
+                // What has been typed, while typing. Shown as it will land, with
+                // a caret and the caps latch, because a virtual keyboard with no
+                // sign of what you have pressed is a keyboard you type twice.
+                if purpose == crate::gamepad_nav::PickerUse::Text {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Typing:").small().weak());
+                        ui.label(
+                            egui::RichText::new(format!("{}_", self.gamepad_nav.kbm_text))
+                                .monospace()
+                                .strong(),
+                        );
+                        if self.gamepad_nav.kbm_text_caps {
+                            ui.label(egui::RichText::new("CAPS").small().strong());
+                        }
+                    });
+                }
+                // Which name the focused key would write, while picking one.
+                if purpose == crate::gamepad_nav::PickerUse::JsmName {
+                    let focused = cells
+                        .get(sel)
+                        .and_then(|c| names.get(crate::kbm_picker::pin_as_bound(&c.pin)));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Binds as:").small().weak());
+                        match focused {
+                            Some(n) => {
+                                ui.label(egui::RichText::new(n).monospace().strong());
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("(this key has no JSM name)")
+                                        .small()
+                                        .italics()
+                                        .weak(),
+                                );
+                            }
+                        }
+                    });
+                }
                 // Output chord preview.
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Output:").small().weak());
-                    if chord.is_empty() {
+                    if purpose != crate::gamepad_nav::PickerUse::Chord {
+                        ui.label(egui::RichText::new("—").small().weak());
+                    } else if chord.is_empty() {
                         ui.label(egui::RichText::new("(none)").small().italics().weak());
                     } else {
                         for (i, pin) in chord.iter().enumerate() {
@@ -288,7 +444,9 @@ impl FlexInputApp {
                     // cards) are always disabled.
                     let self_target = self.gamepad_nav.kbm_picker_exclude.as_deref()
                         .is_some_and(|p| cell.pin.starts_with(p));
-                    let disabled = (cell.analog_only && !analog_ok) || self_target;
+                    let disabled = (cell.analog_only && !analog_ok)
+                        || self_target
+                        || !cell_does_something(purpose, &cell.pin, &names);
                     let resp = if disabled {
                         ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
                     } else {
@@ -421,5 +579,24 @@ impl FlexInputApp {
                 }
             });
         ctx.request_repaint();
+    }
+}
+
+/// Does this cell do anything for what the picker is being used for?
+///
+/// The chord purpose's own exclusions (analog-only cells, a menu's own targets)
+/// are separate and stay where they are — this is only about the purpose.
+pub(crate) fn cell_does_something(
+    purpose: crate::gamepad_nav::PickerUse,
+    pin: &str,
+    names: &std::collections::HashMap<String, String>,
+) -> bool {
+    use crate::gamepad_nav::PickerUse;
+    match purpose {
+        PickerUse::Chord => true,
+        // `false` for the caps latch: whether a key types something doesn't
+        // depend on which of its two characters it would give.
+        PickerUse::Text => crate::kbm_picker::cell_typed(pin, false).is_some(),
+        PickerUse::JsmName => names.contains_key(crate::kbm_picker::pin_as_bound(pin)),
     }
 }

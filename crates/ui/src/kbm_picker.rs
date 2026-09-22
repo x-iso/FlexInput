@@ -82,7 +82,7 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     cw("key_capslock", 0.0, 3.0, 1.75),
     c("key_a", 1.75, 3.0), c("key_s", 2.75, 3.0), c("key_d", 3.75, 3.0), c("key_f", 4.75, 3.0),
     c("key_g", 5.75, 3.0), c("key_h", 6.75, 3.0), c("key_j", 7.75, 3.0), c("key_k", 8.75, 3.0),
-    c("key_l", 9.75, 3.0), c("key_semicolon", 10.75, 3.0), c("key_apostrophe", 11.75, 3.0),
+    c("key_l", 9.75, 3.0), c("key_semicolon", 10.75, 3.0), c("key_quote", 11.75, 3.0),
     cw("key_enter", 12.75, 3.0, 2.25),
 
     // ── Bottom letter row (y=4) ───────────────────────────────────────────
@@ -265,4 +265,167 @@ pub fn nearest_in_dir(
         }
     }
     best
+}
+
+// ── typing, rather than binding ───────────────────────────────────────────────
+//
+// The same grid serves a second purpose: entering TEXT from a pad. A JSM comment
+// or a quoted config-file name can't be built out of pin ids, and neither can the
+// name of a preset. Only what an activated cell MEANS changes, so the layout,
+// the spatial navigation and the window stay one implementation.
+
+/// What activating a cell does while the picker is typing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Typed {
+    /// Append this character.
+    Char(char),
+    /// Take the last character back.
+    Backspace,
+    /// Latch (or unlatch) the shifted form of what follows.
+    Caps,
+    /// Finish, keeping what was typed. Enter, where a typist expects it.
+    Commit,
+    /// Finish, keeping nothing. Escape, likewise.
+    Cancel,
+}
+
+/// The two characters a US keyboard puts on one key.
+///
+/// Without the shifted halves a comment can't hold a `?` and a file name can't
+/// hold a `_`, which are exactly the characters a config wants.
+const PAIRS: &[(&str, char, char)] = &[
+    ("key_backtick", '`', '~'),
+    ("key_num1", '1', '!'), ("key_num2", '2', '@'), ("key_num3", '3', '#'),
+    ("key_num4", '4', '$'), ("key_num5", '5', '%'), ("key_num6", '6', '^'),
+    ("key_num7", '7', '&'), ("key_num8", '8', '*'), ("key_num9", '9', '('),
+    ("key_num0", '0', ')'),
+    ("key_minus", '-', '_'), ("key_equals", '=', '+'),
+    ("key_openbracket", '[', '{'), ("key_closebracket", ']', '}'),
+    ("key_backslash", '\\', '|'),
+    ("key_semicolon", ';', ':'), ("key_quote", '\'', '"'),
+    ("key_comma", ',', '<'), ("key_period", '.', '>'), ("key_slash", '/', '?'),
+];
+
+/// What this cell contributes to what is being typed, or `None` if it
+/// contributes nothing — which is what greys it while typing. A function key or
+/// a mouse button has no character to give.
+pub fn cell_typed(pin: &str, caps: bool) -> Option<Typed> {
+    if let Some(rest) = pin.strip_prefix("key_") {
+        let mut chars = rest.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if c.is_ascii_alphabetic() {
+                return Some(Typed::Char(if caps {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }));
+            }
+        }
+    }
+    if let Some((_, plain, shifted)) = PAIRS.iter().find(|(p, _, _)| *p == pin) {
+        return Some(Typed::Char(if caps { *shifted } else { *plain }));
+    }
+    Some(match pin {
+        "key_space" => Typed::Char(' '),
+        "key_backspace" => Typed::Backspace,
+        // Either of the keys a typist reaches for to change case.
+        "key_shift" | "key_capslock" => Typed::Caps,
+        "key_enter" => Typed::Commit,
+        "key_escape" => Typed::Cancel,
+        _ => return None,
+    })
+}
+
+/// The pin a JSM binding would name, for a cell this grid spells differently.
+///
+/// The layout is built from egui's captured key names, which call the digit row
+/// `Num7`; a binding publishes `key_7`, and that is the spelling the name index
+/// is keyed by. One rename, in the one place that knows the layout's spelling.
+pub fn pin_as_bound(pin: &str) -> &str {
+    match pin.strip_prefix("key_num") {
+        Some(d) if d.len() == 1 && d.starts_with(|c: char| c.is_ascii_digit()) => {
+            match d {
+                "0" => "key_0", "1" => "key_1", "2" => "key_2", "3" => "key_3",
+                "4" => "key_4", "5" => "key_5", "6" => "key_6", "7" => "key_7",
+                "8" => "key_8", _ => "key_9",
+            }
+        }
+        _ => pin,
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::*;
+
+    #[test]
+    fn the_keys_that_carry_characters_carry_both_of_theirs() {
+        assert_eq!(cell_typed("key_a", false), Some(Typed::Char('a')));
+        assert_eq!(cell_typed("key_a", true), Some(Typed::Char('A')));
+        assert_eq!(cell_typed("key_space", false), Some(Typed::Char(' ')));
+        // Shifted halves, without which a comment can't hold a `?` and a file
+        // name can't hold a `_`.
+        assert_eq!(cell_typed("key_slash", true), Some(Typed::Char('?')));
+        assert_eq!(cell_typed("key_minus", true), Some(Typed::Char('_')));
+        assert_eq!(cell_typed("key_num1", false), Some(Typed::Char('1')));
+        assert_eq!(cell_typed("key_num1", true), Some(Typed::Char('!')));
+        // The keys a typist expects to mean something other than a character.
+        assert_eq!(cell_typed("key_backspace", false), Some(Typed::Backspace));
+        assert_eq!(cell_typed("key_shift", false), Some(Typed::Caps));
+        assert_eq!(cell_typed("key_capslock", false), Some(Typed::Caps));
+        assert_eq!(cell_typed("key_enter", false), Some(Typed::Commit));
+        assert_eq!(cell_typed("key_escape", false), Some(Typed::Cancel));
+        // And the ones with nothing to give, which is what greys them.
+        assert_eq!(cell_typed("key_f5", false), None);
+        assert_eq!(cell_typed("mouse_left", false), None);
+        assert_eq!(cell_typed("key_arrowup", false), None);
+        assert_eq!(cell_typed("touch_swipe_x", false), None);
+    }
+
+    /// Every cell on the board either types something or is greyed while
+    /// typing — there is no cell that silently does nothing when pressed.
+    #[test]
+    fn every_key_on_the_board_either_types_or_is_greyed() {
+        for cell in KBM_LAYOUT {
+            let typed = cell_typed(cell.pin, false);
+            let letterish = cell.pin.starts_with("key_")
+                && !matches!(
+                    cell.pin,
+                    "key_f1" | "key_f2" | "key_f3" | "key_f4" | "key_f5" | "key_f6"
+                        | "key_f7" | "key_f8" | "key_f9" | "key_f10" | "key_f11" | "key_f12"
+                        | "key_tab" | "key_ctrl" | "key_alt" | "key_win"
+                        | "key_printscreen" | "key_pause" | "key_insert" | "key_delete"
+                        | "key_home" | "key_end" | "key_pageup" | "key_pagedown"
+                        | "key_arrowup" | "key_arrowdown" | "key_arrowleft" | "key_arrowright"
+                );
+            assert_eq!(
+                typed.is_some(),
+                letterish,
+                "{} types {typed:?}, which is not what its place on a keyboard says",
+                cell.pin
+            );
+        }
+    }
+
+    /// The digit row is spelled two ways in this codebase, and only one of them
+    /// is what a binding publishes.
+    #[test]
+    fn the_digit_row_is_asked_for_under_the_name_a_binding_uses() {
+        assert_eq!(pin_as_bound("key_num7"), "key_7");
+        assert_eq!(pin_as_bound("key_num0"), "key_0");
+        assert_eq!(pin_as_bound("key_a"), "key_a", "everything else is left alone");
+        assert_eq!(pin_as_bound("mouse_left"), "mouse_left");
+        // Every digit cell on the board resolves, so none of them greys out for
+        // want of a name.
+        for cell in KBM_LAYOUT {
+            if cell.pin.starts_with("key_num") {
+                let bound = pin_as_bound(cell.pin);
+                assert!(
+                    bound.len() == 5 && bound.ends_with(|c: char| c.is_ascii_digit()),
+                    "{} became {bound}",
+                    cell.pin
+                );
+            }
+        }
+    }
 }

@@ -394,6 +394,24 @@ pub struct GamepadNav {
     /// the focused pin to the output chord, North resets it, East closes.
     /// `kbm_picker_node`/`_outer` identify the remapper being edited.
     pub kbm_picker_open: bool,
+    /// What this picker session is FOR.
+    ///
+    /// The grid, its spatial navigation and its window are one presentation;
+    /// only what an activated cell MEANS differs. Typing is the second purpose —
+    /// a JSM comment or a quoted config-file name can't be built out of pin ids,
+    /// and neither can the name of a preset — so this is an enum rather than one
+    /// more bool beside the chord fields.
+    pub kbm_picker_use: PickerUse,
+    /// What has been typed so far, while this session is typing.
+    pub kbm_text: String,
+    /// The shift latch: what follows comes out shifted.
+    pub kbm_text_caps: bool,
+    /// A finished session's text, waiting for the node that asked for it.
+    ///
+    /// Tagged with that node, so a result can't land on whoever looks next. A
+    /// second consumer (naming a preset from a pad) wants its own tag rather
+    /// than borrowing this one.
+    pub kbm_text_done: Option<(egui_snarl::NodeId, String)>,
     /// Index into `kbm_picker::KBM_LAYOUT` of the focused cell. The layout uses
     /// absolute (x,y) positions with separated clusters (nav cluster + arrows +
     /// mouse to the right of the main block), so the cursor is a flat cell index
@@ -513,6 +531,10 @@ impl Default for GamepadNav {
             tz_line: 0,
             tz_focus: TzFocus::Zone(0),
             kbm_picker_open: false,
+            kbm_picker_use: PickerUse::default(),
+            kbm_text: String::new(),
+            kbm_text_caps: false,
+            kbm_text_done: None,
             kbm_picker_idx: 0,
             kbm_picker_node: None,
             kbm_picker_path: Vec::new(),
@@ -558,6 +580,19 @@ pub const NAV_BUTTONS: &[&str] = &[
     "dpad_left",
     "dpad_right",
 ];
+
+/// What a KB/M picker session is for. See `GamepadNav::kbm_picker_use`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PickerUse {
+    /// Append pins to a Remapper or Touch-Zones output chord.
+    #[default]
+    Chord,
+    /// One key, yielding the name JSM would bind it by — five presses of a
+    /// virtual keyboard to spell SPACE is not what a keyboard is for.
+    JsmName,
+    /// Characters, accumulated until the typist says they are done.
+    Text,
+}
 
 /// One frame's worth of navigation input for a single device.
 #[derive(Clone)]
