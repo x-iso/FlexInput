@@ -260,6 +260,21 @@ pub(crate) fn active_text(node: &NodeData) -> String {
     active_text_of(node).map(|(_, t)| t.to_string()).unwrap_or_default()
 }
 
+/// Replace the active tab's text on a node.
+///
+/// The same resolution `active_text` uses, so a pad can never read one tab and
+/// write another.
+pub(crate) fn set_active_text(node: &mut NodeData, text: &str) {
+    let Some((active, _)) = active_text_of(node) else { return };
+    let Some(arr) = node.params.get("jsm_tabs").and_then(|v| v.as_array()).cloned() else {
+        return;
+    };
+    let mut arr = arr;
+    let Some(tab) = arr.get_mut(active) else { return };
+    tab["text"] = Value::String(text.to_string());
+    node.params.insert("jsm_tabs".into(), Value::Array(arr));
+}
+
 /// The index of the node's active tab and its text — the one thing both nav
 /// helpers need, so they can't disagree about which tab is being driven.
 fn active_text_of(node: &NodeData) -> Option<(usize, &str)> {
@@ -595,12 +610,17 @@ fn jsm_rows(
         // would switch between two halves that look identical until you press
         // something and the wrong one moves.
         if let Some(pane) = super::scale::jsm_nav_pane(ui, node_id) {
-            ui.label(
-                egui::RichText::new(format!("🎮 {pane}"))
-                    .small()
-                    .color(crate::widgets::NavHighlightStyle::of(ui.ctx()).accent),
-            )
-            .on_hover_text("LB / RB switch between the config text and the faders");
+            let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
+            // While the modifier is held, say what it is waiting for. A held
+            // modifier with nothing on screen is one people press twice.
+            let held = super::scale::jsm_nav_chord(ui, node_id);
+            let text = if held { format!("🎮 {pane} · hold") } else { format!("🎮 {pane}") };
+            ui.label(egui::RichText::new(text).small().color(accent))
+                .on_hover_text(
+                    "LB / RB switch between the config text and the faders.
+                     LT / RT change config tab.
+                     Hold South and tap West to delete the token under the cursor.",
+                );
         }
         // Where the strip goes. Beside the editor suits a wide node; above or
         // below suits a tall one.

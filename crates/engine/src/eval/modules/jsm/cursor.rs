@@ -355,3 +355,50 @@ mod tests {
         assert_eq!(delete(blank, Cursor { line: 1, token: 0 }), blank);
     }
 }
+
+#[cfg(test)]
+mod delete_round_tests {
+    use super::*;
+
+    /// Deleting from a pad is the one edit that loses work, so it has to leave a
+    /// config you would recognise — and leave the cursor somewhere real.
+    #[test]
+    fn deleting_walks_a_line_down_without_stranding_the_cursor() {
+        let mut text = "N = 2 1 # both\n".to_string();
+        let mut cur = Cursor { line: 0, token: 3 };
+
+        // Hold the chord and the line comes apart from the cursor outwards. The
+        // index stays where it was, so once the second output goes the cursor is
+        // on the comment — which is exactly what the highlight shows you, and
+        // why the cursor is drawn rather than assumed.
+        for expect in ["N = 2 # both\n", "N = 2\n", "N =\n", "N\n"] {
+            text = delete(&text, cur);
+            assert_eq!(text, expect, "after deleting token {}", cur.token);
+            cur = clamped(&text, cur);
+            // Whatever is left, the cursor points at a token that exists.
+            if !tokens_at(&text, cur.line).is_empty() {
+                assert!(
+                    selection(&text, cur).is_some(),
+                    "cursor {cur:?} is off the end of {text:?}"
+                );
+            }
+        }
+        // The name is the last thing standing, and deleting it empties the line
+        // rather than the file.
+        text = delete(&text, clamped(&text, cur));
+        assert_eq!(text, "\n", "the line is still there, just empty");
+        assert!(selection(&text, Cursor::default()).is_none());
+        // Deleting again on an empty line is not an edit — a held chord must not
+        // eat the rest of the config.
+        assert_eq!(delete(&text, Cursor::default()), "\n");
+    }
+
+    /// The lines around the one being edited are untouched, byte for byte.
+    #[test]
+    fn deleting_a_token_leaves_the_neighbouring_lines_alone() {
+        let text = "A = B\nGYRO_SENS = 2\nC = D\n";
+        let out = delete(text, Cursor { line: 1, token: 2 });
+        assert_eq!(out, "A = B\nGYRO_SENS =\nC = D\n");
+        assert!(out.starts_with("A = B\n") && out.ends_with("C = D\n"));
+    }
+}

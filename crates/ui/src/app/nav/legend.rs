@@ -114,7 +114,7 @@ impl FlexInputApp {
                         crate::gamepad_nav::JsmPane::Text => "Move cursor",
                         crate::gamepad_nav::JsmPane::Tune => "Pick setting",
                     };
-                    vec![
+                    let mut hints = vec![
                         (hint_vert(), moving),
                         (hint_horiz(), match pane {
                             crate::gamepad_nav::JsmPane::Text => "Token",
@@ -122,10 +122,21 @@ impl FlexInputApp {
                         }),
                         (vec!["btn_lb", "btn_rb"], "Edit / Tune"),
                         (vec!["left_trigger", "right_trigger"], "Config tab"),
-                        (vec!["btn_west"], "Fine"),
-                        (vec!["btn_north"], "Reset"),
-                        (vec!["btn_east"], "Back"),
-                    ]
+                    ];
+                    // The two panes do different things with the face buttons,
+                    // so the bar shows the pane's own, not a union that is half
+                    // wrong wherever you are.
+                    match pane {
+                        crate::gamepad_nav::JsmPane::Text => {
+                            hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
+                        }
+                        crate::gamepad_nav::JsmPane::Tune => {
+                            hints.push((vec!["btn_west"], "Fine"));
+                            hints.push((vec!["btn_north"], "Reset"));
+                        }
+                    }
+                    hints.push((vec!["btn_east"], "Back"));
+                    hints
                 } else if multi {
                     vec![
                         (hint_horiz(), "Select field"),

@@ -85,6 +85,20 @@ pub(crate) fn jsm_nav_pane(ui: &egui::Ui, inner_id: NodeId) -> Option<&'static s
     (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(pane)
 }
 
+/// Whether the pad is holding the editor's modifier, so the body can show it.
+pub(crate) fn publish_jsm_chord(ctx: &egui::Context, inner_id: NodeId, held: bool) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_chord", inner_id.0)), (pass, held)));
+}
+
+pub(crate) fn jsm_nav_chord(ui: &egui::Ui, inner_id: NodeId) -> bool {
+    let held: Option<(u64, bool)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_chord", inner_id.0))));
+    held.is_some_and(|(pass, h)| {
+        h && ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4
+    })
+}
+
 pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui::Rect]) {
     if local_rects.is_empty() { return; }
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())

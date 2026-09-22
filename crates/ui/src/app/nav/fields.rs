@@ -1281,6 +1281,24 @@ impl crate::app::FlexInputApp {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
         let text = self.nav_jsm_text(outer_id);
         let mut cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
+
+        // South is the editor's modifier, held rather than tapped, because East
+        // is spoken for: it backs out of the widget everywhere in this app, and
+        // a delete that shared it would be one slip from losing your place.
+        // Holding South and tapping West is a thumb-roll you can do without
+        // looking, which is the bar an editing chord has to clear.
+        let holding = nav.pressed.contains("btn_south");
+        if holding && nav.is_rising("btn_west") {
+            let edited = flexinput_engine::eval::jsm_cursor_delete(&text, cur);
+            if edited != text {
+                self.nav_set_jsm_text(outer_id, &edited);
+                self.gamepad_nav.jsm_cursor =
+                    flexinput_engine::eval::jsm_cursor_clamped(&edited, cur);
+                crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
+            }
+            return;
+        }
+
         if let Some(dir) = step_dir {
             let (dx, dy) = match dir {
                 NavDir::Left => (-1, 0),
@@ -1291,10 +1309,23 @@ impl crate::app::FlexInputApp {
             cur = flexinput_engine::eval::jsm_cursor_moved(&text, cur, dx, dy);
         }
         self.gamepad_nav.jsm_cursor = cur;
-        let _ = (ctx, inner, nav);
+        // While South is held the pad is composing a chord, so tell the body to
+        // say so — a modifier with no sign it is down is a modifier people press
+        // twice.
+        crate::canvas::viewer::publish_jsm_chord(ctx, inner, holding);
         // The body draws the highlight from this; publishing it here keeps the
         // cursor in one place rather than a copy per viewport.
         crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+    }
+
+    /// Write the config text back to the selected JSM node's active tab.
+    fn nav_set_jsm_text(&mut self, outer_id: egui_snarl::NodeId, text: &str) {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        else { return };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+        crate::canvas::viewer::jsm_set_active_text(node, text);
     }
 
     /// The active tab's text for the selected JSM node.
