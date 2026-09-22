@@ -5227,6 +5227,95 @@ fn setting_a_slider_rewrites_only_the_number() {
     assert_eq!(compile(&out).aim.min_threshold, 12.5);
 }
 
+/// The stick is how a pad types a number, so an empty slot has to become one —
+/// and the step has to suit the setting, or half of them are out of reach.
+#[test]
+fn a_deflection_puts_a_number_in_the_slot_and_then_walks_it() {
+    use super::cursor::Cursor;
+    let scrub = super::knobs::scrub;
+    let val = Cursor { line: 0, token: 2 };
+
+    // Nothing there yet: the first deflection seeds zero rather than stepping,
+    // whichever way the stick went. The direction steers it after that.
+    assert_eq!(scrub("GYRO_SENS = ?", val, 1).unwrap(), "GYRO_SENS = 0");
+    assert_eq!(scrub("GYRO_SENS = ?", val, -1).unwrap(), "GYRO_SENS = 0");
+    assert_eq!(scrub("GYRO_SENS = 0", val, 1).unwrap(), "GYRO_SENS = 1");
+    // Zero, unless the setting can't take zero — seeding a value the setting
+    // has no use for would be its own small lie.
+    assert_eq!(scrub("IN_GAME_SENS = ?", val, 1).unwrap(), "IN_GAME_SENS = 0.1");
+
+    // The step comes from the setting's own range. A deadzone walking in whole
+    // numbers would offer "off" and "all of it" and nothing in between.
+    assert_eq!(
+        scrub("LEFT_STICK_DEADZONE_INNER = 0", val, 1).unwrap(),
+        "LEFT_STICK_DEADZONE_INNER = 0.05"
+    );
+    // Milliseconds in a 0..1000 range walk in fifties, not in ones.
+    assert_eq!(scrub("HOLD_PRESS_TIME = 150", val, 1).unwrap(), "HOLD_PRESS_TIME = 200");
+
+    // The range is also the floor and ceiling: most settings stop at zero, and
+    // the ones JSM lets go negative keep going.
+    assert_eq!(scrub("GYRO_SENS = 0", val, -1).unwrap(), "GYRO_SENS = 0");
+    assert_eq!(
+        scrub("TRIGGER_THRESHOLD = 0", val, -1).unwrap(),
+        "TRIGGER_THRESHOLD = -0.1",
+        "a hair trigger is a negative threshold"
+    );
+
+    // A modeshift sets the same setting, so the chord in front of the name
+    // doesn't change what its number means.
+    assert_eq!(scrub("ZL,GYRO_SENS = 2", val, 1).unwrap(), "ZL,GYRO_SENS = 3");
+    assert_eq!(
+        scrub("ZL,GYRO_SENS = 0", val, -1).unwrap(),
+        "ZL,GYRO_SENS = 0",
+        "and it stops where the setting stops, chord or no chord"
+    );
+
+    // A setting with no range of its own still walks, in ones, unclamped.
+    assert_eq!(scrub("S = 4", val, -1).unwrap(), "S = 3");
+}
+
+/// The scrub refuses anything that isn't already a number or an empty slot: a
+/// thumb brushing the stick must not quietly turn a binding into a digit.
+#[test]
+fn the_stick_only_scrubs_what_is_already_a_number() {
+    use super::cursor::Cursor;
+    let scrub = super::knobs::scrub;
+
+    // A key name is left alone — delete it first, and the slot will take a
+    // number.
+    assert!(scrub("S = SPACE", Cursor { line: 0, token: 2 }, 1).is_none());
+    // So is the setting's name, the `=`, and a comment.
+    assert!(scrub("GYRO_SENS = 2", Cursor { line: 0, token: 0 }, 1).is_none());
+    assert!(scrub("GYRO_SENS = 2", Cursor { line: 0, token: 1 }, 1).is_none());
+    assert!(scrub("GYRO_SENS = 2 # 2 is plenty", Cursor { line: 0, token: 3 }, 1).is_none());
+    // A slot on a blank line is in the NAME position, where a number would be
+    // nonsense — the command list is what fills that.
+    assert!(scrub("?", Cursor { line: 0, token: 0 }, 1).is_none());
+    // And nothing under the cursor is not an edit.
+    assert!(scrub("
+", Cursor { line: 0, token: 0 }, 1).is_none());
+}
+
+/// The number the stick writes is a number the parser reads back — the text is
+/// the only source of truth, so a scrub that didn't round-trip would be a
+/// display that lied.
+#[test]
+fn a_scrubbed_number_reaches_the_config_it_was_typed_into() {
+    use super::cursor::Cursor;
+    let val = Cursor { line: 0, token: 2 };
+    let mut text = "MIN_GYRO_THRESHOLD = ?
+".to_string();
+    for _ in 0..4 {
+        text = super::knobs::scrub(&text, val, 1).expect("a value to walk");
+    }
+    assert_eq!(text, "MIN_GYRO_THRESHOLD = 30
+", "zero, then three steps of ten");
+    assert_eq!(compile(&text).aim.min_threshold, 30.0);
+    // And the line the slider machinery sees agrees with it.
+    assert_eq!(super::knobs::knobs(&text)[0].value, 30.0);
+}
+
 /// `GYRO_SENS` writes BOTH ends of the ramp (JSM's own help: "sets both
 /// MIN_GYRO_SENS and MAX_GYRO_SENS to the same values"), so a config that sets a
 /// ramp and then writes it below has silently flattened that ramp. The file is

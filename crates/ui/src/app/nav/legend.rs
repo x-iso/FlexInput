@@ -128,10 +128,15 @@ impl FlexInputApp {
                     // wrong wherever you are.
                     match pane {
                         crate::gamepad_nav::JsmPane::Text => {
+                            // South is the editor's modifier, so its four verbs
+                            // share a row each rather than a union nobody can
+                            // read. The axis glyphs keep each to two icons.
                             hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
+                            hints.push((vec!["btn_south", "dpad_horizontal"], "Hold: slot"));
+                            hints.push((vec!["btn_south", "dpad_vertical"], "Hold: line"));
                             hints.push((
-                                vec!["btn_south", "dpad_left", "dpad_right"],
-                                "Hold+tap: insert",
+                                vec!["btn_south", "left_stick_vertical"],
+                                "Hold: number",
                             ));
                         }
                         crate::gamepad_nav::JsmPane::Tune => {

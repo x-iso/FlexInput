@@ -234,14 +234,60 @@ pub fn insert_slot(text: &str, cur: Cursor, after: bool) -> (String, Cursor) {
     (out, Cursor { line: cur.line, token })
 }
 
+/// Open an empty line above or below the cursor's, and stand on it.
+///
+/// A config is a list of lines, so "another one of these" is the edit you make
+/// most after getting one line right — and until now the only way to reach a new
+/// line from a pad was to find one that happened to be blank already.
+///
+/// The line is left empty rather than pre-filled with a slot: a `?` is an error
+/// until something replaces it, and a line you opened to think about should not
+/// make the config red while you do.
+pub fn insert_line(text: &str, cur: Cursor, below: bool) -> (String, Cursor) {
+    let (ls, le) = line_span(text, cur.line);
+    let (at, line) = if below { (le, cur.line + 1) } else { (ls, cur.line) };
+    let mut out = String::with_capacity(text.len() + 1);
+    out.push_str(&text[..at]);
+    out.push('\n');
+    out.push_str(&text[at..]);
+    (out, Cursor { line, token: 0 })
+}
+
+/// Take the cursor's line away, when there is nothing on it to take instead.
+///
+/// One chord deletes a token and an empty line, because to the thumb holding the
+/// pad those are the same gesture: remove what I am standing on. Without it,
+/// `insert_line` could ADD a line the pad had no way to remove, and a config
+/// would collect blank lines you needed a keyboard to clear.
+///
+/// The last line is never taken. A text with no lines has nowhere to put the
+/// cursor, so there would be nothing on screen to aim the next edit at.
+fn delete_line(text: &str, cur: Cursor) -> String {
+    if line_count(text) <= 1 {
+        return text.to_string();
+    }
+    let (ls, le) = line_span(text, cur.line);
+    // The newline that ends this line — or, on the last line, the one that ended
+    // the line before, so the line above doesn't inherit a trailing blank.
+    let (from, to) =
+        if le < text.len() { (ls, le + 1) } else { (ls.saturating_sub(1), le) };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..from]);
+    out.push_str(&text[to..]);
+    out
+}
+
 /// Delete the cursor's token, and the one space that held it apart from its
 /// neighbour.
 ///
 /// Deleting a token but leaving its spacing turns `A = B C` into `A =  C`, and a
 /// few of those make a line that no longer reads like the config it is. Taking
 /// the space before it (or after, at the start of a line) keeps the line tidy.
+///
+/// With nothing under the cursor there is no token to take, so the line goes
+/// instead — see [`delete_line`].
 pub fn delete(text: &str, cur: Cursor) -> String {
-    let Some((_, s, e)) = selection(text, cur) else { return text.to_string() };
+    let Some((_, s, e)) = selection(text, cur) else { return delete_line(text, cur) };
     let (ls, _) = line_span(text, cur.line);
     let b = text.as_bytes();
     let mut from = s;
@@ -391,9 +437,8 @@ mod tests {
         assert_eq!(delete(text, Cursor { line: 0, token: 2 }), "N = 1\n", "or the first");
         // Deleting the name takes the space AFTER it, since there is none before.
         assert_eq!(delete(text, Cursor { line: 0, token: 0 }), "= 2 1\n");
-        // Nothing under the cursor is not an edit.
-        let blank = "A = B\n\n";
-        assert_eq!(delete(blank, Cursor { line: 1, token: 0 }), blank);
+        // Nothing under the cursor: the line itself is what gets removed.
+        assert_eq!(delete("A = B\n\n", Cursor { line: 1, token: 0 }), "A = B\n");
     }
 }
 
@@ -429,9 +474,15 @@ mod delete_round_tests {
         text = delete(&text, clamped(&text, cur));
         assert_eq!(text, "\n", "the line is still there, just empty");
         assert!(selection(&text, Cursor::default()).is_none());
-        // Deleting again on an empty line is not an edit — a held chord must not
-        // eat the rest of the config.
-        assert_eq!(delete(&text, Cursor::default()), "\n");
+        // With nothing left on it, the next one takes the line — the same chord
+        // has to undo `insert_line`, or the pad could add lines it couldn't
+        // remove.
+        assert_eq!(delete(&text, Cursor::default()), "");
+        // But never the last line: there would be nowhere to stand. (A line of
+        // spaces, so the guard is what keeps it — an empty text would survive
+        // the arithmetic either way and prove nothing.)
+        assert_eq!(delete("   ", Cursor::default()), "   ");
+        assert_eq!(delete("", Cursor::default()), "");
     }
 
     /// The lines around the one being edited are untouched, byte for byte.
@@ -496,6 +547,48 @@ mod slot_tests {
         assert!(selection(&out, cur).is_some(), "and now there is");
         // The neighbours are untouched.
         assert!(out.starts_with("A = B\n") && out.ends_with("C = D\n"));
+    }
+
+    /// A new line opens on the side you asked for, and the cursor goes to it —
+    /// standing on the line you were already on would make the gesture look like
+    /// it had done nothing.
+    #[test]
+    fn a_new_line_opens_above_or_below_and_takes_the_cursor() {
+        let text = "A = B\nC = D\n";
+        let at_c = Cursor { line: 1, token: 0 };
+
+        let (out, cur) = insert_line(text, at_c, false);
+        assert_eq!(out, "A = B\n\nC = D\n");
+        assert_eq!(cur, Cursor { line: 1, token: 0 }, "on the blank one, not on C");
+        assert!(selection(&out, cur).is_none(), "and it is empty");
+
+        let (out, cur) = insert_line(text, at_c, true);
+        assert_eq!(out, "A = B\nC = D\n\n");
+        assert_eq!(cur, Cursor { line: 2, token: 0 });
+
+        // A file that doesn't end in a newline gets one rather than a half line.
+        let (out, cur) = insert_line("A = B", Cursor::default(), true);
+        assert_eq!(out, "A = B\n");
+        assert_eq!(cur, Cursor { line: 1, token: 0 });
+        assert_eq!(line_count(&out), 2, "the new line is real, not the old one's tail");
+    }
+
+    /// Opening a line and deleting it is a round trip, for the same reason a slot
+    /// is: the pad has to be able to take back what it just did.
+    #[test]
+    fn opening_a_line_and_deleting_it_is_a_round_trip() {
+        for text in ["A = B\nC = D\n", "A = B", "\n", "N = 2 1 # both\n"] {
+            for line in 0..line_count(text) {
+                for below in [true, false] {
+                    let (opened, at) = insert_line(text, Cursor { line, token: 0 }, below);
+                    assert_eq!(
+                        delete(&opened, at),
+                        text,
+                        "{text:?} line {line} below={below}"
+                    );
+                }
+            }
+        }
     }
 
     /// A slot opened and deleted leaves the line exactly as it was — a pad user

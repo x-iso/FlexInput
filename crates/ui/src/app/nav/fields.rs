@@ -1306,6 +1306,20 @@ impl crate::app::FlexInputApp {
                 crate::canvas::viewer::publish_jsm_chord(ctx, inner, true);
                 return;
             }
+            // Up and down open a whole line instead, on that side, and stand on
+            // it. A config is a list of lines, so "another one of these" is the
+            // edit you make right after getting one line right — and until now
+            // the pad could only reach a line that happened to be blank already.
+            let down = nav.is_rising("dpad_down");
+            let up = nav.is_rising("dpad_up");
+            if down || up {
+                let (edited, at) = flexinput_engine::eval::jsm_insert_line(&text, cur, down);
+                self.nav_set_jsm_text(outer_id, &edited);
+                self.gamepad_nav.jsm_cursor = at;
+                crate::canvas::viewer::publish_jsm_cursor(ctx, inner, at);
+                crate::canvas::viewer::publish_jsm_chord(ctx, inner, true);
+                return;
+            }
         }
         if holding && nav.is_rising("btn_west") {
             let edited = flexinput_engine::eval::jsm_cursor_delete(&text, cur);
@@ -1316,6 +1330,46 @@ impl crate::app::FlexInputApp {
                 crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
             }
             return;
+        }
+
+        // The stick, held down, is how a number gets typed: the command list can
+        // offer names and only names, so without this every numeric setting a
+        // pad wrote would stay `GYRO_SENS = ?`.
+        //
+        // One deflection is one step, which is why the latch exists — an axis
+        // held for a fifth of a second would run the value off the end of its
+        // range before you could let go. The step comes from the setting's own
+        // range, and the stick has to be pushed clearly along one axis, for the
+        // same reason walking the faders does: a diagonal must not quietly mean
+        // both things.
+        if holding {
+            let y = nav.lstick.y;
+            /// How far past centre counts as a deflection, and how far back
+            /// counts as letting go. Two thresholds, so a stick resting just
+            /// shy of the line can't chatter.
+            const ENGAGE: f32 = 0.6;
+            const RELEASE: f32 = 0.35;
+            if y.abs() < RELEASE {
+                self.gamepad_nav.jsm_scrub = 0;
+            }
+            let dir = if y.abs() >= ENGAGE && Self::nav_axis_is_clear(nav.lstick, true) {
+                if y > 0.0 { 1 } else { -1 }
+            } else {
+                0
+            };
+            if dir != 0 && dir != self.gamepad_nav.jsm_scrub {
+                self.gamepad_nav.jsm_scrub = dir;
+                if let Some(edited) = flexinput_engine::eval::jsm_scrub_number(&text, cur, dir) {
+                    self.nav_set_jsm_text(outer_id, &edited);
+                    // The token keeps its place: the text under it changed, and
+                    // the cursor has to stay on the number to walk it again.
+                    crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+                    crate::canvas::viewer::publish_jsm_chord(ctx, inner, true);
+                    return;
+                }
+            }
+        } else {
+            self.gamepad_nav.jsm_scrub = 0;
         }
 
         // While the modifier is down the directions belong to the chord, so the

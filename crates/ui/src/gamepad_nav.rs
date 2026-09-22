@@ -273,6 +273,15 @@ pub struct GamepadNav {
     pub jsm_pane: JsmPane,
     /// Where the token cursor is in the config being edited.
     pub jsm_cursor: flexinput_engine::eval::JsmCursor,
+    /// Which way the stick was last pushed to walk a number, while it is still
+    /// pushed there: -1, 0 or +1.
+    ///
+    /// The stick is an axis, not a button, so without a latch one deflection
+    /// held for a fifth of a second would run a setting off the end of its range
+    /// before you could let go. Cleared when the stick comes back to centre, so
+    /// one number is one push — which is what "one deflection at a time" has to
+    /// mean for a value you are reading off the screen as you set it.
+    pub jsm_scrub: i32,
     /// The JSM setting being tuned and the value it held before tuning started,
     /// as `(name, value)`. North restores it.
     ///
@@ -458,6 +467,7 @@ impl Default for GamepadNav {
             fine_increment: false,
             jsm_pane: JsmPane::default(),
             jsm_cursor: Default::default(),
+            jsm_scrub: 0,
             jsm_baseline: None,
             edit_baseline: None,
             cursor_pos: egui::Pos2::ZERO,

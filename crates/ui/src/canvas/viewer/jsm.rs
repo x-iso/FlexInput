@@ -619,7 +619,8 @@ fn jsm_rows(
                 .on_hover_text(
                     "LB / RB switch between the config text and the faders.
                      LT / RT change config tab.
-                     Hold South and tap West to delete the token under the cursor,                      or left / right to open an empty slot beside it.",
+                     Hold South and tap West to delete what the cursor is on, left / right                      to open an empty slot beside it, or up / down to open a new line.
+                     Hold South and push the left stick up or down to walk a number,                      one push at a time.",
                 );
         }
         // Where the strip goes. Beside the editor suits a wide node; above or
@@ -685,9 +686,24 @@ fn jsm_rows(
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
     // Where the pad is, if it is driving this editor. A byte range rather than a
     // line, so the highlight covers exactly the token the buttons would act on.
-    let nav_token: Option<(usize, usize)> = super::scale::jsm_nav_cursor(ui, node_id)
+    let nav_cur = super::scale::jsm_nav_cursor(ui, node_id);
+    let nav_token: Option<(usize, usize)> = nav_cur
         .and_then(|c| flexinput_engine::eval::jsm_selection(&tabs[active].text, c))
         .map(|(_, s, e)| (s, e));
+    // The same place as a CHARACTER index, which is what a galley counts in.
+    // It does two jobs the highlight can't. A line with nothing on it still has
+    // a cursor, and with no token to tint there was nothing at all on screen to
+    // say where the pad was — walking a run of blank lines looked like the pad
+    // had stopped responding. And wherever the cursor is, the editor scrolls to
+    // keep it in view, which a long config needs whether the line is blank or
+    // not.
+    let nav_head: Option<usize> = nav_cur.map(|c| {
+        let body = &tabs[active].text;
+        let at = nav_token
+            .map(|(s, _)| s)
+            .unwrap_or_else(|| flexinput_engine::eval::jsm_line_span(body, c.line).0);
+        body[..at].chars().count()
+    });
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = wrap_width;
@@ -750,21 +766,50 @@ fn jsm_rows(
             .max_height(rows as f32 * line_h)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible),
         |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .code_editor()
-                    .desired_rows(rows)
-                    .desired_width(size.x - bar_w)
-                    .clip_text(true)
-                    .hint_text("Paste or load a JoyShockMapper config")
-                    .layouter(&mut layouter),
-            )
+            let out = egui::TextEdit::multiline(&mut text)
+                .code_editor()
+                .desired_rows(rows)
+                .desired_width(size.x - bar_w)
+                .clip_text(true)
+                .hint_text("Paste or load a JoyShockMapper config")
+                .layouter(&mut layouter)
+                .show(ui);
+            if let Some(head) = nav_head {
+                // A zero-width rect spanning the row the cursor sits on.
+                let at = out
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(head))
+                    .translate(out.galley_pos.to_vec2());
+                let row = egui::Rect::from_min_size(
+                    at.min,
+                    egui::vec2(2.0, at.height().max(line_h)),
+                );
+                if nav_token.is_none() {
+                    // Nothing under the cursor to tint, so draw the cursor
+                    // itself. Solid rather than blinking: this says where the
+                    // pad is, and something that spends half its life invisible
+                    // is a poor answer to "where am I".
+                    let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
+                    ui.painter().with_clip_rect(out.text_clip_rect).rect_filled(row, 0.0, accent);
+                }
+                // Follow the cursor, but only when it MOVES. Scrolling every
+                // frame would fight the wheel, and reading a long config with
+                // the mouse while a pad rests in it is an ordinary thing to do.
+                let key = egui::Id::new(("jsm_nav_head", node_id.0))
+                    .with(ui.ctx().viewport_id())
+                    .with(ui.layer_id());
+                if ui.ctx().data(|d| d.get_temp::<usize>(key)) != Some(head) {
+                    ui.ctx().data_mut(|d| d.insert_temp(key, head));
+                    ui.scroll_to_rect(row, None);
+                }
+            }
+            out
         },
     );
     // The box you see, bar included — not the text inside it, which is taller
     // than the box whenever the config is longer than the editor.
     let editor_rect = editor.inner_rect.with_max_x(editor.inner_rect.max.x + bar_w);
-    let resp = editor.inner;
+    let resp = editor.inner.response;
     if resp.changed() {
         tabs[active].text = text;
         changed = true;

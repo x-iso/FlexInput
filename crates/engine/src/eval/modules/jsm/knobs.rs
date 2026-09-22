@@ -11,6 +11,7 @@
 //! given a control that would silently drop half the line.
 
 use super::cc;
+use super::cursor::{self, Cursor, TokenKind};
 use super::parse::{setting_support, Compiled, Support};
 
 /// A numeric setting line a slider can drive.
@@ -82,18 +83,23 @@ pub fn knobs(text: &str) -> Vec<Knob> {
     out
 }
 
-/// Rewrite the number on one line, keeping everything else about it — the name as
-/// the author spelled it, the spacing, and any trailing comment.
-pub fn set_knob(text: &str, line: usize, value: f32, integral: bool) -> String {
-    let shown = if integral {
-        format!("{}", value.round() as i64)
-    } else if (value * 100.0).round() % 100.0 == 0.0 {
-        // A whole number reads better without a pointless `.00`.
+/// How the editor writes a number back into the config.
+///
+/// Two decimals is as fine as any of these settings are worth writing, and a
+/// whole number reads better without a pointless `.00`.
+fn shown(value: f32, integral: bool) -> String {
+    if integral || (value * 100.0).round() % 100.0 == 0.0 {
         format!("{}", value.round() as i64)
     } else {
         let s = format!("{value:.2}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
-    };
+    }
+}
+
+/// Rewrite the number on one line, keeping everything else about it — the name as
+/// the author spelled it, the spacing, and any trailing comment.
+pub fn set_knob(text: &str, line: usize, value: f32, integral: bool) -> String {
+    let shown = shown(value, integral);
     let mut out: Vec<String> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         if i != line {
@@ -325,6 +331,79 @@ fn virtual_or_stick(cfg: &Compiled, hand: Hand, rest: &str) -> Feel {
     } else {
         Feel::Stick(hand)
     }
+}
+
+/// How far one deflection of the stick moves a setting.
+///
+/// A flat step of 1 would put half of JSM's settings out of a pad's reach: a
+/// deadzone lives in 0..1, where whole numbers offer "off" and "all of it".
+/// Twenty steps across the setting's own range, rounded to a size a person
+/// would have picked (1, 2 or 5 of some power of ten), lands on numbers that
+/// read like numbers — 0.05 for a deadzone, 1 for gyro sensitivity, 50ms for a
+/// hold time.
+///
+/// Deliberately coarse. This gesture exists to get a number THERE; the moment
+/// one is, the setting has a fader in the Tune pane, and that is the tool for
+/// finding the value you actually want.
+fn step_for(lo: f32, hi: f32, integral: bool) -> f32 {
+    let target = (hi - lo) / 20.0;
+    let mut step = if integral { 1.0 } else { 0.01 };
+    for k in -2..=4 {
+        for m in [1.0, 2.0, 5.0] {
+            let c = m * 10f32.powi(k);
+            if c <= target && c > step {
+                step = c;
+            }
+        }
+    }
+    step
+}
+
+/// Walk the number under the cursor, or put one there. `dir` is one deflection
+/// of the stick: +1 up, -1 down.
+///
+/// This is how a pad types a number, and the only way it can — the command list
+/// offers names, and names are all it can offer. Without this, every numeric
+/// setting a pad wrote would be left reading `GYRO_SENS = ?`.
+///
+/// It touches a token only if that token is already a number or an empty slot.
+/// A binding's key (`S = SPACE`) is left alone: turning SPACE into 0 because a
+/// thumb brushed the stick is a worse outcome than making you delete it first,
+/// and delete is one button away.
+pub fn scrub(text: &str, cur: Cursor, dir: i32) -> Option<String> {
+    let (tok, s, e) = cursor::selection(text, cur)?;
+    // Right of the `=` only. A setting's name is never a number, and a line that
+    // starts with one is not a line JSM has any use for.
+    if tok.kind != TokenKind::Value {
+        return None;
+    }
+    let current = text[s..e].parse::<f32>().ok();
+    if current.is_none() && &text[s..e] != cursor::SLOT {
+        return None;
+    }
+    // What this line sets, so the number can be kept inside what the setting
+    // takes. A modeshift (`ZL,GYRO_SENS = 4`) sets the same thing it always
+    // does, so the chord in front of the name doesn't change what a number means
+    // here.
+    let (ls, le) = cursor::line_span(text, cur.line);
+    let line = &text[ls..le];
+    let name = cursor::tokenize(line)
+        .first()
+        .filter(|t| t.kind == TokenKind::Name)
+        .map(|t| t.text(line))
+        .unwrap_or("");
+    let name = name.rsplit([',', '+', '*']).next().unwrap_or(name);
+    let bounds = range(&name.to_ascii_uppercase());
+    let (lo, hi, integral) = bounds.unwrap_or((f32::MIN, f32::MAX, false));
+    let next = match current {
+        Some(v) => v + dir as f32 * if bounds.is_some() { step_for(lo, hi, integral) } else { 1.0 },
+        // Nothing there yet, so the first deflection puts a number in the slot
+        // rather than stepping one. Zero — pulled inside the setting's range,
+        // because seeding a value the setting cannot take would be its own small
+        // lie — and the direction steers it from there.
+        None => 0.0,
+    };
+    Some(cursor::replace(text, cur, &shown(next.clamp(lo, hi), integral)))
 }
 
 /// The slider range for a setting, and whether it is whole-numbered.
