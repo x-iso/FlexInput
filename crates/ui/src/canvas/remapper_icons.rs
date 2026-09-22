@@ -302,6 +302,60 @@ const KB_TILDE:      &[u8] = a!("KBM/keyboard_tilde.svg");
 const KB_COLON:      &[u8] = a!("KBM/keyboard_colon.svg");
 const KB_QUESTION:   &[u8] = a!("KBM/keyboard_question.svg");
 const KB_EXCLAIM:    &[u8] = a!("KBM/keyboard_exclamation.svg");
+const KB_CARET:      &[u8] = a!("KBM/keyboard_caret.svg");
+const KB_ASTERISK:   &[u8] = a!("KBM/keyboard_asterisk.svg");
+const KB_UNDERSCORE: &[u8] = a!("KBM/keyboard_underscore.svg");
+const KB_LESS:       &[u8] = a!("KBM/keyboard_bracket_less.svg");
+const KB_GREATER:    &[u8] = a!("KBM/keyboard_bracket_greater.svg");
+/// A key with no symbol on it, for a character with no icon of its own: the
+/// renderer draws the character over it. Added so the shifted half of the number
+/// row can be SHOWN at all.
+const KB_BLANK:      &[u8] = a!("KBM/keyboard_blank.svg");
+
+
+/// The icon for a CHARACTER, rather than for a pin.
+///
+/// A virtual keyboard that is typing has to show what each key would actually
+/// add, and the caps latch changes half of them — a number row that doesn't
+/// change is a caps key you can't tell you pressed. `None` means no asset has
+/// that glyph, and the caller draws it over [`kb_blank`] instead.
+pub fn char_svg(c: char) -> Option<&'static [u8]> {
+    Some(match c {
+        '0' => KB_0, '1' => KB_1, '2' => KB_2, '3' => KB_3, '4' => KB_4,
+        '5' => KB_5, '6' => KB_6, '7' => KB_7, '8' => KB_8, '9' => KB_9,
+        '!' => KB_EXCLAIM,
+        '^' => KB_CARET,
+        '*' => KB_ASTERISK,
+        '-' => KB_MINUS,
+        '_' => KB_UNDERSCORE,
+        '=' => KB_EQUALS,
+        '+' => KB_PLUS,
+        '[' => KB_BRK_OPEN,
+        ']' => KB_BRK_CLOSE,
+        '/' => KB_SLASH_F,
+        '\\' => KB_SLASH_B,
+        ';' => KB_SEMICOLON,
+        ':' => KB_COLON,
+        '\'' => KB_APOSTROPHE,
+        '\"' => KB_QUOTE,
+        ',' => KB_COMMA,
+        '<' => KB_LESS,
+        '.' => KB_PERIOD,
+        '>' => KB_GREATER,
+        '?' => KB_QUESTION,
+        // The backtick has no glyph of its own in the set, and wears the tilde's
+        // — as it already does when addressed by pin.
+        '`' | '~' => KB_TILDE,
+        // @ # $ % & ( ) { } | have no asset in the set. They come back as None
+        // and are drawn over the blank key.
+        _ => return None,
+    })
+}
+
+/// The blank key shape, for drawing a character over.
+pub fn kb_blank() -> &'static [u8] {
+    KB_BLANK
+}
 
 // Mouse
 const M_LEFT:     &[u8] = a!("KBM/mouse_left.svg");

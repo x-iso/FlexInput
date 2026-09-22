@@ -100,7 +100,14 @@ pub(crate) fn gp_pin_token(pin: &str) -> &'static str {
 pub(crate) fn kbm_cell_texture(ctx: &egui::Context, skin: crate::canvas::remapper_icons::Skin, pin: &str)
     -> Option<egui::TextureHandle>
 {
-    let bytes = crate::canvas::remapper_icons::pin_svg(skin, pin)?;
+    kbm_svg_texture(ctx, crate::canvas::remapper_icons::pin_svg(skin, pin)?)
+}
+
+/// The same, for SVG bytes the caller already chose — a character's glyph rather
+/// than a pin's.
+pub(crate) fn kbm_svg_texture(ctx: &egui::Context, bytes: &'static [u8])
+    -> Option<egui::TextureHandle>
+{
     let size_px = (26.0 * ctx.pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("kbm_picker_icon", bytes.as_ptr() as usize, size_px));
     if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {

@@ -402,6 +402,9 @@ pub struct GamepadNav {
     /// and neither can the name of a preset — so this is an enum rather than one
     /// more bool beside the chord fields.
     pub kbm_picker_use: PickerUse,
+    /// Which side of a JSM line the session is inserting into, and so which
+    /// vocabulary its keys stand for.
+    pub kbm_slot: JsmSlot,
     /// What has been typed so far, while this session is typing.
     pub kbm_text: String,
     /// The shift latch: what follows comes out shifted.
@@ -532,6 +535,7 @@ impl Default for GamepadNav {
             tz_focus: TzFocus::Zone(0),
             kbm_picker_open: false,
             kbm_picker_use: PickerUse::default(),
+            kbm_slot: JsmSlot::default(),
             kbm_text: String::new(),
             kbm_text_caps: false,
             kbm_text_done: None,
@@ -580,6 +584,24 @@ pub const NAV_BUTTONS: &[&str] = &[
     "dpad_left",
     "dpad_right",
 ];
+
+/// Which side of a JSM line a picker session is inserting into.
+///
+/// The two vocabularies are not interchangeable and JSM is right to keep them
+/// apart: `S` is the button you press, `X_A` is the button a virtual pad reports
+/// when something is bound to it. A setting's value takes neither — a number
+/// goes there — so the board has nothing to offer and greys out rather than
+/// pretending.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum JsmSlot {
+    /// Left of the `=`: a button, by the name JSM reads inputs as.
+    #[default]
+    Name,
+    /// Right of the `=`: a key, a mouse button, a pad output, one of ours.
+    Value,
+    /// Neither will do here.
+    Neither,
+}
 
 /// What a KB/M picker session is for. See `GamepadNav::kbm_picker_use`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

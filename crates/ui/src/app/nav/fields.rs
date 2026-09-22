@@ -1470,7 +1470,20 @@ impl crate::app::FlexInputApp {
         text: &str,
         cur: flexinput_engine::eval::JsmCursor,
     ) {
-        use crate::gamepad_nav::PickerUse;
+        use crate::gamepad_nav::{JsmSlot, PickerUse};
+        use flexinput_engine::eval::JsmKind;
+        // Which side of the line the pick will land on decides which vocabulary
+        // the board's keys stand for — the same grammar the command list reads.
+        let kinds = flexinput_engine::eval::jsm_kinds_at(text, cur);
+        self.gamepad_nav.kbm_slot = if kinds.contains(&JsmKind::Binding) {
+            JsmSlot::Value
+        } else if kinds.is_empty() {
+            // A setting's value: a number goes there, and a number comes from
+            // the stick.
+            JsmSlot::Neither
+        } else {
+            JsmSlot::Name
+        };
         // A comment is the one place in a config where characters are the point;
         // everywhere else a key stands for its NAME. Deciding by the line rather
         // than by the position means the board behaves the same wherever you are

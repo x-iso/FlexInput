@@ -515,17 +515,69 @@ mod pad_cluster_tests {
         }
     }
 
+    /// A pad button has a name on BOTH sides of a JSM line, and they are
+    /// different names: `S` is the button you press, `X_A` is what a virtual pad
+    /// reports when something is bound to it. The board is the only place a
+    /// person picks either, so every cell has to have both.
     #[test]
-    fn every_gamepad_cell_is_one_jsm_can_bind() {
-        let names = flexinput_engine::eval::jsm_names_by_pin();
+    fn every_gamepad_cell_is_one_jsm_can_bind_either_way() {
+        let outputs = flexinput_engine::eval::jsm_names_by_pin();
+        let inputs = flexinput_engine::eval::jsm_input_names_by_pin();
         for cell in PAD_LAYOUT {
+            let pin = pin_as_bound(cell.pin);
             assert!(
-                names.contains_key(pin_as_bound(cell.pin)),
-                "{} is on the board but JSM has no name for it",
+                outputs.contains_key(pin),
+                "{} is on the board but nothing can be bound TO it",
+                cell.pin
+            );
+            assert!(
+                inputs.contains_key(pin),
+                "{} is on the board but a line can't be started WITH it",
+                cell.pin
+            );
+            assert_ne!(
+                inputs.get(pin),
+                outputs.get(pin),
+                "{}: the two sides of a line would read the same, which they don't",
                 cell.pin
             );
             assert!(is_pad_cell(cell.pin));
         }
         assert!(!is_pad_cell("key_a"), "and the keyboard is not the gamepad");
+    }
+
+    /// Every character this board can type either has a glyph in the icon set or
+    /// is one of the few drawn over the blank key. A tenth one appearing without
+    /// a face would just look like a bug.
+    #[test]
+    fn every_character_the_board_types_has_a_face() {
+        /// The glyphs the KB/M set hasn't got. Drawn as text over the blank key.
+        const DRAWN_OVER_BLANK: &[char] =
+            &['@', '#', '$', '%', '&', '(', ')', '{', '}', '|'];
+        for cell in KBM_LAYOUT {
+            for caps in [false, true] {
+                let Some(Typed::Char(c)) = cell_typed(cell.pin, caps) else { continue };
+                if c == ' ' {
+                    continue;
+                }
+                let has_icon = crate::canvas::remapper_icons::char_svg(c).is_some();
+                // A letter keeps its pin's icon, which reads the same either way.
+                let is_letter = c.is_ascii_alphabetic();
+                assert!(
+                    has_icon || is_letter || DRAWN_OVER_BLANK.contains(&c),
+                    "{:?} on {} (caps={caps}) has no face and isn't listed as drawn",
+                    c,
+                    cell.pin
+                );
+            }
+        }
+        // And the listed ones really are missing, so the list can't rot into a
+        // set of characters that quietly have icons now.
+        for c in DRAWN_OVER_BLANK {
+            assert!(
+                crate::canvas::remapper_icons::char_svg(*c).is_none(),
+                "{c:?} has an icon now and should be taken off the drawn list"
+            );
+        }
     }
 }

@@ -38,11 +38,9 @@ impl FlexInputApp {
         // character types nothing, and a key JSM has no name for can't be a
         // binding. Both grey the same way the chord purpose greys its own.
         let purpose = self.gamepad_nav.kbm_picker_use;
-        let names = (purpose == crate::gamepad_nav::PickerUse::JsmName)
-            .then(flexinput_engine::eval::jsm_names_by_pin)
-            .unwrap_or_default();
+        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
         let usable = |cell: &crate::kbm_picker::PickerCell| {
-            usable(cell) && cell_does_something(purpose, &cell.pin, &names)
+            usable(cell) && cell_does_something(purpose, &cell.pin, &vocab)
         };
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         idx = match step_dir {
@@ -57,7 +55,7 @@ impl FlexInputApp {
         // Typing is the picker's other purpose: same grid, same navigation,
         // but an activated cell gives a character or a name rather than a pin.
         if purpose != crate::gamepad_nav::PickerUse::Chord {
-            self.drive_kbm_typing(nav, &cells[idx], &names);
+            self.drive_kbm_typing(nav, &cells[idx], &vocab);
             return;
         }
 
@@ -115,7 +113,7 @@ impl FlexInputApp {
         &mut self,
         nav: &crate::gamepad_nav::NavInput,
         cell: &crate::kbm_picker::PickerCell,
-        names: &std::collections::HashMap<String, String>,
+        vocab: &JsmVocab,
     ) {
         use crate::gamepad_nav::PickerUse;
         use crate::kbm_picker::{cell_typed, Typed};
@@ -135,7 +133,7 @@ impl FlexInputApp {
             // be spelled out letter by letter would be a worse list than the
             // list is.
             if nav.is_rising("btn_south") {
-                if let Some(name) = jsm_insert_for_cell(&cell.pin, names) {
+                if let Some(name) = vocab.insert_for(&cell.pin) {
                     self.finish_kbm_typing(name);
                 }
             }
@@ -327,9 +325,7 @@ impl FlexInputApp {
         // What this session is for, and — when it is naming a key for a config —
         // the names JSM binds our pins by, so a key it can't name greys out.
         let purpose = self.gamepad_nav.kbm_picker_use;
-        let names = (purpose == crate::gamepad_nav::PickerUse::JsmName)
-            .then(flexinput_engine::eval::jsm_names_by_pin)
-            .unwrap_or_default();
+        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
 
         const UNIT: f32 = 30.0; // px per grid unit
         const GAP: f32 = 3.0;   // gap between adjacent keys
@@ -359,8 +355,18 @@ impl FlexInputApp {
                     let hints = match purpose {
                         crate::gamepad_nav::PickerUse::Chord =>
                             "Click or LS/D-pad: move   South: add   North: clear   East/Done: close",
-                        crate::gamepad_nav::PickerUse::JsmName =>
-                            "Click or LS/D-pad: move   South: insert this key's JSM name   West: type instead   East: cancel",
+                        crate::gamepad_nav::PickerUse::JsmName => match self.gamepad_nav.kbm_slot {
+                            // What the keys stand for depends on which side of
+                            // the line the pick lands on, so say which.
+                            crate::gamepad_nav::JsmSlot::Name =>
+                                "A line starts with a BUTTON. South: insert its name   West: type instead   East: cancel",
+                            crate::gamepad_nav::JsmSlot::Value =>
+                                "Click or LS/D-pad: move   South: insert this key's name   West: type instead   East: cancel",
+                            // Everything greys out here, and a board full of grey
+                            // has to say why rather than look broken.
+                            crate::gamepad_nav::JsmSlot::Neither =>
+                                "A NUMBER goes here: hold South and push the stick. West: type a word instead   East: cancel",
+                        },
                         crate::gamepad_nav::PickerUse::Text =>
                             "South: type   West or Shift: caps   Backspace   North or Enter: done   East or Esc: cancel",
                     };
@@ -389,9 +395,7 @@ impl FlexInputApp {
                 }
                 // Which name the focused key would write, while picking one.
                 if purpose == crate::gamepad_nav::PickerUse::JsmName {
-                    let focused = cells
-                        .get(sel)
-                        .and_then(|c| jsm_insert_for_cell(&c.pin, &names));
+                    let focused = cells.get(sel).and_then(|c| vocab.insert_for(&c.pin));
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Binds as:").small().weak());
                         match focused {
@@ -464,7 +468,7 @@ impl FlexInputApp {
                         .is_some_and(|p| cell.pin.starts_with(p));
                     let disabled = (cell.analog_only && !analog_ok)
                         || self_target
-                        || !cell_does_something(purpose, &cell.pin, &names);
+                        || !cell_does_something(purpose, &cell.pin, &vocab);
                     let resp = if disabled {
                         ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
                     } else {
@@ -525,7 +529,53 @@ impl FlexInputApp {
                     } else {
                         skin
                     };
-                    if let Some(tex) = kbm_cell_texture(ctx, skin, &cell.pin) {
+                    // While typing, a key wears the character it would ACTUALLY
+                    // add, which the caps latch changes for half of them: a
+                    // number row that doesn't change is a caps key you can't
+                    // tell you pressed. A character with no glyph in the icon set
+                    // (@ # $ % & ( ) { } |) is drawn over the blank key shape,
+                    // in the cell's own background colour so it reads as cut out
+                    // of the key the way the drawn ones are.
+                    let typed = (purpose == crate::gamepad_nav::PickerUse::Text)
+                        .then(|| crate::kbm_picker::cell_typed(
+                            &cell.pin, self.gamepad_nav.kbm_text_caps))
+                        .flatten()
+                        .and_then(|t| match t {
+                            crate::kbm_picker::Typed::Char(c) if c != ' ' => Some(c),
+                            _ => None,
+                        });
+                    let face = match typed {
+                        Some(c) => match crate::canvas::remapper_icons::char_svg(c) {
+                            Some(svg) => (kbm_svg_texture(ctx, svg), None),
+                            None => (
+                                kbm_svg_texture(ctx, crate::canvas::remapper_icons::kb_blank()),
+                                Some(c),
+                            ),
+                        },
+                        None => (kbm_cell_texture(ctx, skin, &cell.pin), None),
+                    };
+                    if let Some(c) = face.1 {
+                        if let Some(tex) = face.0.as_ref() {
+                            let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
+                            let img_rect = egui::Rect::from_center_size(
+                                rect.center(), egui::vec2(s, s));
+                            painter.image(
+                                tex.id(),
+                                img_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                tint,
+                            );
+                        }
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            c.to_string(),
+                            egui::FontId::proportional(UNIT * 0.55),
+                            bg,
+                        );
+                        continue;
+                    }
+                    if let Some(tex) = face.0 {
                         let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
                         let img_rect = egui::Rect::from_center_size(
                             rect.center(), egui::vec2(s, s));
@@ -609,21 +659,54 @@ impl FlexInputApp {
     }
 }
 
-/// What inserting this cell writes into a JSM config, if anything.
+/// The names a JSM config could use for our pins, on whichever side of a line
+/// the picker is inserting into.
 ///
-/// A key or pad button goes in under the name JSM binds it by. One of OUR
-/// targets — a Macro Output port, a Virtual Menu entry — has no JSM name at all,
-/// so it goes in under the `@` tag instead. One function, so what the board
-/// offers, what it previews and what it inserts cannot disagree.
-pub(crate) fn jsm_insert_for_cell(
-    pin: &str,
-    names: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-    if let Some(n) = names.get(crate::kbm_picker::pin_as_bound(pin)) {
-        return Some(n.clone());
+/// Built once per frame rather than per cell: there are 150 cells and the
+/// vocabulary is 200 names.
+#[derive(Default)]
+pub(crate) struct JsmVocab {
+    slot: crate::gamepad_nav::JsmSlot,
+    names: std::collections::HashMap<String, String>,
+}
+
+impl JsmVocab {
+    pub(crate) fn of(slot: crate::gamepad_nav::JsmSlot) -> JsmVocab {
+        use crate::gamepad_nav::JsmSlot as Slot;
+        let names = match slot {
+            Slot::Name => flexinput_engine::eval::jsm_input_names_by_pin(),
+            Slot::Value => flexinput_engine::eval::jsm_names_by_pin(),
+            Slot::Neither => Default::default(),
+        };
+        JsmVocab { slot, names }
     }
-    let entry = crate::macro_icons::registry_entry(pin)?;
-    Some(flexinput_engine::eval::jsm_fi_tag(&entry.name))
+
+    /// What inserting this cell writes into a config, if anything.
+    ///
+    /// Left of the `=`, a pad button goes in as the name JSM READS it as (`S`);
+    /// right of it, as the name a virtual pad REPORTS (`X_A`) — and a key or a
+    /// mouse button only belongs on the right at all. One of ours — a Macro
+    /// Output port, a Virtual Menu entry — has no JSM name, so it goes in under
+    /// the `@` tag, and that is a value too. One function, so what the board
+    /// offers, what it previews and what it inserts cannot disagree.
+    pub(crate) fn insert_for(&self, pin: &str) -> Option<String> {
+        if let Some(n) = self.names.get(crate::kbm_picker::pin_as_bound(pin)) {
+            return Some(n.clone());
+        }
+        // `Neither` needs no guard of its own: it builds no vocabulary, so the
+        // lookup above finds nothing and a FlexInput target is a value.
+        fi_insert(self.slot, &crate::macro_icons::registry_entry(pin)?.name)
+    }
+}
+
+/// How one of OUR targets goes into a config, on this side of a line.
+///
+/// A Macro Output port or a Virtual Menu entry is something a mapping ENDS at,
+/// so it belongs right of the `=` and nowhere else. Split out from the registry
+/// lookup so the rule can be tested without a patch.
+fn fi_insert(slot: crate::gamepad_nav::JsmSlot, name: &str) -> Option<String> {
+    (slot == crate::gamepad_nav::JsmSlot::Value)
+        .then(|| flexinput_engine::eval::jsm_fi_tag(name))
 }
 
 /// Does this cell do anything for what the picker is being used for?
@@ -633,7 +716,7 @@ pub(crate) fn jsm_insert_for_cell(
 pub(crate) fn cell_does_something(
     purpose: crate::gamepad_nav::PickerUse,
     pin: &str,
-    names: &std::collections::HashMap<String, String>,
+    vocab: &JsmVocab,
 ) -> bool {
     use crate::gamepad_nav::PickerUse;
     match purpose {
@@ -641,6 +724,54 @@ pub(crate) fn cell_does_something(
         // `false` for the caps latch: whether a key types something doesn't
         // depend on which of its two characters it would give.
         PickerUse::Text => crate::kbm_picker::cell_typed(pin, false).is_some(),
-        PickerUse::JsmName => jsm_insert_for_cell(pin, names).is_some(),
+        PickerUse::JsmName => vocab.insert_for(pin).is_some(),
+    }
+}
+
+#[cfg(test)]
+mod vocab_tests {
+    use super::{fi_insert, JsmVocab};
+    use crate::gamepad_nav::JsmSlot;
+
+    /// One of our own targets is something a mapping ENDS at, so it belongs
+    /// right of the `=` and nowhere else — a line can't START with a macro port.
+    #[test]
+    fn one_of_our_targets_is_a_value_and_not_a_name() {
+        assert_eq!(fi_insert(JsmSlot::Value, "Reload").as_deref(), Some("@Reload"));
+        assert_eq!(
+            fi_insert(JsmSlot::Value, "Reload sequence").as_deref(),
+            Some("@\"Reload sequence\""),
+            "and it is written the way the parser reads it back"
+        );
+        assert_eq!(fi_insert(JsmSlot::Name, "Reload"), None);
+        assert_eq!(fi_insert(JsmSlot::Neither, "Reload"), None);
+    }
+
+    /// Which side of the line the pick lands on decides what the board's keys
+    /// stand for. JSM keeps the two vocabularies apart and so must this.
+    #[test]
+    fn a_cell_means_a_different_name_on_each_side_of_the_line() {
+        let name = JsmVocab::of(JsmSlot::Name);
+        let value = JsmVocab::of(JsmSlot::Value);
+
+        // A pad button: the name JSM reads inputs as, or the one a virtual pad
+        // reports.
+        assert_eq!(name.insert_for("btn_south").as_deref(), Some("S"));
+        assert_eq!(value.insert_for("btn_south").as_deref(), Some("X_A"));
+        assert_eq!(name.insert_for("left_trigger").as_deref(), Some("ZL"));
+        assert_eq!(value.insert_for("left_trigger").as_deref(), Some("X_LT"));
+
+        // A key or a mouse button belongs only on the right: nothing on a
+        // keyboard can START a JSM line.
+        assert_eq!(value.insert_for("key_space").as_deref(), Some("SPACE"));
+        assert_eq!(name.insert_for("key_space"), None);
+        assert_eq!(value.insert_for("mouse_left").as_deref(), Some("LMOUSE"));
+        assert_eq!(name.insert_for("mouse_left"), None);
+
+        // A setting's value takes a number, so the board has nothing for it.
+        let neither = JsmVocab::of(JsmSlot::Neither);
+        for pin in ["btn_south", "key_space", "mouse_left", "left_trigger"] {
+            assert_eq!(neither.insert_for(pin), None, "{pin}");
+        }
     }
 }

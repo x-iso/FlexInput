@@ -171,6 +171,44 @@ pub fn fi_tag(name: &str) -> String {
     }
 }
 
+/// The name JSM reads each of our pins as an INPUT — the left of a line.
+///
+/// A different vocabulary from the outputs, and JSM is right to keep them
+/// apart: `S` is the button you press, `X_A` is the button a virtual pad
+/// reports. The same piece of plastic, but one is where a mapping starts and the
+/// other is where it ends, and neither spelling works in the other's place.
+///
+/// Derived from `Btn::source` so a button added to the vocabulary turns up here
+/// without being listed twice. Where two buttons read one pin — `ZL` is the pull,
+/// `ZLF` the full pull — the shorter name wins: the soft pull is what a line
+/// means when it says the trigger.
+pub fn input_names_by_pin() -> std::collections::HashMap<String, String> {
+    use super::names::BtnSource as S;
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for b in Btn::ALL {
+        let name = b.name();
+        let pins: Vec<&str> = match b.source() {
+            S::Pin(p) => vec![p],
+            // Both spellings of a trigger read the same line.
+            S::Trigger { analog, digital } => vec![analog, digital],
+            S::TriggerFull { analog } => vec![analog],
+            // A stick direction, a lean or a touch is derived from axes rather
+            // than read off one pin, so no single key stands for it.
+            _ => continue,
+        };
+        for pin in pins {
+            let better = match out.get(pin) {
+                Some(had) => name.len() < had.len(),
+                None => true,
+            };
+            if better {
+                out.insert(pin.to_string(), name.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The JSM name for each of our bus pins a binding can write.
 ///
 /// Derived from the binding parser rather than kept as a second table: every
@@ -736,6 +774,46 @@ mod catalogue_tests {
         ] {
             assert!(at(prefer) < at(over), "{prefer} must be listed before {over}");
         }
+    }
+
+    /// The input vocabulary is the one JSM reads on the LEFT of a line, and it
+    /// is not the output one: `S` is the button you press, `X_A` is what a
+    /// virtual pad reports when you bind one to it.
+    #[test]
+    fn our_pins_carry_the_names_jsm_reads_them_as_inputs() {
+        let by_pin = input_names_by_pin();
+        let name = |p: &str| by_pin.get(p).map(String::as_str);
+        // The face diamond is named by compass point, as JSM names a Switch pad.
+        assert_eq!(name("btn_south"), Some("S"));
+        assert_eq!(name("btn_east"), Some("E"));
+        assert_eq!(name("btn_west"), Some("W"));
+        assert_eq!(name("btn_north"), Some("N"));
+        assert_eq!(name("btn_lb"), Some("L"));
+        assert_eq!(name("btn_rb"), Some("R"));
+        assert_eq!(name("btn_back"), Some("-"));
+        assert_eq!(name("btn_start"), Some("+"));
+        assert_eq!(name("btn_guide"), Some("HOME"));
+        assert_eq!(name("btn_ls"), Some("L3"));
+        assert_eq!(name("dpad_up"), Some("UP"));
+        // A trigger's soft pull, not its full pull: that is what a line means
+        // when it says the trigger, and ZLF is the longer name for the edge case.
+        assert_eq!(name("left_trigger"), Some("ZL"));
+        assert_eq!(name("right_trigger"), Some("ZR"));
+        // And the same name for the digital trigger some pads report instead of
+        // an axis — one JSM button, either way the pad spells it.
+        assert_eq!(name("btn_lt_dig"), Some("ZL"));
+        assert_eq!(name("btn_rt_dig"), Some("ZR"));
+
+        // Every input name here is one the parser reads back as that button.
+        for (pin, n) in &by_pin {
+            let btn = Btn::from_name(n)
+                .unwrap_or_else(|| panic!("`{n}` (for {pin}) isn't a button JSM knows"));
+            assert_eq!(&btn.name(), n);
+        }
+        // And the two vocabularies really are different where it matters.
+        let outputs = names_by_pin();
+        assert_eq!(outputs.get("btn_south").map(String::as_str), Some("X_A"));
+        assert_ne!(outputs.get("btn_south"), by_pin.get("btn_south"));
     }
 
     /// A key this module cannot send is offered greyed, with the reason, rather
