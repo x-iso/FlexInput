@@ -5401,20 +5401,48 @@ fn gyro_sens_under_a_ramp_flattens_it_and_the_editor_says_where() {
 /// both usable across the span people actually use and honest about the rest.
 #[test]
 fn a_value_outside_a_sliders_range_is_kept_until_the_slider_is_dragged() {
-    let text = "REAL_WORLD_CALIBRATION = 25.69\n";
+    // Well past the highest calibration anyone has published, which is still
+    // not a limit — a game whose own sensitivity scale is tiny needs a big one.
+    let text = "REAL_WORLD_CALIBRATION = 2500\n";
     let k = &super::knobs::knobs(text)[0];
-    assert_eq!(k.value, 25.69, "the config's value is read as written");
-    assert_eq!((k.lo, k.hi), (0.0, 10.0), "the range configs actually live in");
+    assert_eq!(k.value, 2500.0, "the config's value is read as written");
+    assert_eq!((k.lo, k.hi), (0.0, 1000.0), "the span real configs live in");
     assert_eq!(k.t(), 1.0, "the handle sits at the end rather than off the track");
     // The parser still takes it — a slider has no say in what is legal.
-    assert_eq!(compile(text).aim.real_world_calibration, 25.69);
+    assert_eq!(compile(text).aim.real_world_calibration, 2500.0);
     // Dragging anywhere lands in range.
     for t in [0.0, 0.5, 1.0] {
         let v = k.at(t);
-        assert!((0.0..=10.0).contains(&v), "at({t}) = {v}");
+        assert!((0.0..=1000.0).contains(&v), "at({t}) = {v}");
     }
     assert_eq!(compile(&super::knobs::set_knob(text, 0, k.at(0.5), false))
-        .aim.real_world_calibration, 5.0);
+        .aim.real_world_calibration, 500.0);
+}
+
+/// The calibration slider has to hold every number a real game asks for.
+///
+/// It absorbs each game's own sensitivity scale, so it spans three orders of
+/// magnitude: JSM's Desktop.txt ships 5.3333 for a 2D cursor, its 3D template
+/// starts from a first guess of 40, the README's worked example lands on 151.5,
+/// and GyroWiki puts Control near 300 at default sensitivity. An earlier cap of
+/// 10 put every 3D game off the end of the track.
+#[test]
+fn the_calibration_slider_holds_the_numbers_real_games_use() {
+    for (written, where_from) in [
+        (1.0, "a 2D game's first guess"),
+        (5.3333, "JSM's own Desktop.txt"),
+        (40.0, "the 3D template's first guess"),
+        (151.5, "the README's worked example"),
+        (300.0, "Control, on default sensitivity"),
+    ] {
+        let text = format!("REAL_WORLD_CALIBRATION = {written}\n");
+        let k = &super::knobs::knobs(&text)[0];
+        assert_eq!(k.value, written, "{where_from}");
+        assert!(
+            k.t() < 1.0,
+            "{where_from} ({written}) pegs the slider at its end"
+        );
+    }
 }
 
 /// The curve preview follows the curve the config chose, and its shape is the same

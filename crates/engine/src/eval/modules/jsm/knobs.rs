@@ -471,11 +471,19 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "GYRO_SMOOTH_TIME" => (0.0, 0.5, false),
         "GYRO_CUTOFF_SPEED" | "GYRO_CUTOFF_RECOVERY" => (0.0, 50.0, false),
         "TRACKBALL_DECAY" => (0.0, 10.0, false),
-        // A slider range, not a limit — the parser takes any positive number, and
-        // a config that writes one outside this keeps it until the slider is
-        // dragged. Real configs live at the low end, so a range up to 400 gave
-        // the whole usable span about two pixels of travel.
-        "REAL_WORLD_CALIBRATION" => (0.0, 10.0, false),
+        // Counts per degree, and it spans three orders of magnitude because it
+        // absorbs each game's own sensitivity scale. JSM's own numbers: a 2D
+        // cursor game calibrates around 1 to 5.4 (its Desktop.txt ships
+        // 5.3333), a 3D camera game starts from a first guess of 40, the
+        // README's worked example lands on 151.5, and GyroWiki has Control at
+        // roughly 300 on default sensitivity. A thousand is about three times
+        // the highest real value anyone has written down, which leaves room
+        // for a game whose sensitivity scale is smaller still.
+        //
+        // A slider range, not a limit: the parser takes any positive number, a
+        // config that writes a bigger one keeps it, and the stick still walks
+        // it down from there.
+        "REAL_WORLD_CALIBRATION" => (0.0, 1000.0, false),
         "IN_GAME_SENS" => (0.1, 10.0, false),
         // Stick aiming and flick.
         "STICK_POWER" => (0.0, 4.0, false),
