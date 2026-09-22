@@ -81,6 +81,12 @@ pub(crate) fn show_module_menu(
 
 // ── Pin label color helpers ───────────────────────────────────────────────────
 
+/// Label tint for a device inlet the Auto-Map bus drives. Derived from the
+/// AutoMap type colour (`[255, 140, 40]`, the colour of the bus pin and its
+/// wire) lifted 25% toward white, because that colour was picked for a filled
+/// chip and reads muddy as small text on the node's dark body.
+pub(crate) const AUTOMAP_INLET_LABEL: Color32 = Color32::from_rgb(255, 169, 94);
+
 pub(crate) fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32> {
     match module_id {
         "display.vectorscope" | "display.oscilloscope" | "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => {

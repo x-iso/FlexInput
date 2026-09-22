@@ -11,6 +11,7 @@ pub fn show(
     descriptors: &[ModuleDescriptor],
     live_device_ids: &HashSet<String>,
     live_signals: &HashMap<(String, String), Signal>,
+    sink_bus: &HashMap<(String, String), Signal>,
     panic_shortcut: &crate::app::PanicShortcut,
     physical_devices: &[PhysicalDevice],
     device_rates: &HashMap<String, u32>,
@@ -19,7 +20,7 @@ pub fn show(
     ping_requests: &crate::easy::io_panel::PingRequests,
 ) -> Option<NodeId> {
     canvas.show(
-        descriptors, live_device_ids, live_signals,
+        descriptors, live_device_ids, live_signals, sink_bus,
         panic_shortcut, physical_devices, device_rates,
         param_defaults, ui, None, Some(ping_requests),
     )

@@ -95,6 +95,13 @@ pub struct FlexViewer<'a> {
     /// from the processing thread. Read by module bodies that need to observe live
     /// canonical pin values (e.g. Remapper's capture state machine).
     pub live_signals: &'a std::collections::HashMap<(String, String), Signal>,
+    /// What the engine routed to each `(device_id, sink pin)` on the last tick —
+    /// direct wires, Auto-Map and the feedback channel alike. Keyed the same way
+    /// as `live_signals` but a SEPARATE map: a virtual pad's sink pins share pin
+    /// names with the source pins it publishes as a device, so the two would
+    /// collide if merged. Read by device nodes to colour and glow their inlets
+    /// (see `device_inlet_drive`).
+    pub sink_bus: &'a std::collections::HashMap<(String, String), Signal>,
     /// Per-device measured polling rate (device_id → Hz). Populated by the
     /// device-io thread.
     pub device_rates: &'a std::collections::HashMap<String, u32>,
@@ -921,7 +928,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             let text = egui::RichText::new(&desc.name).small();
             let text = match channel_label_color(&node.module_id, pin.id.input) {
                 Some(col) => text.color(col),
-                None      => text,
+                // A device inlet says what drives it: the Auto-Map bus's own
+                // orange when the bus covers it, the brighter plain text colour
+                // when you have wired it by hand (a wire beats the bus in the
+                // engine, so the orange drops the moment one lands), and the
+                // default dim label when nothing reaches it at all.
+                None => match device_inlet_drive(
+                    self.sink_bus, node, pin.id.input, !pin.remotes.is_empty())
+                {
+                    InletDrive::AutoMap => text.color(AUTOMAP_INLET_LABEL),
+                    InletDrive::Wired   => text.color(ui.visuals().widgets.inactive.fg_stroke.color),
+                    InletDrive::Idle    => text,
+                },
             };
             ui.label(text);
         }
@@ -950,7 +968,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         } else {
             None
         };
-        let glow = input_pin_glow(self.live_signals, snarl, node, pin.id.node, pin.id.input, self.automap_parent.as_ref())
+        let glow = input_pin_glow(self.live_signals, self.sink_bus, snarl, node, pin.id.node, pin.id.input, self.automap_parent.as_ref())
             .map(|(col, t)| (col, pin_glow_smoothed(ui.ctx(), pin.id.node, pin.id.input, true, t)));
         // Half-shape (flat right edge against the node) for every column
         // pin and every header-relocated AutoMap pin. Half-circle for scalar

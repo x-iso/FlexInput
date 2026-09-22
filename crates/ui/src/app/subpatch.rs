@@ -482,6 +482,7 @@ pub(crate) fn show_subpatch_editors(
                         match &guard { Ok(r) => r, Err(_) => &empty };
                     let _ = inner_canvas.show(
                         descriptors, live_device_ids, &app.last_signals,
+                        &app.last_sink_bus,
                         &panic_shortcut, devices, device_rates_ref,
                         device_defaults_inner, ui, automap_parent, None,
                     );

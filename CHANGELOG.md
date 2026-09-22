@@ -5,6 +5,18 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Device inlets show what is driving them.** On an output device node, an
+  input pin fed by the Auto-Map bus now labels itself in the bus's orange, and
+  one you have wired by hand brightens to plain white-grey — so a glance at the
+  node says which pins the bus covers, which you took over with a wire, and
+  which nothing drives. A hand wire always wins, matching the engine (a direct
+  wire overrides Auto-Map for that pin), so the orange drops the moment you
+  connect one. Auto-mapped inlets also light up under signal now, the same as
+  wired ones: previously only a wire could make an inlet glow, so an entire pad
+  driven off the bus sat visually dead while it was routing everything.
+
 ### Fixed
 
 - **Sub-patch presets now keep their overlay decorations.** Saving a sub-patch

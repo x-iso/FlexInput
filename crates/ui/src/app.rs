@@ -277,6 +277,12 @@ pub struct FlexInputApp {
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     /// Latest raw device signals (written by I/O thread at the polling rate); used for canvas display.
     last_signals: HashMap<(String, String), Signal>,
+    /// Per-frame snapshot of [`Self::sink_bus`] — what the engine actually
+    /// routed to each `(device_id, sink pin)` on the last tick, direct wires and
+    /// Auto-Map alike. The canvas reads it to tell a device inlet the bus drives
+    /// apart from one nothing drives, and to glow the former (an auto-mapped
+    /// inlet has no wire to walk upstream, so it is the only value available).
+    last_sink_bus: HashMap<(String, String), Signal>,
     eval_cache: HashMap<(NodeId, usize), Option<Signal>>,
     logo_texture: Option<egui::TextureHandle>,
     /// Transient HidHide control handle — opened only while the legacy HidHide
@@ -1063,6 +1069,7 @@ impl FlexInputApp {
             devices: vec![],
             shared_devices,
             last_signals: HashMap::new(),
+            last_sink_bus: HashMap::new(),
             eval_cache: HashMap::new(),
             logo_texture,
             hidhide,
@@ -1449,6 +1456,11 @@ impl eframe::App for FlexInputApp {
         // Merge live LED/lightbar feedback into the signal map so displays can
         // relay it (the 3D viewer's LED strip). These are sink-bound OUTPUT
         // pins ("lightbar_*"), so they never collide with input pin names.
+        //
+        // The rest of the bus can't be merged — a virtual pad's sink pins share
+        // their names with the source pins it publishes as a device — so the
+        // canvas gets its own snapshot instead. Small map (one entry per driven
+        // sink pin on the active tab), cloned once per frame.
         {
             let bus = self.sink_bus.read().unwrap();
             for ((dev, pin), sig) in bus.iter() {
@@ -1456,6 +1468,7 @@ impl eframe::App for FlexInputApp {
                     self.last_signals.insert((dev.clone(), pin.clone()), *sig);
                 }
             }
+            self.last_sink_bus.clone_from(&bus);
         }
         // Refresh device list from I/O thread. Both gilrs and MIDI device
         // listings are populated there, so the UI never contends with the
@@ -2892,6 +2905,7 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("canvas_show");
             calibrate_request = crate::panels::canvas::show(
                 canvas, &self.descriptors, &live_device_ids, &self.last_signals,
+                &self.last_sink_bus,
                 &self.panic_shortcut, devices, &device_rates_snap,
                 device_defaults, ui, &ping_requests_for_panel,
             );

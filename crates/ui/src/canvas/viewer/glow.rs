@@ -424,11 +424,94 @@ pub(crate) fn output_pin_glow(
     Some(glow_of(sig))
 }
 
+// ── device inlets: what is driving this pin ───────────────────────────────────
+
+/// What drives one input pin of a device node (`device.sink`, or a
+/// `device.source`'s feedback inlets) this frame.
+///
+/// The engine gives a DIRECT WIRE priority over the Auto-Map bus for the same
+/// sink pin (`directly_wired` in `eval_graph_tick`), so the two are mutually
+/// exclusive and this mirrors that order rather than reporting both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InletDrive {
+    /// At least one wire lands on the pin — the user took it over by hand.
+    Wired,
+    /// No wire, but the engine routed a value to this device pin anyway: the
+    /// Auto-Map bus (or, on a physical pad's haptic inlets, the feedback
+    /// channel that flows backward along an Auto-Map wire).
+    AutoMap,
+    /// Nothing reaches this pin.
+    Idle,
+}
+
+/// The `(device_id, pin_id)` key a device node's input pin occupies on the sink
+/// bus, or `None` for a node that isn't a device or a pin with no routable id
+/// (the Auto-Map bus port itself, an unnamed slot).
+///
+/// `input_pin_ids` is index-parallel with `node.inputs` everywhere it is built
+/// or edited (device add/replace, the keymouse Learn-key rows, MIDI CC pins).
+fn sink_bus_key(node: &NodeData, in_idx: usize) -> Option<(String, String)> {
+    if !matches!(node.module_id.as_str(), "device.sink" | "device.source") {
+        return None;
+    }
+    if node.inputs.get(in_idx)?.signal_type == SignalType::AutoMap {
+        return None;
+    }
+    let dev_id = node.params.get("device_id")?.as_str()?;
+    let pin_id = node.params.get("input_pin_ids")?
+        .as_array()?
+        .get(in_idx)?
+        .as_str()?;
+    if pin_id.is_empty() { return None; }
+    Some((dev_id.to_string(), pin_id.to_string()))
+}
+
+/// The value the engine routed to a device node's input pin, off the sink bus.
+/// `None` when nothing drove it this tick — which is also how a pin the
+/// Auto-Map mapping doesn't cover reads.
+pub(crate) fn sink_bus_signal<'s>(
+    sink_bus: &'s std::collections::HashMap<(String, String), Signal>,
+    node: &NodeData,
+    in_idx: usize,
+) -> Option<&'s Signal> {
+    sink_bus.get(&sink_bus_key(node, in_idx)?)
+}
+
+/// Classify a device node's input pin for the label tint in `show_input`.
+///
+/// `has_wire` comes from the `InPin` snarl already handed the caller, so this
+/// costs no second `Snarl::in_pin` (which allocates its remotes vector) on top
+/// of the one `input_pin_glow` makes for the same pin.
+///
+/// Non-device nodes always report `Idle` — the tint is a device-node cue, and
+/// every other module's inlets keep the plain label they have always had.
+pub(crate) fn device_inlet_drive(
+    sink_bus: &std::collections::HashMap<(String, String), Signal>,
+    node: &NodeData,
+    in_idx: usize,
+    has_wire: bool,
+) -> InletDrive {
+    // Build the key once — `show_input` runs this for every pin of every
+    // visible device node, every frame, and the key owns two Strings.
+    let Some(key) = sink_bus_key(node, in_idx) else {
+        return InletDrive::Idle;
+    };
+    if has_wire {
+        return InletDrive::Wired;
+    }
+    if sink_bus.contains_key(&key) {
+        InletDrive::AutoMap
+    } else {
+        InletDrive::Idle
+    }
+}
+
 /// Look up live activity for any input pin by walking back to the upstream
 /// output's value. Falls back to `NodeExtra.last_signals` when the wire
 /// source can't be resolved (rare; legacy nodes).
 pub(crate) fn input_pin_glow(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
+    sink_bus: &std::collections::HashMap<(String, String), Signal>,
     snarl: &Snarl<NodeData>,
     node: &NodeData,
     node_id: NodeId,
@@ -455,7 +538,14 @@ pub(crate) fn input_pin_glow(
     // signal's type happened to be.
     let pin_id = InPinId { node: node_id, input: in_idx };
     let pin = snarl.in_pin(pin_id);
-    let src = pin.remotes.first().copied()?;
+    let Some(src) = pin.remotes.first().copied() else {
+        // Unwired — but a DEVICE inlet can still be driven, by the Auto-Map bus
+        // or (on a pad's haptic inlets) the feedback channel. There is no wire
+        // to walk for those, so read what the engine actually routed to the pin
+        // and glow it like any other value. Non-device nodes yield `None` here
+        // and keep the "nothing wired, nothing to glow" behaviour.
+        return sink_bus_signal(sink_bus, node, in_idx).map(glow_of);
+    };
     if let Some(glow) = output_pin_glow(live_signals, snarl, src.node, src.output, automap_parent) {
         return Some(glow);
     }
@@ -495,4 +585,122 @@ pub(crate) fn automap_label_abs_y_key(node: egui_snarl::NodeId) -> egui::Id {
 /// by `show_input` this frame, stashed for next-frame delta calculation.
 pub(crate) fn automap_pin_row_y_key(node: egui_snarl::NodeId) -> egui::Id {
     egui::Id::new(("device_sink_automap_pin_row_y", node.0))
+}
+
+#[cfg(test)]
+mod inlet_drive_tests {
+    use super::*;
+    use flexinput_core::PinDescriptor;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    const DEV: &str = "virtual.xinput:0";
+
+    /// A virtual-pad sink node: an A button, a left trigger, and the bus port,
+    /// with `input_pin_ids` index-parallel to `inputs` the way every builder
+    /// and editor in `canvas::mod` keeps it.
+    fn sink_node() -> NodeData {
+        let mut params = HashMap::new();
+        params.insert("device_id".to_string(), json!(DEV));
+        params.insert(
+            "input_pin_ids".to_string(),
+            json!(["btn_south", "left_trigger", "automap_in"]),
+        );
+        NodeData {
+            module_id: "device.sink".to_string(),
+            display_name: "Virtual Xbox".to_string(),
+            category: "Devices".to_string(),
+            inputs: vec![
+                PinDescriptor::new("A", SignalType::Bool),
+                PinDescriptor::new("L.Trigger (LT)", SignalType::Float),
+                PinDescriptor::new("Auto-Map", SignalType::AutoMap),
+            ],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn bus(pins: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
+        pins.iter()
+            .map(|(p, s)| ((DEV.to_string(), p.to_string()), *s))
+            .collect()
+    }
+
+    #[test]
+    fn bus_driven_inlet_reports_automap() {
+        let node = sink_node();
+        let b = bus(&[("btn_south", Signal::Bool(false))]);
+        assert_eq!(device_inlet_drive(&b, &node, 0, false), InletDrive::AutoMap);
+        // The bus doesn't cover the trigger → nothing drives it.
+        assert_eq!(device_inlet_drive(&b, &node, 1, false), InletDrive::Idle);
+    }
+
+    #[test]
+    fn a_direct_wire_beats_the_bus() {
+        // Mirrors the engine: `directly_wired` pins skip the AutoMap pass, so a
+        // wired pin must never read as bus-driven even while the bus still
+        // carries a value for it.
+        let node = sink_node();
+        let b = bus(&[("btn_south", Signal::Bool(true))]);
+        assert_eq!(device_inlet_drive(&b, &node, 0, true), InletDrive::Wired);
+    }
+
+    #[test]
+    fn the_bus_port_itself_is_never_tinted() {
+        let node = sink_node();
+        // `automap_in` is in `input_pin_ids`, so only the pin's TYPE keeps the
+        // bus port out of the tinting — and it must, wired or not.
+        let b = bus(&[("automap_in", Signal::Bool(true))]);
+        assert_eq!(device_inlet_drive(&b, &node, 2, false), InletDrive::Idle);
+        assert_eq!(device_inlet_drive(&b, &node, 2, true), InletDrive::Idle);
+    }
+
+    #[test]
+    fn non_device_nodes_keep_their_plain_labels() {
+        let node = NodeData {
+            module_id: "module.add".to_string(),
+            display_name: "Add".to_string(),
+            category: "Math".to_string(),
+            inputs: vec![PinDescriptor::new("a", SignalType::Float)],
+            outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let b = bus(&[("a", Signal::Float(1.0))]);
+        assert_eq!(device_inlet_drive(&b, &node, 0, true), InletDrive::Idle);
+        assert_eq!(device_inlet_drive(&b, &node, 0, false), InletDrive::Idle);
+    }
+
+    #[test]
+    fn a_pads_haptic_inlet_reads_the_feedback_channel() {
+        // The AutoMap feedback channel writes a PHYSICAL pad's haptic pins into
+        // the same bus, so a device.source's inlets classify the same way.
+        let mut params = HashMap::new();
+        params.insert("device_id".to_string(), json!("gilrs:0"));
+        params.insert("input_pin_ids".to_string(), json!(["rumble_strong"]));
+        let node = NodeData {
+            module_id: "device.source".to_string(),
+            display_name: "Switch Pro".to_string(),
+            category: "Devices".to_string(),
+            inputs: vec![PinDescriptor::new("Rumble (strong)", SignalType::Float)],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let b: HashMap<(String, String), Signal> = [(
+            ("gilrs:0".to_string(), "rumble_strong".to_string()),
+            Signal::Float(0.5),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(device_inlet_drive(&b, &node, 0, false), InletDrive::AutoMap);
+        assert_eq!(
+            sink_bus_signal(&b, &node, 0).map(signal_intensity),
+            Some(0.5),
+        );
+    }
 }
