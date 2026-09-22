@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-09-22
+
 ### Added
 
 - **Device inlets show what is driving them.** On an output device node, an

@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "eframe",
  "env_logger",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-btle"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "glam",
  "log",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-core"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "glam",
  "serde",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-devices"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "flexinput-btle",
  "flexinput-core",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-engine"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "arc-swap",
  "flexinput-core",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-hidmaestro"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "flexinput-core",
  "serde",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-joycon2"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "aes",
  "btleplug",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-modules"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "flexinput-core",
  "glam",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-net"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "bytes",
  "chacha20poly1305",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-ui"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "bytemuck",
  "eframe",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-virtual"
-version = "0.14.0"
+version = "0.14.5"
 dependencies = [
  "enigo",
  "flexinput-core",
