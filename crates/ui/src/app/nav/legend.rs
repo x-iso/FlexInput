@@ -105,6 +105,18 @@ impl FlexInputApp {
                     .map(|o| matches!(self.nav_selected_kind(o),
                         NavWidgetKind::MultiField))
                     .unwrap_or(false);
+                if jsm && self.gamepad_nav.jsm_list_open {
+                    // A panel drawn over the editor, so the bar is the panel's:
+                    // the editor's own buttons all mean something else until it
+                    // closes, and showing them would be a legend for a screen
+                    // you cannot see.
+                    return vec![
+                        (hint_vert(), "Pick"),
+                        (vec!["left_trigger", "right_trigger"], "Group"),
+                        (vec!["btn_south"], "Insert"),
+                        (vec!["btn_east"], "Close"),
+                    ];
+                }
                 if jsm {
                     // Its own axes: the faders are a column, so up/down walks
                     // them and left/right adjusts — the opposite of every other
@@ -131,9 +143,9 @@ impl FlexInputApp {
                             // South is the editor's modifier, so its four verbs
                             // share a row each rather than a union nobody can
                             // read. The axis glyphs keep each to two icons.
+                            hints.push((vec!["btn_west", "btn_north"], "List: fits / keys"));
                             hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
-                            hints.push((vec!["btn_south", "dpad_horizontal"], "Hold: slot"));
-                            hints.push((vec!["btn_south", "dpad_vertical"], "Hold: line"));
+                            hints.push((vec!["btn_south", "dpad"], "Hold: slot / line"));
                             hints.push((
                                 vec!["btn_south", "left_stick_vertical"],
                                 "Hold: number",

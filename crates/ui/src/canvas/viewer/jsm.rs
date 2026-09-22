@@ -619,6 +619,7 @@ fn jsm_rows(
                 .on_hover_text(
                     "LB / RB switch between the config text and the faders.
                      LT / RT change config tab.
+                     West lists what can stand where the cursor is; North lists every key,                      mouse button and pad output. South inserts, LT / RT jump by heading.
                      Hold South and tap West to delete what the cursor is on, left / right                      to open an empty slot beside it, or up / down to open a new line.
                      Hold South and push the left stick up or down to walk a number,                      one push at a time.",
                 );
@@ -664,7 +665,8 @@ fn jsm_rows(
     // The command list is drawn under the editor too, so — pinned — the editor
     // has to give up the room for it or the list opens below the bottom edge and
     // you can't see what you asked for.
-    let list_open = super::jsm_widgets::command_list_state(ui, node_id).open;
+    let list_st = super::jsm_widgets::command_list_state(ui.ctx(), node_id);
+    let list_open = list_st.open;
     let list_want = if list_open { super::jsm_widgets::LIST_H } else { 0.0 };
     let knobs_on = owns_strip && side == Side::Bottom;
     let strip_want = if knobs_on {
@@ -818,10 +820,10 @@ fn jsm_rows(
     // module tells you what it knows, so it goes where the typing happens.
     resp.context_menu(|ui| {
         if ui.button("Commands…").clicked() {
-            let mut st = super::jsm_widgets::command_list_state(ui, node_id);
+            let mut st = super::jsm_widgets::command_list_state(ui.ctx(), node_id);
             st.open = true;
             st.index = 0;
-            super::jsm_widgets::set_command_list_state(ui, node_id, st);
+            super::jsm_widgets::set_command_list_state(ui.ctx(), node_id, st);
             ui.close();
         }
     });
@@ -831,20 +833,54 @@ fn jsm_rows(
     register_exposable_element(ui, node_id, "editor", editor_rect);
 
     // ── the command list, when it was asked for ──────────────────────────────
-    if let Some(pick) = super::jsm_widgets::command_list(
+    //
+    // What it offers depends on where it will land. A pad has a cursor, so the
+    // list offers what can legally stand THERE; a mouse has none, so its pick
+    // goes on a line of its own, where anything can.
+    let list_kinds: &[flexinput_engine::eval::JsmKind] = if list_st.values {
+        // North asked for the keys, wherever the cursor happens to be.
+        &[flexinput_engine::eval::JsmKind::Binding]
+    } else {
+        match nav_cur {
+            Some(c) => flexinput_engine::eval::jsm_kinds_at(&tabs[active].text, c),
+            None => &[
+                flexinput_engine::eval::JsmKind::Setting,
+                flexinput_engine::eval::JsmKind::Command,
+                flexinput_engine::eval::JsmKind::Trigger,
+            ],
+        }
+    };
+    if let Some((name, kind)) = super::jsm_widgets::command_list(
         ui, node_id, size.x, &pins_this_pad_reports(snarl, node_id, live, parent),
         (!resizable).then_some(list_want),
+        list_kinds,
     ) {
-        // Appended on a line of its own. Inserting at the caret would need the
-        // TextEdit's cursor, which a `context_menu` click has already taken the
-        // focus away from — a new line is predictable, and the editor is right
-        // there to move it.
-        let text = &mut tabs[active].text;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+        match nav_cur {
+            // The pad picked it, so it lands under the pad's cursor — and the
+            // cursor moves on to whatever the line still needs, which for a
+            // setting is the slot its number goes in. The nav driver owns that
+            // cursor, so the move goes back to it as a request rather than
+            // being written here behind its back.
+            Some(c) => {
+                let (edited, at) =
+                    flexinput_engine::eval::jsm_insert_pick(&tabs[active].text, c, &name, kind);
+                tabs[active].text = edited;
+                super::scale::publish_jsm_cursor_request(ui.ctx(), node_id, at);
+            }
+            // Appended on a line of its own. Inserting at the caret would need
+            // the TextEdit's cursor, which a `context_menu` click has already
+            // taken the focus away from — a new line is predictable, and the
+            // editor is right there to move it.
+            None => {
+                let line = super::jsm_widgets::insertion_for(&name, kind);
+                let text = &mut tabs[active].text;
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&line);
+                text.push('\n');
+            }
         }
-        text.push_str(&pick);
-        text.push('\n');
         changed = true;
     }
 

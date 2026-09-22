@@ -4001,9 +4001,13 @@ impl FlexInputApp {
                 // does not also back out — East still does, and East is the
                 // button people reach for anyway.
                 let lt_exits = lt_rising && !self.nav_jsm_editor_selected();
+                // A JSM command list drawn over the editor takes East for
+                // itself: while it is up, "back" means close the list, not
+                // leave the widget you opened it from.
+                let list_up = self.nav_jsm_list_open(ctx);
                 // East / LT / back → exit to widget level, committing the edit
                 // as one undo entry if anything actually changed.
-                if nav.is_rising("btn_east") || lt_exits {
+                if (nav.is_rising("btn_east") && !list_up) || lt_exits {
                     self.gamepad_nav.edit_level = EditLevel::Widget;
                     self.nav_set_dropdown_popup(ctx, outer_id, false);
                     if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {

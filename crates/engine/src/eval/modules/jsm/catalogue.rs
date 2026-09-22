@@ -12,6 +12,8 @@
 //! direction is the one that rots on its own, so it is checked against the
 //! parser's own source rather than a second hand-written list.
 
+use super::cursor::{self, Cursor, TokenKind};
+use super::names::{out_from_name, Out};
 use super::help::help_for;
 use super::names::Btn;
 use super::parse::{button_reaches, command_does_nothing, setting_support, Support};
@@ -25,6 +27,10 @@ pub enum Kind {
     Command,
     /// A button, left of the `=`.
     Trigger,
+    /// A value, right of the `=`: a key, a mouse button, a pad output, or one
+    /// of JSM's own actions. A separate vocabulary from the names, because the
+    /// two are never legal in the same place.
+    Binding,
 }
 
 /// What the module does with a name today, for the list to show honestly.
@@ -108,6 +114,109 @@ pub(crate) const COMMANDS: &[&str] = &[
     "HELP", "README", "QUIT",
 ];
 
+/// Every binding name JSM takes on the right of an `=`, apart from the families
+/// a loop can generate (letters, digits, function keys, punctuation).
+///
+/// Kept honest the same way the settings are: a test reads `names.rs` and
+/// requires every name the binding parser matches to be offered here.
+pub(crate) const BINDINGS: &[&str] = &[
+    // Named keys.
+    "ENTER", "ESC", "SPACE", "BACKSPACE", "TAB", "CAPS_LOCK",
+    "PAGEUP", "PAGEDOWN", "HOME", "END", "INSERT", "DELETE", "SCREENSHOT",
+    "UP", "DOWN", "LEFT", "RIGHT",
+    "SHIFT", "CONTROL", "ALT", "LSHIFT", "RSHIFT", "LCONTROL", "RCONTROL",
+    "LALT", "RALT", "LWINDOWS", "RWINDOWS",
+    "SCROLL_LOCK", "NUM_LOCK", "PAUSE", "CONTEXT",
+    "ADD", "SUBTRACT", "DIVIDE", "MULTIPLY", "DECIMAL",
+    "VOLUME_UP", "VOLUME_DOWN", "MUTE",
+    "NEXT_TRACK", "PREV_TRACK", "STOP_TRACK", "PLAY_PAUSE",
+    // Mouse.
+    "LMOUSE", "RMOUSE", "MMOUSE", "BMOUSE", "FMOUSE", "SCROLLUP", "SCROLLDOWN",
+    // Gyro control and calibration, which overlap whatever else the button does.
+    "GYRO_ON", "GYRO_OFF", "GYRO_INVERT", "GYRO_INV_X", "GYRO_INV_Y",
+    "GYRO_TRACKBALL", "GYRO_TRACK_X", "GYRO_TRACK_Y", "CALIBRATE",
+    // Rumble.
+    "SMALL_RUMBLE", "BIG_RUMBLE",
+    // Binding a button to nothing at all, which is how you take one away.
+    "NONE",
+    // The virtual pad, under both of JSM's spellings.
+    "X_A", "X_B", "X_X", "X_Y", "X_LB", "X_RB", "X_LS", "X_RS",
+    "X_BACK", "X_START", "X_GUIDE",
+    "X_UP", "X_DOWN", "X_LEFT", "X_RIGHT", "X_LT", "X_RT",
+    "PS_CROSS", "PS_CIRCLE", "PS_SQUARE", "PS_TRIANGLE", "PS_L1", "PS_R1",
+    "PS_L3", "PS_R3", "PS_SHARE", "PS_OPTIONS", "PS_HOME", "PS_PAD_CLICK",
+    "PS_UP", "PS_DOWN", "PS_LEFT", "PS_RIGHT", "PS_L2", "PS_R2",
+];
+
+/// The punctuation keys, whose JSM names are the characters themselves.
+pub(crate) const PUNCTUATION: &[&str] = &[
+    ";", "'", ",", ".", "/", "\\", "[", "]", "+", "-", "`",
+];
+
+/// Which heading a binding belongs under. Grouped finely, because "Keyboard" as
+/// one heading is a hundred rows, and the triggers jump by heading.
+fn binding_group(name: &str) -> &'static str {
+    let one = name.chars().count() == 1;
+    if name.starts_with("X_") || name.starts_with("PS_") {
+        "Virtual pad"
+    } else if matches!(
+        name,
+        "LMOUSE" | "RMOUSE" | "MMOUSE" | "BMOUSE" | "FMOUSE" | "SCROLLUP" | "SCROLLDOWN"
+    ) {
+        "Mouse"
+    } else if name.starts_with("GYRO_") || name == "CALIBRATE" {
+        "Gyro actions"
+    } else if name.ends_with("RUMBLE") {
+        "Rumble"
+    } else if name == "NONE" {
+        "Nothing"
+    } else if one && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        "Letters & digits"
+    } else if one {
+        "Punctuation"
+    } else if name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+        "Function keys"
+    } else {
+        "Keys"
+    }
+}
+
+/// Every value a binding can take, for the right of an `=`.
+///
+/// The state comes from the binding parser itself, so a key our keyboard sink
+/// cannot send is offered greyed with JSM's own reason rather than looking like
+/// it would work.
+pub fn bindings() -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::with_capacity(BINDINGS.len() + 70);
+    let mut push = |name: String| {
+        let state = match out_from_name(&name) {
+            Some(o) => match o.out {
+                Out::Unsupported { why, .. } => State::Ignored(why),
+                _ => State::Live,
+            },
+            // Unreachable while the drift test passes. Offering a name the
+            // parser doesn't know is the one thing this list must never do.
+            None => State::Ignored("this module doesn't know this name"),
+        };
+        let group = binding_group(&name);
+        out.push(Item { help: help_for(&name), name, kind: Kind::Binding, group, state });
+    };
+    for c in ('A'..='Z').chain('0'..='9') {
+        push(c.to_string());
+    }
+    for p in PUNCTUATION {
+        push((*p).to_string());
+    }
+    for n in 1..=20 {
+        push(format!("F{n}"));
+    }
+    for name in BINDINGS {
+        push((*name).to_string());
+    }
+    out.sort_by_key(|i| group_order(i.group));
+    out
+}
+
 /// Which group a setting's support puts it in.
 fn group_of(s: &Support) -> &'static str {
     match s {
@@ -180,6 +289,71 @@ pub fn catalogue(pad_pins: &std::collections::HashSet<String>) -> Vec<Item> {
     out
 }
 
+/// What kind of name can legally stand where the cursor is.
+///
+/// JSM's grammar is positional: left of the `=` is a setting's name or a
+/// button, a line on its own is a command, and right of the `=` is a VALUE — a
+/// number, a key, or one of a setting's own words. None of those are names, so
+/// there the list has nothing honest to offer and says where values do come
+/// from, rather than offering `GYRO_SENS` as something to set `GYRO_SENS` to.
+pub fn kinds_at(text: &str, cur: Cursor) -> &'static [Kind] {
+    const NAMES: &[Kind] = &[Kind::Setting, Kind::Command, Kind::Trigger];
+    const VALUES: &[Kind] = &[Kind::Binding];
+    match cursor::selection(text, cur) {
+        // A blank line is where a line begins, so anything can start there.
+        None => NAMES,
+        Some((t, _, _)) if t.kind == TokenKind::Name => NAMES,
+        // Right of the `=`, what is legal depends on what is left of it. A
+        // button takes a key, a mouse button, a pad output or one of JSM's own
+        // actions; a setting takes a number or one of its own words, and those
+        // come from the stick rather than from a list of names.
+        Some((t, _, _)) if t.kind == TokenKind::Value && line_binds_a_button(text, cur.line) => {
+            VALUES
+        }
+        Some(_) => &[],
+    }
+}
+
+/// Is the name on this line a BUTTON rather than a setting?
+///
+/// A modeshift puts a chord in front of it (`ZL,S = SPACE` binds S while ZL is
+/// held), so it is the last piece of the name that says what is being bound.
+fn line_binds_a_button(text: &str, line: usize) -> bool {
+    let (ls, le) = cursor::line_span(text, line);
+    let l = &text[ls..le];
+    let Some(tok) = cursor::tokenize(l).into_iter().find(|t| t.kind == TokenKind::Name) else {
+        return false;
+    };
+    let name = tok.text(l);
+    let last = name.rsplit([',', '+']).next().unwrap_or(name).to_ascii_uppercase();
+    Btn::ALL.iter().any(|b| b.name() == last)
+}
+
+/// What picking `name` from the list puts under the cursor, and where the
+/// cursor lands.
+///
+/// Replacing is what the cursor does, so a pick lands on the token you are
+/// standing on rather than at the end of the file — the pad HAS a cursor, and
+/// ignoring it would make the list the one part of the editor that doesn't.
+///
+/// The `=` and an empty slot come with it when the line hasn't got them yet: a
+/// setting's name on its own is an error, and the next thing you want after
+/// choosing a setting is somewhere to put its number. The cursor ends up on
+/// that slot, so choosing a setting and setting it is two gestures, not five.
+pub fn insert_pick(text: &str, cur: Cursor, name: &str, kind: Kind) -> (String, Cursor) {
+    let has_equals =
+        cursor::tokens_at(text, cur.line).iter().any(|t| t.kind == TokenKind::Equals);
+    // A command is a line on its own; giving it an `=` would make it an error.
+    let wants_value = matches!(kind, Kind::Setting | Kind::Trigger);
+    if !wants_value || has_equals {
+        return (cursor::replace(text, cur, name), cur);
+    }
+    (
+        cursor::replace(text, cur, &format!("{name} = {}", cursor::SLOT)),
+        Cursor { line: cur.line, token: cur.token + 2 },
+    )
+}
+
 /// Where a group sits in the list. Explicit rather than alphabetical: aiming is
 /// what most people open this list for, and "Ignored here" belongs at the bottom.
 fn group_order(group: &str) -> u8 {
@@ -194,7 +368,116 @@ fn group_order(group: &str) -> u8 {
         "Buttons" => 7,
         "Commands" => 8,
         "Not live yet" => 9,
-        _ => 10,
+        // The binding vocabulary, which is never mixed with the names above:
+        // what you reach for most on the right of an `=` comes first.
+        "Letters & digits" => 10,
+        "Keys" => 11,
+        "Mouse" => 12,
+        "Punctuation" => 13,
+        "Function keys" => 14,
+        "Gyro actions" => 15,
+        "Virtual pad" => 16,
+        "Rumble" => 17,
+        "Nothing" => 18,
+        _ => 19,
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+    use crate::eval::jsm_compile;
+
+    fn at(line: usize, token: usize) -> Cursor {
+        Cursor { line, token }
+    }
+
+    /// The list offers names where a name can go, and nothing where a value
+    /// goes — offering `GYRO_SENS` as something to set `GYRO_SENS` to would be
+    /// the list forgetting what it is for.
+    #[test]
+    fn the_list_offers_names_only_where_a_name_can_stand() {
+        let text = "GYRO_SENS = 2 # feel
+
+RESET_MAPPINGS
+";
+        assert_eq!(kinds_at(text, at(0, 0)).len(), 3, "the setting's name");
+        assert!(kinds_at(text, at(0, 1)).is_empty(), "the `=` itself");
+        assert!(kinds_at(text, at(0, 2)).is_empty(), "the value");
+        assert!(kinds_at(text, at(0, 3)).is_empty(), "a comment");
+        // A blank line is where a line begins, so anything can start there.
+        assert_eq!(kinds_at(text, at(1, 0)).len(), 3);
+        // A bare command sits in the name position too.
+        assert_eq!(kinds_at(text, at(2, 0)).len(), 3);
+    }
+
+    /// A pick lands on the cursor, and brings what the line still needs.
+    #[test]
+    fn picking_a_setting_leaves_a_line_that_says_what_is_missing() {
+        // On a blank line: the `=` and a slot come too, and the cursor ends up
+        // on the slot so the stick can fill it straight away.
+        let (out, cur) = insert_pick("A = B
+
+", at(1, 0), "GYRO_SENS", Kind::Setting);
+        assert_eq!(out, "A = B
+GYRO_SENS = ?
+");
+        assert_eq!(cur, at(1, 2));
+        assert_eq!(
+            cursor::selection(&out, cur).unwrap().0.kind,
+            TokenKind::Value,
+            "and the slot is a value, which is what the stick scrubs"
+        );
+        // Unfinished, and the config says so rather than looking complete.
+        let status = format!("{:?}", jsm_compile(&out, &[]).lines[1].status);
+        assert!(status.contains("Error"), "an empty slot is an error: {status}");
+
+        // A line that already has its `=` just gets the new name; the value it
+        // was set to is left alone.
+        let (out, cur) = insert_pick("GYRO_SENS = 2
+", at(0, 0), "MIN_GYRO_SENS", Kind::Setting);
+        assert_eq!(out, "MIN_GYRO_SENS = 2
+");
+        assert_eq!(cur, at(0, 0), "the cursor stays on the name it just changed");
+
+        // A button is the left side of a binding, so it wants the same.
+        let (out, _) = insert_pick("
+", at(0, 0), "ZL", Kind::Trigger);
+        assert_eq!(out, "ZL = ?
+");
+
+        // A command stands alone — an `=` would turn it into an error.
+        let (out, cur) = insert_pick("
+", at(0, 0), "RESET_MAPPINGS", Kind::Command);
+        assert_eq!(out, "RESET_MAPPINGS
+");
+        assert_eq!(cur, at(0, 0));
+        assert!(
+            !format!("{:?}", jsm_compile(&out, &[]).lines[0].status).contains("Error"),
+            "and it parses as it stands"
+        );
+    }
+
+    /// Everything the list can offer has to survive being picked: each kind
+    /// lands as a line the parser doesn't reject for a reason the pick caused.
+    #[test]
+    fn every_kind_in_the_catalogue_can_be_picked_onto_a_blank_line() {
+        for item in catalogue(&std::collections::HashSet::new()) {
+            let (out, cur) = insert_pick("
+", at(0, 0), &item.name, item.kind);
+            assert!(
+                cursor::selection(&out, cur).is_some(),
+                "{} left the cursor on nothing: {out:?}",
+                item.name
+            );
+            let wants_value = matches!(item.kind, Kind::Setting | Kind::Trigger);
+            assert_eq!(
+                out.contains(" = "),
+                wants_value,
+                "{} got the wrong shape: {out:?}",
+                item.name
+            );
+        }
     }
 }
 
@@ -294,6 +577,90 @@ mod catalogue_tests {
                 "`{c}` is listed as a command but is also a setting"
             );
         }
+    }
+
+    /// Every name the binding parser takes is offered, and everything offered
+    /// is a name it takes. The list of what goes on the right of an `=` rots
+    /// the same way the settings would, so it is checked the same way.
+    #[test]
+    fn every_binding_the_parser_takes_is_offered_and_nothing_else_is() {
+        let src = include_str!("names.rs");
+        let mut from_source = arm_literals(src, "out_from_name");
+        from_source.extend(arm_literals(src, "pad_pin"));
+        // Two the parser takes but the list must not spread: JSM's own
+        // misspelling of SUBTRACT, and DEFAULT, a second spelling of NONE.
+        // Both are accepted so existing configs load; offering them would put
+        // them into new ones.
+        let aliases: HashSet<String> =
+            ["SUBSTRACT", "DEFAULT"].iter().map(|s| s.to_string()).collect();
+        let offered: HashSet<String> = bindings().into_iter().map(|i| i.name).collect();
+        let missing: Vec<&String> =
+            from_source.difference(&offered).filter(|n| !aliases.contains(*n)).collect();
+        assert!(
+            missing.is_empty(),
+            "the parser binds names the list doesn't offer: {missing:?}"
+        );
+        for item in bindings() {
+            assert!(
+                super::out_from_name(&item.name).is_some(),
+                "`{}` is offered but the parser doesn't bind it",
+                item.name
+            );
+        }
+    }
+
+    /// A key this module cannot send is offered greyed, with the reason, rather
+    /// than as an equal of the ones that work.
+    ///
+    /// This is the property the whole list exists for: it is generated from the
+    /// binding parser instead of typed out precisely so it cannot promise a key
+    /// that goes nowhere.
+    #[test]
+    fn the_key_list_says_which_keys_go_nowhere() {
+        let all = bindings();
+        let state = |n: &str| {
+            all.iter().find(|i| i.name == n).unwrap_or_else(|| panic!("{n} is offered")).state
+        };
+        // Media keys, the numpad and the lock keys have no scancode in our
+        // keyboard sink. JSM takes them; we cannot send them.
+        for name in ["PLAY_PAUSE", "MUTE", "VOLUME_UP", "NUM_LOCK", "PAUSE", "ADD", "DECIMAL"] {
+            assert!(
+                matches!(state(name), State::Ignored(_)),
+                "`{name}` cannot be sent, so it must not be offered as if it could"
+            );
+        }
+        // And everything that does work is offered plainly, or the greying
+        // would mean nothing.
+        for name in ["A", "7", "SPACE", "LMOUSE", "SCROLLUP", "X_A", "PS_CROSS",
+                     "GYRO_ON", "CALIBRATE", "SMALL_RUMBLE", "NONE", "F12"] {
+            assert_eq!(state(name), State::Live, "`{name}` works and should read that way");
+        }
+    }
+
+    /// A binding is only ever offered where a binding can go, and a name only
+    /// where a name can. The two vocabularies never appear together, because
+    /// nowhere in JSM's grammar are both legal.
+    #[test]
+    fn the_two_vocabularies_never_meet() {
+        use crate::eval::JsmCursor as Cur;
+        let text = "S = SPACE\nGYRO_SENS = 2\n";
+        let value_of_a_button = Cur { line: 0, token: 2 };
+        let value_of_a_setting = Cur { line: 1, token: 2 };
+        assert_eq!(kinds_at(text, value_of_a_button), &[Kind::Binding]);
+        assert!(
+            kinds_at(text, value_of_a_setting).is_empty(),
+            "a setting takes a number, which comes from the stick"
+        );
+        // The name position is names, on both kinds of line.
+        for line in 0..2 {
+            let ks = kinds_at(text, Cur { line, token: 0 });
+            assert!(!ks.contains(&Kind::Binding) && ks.len() == 3);
+        }
+        // A modeshift binds what is after the chord, so the chord doesn't
+        // change which vocabulary the value comes from.
+        let shift = "ZL,S = SPACE\nZL,GYRO_SENS = 4\n";
+        assert_eq!(kinds_at(shift, value_of_a_button), &[Kind::Binding]);
+        assert!(kinds_at(shift, value_of_a_setting).is_empty());
     }
 
     #[test]

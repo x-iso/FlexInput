@@ -273,6 +273,13 @@ pub struct GamepadNav {
     pub jsm_pane: JsmPane,
     /// Where the token cursor is in the config being edited.
     pub jsm_cursor: flexinput_engine::eval::JsmCursor,
+    /// Is the command list up on the editor the pad is driving?
+    ///
+    /// Cached by the driver each frame rather than read from egui's memory,
+    /// because the legend that needs it has no context to read from — and a
+    /// legend showing the editor's buttons while a list covers the editor is a
+    /// legend for the wrong screen.
+    pub jsm_list_open: bool,
     /// Which way the stick was last pushed to walk a number, while it is still
     /// pushed there: -1, 0 or +1.
     ///
@@ -468,6 +475,7 @@ impl Default for GamepadNav {
             jsm_pane: JsmPane::default(),
             jsm_cursor: Default::default(),
             jsm_scrub: 0,
+            jsm_list_open: false,
             jsm_baseline: None,
             edit_baseline: None,
             cursor_pos: egui::Pos2::ZERO,

@@ -797,6 +797,27 @@ pub(crate) struct CommandList {
     pub open: bool,
     pub filter: String,
     pub index: usize,
+    /// Rows the pad has asked to move, not yet applied.
+    ///
+    /// The pad says "one down" rather than an index because the list is the
+    /// only place that knows what the filter left in it, or where a group
+    /// begins — a second copy of that in the nav driver would be two answers to
+    /// the same question, and they would drift.
+    pub step: i32,
+    /// Groups the pad has asked to jump. 150 names is a long walk otherwise.
+    pub group_step: i32,
+    /// The pad has chosen the highlighted row.
+    pub confirm: bool,
+    /// Scroll the highlighted row into view: set whenever the pad moves it,
+    /// since a pad has no pointer and cannot scroll the list itself.
+    pub follow: bool,
+    /// Show the binding vocabulary — every key, mouse button, pad output and
+    /// JSM action — rather than what fits where the cursor is.
+    ///
+    /// West asks "what can go here"; North asks "show me the keys". Two
+    /// questions worth asking separately, because the cursor is often on the
+    /// name of a line whose VALUE is the part you came to write.
+    pub values: bool,
 }
 
 /// Room the command list needs: the filter row, the rows themselves, and the
@@ -807,12 +828,36 @@ fn list_id(node_id: NodeId) -> egui::Id {
     egui::Id::new(("jsm_cmd_list", node_id.0))
 }
 
-pub(crate) fn command_list_state(ui: &egui::Ui, node_id: NodeId) -> CommandList {
-    ui.ctx().data(|d| d.get_temp::<CommandList>(list_id(node_id))).unwrap_or_default()
+pub(crate) fn command_list_state(ctx: &egui::Context, node_id: NodeId) -> CommandList {
+    ctx.data(|d| d.get_temp::<CommandList>(list_id(node_id))).unwrap_or_default()
 }
 
-pub(crate) fn set_command_list_state(ui: &egui::Ui, node_id: NodeId, st: CommandList) {
-    ui.ctx().data_mut(|d| d.insert_temp(list_id(node_id), st));
+pub(crate) fn set_command_list_state(ctx: &egui::Context, node_id: NodeId, st: CommandList) {
+    ctx.data_mut(|d| d.insert_temp(list_id(node_id), st));
+}
+
+/// The first row of the group `step` groups away from the one `index` sits in.
+///
+/// Walking 150 names a row at a time is not navigation, and the list is already
+/// grouped for reading — so the triggers jump by heading.
+fn jump_group(rows: &[&flexinput_engine::eval::JsmItem], index: usize, step: i32) -> usize {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut group = "";
+    for (i, r) in rows.iter().enumerate() {
+        if r.group != group {
+            group = r.group;
+            starts.push(i);
+        }
+    }
+    if starts.is_empty() {
+        return index;
+    }
+    // Which group the highlight is in now, then that many headings along. From
+    // the middle of a group, "back" is the previous heading rather than the top
+    // of this one: one press, one heading, whichever way you are going.
+    let here = starts.iter().rposition(|&s| s <= index).unwrap_or(0);
+    let want = (here as i64 + step as i64).clamp(0, starts.len() as i64 - 1) as usize;
+    starts[want]
 }
 
 /// Rows matching the filter, in catalogue order.
@@ -836,17 +881,27 @@ pub(crate) fn filtered<'a>(
 /// A setting comes with its `=` because a setting without one is an error, and
 /// the next thing you want is to type the value. A command and a button stand on
 /// their own — a button is the left side of a binding, so it gets the `=` too.
-pub(crate) fn insertion_for(item: &flexinput_engine::eval::JsmItem) -> String {
+pub(crate) fn insertion_for(name: &str, kind: flexinput_engine::eval::JsmKind) -> String {
     use flexinput_engine::eval::JsmKind as K;
-    match item.kind {
-        K::Setting | K::Trigger => format!("{} = ", item.name),
-        K::Command => item.name.clone(),
+    match kind {
+        K::Setting | K::Trigger => format!("{name} = "),
+        // A command is a whole line. A binding is only ever the right-hand side
+        // of one, so on its own it lands as an error saying so — which is the
+        // truth about a key written where a name belongs, and only reachable by
+        // clicking a row in the pad's own key list with the mouse.
+        K::Command | K::Binding => name.to_string(),
     }
 }
 
 /// The command list itself, drawn under the editor while it is open.
 ///
-/// Returns the text to insert once a row is chosen.
+/// Returns the chosen row's name and kind — the caller decides where it lands,
+/// because that depends on whether a pad with a cursor asked for it or a mouse
+/// with none did.
+///
+/// `kinds` is what can legally stand where the insertion will go. An empty
+/// slice means nothing can: the list says where values come from instead of
+/// offering names that would be an error there.
 ///
 /// Every row says what the module actually does with that name — live, not yet,
 /// or ignored with the reason — because a list that offered all 131 settings as
@@ -857,13 +912,23 @@ pub(crate) fn command_list(
     width: f32,
     pad_pins: &std::collections::HashSet<String>,
     budget: Option<f32>,
-) -> Option<String> {
+    kinds: &[flexinput_engine::eval::JsmKind],
+) -> Option<(String, flexinput_engine::eval::JsmKind)> {
     use flexinput_engine::eval::JsmSupportState as S;
-    let mut st = command_list_state(ui, node_id);
+    let mut st = command_list_state(ui.ctx(), node_id);
     if !st.open {
         return None;
     }
-    let items = flexinput_engine::eval::jsm_catalogue(pad_pins);
+    // Two vocabularies, never mixed: the names that start a line, and the
+    // values that finish one. `kinds` says which of them can stand where this
+    // insertion will land.
+    let mut items: Vec<_> = flexinput_engine::eval::jsm_catalogue(pad_pins)
+        .into_iter()
+        .filter(|i| kinds.contains(&i.kind))
+        .collect();
+    if kinds.contains(&flexinput_engine::eval::JsmKind::Binding) {
+        items.extend(flexinput_engine::eval::jsm_bindings());
+    }
     let mut picked = None;
     let mut close = false;
 
@@ -893,9 +958,39 @@ pub(crate) fn command_list(
     };
     let rows = filtered(&items, &st.filter);
     if rows.is_empty() {
-        ui.label(egui::RichText::new("nothing by that name").small().weak());
+        // Two different nothings, and telling them apart is the difference
+        // between a list that looks broken and one that teaches the other
+        // half of the controls.
+        let why = if kinds.is_empty() {
+            "A value goes here, and the list only knows names — hold South and push the stick for a number, or North for a key or button."
+        } else {
+            "nothing by that name"
+        };
+        ui.label(egui::RichText::new(why).small().weak());
     }
     st.index = st.index.min(rows.len().saturating_sub(1));
+    // What the pad asked for, resolved against the list the pad can actually
+    // see. Anything it moves, it also wants scrolled into view.
+    if st.step != 0 || st.group_step != 0 {
+        st.follow = true;
+        if !rows.is_empty() {
+            if st.step != 0 {
+                let n = rows.len() as i64;
+                st.index = (st.index as i64 + st.step as i64).clamp(0, n - 1) as usize;
+            }
+            if st.group_step != 0 {
+                st.index = jump_group(&rows, st.index, st.group_step);
+            }
+        }
+        st.step = 0;
+        st.group_step = 0;
+    }
+    if st.confirm {
+        st.confirm = false;
+        if let Some(r) = rows.get(st.index) {
+            picked = Some((r.name.clone(), r.kind));
+        }
+    }
 
     let claimant = ui.id().with(("jsm_cmds", node_id.0));
     crate::canvas::wheel::scrolling_body(
@@ -921,6 +1016,12 @@ pub(crate) fn command_list(
                 };
                 let label = egui::RichText::new(&item.name).small().monospace().color(tint);
                 let resp = ui.selectable_label(i == st.index, label);
+                // A pad has no pointer, so the list has to bring the highlight
+                // to it — walking off the bottom of a box you can't scroll is
+                // the same as the highlight vanishing.
+                if i == st.index && st.follow {
+                    resp.scroll_to_me(None);
+                }
                 // JSM's own words for what it does, plus our reason when we
                 // don't run it. Both, because "not live yet" without knowing
                 // what the setting IS tells you nothing.
@@ -937,7 +1038,7 @@ pub(crate) fn command_list(
                 }
                 if resp.clicked() {
                     st.index = i;
-                    picked = Some(insertion_for(item));
+                    picked = Some((item.name.clone(), item.kind));
                 }
             }
         },
@@ -954,18 +1055,51 @@ pub(crate) fn command_list(
             ui.label(egui::RichText::new(w).small().weak().italics());
         }
     }
+    st.follow = false;
     if picked.is_some() || close {
         st.open = false;
     }
-    set_command_list_state(ui, node_id, st);
+    set_command_list_state(ui.ctx(), node_id, st);
     picked
 }
 
 #[cfg(test)]
 mod command_list_tests {
-    use super::{filtered, insertion_for};
+    use super::{filtered, insertion_for, jump_group};
     use flexinput_engine::eval::{jsm_catalogue, JsmKind};
     use std::collections::HashSet;
+
+    /// The triggers jump by heading. 150 names a row at a time is not
+    /// navigation, and the list is already grouped for reading.
+    #[test]
+    fn the_triggers_jump_by_heading_rather_than_by_row() {
+        let items = jsm_catalogue(&HashSet::new());
+        let rows = filtered(&items, "");
+        let mut starts = Vec::new();
+        let mut group = "";
+        for (i, r) in rows.iter().enumerate() {
+            if r.group != group {
+                group = r.group;
+                starts.push(i);
+            }
+        }
+        assert!(starts.len() > 3, "the list is grouped to begin with");
+        assert_eq!(jump_group(&rows, 0, 1), starts[1]);
+        assert_eq!(jump_group(&rows, starts[1], -1), starts[0]);
+        // From inside a group, one press is one heading whichever way you go —
+        // not "back to the top of this one" for half of them.
+        let mid = starts[1] + 1;
+        assert!(mid < starts[2], "a group with more than one row in it");
+        assert_eq!(jump_group(&rows, mid, 1), starts[2]);
+        assert_eq!(jump_group(&rows, mid, -1), starts[0]);
+        // The ends clamp rather than wrap: landing back at the top with no
+        // sign you had reached the bottom is how a list loses you.
+        assert_eq!(jump_group(&rows, 0, -1), starts[0]);
+        let last = *starts.last().unwrap();
+        assert_eq!(jump_group(&rows, last, 1), last);
+        // An empty list has no headings and no opinion.
+        assert_eq!(jump_group(&[], 0, 1), 0);
+    }
 
     #[test]
     fn the_filter_finds_names_by_any_part_of_them() {
@@ -993,15 +1127,16 @@ mod command_list_tests {
 
         // A setting and a button both want their `=`: without one, the line the
         // list just wrote would be an error the moment it landed.
-        assert_eq!(insertion_for(find("GYRO_SENS")), "GYRO_SENS = ");
+        let insert = |n: &str| insertion_for(n, find(n).kind);
+        assert_eq!(insert("GYRO_SENS"), "GYRO_SENS = ");
         assert_eq!(find("S").kind, JsmKind::Trigger);
-        assert_eq!(insertion_for(find("S")), "S = ");
+        assert_eq!(insert("S"), "S = ");
         // A command stands alone, and an `=` would make it one.
-        assert_eq!(insertion_for(find("RESET_MAPPINGS")), "RESET_MAPPINGS");
+        assert_eq!(insert("RESET_MAPPINGS"), "RESET_MAPPINGS");
 
         // The whole point: what the list writes is a line the parser accepts.
         for name in ["RESET_MAPPINGS", "ONE_EURO_FILTER"] {
-            let line = insertion_for(find(name));
+            let line = insert(name);
             let cfg = flexinput_engine::eval::jsm_compile(&line, &[]);
             assert!(
                 !matches!(cfg.lines[0].status, flexinput_engine::eval::JsmLineStatus::Error(_)),

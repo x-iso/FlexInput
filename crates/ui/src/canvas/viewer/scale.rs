@@ -73,6 +73,37 @@ pub(crate) fn jsm_nav_cursor(
     (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(cur)
 }
 
+/// Ask the nav driver to put its cursor somewhere.
+///
+/// The driver owns the cursor and republishes it every frame, so the body
+/// cannot simply write one: the next frame would overwrite it with the old
+/// position. This is the way back. The body uses it after an edit of its own —
+/// picking from the command list moves the cursor onto whatever the line still
+/// needs — and the driver adopts it before doing anything else.
+pub(crate) fn publish_jsm_cursor_request(
+    ctx: &egui::Context,
+    inner_id: NodeId,
+    cur: flexinput_engine::eval::JsmCursor,
+) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_cursor_want", inner_id.0)), cur));
+}
+
+/// Take the pending cursor request, if there is one. Taken rather than read:
+/// a request that stayed would pin the cursor in place every frame after.
+pub(crate) fn take_jsm_cursor_request(
+    ctx: &egui::Context,
+    inner_id: NodeId,
+) -> Option<flexinput_engine::eval::JsmCursor> {
+    let id = egui::Id::new(("jsm_cursor_want", inner_id.0));
+    ctx.data_mut(|d| {
+        let cur = d.get_temp::<flexinput_engine::eval::JsmCursor>(id);
+        if cur.is_some() {
+            d.remove::<flexinput_engine::eval::JsmCursor>(id);
+        }
+        cur
+    })
+}
+
 /// Which pane of a JSM editor the pad is driving, for the body to show.
 pub(crate) fn publish_jsm_pane(ctx: &egui::Context, inner_id: NodeId, pane: &'static str) {
     let pass = ctx.cumulative_pass_nr();

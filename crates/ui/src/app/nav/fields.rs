@@ -27,6 +27,13 @@ impl FlexInputApp {
         // config text walked a token at a time. LB/RB switch between them, and
         // the text pane has its own driver from here on.
         if self.nav_is_jsm_editor(outer_id) {
+            // The command list, while it is open, owns the pad. It is a panel
+            // drawn over the editor, so the bumpers, the triggers and the face
+            // buttons all belong to it until it closes — otherwise you would be
+            // editing a line hidden behind the thing you are reading.
+            if self.nav_drive_jsm_list(ctx, outer_id, nav, step_dir, rt_rising, lt_rising) {
+                return;
+            }
             if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
                 self.gamepad_nav.jsm_pane = self.gamepad_nav.jsm_pane.other();
             }
@@ -1264,6 +1271,79 @@ impl crate::app::FlexInputApp {
         )
     }
 
+    /// Drive the command list while it is open, and say whether it took the pad.
+    ///
+    /// The pad only ever says which WAY to move — one row, one group, or that
+    /// row — and the list resolves it against what the filter actually left in
+    /// it. Sending an index instead would mean keeping a second copy here of
+    /// what is on screen, and two answers to that question eventually disagree.
+    fn nav_drive_jsm_list(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) -> bool {
+        use crate::gamepad_nav::NavDir;
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
+        let mut list = crate::canvas::viewer::command_list_state(ctx, inner);
+        self.gamepad_nav.jsm_list_open = list.open;
+        if !list.open {
+            return false;
+        }
+        match step_dir {
+            Some(NavDir::Up) => list.step -= 1,
+            Some(NavDir::Down) => list.step += 1,
+            _ => {}
+        }
+        // A hundred and fifty names is not a walk. The list is already grouped
+        // for reading, so the triggers jump by heading.
+        list.group_step += (rt_rising as i32) - (lt_rising as i32);
+        if nav.is_rising("btn_south") {
+            list.confirm = true;
+        }
+        // East closes it, and so do the two buttons that open it. A panel you
+        // open with one button and close with another is one you close by
+        // guessing.
+        if nav.is_rising("btn_east")
+            || nav.is_rising("btn_west")
+            || nav.is_rising("btn_north")
+        {
+            list.open = false;
+        }
+        crate::canvas::viewer::set_command_list_state(ctx, inner, list);
+        true
+    }
+
+    /// Open the command list from the pad, on one vocabulary or the other.
+    fn nav_open_jsm_list(
+        &mut self,
+        ctx: &egui::Context,
+        inner: egui_snarl::NodeId,
+        values: bool,
+    ) {
+        let mut list = crate::canvas::viewer::command_list_state(ctx, inner);
+        list.open = true;
+        list.index = 0;
+        list.values = values;
+        // A filter left behind by the mouse would hide most of the list from a
+        // pad, which has no way to see it or clear it.
+        list.filter.clear();
+        list.follow = true;
+        crate::canvas::viewer::set_command_list_state(ctx, inner, list);
+        self.gamepad_nav.jsm_list_open = true;
+    }
+
+    /// Is the command list up on the editor nav is driving?
+    pub(crate) fn nav_jsm_list_open(&self, ctx: &egui::Context) -> bool {
+        self.nav_driving_outer_id()
+            .filter(|o| self.nav_is_jsm_editor(*o))
+            .and_then(|o| self.nav_selected_inner_node(o))
+            .is_some_and(|inner| crate::canvas::viewer::command_list_state(ctx, inner).open)
+    }
+
     /// Walk the config with the token cursor.
     ///
     /// Up/down is a line, left/right is a token — the shape of a JSM line is a
@@ -1279,6 +1359,12 @@ impl crate::app::FlexInputApp {
     ) {
         use crate::gamepad_nav::NavDir;
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
+        // The body may have moved the cursor: picking from the command list
+        // puts it on whatever the new line still needs. Adopt that first, or
+        // the publish at the end of this function would drag it back.
+        if let Some(at) = crate::canvas::viewer::take_jsm_cursor_request(ctx, inner) {
+            self.gamepad_nav.jsm_cursor = at;
+        }
         let text = self.nav_jsm_text(outer_id);
         let mut cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
 
@@ -1320,6 +1406,22 @@ impl crate::app::FlexInputApp {
                 crate::canvas::viewer::publish_jsm_chord(ctx, inner, true);
                 return;
             }
+        }
+        // West on its own opens the list of what can legally stand where the
+        // cursor is. Held, the same button deletes — see below.
+        if !holding && nav.is_rising("btn_west") {
+            self.nav_open_jsm_list(ctx, inner, false);
+            crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+            return;
+        }
+        // North opens the same panel on the other vocabulary: every key, mouse
+        // button, pad output and JSM action, wherever the cursor is. West asks
+        // what can go here; North asks for the keys — and the cursor is often on
+        // the name of a line whose value is the part you came to write.
+        if !holding && nav.is_rising("btn_north") {
+            self.nav_open_jsm_list(ctx, inner, true);
+            crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+            return;
         }
         if holding && nav.is_rising("btn_west") {
             let edited = flexinput_engine::eval::jsm_cursor_delete(&text, cur);
