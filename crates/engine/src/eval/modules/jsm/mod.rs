@@ -12,6 +12,7 @@
 mod aim;
 mod analog;
 mod bind;
+mod catalogue;
 mod cc;
 mod eval;
 mod feedback;
@@ -32,6 +33,8 @@ pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
 
 // The editor compiles the text it is showing to put a status on every line, so
 // the parser's surface is public — the run-time side stays crate-internal.
+pub use catalogue::{catalogue as jsm_catalogue, Item as JsmItem, Kind as JsmKind,
+    State as JsmSupportState};
 pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, sens_curve as jsm_sens_curve,
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,

@@ -75,6 +75,35 @@ pub enum StickId { Left, Right }
 pub enum Dir { Up, Down, Left, Right, Ring }
 
 impl Btn {
+    /// Every button the vocabulary has, for a list to offer.
+    ///
+    /// Round-tripped against `from_name`/`name` by a test, so a button added to
+    /// the enum but forgotten here is caught — a list that quietly omits a
+    /// button is a list people stop trusting.
+    pub const ALL: &'static [Btn] = &[
+        Btn::Up, Btn::Down, Btn::Left, Btn::Right,
+        Btn::L, Btn::Zl, Btn::Zlf, Btn::Minus,
+        Btn::E, Btn::S, Btn::N, Btn::W,
+        Btn::R, Btn::Zr, Btn::Zrf, Btn::Plus, Btn::Home,
+        Btn::Lsl, Btn::Lsr, Btn::Rsl, Btn::Rsr, Btn::L3, Btn::R3,
+        Btn::LeanLeft, Btn::LeanRight, Btn::Mic,
+        Btn::Lup, Btn::Ldown, Btn::Lleft, Btn::Lright, Btn::Lring,
+        Btn::Rup, Btn::Rdown, Btn::Rleft, Btn::Rright, Btn::Rring,
+        Btn::Mup, Btn::Mdown, Btn::Mleft, Btn::Mright, Btn::Mring,
+        Btn::Tup, Btn::Tdown, Btn::Tleft, Btn::Tright, Btn::Tring,
+        Btn::Touch, Btn::Capture,
+        Btn::LTouch, Btn::RTouch, Btn::LMini, Btn::RMini,
+        // The numbered families, listed rather than generated so the round-trip
+        // test covers their bounds too.
+        Btn::T(1), Btn::T(2), Btn::T(3), Btn::T(4), Btn::T(5),
+        Btn::T(6), Btn::T(7), Btn::T(8), Btn::T(9), Btn::T(10),
+        Btn::T(11), Btn::T(12), Btn::T(13), Btn::T(14), Btn::T(15),
+        Btn::T(16), Btn::T(17), Btn::T(18), Btn::T(19), Btn::T(20),
+        Btn::T(21), Btn::T(22), Btn::T(23), Btn::T(24), Btn::T(25),
+        Btn::Misc(1), Btn::Misc(2), Btn::Misc(3),
+        Btn::Misc(4), Btn::Misc(5), Btn::Misc(6),
+    ];
+
     /// Parse a JSM button name. `None` when it isn't one.
     pub fn from_name(name: &str) -> Option<Btn> {
         use Btn::*;

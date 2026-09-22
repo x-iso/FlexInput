@@ -708,10 +708,38 @@ fn jsm_rows(
         tabs[active].text = text;
         changed = true;
     }
+    // Right-click the editor for the vocabulary. The list is the only place the
+    // module tells you what it knows, so it goes where the typing happens.
+    resp.context_menu(|ui| {
+        if ui.button("Commands…").clicked() {
+            let mut st = super::jsm_widgets::command_list_state(ui, node_id);
+            st.open = true;
+            st.index = 0;
+            super::jsm_widgets::set_command_list_state(ui, node_id, st);
+            ui.close();
+        }
+    });
     // A binding under test must not type into the editor it is being edited in.
     flexinput_engine::eval::set_jsm_editor_focus(resp.has_focus());
     // The editor is what you pin to the config overlay.
     register_exposable_element(ui, node_id, "editor", editor_rect);
+
+    // ── the command list, when it was asked for ──────────────────────────────
+    if let Some(pick) = super::jsm_widgets::command_list(
+        ui, node_id, size.x, &pins_this_pad_reports(snarl, node_id, live, parent),
+    ) {
+        // Appended on a line of its own. Inserting at the caret would need the
+        // TextEdit's cursor, which a `context_menu` click has already taken the
+        // focus away from — a new line is predictable, and the editor is right
+        // there to move it.
+        let text = &mut tabs[active].text;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&pick);
+        text.push('\n');
+        changed = true;
+    }
 
     // ── what the parser made of it ───────────────────────────────────────────
     let (errors, pending, ignored) = compiled.summary();

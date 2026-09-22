@@ -509,7 +509,7 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs) -> LineInfo
 ///
 /// These are the same reasons a bare command line gives, so a command means the same
 /// thing whether it is written on its own or bound to a button.
-fn command_does_nothing(name: &str) -> Option<&'static str> {
+pub(crate) fn command_does_nothing(name: &str) -> Option<&'static str> {
     Some(match name.trim().to_ascii_uppercase().as_str() {
         // The ones that DO something: re-centring the motion stick, resetting, and
         // switching layers (the last two never arrive as `Out::Command` at all).
@@ -1020,23 +1020,7 @@ pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String
             Trigger::Sim(x, y) | Trigger::Diag(x, y) => vec![x, y],
         };
         for btn in buttons {
-            let needed: Vec<&str> = match btn.source() {
-                BtnSource::Pin(p) => vec![p],
-                // Either form will do — a pad with only one of them still works.
-                BtnSource::Trigger { analog, digital } => {
-                    if available.contains(analog) || available.contains(digital) {
-                        continue;
-                    }
-                    vec![analog, digital]
-                }
-                BtnSource::TriggerFull { analog } => vec![analog],
-                BtnSource::Stick { stick, .. } => match stick {
-                    StickId::Left => vec!["left_stick"],
-                    StickId::Right => vec!["right_stick"],
-                },
-                // Sources that aren't live yet already say so on the line.
-                _ => continue,
-            };
+            let Some(needed) = pins_a_button_needs(btn) else { continue };
             if needed.iter().any(|p| available.contains(*p)) {
                 continue;
             }
@@ -1054,6 +1038,39 @@ pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String
                 info.notes.push(note);
             }
         }
+    }
+}
+
+/// The bus pins a button could read from — ANY of them will do, since a pad
+/// reporting either the analog trigger or its digital twin can drive it.
+///
+/// `None` for a source that isn't live here at all; those already say so on
+/// their own line, and the catalogue reports them from `BtnSource::Absent`.
+pub(crate) fn pins_a_button_needs(btn: Btn) -> Option<Vec<&'static str>> {
+    Some(match btn.source() {
+        BtnSource::Pin(p) => vec![p],
+        BtnSource::Trigger { analog, digital } => vec![analog, digital],
+        BtnSource::TriggerFull { analog } => vec![analog],
+        BtnSource::Stick { stick, .. } => match stick {
+            StickId::Left => vec!["left_stick"],
+            StickId::Right => vec!["right_stick"],
+        },
+        _ => return None,
+    })
+}
+
+/// Would this button ever fire on a pad reporting `available`?
+///
+/// An empty set means "no pad connected", and then nothing is claimed either
+/// way — a config is often written for a controller that isn't plugged in.
+pub(crate) fn button_reaches(btn: Btn, available: &HashSet<String>) -> bool {
+    if available.is_empty() {
+        return true;
+    }
+    match pins_a_button_needs(btn) {
+        Some(needed) => needed.iter().any(|p| available.contains(*p)),
+        // Not live here for a reason of its own, which the caller reports.
+        None => true,
     }
 }
 

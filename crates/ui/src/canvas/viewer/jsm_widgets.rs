@@ -787,3 +787,200 @@ mod tests {
         assert_eq!(knob_name_of("knob:"), None, "an empty name is not a setting");
     }
 }
+
+// ── the command list ─────────────────────────────────────────────────────────
+
+/// Per-node state for the "Commands…" list: whether it is open, what has been
+/// typed to filter it, and which row is highlighted.
+#[derive(Clone, Default)]
+pub(crate) struct CommandList {
+    pub open: bool,
+    pub filter: String,
+    pub index: usize,
+}
+
+fn list_id(node_id: NodeId) -> egui::Id {
+    egui::Id::new(("jsm_cmd_list", node_id.0))
+}
+
+pub(crate) fn command_list_state(ui: &egui::Ui, node_id: NodeId) -> CommandList {
+    ui.ctx().data(|d| d.get_temp::<CommandList>(list_id(node_id))).unwrap_or_default()
+}
+
+pub(crate) fn set_command_list_state(ui: &egui::Ui, node_id: NodeId, st: CommandList) {
+    ui.ctx().data_mut(|d| d.insert_temp(list_id(node_id), st));
+}
+
+/// Rows matching the filter, in catalogue order.
+///
+/// Matching is on the name only and is case-insensitive and substring-based:
+/// people look for "GYRO" or "stick", and a fuzzy match would put surprising
+/// things at the top of a list whose whole job is to be predictable.
+pub(crate) fn filtered<'a>(
+    items: &'a [flexinput_engine::eval::JsmItem],
+    filter: &str,
+) -> Vec<&'a flexinput_engine::eval::JsmItem> {
+    let needle = filter.trim().to_ascii_uppercase();
+    items
+        .iter()
+        .filter(|i| needle.is_empty() || i.name.to_ascii_uppercase().contains(&needle))
+        .collect()
+}
+
+/// What picking a row types into the config.
+///
+/// A setting comes with its `=` because a setting without one is an error, and
+/// the next thing you want is to type the value. A command and a button stand on
+/// their own — a button is the left side of a binding, so it gets the `=` too.
+pub(crate) fn insertion_for(item: &flexinput_engine::eval::JsmItem) -> String {
+    use flexinput_engine::eval::JsmKind as K;
+    match item.kind {
+        K::Setting | K::Trigger => format!("{} = ", item.name),
+        K::Command => item.name.clone(),
+    }
+}
+
+/// The command list itself, drawn under the editor while it is open.
+///
+/// Returns the text to insert once a row is chosen.
+///
+/// Every row says what the module actually does with that name — live, not yet,
+/// or ignored with the reason — because a list that offered all 131 settings as
+/// equals would be quietly promising things this module doesn't run.
+pub(crate) fn command_list(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    width: f32,
+    pad_pins: &std::collections::HashSet<String>,
+) -> Option<String> {
+    use flexinput_engine::eval::JsmSupportState as S;
+    let mut st = command_list_state(ui, node_id);
+    if !st.open {
+        return None;
+    }
+    let items = flexinput_engine::eval::jsm_catalogue(pad_pins);
+    let mut picked = None;
+    let mut close = false;
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Commands").small().strong());
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut st.filter)
+                .desired_width((width - 90.0).max(60.0))
+                .font(egui::TextStyle::Small)
+                .hint_text("filter"),
+        );
+        // Typing narrows the list, so the highlight has to come back to the top
+        // or it would point at a row that scrolled out from under it.
+        if resp.changed() {
+            st.index = 0;
+        }
+        if ui.small_button("✕").on_hover_text("Close the list").clicked() {
+            close = true;
+        }
+    });
+
+    let rows = filtered(&items, &st.filter);
+    if rows.is_empty() {
+        ui.label(egui::RichText::new("nothing by that name").small().weak());
+    }
+    st.index = st.index.min(rows.len().saturating_sub(1));
+
+    let claimant = ui.id().with(("jsm_cmds", node_id.0));
+    crate::canvas::wheel::scrolling_body(
+        ui,
+        claimant,
+        egui::ScrollArea::vertical()
+            .id_salt(("jsm_cmds", node_id.0))
+            .max_height(160.0)
+            .max_width(width)
+            .auto_shrink([false, true]),
+        |ui| {
+            ui.set_max_width(width);
+            let mut group = "";
+            for (i, item) in rows.iter().enumerate() {
+                if item.group != group {
+                    group = item.group;
+                    ui.label(egui::RichText::new(group).small().weak().italics());
+                }
+                let (tint, why) = match item.state {
+                    S::Live => (ui.visuals().text_color(), None),
+                    S::Pending(w) => (Color32::from_rgb(214, 168, 74), Some(w)),
+                    S::Ignored(w) => (ui.visuals().weak_text_color(), Some(w)),
+                };
+                let label = egui::RichText::new(&item.name).small().monospace().color(tint);
+                let resp = ui.selectable_label(i == st.index, label);
+                if let Some(w) = why {
+                    resp.clone().on_hover_text(w);
+                }
+                if resp.clicked() {
+                    st.index = i;
+                    picked = Some(insertion_for(item));
+                }
+            }
+        },
+    );
+
+    if let Some(row) = rows.get(st.index) {
+        // The reason in full under the list, so it is readable without hovering.
+        if let S::Pending(w) | S::Ignored(w) = row.state {
+            ui.label(egui::RichText::new(w).small().weak());
+        }
+    }
+    if picked.is_some() || close {
+        st.open = false;
+    }
+    set_command_list_state(ui, node_id, st);
+    picked
+}
+
+#[cfg(test)]
+mod command_list_tests {
+    use super::{filtered, insertion_for};
+    use flexinput_engine::eval::{jsm_catalogue, JsmKind};
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_filter_finds_names_by_any_part_of_them() {
+        let items = jsm_catalogue(&HashSet::new());
+        let names = |f: &str| -> Vec<String> {
+            filtered(&items, f).iter().map(|i| i.name.clone()).collect()
+        };
+        // Case-insensitive substring, because people type "gyro" not "GYRO_".
+        let gyro = names("gyro");
+        assert!(gyro.contains(&"GYRO_SENS".to_string()));
+        assert!(gyro.contains(&"MIN_GYRO_SENS".to_string()), "matches in the middle too");
+        assert!(!gyro.contains(&"STICK_POWER".to_string()));
+        assert_eq!(names("GYRO"), gyro, "case makes no difference");
+
+        // An empty filter is the whole catalogue, not nothing.
+        assert_eq!(filtered(&items, "").len(), items.len());
+        assert_eq!(filtered(&items, "   ").len(), items.len(), "whitespace is not a filter");
+        assert!(names("zzzznope").is_empty());
+    }
+
+    #[test]
+    fn a_picked_row_is_inserted_as_a_line_that_parses() {
+        let items = jsm_catalogue(&HashSet::new());
+        let find = |n: &str| items.iter().find(|i| i.name == n).expect("listed");
+
+        // A setting and a button both want their `=`: without one, the line the
+        // list just wrote would be an error the moment it landed.
+        assert_eq!(insertion_for(find("GYRO_SENS")), "GYRO_SENS = ");
+        assert_eq!(find("S").kind, JsmKind::Trigger);
+        assert_eq!(insertion_for(find("S")), "S = ");
+        // A command stands alone, and an `=` would make it one.
+        assert_eq!(insertion_for(find("RESET_MAPPINGS")), "RESET_MAPPINGS");
+
+        // The whole point: what the list writes is a line the parser accepts.
+        for name in ["RESET_MAPPINGS", "ONE_EURO_FILTER"] {
+            let line = insertion_for(find(name));
+            let cfg = flexinput_engine::eval::jsm_compile(&line, &[]);
+            assert!(
+                !matches!(cfg.lines[0].status, flexinput_engine::eval::JsmLineStatus::Error(_)),
+                "`{line}` should not land as an error: {:?}",
+                cfg.lines[0].status
+            );
+        }
+    }
+}
