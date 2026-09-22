@@ -619,7 +619,7 @@ fn jsm_rows(
                 .on_hover_text(
                     "LB / RB switch between the config text and the faders.
                      LT / RT change config tab.
-                     Hold South and tap West to delete the token under the cursor.",
+                     Hold South and tap West to delete the token under the cursor,                      or left / right to open an empty slot beside it.",
                 );
         }
         // Where the strip goes. Beside the editor suits a wide node; above or

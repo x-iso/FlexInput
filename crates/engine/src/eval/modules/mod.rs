@@ -22,6 +22,7 @@ pub(crate) use gyro3dof::*;
 pub(crate) use jsm::*;
 // Read by the UI to compile the config text it is showing.
 pub use jsm::{jsm_catalogue, jsm_compile, jsm_cursor_clamped, jsm_cursor_delete,
+    jsm_insert_slot, JSM_SLOT,
     jsm_cursor_moved, jsm_cursor_replace, jsm_editor_focus, jsm_feel_of, jsm_knobs,
     jsm_line_count, jsm_selection, jsm_tokens_at, JsmCursor, JsmToken, JsmTokenKind,
     jsm_note_missing_inputs,

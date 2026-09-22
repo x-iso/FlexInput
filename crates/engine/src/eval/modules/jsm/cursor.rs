@@ -193,6 +193,47 @@ pub fn replace(text: &str, cur: Cursor, with: &str) -> String {
     }
 }
 
+/// What an empty slot looks like until something is put in it.
+///
+/// A real token, not a hidden gap: the cursor has to be able to land on it, the
+/// highlight has to be able to cover it, and — the point — the parser has to be
+/// able to complain about it. An unfinished line IS an error, and `?` reads as
+/// one in every position ("`?` isn't a key, button or action JSM can bind"), so
+/// the editor says what is missing without the editor having to know.
+pub const SLOT: &str = "?";
+
+/// Make an empty slot beside the cursor's token and move onto it.
+///
+/// This is how anything gets ADDED. Replacing is the common edit and the cursor
+/// does that already; without a slot there would be no way to turn `N = 2` into
+/// `N = 2 1` at all, because every pick would land on top of the `2`.
+///
+/// Nothing can follow a comment on a line, so asking for a slot after one puts
+/// it before instead — the alternative is a `?` inside the comment text, which
+/// is not a token and would leave the cursor pointing at nothing.
+pub fn insert_slot(text: &str, cur: Cursor, after: bool) -> (String, Cursor) {
+    let Some((tok, s, e)) = selection(text, cur) else {
+        // A blank line: the slot is simply the line's first token.
+        let (_, le) = line_span(text, cur.line);
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push_str(&text[..le]);
+        out.push_str(SLOT);
+        out.push_str(&text[le..]);
+        return (out, Cursor { line: cur.line, token: 0 });
+    };
+    let after = after && tok.kind != TokenKind::Comment;
+    let (at, insert, token) = if after {
+        (e, format!(" {SLOT}"), cur.token + 1)
+    } else {
+        (s, format!("{SLOT} "), cur.token)
+    };
+    let mut out = String::with_capacity(text.len() + insert.len());
+    out.push_str(&text[..at]);
+    out.push_str(&insert);
+    out.push_str(&text[at..]);
+    (out, Cursor { line: cur.line, token })
+}
+
 /// Delete the cursor's token, and the one space that held it apart from its
 /// neighbour.
 ///
@@ -400,5 +441,76 @@ mod delete_round_tests {
         let out = delete(text, Cursor { line: 1, token: 2 });
         assert_eq!(out, "A = B\nGYRO_SENS =\nC = D\n");
         assert!(out.starts_with("A = B\n") && out.ends_with("C = D\n"));
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    /// A slot is how anything gets ADDED: the cursor replaces, so without one
+    /// there is no way to turn `N = 2` into `N = 2 1` from a pad at all.
+    #[test]
+    fn a_slot_opens_beside_the_cursor_and_takes_it() {
+        let text = "N = 2\n";
+        let (out, cur) = insert_slot(text, Cursor { line: 0, token: 2 }, true);
+        assert_eq!(out, "N = 2 ?\n");
+        assert_eq!(cur, Cursor { line: 0, token: 3 }, "the cursor moves onto the slot");
+        assert_eq!(selection(&out, cur).unwrap().0.kind, TokenKind::Value);
+
+        // Before, for an output that belongs first.
+        let (out, cur) = insert_slot(text, Cursor { line: 0, token: 2 }, false);
+        assert_eq!(out, "N = ? 2\n");
+        assert_eq!(cur, Cursor { line: 0, token: 2 }, "the slot takes the index");
+
+        // And filling it is the ordinary replace.
+        assert_eq!(replace(&out, cur, "1"), "N = 1 2\n");
+    }
+
+    /// Nothing can follow a comment on a line, so "after" a comment means before
+    /// it — a `?` inside the comment text is not a token, and the cursor would
+    /// be left pointing at nothing.
+    #[test]
+    fn a_slot_asked_for_after_a_comment_lands_before_it() {
+        let text = "S = SPACE # jump\n";
+        let comment = Cursor { line: 0, token: 3 };
+        assert_eq!(selection(text, comment).unwrap().0.kind, TokenKind::Comment);
+
+        let (out, cur) = insert_slot(text, comment, true);
+        assert_eq!(out, "S = SPACE ? # jump\n");
+        assert_eq!(cur, comment, "the slot took the comment's index");
+        assert_eq!(selection(&out, cur).unwrap().0.text(&out[..out.len() - 1]), "?");
+    }
+
+    /// On a blank line the slot IS the line — that is how you start a new
+    /// setting on the empty line you just moved onto.
+    #[test]
+    fn a_slot_on_a_blank_line_becomes_its_first_token() {
+        let text = "A = B\n\nC = D\n";
+        let blank = Cursor { line: 1, token: 0 };
+        assert!(selection(text, blank).is_none(), "nothing there to begin with");
+
+        let (out, cur) = insert_slot(text, blank, true);
+        assert_eq!(out, "A = B\n?\nC = D\n");
+        assert_eq!(cur, blank);
+        assert!(selection(&out, cur).is_some(), "and now there is");
+        // The neighbours are untouched.
+        assert!(out.starts_with("A = B\n") && out.ends_with("C = D\n"));
+    }
+
+    /// A slot opened and deleted leaves the line exactly as it was — a pad user
+    /// who opens one by mistake gets their config back, not a stray space.
+    #[test]
+    fn opening_a_slot_and_deleting_it_is_a_round_trip() {
+        for (text, cur) in [
+            ("N = 2 1\n", Cursor { line: 0, token: 2 }),
+            ("GYRO_SENS = 4   # feel\n", Cursor { line: 0, token: 0 }),
+            ("S = SPACE # jump\n", Cursor { line: 0, token: 2 }),
+        ] {
+            for after in [true, false] {
+                let (opened, at) = insert_slot(text, cur, after);
+                assert_eq!(delete(&opened, at), text, "{text:?} after={after}");
+            }
+        }
     }
 }

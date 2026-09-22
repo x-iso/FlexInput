@@ -129,6 +129,10 @@ impl FlexInputApp {
                     match pane {
                         crate::gamepad_nav::JsmPane::Text => {
                             hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
+                            hints.push((
+                                vec!["btn_south", "dpad_left", "dpad_right"],
+                                "Hold+tap: insert",
+                            ));
                         }
                         crate::gamepad_nav::JsmPane::Tune => {
                             hints.push((vec!["btn_west"], "Fine"));

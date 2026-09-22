@@ -1288,6 +1288,25 @@ impl crate::app::FlexInputApp {
         // Holding South and tapping West is a thumb-roll you can do without
         // looking, which is the bar an editing chord has to clear.
         let holding = nav.pressed.contains("btn_south");
+        // South + left/right opens an empty slot on that side and moves onto it.
+        // Replacing is what the cursor does on its own, so without this there is
+        // no way to ADD anything — every pick would land on the token you are
+        // standing on, and `N = 2` could never become `N = 2 1`.
+        //
+        // The dpad only, and only on the press. The stick auto-repeats, and a
+        // held stick would spray slots down the line faster than you could see.
+        if holding {
+            let right = nav.is_rising("dpad_right");
+            let left = nav.is_rising("dpad_left");
+            if right || left {
+                let (edited, at) = flexinput_engine::eval::jsm_insert_slot(&text, cur, right);
+                self.nav_set_jsm_text(outer_id, &edited);
+                self.gamepad_nav.jsm_cursor = at;
+                crate::canvas::viewer::publish_jsm_cursor(ctx, inner, at);
+                crate::canvas::viewer::publish_jsm_chord(ctx, inner, true);
+                return;
+            }
+        }
         if holding && nav.is_rising("btn_west") {
             let edited = flexinput_engine::eval::jsm_cursor_delete(&text, cur);
             if edited != text {
@@ -1299,7 +1318,10 @@ impl crate::app::FlexInputApp {
             return;
         }
 
-        if let Some(dir) = step_dir {
+        // While the modifier is down the directions belong to the chord, so the
+        // cursor stays put — otherwise opening a slot would also walk away from
+        // the one you just opened.
+        if let (Some(dir), false) = (step_dir, holding) {
             let (dx, dy) = match dir {
                 NavDir::Left => (-1, 0),
                 NavDir::Right => (1, 0),
