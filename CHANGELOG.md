@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-09-24
+
 ### Added
 
 - **The JSM Config tune panel can calibrate its own real-world calibration.**
