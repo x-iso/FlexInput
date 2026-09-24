@@ -808,9 +808,6 @@ pub(crate) struct CommandList {
     pub group_step: i32,
     /// The pad has chosen the highlighted row.
     pub confirm: bool,
-    /// Scroll the highlighted row into view: set whenever the pad moves it,
-    /// since a pad has no pointer and cannot scroll the list itself.
-    pub follow: bool,
 }
 
 /// Room the command list needs: the filter row, the rows themselves, and the
@@ -976,7 +973,6 @@ pub(crate) fn command_list(
     // What the pad asked for, resolved against the list the pad can actually
     // see. Anything it moves, it also wants scrolled into view.
     if st.step != 0 || st.group_step != 0 {
-        st.follow = true;
         if !rows.is_empty() {
             if st.step != 0 {
                 let n = rows.len() as i64;
@@ -995,6 +991,20 @@ pub(crate) fn command_list(
             picked = Some((r.name.clone(), r.kind));
         }
     }
+
+    // Whether THIS copy of the list still has to scroll.
+    //
+    // `ctx.data` is shared across viewports, so the pinned copy in the config
+    // overlay and the one on the canvas read and write the SAME `CommandList`.
+    // Whichever drew first used to consume `follow` and clear it, leaving the
+    // other showing a highlight it never scrolled to — which, in the overlay, is
+    // a list stuck on its first few rows however far the pad walks. Each viewport
+    // remembers the row it last brought into view instead, so both scroll and
+    // neither fights the wheel: it fires on a CHANGE of row, not every frame.
+    let seen_id = egui::Id::new(("jsm_cmds_scrolled", node_id.0, ui.ctx().viewport_id()));
+    let seen: Option<usize> = ui.ctx().data(|d| d.get_temp(seen_id));
+    let follow = seen != Some(st.index);
+    ui.ctx().data_mut(|d| d.insert_temp(seen_id, st.index));
 
     let claimant = ui.id().with(("jsm_cmds", node_id.0));
     crate::canvas::wheel::scrolling_body(
@@ -1023,7 +1033,7 @@ pub(crate) fn command_list(
                 // A pad has no pointer, so the list has to bring the highlight
                 // to it — walking off the bottom of a box you can't scroll is
                 // the same as the highlight vanishing.
-                if i == st.index && st.follow {
+                if i == st.index && follow {
                     resp.scroll_to_me(None);
                 }
                 // JSM's own words for what it does, plus our reason when we
@@ -1059,7 +1069,6 @@ pub(crate) fn command_list(
             ui.label(egui::RichText::new(w).small().weak().italics());
         }
     }
-    st.follow = false;
     if picked.is_some() || close {
         st.open = false;
     }

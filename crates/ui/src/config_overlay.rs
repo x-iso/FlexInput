@@ -143,6 +143,25 @@ pub fn set_config_overlay_edit(ctx: &egui::Context, on: bool) {
 /// rest of the device passes through.
 const RWS_SWEEP_CONTROL_PINS: &[&str] = &["btn_south", "btn_east"];
 
+/// Modules that run a measure calibration sweep on the shared `cal_*` params:
+/// RWS Aim's own widget, and the JSM Config tune panel's "Calibrate RWC" row.
+/// Both need the same two things from the overlay — the pad passed through so
+/// the camera can be turned, and the 360° method's reference frame.
+fn runs_measure_sweep(node: &NodeData) -> bool {
+    matches!(node.module_id.as_str(), "processing.rws" | "module.jsm")
+}
+
+/// The sweep this node is running, if any: "pitch" or "yaw".
+fn sweep_axis(node: &NodeData) -> Option<&str> {
+    if !runs_measure_sweep(node) {
+        return None;
+    }
+    node.params
+        .get("cal_measure")
+        .and_then(|v| v.as_str())
+        .filter(|a| *a == "pitch" || *a == "yaw")
+}
+
 /// While an RWS pin is running a MEASURE calibration sweep (`cal_measure` =
 /// pitch/yaw), the user's gyro/stick must reach the RWS node so the camera moves
 /// — but the config overlay source-blocks every physical input by default. This
@@ -167,11 +186,7 @@ fn rws_measure_passthrough<V>(
             _ => None,
         };
         let Some(node) = node else { continue };
-        if node.module_id != "processing.rws" {
-            continue;
-        }
-        let cm = node.params.get("cal_measure").and_then(|v| v.as_str()).unwrap_or("off");
-        if cm == "pitch" || cm == "yaw" {
+        if sweep_axis(node).is_some() {
             if let Some(dev) = crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id) {
                 let pins: Vec<String> = live_signals
                     .keys()
@@ -208,10 +223,9 @@ fn rws_reference_frame(
             _ => None,
         };
         let Some(node) = node else { return false };
-        node.module_id == "processing.rws"
-            && node.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false)
+        node.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false)
             // Snapshot comparison is the 360° horizontal aid only.
-            && node.params.get("cal_measure").and_then(|v| v.as_str()) == Some("yaw")
+            && sweep_axis(node) == Some("yaw")
     });
 
     let tex_key = egui::Id::new("fxi_rws_ref_tex");

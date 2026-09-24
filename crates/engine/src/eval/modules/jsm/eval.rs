@@ -71,6 +71,11 @@ pub struct JsmState {
     /// file), so it is not always the tab the editor has open — `RESET_MAPPINGS`,
     /// or an edit, brings it back to that one.
     layer: String,
+    /// The calibration sweep's running total. Deliberately NOT reset when the
+    /// config recompiles: a Finish rewrites the config text, which recompiles
+    /// this node, and clearing here would throw the measurement away on the very
+    /// tick it is being read.
+    cal: super::cal::Measure,
     /// Every pin any layer of this node has ever claimed.
     ///
     /// A sink latches what it was last told, so a pin has to keep being told
@@ -154,6 +159,7 @@ pub(crate) fn jsm_publish(
         Box::new(JsmState {
             gen,
             layer: selected.clone(),
+            cal: super::cal::Measure::default(),
             ever_claimed: HashSet::new(),
             cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
@@ -249,13 +255,13 @@ pub(crate) fn jsm_publish(
     // Then aiming: the gyro and whichever sticks are pointed at the mouse. What
     // is pointed at a virtual pad's stick instead comes back as a camera rate for
     // the pad side to convert.
+    let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0) * GYRO_REF_DPS;
+    let gyro = Gyro {
+        roll: f("gyro_x"),
+        pitch: f("gyro_y"),
+        yaw: f("gyro_z"),
+    };
     let aimed = {
-        let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0) * GYRO_REF_DPS;
-        let gyro = Gyro {
-            roll: f("gyro_x"),
-            pitch: f("gyro_y"),
-            yaw: f("gyro_z"),
-        };
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
         st.aim
@@ -409,6 +415,48 @@ pub(crate) fn jsm_publish(
         collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
     }
 
+    // ── a calibration sweep, when one is running ─────────────────────────────
+    //
+    // Replaces what the config just aimed with, rather than adding to it: the
+    // whole point is to drive the game from the raw pad rotation at the current
+    // calibration and nothing else. Published last so it lands over the config's
+    // own `mouse_move` and stick. See `cal.rs` for why the config's aiming is set
+    // aside for the duration.
+    let sweep = super::cal::Sweep::read(&snap.params);
+    {
+        let counts_per_deg = res.aim.real_world_calibration / res.aim.in_game_sens.max(1e-6);
+        let (rate, defl) = match sweep {
+            Some(sw) => {
+                let (d, rate, defl) = super::cal::drive(
+                    sw, gyro.yaw, gyro.pitch, counts_per_deg, res.pad.calibration);
+                if let Some(m) = d.mouse {
+                    collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m * dt));
+                }
+                if let Some(v) = d.stick {
+                    // The stick the gyro is pointed at, or the right one when it
+                    // is pointed at the mouse and the user is calibrating a stick
+                    // anyway (they may be about to switch `GYRO_OUTPUT` over).
+                    let side = res.pad.gyro_dest.side().unwrap_or(1);
+                    let name = if side == 0 { "left_stick" } else { "right_stick" };
+                    collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(v));
+                    collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(v.x));
+                    collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(v.y));
+                } else if let Some(side) = res.pad.gyro_dest.side() {
+                    // Calibrating the mouse while the gyro drives a stick: hold
+                    // that stick still, or it turns the camera too and the
+                    // measured rotation answers for both.
+                    let name = if side == 0 { "left_stick" } else { "right_stick" };
+                    collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
+                    collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
+                    collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+                }
+                (rate, defl)
+            }
+            None => (0.0, 0.0),
+        };
+        st.cal.tick(sweep, rate, defl, dt);
+    }
+
     // ── what goes back to the pad ────────────────────────────────────────────
     //
     // Rumble, the light bar and the adaptive triggers are the only things this
@@ -463,9 +511,21 @@ pub(crate) fn jsm_publish(
         }
     }
 
-    // output[0] is the AutoMap pass-through, which carries no scalar.
-    vec![None; snap.n_outputs.max(1)]
+    // output[0] is the AutoMap pass-through, which carries no scalar. The two
+    // after it are not pins at all — they are how the calibration widget reads
+    // the sweep this node is integrating, the same trailing-output channel RWS
+    // publishes its own measurement on. See `CAL_DEG_OUT` / `CAL_PEAK_OUT`.
+    let mut out = vec![None; snap.n_outputs.max(1)];
+    out.push(Some(Signal::Float(st.cal.deg)));
+    out.push(Some(Signal::Float(st.cal.peak)));
+    out
 }
+
+/// Index of the measured-rotation trailing output in a JSM node's `last_out`,
+/// and of the peak stick deflection beside it. The module declares exactly one
+/// output pin (the bus), so the display-only pair sits at 1 and 2.
+pub const CAL_DEG_OUT: usize = 1;
+pub const CAL_PEAK_OUT: usize = 2;
 
 /// Every tab the node holds, as (name, text) — what a layer switch can reach.
 fn all_tabs(snap: &NodeSnap) -> Vec<(String, String)> {

@@ -638,12 +638,22 @@ pub(crate) fn rws_measure_controls(
     snarl: &mut Snarl<NodeData>,
     split_hints: bool,
 ) -> bool {
-    let guide = |ui: &mut egui::Ui, instruction: &str, pad_hint: &str| {
+    // The instruction is prose; the hint names buttons, so it is drawn with the
+    // connected pad's own glyphs (`{pin}` placeholders) rather than letters that
+    // are only right on an Xbox pad. Both halves are laid out as rows either way
+    // — a glyph can't be interpolated into a string — so `split_hints` now only
+    // decides whether they share a row.
+    let guide = |ui: &mut egui::Ui, instruction: &str, hint: &str| {
         if split_hints {
             ui.label(egui::RichText::new(instruction).small().weak());
-            ui.label(egui::RichText::new(pad_hint).small().weak());
+            super::pad_hints::pad_hint(ui, hint);
         } else {
-            ui.label(egui::RichText::new(format!("{instruction}  ·  {pad_hint}")).small().weak());
+            // One row, not wrapped: the pin's sized frames were laid out for a
+            // single line of guidance.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{instruction}  ·  ")).small().weak());
+                super::pad_hints::pad_hint_inline(ui, hint);
+            });
         }
     };
     let (axis, theta, peak_defl) = rws_measure_state(node_id, snarl);
@@ -685,7 +695,7 @@ pub(crate) fn rws_measure_controls(
             (_, false) => "Turn one full 360°, then Finish",
             (_, true) => "Turn one full 360° (steadily, not too fast), then Finish",
         };
-        guide(ui, instruction, "A = Finish · B = Cancel");
+        guide(ui, instruction, "{btn_south} Finish · {btn_east} Cancel");
     } else {
         let r = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Auto-cal").small().weak())
@@ -738,9 +748,11 @@ pub(crate) fn rws_measure_controls(
             }
         }
         if pending == "pitch" {
-            guide(ui, "Aim the camera straight DOWN first", "A = Start · ◄► method · ▲▼ output");
+            guide(ui, "Aim the camera straight DOWN first",
+                "{btn_south} Start · {dpad_left}{dpad_right} method · {dpad_up}{dpad_down} output");
         } else {
-            guide(ui, "Aim straight ahead first", "A = Start · ◄► method · ▲▼ output · Y = snapshot");
+            guide(ui, "Aim straight ahead first",
+                "{btn_south} Start · {dpad_left}{dpad_right} method ·                  {dpad_up}{dpad_down} output · {btn_north} snapshot");
         }
         // Mouse only: the in-game mouse sensitivity sets the angular resolution.
         if !is_stick {

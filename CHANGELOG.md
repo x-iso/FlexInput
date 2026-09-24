@@ -5,6 +5,69 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The JSM Config tune panel can calibrate its own real-world calibration.**
+  Under the sensitivity curve there is now a **Calibrate RWC** row; open it (a
+  click, or South on the pad) and it unfolds into the same measure calibration
+  RWS Aim carries, stacked to fit the panel's narrow column — method and output
+  on one row, the snapshot reference on the next, guidance under that. Turn the
+  camera the amount it asks for and Finish, and the constant that would have made
+  that a 1:1 physical rotation is solved from how far the pad really turned:
+  **Mouse** writes `REAL_WORLD_CALIBRATION`, **Stick** writes
+  `VIRTUAL_STICK_CALIBRATION`. `IN_GAME_SENS` is part of the sum — JSM divides
+  the calibration by it everywhere it aims, so the answer is multiplied back
+  through it and a config that never sets the command is simply the neutral case
+  of 1. The answer lands in the config text, on its own line if the config never
+  had one, so it shows on its own fader and travels with the config.
+
+  While a sweep runs the config's own aiming is set aside and the game is driven
+  from the raw pad rotation at the calibration the config has now — a sensitivity
+  curve, smoothing or acceleration folded into the measurement would make it
+  wrong, and a curve would make it unsolvable. Only the axis being measured
+  moves, and the output that isn't being calibrated is held still, so a config
+  that drives both can't turn the camera twice. A stick pushed past full
+  deflection mid-sweep is reported rather than solved, because past that point
+  the game turns slower than the pad does. The pad flow is RWS Aim's, button for
+  button: ◄► method, ▲▼ output, Y snapshot, A start, A finish, B cancel. The
+  panel can also be pinned on its own into the config overlay, which is where a
+  sweep is usually run.
+
+### Changed
+
+- **Gamepad guidance names buttons with the pad's own glyphs.** The JSM
+  calibration panel and RWS Aim's both spelled their controls out as letters and
+  arrows — "A = Start · ◄► method" — which is right only on an Xbox pad, and
+  worst on a Switch Pro, where the letter exists but is in the other place. They
+  now draw the connected pad's own button art, restyling with it the way every
+  other `gp:` icon in the app does, and fall back to a word for a button no
+  family has art for.
+
+### Fixed
+
+- **The JSM calibration panel can be backed out of.** East closed the whole
+  editor instead of the panel, so the tuning faders underneath became
+  unreachable — and since the panel was still open, re-entering the editor
+  dropped straight back into it. East now folds the panel away (or cancels a
+  running sweep) before it means "leave the editor", the same arrangement the
+  command list has. Up/Down flipping the Mouse/Stick output is edge-triggered
+  too, so holding a direction no longer flips it back and forth.
+
+- **The command list scrolls to the pad's selection in the config overlay.**
+  Walking the list past the first few rows moved the highlight out of sight
+  rather than scrolling to it. The list's state is shared between the pinned
+  overlay copy and the one on the canvas, so whichever drew first consumed the
+  "scroll to the highlight" flag and left the other stuck; each now remembers the
+  row it last brought into view, so both follow the selection and neither fights
+  the mouse wheel.
+
+- **A patch saved mid-calibration no longer resumes the sweep when it loads.**
+  An RWS Aim or JSM Config node saved while measuring came back measuring —
+  driving the mouse from the gyro the moment the patch opened, with the widget
+  that stops it nowhere on screen. A sweep is something you are doing rather than
+  a setting, so it is stopped on load; the method and output it was set to are
+  settings and still persist.
+
 ## [0.14.5] - 2026-09-22
 
 ### Added

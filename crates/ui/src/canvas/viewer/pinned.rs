@@ -394,6 +394,12 @@ pub(crate) fn render_pinned_element_impl(
             );
             return;
         }
+        // "Calibrate RWC" on its own. Named "measure" to match RWS Aim's, because
+        // the config overlay's sweep handling keys on the element name.
+        ("module.jsm", "measure") => {
+            super::jsm::show_jsm_measure_sized(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("module.jsm", k) if super::jsm_widgets::knob_name_of(k).is_some() => {
             let name = super::jsm_widgets::knob_name_of(k).unwrap_or_default().to_string();
             super::jsm::show_jsm_knob_sized(

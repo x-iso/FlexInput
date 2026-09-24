@@ -3248,6 +3248,11 @@ pub(crate) enum NavField {
     /// it carries a name instead of a `&'static str` key: there is no param to
     /// write, and editing goes back through the same text rewrite a drag uses.
     JsmValue { name: String },
+    /// JSM Config's "Calibrate RWC" row. It edits nothing by itself — South
+    /// opens the panel, which then owns the pad (`nav_drive_jsm_calibrate`) the
+    /// way the command list does. It is a field only so the pad can FOCUS it,
+    /// and so its rect lines up with the one the tune panel publishes.
+    JsmCalibrate,
 }
 
 #[derive(Clone)]
@@ -4003,11 +4008,14 @@ impl FlexInputApp {
                 let lt_exits = lt_rising && !self.nav_jsm_editor_selected();
                 // A JSM command list drawn over the editor takes East for
                 // itself: while it is up, "back" means close the list, not
-                // leave the widget you opened it from.
-                let list_up = self.nav_jsm_list_open(ctx);
+                // leave the widget you opened it from. The calibration panel is
+                // the same arrangement — East folds it away (or cancels its
+                // sweep) before it means "leave the editor", so the faders
+                // underneath stay reachable without dropping out of the widget.
+                let panel_up = self.nav_jsm_list_open(ctx) || self.nav_jsm_cal_open();
                 // East / LT / back → exit to widget level, committing the edit
                 // as one undo entry if anything actually changed.
-                if (nav.is_rising("btn_east") && !list_up) || lt_exits {
+                if (nav.is_rising("btn_east") && !panel_up) || lt_exits {
                     self.gamepad_nav.edit_level = EditLevel::Widget;
                     self.nav_set_dropdown_popup(ctx, outer_id, false);
                     if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {

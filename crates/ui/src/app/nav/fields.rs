@@ -34,6 +34,13 @@ impl FlexInputApp {
             if self.nav_drive_jsm_list(ctx, outer_id, nav, step_dir, rt_rising, lt_rising) {
                 return;
             }
+            // The calibration panel owns the pad once it is open, for the same
+            // reason the list does: its controls are drawn over the faders, and
+            // walking them at the same time would be editing something you can't
+            // see. South on the focused row is what opens it.
+            if self.nav_drive_jsm_calibrate(ctx, outer_id, nav, rt_rising) {
+                return;
+            }
             if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
                 self.gamepad_nav.jsm_pane = self.gamepad_nav.jsm_pane.other();
             }
@@ -138,6 +145,9 @@ impl FlexInputApp {
                 // nudging it. See `GamepadNav::jsm_baseline` for why that, and
                 // not JSM's own default.
                 NavField::JsmValue { name } => self.nav_restore_jsm_baseline(outer_id, inner, name),
+                // Nothing to reset: the row holds no value, and North is the
+                // snapshot toggle once the panel it opens owns the pad.
+                NavField::JsmCalibrate => {}
             }
         }
 
@@ -192,6 +202,9 @@ impl FlexInputApp {
                     self.nav_adjust_jsm_knob(outer_id, inner, name, delta);
                 }
             }
+            // Focus only: South opens the panel, and it drives itself from there
+            // (`nav_drive_jsm_calibrate`), so there is nothing to adjust here.
+            NavField::JsmCalibrate => {}
             NavField::EnumPair { key_a, key_b, opts } => {
                 let dir = if nav.is_rising("btn_south") || rt_rising { 1 } else { edit_press };
                 if dir != 0 {
@@ -337,6 +350,9 @@ impl FlexInputApp {
                     format!("{:.2}", k.value)
                 })
                 .unwrap_or_default(),
+            // What the row would do if South were pressed: the method waiting to
+            // run, or how far the sweep already running has got.
+            NavField::JsmCalibrate => self.nav_jsm_cal_summary(outer_id),
         };
         // Find the item's screen rect (published by render_subpatch_body) to
         // anchor the HUD just above it.
@@ -761,14 +777,17 @@ impl FlexInputApp {
         // the whole point of the module, and means a setting added while the
         // overlay is open is navigable straight away.
         if mid == "module.jsm" && elem == "editor" {
-            return self
-                .nav_jsm_knobs(outer_id)
-                .into_iter()
-                .map(|k| NavFieldDef {
-                    label: k.name.clone().into(),
-                    field: NavField::JsmValue { name: k.name },
-                })
-                .collect();
+            // The calibration row comes first, matching where the tune panel
+            // draws it — under the curve, above the faders.
+            return std::iter::once(NavFieldDef {
+                label: "Calibrate RWC".into(),
+                field: NavField::JsmCalibrate,
+            })
+            .chain(self.nav_jsm_knobs(outer_id).into_iter().map(|k| NavFieldDef {
+                label: k.name.clone().into(),
+                field: NavField::JsmValue { name: k.name },
+            }))
+            .collect();
         }
         match (mid.as_str(), elem.as_str()) {
             // ── single-field elements (also driven by the unified editor) ──
@@ -1405,6 +1424,134 @@ impl crate::app::FlexInputApp {
         )
     }
 
+    /// One line for the focus HUD: the method South would start, or how far the
+    /// sweep already running has turned.
+    pub(crate) fn nav_jsm_cal_summary(&self, outer_id: egui_snarl::NodeId) -> String {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return String::new() };
+        let axis = self
+            .get_subpatch_param_str(outer_id, inner, "cal_measure")
+            .filter(|a| a == "pitch" || a == "yaw");
+        match axis {
+            Some(a) => {
+                let deg = self.tabs[self.active_tab]
+                    .canvas
+                    .snarl
+                    .get_node(outer_id)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| sp.snarl.get_node(inner))
+                    .and_then(|n| {
+                        n.extra.last_out.get(flexinput_engine::eval::JSM_CAL_DEG_OUT).copied().flatten()
+                    })
+                    .map(|s| s.as_float())
+                    .unwrap_or(0.0);
+                let target = if a == "yaw" { 360.0 } else { 180.0 };
+                format!("{:.0}° / {target:.0}°", deg.abs())
+            }
+            None => {
+                let pending = self
+                    .get_subpatch_param_str(outer_id, inner, "cal_pending")
+                    .filter(|p| p == "pitch" || p == "yaw")
+                    .unwrap_or_else(|| "yaw".into());
+                if pending == "pitch" { "↕180°".into() } else { "↔360°".into() }
+            }
+        }
+    }
+
+    /// The calibration panel's gamepad flow, and whether it took the pad.
+    ///
+    /// Deliberately the SAME button map as RWS Aim's measure widget
+    /// (`nav_drive_rws_measure`), on the same param names, because it is the same
+    /// procedure: ◄► pick the method, ▲▼ the output, Y the snapshot reference, A
+    /// start, A finish, B cancel. The only addition is opening and closing, which
+    /// RWS doesn't need — its widget is a pin of its own, while this one is a row
+    /// folded into the tune panel.
+    ///
+    /// Takes the pad whenever the panel is open, so the faders underneath can't
+    /// be walked while their controls are covered.
+    fn nav_drive_jsm_calibrate(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        rt_rising: bool,
+    ) -> bool {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
+        let open = self.get_subpatch_param_bool(outer_id, inner, "cal_open").unwrap_or(false);
+        let south = nav.is_rising("btn_south") || rt_rising;
+
+        if !open {
+            // Shut, the row is an ordinary field the pad walks past — until South
+            // lands on it. Field 0 is the calibration row (see `nav_fields_for`),
+            // and only the fader pane has fields at all.
+            let on_the_row = self.gamepad_nav.jsm_pane == crate::gamepad_nav::JsmPane::Tune
+                && self.gamepad_nav.field_index == 0;
+            if !(south && on_the_row) {
+                return false;
+            }
+            self.set_subpatch_param_bool(outer_id, inner, "cal_open", true);
+            self.nav_jsm_cal_wrote(ctx);
+            return true;
+        }
+
+        let sweeping = self
+            .get_subpatch_param_str(outer_id, inner, "cal_measure")
+            .is_some_and(|a| a == "pitch" || a == "yaw");
+        let east = nav.is_rising("btn_east");
+
+        if sweeping {
+            // A running sweep answers only two buttons, so neither can be
+            // mistaken for the other with the camera mid-turn.
+            if south {
+                self.set_subpatch_param_bool(outer_id, inner, "cal_finish", true);
+            } else if east {
+                self.set_subpatch_param_str(outer_id, inner, "cal_measure", "off");
+            }
+            self.nav_jsm_cal_wrote(ctx);
+            return true;
+        }
+
+        if nav.is_rising("dpad_left") {
+            self.set_subpatch_param_str(outer_id, inner, "cal_pending", "pitch");
+        }
+        if nav.is_rising("dpad_right") {
+            self.set_subpatch_param_str(outer_id, inner, "cal_pending", "yaw");
+        }
+        // Up/Down flips which output gets solved (Mouse ↔ Stick). Edge-triggered
+        // on the dpad, exactly as RWS Aim's does: a held direction repeating
+        // would flip a two-state toggle back and forth under your thumb.
+        if nav.is_rising("dpad_up") || nav.is_rising("dpad_down") {
+            let cur = self.get_subpatch_param_str(outer_id, inner, "cal_output");
+            let next = if cur.as_deref() == Some("stick") { "mouse" } else { "stick" };
+            self.set_subpatch_param_str(outer_id, inner, "cal_output", next);
+        }
+        // Y toggles the snapshot reference (the 360° method's alignment aid).
+        if nav.is_rising("btn_north") {
+            let s = self.get_subpatch_param_bool(outer_id, inner, "cal_ref_shot").unwrap_or(false);
+            self.set_subpatch_param_bool(outer_id, inner, "cal_ref_shot", !s);
+        }
+        if south {
+            let pending = self
+                .get_subpatch_param_str(outer_id, inner, "cal_pending")
+                .filter(|p| p == "pitch" || p == "yaw")
+                .unwrap_or_else(|| "yaw".into());
+            self.set_subpatch_param_str(outer_id, inner, "cal_measure", &pending);
+        } else if east {
+            // Nothing running: East folds the panel away and hands the faders back.
+            self.set_subpatch_param_bool(outer_id, inner, "cal_open", false);
+        }
+        self.nav_jsm_cal_wrote(ctx);
+        true
+    }
+
+    /// These are direct writes into the tab's embedded sub-patch copy, so bump
+    /// the canvas generation (no undo entry — calibration state is transient) and
+    /// an open sub-patch editor re-pulls instead of writing its stale copy back.
+    fn nav_jsm_cal_wrote(&mut self, ctx: &egui::Context) {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+        ctx.request_repaint();
+    }
+
     /// Drive the command list while it is open, and say whether it took the pad.
     ///
     /// The pad only ever says which WAY to move — one row, one group, or that
@@ -1542,12 +1689,26 @@ impl crate::app::FlexInputApp {
         // A filter left behind by the mouse would hide most of the list from a
         // pad, which has no way to see it or clear it.
         list.filter.clear();
-        list.follow = true;
         crate::canvas::viewer::set_command_list_state(ctx, inner, list);
         self.gamepad_nav.jsm_list_open = true;
     }
 
     /// Is the command list up on the editor nav is driving?
+    /// Is the JSM calibration panel open on the widget the pad is driving?
+    ///
+    /// While it is, East belongs to IT — it folds the panel away, or cancels a
+    /// sweep — rather than backing out of the whole editor. Same arrangement the
+    /// command list has, and for the same reason: a panel drawn over the faders
+    /// owns "back" until it is gone.
+    pub(crate) fn nav_jsm_cal_open(&self) -> bool {
+        self.nav_driving_outer_id()
+            .filter(|o| self.nav_is_jsm_editor(*o))
+            .and_then(|o| self.nav_selected_inner_node(o).map(|inner| (o, inner)))
+            .is_some_and(|(o, inner)| {
+                self.get_subpatch_param_bool(o, inner, "cal_open").unwrap_or(false)
+            })
+    }
+
     pub(crate) fn nav_jsm_list_open(&self, ctx: &egui::Context) -> bool {
         self.nav_driving_outer_id()
             .filter(|o| self.nav_is_jsm_editor(*o))

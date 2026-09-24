@@ -140,6 +140,18 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
     // snarl of every sub-patch, reached by the recursion at the bottom.
     renumber_subpatch_ports(snarl);
     for (_, node) in snarl.nodes_ids_data_mut() {
+        // A measure calibration is a thing you are DOING, not a setting. Saved
+        // mid-sweep it would come back running — driving the mouse from the gyro
+        // the moment the patch loads, with the widget that stops it nowhere on
+        // screen. Land every patch with the sweep stopped; the method and output
+        // it was set to are settings and do persist.
+        if matches!(node.value.module_id.as_str(), "processing.rws" | "module.jsm")
+            && node.value.params.get("cal_measure").and_then(|v| v.as_str())
+                .is_some_and(|a| a == "pitch" || a == "yaw")
+        {
+            node.value.params.insert("cal_measure".to_string(), Value::from("off"));
+            node.value.params.insert("cal_finish".to_string(), Value::Bool(false));
+        }
         if node.value.module_id == "module.map_action" && node.value.outputs.len() < 2 {
             node.value.outputs = vec![
                 PinDescriptor::new("Gate",   SignalType::Bool),
@@ -3442,5 +3454,57 @@ mod group_tests {
         let _ = canvas.group_selected_into_subpatch(&[id_a, id_b]);
 
         assert!(canvas.can_undo(), "undo snapshot should be pushed after grouping");
+    }
+}
+
+#[cfg(test)]
+mod cal_migration_tests {
+    use super::*;
+
+    fn node_mid_sweep(module_id: &str) -> NodeData {
+        let mut params = HashMap::new();
+        params.insert("cal_measure".to_string(), Value::from("yaw"));
+        params.insert("cal_output".to_string(), Value::from("stick"));
+        params.insert("cal_finish".to_string(), Value::Bool(true));
+        NodeData {
+            module_id: module_id.to_string(),
+            display_name: "Aim".to_string(),
+            category: "Processing".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_patch_saved_mid_sweep_loads_with_the_sweep_stopped() {
+        for module_id in ["processing.rws", "module.jsm"] {
+            let mut snarl: Snarl<NodeData> = Snarl::new();
+            let id = snarl.insert_node(egui::pos2(0.0, 0.0), node_mid_sweep(module_id));
+            migrate_loaded_snarl(&mut snarl);
+            let p = &snarl.get_node(id).unwrap().params;
+            assert_eq!(
+                p.get("cal_measure").and_then(|v| v.as_str()),
+                Some("off"),
+                "{module_id} should not come back mid-sweep"
+            );
+            assert_eq!(p.get("cal_finish").and_then(|v| v.as_bool()), Some(false));
+            // Which method and output it was set to are settings, and survive.
+            assert_eq!(p.get("cal_output").and_then(|v| v.as_str()), Some("stick"));
+        }
+    }
+
+    #[test]
+    fn an_idle_node_is_left_alone() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut n = node_mid_sweep("processing.rws");
+        n.params.insert("cal_measure".to_string(), Value::from("off"));
+        n.params.remove("cal_finish");
+        let id = snarl.insert_node(egui::pos2(0.0, 0.0), n);
+        migrate_loaded_snarl(&mut snarl);
+        // No `cal_finish` is written where there was none to clear.
+        assert!(!snarl.get_node(id).unwrap().params.contains_key("cal_finish"));
     }
 }

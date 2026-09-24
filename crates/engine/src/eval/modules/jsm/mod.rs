@@ -12,6 +12,7 @@
 mod aim;
 mod analog;
 mod bind;
+mod cal;
 mod catalogue;
 mod cc;
 mod cursor;
@@ -30,6 +31,9 @@ mod tests;
 
 pub(crate) use eval::{jsm_publish, JsmState};
 
+// Read by the calibration widget: where the sweep's measurement lands.
+pub use eval::{CAL_DEG_OUT as JSM_CAL_DEG_OUT, CAL_PEAK_OUT as JSM_CAL_PEAK_OUT};
+
 // The UI pauses the config's typing while its editor has focus.
 pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
 
@@ -47,6 +51,7 @@ pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue, fi_tag
     kinds_at as jsm_kinds_at, Item as JsmItem, Kind as JsmKind,
     State as JsmSupportState};
 pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, scrub as jsm_scrub_number,
+    line_of as jsm_setting_line, set_setting as jsm_set_setting,
     sens_curve as jsm_sens_curve,
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,

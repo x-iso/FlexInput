@@ -221,6 +221,34 @@ pub(crate) fn show_jsm_curve_sized(
     }
 }
 
+/// The calibration panel on its own, for the config overlay — which is where a
+/// sweep is actually run, the game being what the camera turns in. Pinned like
+/// this it is always expanded: the pin IS the widget.
+pub(crate) fn show_jsm_measure_sized(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    size: egui::Vec2,
+) {
+    let mut tabs = read_tabs(snarl, node_id);
+    let active = active_tab(snarl, node_id, tabs.len());
+    let Some(tab) = tabs.get(active) else { return };
+    ui.set_max_width(size.x);
+    let text = tab.text.clone();
+    let (_, edits) = super::jsm_cal::calibrate_block(node_id, ui, snarl, size.x, &text, true);
+    let wrote = !edits.params.is_empty() || edits.text.is_some();
+    if let Some(text) = edits.text {
+        tabs[active].text = text;
+        write_tabs(snarl, node_id, &tabs, active);
+    }
+    apply_cal_params(snarl, node_id, &edits.params);
+    // Pinned, this ran in the overlay's viewport: bump the canvas generation so
+    // an open sub-patch editor re-reads rather than writing its stale copy back.
+    if wrote {
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
 /// One setting's slider on its own, for the config overlay. The setting is found by
 /// name, so it follows the line if the config is edited around it — and says so
 /// plainly if the line is gone rather than silently showing nothing.
@@ -458,17 +486,19 @@ fn strip_column(
     let width = width.min(ui.available_width().max(60.0));
     let mut edited = None;
     let mut warp = None;
+    let mut cal_params: Vec<(&'static str, Value)> = Vec::new();
     ui.vertical(|ui| {
         ui.set_max_width(width);
         // Beside the editor the strip owns its column's full height, whether the
         // body is a node (which grows) or a pin (which does not) — either way it
         // has a column to fill rather than a leftover to squeeze into.
-        let (text, w) = knob_rows(
+        let r = knob_rows(
             node_id, ui, snarl, width, &tabs[active].text, live, parent, paint,
             Some(height),
         );
-        edited = text;
-        warp = w;
+        edited = r.text;
+        warp = r.warp;
+        cal_params = r.params;
     });
     if let Some(w) = warp {
         set_curve_warp(snarl, node_id, w);
@@ -483,6 +513,27 @@ fn strip_column(
             mark_overlay_param_write(ui.ctx());
         }
     }
+    if apply_cal_params(snarl, node_id, &cal_params) && !resizable {
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
+/// Write the calibration panel's transient params onto the node. Returns whether
+/// anything was written, so a pinned render can flag the overlay write.
+fn apply_cal_params(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    params: &[(&'static str, Value)],
+) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    if let Some(n) = snarl.get_node_mut(node_id) {
+        for (k, v) in params {
+            n.params.insert((*k).to_string(), v.clone());
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +559,7 @@ fn jsm_rows(
     // `knob_rows` only borrows the snarl to read; an axis change is applied once
     // the borrow is done.
     let mut pending_warp: Option<f32> = None;
+    let mut pending_cal: Vec<(&'static str, Value)> = Vec::new();
     let side = knob_side(snarl, node_id);
 
     // ── the strip, when it goes above the editor ─────────────────────────────
@@ -515,16 +567,17 @@ fn jsm_rows(
     // already in this column) accounts for it without being told.
     if owns_strip && side == Side::Top {
         let budget = (!resizable).then(|| (size.y * 0.5).max(56.0));
-        let (text, warp) = knob_rows(
+        let r = knob_rows(
             node_id, ui, snarl, size.x, &tabs[active].text, live, parent, paint, budget,
         );
-        if let Some(text) = text {
+        if let Some(text) = r.text {
             tabs[active].text = text;
             changed = true;
         }
-        if let Some(w) = warp {
+        if let Some(w) = r.warp {
             pending_warp = Some(w);
         }
+        pending_cal = r.params;
     }
 
     // ── tab bar ──────────────────────────────────────────────────────────────
@@ -922,16 +975,17 @@ fn jsm_rows(
 
     // ── a slider per numeric setting, and the curve they shape ───────────────
     if knobs_on {
-        let (text, warp) = knob_rows(
+        let r = knob_rows(
             node_id, ui, snarl, size.x, &tabs[active].text, live, parent, paint, strip_budget,
         );
-        if let Some(text) = text {
+        if let Some(text) = r.text {
             tabs[active].text = text;
             changed = true;
         }
-        if let Some(w) = warp {
+        if let Some(w) = r.warp {
             pending_warp = Some(w);
         }
+        pending_cal = r.params;
     }
 
     // ── resize handle (node body only) ───────────────────────────────────────
@@ -944,6 +998,9 @@ fn jsm_rows(
         }
     }
 
+    if apply_cal_params(snarl, node_id, &pending_cal) && !resizable {
+        mark_overlay_param_write(ui.ctx());
+    }
     if let Some(w) = pending_warp {
         set_curve_warp(snarl, node_id, w);
         if !resizable {
@@ -987,6 +1044,16 @@ fn show_knobs(snarl: &Snarl<NodeData>, node_id: NodeId) -> bool {
         .unwrap_or(false)
 }
 
+/// What one pass of the tuning strip wants applied once the snarl borrow is
+/// released: the rewritten config text (a fader drag, or a calibration's answer),
+/// a new curve-warp, and any calibration params the panel touched.
+#[derive(Default)]
+struct KnobRows {
+    text: Option<String>,
+    warp: Option<f32>,
+    params: Vec<(&'static str, Value)>,
+}
+
 /// The curve preview and a slider per numeric setting, under the diagnostics.
 ///
 /// Returns the rewritten config text when a slider moved — the text is the source
@@ -1005,7 +1072,7 @@ fn knob_rows(
     parent: Option<&AutomapGlowParent<'_>>,
     paint: super::jsm_widgets::JsmPaint<'_>,
     budget: Option<f32>,
-) -> (Option<String>, Option<f32>) {
+) -> KnobRows {
     // The curve first, and it stays put while the faders scroll: it is the thing
     // you are watching as you drag one.
     let curve_h = match budget {
@@ -1031,6 +1098,21 @@ fn knob_rows(
     register_exposable_element(ui, node_id, "curve", rect);
     let new_warp = super::jsm_widgets::warp_slider(ui, width, warp, paint);
 
+    // Calibration sits directly under the curve and above the faders: it is the
+    // thing that decides what the curve's speeds MEAN, and it stays put while the
+    // faders scroll for the same reason the curve does. Pinnable on its own, so a
+    // tuning session can carry just this into the config overlay.
+    let cal_start = ui.cursor().min;
+    let (cal_header, cal_edits) =
+        super::jsm_cal::calibrate_block(node_id, ui, snarl, fader_width(ui, width, budget), text, false);
+    register_exposable_element(
+        ui,
+        node_id,
+        "measure",
+        egui::Rect::from_min_max(cal_start, ui.cursor().min + egui::vec2(width, 0.0)),
+    );
+    let cal_h = ui.cursor().min.y - cal_start.y;
+
     let knobs = flexinput_engine::eval::jsm_knobs(text);
     if knobs.is_empty() {
         ui.label(
@@ -1038,23 +1120,26 @@ fn knob_rows(
                 .small()
                 .weak(),
         );
-        return (None, new_warp);
+        publish_nav_field_rects(ui, node_id, &[cal_header]);
+        return KnobRows { text: cal_edits.text, warp: new_warp, params: cal_edits.params };
     }
 
     // Inside a scroll area the bar takes a lane off the right — without allowing
     // for it the fader ran under the bar and the value printed above its right
     // end was half-hidden behind it.
-    let fader_w = match budget {
-        Some(_) => (width - ui.style().spacing.scroll.allocated_width()).max(24.0),
-        None => width,
-    };
+    let fader_w = fader_width(ui, width, budget);
     // One rect per fader, in the order nav walks them, so the focused-field ring
     // lands on the setting the pad is actually editing.
-    let mut field_rects: Vec<egui::Rect> = Vec::with_capacity(knobs.len());
+    // The calibrate row is field 0 — the pad meets it before the faders, which is
+    // the order it reads in, and `nav_fields_for` prepends its label to match.
+    let mut field_rects: Vec<egui::Rect> = Vec::with_capacity(knobs.len() + 1);
+    field_rects.push(cal_header);
     // The fader gamepad nav has focused, and the one this strip last scrolled to.
     // Only a CHANGE scrolls: holding focus on a row while the wheel is used would
     // otherwise drag the strip straight back, and the mouse would feel stuck.
-    let focus = nav_focus_field(ui, node_id);
+    // Field 0 is the calibrate row, so a fader's field index is one past its
+    // position in `knobs`.
+    let focus = nav_focus_field(ui, node_id).and_then(|f| f.checked_sub(1));
     let scrolled_to_id = egui::Id::new(("jsm_nav_scrolled", node_id.0));
     let scrolled_to: Option<usize> = ui.ctx().data(|d| d.get_temp(scrolled_to_id));
     let bring_into_view = focus.filter(|f| Some(*f) != scrolled_to);
@@ -1102,7 +1187,7 @@ fn knob_rows(
             ui,
             node_id,
             width,
-            (h - curve_h - super::jsm_widgets::WARP_H - ui.spacing().item_spacing.y)
+            (h - curve_h - cal_h - super::jsm_widgets::WARP_H - ui.spacing().item_spacing.y)
                 .max(super::jsm_widgets::fader_height(ui)),
             |ui| faders(ui, &mut field_rects),
         ),
@@ -1111,7 +1196,24 @@ fn knob_rows(
     // Keyed by (inner node, current element) — the pinned renderer stamps the
     // element before dispatching, which is the same key the focus ring reads.
     publish_nav_field_rects(ui, node_id, &field_rects);
-    (edited, new_warp)
+    // A Finish rewrites the same text a fader drag does, and only one of the two
+    // can happen in a frame — the faders are behind the calibration panel while
+    // it is open, and its own buttons are what was clicked.
+    KnobRows {
+        text: cal_edits.text.or(edited),
+        warp: new_warp,
+        params: cal_edits.params,
+    }
+}
+
+/// The fader column's width: inside a scroll area the bar takes a lane off the
+/// right, and without allowing for it a fader runs under the bar and the value
+/// printed above its right end is half-hidden behind it.
+fn fader_width(ui: &egui::Ui, width: f32, budget: Option<f32>) -> f32 {
+    match budget {
+        Some(_) => (width - ui.style().spacing.scroll.allocated_width()).max(24.0),
+        None => width,
+    }
 }
 
 /// Bottom-right grip that drags the editor's size, like the 3D viewer's.

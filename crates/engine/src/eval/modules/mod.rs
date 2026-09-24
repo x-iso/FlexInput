@@ -29,7 +29,9 @@ pub use jsm::{jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi
     jsm_line_count, jsm_line_span, jsm_scrub_number,
     jsm_selection, jsm_tokens_at, JsmCursor, JsmToken, JsmTokenKind,
     jsm_note_missing_inputs,
-    jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, set_jsm_editor_focus, JsmConfig, JsmCurvePoint, JsmFeel,
+    jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, jsm_set_setting, jsm_setting_line,
+    JSM_CAL_DEG_OUT, JSM_CAL_PEAK_OUT,
+    set_jsm_editor_focus, JsmConfig, JsmCurvePoint, JsmFeel,
     JsmHand, JsmItem, JsmKind, JsmKnob, JsmLineInfo, JsmLineStatus, JsmSupportState};
 pub(crate) use lean::*;
 pub(crate) use map_action::*;

@@ -118,9 +118,14 @@ impl FlexInputApp {
             if let Some((outer, inner, elem)) = self.gamepad_nav.config_nav_sel.clone() {
                 let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
                 let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
-                // RWS measure widget: bespoke South/East flow (not field-walking).
+                // The measure widget: bespoke South/East flow (not field-walking).
+                // RWS Aim's and the JSM Config one are the same procedure on the
+                // same params, so one driver serves both.
                 if elem == "measure"
-                    && self.nav_selected_module_id(outer).as_deref() == Some("processing.rws")
+                    && matches!(
+                        self.nav_selected_module_id(outer).as_deref(),
+                        Some("processing.rws") | Some("module.jsm")
+                    )
                 {
                     self.nav_drive_rws_measure(ctx, outer, inner, nav, rt_rising);
                     return;
@@ -351,15 +356,20 @@ impl FlexInputApp {
         }
     }
 
-    /// The config pin whose RWS node is mid measure sweep (`cal_measure` =
+    /// The config pin whose node is mid measure sweep (`cal_measure` =
     /// pitch/yaw), as its `(source_path, inner)` address. Only one runs at a time.
+    ///
+    /// Both RWS Aim and the JSM Config tune panel run this same sweep on the same
+    /// params, and both are reached the same way once one is running — so this
+    /// asks what the node is DOING rather than which module it is.
     fn config_active_rws_sweep(&self) -> Option<(Vec<usize>, egui_snarl::NodeId)> {
         self.tabs[self.active_tab].config.items.iter().find_map(|it| {
             let crate::canvas::node::LayoutItem::Module(m) = it else { return None };
             let inner = egui_snarl::NodeId(m.inner_node_id);
             let node = self.picker_node(&m.source_path, inner)?;
+            let runs_sweep = matches!(node.module_id.as_str(), "processing.rws" | "module.jsm");
             let cm = node.params.get("cal_measure").and_then(|v| v.as_str());
-            (node.module_id == "processing.rws" && matches!(cm, Some("pitch" | "yaw")))
+            (runs_sweep && matches!(cm, Some("pitch" | "yaw")))
                 .then(|| (m.source_path.clone(), inner))
         })
     }

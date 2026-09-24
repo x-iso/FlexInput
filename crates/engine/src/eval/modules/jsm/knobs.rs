@@ -134,6 +134,41 @@ pub fn set_knob(text: &str, line: usize, value: f32, integral: bool) -> String {
     }
 }
 
+/// Which line of `text` sets `name`, if any.
+///
+/// Matches the way the parser does — leading whitespace ignored, the name
+/// case-insensitive, a `#` comment stripped first — so a line this finds is the
+/// same line the config is actually running.
+pub fn line_of(text: &str, name: &str) -> Option<usize> {
+    text.lines().position(|raw| {
+        let body = match raw.find('#') {
+            Some(at) => &raw[..at],
+            None => raw,
+        };
+        body.split_once('=')
+            .is_some_and(|(lhs, _)| lhs.trim().eq_ignore_ascii_case(name))
+    })
+}
+
+/// Set `name` to `value`, rewriting the line the config already has for it, or
+/// appending one when it has none.
+///
+/// A calibration writes its answer here rather than into a node param, because
+/// the config text is this module's only source of truth: the measured value
+/// then shows up on its own fader, undoes with the rest of the edit, and travels
+/// with the config the way a hand-typed one does.
+pub fn set_setting(text: &str, name: &str, value: f32, integral: bool) -> String {
+    if let Some(line) = line_of(text, name) {
+        return set_knob(text, line, value, integral);
+    }
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{name} = {}\n", shown(value, integral)));
+    out
+}
+
 /// One point of the sensitivity curve: how fast the pad is turning, and the
 /// sensitivity the config gives at that speed.
 #[derive(Clone, Copy, PartialEq, Debug)]

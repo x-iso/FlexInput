@@ -5854,3 +5854,197 @@ fn no_diagnostic_promises_a_numbered_phase() {
         );
     }
 }
+
+// ── the calibration sweep, end to end through the node ───────────────────────
+//
+// The parts most easily broken silently: that the `cal_*` params reach the
+// evaluator at all, that the sweep drives the bus instead of the config's own
+// aiming, and that the measurement comes back on the trailing outputs the widget
+// reads it from.
+
+/// Run a node for `ticks` at `dt` with the pad turning at a fixed rate, and
+/// return (bus, outputs). `gyro` names the pin and the rate in deg/s.
+fn run_sweep(
+    snap: &NodeSnap,
+    gyro: &[(&str, f32)],
+    ticks: usize,
+    dt: f32,
+) -> (HashMap<String, Signal>, Vec<Option<Signal>>) {
+    const GYRO_REF_DPS: f32 = 2000.0;
+    let uid = snap.node_uid;
+    let key = format!("collector:{uid}");
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    for (pin, dps) in gyro {
+        dev.insert(
+            (PAD.to_string(), (*pin).to_string()),
+            Signal::Float(dps / GYRO_REF_DPS),
+        );
+    }
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut out = Vec::new();
+    for _ in 0..ticks {
+        collector.clear();
+        out = super::eval::jsm_publish(snap, uid, &dev, &mut collector, &mut state, dt);
+    }
+    let bus = collector
+        .into_iter()
+        .filter(|((d, _), _)| *d == key)
+        .map(|((_, p), s)| (p, s))
+        .collect();
+    (bus, out)
+}
+
+fn sweeping(text: &str, axis: &str, output: &str) -> NodeSnap {
+    let mut snap = jsm_snap(7311, text, false);
+    snap.params
+        .insert("cal_measure".to_string(), serde_json::json!(axis));
+    snap.params
+        .insert("cal_output".to_string(), serde_json::json!(output));
+    snap
+}
+
+#[test]
+fn a_sweep_publishes_the_rotation_it_has_measured() {
+    let _guard = alone();
+    // Ten ticks of 10 ms at 90°/s of yaw is 9° of turn.
+    let snap = sweeping("REAL_WORLD_CALIBRATION = 40", "yaw", "mouse");
+    let (_, out) = run_sweep(&snap, &[("gyro_z", 90.0)], 10, 0.010);
+    let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+        Some(Signal::Float(f)) => f,
+        other => panic!("the measurement should be a float, got {other:?}"),
+    };
+    assert!((deg - 9.0).abs() < 0.01, "expected ~9°, got {deg}");
+    // Nothing runs when no sweep does.
+    let idle = jsm_snap(7311, "REAL_WORLD_CALIBRATION = 40", false);
+    let (_, out) = run_sweep(&idle, &[("gyro_z", 90.0)], 10, 0.010);
+    assert_eq!(
+        out.get(super::eval::CAL_DEG_OUT).copied().flatten(),
+        Some(Signal::Float(0.0)),
+        "an idle node measures nothing"
+    );
+}
+
+#[test]
+fn the_sweep_drives_the_mouse_at_the_configs_calibration() {
+    let _guard = alone();
+    // 40 counts/° ÷ IN_GAME_SENS 2 = 20 counts/°, and 90°/s for 10 ms is 0.9° —
+    // so 18 counts this tick, on x alone.
+    let snap = sweeping(
+        "REAL_WORLD_CALIBRATION = 40\nIN_GAME_SENS = 2",
+        "yaw",
+        "mouse",
+    );
+    let (bus, _) = run_sweep(&snap, &[("gyro_z", 90.0)], 1, 0.010);
+    let m = match bus.get("mouse_move") {
+        Some(Signal::Vec2(v)) => *v,
+        other => panic!("the sweep must drive mouse_move, got {other:?}"),
+    };
+    assert!((m.x - 18.0).abs() < 0.01, "expected 18 counts, got {}", m.x);
+    assert_eq!(m.y, 0.0, "the off-axis is blocked during a yaw sweep");
+}
+
+#[test]
+fn a_sweep_ignores_the_configs_own_sensitivity() {
+    let _guard = alone();
+    // A config with a steep gyro sensitivity and heavy smoothing would fold both
+    // into the answer. The sweep drives from the raw rotation, so the same turn
+    // moves the mouse by the same amount either way.
+    let plain = sweeping("REAL_WORLD_CALIBRATION = 40", "yaw", "mouse");
+    let loud = sweeping(
+        "REAL_WORLD_CALIBRATION = 40\nGYRO_SENS = 8\nGYRO_SMOOTH_TIME = 0.5",
+        "yaw",
+        "mouse",
+    );
+    let (a, _) = run_sweep(&plain, &[("gyro_z", 90.0)], 1, 0.010);
+    let (b, _) = run_sweep(&loud, &[("gyro_z", 90.0)], 1, 0.010);
+    assert_eq!(a.get("mouse_move"), b.get("mouse_move"));
+}
+
+#[test]
+fn a_stick_sweep_drives_the_stick_and_holds_the_mouse_still() {
+    let _guard = alone();
+    // 180°/s against a 360 °/s calibration is half deflection.
+    let snap = sweeping(
+        "GYRO_OUTPUT = RIGHT_STICK\nVIRTUAL_STICK_CALIBRATION = 360",
+        "yaw",
+        "stick",
+    );
+    let (bus, out) = run_sweep(&snap, &[("gyro_z", 180.0)], 1, 0.010);
+    match bus.get("right_stick") {
+        Some(Signal::Vec2(v)) => assert!((v.x - 0.5).abs() < 0.01, "got {v:?}"),
+        other => panic!("the sweep must drive the stick, got {other:?}"),
+    }
+    assert_eq!(
+        bus.get("mouse_move"),
+        Some(&Signal::Vec2(glam::Vec2::ZERO)),
+        "the output not being calibrated must not move the camera"
+    );
+    // Half deflection is well inside the limit, so the result stands.
+    assert_eq!(
+        out.get(super::eval::CAL_PEAK_OUT).copied().flatten(),
+        Some(Signal::Float(0.5))
+    );
+}
+
+#[test]
+fn turning_past_full_stick_is_reported_as_the_peak() {
+    let _guard = alone();
+    // 720°/s against a 360 °/s calibration is twice what the stick can express:
+    // the stick pins at 1.0 and the widget is told the sweep saturated.
+    let snap = sweeping(
+        "GYRO_OUTPUT = RIGHT_STICK\nVIRTUAL_STICK_CALIBRATION = 360",
+        "yaw",
+        "stick",
+    );
+    let (bus, out) = run_sweep(&snap, &[("gyro_z", 720.0)], 1, 0.010);
+    match bus.get("right_stick") {
+        Some(Signal::Vec2(v)) => assert_eq!(v.x, 1.0, "the stick cannot go past full"),
+        other => panic!("got {other:?}"),
+    }
+    assert_eq!(
+        out.get(super::eval::CAL_PEAK_OUT).copied().flatten(),
+        Some(Signal::Float(2.0)),
+        "the UNCLAMPED deflection is what tells the widget to refuse the answer"
+    );
+}
+
+#[test]
+fn calibrating_the_mouse_holds_a_gyro_driven_stick_still() {
+    let _guard = alone();
+    // `GYRO_OUTPUT = RIGHT_STICK` with the mouse being calibrated: the stick
+    // would otherwise turn the camera too, and the measured rotation would be
+    // answering for both outputs at once.
+    let snap = sweeping(
+        "GYRO_OUTPUT = RIGHT_STICK\nREAL_WORLD_CALIBRATION = 40",
+        "yaw",
+        "mouse",
+    );
+    let (bus, _) = run_sweep(&snap, &[("gyro_z", 180.0)], 1, 0.010);
+    assert_eq!(bus.get("right_stick"), Some(&Signal::Vec2(glam::Vec2::ZERO)));
+    match bus.get("mouse_move") {
+        Some(Signal::Vec2(v)) => assert!(v.x > 0.0, "the mouse is what should move"),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn the_pitch_method_measures_the_vertical_and_blocks_the_horizontal() {
+    let _guard = alone();
+    // Turning mostly sideways during a 180° vertical sweep must neither move the
+    // camera sideways nor count toward the measurement.
+    let snap = sweeping("REAL_WORLD_CALIBRATION = 40", "pitch", "mouse");
+    let (bus, out) = run_sweep(&snap, &[("gyro_y", 45.0), ("gyro_z", 200.0)], 10, 0.010);
+    match bus.get("mouse_move") {
+        Some(Signal::Vec2(v)) => {
+            assert_eq!(v.x, 0.0, "the horizontal is blocked");
+            assert!(v.y > 0.0, "the vertical is what drives");
+        }
+        other => panic!("got {other:?}"),
+    }
+    let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+        Some(Signal::Float(f)) => f,
+        other => panic!("got {other:?}"),
+    };
+    assert!((deg - 4.5).abs() < 0.01, "only the pitch counts; got {deg}");
+}
