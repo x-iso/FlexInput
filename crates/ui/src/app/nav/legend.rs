@@ -173,6 +173,15 @@ impl FlexInputApp {
                         crate::gamepad_nav::JsmPane::Tune => {
                             hints.push((vec!["btn_west"], "Fine"));
                             hints.push((vec!["btn_north"], "Reset"));
+                            // Only on a setting that takes a pair: a legend
+                            // offering Select where it does nothing is a lie.
+                            if let Some(act) = self.nav_jsm_pair_action() {
+                                hints.push((vec!["btn_back"], if act == "Split" {
+                                    "Split H / V"
+                                } else {
+                                    "Join H / V"
+                                }));
+                            }
                         }
                     }
                     hints.push((vec!["btn_east"], "Back"));

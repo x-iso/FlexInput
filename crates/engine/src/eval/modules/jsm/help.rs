@@ -8,7 +8,10 @@
 //! config written against those reads the same words here.
 //!
 //! 32 names have no upstream help and carry none: no tooltip beats
-//! an invented one.
+//! an invented one. The exceptions are where FlexInput itself adds something:
+//! a setting of its own (`LOCAL_AXIS_OFFSET`), which has no upstream text, and a
+//! setting it extends (`ROLL_CONTRIBUTION`, which also works under `LOCAL` here),
+//! whose upstream words are kept and followed by a sentence saying what changed.
 
 /// `(NAME, JSM's description)`, sorted by name.
 pub(crate) const HELP: &[(&str, &str)] = &[
@@ -124,6 +127,8 @@ pub(crate) const HELP: &[(&str, &str)] = &[
      "Sets the adaptive trigger effect on the left trigger:"),
     ("LIGHT_BAR",
      "Changes the color bar of the DS4. Either enter as a hex code (xRRGGBB), as three decimal values between 0 and 255 (RRR GGG BBB), or as a common color name in all caps and underscores."),
+    ("LOCAL_AXIS_OFFSET",
+     "FlexInput's own setting, not JoyShockMapper's. When GYRO_SPACE is LOCAL, rotates the two mapped mouse axes together by this many degrees, so a controller held slightly rolled turns the camera straight instead of diagonally. Positive rotates counter-clockwise. Valid range is -180 to 180."),
     ("MAX_GYRO_SENS",
      "Maximum gyro sensitivity when turning controller at or above MAX_GYRO_THRESHOLD. You can assign a second value as a different vertical sensitivity."),
     ("MAX_GYRO_THRESHOLD",
@@ -183,7 +188,7 @@ pub(crate) const HELP: &[(&str, &str)] = &[
     ("RIGHT_TRIGGER_EFFECT",
      "Sets the adaptive trigger effect on the right trigger:"),
     ("ROLL_CONTRIBUTION",
-     "When GYRO_SPACE is YAW_PLUS_ROLL, adds roll to horizontal turn as a percentage of yaw sensitivity. Valid range is -100 to 100."),
+     "When GYRO_SPACE is YAW_PLUS_ROLL, adds roll to horizontal turn as a percentage of yaw sensitivity. Valid range is -100 to 100. In FlexInput it also works with GYRO_SPACE = LOCAL, where the roll joins whichever axis MOUSE_X_FROM_GYRO_AXIS turns with (the fork only honours it with YAW_PLUS_ROLL)."),
     ("ROTATE_SMOOTH_OVERRIDE",
      "Some smoothing is applied to flick stick rotations to account for the controller's stick resolution. This value overrides the smoothing threshold."),
     ("SCREEN_RESOLUTION_X",

@@ -5,10 +5,13 @@
 //! slider is a nicer way to type a number, so dragging one rewrites the number on
 //! its line and the parser sees the edit like any other. Nothing here holds state.
 //!
-//! Only a line with exactly one number gets a slider. Several of JSM's settings
-//! take a pair (`GRID_SIZE = 2 3`, `MIN_GYRO_SENS = 2 3`), and one slider cannot
-//! honestly stand for two numbers — so those are left to the keyboard rather than
-//! given a control that would silently drop half the line.
+//! A line with one number gets one slider. Several of JSM's settings take a pair
+//! (`GRID_SIZE = 2 3`, `MIN_GYRO_SENS = 2 3`) — one number for both axes, or one
+//! each — and a pair line gets TWO sliders, one per number, because one slider
+//! cannot honestly stand for two numbers. Whether a setting is split is read off
+//! the text like everything else: `split_pair` / `join_pair` rewrite `2` as `2 2`
+//! and back, and the faders follow. Any other line with more than one number is
+//! left to the keyboard.
 
 use super::cc;
 use super::cursor::{self, Cursor, TokenKind};
@@ -26,9 +29,60 @@ pub struct Knob {
     pub hi: f32,
     /// Whole numbers only — a millisecond count, a zone, a grid dimension.
     pub integral: bool,
+    /// Which number of a pair line this fader drives: `None` for a line with one
+    /// number, `Some(0)` / `Some(1)` for the two a pair line gets.
+    pub part: Option<u8>,
+}
+
+/// Settings that take one number for both axes, or one each (`FloatXY` in JSM).
+pub fn pairable(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "GYRO_SENS" | "MIN_GYRO_SENS" | "MAX_GYRO_SENS" | "STICK_SENS" | "TOUCHPAD_SENS"
+            | "GRID_SIZE"
+    )
+}
+
+/// What each number of a pair means, for the fader labels.
+fn part_names(name: &str) -> (&'static str, &'static str) {
+    match name.to_ascii_uppercase().as_str() {
+        "GRID_SIZE" => ("cols", "rows"),
+        "TOUCHPAD_SENS" => ("X", "Y"),
+        // The sensitivities: JSM's second number is the vertical.
+        _ => ("H", "V"),
+    }
+}
+
+/// The suffix a pair's SECOND fader carries in its key. The first keeps the bare
+/// name, so a fader pinned before a split still finds its (horizontal) half.
+const SECOND: &str = "/2";
+
+/// The setting a knob key names — a pair's second fader is keyed `NAME/2`.
+pub fn key_setting(key: &str) -> &str {
+    key.strip_suffix(SECOND).unwrap_or(key)
 }
 
 impl Knob {
+    /// This fader's identity for pinning and gamepad nav. Unique per fader: the
+    /// two halves of a pair share a name, so the name alone can't be the key.
+    pub fn key(&self) -> String {
+        match self.part {
+            Some(1) => format!("{}{SECOND}", self.name),
+            _ => self.name.clone(),
+        }
+    }
+
+    /// What the fader is labelled: the name, plus which number it is for a pair.
+    pub fn label(&self) -> String {
+        match self.part {
+            None => self.name.clone(),
+            Some(i) => {
+                let (a, b) = part_names(&self.name);
+                format!("{} {}", self.name, if i == 0 { a } else { b })
+            }
+        }
+    }
+
     /// Where the handle sits, 0..1.
     pub fn t(&self) -> f32 {
         if self.hi <= self.lo {
@@ -71,14 +125,29 @@ pub fn knobs(text: &str) -> Vec<Knob> {
             Some(_) => {}
         }
         let Some((lo, hi, integral)) = range(&upper) else { continue };
-        // Exactly one number, or nothing doing — see the note at the top.
-        let mut words = rhs.split_whitespace();
-        let Some(first) = words.next() else { continue };
-        if words.next().is_some() {
+        // One number, or a pair where the setting takes one — see the note at the top.
+        let words: Vec<&str> = rhs.split_whitespace().collect();
+        let Ok(nums) = words.iter().map(|w| w.parse::<f32>()).collect::<Result<Vec<_>, _>>()
+        else {
             continue;
+        };
+        let knob = |value: f32, part: Option<u8>| Knob {
+            line,
+            name: name.to_string(),
+            value,
+            lo,
+            hi,
+            integral,
+            part,
+        };
+        match nums.as_slice() {
+            [v] => out.push(knob(*v, None)),
+            [a, b] if pairable(&upper) => {
+                out.push(knob(*a, Some(0)));
+                out.push(knob(*b, Some(1)));
+            }
+            _ => {}
         }
-        let Ok(value) = first.parse::<f32>() else { continue };
-        out.push(Knob { line, name: name.to_string(), value, lo, hi, integral });
     }
     out
 }
@@ -94,6 +163,96 @@ fn shown(value: f32, integral: bool) -> String {
         let s = format!("{value:.2}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// Rewrite one line's value part through `f`, keeping the name as the author
+/// spelled it and any trailing comment. `f` gets the text after the `=` and
+/// returns its replacement.
+fn rewrite_rhs(text: &str, line: usize, f: impl FnOnce(&str) -> String) -> String {
+    let mut f = Some(f);
+    let mut out: Vec<String> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        if i != line {
+            out.push(raw.to_string());
+            continue;
+        }
+        let (body, comment) = match raw.find('#') {
+            Some(at) => (&raw[..at], &raw[at..]),
+            None => (raw, ""),
+        };
+        let Some((lhs, rhs)) = body.split_once('=') else {
+            out.push(raw.to_string());
+            continue;
+        };
+        let rhs = (f.take().expect("one line"))(rhs);
+        out.push(format!("{lhs}={rhs}{comment}"));
+    }
+    let joined = out.join("\n");
+    // `lines()` drops a trailing newline; put it back.
+    if text.ends_with('\n') { joined + "\n" } else { joined }
+}
+
+/// The byte span of each whitespace-separated word in `s`.
+fn word_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        match (c.is_whitespace(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(st)) => {
+                spans.push((st, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        spans.push((st, s.len()));
+    }
+    spans
+}
+
+/// Rewrite the number a fader drives — the line's first number, or for a pair's
+/// second fader its second — and nothing else about the line.
+pub fn set_knob_part(text: &str, line: usize, part: Option<u8>, value: f32, integral: bool) -> String {
+    let shown = shown(value, integral);
+    let which = part.unwrap_or(0) as usize;
+    rewrite_rhs(text, line, |rhs| match word_spans(rhs).get(which) {
+        Some(&(a, b)) => format!("{}{shown}{}", &rhs[..a], &rhs[b..]),
+        None => rhs.to_string(),
+    })
+}
+
+/// Give a one-number pair setting its second number, equal to the first:
+/// `GYRO_SENS = 2` becomes `GYRO_SENS = 2 2`, which means the same thing — so the
+/// split changes how it is tuned, never how it aims.
+pub fn split_pair(text: &str, line: usize) -> String {
+    rewrite_rhs(text, line, |rhs| match word_spans(rhs).as_slice() {
+        [(a, b)] => format!("{} {}{}", &rhs[..*b], &rhs[*a..*b], &rhs[*b..]),
+        _ => rhs.to_string(),
+    })
+}
+
+/// Drop a pair line's second number, keeping the first for both axes:
+/// `GYRO_SENS = 2 3` becomes `GYRO_SENS = 2`.
+pub fn join_pair(text: &str, line: usize) -> String {
+    rewrite_rhs(text, line, |rhs| match word_spans(rhs).as_slice() {
+        [(_, b), (_, d)] => format!("{}{}", &rhs[..*b], &rhs[*d..]),
+        _ => rhs.to_string(),
+    })
+}
+
+/// Split a single-number pair setting into two faders, or join a pair back into
+/// one — whichever this fader's line is now. `None` for a setting that can't
+/// take a pair.
+pub fn toggle_pair(text: &str, knob: &Knob) -> Option<String> {
+    if !pairable(&knob.name) {
+        return None;
+    }
+    Some(match knob.part {
+        None => split_pair(text, knob.line),
+        Some(_) => join_pair(text, knob.line),
+    })
 }
 
 /// Rewrite the number on one line, keeping everything else about it — the name as
@@ -297,7 +456,8 @@ fn aiming_hand(cfg: &Compiled) -> Hand {
 /// gyro. Guessing would hand the game the wrong input at the exact moment the
 /// user is judging feel.
 pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
-    let upper = name.to_ascii_uppercase();
+    // A pair's second fader is keyed `NAME/2`; it feels like the setting it is.
+    let upper = key_setting(name).to_ascii_uppercase();
     // A setting that names its side means that side.
     if let Some(rest) = upper.strip_prefix("LEFT_STICK_") {
         return virtual_or_stick(cfg, Hand::Left, rest);
@@ -316,6 +476,7 @@ pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
         | "ACCEL_SIGMOID_MID" | "ACCEL_SIGMOID_WIDTH" | "ACCEL_JUMP_TAU"
         | "ONE_EURO_MIN_CUTOFF" | "ONE_EURO_SPEED_COEFF" | "GYRO_ANGLE_SNAP"
         | "DECEL_BRAKE_STRENGTH" | "DECEL_BRAKE_THRESHOLD" | "ROLL_CONTRIBUTION"
+        | "LOCAL_AXIS_OFFSET"
         | "LEAN_THRESHOLD" | "MOTION_DEADZONE_INNER" | "MOTION_DEADZONE_OUTER" => Feel::Gyro,
 
         // The winding settings shape whatever was routed to a virtual stick,
@@ -333,7 +494,7 @@ pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
         "TRIGGER_THRESHOLD" | "TRIGGER_SKIP_DELAY" => Feel::Triggers,
 
         // Aiming and flick settings that don't say which stick: the one aiming.
-        "STICK_DEADZONE_INNER" | "STICK_DEADZONE_OUTER" | "STICK_POWER"
+        "STICK_DEADZONE_INNER" | "STICK_DEADZONE_OUTER" | "STICK_SENS" | "STICK_POWER"
         | "STICK_ACCELERATION_RATE" | "STICK_ACCELERATION_CAP" | "SCROLL_SENS"
         | "FLICK_TIME" | "FLICK_TIME_EXPONENT" | "FLICK_SNAP_STRENGTH"
         | "FLICK_DEADZONE_ANGLE" | "ROTATE_SMOOTH_OVERRIDE" | "MOUSE_RING_RADIUS" => {
@@ -521,6 +682,9 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "REAL_WORLD_CALIBRATION" => (0.0, 1000.0, false),
         "IN_GAME_SENS" => (0.1, 10.0, false),
         // Stick aiming and flick.
+        // Degrees per second at full deflection (JSM's default is 360) — the same
+        // scale as VIRTUAL_STICK_CALIBRATION, which is that rate the other way round.
+        "STICK_SENS" => (0.0, 1080.0, false),
         "STICK_POWER" => (0.0, 4.0, false),
         "STICK_ACCELERATION_RATE" => (0.0, 10.0, false),
         "STICK_ACCELERATION_CAP" => (1.0, 100.0, false),
@@ -545,6 +709,11 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "MOTION_DEADZONE_INNER" | "MOTION_DEADZONE_OUTER" => (0.0, 180.0, false),
         "TOUCH_DEADZONE_INNER" => (0.0, 1.0, false),
         "TOUCH_STICK_RADIUS" => (20.0, 600.0, false),
+        // Mouse counts per touchpad point; JSM's default is 1.
+        "TOUCHPAD_SENS" => (0.0, 5.0, false),
+        // Columns and rows. Five each keeps every combination the faders can
+        // reach inside JSM's 25-cell ceiling, so a drag can never write an error.
+        "GRID_SIZE" => (1.0, 5.0, true),
         // The custom-curve fork.
         "ACCEL_NATURAL_VHALF" => (0.0, 1000.0, false),
         "ACCEL_POWER_VREF" => (0.0, 10.0, false),
@@ -558,6 +727,9 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "DECEL_BRAKE_STRENGTH" => (0.0, 1.0, false),
         "DECEL_BRAKE_THRESHOLD" => (0.0, 200.0, false),
         "ROLL_CONTRIBUTION" => (-100.0, 100.0, false),
+        // A pad held a few degrees rolled is the case this exists for, so the slider
+        // spans the useful band; the parser still takes a full turn either way.
+        "LOCAL_AXIS_OFFSET" => (-45.0, 45.0, false),
         _ => return None,
     };
     Some(r)

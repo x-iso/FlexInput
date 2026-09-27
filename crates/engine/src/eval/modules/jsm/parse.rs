@@ -2014,6 +2014,8 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
 pub(crate) enum MotionId {
     Space,
     LeanThreshold,
+    /// `LOCAL_AXIS_OFFSET` — FlexInput's own, see `motion::local_space`.
+    LocalAxisOffset,
     /// The motion stick, in the same settings a thumbstick has.
     MotionStick,
     MotionRing,
@@ -2071,6 +2073,20 @@ fn motion_setting(
                 ok
             }
             _ => wants("an angle in degrees, 0 to 90"),
+        },
+        MotionId::LocalAxisOffset => match num() {
+            Some(v) if (-180.0..=180.0).contains(&v) => {
+                m.local_axis_offset = v;
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(FLEXINPUT_NOTE.to_string());
+                // Said against the space as parsed so far, like `ROLL_CONTRIBUTION`:
+                // a `GYRO_SPACE` line further down the file isn't known yet.
+                if m.space != Space::Local {
+                    info.notes.push("only does anything with `GYRO_SPACE = LOCAL`".to_string());
+                }
+                info
+            }
+            _ => wants("an angle in degrees, -180 to 180"),
         },
         MotionId::MotionStick | MotionId::TouchStick => {
             let touch = which == MotionId::TouchStick;
@@ -2553,10 +2569,19 @@ fn cc_setting(
                 c.roll_contribution = v;
                 let mut info = LineInfo::of(LineStatus::Ok);
                 info.notes.push(FORK_NOTE.to_string());
-                if m.space != super::motion::Space::YawPlusRoll {
-                    info.notes.push(
-                        "only does anything with `GYRO_SPACE = YAW_PLUS_ROLL`".to_string(),
-                    );
+                match m.space {
+                    super::motion::Space::YawPlusRoll => {}
+                    // FlexInput's extension: the share joins whichever axis LOCAL's
+                    // masks picked for the turn. Said, because the same line in the
+                    // fork does nothing under LOCAL.
+                    super::motion::Space::Local => info.notes.push(
+                        "FlexInput also mixes this into `GYRO_SPACE = LOCAL`; the fork                          only honours it with `YAW_PLUS_ROLL`"
+                            .to_string(),
+                    ),
+                    _ => info.notes.push(
+                        "only does anything with `GYRO_SPACE = LOCAL` or `YAW_PLUS_ROLL`"
+                            .to_string(),
+                    ),
                 }
                 info
             }
@@ -2564,6 +2589,10 @@ fn cc_setting(
         },
     }
 }
+
+/// Said on a setting FlexInput adds of its own — neither stock JSM nor the fork has
+/// it, so a config using it is one to keep here.
+const FLEXINPUT_NOTE: &str = "FlexInput's own setting, not JoyShockMapper's — a config using it                               won't load in JSM or the custom-curve fork";
 
 /// Said on a line that comes from the custom-curve fork rather than from JSM itself,
 /// so nobody is surprised that a stock JSM build doesn't know it.
@@ -2721,6 +2750,7 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "MOTION_DEADZONE_OUTER" => Motion(MotionId::MotionDeadzone(false)),
         "MOTION_STICK_AXIS" => Motion(MotionId::MotionAxis),
         "LEAN_THRESHOLD" => Motion(MotionId::LeanThreshold),
+        "LOCAL_AXIS_OFFSET" => Motion(MotionId::LocalAxisOffset),
 
         // The JSM_custom_curve fork's additions. See `cc.rs` and the plan's phase 9.
         "ACCEL_CURVE" => Cc(CcId::Curve),

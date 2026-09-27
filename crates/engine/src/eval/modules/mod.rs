@@ -31,6 +31,7 @@ pub use jsm::{jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi
     jsm_note_missing_inputs,
     jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, jsm_set_setting, jsm_setting_line,
     JSM_CAL_DEG_OUT, JSM_CAL_PEAK_OUT,
+    jsm_set_knob_part, jsm_toggle_pair, jsm_knob_key_setting, jsm_pairable,
     set_jsm_editor_focus, JsmConfig, JsmCurvePoint, JsmFeel,
     JsmHand, JsmItem, JsmKind, JsmKnob, JsmLineInfo, JsmLineStatus, JsmSupportState};
 pub(crate) use lean::*;

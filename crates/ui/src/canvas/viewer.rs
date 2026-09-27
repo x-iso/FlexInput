@@ -37,6 +37,7 @@ pub(crate) use jsm::set_active_text as jsm_set_active_text;
 pub(crate) use scale::{publish_jsm_chord, publish_jsm_cursor, publish_jsm_pane};
 pub(crate) use jsm::knobs_of as jsm_knobs_of;
 pub(crate) use jsm::nav_nudge_knob as jsm_nav_nudge_knob;
+pub(crate) use jsm::nav_toggle_pair as jsm_nav_toggle_pair;
 pub(crate) use jsm_widgets::knob_name_of as jsm_knob_name_of;
 // The pad drives the command list by asking it to move, not by index: see
 // `CommandList`.

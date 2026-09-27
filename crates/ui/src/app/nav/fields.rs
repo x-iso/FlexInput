@@ -60,6 +60,13 @@ impl FlexInputApp {
                 self.nav_drive_jsm_text(ctx, outer_id, nav, step_dir);
                 return;
             }
+            // Select splits the focused setting into two faders, or joins a pair
+            // back into one. The app's own Select (Alt-Tab) stands aside while
+            // this widget is being edited — see `nav_claimed_buttons`.
+            if nav.is_rising("btn_back") {
+                self.nav_toggle_jsm_pair(ctx, outer_id);
+                return;
+            }
         }
         let fields = self.nav_element_fields(outer_id);
         if fields.is_empty() { return; }
@@ -343,7 +350,7 @@ impl FlexInputApp {
             NavField::JsmValue { name } => self
                 .nav_jsm_knobs(outer_id)
                 .into_iter()
-                .find(|k| k.name == *name)
+                .find(|k| k.key() == *name)
                 .map(|k| if k.integral {
                     format!("{}", k.value.round() as i64)
                 } else {
@@ -784,8 +791,9 @@ impl FlexInputApp {
                 field: NavField::JsmCalibrate,
             })
             .chain(self.nav_jsm_knobs(outer_id).into_iter().map(|k| NavFieldDef {
-                label: k.name.clone().into(),
-                field: NavField::JsmValue { name: k.name },
+                label: k.label().into(),
+                // The fader's KEY, not its name: a pair's two halves share a name.
+                field: NavField::JsmValue { name: k.key() },
             }))
             .collect();
         }
@@ -1995,7 +2003,7 @@ impl crate::app::FlexInputApp {
         if self.gamepad_nav.jsm_baseline.as_ref().is_some_and(|(n, _)| n == name) {
             return;
         }
-        let value = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.name == name).map(|k| k.value);
+        let value = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.key() == name).map(|k| k.value);
         self.gamepad_nav.jsm_baseline = value.map(|v| (name.to_string(), v));
     }
 
@@ -2005,7 +2013,7 @@ impl crate::app::FlexInputApp {
     {
         let Some((_, want)) = self.gamepad_nav.jsm_baseline.clone().filter(|(n, _)| n == name)
         else { return; };
-        let Some(k) = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.name == name)
+        let Some(k) = self.nav_jsm_knobs(outer_id).into_iter().find(|k| k.key() == name)
         else { return; };
         if (k.value - want).abs() < f32::EPSILON {
             return;
@@ -2034,6 +2042,87 @@ impl crate::app::FlexInputApp {
             .and_then(|sp| sp.snarl.get_node(inner))
             .map(crate::canvas::viewer::jsm_knobs_of)
             .unwrap_or_default()
+    }
+
+    /// Pad buttons the widget being edited takes for itself, away from the
+    /// app-wide shortcuts they normally drive (Select → Alt-Tab; Start → presets,
+    /// hold for Settings).
+    ///
+    /// Strictly contextual: only while a widget is ENTERED (edit level
+    /// `Editing`), and only for the widgets listed here. Anywhere else the app's
+    /// shortcuts keep working exactly as before. To give another widget Select or
+    /// Start, add it here and handle the button in that widget's driver.
+    pub(crate) fn nav_claimed_buttons(&self) -> &'static [&'static str] {
+        if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Editing {
+            return &[];
+        }
+        let Some(outer) = self.nav_driving_outer_id() else { return &[] };
+        if self.nav_is_jsm_editor(outer) {
+            // Select splits / joins a pair setting's faders.
+            return &["btn_back"];
+        }
+        &[]
+    }
+
+    /// Does the widget being edited take this button for itself?
+    pub(crate) fn nav_widget_claims(&self, pin: &str) -> bool {
+        self.nav_claimed_buttons().contains(&pin)
+    }
+
+    /// The focused JSM fader, when the Tune pane has one focused: its key.
+    fn nav_focused_jsm_key(&self, outer_id: egui_snarl::NodeId) -> Option<String> {
+        match self.nav_element_fields(outer_id).get(self.gamepad_nav.field_index)?.field.clone() {
+            NavField::JsmValue { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// What Select would do to the focused fader — "Split" or "Join" — or `None`
+    /// when its setting has no pair form (so the legend only offers it where it
+    /// does something).
+    pub(crate) fn nav_jsm_pair_action(&self) -> Option<&'static str> {
+        let outer = self.nav_driving_outer_id()?;
+        if !self.nav_is_jsm_editor(outer)
+            || self.gamepad_nav.jsm_pane != crate::gamepad_nav::JsmPane::Tune
+        {
+            return None;
+        }
+        let key = self.nav_focused_jsm_key(outer)?;
+        let k = self.nav_jsm_knobs(outer).into_iter().find(|k| k.key() == key)?;
+        if !flexinput_engine::eval::jsm_pairable(&k.name) {
+            return None;
+        }
+        Some(if k.part.is_none() { "Split" } else { "Join" })
+    }
+
+    /// Select on a focused fader: split its setting into two faders, or join a
+    /// pair back into one, then keep focus on the setting's first fader.
+    fn nav_toggle_jsm_pair(&mut self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+        let Some(key) = self.nav_focused_jsm_key(outer_id) else { return };
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
+        let focus = {
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+            else {
+                return;
+            };
+            let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+            crate::canvas::viewer::jsm_nav_toggle_pair(node, &key)
+        };
+        let Some(focus) = focus else { return };
+        // The field list just changed length under the cursor: land on the
+        // setting's first fader, which exists either way.
+        if let Some(i) = self.nav_element_fields(outer_id).iter().position(
+            |d| matches!(&d.field, NavField::JsmValue { name } if *name == focus),
+        ) {
+            self.gamepad_nav.field_index = i;
+        }
+        // A direct write into the tab's embedded copy (the edit's undo entry is
+        // the widget session's, committed on exit): bump the generation so an
+        // open sub-patch editor re-pulls instead of writing back stale.
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+        ctx.request_repaint();
     }
 
     /// Nudge one JSM setting by a fraction of its range. Unlike every other nav

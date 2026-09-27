@@ -52,6 +52,8 @@ pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue, fi_tag
     State as JsmSupportState};
 pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, scrub as jsm_scrub_number,
     line_of as jsm_setting_line, set_setting as jsm_set_setting,
+    set_knob_part as jsm_set_knob_part, toggle_pair as jsm_toggle_pair,
+    key_setting as jsm_knob_key_setting, pairable as jsm_pairable,
     sens_curve as jsm_sens_curve,
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,

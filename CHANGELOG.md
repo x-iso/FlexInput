@@ -5,7 +5,45 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **JSM Config: roll contribution and an axis offset for `GYRO_SPACE = LOCAL`.**
+  `ROLL_CONTRIBUTION` now works under `LOCAL` as well as `YAW_PLUS_ROLL`, mixing
+  its share of roll into whichever axis the `MOUSE_X_FROM_GYRO_AXIS` pick drives
+  the turn with — with the default picks that is exactly `YAW_PLUS_ROLL`, but it
+  keeps working when the turn comes from another axis. The new
+  **`LOCAL_AXIS_OFFSET`** rotates the two mapped mouse axes together by any angle
+  (positive counter-clockwise), so a pad held a little rolled turns the camera
+  straight rather than diagonally — something the axis picks, which only choose
+  whole axes, can't express. Both get a tuning fader when set. `LOCAL_AXIS_OFFSET`
+  is FlexInput's own, and the editor says so on the line; the gravity spaces
+  ignore both settings, and say that too.
+
+- **Two-number JSM settings get a fader per number, and Select splits or joins
+  them.** `GYRO_SENS`, `MIN_GYRO_SENS`, `MAX_GYRO_SENS`, `STICK_SENS`,
+  `TOUCHPAD_SENS` and `GRID_SIZE` take one number for both axes or one each. A
+  line with two numbers now shows two faders (H / V, X / Y, or cols / rows)
+  instead of none. Select on the pad — or the small split / join chip on the
+  fader — turns `2` into `2 2` (same meaning, now tunable apart) or joins a pair
+  back to its first number. The config text is the only state, so a line typed
+  with two numbers gets two faders without being asked.
+
+  Select is taken by the JSM editor only while it is being edited; everywhere
+  else it still opens Alt-Tab. That exception comes from a small table any
+  widget can join, for Select or Start, so other widgets can take either button
+  in their own edit context the same way.
+
 ### Fixed
+
+- **`STICK_SENS` and `TOUCHPAD_SENS` get tuning faders.** Both are single
+  numbers the module runs, but neither had a slider range, so the tune panel
+  skipped them. Tuning `STICK_SENS` also hands the aiming stick to the game, like
+  the other stick-aim settings, so the change can be felt while dragging.
+
+- **The JSM tune panel's faders track the right setting in the config overlay.**
+  Since the Calibrate RWC row became the panel's first field, the overlay was
+  reading the focused fader one slot off, so tuning one setting passed through
+  the pad input of the setting below it.
 
 - **A Steam Controller's gyro no longer goes dead after assigning a virtual
   output.** Its IMU is switched on by a one-time command, and the pad could lose

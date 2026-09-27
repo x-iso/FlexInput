@@ -3545,8 +3545,10 @@ impl FlexInputApp {
         // ── Select / minus → Alt+Tab window switcher (hold to keep switching) ─
         // Engaged immediately on press; holds Alt while Select is held, releases
         // (commits) on release. No File menu — egui menus can't be gamepad-
-        // navigated, so Select is dedicated to the OS switcher.
-        if nav.is_rising("btn_back") {
+        // navigated, so Select is dedicated to the OS switcher — except while a
+        // widget that takes Select for itself is being edited (`nav_claimed_buttons`),
+        // where the press goes to that widget instead.
+        if nav.is_rising("btn_back") && !self.nav_widget_claims("btn_back") {
             self.enter_alt_tab(&dev_id, ctx);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
@@ -3566,7 +3568,12 @@ impl FlexInputApp {
         }
 
         // ── Start: tap = preset dropdown, hold (>250ms) = gamepad Settings ───
-        if nav.is_rising("btn_start") {
+        // Stands aside, like Select above, for a widget being edited that takes
+        // Start for itself. A press already in progress is dropped rather than
+        // left to fire on release.
+        if self.nav_widget_claims("btn_start") {
+            self.gamepad_nav.start_down_at = None;
+        } else if nav.is_rising("btn_start") {
             self.gamepad_nav.start_down_at = Some(std::time::Instant::now());
             self.gamepad_nav.start_hold_fired = false;
         }

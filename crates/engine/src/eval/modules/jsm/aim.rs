@@ -325,7 +325,13 @@ impl Aim {
                 super::motion::JsmGyro { x: in_x, y: in_y, z: in_z },
             )
         } else {
-            (pick(s.mouse_x_from, 1.0), pick(s.mouse_y_from, -1.0))
+            super::motion::local_space(
+                pick(s.mouse_x_from, 1.0),
+                pick(s.mouse_y_from, -1.0),
+                in_z,
+                c.roll_contribution,
+                m.local_axis_offset,
+            )
         };
 
         // ── smoothing ────────────────────────────────────────────────────────

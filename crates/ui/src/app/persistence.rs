@@ -150,8 +150,10 @@ impl FlexInputApp {
         if elem != "editor" {
             return None;
         }
+        // Field 0 is the Calibrate RWC row (see `nav_fields_for`), so the faders
+        // start at field 1.
         self.nav_jsm_knobs(*outer)
-            .get(self.gamepad_nav.field_index)
+            .get(self.gamepad_nav.field_index.checked_sub(1)?)
             .map(|k| k.name.clone())
     }
 

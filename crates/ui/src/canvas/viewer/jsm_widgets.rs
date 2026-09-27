@@ -121,21 +121,39 @@ const GRAPH_H: f32 = 110.0;
 /// How much of the body the diagnostics may take before they start scrolling.
 const NOTES_MAX_H: f32 = 96.0;
 
+/// What one fader did this frame.
+#[derive(Default)]
+pub(crate) struct FaderOut {
+    /// The new value while it is being dragged.
+    pub(crate) value: Option<f32>,
+    /// Its split/join chip was clicked (pair settings only).
+    pub(crate) toggle_pair: bool,
+}
+
 /// One setting's slider: its name and value above, the fader below, full width.
 ///
-/// Returns the new value while it is being dragged or scrolled.
+/// A setting that takes a pair carries a small chip in its caption to split it
+/// into two faders or join them back — the mouse's way to do what Select does on
+/// the pad. Only the first fader of a pair carries it, so the pair reads as one
+/// setting with one switch.
 pub(crate) fn fader(
     ui: &mut egui::Ui,
     width: f32,
     knob: &JsmKnob,
     paint: JsmPaint<'_>,
-) -> Option<f32> {
-    let mut out = None;
+) -> FaderOut {
+    let mut out = FaderOut::default();
+    let chip = match knob.part {
+        _ if !flexinput_engine::eval::jsm_pairable(&knob.name) => None,
+        None => Some(("split", "Give this its own vertical value — two faders (Select on the pad)")),
+        Some(0) => Some(("join", "Use one value for both again — one fader (Select on the pad)")),
+        Some(_) => None,
+    };
     // The value is laid out first and keeps its full width; the NAME is what
     // gives way, with an ellipsis. A trimmed number is useless — it can read as a
     // different number — whereas a trimmed name is still recognisable, and the
     // tooltip carries it in full either way.
-    caption_row(ui, width, &knob.name, &shown_value(knob));
+    out.toggle_pair = caption_row(ui, width, &knob.label(), &shown_value(knob), chip);
 
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, FADER_H),
@@ -147,7 +165,7 @@ pub(crate) fn fader(
         // a fader this short wants — chasing a 5px handle is no fun.
         if let Some(p) = resp.interact_pointer_pos() {
             let nt = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            out = Some(knob.at(nt));
+            out.value = Some(knob.at(nt));
         }
     }
     // Deliberately no wheel adjustment here: the strip these sit in scrolls, and
@@ -168,7 +186,7 @@ pub(crate) fn fader(
     if active {
         resp.on_hover_text(format!(
             "{} — {} to {}{}",
-            knob.name,
+            knob.label(),
             trim(knob.lo),
             trim(knob.hi),
             if knob.value < knob.lo || knob.value > knob.hi {
@@ -266,7 +284,7 @@ pub(crate) fn pinned_fader(
         text.text(
             egui::pos2(rect.left() + 2.0, rect.top() + label_h * 0.5),
             egui::Align2::LEFT_CENTER,
-            &knob.name,
+            knob.label(),
             font.clone(),
             vis.weak_text_color(),
         );
@@ -282,7 +300,7 @@ pub(crate) fn pinned_fader(
         text.text(
             egui::pos2(rect.center().x, rect.top() - 1.0),
             egui::Align2::CENTER_BOTTOM,
-            &knob.name,
+            knob.label(),
             font.clone(),
             vis.weak_text_color(),
         );
@@ -297,7 +315,7 @@ pub(crate) fn pinned_fader(
     if active {
         resp.on_hover_text(format!(
             "{} = {} — {} to {}",
-            knob.name,
+            knob.label(),
             shown_value(knob),
             trim(knob.lo),
             trim(knob.hi)
@@ -397,14 +415,27 @@ pub(crate) fn warp_slider(
 /// The width a fader strip gets can be narrow (beside the editor, on a small
 /// node), and something has to give. A trimmed number can read as a *different*
 /// number, so it never gives; a trimmed name is still recognisable.
-fn caption_row(ui: &mut egui::Ui, width: f32, name: &str, value: &str) {
+/// A fader's caption: name on the left (ellipsized), value on the right, and an
+/// optional clickable chip just before the value. Returns whether the chip was
+/// clicked.
+fn caption_row(
+    ui: &mut egui::Ui,
+    width: f32,
+    name: &str,
+    value: &str,
+    chip: Option<(&str, &str)>,
+) -> bool {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let (weak, strong) = (ui.visuals().weak_text_color(), ui.visuals().text_color());
     let val = ui.ctx().fonts_mut(|f| {
         f.layout_no_wrap(value.to_string(), egui::FontId::monospace(font.size), strong)
     });
+    let chip_g = chip.map(|(label, _)| {
+        ui.ctx().fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), weak))
+    });
     let gap = 6.0;
-    let name_w = (width - val.size().x - gap).max(8.0);
+    let chip_w = chip_g.as_ref().map_or(0.0, |g| g.size().x + 8.0 + gap);
+    let name_w = (width - val.size().x - gap - chip_w).max(8.0);
     let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), font, weak);
     job.wrap.max_width = name_w;
     job.wrap.max_rows = 1;
@@ -419,11 +450,23 @@ fn caption_row(ui: &mut egui::Ui, width: f32, name: &str, value: &str) {
         nm,
         weak,
     );
+    let val_w = val.size().x;
     painter.galley(
-        egui::pos2(row.right() - val.size().x, row.center().y - val.size().y * 0.5),
+        egui::pos2(row.right() - val_w, row.center().y - val.size().y * 0.5),
         val,
         strong,
     );
+    let (Some(g), Some((_, tip))) = (chip_g, chip) else { return false };
+    let size = g.size() + egui::vec2(8.0, 0.0);
+    let chip_rect = egui::Rect::from_min_size(
+        egui::pos2(row.right() - val_w - gap - size.x, row.center().y - size.y * 0.5),
+        size,
+    );
+    let resp = ui.interact(chip_rect, ui.id().with(("jsm_pair_chip", name)), egui::Sense::click());
+    let vis = ui.visuals().widgets.style(&resp);
+    ui.painter().rect_filled(chip_rect, 3.0, vis.weak_bg_fill);
+    ui.painter().galley(chip_rect.min + egui::vec2(4.0, 0.0), g, vis.text_color());
+    resp.on_hover_text(tip).clicked()
 }
 
 /// A setting's value as the config would spell it.

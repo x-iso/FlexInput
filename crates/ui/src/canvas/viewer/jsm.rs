@@ -264,7 +264,8 @@ pub(crate) fn show_jsm_knob_sized(
     let active = active_tab(snarl, node_id, tabs.len());
     let Some(tab) = tabs.get(active) else { return };
     let knobs = flexinput_engine::eval::jsm_knobs(&tab.text);
-    let Some(knob) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
+    // `name` is the fader's KEY: a pair's second half is `NAME/2`.
+    let Some(knob) = knobs.iter().find(|k| k.key().eq_ignore_ascii_case(name)) else {
         ui.label(
             egui::RichText::new(format!("`{name}` isn't set in this tab any more"))
                 .small()
@@ -273,7 +274,8 @@ pub(crate) fn show_jsm_knob_sized(
         return;
     };
     if let Some(v) = super::jsm_widgets::pinned_fader(ui, size, knob, paint) {
-        let text = flexinput_engine::eval::jsm_set_knob(&tab.text, knob.line, v, knob.integral);
+        let text = flexinput_engine::eval::jsm_set_knob_part(
+            &tab.text, knob.line, knob.part, v, knob.integral);
         tabs[active].text = text;
         write_tabs(snarl, node_id, &tabs, active);
         // Pinned, this ran in the overlay's viewport: bump the canvas generation so
@@ -341,7 +343,8 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
     // line nav rewrites can never be from different tabs.
     let Some((active, text)) = active_text_of(node) else { return false };
     let knobs = flexinput_engine::eval::jsm_knobs(text);
-    let Some(k) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
+    // `name` is the fader's KEY: a pair's second half is `NAME/2`.
+    let Some(k) = knobs.iter().find(|k| k.key().eq_ignore_ascii_case(name)) else {
         return false;
     };
     let mut next = k.at(k.t() + delta);
@@ -356,7 +359,7 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
     if (next - k.value).abs() < f32::EPSILON {
         return false;
     }
-    let rewritten = flexinput_engine::eval::jsm_set_knob(text, k.line, next, k.integral);
+    let rewritten = flexinput_engine::eval::jsm_set_knob_part(text, k.line, k.part, next, k.integral);
     let mut arr = match node.params.get("jsm_tabs").and_then(|v| v.as_array()) {
         Some(a) => a.clone(),
         None => return false,
@@ -365,6 +368,23 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
     tab["text"] = Value::String(rewritten);
     node.params.insert("jsm_tabs".into(), Value::Array(arr));
     true
+}
+
+/// Split a pair setting's fader into two, or join a pair's two back into one —
+/// the pad's Select on a focused fader.
+///
+/// Returns the key the pad should stay focused on afterwards: the first fader of
+/// the setting, which exists either way, so a join from the second half doesn't
+/// leave focus on whatever setting slid up into its place. `None` when the
+/// fader's setting has no pair form, or no longer exists.
+pub(crate) fn nav_toggle_pair(node: &mut NodeData, key: &str) -> Option<String> {
+    let (_, text) = active_text_of(node)?;
+    let knobs = flexinput_engine::eval::jsm_knobs(text);
+    let k = knobs.iter().find(|k| k.key().eq_ignore_ascii_case(key))?;
+    let rewritten = flexinput_engine::eval::jsm_toggle_pair(text, k)?;
+    let focus = k.name.clone();
+    set_active_text(node, &rewritten);
+    Some(focus)
 }
 
 /// Which tab the editor has open, clamped to what exists.
@@ -1150,13 +1170,18 @@ fn knob_rows(
         let mut edited = None;
         for (i, knob) in knobs.iter().enumerate() {
             let start = ui.cursor().min;
-            if let Some(v) = super::jsm_widgets::fader(ui, fader_w, knob, paint) {
-                edited = Some(flexinput_engine::eval::jsm_set_knob(
+            let f = super::jsm_widgets::fader(ui, fader_w, knob, paint);
+            if let Some(v) = f.value {
+                edited = Some(flexinput_engine::eval::jsm_set_knob_part(
                     text,
                     knob.line,
+                    knob.part,
                     v,
                     knob.integral,
                 ));
+            }
+            if f.toggle_pair {
+                edited = flexinput_engine::eval::jsm_toggle_pair(text, knob).or(edited);
             }
             // Each slider pins on its own, so a tuning session can carry just the
             // two or three that matter into the config overlay. A row scrolled out
@@ -1174,7 +1199,7 @@ fn knob_rows(
                 register_exposable_element(
                     ui,
                     node_id,
-                    &super::jsm_widgets::knob_element_id(&knob.name),
+                    &super::jsm_widgets::knob_element_id(&knob.key()),
                     row,
                 );
             }
@@ -1365,6 +1390,50 @@ mod tests {
         let mut node = node_with("DECEL_BRAKE_STRENGTH = 1\n");
         assert!(!super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", 0.005));
         assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 1\n");
+    }
+
+    // Select on a fader splits a pair setting into two faders and joins them back,
+    // rewriting only that line; each half then nudges only its own number; and
+    // focus always lands on the setting's first fader, which exists either way.
+    #[test]
+    fn select_splits_and_joins_a_pair_and_each_half_nudges_its_own_number() {
+        use crate::canvas::node::{NodeData, NodeExtra};
+        let mut node = NodeData {
+            module_id: "module.jsm".into(),
+            display_name: String::new(),
+            category: String::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            params: Default::default(),
+            subpatch: None,
+            extra: NodeExtra::default(),
+        };
+        node.params.insert(
+            "jsm_tabs".into(),
+            serde_json::json!([{ "name": "m", "text": "GYRO_SENS = 2\nSTICK_POWER = 1\n" }]),
+        );
+        let text_of = |n: &NodeData| n.params["jsm_tabs"][0]["text"].as_str().unwrap().to_string();
+
+        // Split: same meaning (2 for both), now two faders.
+        assert_eq!(super::nav_toggle_pair(&mut node, "GYRO_SENS").as_deref(), Some("GYRO_SENS"));
+        assert_eq!(text_of(&node), "GYRO_SENS = 2 2\nSTICK_POWER = 1\n");
+        let keys: Vec<String> = super::knobs_of(&node).iter().map(|k| k.key()).collect();
+        assert_eq!(keys, ["GYRO_SENS", "GYRO_SENS/2", "STICK_POWER"]);
+
+        // The vertical half nudges only the second number.
+        assert!(super::nav_nudge_knob(&mut node, "GYRO_SENS/2", 0.1));
+        let t = text_of(&node);
+        assert!(t.starts_with("GYRO_SENS = 2 "), "horizontal untouched: {t}");
+        assert_ne!(t, "GYRO_SENS = 2 2\nSTICK_POWER = 1\n", "vertical moved");
+
+        // Join from the SECOND half: back to one number (the first), and focus goes
+        // to the setting's first fader rather than whatever slid into its slot.
+        assert_eq!(super::nav_toggle_pair(&mut node, "GYRO_SENS/2").as_deref(), Some("GYRO_SENS"));
+        assert_eq!(text_of(&node), "GYRO_SENS = 2\nSTICK_POWER = 1\n");
+
+        // A setting with no pair form has nothing to toggle, and is left alone.
+        assert_eq!(super::nav_toggle_pair(&mut node, "STICK_POWER"), None);
+        assert_eq!(text_of(&node), "GYRO_SENS = 2\nSTICK_POWER = 1\n");
     }
 
     // Gamepad nav walks `knobs_of` while the body draws `jsm_knobs` of the same

@@ -4862,13 +4862,127 @@ fn yaw_plus_roll_mixes_roll_into_the_turn() {
         "at 100% roll joins the turn: {plain} then {mixed}"
     );
 
-    // And `ROLL_CONTRIBUTION` says when it is doing nothing.
-    let idle = one("ROLL_CONTRIBUTION = 50");
+    // And `ROLL_CONTRIBUTION` says when it is doing nothing — which, now that
+    // LOCAL honours it too, is only in a gravity space.
+    let idle = compile("GYRO_SPACE = PLAYER_TURN\nROLL_CONTRIBUTION = 50").lines[1].clone();
     assert!(
-        idle.notes.iter().any(|n| n.contains("YAW_PLUS_ROLL")),
-        "it says which space it needs: {:?}",
+        idle.notes.iter().any(|n| n.contains("only does anything")),
+        "a gravity space ignores it, and says so: {:?}",
         idle.notes
     );
+    // Under LOCAL it works, and says that it is FlexInput's doing rather than the
+    // fork's, since the same line in the fork would be inert.
+    let local = one("ROLL_CONTRIBUTION = 50");
+    assert!(
+        local.notes.iter().any(|n| n.contains("FlexInput also mixes")),
+        "LOCAL mixes it in: {:?}",
+        local.notes
+    );
+    assert!(
+        !local.notes.iter().any(|n| n.contains("only does anything")),
+        "and does not claim to be inert: {:?}",
+        local.notes
+    );
+}
+
+// ── LOCAL: roll share and axis offset (FlexInput's additions) ───────────────
+
+/// With JSM's default axis picks, LOCAL plus a roll share is YAW_PLUS_ROLL — the
+/// same share, the same sign. One setting, one meaning, in both spaces.
+#[test]
+fn local_with_a_roll_share_is_yaw_plus_roll() {
+    let run = |space: &str| {
+        let mut a = Aiming::new(&format!(
+            "{AIM_CFG}\nGYRO_SPACE = {space}\nROLL_CONTRIBUTION = 60"
+        ));
+        a.gyro = Gyro { roll: 40.0, pitch: 25.0, yaw: 30.0 };
+        a.ticks(3)
+    };
+    let local = run("LOCAL");
+    let ypr = run("YAW_PLUS_ROLL");
+    assert!(
+        (local - ypr).length() < 1e-5,
+        "LOCAL + roll share should match YAW_PLUS_ROLL: {local:?} vs {ypr:?}"
+    );
+    // And the roll really is in there.
+    let mut plain = Aiming::new(&format!("{AIM_CFG}\nGYRO_SPACE = LOCAL"));
+    plain.gyro = Gyro { roll: 40.0, pitch: 25.0, yaw: 30.0 };
+    assert!((plain.ticks(3).x - local.x).abs() > 0.1, "the share changes the turn");
+}
+
+/// LOCAL keeps the roll share working with any axis pick — it joins whichever
+/// axis drives the turn, which YAW_PLUS_ROLL (fixed to yaw) can't do.
+#[test]
+fn local_roll_share_joins_whatever_axis_drives_the_turn() {
+    // Horizontal from PITCH instead of yaw; still no yaw anywhere.
+    let run = |pct: f32| {
+        let mut a = Aiming::new(&format!(
+            "{AIM_CFG}\nMOUSE_X_FROM_GYRO_AXIS = X\nROLL_CONTRIBUTION = {pct}"
+        ));
+        a.gyro = Gyro { roll: 50.0, pitch: 0.0, yaw: 0.0 };
+        a.ticks(3).x
+    };
+    assert!(run(0.0).abs() < 1e-6, "no pitch and no share: nothing turns");
+    assert!(run(100.0).abs() > 0.1, "the roll share turns on its own");
+}
+
+/// LOCAL_AXIS_OFFSET rotates the output. Positive is counter-clockwise on screen,
+/// so a quarter turn sends a plain yaw straight up — and the length is kept.
+#[test]
+fn local_axis_offset_rotates_the_output() {
+    let yaw_right = |offset: f32| {
+        let mut a = Aiming::new(&format!("{AIM_CFG}\nLOCAL_AXIS_OFFSET = {offset}"));
+        a.turn(0.0, 90.0)
+    };
+    let plain = yaw_right(0.0);
+    assert!(plain.x > 0.0 && plain.y.abs() < 1e-6, "0° is stock LOCAL: {plain:?}");
+
+    let quarter = yaw_right(90.0);
+    assert!(quarter.x.abs() < 1e-4, "a quarter turn leaves no x: {quarter:?}");
+    assert!(quarter.y > 0.0, "counter-clockwise sends right to UP: {quarter:?}");
+    assert!((quarter.length() - plain.length()).abs() < 1e-4, "a rotation keeps length");
+
+    let back = yaw_right(-90.0);
+    assert!(back.y < 0.0, "and the other way sends it down: {back:?}");
+
+    // The case it is for: a small correction, at exactly that angle.
+    let small = yaw_right(10.0);
+    let angle = small.y.atan2(small.x).to_degrees();
+    assert!((angle - 10.0).abs() < 1e-3, "10° of offset is 10° of output: {angle}");
+}
+
+/// The offset is a LOCAL thing: a gravity space ignores it, and the line says so.
+/// Either way the line says it is FlexInput's own, not JSM's.
+#[test]
+fn local_axis_offset_is_local_only_and_ours() {
+    let under_local = one("LOCAL_AXIS_OFFSET = 15");
+    assert_eq!(under_local.status, LineStatus::Ok);
+    assert!(under_local.notes.iter().any(|n| n.contains("FlexInput's own")), "{:?}", under_local.notes);
+    assert!(!under_local.notes.iter().any(|n| n.contains("only does anything")));
+
+    let under_gravity =
+        compile("GYRO_SPACE = WORLD_TURN\nLOCAL_AXIS_OFFSET = 15").lines[1].clone();
+    assert!(
+        under_gravity.notes.iter().any(|n| n.contains("only does anything with `GYRO_SPACE = LOCAL`")),
+        "{:?}",
+        under_gravity.notes
+    );
+
+    // Past a full half-turn either way is an error, not a silent wrap.
+    assert!(matches!(one("LOCAL_AXIS_OFFSET = 200").status, LineStatus::Error(_)));
+
+    // And a gravity space really ignores it.
+    let turn = |cfg: &str| {
+        let mut a = Aiming::new(cfg);
+        a.accel = Some(glam::Vec3::new(0.0, 0.0, 1.0)); // flat, face up
+        for _ in 0..200 { a.turn(0.0, 0.0); } // let gravity settle
+        a.turn(0.0, 90.0)
+    };
+    let base = turn(&format!("{AIM_CFG}\nGYRO_SPACE = PLAYER_TURN"));
+    let offs = turn(&format!("{AIM_CFG}\nGYRO_SPACE = PLAYER_TURN\nLOCAL_AXIS_OFFSET = 30"));
+    // Not vacuous: the gravity space is really turning the camera here.
+    assert!(base.length() > 0.1, "PLAYER_TURN should aim once gravity settles: {base:?}");
+    assert!((base - offs).length() < 1e-6, "{base:?} vs {offs:?}");
 }
 
 /// Decay smoothing is an alternative to the rolling average, and says that the two
@@ -5345,19 +5459,77 @@ fn a_numeric_setting_gets_a_slider() {
     assert!(super::knobs::knobs("S = A\nFLOOMP = 3").is_empty());
 }
 
-/// A setting that takes two numbers gets no slider: one control cannot honestly
-/// stand for a pair, and silently dropping half the line would be worse than
-/// leaving it to the keyboard.
+/// A pair line gets one fader per number — one control cannot honestly stand for
+/// two, and silently dropping half the line would be worse. Each fader has its own
+/// key and label, and writes only its own number.
 #[test]
-fn a_paired_setting_gets_no_slider() {
-    assert!(super::knobs::knobs("MIN_GYRO_SENS = 2 3").is_empty(), "a pair");
-    assert_eq!(
-        super::knobs::knobs("MIN_GYRO_SENS = 2").len(),
-        1,
-        "but one number is fine"
-    );
+fn a_paired_setting_gets_a_fader_per_number() {
+    let k = super::knobs::knobs("MIN_GYRO_SENS = 2 3");
+    assert_eq!(k.len(), 2, "a pair is two faders: {k:?}");
+    assert_eq!((k[0].value, k[0].part), (2.0, Some(0)));
+    assert_eq!((k[1].value, k[1].part), (3.0, Some(1)));
+    // The first half keeps the bare name as its key, so a fader pinned before a
+    // split still finds the horizontal; the second is told apart.
+    assert_eq!(k[0].key(), "MIN_GYRO_SENS");
+    assert_eq!(k[1].key(), "MIN_GYRO_SENS/2");
+    assert_eq!(k[1].label(), "MIN_GYRO_SENS V");
+    assert_eq!(super::knobs::key_setting(&k[1].key()), "MIN_GYRO_SENS");
+
+    let one = super::knobs::knobs("MIN_GYRO_SENS = 2");
+    assert_eq!(one.len(), 1, "one number is one fader");
+    assert_eq!(one[0].part, None);
+
+    // A setting that does NOT take a pair still gets nothing for two numbers.
+    assert!(super::knobs::knobs("GYRO_SMOOTH_TIME = 0.1 0.2").is_empty());
     // And a chorded setting is a modeshift — which chord would the slider be for?
     assert!(super::knobs::knobs("ZL,GYRO_SENS = 4").is_empty());
+}
+
+/// Each half of a pair rewrites only its own number, and nothing else on the line.
+#[test]
+fn each_half_of_a_pair_writes_its_own_number() {
+    use super::knobs::set_knob_part;
+    let line = "GYRO_SENS   =  2   3   # tuned";
+    assert_eq!(set_knob_part(line, 0, Some(1), 4.5, false), "GYRO_SENS   =  2   4.5   # tuned");
+    assert_eq!(set_knob_part(line, 0, Some(0), 1.0, false), "GYRO_SENS   =  1   3   # tuned");
+    // A single-number line is part `None`: its one number.
+    assert_eq!(set_knob_part("STICK_SENS = 360", 0, None, 540.0, false), "STICK_SENS = 540");
+}
+
+/// Splitting writes the number twice, which means exactly what it meant before —
+/// the split changes how the setting is tuned, never how it aims. Joining keeps
+/// the first number for both.
+#[test]
+fn split_and_join_round_trip_through_the_text() {
+    use super::knobs::{join_pair, knobs, split_pair, toggle_pair};
+    let text = "GYRO_SENS = 2 # base\nSTICK_SENS = 360";
+    let split = split_pair(text, 0);
+    assert_eq!(split.lines().next(), Some("GYRO_SENS = 2 2 # base"));
+    // Same meaning either way.
+    assert_eq!(compile(text).aim.min_sens, compile(&split).aim.min_sens);
+
+    let joined = join_pair("GYRO_SENS = 2 3", 0);
+    assert_eq!(joined, "GYRO_SENS = 2");
+
+    // `toggle_pair` picks the right one from the fader it is given.
+    let single = &knobs("STICK_SENS = 360")[0];
+    assert_eq!(toggle_pair("STICK_SENS = 360", single).as_deref(), Some("STICK_SENS = 360 360"));
+    let half = &knobs("STICK_SENS = 360 180")[1];
+    assert_eq!(toggle_pair("STICK_SENS = 360 180", half).as_deref(), Some("STICK_SENS = 360"));
+    // A setting with no pair form has nothing to toggle.
+    let plain = &knobs("STICK_POWER = 2")[0];
+    assert_eq!(toggle_pair("STICK_POWER = 2", plain), None);
+}
+
+/// GRID_SIZE's faders stop at 5 each, so a drag can never write a grid past the
+/// 25 cells JSM allows.
+#[test]
+fn grid_size_faders_stay_inside_twenty_five_cells() {
+    let k = super::knobs::knobs("GRID_SIZE = 3 2");
+    assert_eq!(k.len(), 2);
+    assert!(k.iter().all(|k| k.integral && k.hi * k.hi <= 25.0));
+    assert_eq!(k[0].label(), "GRID_SIZE cols");
+    assert_eq!(k[1].label(), "GRID_SIZE rows");
 }
 
 /// A slider's range is the span it moves through, and its position follows the
@@ -6047,4 +6219,26 @@ fn the_pitch_method_measures_the_vertical_and_blocks_the_horizontal() {
         other => panic!("got {other:?}"),
     };
     assert!((deg - 4.5).abs() < 0.01, "only the pitch counts; got {deg}");
+}
+
+/// `STICK_SENS` gets a fader like every other single-number aiming setting, and
+/// tuning it hands the aiming stick to the game so the change can be felt.
+#[test]
+fn stick_and_touchpad_sens_get_faders() {
+    let k = super::knobs::knobs("RIGHT_STICK_MODE = AIM\nSTICK_SENS = 540");
+    let sens = k.iter().find(|k| k.name == "STICK_SENS").expect("STICK_SENS should get a fader");
+    assert_eq!(sens.value, 540.0);
+    assert!(sens.lo <= 360.0 && 360.0 <= sens.hi, "JSM's default sits inside the range");
+    // The pair form (separate vertical) is two faders, one per number.
+    assert_eq!(super::knobs::knobs("STICK_SENS = 360 180").len(), 2);
+
+    // TOUCHPAD_SENS had the same gap.
+    let t = super::knobs::knobs("TOUCHPAD_MODE = MOUSE\nTOUCHPAD_SENS = 2");
+    assert!(t.iter().any(|k| k.name == "TOUCHPAD_SENS" && k.value == 2.0), "{t:?}");
+
+    let cfg = compile("RIGHT_STICK_MODE = AIM\nSTICK_SENS = 540");
+    assert!(
+        matches!(super::knobs::feel_of(&cfg, "STICK_SENS"), super::knobs::Feel::Stick(_)),
+        "tuning it should pass the aiming stick through"
+    );
 }
