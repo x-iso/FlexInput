@@ -355,10 +355,13 @@ fn input_card(
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
     // Top: icon (48 px) + tight inset. Bottom: two slider rows ~22 px
-    // each + small gap + insets, plus a digital-trigger toggle row.
+    // each + small gap + insets, plus a digital-trigger toggle row, plus the
+    // touch + misc mute row on pads that get it.
     let top_h = INPUT_CARD_ICON_H + 8.0;
     let trigger_row_h = 22.0;
-    let bot_h = 60.0 + trigger_row_h;
+    let has_touch_misc = crate::canvas::viewer::has_touch_misc_suppression(&d.id);
+    let touch_row_h = if has_touch_misc { 22.0 } else { 0.0 };
+    let bot_h = 60.0 + trigger_row_h + touch_row_h;
     let card_h = top_h + bot_h;
 
     // Allocate the full card rect inside the parent VERTICAL layout
@@ -513,6 +516,7 @@ fn input_card(
             if let Some(params) = canvas.snarl.get_node_mut(node_id).map(|n| &mut n.params) {
                 input_slider_rows(&mut bot_ui, params, &dev_id_owned, defaults, true);
                 digital_trigger_toggle(&mut bot_ui, params, d.kind, true);
+                if has_touch_misc { touch_misc_toggle(&mut bot_ui, params, true); }
             }
         }
     } else {
@@ -523,6 +527,7 @@ fn input_card(
             Value::from(defaults.gyro_mult as f64));
         input_slider_rows(&mut bot_ui, &mut preview, &d.id, defaults, false);
         digital_trigger_toggle(&mut bot_ui, &mut preview, d.kind, false);
+        if has_touch_misc { touch_misc_toggle(&mut bot_ui, &mut preview, false); }
     }
 
     // XInput physical input cards carry the player-slot circles too: a physical
@@ -590,6 +595,17 @@ fn input_card(
                             egui::vec2(inner.width(), row_h)),
                         action: LeftNavAction::ToggleParam {
                             node: node_id, key: "digital_triggers".into() },
+                    });
+                }
+                // Touch + misc mute sits one row below the trigger toggle,
+                // which renders (forced/disabled or not) on every pad.
+                if has_touch_misc {
+                    nav_targets.push(LeftNavTarget {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(inner.left(), y + 2.0 + trigger_row_h),
+                            egui::vec2(inner.width(), row_h)),
+                        action: LeftNavAction::ToggleParam {
+                            node: node_id, key: "suppress_touch_misc".into() },
                     });
                 }
             }
@@ -748,6 +764,25 @@ fn digital_trigger_toggle(
              and 0 below it. The LT/RT digital buttons follow the same threshold. \
              Output stays analog-typed, so it still drives analog wires at full/zero.",
         );
+    });
+}
+
+/// Easy-mode twin of the Advanced header's "Suppress touch + misc" toggle
+/// (`touch_misc_header_toggle`): same `suppress_touch_misc` param, same
+/// device gate (`has_touch_misc_suppression`, checked by the caller).
+fn touch_misc_toggle(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    enabled: bool,
+) {
+    let mut checked = params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(false);
+    ui.add_space(2.0);
+    ui.add_enabled_ui(enabled, |ui| {
+        let resp = ui.checkbox(&mut checked, egui::RichText::new("Suppress touch + misc").size(11.0));
+        if resp.changed() {
+            params.insert("suppress_touch_misc".into(), Value::Bool(checked));
+        }
+        resp.on_hover_text(crate::canvas::viewer::TOUCH_MISC_HOVER);
     });
 }
 

@@ -20,6 +20,7 @@
 //! that a compile-time guarantee.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use glam::Vec2;
 
@@ -140,15 +141,8 @@ struct OpenPad {
     /// sensors were enabled then too). Gates the per-poll sensor reads.
     has_gyro: bool,
     has_accel: bool,
-    /// Remaining sensor-enable RE-ASSERTS for a wireless pad. Over Bluetooth the
-    /// mode-switch subcommand that puts a Switch Pro into full-report mode (0x30,
-    /// the report that carries IMU) can silently fail if it races the cold BT
-    /// link settling — the pad stays in simple mode (0x3F: buttons/sticks fine,
-    /// gyro/accel frozen) even though `sensor_enabled` reports true. Re-asserting
-    /// the enable a few times over the first several seconds (once per ~2 s
-    /// enumerate) gives it a chance to take once the link is stable. Set to 0 for
-    /// wired pads (their enable sticks immediately) so they're never disturbed.
-    sensor_retries: u8,
+    /// Frozen-IMU watchdog (see `ImuWatchdog`).
+    imu_watch: ImuWatchdog,
     /// Number of touchpads SDL reports for this pad (0 for most generic pads).
     num_touchpads: u16,
     /// Last-sent rumble (strong, weak) as 0-255 bytes, to skip redundant
@@ -162,6 +156,62 @@ struct OpenPad {
     /// it is born and dropped with the connection — a reconnect gets a fresh
     /// window rather than judging new samples against pre-disconnect ones.
     spike: SpikeFilter,
+}
+
+/// Revives a pad whose IMU stream went dead while the pad itself stayed open.
+///
+/// A pad's IMU is switched on by a ONE-SHOT command to the device (the Steam
+/// Controller's `SETTING_IMU_MODE` feature report, a Switch Pro's IMU/full-report
+/// subcommands). Anything that resets the device's settings afterwards — Steam
+/// Input reconfiguring the pad when it loses or regains it (HidHide cloaking it
+/// the moment a virtual output is assigned), a Bluetooth mode switch that didn't
+/// take — turns the stream off, while SDL still believes the sensors are on.
+/// Buttons and sticks keep working (SDL re-sends the Steam Controller's
+/// lizard-mode-off every 3 s, but never the IMU mode), so the pad looks alive
+/// with gyro/accel frozen at their last value.
+///
+/// Calling `sensor_set_enabled(true)` again does NOTHING: SDL returns early when
+/// the sensor is already enabled (`SDL_SetGamepadSensorEnabled`), so the command
+/// never reaches the device. Only an off→on toggle of every sensor makes SDL
+/// re-send it. A live IMU never repeats a six-axis sample bit-for-bit for long —
+/// accel noise alone rules it out — so a sample frozen for `STALL` means the
+/// stream is off, and the watchdog toggles, backing off if it doesn't help.
+struct ImuWatchdog {
+    last: [f32; 6],
+    last_change: Instant,
+    next_kick: Instant,
+    kicks: u32,
+}
+
+impl ImuWatchdog {
+    const STALL: Duration = Duration::from_millis(500);
+    /// First few kicks come quickly (the fix usually takes on the first); a pad
+    /// that stays frozen after that is left alone except for a slow retry.
+    const FAST_KICKS: u32 = 5;
+    const FAST_GAP: Duration = Duration::from_secs(1);
+    const SLOW_GAP: Duration = Duration::from_secs(10);
+
+    fn new(now: Instant) -> Self {
+        Self { last: [f32::NAN; 6], last_change: now, next_kick: now, kicks: 0 }
+    }
+
+    /// Feed one raw sample; true when the sensors should be toggled now.
+    fn observe(&mut self, sample: [f32; 6], now: Instant) -> bool {
+        if sample.iter().zip(&self.last).any(|(a, b)| a.to_bits() != b.to_bits()) {
+            self.last = sample;
+            self.last_change = now;
+            self.next_kick = now;
+            self.kicks = 0;
+            return false;
+        }
+        if now.duration_since(self.last_change) < Self::STALL || now < self.next_kick {
+            return false;
+        }
+        self.kicks += 1;
+        let gap = if self.kicks < Self::FAST_KICKS { Self::FAST_GAP } else { Self::SLOW_GAP };
+        self.next_kick = now + gap;
+        true
+    }
 }
 
 pub struct SdlBackend {
@@ -391,10 +441,6 @@ impl SdlBackend {
                  serial={serial:?} path={path:?}"
             );
 
-            // Wireless pads with a sensor get a handful of enable re-asserts (see
-            // the field doc); wired pads and sensor-less pads get none.
-            let sensor_retries = if conn == "wireless" && (has_gyro || has_accel) { 8 } else { 0 };
-
             pads.insert(
                 id,
                 OpenPad {
@@ -403,35 +449,12 @@ impl SdlBackend {
                     kind,
                     has_gyro,
                     has_accel,
-                    sensor_retries,
+                    imu_watch: ImuWatchdog::new(Instant::now()),
                     num_touchpads,
                     last_rumble: (0, 0),
                     last_led: (0, 0, 0),
                     spike: SpikeFilter::new(),
                 },
-            );
-        }
-
-        // Re-assert sensor enable for wireless pads with retries left (see
-        // OpenPad::sensor_retries). Runs once per enumerate (~2 s): a Switch Pro
-        // whose full-report mode-switch didn't take at cold BT connect gets more
-        // chances once the link settles. Wired pads have 0 retries so are never
-        // touched. A pad freshly opened this cycle was just enabled above, so the
-        // first re-assert is redundant but harmless.
-        for pad in pads.values_mut() {
-            if pad.sensor_retries == 0 {
-                continue;
-            }
-            pad.sensor_retries -= 1;
-            if pad.has_gyro {
-                let _ = pad.gamepad.sensor_set_enabled(SensorType::Gyroscope, true);
-            }
-            if pad.has_accel {
-                let _ = pad.gamepad.sensor_set_enabled(SensorType::Accelerometer, true);
-            }
-            eprintln!(
-                "[sdl] re-assert sensors {} (retries left {})",
-                pad.dev_id, pad.sensor_retries
             );
         }
     }
@@ -636,11 +659,13 @@ impl DeviceBackend for SdlBackend {
             // perfectly quiet axis and leaves alone, and its pins are simply
             // not pushed.
             let mut imu = [0.0f32; 6];
+            let mut raw = [0.0f32; 6];
             let mut got_gyro = false;
             let mut got_accel = false;
             if pad.has_gyro {
                 let mut d = [0.0f32; 3];
                 if g.sensor_get_data(SensorType::Gyroscope, &mut d).is_ok() {
+                    raw[..3].copy_from_slice(&d);
                     // SDL's frame → canonical, THEN scale. SDL gyro is rad/s;
                     // convert to deg/s and normalize to the ±ref scale.
                     let c = sdl_gyro_to_canonical(d);
@@ -654,6 +679,7 @@ impl DeviceBackend for SdlBackend {
             if pad.has_accel {
                 let mut d = [0.0f32; 3];
                 if g.sensor_get_data(SensorType::Accelerometer, &mut d).is_ok() {
+                    raw[3..].copy_from_slice(&d);
                     // SDL's frame → canonical, THEN scale. SDL accel is m/s²;
                     // convert to G and normalize to the ±ref scale.
                     let c = sdl_accel_to_canonical(d);
@@ -666,6 +692,20 @@ impl DeviceBackend for SdlBackend {
                 }
             }
             if got_gyro || got_accel {
+                // Frozen stream → toggle every sensor off and back on, the only
+                // way to make SDL re-send the enable (see `ImuWatchdog`).
+                if pad.imu_watch.observe(raw, Instant::now()) {
+                    for (has, ty) in [(pad.has_gyro, SensorType::Gyroscope),
+                                      (pad.has_accel, SensorType::Accelerometer)] {
+                        if has { let _ = g.sensor_set_enabled(ty, false); }
+                    }
+                    for (has, ty) in [(pad.has_gyro, SensorType::Gyroscope),
+                                      (pad.has_accel, SensorType::Accelerometer)] {
+                        if has { let _ = g.sensor_set_enabled(ty, true); }
+                    }
+                    eprintln!("[sdl] IMU frozen on {dev} — re-enabled sensors (kick {})",
+                              pad.imu_watch.kicks);
+                }
                 let imu = pad.spike.push(imu);
                 if got_gyro {
                     out.push((dev.clone(), "gyro_x".into(), Signal::Float(imu[0])));
@@ -903,5 +943,34 @@ mod tests {
         assert_eq!(g[0], a[0], "roll matches accel");
         assert_eq!(g[1], -a[1], "pitch is inverted vs accel");
         assert_eq!(g[2], -a[2], "yaw is inverted vs accel");
+    }
+
+    /// Kicks only after a sample is frozen for `STALL`, backs off between kicks,
+    /// and forgets the streak the moment data moves again.
+    #[test]
+    fn imu_watchdog_kicks_only_on_a_frozen_stream() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut w = ImuWatchdog::new(t0);
+        let s = [0.1, 0.2, 0.3, 0.0, -1.0, 0.0];
+
+        assert!(!w.observe(s, ms(0)));
+        assert!(!w.observe(s, ms(499)), "a repeat within STALL is normal between reports");
+        assert!(w.observe(s, ms(500)), "frozen for STALL → kick");
+        assert!(!w.observe(s, ms(900)), "no second kick inside the gap");
+        assert!(w.observe(s, ms(1500)));
+
+        let mut moved = s;
+        moved[3] = 0.001;
+        assert!(!w.observe(moved, ms(1600)), "live data never kicks");
+        assert_eq!(w.kicks, 0, "streak resets once data moves");
+
+        for k in 1..ImuWatchdog::FAST_KICKS {
+            assert!(w.observe(moved, ms(2100 + (k as u64 - 1) * 1000)));
+        }
+        let t = 2100 + (ImuWatchdog::FAST_KICKS as u64 - 2) * 1000;
+        assert!(w.observe(moved, ms(t + 1000)), "last fast kick");
+        assert!(!w.observe(moved, ms(t + 2000)), "then backs off to SLOW_GAP");
+        assert!(w.observe(moved, ms(t + 11000)));
     }
 }

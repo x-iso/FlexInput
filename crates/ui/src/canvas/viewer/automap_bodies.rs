@@ -106,6 +106,16 @@ pub(crate) fn has_touch_misc_suppression(dev_id: &str) -> bool {
     dev_id.starts_with("sdl:")
 }
 
+/// Hover text for the "Suppress touch + misc" toggle, shared by the Advanced
+/// node header and the Easy-mode input card.
+pub(crate) const TOUCH_MISC_HOVER: &str =
+    "Mute this pad's touchpad fingers and all Misc 1-6 buttons.\n\
+     Capacitive sensors (e.g. the Steam Controller's trackpads and thumb rest) \
+     fire just from holding the controller, which steals Learn captures and \
+     triggers mappings you didn't press. Turn this on while you build the \
+     mapping, then off to use those inputs.\n\
+     Touchpad click and the rear paddles are real switches and stay live.";
+
 /// Advanced-mode device.source body toggle muting the capacitive / auxiliary
 /// pins while the user builds a mapping. Stored on `suppress_touch_misc`;
 /// consumed by the UI signal mask (Learn / previews) and the engine's
@@ -129,14 +139,7 @@ pub(crate) fn touch_misc_header_toggle(
             n.params.insert("suppress_touch_misc".into(), Value::Bool(checked));
         }
     }
-    resp.on_hover_text(
-        "Mute this pad's touchpad fingers and all Misc 1-6 buttons.\n\
-         Capacitive sensors (e.g. the Steam Controller's trackpads and thumb rest) \
-         fire just from holding the controller, which steals Learn captures and \
-         triggers mappings you didn't press. Turn this on while you build the \
-         mapping, then off to use those inputs.\n\
-         Touchpad click and the rear paddles are real switches and stay live.",
-    );
+    resp.on_hover_text(TOUCH_MISC_HOVER);
 }
 
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {

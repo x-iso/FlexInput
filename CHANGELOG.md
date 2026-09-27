@@ -5,6 +5,20 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Steam Controller's gyro no longer goes dead after assigning a virtual
+  output.** Its IMU is switched on by a one-time command, and the pad could lose
+  that setting — typically when Steam Input reconfigured it as the controller got
+  hidden for the new output — while buttons and sticks kept working. FlexInput
+  now notices a frozen gyro/accel stream on any SDL-read pad and switches the
+  sensors back on. The old re-enable retries for wireless pads never actually
+  reached the controller; this replaces them.
+
+- **"Suppress touch + misc" shows on the Easy-mode input card.** It was only in
+  the Advanced-mode device node, so a Steam Controller in Easy mode had no way to
+  mute its trackpads and grip sensors.
+
 ## [0.14.6] - 2026-09-24
 
 ### Added
