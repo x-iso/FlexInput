@@ -193,6 +193,76 @@ pub struct ProcessingOutput {
 /// so the I/O thread never contends on the UI/processing mutex.
 pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 
+/// Sink pins that carry a one-shot DISPLACEMENT (pixels moved this tick) rather
+/// than a level. Every other pin is a state the I/O thread may sample at its own
+/// rate; these are not. The engine ticks at the sample rate and the I/O thread
+/// reads the bus at the polling rate, so publishing only the latest tick's
+/// displacement kept 1 tick in (sample rate / polling rate) — 1 in 4 at the
+/// 2 kHz / 500 Hz defaults — and a JSM config aimed 4x slower than in JSM. They
+/// are therefore banked across ticks here and drained by the reader instead.
+pub fn is_displacement_pin(pin: &str) -> bool {
+    matches!(pin, "mouse_move" | "mouse_move_x" | "mouse_move_y")
+}
+
+fn add_displacement(into: &mut HashMap<(String, String), Signal>, key: &(String, String), v: Signal) {
+    match (into.get_mut(key), v) {
+        (Some(Signal::Vec2(a)), Signal::Vec2(b)) => *a += b,
+        (Some(Signal::Float(a)), Signal::Float(b)) => *a += b,
+        // First sighting, or a type that changed under us: the new value stands.
+        _ => { into.insert(key.clone(), v); }
+    }
+}
+
+/// Add one tick's displacement pins into `bank`.
+fn bank_displacement(bank: &mut HashMap<(String, String), Signal>, sinks: &HashMap<(String, String), Signal>) {
+    for (k, &v) in sinks {
+        if is_displacement_pin(&k.1) {
+            add_displacement(bank, k, v);
+        }
+    }
+}
+
+/// Replace the bus with the latest tick's `sinks`, except that each displacement
+/// pin becomes everything banked since the last publish plus whatever the reader
+/// has not drained yet. Empties `bank`.
+fn publish_sink_bus(
+    bus: &mut HashMap<(String, String), Signal>,
+    sinks: &HashMap<(String, String), Signal>,
+    bank: &mut HashMap<(String, String), Signal>,
+) {
+    let undrained: Vec<((String, String), Signal)> = bus
+        .iter()
+        .filter(|(k, _)| is_displacement_pin(&k.1))
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    bus.clone_from(sinks);
+    bus.retain(|k, _| !is_displacement_pin(&k.1));
+    for (k, v) in bank.drain() {
+        add_displacement(bus, &k, v);
+    }
+    for (k, v) in undrained {
+        add_displacement(bus, &k, v);
+    }
+}
+
+/// Read the bus for the sinks: a copy of it, with the displacement pins zeroed
+/// in the bus afterwards so the same movement is never delivered twice. The I/O
+/// thread calls this once per iteration.
+pub fn drain_sink_bus(bus: &SinkBus) -> HashMap<(String, String), Signal> {
+    let mut bus = bus.write().unwrap();
+    let out = bus.clone();
+    for (k, v) in bus.iter_mut() {
+        if is_displacement_pin(&k.1) {
+            *v = match *v {
+                Signal::Vec2(_) => Signal::Vec2(Default::default()),
+                Signal::Float(_) => Signal::Float(0.0),
+                other => other,
+            };
+        }
+    }
+    out
+}
+
 /// UI→engine source-block channel. The UI writes the set of physical device
 /// `(device_id, pin)` pairs to suppress from the game while the config overlay
 /// is open; the processing thread unions it into `state[MACRO_CARRY_UID].source_block`
@@ -264,6 +334,9 @@ pub fn spawn_processing_thread(
         // Pre-allocated outside the hot loop so it grows once and is
         // reused thereafter.
         let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
+        // Displacement pins summed over the catch-up loop (see
+        // `is_displacement_pin`); emptied into the sink bus once per wakeup.
+        let mut disp_bank: HashMap<(String, String), Signal> = HashMap::new();
 
         // High-resolution waiter for the sub-tick sleep below — precise without
         // raising the global timer resolution (see hr_timer). The device-I/O
@@ -360,13 +433,15 @@ pub fn spawn_processing_thread(
                         // clears tick_out on entry, so we must move (not
                         // clone) the samples here before the next call.
                         scope_acc.append(&mut tick_out.scope_samples);
+                        bank_displacement(&mut disp_bank, &tick_out.sink_outputs);
                     }
                 }
 
-                // tick_out now holds the LAST tick's outputs/inputs/sinks.
+                // tick_out now holds the LAST tick's outputs/inputs/sinks; the
+                // displacement pins carry every tick's share instead.
                 {
                     puffin::profile_scope!("write_sink_bus");
-                    *sink_bus.write().unwrap() = tick_out.sink_outputs.clone();
+                    publish_sink_bus(&mut sink_bus.write().unwrap(), &tick_out.sink_outputs, &mut disp_bank);
                 }
                 {
                     puffin::profile_scope!("write_proc_outputs");
@@ -416,4 +491,85 @@ pub fn spawn_processing_thread(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec2;
+
+    fn key(pin: &str) -> (String, String) {
+        ("virtual.keymouse:0".to_string(), pin.to_string())
+    }
+
+    fn tick(disp: Vec2, lmb: bool) -> HashMap<(String, String), Signal> {
+        HashMap::from([
+            (key("mouse_move"), Signal::Vec2(disp)),
+            (key("mouse_move_x"), Signal::Float(disp.x)),
+            (key("mouse_left"), Signal::Bool(lmb)),
+        ])
+    }
+
+    /// Run `engine_ticks` ticks of one displacement each, publishing every
+    /// `ticks_per_wakeup` and draining every `ticks_per_read`; return what the
+    /// reader was handed in total.
+    fn deliver(engine_ticks: usize, ticks_per_wakeup: usize, ticks_per_read: usize, per_tick: Vec2) -> (Vec2, f32) {
+        let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
+        let mut bank = HashMap::new();
+        let (mut got, mut got_x) = (Vec2::ZERO, 0.0);
+        for t in 1..=engine_ticks {
+            let last = tick(per_tick, true);
+            bank_displacement(&mut bank, &last);
+            if t % ticks_per_wakeup == 0 {
+                publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
+            }
+            if t % ticks_per_read == 0 {
+                let seen = drain_sink_bus(&bus);
+                if let Some(Signal::Vec2(v)) = seen.get(&key("mouse_move")) { got += *v; }
+                got_x += seen.get(&key("mouse_move_x")).map(|s| s.as_float()).unwrap_or(0.0);
+                assert_eq!(seen.get(&key("mouse_left")), Some(&Signal::Bool(true)), "a level pin passes as it stands");
+            }
+        }
+        (got, got_x)
+    }
+
+    /// The reported bug: the engine at 2 kHz, the I/O thread at 500 Hz. The
+    /// reader must see all four ticks' movement, not the last one's.
+    #[test]
+    fn displacement_survives_a_slower_reader() {
+        let (got, got_x) = deliver(400, 1, 4, Vec2::new(0.5, -0.25));
+        assert!((got - Vec2::new(200.0, -100.0)).length() < 1e-3, "{got}");
+        assert!((got_x - 200.0).abs() < 1e-3, "{got_x}");
+    }
+
+    /// A catch-up burst runs several ticks per wakeup and publishes once.
+    #[test]
+    fn displacement_survives_a_catch_up_burst() {
+        let (got, _) = deliver(400, 8, 8, Vec2::new(1.0, 0.0));
+        assert!((got.x - 400.0).abs() < 1e-3, "{got}");
+    }
+
+    /// A reader faster than the engine must not deliver one tick twice.
+    #[test]
+    fn displacement_is_not_delivered_twice_to_a_faster_reader() {
+        let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
+        let mut bank = HashMap::new();
+        let last = tick(Vec2::new(3.0, 0.0), false);
+        bank_displacement(&mut bank, &last);
+        publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
+        let first = drain_sink_bus(&bus);
+        let second = drain_sink_bus(&bus);
+        assert_eq!(first.get(&key("mouse_move")), Some(&Signal::Vec2(Vec2::new(3.0, 0.0))));
+        assert_eq!(second.get(&key("mouse_move")), Some(&Signal::Vec2(Vec2::ZERO)));
+    }
+
+    #[test]
+    fn only_the_mouse_move_pins_are_displacements() {
+        for pin in ["mouse_move", "mouse_move_x", "mouse_move_y"] {
+            assert!(is_displacement_pin(pin), "{pin}");
+        }
+        for pin in ["mouse", "mouse_x", "right_stick", "scroll_up", "mouse_left"] {
+            assert!(!is_displacement_pin(pin), "{pin}");
+        }
+    }
 }

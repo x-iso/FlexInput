@@ -349,9 +349,12 @@ pub(crate) fn spawn_io_thread(
 
                 // ── Get latest sink outputs from processing thread ─────────────
                 // Uses a separate RwLock so this read never contends on proc_outputs.
+                // A drain, not a read: the mouse displacement pins are banked across
+                // engine ticks and must be delivered exactly once (see
+                // `flexinput_engine::is_displacement_pin`).
                 let sink_outputs: HashMap<(String, String), Signal> = {
                     puffin::profile_scope!("read_sink_bus");
-                    sink_bus.read().unwrap().clone()
+                    flexinput_engine::drain_sink_bus(&sink_bus)
                 };
                 mark!("sink_bus");
 
