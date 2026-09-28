@@ -1233,12 +1233,22 @@ fn knob_rows(
     // Field 0 is the calibrate row, so a fader's field index is one past its
     // position in `knobs`.
     let focus = nav_focus_field(ui, node_id).and_then(|f| f.checked_sub(1));
-    let scrolled_to_id = egui::Id::new(("jsm_nav_scrolled", node_id.0));
+    // Per place drawn: `ctx.data` is shared by every place this node is drawn —
+    // its canvas body, a pin, the config overlay — and a memo keyed by the node
+    // alone was used up by whichever drew first. The pin then saw no change and
+    // never scrolled, leaving the focused fader below its edge. Viewport and
+    // layer aren't enough on their own (every pin host draws on the background
+    // layer), so the drawing Ui's own id, which differs per host, goes in too.
+    let scrolled_to_id = egui::Id::new(("jsm_nav_scrolled", node_id.0))
+        .with(ui.ctx().viewport_id())
+        .with(ui.layer_id())
+        .with(ui.id());
+    // The memo is the fader last SEEN in view, not the last one asked for: a
+    // scroll requested in a pass egui then discards never happens, and a memo
+    // written at request time would call it done. So the strip keeps asking
+    // until the focused fader is on screen, and only then leaves it to the wheel.
     let scrolled_to: Option<usize> = ui.ctx().data(|d| d.get_temp(scrolled_to_id));
     let bring_into_view = focus.filter(|f| Some(*f) != scrolled_to);
-    if let Some(f) = bring_into_view {
-        ui.ctx().data_mut(|d| d.insert_temp(scrolled_to_id, f));
-    }
     let faders = |ui: &mut egui::Ui, field_rects: &mut Vec<egui::Rect>| {
         let mut edited = None;
         for (i, knob) in knobs.iter().enumerate() {
@@ -1262,7 +1272,16 @@ fn knob_rows(
             // pointer is actually over.
             let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(fader_w, 0.0));
             if bring_into_view == Some(i) {
-                ui.scroll_to_rect(row, None);
+                // In view: done, and the wheel is free again. A fader taller than
+                // the strip counts once its top is showing.
+                let clip = ui.clip_rect();
+                let in_view = clip.contains_rect(row)
+                    || (row.height() > clip.height() && clip.contains(row.left_top()));
+                if in_view {
+                    ui.ctx().data_mut(|d| d.insert_temp(scrolled_to_id, i));
+                } else {
+                    ui.scroll_to_rect(row, None);
+                }
             }
             // Clipped to what is actually on screen, so a row scrolled out of the
             // band publishes an empty rect and the focus ring skips it instead of

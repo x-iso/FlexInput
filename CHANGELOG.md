@@ -24,6 +24,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **The pinned JSM editor's tune panel follows the pad down the faders.**
+  Walking past the faders that fit in a pinned editor left the selection below
+  its edge, out of sight. The panel now scrolls to the focused fader, and once
+  it is showing, the mouse wheel is left alone again.
+
 - **Rumble now works on a Switch Pro Controller connected through the
   Bluetooth dongle.** That connection never sent rumble at all, and it never
   turned the controller's vibration on either.
