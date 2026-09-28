@@ -59,7 +59,7 @@ Carry the AutoMap gamepad bus between two FlexInput instances over the network:
 | **Processing** | Delay, Average, DC Filter, Response Curve, Vec Response Curve, Vec Reshaper, Two-way Response Curve, Vec→Axis, Axis→Vec, Vec→Deflection, Gyro 3DOF |
 | **Display** | Readout, Oscilloscope, Trigger Scope, Vectorscope |
 | **Generator** | Oscillator, Envelope |
-| **AutoMap** | AutoMap Splitter, AutoMap Collector, AutoMap Fork, AutoMap Selector, AutoMap Combiner, Touch Zones, Remapper, Map Action, Feedback Control, Audio Stream Haptics |
+| **AutoMap** | AutoMap Splitter, AutoMap Collector, AutoMap Fork, AutoMap Selector, AutoMap Combiner, Touch Zones, Remapper, Map Action, Feedback Control, Audio Stream Haptics, JSM Config |
 | **SubPatch** | Inlet, Outlet |
 | **Network** | Network Send, Network Receive |
 
@@ -136,6 +136,20 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
   [larfingshnew/3d-controller-overlay](https://github.com/larfingshnew/3d-controller-overlay)
   (MIT). That repo is also the reference for the model format when adding
   custom controllers — see `app/assets/models/README.md`.
+- The **JSM Config** module reimplements the config language and mapping rules
+  of [Electronicks/JoyShockMapper](https://github.com/Electronicks/JoyShockMapper)
+  (MIT, by Julian "Jibb" Smart and Nicolas Lessard), followed as of 3.6.2, and
+  the gyro additions of its fork
+  [evan1mclean/JSM_custom_curve](https://github.com/evan1mclean/JSM_custom_curve)
+  (MIT), followed as of commit `0ace2da`. No JSM code is linked in; the module is
+  a Rust port written against their source and documentation.
+- DualSense adaptive-trigger effect byte layouts follow John "Nielk1" Klein's
+  [TriggerEffectGenerator](https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db)
+  (MIT), the encoder JoyShockMapper uses.
+- Controller protocol research: the Switch Pro report and SPI-flash layouts
+  follow [dekuNukem/Nintendo_Switch_Reverse_Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering),
+  and the Joy-Con 2 / Switch 2 protocol follows
+  [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research).
 - Macro & menu icons in `app/assets/general` are from
   [game-icons.net](https://game-icons.net/) by their respective authors,
   licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).

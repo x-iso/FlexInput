@@ -150,6 +150,39 @@ pub const LICENSES: &[License] = &[
         text: include_str!("../../../licenses/enigo.txt"),
     },
     License {
+        name: "JoyShockMapper",
+        what: "The JSM Config module reimplements JoyShockMapper's config \
+               language and the rules it maps a pad by, following its source \
+               and documentation.",
+        spdx: "MIT",
+        url: "https://github.com/Electronicks/JoyShockMapper",
+        note: Some("By Julian \"Jibb\" Smart and Nicolas Lessard (Electronicks). \
+                    Followed as of 3.6.2."),
+        text: include_str!("../../../licenses/JoyShockMapper.txt"),
+    },
+    License {
+        name: "JSM_custom_curve",
+        what: "The JSM Config module's gyro additions — acceleration curves, \
+               smoothing, the one-euro filter, angle snapping, the brake and \
+               the roll-mixing gyro space — follow this JoyShockMapper fork.",
+        spdx: "MIT",
+        url: "https://github.com/evan1mclean/JSM_custom_curve",
+        note: Some("By evan1mclean. Followed as of commit 0ace2da. The fork \
+                    carries JoyShockMapper's licence unchanged."),
+        text: include_str!("../../../licenses/JoyShockMapper.txt"),
+    },
+    License {
+        name: "TriggerEffectGenerator",
+        what: "The DualSense adaptive-trigger effect byte layouts — in the \
+               physical pad's encoder, the virtual DualSense's decoder and the \
+               JSM Config module — follow Nielk1's generator, the reference \
+               JoyShockMapper encodes with.",
+        spdx: "MIT",
+        url: "https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db",
+        note: Some("By John \"Nielk1\" Klein."),
+        text: include_str!("../../../licenses/TriggerEffectGenerator.txt"),
+    },
+    License {
         name: "3D controller models",
         what: "The controller meshes in app/assets/models, adapted from \
                larfingshnew/3d-controller-overlay.",

@@ -5,6 +5,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-09-28
+
+The JSM Config module arrives on `main` with this release. It first shipped in
+0.14.5, and its entries there cover what it runs and how the editor works; this
+release builds on them.
+
 ### Added
 
 - **JSM Config: roll contribution and an axis offset for `GYRO_SPACE = LOCAL`.**
@@ -197,6 +203,139 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **JSM Config: run a JoyShockMapper config inside a patch.** A new AutoMap
+  module whose body is the config text itself: tabs with Load / Save, each line
+  tinted by what the parser made of it, and the lines worth explaining listed
+  underneath. Put it on an AutoMap wire and it applies the config to the bus by
+  JSM's own rules, then republishes the bus. It either passes through whatever
+  the config never mentions or, with **strict** on, publishes only what the
+  config says, which is how JSM behaves when the pad is hidden from the game.
+  The press rules, timings and chord layering are ported from the
+  [JoyShockMapper](https://github.com/Electronicks/JoyShockMapper) 3.6.2
+  source rather than its README, and JSM's own `GyroConfigs/xbox.txt`,
+  `Desktop.txt` and `Xbox.txt` load without errors and play. What runs:
+  - **buttons**: tap and hold, every action and event modifier, chords,
+    simultaneous and diagonal presses, double press, turbo, and JSM's timing
+    settings. A later binding for a button replaces an earlier one, as in JSM,
+    and the line that loses says which line replaced it;
+  - **triggers**: the threshold, the hair trigger, and the dual-stage full pull
+    with every skip mode and `TRIGGER_SKIP_DELAY`;
+  - **sticks**: `NO_MOUSE` in JSM's eight sectors, `SCROLL_WHEEL`, ring modes,
+    deadzones, `STICK_AXIS_X/Y`, `CONTROLLER_ORIENTATION`, stick `AIM`, flick
+    stick and `MOUSE_AREA`;
+  - **gyro**: gyro mouse with the sensitivity ramp, smoothing, cutoff,
+    trackball, `GYRO_ON` / `GYRO_OFF`, the four gravity gyro spaces, the lean
+    buttons and the motion stick;
+  - **virtual-pad output**: `LEFT_STICK` / `RIGHT_STICK`, the
+    `*_ANGLE_TO_X/Y` and wind modes, `GYRO_OUTPUT` and `FLICK_STICK_OUTPUT` to
+    a stick, `X_LT` / `X_RT` trigger pass-through, `VIRTUAL_STICK_CALIBRATION`,
+    and the undeadzone, unpower, scale and angle settings. Gyro and stick add
+    in degrees per second of camera turn before becoming a stick position, so
+    they can share one virtual stick without clipping each other;
+  - **touchpad**: a grid of buttons (`GRID_SIZE`, up to `T25`), a relative
+    stick per finger, mouse mode, and the touchpad as a third dual-stage
+    trigger (a touch is the soft pull, a click the full one);
+  - **modeshifts**: any setting the module runs can be chorded
+    (`ZL,GYRO_SENS = 4`), resolved as JSM resolves them;
+  - **feedback**: rumble, the light bar and four of JSM's seven adaptive-trigger
+    effects (`OFF`, `RESISTANCE`, `SEMI_AUTOMATIC`, `AUTOMATIC`) go back to the
+    physical pad and replace the game's own. With `RUMBLE` on, the game keeps
+    the rumble;
+  - **layers**: each config is a tab, and a quoted config file name switches to
+    that tab or includes it. `RESET_MAPPINGS` works both bound to a button and
+    on a line of its own.
+
+  Of everything JSM can express, only `MOUSE_RING` and `HYBRID_AIM` don't run,
+  and their lines say why. Any line the patch can't deliver says so and gives a
+  reason you can act on: an output that needs a virtual pad downstream, a button
+  the wired pad doesn't report, a key the keyboard sink can't send. The module
+  takes over from the pad only what it actually runs. JSM's gyro calibration,
+  whitelisting, autoload and profiles stay with FlexInput. The Auto-Map
+  Combiner now lists conflicts against a JSM Config node, and against Audio
+  Stream Haptics and both network nodes, which it had missed.
+
+- **JSM Config: the JSM_custom_curve fork's gyro features.** Configs written for
+  [evan1mclean's fork](https://github.com/evan1mclean/JSM_custom_curve) run too:
+  the five `ACCEL_CURVE` shapes (Natural, Power, Quadratic, Sigmoid, Jump),
+  decay smoothing, the one-euro filter, `GYRO_ANGLE_SNAP` and its eased variant,
+  the deceleration brake, and the `YAW_PLUS_ROLL` gyro space with
+  `ROLL_CONTRIBUTION`. They run in the fork's own pipeline order. Each line
+  that uses one says it comes from the fork, since such a config won't load in
+  stock JSM. `MISC1`-`MISC6` map to the pad's misc buttons. `IGNORE_GYRO_DEVICES`
+  and `TELEMETRY_*` are ignored, each with its reason on the line. One change
+  from the fork: its eased snap speeds up the remaining axis right at the edge
+  of the snap zone, so here both axes blend along the same curve instead.
+
+- **JSM Config: tune a config with faders and a live sensitivity curve.** The
+  **Tune** toggle in the header adds two things under the diagnostics. The
+  first is the sensitivity curve the config describes, drawn as the fork's GUI
+  draws it: a solid line for sensitivity, a dashed one for camera speed, and a
+  dot at the pad's current turn speed. The second is a fader for every numeric
+  setting in the config. Both work on the text: a fader rewrites only the
+  number on its own line, so spacing and comments stay as they were. The curve
+  includes `GYRO_CUTOFF_SPEED`'s deadzone. A Log ⟷ Exp row stretches the speed
+  axis so the slow end and the noise floor become visible; double-click it to
+  go back to linear. A dropdown places the fader strip below, above, left or
+  right of the editor.
+  The editor, the curve and each fader can be pinned to the config overlay on
+  their own. A pinned fader finds its setting by name and takes the Knob
+  module's shape: horizontal when wide, vertical when tall, rotary when square.
+  Pinned JSM elements take their colours from the layout inspector. The editor
+  also warns in three cases: a `GYRO_SENS` line that flattens a
+  `MIN_`/`MAX_GYRO_SENS` ramp, a curve that ignores `MAX_GYRO_THRESHOLD`, and a
+  config that sets both `REAL_WORLD_CALIBRATION` and `IN_GAME_SENS`, since a
+  calibration measured in-game already includes the in-game sensitivity.
+
+- **JSM Config: the input you're tuning reaches the game.** While a setting is
+  focused in the config overlay, the one input it governs reaches the game and
+  nothing else does. That's the gyro for a gyro setting, the stick for a stick
+  setting, and whatever drives a virtual stick for an output setting. You can
+  feel a sensitivity change as you make it. A left-stick setting is adjusted
+  with the right stick, so you never aim and tune with the same thumb.
+
+- **JSM Config: a command list.** Right-click the editor and choose
+  **Commands…** to see every setting, command and button the module knows. The
+  list is grouped and filterable. Each entry says what the module actually does
+  with it and carries JoyShockMapper's own description from its `HELP` text.
+  Buttons the connected pad lacks are listed but marked, since configs are often
+  shared between controllers. A pick goes in at the cursor, with a `?` slot for
+  its value.
+
+- **JSM Config: edit the whole config from a gamepad.** The editor pin is a nav
+  target with two panes, the config text and the tune faders. LB/RB switch
+  panes and LT/RT walk the config tabs.
+  - **Text pane**: the cursor moves by whole tokens, up/down by line and
+    left/right by token. West lists what can legally go at the cursor. North
+    opens the KB/M board, which inserts the name JSM binds a key by, or types
+    characters in a comment. On the board, West latches caps. Its gamepad
+    cluster names a pad button according to which side of the `=` it lands on
+    (`S` on the left, `X_A` on the right).
+  - **Chords (hold South)**: West deletes the token under the cursor.
+    Left/right opens an empty `?` slot beside it. Up/down opens a line, or
+    removes an empty one. The left stick steps a number by an amount that fits
+    the setting.
+  - **Tune pane**: the dpad walks the faders, the stick edits, and West toggles
+    fine steps. North restores the value the setting had before this tuning
+    pass.
+
+  The editor and the fader strip scroll to follow the selection.
+
+- **JSM Config: bind FlexInput's own targets with `@`.** `S = @Reload` binds a
+  Macro Output port, and `N = @"Weapon wheel — Show"` binds a Virtual Menu
+  entry, both by name. If a name doesn't match anything in the patch, the line
+  says so. `@` has no meaning in JSM's grammar, so this doesn't conflict with
+  anything JSM accepts.
+
+- **A factory preset in JSM style.** Easy mode gains **Generic JSM-style
+  setup**, a general-purpose layout built around a JSM Config node, so a JSM
+  config can be used without building the patch by hand.
+
+- **The gyro calibration scope reads in degrees per second.** Its peak readout
+  showed normalized units ("peak ±0.003"), which tell you nothing about whether
+  a spike would visibly throw your aim. It now reads "peak ±5.60 °/s". The side
+  rails and the noise-floor deadzone readout use the same unit, and the number
+  of decimals scales with the size of the value.
+
 - **Device inlets show what is driving them.** On an output device node, an
   input pin fed by the Auto-Map bus now labels itself in the bus's orange, and
   one you have wired by hand brightens to plain white-grey — so a glance at the
@@ -207,7 +346,72 @@ All notable changes to FlexInput are documented here. This project adheres to
   wired ones: previously only a wire could make an inlet glow, so an entire pad
   driven off the bus sat visually dead while it was routing everything.
 
+- **Feedback Control can override the game's feedback.** A new **Override game
+  feedback** toggle in its header makes each kind of feedback it has wired
+  replace the game's rather than add to it: rumble, light bar, player LED, mic
+  LED, or either trigger. Kinds it hasn't wired stay with the game.
+
+### Changed
+
+- **Remapper: in-order chords work as mode shifts.** In an "in order" chord, the
+  earlier inputs are modifiers and the last input is the trigger. The modifiers
+  keep working as normal until the trigger completes the chord, and then the
+  chord takes all its inputs. If you back out of the chord, modifiers you're
+  still holding go back to the game rather than being released. Pressing the
+  trigger before the modifier is ordinary input, so Y then LB is just Y + LB.
+  Normal press mode no longer waits out the time gap before starting a chord.
+  - **Hold, Normal and Long modes**: once the chord fires, its output stays on
+    while the trigger is held, even after the modifiers are released.
+  - **Short and Double modes**: Turbo decides what the time gap measures. With
+    Turbo on, the whole chord must finish within the gap. With it off, only the
+    trigger is timed, so a modifier can be held for as long as you like.
+  - Hold and Turbo have tooltips on in-order cards, and Turbo can be reached
+    with gamepad nav there.
+
+- **Left and right keyboard modifiers are different keys.** `LSHIFT`, `RCONTROL`
+  and the other sided modifiers now reach Windows as the side they name, on
+  both the HIDMaestro keyboard and the enigo fallback. They used to arrive as a
+  generic modifier. A plain Shift, Ctrl or Alt is still the left one.
+
 ### Fixed
+
+- **Audio Stream Haptics replaces the game's rumble instead of adding to it.**
+  Its Rumble mix slider looked for the game's rumble on the forward AutoMap bus,
+  where rumble never travels, so the slider always read zero game rumble. The
+  game's rumble also reached the pad directly, with the module's output added on
+  top. At the gate end the pad rumbled whenever the game did, and at the replace
+  end the game's rumble and the audio played together. Audio Stream Haptics now
+  takes over the pad's rumble, and its slider follows the game's actual rumble.
+  That works behind an AutoMap Selector, on a Network Receive, and on the
+  sender's pad for a network peer. Feedback now resolves in layers: a direct
+  wire first, then a module that overrides a kind of feedback, then the game's
+  own. Values in Add mode stack on top.
+
+- **The outlier spike filter can reject spikes on a quiet pad.** Its threshold
+  was built on a fixed noise floor, so on a quiet pad a real spike sat below the
+  bar even at 100%, and no slider setting could make it fire. Each axis now
+  measures its own device's noise, and the sensitivity means a multiple of that
+  noise, from 24× at 0% to 3× at 100%. A new per-device **window** control
+  (3 / 5 / 7) sets the longest burst the filter can repair. The default is 3,
+  so latency is unchanged. The filter also works for SDL and Joy-Con 2 pads
+  now; it did nothing for either before.
+
+- **Deleting a sub-patch output port no longer breaks its other outputs.** The
+  remaining outlets kept their old numbers while the outer pins were
+  renumbered, so an output could resolve to nothing even though everything
+  inside the sub-patch still worked. That silenced the mouse and pad outputs,
+  and also stopped HidHide from hiding the physical pad behind them. Ports are
+  renumbered on load, so existing patches and presets are repaired without
+  being opened.
+
+- **The KB/M picker's apostrophe key works**, and so do digit keys on the
+  enigo keyboard fallback. The apostrophe cell was sending a key name neither
+  keyboard recognized, and the fallback dropped every non-letter single-key
+  name.
+
+- **A Switch pad's Capture button can be bound.** JSM's `CAPTURE` reads the
+  touchpad click on PlayStation pads and Capture/Share on everything else, and
+  the JSM Config module now does the same.
 
 - **Sub-patch presets now keep their overlay decorations.** Saving a sub-patch
   to `.fxsp` carried only its pinned widgets, so boxes, labels and other

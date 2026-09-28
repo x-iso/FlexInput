@@ -29,6 +29,8 @@ straight at it instead — no copy, so it can't drift:
 | `rfd.txt` | `rfd` 0.15.4 crate source, `LICENSE` |
 | `serde.txt` | `serde` 1.0.228 crate source, `LICENSE-MIT` |
 | `enigo.txt` | `enigo` 0.6.1 crate source, `LICENSE` |
+| `JoyShockMapper.txt` | `Electronicks/JoyShockMapper` branch `master`, `LICENSE.md` — the rules the JSM Config module ports. Byte-identical to the `LICENSE.md` of `evan1mclean/JSM_custom_curve`, so both entries point at this one copy |
+| `TriggerEffectGenerator.txt` | Nielk1's gist `6d54cc2c00d2201ccb8c2720ad7538db`, the MIT header of `ExtendInput.DataTools.DualSense.TriggerEffectGenerator.cs` with its comment markers removed |
 | `3d-controller-overlay.txt` | `larfingshnew/3d-controller-overlay`, `LICENSE` — the models in `app/assets/models` |
 | `CC-BY-3.0.txt` | creativecommons.org legal code — the game-icons.net icons in `app/assets/general` |
 | `CC0-1.0.txt` | creativecommons.org legal code — the Kenney input-prompt icons |

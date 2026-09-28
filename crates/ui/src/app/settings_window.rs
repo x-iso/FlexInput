@@ -1626,6 +1626,40 @@ impl FlexInputApp {
                     );
                     ui.label(egui::RichText::new("by larfingshnew (MIT).").small());
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("JSM Config follows").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("JoyShockMapper").small(),
+                        "https://github.com/Electronicks/JoyShockMapper",
+                    );
+                    ui.label(egui::RichText::new("by Jibb Smart and Electronicks, and its").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("JSM_custom_curve").small(),
+                        "https://github.com/evan1mclean/JSM_custom_curve",
+                    );
+                    ui.label(egui::RichText::new("fork by evan1mclean (both MIT).").small());
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Adaptive-trigger effects follow Nielk1's").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("TriggerEffectGenerator").small(),
+                        "https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db",
+                    );
+                    ui.label(egui::RichText::new("(MIT).").small());
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Controller protocol research by").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("dekuNukem").small(),
+                        "https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering",
+                    );
+                    ui.label(egui::RichText::new("(Switch Pro) and").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("ndeadly").small(),
+                        "https://github.com/ndeadly/switch2_controller_research",
+                    );
+                    ui.label(egui::RichText::new("(Switch 2 / Joy-Con 2).").small());
+                });
                 ui.add_space(8.0);
                 if ui.button("Third-party licenses…")
                     .on_hover_text("Full licence text for everything FlexInput redistributes")
