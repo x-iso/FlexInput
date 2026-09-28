@@ -38,8 +38,8 @@ use flexinput_core::Signal;
 
 use crate::gyro::{
     parse_switch_pro_report_calibrated, push_switch_pro_buttons, switch_pro_calib_from_spi,
-    switch_pro_spi_reply, switch_pro_spi_request, HidReading, SwitchProCalib,
-    SWITCH_PRO_CALIB_READS,
+    switch_pro_enable_vibration, switch_pro_spi_reply, switch_pro_spi_request,
+    switch_rumble_report, HidReading, OutputState, SwitchProCalib, SWITCH_PRO_CALIB_READS,
 };
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
 
@@ -127,6 +127,12 @@ struct Shared {
     pair_requested: AtomicBool,
     pair_phase: Mutex<PairPhase>,
     pads: Mutex<HashMap<[u8; 6], PadState>>,
+    /// Feedback staged by `send`, per controller, for the worker to write.
+    ///
+    /// ⭐ Staged, not sent. `send` runs on the I/O thread and the radio
+    /// belongs to the worker — the same rule as pairing: the owner of the
+    /// hardware does the talking.
+    outputs: Mutex<HashMap<[u8; 6], OutputState>>,
     shutdown: AtomicBool,
     /// Set once the radio could not be opened, so the reason is logged once
     /// rather than every retry.
@@ -336,7 +342,6 @@ struct SpiProbe {
     blobs: [Option<Vec<u8>>; 4],
     attempts: u8,
     next_try: Option<Instant>,
-    counter: u8,
 }
 
 /// How many times to ask before settling for the fallback numbers.
@@ -369,7 +374,41 @@ struct Link {
     /// square circularity plot — see `switch_pro_fallback_calib`.
     calib: Option<SwitchProCalib>,
     spi: SpiProbe,
+    /// The Switch output packet counter, shared by every report we send —
+    /// subcommands and rumble alike.
+    counter: u8,
+    /// Whether the controller acknowledged "enable vibration" (`0x48`).
+    ///
+    /// ⛔ Until it does, every rumble report is silently ignored. The HID
+    /// path sends it at init; this transport never did, which is half of why
+    /// rumble over the dongle did nothing at all.
+    vib_on: bool,
+    vib_tries: u8,
+    vib_next: Option<Instant>,
+    /// What rumble state the controller last received, and when.
+    rumble_sent: Option<OutputState>,
+    rumble_at: Option<Instant>,
 }
+
+impl Link {
+    fn next_counter(&mut self) -> u8 {
+        let c = self.counter;
+        self.counter = self.counter.wrapping_add(1);
+        c
+    }
+}
+
+/// How many times to ask for vibration before giving up on it.
+const VIB_ATTEMPTS: u8 = 5;
+/// Gap between those asks.
+const VIB_RETRY: Duration = Duration::from_millis(500);
+/// Re-send an unchanged rumble state this often — the same heartbeat the HID
+/// path keeps.
+const RUMBLE_HEARTBEAT: Duration = Duration::from_secs(1);
+/// Never send rumble faster than this. A modulated rumble changes every tick,
+/// and the I/O thread ticks far faster than a controller can use; unthrottled
+/// it would spend the link's airtime on output instead of input.
+const RUMBLE_MIN_GAP: Duration = Duration::from_millis(12);
 
 /// Answer the remote's L2CAP signalling on a live link.
 ///
@@ -603,11 +642,18 @@ fn run_inner(shared: &Arc<Shared>) {
         let (Some(r), Some(sub)) = (radio.as_ref(), sub.as_ref()) else { continue };
 
         // ── Drop links that have gone quiet ──────────────────────────────
+        //
+        // ⛔ **Disconnected, not just forgotten.** A link that stops
+        // delivering can still be UP in the dongle — and a controller that is
+        // still connected at the radio level never calls again. Forgetting it
+        // here stranded the pad exactly as a failed setup did: searching,
+        // unreachable, until power-cycled.
         links.retain(|l| {
             let alive = l.last.elapsed() < STALE;
             if !alive {
                 eprintln!("[bt-classic] {} disconnected", keystore::format_addr(l.addr));
                 shared.pads.lock().unwrap().remove(&l.addr);
+                let _ = r.with_dongle(|d| d.disconnect(l.conn));
             }
             alive
         });
@@ -771,8 +817,38 @@ fn run_inner(shared: &Arc<Shared>) {
             if trace() {
                 eprintln!("[bt-classic] evt {evt:?}");
             }
-            let flexinput_btle::Event::ConnectionRequest { address, .. } = evt else {
-                continue;
+            let address = match evt {
+                flexinput_btle::Event::ConnectionRequest { address, .. } => address,
+                // ⭐ A link that went down is dropped NOW, not after `STALE`.
+                // Until it is, a controller calling straight back is taken for
+                // one that is already connected and ignored below.
+                flexinput_btle::Event::DisconnectionComplete { conn_handle, reason } => {
+                    if let Some(i) = links.iter().position(|l| l.conn == conn_handle) {
+                        let gone = links.remove(i);
+                        eprintln!(
+                            "[bt-classic] {} disconnected (reason {reason:#04x})",
+                            keystore::format_addr(gone.addr)
+                        );
+                        shared.pads.lock().unwrap().remove(&gone.addr);
+                    }
+                    continue;
+                }
+                // ⛔ **A link nobody is tracking is closed.** An incoming link
+                // whose setup gave up before `Connection Complete` arrived
+                // comes up anyway, moments later, with no one waiting for it —
+                // and a controller connected to a link we ignore can never
+                // call again. Closing it lets it retry cleanly.
+                flexinput_btle::Event::ConnectionComplete { status: 0, conn_handle, address }
+                    if !links.iter().any(|l| l.conn == conn_handle) =>
+                {
+                    eprintln!(
+                        "[bt-classic] {} came up untracked — closing it so it can call again",
+                        keystore::format_addr(address)
+                    );
+                    let _ = r.with_dongle(|d| d.disconnect(conn_handle));
+                    continue;
+                }
+                _ => continue,
             };
             let text = keystore::format_addr(address);
             let Some(key) = known.get(&text).map(|p| p.key) else {
@@ -782,8 +858,14 @@ fn run_inner(shared: &Arc<Shared>) {
                 // one retry.
                 continue;
             };
-            if links.iter().any(|l| l.addr == address) {
-                continue;
+            // ⛔ **A controller that is calling us is NOT connected to us.**
+            // It cannot page while it holds a link, so any link we still have
+            // for it is dead and only not yet timed out. Ignoring the call on
+            // the strength of that dead link threw away the reconnection.
+            if let Some(i) = links.iter().position(|l| l.addr == address) {
+                let old = links.remove(i);
+                shared.pads.lock().unwrap().remove(&old.addr);
+                let _ = r.with_dongle(|d| d.disconnect(old.conn));
             }
             eprintln!("[bt-classic] {text} is calling — accepting");
             let base = 0x0040 + (links.len() as u16) * 2;
@@ -837,12 +919,58 @@ fn run_inner(shared: &Arc<Shared>) {
                 // counterpart of the `0xa1` every input report carries.
                 let mut frame = Vec::with_capacity(65);
                 frame.push(0xA2);
-                frame.extend_from_slice(&switch_pro_spi_request(*addr, *len, link.spi.counter));
-                link.spi.counter = link.spi.counter.wrapping_add(1);
+                let counter = link.next_counter();
+                frame.extend_from_slice(&switch_pro_spi_request(*addr, *len, counter));
                 let _ = r.with_dongle(|d| {
                     d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame)
                 });
             }
+        }
+
+        // ── Vibration on, then rumble ────────────────────────────────────
+        //
+        // Fire-and-forget like the SPI reads: the ack is picked out of the
+        // input stream below. Rumble goes out on change, on a one-second
+        // heartbeat, or continuously while amplitude modulation is running —
+        // the same policy as the HID path, from the same encoder.
+        let staged = shared.outputs.lock().map(|o| o.clone()).unwrap_or_default();
+        for link in links.iter_mut() {
+            if !link.reported {
+                continue;
+            }
+            if !link.vib_on
+                && link.vib_tries < VIB_ATTEMPTS
+                && link.vib_next.is_none_or(|t| Instant::now() >= t)
+            {
+                link.vib_tries += 1;
+                link.vib_next = Some(Instant::now() + VIB_RETRY);
+                let mut frame = Vec::with_capacity(65);
+                frame.push(0xA2);
+                let counter = link.next_counter();
+                frame.extend_from_slice(&switch_pro_enable_vibration(counter));
+                let _ = r.with_dongle(|d| {
+                    d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame)
+                });
+            }
+            let Some(out) = staged.get(&link.addr).copied() else { continue };
+            let since = link.rumble_at.map(|t| t.elapsed());
+            if since.is_some_and(|d| d < RUMBLE_MIN_GAP) {
+                continue;
+            }
+            let changed = link.rumble_sent != Some(out);
+            let heartbeat = since.is_none_or(|d| d >= RUMBLE_HEARTBEAT);
+            if !changed && !heartbeat {
+                continue;
+            }
+            let counter = link.next_counter();
+            let (report, am) = switch_rumble_report(&out, counter);
+            let mut frame = Vec::with_capacity(65);
+            frame.push(0xA2);
+            frame.extend_from_slice(&report);
+            let _ = r.with_dongle(|d| d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame));
+            // A modulated rumble differs every packet: never "unchanged".
+            link.rumble_sent = if am { None } else { Some(out) };
+            link.rumble_at = Some(Instant::now());
         }
 
         // ── Service every link from ONE read ─────────────────────────────
@@ -882,6 +1010,17 @@ fn run_inner(shared: &Arc<Shared>) {
         // every field by one and yields plausible nonsense.
             if pkt.payload.len() < 2 || pkt.payload[0] != 0xA1 {
                 continue;
+            }
+            // Vibration acknowledged — subcommand id echoed at byte 14 of the
+            // `0x21` reply (byte 15 of the payload, behind the DATA header).
+            if pkt.payload[1] == 0x21 && !link.vib_on && pkt.payload.get(15) == Some(&0x48) {
+                link.vib_on = true;
+                if trace() {
+                    eprintln!(
+                        "[bt-classic] {} vibration enabled",
+                        keystore::format_addr(link.addr)
+                    );
+                }
             }
             // ⭐ A subcommand acknowledgement, not an input report. These carry
             // the stick calibration and arrive interleaved with the input
@@ -1310,11 +1449,30 @@ fn bring_up(
         cadence: flexinput_btle::cadence::Cadence::new(),
         calib: None,
         spi: SpiProbe::default(),
+        counter: 0,
+        vib_on: false,
+        vib_tries: 0,
+        vib_next: None,
+        rumble_sent: None,
+        rumble_at: None,
     })
 }
 
 fn device_id(addr: [u8; 6]) -> String {
     format!("btc:switch_pro:{}", addr.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// The address back out of a [`device_id`]; `None` for anybody else's id.
+fn parse_device_id(id: &str) -> Option<[u8; 6]> {
+    let hex = id.strip_prefix("btc:switch_pro:")?;
+    if hex.len() != 12 {
+        return None;
+    }
+    let mut addr = [0u8; 6];
+    for (i, b) in addr.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(addr)
 }
 
 impl DeviceBackend for ClassicBtBackend {
@@ -1340,6 +1498,21 @@ impl DeviceBackend for ClassicBtBackend {
                 pid: None,
             })
             .collect()
+    }
+
+    fn send(&mut self, device_id: &str, pin_id: &str, signal: Signal) {
+        let Some(addr) = parse_device_id(device_id) else { return };
+        let f = match signal {
+            Signal::Float(f) => f.clamp(0.0, 1.0),
+            Signal::Bool(b) => if b { 1.0 } else { 0.0 },
+            _ => return,
+        };
+        // Only rumble reaches a Pro Controller, and every rumble pin is a
+        // linear 0–255 byte — the same scaling the HID path uses for them.
+        let byte = (f * 255.0) as u8;
+        if let Ok(mut outs) = self.shared.outputs.lock() {
+            outs.entry(addr).or_default().stage(pin_id, byte);
+        }
     }
 
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {
@@ -1476,6 +1649,14 @@ mod tests {
         assert!(matches!(east.2, Signal::Bool(true)), "A must publish as EAST");
         let south = out.iter().find(|(_, p, _)| p == "btn_south").expect("btn_south pin");
         assert!(matches!(south.2, Signal::Bool(false)), "A must not publish as south");
+    }
+
+    #[test]
+    fn a_device_id_parses_back_to_its_address() {
+        let a = [0xda, 0x2d, 0x16, 0x0f, 0x01, 0x69];
+        assert_eq!(parse_device_id(&device_id(a)), Some(a));
+        assert_eq!(parse_device_id("gilrs:switch_pro:0"), None);
+        assert_eq!(parse_device_id("btc:switch_pro:da2d"), None);
     }
 
     #[test]

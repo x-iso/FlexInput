@@ -238,7 +238,7 @@ struct HidEntry {
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct OutputState {
+pub(crate) struct OutputState {
     /// Big / heavy / low-frequency motor (DS4 "left", DualSense `motor_left`).
     rumble_strong: u8,
     /// Small / light / high-frequency motor (DS4 "right", DualSense `motor_right`).
@@ -286,6 +286,65 @@ struct OutputState {
     hd2_l_freq: u8,
     hd2_r_amp:  u8,
     hd2_r_freq: u8,
+}
+
+impl OutputState {
+    /// Stage one output byte by pin name. `false` for a pin this state does
+    /// not carry. Shared by every transport that writes these reports, so a
+    /// pin added here reaches all of them.
+    pub(crate) fn stage(&mut self, pin_id: &str, byte: u8) -> bool {
+        match pin_id {
+            "rumble_strong" => { self.rumble_strong = byte; true }
+            "rumble_weak"   => { self.rumble_weak   = byte; true }
+            // Legacy amplitude-only HD rumble pins — route to per-side amp field.
+            "hd_rumble_l" => { self.hd_l_amp = byte; true }
+            "hd_rumble_r" => { self.hd_r_amp = byte; true }
+            // HD rumble carrier 1 (LF) — amplitude + frequency per side. Shared by
+            // Switch Pro (table encode) and DualSense (PCM synth).
+            "hd_l_amp"  => { self.hd_l_amp  = byte; true }
+            "hd_l_freq" => { self.hd_l_freq  = byte; true }
+            "hd_r_amp"  => { self.hd_r_amp   = byte; true }
+            "hd_r_freq" => { self.hd_r_freq  = byte; true }
+            // HD rumble carrier 2 (HF) — the second simultaneous carrier.
+            "hd2_l_amp"  => { self.hd2_l_amp  = byte; true }
+            "hd2_l_freq" => { self.hd2_l_freq = byte; true }
+            "hd2_r_amp"  => { self.hd2_r_amp  = byte; true }
+            "hd2_r_freq" => { self.hd2_r_freq = byte; true }
+            // DualSense HD haptics legacy aliases — amplitude + frequency per side
+            // (USB only). Route to carrier 1 so old patches keep working.
+            "ds_l_amp"  => { self.hd_l_amp  = byte; true }
+            "ds_l_freq" => { self.hd_l_freq = byte; true }
+            "ds_r_amp"  => { self.hd_r_amp  = byte; true }
+            "ds_r_freq" => { self.hd_r_freq = byte; true }
+            "lightbar_r"    => { self.lightbar_r = byte; true }
+            "lightbar_g"    => { self.lightbar_g = byte; true }
+            "lightbar_b"    => { self.lightbar_b = byte; true }
+            // Adaptive trigger pins — caller passes Float 0–1 already scaled to
+            // the appropriate range before calling set_output_byte:
+            //   mode:      0–6  (index into `TriggerMode::ALL`)
+            //   start/end: 0–9 (zone index along trigger travel)
+            //   strength, strength2: 0–7 (force levels)
+            //   freq, period: 0–255 (raw bytes)
+            "trigger_r_mode"      => { self.trigger_r_mode      = byte; true }
+            "trigger_r_start"     => { self.trigger_r_start     = byte; true }
+            "trigger_r_end"       => { self.trigger_r_end       = byte; true }
+            "trigger_r_strength"  => { self.trigger_r_strength  = byte; true }
+            "trigger_r_freq"      => { self.trigger_r_freq      = byte; true }
+            "trigger_r_strength2" => { self.trigger_r_strength2 = byte; true }
+            "trigger_r_period"    => { self.trigger_r_period    = byte; true }
+            "trigger_l_mode"      => { self.trigger_l_mode      = byte; true }
+            "trigger_l_start"     => { self.trigger_l_start     = byte; true }
+            "trigger_l_end"       => { self.trigger_l_end       = byte; true }
+            "trigger_l_strength"  => { self.trigger_l_strength  = byte; true }
+            "trigger_l_freq"      => { self.trigger_l_freq      = byte; true }
+            "trigger_l_strength2" => { self.trigger_l_strength2 = byte; true }
+            "trigger_l_period"    => { self.trigger_l_period    = byte; true }
+            // DualSense LEDs — caller passes scaled byte
+            "player_led" => { self.player_led = byte; true }
+            "mic_led"    => { self.mic_led    = byte; true }
+            _ => false,
+        }
+    }
 }
 
 pub struct GyroManager {
@@ -551,57 +610,7 @@ impl GyroManager {
             Some(e) => e,
             None => return,
         };
-        let updated = match pin_id {
-            "rumble_strong" => { entry.out.rumble_strong = byte; true }
-            "rumble_weak"   => { entry.out.rumble_weak   = byte; true }
-            // Legacy amplitude-only HD rumble pins — route to per-side amp field.
-            "hd_rumble_l" => { entry.out.hd_l_amp = byte; true }
-            "hd_rumble_r" => { entry.out.hd_r_amp = byte; true }
-            // HD rumble carrier 1 (LF) — amplitude + frequency per side. Shared by
-            // Switch Pro (table encode) and DualSense (PCM synth).
-            "hd_l_amp"  => { entry.out.hd_l_amp  = byte; true }
-            "hd_l_freq" => { entry.out.hd_l_freq  = byte; true }
-            "hd_r_amp"  => { entry.out.hd_r_amp   = byte; true }
-            "hd_r_freq" => { entry.out.hd_r_freq  = byte; true }
-            // HD rumble carrier 2 (HF) — the second simultaneous carrier.
-            "hd2_l_amp"  => { entry.out.hd2_l_amp  = byte; true }
-            "hd2_l_freq" => { entry.out.hd2_l_freq = byte; true }
-            "hd2_r_amp"  => { entry.out.hd2_r_amp  = byte; true }
-            "hd2_r_freq" => { entry.out.hd2_r_freq = byte; true }
-            // DualSense HD haptics legacy aliases — amplitude + frequency per side
-            // (USB only). Route to carrier 1 so old patches keep working.
-            "ds_l_amp"  => { entry.out.hd_l_amp  = byte; true }
-            "ds_l_freq" => { entry.out.hd_l_freq = byte; true }
-            "ds_r_amp"  => { entry.out.hd_r_amp  = byte; true }
-            "ds_r_freq" => { entry.out.hd_r_freq = byte; true }
-            "lightbar_r"    => { entry.out.lightbar_r = byte; true }
-            "lightbar_g"    => { entry.out.lightbar_g = byte; true }
-            "lightbar_b"    => { entry.out.lightbar_b = byte; true }
-            // Adaptive trigger pins — caller passes Float 0–1 already scaled to
-            // the appropriate range before calling set_output_byte:
-            //   mode:      0–6  (index into `TriggerMode::ALL`)
-            //   start/end: 0–9 (zone index along trigger travel)
-            //   strength, strength2: 0–7 (force levels)
-            //   freq, period: 0–255 (raw bytes)
-            "trigger_r_mode"      => { entry.out.trigger_r_mode      = byte; true }
-            "trigger_r_start"     => { entry.out.trigger_r_start     = byte; true }
-            "trigger_r_end"       => { entry.out.trigger_r_end       = byte; true }
-            "trigger_r_strength"  => { entry.out.trigger_r_strength  = byte; true }
-            "trigger_r_freq"      => { entry.out.trigger_r_freq      = byte; true }
-            "trigger_r_strength2" => { entry.out.trigger_r_strength2 = byte; true }
-            "trigger_r_period"    => { entry.out.trigger_r_period    = byte; true }
-            "trigger_l_mode"      => { entry.out.trigger_l_mode      = byte; true }
-            "trigger_l_start"     => { entry.out.trigger_l_start     = byte; true }
-            "trigger_l_end"       => { entry.out.trigger_l_end       = byte; true }
-            "trigger_l_strength"  => { entry.out.trigger_l_strength  = byte; true }
-            "trigger_l_freq"      => { entry.out.trigger_l_freq      = byte; true }
-            "trigger_l_strength2" => { entry.out.trigger_l_strength2 = byte; true }
-            "trigger_l_period"    => { entry.out.trigger_l_period    = byte; true }
-            // DualSense LEDs — caller passes scaled byte
-            "player_led" => { entry.out.player_led = byte; true }
-            "mic_led"    => { entry.out.mic_led    = byte; true }
-            _ => false,
-        };
+        let updated = entry.out.stage(pin_id, byte);
         if updated { entry.output_active = true; }
     }
 
@@ -676,56 +685,12 @@ impl GyroManager {
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter, .. } => {
                     if !*initialized { continue; }
-                    // The Switch Pro voice coil is driven by amplitude+frequency
-                    // (HD rumble). It has no classic ERM motors, so a value wired
-                    // to the legacy `rumble_strong/weak` pins would otherwise be
-                    // silent. When no explicit HD amplitude is set, synthesize it
-                    // from the legacy pins (strong→left, weak→right) so legacy
-                    // rumble — and the game's classic rumble routed via AutoMap —
-                    // is audible. Explicit HD wiring always wins: if either
-                    // hd_*_amp is non-zero we use the HD pins verbatim and ignore
-                    // legacy, so the two paths never fight.
-                    // Both carriers count as "HD set" — carrier 2 (hd2_*) alone is
-                    // enough to take the HD path.
-                    let hd_set = out.hd_l_amp != 0 || out.hd_r_amp != 0
-                        || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
-                    // Per side: carrier 1 (LF) + carrier 2 (HF). In legacy fallback
-                    // (no HD wiring) the classic rumble pins drive carrier 1 only at
-                    // the firmware-default ~320 Hz, with carrier 2 silent.
-                    let (l_lf_a, l_lf_f, l_hf_a, l_hf_f,
-                         r_lf_a, r_lf_f, r_hf_a, r_hf_f) = if hd_set {
-                        (
-                            out.hd_l_amp  as f32 / 255.0, out.hd_l_freq  as f32 / 255.0,
-                            out.hd2_l_amp as f32 / 255.0, out.hd2_l_freq as f32 / 255.0,
-                            out.hd_r_amp  as f32 / 255.0, out.hd_r_freq  as f32 / 255.0,
-                            out.hd2_r_amp as f32 / 255.0, out.hd2_r_freq as f32 / 255.0,
-                        )
-                    } else {
-                        const DEFAULT_FREQ: f32 = 0.6;
-                        let l = out.rumble_strong as f32 / 255.0;
-                        let r = out.rumble_weak as f32 / 255.0;
-                        (
-                            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
-                            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
-                        )
-                    };
-                    // HF "texture" = amplitude modulation of the LF carrier. Advance
-                    // each side's modulator phase from a monotonic process clock (so
-                    // the flutter is smooth regardless of when packets actually go
-                    // out): phase = elapsed_secs * (2π · mod_rate_hz). hd2_*_amp is the
-                    // mod DEPTH, hd2_*_freq the mod RATE.
-                    let t = SWITCH_AM_EPOCH.get_or_init(std::time::Instant::now)
-                        .elapsed().as_secs_f32();
-                    let l_phase = t * am_rate_rad_per_sec(l_hf_f);
-                    let r_phase = t * am_rate_rad_per_sec(r_hf_f);
-                    let left  = switch_rumble_encode_am(l_lf_a, l_lf_f, l_hf_a, l_hf_f, l_phase);
-                    let right = switch_rumble_encode_am(r_lf_a, r_lf_f, r_hf_a, r_hf_f, r_phase);
-                    let pkt = build_switch_rumble_only(*packet_counter, left, right);
+                    let (pkt, am) = switch_rumble_report(out, *packet_counter);
                     *packet_counter = packet_counter.wrapping_add(1);
                     hid_write(device, &pkt);
                     // When AM is active the packet changes every tick even with steady
                     // inputs, so force continuous re-send (bypass the unchanged-skip).
-                    force_continuous = l_hf_a > 0.0 || r_hf_a > 0.0;
+                    force_continuous = am;
                 }
             }
             // Record what we just wrote so the next iteration can skip
@@ -1081,6 +1046,12 @@ fn wait_for_ack(device: &HidDevice, expected_id: u8, buf: &mut [u8; 64]) -> bool
 /// them — there was nothing to call.
 pub(crate) const SWITCH_PRO_CALIB_READS: [(u32, u8); 4] =
     [(0x6_03D, 9), (0x6_046, 9), (0x8_010, 11), (0x8_01B, 11)];
+
+/// Build the output report that turns the vibration motor on (subcommand
+/// `0x48 0x01`). Without it the controller ignores every rumble report.
+pub(crate) fn switch_pro_enable_vibration(counter: u8) -> [u8; 64] {
+    subcommand(counter, 0x48, &[0x01])
+}
 
 /// Build the output report that asks for `len` bytes at `addr`.
 pub(crate) fn switch_pro_spi_request(addr: u32, len: u8, counter: u8) -> [u8; 64] {
@@ -1658,6 +1629,61 @@ fn build_ds4_usb_out(out: &OutputState) -> [u8; 32] {
     r[8] = out.lightbar_b;
     // bytes 9, 10: flash on/off durations — leave at 0 (steady)
     r
+}
+
+/// The Switch Pro rumble-only report (`0x10`) for this output state, and
+/// whether amplitude modulation is active — in which case the packet changes
+/// every tick and must be re-sent continuously, not only on change.
+///
+/// ⭐ One encoder for every transport. The HID path and the dongle path both
+/// call this, so a rumble that works on one cannot be silent on the other.
+pub(crate) fn switch_rumble_report(out: &OutputState, counter: u8) -> ([u8; 64], bool) {
+    // The Switch Pro voice coil is driven by amplitude+frequency
+    // (HD rumble). It has no classic ERM motors, so a value wired
+    // to the legacy `rumble_strong/weak` pins would otherwise be
+    // silent. When no explicit HD amplitude is set, synthesize it
+    // from the legacy pins (strong→left, weak→right) so legacy
+    // rumble — and the game's classic rumble routed via AutoMap —
+    // is audible. Explicit HD wiring always wins: if either
+    // hd_*_amp is non-zero we use the HD pins verbatim and ignore
+    // legacy, so the two paths never fight.
+    // Both carriers count as "HD set" — carrier 2 (hd2_*) alone is
+    // enough to take the HD path.
+    let hd_set = out.hd_l_amp != 0 || out.hd_r_amp != 0
+        || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
+    // Per side: carrier 1 (LF) + carrier 2 (HF). In legacy fallback
+    // (no HD wiring) the classic rumble pins drive carrier 1 only at
+    // the firmware-default ~320 Hz, with carrier 2 silent.
+    let (l_lf_a, l_lf_f, l_hf_a, l_hf_f,
+         r_lf_a, r_lf_f, r_hf_a, r_hf_f) = if hd_set {
+        (
+            out.hd_l_amp  as f32 / 255.0, out.hd_l_freq  as f32 / 255.0,
+            out.hd2_l_amp as f32 / 255.0, out.hd2_l_freq as f32 / 255.0,
+            out.hd_r_amp  as f32 / 255.0, out.hd_r_freq  as f32 / 255.0,
+            out.hd2_r_amp as f32 / 255.0, out.hd2_r_freq as f32 / 255.0,
+        )
+    } else {
+        const DEFAULT_FREQ: f32 = 0.6;
+        let l = out.rumble_strong as f32 / 255.0;
+        let r = out.rumble_weak as f32 / 255.0;
+        (
+            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
+            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
+        )
+    };
+    // HF "texture" = amplitude modulation of the LF carrier. Advance
+    // each side's modulator phase from a monotonic process clock (so
+    // the flutter is smooth regardless of when packets actually go
+    // out): phase = elapsed_secs * (2π · mod_rate_hz). hd2_*_amp is the
+    // mod DEPTH, hd2_*_freq the mod RATE.
+    let t = SWITCH_AM_EPOCH.get_or_init(std::time::Instant::now)
+        .elapsed().as_secs_f32();
+    let l_phase = t * am_rate_rad_per_sec(l_hf_f);
+    let r_phase = t * am_rate_rad_per_sec(r_hf_f);
+    let left  = switch_rumble_encode_am(l_lf_a, l_lf_f, l_hf_a, l_hf_f, l_phase);
+    let right = switch_rumble_encode_am(r_lf_a, r_lf_f, r_hf_a, r_hf_f, r_phase);
+    let pkt = build_switch_rumble_only(counter, left, right);
+    (pkt, l_hf_a > 0.0 || r_hf_a > 0.0)
 }
 
 /// Switch Pro rumble-only output report 0x10 (49 bytes — we send 64 to be safe).

@@ -141,6 +141,17 @@ impl LinkParams {
 /// link is already coming in".
 pub const NO_PAGE: u8 = 0xFF;
 
+/// How many times to repeat an authentication or encryption request that lost
+/// an LMP transaction collision, before treating the failure as real.
+const COLLISION_RETRIES: u8 = 3;
+
+/// `LMP Error Transaction Collision` (`0x23`) and `Different Transaction
+/// Collision` (`0x2A`): both ends started the same procedure at once. Not a
+/// refusal — one of the two carries on, and asking again settles it.
+fn is_collision(status: u8) -> bool {
+    matches!(status, 0x23 | 0x2A)
+}
+
 /// A live BR/EDR link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassicLink {
@@ -1977,6 +1988,45 @@ impl Dongle {
         patience: Duration,
         on_event: &mut dyn FnMut(&str),
     ) -> Result<ClassicLink> {
+        // ⛔ **Every failure after the link came up takes the link DOWN.**
+        //
+        // Authentication refused, encryption refused, a command that failed —
+        // each used to return its error with the ACL link still standing. That
+        // link lives in the dongle, and nothing on this side tracked it any
+        // more: the controller was connected to us at the radio level, so it
+        // never called again, and no page could reach it either. It sat
+        // "searching" until switched off — the "protocol error, then nothing
+        // until I power-cycle the pad" report. Only the timeout path used to
+        // disconnect; now every exit that leaves a link behind does.
+        let mut up: Option<u16> = None;
+        let result = self.page_and_pair_inner(
+            addr, psrm, clock_offset, known_key, patience, on_event, &mut up,
+        );
+        if result.is_err() {
+            if let Some(h) = up {
+                let closed = self.disconnect_and_wait(h, Duration::from_millis(800));
+                on_event(if closed {
+                    "setup failed — link closed so the controller can call again"
+                } else {
+                    "setup failed — link close not confirmed"
+                });
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn page_and_pair_inner(
+        &self,
+        addr: [u8; 6],
+        psrm: u8,
+        clock_offset: u16,
+        known_key: Option<[u8; 16]>,
+        patience: Duration,
+        on_event: &mut dyn FnMut(&str),
+        // Set while an ACL link is up, so the caller can close it on failure.
+        up: &mut Option<u16>,
+    ) -> Result<ClassicLink> {
         // Secure Simple Pairing must be ON before paging: it is what makes the
         // controller use SSP rather than legacy PIN pairing, which modern
         // gamepads refuse outright. Best-effort — a controller that rejects it
@@ -2022,6 +2072,9 @@ impl Dongle {
         };
         let mut connected = false;
         let mut paired = known_key.is_some();
+        // Retries left after an LMP transaction collision — see below.
+        let mut auth_retries = COLLISION_RETRIES;
+        let mut crypt_retries = COLLISION_RETRIES;
         // Paging a controller that is awake is quick; one that has to be woken
         // by its Sync button can take most of this.
         let deadline = std::time::Instant::now() + patience;
@@ -2038,6 +2091,7 @@ impl Dongle {
                     }
                     link.conn_handle = conn_handle;
                     connected = true;
+                    *up = Some(conn_handle);
                     on_event(&format!("ACL link up, handle {conn_handle:#06x}"));
                     // Nothing else demands authentication on a Just Works pair,
                     // so ask for it — otherwise the link sits unencrypted and
@@ -2121,6 +2175,26 @@ impl Dongle {
                 Event::AuthenticationComplete { status, conn_handle }
                     if connected && conn_handle == link.conn_handle =>
                 {
+                    // ⭐ **A collision is not a refusal.** A controller that
+                    // called us runs its OWN authentication as it connects,
+                    // and ours, asked for a moment later, meets it in the air:
+                    // the radio reports `0x23`/`0x2A` (transaction collision)
+                    // for ours while theirs carries on. Failing here abandoned
+                    // a link that was about to authenticate perfectly well,
+                    // and made reconnection depend on who spoke first. Ask
+                    // again; on a link already authenticated the answer is
+                    // immediate.
+                    if is_collision(status) && auth_retries > 0 {
+                        auth_retries -= 1;
+                        on_event(&format!(
+                            "authentication collided ({status:#04x}) — asking again"
+                        ));
+                        self.send_command(
+                            Opcode::AUTHENTICATION_REQUESTED,
+                            &conn_handle.to_le_bytes(),
+                        )?;
+                        continue;
+                    }
                     if status != 0 {
                         return Err(Error::Protocol(format!(
                             "authentication failed: status {status:#04x}"
@@ -2140,6 +2214,19 @@ impl Dongle {
                         on_event("⭐ link encrypted");
                         return Ok(link);
                     }
+                    // The same collision one step later: the remote started
+                    // encryption itself while ours was on the way.
+                    if is_collision(status) && crypt_retries > 0 {
+                        crypt_retries -= 1;
+                        on_event(&format!(
+                            "encryption collided ({status:#04x}) — asking again"
+                        ));
+                        let mut p = Vec::with_capacity(3);
+                        p.extend_from_slice(&conn_handle.to_le_bytes());
+                        p.push(0x01);
+                        self.send_command(Opcode::SET_CONNECTION_ENCRYPTION, &p)?;
+                        continue;
+                    }
                     return Err(Error::Protocol(format!(
                         "encryption refused: status {status:#04x} enabled {enabled}"
                     )));
@@ -2147,6 +2234,8 @@ impl Dongle {
                 Event::DisconnectionComplete { conn_handle, reason }
                     if connected && conn_handle == link.conn_handle =>
                 {
+                    // Already gone — nothing for the caller to close.
+                    *up = None;
                     return Err(Error::Protocol(format!(
                         "remote dropped the link (reason {reason:#04x}) — \
                          paired={paired}, encrypted={}",
@@ -2156,9 +2245,9 @@ impl Dongle {
                 _ => {}
             }
         }
-        if connected {
-            let _ = self.disconnect(link.conn_handle);
-        } else if psrm != NO_PAGE {
+        // A link that came up is closed by `page_and_pair`, which waits for
+        // the confirmation.
+        if !connected && psrm != NO_PAGE {
             // ⛔ Take the radio out of paging on the way out. Without this the
             // dongle goes on calling a controller that is calling US, and the
             // two page past each other for the rest of the page timeout.

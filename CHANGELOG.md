@@ -24,6 +24,18 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Rumble now works on a Switch Pro Controller connected through the
+  Bluetooth dongle.** That connection never sent rumble at all, and it never
+  turned the controller's vibration on either.
+
+- **A Switch Pro Controller on the Bluetooth dongle no longer gets stuck after
+  a failed connection.** When a connection failed partway, often with a
+  "protocol error", the link stayed half-open. The controller then stopped
+  trying until you power-cycled it. Failed and silent links are now closed so
+  the controller can reconnect. A controller that turns back on quickly is no
+  longer ignored. When the controller and the dongle both start the security
+  handshake at the same moment, the dongle now retries instead of giving up.
+
 - **Gyro aiming through `mouse_move` is no longer ~4x too slow.** The engine
   and the mouse output run at different rates, and only one engine tick in
   (sample rate / polling rate) — 1 in 4 by default — reached the mouse. A JSM
