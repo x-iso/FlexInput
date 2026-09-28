@@ -265,8 +265,14 @@ pub(crate) fn calibrate_block(
         let instruction = match (axis.as_str(), out_stick) {
             ("pitch", false) => "Turn the camera fully UP, then Finish",
             ("pitch", true) => "Turn fully UP, steadily, then Finish",
-            (_, false) => "Turn one full 360°, then Finish",
-            (_, true) => "Turn one full 360°, steadily, then Finish",
+            (_, false) => {
+                "Turn one full 360° — circle a stick round its edge for the bulk, the pad \
+                 to line up — then Finish"
+            }
+            (_, true) => {
+                "Turn one full 360°, steadily — circle a stick round its edge for the bulk, \
+                 the pad to line up — then Finish"
+            }
         };
         hint(ui, instruction);
         super::pad_hints::pad_hint(ui, "{btn_south} Finish · {btn_east} Cancel");
@@ -346,7 +352,13 @@ pub(crate) fn calibrate_block(
         }
         super::pad_hints::pad_hint(
             ui,
-            "{btn_south} Start · {dpad_left}{dpad_right} method ·              {dpad_up}{dpad_down} out · {btn_north} snapshot · {btn_east} close",
+            if pending == "yaw" {
+                "{btn_south} Start · {dpad_left}{dpad_right} method · {dpad_up}{dpad_down} out · \
+                 {btn_north} snapshot · {btn_east} close"
+            } else {
+                "{btn_south} Start · {dpad_left}{dpad_right} method · {dpad_up}{dpad_down} out · \
+                 {btn_east} close"
+            },
         );
         if !out_stick {
             hint(

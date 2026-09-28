@@ -451,6 +451,128 @@ pub fn insert_pick(text: &str, cur: Cursor, name: &str, kind: Kind) -> (String, 
     )
 }
 
+/// Every word a setting takes as its value — the modes, spaces, directions and
+/// switches, as opposed to the numbers.
+///
+/// Only the CANDIDATES: which of them a particular setting takes is never
+/// written down here but asked of the parser, by trying each (`value_options`).
+/// `value_words_tests` holds this list to the parser's source, so a word the
+/// parser learns has to be added here too.
+pub(crate) const VALUE_WORDS: &[&str] = &[
+    // Switches and axes.
+    "ON", "OFF", "STANDARD", "INVERTED", "INNER", "OUTER",
+    // Stick modes.
+    "NO_MOUSE", "AIM", "FLICK", "FLICK_ONLY", "ROTATE_ONLY", "MOUSE_RING", "MOUSE_AREA",
+    "HYBRID_AIM", "SCROLL_WHEEL", "INNER_RING", "OUTER_RING",
+    "LEFT_ANGLE_TO_X", "LEFT_ANGLE_TO_Y", "RIGHT_ANGLE_TO_X", "RIGHT_ANGLE_TO_Y",
+    "LEFT_WIND_X", "RIGHT_WIND_X", "LEFT_STEER_X", "RIGHT_STEER_X",
+    // Where the gyro or the flick stick goes — after the stick modes, since
+    // LEFT_STICK and RIGHT_STICK are stick modes too, and not the first ones
+    // worth offering there. A destination's own list is ordered by the parser.
+    "MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION", "NONE",
+    // Trigger modes.
+    "NO_FULL", "NO_SKIP", "NO_SKIP_EXCLUSIVE", "MUST_SKIP", "MAY_SKIP", "MUST_SKIP_R",
+    "MAY_SKIP_R", "X_LT", "X_RT", "PS_L2", "PS_R2",
+    // Gyro spaces and axes.
+    "LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL",
+    "X", "Y", "Z",
+    // Flick snapping.
+    "FOUR", "EIGHT",
+    // How the pad is held.
+    "FORWARD", "LEFT", "RIGHT", "BACKWARD", "JOYCON_SIDEWAYS",
+    // The touchpad.
+    "GRID_AND_STICK", "PS_TOUCHPAD",
+    // The custom-curve fork's acceleration curves.
+    "LINEAR", "NATURAL", "POWER", "QUADRATIC", "SIGMOID", "JUMP",
+    // Adaptive trigger effects.
+    "RESISTANCE", "SEMI_AUTOMATIC", "AUTOMATIC", "BOW", "GALLOPING", "MACHINE",
+    // Light bar colours.
+    "RED", "GREEN", "BLUE", "YELLOW", "CYAN", "MAGENTA", "PINK", "ORANGE", "PURPLE",
+    "WHITE", "GREY", "BLACK",
+];
+
+/// Spellings the parser accepts so existing configs load, but which cycling
+/// shouldn't spread into new ones — each is a second name for a word above.
+#[cfg(test)]
+const VALUE_ALIASES: &[&str] = &["TRUE", "FALSE", "GRAY"];
+
+/// The words that can stand at the cursor, in the order the parser lists them.
+///
+/// Only right of a SETTING's `=` — a button's value is a binding, and the
+/// command list is where those come from. Each candidate is tried in the line as
+/// it stands (so the second word of `STICK_AXIS_X = STANDARD INVERTED` is tried
+/// as a second word), and kept if the parser takes it. A setting that doesn't
+/// look at its value at all — one this module ignores, say — would take any word,
+/// so a word no setting could take is tried first: if even that passes, the
+/// setting has nothing to choose between and nothing is offered. Numbers aren't
+/// words; a numeric setting gets nothing here, and the stick scrubs it instead.
+pub fn value_options(text: &str, cur: Cursor) -> Vec<&'static str> {
+    use super::parse::LineStatus;
+    let Some((tok, _, _)) = cursor::selection(text, cur) else { return Vec::new() };
+    if tok.kind != TokenKind::Value || line_binds_a_button(text, cur.line) {
+        return Vec::new();
+    }
+    let (ls, le) = cursor::line_span(text, cur.line);
+    let line = &text[ls..le];
+    let here = Cursor { line: 0, token: cur.token };
+    let status = |w: &str| {
+        let probe = cursor::replace(line, here, w);
+        super::parse::compile_with(&probe, &[]).lines.into_iter().next().map(|l| l.status)
+    };
+    // What the parser says when the value is wrong is also the order it lists
+    // the right ones in, which is the order worth cycling through.
+    let wants = match status("FLEXINPUT_NOT_A_VALUE") {
+        Some(LineStatus::Error(msg)) => msg,
+        _ => return Vec::new(),
+    };
+    let listed: Vec<&str> = wants
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Only the value's FIRST word can be a mode that wants numbers after it; a
+    // mode word tried in a number's place would name itself in the same error
+    // ("wants a force after `RESISTANCE`") without being anything that fits.
+    let first_word = cursor::tokenize(line).iter().position(|t| t.kind == TokenKind::Value)
+        == Some(cur.token);
+    let mut out: Vec<&'static str> = VALUE_WORDS
+        .iter()
+        .copied()
+        .filter(|w| match status(w) {
+            None | Some(LineStatus::Blank) => false,
+            // Recognised, but wanting numbers after it (`RESISTANCE 0 5`): still
+            // one of the setting's words — the line then says what it needs.
+            Some(LineStatus::Error(msg)) => first_word && msg.contains(&format!("after `{w}`")),
+            Some(_) => true,
+        })
+        .collect();
+    // Stable, so words the message doesn't name keep this list's order, after.
+    out.sort_by_key(|w| listed.iter().position(|l| l == w).unwrap_or(usize::MAX));
+    out
+}
+
+/// Step the value under the cursor to the next word the setting takes (`dir`
+/// +1) or the previous one (-1), wrapping. A slot, a number or a word the setting
+/// doesn't take starts from the first (or, going back, the last). `None` when
+/// the cursor isn't on a value that has words to choose from.
+pub fn cycle_value(text: &str, cur: Cursor, dir: i32) -> Option<String> {
+    let opts = value_options(text, cur);
+    if opts.is_empty() {
+        return None;
+    }
+    let (tok, _, _) = cursor::selection(text, cur)?;
+    let (ls, le) = cursor::line_span(text, cur.line);
+    let now = tok.text(&text[ls..le]).to_ascii_uppercase();
+    let n = opts.len() as i32;
+    let next = match opts.iter().position(|o| *o == now) {
+        Some(i) => (i as i32 + dir).rem_euclid(n) as usize,
+        None if dir < 0 => opts.len() - 1,
+        None => 0,
+    };
+    // A trigger effect's numbers belong to its mode: stepping the mode gives the
+    // line the new one's numbers, carrying over what the two share.
+    Some(super::knobs::replace_word(text, cur, opts[next]))
+}
+
 /// Where a group sits in the list. Explicit rather than alphabetical: aiming is
 /// what most people open this list for, and "Ignored here" belongs at the bottom.
 fn group_order(group: &str) -> u8 {
@@ -608,7 +730,11 @@ mod catalogue_tests {
                 _ => {}
             }
         }
-        let body = &src[open..end];
+        arm_literals_in(&src[open..end])
+    }
+
+    /// As `arm_literals`, over any stretch of source.
+    fn arm_literals_in(body: &str) -> HashSet<String> {
         let mut out = HashSet::new();
         // `"NAME"` (possibly `|`-joined) immediately before a `=>`.
         for (i, _) in body.match_indices("=>") {
@@ -674,6 +800,111 @@ mod catalogue_tests {
                 "`{c}` is listed as a command but is also a setting"
             );
         }
+    }
+
+    /// Every word the parser matches anywhere is one the value cycle can offer,
+    /// a setting or command name, or a spelling deliberately left out — so a word
+    /// the parser learns can't go missing from Select on the pad. The other way,
+    /// every word offered must be one some setting actually takes.
+    #[test]
+    fn every_value_word_the_parser_takes_can_be_cycled_to() {
+        // The parser, and the trigger-effect table it reads its effects from.
+        let mut from_source = arm_literals_in(include_str!("parse.rs"));
+        from_source.extend(arm_literals_in(include_str!("feedback.rs")));
+        let known: HashSet<&str> = VALUE_WORDS
+            .iter()
+            .chain(SETTINGS)
+            .chain(COMMANDS)
+            .chain(VALUE_ALIASES)
+            .copied()
+            .collect();
+        let mut missing: Vec<&String> = from_source
+            .iter()
+            // Numbers are scrubbed with the stick, not cycled.
+            .filter(|w| w.starts_with(|c: char| c.is_ascii_uppercase()))
+            .filter(|w| !known.contains(w.as_str()))
+            .collect();
+        missing.sort();
+        assert!(missing.is_empty(), "words the parser takes that Select can't reach: {missing:?}");
+        for w in VALUE_WORDS {
+            assert!(from_source.contains(*w), "`{w}` is offered but no setting takes it");
+        }
+    }
+
+    fn cursor_on_value(text: &str) -> Cursor {
+        let toks = cursor::tokens_at(text, 0);
+        let i = toks.iter().position(|t| t.kind == TokenKind::Value).expect("a value");
+        Cursor { line: 0, token: i }
+    }
+
+    /// Select on `GYRO_SPACE = ?` walks exactly the spaces JSM takes, in the
+    /// order the parser names them, and wraps.
+    #[test]
+    fn select_cycles_a_settings_own_words() {
+        let text = "GYRO_SPACE = ?";
+        let cur = cursor_on_value(text);
+        assert_eq!(
+            value_options(text, cur),
+            ["LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL"]
+        );
+        let one = cycle_value(text, cur, 1).unwrap();
+        assert_eq!(one, "GYRO_SPACE = LOCAL");
+        assert_eq!(cycle_value(&one, cur, 1).unwrap(), "GYRO_SPACE = PLAYER_TURN");
+        // Back from the first wraps to the last; from a slot, back starts there.
+        assert_eq!(cycle_value(&one, cur, -1).unwrap(), "GYRO_SPACE = YAW_PLUS_ROLL");
+        assert_eq!(cycle_value(text, cur, -1).unwrap(), "GYRO_SPACE = YAW_PLUS_ROLL");
+    }
+
+    #[test]
+    fn select_keeps_the_rest_of_the_line_and_reads_its_place() {
+        // The second word of an axis pair is tried as a second word, and the
+        // comment rides along untouched.
+        let text = "MOTION_STICK_AXIS = STANDARD STANDARD # mine";
+        let cur = Cursor { line: 0, token: 3 };
+        assert_eq!(value_options(text, cur), ["STANDARD", "INVERTED"]);
+        assert_eq!(
+            cycle_value(text, cur, 1).unwrap(),
+            "MOTION_STICK_AXIS = STANDARD INVERTED # mine"
+        );
+        // Any case the author wrote is still found in the list.
+        assert_eq!(cycle_value("RUMBLE = on", cursor_on_value("RUMBLE = on"), 1).unwrap(), "RUMBLE = OFF");
+    }
+
+    /// A stick mode list starts with the modes, not with the two words that also
+    /// name a stick as somewhere to send the gyro.
+    #[test]
+    fn stick_modes_start_with_the_modes() {
+        let t = "RIGHT_STICK_MODE = ?";
+        let opts = value_options(t, cursor_on_value(t));
+        assert_eq!(opts.first(), Some(&"NO_MOUSE"), "{opts:?}");
+        assert!(!opts.contains(&"LEFT_STEER_X"), "steering is the motion stick's alone");
+        let t = "GYRO_OUTPUT = ?";
+        assert_eq!(value_options(t, cursor_on_value(t)), ["MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION"]);
+    }
+
+    /// A word the parser recognises but wants numbers after is still one of the
+    /// setting's words: stepping onto it leaves a line that says which numbers.
+    #[test]
+    fn an_effect_that_wants_numbers_is_still_offered() {
+        let t = "LEFT_TRIGGER_EFFECT = ?";
+        let opts = value_options(t, cursor_on_value(t));
+        for w in ["OFF", "RESISTANCE", "SEMI_AUTOMATIC", "AUTOMATIC", "BOW", "GALLOPING", "MACHINE"] {
+            assert!(opts.contains(&w), "{w} missing from {opts:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_to_cycle_where_there_are_no_words() {
+        // A number, a button's binding, a setting that ignores its value, and the
+        // name side of the line all have nothing for Select to step through.
+        for text in ["GYRO_SENS = 2", "S = SPACE", "AUTOLOAD = ON"] {
+            assert_eq!(cycle_value(text, cursor_on_value(text), 1), None, "{text}");
+        }
+        // A trigger effect's NUMBER is a number, even though a mode word tried
+        // there would make the parser name that word in its complaint.
+        let t = "LEFT_TRIGGER_EFFECT = RESISTANCE 3 7";
+        assert_eq!(cycle_value(t, Cursor { line: 0, token: 4 }, 1), None);
+        assert_eq!(cycle_value("GYRO_SPACE = LOCAL", Cursor { line: 0, token: 0 }, 1), None);
     }
 
     /// Every name the binding parser takes is offered, and everything offered

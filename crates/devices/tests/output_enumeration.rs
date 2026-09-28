@@ -99,7 +99,9 @@ fn dualsense_inputs_include_adaptive_trigger_pins() {
     let inputs = layouts::inputs_for(ControllerKind::DualSense);
     for pin in [
         "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength", "trigger_r_freq",
+        "trigger_r_strength2", "trigger_r_period",
         "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength", "trigger_l_freq",
+        "trigger_l_strength2", "trigger_l_period",
     ] {
         assert!(inputs.iter().any(|p| p.id == pin),
             "DualSense must expose {pin}");

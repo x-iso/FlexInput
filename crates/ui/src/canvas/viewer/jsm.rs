@@ -370,6 +370,69 @@ pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> boo
     true
 }
 
+/// Tab in the text editor: step the setting value under the caret to the next
+/// word its setting takes (Shift+Tab: the previous) — what Select does on the
+/// pad, with the same filling-in of a trigger effect's numbers — and select the
+/// new word, so another Tab steps again and typing replaces it.
+///
+/// Only where there IS something to step through. Anywhere else the key is left
+/// alone and the editor types a tab as it always has. Returns whether the text
+/// changed.
+fn tab_cycles_the_value(ui: &egui::Ui, edit_id: egui::Id, text: &mut String) -> bool {
+    use egui::text::{CCursor, CCursorRange};
+    if !ui.memory(|m| m.has_focus(edit_id)) {
+        return false;
+    }
+    let Some(dir) = ui.input(|i| {
+        let plain = i.modifiers.is_none() || i.modifiers.shift_only();
+        (plain && i.key_pressed(egui::Key::Tab)).then_some(if i.modifiers.shift { -1 } else { 1 })
+    }) else {
+        return false;
+    };
+    let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), edit_id) else {
+        return false;
+    };
+    let Some(caret) = state.cursor.char_range().map(|r| r.primary.index) else { return false };
+    let Some((edited, start, end)) = tab_cycle(text, caret, dir) else { return false };
+    // Ours now, not the editor's: it would otherwise type a tab over the word.
+    let mods = if dir < 0 { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+    ui.ctx().input_mut(|i| i.consume_key(mods, egui::Key::Tab));
+    *text = edited;
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(start), CCursor::new(end))));
+    state.store(ui.ctx(), edit_id);
+    true
+}
+
+/// The text-side half of `tab_cycles_the_value`: the value token the caret is
+/// in or just after (`caret` in chars), stepped by `dir`. Returns the new text
+/// and the new word's span, in chars. `None` where there is nothing to step.
+fn tab_cycle(text: &str, caret: usize, dir: i32) -> Option<(String, usize, usize)> {
+    use flexinput_engine::eval::{JsmCursor, JsmTokenKind};
+    let char_to_byte =
+        |c: usize| text.char_indices().nth(c).map(|(b, _)| b).unwrap_or(text.len());
+    let at = char_to_byte(caret);
+    // Which line, and where on it.
+    let line = text[..at].matches('\n').count();
+    let (ls, _) = flexinput_engine::eval::jsm_line_span(text, line);
+    let col = at - ls;
+    // The token the caret touches — in it, or just past its end, which is
+    // where a caret sits after typing a word.
+    let toks = flexinput_engine::eval::jsm_tokens_at(text, line);
+    let token = toks
+        .iter()
+        .position(|t| t.kind == JsmTokenKind::Value && t.start <= col && col <= t.end)?;
+    let cur = JsmCursor { line, token };
+    let edited = flexinput_engine::eval::jsm_cycle_value(text, cur, dir)?;
+    // The word now in that place, as a char span.
+    let (ls, _) = flexinput_engine::eval::jsm_line_span(&edited, line);
+    let t = *flexinput_engine::eval::jsm_tokens_at(&edited, line).get(token)?;
+    let (start, end) = {
+        let byte_to_char = |b: usize| edited[..b].chars().count();
+        (byte_to_char(ls + t.start), byte_to_char(ls + t.end))
+    };
+    Some((edited, start, end))
+}
+
 /// Split a pair setting's fader into two, or join a pair's two back into one —
 /// the pad's Select on a focused fader.
 ///
@@ -847,6 +910,12 @@ fn jsm_rows(
     // frame doesn't change colour just because the pointer crossed it.
     super::jsm_widgets::style_text_editor(ui, paint);
     let wheel_id = egui::Id::new(("jsm_wheel", node_id.0));
+    // The TextEdit's own id, per viewport and layer: the same node can be open
+    // in several windows at once, and each has its own caret.
+    let edit_id = egui::Id::new(("jsm_text", node_id.0))
+        .with(ui.ctx().viewport_id())
+        .with(ui.layer_id());
+    let mut tabbed = false;
     let editor = crate::canvas::wheel::scrolling_body(
         ui,
         wheel_id,
@@ -855,7 +924,11 @@ fn jsm_rows(
             .max_height(rows as f32 * line_h)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible),
         |ui| {
+            // Tab cycles the setting value under the caret, before the editor
+            // would take the key and type a tab.
+            tabbed = tab_cycles_the_value(ui, edit_id, &mut text);
             let out = egui::TextEdit::multiline(&mut text)
+                .id(edit_id)
                 .code_editor()
                 .desired_rows(rows)
                 .desired_width(size.x - bar_w)
@@ -899,7 +972,7 @@ fn jsm_rows(
     // than the box whenever the config is longer than the editor.
     let editor_rect = editor.inner_rect.with_max_x(editor.inner_rect.max.x + bar_w);
     let resp = editor.inner.response;
-    if resp.changed() {
+    if resp.changed() || tabbed {
         tabs[active].text = text;
         changed = true;
     }
@@ -1390,6 +1463,32 @@ mod tests {
         let mut node = node_with("DECEL_BRAKE_STRENGTH = 1\n");
         assert!(!super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", 0.005));
         assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 1\n");
+    }
+
+    // Tab in the text editor steps the value the caret is on or just after —
+    // the same stepping, and filling-in, as Select on the pad — and hands back the
+    // new word's span to select. Where there is nothing to step, it does nothing
+    // and the editor types its tab.
+    #[test]
+    fn tab_steps_the_value_under_the_caret() {
+        let text = "GYRO_SPACE = LOCAL\nLEFT_TRIGGER_EFFECT = RESISTANCE 3 7";
+        // Just after LOCAL, where a caret sits once the word is typed.
+        let (out, s, e) = super::tab_cycle(text, 18, 1).expect("LOCAL has neighbours");
+        assert!(out.starts_with("GYRO_SPACE = PLAYER_TURN\n"), "{out}");
+        assert_eq!(out.chars().skip(s).take(e - s).collect::<String>(), "PLAYER_TURN");
+        // Shift+Tab goes back, wrapping.
+        let (back, _, _) = super::tab_cycle(text, 15, -1).unwrap();
+        assert!(back.starts_with("GYRO_SPACE = YAW_PLUS_ROLL\n"), "{back}");
+        // A trigger effect's numbers are filled in to suit the new mode.
+        let at = text.find("RESISTANCE").unwrap() + 2;
+        let (out, s, e) = super::tab_cycle(text, at, 1).unwrap();
+        assert!(out.ends_with("LEFT_TRIGGER_EFFECT = BOW 3 6 7 7"), "{out}");
+        assert_eq!(out.chars().skip(s).take(e - s).collect::<String>(), "BOW");
+        // On a number, on a name, or on a blank: nothing to step.
+        let on_number = text.rfind('7').unwrap();
+        assert!(super::tab_cycle(text, on_number, 1).is_none());
+        assert!(super::tab_cycle(text, 2, 1).is_none(), "the name");
+        assert!(super::tab_cycle("", 0, 1).is_none());
     }
 
     // Select on a fader splits a pair setting into two faders and joins them back,

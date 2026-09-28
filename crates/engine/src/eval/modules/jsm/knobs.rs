@@ -29,9 +29,18 @@ pub struct Knob {
     pub hi: f32,
     /// Whole numbers only — a millisecond count, a zone, a grid dimension.
     pub integral: bool,
-    /// Which number of a pair line this fader drives: `None` for a line with one
-    /// number, `Some(0)` / `Some(1)` for the two a pair line gets.
+    /// Which word after the `=` this fader drives: `None` for a line with one
+    /// number, `Some(0)` / `Some(1)` for the two a pair line gets, and for a
+    /// trigger effect `Some(1)`… for the numbers after its mode word.
     pub part: Option<u8>,
+    /// What the fader is labelled, where the setting's name alone wouldn't say
+    /// which number it is — a trigger effect's `snap force (R BOW)`.
+    pub caption: Option<String>,
+}
+
+/// The two settings whose line is a mode word followed by that mode's numbers.
+fn is_trigger_effect(upper: &str) -> bool {
+    matches!(upper, "LEFT_TRIGGER_EFFECT" | "RIGHT_TRIGGER_EFFECT")
 }
 
 /// Settings that take one number for both axes, or one each (`FloatXY` in JSM).
@@ -53,27 +62,33 @@ fn part_names(name: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// The suffix a pair's SECOND fader carries in its key. The first keeps the bare
-/// name, so a fader pinned before a split still finds its (horizontal) half.
-const SECOND: &str = "/2";
-
-/// The setting a knob key names — a pair's second fader is keyed `NAME/2`.
+/// The setting a knob key names. A fader past a line's first number is keyed
+/// `NAME/n` — `n` counting words after the `=` from 1, so a pair's second fader
+/// is `NAME/2` — while the first keeps the bare name, so a fader pinned before a
+/// split still finds its (horizontal) half.
 pub fn key_setting(key: &str) -> &str {
-    key.strip_suffix(SECOND).unwrap_or(key)
+    match key.rsplit_once('/') {
+        Some((name, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => key,
+    }
 }
 
 impl Knob {
     /// This fader's identity for pinning and gamepad nav. Unique per fader: the
-    /// two halves of a pair share a name, so the name alone can't be the key.
+    /// numbers of one line share a name, so the name alone can't be the key.
     pub fn key(&self) -> String {
         match self.part {
-            Some(1) => format!("{}{SECOND}", self.name),
+            Some(i) if i > 0 => format!("{}/{}", self.name, i + 1),
             _ => self.name.clone(),
         }
     }
 
-    /// What the fader is labelled: the name, plus which number it is for a pair.
+    /// What the fader is labelled: the name, plus which number it is where the
+    /// line has several.
     pub fn label(&self) -> String {
+        if let Some(c) = &self.caption {
+            return c.clone();
+        }
         match self.part {
             None => self.name.clone(),
             Some(i) => {
@@ -124,6 +139,10 @@ pub fn knobs(text: &str) -> Vec<Knob> {
             Some(Support::Pending(_)) | Some(Support::Ignored(_)) | None => continue,
             Some(_) => {}
         }
+        if is_trigger_effect(&upper) {
+            out.extend(trigger_effect_knobs(line, name, &upper, rhs));
+            continue;
+        }
         let Some((lo, hi, integral)) = range(&upper) else { continue };
         // One number, or a pair where the setting takes one — see the note at the top.
         let words: Vec<&str> = rhs.split_whitespace().collect();
@@ -139,6 +158,7 @@ pub fn knobs(text: &str) -> Vec<Knob> {
             hi,
             integral,
             part,
+            caption: None,
         };
         match nums.as_slice() {
             [v] => out.push(knob(*v, None)),
@@ -150,6 +170,123 @@ pub fn knobs(text: &str) -> Vec<Knob> {
         }
     }
     out
+}
+
+/// A trigger effect's faders: one per number its mode takes, each labelled with
+/// what that number does — first, since a narrow panel trims a label from its
+/// end: `snap force (L BOW)` — and held to JSM's range for it.
+/// A number the line hasn't got yet gets no fader — the line says it is
+/// missing, and picking the mode with Select fills it in.
+fn trigger_effect_knobs(line: usize, name: &str, upper: &str, rhs: &str) -> Vec<Knob> {
+    let words: Vec<&str> = rhs.split_whitespace().collect();
+    let Some(mode) = words.first() else { return Vec::new() };
+    let Some(params) = super::feedback::effect_params(mode) else { return Vec::new() };
+    let side = if upper.starts_with("LEFT") { "L" } else { "R" };
+    let mode = mode.to_ascii_uppercase();
+    params
+        .iter()
+        .enumerate()
+        .filter_map(|(i, prm)| {
+            let value = words.get(i + 1)?.parse::<f32>().ok()?;
+            Some(Knob {
+                line,
+                name: name.to_string(),
+                value,
+                lo: prm.lo as f32,
+                hi: prm.hi as f32,
+                integral: true,
+                // Word 0 is the mode; its numbers are words 1…
+                part: Some(i as u8 + 1),
+                caption: Some(format!("{} ({side} {mode})", prm.name)),
+            })
+        })
+        .collect()
+}
+
+/// Give a trigger effect line exactly the numbers its mode takes.
+///
+/// Changing the mode word leaves the old mode's numbers behind — too many for
+/// `RESISTANCE` after `MACHINE`, too few the other way. This rewrites them to
+/// the new mode's list: a number the two modes share by name (the start zone,
+/// the force, the frequency…) carries over, held to the new mode's range; one
+/// the new mode adds gets its default; one it doesn't take goes. Where the new
+/// mode needs its numbers in order (an end past its start, a second foot after
+/// the first) the later one is moved on, or the earlier back, until it is.
+///
+/// `was` is the mode word the numbers were written for — the one just replaced.
+/// Without it (or if it isn't an effect) they are read against the line's own
+/// mode.
+///
+/// A line that isn't a trigger effect, or whose mode word isn't one, comes back
+/// as it was. The name, the spacing before the value, and a trailing comment
+/// are kept.
+pub fn settle_trigger_effect(text: &str, line: usize, was: Option<&str>) -> String {
+    let Some(raw) = text.lines().nth(line) else { return text.to_string() };
+    let body = raw.split('#').next().unwrap_or("");
+    let Some((lhs, rhs)) = body.split_once('=') else { return text.to_string() };
+    if !is_trigger_effect(&lhs.trim().to_ascii_uppercase()) {
+        return text.to_string();
+    }
+    let words: Vec<&str> = rhs.split_whitespace().collect();
+    let Some(&mode) = words.first() else { return text.to_string() };
+    let Some(params) = super::feedback::effect_params(mode) else { return text.to_string() };
+    // What the line says now, by name — the numbers read against the mode they
+    // were written for. A number with no name there has nothing to carry into.
+    let old = was.and_then(super::feedback::effect_params).unwrap_or(params);
+    let had: Vec<(&str, u32)> = old
+        .iter()
+        .zip(words.iter().skip(1).map_while(|w| w.parse::<u32>().ok()))
+        .map(|(p, n)| (p.name, n))
+        .collect();
+    let mut v: Vec<u8> = params
+        .iter()
+        .map(|prm| {
+            had.iter()
+                .find(|(n, _)| *n == prm.name)
+                .map(|(_, x)| (*x).clamp(prm.lo as u32, prm.hi as u32) as u8)
+                .unwrap_or(prm.default)
+        })
+        .collect();
+    for &(early, late) in super::feedback::effect_orderings(mode) {
+        if v[late] <= v[early] {
+            v[late] = (v[early] + 1).min(params[late].hi);
+            if v[late] <= v[early] {
+                v[early] = v[late].saturating_sub(1).max(params[early].lo);
+            }
+        }
+    }
+    let mut value = mode.to_string();
+    for n in &v {
+        value.push(' ');
+        value.push_str(&n.to_string());
+    }
+    rewrite_rhs(text, line, |rhs| {
+        let lead: String = rhs.chars().take_while(|c| c.is_whitespace()).collect();
+        let trail: String = {
+            let t: String = rhs.chars().rev().take_while(|c| c.is_whitespace()).collect();
+            t.chars().rev().collect()
+        };
+        format!("{lead}{value}{trail}")
+    })
+}
+
+/// Replace the word under the cursor, as the pad's editing does — and when that
+/// word is a trigger effect's MODE, give the line the new mode's numbers
+/// (`settle_trigger_effect`). A number typed over a number is left exactly as
+/// typed: clamping it would be the editor second-guessing a value you chose,
+/// and the line already says when one is out of range.
+pub fn replace_word(text: &str, cur: Cursor, with: &str) -> String {
+    let was = cursor::selection(text, cur).map(|(_, s, e)| text[s..e].to_string());
+    let out = cursor::replace(text, cur, with);
+    let on_mode = cursor::tokens_at(text, cur.line)
+        .iter()
+        .position(|t| t.kind == TokenKind::Value)
+        == Some(cur.token);
+    if on_mode {
+        settle_trigger_effect(&out, cur.line, was.as_deref())
+    } else {
+        out
+    }
 }
 
 /// How the editor writes a number back into the config.
@@ -491,7 +628,9 @@ pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
             }
         }
 
-        "TRIGGER_THRESHOLD" | "TRIGGER_SKIP_DELAY" => Feel::Triggers,
+        // A trigger effect is felt by pulling the trigger it is on.
+        "TRIGGER_THRESHOLD" | "TRIGGER_SKIP_DELAY" | "LEFT_TRIGGER_EFFECT"
+        | "RIGHT_TRIGGER_EFFECT" => Feel::Triggers,
 
         // Aiming and flick settings that don't say which stick: the one aiming.
         "STICK_DEADZONE_INNER" | "STICK_DEADZONE_OUTER" | "STICK_SENS" | "STICK_POWER"
@@ -603,7 +742,23 @@ pub fn scrub(text: &str, cur: Cursor, dir: i32) -> Option<String> {
         .map(|t| t.text(line))
         .unwrap_or("");
     let name = name.rsplit([',', '+', '*']).next().unwrap_or(name);
-    let bounds = range(&name.to_ascii_uppercase());
+    let upper = name.to_ascii_uppercase();
+    let bounds = if is_trigger_effect(&upper) {
+        // A trigger effect's numbers each have their own range, by position
+        // after the mode word.
+        let values: Vec<_> =
+            cursor::tokenize(line).into_iter().filter(|t| t.kind == TokenKind::Value).collect();
+        let at = cursor::tokenize(line).get(cur.token).map(|t| t.start);
+        let i = values.iter().position(|t| Some(t.start) == at);
+        values
+            .first()
+            .and_then(|m| super::feedback::effect_params(m.text(line)))
+            .zip(i.and_then(|i| i.checked_sub(1)))
+            .and_then(|(ps, i)| ps.get(i))
+            .map(|p| (p.lo as f32, p.hi as f32, true))
+    } else {
+        range(&upper)
+    };
     let (lo, hi, integral) = bounds.unwrap_or((f32::MIN, f32::MAX, false));
     let step = if bounds.is_some() { step_for(lo, hi, integral) } else { 1.0 };
     let (next, floor, ceiling) = match current {

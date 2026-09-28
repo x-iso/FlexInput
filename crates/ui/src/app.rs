@@ -3826,8 +3826,16 @@ impl FlexInputApp {
             step_dir = Some(NavDir::Right);
         }
 
-        // Left-stick auto-repeat. Magnitude scales speed.
-        let stick = gn::stick_dir(nav.lstick);
+        // Left-stick auto-repeat. Magnitude scales speed. A multi-field editor
+        // being edited engages sooner — see `FIELD_STICK_ENGAGE`.
+        let engage = if self.gamepad_nav.edit_level == EditLevel::Editing
+            && matches!(self.nav_selected_kind(outer_id), NavWidgetKind::MultiField)
+        {
+            gn::FIELD_STICK_ENGAGE
+        } else {
+            0.5
+        };
+        let stick = gn::stick_dir_past(nav.lstick, engage);
         let mag = nav.lstick.length();
         if let Some(sd) = stick {
             if self.gamepad_nav.repeat_dir != Some(sd) {

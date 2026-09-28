@@ -7,34 +7,35 @@
 //! is exactly what JSM does: while it owns the pad, the game's rumble reaches it
 //! only if `RUMBLE` is on.
 //!
-//! ## The adaptive triggers do not line up, and that is worth saying out loud
+//! ## The adaptive triggers
 //!
-//! JSM carries the DualSense's full effect vocabulary — seven usable modes with up
-//! to six parameters. Our bus carries the four the DualSense encoder here
-//! implements: off, feedback (constant resistance), weapon (a click between two
-//! zones), and vibration. Four of JSM's seven land exactly:
+//! All seven of JSM's effects are carried, each to the DualSense effect JSM's
+//! own encoder (Nielk1's `TriggerEffectGenerator`) builds for it:
 //!
-//! | JSM | ours | parameters JSM gives it |
+//! | JSM | pad effect | parameters, in JSM's order |
 //! | --- | --- | --- |
 //! | `OFF` | off | — |
-//! | `RESISTANCE` | feedback | start, force |
-//! | `SEMI_AUTOMATIC` | weapon | start, end, force |
-//! | `AUTOMATIC` | vibration | start, force, frequency |
+//! | `RESISTANCE` | feedback | start 0-9, force 0-8 |
+//! | `BOW` | bow | start 0-8, end 0-8, force 0-8, snap force 0-8 |
+//! | `GALLOPING` | galloping | start 0-8, end 0-9, first foot 0-6, second foot 0-7, frequency |
+//! | `SEMI_AUTOMATIC` | weapon | start 2-7, end 0-8, force 0-8 |
+//! | `AUTOMATIC` | vibration | start 0-9, force 0-8, frequency |
+//! | `MACHINE` | machine | start 0-8, end 0-9, force A 0-7, force B 0-7, frequency, period |
 //!
-//! `BOW`, `GALLOPING` and `MACHINE` have no home in that model — they need two
-//! forces, or a second frequency, and there is nowhere on the bus to put them. A
-//! config asking for one is told so on its line, with the nearest thing named,
-//! rather than being quietly given something that feels wrong. Extending the bus
-//! to carry them is a deliberate change across several modules (the pin list, the
-//! DualSense encoder, every feedback-producing module's vocabulary) and belongs on
-//! its own, not smuggled in here.
+//! JSM sends `SEMI_AUTOMATIC` and `AUTOMATIC` through the generator's "simple"
+//! effects, which take raw 0-255 positions — so its documented zones (start 2-7)
+//! land in the first few percent of the pull there. Here they mean what JSM's
+//! documentation says they mean, through the zone-based weapon and vibration
+//! effects its own mode codes (0x25, 0x26) name.
 //!
 //! ## Units
 //!
-//! JSM speaks the DualSense's own numbers: zones 0-9 along the trigger, force
-//! 0-7, frequency 0-255. Our pins are all `Float` 0..1 and the device layer scales
-//! each back to its own range, so every value is divided by its JSM maximum on the
-//! way out. A config's numbers therefore mean what they meant in JSM.
+//! JSM speaks the DualSense's own numbers, and so do the pins, as fractions: zones
+//! 0-9 (/9), 3-bit forces 0-7 (/7), frequency and period 0-255 (/255). A 0-8
+//! force is JSM's "0 = none, 1-8 = weakest to strongest", which the pad stores as
+//! 0-7 — so it goes out as `force - 1`, and a 0 turns the effect off, exactly as
+//! the generator does. The feet and machine amplitudes are already 3-bit values
+//! and go out as written.
 
 /// One trigger's effect (`LEFT_TRIGGER_EFFECT` / `RIGHT_TRIGGER_EFFECT`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -45,12 +46,125 @@ pub enum Effect {
     #[default]
     Auto,
     Off,
-    /// Constant resistance from `start` onwards.
+    /// Constant resistance from `start` onwards. `force` 0-8.
     Resistance { start: u8, force: u8 },
-    /// A click at `start`, releasing at `end`.
+    /// Resistance from `start` that snaps back at `end`. Both forces 0-8.
+    Bow { start: u8, end: u8, force: u8, snap: u8 },
+    /// Two pulses between `start` and `end`, repeated at `frequency`. Feet 0-6
+    /// and 0-7, the first below the second.
+    Galloping { start: u8, end: u8, first_foot: u8, second_foot: u8, frequency: u8 },
+    /// A click at `start`, releasing at `end`. `force` 0-8.
     SemiAutomatic { start: u8, end: u8, force: u8 },
-    /// Vibration from `start` onwards.
+    /// Vibration from `start` onwards. `force` 0-8.
     Automatic { start: u8, force: u8, frequency: u8 },
+    /// Vibration between `start` and `end`, alternating amplitudes A and B (0-7
+    /// each) at `frequency`, every `period`.
+    Machine { start: u8, end: u8, force_a: u8, force_b: u8, frequency: u8, period: u8 },
+}
+
+/// One number a trigger effect takes: what it is, JSM's range for it, and what
+/// the editor writes when the number has to be made up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EffectParam {
+    /// What the number does, as the fader and the line's errors name it.
+    pub name: &'static str,
+    pub lo: u8,
+    pub hi: u8,
+    /// A value that gives a clearly felt effect, for filling in a number the
+    /// line doesn't have yet.
+    pub default: u8,
+}
+
+const fn p(name: &'static str, lo: u8, hi: u8, default: u8) -> EffectParam {
+    EffectParam { name, lo, hi, default }
+}
+
+/// The numbers each trigger effect takes, in the order JSM reads them and with
+/// JSM's documented ranges — the one table the parser, the tune panel's faders
+/// and the editor's auto-fill all read, so they cannot disagree about what a
+/// number means. `None` for a word that isn't an effect; `ON` and `OFF` take no
+/// numbers.
+///
+/// Two ranges are a notch narrower than JSM's help text, to the limit its
+/// encoder actually accepts: `MACHINE`'s start stops at 8 (the generator refuses
+/// 9 and sends nothing usable).
+pub fn effect_params(mode: &str) -> Option<&'static [EffectParam]> {
+    const START_9: EffectParam = p("start zone", 0, 9, 2);
+    const START_8: EffectParam = p("start zone", 0, 8, 2);
+    const FORCE: EffectParam = p("force", 0, 8, 5);
+    const FREQ: EffectParam = p("frequency", 0, 255, 20);
+    const RESISTANCE: &[EffectParam] = &[START_9, FORCE];
+    const BOW: &[EffectParam] =
+        &[START_8, p("end zone", 0, 8, 6), FORCE, p("snap force", 0, 8, 7)];
+    const GALLOPING: &[EffectParam] = &[
+        START_8,
+        p("end zone", 0, 9, 8),
+        p("first foot", 0, 6, 3),
+        p("second foot", 0, 7, 5),
+        FREQ,
+    ];
+    const SEMI_AUTOMATIC: &[EffectParam] =
+        &[p("start zone", 2, 7, 3), p("end zone", 0, 8, 6), FORCE];
+    const AUTOMATIC: &[EffectParam] = &[START_9, FORCE, FREQ];
+    const MACHINE: &[EffectParam] = &[
+        START_8,
+        p("end zone", 0, 9, 8),
+        p("force A", 0, 7, 3),
+        p("force B", 0, 7, 6),
+        FREQ,
+        p("period", 0, 255, 10),
+    ];
+    Some(match mode.to_ascii_uppercase().as_str() {
+        "ON" | "OFF" => &[],
+        "RESISTANCE" => RESISTANCE,
+        "BOW" => BOW,
+        "GALLOPING" => GALLOPING,
+        "SEMI_AUTOMATIC" => SEMI_AUTOMATIC,
+        "AUTOMATIC" => AUTOMATIC,
+        "MACHINE" => MACHINE,
+        _ => return None,
+    })
+}
+
+/// The effect a mode word and its numbers (already held to `effect_params`)
+/// describe. `None` for a word that isn't an effect.
+pub(crate) fn effect_of(mode: &str, v: &[u8]) -> Option<Effect> {
+    let n = |i: usize| v.get(i).copied().unwrap_or(0);
+    Some(match mode.to_ascii_uppercase().as_str() {
+        "ON" => Effect::Auto,
+        "OFF" => Effect::Off,
+        "RESISTANCE" => Effect::Resistance { start: n(0), force: n(1) },
+        "BOW" => Effect::Bow { start: n(0), end: n(1), force: n(2), snap: n(3) },
+        "GALLOPING" => Effect::Galloping {
+            start: n(0),
+            end: n(1),
+            first_foot: n(2),
+            second_foot: n(3),
+            frequency: n(4),
+        },
+        "SEMI_AUTOMATIC" => Effect::SemiAutomatic { start: n(0), end: n(1), force: n(2) },
+        "AUTOMATIC" => Effect::Automatic { start: n(0), force: n(1), frequency: n(2) },
+        "MACHINE" => Effect::Machine {
+            start: n(0),
+            end: n(1),
+            force_a: n(2),
+            force_b: n(3),
+            frequency: n(4),
+            period: n(5),
+        },
+        _ => return None,
+    })
+}
+
+/// Where a mode's numbers have to be in order — an end zone past its start, a
+/// second foot after the first — as `(earlier, later)` indices into its
+/// `effect_params`.
+pub(crate) fn effect_orderings(mode: &str) -> &'static [(usize, usize)] {
+    match mode.to_ascii_uppercase().as_str() {
+        "BOW" | "SEMI_AUTOMATIC" | "MACHINE" => &[(0, 1)],
+        "GALLOPING" => &[(0, 1), (2, 3)],
+        _ => &[],
+    }
 }
 
 /// What the feedback side of a config is configured with.
@@ -110,51 +224,98 @@ pub fn pins(s: &Settings, rumble: Option<(f32, f32)>) -> Vec<Pin> {
         out.push(("rumble_weak", weak));
     }
 
-    // The five pins of each trigger's group, left then right.
-    const LEFT: [&str; 5] = [
+    // The seven pins of each trigger's group, left then right.
+    const LEFT: [&str; 7] = [
         "trigger_l_mode",
         "trigger_l_start",
         "trigger_l_end",
         "trigger_l_strength",
         "trigger_l_freq",
+        "trigger_l_strength2",
+        "trigger_l_period",
     ];
-    const RIGHT: [&str; 5] = [
+    const RIGHT: [&str; 7] = [
         "trigger_r_mode",
         "trigger_r_start",
         "trigger_r_end",
         "trigger_r_strength",
         "trigger_r_freq",
+        "trigger_r_strength2",
+        "trigger_r_period",
     ];
-    // Zones are 0-9, force 0-7, frequency 0-255 — JSM's own scales; the pins are
-    // fractions of each.
-    let zone = |v: u8| (v.min(9) as f32) / 9.0;
-    let force = |v: u8| (v.min(7) as f32) / 7.0;
-    let freq = |v: u8| v as f32 / 255.0;
 
     for (side, effect) in s.trigger.iter().enumerate() {
         let pins = if side == 0 { LEFT } else { RIGHT };
         // `ADAPTIVE_TRIGGER = OFF` wins over whatever effect is set, which is how
         // JSM uses it: one switch to stop the triggers fighting you.
         let effect = if s.adaptive { *effect } else { Effect::Off };
-        // (mode, start, end, strength, freq) — every pin of the group gets a value
-        // whenever any of them does, or a leftover from a previous effect would
-        // shape this one.
-        let values = match effect {
-            // Nothing of our own: leave the group alone, so the game keeps whatever
-            // it was asking for.
-            Effect::Auto => continue,
-            Effect::Off => [0.0; 5],
-            Effect::Resistance { start, force: f } => {
-                [1.0 / 3.0, zone(start), 0.0, force(f), 0.0]
-            }
-            Effect::SemiAutomatic { start, end, force: f } => {
-                [2.0 / 3.0, zone(start), zone(end), force(f), 0.0]
-            }
-            Effect::Automatic { start, force: f, frequency } => {
-                [1.0, zone(start), 0.0, force(f), freq(frequency)]
-            }
-        };
+        // Nothing of our own: leave the group alone, so the game keeps whatever
+        // it was asking for.
+        let Some(values) = trigger_pins(effect) else { continue };
+        // Every pin of the group gets a value whenever any of them does, or a
+        // leftover from a previous effect would shape this one.
         out.extend(pins.iter().copied().zip(values));
     }
     out
+}
+
+/// Is this an effect whose numbers make it no effect at all — a zero force or
+/// frequency, which the generator turns into "off"? (`OFF` itself says so on
+/// purpose, so it doesn't count.)
+pub(crate) fn does_nothing(effect: Effect) -> bool {
+    !matches!(effect, Effect::Off | Effect::Auto) && trigger_pins(effect) == Some([0.0; 7])
+}
+
+/// One trigger's effect as its seven pins — (mode, start, end, strength, freq,
+/// strength2, period), each a fraction of its range — or `None` for `ON`,
+/// which leaves the trigger to the game.
+///
+/// The conditions under which an effect turns into "off" are the generator's
+/// own: a 0-8 force of 0, or a frequency of 0, is no effect at all.
+fn trigger_pins(effect: Effect) -> Option<[f32; 7]> {
+    use flexinput_core::automap::TriggerMode;
+    let zone = |v: u8| (v.min(9) as f32) / 9.0;
+    // A 3-bit force as the pad stores it.
+    let bits = |v: u8| (v.min(7) as f32) / 7.0;
+    // A 0-8 force: 1-8 is 0-7 on the pad, and 0 is no effect.
+    let force = |v: u8| bits(v.saturating_sub(1));
+    let byte = |v: u8| v as f32 / 255.0;
+    let off = [0.0; 7];
+    let m = |mode: TriggerMode| mode.pin();
+    Some(match effect {
+        Effect::Auto => return None,
+        Effect::Off => off,
+        Effect::Resistance { start, force: f } if f > 0 => {
+            [m(TriggerMode::Feedback), zone(start), 0.0, force(f), 0.0, 0.0, 0.0]
+        }
+        Effect::Bow { start, end, force: f, snap } if end > 0 && f > 0 && snap > 0 => {
+            [m(TriggerMode::Bow), zone(start), zone(end), force(f), 0.0, force(snap), 0.0]
+        }
+        Effect::Galloping { start, end, first_foot, second_foot, frequency } if frequency > 0 => [
+            m(TriggerMode::Galloping),
+            zone(start),
+            zone(end),
+            bits(first_foot),
+            byte(frequency),
+            bits(second_foot),
+            0.0,
+        ],
+        Effect::SemiAutomatic { start, end, force: f } if f > 0 => {
+            [m(TriggerMode::Weapon), zone(start), zone(end), force(f), 0.0, 0.0, 0.0]
+        }
+        Effect::Automatic { start, force: f, frequency } if f > 0 && frequency > 0 => {
+            [m(TriggerMode::Vibration), zone(start), 0.0, force(f), byte(frequency), 0.0, 0.0]
+        }
+        Effect::Machine { start, end, force_a, force_b, frequency, period } if frequency > 0 => [
+            m(TriggerMode::Machine),
+            zone(start),
+            zone(end),
+            bits(force_a),
+            byte(frequency),
+            bits(force_b),
+            byte(period),
+        ],
+        // A zero force or frequency: the generator's "no effect".
+        _ => off,
+    })
 }

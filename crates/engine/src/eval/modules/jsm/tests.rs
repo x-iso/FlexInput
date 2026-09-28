@@ -3832,38 +3832,87 @@ fn a_rumble_binding_carries_jsms_own_amplitudes() {
     );
 }
 
-/// The four adaptive-trigger effects our bus can carry, with JSM's own numbers
-/// landing on the right pins at the right scale.
+/// Every one of JSM's adaptive-trigger effects lands on its pins, in JSM's
+/// parameter order and on the scale JSM's own encoder uses: zones /9, a 0-8
+/// force as `force - 1` of 7, feet and machine amplitudes as written of 7, and
+/// frequency and period /255.
 #[test]
-fn the_trigger_effects_our_bus_carries_land_on_their_pins() {
-    // `RESISTANCE start force` — zones are 0-9, force 0-7.
+fn every_trigger_effect_lands_on_its_pins() {
+    use flexinput_core::automap::TriggerMode;
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+    let mode = |m: &HashMap<String, f32>, pin: &str| TriggerMode::from_pin(m[pin]);
+
+    // `RESISTANCE start force` — force 1-8 is the pad's 0-7.
     let r = fb_pins("LEFT_TRIGGER_EFFECT = RESISTANCE 3 7", None);
-    assert!((r["trigger_l_mode"] - 1.0 / 3.0).abs() < 1e-6, "feedback mode");
-    assert!((r["trigger_l_start"] - 3.0 / 9.0).abs() < 1e-6, "zone 3 of 9");
-    assert_eq!(r["trigger_l_strength"], 1.0, "force 7 of 7 is full");
+    assert_eq!(mode(&r, "trigger_l_mode"), TriggerMode::Feedback);
+    assert!(near(r["trigger_l_start"], 3.0 / 9.0), "zone 3 of 9");
+    assert!(near(r["trigger_l_strength"], 6.0 / 7.0), "force 7 is the pad's 6");
+    let full = fb_pins("LEFT_TRIGGER_EFFECT = RESISTANCE 3 8", None);
+    assert_eq!(full["trigger_l_strength"], 1.0, "force 8 is full");
 
-    // `SEMI_AUTOMATIC start end force` — the one that uses both zones.
+    // `BOW start end force snapForce`.
+    let b = fb_pins("LEFT_TRIGGER_EFFECT = BOW 2 5 4 6", None);
+    assert_eq!(mode(&b, "trigger_l_mode"), TriggerMode::Bow);
+    assert!(near(b["trigger_l_start"], 2.0 / 9.0) && near(b["trigger_l_end"], 5.0 / 9.0));
+    assert!(near(b["trigger_l_strength"], 3.0 / 7.0) && near(b["trigger_l_strength2"], 5.0 / 7.0));
+
+    // `GALLOPING start end firstFoot secondFoot frequency` — feet as written.
+    let g = fb_pins("RIGHT_TRIGGER_EFFECT = GALLOPING 1 8 3 5 100", None);
+    assert_eq!(mode(&g, "trigger_r_mode"), TriggerMode::Galloping);
+    assert!(near(g["trigger_r_start"], 1.0 / 9.0) && near(g["trigger_r_end"], 8.0 / 9.0));
+    assert!(near(g["trigger_r_strength"], 3.0 / 7.0) && near(g["trigger_r_strength2"], 5.0 / 7.0));
+    assert!(near(g["trigger_r_freq"], 100.0 / 255.0));
+
+    // `SEMI_AUTOMATIC start end force` — the click.
     let s = fb_pins("RIGHT_TRIGGER_EFFECT = SEMI_AUTOMATIC 2 6 4", None);
-    assert!((s["trigger_r_mode"] - 2.0 / 3.0).abs() < 1e-6, "weapon mode");
-    assert!((s["trigger_r_start"] - 2.0 / 9.0).abs() < 1e-6);
-    assert!((s["trigger_r_end"] - 6.0 / 9.0).abs() < 1e-6);
+    assert_eq!(mode(&s, "trigger_r_mode"), TriggerMode::Weapon);
+    assert!(near(s["trigger_r_start"], 2.0 / 9.0) && near(s["trigger_r_end"], 6.0 / 9.0));
+    assert!(near(s["trigger_r_strength"], 3.0 / 7.0));
 
-    // `AUTOMATIC start force frequency` — frequency is 0-255.
+    // `AUTOMATIC start force frequency` — vibration.
     let a = fb_pins("LEFT_TRIGGER_EFFECT = AUTOMATIC 1 5 255", None);
-    assert_eq!(a["trigger_l_mode"], 1.0, "vibration mode");
+    assert_eq!(mode(&a, "trigger_l_mode"), TriggerMode::Vibration);
     assert_eq!(a["trigger_l_freq"], 1.0, "frequency 255 of 255");
+    assert!(near(a["trigger_l_strength"], 4.0 / 7.0));
+
+    // `MACHINE start end forceA forceB frequency period` — amplitudes as written.
+    let m = fb_pins("LEFT_TRIGGER_EFFECT = MACHINE 1 9 3 4 40 60", None);
+    assert_eq!(mode(&m, "trigger_l_mode"), TriggerMode::Machine);
+    assert!(near(m["trigger_l_start"], 1.0 / 9.0) && near(m["trigger_l_end"], 1.0));
+    assert!(near(m["trigger_l_strength"], 3.0 / 7.0) && near(m["trigger_l_strength2"], 4.0 / 7.0));
+    assert!(near(m["trigger_l_freq"], 40.0 / 255.0) && near(m["trigger_l_period"], 60.0 / 255.0));
 
     // `OFF` writes every pin of the group, so a previous effect can't shape it.
     let off = fb_pins("LEFT_TRIGGER_EFFECT = OFF", None);
-    for pin in ["trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength", "trigger_l_freq"] {
+    for pin in [
+        "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength",
+        "trigger_l_freq", "trigger_l_strength2", "trigger_l_period",
+    ] {
         assert_eq!(off.get(pin), Some(&0.0), "{pin} is zeroed");
     }
+}
 
-    // A missing parameter is an error naming what was wanted.
-    match one("LEFT_TRIGGER_EFFECT = RESISTANCE 3").status {
-        LineStatus::Error(why) => assert!(why.contains("force"), "{why}"),
-        other => panic!("a short RESISTANCE should be an error, got {other:?}"),
-    }
+/// A number missing or out of JSM's range is an error that names it; a zero
+/// force or frequency is JSM's "no effect", which switches the trigger off and
+/// says so.
+#[test]
+fn trigger_effect_numbers_are_held_to_jsms_ranges() {
+    let error_of = |line: &str| match one(line).status {
+        LineStatus::Error(why) => why,
+        other => panic!("`{line}` should be an error, got {other:?}"),
+    };
+    assert!(error_of("LEFT_TRIGGER_EFFECT = RESISTANCE 3").contains("force"));
+    assert!(error_of("LEFT_TRIGGER_EFFECT = RESISTANCE 3 9").contains("0 to 8"));
+    assert!(error_of("LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 1 6 4").contains("2 to 7"));
+    assert!(error_of("LEFT_TRIGGER_EFFECT = BOW 5 3 1 1").contains("end zone past"));
+    assert!(error_of("LEFT_TRIGGER_EFFECT = GALLOPING 1 8 5 3 100").contains("second foot past the first foot"));
+    assert!(error_of("LEFT_TRIGGER_EFFECT = MACHINE 1 9 3 8 40 60").contains("0 to 7"));
+
+    let zero = one("LEFT_TRIGGER_EFFECT = RESISTANCE 3 0");
+    assert_eq!(zero.status, LineStatus::Ok);
+    assert!(zero.notes.join(" ").contains("no effect"), "{:?}", zero.notes);
+    let out = fb_pins("LEFT_TRIGGER_EFFECT = AUTOMATIC 1 5 0", None);
+    assert_eq!(out["trigger_l_mode"], 0.0, "no frequency, no vibration: off");
 }
 
 /// `ON` — JSM's default — means "no effect of my own", so the group is left
@@ -3890,30 +3939,6 @@ fn adaptive_trigger_off_overrules_the_effects() {
     );
     assert_eq!(out["trigger_l_mode"], 0.0, "the effect is switched off: {out:?}");
     assert_eq!(out["trigger_l_strength"], 0.0);
-}
-
-/// The three effects the bus has nowhere to put say so, name the nearest thing
-/// that works, and leave the trigger as the game set it — rather than quietly
-/// giving the player something that feels wrong.
-#[test]
-fn the_effects_our_bus_cannot_carry_say_so_and_suggest_one_that_works() {
-    for (mode, expect) in [
-        ("BOW 2 5 4 6", "SEMI_AUTOMATIC"),
-        ("GALLOPING 1 8 3 5 100", "AUTOMATIC"),
-        ("MACHINE 1 9 3 4 40 60", "AUTOMATIC"),
-    ] {
-        let line = one(&format!("LEFT_TRIGGER_EFFECT = {mode}"));
-        assert_eq!(line.status, LineStatus::Ok, "{mode} is understood, not an error");
-        let note = line.notes.join(" ");
-        assert!(note.contains("four trigger effects"), "{mode}: says why: {note}");
-        assert!(note.contains(expect), "{mode}: names the nearest: {note}");
-    }
-    // And the trigger is left alone rather than set to something arbitrary.
-    let out = fb_pins("LEFT_TRIGGER_EFFECT = BOW 2 5 4 6", None);
-    assert!(
-        !out.keys().any(|k| k.starts_with("trigger_l_")),
-        "the trigger is left as the game set it: {out:?}"
-    );
 }
 
 /// Trigger travel calibration is the device card's, not the config's.
@@ -6181,6 +6206,58 @@ fn turning_past_full_stick_is_reported_as_the_peak() {
     );
 }
 
+/// During the 360 sweep a stick circled round its edge turns the camera alongside
+/// the gyro, and the two add — with a config that has no flick stick at all,
+/// since the sweep sets the config's own aiming aside, and with the stick itself
+/// held still on the output.
+#[test]
+fn a_circled_stick_and_the_gyro_turn_the_360_together_without_a_flick_config() {
+    let _guard = alone();
+    for cfg in ["REAL_WORLD_CALIBRATION = 40", "REAL_WORLD_CALIBRATION = 40\nRIGHT_STICK_MODE = AIM"] {
+        let snap = sweeping(cfg, "yaw", "mouse");
+        let uid = snap.node_uid;
+        let key = format!("collector:{uid}");
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let mut out = Vec::new();
+        let mut total_x = 0.0;
+        let mut last_bus: HashMap<String, Signal> = HashMap::new();
+        // 90° of clockwise sweep in 9° steps, read every fourth 1 ms tick the way a
+        // stick polling slower than the engine delivers it, then held while the
+        // payout drains.
+        for i in 0..400 {
+            let a = ((i / 4).min(10) as f32 * 9.0).to_radians();
+            let v = glam::Vec2::new(a.sin(), a.cos());
+            let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+            dev.insert((PAD.to_string(), "right_stick".to_string()), Signal::Vec2(v));
+            dev.insert((PAD.to_string(), "right_stick_x".to_string()), Signal::Float(v.x));
+            dev.insert((PAD.to_string(), "right_stick_y".to_string()), Signal::Float(v.y));
+            // And the pad turning at 90°/s the whole time: 36° over the 400 ms.
+            dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(90.0 / 2000.0));
+            let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+            out = super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.001);
+            last_bus = collector
+                .into_iter()
+                .filter(|((d, _), _)| *d == key)
+                .map(|((_, p), s)| (p, s))
+                .collect();
+            if let Some(Signal::Vec2(m)) = last_bus.get("mouse_move") {
+                total_x += m.x;
+                // No tick carries the whole step: the mouse is only handed the
+                // latest tick's displacement, so a spike on one tick is lost.
+                assert!(m.x < 9.0 * 40.0 * 0.5, "{cfg}: tick {i} spiked {}", m.x);
+            }
+        }
+        // 90° swept + 36° turned = 126°, at 40 counts/° is 5040 counts, to the right.
+        assert!((total_x - 5040.0).abs() < 1.0, "{cfg}: expected 5040 counts, got {total_x}");
+        let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+            Some(Signal::Float(f)) => f,
+            other => panic!("got {other:?}"),
+        };
+        assert!((deg - 126.0).abs() < 0.1, "{cfg}: expected 126°, got {deg}");
+        assert_eq!(last_bus.get("right_stick"), Some(&Signal::Vec2(glam::Vec2::ZERO)), "{cfg}");
+    }
+}
+
 #[test]
 fn calibrating_the_mouse_holds_a_gyro_driven_stick_still() {
     let _guard = alone();
@@ -6240,5 +6317,113 @@ fn stick_and_touchpad_sens_get_faders() {
     assert!(
         matches!(super::knobs::feel_of(&cfg, "STICK_SENS"), super::knobs::Feel::Stick(_)),
         "tuning it should pass the aiming stick through"
+    );
+}
+
+/// A trigger effect gets a fader per number its mode takes, each named for
+/// what it does and held to JSM's range for it, and each rewrites only its own
+/// number.
+#[test]
+fn a_trigger_effect_gets_a_named_fader_per_number() {
+    use super::knobs::{key_setting, knobs, set_knob_part};
+    let text = "RIGHT_TRIGGER_EFFECT = BOW 2 6 4 7 # draw";
+    let k = knobs(text);
+    let labels: Vec<String> = k.iter().map(|k| k.label()).collect();
+    assert_eq!(
+        labels,
+        ["start zone (R BOW)", "end zone (R BOW)", "force (R BOW)", "snap force (R BOW)"]
+    );
+    assert_eq!(k.iter().map(|k| k.value).collect::<Vec<_>>(), [2.0, 6.0, 4.0, 7.0]);
+    assert!(k.iter().all(|k| k.integral && k.lo == 0.0 && k.hi == 8.0));
+    // Every fader has its own key, and each names the setting it belongs to.
+    let keys: Vec<String> = k.iter().map(|k| k.key()).collect();
+    assert_eq!(keys.iter().collect::<std::collections::HashSet<_>>().len(), 4, "{keys:?}");
+    assert!(keys.iter().all(|key| key_setting(key) == "RIGHT_TRIGGER_EFFECT"), "{keys:?}");
+    // The snap force's fader moves the snap force, and nothing else.
+    assert_eq!(
+        set_knob_part(text, 0, k[3].part, 3.0, true),
+        "RIGHT_TRIGGER_EFFECT = BOW 2 6 4 3 # draw"
+    );
+
+    // Frequency and period reach 255; a mode with no numbers gets no faders.
+    let m = knobs("LEFT_TRIGGER_EFFECT = MACHINE 1 9 3 4 40 60");
+    assert_eq!(m[5].label(), "period (L MACHINE)");
+    assert_eq!(m[5].hi, 255.0);
+    assert!(knobs("LEFT_TRIGGER_EFFECT = OFF").is_empty());
+    // A number the line hasn't got yet gets no fader; the ones it has still do.
+    assert_eq!(knobs("LEFT_TRIGGER_EFFECT = AUTOMATIC 1 5").len(), 2);
+}
+
+/// Stepping a trigger effect's mode with Select gives the line exactly the new
+/// mode's numbers: what the two modes share by name carries over, what the new
+/// one adds gets a default, what it doesn't take goes — and the comment stays.
+#[test]
+fn stepping_a_trigger_mode_fills_and_trims_its_numbers() {
+    use super::catalogue::cycle_value;
+    use super::cursor::Cursor;
+    let mode = Cursor { line: 0, token: 2 };
+    let mut text = "LEFT_TRIGGER_EFFECT = RESISTANCE 3 7 # mine".to_string();
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        text = cycle_value(&text, mode, 1).expect("modes to step through");
+        seen.push(text.split_once("= ").unwrap().1.to_string());
+        let c = compile(&text);
+        assert!(errors(&c).is_empty(), "every step is a line JSM takes: {text} {:?}", errors(&c));
+    }
+    assert_eq!(
+        seen,
+        [
+            "BOW 3 6 7 7 # mine",
+            "GALLOPING 3 6 3 5 20 # mine",
+            "SEMI_AUTOMATIC 3 6 5 # mine",
+            "AUTOMATIC 3 5 20 # mine",
+            "MACHINE 3 8 3 6 20 10 # mine",
+            "ON # mine",
+            "OFF # mine",
+            "RESISTANCE 2 5 # mine",
+        ]
+    );
+}
+
+/// A carried number that doesn't suit the new mode is brought into its range,
+/// and one that has to come after another is moved after it.
+#[test]
+fn a_carried_trigger_number_is_brought_into_the_new_modes_range() {
+    use super::catalogue::cycle_value;
+    use super::cursor::Cursor;
+    let mode = Cursor { line: 0, token: 2 };
+    // RESISTANCE's start runs to 9; SEMI_AUTOMATIC's stops at 7 and wants an end
+    // past it — so start 7, and the end moved on to 8.
+    let text = cycle_value("LEFT_TRIGGER_EFFECT = AUTOMATIC 9 8 30", mode, -1).unwrap();
+    assert_eq!(text, "LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 7 8 8");
+    assert!(errors(&compile(&text)).is_empty());
+}
+
+/// Typing a number over a number leaves it as typed — the line says when it
+/// is out of range; the editor doesn't quietly change what you chose.
+#[test]
+fn a_typed_trigger_number_is_left_as_typed() {
+    use super::cursor::Cursor;
+    use super::knobs::replace_word;
+    let text = "LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 3 6 5";
+    let out = replace_word(text, Cursor { line: 0, token: 3 }, "12");
+    assert_eq!(out, "LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 12 6 5");
+    // But typing the MODE settles its numbers, as Select does.
+    let out = replace_word(text, Cursor { line: 0, token: 2 }, "RESISTANCE");
+    assert_eq!(out, "LEFT_TRIGGER_EFFECT = RESISTANCE 3 5");
+}
+
+/// Scrubbing a trigger effect's number with the stick stays inside that
+/// number's own range — a SEMI_AUTOMATIC start stops at 7.
+#[test]
+fn scrubbing_a_trigger_number_keeps_to_its_range() {
+    use super::cursor::Cursor;
+    let text = "LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 7 8 5";
+    let start = Cursor { line: 0, token: 3 };
+    let up = super::knobs::scrub(text, start, 1);
+    assert!(up.is_none() || up.as_deref() == Some(text), "already at the top: {up:?}");
+    assert_eq!(
+        super::knobs::scrub(text, start, -1).as_deref(),
+        Some("LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 6 8 5")
     );
 }

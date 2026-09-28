@@ -542,7 +542,9 @@ pub(crate) fn curve_graph(
     // panel, so the axis labels appear only where they would fit — cramped, they
     // would cover the curve they are there to explain.
     let labelled = width >= 200.0 && height >= 80.0;
-    let (pad_l, pad_b, pad_tr) = if labelled { (30.0, 13.0, 6.0) } else { (3.0, 3.0, 3.0) };
+    // Labelled, the bottom holds two rows: the speed numbers, and under them the
+    // axis's name — sharing one row put the name on top of the numbers.
+    let (pad_l, pad_b, pad_tr) = if labelled { (30.0, 24.0, 6.0) } else { (3.0, 3.0, 3.0) };
     let plot = egui::Rect::from_min_max(
         rect.min + egui::vec2(pad_l, pad_tr),
         rect.max - egui::vec2(pad_tr, pad_b),
@@ -671,6 +673,16 @@ pub(crate) fn curve_graph(
             "turn speed °/s",
             small.clone(),
             vis.weak_text_color(),
+        );
+        // The vertical axis's name runs up its own line, inside the plot at the
+        // top: the numbers already fill the margin beside it, and the top-left
+        // corner is where a sensitivity curve almost never goes — it starts low
+        // and climbs to the right.
+        let galley = painter.layout_no_wrap("sensitivity".into(), small.clone(), vis.weak_text_color());
+        let pos = egui::pos2(plot.left() + 2.0, plot.top() + 2.0 + galley.size().x);
+        painter.add(
+            egui::epaint::TextShape::new(pos, galley, vis.weak_text_color())
+                .with_angle(-std::f32::consts::FRAC_PI_2),
         );
     } else {
         painter.text(

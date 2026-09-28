@@ -256,6 +256,11 @@ pub struct GamepadNav {
     /// Left-stick directional auto-repeat accumulator (in "steps").
     pub repeat_accum: f32,
     pub repeat_dir: Option<NavDir>,
+    /// The left stick has walked a field list and hasn't been back to neutral
+    /// since. While set, that stick edits nothing: a thumb scrolling down a
+    /// column of faders is never perfectly straight, and its sideways slop would
+    /// otherwise nudge every fader it passed.
+    pub stick_walk_latch: bool,
     /// Widget-level vs editing-a-widget.
     pub edit_level: EditLevel,
     /// The physical device id driving nav this frame (set by `run_gamepad_nav`
@@ -490,6 +495,7 @@ impl Default for GamepadNav {
             prev_pressed: HashSet::new(),
             repeat_accum: 0.0,
             repeat_dir: None,
+            stick_walk_latch: false,
             edit_level: EditLevel::Widget,
             active_dev: None,
             fine_increment: false,
@@ -865,7 +871,18 @@ pub fn nearest_target_rect_in_dir(
 /// Map a left-stick vector to a dominant direction once it clears the
 /// engage threshold. Returns `None` when near-centred.
 pub fn stick_dir(v: egui::Vec2) -> Option<NavDir> {
-    if v.length() < 0.5 {
+    stick_dir_past(v, 0.5)
+}
+
+/// How far the stick must go before it walks or edits a multi-field editor's
+/// fields. Lower than the 0.5 everywhere else: fine-tuning a fader wants the
+/// small pushes, and the walk latch (`stick_walk_latch`) is what keeps a scroll
+/// from editing on the way.
+pub const FIELD_STICK_ENGAGE: f32 = 0.2;
+
+/// `stick_dir` with the engage threshold given.
+pub fn stick_dir_past(v: egui::Vec2, engage: f32) -> Option<NavDir> {
+    if v.length() < engage {
         return None;
     }
     if v.x.abs() >= v.y.abs() {

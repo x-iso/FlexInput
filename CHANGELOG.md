@@ -33,7 +33,78 @@ All notable changes to FlexInput are documented here. This project adheres to
   widget can join, for Select or Start, so other widgets can take either button
   in their own edit context the same way.
 
+- **All seven DualSense adaptive-trigger effects.** `BOW`, `GALLOPING` and
+  `MACHINE` join off, resistance, the click and vibration — in JSM configs, and
+  on the trigger pins everywhere else. Each trigger gains two pins,
+  **Strength 2** (bow's snap force, galloping's second foot, machine's second
+  amplitude) and **Period** (machine's), and the mode pin now names seven
+  effects in sixths (0 off, ⅙ bow, ⅓ resistance, ½ galloping, ⅔ click,
+  ⅚ machine, 1 vibration). The four original effects keep the values they had,
+  so existing patches are unchanged. A game driving a virtual DualSense with
+  any of the seven now reaches the physical pad too — the virtual pad decodes
+  them all. The byte layouts follow Nielk1's `TriggerEffectGenerator`, the
+  encoder JSM itself uses, and are tested against it byte for byte.
+
+- **Trigger effects get a named fader per number, and fill in their own
+  numbers.** A `LEFT_`/`RIGHT_TRIGGER_EFFECT` line puts one fader on the tune
+  panel for each number its mode takes, labelled with what it does —
+  `snap force (R BOW)`, `second foot (L GALLOPING)`, `period (R MACHINE)` — and
+  held to JSM's range for that number. Changing the mode with Select (or typing
+  it on the pad's keyboard) rewrites the numbers to fit: what the old and new
+  modes share by name, like the start zone or the force, carries over and is
+  brought into the new mode's range; what the new mode adds gets a default
+  that is clearly felt; what it doesn't take is dropped. An end zone is kept
+  past its start, and galloping's second foot after its first. Tuning one of
+  these faders from the config overlay lets the triggers through, so the effect
+  can be felt while it changes, and scrubbing a number with the stick keeps it
+  inside its own range. The parser, the faders and the fill-in all read one
+  table of each mode's numbers, so they can't disagree.
+
+- **Select steps a JSM setting through its own words.** In the config editor's
+  text pane, with the cursor on a setting's value — `GYRO_SPACE = ?`, say —
+  Select cycles through exactly the words that setting takes (LOCAL,
+  PLAYER_TURN, PLAYER_LEAN…), and South + Select goes back. The words are found
+  by asking the parser rather than from a list of our own, so only what the line
+  will accept is ever offered, in the order JSM lists them. Stick and trigger
+  modes, gyro spaces and axes, orientations, light-bar colours, trigger effects
+  and every ON/OFF setting work this way; numbers are still scrubbed with the
+  stick. The bar at the bottom shows the hint only where Select has something
+  to step through.
+
+  With the keyboard, **Tab** does the same in the text editor: with the caret
+  in or just after a setting's value, Tab steps to the next word it takes and
+  Shift+Tab to the previous one, filling in a trigger effect's numbers just as
+  Select does. The new word comes selected, so another Tab keeps stepping and
+  typing replaces it. Where there is nothing to step through, Tab types a tab as
+  before.
+
+- **Calibrate RWC's 360° can be turned with a stick as well as the pad.** While
+  the sweep runs, circling either stick round its edge turns the camera too —
+  JSM's own flick-stick calibration, working alongside the gyro rather than
+  instead of it: the stick does the coarse turning without spinning the whole
+  pad round, and the pad lines up the finish. Every degree the stick sweeps
+  turns the game one degree at the current calibration, just as a degree of pad
+  rotation does, so the two simply add. The config needs no flick stick of its
+  own. Pushing out only sets where the count starts, so there is no flick jump
+  to spoil it, and both sticks are held still on the output while it runs.
+
 ### Fixed
+
+- **JSM trigger-effect forces mean what they mean in JSM.** JSM's forces run
+  0-8, where 0 is no effect and 1-8 are the pad's eight levels; they were taken
+  one level too strong, and a force of 0 still resisted. A zero force or
+  frequency now switches the effect off and says so on the line, and a number
+  outside JSM's range for its position is an error naming it, rather than
+  being sent to the pad as it stood.
+
+- **Scrolling the JSM tune panel with the left stick no longer nudges every
+  fader it passes.** Once the stick moves the selection it edits nothing until it
+  has been back to centre, and sideways drift under 20% never edits. The stick
+  also engages from 20% instead of 50% in these editors, for finer adjustment.
+
+- **The JSM curve graph's axis labels have room.** The speed axis's name sits on
+  its own row under the numbers instead of on top of them, and the sensitivity
+  axis is named, up the inside of its left edge.
 
 - **`STICK_SENS` and `TOUCHPAD_SENS` get tuning faders.** Both are single
   numbers the module runs, but neither had a slider range, so the tune panel

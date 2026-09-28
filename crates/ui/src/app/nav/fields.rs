@@ -96,6 +96,10 @@ impl FlexInputApp {
             .iter()
             .any(|p| nav.is_rising(p));
         let multi = n > 1;
+        // Back at neutral, the left stick may edit again (see `stick_walk_latch`).
+        if nav.lstick.length() < Self::NAV_STICK_NEUTRAL {
+            self.gamepad_nav.stick_walk_latch = false;
+        }
         let mut edit_press = 0i32; // -1/+1 from the dpad or the stick
         if let Some(dir) = step_dir {
             // Walking is the destructive one: slipping onto the next setting and
@@ -116,6 +120,9 @@ impl FlexInputApp {
                     } else {
                         (self.gamepad_nav.field_index + 1).min(n - 1)
                     };
+                    if !from_dpad {
+                        self.gamepad_nav.stick_walk_latch = true;
+                    }
                 }
                 // A walking direction that wasn't clear enough is dropped, not
                 // turned into an edit — the pad was pointed between the two.
@@ -123,7 +130,13 @@ impl FlexInputApp {
                 NavDir::Up | NavDir::Right => edit_press = 1,
                 NavDir::Down | NavDir::Left => edit_press = -1,
             }
+            // A stick that has been walking doesn't turn into an edit by swerving
+            // sideways on the way: it has to come back to neutral first.
+            if !from_dpad && self.gamepad_nav.stick_walk_latch {
+                edit_press = 0;
+            }
         }
+        let lstick_latched = self.gamepad_nav.stick_walk_latch;
         let idx = self.gamepad_nav.field_index;
         let def = fields[idx].clone();
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
@@ -161,7 +174,11 @@ impl FlexInputApp {
         match &def.field {
             NavField::Value { key, lo, hi, default, step } => {
                 let press = edit_press as f32;
-                let cont = if mag > 0.5 { nav.lstick.x } else { 0.0 };
+                let cont = if mag > crate::gamepad_nav::FIELD_STICK_ENGAGE && !lstick_latched {
+                    Self::nav_edit_axis(nav.lstick.x)
+                } else {
+                    0.0
+                };
                 if press != 0.0 || cont != 0.0 {
                     self.nav_adjust_field_value(outer_id, inner, *key, *lo, *hi, *default, *step,
                         press, cont, fine, dt);
@@ -191,13 +208,19 @@ impl FlexInputApp {
                 self.nav_note_jsm_baseline(outer_id, name);
                 let press = edit_press as f32;
                 // The stick this setting hands to the game is not one nav may
-                // use — you would be aiming and adjusting with the same thumb.
-                let stick = self.nav_free_stick(outer_id, name, nav);
+                // use — you would be aiming and adjusting with the same thumb —
+                // so such a setting is adjusted with the other one.
+                let lstick_is_free = !self.nav_tuning_takes_lstick(outer_id, name);
+                let stick = if lstick_is_free { nav.lstick } else { nav.rstick };
                 // In a column the faders are walked with up/down, so the value is
                 // driven by the stick's X — and vice versa, or holding the stick
-                // to adjust would also be holding it to change focus.
-                let cont = if stick.length() > 0.5 {
-                    if column { stick.x } else { stick.y }
+                // to adjust would also be holding it to change focus. The left
+                // stick fresh from walking edits nothing until it has been back
+                // to neutral.
+                let cont = if stick.length() > crate::gamepad_nav::FIELD_STICK_ENGAGE
+                    && !(lstick_is_free && lstick_latched)
+                {
+                    Self::nav_edit_axis(if column { stick.x } else { stick.y })
                 } else {
                     0.0
                 };
@@ -1683,7 +1706,8 @@ impl crate::app::FlexInputApp {
             crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
             return;
         };
-        let edited = flexinput_engine::eval::jsm_cursor_replace(&text, cur, &landing);
+        // Typing a trigger effect's mode gives the line that mode's numbers.
+        let edited = flexinput_engine::eval::jsm_replace_word(&text, cur, &landing);
         self.nav_set_jsm_text(outer_id, &edited);
         self.gamepad_nav.jsm_cursor = flexinput_engine::eval::jsm_cursor_clamped(&edited, cur);
         crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
@@ -1798,6 +1822,21 @@ impl crate::app::FlexInputApp {
                 return;
             }
         }
+        // Select steps the value under the cursor through the words its setting
+        // takes — `GYRO_SPACE = ?` to LOCAL, PLAYER_TURN… — and back with South
+        // held. The words come from asking the parser, so it only ever offers
+        // what the line will accept. The app's own Select (Alt-Tab) stands aside
+        // while this editor is being edited — see `nav_claimed_buttons`.
+        if nav.is_rising("btn_back") {
+            let dir = if holding { -1 } else { 1 };
+            if let Some(edited) = flexinput_engine::eval::jsm_cycle_value(&text, cur, dir) {
+                self.nav_set_jsm_text(outer_id, &edited);
+                // One word for another: the cursor stays on it, to step again.
+                crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
+                crate::canvas::viewer::publish_jsm_chord(ctx, inner, holding);
+            }
+            return;
+        }
         // West on its own opens the list of what can legally stand where the
         // cursor is. Held, the same button deletes — see below.
         if !holding && nav.is_rising("btn_west") {
@@ -1891,6 +1930,18 @@ impl crate::app::FlexInputApp {
         crate::canvas::viewer::publish_jsm_cursor(ctx, inner, cur);
     }
 
+    /// Does Select have words to step through at the text cursor? For the legend,
+    /// which offers it only where it does something.
+    pub(crate) fn nav_jsm_value_has_options(&self) -> bool {
+        let Some(outer) = self.nav_driving_outer_id() else { return false };
+        if !self.nav_is_jsm_editor(outer) {
+            return false;
+        }
+        let text = self.nav_jsm_text(outer);
+        let cur = flexinput_engine::eval::jsm_cursor_clamped(&text, self.gamepad_nav.jsm_cursor);
+        !flexinput_engine::eval::jsm_value_options(&text, cur).is_empty()
+    }
+
     /// Write the config text back to the selected JSM node's active tab.
     fn nav_set_jsm_text(&mut self, outer_id: egui_snarl::NodeId, text: &str) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
@@ -1932,7 +1983,7 @@ impl crate::app::FlexInputApp {
     fn nav_axis_is_clear(stick: egui::Vec2, column: bool) -> bool {
         /// How much the walking axis must beat the other by.
         const MARGIN: f32 = 1.6;
-        if stick.length() < 0.5 {
+        if stick.length() < crate::gamepad_nav::FIELD_STICK_ENGAGE {
             return true;
         }
         let (walk, cross) = if column {
@@ -1941,6 +1992,23 @@ impl crate::app::FlexInputApp {
             (stick.x.abs(), stick.y.abs())
         };
         walk >= cross * MARGIN
+    }
+
+    /// Below this the left stick counts as back at neutral, releasing the walk
+    /// latch (`GamepadNav::stick_walk_latch`).
+    const NAV_STICK_NEUTRAL: f32 = 0.2;
+
+    /// A stick's deflection along the axis that edits a value, with the first
+    /// fifth of it ignored and the rest rescaled to start from zero. A thumb
+    /// pushing along the OTHER axis always leaks a little into this one; that
+    /// leak shouldn't edit anything.
+    fn nav_edit_axis(v: f32) -> f32 {
+        const DEAD: f32 = 0.2;
+        if v.abs() < DEAD {
+            0.0
+        } else {
+            v.signum() * (v.abs() - DEAD) / (1.0 - DEAD)
+        }
     }
 
     /// Does tuning this setting hand the LEFT stick to the game?
@@ -1967,21 +2035,6 @@ impl crate::app::FlexInputApp {
         )
     }
 
-    /// The stick nav may use while `name` is being tuned — the one the setting is
-    /// not handing to the game.
-    fn nav_free_stick(
-        &self,
-        outer_id: egui_snarl::NodeId,
-        name: &str,
-        nav: &crate::gamepad_nav::NavInput,
-    ) -> egui::Vec2 {
-        if self.nav_tuning_takes_lstick(outer_id, name) {
-            nav.rstick
-        } else {
-            nav.lstick
-        }
-    }
-
     /// Is there enough of this field left on screen to ring?
     ///
     /// A scrolling strip publishes each row clipped to the band actually visible,
@@ -1994,6 +2047,11 @@ impl crate::app::FlexInputApp {
     #[cfg(test)]
     pub(crate) fn nav_axis_is_clear_for_test(stick: egui::Vec2, column: bool) -> bool {
         Self::nav_axis_is_clear(stick, column)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nav_edit_axis_for_test(v: f32) -> f32 {
+        Self::nav_edit_axis(v)
     }
 
     /// Remember what a JSM setting was worth before the pad started changing it,
@@ -2058,7 +2116,8 @@ impl crate::app::FlexInputApp {
         }
         let Some(outer) = self.nav_driving_outer_id() else { return &[] };
         if self.nav_is_jsm_editor(outer) {
-            // Select splits / joins a pair setting's faders.
+            // Select splits / joins a pair setting's faders in the Tune pane,
+            // and steps a setting's value through its words in the text pane.
             return &["btn_back"];
         }
         &[]
@@ -2255,6 +2314,18 @@ mod nav_axis_tests {
     // degrees off the horizontal also counted as a step DOWN the list, so focus
     // slipped to the next setting and kept editing that one — with nothing on
     // screen to say it had happened until the config was wrong.
+    // A thumb scrolling down the faders leaks a little sideways; that leak must
+    // not edit. Past the deadzone the edit starts from zero, not with a jump.
+    #[test]
+    fn sideways_leak_under_a_fifth_edits_nothing() {
+        let e = FlexInputApp::nav_edit_axis_for_test;
+        assert_eq!(e(0.0), 0.0);
+        assert_eq!(e(0.19), 0.0);
+        assert_eq!(e(-0.19), 0.0);
+        assert!(e(0.21) > 0.0 && e(0.21) < 0.05, "starts from zero: {}", e(0.21));
+        assert!((e(1.0) - 1.0).abs() < 1e-6 && (e(-1.0) + 1.0).abs() < 1e-6);
+    }
+
     #[test]
     fn a_stick_held_near_a_diagonal_does_not_walk_the_list() {
         // A column (the JSM editor): up/down walks, so Y must dominate.
@@ -2270,7 +2341,10 @@ mod nav_axis_tests {
         // Below the engage threshold the direction came from the dpad, which is
         // unambiguous — gating it there would make the dpad feel broken.
         assert!(clear(0.0, 0.0, true), "the dpad");
-        assert!(clear(0.3, 0.3, true), "a barely-touched stick is the dpad's case");
+        assert!(clear(0.1, 0.1, true), "a barely-touched stick is the dpad's case");
+        // Past the 20% engage a small push is a real one, and held on the
+        // diagonal it still doesn't walk.
+        assert!(!clear(0.3, 0.3, true), "a small diagonal push");
     }
 
     // A strip that scrolls publishes each row clipped to the band on screen, so a

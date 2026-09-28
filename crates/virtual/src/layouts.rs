@@ -45,11 +45,15 @@ pub static DUALSENSE_SOURCE_PINS: &[SourcePin] = &[
     op!("trigger_r_end",      "R.Trigger End",            SignalType::Float),
     op!("trigger_r_strength", "R.Trigger Strength",       SignalType::Float),
     op!("trigger_r_freq",     "R.Trigger Freq",           SignalType::Float),
+    op!("trigger_r_strength2", "R.Trigger Strength 2",    SignalType::Float),
+    op!("trigger_r_period",   "R.Trigger Period",         SignalType::Float),
     op!("trigger_l_mode",     "L.Trigger Mode",           SignalType::Float),
     op!("trigger_l_start",    "L.Trigger Start",          SignalType::Float),
     op!("trigger_l_end",      "L.Trigger End",            SignalType::Float),
     op!("trigger_l_strength", "L.Trigger Strength",       SignalType::Float),
     op!("trigger_l_freq",     "L.Trigger Freq",           SignalType::Float),
+    op!("trigger_l_strength2", "L.Trigger Strength 2",    SignalType::Float),
+    op!("trigger_l_period",   "L.Trigger Period",         SignalType::Float),
 ];
 
 pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[

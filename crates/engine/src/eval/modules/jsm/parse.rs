@@ -2310,69 +2310,53 @@ fn fb_setting(name: &str, rhs: &str, which: FbId, f: &mut super::feedback::Setti
         },
         FbId::Effect(right) => {
             // JSM reads the parameters positionally, in an order that differs per
-            // mode, so each arm takes exactly the numbers its mode uses.
-            let mut nums = words.map(|w| w.parse::<u32>().ok());
-            let mut next = |what: &str| -> Result<u8, LineInfo> {
-                match nums.next() {
-                    Some(Some(v)) => Ok(v.min(255) as u8),
-                    _ => Err(wants(&format!("{what} after `{first}`"))),
-                }
+            // mode, so each arm takes exactly the numbers its mode uses, in that
+            // order, each held to the range JSM documents for it. JSM itself
+            // takes an out-of-range number and sends the pad nonsense; here the
+            // line says which number and what it should be.
+            //
+            // The numbers, their names and their ranges all come from
+            // `feedback::effect_params`, the table the tune panel's faders read too.
+            let Some(params) = super::feedback::effect_params(&first) else {
+                return wants(
+                    "ON, OFF, RESISTANCE, BOW, GALLOPING, SEMI_AUTOMATIC, AUTOMATIC or MACHINE",
+                );
             };
-            let effect = match first.as_str() {
-                "ON" => Effect::Auto,
-                "OFF" => Effect::Off,
-                "RESISTANCE" => {
-                    let (start, force) = match (next("a start zone"), next("a force")) {
-                        (Ok(a), Ok(b)) => (a, b),
-                        (Err(e), _) | (_, Err(e)) => return e,
-                    };
-                    Effect::Resistance { start, force }
-                }
-                "SEMI_AUTOMATIC" => {
-                    let (start, end, force) =
-                        match (next("a start zone"), next("an end zone"), next("a force")) {
-                            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
-                        };
-                    Effect::SemiAutomatic { start, end, force }
-                }
-                "AUTOMATIC" => {
-                    let (start, force, frequency) =
-                        match (next("a start zone"), next("a force"), next("a frequency")) {
-                            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
-                        };
-                    Effect::Automatic { start, force, frequency }
-                }
-                // The three the bus has nowhere to put. Not an error — JSM knows
-                // them and so do we — but the line must say what it will actually
-                // do, and name the nearest thing that works.
-                "BOW" | "GALLOPING" | "MACHINE" => {
-                    let nearest = match first.as_str() {
-                        "BOW" => "SEMI_AUTOMATIC, which clicks between two zones",
-                        "GALLOPING" => "AUTOMATIC, which vibrates from one zone on",
-                        _ => "AUTOMATIC, which vibrates from one zone on",
-                    };
-                    let mut info = LineInfo::of(LineStatus::Ok);
-                    f.trigger[right as usize] = Effect::Auto;
-                    info.notes.push(format!(
-                        "`{first}` needs two forces or a second frequency, and the bus carries \
-                         four trigger effects — off, resistance, a click, and vibration. The \
-                         trigger is left as the game set it; try {nearest}."
-                    ));
-                    return info;
-                }
-                _ => {
-                    return wants(
-                        "ON, OFF, RESISTANCE, SEMI_AUTOMATIC, AUTOMATIC, BOW, GALLOPING or \
-                         MACHINE",
-                    )
-                }
+            let a = |name: &str| {
+                if name.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" }
             };
+            let mut v = Vec::with_capacity(params.len());
+            for (prm, word) in params.iter().zip(words.map(Some).chain(std::iter::repeat(None))) {
+                let (lo, hi, name) = (prm.lo as u32, prm.hi as u32, prm.name);
+                match word.map(|w| w.parse::<u32>()) {
+                    Some(Ok(n)) if (lo..=hi).contains(&n) => v.push(n as u8),
+                    Some(Ok(n)) => {
+                        return wants(&format!(
+                            "{} {name} of {lo} to {hi} after `{first}`, not {n}",
+                            a(name)
+                        ))
+                    }
+                    _ => return wants(&format!("{} {name} ({lo}-{hi}) after `{first}`", a(name))),
+                }
+            }
+            for &(early, late) in super::feedback::effect_orderings(&first) {
+                if v[late] <= v[early] {
+                    let (e, l) = (params[early].name, params[late].name);
+                    return wants(&format!("{} {l} past the {e} after `{first}`", a(l)));
+                }
+            }
+            let effect = super::feedback::effect_of(&first, &v).expect("an effect with params is one");
             f.trigger[right as usize] = effect;
             let mut info = LineInfo::of(LineStatus::Ok);
             if effect != Effect::Auto {
                 info.notes.push(TRIGGER_NOTE.to_string());
+            }
+            if super::feedback::does_nothing(effect) {
+                info.notes.push(
+                    "a force or frequency of 0 is no effect at all, as in JSM — the trigger \
+                     is switched off"
+                        .to_string(),
+                );
             }
             info
         }

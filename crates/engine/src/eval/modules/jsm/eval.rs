@@ -76,6 +76,8 @@ pub struct JsmState {
     /// this node, and clearing here would throw the measurement away on the very
     /// tick it is being read.
     cal: super::cal::Measure,
+    /// The stick being circled, when a 360 sweep is turned with a stick.
+    cal_flick: super::cal::Flick,
     /// Every pin any layer of this node has ever claimed.
     ///
     /// A sink latches what it was last told, so a pin has to keep being told
@@ -160,6 +162,7 @@ pub(crate) fn jsm_publish(
             gen,
             layer: selected.clone(),
             cal: super::cal::Measure::default(),
+            cal_flick: super::cal::Flick::default(),
             ever_claimed: HashSet::new(),
             cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
@@ -427,8 +430,25 @@ pub(crate) fn jsm_publish(
         let counts_per_deg = res.aim.real_world_calibration / res.aim.in_game_sens.max(1e-6);
         let (rate, defl) = match sweep {
             Some(sw) => {
+                // The 360° can be turned with the pad, with a stick circled round
+                // its edge, or both at once (see `Axis::takes_flick`): the rate
+                // the stick is circled at adds to the gyro's yaw. The sticks are
+                // held still on the bus so neither can turn the camera a second
+                // time through the pass-through or whatever the config maps it
+                // to.
+                let yaw = if sw.axis.takes_flick() {
+                    let sticks = [bus_stick(&upstream, "left_stick"), bus_stick(&upstream, "right_stick")];
+                    for name in ["left_stick", "right_stick"] {
+                        collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
+                        collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
+                        collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+                    }
+                    gyro.yaw + st.cal_flick.rate(sticks, dt)
+                } else {
+                    gyro.yaw
+                };
                 let (d, rate, defl) = super::cal::drive(
-                    sw, gyro.yaw, gyro.pitch, counts_per_deg, res.pad.calibration);
+                    sw, yaw, gyro.pitch, counts_per_deg, res.pad.calibration);
                 if let Some(m) = d.mouse {
                     collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m * dt));
                 }
@@ -452,7 +472,10 @@ pub(crate) fn jsm_publish(
                 }
                 (rate, defl)
             }
-            None => (0.0, 0.0),
+            None => {
+                st.cal_flick = super::cal::Flick::default();
+                (0.0, 0.0)
+            }
         };
         st.cal.tick(sweep, rate, defl, dt);
     }
@@ -571,6 +594,15 @@ fn text_gen_of(tabs: &[(String, String)], selected: &str) -> u64 {
 }
 
 
+/// A stick off the bus: its Vec2 when there is one, else its two axis floats.
+fn bus_stick(upstream: &HashMap<String, Signal>, name: &str) -> Vec2 {
+    if let Some(Signal::Vec2(v)) = upstream.get(name) {
+        return *v;
+    }
+    let axis = |a: &str| upstream.get(&format!("{name}_{a}")).map(|s| s.as_float()).unwrap_or(0.0);
+    Vec2::new(axis("x"), axis("y"))
+}
+
 /// What the analog side needs off the bus this tick.
 fn read_pad(
     upstream: &HashMap<String, Signal>,
@@ -580,19 +612,8 @@ fn read_pad(
     let analog = |pin: &str| upstream.get(pin).map(|s| s.as_float());
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     let stick = |name: &str| -> (f32, f32) {
-        if let Some(Signal::Vec2(v)) = upstream.get(name) {
-            return (v.x, v.y);
-        }
-        (
-            upstream
-                .get(&format!("{name}_x"))
-                .map(|s| s.as_float())
-                .unwrap_or(0.0),
-            upstream
-                .get(&format!("{name}_y"))
-                .map(|s| s.as_float())
-                .unwrap_or(0.0),
-        )
+        let v = bus_stick(upstream, name);
+        (v.x, v.y)
     };
     let fingers = touch_fingers(upstream);
     Pad {

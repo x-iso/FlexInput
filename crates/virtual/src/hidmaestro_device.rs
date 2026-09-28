@@ -124,9 +124,21 @@ struct DsFeedback {
     lightbar: (f32, f32, f32),
     player_led: f32,
     mic_led: f32,
-    /// (mode, start, end, strength, freq) per trigger, each 0–1.
-    trig_r: (f32, f32, f32, f32, f32),
-    trig_l: (f32, f32, f32, f32, f32),
+    trig_r: Trig,
+    trig_l: Trig,
+}
+
+/// One trigger's effect as the `trigger_*` pins carry it, each 0–1 (see
+/// `flexinput_core::automap::TriggerMode` for the mode's values).
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Trig {
+    mode: f32,
+    start: f32,
+    end: f32,
+    strength: f32,
+    freq: f32,
+    strength2: f32,
+    period: f32,
 }
 
 impl DsFeedback {
@@ -134,23 +146,27 @@ impl DsFeedback {
     /// profile doesn't declare still report 0.0 — harmless (a physical pad that
     /// lacks the pin drops it, and 0 = "off" otherwise).
     fn as_pins(&self) -> Vec<(&'static str, Signal)> {
-        vec![
+        let mut out = vec![
             ("lightbar_r", Signal::Float(self.lightbar.0)),
             ("lightbar_g", Signal::Float(self.lightbar.1)),
             ("lightbar_b", Signal::Float(self.lightbar.2)),
             ("player_led", Signal::Float(self.player_led)),
             ("mic_led", Signal::Float(self.mic_led)),
-            ("trigger_r_mode", Signal::Float(self.trig_r.0)),
-            ("trigger_r_start", Signal::Float(self.trig_r.1)),
-            ("trigger_r_end", Signal::Float(self.trig_r.2)),
-            ("trigger_r_strength", Signal::Float(self.trig_r.3)),
-            ("trigger_r_freq", Signal::Float(self.trig_r.4)),
-            ("trigger_l_mode", Signal::Float(self.trig_l.0)),
-            ("trigger_l_start", Signal::Float(self.trig_l.1)),
-            ("trigger_l_end", Signal::Float(self.trig_l.2)),
-            ("trigger_l_strength", Signal::Float(self.trig_l.3)),
-            ("trigger_l_freq", Signal::Float(self.trig_l.4)),
-        ]
+        ];
+        for (t, pins) in [
+            (&self.trig_r, [
+                "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength",
+                "trigger_r_freq", "trigger_r_strength2", "trigger_r_period",
+            ]),
+            (&self.trig_l, [
+                "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength",
+                "trigger_l_freq", "trigger_l_strength2", "trigger_l_period",
+            ]),
+        ] {
+            let v = [t.mode, t.start, t.end, t.strength, t.freq, t.strength2, t.period];
+            out.extend(pins.into_iter().zip(v).map(|(p, v)| (p, Signal::Float(v))));
+        }
+        out
     }
 }
 
@@ -545,48 +561,76 @@ fn decode_player_led(b: u8) -> f32 {
     }
 }
 
-/// Decode one 11-byte DualSense adaptive-trigger effect block back into
-/// `(mode, start, end, strength, freq)`, each normalized 0–1 — the inverse of
-/// `flexinput_devices::gyro::encode_trigger_effect`. `mode` 0/0.33/0.66/1 maps to
-/// Off/Feedback(0x21)/Weapon(0x25)/Vibration(0x26); `start`/`end` are zone 0–9
-/// (→ /9); `strength` is force 0–7 (→ /7); `freq` is 0–255 (→ /255, Vibration).
-/// A short/empty block decodes as Off. This is intentionally the rough inverse —
-/// it recovers the parameters the encoder packs, enough to forward the effect to
-/// a physical DualSense (which re-encodes them).
-fn decode_trigger_effect(block: &[u8]) -> (f32, f32, f32, f32, f32) {
-    let off = (0.0, 0.0, 0.0, 0.0, 0.0);
-    if block.len() < 7 {
-        return off;
+/// Decode one 11-byte DualSense adaptive-trigger effect block back into the
+/// `trigger_*` pins, each normalized 0–1 — the inverse of
+/// `flexinput_devices::gyro::encode_trigger_effect`, for all seven effect types
+/// that encoder writes (Off 0x05, Feedback 0x21, Bow 0x22, Galloping 0x23,
+/// Weapon 0x25, Vibration 0x26, Machine 0x27; byte layouts per Nielk1's
+/// `TriggerEffectGenerator`). Zones are 0–9 (→ /9), forces 0–7 (→ /7), freq and
+/// period raw bytes (→ /255). A short/empty block, and the "simple" effect types
+/// whose positions are raw bytes rather than zones, decode as Off. Enough to
+/// forward a game's effect to a physical DualSense, which re-encodes it.
+fn decode_trigger_effect(block: &[u8]) -> Trig {
+    use flexinput_core::automap::TriggerMode;
+    if block.len() < 10 {
+        return Trig::default();
     }
-    // Lowest set bit of the 10-bit active-zone field (params byte 1..3) → start.
-    let active = (block[1] as u16) | ((block[2] as u16) << 8);
-    let start_zone: f32 = if active == 0 { 0.0 } else { active.trailing_zeros() as f32 };
-    // Force is a 3-bit value repeated per active zone (params byte 3..7). Read the
-    // 3 bits at the start zone's slot.
-    let force_bits = (block[3] as u32)
-        | ((block[4] as u32) << 8)
-        | ((block[5] as u32) << 16)
-        | ((block[6] as u32) << 24);
-    let force_at = |zone: u32| ((force_bits >> (zone * 3)) & 0x7) as f32;
+    let zone = |z: u32| (z as f32 / 9.0).clamp(0.0, 1.0);
+    let force = |f: u8| (f.min(7) as f32 / 7.0).clamp(0.0, 1.0);
+    let byte = |b: u8| b as f32 / 255.0;
+    // The 10-bit zone field (params bytes 1..3): every active zone for the
+    // positional effects, just the start and end bits for the two-zone ones.
+    let zones = (block[1] as u16) | ((block[2] as u16) << 8);
+    let lo = if zones == 0 { 0 } else { zones.trailing_zeros() };
+    let hi = if zones == 0 { 0 } else { 15 - zones.leading_zeros() };
+    // Positional effects repeat a 3-bit force per active zone (bytes 3..7); read
+    // the one at the start zone.
+    let forces = u32::from_le_bytes([block[3], block[4], block[5], block[6]]);
+    let force_at = |z: u32| ((forces >> (z * 3)) & 0x7) as u8;
+    // Two-zone effects pack a pair of 3-bit values into byte 3.
+    let (low3, high3) = (block[3] & 0x7, (block[3] >> 3) & 0x7);
 
+    let t = |mode: TriggerMode| Trig { mode: mode.pin(), ..Trig::default() };
     match block[0] {
-        0x21 => {
-            // Feedback: constant resistance from start zone, force = strength.
-            (0.33, (start_zone / 9.0).clamp(0.0, 1.0), 0.0, (force_at(start_zone as u32) / 7.0).clamp(0.0, 1.0), 0.0)
-        }
-        0x25 => {
-            // Weapon: two set bits in start_end (byte1..3) = start, end; byte3 = strength.
-            let lo = if active == 0 { 0 } else { active.trailing_zeros() };
-            let hi = if active == 0 { 0 } else { 15 - active.leading_zeros() };
-            let strength = block.get(3).copied().unwrap_or(0).min(7) as f32;
-            ((0.66), (lo as f32 / 9.0).clamp(0.0, 1.0), (hi as f32 / 9.0).clamp(0.0, 1.0), (strength / 7.0).clamp(0.0, 1.0), 0.0)
-        }
-        0x26 => {
-            // Vibration: like Feedback + frequency at params byte 9 (block[9]).
-            let freq = block.get(9).copied().unwrap_or(0) as f32 / 255.0;
-            (1.0, (start_zone / 9.0).clamp(0.0, 1.0), 0.0, (force_at(start_zone as u32) / 7.0).clamp(0.0, 1.0), freq.clamp(0.0, 1.0))
-        }
-        _ => off, // 0x00 / 0x05 (off) and anything unrecognized.
+        0x21 => Trig { start: zone(lo), strength: force(force_at(lo)), ..t(TriggerMode::Feedback) },
+        0x22 => Trig {
+            start: zone(lo),
+            end: zone(hi),
+            strength: force(low3),
+            strength2: force(high3),
+            ..t(TriggerMode::Bow)
+        },
+        // Galloping packs the SECOND foot low and the first above it.
+        0x23 => Trig {
+            start: zone(lo),
+            end: zone(hi),
+            strength: force(high3),
+            strength2: force(low3),
+            freq: byte(block[4]),
+            ..t(TriggerMode::Galloping)
+        },
+        0x25 => Trig {
+            start: zone(lo),
+            end: zone(hi),
+            strength: force(block[3]),
+            ..t(TriggerMode::Weapon)
+        },
+        0x26 => Trig {
+            start: zone(lo),
+            strength: force(force_at(lo)),
+            freq: byte(block[9]),
+            ..t(TriggerMode::Vibration)
+        },
+        0x27 => Trig {
+            start: zone(lo),
+            end: zone(hi),
+            strength: force(low3),
+            strength2: force(high3),
+            freq: byte(block[4]),
+            period: byte(block[5]),
+            ..t(TriggerMode::Machine)
+        },
+        _ => Trig::default(), // 0x00 / 0x05 (off) and anything unrecognized.
     }
 }
 
@@ -695,13 +739,42 @@ mod tests {
     fn decode_trigger_feedback_recovers_params() {
         // Feedback mode, start zone 3, strength 5.
         let block = encode_feedback(3, 5);
-        let (mode, start, _end, strength, freq) = decode_trigger_effect(&block);
-        assert!((mode - 0.33).abs() < 0.01, "mode = Feedback");
-        assert!((start - 3.0 / 9.0).abs() < 0.02, "start zone 3, got {start}");
-        assert!((strength - 5.0 / 7.0).abs() < 0.02, "strength 5, got {strength}");
-        assert_eq!(freq, 0.0, "feedback has no freq");
+        let t = decode_trigger_effect(&block);
+        assert!((t.mode - 1.0 / 3.0).abs() < 0.01, "mode = Feedback");
+        assert!((t.start - 3.0 / 9.0).abs() < 0.02, "start zone 3, got {}", t.start);
+        assert!((t.strength - 5.0 / 7.0).abs() < 0.02, "strength 5, got {}", t.strength);
+        assert_eq!(t.freq, 0.0, "feedback has no freq");
         // Off block decodes to all-zero.
-        assert_eq!(decode_trigger_effect(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), (0.0, 0.0, 0.0, 0.0, 0.0));
+        assert_eq!(decode_trigger_effect(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Trig::default());
+    }
+
+    /// The three two-force effects, from blocks laid out by hand the way Nielk1's
+    /// `TriggerEffectGenerator` writes them (which is what games and JSM send),
+    /// not by our own encoder — so a shared mistake can't pass both ways.
+    #[test]
+    fn decode_trigger_two_force_effects_from_reference_blocks() {
+        use flexinput_core::automap::TriggerMode;
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // Bow(start 1, end 6, strength 5, snapForce 8): zones 0x42, forces packed
+        // (5-1) | (8-1)<<3 = 0x3C.
+        let t = decode_trigger_effect(&[0x22, 0x42, 0x00, 0x3C, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(TriggerMode::from_pin(t.mode), TriggerMode::Bow);
+        assert!(near(t.start, 1.0 / 9.0) && near(t.end, 6.0 / 9.0), "{t:?}");
+        assert!(near(t.strength, 4.0 / 7.0) && near(t.strength2, 1.0), "{t:?}");
+        // Galloping(start 2, end 8, firstFoot 3, secondFoot 6, freq 20): zones
+        // 0x104, second foot LOW and first above it: 6 | 3<<3 = 0x1E.
+        let t = decode_trigger_effect(&[0x23, 0x04, 0x01, 0x1E, 20, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(TriggerMode::from_pin(t.mode), TriggerMode::Galloping);
+        assert!(near(t.start, 2.0 / 9.0) && near(t.end, 8.0 / 9.0), "{t:?}");
+        assert!(near(t.strength, 3.0 / 7.0) && near(t.strength2, 6.0 / 7.0), "{t:?}");
+        assert!(near(t.freq, 20.0 / 255.0), "{t:?}");
+        // Machine(start 1, end 9, A 2, B 5, freq 30, period 12): zones 0x202,
+        // amplitudes 2 | 5<<3 = 0x2A.
+        let t = decode_trigger_effect(&[0x27, 0x02, 0x02, 0x2A, 30, 12, 0, 0, 0, 0, 0]);
+        assert_eq!(TriggerMode::from_pin(t.mode), TriggerMode::Machine);
+        assert!(near(t.start, 1.0 / 9.0) && near(t.end, 1.0), "{t:?}");
+        assert!(near(t.strength, 2.0 / 7.0) && near(t.strength2, 5.0 / 7.0), "{t:?}");
+        assert!(near(t.freq, 30.0 / 255.0) && near(t.period, 12.0 / 255.0), "{t:?}");
     }
 
     #[test]

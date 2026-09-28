@@ -35,6 +35,17 @@ impl Axis {
             Axis::Yaw => 2,
         }
     }
+
+    /// Can a circled stick turn the camera for this sweep? The 360° only — JSM's
+    /// own flick-stick calibration, taken alongside the gyro rather than
+    /// instead of it: the stick does the coarse turning without spinning the
+    /// whole pad round, and the gyro lines up the finish. Every degree the stick
+    /// sweeps turns the game one degree at the current calibration, exactly as a
+    /// degree of pad rotation does, so the two simply add. There is no stick
+    /// equivalent of the 180° pitch sweep.
+    pub fn takes_flick(self) -> bool {
+        self == Axis::Yaw
+    }
 }
 
 /// A sweep in progress: which turn, and which output it is solving for.
@@ -60,6 +71,87 @@ impl Sweep {
         };
         let stick = params.get("cal_output").and_then(|v| v.as_str()) == Some("stick");
         Some(Sweep { axis, stick })
+    }
+}
+
+/// How far out a stick must be to start being followed. Short of the edge the
+/// angle is mostly noise, and a thumb dropping back through the middle would
+/// swing it half a turn in one tick.
+pub const FLICK_EDGE: f32 = 0.7;
+
+/// Once followed, the stick keeps being read down to here — a thumb circling
+/// the rim drifts inwards on the way round, and letting go of the count at the
+/// first wobble would lose part of the turn.
+const FLICK_RELEASE: f32 = 0.35;
+
+/// How long the stick must stay below `FLICK_RELEASE` to let go of it. A
+/// Bluetooth gap reads as a stick at rest for a moment; that must not restart
+/// the count from wherever the stick comes back.
+const FLICK_RELEASE_HOLD_S: f32 = 0.06;
+
+/// The swept angle is paid out over this long rather than in the tick it was
+/// read. A stick polls slower than the engine ticks, so the raw per-tick change
+/// comes as 0, 0, spike, 0… — and the mouse is handed only the latest tick's
+/// displacement, so most spikes would simply never reach the game. Spread out,
+/// it is a steady stream like the gyro's. The same window RWS Aim's flick uses.
+const FLICK_SMOOTH_S: f32 = 0.025;
+
+/// Follows a stick circling its edge, turning its angle into a rate.
+#[derive(Default)]
+pub struct Flick {
+    /// The stick being followed (0 left, 1 right) and its last angle in degrees,
+    /// clockwise from up. `None` while neither stick is being followed.
+    prev: Option<(usize, f32)>,
+    /// Swept degrees not yet paid out.
+    pending: f32,
+    /// How long the followed stick has been below the release floor.
+    below_s: f32,
+}
+
+impl Flick {
+    /// The clockwise rate to turn the camera at this tick, in degrees per second,
+    /// from whichever stick is circling its edge. Pushing out only picks the
+    /// starting angle; it is the sweep round that turns the camera, so unlike
+    /// JSM's flick there is no jump to the pushed direction to spoil the count.
+    /// Every degree swept is paid out exactly once, so the total is conserved.
+    pub fn rate(&mut self, sticks: [Vec2; 2], dt: f32) -> f32 {
+        match self.prev {
+            Some((side, prev)) => {
+                let v = sticks[side];
+                if v.length() >= FLICK_RELEASE {
+                    self.below_s = 0.0;
+                    let angle = v.x.atan2(v.y).to_degrees();
+                    // The short way round, so crossing ±180 isn't a whole turn back.
+                    self.pending += (angle - prev + 540.0).rem_euclid(360.0) - 180.0;
+                    self.prev = Some((side, angle));
+                } else {
+                    // Hold the last angle through a dropout; let go only once the
+                    // stick has plainly been released.
+                    self.below_s += dt;
+                    if self.below_s >= FLICK_RELEASE_HOLD_S {
+                        self.prev = None;
+                    }
+                }
+            }
+            None => {
+                let side = if sticks[1].length() >= sticks[0].length() { 1 } else { 0 };
+                let v = sticks[side];
+                if v.length() >= FLICK_EDGE {
+                    self.prev = Some((side, v.x.atan2(v.y).to_degrees()));
+                    self.below_s = 0.0;
+                }
+            }
+        }
+        if dt <= 0.0 || self.pending == 0.0 {
+            return 0.0;
+        }
+        let emit = if FLICK_SMOOTH_S <= dt {
+            self.pending
+        } else {
+            self.pending * (dt / FLICK_SMOOTH_S)
+        };
+        self.pending -= emit;
+        emit / dt
     }
 }
 
@@ -153,6 +245,47 @@ mod tests {
         p.insert("cal_measure".to_string(), serde_json::json!(measure));
         p.insert("cal_output".to_string(), serde_json::json!(output));
         p
+    }
+
+    #[test]
+    fn a_circled_stick_turns_the_360_only() {
+        assert!(Axis::Yaw.takes_flick());
+        assert!(!Axis::Pitch.takes_flick(), "no stick form of the 180");
+    }
+
+    #[test]
+    fn circling_the_stick_counts_the_degrees_swept_clockwise() {
+        let mut f = Flick::default();
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            [Vec2::ZERO, Vec2::new(r.sin(), r.cos())]
+        };
+        // Sum what is paid out over `ticks` ticks of 1 ms with the stick at `deg`.
+        let turn = |f: &mut Flick, sticks: [Vec2; 2], ticks: usize| -> f32 {
+            (0..ticks).map(|_| f.rate(sticks, 0.001) * 0.001).sum()
+        };
+        // Pushing out picks the start and turns nothing.
+        assert!(turn(&mut f, at(90.0), 100).abs() < 1e-6);
+        // A quarter turn further clockwise, read in ONE tick the way a slow-polling
+        // stick delivers it, is paid out in full — just not all at once.
+        let first = f.rate(at(180.0), 0.001) * 0.001;
+        assert!(first > 0.0 && first < 90.0, "spread out, not one spike: {first}");
+        let rest = turn(&mut f, at(180.0), 500);
+        assert!((first + rest - 90.0).abs() < 1e-2, "{}", first + rest);
+        // Across ±180 is the short way round, not most of a turn back.
+        let d = turn(&mut f, at(-170.0), 500);
+        assert!((d - 10.0).abs() < 1e-2, "{d}");
+        // Anticlockwise counts back.
+        let d = turn(&mut f, at(170.0), 500);
+        assert!((d + 20.0).abs() < 1e-2, "{d}");
+        // A dropout shorter than the hold keeps the count going from where it was.
+        turn(&mut f, [Vec2::ZERO; 2], 20);
+        let d = turn(&mut f, at(-160.0), 500);
+        assert!((d - 30.0).abs() < 1e-2, "a gap is not a release: {d}");
+        // Letting go for real forgets the angle: coming back elsewhere is a new
+        // start, not a jump.
+        turn(&mut f, [Vec2::ZERO; 2], 200);
+        assert!(turn(&mut f, at(0.0), 500).abs() < 1e-6);
     }
 
     #[test]

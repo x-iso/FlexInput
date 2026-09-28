@@ -163,6 +163,11 @@ impl FlexInputApp {
                             // read. The axis glyphs keep each to two icons.
                             hints.push((vec!["btn_west"], "List"));
                             hints.push((vec!["btn_north"], "Keyboard"));
+                            // Only on a value that has words to step through.
+                            if self.nav_jsm_value_has_options() {
+                                hints.push((vec!["btn_back"], "Next option"));
+                                hints.push((vec!["btn_south", "btn_back"], "Hold+tap: previous"));
+                            }
                             hints.push((vec!["btn_south", "btn_west"], "Hold+tap: delete"));
                             hints.push((vec!["btn_south", "dpad"], "Hold: slot / line"));
                             hints.push((

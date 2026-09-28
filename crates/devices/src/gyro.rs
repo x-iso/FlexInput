@@ -247,18 +247,23 @@ struct OutputState {
     lightbar_g: u8,
     lightbar_b: u8,
     // DualSense adaptive trigger — right
-    // mode: 0=Off, 1=Feedback, 2=Weapon, 3=Vibration
-    trigger_r_mode:     u8,
-    trigger_r_start:    u8, // zone 0–9 (stored as raw zone; caller passes 0–9 already scaled)
-    trigger_r_end:      u8, // zone 0–9 (Weapon mode only)
-    trigger_r_strength: u8, // force 0–7
-    trigger_r_freq:     u8, // 0–255 (Vibration mode only)
+    // mode: index into `TriggerMode::ALL` — 0 Off, 1 Bow, 2 Feedback,
+    // 3 Galloping, 4 Weapon, 5 Machine, 6 Vibration
+    trigger_r_mode:      u8,
+    trigger_r_start:     u8, // zone 0–9 (stored as raw zone; caller passes 0–9 already scaled)
+    trigger_r_end:       u8, // zone 0–9 (Bow, Galloping, Weapon, Machine)
+    trigger_r_strength:  u8, // force 0–7
+    trigger_r_freq:      u8, // 0–255 (Galloping, Machine, Vibration)
+    trigger_r_strength2: u8, // second force 0–7 (Bow snap, Galloping 2nd foot, Machine B)
+    trigger_r_period:    u8, // 0–255 (Machine only)
     // DualSense adaptive trigger — left
-    trigger_l_mode:     u8,
-    trigger_l_start:    u8,
-    trigger_l_end:      u8,
-    trigger_l_strength: u8,
-    trigger_l_freq:     u8,
+    trigger_l_mode:      u8,
+    trigger_l_start:     u8,
+    trigger_l_end:       u8,
+    trigger_l_strength:  u8,
+    trigger_l_freq:      u8,
+    trigger_l_strength2: u8,
+    trigger_l_period:    u8,
     // DualSense LEDs
     // player_led: 0=off, 1=P1(0x04), 2=P2(0x0A), 3=P3(0x15), 4=P4(0x1B)
     player_led: u8,
@@ -574,20 +579,24 @@ impl GyroManager {
             "lightbar_b"    => { entry.out.lightbar_b = byte; true }
             // Adaptive trigger pins — caller passes Float 0–1 already scaled to
             // the appropriate range before calling set_output_byte:
-            //   mode:     0–3  (0=Off,1=Feedback,2=Weapon,3=Vibration)
+            //   mode:      0–6  (index into `TriggerMode::ALL`)
             //   start/end: 0–9 (zone index along trigger travel)
-            //   strength:  0–7 (force level)
-            //   freq:      0–255 (vibration frequency, Vibration mode only)
-            "trigger_r_mode"     => { entry.out.trigger_r_mode     = byte; true }
-            "trigger_r_start"    => { entry.out.trigger_r_start    = byte; true }
-            "trigger_r_end"      => { entry.out.trigger_r_end      = byte; true }
-            "trigger_r_strength" => { entry.out.trigger_r_strength = byte; true }
-            "trigger_r_freq"     => { entry.out.trigger_r_freq     = byte; true }
-            "trigger_l_mode"     => { entry.out.trigger_l_mode     = byte; true }
-            "trigger_l_start"    => { entry.out.trigger_l_start    = byte; true }
-            "trigger_l_end"      => { entry.out.trigger_l_end      = byte; true }
-            "trigger_l_strength" => { entry.out.trigger_l_strength = byte; true }
-            "trigger_l_freq"     => { entry.out.trigger_l_freq     = byte; true }
+            //   strength, strength2: 0–7 (force levels)
+            //   freq, period: 0–255 (raw bytes)
+            "trigger_r_mode"      => { entry.out.trigger_r_mode      = byte; true }
+            "trigger_r_start"     => { entry.out.trigger_r_start     = byte; true }
+            "trigger_r_end"       => { entry.out.trigger_r_end       = byte; true }
+            "trigger_r_strength"  => { entry.out.trigger_r_strength  = byte; true }
+            "trigger_r_freq"      => { entry.out.trigger_r_freq      = byte; true }
+            "trigger_r_strength2" => { entry.out.trigger_r_strength2 = byte; true }
+            "trigger_r_period"    => { entry.out.trigger_r_period    = byte; true }
+            "trigger_l_mode"      => { entry.out.trigger_l_mode      = byte; true }
+            "trigger_l_start"     => { entry.out.trigger_l_start     = byte; true }
+            "trigger_l_end"       => { entry.out.trigger_l_end       = byte; true }
+            "trigger_l_strength"  => { entry.out.trigger_l_strength  = byte; true }
+            "trigger_l_freq"      => { entry.out.trigger_l_freq      = byte; true }
+            "trigger_l_strength2" => { entry.out.trigger_l_strength2 = byte; true }
+            "trigger_l_period"    => { entry.out.trigger_l_period    = byte; true }
             // DualSense LEDs — caller passes scaled byte
             "player_led" => { entry.out.player_led = byte; true }
             "mic_led"    => { entry.out.mic_led    = byte; true }
@@ -1854,64 +1863,111 @@ fn am_rate_rad_per_sec(mod_rate01: f32) -> f32 {
     hz * std::f32::consts::TAU
 }
 
+/// One trigger's effect parameters, as the output pins deliver them (already
+/// scaled to device units by the backend).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct TriggerParams {
+    /// Index into `TriggerMode::ALL`.
+    mode: u8,
+    /// Zones 0–9 along the trigger's travel (0 = rest, 9 = fully pressed).
+    start: u8,
+    end: u8,
+    /// 3-bit forces, 0–7.
+    strength: u8,
+    strength2: u8,
+    /// Raw bytes.
+    freq: u8,
+    period: u8,
+}
+
 /// Encode one DualSense adaptive trigger effect into 11 bytes:
-/// byte[0] = mode byte, bytes[1..10] = effect params.
+/// byte[0] = effect type, bytes[1..10] = effect params.
 ///
-/// mode: 0=Off(0x05), 1=Feedback(0x21), 2=Weapon(0x25), 3=Vibration(0x26)
-/// start/end: zone 0–9 along trigger travel (0=rest, 9=fully pressed)
-/// strength: force 0–7
-/// freq: oscillation 0–255 (Vibration mode only)
-///
-/// Bit-packing derived from MysteriousJ/Joystick-Input-Examples and confirmed
-/// against Linux hid-playstation.c trigger effect structs.
-fn encode_trigger_effect(mode: u8, start: u8, end: u8, strength: u8, freq: u8) -> [u8; 11] {
+/// Byte layouts follow John "Nielk1" Klein's `TriggerEffectGenerator` (MIT) —
+/// the reference JoyShockMapper, DSX and others encode with — for the seven
+/// "extended" effect types 0x05/0x21/0x22/0x23/0x25/0x26/0x27. The forces here
+/// are already the 3-bit values the pad takes (the generator's `strength - 1`
+/// happens upstream, where "0 = no effect" is meaningful), so nothing is
+/// offset again. Parameters out of the pad's range are clamped rather than the
+/// effect refused: a pin is a continuous value, and a slightly-off one should
+/// still feel like the effect asked for.
+fn encode_trigger_effect(t: TriggerParams) -> [u8; 11] {
+    use flexinput_core::automap::TriggerMode;
     let mut p = [0u8; 11];
+    // Every active zone from `start` on, with the same 3-bit force in each.
+    let zones_from = |start: u8, force: u8| -> (u16, u32) {
+        let s = start.min(9) as u16;
+        let f = force.min(7) as u32;
+        let active: u16 = ((1u16 << (10 - s)) - 1) << s;
+        let mut forces = 0u32;
+        for z in s..10 {
+            forces |= f << (z * 3);
+        }
+        (active, forces)
+    };
+    // A start and an end zone as a two-bit mask; the end is kept past the start.
+    let span = |start: u8, lo: u8, hi: u8, end: u8, end_max: u8| -> u16 {
+        let s = start.clamp(lo, hi);
+        let e = end.max(s + 1).min(end_max);
+        (1u16 << s) | (1u16 << e)
+    };
+    let mode = TriggerMode::ALL.get(t.mode as usize).copied().unwrap_or(TriggerMode::Off);
     match mode {
-        1 => {
-            // Feedback (0x21): constant resistance from start zone onwards.
+        TriggerMode::Feedback => {
+            // Constant resistance from `start` on.
             p[0] = 0x21;
-            let s = (start.min(9)) as u16;
-            let f = (strength.min(7)) as u32;
-            // active_zones: bits s..9 set (10-bit field, LSB-first across 2 bytes)
-            let active: u16 = if s < 10 { ((1u16 << (10 - s)) - 1) << s } else { 0 };
-            // force_zones: 3-bit force value repeated for each active zone (10 zones × 3 bits)
-            let mut force = 0u32;
-            for z in s..10 { force |= f << (z * 3); }
-            p[1] = (active & 0xFF) as u8;
-            p[2] = ((active >> 8) & 0xFF) as u8;
-            p[3] = (force & 0xFF) as u8;
-            p[4] = ((force >> 8) & 0xFF) as u8;
-            p[5] = ((force >> 16) & 0xFF) as u8;
-            p[6] = ((force >> 24) & 0xFF) as u8;
+            let (active, forces) = zones_from(t.start, t.strength);
+            p[1..3].copy_from_slice(&active.to_le_bytes());
+            p[3..7].copy_from_slice(&forces.to_le_bytes());
         }
-        2 => {
-            // Weapon (0x25): hard resistance between start and end, then releases.
+        TriggerMode::Bow => {
+            // Resistance from `start`, a snap at `end`: start 0–8, end past it,
+            // up to 8; strength and snap force packed as two 3-bit fields.
+            p[0] = 0x22;
+            let zones = span(t.start, 0, 7, t.end, 8);
+            let pair = (t.strength.min(7) as u16) | ((t.strength2.min(7) as u16) << 3);
+            p[1..3].copy_from_slice(&zones.to_le_bytes());
+            p[3..5].copy_from_slice(&pair.to_le_bytes());
+        }
+        TriggerMode::Galloping => {
+            // Two feet between `start` and `end` at `freq`. The generator packs
+            // the SECOND foot low and the first above it; the first must come
+            // before the second (first 0–6, second 1–7).
+            p[0] = 0x23;
+            let zones = span(t.start, 0, 8, t.end, 9);
+            let second = t.strength2.clamp(1, 7);
+            let first = t.strength.min(second - 1);
+            p[1..3].copy_from_slice(&zones.to_le_bytes());
+            p[3] = second | (first << 3);
+            p[4] = t.freq;
+        }
+        TriggerMode::Weapon => {
+            // A click between `start` (2–7) and `end` (past it, up to 8).
             p[0] = 0x25;
-            let s = (start.clamp(2, 7)) as u16;
-            let e = (end.max(start.saturating_add(1)).clamp(3, 8)) as u16;
-            let start_end: u16 = (1u16 << s) | (1u16 << e);
-            p[1] = (start_end & 0xFF) as u8;
-            p[2] = ((start_end >> 8) & 0xFF) as u8;
-            p[3] = strength.min(7);
+            let zones = span(t.start, 2, 7, t.end, 8);
+            p[1..3].copy_from_slice(&zones.to_le_bytes());
+            p[3] = t.strength.min(7);
         }
-        3 => {
-            // Vibration (0x26): oscillating resistance in a zone range.
+        TriggerMode::Machine => {
+            // Vibration between `start` and `end`, alternating amplitudes A and
+            // B at `freq`, every `period`.
+            p[0] = 0x27;
+            let zones = span(t.start, 0, 8, t.end, 9);
+            p[1..3].copy_from_slice(&zones.to_le_bytes());
+            p[3] = t.strength.min(7) | (t.strength2.min(7) << 3);
+            p[4] = t.freq;
+            p[5] = t.period;
+        }
+        TriggerMode::Vibration => {
+            // Vibration from `start` on, at `freq`.
             p[0] = 0x26;
-            let s = (start.min(9)) as u16;
-            let f = (strength.min(7)) as u32;
-            let active: u16 = if s < 10 { ((1u16 << (10 - s)) - 1) << s } else { 0 };
-            let mut force = 0u32;
-            for z in s..10 { force |= f << (z * 3); }
-            p[1] = (active & 0xFF) as u8;
-            p[2] = ((active >> 8) & 0xFF) as u8;
-            p[3] = (force & 0xFF) as u8;
-            p[4] = ((force >> 8) & 0xFF) as u8;
-            p[5] = ((force >> 16) & 0xFF) as u8;
-            p[6] = ((force >> 24) & 0xFF) as u8;
-            p[9] = freq;
+            let (active, forces) = zones_from(t.start, t.strength);
+            p[1..3].copy_from_slice(&active.to_le_bytes());
+            p[3..7].copy_from_slice(&forces.to_le_bytes());
+            p[9] = t.freq;
         }
-        _ => {
-            // Off (0x05) — deactivate any effect.
+        TriggerMode::Off => {
+            // Deactivate any effect.
             p[0] = 0x05;
         }
     }
@@ -2010,14 +2066,24 @@ fn fill_dualsense_common(dst: &mut [u8], out: &OutputState) {
     dst[8] = out.mic_led.min(2);
     // +10..+36 reserved2[27] — trigger effect blobs are placed here.
     // Adaptive trigger effect encodings live at dst[10..21] (right) and dst[21..32] (left).
-    let rt = encode_trigger_effect(
-        out.trigger_r_mode, out.trigger_r_start,
-        out.trigger_r_end,  out.trigger_r_strength, out.trigger_r_freq,
-    );
-    let lt = encode_trigger_effect(
-        out.trigger_l_mode, out.trigger_l_start,
-        out.trigger_l_end,  out.trigger_l_strength, out.trigger_l_freq,
-    );
+    let rt = encode_trigger_effect(TriggerParams {
+        mode: out.trigger_r_mode,
+        start: out.trigger_r_start,
+        end: out.trigger_r_end,
+        strength: out.trigger_r_strength,
+        strength2: out.trigger_r_strength2,
+        freq: out.trigger_r_freq,
+        period: out.trigger_r_period,
+    });
+    let lt = encode_trigger_effect(TriggerParams {
+        mode: out.trigger_l_mode,
+        start: out.trigger_l_start,
+        end: out.trigger_l_end,
+        strength: out.trigger_l_strength,
+        strength2: out.trigger_l_strength2,
+        freq: out.trigger_l_freq,
+        period: out.trigger_l_period,
+    });
     dst[10..21].copy_from_slice(&rt);
     dst[21..32].copy_from_slice(&lt);
     // +38 valid_flag2:
@@ -2540,5 +2606,72 @@ mod switch_pro_spi_tests {
         let mut r = reply(0x6_03D, 9, 0x22);
         r.truncate(24);
         assert!(switch_pro_spi_reply(&r, 0x6_03D, 9).is_none());
+    }
+}
+
+#[cfg(test)]
+mod trigger_encode_tests {
+    use super::{encode_trigger_effect, TriggerParams};
+
+    /// Mode indices into `TriggerMode::ALL`.
+    const OFF: u8 = 0;
+    const BOW: u8 = 1;
+    const FEEDBACK: u8 = 2;
+    const GALLOPING: u8 = 3;
+    const WEAPON: u8 = 4;
+    const MACHINE: u8 = 5;
+    const VIBRATION: u8 = 6;
+
+    fn enc(mode: u8, f: impl FnOnce(&mut TriggerParams)) -> [u8; 11] {
+        let mut t = TriggerParams { mode, ..TriggerParams::default() };
+        f(&mut t);
+        encode_trigger_effect(t)
+    }
+
+    /// Each effect's bytes, against blocks laid out by hand from Nielk1's
+    /// `TriggerEffectGenerator` — the reference JoyShockMapper encodes with.
+    /// The forces passed here are already the pad's 3-bit values (the
+    /// generator's `strength - 1`).
+    #[test]
+    fn every_effect_matches_the_reference_layout() {
+        // Bow(start 1, end 6, strength 5, snapForce 8).
+        let b = enc(BOW, |t| { t.start = 1; t.end = 6; t.strength = 4; t.strength2 = 7; });
+        assert_eq!(b, [0x22, 0x42, 0x00, 0x3C, 0, 0, 0, 0, 0, 0, 0]);
+        // Galloping(start 2, end 8, firstFoot 3, secondFoot 6, freq 20): the
+        // second foot sits in the low bits.
+        let g = enc(GALLOPING, |t| {
+            t.start = 2; t.end = 8; t.strength = 3; t.strength2 = 6; t.freq = 20;
+        });
+        assert_eq!(g, [0x23, 0x04, 0x01, 0x1E, 20, 0, 0, 0, 0, 0, 0]);
+        // Machine(start 1, end 9, A 2, B 5, freq 30, period 12).
+        let m = enc(MACHINE, |t| {
+            t.start = 1; t.end = 9; t.strength = 2; t.strength2 = 5; t.freq = 30; t.period = 12;
+        });
+        assert_eq!(m, [0x27, 0x02, 0x02, 0x2A, 30, 12, 0, 0, 0, 0, 0]);
+        // Weapon(start 4, end 7, strength 6).
+        let w = enc(WEAPON, |t| { t.start = 4; t.end = 7; t.strength = 5; });
+        assert_eq!(w, [0x25, 0x90, 0x00, 5, 0, 0, 0, 0, 0, 0, 0]);
+        // Feedback(position 8, strength 8): zones 8 and 9, force 7 in each.
+        let f = enc(FEEDBACK, |t| { t.start = 8; t.strength = 7; });
+        assert_eq!(f, [0x21, 0x00, 0x03, 0x00, 0x00, 0x00, 0x3F, 0, 0, 0, 0]);
+        // Vibration(position 9, amplitude 3, frequency 40).
+        let v = enc(VIBRATION, |t| { t.start = 9; t.strength = 2; t.freq = 40; });
+        assert_eq!(v, [0x26, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10, 0, 0, 40, 0]);
+        assert_eq!(enc(OFF, |_| {}), [0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// A pin is a continuous value, so one slightly out of the pad's range is
+    /// clamped into it rather than the effect refused: an end zone that isn't
+    /// past the start is moved past it, and galloping's first foot is kept
+    /// before its second.
+    #[test]
+    fn out_of_range_parameters_are_brought_into_range() {
+        let b = enc(BOW, |t| { t.start = 5; t.end = 2; t.strength = 3; t.strength2 = 3; });
+        assert_eq!(u16::from_le_bytes([b[1], b[2]]), (1 << 5) | (1 << 6), "end moved past start");
+        let g = enc(GALLOPING, |t| { t.start = 0; t.end = 9; t.strength = 7; t.strength2 = 4; t.freq = 1; });
+        assert_eq!(g[3] & 0x7, 4, "second foot");
+        assert_eq!(g[3] >> 3, 3, "first foot kept below the second");
+        let w = enc(WEAPON, |t| { t.start = 0; t.end = 0; t.strength = 1; });
+        assert_eq!(u16::from_le_bytes([w[1], w[2]]), (1 << 2) | (1 << 3), "weapon starts at 2 at the earliest");
     }
 }

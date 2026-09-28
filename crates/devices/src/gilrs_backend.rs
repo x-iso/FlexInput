@@ -1065,13 +1065,21 @@ impl DeviceBackend for GilrsBackend {
             _ => return,
         };
         let byte = match pin_id {
-            // Trigger mode: 0=Off, 1=Feedback, 2=Weapon, 3=Vibration → scale to 0–3
-            "trigger_r_mode" | "trigger_l_mode" => (f * 3.0).round() as u8,
+            // Trigger mode: which of the seven effects, as its index in
+            // `TriggerMode::ALL` (the pin holds it in sixths).
+            "trigger_r_mode" | "trigger_l_mode" => {
+                use flexinput_core::automap::TriggerMode;
+                let m = TriggerMode::from_pin(f);
+                TriggerMode::ALL.iter().position(|x| *x == m).unwrap_or(0) as u8
+            }
             // Trigger zones: 0–9 along trigger travel → scale to 0–9
             "trigger_r_start" | "trigger_r_end" |
             "trigger_l_start" | "trigger_l_end" => (f * 9.0).round() as u8,
-            // Trigger force: 0–7 → scale to 0–7
-            "trigger_r_strength" | "trigger_l_strength" => (f * 7.0).round() as u8,
+            // Trigger forces: 0–7 → scale to 0–7
+            "trigger_r_strength" | "trigger_l_strength" |
+            "trigger_r_strength2" | "trigger_l_strength2" => (f * 7.0).round() as u8,
+            // Machine's period: a raw byte, like the frequency.
+            "trigger_r_period" | "trigger_l_period" => (f * 255.0).round() as u8,
             // Player LED: 0=off, 1=P1, 2=P2, 3=P3, 4=P4 → scale to 0–4
             "player_led" => (f * 4.0).round() as u8,
             // Mic LED: 0=off, 1=on, 2=pulsing → scale to 0–2

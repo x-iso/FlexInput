@@ -54,11 +54,15 @@ pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("trigger_r_end",      &["trigger_r_end"]),
     ("trigger_r_strength", &["trigger_r_strength"]),
     ("trigger_r_freq",     &["trigger_r_freq"]),
+    ("trigger_r_strength2", &["trigger_r_strength2"]),
+    ("trigger_r_period",   &["trigger_r_period"]),
     ("trigger_l_mode",     &["trigger_l_mode"]),
     ("trigger_l_start",    &["trigger_l_start"]),
     ("trigger_l_end",      &["trigger_l_end"]),
     ("trigger_l_strength", &["trigger_l_strength"]),
     ("trigger_l_freq",     &["trigger_l_freq"]),
+    ("trigger_l_strength2", &["trigger_l_strength2"]),
+    ("trigger_l_period",   &["trigger_l_period"]),
 ];
 
 /// Resolve feedback pin-id mapping for the AutoMap reverse-flow channel.
@@ -107,6 +111,49 @@ pub fn feedback_group(pin: &str) -> Option<FeedbackGroup> {
         p if p.starts_with("hd_") || p.starts_with("hd2_") || p.starts_with("ds_") => Rumble,
         _ => return None,
     })
+}
+
+/// A DualSense adaptive-trigger effect, as carried on the `trigger_*_mode` pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerMode {
+    Off,
+    /// Resistance that builds from `start` to a snap at `end`, then lets go.
+    Bow,
+    /// Constant resistance from `start` on.
+    Feedback,
+    /// Two pulses — `strength` then `strength2` — repeated at `freq`.
+    Galloping,
+    /// A click at `start`, releasing at `end`.
+    Weapon,
+    /// Vibration alternating between `strength` and `strength2` at `freq`,
+    /// every `period`.
+    Machine,
+    /// Vibration from `start` on, at `freq`.
+    Vibration,
+}
+
+impl TriggerMode {
+    /// In pin order: the value of mode `m` on the pin is `index / 6`.
+    pub const ALL: [TriggerMode; 7] = [
+        TriggerMode::Off,
+        TriggerMode::Bow,
+        TriggerMode::Feedback,
+        TriggerMode::Galloping,
+        TriggerMode::Weapon,
+        TriggerMode::Machine,
+        TriggerMode::Vibration,
+    ];
+
+    /// The mode a `trigger_*_mode` pin value names — the nearest sixth.
+    pub fn from_pin(v: f32) -> TriggerMode {
+        let i = (v.clamp(0.0, 1.0) * 6.0).round() as usize;
+        Self::ALL[i.min(6)]
+    }
+
+    /// The pin value that names this mode.
+    pub fn pin(self) -> f32 {
+        Self::ALL.iter().position(|m| *m == self).unwrap_or(0) as f32 / 6.0
+    }
 }
 
 /// A single auto-mappable signal in the canonical gamepad bus.
@@ -201,16 +248,28 @@ pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "player_led",    display_name: "Player LED",              signal_type: SignalType::Float },
     AutoMapPin { id: "mic_led",       display_name: "Mic LED",                 signal_type: SignalType::Float },
     // ── DualSense adaptive triggers ───────────────────────────────────────────
+    // All 0..1. `mode` is one of seven effects at sixths — 0 off, 1/6 bow,
+    // 2/6 feedback, 3/6 galloping, 4/6 weapon, 5/6 machine, 1 vibration — see
+    // `TriggerMode`. The four original effects kept their old values
+    // (0, 1/3, 2/3, 1), so anything written for them still means the same.
+    // start/end are zones 0-9 (/9); strength and strength2 are the effect's
+    // 3-bit forces 0-7 (/7); freq and period are raw bytes (/255). strength2 is
+    // bow's snap force, galloping's second foot, machine's second amplitude;
+    // period is machine's alone.
     AutoMapPin { id: "trigger_r_mode",     display_name: "R.Trigger Mode",     signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_r_start",    display_name: "R.Trigger Start",    signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_r_end",      display_name: "R.Trigger End",      signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_r_strength", display_name: "R.Trigger Strength", signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_r_freq",     display_name: "R.Trigger Freq",     signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_strength2", display_name: "R.Trigger Strength 2", signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_period",   display_name: "R.Trigger Period",   signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_mode",     display_name: "L.Trigger Mode",     signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_start",    display_name: "L.Trigger Start",    signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_end",      display_name: "L.Trigger End",      signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_strength", display_name: "L.Trigger Strength", signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_freq",     display_name: "L.Trigger Freq",     signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_strength2", display_name: "L.Trigger Strength 2", signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_period",   display_name: "L.Trigger Period",   signal_type: SignalType::Float },
 ];
 
 /// Basic feedback OUTPUT taps the game is requesting on the virtual destination
@@ -437,6 +496,22 @@ mod tests {
         assert_eq!(feedback_group("rumble_strong"), feedback_group("hd2_r_freq"));
         assert_ne!(feedback_group("trigger_l_mode"), feedback_group("trigger_r_mode"));
         assert_eq!(feedback_group("left_stick"), None);
+    }
+
+    /// The four effects the trigger mode pin carried before it had seven keep
+    /// their values — 0, 1/3, 2/3, 1, and the 0.33 / 0.66 a producer might
+    /// have written for them — so an existing patch means the same thing.
+    #[test]
+    fn the_original_trigger_modes_keep_their_pin_values() {
+        use TriggerMode::*;
+        for (v, m) in [(0.0, Off), (1.0 / 3.0, Feedback), (0.33, Feedback), (2.0 / 3.0, Weapon),
+            (0.66, Weapon), (1.0, Vibration)]
+        {
+            assert_eq!(TriggerMode::from_pin(v), m, "{v}");
+        }
+        for m in TriggerMode::ALL {
+            assert_eq!(TriggerMode::from_pin(m.pin()), m, "{m:?} round-trips");
+        }
     }
 
     // Every gamepad source node exposes both the analog trigger pin and the digital

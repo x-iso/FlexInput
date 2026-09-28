@@ -436,21 +436,29 @@ fn dualsense_inputs() -> Vec<DevicePin> {
         // mic_led: 0=off, 0.5=on(orange), 1.0=pulsing
         fl("mic_led",    "Mic LED (0=off 0.5=on 1=pulse)"),
         // Adaptive triggers. All accept Float 0–1, scaled per pin.
-        // Mode: 0=off, 0.33=Feedback(constant resist), 0.66=Weapon(click), 1=Vibration
-        fl("trigger_r_mode",     "R.Trigger Mode (0=off 0.33=resist 0.66=click 1=vib)"),
+        // Mode, in sixths (`TriggerMode`): 0=off, 1/6=bow, 2/6=resist,
+        // 3/6=galloping, 4/6=click, 5/6=machine, 1=vibration. The original four
+        // (0, 0.33, 0.66, 1) are unchanged.
+        fl("trigger_r_mode",      "R.Trigger Mode (0 off · ⅙ bow · ⅓ resist · ½ gallop · ⅔ click · ⅚ machine · 1 vib)"),
         // Start/End: trigger travel position, 0=rest 1=fully pressed
-        fl("trigger_r_start",    "R.Trigger Start (0=rest 1=full)"),
-        // End only used in Weapon(click) mode
-        fl("trigger_r_end",      "R.Trigger End (Weapon mode only)"),
+        fl("trigger_r_start",     "R.Trigger Start (0=rest 1=full)"),
+        // End: bow, galloping, click and machine
+        fl("trigger_r_end",       "R.Trigger End (bow/gallop/click/machine)"),
         // Strength: 0=none 1=max
-        fl("trigger_r_strength", "R.Trigger Strength (0–1)"),
-        // Freq: vibration speed, only used in Vibration mode
-        fl("trigger_r_freq",     "R.Trigger Freq (Vibration mode only)"),
-        fl("trigger_l_mode",     "L.Trigger Mode (0=off 0.33=resist 0.66=click 1=vib)"),
-        fl("trigger_l_start",    "L.Trigger Start (0=rest 1=full)"),
-        fl("trigger_l_end",      "L.Trigger End (Weapon mode only)"),
-        fl("trigger_l_strength", "L.Trigger Strength (0–1)"),
-        fl("trigger_l_freq",     "L.Trigger Freq (Vibration mode only)"),
+        fl("trigger_r_strength",  "R.Trigger Strength (0–1)"),
+        // Freq: galloping, machine and vibration
+        fl("trigger_r_freq",      "R.Trigger Freq (gallop/machine/vib)"),
+        // The second force: bow's snap, galloping's second foot, machine's B
+        fl("trigger_r_strength2", "R.Trigger Strength 2 (bow/gallop/machine)"),
+        // Machine's period
+        fl("trigger_r_period",    "R.Trigger Period (machine)"),
+        fl("trigger_l_mode",      "L.Trigger Mode (0 off · ⅙ bow · ⅓ resist · ½ gallop · ⅔ click · ⅚ machine · 1 vib)"),
+        fl("trigger_l_start",     "L.Trigger Start (0=rest 1=full)"),
+        fl("trigger_l_end",       "L.Trigger End (bow/gallop/click/machine)"),
+        fl("trigger_l_strength",  "L.Trigger Strength (0–1)"),
+        fl("trigger_l_freq",      "L.Trigger Freq (gallop/machine/vib)"),
+        fl("trigger_l_strength2", "L.Trigger Strength 2 (bow/gallop/machine)"),
+        fl("trigger_l_period",    "L.Trigger Period (machine)"),
     ]);
     pins
 }
