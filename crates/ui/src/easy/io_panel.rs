@@ -356,10 +356,10 @@ fn input_card(
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
     // Top: icon (48 px) + tight inset. Bottom: two slider rows ~22 px
     // each + small gap + insets, plus a digital-trigger toggle row, plus the
-    // touch + misc mute row on pads that get it.
+    // capacitive-touch mute row on pads that have capacitive sensors.
     let top_h = INPUT_CARD_ICON_H + 8.0;
     let trigger_row_h = 22.0;
-    let has_touch_misc = crate::canvas::viewer::has_touch_misc_suppression(&d.id);
+    let has_touch_misc = crate::canvas::viewer::has_capacitive_suppression(d);
     let touch_row_h = if has_touch_misc { 22.0 } else { 0.0 };
     let bot_h = 60.0 + trigger_row_h + touch_row_h;
     let card_h = top_h + bot_h;
@@ -597,7 +597,7 @@ fn input_card(
                             node: node_id, key: "digital_triggers".into() },
                     });
                 }
-                // Touch + misc mute sits one row below the trigger toggle,
+                // Capacitive mute sits one row below the trigger toggle,
                 // which renders (forced/disabled or not) on every pad.
                 if has_touch_misc {
                     nav_targets.push(LeftNavTarget {
@@ -767,22 +767,23 @@ fn digital_trigger_toggle(
     });
 }
 
-/// Easy-mode twin of the Advanced header's "Suppress touch + misc" toggle
+/// Easy-mode twin of the Advanced header's "Suppress capacitive touch" toggle
 /// (`touch_misc_header_toggle`): same `suppress_touch_misc` param, same
-/// device gate (`has_touch_misc_suppression`, checked by the caller).
+/// device gate (`has_capacitive_suppression`, checked by the caller).
 fn touch_misc_toggle(
     ui: &mut egui::Ui,
     params: &mut HashMap<String, Value>,
     enabled: bool,
 ) {
+    use crate::canvas::viewer::{CAPACITIVE_HOVER, CAPACITIVE_LABEL};
     let mut checked = params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(false);
     ui.add_space(2.0);
     ui.add_enabled_ui(enabled, |ui| {
-        let resp = ui.checkbox(&mut checked, egui::RichText::new("Suppress touch + misc").size(11.0));
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(CAPACITIVE_LABEL).size(11.0));
         if resp.changed() {
             params.insert("suppress_touch_misc".into(), Value::Bool(checked));
         }
-        resp.on_hover_text(crate::canvas::viewer::TOUCH_MISC_HOVER);
+        resp.on_hover_text(CAPACITIVE_HOVER);
     });
 }
 

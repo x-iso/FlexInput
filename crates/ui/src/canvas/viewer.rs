@@ -884,10 +884,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             }
 
-            // Capacitive/auxiliary input mute — SDL pads only (see
-            // `has_touch_misc_suppression`). Sits next to the digital-trigger
+            // Capacitive stick-cap / grip mute — pads that have them (see
+            // `has_capacitive_suppression`). Sits next to the digital-trigger
             // toggle because both are per-device input-conditioning opt-ins.
-            if is_device_source && has_touch_misc_suppression(dev_id_str) {
+            if is_device_source
+                && self.physical_devices.iter()
+                    .any(|d| d.id == dev_id_str && has_capacitive_suppression(d))
+            {
                 touch_misc_header_toggle(ui, snarl, node);
             }
 

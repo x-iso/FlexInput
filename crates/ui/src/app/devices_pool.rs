@@ -26,12 +26,12 @@ pub(crate) fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
 }
 
 /// Collect the `device_id` of every `device.source` node with the
-/// "Suppress touch + misc" toggle on. Recurses into sub-patches — a device
-/// node can live inside one.
+/// "Suppress capacitive touch" toggle on (`suppress_touch_misc` param).
+/// Recurses into sub-patches — a device node can live inside one.
 ///
-/// Pairs with [`mask_touch_misc_pins`]: the UI masks these pins out of
-/// `last_signals` so a Remapper / Touch Zones / Lean "Learn" can't capture a
-/// capacitive sensor instead of the button the user meant, and the card
+/// Pairs with [`mask_capacitive_pins`]: the UI masks the capacitive pins out
+/// of `last_signals` so a Remapper / Touch Zones / Lean "Learn" can't capture a
+/// stick cap or grip instead of the button the user meant, and the card
 /// previews match what the engine routes. The engine reads the SAME param in
 /// `preprocess_dev_sigs` (pass 4) for the routing half.
 pub(crate) fn collect_touch_misc_suppressed(
@@ -53,17 +53,18 @@ pub(crate) fn collect_touch_misc_suppressed(
     }
 }
 
-/// Zero every touch/misc pin belonging to a suppressed device. Zeroed rather
-/// than removed so presence probes (`contains_key`, e.g. the analog-trigger
-/// detection in `remapper_pressed_now`) still see the pad's real shape.
-pub(crate) fn mask_touch_misc_pins(
+/// Zero the capacitive pins of every suppressed device — the ones its backend
+/// names on `automap::CAPACITIVE_MASK_PIN`. Zeroed rather than removed so
+/// presence probes (`contains_key`, e.g. the analog-trigger detection in
+/// `remapper_pressed_now`) still see the pad's real shape.
+pub(crate) fn mask_capacitive_pins(
     signals: &mut HashMap<(String, String), Signal>,
     suppressed: &std::collections::HashSet<String>,
 ) {
-    if suppressed.is_empty() { return; }
+    use flexinput_core::automap::{capacitive_mask_of, capacitive_pins};
     for dev in suppressed {
-        for pin in flexinput_core::automap::TOUCH_MISC_PINS {
-            if let Some(sig) = signals.get_mut(&(dev.clone(), (*pin).to_string())) {
+        for pin in capacitive_pins(capacitive_mask_of(signals, dev)) {
+            if let Some(sig) = signals.get_mut(&(dev.clone(), pin.to_string())) {
                 *sig = sig.zeroed();
             }
         }

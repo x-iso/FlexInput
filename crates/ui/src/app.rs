@@ -1388,11 +1388,11 @@ impl eframe::App for FlexInputApp {
             self.last_signals = (*snap).clone();
         }
 
-        // "Suppress touch + misc" (device.source toggle): mute the capacitive /
-        // auxiliary pins of every device that opted in, BEFORE anything in the
-        // UI reads them. This is the half that lets a mapping session finish —
-        // a Steam Controller's trackpads and thumb-rest sensor otherwise win
-        // every Remapper / Touch Zones / Lean "Learn" capture just from the user
+        // "Suppress capacitive touch" (device.source toggle): mute the capacitive
+        // stick-cap / grip pins of every device that opted in, BEFORE anything
+        // in the UI reads them. This is the half that lets a mapping session
+        // finish — a Steam Controller's stick caps and grips otherwise win every
+        // Remapper / Touch Zones / Lean "Learn" capture just from the user
         // holding the pad. The engine mutes the same pins from the same param
         // (`preprocess_dev_sigs` pass 4), so what you can Learn and what
         // actually routes stay in agreement.
@@ -1405,7 +1405,7 @@ impl eframe::App for FlexInputApp {
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 devices_pool::collect_touch_misc_suppressed(&tab.canvas.snarl, &mut suppressed);
             }
-            devices_pool::mask_touch_misc_pins(&mut self.last_signals, &suppressed);
+            devices_pool::mask_capacitive_pins(&mut self.last_signals, &suppressed);
         }
 
         // Config overlay (M3): while it's summoned, suppress the physical input

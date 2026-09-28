@@ -7,6 +7,13 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **"Suppress touch + misc" is now "Suppress capacitive touch", and mutes only
+  the capacitive sensors.** On a Steam Controller that is touch on the stick
+  caps and the grips — the inputs you can't avoid brushing while learning a
+  mapping. Trackpads, pad clicks and Misc buttons that are real switches now
+  stay live with it on. It shows on the pads that have such sensors: Steam
+  Controller, Steam Deck and HORIPAD for Steam. Patches that had it on keep it on.
+
 - **JSM Config: `LOCAL_AXIS_OFFSET` is now the pitch of your neutral hold**, as
   in Steam Input's local space. It used to rotate the mouse output on screen,
   which fixed nothing anyone actually had. Now it says how far the pad is tipped

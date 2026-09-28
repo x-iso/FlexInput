@@ -98,10 +98,10 @@ pub(crate) struct DeviceCal {
     /// Written by the Calibration window's yellow pin. Defaults to 0.5.
     ltrig_threshold: f32,
     rtrig_threshold: f32,
-    /// "Suppress touch + misc" opt-in (device.source `suppress_touch_misc`
-    /// param). Mutes every pin in `automap::TOUCH_MISC_PINS` so a pad whose
-    /// capacitive sensors fire on their own (Steam Controller trackpads and
-    /// thumb-rest) can be mapped without them hijacking the capture. The UI
+    /// "Suppress capacitive touch" opt-in (device.source `suppress_touch_misc`
+    /// param — the key predates the rename and is kept so saved patches keep
+    /// their setting). Mutes the pad's capacitive stick-cap / grip pins (see
+    /// `automap::capacitive_misc_mask`) so they can't hijack a capture. The UI
     /// masks the SAME pins out of `last_signals`, so Learn and routing agree.
     suppress_touch_misc: bool,
 }
@@ -538,22 +538,24 @@ pub(crate) fn preprocess_dev_sigs(
         }
     }
 
-    // ── Pass 4: touch + misc mute ───────────────────────────────────────────
+    // ── Pass 4: capacitive touch mute ───────────────────────────────────────
     //
-    // "Suppress touch + misc" on a device.source: zero every pin in
-    // `TOUCH_MISC_PINS` so a pad whose capacitive sensors fire on their own
-    // (Steam Controller trackpads / thumb rest, which sit on the SDL misc pins)
-    // stops driving anything while the user builds a mapping. Zeroed rather
-    // than removed so presence probes still see the pad's real shape.
+    // "Suppress capacitive touch" on a device.source: zero the pad's capacitive
+    // stick-cap / grip pins so they stop driving anything while the user builds
+    // a mapping. Which pins those are comes from the device itself — its backend
+    // publishes the mask on `CAPACITIVE_MASK_PIN` — because the Misc slots mean
+    // different things on different pads. Zeroed rather than removed so presence
+    // probes still see the pad's real shape.
     //
-    // The UI applies the same mask to `last_signals` (see `mask_suppressed_pins`
-    // in app.rs) — that half is what stops a Remapper / Touch Zones / Lean
+    // The UI applies the same mask to `last_signals` (`mask_capacitive_pins` in
+    // devices_pool.rs) — that half is what stops a Remapper / Touch Zones / Lean
     // "Learn" from capturing the sensor instead of the button the user pressed.
-    // Both halves read this one param, so they cannot disagree.
+    // Both halves read the same param and the same mask, so they cannot disagree.
     for (dev_id, (_, _, cal)) in &params {
         if !cal.suppress_touch_misc { continue; }
-        for pin in flexinput_core::automap::TOUCH_MISC_PINS {
-            let key = (dev_id.clone(), (*pin).to_string());
+        let mask = flexinput_core::automap::capacitive_mask_of(dev_sigs, dev_id);
+        for pin in flexinput_core::automap::capacitive_pins(mask) {
+            let key = (dev_id.clone(), pin.to_string());
             if let Some(sig) = out.get(&key).copied() {
                 out.insert(key, sig.zeroed());
             }

@@ -165,42 +165,64 @@ pub struct AutoMapPin {
 
 use crate::SignalType;
 
-/// Pins gated by a `device.source`'s "Suppress touch + misc" toggle
-/// (`suppress_touch_misc` param).
-///
-/// These are the CAPACITIVE / auxiliary inputs a pad reports whether or not the
-/// user meant to press anything. On a Steam Controller both trackpads and the
-/// thumb-rest sensor land here, and they fire continuously just from holding the
-/// controller — which hijacks a Remapper / Touch Zones / Lean "Learn" capture
-/// before the user can press the button they actually wanted, and keeps firing
-/// any mapping already bound to them. The toggle is a temporary mute so a
-/// mapping session can be completed, then switched back off.
-///
-/// Two deliberate exclusions:
-/// - `btn_touchpad` — the touchpad CLICK is a real switch under the pad, a
-///   deliberate press, and stays mappable independently of the finger sensing
-///   above it. Suppressing the touch point should not cost you the click.
-/// - `btn_paddle_*` — rear paddles are mechanical switches on every pad that
-///   has them and never fire on their own.
-///
-/// The whole `btn_misc*` group goes, not a subset: SDL hands out those slots
-/// generically and a pad can put capacitive touch buttons or grip sensors on
-/// any of them, so there is no reliable way to keep "the real ones".
-///
-/// Both consumers gate on the same list so the UI and the engine agree:
-/// - UI: `app.rs` masks these out of `last_signals` (Learn capture, pin glow,
-///   card previews) for every suppressed device.
-/// - Engine: `preprocess_dev_sigs` zeroes them so nothing downstream routes.
-pub const TOUCH_MISC_PINS: &[&str] = &[
-    "touch1_x", "touch1_y", "touch1_active",
-    "touch2_x", "touch2_y", "touch2_active",
-    "btn_misc1", "btn_misc2", "btn_misc3",
-    "btn_misc4", "btn_misc5", "btn_misc6",
+/// The Misc pins, in bit order for [`capacitive_misc_mask`] (bit n = `MISC_PINS[n]`).
+pub const MISC_PINS: [&str; 6] = [
+    "btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
 ];
 
-/// Whether `pin` is muted by the "Suppress touch + misc" toggle.
-pub fn is_touch_misc_pin(pin: &str) -> bool {
-    TOUCH_MISC_PINS.contains(&pin)
+/// Which of a pad's Misc pins are CAPACITIVE touch sensors (stick caps, grips)
+/// rather than switches, as a bitmask over [`MISC_PINS`]. 0 for every pad
+/// without them.
+///
+/// These are what the device.source "Suppress capacitive touch" toggle
+/// (`suppress_touch_misc` param) mutes. They assert just from holding the pad,
+/// so they hijack a Remapper / Touch Zones / Lean "Learn" capture before the
+/// user can press the button they meant, and keep firing any mapping bound to
+/// them. The toggle is a mute for building a mapping, switched back off after.
+///
+/// It has to be a per-device table because SDL hands the Misc slots out per
+/// pad: on a GameCube-style pad Misc 3/4 are the trigger buttons, and on a
+/// Flydigi Vader Misc 2-6 are real macro buttons. Slots are taken from SDL
+/// 3.4's `SDL_gamepad.c` mappings:
+/// - Steam Controller (2nd gen, "Triton", incl. its dongles): Misc 3/4 = left /
+///   right stick touch, Misc 5/6 = left / right grip touch.
+/// - Steam Deck: Misc 3/4 = left / right stick touch.
+/// - HORI Wireless HORIPAD for Steam: Misc 3/4 = capsense left / right stick.
+///
+/// Trackpads are deliberately NOT here: finger contact is how a pad is meant to
+/// be used, and the pad CLICK (Misc 2 on a Steam Controller / Deck) is a switch.
+pub fn capacitive_misc_mask(vid: u16, pid: u16) -> u8 {
+    const STICKS: u8 = 0b00_1100; // misc3, misc4
+    const GRIPS: u8 = 0b11_0000;  // misc5, misc6
+    match (vid, pid) {
+        (0x28DE, 0x1302..=0x1305) => STICKS | GRIPS,
+        (0x28DE, 0x1205) => STICKS,
+        (0x0F0D, 0x01AB) | (0x0F0D, 0x0196) => STICKS,
+        _ => 0,
+    }
+}
+
+/// The pins a [`capacitive_misc_mask`] names.
+pub fn capacitive_pins(mask: u8) -> impl Iterator<Item = &'static str> {
+    MISC_PINS.iter().enumerate().filter(move |(i, _)| mask & (1 << i) != 0).map(|(_, p)| *p)
+}
+
+/// Synthetic per-device signal carrying that device's [`capacitive_misc_mask`]
+/// (as a Float), published by the backend that knows its vid/pid. The engine and
+/// the UI both see the device signals but not its identity, so this is how they
+/// learn which pins the capacitive mute covers. Not a real pin — nothing looks
+/// it up by name except those two mutes, and it is absent from `ALL_PINS`, so
+/// no bus, Learn or picker ever carries it.
+pub const CAPACITIVE_MASK_PIN: &str = "__capacitive_misc";
+
+/// Read a device's capacitive mask back from a signal map (0 if not published).
+pub fn capacitive_mask_of<S: std::hash::BuildHasher>(
+    signals: &std::collections::HashMap<(String, String), crate::Signal, S>,
+    dev_id: &str,
+) -> u8 {
+    signals.get(&(dev_id.to_string(), CAPACITIVE_MASK_PIN.to_string()))
+        .map(|s| s.as_float() as u8)
+        .unwrap_or(0)
 }
 
 /// Every haptic / feedback INPUT port across all controller families — the
@@ -485,6 +507,21 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slots per SDL 3.4's mappings: Triton sticks+grips, Deck / HORI sticks,
+    /// and nothing for pads whose Misc slots are real buttons.
+    #[test]
+    fn capacitive_mask_names_only_stick_caps_and_grips() {
+        let pins = |vid, pid| capacitive_pins(capacitive_misc_mask(vid, pid)).collect::<Vec<_>>();
+        let sticks_grips = ["btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6"];
+        for pid in 0x1302..=0x1305 {
+            assert_eq!(pins(0x28DE, pid), sticks_grips, "Steam Controller {pid:04X}");
+        }
+        assert_eq!(pins(0x28DE, 0x1205), ["btn_misc3", "btn_misc4"], "Steam Deck");
+        assert_eq!(pins(0x0F0D, 0x01AB), ["btn_misc3", "btn_misc4"], "HORI (USB)");
+        assert_eq!(pins(0x0F0D, 0x0196), ["btn_misc3", "btn_misc4"], "HORI (BT)");
+        assert!(pins(0x2DC8, 0x6012).is_empty(), "other pads mute nothing");
+    }
 
     // An override can only take over a kind of feedback it can name: every
     // feedback pin a device exposes must belong to a group.

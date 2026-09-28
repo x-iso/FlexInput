@@ -90,34 +90,31 @@ pub(crate) fn feedback_override_header_toggle(
     );
 }
 
-/// Whether the "Suppress touch + misc" toggle is worth showing for this device.
-///
-/// SDL-backed pads only. SDL is the backend that surfaces a pad's touchpad
-/// fingers and its `btn_misc1..6` extras generically, and those pins are where a
-/// Steam Controller's CAPACITIVE sensors (both trackpads, thumb rest) land —
-/// they assert continuously just from holding the pad. The natively-parsed
-/// families don't need it: a DS4 / DualSense touchpad CLICK and a Switch Pro's
-/// Capture button are deliberate presses, not always-on sensors.
-///
-/// This also covers a native pad routed through SDL by the global `sdl_all_pads`
-/// switch (its id becomes `sdl:<kind>:…`), which is harmless — the toggle is
-/// opt-in and defaults OFF.
-pub(crate) fn has_touch_misc_suppression(dev_id: &str) -> bool {
-    dev_id.starts_with("sdl:")
+/// Whether the "Suppress capacitive touch" toggle is worth showing for this
+/// device: an SDL-read pad with capacitive stick caps or grips
+/// (`automap::capacitive_misc_mask`). The SDL backend is what publishes the
+/// mask the mute acts on, so a pad read any other way has nothing to mute.
+pub(crate) fn has_capacitive_suppression(dev: &flexinput_devices::PhysicalDevice) -> bool {
+    dev.id.starts_with("sdl:")
+        && match (dev.vid, dev.pid) {
+            (Some(v), Some(p)) => flexinput_core::automap::capacitive_misc_mask(v, p) != 0,
+            _ => false,
+        }
 }
 
-/// Hover text for the "Suppress touch + misc" toggle, shared by the Advanced
-/// node header and the Easy-mode input card.
-pub(crate) const TOUCH_MISC_HOVER: &str =
-    "Mute this pad's touchpad fingers and all Misc 1-6 buttons.\n\
-     Capacitive sensors (e.g. the Steam Controller's trackpads and thumb rest) \
-     fire just from holding the controller, which steals Learn captures and \
-     triggers mappings you didn't press. Turn this on while you build the \
+/// Label and hover text for that toggle, shared by the Advanced node header and
+/// the Easy-mode input card.
+pub(crate) const CAPACITIVE_LABEL: &str = "Suppress capacitive touch";
+pub(crate) const CAPACITIVE_HOVER: &str =
+    "Mute this pad's capacitive sensors: touch on the stick caps and, on a \
+     Steam Controller, the grips.\n\
+     They fire just from holding the controller, which steals Learn captures \
+     and triggers mappings you didn't press. Turn this on while you build the \
      mapping, then off to use those inputs.\n\
-     Touchpad click and the rear paddles are real switches and stay live.";
+     Trackpads, pad clicks, paddles and every other button stay live.";
 
-/// Advanced-mode device.source body toggle muting the capacitive / auxiliary
-/// pins while the user builds a mapping. Stored on `suppress_touch_misc`;
+/// Advanced-mode device.source body toggle muting the capacitive stick-cap /
+/// grip pins while the user builds a mapping. Stored on `suppress_touch_misc`;
 /// consumed by the UI signal mask (Learn / previews) and the engine's
 /// `preprocess_dev_sigs` (routing) from that one param.
 pub(crate) fn touch_misc_header_toggle(
@@ -132,14 +129,14 @@ pub(crate) fn touch_misc_header_toggle(
 
     let resp = ui.checkbox(
         &mut checked,
-        egui::RichText::new("Suppress touch + misc").small(),
+        egui::RichText::new(CAPACITIVE_LABEL).small(),
     );
     if resp.changed() {
         if let Some(n) = snarl.get_node_mut(node) {
             n.params.insert("suppress_touch_misc".into(), Value::Bool(checked));
         }
     }
-    resp.on_hover_text(TOUCH_MISC_HOVER);
+    resp.on_hover_text(CAPACITIVE_HOVER);
 }
 
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {

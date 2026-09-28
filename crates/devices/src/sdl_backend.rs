@@ -145,6 +145,10 @@ struct OpenPad {
     imu_watch: ImuWatchdog,
     /// Number of touchpads SDL reports for this pad (0 for most generic pads).
     num_touchpads: u16,
+    /// Which Misc pins are capacitive sensors on this pad
+    /// (`automap::capacitive_misc_mask`), published each poll on
+    /// `CAPACITIVE_MASK_PIN` for the "Suppress capacitive touch" mute.
+    capacitive_mask: u8,
     /// Last-sent rumble (strong, weak) as 0-255 bytes, to skip redundant
     /// `set_rumble` calls. SDL rumble is re-armed with a long duration each
     /// change and refreshed periodically so it doesn't auto-expire.
@@ -451,6 +455,10 @@ impl SdlBackend {
                     has_accel,
                     imu_watch: ImuWatchdog::new(Instant::now()),
                     num_touchpads,
+                    capacitive_mask: match (vid, pid) {
+                        (Some(v), Some(p)) => flexinput_core::automap::capacitive_misc_mask(v, p),
+                        _ => 0,
+                    },
                     last_rumble: (0, 0),
                     last_led: (0, 0, 0),
                     spike: SpikeFilter::new(),
@@ -649,6 +657,10 @@ impl DeviceBackend for SdlBackend {
             // (`touchzones::field_click_pins`). Finger contact on either pad comes
             // from the touchpad API below as touch1_* / touch2_*.
             out.push((dev.clone(), "btn_touchpad".into(), Signal::Bool(b(Button::Touchpad))));
+            if pad.capacitive_mask != 0 {
+                out.push((dev.clone(), flexinput_core::automap::CAPACITIVE_MASK_PIN.into(),
+                          Signal::Float(pad.capacitive_mask as f32)));
+            }
 
             // ── Gyro / accel via SDL sensor API. Normalized to the shared
             // ±reference (GYRO_REF_DPS / ACCEL_REF_G) so SDL gyro drops straight
