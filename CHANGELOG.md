@@ -5,6 +5,27 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **JSM Config: `LOCAL_AXIS_OFFSET` is now the pitch of your neutral hold**, as
+  in Steam Input's local space. It used to rotate the mouse output on screen,
+  which fixed nothing anyone actually had. Now it says how far the pad is tipped
+  from lying flat (positive = far edge raised, -90 to 90), and yaw and roll are
+  measured about that hold: with the usual tilted grip, turning your body turns
+  the camera fully instead of only its cosine share. Pitch is unchanged, and so
+  is 0. A config that set it for the old meaning needs a new value.
+
+### Fixed
+
+- **Gyro aiming through `mouse_move` is no longer ~4x too slow.** The engine
+  and the mouse output run at different rates, and only one engine tick in
+  (sample rate / polling rate) — 1 in 4 by default — reached the mouse. A JSM
+  config now aims exactly as it does in JoyShockMapper. RWS Aim had the same
+  loss, but calibration had absorbed it: **recalibrate RWS Aim `scale`, and any
+  `REAL_WORLD_CALIBRATION` you measured with the JSM module's Calibrate**, or
+  they will aim about 4x too fast. Values taken from JSM or GyroWiki are right
+  as they are.
+
 ## [0.14.8] - 2026-09-28
 
 The JSM Config module arrives on `main` with this release. It first shipped in

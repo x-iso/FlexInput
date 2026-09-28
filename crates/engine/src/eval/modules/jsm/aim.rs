@@ -302,7 +302,14 @@ impl Aim {
         let (in_x, in_y, in_z) = (gyro.pitch, -gyro.yaw, gyro.roll);
 
         // ── the gyro, into the two mouse axes ────────────────────────────────
+        // `LOCAL` measures about the neutral hold `LOCAL_AXIS_OFFSET` names, before
+        // the axis picks, so they choose among the neutral's yaw and roll.
+        let local = super::motion::neutral_pitch(
+            super::motion::JsmGyro { x: in_x, y: in_y, z: in_z },
+            m.local_axis_offset,
+        );
         let pick = |m: AxisMask, x_sign: f32| {
+            let (in_x, in_y, in_z) = (local.x, local.y, local.z);
             // `gyroX += inGyroX; gyroX -= inGyroY; gyroX -= inGyroZ` for mouse x,
             // and the signs the other way round for mouse y.
             let mut v = 0.0;
@@ -328,9 +335,8 @@ impl Aim {
             super::motion::local_space(
                 pick(s.mouse_x_from, 1.0),
                 pick(s.mouse_y_from, -1.0),
-                in_z,
+                local.z,
                 c.roll_contribution,
-                m.local_axis_offset,
             )
         };
 

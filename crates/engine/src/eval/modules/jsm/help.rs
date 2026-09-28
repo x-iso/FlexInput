@@ -136,7 +136,7 @@ pub(crate) const HELP: &[(&str, &str)] = &[
     ("LIGHT_BAR",
      "Changes the color bar of the DS4. Either enter as a hex code (xRRGGBB), as three decimal values between 0 and 255 (RRR GGG BBB), or as a common color name in all caps and underscores."),
     ("LOCAL_AXIS_OFFSET",
-     "FlexInput's own setting, not JoyShockMapper's. When GYRO_SPACE is LOCAL, rotates the two mapped mouse axes together by this many degrees, so a controller held slightly rolled turns the camera straight instead of diagonally. Positive rotates counter-clockwise. Valid range is -180 to 180."),
+     "FlexInput's own setting, not JoyShockMapper's, modelled on Steam Input's local-space pitch offset. When GYRO_SPACE is LOCAL, sets how far the controller's neutral hold is pitched from lying flat, and measures yaw and roll about that hold instead of the controller's face: with the far edge raised, turning your body still turns the camera fully. Pitch itself is unchanged. Positive means the far (trigger) edge is raised. Valid range is -90 to 90."),
     ("MAX_GYRO_SENS",
      "Maximum gyro sensitivity when turning controller at or above MAX_GYRO_THRESHOLD. You can assign a second value as a different vertical sensitivity."),
     ("MAX_GYRO_THRESHOLD",

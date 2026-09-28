@@ -4951,29 +4951,95 @@ fn local_roll_share_joins_whatever_axis_drives_the_turn() {
     assert!(run(100.0).abs() > 0.1, "the roll share turns on its own");
 }
 
-/// LOCAL_AXIS_OFFSET rotates the output. Positive is counter-clockwise on screen,
-/// so a quarter turn sends a plain yaw straight up — and the length is kept.
+/// A body turn with the pad held nose-up (far edge raised) by `hold` degrees, in
+/// our bus's gyro terms: the turn is about the world's up, which the pad sees as
+/// part yaw (about its face) and part roll (about its forward axis).
+fn body_turn(hold: f32, rate: f32) -> Gyro {
+    let (sin, cos) = hold.to_radians().sin_cos();
+    // JSM Y = -yaw and JSM Z = +roll (see `aim.rs`); a flat pad turning right is
+    // `yaw = rate`, so the tilted turn is JSM (0, -rate cos, -rate sin).
+    Gyro { roll: -rate * sin, pitch: 0.0, yaw: rate * cos }
+}
+
+/// LOCAL_AXIS_OFFSET says how far the neutral hold is pitched. Held at that angle,
+/// a body turn turns the camera as fully as a flat pad's yaw does — and without it,
+/// only the cosine share reaches the camera, which is the problem it exists for.
 #[test]
-fn local_axis_offset_rotates_the_output() {
-    let yaw_right = |offset: f32| {
-        let mut a = Aiming::new(&format!("{AIM_CFG}\nLOCAL_AXIS_OFFSET = {offset}"));
-        a.turn(0.0, 90.0)
+fn local_axis_offset_measures_the_turn_about_the_neutral_hold() {
+    let run = |offset: f32, g: Gyro| {
+        let mut a = Aiming::new(&format!("{AIM_CFG}
+LOCAL_AXIS_OFFSET = {offset}"));
+        a.gyro = g;
+        a.tick()
     };
-    let plain = yaw_right(0.0);
-    assert!(plain.x > 0.0 && plain.y.abs() < 1e-6, "0° is stock LOCAL: {plain:?}");
+    let flat = run(0.0, body_turn(0.0, 90.0));
+    assert!(flat.x > 0.0 && flat.y.abs() < 1e-6, "0 is stock LOCAL: {flat:?}");
 
-    let quarter = yaw_right(90.0);
-    assert!(quarter.x.abs() < 1e-4, "a quarter turn leaves no x: {quarter:?}");
-    assert!(quarter.y > 0.0, "counter-clockwise sends right to UP: {quarter:?}");
-    assert!((quarter.length() - plain.length()).abs() < 1e-4, "a rotation keeps length");
+    let hold = 40.0f32;
+    let stock = run(0.0, body_turn(hold, 90.0));
+    assert!(
+        (stock.x - flat.x * hold.to_radians().cos()).abs() < 1e-4,
+        "stock LOCAL loses the roll share of a tilted turn: {stock:?} vs {flat:?}"
+    );
+    let fixed = run(hold, body_turn(hold, 90.0));
+    assert!((fixed.x - flat.x).abs() < 1e-4, "the whole turn comes back: {fixed:?} vs {flat:?}");
+    assert!(fixed.y.abs() < 1e-6, "and a turn stays horizontal: {fixed:?}");
 
-    let back = yaw_right(-90.0);
-    assert!(back.y < 0.0, "and the other way sends it down: {back:?}");
+    // The sign is not a coin toss: the wrong way round makes it worse, not better.
+    let wrong = run(-hold, body_turn(hold, 90.0));
+    assert!(wrong.x < stock.x, "a negative offset is a nose-down hold: {wrong:?}");
+}
 
-    // The case it is for: a small correction, at exactly that angle.
-    let small = yaw_right(10.0);
-    let angle = small.y.atan2(small.x).to_degrees();
-    assert!((angle - 10.0).abs() < 1e-3, "10° of offset is 10° of output: {angle}");
+/// Pitch is the pad's own under any offset: the neutral hold is pitched ABOUT the
+/// pitch axis, so nothing about it changes.
+#[test]
+fn local_axis_offset_leaves_pitch_alone() {
+    let pitch_up = |offset: f32| {
+        let mut a = Aiming::new(&format!("{AIM_CFG}
+LOCAL_AXIS_OFFSET = {offset}"));
+        a.turn(90.0, 0.0)
+    };
+    let base = pitch_up(0.0);
+    assert!(base.y.abs() > 0.1, "not vacuous: {base:?}");
+    for offset in [-60.0, 25.0, 90.0] {
+        assert!((pitch_up(offset) - base).length() < 1e-6, "{offset}: {:?} vs {base:?}", pitch_up(offset));
+    }
+}
+
+/// The same turn `WORLD_TURN` measures from gravity, when the pad really is held at
+/// the offset's angle — so the offset and the gravity table at the top of
+/// `motion.rs` agree on which way nose-up is.
+#[test]
+fn local_axis_offset_agrees_with_world_turn_at_that_hold() {
+    let hold = 35.0f32;
+    let (sin, cos) = hold.to_radians().sin_cos();
+    let settle = |a: &mut Aiming| {
+        // Our accel reads (0,0,1) flat and (1,0,0) nose-up 90°.
+        a.accel = Some(glam::Vec3::new(sin, 0.0, cos));
+        for _ in 0..400 { a.turn(0.0, 0.0); }
+        a.gyro = body_turn(hold, 90.0);
+        a.tick()
+    };
+    let world = settle(&mut Aiming::new(&format!("{AIM_CFG}
+GYRO_SPACE = WORLD_TURN")));
+    let local = settle(&mut Aiming::new(&format!("{AIM_CFG}
+LOCAL_AXIS_OFFSET = {hold}")));
+    assert!(world.x > 0.1, "not vacuous: {world:?}");
+    assert!((world.x - local.x).abs() / world.x < 0.01, "{world:?} vs {local:?}");
+}
+
+/// With the offset set, `ROLL_CONTRIBUTION` is a share of roll about the NEUTRAL
+/// hold's forward axis — a body turn at that hold has none, so it adds nothing.
+#[test]
+fn local_roll_share_is_taken_about_the_neutral_hold() {
+    let run = |pct: f32| {
+        let mut a = Aiming::new(&format!("{AIM_CFG}
+LOCAL_AXIS_OFFSET = 30
+ROLL_CONTRIBUTION = {pct}"));
+        a.gyro = body_turn(30.0, 90.0);
+        a.tick()
+    };
+    assert!((run(0.0) - run(100.0)).length() < 1e-4, "{:?} vs {:?}", run(0.0), run(100.0));
 }
 
 /// The offset is a LOCAL thing: a gravity space ignores it, and the line says so.
@@ -4993,8 +5059,9 @@ fn local_axis_offset_is_local_only_and_ours() {
         under_gravity.notes
     );
 
-    // Past a full half-turn either way is an error, not a silent wrap.
-    assert!(matches!(one("LOCAL_AXIS_OFFSET = 200").status, LineStatus::Error(_)));
+    // A hold past vertical either way is an error, not a silent wrap.
+    assert!(matches!(one("LOCAL_AXIS_OFFSET = 91").status, LineStatus::Error(_)));
+    assert!(matches!(one("LOCAL_AXIS_OFFSET = -90").status, LineStatus::Ok));
 
     // And a gravity space really ignores it.
     let turn = |cfg: &str| {

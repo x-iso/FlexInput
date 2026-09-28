@@ -882,9 +882,9 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "DECEL_BRAKE_STRENGTH" => (0.0, 1.0, false),
         "DECEL_BRAKE_THRESHOLD" => (0.0, 200.0, false),
         "ROLL_CONTRIBUTION" => (-100.0, 100.0, false),
-        // A pad held a few degrees rolled is the case this exists for, so the slider
-        // spans the useful band; the parser still takes a full turn either way.
-        "LOCAL_AXIS_OFFSET" => (-45.0, 45.0, false),
+        // A neutral hold's pitch: the whole band the parser takes, since a grip
+        // anywhere from flat to well past 45 degrees is ordinary.
+        "LOCAL_AXIS_OFFSET" => (-90.0, 90.0, false),
         _ => return None,
     };
     Some(r)

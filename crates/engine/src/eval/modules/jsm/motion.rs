@@ -86,14 +86,17 @@ pub struct Settings {
     pub space: Space,
     /// `LEAN_THRESHOLD`, in degrees of side tilt.
     pub lean_threshold: f32,
-    /// `LOCAL_AXIS_OFFSET`, in degrees: FlexInput's own addition, not JSM's.
+    /// `LOCAL_AXIS_OFFSET`, in degrees: FlexInput's own addition, not JSM's, and
+    /// modelled on Steam Input's local-space pitch offset.
     ///
-    /// `LOCAL` picks each mouse axis from ONE of the pad's axes, which quantizes
-    /// the mapping to whole quarter turns — a pad held rolled a little in the hands
-    /// turns the camera a little diagonally, and no axis pick can straighten it.
-    /// This rotates the two mapped axes together by an arbitrary angle, after the
-    /// pick, so the correction is continuous. Positive turns the output
-    /// counter-clockwise on screen. Zero is exactly stock `LOCAL`.
+    /// Stock `LOCAL` takes the pad lying flat as neutral, so its yaw is a turn
+    /// about the axis out of the pad's face. Nobody holds a pad like that: the
+    /// usual grip has the far edge raised, and turning the body then turns the pad
+    /// about an axis that is tilted back from its face — partly yaw, partly roll —
+    /// so only part of the turn reaches the camera. This says how far the neutral
+    /// hold is pitched, and measures yaw and roll about that neutral instead (see
+    /// [`neutral_pitch`]). Pitch itself is untouched. Positive is the far (trigger)
+    /// edge raised. Zero is exactly stock `LOCAL`.
     pub local_axis_offset: f32,
 }
 
@@ -239,32 +242,45 @@ pub struct JsmGyro {
     pub z: f32,
 }
 
+/// `LOCAL_AXIS_OFFSET`: the gyro, re-measured against a neutral hold pitched
+/// `offset_deg` from flat (positive = far edge raised). The pitch axis is the pad's
+/// own either way, so pitch passes through; yaw becomes the turn about the
+/// neutral's up and roll the turn about its forward.
+///
+/// A pad pitched nose-up by θ has its up at `(0, cos θ, sin θ)` in JSM's frame —
+/// the negative of the gravity `(0, -cos θ, -sin θ)` it would read (see the table
+/// at the top) — so this yaw is exactly what `WORLD_TURN` would measure with the
+/// pad held still at that angle. The difference is that nothing here tracks the
+/// pad: it is a fixed correction, which is what keeps `LOCAL` independent of
+/// posture.
+pub fn neutral_pitch(r: JsmGyro, offset_deg: f32) -> JsmGyro {
+    if offset_deg == 0.0 {
+        // Exactly stock `LOCAL`: no rounding from a rotation that does nothing.
+        return r;
+    }
+    let (sin, cos) = offset_deg.to_radians().sin_cos();
+    JsmGyro {
+        x: r.x,
+        y: r.y * cos + r.z * sin,
+        z: r.z * cos - r.y * sin,
+    }
+}
+
 /// `GYRO_SPACE = LOCAL`, finished: the two axes the masks picked, with a share of
-/// roll mixed into the turn and the pair rotated by `LOCAL_AXIS_OFFSET`.
+/// roll mixed into the turn.
 ///
 /// `gx`/`gy` are what `MOUSE_X_FROM_GYRO_AXIS` / `MOUSE_Y_FROM_GYRO_AXIS` selected
 /// (JSM's convention: y counts DOWN the screen, flipped when the mouse is written).
-/// `roll` is the pad's roll rate in JSM's frame.
+/// `roll` is the pad's roll rate in JSM's frame, already taken about the neutral
+/// hold ([`neutral_pitch`]).
 ///
 /// **Roll** uses `ROLL_CONTRIBUTION` exactly as `YAW_PLUS_ROLL` does — same share,
 /// same sign — so with the default axis picks `LOCAL` plus a roll share IS
 /// `YAW_PLUS_ROLL`. What `LOCAL` adds is that it keeps working with any pick: the
 /// share joins whichever axis is driving the turn rather than assuming yaw. This is
 /// FlexInput's extension; the fork only honours the setting in its own space.
-///
-/// **Offset** rotates after the roll is mixed in, so the correction applies to the
-/// turn as the player actually makes it. Positive is counter-clockwise on screen.
-pub fn local_space(gx: f32, gy: f32, roll: f32, roll_contribution: f32, offset_deg: f32) -> (f32, f32) {
-    let gx = gx - roll * roll_contribution / 100.0;
-    if offset_deg == 0.0 {
-        // Exactly stock `LOCAL`: no trig, no rounding introduced by a rotation that
-        // does nothing.
-        return (gx, gy);
-    }
-    let (sin, cos) = offset_deg.to_radians().sin_cos();
-    // Counter-clockwise in screen space with y UP is (x cos - y sin, x sin + y cos).
-    // `gy` counts down, so rotate (gx, -gy) and flip back.
-    (gx * cos + gy * sin, -gx * sin + gy * cos)
+pub fn local_space(gx: f32, gy: f32, roll: f32, roll_contribution: f32) -> (f32, f32) {
+    (gx - roll * roll_contribution / 100.0, gy)
 }
 
 /// Turn a gyro reading into the two mouse axes, for a space measured against

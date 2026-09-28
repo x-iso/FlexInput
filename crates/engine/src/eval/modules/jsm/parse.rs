@@ -2014,7 +2014,7 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
 pub(crate) enum MotionId {
     Space,
     LeanThreshold,
-    /// `LOCAL_AXIS_OFFSET` — FlexInput's own, see `motion::local_space`.
+    /// `LOCAL_AXIS_OFFSET` — FlexInput's own, see `motion::neutral_pitch`.
     LocalAxisOffset,
     /// The motion stick, in the same settings a thumbstick has.
     MotionStick,
@@ -2075,7 +2075,7 @@ fn motion_setting(
             _ => wants("an angle in degrees, 0 to 90"),
         },
         MotionId::LocalAxisOffset => match num() {
-            Some(v) if (-180.0..=180.0).contains(&v) => {
+            Some(v) if (-90.0..=90.0).contains(&v) => {
                 m.local_axis_offset = v;
                 let mut info = LineInfo::of(LineStatus::Ok);
                 info.notes.push(FLEXINPUT_NOTE.to_string());
@@ -2086,7 +2086,7 @@ fn motion_setting(
                 }
                 info
             }
-            _ => wants("an angle in degrees, -180 to 180"),
+            _ => wants("the neutral hold's pitch in degrees, -90 to 90"),
         },
         MotionId::MotionStick | MotionId::TouchStick => {
             let touch = which == MotionId::TouchStick;
