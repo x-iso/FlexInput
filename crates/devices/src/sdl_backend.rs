@@ -642,11 +642,12 @@ impl DeviceBackend for SdlBackend {
                 // XInput / DS4 have no extra share-class pin in their layout.
                 _ => {}
             }
-            // Touchpad click is a Button in SDL. NOTE: SDL2's GameController API
-            // has only ONE touchpad button, so a two-pad device (Steam Controller)
-            // reports a single click here — there is no distinct second-pad click
-            // to drive `btn_touchpad2` (field-1 tz_click). Finger CONTACT on the
-            // second pad still works (touch2_* above); only its click is absent.
+            // Touchpad click is a Button in SDL, and SDL's gamepad API has only ONE
+            // touchpad button. A two-pad device (Steam Controller 2, Steam Deck)
+            // reports its LEFT pad click here and its RIGHT pad click on Misc2
+            // (`btn_misc2` above); Touch Zones reads that as Pad B's click
+            // (`touchzones::field_click_pins`). Finger contact on either pad comes
+            // from the touchpad API below as touch1_* / touch2_*.
             out.push((dev.clone(), "btn_touchpad".into(), Signal::Bool(b(Button::Touchpad))));
 
             // ── Gyro / accel via SDL sensor API. Normalized to the shared

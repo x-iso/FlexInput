@@ -426,6 +426,24 @@ pub fn click_pin_id(field: usize) -> String {
     format!("f{field}c")
 }
 
+/// Device pins that press a field's click — any one of them held counts.
+///
+/// Field 0 is the touchpad button. Field 1 exists only in split mode, where it
+/// is the SECOND physical pad on a two-pad device, and its click arrives under
+/// a Misc name rather than a touchpad one: SDL's Steam Controller and Steam
+/// Deck mappings put the left-pad click on `touchpad` and the right-pad click on
+/// `misc2` (SDL 3.4 `SDL_gamepad.c`). `btn_misc2` stays a Misc pin on the bus —
+/// other mappings (JSM configs) address it by that name — and Touch Zones reads
+/// it as Pad B's click as well. `btn_touchpad2` is the dedicated name, for a
+/// source that ever reports it. The pads' finger CONTACT needs no such routing:
+/// it comes from SDL's touchpad API as `touch2_*`, not from a Misc button.
+pub fn field_click_pins(field: usize) -> &'static [&'static str] {
+    match field {
+        0 => &["btn_touchpad"],
+        _ => &["btn_touchpad2", "btn_misc2"],
+    }
+}
+
 /// Parse a dynamic port id into a [`Pin`]. Returns `None` for the passthrough
 /// sentinel or any unrecognized id.
 pub fn parse_pin(id: &str) -> Option<Pin> {

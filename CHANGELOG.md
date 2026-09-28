@@ -26,6 +26,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   they will aim about 4x too fast. Values taken from JSM or GyroWiki are right
   as they are.
 
+- **Touch Zones' Split pads mode can map the second pad.** Learn only watched
+  the first touch point, so a gesture demonstrated on Pad B — the right pad of a
+  Steam Controller — was never seen. Learn now follows whichever pad is touched
+  and selects the zone on that pad. Pad B's click also works now: on a Steam
+  Controller or Steam Deck it arrives as Misc 2, which Touch Zones reads as the
+  second pad's click while Misc 2 stays available to other mappings.
+
 ## [0.14.8] - 2026-09-28
 
 The JSM Config module arrives on `main` with this release. It first shipped in

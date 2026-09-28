@@ -178,7 +178,7 @@ pub(crate) fn tz_live_hits(
     let mut active_out: std::collections::HashMap<(usize, usize), Vec<String>> = std::collections::HashMap::new();
     for (&(f, z), &(_, _, act)) in &m {
         if !act { continue; }
-        let clicked = readb(if f == 0 { "btn_touchpad" } else { "btn_touchpad2" });
+        let clicked = tz::field_click_pins(f).iter().any(|p| readb(p));
         for c in cards.iter().filter(|c|
             c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == f as u64 &&
             c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == z as u64)
@@ -2369,17 +2369,21 @@ pub(crate) fn render_touch_zone_cards(
     // idle → Learn → (demonstrate on pad) → captured → Assign / gamepad → commit.
     // (Menu nodes never enter "learning" — their trigger is fixed.)
     if !menu_mode && phase == "learning" {
-        if let Some(trig) = tz_learn_capture(snarl, node_id, live_signals, dev.as_deref()) {
+        if let Some((trig, field)) =
+            tz_learn_capture(snarl, node_id, live_signals, dev.as_deref(), !single, sel_f)
+        {
             // The zone the gesture STARTED on becomes the mapping's target — matching
             // the Learn hint "demonstrate … on a zone". Located from the captured
-            // touchdown point in the current field's tree. (The tab-follow was
-            // suppressed during "learning", so sel_field still holds the active field.)
+            // touchdown point in the tree of the pad it was made on (split mode can
+            // capture on either pad, whichever tab was showing; the tab-follow was
+            // suppressed during "learning", so the selection moves here instead).
             let sx = getp(snarl, "_tz_cap_sx").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
             let sy = getp(snarl, "_tz_cap_sy").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-            let start_zone = tz_field_tree(snarl, node_id, sel_f).locate(sx, sy).0 as usize;
+            let start_zone = tz_field_tree(snarl, node_id, field).locate(sx, sy).0 as usize;
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_tz_trig".into(), Value::from(trig.as_str()));
                 node.params.insert("_tz_phase".into(), Value::from("captured"));
+                node.params.insert("sel_field".into(), Value::from(field as u64));
                 node.params.insert("sel_zone".into(), Value::from(start_zone as u64));
             }
         }
@@ -2625,7 +2629,8 @@ pub(crate) fn render_touch_zone_cards(
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("learning"));
                         for k in ["_tz_trig", "_tz_cap_active", "_tz_cap_sx", "_tz_cap_sy",
-                                  "_tz_cap_click", "_tz_cap_moved", "_tz_cap_dir"] { node.params.remove(k); }
+                                  "_tz_cap_click", "_tz_cap_moved", "_tz_cap_dir",
+                                  "_tz_cap_field"] { node.params.remove(k); }
                     }
                 }
             }
@@ -2931,29 +2936,49 @@ pub(crate) fn render_touch_zone_cards(
     // = finger-motion pointer).
 }
 
-/// UI-side trigger capture during Learn: track the primary finger (touch1) from
-/// touch-down to release and classify the gesture — swipe (moved past threshold),
-/// click (pad pressed), else plain touch. Returns the trigger token on release.
-/// Scratch persists in `_tz_cap_*` node params.
+/// UI-side trigger capture during Learn: track one finger from touch-down to
+/// release and classify the gesture — swipe (moved past threshold), click (pad
+/// pressed), else plain touch. Returns the trigger token and the field it was
+/// demonstrated on, on release. Scratch persists in `_tz_cap_*` node params.
+///
+/// Which finger: single mode watches touch1, as before. Split mode gives each
+/// field its own finger (touch1 → Pad A, touch2 → Pad B, the same pairing the
+/// engine uses), so it watches whichever pad is touched first — `pref_field`'s
+/// finger wins a tie — and holds that finger until release. The field and click
+/// pin are chosen with it, so the gesture is read from the pad it was made on.
 pub(crate) fn tz_learn_capture(
     snarl: &mut Snarl<NodeData>,
     node_id: NodeId,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     dev: Option<&str>,
-) -> Option<String> {
+    split: bool,
+    pref_field: usize,
+) -> Option<(String, usize)> {
     use flexinput_core::touchzones as tz;
     let dev = dev?;
     let readf = |pin: &str| live_signals.get(&(dev.to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
     let readb = |pin: &str| live_signals.get(&(dev.to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
     const SWIPE_THRESH: f32 = 0.18;
-    let active = readb("touch1_active");
-    let click = readb("btn_touchpad");
-    let (ux, uy) = tz::pad_point_to_unit(readf("touch1_x"), readf("touch1_y"));
+    const FINGER: [(&str, &str, &str); 2] = [("touch1_x", "touch1_y", "touch1_active"),
+                                             ("touch2_x", "touch2_y", "touch2_active")];
     let node = snarl.get_node_mut(node_id)?;
     let prev_active = node.params.get("_tz_cap_active").and_then(|v| v.as_bool()).unwrap_or(false);
+    let field = if !split {
+        0
+    } else if prev_active {
+        node.params.get("_tz_cap_field").and_then(|v| v.as_u64()).unwrap_or(0).min(1) as usize
+    } else {
+        let pref = pref_field.min(1);
+        if readb(FINGER[pref].2) { pref } else if readb(FINGER[1 - pref].2) { 1 - pref } else { pref }
+    };
+    let (px, py, pa) = FINGER[field];
+    let active = readb(pa);
+    let click = tz::field_click_pins(field).iter().any(|p| readb(p));
+    let (ux, uy) = tz::pad_point_to_unit(readf(px), readf(py));
     let mut result = None;
     if active {
         if !prev_active {
+            node.params.insert("_tz_cap_field".into(), Value::from(field as u64));
             node.params.insert("_tz_cap_sx".into(), Value::from(ux as f64));
             node.params.insert("_tz_cap_sy".into(), Value::from(uy as f64));
             node.params.insert("_tz_cap_click".into(), Value::from(false));
@@ -2980,9 +3005,10 @@ pub(crate) fn tz_learn_capture(
             let moved = node.params.get("_tz_cap_moved").and_then(|v| v.as_bool()).unwrap_or(false);
             let clicked = node.params.get("_tz_cap_click").and_then(|v| v.as_bool()).unwrap_or(false);
             let dir = node.params.get("_tz_cap_dir").and_then(|v| v.as_u64()).unwrap_or(0);
-            result = Some(if moved {
+            let trig = if moved {
                 match dir { 1 => "tz_swipe_up", 2 => "tz_swipe_down", 3 => "tz_swipe_left", _ => "tz_swipe_right" }.to_string()
-            } else if clicked { "tz_click".to_string() } else { "tz_touch".to_string() });
+            } else if clicked { "tz_click".to_string() } else { "tz_touch".to_string() };
+            result = Some((trig, field));
         }
         node.params.insert("_tz_cap_active".into(), Value::from(false));
     }

@@ -1691,6 +1691,38 @@ mod trigger_tests {
             "analog output still runs alongside the click");
     }
 
+    // Split mode on a two-pad SDL device (Steam Controller 2 / Steam Deck): Pad B
+    // is the right pad — contact on touch2, click on Misc2 — and the left pad's
+    // click (btn_touchpad) must not press Pad B.
+    #[test]
+    fn touch_zones_pad_b_click_reads_misc2() {
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("field_mode".into(), Value::String("split".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":1,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
+        ]));
+        let input = |left_click: bool, misc2: bool| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch2_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch2_x".into()), Signal::Float(0.3));
+            m.insert(("pad".into(), "touch2_y".into()), Signal::Float(0.3));
+            m.insert(("pad".into(), "btn_touchpad".into()), Signal::Bool(left_click));
+            m.insert(("pad".into(), "btn_misc2".into()), Signal::Bool(misc2));
+            m
+        };
+        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+            c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+        let mut state = HashMap::new();
+        let mut c = HashMap::new();
+        eval_touch_zones_map_node(&n, 1, &input(true, false), &mut c, &mut state, 0.016);
+        assert!(!getb(&c, "btn_east"), "the left pad's click is Pad A's, not Pad B's");
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &input(false, true), &mut c, &mut state, 0.016);
+        assert!(getb(&c, "btn_east"), "the right pad's click (Misc2) fires Pad B's click mapping");
+    }
+
     // Analog swipe drives a finger coordinate continuously (absolute position).
     #[test]
     fn remapper_swipe_tracks_analog_input() {

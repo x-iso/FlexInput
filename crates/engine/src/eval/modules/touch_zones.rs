@@ -102,8 +102,7 @@ pub(crate) fn eval_touch_zones_map_node(
         zone_hit.insert((field, eff), (lx, ly));
     }
     let click = |field: usize| -> bool {
-        let pin = if field == 0 { "btn_touchpad" } else { "btn_touchpad2" };
-        read(pin).map(|s| s.as_bool()).unwrap_or(false)
+        tz::field_click_pins(field).iter().any(|p| read(p).map(|s| s.as_bool()).unwrap_or(false))
     };
 
     // ── Apply mapping cards ───────────────────────────────────────────────

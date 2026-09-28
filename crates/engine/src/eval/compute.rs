@@ -147,13 +147,11 @@ pub(crate) fn compute_node(
                         (None, tz::ZoneComp::Active)      => Signal::Bool(false),
                         (None, _)                         => Signal::Float(0.0),
                     }),
-                    // Field 0 click = the touchpad button. Field 1 reads the
-                    // reserved `btn_touchpad2` pin (populated only once a device
-                    // with two clickable pads — e.g. Steam Controller — exposes it).
-                    tz::Pin::Click { field } => {
-                        let pin = if field == 0 { "btn_touchpad" } else { "btn_touchpad2" };
-                        Some(Signal::Bool(read(pin).map(|s| s.as_bool()).unwrap_or(false)))
-                    }
+                    // Field 0 click = the touchpad button; field 1 = the second
+                    // pad's click (see `field_click_pins`).
+                    tz::Pin::Click { field } => Some(Signal::Bool(
+                        tz::field_click_pins(field).iter()
+                            .any(|p| read(p).map(|s| s.as_bool()).unwrap_or(false)))),
                 }
             }).collect()
         }
