@@ -55,6 +55,42 @@ pub(crate) fn mark_produced(key: &str, pin: &str, collector_sigs: &mut HashMap<(
     }
 }
 
+/// Add the MIDI pins an upstream bus carries to a mapping module's upstream
+/// snapshot. The collector's value wins over the raw device's, matching how the
+/// canonical pins are snapshotted.
+///
+/// MIDI pins are dynamic, so a mapping module takes whatever the bus actually
+/// carries rather than walking a list. Pins at rest are absent; a reader that
+/// finds nothing reads rest, which is what `Signal::as_bool` / `as_float`
+/// already do with a missing pin.
+pub(crate) fn fill_upstream_midi(
+    collector_id: &str,
+    dev_id: &str,
+    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    upstream: &mut HashMap<String, Signal>,
+) {
+    if !collector_id.is_empty() {
+        for ((k, pin), &sig) in collector_sigs.iter() {
+            if k == collector_id && midi::is_midi_pin(pin) {
+                upstream.insert(pin.clone(), sig);
+            }
+        }
+    }
+    if !dev_id.is_empty() {
+        for ((d, pin), &sig) in dev_sigs.iter() {
+            if d == dev_id && midi::is_midi_pin(pin) {
+                upstream.entry(pin.clone()).or_insert(sig);
+            }
+        }
+    }
+}
+
+/// Rest value for a MIDI pin id, for publishing a claimed pin as "off".
+pub(crate) fn midi_rest(pin: &str) -> Option<Signal> {
+    midi::parse_pin(pin).map(|p| p.rest_value())
+}
+
 /// MIDI pins a MIDI Out sink should send from its AutoMap source this tick:
 /// produced pins from the source collector key, or — with Thru on — every MIDI
 /// pin on the bus, raw device pins included.

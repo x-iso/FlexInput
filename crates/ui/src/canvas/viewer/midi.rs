@@ -230,6 +230,38 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
     added
 }
 
+/// Move the MIDI pin at `idx` of a mapping's pin list onto another channel.
+///
+/// A note's velocity twin moves with it: an analog card reads the velocity of
+/// the note it fires on, and leaving it behind would have it listening on a
+/// channel the note no longer uses. Returns false when the slot isn't a MIDI
+/// pin with a channel (transport, BPM, SysEx), which nothing should offer.
+pub(crate) fn midi_set_pin_channel(pins: &mut [Value], idx: usize, new_ch: Channel) -> bool {
+    let Some(pin) = pins.get(idx).and_then(|v| v.as_str()).and_then(fmidi::parse_pin) else {
+        return false;
+    };
+    let Some(old_ch) = pin.channel() else { return false };
+    if old_ch == new_ch {
+        return false;
+    }
+    let velocity_twin = match pin {
+        MidiPin::Note { note, .. } => {
+            let from = MidiPin::Velocity { ch: old_ch, note };
+            Some((from.to_id(), from.with_channel(new_ch).to_id()))
+        }
+        _ => None,
+    };
+    pins[idx] = Value::String(pin.with_channel(new_ch).to_id());
+    if let Some((from, to)) = velocity_twin {
+        for slot in pins.iter_mut() {
+            if slot.as_str() == Some(from.as_str()) {
+                *slot = Value::String(to.clone());
+            }
+        }
+    }
+    true
+}
+
 // ── Node bodies ───────────────────────────────────────────────────────────────
 
 /// `(real pin index, pin id)` for every non-AutoMap pin, in order.
@@ -403,6 +435,37 @@ mod tests {
     fn a_malformed_sysex_builds_nothing() {
         assert_eq!(PickKind::SysEx.build(Channel::Any, 0, "F0 7E"), None);
         assert_eq!(PickKind::SysEx.build(Channel::Any, 0, "zz"), None);
+    }
+
+    #[test]
+    fn changing_a_notes_channel_takes_its_velocity_with_it() {
+        let mut pins = vec![
+            Value::from("midi:note:1:60"),
+            Value::from("midi:vel:1:60"),
+            Value::from("btn_south"),
+        ];
+        assert!(midi_set_pin_channel(&mut pins, 0, Channel::Ch(9)));
+        assert_eq!(pins[0], Value::from("midi:note:10:60"));
+        assert_eq!(pins[1], Value::from("midi:vel:10:60"), "the velocity twin follows");
+        assert_eq!(pins[2], Value::from("btn_south"), "other pins untouched");
+    }
+
+    #[test]
+    fn a_channel_change_round_trips_to_any_and_back() {
+        let mut pins = vec![Value::from("midi:cc:3:74")];
+        assert!(midi_set_pin_channel(&mut pins, 0, Channel::Any));
+        assert_eq!(pins[0], Value::from("midi:cc:*:74"));
+        assert!(midi_set_pin_channel(&mut pins, 0, Channel::Ch(2)));
+        assert_eq!(pins[0], Value::from("midi:cc:3:74"));
+    }
+
+    #[test]
+    fn a_pin_with_no_channel_or_no_change_is_refused() {
+        let mut pins = vec![Value::from("midi:rt:start"), Value::from("key_a")];
+        assert!(!midi_set_pin_channel(&mut pins, 0, Channel::Ch(1)));
+        assert!(!midi_set_pin_channel(&mut pins, 1, Channel::Ch(1)));
+        let mut same = vec![Value::from("midi:cc:1:7")];
+        assert!(!midi_set_pin_channel(&mut same, 0, Channel::Ch(0)), "no change is not a change");
     }
 
     #[test]

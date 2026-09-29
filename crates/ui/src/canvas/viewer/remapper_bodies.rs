@@ -35,6 +35,14 @@ pub(crate) fn show_remapper_body(
         (Some(dev), true) => remapper_pressed_now(live_signals, dev),
         _ => Vec::new(),
     };
+    // A MIDI port upstream: notes while held, knobs and benders while moving.
+    if let (Some(dev), true) = (&upstream_dev_id, wired) {
+        for p in remapper_midi_pressed_now(ui, live_signals, dev) {
+            if !pressed_now.iter().any(|q| q == &p) {
+                pressed_now.push(p);
+            }
+        }
+    }
     // During Learn, merge in live OS keyboard/mouse so the user can map to
     // keys/mouse buttons even when no virtual KB/M sink is in the graph.
     if phase == "learning" {
@@ -524,7 +532,14 @@ pub(crate) fn show_remapper_body(
                     entry.insert("out".to_string(), Value::Array(out_arr));
                     // A touchpad swipe output is continuous → force analog mode so
                     // the engine drives the finger by the input's magnitude.
-                    if new_draft_output.iter().any(|p| remapper_out_is_swipe(p)) {
+                    //
+                    // A MIDI knob, bender or pressure input is continuous in the
+                    // same way: captured from a value that MOVED, it should drive
+                    // its target by that value, not gate it on and off.
+                    let continuous_midi_in = new_draft_input.iter().any(|p| {
+                        flexinput_core::midi::parse_pin(p).is_some_and(|m| m.is_continuous())
+                    });
+                    if continuous_midi_in || new_draft_output.iter().any(|p| remapper_out_is_swipe(p)) {
                         entry.insert("mode".to_string(), Value::String("analog".to_string()));
                     }
                     let mut all = mappings.clone();

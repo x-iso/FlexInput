@@ -37,6 +37,10 @@ pub(crate) fn eval_remapper_node(
                 });
                 if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
             }
+            // MIDI pins are dynamic (never in ALL_PINS), so take whatever the
+            // bus carries. Cheap: only a MIDI device or a bus downstream of one
+            // has any.
+            fill_upstream_midi(collector_id, dev_id, &*collector_sigs, dev_sigs, &mut upstream);
             // A processed Vec2 on the collector is authoritative over raw axes.
             vec2_authoritative_axis_fill(&mut upstream, collector_id, &*collector_sigs);
             // Derive synthetic cardinal-direction Bool pins from each stick's
@@ -795,6 +799,25 @@ pub(crate) fn remapper_pass_through_and_suppress(
         };
         let sig = suppress_signal_for_pin(ap.id, raw, &suppression);
         collector_sigs.insert((key.to_string(), ap.id.to_string()), sig);
+    }
+
+    // MIDI pins: dynamic, so driven by what the upstream snapshot holds rather
+    // than by a list. A claimed one publishes its rest value so a downstream
+    // reader sees it released instead of falling back to the raw device.
+    // Shared with the JSM module, which calls this same pass-through.
+    for (pin, raw) in upstream.iter() {
+        if !flexinput_core::midi::is_midi_pin(pin) {
+            continue;
+        }
+        let sig = if all_claimed.contains(pin) {
+            match midi_rest(pin) {
+                Some(off) => off,
+                None => continue,
+            }
+        } else {
+            *raw
+        };
+        collector_sigs.insert((key.to_string(), pin.clone()), sig);
     }
 
     // Recompute synthetic stick cardinals from the (possibly clamped) axes so

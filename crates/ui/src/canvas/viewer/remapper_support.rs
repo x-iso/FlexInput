@@ -164,6 +164,65 @@ pub(crate) fn remapper_pressed_now(
     out
 }
 
+/// A MIDI value has to MOVE to count as pressed, and this is how long it counts
+/// for afterwards. A knob left at two thirds is not a held button — without
+/// this, Learn would latch every resting fader on the controller at once.
+const MIDI_MOVE_HOLD: f64 = 0.3;
+/// Smaller than one step of a 7-bit controller, so a single click of a knob
+/// registers. MIDI is quantised, so there is no noise to reject.
+const MIDI_MOVE_DELTA: f32 = 1.0 / 254.0;
+
+/// Which MIDI pins of `dev_id` count as pressed right now.
+///
+/// Notes and pulses (program change, transport, SysEx) count while asserted.
+/// Continuous controls — CC, bend, pressure, aftertouch — count only while
+/// MOVING: their last value and the time it last changed are kept in egui temp
+/// memory per device, and a pin counts for [`MIDI_MOVE_HOLD`] after its last
+/// change. That is what lets the Remapper's latch-on-release capture work
+/// unchanged for a knob, which never "releases".
+///
+/// Empty for a device that isn't a MIDI port.
+pub(crate) fn remapper_midi_pressed_now(
+    ui: &egui::Ui,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev_id: &str,
+) -> Vec<String> {
+    use flexinput_core::midi;
+    if !dev_id.starts_with("midi_in:") {
+        return Vec::new();
+    }
+    let now = ui.input(|i| i.time);
+    let key = egui::Id::new(("midi_activity", dev_id));
+    let mut seen: std::collections::HashMap<String, (f32, f64)> =
+        ui.ctx().data(|d| d.get_temp(key)).unwrap_or_default();
+
+    let mut out = Vec::new();
+    for ((dev, pin), sig) in live_signals.iter() {
+        if dev != dev_id {
+            continue;
+        }
+        let Some(parsed) = midi::parse_pin(pin) else { continue };
+        if parsed.is_continuous() {
+            let v = sig.as_float();
+            let changed_at = match seen.get(pin) {
+                Some((prev, at)) if (v - prev).abs() < MIDI_MOVE_DELTA => *at,
+                _ => now,
+            };
+            seen.insert(pin.clone(), (v, changed_at));
+            if now - changed_at <= MIDI_MOVE_HOLD {
+                out.push(pin.clone());
+            }
+        } else if sig.as_bool() {
+            out.push(pin.clone());
+        }
+    }
+    // A pin that stopped being published (back to rest) is forgotten, so the
+    // next time it moves it reads as a fresh change rather than a stale one.
+    seen.retain(|pin, _| live_signals.contains_key(&(dev_id.to_string(), pin.clone())));
+    ui.ctx().data_mut(|d| d.insert_temp(key, seen));
+    out
+}
+
 /// Read live OS keyboard + mouse state as canonical AutoMap pin IDs. Used in
 /// the Remapper's `learning` phase so the user can map to keys/mouse buttons
 /// that are otherwise only present on the bus when a virtual KB/M sink is wired.
@@ -260,6 +319,11 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
         }
         return;
     }
+    if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
+        ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
+            .on_hover_text(p.display_name());
+        return;
+    }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
         let tint = egui::Color32::TRANSPARENT;
@@ -352,6 +416,12 @@ pub(crate) fn paint_chord_chip_to_rect(
             }
             None => return paint_text_pill(painter, top_left, chip_h, "target?".to_string(), true),
         }
+    }
+
+    // MIDI: no glyph exists, and the short name IS the rendering (bright, not
+    // the dimmed "icon missing" pill).
+    if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
+        return paint_text_pill(painter, top_left, chip_h, p.short_label(), false);
     }
 
     // Probe current skin first; fall back to any other skin that has the
@@ -523,6 +593,9 @@ pub(crate) fn remapper_key_to_pin_id(key: egui::Key) -> String {
 pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
         return p.display_name.to_string();
+    }
+    if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
+        return p.display_name();
     }
     // Synthetic stick-cardinal pins (derived inside Remapper, not canonical).
     match pin_id {

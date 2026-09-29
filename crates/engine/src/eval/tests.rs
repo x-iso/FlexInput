@@ -4746,6 +4746,94 @@ mod midi_source_tests {
         );
     }
 
+    fn pad_sink(uid: usize, src_key: &str) -> NodeSnap {
+        let pins: Vec<String> = automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect();
+        let mut n = node(uid, "device.sink");
+        n.sink_target = Some(crate::graph::SinkTarget {
+            device_id: "virtual.xinput:0".to_string(),
+            multi_sources: vec![Vec::new(); pins.len()],
+            automap_source: Some((src_key.to_string(), pins.clone())),
+            pin_ids: pins,
+            automap_fallback_dev: Some("midi_in:0".to_string()),
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        n
+    }
+
+    fn remapper(uid: usize, mappings: serde_json::Value) -> NodeSnap {
+        let mut n = node(uid, "module.remapper");
+        n.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
+        n.params.insert("mappings".into(), mappings);
+        n.input_sources = vec![Some((0, 0))];
+        n.n_outputs = 1;
+        n
+    }
+
+    /// A MIDI note drives a pad button through the Remapper; the note it
+    /// consumed is published RELEASED on its bus (so a downstream reader can't
+    /// fall back to the raw device and see it still held), while a MIDI pin the
+    /// config never mentions passes through untouched.
+    ///
+    /// The pass-through under test is `remapper_pass_through_and_suppress`,
+    /// which the JSM module calls too — so this pins MIDI on the bus for both.
+    #[test]
+    fn a_midi_note_drives_a_pad_button_and_is_consumed() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([{ "in": ["midi:note:1:60"], "out": ["btn_south"] }])),
+                pad_sink(3, "remap:2"),
+                midi_out_sink(4, "remap:2", Some("midi_in:0"), true),
+            ],
+        };
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+
+        assert_eq!(
+            out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string())),
+            Some(&Signal::Bool(true)),
+            "the note should press the pad button",
+        );
+        assert_eq!(
+            out.sink_outputs.get(&("midi_out:0".to_string(), "midi:note:1:60".to_string())),
+            Some(&Signal::Bool(false)),
+            "a consumed note must read released downstream, not leak from the raw device",
+        );
+        assert_eq!(
+            out.sink_outputs.get(&("midi_out:0".to_string(), "midi:cc:1:7".to_string())),
+            Some(&Signal::Float(0.5)),
+            "an unmapped MIDI pin passes through",
+        );
+    }
+
+    /// Any-channel input: a mapping on `midi:note:*:60` fires whichever channel
+    /// the note arrives on (the device publishes the `*` twin).
+    #[test]
+    fn an_any_channel_mapping_fires_from_any_channel() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([{ "in": ["midi:note:*:60"], "out": ["btn_north"] }])),
+                pad_sink(3, "remap:2"),
+            ],
+        };
+        let north = |sigs: &HashMap<(String, String), Signal>| {
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            out.sink_outputs
+                .get(&("virtual.xinput:0".to_string(), "btn_north".to_string()))
+                .map(|s| s.as_bool())
+                .unwrap_or(false)
+        };
+        let mut on_ch9 = HashMap::new();
+        on_ch9.insert(("midi_in:0".to_string(), "midi:note:9:60".to_string()), Signal::Bool(true));
+        on_ch9.insert(("midi_in:0".to_string(), "midi:note:*:60".to_string()), Signal::Bool(true));
+        assert!(north(&on_ch9));
+        assert!(!north(&HashMap::new()));
+    }
+
     /// A Splitter reading a MIDI pin that isn't playing gets its rest value,
     /// not "no signal".
     #[test]

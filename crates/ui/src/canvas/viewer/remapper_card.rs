@@ -511,11 +511,15 @@ pub(crate) fn remapper_mapping_card_pixel(
     let chord_y_out_first = 69.0 * s; // = label_y(72) - 3, center at y=82
 
     let chord_painter = painter.clone();
-    let render_chord_row_painter = |row_y_start: f32, pins: &[String], sep: &str| {
+    // Rects of the in-row's MIDI chips, for the channel popup below. Collected
+    // while painting because that is the only place a chip's geometry exists —
+    // the row wraps, and a chip's width depends on what was drawn.
+    let mut midi_in_chips: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut render_chord_row_painter = |row_y_start: f32, pins: &[String], sep: &str, is_in: bool| {
         let mut cur_x = chord_x_start;
         let mut row_y = row_y_start;
         let mut first = true;
-        for p in pins {
+        for (pin_idx, p) in pins.iter().enumerate() {
             let render_id: &str = match p.as_str() {
                 "touchpad_left"   => "touch_left",
                 "touchpad_center" => "touch_center",
@@ -548,11 +552,17 @@ pub(crate) fn remapper_mapping_card_pixel(
             let painted_w = paint_chord_chip_to_rect(
                 &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id, skin,
             );
+            if is_in && flexinput_core::midi::parse_pin(p).is_some_and(|m| m.channel().is_some()) {
+                midi_in_chips.push((
+                    pin_idx,
+                    egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size)),
+                ));
+            }
             cur_x += painted_w + chord_gap;
         }
     };
 
-    render_chord_row_painter(chord_y_in, in_pins, in_sep);
+    render_chord_row_painter(chord_y_in, in_pins, in_sep, true);
     if let Some(out_pins) = out_pins {
         // Out row starts after the in row's actual wrapped height — keep
         // label pill paired with the first chip on the row.
@@ -564,8 +574,9 @@ pub(crate) fn remapper_mapping_card_pixel(
         // the out row down by exactly one row pitch per extra in-row.
         let extra = (in_rows as f32 - 1.0) * row_pitch_y;
         draw_io_pill("out", 5.0, 72.0 + extra / s);
-        render_chord_row_painter(chord_y_out_first + extra, out_pins, "+");
+        render_chord_row_painter(chord_y_out_first + extra, out_pins, "+", false);
     }
+    drop(render_chord_row_painter);
 
     // ── Body drag handle (reorder) ─────────────────────────────────────────
     // The whole body strip (below the 31px header) is the drag handle. The
@@ -630,6 +641,56 @@ pub(crate) fn remapper_mapping_card_pixel(
                 mapping.insert("in_order".to_string(), Value::Bool(true));
             }
             changed = true;
+        }
+    }
+
+    // ── MIDI channel, on an in-chip (on top of the drag handle) ─────────────
+    // A MIDI input is captured on whatever channel the controller happened to
+    // send, which is often not the one to listen on — a pad-per-channel
+    // controller, or a config meant to work whatever the keyboard is set to.
+    // Clicking the chip picks another channel, or "any", which matches every
+    // channel (the `*` the engine resolves against each one).
+    for (pin_idx, chip_rect) in midi_in_chips {
+        let Some(pin) = in_pins.get(pin_idx).and_then(|p| flexinput_core::midi::parse_pin(p)) else {
+            continue;
+        };
+        let Some(ch) = pin.channel() else { continue };
+        let id = ui.id().with(("fxi_midi_ch", mapping_idx, pin_idx));
+        let resp = ui.interact(chip_rect, id, egui::Sense::click())
+            .on_hover_text(format!("{}\nClick to change channel.", pin.display_name()));
+        if resp.hovered() {
+            painter.rect_filled(chip_rect, RADIUS, Color32::from_white_alpha(28));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let popup_id = id.with("popup");
+        if resp.clicked() {
+            egui::Popup::toggle_id(ui.ctx(), popup_id);
+        }
+        let mut picked: Option<flexinput_core::midi::Channel> = None;
+        popup_below_widget(
+            &resp, popup_id,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                use flexinput_core::midi::Channel;
+                ui.set_min_width(110.0);
+                if ui.add(egui::Button::selectable(ch == Channel::Any, "any channel"))
+                    .on_hover_text("Fire whichever channel this message arrives on.")
+                    .clicked()
+                {
+                    picked = Some(Channel::Any);
+                }
+                for c in 0..16u8 {
+                    if ui.add(egui::Button::selectable(ch == Channel::Ch(c), format!("ch {}", c + 1))).clicked() {
+                        picked = Some(Channel::Ch(c));
+                    }
+                }
+            },
+        );
+        if let Some(new_ch) = picked {
+            if let Some(Value::Array(arr)) = mapping.get_mut("in") {
+                changed |= midi_set_pin_channel(arr, pin_idx, new_ch);
+            }
+            egui::Popup::close_id(ui.ctx(), popup_id);
         }
     }
 
