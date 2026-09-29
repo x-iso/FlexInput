@@ -230,6 +230,38 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
     added
 }
 
+/// Key for the per-frame list of MIDI In ports a mapping card can learn from.
+const MIDI_IN_REGISTRY: &str = "fxi_midi_in_ports";
+
+/// Publish the MIDI In ports currently on the machine, as `(device id, name)`.
+///
+/// A card's Learn needs the ports themselves, not the pins they happen to be
+/// publishing: a port sitting idle carries no pins at all (the backend only
+/// emits what is away from rest), so live signals can't be asked which ports
+/// exist. Called once a frame from the app, read by every card.
+pub fn set_midi_in_registry(ctx: &egui::Context, ports: Vec<(String, String)>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(MIDI_IN_REGISTRY), ports));
+}
+
+/// The MIDI In ports published this frame, `(device id, name)`.
+pub(crate) fn midi_in_registry(ctx: &egui::Context) -> Vec<(String, String)> {
+    ctx.data(|d| d.get_temp::<Vec<(String, String)>>(egui::Id::new(MIDI_IN_REGISTRY)))
+        .unwrap_or_default()
+}
+
+/// Which MIDI In ports a card should listen to while learning an output.
+///
+/// All of them by default — a controller is usually the only one, and asking
+/// which port a note came from before you have played it is backwards. A card
+/// that picked one in `midi_learn_ref` hears only that one.
+pub(crate) fn midi_learn_ref_ports(ctx: &egui::Context, picked: &str) -> Vec<String> {
+    midi_in_registry(ctx)
+        .into_iter()
+        .filter(|(id, _)| picked.is_empty() || id == picked)
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// Move the MIDI pin at `idx` of a mapping's pin list onto another channel.
 ///
 /// A note's velocity twin moves with it: an analog card reads the velocity of

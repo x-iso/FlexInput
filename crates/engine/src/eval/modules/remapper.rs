@@ -380,6 +380,9 @@ pub(crate) fn eval_remapper_node(
             // Accumulate cardinal-axis writes additively; track button-output
             // emissions per output-pin for turbo / sustain handling.
             let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
+            // MIDI value pins an analog card drives, summed like the axes above
+            // so two cards can push one controller.
+            let mut midi_analog_acc: HashMap<String, f32> = HashMap::new();
             let mut analog_button_out: HashSet<String> = HashSet::new();
             let mut analog_out_pins: HashSet<String> = HashSet::new();
             for &t_idx in &analog_emit_idx {
@@ -440,6 +443,24 @@ pub(crate) fn eval_remapper_node(
                         // triggers like Switch Pro).
                         let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
                         *entry += mag_from_input.max(0.0);
+                    } else if let Some((_, bipolar)) = midi_analog_out(out_p) {
+                        // A MIDI value pin takes the input's live magnitude,
+                        // and an analog TRIGGER contributes its travel rather
+                        // than the full-magnitude stand-in a pad target gets:
+                        // a controller that jumps to 127 the moment the trigger
+                        // leaves zero would make "trigger → CC" pointless.
+                        let live = analog_in_value(&upstream, in_p)
+                            .map(|raw| shape.shaped(raw))
+                            .unwrap_or(mag_from_input);
+                        // A bend is two-sided, so a cardinal input keeps its
+                        // sign and the two directions of one stick axis bend
+                        // either way; everything else is one-sided, 0 at rest.
+                        let v = match (bipolar, analog_axis_for_cardinal(in_p)) {
+                            (true, Some((_, sign))) => sign * live,
+                            (true, None) => live,
+                            (false, _) => live.max(0.0),
+                        };
+                        *midi_analog_acc.entry(out_p.clone()).or_insert(0.0) += v;
                     } else {
                         // Non-cardinal out: button / key.
                         // With a manual threshold, the output is a PLAIN HOLD:
@@ -458,6 +479,32 @@ pub(crate) fn eval_remapper_node(
                             analog_button_out.insert(out_p.clone());
                         }
                     }
+                }
+            }
+            // Commit the MIDI value accumulator. A one-sided pin rests at 0
+            // and a bend at centre, which is 0 on the bus either way, so an
+            // analog card that is doing nothing writes its pin at rest rather
+            // than leaving the last value standing.
+            for (pin, v) in &midi_analog_acc {
+                let bipolar = midi_analog_out(pin).map(|(_, b)| b).unwrap_or(false);
+                let clamped = if bipolar { v.clamp(-1.0, 1.0) } else { v.clamp(0.0, 1.0) };
+                collector_sigs.insert((key.clone(), pin.clone()), Signal::Float(clamped));
+                mark_produced(&key, pin, collector_sigs);
+            }
+            // An analog card that isn't firing writes its MIDI pin at rest, the
+            // way the digital pass writes an off level — so the value on the
+            // bus says "nothing is driving this" rather than going absent and
+            // leaving a downstream reader to infer it. A card the pass above
+            // already wrote keeps that value, and the digital pass, which runs
+            // later, still wins over both.
+            for m in &mappings {
+                if m.get("mode").and_then(|v| v.as_str()) != Some("analog") { continue; }
+                let outs = m.get("out").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                for v in &outs {
+                    let Some(p) = v.as_str() else { continue };
+                    if midi_analog_acc.contains_key(p) || midi_analog_out(p).is_none() { continue; }
+                    collector_sigs.insert((key.clone(), p.to_string()), Signal::Float(0.0));
+                    mark_produced(&key, p, collector_sigs);
                 }
             }
             // Commit axis accumulator: clamp ±1 then write.
@@ -499,6 +546,10 @@ pub(crate) fn eval_remapper_node(
                     for v in arr {
                         if let Some(s) = v.as_str() {
                             if !is_bus_out_pin(s) { continue; }
+                            // MIDI pins are typed and carry per-card levels
+                            // (velocity, on / off), so they are published by
+                            // the MIDI pass below rather than as plain bools.
+                            if flexinput_core::midi::is_midi_pin(s) { continue; }
                             digital_all_out_pins.insert(s.to_string());
                         }
                     }
@@ -520,6 +571,58 @@ pub(crate) fn eval_remapper_node(
                     merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
                 }
             }
+            // ── MIDI outputs ────────────────────────────────────────────
+            //
+            // A note is a gate on the bus and its velocity rides a twin pin the
+            // MIDI Out encoder reads; a value pin driven by a button sends the
+            // card's on / off level. Everything published here is MARKED
+            // produced, which is what lets a MIDI Out send it with its Thru
+            // toggle off — the setting that stops a shared In/Out port from
+            // feeding itself.
+            {
+                let mut midi_on_now: HashMap<String, Signal> = HashMap::new();
+                for (_, out_pins, is_analog, idx) in &triggered {
+                    if *is_analog { continue; }
+                    let (vel, on, _) = midi_card_levels(&mappings[*idx]);
+                    for p in out_pins {
+                        let Some(pin) = flexinput_core::midi::parse_pin(p) else { continue };
+                        if pin.is_continuous() {
+                            midi_on_now.insert(p.clone(), Signal::Float(on));
+                        } else {
+                            midi_on_now.insert(p.clone(), Signal::Bool(true));
+                            if let Some(twin) = midi_velocity_twin(&pin) {
+                                midi_on_now.insert(twin.to_id(), Signal::Float(vel));
+                            }
+                        }
+                    }
+                }
+                // Released cards write their off level, so a value pin returns
+                // to rest and a note lifts instead of hanging.
+                let mut midi_off_now: HashMap<String, Signal> = HashMap::new();
+                for m in &mappings {
+                    if m.get("mode").and_then(|v| v.as_str()) == Some("analog") { continue; }
+                    let (_, _, off) = midi_card_levels(m);
+                    let outs = m.get("out").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    for v in &outs {
+                        let Some(p) = v.as_str() else { continue };
+                        let Some(pin) = flexinput_core::midi::parse_pin(p) else { continue };
+                        if midi_on_now.contains_key(p) { continue; }
+                        if pin.is_continuous() {
+                            midi_off_now.insert(p.to_string(), Signal::Float(off));
+                        } else {
+                            midi_off_now.insert(p.to_string(), Signal::Bool(false));
+                            if let Some(twin) = midi_velocity_twin(&pin) {
+                                midi_off_now.insert(twin.to_id(), Signal::Float(0.0));
+                            }
+                        }
+                    }
+                }
+                for (pin, sig) in midi_on_now.into_iter().chain(midi_off_now) {
+                    collector_sigs.insert((key.clone(), pin.clone()), sig);
+                    mark_produced(&key, &pin, collector_sigs);
+                }
+            }
+
             for out_pin in &digital_all_out_pins {
                 let sig_type = automap::ALL_PINS.iter()
                     .find(|p| p.id == out_pin.as_str())
@@ -572,8 +675,14 @@ pub(crate) fn eval_remapper_node(
                             // release pass or it would clobber the analog value.
                             // Macro pins are published via the macro namespace
                             // in the emit loop above, never as bus buttons.
+                            // A MIDI VALUE pin (CC, bend, pressure…) is an
+                            // axis, not a button: the accumulator above owns
+                            // it, and letting the button release pass write it
+                            // too would stamp the live value back to off. A
+                            // MIDI note is a gate and does belong here.
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
+                                && midi_analog_out(s).is_none()
                                 && is_bus_out_pin(s)
                             {
                                 analog_button_pins.insert(s.to_string());
@@ -585,6 +694,27 @@ pub(crate) fn eval_remapper_node(
             for out_pin in &analog_button_pins {
                 if digital_asserted.contains(out_pin) { continue; } // digital wins for this pin
                 let on = analog_button_out.contains(out_pin);
+                // An analog card on a MIDI note: the gate still comes from the
+                // button path above, so only the typed value, its velocity and
+                // the produced mark are MIDI's business here.
+                if let Some(pin) = flexinput_core::midi::parse_pin(out_pin) {
+                    let vel = mappings.iter()
+                        .find(|m| m.get("out").and_then(|v| v.as_array()).is_some_and(|a|
+                            a.iter().any(|v| v.as_str() == Some(out_pin.as_str()))))
+                        .map(|m| midi_card_levels(m).0)
+                        .unwrap_or(MIDI_CARD_VELOCITY / 127.0);
+                    collector_sigs.insert((key.clone(), out_pin.clone()), Signal::Bool(on));
+                    mark_produced(&key, out_pin, collector_sigs);
+                    if let Some(twin) = midi_velocity_twin(&pin) {
+                        let id = twin.to_id();
+                        collector_sigs.insert(
+                            (key.clone(), id.clone()),
+                            Signal::Float(if on { vel } else { 0.0 }),
+                        );
+                        mark_produced(&key, &id, collector_sigs);
+                    }
+                    continue;
+                }
                 let sig_type = automap::ALL_PINS.iter()
                     .find(|p| p.id == out_pin.as_str())
                     .map(|p| p.signal_type)
@@ -767,6 +897,43 @@ fn analog_chord_active(in_pins: &[&str], mut pin_passes: impl FnMut(&str) -> boo
 ///   - unmapped pins → raw pass-through
 /// Then recomputes synthetic stick cardinals from the clamped axes and publishes
 /// the consumed-pin markers for downstream Combiner hierarchy suppression.
+/// Default NoteOn velocity for a card that hasn't set one, matching the
+/// device encoder's own default.
+pub(crate) const MIDI_CARD_VELOCITY: f32 = 100.0;
+
+/// What a card sends on a MIDI pin it drives as a BUTTON: the note velocity,
+/// and the on / off values for a value pin (CC and friends). All three are
+/// per card — `midi_vel`, `midi_on`, `midi_off`, in MIDI's own 0–127 — since a
+/// card is one gesture and its outputs want one answer.
+pub(crate) fn midi_card_levels(m: &serde_json::Value) -> (f32, f32, f32) {
+    let read = |k: &str, d: f32| m.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+    (
+        read("midi_vel", MIDI_CARD_VELOCITY).clamp(1.0, 127.0) / 127.0,
+        read("midi_on", 127.0).clamp(0.0, 127.0) / 127.0,
+        read("midi_off", 0.0).clamp(0.0, 127.0) / 127.0,
+    )
+}
+
+/// A MIDI pin an ANALOG card can drive with a live value, and whether it is
+/// two-sided. A note is not one: it is a gate, and keeps the button path.
+pub(crate) fn midi_analog_out(pin: &str) -> Option<(flexinput_core::midi::MidiPin, bool)> {
+    let p = flexinput_core::midi::parse_pin(pin)?;
+    p.is_continuous().then(|| {
+        let bipolar = matches!(p, flexinput_core::midi::MidiPin::PitchBend { .. });
+        (p, bipolar)
+    })
+}
+
+/// The velocity pin that rides along with a note gate.
+pub(crate) fn midi_velocity_twin(pin: &flexinput_core::midi::MidiPin) -> Option<flexinput_core::midi::MidiPin> {
+    match *pin {
+        flexinput_core::midi::MidiPin::Note { ch, note } => {
+            Some(flexinput_core::midi::MidiPin::Velocity { ch, note })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn remapper_pass_through_and_suppress(
     key: &str,
     upstream: &HashMap<String, Signal>,

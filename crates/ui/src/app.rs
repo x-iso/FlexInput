@@ -1596,6 +1596,18 @@ impl eframe::App for FlexInputApp {
             *self.pinned_midi_ids.write().unwrap() = pinned;
         }
 
+        // Publish the MIDI In ports for this frame's mapping cards: learning a
+        // MIDI output needs the PORTS, and an idle port publishes no pins to
+        // find it by.
+        {
+            let ports: Vec<(String, String)> = self.devices
+                .iter()
+                .filter(|d| d.kind == flexinput_devices::ControllerKind::MidiIn)
+                .map(|d| (d.id.clone(), d.display_name.clone()))
+                .collect();
+            crate::canvas::viewer::set_midi_in_registry(ctx, ports);
+        }
+
         // Feed learned MIDI pins into the active tab's MIDI In nodes.
         {
             let snarl = &mut self.tabs[self.active_tab].canvas.snarl;

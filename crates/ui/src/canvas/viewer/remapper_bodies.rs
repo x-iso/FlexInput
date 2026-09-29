@@ -51,6 +51,22 @@ pub(crate) fn show_remapper_body(
                 pressed_now.push(p);
             }
         }
+        // Learning a MIDI OUTPUT: play the message on a MIDI controller and the
+        // card captures what it sent. The reference is every MIDI In port in
+        // the patch (they are only open while a node uses one), or the single
+        // port this card picked — not the wired upstream, which is the pad the
+        // mapping is FROM.
+        let picked = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("midi_learn_ref").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        for dev in midi_learn_ref_ports(ui.ctx(), &picked) {
+            for p in remapper_midi_pressed_now(ui, live_signals, &dev) {
+                if !pressed_now.iter().any(|q| q == &p) {
+                    pressed_now.push(p);
+                }
+            }
+        }
     }
 
     // Is gamepad UI-nav active for the upstream device this frame? While it is,
@@ -482,6 +498,73 @@ pub(crate) fn show_remapper_body(
             // latched (ready_to_learn) AND during output learning, so the user
             // can pick a mouse/keyboard/touchpad action BEFORE (or instead of)
             // learning a gamepad output chord.
+            // Which MIDI In to learn a MIDI output from. Only worth asking
+            // when there is more than one — with a single controller the
+            // answer is never in doubt.
+            if in_learning {
+                let ports = crate::canvas::viewer::midi_in_registry(ui.ctx());
+                if ports.len() > 1 {
+                    let picked = snarl.get_node(node_id)
+                        .and_then(|n| n.params.get("midi_learn_ref").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let label = ports.iter()
+                        .find(|(id, _)| id == &picked)
+                        .map(|(_, name)| name.as_str())
+                        .unwrap_or("All MIDI");
+                    let mut chosen: Option<String> = None;
+                    egui::ComboBox::from_id_salt((node_id, "midi_learn_ref"))
+                        .selected_text(egui::RichText::new(label).size(12.0))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(picked.is_empty(), "All MIDI").clicked() {
+                                chosen = Some(String::new());
+                            }
+                            for (id, name) in &ports {
+                                if ui.selectable_label(&picked == id, name).clicked() {
+                                    chosen = Some(id.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Which MIDI input this card learns its MIDI output from.");
+                    if let Some(pick) = chosen {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.insert("midi_learn_ref".to_string(), Value::String(pick));
+                        }
+                    }
+                }
+            }
+            // MIDI… — type a MIDI output instead of playing it. Learning from a
+            // controller is the quick way, but a config is often written for a
+            // synth that isn't plugged in yet, and SysEx or an NRPN is not
+            // something anyone wants to perform to capture.
+            if in_learning || learn_enabled {
+                let midi_btn = ui.add(egui::Button::new(egui::RichText::new("MIDI…").size(13.0)))
+                    .on_hover_text("Add a MIDI message as this mapping's output.");
+                let popup_id = ui.id().with((node_id, "midi_out_add_popup"));
+                if midi_btn.clicked() {
+                    egui::Popup::toggle_id(ui.ctx(), popup_id);
+                }
+                let mut picked = None;
+                crate::widgets::popup_below_widget(
+                    &midi_btn, popup_id,
+                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                    |ui| {
+                        picked = midi_pin_picker(ui, (node_id, "midi_out_add"), true);
+                    },
+                );
+                if let Some(pin) = picked {
+                    let id = pin.to_id();
+                    if !new_draft_output.iter().any(|p| p == &id) {
+                        new_draft_output.push(id);
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            remapper_write_str_array(node, "draft_output", &new_draft_output);
+                        }
+                    }
+                    egui::Popup::close_id(ui.ctx(), popup_id);
+                }
+            }
             if in_learning || learn_enabled {
                 let special_btn = ui.add(egui::Button::new(
                     egui::RichText::new("Special…").size(13.0)));

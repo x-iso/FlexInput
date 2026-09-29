@@ -515,6 +515,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     // while painting because that is the only place a chip's geometry exists —
     // the row wraps, and a chip's width depends on what was drawn.
     let mut midi_in_chips: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut midi_out_chips: Vec<(usize, egui::Rect)> = Vec::new();
     let mut render_chord_row_painter = |row_y_start: f32, pins: &[String], sep: &str, is_in: bool| {
         let mut cur_x = chord_x_start;
         let mut row_y = row_y_start;
@@ -552,11 +553,17 @@ pub(crate) fn remapper_mapping_card_pixel(
             let painted_w = paint_chord_chip_to_rect(
                 &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id, skin,
             );
-            if is_in && flexinput_core::midi::parse_pin(p).is_some_and(|m| m.channel().is_some()) {
-                midi_in_chips.push((
-                    pin_idx,
-                    egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size)),
-                ));
+            if flexinput_core::midi::is_midi_pin(p) {
+                let rect = egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size));
+                // The in row offers a channel (including "any"); the out row
+                // offers a channel and what this card sends on it.
+                if is_in {
+                    if flexinput_core::midi::parse_pin(p).is_some_and(|m| m.channel().is_some()) {
+                        midi_in_chips.push((pin_idx, rect));
+                    }
+                } else {
+                    midi_out_chips.push((pin_idx, rect));
+                }
             }
             cur_x += painted_w + chord_gap;
         }
@@ -688,6 +695,94 @@ pub(crate) fn remapper_mapping_card_pixel(
         );
         if let Some(new_ch) = picked {
             if let Some(Value::Array(arr)) = mapping.get_mut("in") {
+                changed |= midi_set_pin_channel(arr, pin_idx, new_ch);
+            }
+            egui::Popup::close_id(ui.ctx(), popup_id);
+        }
+    }
+
+    // ── MIDI output settings, on an out-chip ───────────────────────────────
+    // What a card SENDS: the channel, a note's velocity, and the on / off
+    // values a value pin (CC and friends) gets when a button drives it. The
+    // levels belong to the card rather than the pin — a card is one gesture,
+    // and asking for a velocity per note of a chord is a question nobody has.
+    for (pin_idx, chip_rect) in midi_out_chips {
+        let Some(pin) = out_pins
+            .and_then(|o| o.get(pin_idx))
+            .and_then(|p| flexinput_core::midi::parse_pin(p))
+        else {
+            continue;
+        };
+        let id = ui.id().with(("fxi_midi_out", mapping_idx, pin_idx));
+        let resp = ui.interact(chip_rect, id, egui::Sense::click())
+            .on_hover_text(format!("{}\nClick for channel and levels.", pin.display_name()));
+        if resp.hovered() {
+            painter.rect_filled(chip_rect, RADIUS, Color32::from_white_alpha(28));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let popup_id = id.with("popup");
+        if resp.clicked() {
+            egui::Popup::toggle_id(ui.ctx(), popup_id);
+        }
+        let is_note = matches!(pin, flexinput_core::midi::MidiPin::Note { .. });
+        let is_value = pin.is_continuous();
+        let (mut vel, mut on, mut off) = (
+            mapping.get("midi_vel").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+            mapping.get("midi_on").and_then(|v| v.as_f64()).unwrap_or(127.0) as f32,
+            mapping.get("midi_off").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        );
+        let (vel0, on0, off0) = (vel, on, off);
+        let mut picked_ch: Option<flexinput_core::midi::Channel> = None;
+        popup_below_widget(
+            &resp, popup_id,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                use flexinput_core::midi::Channel;
+                ui.set_min_width(150.0);
+                if is_note {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Velocity").size(12.0));
+                        ui.add(egui::DragValue::new(&mut vel).range(1.0..=127.0).speed(0.5));
+                    });
+                } else if is_value {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("On").size(12.0));
+                        ui.add(egui::DragValue::new(&mut on).range(0.0..=127.0).speed(0.5));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Off").size(12.0));
+                        ui.add(egui::DragValue::new(&mut off).range(0.0..=127.0).speed(0.5));
+                    })
+                    .response
+                    .on_hover_text(
+                        "A button on a controller sends these two values. \
+                         An analog card ignores them and sends its live value.",
+                    );
+                }
+                if let Some(cur) = pin.channel() {
+                    ui.separator();
+                    for c in 0..16u8 {
+                        if ui.add(egui::Button::selectable(cur == Channel::Ch(c), format!("ch {}", c + 1))).clicked() {
+                            picked_ch = Some(Channel::Ch(c));
+                        }
+                    }
+                }
+            },
+        );
+        if vel != vel0 {
+            mapping.insert("midi_vel".to_string(), Value::from(vel as f64));
+            changed = true;
+        }
+        if on != on0 {
+            mapping.insert("midi_on".to_string(), Value::from(on as f64));
+            changed = true;
+        }
+        if off != off0 {
+            mapping.insert("midi_off".to_string(), Value::from(off as f64));
+            changed = true;
+        }
+        if let Some(new_ch) = picked_ch {
+            if let Some(Value::Array(arr)) = mapping.get_mut("out") {
                 changed |= midi_set_pin_channel(arr, pin_idx, new_ch);
             }
             egui::Popup::close_id(ui.ctx(), popup_id);

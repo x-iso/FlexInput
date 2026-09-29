@@ -4834,6 +4834,123 @@ mod midi_source_tests {
         assert!(!north(&HashMap::new()));
     }
 
+    const PAD: &str = "gilrs:xinput:0";
+
+    fn pad_source_for_midi(uid: usize) -> NodeSnap {
+        let mut n = node(uid, "device.source");
+        n.device_id = Some(PAD.to_string());
+        // No stick deadzone, so the numbers below are the ones the mapping
+        // sees rather than deadzone-rescaled ones.
+        n.params.insert("deadzone".into(), Value::from(0.0));
+        n
+    }
+
+    fn pad_remapper(uid: usize, mappings: serde_json::Value) -> NodeSnap {
+        let mut n = node(uid, "module.remapper");
+        n.params.insert("_automap_device_id".into(), Value::String(PAD.into()));
+        n.params.insert("mappings".into(), mappings);
+        n.input_sources = vec![Some((0, 0))];
+        n.n_outputs = 1;
+        n
+    }
+
+    fn pad_sigs(pairs: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
+        pairs.iter().map(|(p, s)| ((PAD.to_string(), p.to_string()), *s)).collect()
+    }
+
+    fn midi_out_of(out: &TickOutput, pin: &str) -> Option<Signal> {
+        out.sink_outputs.get(&("midi_out:0".to_string(), pin.to_string())).copied()
+    }
+
+    /// A pad button plays a note, and the note reaches a MIDI Out with Thru
+    /// OFF — proving it was published as PRODUCED, the thing that separates a
+    /// mapping's own MIDI from raw MIDI passing by. Its velocity rides the twin
+    /// pin the device encoder reads, and releasing lifts both.
+    #[test]
+    fn a_pad_button_plays_a_note_with_its_velocity() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                pad_source_for_midi(1),
+                pad_remapper(2, serde_json::json!([
+                    { "in": ["btn_south"], "out": ["midi:note:1:60"], "midi_vel": 64.0 }
+                ])),
+                midi_out_sink(3, "remap:2", Some(PAD), false),
+            ],
+        };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_south", Signal::Bool(true))]), 0.016, &mut out);
+        assert_eq!(midi_out_of(&out, "midi:note:1:60"), Some(Signal::Bool(true)));
+        let vel = midi_out_of(&out, "midi:vel:1:60").map(|s| s.as_float()).unwrap_or(0.0);
+        assert!((vel - 64.0 / 127.0).abs() < 1e-6, "velocity {vel}");
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_south", Signal::Bool(false))]), 0.016, &mut out);
+        assert_eq!(midi_out_of(&out, "midi:note:1:60"), Some(Signal::Bool(false)));
+        assert_eq!(midi_out_of(&out, "midi:vel:1:60"), Some(Signal::Float(0.0)));
+    }
+
+    /// A button on a CC sends the card's on level, and its off level when
+    /// released — so a CC used as a switch doesn't stick at its last value.
+    #[test]
+    fn a_button_on_a_cc_sends_the_cards_levels() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                pad_source_for_midi(1),
+                pad_remapper(2, serde_json::json!([
+                    { "in": ["btn_east"], "out": ["midi:cc:2:74"], "midi_on": 100.0, "midi_off": 20.0 }
+                ])),
+                midi_out_sink(3, "remap:2", Some(PAD), false),
+            ],
+        };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let value = |o: &TickOutput| midi_out_of(o, "midi:cc:2:74").map(|s| s.as_float()).unwrap_or(-1.0);
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_east", Signal::Bool(true))]), 0.016, &mut out);
+        assert!((value(&out) - 100.0 / 127.0).abs() < 1e-6, "on {}", value(&out));
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_east", Signal::Bool(false))]), 0.016, &mut out);
+        assert!((value(&out) - 20.0 / 127.0).abs() < 1e-6, "off {}", value(&out));
+    }
+
+    /// An analog card sends a live value: a trigger's TRAVEL (not a full-scale
+    /// stand-in the moment it leaves zero), and a stick's two directions bend
+    /// either side of centre.
+    #[test]
+    fn analog_cards_send_travel_and_bend_both_ways() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                pad_source_for_midi(1),
+                pad_remapper(2, serde_json::json!([
+                    { "in": ["left_trigger"], "out": ["midi:cc:1:7"], "mode": "analog" },
+                    { "in": ["left_stick_right"], "out": ["midi:pb:1"], "mode": "analog" },
+                    { "in": ["left_stick_left"], "out": ["midi:pb:1"], "mode": "analog" },
+                ])),
+                midi_out_sink(3, "remap:2", Some(PAD), false),
+            ],
+        };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[
+            ("left_trigger", Signal::Float(0.5)),
+            ("left_stick_x", Signal::Float(0.8)),
+        ]), 0.016, &mut out);
+        let cc = midi_out_of(&out, "midi:cc:1:7").map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((cc - 0.5).abs() < 1e-3, "a half-pulled trigger should send half scale, got {cc}");
+        let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(0.0);
+        assert!((bend - 0.8).abs() < 1e-3, "stick right bends up, got {bend}");
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("left_stick_x", Signal::Float(-0.6))]), 0.016, &mut out);
+        let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(0.0);
+        assert!((bend + 0.6).abs() < 1e-3, "stick left bends down, got {bend}");
+
+        eval_graph_tick(&graph, &mut state, &pad_sigs(&[]), 0.016, &mut out);
+        let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(9.0);
+        let cc = midi_out_of(&out, "midi:cc:1:7").map(|s| s.as_float()).unwrap_or(9.0);
+        assert!(bend.abs() < 1e-6 && cc.abs() < 1e-6, "released analog cards rest, got {bend} / {cc}");
+    }
+
     /// A Splitter reading a MIDI pin that isn't playing gets its rest value,
     /// not "no signal".
     #[test]
