@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-09-29
+
 ### Changed
 
 - **"Suppress touch + misc" is now "Suppress capacitive touch", and mutes only
