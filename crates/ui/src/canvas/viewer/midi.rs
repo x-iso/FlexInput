@@ -148,6 +148,49 @@ impl Default for PickerState {
 /// `for_output` hides kinds (and the "any channel" choice) a MIDI output can't
 /// write. Returns the pin when Add is clicked with a valid selection.
 pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, for_output: bool) -> Option<MidiPin> {
+    let mut added = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let built = midi_pin_picker_fields(ui, id_salt, for_output);
+        if midi_pin_add_button(ui, "Add", built.clone(), true).clicked() {
+            added = built;
+        }
+    });
+    added
+}
+
+/// An Add-style button for a picked pin: disabled (with the reason) when the
+/// selection can't be used. Shared by every place the picker is offered, so
+/// "why is this greyed out" is answered the same way each time.
+pub(crate) fn midi_pin_add_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    built: Option<MidiPin>,
+    allowed: bool,
+) -> egui::Response {
+    let usable = allowed && built.is_some();
+    let resp = ui.add_enabled(usable, egui::Button::new(egui::RichText::new(label).small()));
+    match (&built, allowed) {
+        (None, _) => resp.on_disabled_hover_text(format!(
+            "A complete SysEx message: starts F0, ends F7, at most {} bytes.",
+            fmidi::SYSEX_MAX_BYTES
+        )),
+        (Some(_), false) => resp.on_disabled_hover_text(
+            "An output has to name one channel, and has to be a message that can be sent.",
+        ),
+        _ => resp,
+    }
+}
+
+/// The picker's controls WITHOUT an Add button, for callers that offer their
+/// own (the Remapper adds a picked message as an input or as an output, and
+/// which one is not the picker's business). Returns the pin currently built,
+/// or `None` while the selection is incomplete.
+pub(crate) fn midi_pin_picker_fields(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    for_output: bool,
+) -> Option<MidiPin> {
     let id = egui::Id::new(("midi_pin_picker", id_salt));
     let mut st: PickerState = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_default();
     if for_output && !st.kind.writable() {
@@ -157,9 +200,8 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
         st.channel = 1;
     }
 
-    let mut added = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+    let built;
+    {
         egui::ComboBox::from_id_salt(id.with("kind"))
             .selected_text(egui::RichText::new(st.kind.label()).small())
             .width(110.0)
@@ -211,23 +253,11 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
         }
 
         let ch = if st.channel == 0 { Channel::Any } else { Channel::Ch(st.channel - 1) };
-        let built = st.kind.build(ch, st.number, &st.sysex);
-        let resp = ui.add_enabled(built.is_some(), egui::Button::new(egui::RichText::new("Add").small()));
-        let resp = if built.is_none() && st.kind == PickKind::SysEx {
-            resp.on_disabled_hover_text(format!(
-                "A complete SysEx message: starts F0, ends F7, at most {} bytes.",
-                fmidi::SYSEX_MAX_BYTES
-            ))
-        } else {
-            resp
-        };
-        if resp.clicked() {
-            added = built;
-        }
-    });
+        built = st.kind.build(ch, st.number, &st.sysex);
+    }
 
     ui.ctx().data_mut(|d| d.insert_temp(id, st));
-    added
+    built
 }
 
 /// Key for the per-frame list of MIDI In ports a mapping card can learn from.

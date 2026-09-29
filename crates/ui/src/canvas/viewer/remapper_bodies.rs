@@ -535,26 +535,71 @@ pub(crate) fn show_remapper_body(
                     }
                 }
             }
-            // MIDI… — type a MIDI output instead of playing it. Learning from a
-            // controller is the quick way, but a config is often written for a
-            // synth that isn't plugged in yet, and SysEx or an NRPN is not
-            // something anyone wants to perform to capture.
-            if in_learning || learn_enabled {
+            // MIDI… — pick a message by hand instead of playing it, on EITHER
+            // side: an input for a controller that isn't plugged in (or a note
+            // at the wrong end of an 88-key board), an output for a synth that
+            // isn't either. A SysEx or an NRPN sweep is also not something
+            // anyone wants to perform just to capture it.
+            {
                 let midi_btn = ui.add(egui::Button::new(egui::RichText::new("MIDI…").size(13.0)))
-                    .on_hover_text("Add a MIDI message as this mapping's output.");
-                let popup_id = ui.id().with((node_id, "midi_out_add_popup"));
+                    .on_hover_text("Add a MIDI message to this mapping by hand.");
+                let popup_id = ui.id().with((node_id, "midi_pick_popup"));
                 if midi_btn.clicked() {
                     egui::Popup::toggle_id(ui.ctx(), popup_id);
                 }
-                let mut picked = None;
+                // An input can be added while the card is still collecting its
+                // trigger; an output once the input is latched. During output
+                // learning the input is settled, so only the output side is
+                // offered.
+                let can_add_input = !in_learning;
+                let can_add_output = in_learning || learn_enabled;
+                let mut add_input: Option<flexinput_core::midi::MidiPin> = None;
+                let mut add_output: Option<flexinput_core::midi::MidiPin> = None;
                 crate::widgets::popup_below_widget(
                     &midi_btn, popup_id,
                     egui::PopupCloseBehavior::CloseOnClickOutside,
                     |ui| {
-                        picked = midi_pin_picker(ui, (node_id, "midi_out_add"), true);
+                        ui.set_min_width(300.0);
+                        // Every kind is offered: "any channel", Playing and BPM
+                        // are input-only, and the output button says so itself
+                        // rather than the list quietly hiding them.
+                        let built = ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            midi_pin_picker_fields(ui, (node_id, "midi_pick"), false)
+                        }).inner;
+                        ui.horizontal(|ui| {
+                            if can_add_input
+                                && midi_pin_add_button(ui, "Add as input", built.clone(), true).clicked()
+                            {
+                                add_input = built.clone();
+                            }
+                            if can_add_output {
+                                let ok = built.as_ref().is_some_and(|p| p.is_output_capable());
+                                if midi_pin_add_button(ui, "Add as output", built.clone(), ok).clicked() {
+                                    add_output = built.clone();
+                                }
+                            }
+                        });
                     },
                 );
-                if let Some(pin) = picked {
+                if let Some(pin) = add_input {
+                    let id = pin.to_id();
+                    if !new_draft_input.iter().any(|p| p == &id) {
+                        new_draft_input.push(id);
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            remapper_write_str_array(node, "draft_input", &new_draft_input);
+                            // Latch it, the way a played chord latches when it is
+                            // released: left capturing, the state machine would
+                            // replace this draft the moment the pad was touched,
+                            // and Learn would clear it to start a fresh capture.
+                            node.params.insert("ui_phase".to_string(),
+                                Value::String("ready_to_learn".to_string()));
+                            node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+                        }
+                    }
+                    egui::Popup::close_id(ui.ctx(), popup_id);
+                }
+                if let Some(pin) = add_output {
                     let id = pin.to_id();
                     if !new_draft_output.iter().any(|p| p == &id) {
                         new_draft_output.push(id);
