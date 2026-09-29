@@ -860,10 +860,146 @@ Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
 9. **The custom-curve fork.** The five acceleration curves, decay smoothing, the
    one-euro filter, angle snap, the deceleration brake and `YAW_PLUS_ROLL`.
    *(landed — see above)*
+10. **MIDI.** The `MIDI_*` vocabulary on both sides, the channel / velocity
+   settings, continuous sources into CC and bend, and MIDI as an input.
+   *(planned — see above. Needs the bus work in the MIDI plan's phases 4–5.)*
 
 Each phase lands with engine tests in the style of the Remapper's
 (`rig_steps`-like tick stepping), and with mutation checks that the tests catch
 the semantics they describe.
+
+## Phase 10 — MIDI
+
+FlexInput's MIDI work (`feat/midi`) gives the bus a full MIDI vocabulary, so a
+config can both **play MIDI** and **be played by it**. The names are ours, not
+JSM's — JSM has no MIDI at all — and they are taken the same way `@` was: no JSM
+name begins `MIDI_`, in any position, so nothing is being taken away.
+
+Everything here needs the bus side first (MIDI plan, phases 4–5): dynamic MIDI
+pins through the shared `remapper_pass_through_and_suppress`, which this module
+already calls, and the produced-pin marking a MIDI Out sink needs.
+
+### The names
+
+One spelling, both sides of the `=` — a note is `MIDI_C4` whether a button plays
+it or it presses a key.
+
+| what | spelling | notes |
+| --- | --- | --- |
+| note | `MIDI_C4`, `MIDI_CS4` | `S` is the sharp: `#` is not a legal JSM word character |
+| note by number | `MIDI_N60` | always available, and the only way to reach octave −1 |
+| CC | `MIDI_CC7` | `MIDI_CC14_7` for the 14-bit pair |
+| parameter | `MIDI_NRPN130`, `MIDI_RPN0` | |
+| bend / pressure | `MIDI_PB`, `MIDI_CP` | |
+| poly aftertouch | `MIDI_AT_C4`, `MIDI_AT_N60` | |
+| program change | `MIDI_PC5` | a pulse |
+| transport | `MIDI_START`, `MIDI_STOP`, `MIDI_CONTINUE` | pulses |
+| clock, transport state | `MIDI_BPM`, `MIDI_PLAYING` | inputs only — nothing to send |
+| channel override | `_CH10` suffix, `_CHANY` on an input | `MIDI_CC7_CH10` |
+
+SysEx has no word spelling and gets none: it goes through the `@` target syntax
+that already exists, as `@"midi:sx:F07E7F0601F7"`. A pin id is exactly what that
+syntax is for, and inventing a second escape for one message type would be worse
+than the quotes.
+
+### Settings
+
+Chordable like any other setting, through phase 4's `resolve`.
+
+- `MIDI_CHANNEL` (1–16, default 1) — the channel an output uses when its name
+  doesn't say.
+- `MIDI_IN_CHANNEL` (1–16 or `ANY`, default `ANY`) — the same for an input.
+  Deliberately a separate setting with a different default: an output has to pick
+  one channel, while an input that says nothing should hear a controller
+  whichever channel it happens to be set to.
+- `MIDI_VELOCITY` (1–127, default 100) — note-on velocity for a button-played
+  note. A note played by an analog source takes its velocity from that source's
+  value at the moment it crosses on.
+- `MIDI_IN_THRESHOLD` (0–1, default 0.5) — where a continuous MIDI input counts
+  as pressed when it is used as a button.
+- `GYRO_MIDI_SCALE` (deg/s at full scale, default 360) and `ACCEL_MIDI_SCALE`
+  (g at full scale, default 2) — what counts as "all the way" for a rate or a
+  force. Without them a gyro axis would be a value with no top.
+
+### Playing MIDI
+
+A binding whose output is a MIDI name works with every event modifier the module
+already has, because a note is a gate on the bus like any key: tap, hold, toggle,
+turbo, release all mean what they mean everywhere else.
+
+```
+MIDI_CHANNEL  = 3
+MIDI_VELOCITY = 100
+
+S  = MIDI_C4
+W  = MIDI_CS4_CH10     # drums, on their own channel
+N  = MIDI_PC5'         # a tap sends one program change
+ZL = MIDI_CC7          # the pull IS the value — as ZL = X_LT already reads
+```
+
+Continuous sources reach MIDI through a per-axis target setting, so one source
+can drive two different messages without a binding for each:
+
+| source | mode | targets |
+| --- | --- | --- |
+| stick | `LEFT_STICK_MODE = MIDI` | `LEFT_MIDI_X`, `LEFT_MIDI_Y` |
+| motion stick | `MOTION_STICK_MODE = MIDI` | `MOTION_MIDI_X`, `MOTION_MIDI_Y` |
+| touchpad | `TOUCHPAD_MODE = MIDI` | `TOUCH_MIDI_X`, `TOUCH_MIDI_Y` |
+| gyro | `GYRO_OUTPUT = MIDI` | `GYRO_MIDI_X/Y/Z` |
+| accelerometer | — | `ACCEL_MIDI_X/Y/Z` |
+
+The accelerometer is the one source with no mode to switch: the module never
+claims the accel pins (they pass through so a virtual pad downstream keeps its
+motion), and sending them to MIDI doesn't change that. Setting a target is
+enough.
+
+**How a value becomes a number.** A one-sided source (a trigger pull, a touch
+stick's distance) fills 0–127 from its bottom to its top. A two-sided one (a
+stick axis, a gyro rate over `GYRO_MIDI_SCALE`, an accel axis over
+`ACCEL_MIDI_SCALE`) is centred: 64 at rest, 0 and 127 at the extremes. A bend
+target is the exception that proves the rule — it is two-sided in the protocol
+too, so it uses the whole 14-bit range with its own centre, and a one-sided
+source into a bend starts at the centre and pushes one way.
+
+### Being played by MIDI
+
+A MIDI name left of the `=` is a button like any other: bound, chorded
+(`MIDI_C4,MIDI_E4`), simultaneous, double-pressed, used as a modeshift or as the
+gyro on/off button.
+
+```
+MIDI_C4      = SPACE
+MIDI_C4,MIDI_E4 = ^CTRL
+MIDI_CC7     = X_LT          # a knob drives the virtual trigger
+MIDI_CC64    = GYRO_ON       # a sustain pedal turns the gyro on
+```
+
+A continuous input used as a button crosses at `MIDI_IN_THRESHOLD`; used as an
+analog target it passes its value straight through. A note used as an analog
+source gives its velocity.
+
+Inputs need a MIDI In port on the wire, and the module says so the way it
+already says a pad lacks a button (`note_inputs_this_pad_lacks`): a MIDI name in
+a config whose wired device isn't a MIDI port gets a note on its line rather
+than silence.
+
+### What it costs in the code
+
+- **`Btn` cannot hold these.** Its variants are fixed and a test walks all of
+  them, which is exactly the property worth keeping. MIDI inputs parse down a
+  separate path to an owned pin (`BtnSource` gains an owned-pin variant), so the
+  exhaustive walk still means what it says.
+- **Strict mode has a hole to close first.** It zeroes `ALL_PINS` only, so MIDI
+  pins are simply absent from this module's key and a downstream reader falls
+  back to the raw device — raw MIDI slips past a strict config today. Strict must
+  zero the MIDI pins present upstream, found through the same dynamic scan the
+  pass-through uses.
+- **Produced, not passed through.** MIDI this module plays is marked produced, so
+  a MIDI Out sink sends it with its Thru toggle off — which is what keeps a
+  shared In/Out port from feeding itself.
+- **The editor** gains a "MIDI" group in the catalogue, on both the trigger and
+  binding sides, and inserts through the same typed picker the MIDI nodes use
+  (type, channel, number) via a `midi_tag` next to `fi_tag`.
 
 ## Settled, and deliberately left out
 
