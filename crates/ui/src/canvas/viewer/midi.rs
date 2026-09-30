@@ -869,16 +869,16 @@ pub(crate) fn add_midi_output_pin(node: &mut NodeData, pin: &MidiPin) {
     push_midi_pin(node, pin, true);
 }
 
-pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let Some(node) = snarl.get_node(node_id) else { return };
-    let is_learning = node.params.get("learning").and_then(|v| v.as_bool()).unwrap_or(false);
-    let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
-
+/// The pin list with a remove button per row, shared by both MIDI bodies.
+/// Returns the real index of the pin whose × was clicked.
+fn midi_pin_list(ui: &mut egui::Ui, rows: &[(usize, String)]) -> Option<usize> {
+    let mut to_remove = None;
     ui.vertical(|ui| {
         ui.set_min_width(180.0);
-
-        let mut to_remove: Option<usize> = None;
-        for (idx, id) in &rows {
+        if rows.is_empty() {
+            ui.label(egui::RichText::new("No messages yet — add them from the header.").small().weak());
+        }
+        for (idx, id) in rows {
             ui.horizontal(|ui| {
                 if ui.small_button("×").clicked() {
                     to_remove = Some(*idx);
@@ -886,113 +886,141 @@ pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut eg
                 ui.label(egui::RichText::new(midi_pin_label(id)).small());
             });
         }
-        if let Some(rm_idx) = to_remove {
-            remove_midi_output(node_id, rm_idx, outputs, snarl);
-        }
-
-        ui.add_space(4.0);
-        if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_in_add"), false) {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                add_midi_output_pin(node, &pin);
-            }
-        }
-
-        ui.horizontal(|ui| {
-            let learn_label = if is_learning {
-                egui::RichText::new("● Stop").small().color(Color32::from_rgb(220, 80, 80))
-            } else {
-                egui::RichText::new("Learn").small()
-            };
-            let resp = ui.button(learn_label).on_hover_text(
-                "Add a pin for each note, controller, bend, program change or \
-                 transport message this port receives while Learn is on.",
-            );
-            if resp.clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("learning".to_string(), Value::Bool(!is_learning));
-                }
-            }
-            let has_unused = outputs.iter().enumerate()
-                .any(|(i, o)| o.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
-            if has_unused && ui.small_button("Clear unused").clicked() {
-                clear_unused_midi_outputs(node_id, outputs, snarl);
-            }
-        });
     });
+    to_remove
+}
+
+/// Last frame's width of a MIDI In node's header controls.
+pub(crate) fn midi_header_w_key(node: NodeId) -> egui::Id {
+    egui::Id::new(("midi_in_header_controls_w", node.0))
+}
+
+pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
+    if let Some(rm_idx) = midi_pin_list(ui, &rows) {
+        remove_midi_output(node_id, rm_idx, outputs, snarl);
+    }
+}
+
+/// A MIDI In node's header controls, under its title: Flush, Learn, Clear
+/// unused, and the picker that adds a message.
+pub(crate) fn show_midi_in_header_controls(
+    node_id: NodeId,
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let is_learning = node.params.get("learning").and_then(|v| v.as_bool()).unwrap_or(false);
+    let in_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
+
+    ui.horizontal(|ui| {
+        // A keyboard unplugged mid-chord never sends its Note Offs, leaving
+        // those notes held for good.
+        if ui.small_button("Flush")
+            .on_hover_text("Release every note this port still holds — for notes left \
+                            stuck when a keyboard was unplugged or dropped its Note Off.")
+            .clicked()
+        {
+            request_midi_flush(ui.ctx(), &in_id);
+        }
+        let learn_label = if is_learning {
+            egui::RichText::new("● Stop").small().color(Color32::from_rgb(220, 80, 80))
+        } else {
+            egui::RichText::new("Learn").small()
+        };
+        let resp = ui.small_button(learn_label).on_hover_text(
+            "Add a pin for each note, controller, bend, program change or \
+             transport message this port receives while Learn is on.",
+        );
+        if resp.clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("learning".to_string(), Value::Bool(!is_learning));
+            }
+        }
+        let has_unused = outputs.iter().enumerate()
+            .any(|(i, o)| o.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
+        if has_unused && ui.small_button("Clear unused").clicked() {
+            clear_unused_midi_outputs(node_id, outputs, snarl);
+        }
+    });
+    if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_in_add"), false) {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            add_midi_output_pin(node, &pin);
+        }
+    }
 }
 
 pub(crate) fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let Some(node) = snarl.get_node(node_id) else { return };
     let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
+    if let Some(rm_idx) = midi_pin_list(ui, &rows) {
+        remove_midi_input(node_id, rm_idx, inputs, snarl);
+    }
+}
+
+/// A MIDI Out node's header controls, under its title: MIDI Thru (with the
+/// loop warning), the loop breaker's mute notice, the picker that adds a
+/// message, and Clear unused.
+pub(crate) fn show_midi_out_header_controls(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
     let mut thru = node.params.get("midi_thru").and_then(|v| v.as_bool()).unwrap_or(false);
     let out_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    ui.vertical(|ui| {
-        ui.set_min_width(180.0);
-
-        let guard = midi_guard_view(ui.ctx());
-        let risk = midi_out_loop_risk(snarl, &out_id, thru, &guard);
-        let muted = guard.muted.iter().any(|m| *m == out_id);
-        ui.horizontal(|ui| {
-            let resp = ui.checkbox(&mut thru, egui::RichText::new("MIDI Thru").small()).on_hover_text(
-                "Off (default): only MIDI that a mapping or a Collector produces is sent \
-                 from the Auto-Map input.\n\
-                 On: raw MIDI arriving on the Auto-Map bus is forwarded too.\n\n\
-                 Leave it off when this port's MIDI In also feeds the patch: \
-                 forwarding it back out is a feedback loop.",
-            );
-            if resp.changed() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("midi_thru".to_string(), Value::Bool(thru));
-                }
-            }
-            if let Some(why) = &risk {
-                ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 170, 60)))
-                    .on_hover_text(why);
-            }
-        });
-        // The breaker muted this port: say so, loudly, with the way back.
-        if muted {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⛔ Muted — a feedback loop was caught")
-                    .small().color(Color32::from_rgb(226, 104, 92)))
-                    .on_hover_text(
-                        "This port was sending in a runaway loop with a MIDI In, so the loop \
-                         breaker stopped it. Break the loop (Thru off, or unwire the mapping \
-                         that answers itself), then unmute.",
-                    );
-                if ui.small_button("Unmute").clicked() {
-                    request_midi_unmute(ui.ctx(), &out_id);
-                }
-            });
-        }
-
-        let mut to_remove: Option<usize> = None;
-        for (idx, id) in &rows {
-            ui.horizontal(|ui| {
-                if ui.small_button("×").clicked() {
-                    to_remove = Some(*idx);
-                }
-                ui.label(egui::RichText::new(midi_pin_label(id)).small());
-            });
-        }
-        if let Some(rm_idx) = to_remove {
-            remove_midi_input(node_id, rm_idx, inputs, snarl);
-        }
-
-        ui.add_space(4.0);
-        if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_out_add"), true) {
+    let guard = midi_guard_view(ui.ctx());
+    let risk = midi_out_loop_risk(snarl, &out_id, thru, &guard);
+    let muted = guard.muted.iter().any(|m| *m == out_id);
+    ui.horizontal(|ui| {
+        let resp = ui.checkbox(&mut thru, egui::RichText::new("MIDI Thru").small()).on_hover_text(
+            "Off (default): only MIDI that a mapping or a Collector produces is sent \
+             from the Auto-Map input.\n\
+             On: raw MIDI arriving on the Auto-Map bus is forwarded too.\n\n\
+             Leave it off when this port's MIDI In also feeds the patch: \
+             forwarding it back out is a feedback loop.",
+        );
+        if resp.changed() {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                push_midi_pin(node, &pin, false);
+                node.params.insert("midi_thru".to_string(), Value::Bool(thru));
             }
         }
-
+        if let Some(why) = &risk {
+            ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 170, 60)))
+                .on_hover_text(why);
+        }
         let has_unused = inputs.iter().enumerate()
             .any(|(i, p)| p.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
         if has_unused && ui.small_button("Clear unused").clicked() {
             clear_unused_midi_inputs(node_id, inputs, snarl);
         }
     });
+    // The breaker muted this port: say so, loudly, with the way back.
+    if muted {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("⛔ Muted — a feedback loop was caught")
+                .small().color(Color32::from_rgb(226, 104, 92)))
+                .on_hover_text(
+                    "This port was sending in a runaway loop with a MIDI In, so the loop \
+                     breaker stopped it. Break the loop (Thru off, or unwire the mapping \
+                     that answers itself), then unmute.",
+                );
+            if ui.small_button("Unmute").clicked() {
+                request_midi_unmute(ui.ctx(), &out_id);
+            }
+        });
+    }
+    if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_out_add"), true) {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            push_midi_pin(node, &pin, false);
+        }
+    }
 }
 
 // ── MIDI pin removal helpers ──────────────────────────────────────────────────

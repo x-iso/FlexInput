@@ -259,7 +259,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // Computed up-front (outside the closure that mutates the snarl) so
         // the `data` borrow doesn't outlive the snarl.get_node_mut calls.
         let device_body_w: f32 = if is_device_source {
-            estimate_device_body_width(ui, data)
+            let header_w: f32 = ui.ctx().data(|d| d.get_temp(midi_header_w_key(node))).unwrap_or(0.0);
+            estimate_device_body_width(ui, data).max(header_w)
         } else { 0.0 };
 
         let is_subpatch = snarl.get_node(node).map(|n| n.module_id == "subpatch").unwrap_or(false);
@@ -326,17 +327,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let has_cal_here = has_gy_c || has_st_c || has_dz_c;
                     ui.vertical(|ui| {
                         ui.label(&title);
-                        // A keyboard unplugged mid-chord never sends its Note
-                        // Offs, leaving those notes held for good.
-                        if dev_id_str.starts_with("midi_in:") {
-                            if ui.small_button("Flush")
-                                .on_hover_text("Release every note this port still holds — for notes left \
-                                                stuck when a keyboard was unplugged or dropped its Note Off.")
-                                .clicked()
-                            {
-                                request_midi_flush(ui.ctx(), dev_id_str);
-                            }
-                        }
                         if has_cal_here {
                             ui.horizontal(|ui| {
                                 let cal_resp = ui.small_button("Calibrate")
@@ -701,6 +691,20 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 crate::easy::io_panel::canvas_node_xinput_slots(ui, dev_id_str);
             }
 
+            // MIDI ports: everything that adds or manages the node's messages
+            // lives in the header; the body is just the message list.
+            let is_midi_in = is_device_source && dev_id_str.starts_with("midi_in:");
+            if is_midi_in {
+                // Its width (next frame) right-aligns the Auto-Map label above,
+                // which otherwise only knows the body's width.
+                let w = ui.scope(|ui| show_midi_in_header_controls(node, _outputs, ui, snarl))
+                    .response.rect.width();
+                ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
+            }
+            if is_device_sink && dev_id_str.starts_with("midi_out:") {
+                show_midi_out_header_controls(node, _inputs, ui, snarl);
+            }
+
             // Mouse-sensitivity slider for the virtual keyboard+mouse sink.
             // Rendered ABOVE the "Auto-Map" label so the AutoMap pin (Y =
             // bottom-of-header) sits in line with the label, not crowded
@@ -794,7 +798,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // protrude past the header bottom and remain visible
             // through the translucent body when collapsed. Each slider
             // row is ~22 px tall.
-            if is_device_source {
+            // (A MIDI In header is already that tall with its controls.)
+            if is_device_source && !is_midi_in {
                 const SLIDER_ROW_H: f32 = 22.0;
                 let present_rows = (has_deadzone as u8) + (has_gyro as u8);
                 let missing_rows = 2 - present_rows.min(2);
