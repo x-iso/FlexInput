@@ -48,8 +48,7 @@ impl FlexInputApp {
         self.gamepad_nav.tz_line = 0;
         // The spatial walk starts on the current zone (so the cards widget's
         // context is set from the moment you enter the field).
-        let sel_zone = self.tabs[self.active_tab].canvas.snarl.get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+        let sel_zone = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64()))
             .unwrap_or(0) as usize;
         self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Zone(sel_zone);
@@ -142,10 +141,9 @@ impl FlexInputApp {
             0 => {
                 self.gamepad_nav.tz_focus = TzFocus::Zone(t.1 as usize);
                 // Focusing a zone re-targets the separate cards widget live.
-                if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
-                    .get_node_mut(outer).and_then(|n| n.subpatch.as_mut())
+                if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
                 {
-                    if let Some(n) = sp.snarl.get_node_mut(inner) {
+                    if let Some(n) = sp.get_node_mut(inner) {
                         n.params.insert("sel_field".into(), serde_json::Value::from(field as u64));
                         n.params.insert("sel_zone".into(), serde_json::Value::from(t.1 as u64));
                     }
@@ -164,9 +162,8 @@ impl FlexInputApp {
     pub(crate) fn nav_menu_rotate_origin(&mut self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, delta: f32)
     {
-        let Some(sp) = self.tabs[self.active_tab].canvas.snarl
-            .get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let Some(n) = sp.get_node_mut(inner) else { return; };
         let cur = n.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
         n.params.insert("menu_radial_origin".into(),
             serde_json::json!((cur + delta).rem_euclid(1.0) as f64));
@@ -397,16 +394,15 @@ impl FlexInputApp {
     /// Cycle the SELECTED zone of the Touch Zones cards widget by `dir`, wrapping
     /// within the current pad's zone count.
     pub(crate) fn nav_tz_cycle_zone(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, dir: i32) {
-        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
         let field = node.and_then(|n| n.params.get("sel_field").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
         let zone = node.and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
         let col = self.tz_edges(outer, inner, field, "col_edges");
         let row = self.tz_edges(outer, inner, field, "row_edges");
         let zn = flexinput_core::touchzones::zone_count(&col, &row).max(1) as i32;
         let new = (zone as i32 + dir).rem_euclid(zn) as u64;
-        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) {
-            if let Some(n) = sp.snarl.get_node_mut(inner) {
+        if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) {
+            if let Some(n) = sp.get_node_mut(inner) {
                 n.params.insert("sel_zone".into(), serde_json::Value::from(new));
             }
         }
@@ -445,8 +441,7 @@ impl FlexInputApp {
     /// Whether the SELECTED zone is in Touchpad mode (its first card's `tp_mode`).
     /// Used with `has_analog`/`has_mouse` to mirror the body's mouse-speed gate.
     pub(crate) fn nav_tz_selected_zone_touchpad(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
-        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
         let Some(node) = node else { return false; };
         let sel_f = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0);
         let sel_z = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -468,23 +463,20 @@ impl FlexInputApp {
     /// Toggle the SELECTED zone's "hold" flag in the `hold_zones` param (mirrors
     /// the header checkbox), for the gamepad-nav path.
     pub(crate) fn nav_tz_toggle_hold(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) {
-        let (field, zone) = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+        let (field, zone) = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
             .map(|n| (
                 n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                 n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize))
             .unwrap_or((0, 0));
-        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut()) else { return; };
-        let held = crate::canvas::viewer::tz_zone_held(&sp.snarl, inner, field, zone);
-        crate::canvas::viewer::tz_set_zone_held(&mut sp.snarl, inner, field, zone, !held);
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let held = crate::canvas::viewer::tz_zone_held(sp, inner, field, zone);
+        crate::canvas::viewer::tz_set_zone_held(sp, inner, field, zone, !held);
     }
 
     /// Whether any card in the node's `zone_maps` drives a relative-mouse output
     /// (gates the mouse-speed nav item, mirroring the body's `has_mouse_card`).
     pub(crate) fn nav_tz_has_mouse_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
-        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
             .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
                 .map(|a| a.iter().any(|p| matches!(p.as_str(),
@@ -498,9 +490,8 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_nudge_mouse_speed(&mut self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, delta: f32)
     {
-        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let Some(n) = sp.get_node_mut(inner) else { return; };
         let sel_f = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let sel_z = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let in_zone = |c: &serde_json::Value| -> bool {
@@ -543,8 +534,7 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_card_shows_adaptive(&self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, idx: usize) -> bool
     {
-        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
         let Some(node) = node else { return false; };
         let cards = node.params.get("zone_maps").and_then(|v| v.as_array());
         let Some(cards) = cards else { return false; };
@@ -585,9 +575,8 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_cycle_mode(&mut self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, dir: i32)
     {
-        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let Some(n) = sp.get_node_mut(inner) else { return; };
         let sel_f = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let sel_z = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         const MODES: [&str; 3] = ["synced", "percard", "touchpad"];
@@ -615,8 +604,7 @@ impl FlexInputApp {
     /// Whether any card drives an analog output (stick/mouse/scroll) — gates the
     /// tp_mode nav item, mirroring the body's `has_analog_card`.
     pub(crate) fn nav_tz_has_analog_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
-        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
             .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
                 .map(|a| a.iter().any(|p| p.as_str()
@@ -632,8 +620,7 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_zone_card_indices(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId)
         -> Vec<usize>
     {
-        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
         let Some(node) = node else { return Vec::new(); };
         let field = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0);
         let zone = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -703,7 +690,7 @@ impl FlexInputApp {
             self.gamepad_nav.edit_level = EditLevel::Widget;
             return;
         };
-        let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
+        let phase = self.picker_target_param_str(&nav_path(outer_id), inner, "_tz_phase")
             .unwrap_or_else(|| "idle".into());
         let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer_id, inner);
@@ -839,7 +826,7 @@ impl FlexInputApp {
                         // update()).
                         self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
                             inner,
-                            path: vec![outer_id.0],
+                            path: nav_path(outer_id),
                             draft_key: "_tz_draft_out".to_string(),
                             phase_key: None,
                             touch_zones: true,

@@ -439,15 +439,15 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str) -> Option<String>
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        sp.snarl.get_node(inner)?.params.get(key)?.as_str().map(|s| s.to_string())
+        let sp = nav_scope(&canvas.snarl, outer_id)?;
+        sp.get_node(inner)?.params.get(key)?.as_str().map(|s| s.to_string())
     }
     pub(crate) fn set_subpatch_param_str(&mut self, outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, key: &str, val: &str)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
         }
     }
@@ -455,8 +455,8 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str, val: bool)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             node.params.insert(key.to_string(), serde_json::Value::Bool(val));
         }
     }
@@ -466,8 +466,8 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             node.params.remove(key);
         }
     }
@@ -475,8 +475,8 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str) -> Option<bool>
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        sp.snarl.get_node(inner)?.params.get(key)?.as_bool()
+        let sp = nav_scope(&canvas.snarl, outer_id)?;
+        sp.get_node(inner)?.params.get(key)?.as_bool()
     }
 
     /// Hit-test the RS/gyro cursor against the sub-patch item screen rects
@@ -651,8 +651,8 @@ impl FlexInputApp {
             return None;
         }
         let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        let mid = sp.snarl.get_node(*inner)?.module_id.clone();
+        let sp = nav_scope(&canvas.snarl, outer_id)?;
+        let mid = sp.get_node(*inner)?.module_id.clone();
         Some((*inner, mid, elem.clone()))
     }
 
@@ -762,8 +762,8 @@ impl FlexInputApp {
         let Some((key, opts)) = self.nav_enum_spec(outer_id) else { return; };
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         let cur = node.params.get(key).and_then(|v| v.as_str()).unwrap_or(opts[0]);
         let idx = opts.iter().position(|o| *o == cur).unwrap_or(0) as i32;
         let next = opts[(idx + dir).rem_euclid(opts.len() as i32) as usize];
@@ -1155,8 +1155,8 @@ impl FlexInputApp {
             self.nav_note_jsm_baseline(outer_id, name);
         }
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         match node.module_id.as_str() {
             "module.jsm" => {
                 if let Some(name) = jsm_knob {
@@ -1247,8 +1247,8 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str) -> Option<f32>
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
+        let sp = nav_scope(&canvas.snarl, outer_id)?;
+        sp.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
     }
 }
 
@@ -1407,9 +1407,9 @@ impl crate::app::FlexInputApp {
     fn nav_cycle_jsm_tab(&mut self, outer_id: egui_snarl::NodeId, step: i32) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id)
         else { return };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+        let Some(node) = sp.get_node_mut(inner) else { return };
         let count = node
             .params
             .get("jsm_tabs")
@@ -1464,12 +1464,9 @@ impl crate::app::FlexInputApp {
             .filter(|a| a == "pitch" || a == "yaw");
         match axis {
             Some(a) => {
-                let deg = self.tabs[self.active_tab]
-                    .canvas
-                    .snarl
-                    .get_node(outer_id)
-                    .and_then(|n| n.subpatch.as_ref())
-                    .and_then(|sp| sp.snarl.get_node(inner))
+                let deg = nav_scope(&self.tabs[self.active_tab]
+                    .canvas.snarl, outer_id)
+                    .and_then(|sp| sp.get_node(inner))
                     .and_then(|n| {
                         n.extra.last_out.get(flexinput_engine::eval::JSM_CAL_DEG_OUT).copied().flatten()
                     })
@@ -1946,9 +1943,9 @@ impl crate::app::FlexInputApp {
     fn nav_set_jsm_text(&mut self, outer_id: egui_snarl::NodeId, text: &str) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id)
         else { return };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+        let Some(node) = sp.get_node_mut(inner) else { return };
         crate::canvas::viewer::jsm_set_active_text(node, text);
     }
 
@@ -1956,11 +1953,8 @@ impl crate::app::FlexInputApp {
     fn nav_jsm_text(&self, outer_id: egui_snarl::NodeId) -> String {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return String::new() };
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas
-            .snarl
-            .get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
             .map(crate::canvas::viewer::jsm_active_text)
             .unwrap_or_default()
     }
@@ -2019,11 +2013,8 @@ impl crate::app::FlexInputApp {
         use flexinput_engine::eval::{JsmFeel, JsmHand};
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
         let canvas = &self.tabs[self.active_tab].canvas;
-        let Some(node) = canvas
-            .snarl
-            .get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        let Some(node) = nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
         else {
             return false;
         };
@@ -2093,11 +2084,8 @@ impl crate::app::FlexInputApp {
     ) -> Vec<flexinput_engine::eval::JsmKnob> {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![] };
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas
-            .snarl
-            .get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
             .map(crate::canvas::viewer::jsm_knobs_of)
             .unwrap_or_default()
     }
@@ -2161,11 +2149,11 @@ impl crate::app::FlexInputApp {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
         let focus = {
             let canvas = &mut self.tabs[self.active_tab].canvas;
-            let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+            let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id)
             else {
                 return;
             };
-            let Some(node) = sp.snarl.get_node_mut(inner) else { return };
+            let Some(node) = sp.get_node_mut(inner) else { return };
             crate::canvas::viewer::jsm_nav_toggle_pair(node, &key)
         };
         let Some(focus) = focus else { return };
@@ -2190,8 +2178,8 @@ impl crate::app::FlexInputApp {
         inner: egui_snarl::NodeId, name: &str, delta: f32)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             crate::canvas::viewer::jsm_nav_nudge_knob(node, name, delta);
         }
     }
@@ -2200,8 +2188,8 @@ impl crate::app::FlexInputApp {
         inner: egui_snarl::NodeId, key: &str, val: f32)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             node.params.insert(key.to_string(), serde_json::Value::from(val as f64));
         }
     }
@@ -2211,8 +2199,8 @@ impl crate::app::FlexInputApp {
         inner: egui_snarl::NodeId, key: &str, val: i64)
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             node.params.insert(key.to_string(), serde_json::Value::from(val));
         }
     }
@@ -2235,8 +2223,8 @@ impl crate::app::FlexInputApp {
     pub(crate) fn nav_cycle_dropdown(&mut self, outer_id: egui_snarl::NodeId, dir: i32) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         if node.module_id != "module.dropdown" { return; }
         let n = node.params.get("options").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
         if n == 0 { return; }
@@ -2250,8 +2238,8 @@ impl crate::app::FlexInputApp {
     pub(crate) fn nav_toggle_switch(&mut self, outer_id: egui_snarl::NodeId) -> bool {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return false; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return false; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return false; };
+        let Some(node) = sp.get_node_mut(inner) else { return false; };
         if node.module_id != "module.switch" { return false; }
         // Current state must come from the engine's last emitted value when
         // present (it reconciles UI clicks with direct/latch inputs); the
@@ -2293,8 +2281,8 @@ impl crate::app::FlexInputApp {
         }
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         if matches!(node.module_id.as_str(), "module.knob" | "module.constant") {
             node.params.insert("value".to_string(), serde_json::Value::from(0.0f64));
         }

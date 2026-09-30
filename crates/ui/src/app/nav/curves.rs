@@ -16,7 +16,7 @@ impl FlexInputApp {
         let scope = self.nav_remap_mappings_key(outer_id);
         let inner = self.nav_selected_inner_node(outer_id)?;
         let canvas = &self.tabs[self.active_tab].canvas;
-        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
         match scope {
             "lean_left" | "lean_right" => Some(true),
             "mappings" => {
@@ -93,7 +93,7 @@ impl FlexInputApp {
         let inner = self.nav_selected_inner_node(outer_id)?;
         let idx = self.gamepad_nav.remap_card;
         let canvas = &self.tabs[self.active_tab].canvas;
-        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
         let pts: Vec<[f32; 2]> = node.params.get(scope).and_then(|v| v.as_array())
             .and_then(|a| a.get(idx))
             .and_then(|m| m.get("curve").and_then(|v| v.as_array()))
@@ -135,9 +135,8 @@ impl FlexInputApp {
         -> (&'static str, Option<&'static str>)
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let node = canvas.snarl.get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner));
+        let node = nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner));
         if node.map(|n| n.module_id.as_str()) == Some("module.audio_stream_haptics") {
             return ("asth_eq_points", None);
         }
@@ -167,8 +166,8 @@ impl FlexInputApp {
         }
         let inner = self.nav_selected_inner_node(outer_id)?;
         let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        let node = sp.snarl.get_node(inner)?;
+        let sp = nav_scope(&canvas.snarl, outer_id)?;
+        let node = sp.get_node(inner)?;
         // Touch Zones per-zone response curve: not a top-level curve param — it
         // lives on the selected analog zone's card. Read it via the shared helper.
         if node.module_id == "module.touch_zones" {
@@ -214,29 +213,28 @@ impl FlexInputApp {
         // Touch Zones: write back to the selected analog zone's card curve.
         {
             let canvas = &self.tabs[self.active_tab].canvas;
-            let is_tz = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.snarl.get_node(inner))
+            let is_tz = nav_scope(&canvas.snarl, outer_id)
+                .and_then(|sp| sp.get_node(inner))
                 .map(|n| n.module_id == "module.touch_zones").unwrap_or(false);
             if is_tz {
-                let (field, zone) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-                    .and_then(|sp| sp.snarl.get_node(inner))
+                let (field, zone) = nav_scope(&canvas.snarl, outer_id)
+                    .and_then(|sp| sp.get_node(inner))
                     .map(|n| (
                         n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                         n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize))
                     .unwrap_or((0, 0));
-                if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
-                    .get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+                if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer_id)
                 {
-                    crate::canvas::viewer::tz_set_zone_curve(&mut sp.snarl, inner, field, zone, pts);
+                    crate::canvas::viewer::tz_set_zone_curve(sp, inner, field, zone, pts);
                 }
                 return;
             }
         }
         let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id)
         else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         let arr: Vec<serde_json::Value> = pts.iter()
             .map(|p| serde_json::json!([p[0] as f64, p[1] as f64])).collect();
         node.params.insert(pts_key.into(), serde_json::Value::Array(arr));
@@ -335,7 +333,7 @@ impl FlexInputApp {
             return None;
         }
         let canvas = &self.tabs[self.active_tab].canvas;
-        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
         if node.module_id == "module.touch_zones" { return None; }
         self.nav_curve_keys(outer_id, inner).1
     }
@@ -346,7 +344,7 @@ impl FlexInputApp {
     {
         let bias_key = self.nav_curve_bias_key(outer_id, inner)?;
         let canvas = &self.tabs[self.active_tab].canvas;
-        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
         Some(node.params.get(bias_key).and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
             .unwrap_or_default())
@@ -358,9 +356,8 @@ impl FlexInputApp {
     {
         let Some(bias_key) = self.nav_curve_bias_key(outer_id, inner) else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(node) = canvas.snarl.get_node_mut(outer_id)
-            .and_then(|n| n.subpatch.as_mut())
-            .and_then(|sp| sp.snarl.get_node_mut(inner)) else { return; };
+        let Some(node) = nav_scope_mut(&mut canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node_mut(inner)) else { return; };
         node.params.insert(bias_key.into(), serde_json::Value::Array(
             biases.iter().map(|&b| serde_json::Value::from(b as f64)).collect()));
     }
@@ -395,8 +392,8 @@ impl FlexInputApp {
         // No per-segment biases (ASTH EQ) → nothing to adjust.
         let Some(bias_key) = bias_key else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return; };
+        let Some(node) = sp.get_node_mut(inner) else { return; };
         let n_pts = node.params.get(pts_key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
         if n_pts < 2 { return; }
         let seg = i.min(n_pts - 2); // segment index to the right of dot i

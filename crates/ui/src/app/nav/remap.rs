@@ -118,9 +118,8 @@ impl FlexInputApp {
         let key = self.nav_remap_mappings_key(outer_id);
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return 0; };
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
             .map(|a| a.len()).unwrap_or(0)
     }
@@ -132,8 +131,8 @@ impl FlexInputApp {
         let key = self.nav_remap_mappings_key(outer_id);
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return false; };
-        let Some(node) = sp.snarl.get_node_mut(inner) else { return false; };
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return false; };
+        let Some(node) = sp.get_node_mut(inner) else { return false; };
         let mut arr = node.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let changed = f(&mut arr);
         if changed {
@@ -169,8 +168,7 @@ impl FlexInputApp {
         let key = self.nav_remap_mappings_key(outer_id);
         let inner = self.nav_selected_inner_node(outer_id)?;
         let canvas = &self.tabs[self.active_tab].canvas;
-        let arr = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?
-            .snarl.get_node(inner)?.params.get(key)?.as_array()?;
+        let arr = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?.params.get(key)?.as_array()?;
         let m = arr.get(idx)?;
         Some(m.get("mode").and_then(|v| v.as_str()).unwrap_or("down").to_string())
     }
@@ -180,8 +178,8 @@ impl FlexInputApp {
         let mkey = self.nav_remap_mappings_key(outer_id);
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|node| node.params.get(mkey).and_then(|v| v.as_array()))
             .and_then(|a| a.get(idx))
             .and_then(|m| m.get(key).and_then(|v| v.as_bool()))
@@ -257,8 +255,7 @@ impl FlexInputApp {
         let key = self.nav_remap_mappings_key(outer_id);
         let inner = self.nav_selected_inner_node(outer_id)?;
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?
-            .snarl.get_node(inner)?.params.get(key)?.as_array()?.get(idx).cloned()
+        nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?.params.get(key)?.as_array()?.get(idx).cloned()
     }
 
     /// Set card `idx`'s press mode to `mode` directly, applying the same
@@ -330,9 +327,8 @@ impl FlexInputApp {
         field: usize, which: &str) -> Vec<f32>
     {
         let key = Self::tz_edge_key(field, which);
-        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get(&key).and_then(|v| v.as_array()))
             .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
             .unwrap_or_default()
@@ -345,10 +341,9 @@ impl FlexInputApp {
         field: usize, which: &str, vals: &[f32])
     {
         let key = Self::tz_edge_key(field, which);
-        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
-            .get_node_mut(outer).and_then(|n| n.subpatch.as_mut())
+        if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
         {
-            if let Some(node) = sp.snarl.get_node_mut(inner) {
+            if let Some(node) = sp.get_node_mut(inner) {
                 node.params.insert(key, serde_json::Value::Array(
                     vals.iter().map(|v| serde_json::json!(*v as f64)).collect()));
             }
@@ -358,18 +353,16 @@ impl FlexInputApp {
     /// Mapping mode allows add/remove of dividers (no typed wiring to break);
     /// ports mode is move-only.
     pub(crate) fn tz_is_mapping(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
-        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str()))
             == Some("mapping")
     }
 
     /// Number of pads (2 in split mode, else 1).
     pub(crate) fn tz_n_fields(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> usize {
-        let split = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        let split = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
         if split { 2 } else { 1 }
     }
@@ -384,9 +377,8 @@ impl FlexInputApp {
     pub(crate) fn tz_tree_divs(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, field: usize)
         -> Vec<(u8, f32, f32, f32, Vec<u8>)>
     {
-        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()) else { return Vec::new(); };
-        crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field).dividers().into_iter()
+        let Some(sp) = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer) else { return Vec::new(); };
+        crate::canvas::viewer::tz_field_tree(sp, inner, field).dividers().into_iter()
             .map(|d| (
                 if d.axis == flexinput_core::touchzones::Axis::V { 0u8 } else { 1u8 },
                 d.pos, d.lo, d.hi, d.path,
@@ -414,12 +406,11 @@ impl FlexInputApp {
     pub(crate) fn tz_tree_set_t(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
         field: usize, path: &[u8], t: f32)
     {
-        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut())
+        if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
         {
-            let mut tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
+            let mut tree = crate::canvas::viewer::tz_field_tree(sp, inner, field);
             if tree.set_divider_t(path, t) {
-                crate::canvas::viewer::tz_set_field_tree(&mut sp.snarl, inner, field, &tree);
+                crate::canvas::viewer::tz_set_field_tree(sp, inner, field, &tree);
             }
         }
     }
@@ -429,11 +420,10 @@ impl FlexInputApp {
     pub(crate) fn tz_tree_remove(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
         field: usize, path: &[u8])
     {
-        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut())
+        if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
         {
-            let tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
-            crate::canvas::viewer::tz_request_or_apply_merge(&mut sp.snarl, inner, field, &tree, path);
+            let tree = crate::canvas::viewer::tz_field_tree(sp, inner, field);
+            crate::canvas::viewer::tz_request_or_apply_merge(sp, inner, field, &tree, path);
         }
     }
 
@@ -442,16 +432,14 @@ impl FlexInputApp {
     pub(crate) fn tz_tree_add(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
         field: usize, axis: flexinput_core::touchzones::Axis)
     {
-        let zone = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+        let zone = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
             .and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64())).unwrap_or(0) as u32;
-        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
-            .and_then(|n| n.subpatch.as_mut())
+        if let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
         {
-            let tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
+            let tree = crate::canvas::viewer::tz_field_tree(sp, inner, field);
             if let Some([x0, y0, x1, y1]) = tree.zone_rect(zone) {
                 let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-                crate::canvas::viewer::tz_subdivide_at(&mut sp.snarl, inner, field, cx, cy, axis, false);
+                crate::canvas::viewer::tz_subdivide_at(sp, inner, field, cx, cy, axis, false);
             }
         }
     }
@@ -488,7 +476,7 @@ impl FlexInputApp {
                         self.nav_publish_remap_selection(ctx, outer_id, inner);
                     }
                     EditLevel::TzCards => {
-                        let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
+                        let phase = self.picker_target_param_str(&nav_path(outer_id), inner, "_tz_phase")
                             .unwrap_or_else(|| "idle".into());
                         self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
                     }
@@ -620,14 +608,14 @@ impl FlexInputApp {
                     // config overlay is up, the main window otherwise.
                     self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
                         inner,
-                        path: vec![outer_id.0],
+                        path: nav_path(outer_id),
                         purpose: crate::canvas::viewer::MidiModalPurpose::Add,
                     }, None);
                 } else if action == "_nav_act_special" || lean_draft.is_some() {
                     self.gamepad_nav.kbm_picker_open = true;
                     self.gamepad_nav.kbm_picker_idx = 0;
                     self.gamepad_nav.kbm_picker_node = Some(inner);
-                    self.gamepad_nav.kbm_picker_path = vec![outer_id.0];
+                    self.gamepad_nav.kbm_picker_path = nav_path(outer_id);
                     self.gamepad_nav.kbm_picker_touch_zones = false;
                     self.gamepad_nav.kbm_picker_exclude = None;
                     // When the config overlay owns nav (config_nav_sel set), draw
@@ -731,8 +719,8 @@ impl FlexInputApp {
         -> Vec<String>
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer).and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
             .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_default()
@@ -743,8 +731,8 @@ impl FlexInputApp {
         inner: egui_snarl::NodeId, key: &str, vals: &[String])
     {
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let Some(sp) = canvas.snarl.get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) else { return; };
-        if let Some(node) = sp.snarl.get_node_mut(inner) {
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer) else { return; };
+        if let Some(node) = sp.get_node_mut(inner) {
             let arr: Vec<serde_json::Value> = vals.iter()
                 .map(|s| serde_json::Value::String(s.clone())).collect();
             node.params.insert(key.to_string(), serde_json::Value::Array(arr));
@@ -770,7 +758,7 @@ impl FlexInputApp {
     }
 
     /// Mutable resolve through the TAB canvas only. While a sub-patch editor
-    /// window is open, the tab node's `sp.snarl` is a MIRROR — the editor's
+    /// window is open, the tab node's `sp` is a MIRROR — the editor's
     /// own `canvas` is the live copy, cloned over the mirror on every editor
     /// mutation (see `show_subpatch_editors`' write-back). Writing only here
     /// gets silently wiped by that clone, so picker writes must go through
@@ -1019,8 +1007,8 @@ impl FlexInputApp {
     pub(crate) fn nav_lean_draft_len(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, side: &str) -> usize {
         let key = if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" };
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer).and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
             .map(|a| a.len()).unwrap_or(0)
     }
@@ -1062,8 +1050,8 @@ impl FlexInputApp {
     /// Length of the captured input/output drafts.
     pub(crate) fn nav_remap_draft_len(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId, key: &str) -> usize {
         let canvas = &self.tabs[self.active_tab].canvas;
-        canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+        nav_scope(&canvas.snarl, outer_id)
+            .and_then(|sp| sp.get_node(inner))
             .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
             .map(|a| a.len()).unwrap_or(0)
     }
@@ -1346,7 +1334,7 @@ impl FlexInputApp {
                     if let Some(&(_, side_out, pin_idx)) = midi_chip_fields.iter().find(|(id, _, _)| *id == f) {
                         self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
                             inner,
-                            path: vec![outer_id.0],
+                            path: nav_path(outer_id),
                             purpose: crate::canvas::viewer::MidiModalPurpose::Chip {
                                 card: idx,
                                 cards_key: scope.to_string(),

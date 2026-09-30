@@ -127,7 +127,7 @@ impl FlexInputApp {
                 // Row-type (multi-field) widgets split the axes: horizontal =
                 // select field, vertical = adjust value. Single-value widgets
                 // (knob / constant) adjust on any direction.
-                let multi = self.nav_active_outer_id()
+                let multi = self.nav_driving_outer_id()
                     .map(|o| matches!(self.nav_selected_kind(o),
                         NavWidgetKind::MultiField))
                     .unwrap_or(false);
@@ -250,10 +250,10 @@ impl FlexInputApp {
                 // The spatial walk alternates zone ↔ border/seam; the hints track
                 // what's currently focused. Add/remove/divide only in mapping mode.
                 use crate::gamepad_nav::TzFocus;
-                let mapping = self.nav_active_outer_id()
+                let mapping = self.nav_driving_outer_id()
                     .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_is_mapping(o, i)))
                     .unwrap_or(false);
-                let split = self.nav_active_outer_id()
+                let split = self.nav_driving_outer_id()
                     .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_n_fields(o, i) > 1))
                     .unwrap_or(false);
                 let mut v = vec![(hint_move(), "Walk zones/borders")];
@@ -295,7 +295,7 @@ impl FlexInputApp {
             EditLevel::TzCards => {
                 // Two-row nav (actions + cards + optional curve), mirroring the
                 // Remapper. West/LT-RT only shown when relevant.
-                let ids = self.nav_active_outer_id()
+                let ids = self.nav_driving_outer_id()
                     .and_then(|o| self.nav_selected_inner_node(o).map(|i| (o, i)));
                 let has_mouse = ids.map(|(o, i)| self.nav_tz_has_mouse_card(o, i)).unwrap_or(false);
                 let has_analog = ids.map(|(o, i)| self.nav_tz_has_analog_card(o, i)).unwrap_or(false);

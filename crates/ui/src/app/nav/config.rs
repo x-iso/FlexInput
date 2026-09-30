@@ -9,9 +9,11 @@
 //! `nav_drive_subpatch` — so response curves get the full dot nav (highlight,
 //! cursor-grab, add/delete, bias, undo), knobs/dropdowns the field editor, etc.
 //!
-//! Reuse requires a sub-patch `outer_id`, so only pins that live inside a
-//! first-level sub-patch (`source_path == [sp]`, the Easy-mode norm) are
-//! editable; top-level pins are focus-only for now.
+//! The shared editors address a widget as `(outer, inner)`. A pin inside a
+//! first-level sub-patch (`source_path == [sp]`, the Easy-mode norm) uses that
+//! sub-patch as `outer`; a pin on the tab canvas itself (`[]`, what an
+//! Advanced-mode canvas pins) uses [`super::NAV_TAB_CANVAS`]. Deeper pins are
+//! focus-only.
 //!
 //! Output suppression here is the config overlay's own SELECTIVE engine
 //! source-block, NOT `ui_nav_suppress`/`io_bypass` (which drop ALL output and
@@ -180,8 +182,7 @@ impl FlexInputApp {
         }
 
         // Point the shared resolvers at the focused pin (drives South-enter's
-        // `nav_selected_kind`, and the editors once entered). None for top-level
-        // pins — they can't drive the sub-patch-keyed editors.
+        // `nav_selected_kind`, and the editors once entered).
         self.gamepad_nav.config_nav_sel = self.config_pin_outer_inner_elem();
 
         // South / RT → enter the SAME editor the sub-patch canvas would, chosen
@@ -318,22 +319,21 @@ impl FlexInputApp {
         }
     }
 
-    /// `(outer sub-patch node, inner node, element_id)` for the gamepad-focused
-    /// config pin, or `None` for a top-level pin (no sub-patch outer to drive
-    /// the shared editors) or no focus.
+    /// `(outer, inner node, element_id)` for the gamepad-focused config pin —
+    /// `outer` being its sub-patch, or [`super::NAV_TAB_CANVAS`] for a node on
+    /// the tab canvas itself. `None` with no focus, or for a pin nested deeper
+    /// than one sub-patch (focus-only).
     fn config_pin_outer_inner_elem(&self) -> Option<(egui_snarl::NodeId, egui_snarl::NodeId, String)> {
         use crate::canvas::node::LayoutItem;
         let i = self.gamepad_nav.config_index?;
         let tab = self.tabs.get(self.active_tab)?;
         let LayoutItem::Module(m) = tab.config.items.get(i)? else { return None };
-        match m.source_path.as_slice() {
-            [sp] => Some((
-                egui_snarl::NodeId(*sp),
-                egui_snarl::NodeId(m.inner_node_id),
-                m.element_id.clone(),
-            )),
-            _ => None,
-        }
+        let outer = match m.source_path.as_slice() {
+            [] => super::NAV_TAB_CANVAS,
+            [sp] => egui_snarl::NodeId(*sp),
+            _ => return None,
+        };
+        Some((outer, egui_snarl::NodeId(m.inner_node_id), m.element_id.clone()))
     }
 
     /// While a Remapper / Touch Zones mapping-list pin is being card-navigated in
@@ -364,7 +364,7 @@ impl FlexInputApp {
             return ControlInput::LeftStick;
         };
         let snarl = &self.tabs[self.active_tab].canvas.snarl;
-        match crate::app::config_passthrough_pins(snarl, &[outer.0], inner.0) {
+        match crate::app::config_passthrough_pins(snarl, &super::nav_path(*outer), inner.0) {
             Some((_, pins)) => crate::app::control_input_from_pins(&pins),
             None => ControlInput::LeftStick,
         }
