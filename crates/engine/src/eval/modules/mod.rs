@@ -29,7 +29,7 @@ pub use jsm::{jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi
     jsm_cursor_moved, jsm_cursor_replace, jsm_editor_focus, jsm_feel_of, jsm_knobs,
     jsm_line_count, jsm_line_span, jsm_scrub_number,
     jsm_selection, jsm_tokens_at, JsmCursor, JsmToken, JsmTokenKind,
-    jsm_note_missing_inputs,
+    jsm_note_missing_inputs, jsm_midi_tag,
     jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, jsm_set_setting, jsm_setting_line,
     JSM_CAL_DEG_OUT, JSM_CAL_PEAK_OUT,
     jsm_set_knob_part, jsm_toggle_pair, jsm_knob_key_setting, jsm_pairable, jsm_replace_word,

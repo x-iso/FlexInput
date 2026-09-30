@@ -890,7 +890,8 @@ it or it presses a key.
 | note by number | `MIDI_N60` | always available, and the only way to reach octave −1 |
 | CC | `MIDI_CC7` | `MIDI_CC14_7` for the 14-bit pair |
 | parameter | `MIDI_NRPN130`, `MIDI_RPN0` | |
-| bend / pressure | `MIDI_PB`, `MIDI_CP` | |
+| bend / pressure | `MIDI_PB`, `MIDI_CP` | `MIDI_PB` is the whole wheel, both ways |
+| half a bend | `MIDI_PB_UP`, `MIDI_PB_DOWN` | what a one-way source (a button, a trigger, a knob, a finger) pushes, and — as an input — only that way pressing; the whole wheel from a one-way source is an error that says which to pick |
 | poly aftertouch | `MIDI_AT_C4`, `MIDI_AT_N60` | |
 | program change | `MIDI_PC5` | a pulse |
 | transport | `MIDI_START`, `MIDI_STOP`, `MIDI_CONTINUE` | pulses |
@@ -934,8 +935,16 @@ MIDI_VELOCITY = 100
 S  = MIDI_C4
 W  = MIDI_CS4_CH10     # drums, on their own channel
 N  = MIDI_PC5'         # a tap sends one program change
-ZL = MIDI_CC7          # the pull IS the value — as ZL = X_LT already reads
+ZL = MIDI_CC7          # the pull IS the value
 ```
+
+A binding carries a VALUE only where MIDI is involved: a trigger or MIDI input
+held on a MIDI controller, bend or pressure hands it its reading, a note played
+from one takes its velocity from it, and a MIDI input held on a virtual trigger
+(`MIDI_CC7 = X_LT`) drives it by its value. `ZL = X_LT` stays what it is in JSM
+— a full press of the virtual trigger — since `ZL_MODE = X_LT` is JSM's way of
+passing the pull through, and changing a JSM line's meaning is off the table.
+A tap, toggle or turbo has no button behind it once fired, so it sends full.
 
 Continuous sources reach MIDI through a per-axis target setting, so one source
 can drive two different messages without a binding for each:
@@ -1012,9 +1021,16 @@ than silence.
 - **Produced, not passed through.** MIDI this module plays is marked produced, so
   a MIDI Out sink sends it with its Thru toggle off — which is what keeps a
   shared In/Out port from feeding itself.
-- **The editor** gains a "MIDI" group in the catalogue, on both the trigger and
-  binding sides, and inserts through the same typed picker the MIDI nodes use
-  (type, channel, number) via a `midi_tag` next to `fi_tag`.
+- **The editor** gains a "MIDI…" row in the command list, on both the trigger and
+  binding sides. It opens the app's MIDI editor window (the Remapper's, with an
+  Insert row in place of the add buttons): type, channel and number, walked with
+  the pad, then Insert writes the `MIDI_*` name (`jsm_midi_tag`) where the list's
+  pick would have gone. The window's "any channel" writes a name with no channel,
+  so it takes the config's `MIDI_CHANNEL` / `MIDI_IN_CHANNEL`. The row lives in
+  the UI, not the catalogue, like the `@` targets: it is not a name the parser
+  reads, and the catalogue's drift tests hold it to exactly those.
+- **SysEx behind `@`** needed the parser to take a pin id there — `@` resolved
+  only Macro Output and menu names before. Any sendable MIDI pin id now works.
 
 ## Settled, and deliberately left out
 

@@ -61,5 +61,7 @@ pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, scrub as jsm_scrub_n
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,
     Knob as JsmKnob};
+// The editor's "MIDI…" row writes what a MIDI picker built as a config name.
+pub use midi::tag_for_pin as jsm_midi_tag;
 pub use parse::{compile_full as jsm_compile_full, compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
     Compiled as JsmConfig, LineInfo as JsmLineInfo, LineStatus as JsmLineStatus};

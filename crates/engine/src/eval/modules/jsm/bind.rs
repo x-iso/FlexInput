@@ -78,7 +78,7 @@ struct Timed {
 }
 
 /// Everything the config asks for right now.
-#[derive(Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub struct Outputs {
     /// Pins to drive true this tick.
     pub pins: HashSet<String>,
@@ -129,6 +129,21 @@ impl Runtime {
     /// The chords held right now, oldest first — what a modeshift resolves
     /// against (`parse::resolve`).
     pub fn chords(&self) -> &[Btn] { &self.chords }
+
+    /// Which buttons are holding each held pin, and through which binding, for
+    /// a pin that takes its value from the button rather than just being on
+    /// (`ZL = MIDI_CC7`: the pull IS the value). Only pins a live press holds; a
+    /// tap, a toggle or a turbo pulse has no button behind it any more and
+    /// reads full.
+    pub fn held_by(&self) -> HashMap<String, Vec<(Btn, usize)>> {
+        let mut out: HashMap<String, Vec<(Btn, usize)>> = HashMap::new();
+        for p in self.presses.iter().filter(|p| !p.ended) {
+            for pin in &p.held {
+                out.entry(pin.clone()).or_default().push((p.owner, p.binding));
+            }
+        }
+        out
+    }
 
     /// Advance one tick. `down` answers "is this JSM button pressed right now?".
     ///
@@ -432,7 +447,7 @@ impl Runtime {
             Out::Reset => self.out.reset = true,
             Out::Rumble { strong, weak } => self.out.rumble = Some((*strong, *weak)),
             Out::Pulse(pin) => self.timed.push(Timed { pin: pin.clone(), until: self.t + TAP_HOLD }),
-            Out::Pin(pin) => match action {
+            Out::Pin(pin) | Out::Bend { pin, .. } => match action {
                 ActionMod::Toggle => {
                     if !self.toggles.remove(pin) { self.toggles.insert(pin.clone()); }
                 }

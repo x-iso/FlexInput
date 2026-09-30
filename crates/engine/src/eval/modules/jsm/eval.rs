@@ -237,7 +237,12 @@ pub(crate) fn jsm_publish(
     }
 
     let (lean_l, lean_r) = super::motion::lean(gravity, &res.motion, res.settings.orientation);
-    let ext = Extra { lean: (lean_l, lean_r), cells: touch_out.cells, midi: res.midi };
+    let ext = Extra {
+        lean: (lean_l, lean_r),
+        cells: touch_out.cells,
+        midi: res.midi,
+        analog_fed: st.cfg.analog_fed.clone(),
+    };
     let analog = &st.analog;
     let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
     // A trigger handed straight to the virtual pad can still chord, but its own
@@ -251,7 +256,9 @@ pub(crate) fn jsm_publish(
         Btn::Zr | Btn::Zrf => zr_pad,
         _ => false,
     };
-    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only);
+    // Cloned so the runtime can be asked, below, which button holds which pin.
+    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only).clone();
+    let held_by = st.rt.held_by();
     let driven: Vec<String> = outputs.pins.iter().cloned().collect();
     let gyro_actions = outputs.gyro.clone();
     let recentre = outputs
@@ -367,18 +374,25 @@ pub(crate) fn jsm_publish(
         // marked PRODUCED so a MIDI Out sends it with its Thru toggle off — the
         // setting that stops a shared In/Out port feeding itself.
         if let Some(mp) = flexinput_core::midi::parse_pin(&pin) {
+            // Held by a trigger or a MIDI input, a value takes that input's
+            // reading (`ZL = MIDI_CC7` — the pull IS the value) and a note its
+            // velocity from it; otherwise full, and `MIDI_VELOCITY`.
+            let holders: &[(Btn, usize)] = held_by.get(&pin).map(Vec::as_slice).unwrap_or(&[]);
+            let fed = holders.first().and_then(|(b, _)| analog_reading(*b, &upstream, &res.midi));
             let sig = match (on, mp.is_continuous()) {
-                (true, true) => Signal::Float(1.0),
+                (true, true) => Signal::Float(held_value(&st.cfg, &pin, &mp, holders, &upstream, &res.midi)),
                 (true, false) => Signal::Bool(true),
                 (false, _) => mp.rest_value(),
             };
             if on {
                 if let flexinput_core::midi::MidiPin::Note { ch, note } = mp {
                     let vel = flexinput_core::midi::MidiPin::Velocity { ch, note }.to_id();
-                    collector_sigs.insert(
-                        (key.clone(), vel.clone()),
-                        Signal::Float(res.midi.velocity as f32 / 127.0),
-                    );
+                    // Never 0: a note-on at velocity 0 is a note-off.
+                    let v = match fed {
+                        Some((r, _)) => r.abs().clamp(1.0 / 127.0, 1.0),
+                        None => res.midi.velocity as f32 / 127.0,
+                    };
+                    collector_sigs.insert((key.clone(), vel.clone()), Signal::Float(v));
                     crate::eval::midi_bus::mark_produced(&key, &vel, collector_sigs);
                 }
             }
@@ -386,7 +400,20 @@ pub(crate) fn jsm_publish(
             crate::eval::midi_bus::mark_produced(&key, &pin, collector_sigs);
             continue;
         }
-        let sig = if on { on_value(&pin) } else { pin_off_value(&pin) };
+        // A virtual trigger held by a MIDI input takes that input's value
+        // (`MIDI_CC7 = X_LT`). Held by the pad's own trigger it stays JSM's
+        // full press — `ZL = X_LT` means that in JSM, and `ZL_MODE = X_LT` is
+        // the way it passes the pull through.
+        let fed = held_by
+            .get(&pin)
+            .and_then(|h| h.first())
+            .filter(|(b, _)| matches!(b, Btn::Midi(_)) && super::parse::takes_a_value(&pin))
+            .and_then(|(b, _)| analog_reading(*b, &upstream, &res.midi));
+        let sig = match (on, fed) {
+            (true, Some((r, _))) => Signal::Float(r.abs().clamp(0.0, 1.0)),
+            (true, None) => on_value(&pin),
+            (false, _) => pin_off_value(&pin),
+        };
         collector_sigs.insert((key.clone(), pin), sig);
     }
 
@@ -504,7 +531,7 @@ pub(crate) fn jsm_publish(
         for (src, reading) in send {
             let Some(target) = m.target(src) else { continue };
             let pin = target.pin(Some(m.channel));
-            let v = super::midi::value_for(&pin, reading, src.two_sided());
+            let v = super::midi::value_for(&pin, target.bend_dir(), reading, src.two_sided());
             let id = pin.to_id();
             collector_sigs.insert((key.clone(), id.clone()), Signal::Float(v));
             crate::eval::midi_bus::mark_produced(&key, &id, collector_sigs);
@@ -766,6 +793,8 @@ struct Extra {
     /// The channel a `MIDI_*` button listens on when it doesn't say, and where a
     /// continuous one counts as pressed.
     midi: super::midi::Settings,
+    /// MIDI inputs that only feed a value, and so press from any movement.
+    analog_fed: HashSet<Btn>,
 }
 
 /// Is this JSM button pressed right now? Buttons read straight off a pin; the
@@ -801,9 +830,94 @@ fn button_down(
         },
         // A MIDI message: a note while it sounds, a knob or bend past the
         // threshold. An idle pin is absent from the bus, which reads released.
-        BtnSource::Midi(m) => upstream
-            .get(&m.pin(ext.midi.in_channel).to_id())
-            .is_some_and(|v| super::midi::value_pressed(m.kind, *v, ext.midi.in_threshold)),
+        BtnSource::Midi(m) => {
+            let threshold = if ext.analog_fed.contains(&btn) { 0.0 } else { ext.midi.in_threshold };
+            upstream
+                .get(&m.pin(ext.midi.in_channel).to_id())
+                .is_some_and(|v| super::midi::value_pressed(m, *v, threshold))
+        }
+    }
+}
+
+/// What a held MIDI value pin reads this tick.
+///
+/// Held by one binding it takes that binding's source (`ZL = MIDI_CC7` sends the
+/// pull). A bend can be held by several pushing different ways (`ZL =
+/// MIDI_PB_DOWN`, `ZR = MIDI_PB_UP`), so each holder pushes its binding's way and
+/// they add up — both pulled fully cancel, as two hands on one wheel would.
+/// Anything else takes the strongest holder. Held with nobody behind it — a
+/// toggle, a tap — it reads full, the way any key does.
+fn held_value(
+    cfg: &Compiled,
+    pin: &str,
+    mp: &flexinput_core::midi::MidiPin,
+    holders: &[(Btn, usize)],
+    upstream: &HashMap<String, Signal>,
+    midi: &super::midi::Settings,
+) -> f32 {
+    use flexinput_core::midi::MidiPin;
+    // The way a binding pushes this bend, if it names one.
+    let dir_in = |binding: &super::parse::Binding| {
+        binding.steps.iter().find_map(|s| match &s.out {
+            Out::Bend { pin: p, dir } if p == pin => Some(*dir),
+            _ => None,
+        })
+    };
+    let bend = matches!(mp, MidiPin::PitchBend { .. });
+    if holders.is_empty() {
+        // A toggle or a tap: full, whichever way the config pushes this bend.
+        let dir = if bend { cfg.bindings.iter().find_map(|b| dir_in(b)) } else { None };
+        return super::midi::value_for(mp, dir, 1.0, false);
+    }
+    let mut total = 0.0f32;
+    let mut strongest = 0.0f32;
+    for (owner, binding) in holders {
+        let dir = cfg.bindings.get(*binding).and_then(|b| dir_in(b));
+        let (r, two_sided) = analog_reading(*owner, upstream, midi).unwrap_or((1.0, false));
+        let v = super::midi::value_for(mp, dir, r, two_sided);
+        total += v;
+        if v.abs() > strongest.abs() {
+            strongest = v;
+        }
+    }
+    if bend { total.clamp(-1.0, 1.0) } else { strongest }
+}
+
+/// A button's reading, where it has one worth handing to a value: a trigger's
+/// pull, a MIDI knob, bend or pressure, or the velocity a note arrived with —
+/// with whether it is two-sided (a bend). `None` for a plain button.
+fn analog_reading(
+    btn: Btn,
+    upstream: &HashMap<String, Signal>,
+    midi: &super::midi::Settings,
+) -> Option<(f32, bool)> {
+    let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0);
+    match btn.source() {
+        BtnSource::Trigger { analog, digital } => Some((
+            if upstream.contains_key(analog) {
+                f(analog).clamp(0.0, 1.0)
+            } else if upstream.get(digital).is_some_and(|s| s.as_bool()) {
+                1.0
+            } else {
+                0.0
+            },
+            false,
+        )),
+        BtnSource::TriggerFull { analog } => Some((f(analog).clamp(0.0, 1.0), false)),
+        BtnSource::Midi(m) => {
+            use flexinput_core::midi::MidiPin;
+            match m.pin(midi.in_channel) {
+                MidiPin::Note { ch, note } => Some((f(&MidiPin::Velocity { ch, note }.to_id()), false)),
+                // The whole wheel is two-sided; a named half reads its own side.
+                p @ MidiPin::PitchBend { .. } => Some(match m.bend_dir() {
+                    Some(_) => (m.reading(f(&p.to_id())), false),
+                    None => (f(&p.to_id()), true),
+                }),
+                p if p.is_continuous() && p != MidiPin::Bpm => Some((f(&p.to_id()), false)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -977,7 +1091,7 @@ fn claimed_outputs(cfg: &Compiled) -> Vec<String> {
     for b in &cfg.bindings {
         for step in &b.steps {
             match &step.out {
-                Out::Pin(p) | Out::Pulse(p) => { pins.insert(p.clone()); }
+                Out::Pin(p) | Out::Pulse(p) | Out::Bend { pin: p, .. } => { pins.insert(p.clone()); }
                 _ => {}
             }
         }

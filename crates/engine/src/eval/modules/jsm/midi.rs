@@ -11,6 +11,8 @@
 //! MIDI_CC7  MIDI_CC14_7              a controller, 7- or 14-bit
 //! MIDI_NRPN130  MIDI_RPN0            a parameter
 //! MIDI_PB  MIDI_CP  MIDI_AT_C4       bend, channel pressure, poly aftertouch
+//! MIDI_PB_UP  MIDI_PB_DOWN           one half of the bend: which way a trigger or
+//!                                    button pushes it, or which way presses
 //! MIDI_PC5                           a program change
 //! MIDI_START  MIDI_STOP  MIDI_CONTINUE
 //! MIDI_BPM  MIDI_PLAYING             inputs only: there is nothing to send
@@ -75,9 +77,14 @@ pub enum Chan {
 pub struct MidiName {
     pub kind: Kind,
     /// Note, controller, parameter or program number (0 where there is none).
+    /// For a bend, which half: 0 the whole wheel, [`BEND_UP`] or [`BEND_DOWN`].
     pub num: u16,
     pub chan: Chan,
 }
+
+/// `MIDI_PB_UP` / `MIDI_PB_DOWN`, in a bend's [`MidiName::num`].
+pub const BEND_UP: u16 = 1;
+pub const BEND_DOWN: u16 = 2;
 
 /// Parse a `MIDI_*` name. `None` when the name isn't one at all (so the caller
 /// tries its other vocabularies); `Some(Err)` when it is plainly meant as one
@@ -109,6 +116,8 @@ fn parse_body(body: &str, raw: &str) -> Result<MidiName, String> {
     let mk = |kind: Kind, n: u16| MidiName { kind, num: n, chan };
     let name = match body {
         "PB" => mk(Kind::Bend, 0),
+        "PB_UP" => mk(Kind::Bend, BEND_UP),
+        "PB_DOWN" => mk(Kind::Bend, BEND_DOWN),
         "CP" => mk(Kind::Pressure, 0),
         "START" => mk(Kind::Start, 0),
         "STOP" => mk(Kind::Stop, 0),
@@ -199,7 +208,11 @@ impl MidiName {
             Kind::Cc14 => format!("CC14_{}", self.num),
             Kind::Nrpn => format!("NRPN{}", self.num),
             Kind::Rpn => format!("RPN{}", self.num),
-            Kind::Bend => "PB".into(),
+            Kind::Bend => match self.num {
+                BEND_UP => "PB_UP".into(),
+                BEND_DOWN => "PB_DOWN".into(),
+                _ => "PB".into(),
+            },
             Kind::Pressure => "CP".into(),
             Kind::Aftertouch => format!("AT_{}", spell_note(self.num)),
             Kind::Program => format!("PC{}", self.num),
@@ -215,6 +228,21 @@ impl MidiName {
             Chan::Ch(n) => format!("_CH{n}"),
         };
         format!("MIDI_{body}{chan}")
+    }
+
+    /// For `MIDI_PB_UP` / `MIDI_PB_DOWN`, which way (+1 up, −1 down); `None`
+    /// for the whole wheel and for anything that isn't a bend.
+    pub fn bend_dir(&self) -> Option<f32> {
+        match (self.kind, self.num) {
+            (Kind::Bend, BEND_UP) => Some(1.0),
+            (Kind::Bend, BEND_DOWN) => Some(-1.0),
+            _ => None,
+        }
+    }
+
+    /// The whole bend wheel, with no half named.
+    pub fn is_whole_bend(&self) -> bool {
+        self.kind == Kind::Bend && self.bend_dir().is_none()
     }
 
     /// Why this name can't be an output, if it can't.
@@ -285,6 +313,41 @@ impl MidiName {
     }
 }
 
+/// How a bus pin a MIDI picker built is written in a config — the editor's
+/// "MIDI…" row inserts this. `None` for what a config can't name (a velocity
+/// twin, derived state it has no word for).
+///
+/// A picker's "any channel" becomes a name with no channel at all, so it takes
+/// the config's own `MIDI_CHANNEL` / `MIDI_IN_CHANNEL` — which is what "I don't
+/// mind which" means once the config says. SysEx has no word spelling; it goes
+/// behind `@` as the pin id itself.
+pub fn tag_for_pin(pin_id: &str) -> Option<String> {
+    let pin = flexinput_core::midi::parse_pin(pin_id)?;
+    let chan = match pin.channel() {
+        Some(Channel::Ch(c)) => Chan::Ch(c + 1),
+        _ => Chan::Unsaid,
+    };
+    let (kind, num) = match pin {
+        MidiPin::Note { note, .. } => (Kind::Note, note as u16),
+        MidiPin::Cc { cc, .. } => (Kind::Cc, cc as u16),
+        MidiPin::Cc14 { cc, .. } => (Kind::Cc14, cc as u16),
+        MidiPin::Nrpn { param, .. } => (Kind::Nrpn, param),
+        MidiPin::Rpn { param, .. } => (Kind::Rpn, param),
+        MidiPin::PitchBend { .. } => (Kind::Bend, 0),
+        MidiPin::ChannelPressure { .. } => (Kind::Pressure, 0),
+        MidiPin::PolyAftertouch { note, .. } => (Kind::Aftertouch, note as u16),
+        MidiPin::ProgramChange { program, .. } => (Kind::Program, program as u16),
+        MidiPin::Transport(Transport::Start) => (Kind::Start, 0),
+        MidiPin::Transport(Transport::Stop) => (Kind::Stop, 0),
+        MidiPin::Transport(Transport::Continue) => (Kind::Continue, 0),
+        MidiPin::Bpm => (Kind::Bpm, 0),
+        MidiPin::Playing => (Kind::Playing, 0),
+        MidiPin::SysEx(_) => return Some(format!("@\"{pin_id}\"")),
+        MidiPin::Velocity { .. } => return None,
+    };
+    Some(MidiName { kind, num, chan }.spell())
+}
+
 /// A continuous source a config can point at a MIDI value, one axis at a time.
 ///
 /// A thumbstick, the motion stick and the gyro only send once their mode says
@@ -340,14 +403,18 @@ impl Source {
 ///
 /// A one-sided reading (0..1) fills the value from bottom to top. A two-sided
 /// one (−1..1) is centred: 64 at rest, 0 and 127 at the ends. A bend is
-/// two-sided in the protocol too, so it takes a two-sided reading as it stands
-/// and a one-sided one as a push up from its centre.
-pub fn value_for(target: &MidiPin, reading: f32, two_sided: bool) -> f32 {
+/// two-sided in the protocol too: the whole wheel takes a two-sided reading as
+/// it stands, and a named half (`bend_dir`, from `MIDI_PB_UP` / `_DOWN`) takes a
+/// one-sided reading — or a two-sided one's upper half — as a push that way
+/// from the centre.
+pub fn value_for(target: &MidiPin, bend_dir: Option<f32>, reading: f32, two_sided: bool) -> f32 {
     let bend = matches!(target, MidiPin::PitchBend { .. });
-    match (bend, two_sided) {
-        (true, _) => reading.clamp(-1.0, 1.0),
-        (false, true) => (0.5 + 0.5 * reading).clamp(0.0, 1.0),
-        (false, false) => reading.clamp(0.0, 1.0),
+    match (bend, bend_dir, two_sided) {
+        (true, Some(dir), true) => dir * reading.clamp(0.0, 1.0),
+        (true, Some(dir), false) => dir * reading.abs().clamp(0.0, 1.0),
+        (true, None, _) => reading.clamp(-1.0, 1.0),
+        (false, _, true) => (0.5 + 0.5 * reading).clamp(0.0, 1.0),
+        (false, _, false) => reading.clamp(0.0, 1.0),
     }
 }
 
@@ -480,6 +547,14 @@ pub(crate) fn apply(name: &str, rhs: &str, which: MidiId, s: &mut Settings) -> R
             if let Some(why) = m.output_problem() {
                 return Err(why);
             }
+            // A finger's place starts at the bottom and goes one way, so on a
+            // wheel that goes both it has to say which.
+            if !source.two_sided() && m.is_whole_bend() {
+                return Err(format!(
+                    "`{name}` reads one way from the bottom, and a bend goes both — say which \
+                     half: MIDI_PB_UP or MIDI_PB_DOWN"
+                ));
+            }
             // A note or a program change is a gate; a stick sweeping through
             // one would retrigger it on every move.
             if !m.kind.is_continuous() {
@@ -496,14 +571,27 @@ pub(crate) fn apply(name: &str, rhs: &str, which: MidiId, s: &mut Settings) -> R
 }
 
 /// Is `value` (a MIDI input pin's bus value) pressed? A gate is itself; a
-/// continuous value crosses at `threshold` — both halves of a bend count.
-pub fn value_pressed(kind: Kind, value: flexinput_core::Signal, threshold: f32) -> bool {
-    if kind.is_continuous() {
-        let v = value.as_float();
-        let v = if kind == Kind::Bend { v.abs() } else { v };
+/// continuous value crosses at `threshold` — both halves of the whole bend
+/// wheel count, and `MIDI_PB_UP` / `_DOWN` only their own.
+pub fn value_pressed(name: MidiName, value: flexinput_core::Signal, threshold: f32) -> bool {
+    if name.kind.is_continuous() {
+        let v = name.reading(value.as_float());
         v >= threshold.max(f32::EPSILON)
     } else {
         value.as_bool()
+    }
+}
+
+impl MidiName {
+    /// An input's continuous value as this name reads it: a named bend half
+    /// only its own side (0..1), the whole wheel its size either way, anything
+    /// else as it stands.
+    pub fn reading(&self, v: f32) -> f32 {
+        match self.bend_dir() {
+            Some(dir) => (v * dir).max(0.0),
+            None if self.kind == Kind::Bend => v.abs(),
+            None => v,
+        }
     }
 }
 
@@ -520,6 +608,7 @@ mod tests {
         for s in [
             "MIDI_C4", "MIDI_CS4", "MIDI_N5", "MIDI_G9", "MIDI_CC7", "MIDI_CC14_7",
             "MIDI_NRPN130", "MIDI_RPN0", "MIDI_PB", "MIDI_CP", "MIDI_AT_C4", "MIDI_PC5",
+            "MIDI_PB_UP", "MIDI_PB_DOWN_CH3",
             "MIDI_START", "MIDI_STOP", "MIDI_CONTINUE", "MIDI_BPM", "MIDI_PLAYING",
             "MIDI_C4_CH10", "MIDI_CC7_CHANY", "MIDI_PB_CH16",
         ] {
@@ -568,16 +657,32 @@ mod tests {
     }
 
     #[test]
+    fn a_picked_pin_is_written_the_way_the_parser_reads_it() {
+        assert_eq!(tag_for_pin("midi:note:*:60").as_deref(), Some("MIDI_C4"), "any = the config's own");
+        assert_eq!(tag_for_pin("midi:note:10:61").as_deref(), Some("MIDI_CS4_CH10"));
+        assert_eq!(tag_for_pin("midi:cc14:2:7").as_deref(), Some("MIDI_CC14_7_CH2"));
+        assert_eq!(tag_for_pin("midi:rt:start").as_deref(), Some("MIDI_START"));
+        assert_eq!(tag_for_pin("midi:sx:F07E7F0601F7").as_deref(), Some("@\"midi:sx:F07E7F0601F7\""));
+        assert_eq!(tag_for_pin("midi:vel:1:60"), None);
+        // And every word it writes parses back to the same pin.
+        for id in ["midi:note:3:0", "midi:nrpn:1:300", "midi:pat:16:127", "midi:pc:4:5", "midi:pb:9"] {
+            let tag = tag_for_pin(id).unwrap();
+            assert_eq!(p(&tag).pin(None).to_id(), id, "{tag}");
+        }
+    }
+
+    #[test]
     fn a_reading_lands_centred_or_from_the_bottom() {
         let cc = MidiPin::Cc { ch: Channel::Ch(0), cc: 1 };
         let pb = MidiPin::PitchBend { ch: Channel::Ch(0) };
-        assert_eq!(value_for(&cc, 0.0, true), 0.5, "a centred stick sits at 64");
-        assert_eq!(value_for(&cc, -1.0, true), 0.0);
-        assert_eq!(value_for(&cc, 1.0, true), 1.0);
-        assert_eq!(value_for(&cc, 0.25, false), 0.25, "a finger fills from the bottom");
-        assert_eq!(value_for(&pb, -0.5, true), -0.5, "a bend is two-sided already");
-        assert_eq!(value_for(&pb, 0.5, false), 0.5, "a one-sided reading pushes up from centre");
-        assert_eq!(value_for(&cc, 3.0, true), 1.0, "past the scale it pins at the end");
+        assert_eq!(value_for(&cc, None, 0.0, true), 0.5, "a centred stick sits at 64");
+        assert_eq!(value_for(&cc, None, -1.0, true), 0.0);
+        assert_eq!(value_for(&cc, None, 1.0, true), 1.0);
+        assert_eq!(value_for(&cc, None, 0.25, false), 0.25, "a finger fills from the bottom");
+        assert_eq!(value_for(&pb, None, -0.5, true), -0.5, "the whole wheel is two-sided already");
+        assert_eq!(value_for(&pb, Some(-1.0), 0.5, false), -0.5, "a named half pushes its way");
+        assert_eq!(value_for(&pb, Some(1.0), -0.5, true), 0.0, "and takes a stick's upper half");
+        assert_eq!(value_for(&cc, None, 3.0, true), 1.0, "past the scale it pins at the end");
     }
 
     #[test]
@@ -590,15 +695,21 @@ mod tests {
         for bad in ["MIDI_C4", "MIDI_PC3", "MIDI_BPM", "MIDI_CC1_CHANY", "SPACE"] {
             assert!(apply("LEFT_MIDI_X", bad, MidiId::Target(Source::LeftX), &mut s).is_err(), "{bad}");
         }
+        // A finger reads one way, so it has to name a half of the bend.
+        assert!(apply("TOUCH_MIDI_X", "MIDI_PB", MidiId::Target(Source::TouchX), &mut s).is_err());
+        assert!(apply("TOUCH_MIDI_X", "MIDI_PB_DOWN", MidiId::Target(Source::TouchX), &mut s).is_ok());
+        assert!(apply("LEFT_MIDI_X", "MIDI_PB", MidiId::Target(Source::LeftX), &mut s).is_ok());
     }
 
     #[test]
     fn a_continuous_input_crosses_at_the_threshold_and_a_bend_both_ways() {
         use flexinput_core::Signal;
-        assert!(!value_pressed(Kind::Cc, Signal::Float(0.4), 0.5));
-        assert!(value_pressed(Kind::Cc, Signal::Float(0.5), 0.5));
-        assert!(value_pressed(Kind::Bend, Signal::Float(-0.8), 0.5));
-        assert!(value_pressed(Kind::Note, Signal::Bool(true), 0.5));
-        assert!(!value_pressed(Kind::Cc, Signal::Float(0.0), 0.0), "rest never presses");
+        assert!(!value_pressed(p("MIDI_CC1"), Signal::Float(0.4), 0.5));
+        assert!(value_pressed(p("MIDI_CC1"), Signal::Float(0.5), 0.5));
+        assert!(value_pressed(p("MIDI_PB"), Signal::Float(-0.8), 0.5));
+        assert!(value_pressed(p("MIDI_PB_DOWN"), Signal::Float(-0.8), 0.5));
+        assert!(!value_pressed(p("MIDI_PB_UP"), Signal::Float(-0.8), 0.5), "the other half");
+        assert!(value_pressed(p("MIDI_C4"), Signal::Bool(true), 0.5));
+        assert!(!value_pressed(p("MIDI_CC1"), Signal::Float(0.0), 0.0), "rest never presses");
     }
 }

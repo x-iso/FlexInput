@@ -430,7 +430,9 @@ fn line_binds_a_button(text: &str, line: usize) -> bool {
     };
     let name = tok.text(l);
     let last = name.rsplit([',', '+']).next().unwrap_or(name).to_ascii_uppercase();
-    Btn::ALL.iter().any(|b| b.name() == last)
+    // `from_name` rather than a walk of `Btn::ALL`: a MIDI name is a button too,
+    // and far too many to list.
+    Btn::from_name(&last).is_some()
 }
 
 /// What picking `name` from the list puts under the cursor, and where the

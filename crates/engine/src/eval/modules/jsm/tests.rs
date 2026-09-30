@@ -6661,3 +6661,126 @@ fn midi_source_lines_refuse_what_cannot_work() {
     assert!(!err("TOUCHPAD_MODE = MIDI"));
     assert!(!err("L,LEFT_MIDI_X = MIDI_CC2"), "a target can change with a chord");
 }
+
+/// A trigger bound to a MIDI value hands it the pull — the pull IS the value.
+#[test]
+fn a_trigger_bound_to_a_controller_sends_its_pull() {
+    let bus = run_node_with("ZL = MIDI_CC7", false, &[("left_trigger", Signal::Float(0.3))], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:cc:1:7") else { panic!("{bus:?}") };
+    assert!((v - 0.3).abs() < 1e-4, "got {v}");
+    // Bound to a half of the bend, the pull pushes that way from the centre.
+    let bus = run_node_with("ZL = MIDI_PB_UP", false, &[("left_trigger", Signal::Float(0.3))], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:pb:1") else { panic!("{bus:?}") };
+    assert!((v - 0.3).abs() < 1e-4, "got {v}");
+    let bus = run_node_with("ZL = MIDI_PB_DOWN", false, &[("left_trigger", Signal::Float(0.3))], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:pb:1") else { panic!("{bus:?}") };
+    assert!((v + 0.3).abs() < 1e-4, "got {v}");
+}
+
+/// Two triggers on one bend, each pushing its own way: they add up, as two
+/// hands on one wheel would.
+#[test]
+fn two_halves_of_a_bend_add_up() {
+    let text = "ZL = MIDI_PB_DOWN
+ZR = MIDI_PB_UP";
+    let both = [("left_trigger", Signal::Float(0.2)), ("right_trigger", Signal::Float(0.7))];
+    let bus = run_node_with(text, false, &both, 2);
+    let Some(Signal::Float(v)) = bus.get("midi:pb:1") else { panic!("{bus:?}") };
+    assert!((v - 0.5).abs() < 1e-4, "0.7 up and 0.2 down leave 0.5 up, got {v}");
+    // A button pushes all the way.
+    let bus = run_node("S = MIDI_PB_DOWN", false, &["btn_south"], 2);
+    assert_eq!(bus.get("midi:pb:1"), Some(&Signal::Float(-1.0)), "{bus:?}");
+}
+
+/// The whole wheel goes both ways, so only a bend can drive it; anything that
+/// pushes one way has to say which.
+#[test]
+fn the_whole_bend_wants_a_way_unless_a_bend_drives_it() {
+    let err = |line: &str| matches!(one(line).status, LineStatus::Error(_));
+    assert!(err("ZL = MIDI_PB"));
+    assert!(err("S = MIDI_PB_CH2"));
+    assert!(!err("ZL = MIDI_PB_UP"));
+    assert!(!err("MIDI_PB = MIDI_PB_CH2"), "a bend drives a bend, both ways");
+    // And a whole bend passes through signed.
+    let bus = run_node_with("MIDI_PB = MIDI_PB_CH2", false, &[("midi:pb:*", Signal::Float(-0.6))], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:pb:2") else { panic!("{bus:?}") };
+    assert!((v + 0.6).abs() < 1e-4, "got {v}");
+}
+
+/// A half of the bend as an input presses only its own way, and as a value
+/// hands on only its own side.
+#[test]
+fn a_bend_half_presses_only_its_own_way() {
+    let text = "MIDI_PB_DOWN = SPACE
+MIDI_PB_UP = X_RT";
+    let bus = run_node_with(text, false, &[("midi:pb:*", Signal::Float(-0.8))], 2);
+    assert!(on(&bus, "key_space"), "{bus:?}");
+    assert_eq!(bus.get("right_trigger"), Some(&Signal::Float(0.0)), "the up half is at rest");
+    let bus = run_node_with(text, false, &[("midi:pb:*", Signal::Float(0.4))], 2);
+    assert!(!on(&bus, "key_space"));
+    let Some(Signal::Float(v)) = bus.get("right_trigger") else { panic!("{bus:?}") };
+    assert!((v - 0.4).abs() < 1e-4, "got {v}");
+}
+
+/// A note played from a trigger takes its velocity from how far it is pulled.
+#[test]
+fn a_note_played_from_a_trigger_takes_its_velocity_from_the_pull() {
+    let bus = run_node_with("ZR = MIDI_C4", false, &[("right_trigger", Signal::Float(0.6))], 2);
+    assert_eq!(bus.get("midi:note:1:60"), Some(&Signal::Bool(true)), "{bus:?}");
+    let Some(Signal::Float(v)) = bus.get("midi:vel:1:60") else { panic!("{bus:?}") };
+    assert!((v - 0.6).abs() < 1e-4, "got {v}");
+}
+
+/// A knob bound to a virtual trigger drives it by its value, from the first bit
+/// of movement — not from `MIDI_IN_THRESHOLD`, which is for a knob used as a
+/// button.
+#[test]
+fn a_knob_drives_a_virtual_trigger_by_its_value() {
+    let bus = run_node_with("MIDI_CC7 = X_LT", false, &[("midi:cc:*:7", Signal::Float(0.2))], 2);
+    let Some(Signal::Float(v)) = bus.get("left_trigger") else { panic!("{bus:?}") };
+    assert!((v - 0.2).abs() < 1e-4, "below the button threshold it still passes, got {v}");
+}
+
+/// A note bound to a value hands it the velocity the note arrived with.
+#[test]
+fn a_note_bound_to_a_trigger_gives_its_velocity() {
+    let sigs = [
+        ("midi:note:*:60", Signal::Bool(true)),
+        ("midi:vel:*:60", Signal::Float(0.5)),
+    ];
+    let bus = run_node_with("MIDI_C4 = X_RT", false, &sigs, 2);
+    let Some(Signal::Float(v)) = bus.get("right_trigger") else { panic!("{bus:?}") };
+    assert!((v - 0.5).abs() < 1e-4, "got {v}");
+}
+
+/// The pad's own trigger bound to a pad trigger stays JSM's full press:
+/// `ZL = X_LT` is a button in JSM, and `ZL_MODE = X_LT` is how it passes the
+/// pull through. Only MIDI, which is ours, carries a value through a binding.
+#[test]
+fn a_trigger_bound_to_a_pad_trigger_is_still_a_full_press() {
+    let bus = run_node_with("ZL = X_LT", false, &[("left_trigger", Signal::Float(0.3))], 2);
+    assert_eq!(bus.get("left_trigger"), Some(&Signal::Float(1.0)), "{bus:?}");
+}
+
+/// A SysEx has no word spelling, so it goes behind `@` as its pin id — and so
+/// can any MIDI pin. One a port reports but nothing can send is refused.
+#[test]
+fn a_sysex_goes_behind_at_as_its_pin_id() {
+    assert_eq!(steps("S = @\"midi:sx:F07E7F0601F7\"")[0].out, Out::Pin("midi:sx:F07E7F0601F7".into()));
+    assert!(matches!(one("S = @\"midi:rt:bpm\"").status, LineStatus::Error(_)));
+    let bus = run_node("S = @\"midi:sx:F07E7F0601F7\"", false, &["btn_south"], 2);
+    assert_eq!(bus.get("midi:sx:F07E7F0601F7"), Some(&Signal::Bool(true)), "{bus:?}");
+    assert!(bus.contains_key("__midi_out__:midi:sx:F07E7F0601F7"));
+}
+
+/// Right of a MIDI button's `=`, the editor offers bindings — a MIDI name is a
+/// button like any other, so the line binds one.
+#[test]
+fn a_midi_line_takes_bindings_on_its_right() {
+    let text = "MIDI_C4 = ";
+    let cur = super::cursor::Cursor { line: 0, token: 2 };
+    assert_eq!(
+        super::catalogue::kinds_at(&format!("{text}{}", super::cursor::SLOT), cur),
+        &[super::catalogue::Kind::Binding]
+    );
+}

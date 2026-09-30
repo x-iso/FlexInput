@@ -232,6 +232,11 @@ pub struct Compiled {
     /// Every button the config mentions, however it mentions it. Pass-through
     /// mode hands the rest of the bus straight on.
     pub mentioned: HashSet<Btn>,
+    /// MIDI knobs, bends and pressures whose only job is to feed a value
+    /// (`MIDI_CC7 = X_LT`). They count as pressed from the first bit of
+    /// movement rather than at `MIDI_IN_THRESHOLD`, or the target would sit at
+    /// zero for the bottom half of the knob and then jump.
+    pub analog_fed: HashSet<Btn>,
 }
 
 impl Compiled {
@@ -321,6 +326,7 @@ pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
         neutral_at_load: false,
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
+        analog_fed: HashSet::new(),
     };
     for (n, line) in text.lines().enumerate() {
         let info = compile_line(line, n, &mut out, tabs, ports);
@@ -342,10 +348,35 @@ fn settle_midi(out: &mut Compiled) {
     for b in &mut out.bindings {
         for step in &mut b.steps {
             if let Out::Midi(m) = step.out {
-                step.out = Out::Pin(m.pin(channel).to_id());
+                let pin = m.pin(channel).to_id();
+                step.out = match m.bend_dir() {
+                    Some(dir) => Out::Bend { pin, dir },
+                    None => Out::Pin(pin),
+                };
             }
         }
     }
+    // A continuous MIDI input bound on its own to nothing but values.
+    out.analog_fed.clear();
+    for b in &out.bindings {
+        let Trigger::Simple(btn @ Btn::Midi(m)) = b.trigger else { continue };
+        if m.kind.is_continuous()
+            && b.steps.iter().all(|s| match &s.out {
+                Out::Pin(p) => takes_a_value(p),
+                Out::Bend { .. } => true,
+                _ => false,
+            })
+        {
+            out.analog_fed.insert(btn);
+        }
+    }
+}
+
+/// A pin a button can hand a value to rather than just switch on: a MIDI
+/// controller, bend or pressure, or a virtual pad's trigger.
+pub(crate) fn takes_a_value(pin: &str) -> bool {
+    flexinput_core::midi::parse_pin(pin).is_some_and(|m| m.is_continuous())
+        || matches!(pin, "left_trigger" | "right_trigger")
 }
 
 /// Which settings a line actually writes. Almost always just itself — but
@@ -649,6 +680,7 @@ fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
     out.neutral_at_load |= inner.neutral_at_load;
     out.modeshifts.extend(inner.modeshifts);
     out.mentioned.extend(inner.mentioned.iter().copied());
+    out.analog_fed.extend(inner.analog_fed.iter().copied());
     // A binding is an assignment, so the included tab's win — and they are folded in
     // one at a time so the replacement rule applies to each.
     for b in inner.bindings {
@@ -719,6 +751,7 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
             out.bindings.clear();
             out.modeshifts.clear();
             out.mentioned.clear();
+            out.analog_fed.clear();
             out.timings = Timings::default();
             out.settings = Settings::default();
             out.aim = super::aim::Settings::default();
@@ -958,6 +991,22 @@ fn binding_line(
         Ok(v) => v,
         Err(e) => return LineInfo::of(LineStatus::Error(e)),
     };
+    // The whole bend wheel goes both ways, and only a bend reads both ways. A
+    // button, a trigger or a knob pushes ONE way, so its line says which.
+    let bend_source = matches!(trigger, Trigger::Simple(Btn::Midi(m)) if m.is_whole_bend());
+    if !bend_source {
+        if let Some(m) = steps.iter().find_map(|s| match s.out {
+            Out::Midi(m) if m.is_whole_bend() => Some(m),
+            _ => None,
+        }) {
+            return LineInfo::of(LineStatus::Error(format!(
+                "`{}` goes both ways and this pushes one — say which: `{}` or `{}`",
+                m.spell(),
+                super::midi::MidiName { num: super::midi::BEND_UP, ..m }.spell(),
+                super::midi::MidiName { num: super::midi::BEND_DOWN, ..m }.spell(),
+            )));
+        }
+    }
 
     out.mentioned.insert(btn);
     if let Some((_, second)) = &combo {
@@ -1378,17 +1427,30 @@ pub(crate) fn parse_mapping(
 
         let mut action = action;
         let out = if fi {
-            // Resolved here rather than left for later: an unresolved target is
-            // a line that does nothing, and this module's whole job is to say so
-            // at the point you can still see the line.
-            match port_pin(&key, ports) {
-                Some(pin) => Out::Pin(pin),
-                None if ports.is_empty() => return Err(format!(
-                    "`@{key}` — this patch has no Macro Output ports or Virtual Menu entries to bind to"
-                )),
-                None => return Err(format!(
-                    "`@{key}` isn't a Macro Output port or Virtual Menu entry in this patch"
-                )),
+            // A MIDI message by its bus pin id — how a SysEx is written, since it
+            // has no word spelling (`@"midi:sx:F07E7F0601F7"`). Any other MIDI
+            // pin works the same way, though its `MIDI_*` name reads better.
+            if let Some(pin) = flexinput_core::midi::parse_pin(&key) {
+                if !pin.is_output_capable() {
+                    return Err(format!(
+                        "`@{key}` can't be sent — it is state a port reports, or an any-channel \
+                         input"
+                    ));
+                }
+                Out::Pin(pin.to_id())
+            } else {
+                // Resolved here rather than left for later: an unresolved target
+                // is a line that does nothing, and this module's whole job is to
+                // say so at the point you can still see the line.
+                match port_pin(&key, ports) {
+                    Some(pin) => Out::Pin(pin),
+                    None if ports.is_empty() => return Err(format!(
+                        "`@{key}` — this patch has no Macro Output ports or Virtual Menu entries to bind to"
+                    )),
+                    None => return Err(format!(
+                        "`@{key}` isn't a Macro Output port or Virtual Menu entry in this patch"
+                    )),
+                }
             }
         } else if command {
             // A console command has no key to release, so it fires and is done.

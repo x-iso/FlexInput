@@ -296,6 +296,12 @@ pub enum Out {
     /// the whole config has been read, since `MIDI_CHANNEL` may come later in
     /// the file than the binding that relies on it.
     Midi(super::midi::MidiName),
+    /// `MIDI_PB_UP` / `MIDI_PB_DOWN`, settled: a bend pin held like any other,
+    /// pushed `dir` (+1 up, −1 down) by whatever holds it. Kept apart from
+    /// [`Out::Pin`] because two bindings can push ONE bend opposite ways
+    /// (`ZL = MIDI_PB_DOWN`, `ZR = MIDI_PB_UP`), so the way is the binding's,
+    /// not the pin's.
+    Bend { pin: String, dir: f32 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
