@@ -17,6 +17,11 @@ pub(crate) fn show_remapper_body(
     let upstream_dev_id = if wired {
         remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
     } else { None };
+    // Every device behind the input — all of a Combiner's ports, not just the
+    // first — so Learn hears a MIDI port AND a pad merged ahead of this node.
+    let upstream_devs: Vec<String> = if wired {
+        remapper_upstream_device_ids(snarl, node_id, 0, automap_parent)
+    } else { Vec::new() };
 
     let (phase, draft_input, draft_output, mappings, pressed_prev) = snarl.get_node(node_id)
         .map(|n| (
@@ -31,18 +36,9 @@ pub(crate) fn show_remapper_body(
     // ── Capture state machine ──────────────────────────────────────────────
     // Runs whenever a wire is connected. The phase transition idle→capturing
     // happens on connect; ready_to_learn / capture-done on release.
-    let mut pressed_now: Vec<String> = match (&upstream_dev_id, wired) {
-        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-        _ => Vec::new(),
-    };
-    // A MIDI port upstream: notes while held, knobs and benders while moving.
-    if let (Some(dev), true) = (&upstream_dev_id, wired) {
-        for p in remapper_midi_pressed_now(ui, live_signals, dev) {
-            if !pressed_now.iter().any(|q| q == &p) {
-                pressed_now.push(p);
-            }
-        }
-    }
+    // Pads read their pressed pins, MIDI ports their sounding notes and moving
+    // knobs — every device behind the input, merged.
+    let mut pressed_now: Vec<String> = remapper_upstream_pressed_now(ui, live_signals, &upstream_devs);
     // During Learn, merge in live OS keyboard/mouse so the user can map to
     // keys/mouse buttons even when no virtual KB/M sink is in the graph.
     if phase == "learning" {
@@ -73,11 +69,11 @@ pub(crate) fn show_remapper_body(
     // the controller is driving FlexInput's own UI, so the capture state
     // machine must HOLD a latched combo instead of re-capturing every press.
     // The app's nav driver pass-stamps a temp flag per nav device each frame.
-    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+    let nav_active_for_device = upstream_devs.iter().any(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
         stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
-    }).unwrap_or(false);
+    });
 
     // While UI-nav is active, the auto-capture state machine is suppressed (the
     // controller drives the UI). The nav driver arms a one-shot capture by
@@ -653,10 +649,7 @@ pub(crate) fn show_remapper_body(
             let filter_live: Vec<String> = if nav_active_for_device {
                 new_draft_input.clone()
             } else {
-                match (&upstream_dev_id, wired) {
-                    (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-                    _ => Vec::new(),
-                }
+                remapper_upstream_pressed_now(ui, live_signals, &upstream_devs)
             };
             let filter = mapping_filter_row(
                 ui,
@@ -821,6 +814,11 @@ pub(crate) fn show_map_action_body(
     let upstream_dev_id = if wired {
         remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
     } else { None };
+    // Every device behind the input — all of a Combiner's ports, not just the
+    // first — so Learn hears a MIDI port AND a pad merged ahead of this node.
+    let upstream_devs: Vec<String> = if wired {
+        remapper_upstream_device_ids(snarl, node_id, 0, automap_parent)
+    } else { Vec::new() };
 
     let (phase, draft_input, mappings, pressed_prev) = snarl.get_node(node_id)
         .map(|n| (
@@ -832,27 +830,17 @@ pub(crate) fn show_map_action_body(
         .unwrap_or_else(|| ("idle".into(), vec![], vec![], vec![]));
 
     // Capture state machine (input side only)
-    let mut pressed_now: Vec<String> = match (&upstream_dev_id, wired) {
-        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-        _ => Vec::new(),
-    };
-    // A MIDI port upstream: notes while held, knobs and benders while moving —
-    // the Remapper's rule, so a note can be learned as an action's trigger.
-    if let (Some(dev), true) = (&upstream_dev_id, wired) {
-        for p in remapper_midi_pressed_now(ui, live_signals, dev) {
-            if !pressed_now.iter().any(|q| q == &p) {
-                pressed_now.push(p);
-            }
-        }
-    }
+    // Every device behind the input, pads and MIDI ports alike — the Remapper's
+    // rule, so a note can be learned as an action's trigger.
+    let mut pressed_now: Vec<String> = remapper_upstream_pressed_now(ui, live_signals, &upstream_devs);
 
     // Hold the latched combo while gamepad UI-nav is active for this device
     // (mirror of the Remapper guard). Pass-stamped per device by the app.
-    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+    let nav_active_for_device = upstream_devs.iter().any(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
         stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
-    }).unwrap_or(false);
+    });
     // One-shot capture arm: in nav mode, auto-capture is suppressed so the
     // gamepad can drive the UI without polluting the mapping. The "Capture"
     // button (clickable via gamepad South) sets `_nav_capture_armed`, which lets
@@ -1168,10 +1156,7 @@ pub(crate) fn show_map_action_body(
             let filter_live: Vec<String> = if nav_active_for_device {
                 new_draft_input.clone()
             } else {
-                match (&upstream_dev_id, wired) {
-                    (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-                    _ => Vec::new(),
-                }
+                remapper_upstream_pressed_now(ui, live_signals, &upstream_devs)
             };
             let filter = mapping_filter_row(
                 ui,

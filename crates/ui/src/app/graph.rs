@@ -180,6 +180,57 @@ pub(crate) fn is_real_device_id(id: &str) -> bool {
         || id.starts_with("virtual.")
 }
 
+/// Every real device an AutoMap chain draws from, for UI capture — the
+/// many-device counterpart of [`find_automap_device_id_for_viewer`].
+///
+/// Usually that is one device. But an AutoMap Combiner MERGES all of its ports
+/// (a gamepad and a MIDI port, say — pins that never compete), and resolving
+/// it to one device made a Remapper's Learn hear only whichever sat on port 0.
+/// So a Combiner contributes every port's devices; any other node with an
+/// AutoMap input is followed upstream; and whatever this walk can't see past (a
+/// sub-patch inlet, say) falls back to the single-device resolver.
+pub fn find_automap_device_ids_for_viewer(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |id: String, out: &mut Vec<String>| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    let Some(node) = snarl.get_node(src.node) else { return out };
+    let automap_inputs: Vec<usize> = node.inputs.iter().enumerate()
+        .filter(|(_, p)| p.signal_type == SignalType::AutoMap)
+        .map(|(i, _)| i)
+        .collect();
+    let upstream_of = |i: usize| snarl.in_pin(InPinId { node: src.node, input: i }).remotes.first().copied();
+    if node.module_id == "device.source" {
+        if let Some(id) = node.params.get("device_id").and_then(|v| v.as_str()) {
+            push(id.to_string(), &mut out);
+        }
+    } else if node.module_id == "module.automap_combiner" {
+        for i in automap_inputs {
+            if let Some(up) = upstream_of(i) {
+                for id in find_automap_device_ids_for_viewer(snarl, up, parent) {
+                    push(id, &mut out);
+                }
+            }
+        }
+    } else if let Some(up) = automap_inputs.first().and_then(|&i| upstream_of(i)) {
+        for id in find_automap_device_ids_for_viewer(snarl, up, parent) {
+            push(id, &mut out);
+        }
+    }
+    if out.is_empty() {
+        if let Some(id) = find_automap_device_id_for_viewer(snarl, src, parent) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Public helper for the viewer: resolve an AutoMap chain back to the
 /// originating physical device id (or a sensible fallback) for UI capture.
 /// Returns `Some(device_id)` when resolved, or `None` when not wired.

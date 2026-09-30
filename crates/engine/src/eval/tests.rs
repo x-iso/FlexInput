@@ -5035,6 +5035,44 @@ mod midi_source_tests {
         let out = compute_node(&snap, &[], &mut NodeState::default(), &HashMap::new(), &HashMap::new(), 0.016);
         assert_eq!(out, vec![None]);
     }
+
+    /// A Combiner fed a MIDI port and a gamepad carries BOTH on: the pad's pins
+    /// and the MIDI pins never compete for a pin, so port order must not decide
+    /// which one gets through — whichever sits on port 0.
+    #[test]
+    fn a_combiner_carries_midi_and_a_pad_whichever_port_comes_first() {
+        for midi_first in [true, false] {
+            let midi = midi_source(&["automap_out"]);
+            let pad = pad_source_for_midi(5);
+            let devs = if midi_first { ["midi_in:0", PAD] } else { [PAD, "midi_in:0"] };
+            let mut comb = node(3, "module.automap_combiner");
+            comb.params.insert("_automap_input_devs".into(), serde_json::json!(devs));
+            comb.params.insert("_automap_input_collectors".into(), serde_json::json!(["", ""]));
+            comb.input_sources = vec![Some((0, 0)), Some((1, 0))];
+            // Downstream, a Remapper resolves to the combiner's bus, with the
+            // first port's device as its raw fallback — as the graph builder
+            // stamps it.
+            let mut remap = node(2, "module.remapper");
+            remap.params.insert("_automap_device_id".into(), Value::String(devs[0].into()));
+            remap.params.insert("_automap_collector_id".into(), Value::String("combiner:3".into()));
+            remap.params.insert("mappings".into(), serde_json::json!([
+                { "in": ["midi:note:1:60"], "out": ["btn_north"] },
+            ]));
+            remap.input_sources = vec![Some((2, 0))];
+            remap.n_outputs = 1;
+            let sink = pad_sink(4, "remap:2");
+            let graph = ProcessingGraph { nodes: vec![midi, pad, comb, remap, sink] };
+            let mut sigs = pad_sigs(&[("btn_south", Signal::Bool(true))]);
+            sigs.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+            let on = |pin: &str| out.sink_outputs
+                .get(&("virtual.xinput:0".to_string(), pin.to_string()))
+                .map(|s| s.as_bool()).unwrap_or(false);
+            assert!(on("btn_north"), "midi first = {midi_first}: the note should press North");
+            assert!(on("btn_south"), "midi first = {midi_first}: the pad's South should pass");
+        }
+    }
 }
 
 /// MIDI outputs from the other mapping modules — Lean, Touch Zones, the Virtual

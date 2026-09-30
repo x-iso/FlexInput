@@ -1086,6 +1086,27 @@ mod tests {
         }
     }
 
+    /// A note reaches the bus three ways — its channel's pin, the any-channel
+    /// twin, and its velocity — and Learn must capture it once, as sent. It
+    /// used to learn the twin too, so every note became a two-message chord.
+    #[test]
+    fn learn_captures_a_midi_message_once_as_it_was_sent() {
+        let ctx = egui::Context::default();
+        let mut live = std::collections::HashMap::new();
+        let dev = "midi_in:0".to_string();
+        live.insert((dev.clone(), "midi:note:3:60".to_string()), Signal::Bool(true));
+        live.insert((dev.clone(), "midi:note:*:60".to_string()), Signal::Bool(true));
+        live.insert((dev.clone(), "midi:vel:3:60".to_string()), Signal::Float(0.9));
+        live.insert((dev.clone(), "midi:vel:*:60".to_string()), Signal::Float(0.9));
+        let mut got = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                got = crate::canvas::viewer::remapper_midi_pressed_now(ui, &live, &dev);
+            });
+        });
+        assert_eq!(got, vec!["midi:note:3:60".to_string()]);
+    }
+
     #[test]
     fn a_stick_step_walks_the_type_and_channel_round_and_clamps_the_number() {
         let mut st = PickerState { kind: PickKind::Cc, channel: 1, number: 7, sysex: String::new() };

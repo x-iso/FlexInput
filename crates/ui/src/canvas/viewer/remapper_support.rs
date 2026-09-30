@@ -48,6 +48,41 @@ pub(crate) fn remapper_upstream_device_id(
     crate::app::find_automap_device_id_for_viewer(snarl, src, automap_parent)
 }
 
+/// Every device the AutoMap input `input_idx` draws from — see
+/// `find_automap_device_ids_for_viewer`: one, or all of a Combiner's ports.
+pub(crate) fn remapper_upstream_device_ids(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    input_idx: usize,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> Vec<String> {
+    let pin = snarl.in_pin(InPinId { node: node_id, input: input_idx });
+    let Some(&src) = pin.remotes.first() else { return Vec::new() };
+    crate::app::find_automap_device_ids_for_viewer(snarl, src, automap_parent)
+}
+
+/// What those devices hold down right now, each read its own way: a pad's
+/// pressed pins, a MIDI port's sounding notes and moving knobs. Merged, so a
+/// chord can span a pad and a keyboard behind one Combiner.
+pub(crate) fn remapper_upstream_pressed_now(
+    ui: &egui::Ui,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    devs: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dev in devs {
+        for p in remapper_pressed_now(live_signals, dev)
+            .into_iter()
+            .chain(remapper_midi_pressed_now(ui, live_signals, dev))
+        {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Hold gamepad UI-nav inert (`widgets::hold_nav_for_capture`) while `node_id`
 /// has its one-shot nav capture armed (`armed_key`) in one of `capture_phases`
 /// (`phase_key`) AND the pad it captures from is the one driving nav. Call AFTER
@@ -211,6 +246,17 @@ pub(crate) fn remapper_midi_pressed_now(
         // un-enterable afterwards too). They are reachable from the pick row,
         // which is where a mapping on them belongs.
         if matches!(parsed, midi::MidiPin::Playing | midi::MidiPin::Bpm) {
+            continue;
+        }
+        // Two pins ride along with every message and are not messages of their
+        // own. The backend publishes each channel message twice — on its channel
+        // and on the any-channel twin (`midi:note:*:60`) that any-channel
+        // mappings match — so learning both made every note a two-pin chord.
+        // And a note's velocity pin is part of the note. Learn captures the
+        // message as it was sent; "any channel" is a choice made on the chip.
+        if parsed.channel() == Some(midi::Channel::Any)
+            || matches!(parsed, midi::MidiPin::Velocity { .. })
+        {
             continue;
         }
         if parsed.is_continuous() {
