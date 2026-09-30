@@ -1005,11 +1005,37 @@ fn jsm_rows(
             flexinput_engine::eval::JsmKind::Trigger,
         ],
     };
-    if let Some((name, kind)) = super::jsm_widgets::command_list(
+    let picked = super::jsm_widgets::command_list(
         ui, node_id, size.x, &pins_this_pad_reports(snarl, node_id, live, parent),
         (!resizable).then_some(list_want),
         list_kinds,
-    ) {
+    );
+    // "MIDI…" opens the MIDI editor window instead of inserting anything: the
+    // window builds the message, and hands its name back here to be put in place.
+    let path = super::subpatch_path(parent);
+    let picked = match picked {
+        Some((name, kind)) if name == super::midi::JSM_MIDI_ROW => {
+            super::midi::request_midi_modal(ui.ctx(), super::midi::MidiModalRequest {
+                inner: node_id,
+                path: path.clone(),
+                purpose: super::midi::MidiModalPurpose::JsmInsert {
+                    output: kind == flexinput_engine::eval::JsmKind::Binding,
+                    cursor: nav_cur,
+                },
+            });
+            None
+        }
+        Some(pick) => Some((pick, nav_cur)),
+        None => super::midi::take_jsm_midi_insert(ui.ctx(), &path, node_id).map(|ins| {
+            let kind = if ins.output {
+                flexinput_engine::eval::JsmKind::Binding
+            } else {
+                flexinput_engine::eval::JsmKind::Trigger
+            };
+            ((ins.tag, kind), ins.cursor)
+        }),
+    };
+    if let Some(((name, kind), nav_cur)) = picked {
         match nav_cur {
             // The pad picked it, so it lands under the pad's cursor — and the
             // cursor moves on to whatever the line still needs, which for a

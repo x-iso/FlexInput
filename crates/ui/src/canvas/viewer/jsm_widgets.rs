@@ -971,6 +971,33 @@ pub(crate) fn command_list(
         .into_iter()
         .filter(|i| kinds.contains(&i.kind))
         .collect();
+    // MIDI, on either side of the `=`: too many names to list, so one row opens
+    // the MIDI editor window, which builds the message and writes its name.
+    {
+        use flexinput_engine::eval::JsmKind as K;
+        let side = if kinds.contains(&K::Binding) {
+            Some(K::Binding)
+        } else if kinds.contains(&K::Trigger) {
+            Some(K::Trigger)
+        } else {
+            None
+        };
+        if let Some(kind) = side {
+            items.push(flexinput_engine::eval::JsmItem {
+                name: super::midi::JSM_MIDI_ROW.to_string(),
+                kind,
+                group: "MIDI",
+                state: flexinput_engine::eval::JsmSupportState::Live,
+                help: Some(if kind == K::Binding {
+                    "Build a MIDI message to play — a note, a controller, a program change — \
+                     and write its MIDI_ name here."
+                } else {
+                    "Build a MIDI message that presses this binding — a note, a knob past \
+                     MIDI_IN_THRESHOLD — and write its MIDI_ name here."
+                }),
+            });
+        }
+    }
     if kinds.contains(&flexinput_engine::eval::JsmKind::Binding) {
         items.extend(flexinput_engine::eval::jsm_bindings());
         // FlexInput's own targets, which JSM has no names for because they are

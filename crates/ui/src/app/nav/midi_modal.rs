@@ -24,6 +24,8 @@ pub(crate) struct MidiModalOutcome {
     close: bool,
     add_input: bool,
     add_output: bool,
+    /// JSM insert: write the message's name into the editor.
+    insert: bool,
     /// Chip editor: a row stepped by its ◀ / ▶ buttons.
     step: Option<(MidiChipRow, i32)>,
     /// Chip editor: a level dragged to a value.
@@ -72,6 +74,8 @@ impl FlexInputApp {
     fn midi_modal_row_count(&self, m: &MidiModal) -> usize {
         match &m.purpose {
             MidiModalPurpose::Add => MidiAddRow::ALL.len(),
+            // Type, channel, number, then Insert.
+            MidiModalPurpose::JsmInsert { .. } => JSM_INSERT_ROW + 1,
             MidiModalPurpose::Chip { side_out, pin_idx, .. } => self.midi_modal_card(m)
                 .and_then(|c| {
                     let key = if *side_out { "out" } else { "in" };
@@ -123,6 +127,42 @@ impl FlexInputApp {
         }
     }
 
+    /// Why the message the editor builds can't be written on this side of a JSM
+    /// binding, if it can't.
+    fn midi_modal_jsm_problem(ctx: &egui::Context, m: &MidiModal, output: bool) -> Option<&'static str> {
+        use flexinput_core::midi::MidiPin;
+        let Some(pin) = midi_pick_built(ctx, m.inner) else {
+            return Some("Finish the message first (a SysEx needs F0 … F7).");
+        };
+        match (output, &pin) {
+            (true, MidiPin::Bpm | MidiPin::Playing) => {
+                Some("That is state a port reports — there is nothing to send.")
+            }
+            (false, MidiPin::Bpm) => Some("A tempo drives a value, not a binding."),
+            (false, MidiPin::SysEx(_)) => Some("A SysEx can be played, not pressed."),
+            _ => None,
+        }
+    }
+
+    /// Write the message's `MIDI_*` name into the JSM editor that asked, and
+    /// close. The editor's body puts it in place (`take_jsm_midi_insert`).
+    fn midi_modal_jsm_insert(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.gamepad_nav.midi_modal.clone() else { return };
+        let MidiModalPurpose::JsmInsert { output, cursor } = m.purpose else { return };
+        if Self::midi_modal_jsm_problem(ctx, &m, output).is_some() {
+            return;
+        }
+        let Some(pin) = midi_pick_built(ctx, m.inner) else { return };
+        let Some(tag) = flexinput_engine::eval::jsm_midi_tag(&pin.to_id()) else { return };
+        crate::canvas::viewer::set_jsm_midi_insert(
+            ctx,
+            &m.path,
+            m.inner,
+            crate::canvas::viewer::JsmMidiInsert { tag, output, cursor },
+        );
+        self.close_midi_modal();
+    }
+
     /// Drive the open editor from the pad.
     pub(crate) fn drive_midi_modal(
         &mut self,
@@ -157,6 +197,11 @@ impl FlexInputApp {
                             midi_pick_nav_adjust(ctx, m.inner, field, delta);
                         }
                     }
+                    MidiModalPurpose::JsmInsert { .. } => {
+                        if row < JSM_INSERT_ROW {
+                            midi_pick_nav_adjust(ctx, m.inner, row, delta);
+                        }
+                    }
                     MidiModalPurpose::Chip { side_out, pin_idx, .. } => {
                         let (side_out, pin_idx) = (*side_out, *pin_idx);
                         if let Some(r) = self.midi_modal_chip_row(&m, row) {
@@ -173,12 +218,16 @@ impl FlexInputApp {
             open.row = row;
         }
         if nav.is_rising("btn_south") {
-            if let MidiModalPurpose::Add = m.purpose {
-                match MidiAddRow::ALL[row] {
+            match m.purpose {
+                MidiModalPurpose::Add => match MidiAddRow::ALL[row] {
                     MidiAddRow::AddInput => self.midi_modal_add(ctx, false),
                     MidiAddRow::AddOutput => self.midi_modal_add(ctx, true),
                     _ => {}
+                },
+                MidiModalPurpose::JsmInsert { .. } if row == JSM_INSERT_ROW => {
+                    self.midi_modal_jsm_insert(ctx);
                 }
+                _ => {}
             }
         }
     }
@@ -200,6 +249,14 @@ impl FlexInputApp {
             MidiModalPurpose::Add => "MIDI message",
             MidiModalPurpose::Chip { side_out: false, .. } => "MIDI input",
             MidiModalPurpose::Chip { side_out: true, .. } => "MIDI output",
+            MidiModalPurpose::JsmInsert { output: true, .. } => "MIDI to play",
+            MidiModalPurpose::JsmInsert { output: false, .. } => "MIDI that presses",
+        };
+        let hint = match m.purpose {
+            MidiModalPurpose::JsmInsert { .. } => {
+                "Up/Down: row   Left/Right: change   South: insert   East: close"
+            }
+            _ => "Up/Down: row   Left/Right: change   South: add   East: close",
         };
         egui::Window::new(title)
             .id(egui::Id::new("gp_midi_modal"))
@@ -208,8 +265,7 @@ impl FlexInputApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(
-                        "Up/Down: row   Left/Right: change   South: add   East: close")
+                    ui.label(egui::RichText::new(hint)
                         .small().color(egui::Color32::from_gray(150)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(egui::RichText::new("Done").size(13.0)).clicked() {
@@ -222,6 +278,9 @@ impl FlexInputApp {
                     MidiModalPurpose::Add => self.midi_modal_add_ui(ui, &m, &mut out),
                     MidiModalPurpose::Chip { side_out, pin_idx, .. } => {
                         self.midi_modal_chip_ui(ui, &m, side_out, pin_idx, &mut out)
+                    }
+                    MidiModalPurpose::JsmInsert { output, .. } => {
+                        self.midi_modal_jsm_ui(ui, &m, output, &mut out)
                     }
                 }
             });
@@ -261,6 +320,36 @@ impl FlexInputApp {
                 });
             if focused == Some(MidiAddRow::AddOutput) { ring_row(ui, resp.rect); }
             if resp.clicked() { out.add_output = true; }
+        });
+    }
+
+    fn midi_modal_jsm_ui(&self, ui: &mut egui::Ui, m: &MidiModal, output: bool, out: &mut MidiModalOutcome) {
+        let focused = MidiAddRow::ALL.get(m.row).copied().filter(|_| m.row < JSM_INSERT_ROW);
+        let rects = midi_add_rows_ui(ui, m.inner, focused);
+        for (i, r) in rects.iter().enumerate() {
+            if ui.rect_contains_pointer(*r) && ui.input(|i| i.pointer.any_click()) {
+                out.focus = Some(i);
+            }
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(if output {
+            "Any channel: the config's MIDI_CHANNEL."
+        } else {
+            "Any channel: the config's MIDI_IN_CHANNEL."
+        }).small().weak());
+        ui.add_space(4.0);
+        let problem = Self::midi_modal_jsm_problem(ui.ctx(), m, output);
+        let tag = midi_pick_built(ui.ctx(), m.inner)
+            .and_then(|p| flexinput_engine::eval::jsm_midi_tag(&p.to_id()));
+        ui.horizontal(|ui| {
+            let resp = ui.add_enabled(problem.is_none() && tag.is_some(),
+                egui::Button::new(egui::RichText::new("Insert").size(13.0)))
+                .on_disabled_hover_text(problem.unwrap_or("Nothing a config can name."));
+            if m.row == JSM_INSERT_ROW { ring_row(ui, resp.rect); }
+            if resp.clicked() { out.insert = true; }
+            if let Some(t) = &tag {
+                ui.label(egui::RichText::new(t).monospace().small());
+            }
         });
     }
 
@@ -325,6 +414,7 @@ impl FlexInputApp {
         }
         if out.add_input { self.midi_modal_add(ctx, false); }
         if out.add_output { self.midi_modal_add(ctx, true); }
+        if out.insert { self.midi_modal_jsm_insert(ctx); }
         if let MidiModalPurpose::Chip { side_out, pin_idx, .. } = m.purpose {
             if let Some((row, delta)) = out.step {
                 self.midi_modal_edit_card(&m, &move |c| midi_chip_step(c, side_out, pin_idx, row, delta));
@@ -367,6 +457,10 @@ impl FlexInputApp {
         self.apply_midi_modal_outcome(ctx, out);
     }
 }
+
+/// The JSM insert editor's button row, after its type / channel / number rows
+/// (which are the Add editor's first three, stepped by the same field index).
+const JSM_INSERT_ROW: usize = 3;
 
 /// Render `f` in the always-on-top, see-through viewport that floats over the
 /// game while the config overlay is up — the one the KB/M picker uses. Every

@@ -408,6 +408,36 @@ pub enum MidiModalPurpose {
     /// `cards_key` list (`mappings` for a Remapper): the out row when
     /// `side_out`, else the in row; `pin_idx` is the chip's index in that row.
     Chip { card: usize, cards_key: String, side_out: bool, pin_idx: usize },
+    /// Build a message and write its `MIDI_*` name into a JSM Config editor:
+    /// right of an `=` when `output` (something to play), left of one otherwise
+    /// (something that presses). `cursor` is the pad's cursor in the editor, or
+    /// `None` for a mouse, whose pick goes on a line of its own.
+    JsmInsert { output: bool, cursor: Option<flexinput_engine::eval::JsmCursor> },
+}
+
+/// The command-list row that opens the MIDI editor for a JSM Config editor.
+pub(crate) const JSM_MIDI_ROW: &str = "MIDI…";
+
+/// A `MIDI_*` name the editor window built for a JSM Config editor, waiting for
+/// that editor's body to put it in place — the body owns the text, and is the
+/// one place a pick from the command list is already applied.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JsmMidiInsert {
+    pub tag: String,
+    pub output: bool,
+    pub cursor: Option<flexinput_engine::eval::JsmCursor>,
+}
+
+fn jsm_midi_insert_id(path: &[usize], node: NodeId) -> egui::Id {
+    egui::Id::new(("jsm_midi_insert", path.to_vec(), node.0))
+}
+
+pub(crate) fn set_jsm_midi_insert(ctx: &egui::Context, path: &[usize], node: NodeId, v: JsmMidiInsert) {
+    ctx.data_mut(|d| d.insert_temp(jsm_midi_insert_id(path, node), v));
+}
+
+pub(crate) fn take_jsm_midi_insert(ctx: &egui::Context, path: &[usize], node: NodeId) -> Option<JsmMidiInsert> {
+    ctx.data_mut(|d| d.remove_temp::<JsmMidiInsert>(jsm_midi_insert_id(path, node)))
 }
 
 /// A request to open the editor, from a node body (a mouse click) to the app,
