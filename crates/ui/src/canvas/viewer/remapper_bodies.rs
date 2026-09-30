@@ -429,6 +429,9 @@ pub(crate) fn show_remapper_body(
         // and their rects are published so the driver can glow the focused one.
         let in_learning = new_phase == "learning";
         let learn_enabled = new_phase == "ready_to_learn";
+        let midi_pick_open = snarl.get_node(node_id)
+            .and_then(|n| n.params.get(MIDI_PICK_OPEN).and_then(|v| v.as_bool()))
+            .unwrap_or(false);
         let need_input_arm = new_phase != "ready_to_learn" && new_phase != "learning"
             && new_draft_input.is_empty();
         let add_enabled = (in_learning && !new_draft_output.is_empty())
@@ -439,17 +442,23 @@ pub(crate) fn show_remapper_body(
             || new_phase == "ready_to_learn" || new_phase == "learning";
 
         // Consume one-shot gamepad activation flags.
-        let (act_learn, act_special, act_add, act_clear) = {
+        let (act_learn, act_special, act_add, act_clear, act_midi, act_midi_in, act_midi_out) = {
             let n = snarl.get_node(node_id);
             let g = |k: &str| n.and_then(|n| n.params.get(k)).and_then(|v| v.as_bool()).unwrap_or(false);
-            (g("_nav_act_learn"), g("_nav_act_special"), g("_nav_act_add"), g("_nav_act_clear"))
+            (
+                g("_nav_act_learn"), g("_nav_act_special"), g("_nav_act_add"), g("_nav_act_clear"),
+                g(NAV_ACT_MIDI), g(NAV_ACT_MIDI_ADD_IN), g(NAV_ACT_MIDI_ADD_OUT),
+            )
         };
-        if act_learn || act_special || act_add || act_clear {
+        if act_learn || act_special || act_add || act_clear || act_midi || act_midi_in || act_midi_out {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_nav_act_learn".into(), Value::from(false));
                 node.params.insert("_nav_act_special".into(), Value::from(false));
                 node.params.insert("_nav_act_add".into(), Value::from(false));
                 node.params.insert("_nav_act_clear".into(), Value::from(false));
+                for k in NAV_ACT_MIDI_ALL {
+                    node.params.insert(k.to_string(), Value::from(false));
+                }
             }
         }
 
@@ -457,6 +466,13 @@ pub(crate) fn show_remapper_body(
         let mut special_rect = egui::Rect::NOTHING;
         let mut add_rect = egui::Rect::NOTHING;
         let mut clear_rect = egui::Rect::NOTHING;
+        // The MIDI… button and, while its row is open, that row's own items.
+        let mut midi_rect = egui::Rect::NOTHING;
+        let mut midi_kind_rect = egui::Rect::NOTHING;
+        let mut midi_ch_rect = egui::Rect::NOTHING;
+        let mut midi_num_rect = egui::Rect::NOTHING;
+        let mut midi_in_rect = egui::Rect::NOTHING;
+        let mut midi_out_rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
             let learn_label = if in_learning { "Stop" } else { "Learn" };
             let learn_btn = ui.add_enabled(
@@ -537,77 +553,21 @@ pub(crate) fn show_remapper_body(
             }
             // MIDI… — pick a message by hand instead of playing it, on EITHER
             // side: an input for a controller that isn't plugged in (or a note
-            // at the wrong end of an 88-key board), an output for a synth that
+            // at the far end of an 88-key board), an output for a synth that
             // isn't either. A SysEx or an NRPN sweep is also not something
             // anyone wants to perform just to capture it.
+            //
+            // It opens a ROW rather than a popup: a dropdown inside a popup
+            // registers as a click outside it and shuts the whole thing, and a
+            // row can be reached by the gamepad.
             {
                 let midi_btn = ui.add(egui::Button::new(egui::RichText::new("MIDI…").size(13.0)))
                     .on_hover_text("Add a MIDI message to this mapping by hand.");
-                let popup_id = ui.id().with((node_id, "midi_pick_popup"));
-                if midi_btn.clicked() {
-                    egui::Popup::toggle_id(ui.ctx(), popup_id);
-                }
-                // An input can be added while the card is still collecting its
-                // trigger; an output once the input is latched. During output
-                // learning the input is settled, so only the output side is
-                // offered.
-                let can_add_input = !in_learning;
-                let can_add_output = in_learning || learn_enabled;
-                let mut add_input: Option<flexinput_core::midi::MidiPin> = None;
-                let mut add_output: Option<flexinput_core::midi::MidiPin> = None;
-                crate::widgets::popup_below_widget(
-                    &midi_btn, popup_id,
-                    egui::PopupCloseBehavior::CloseOnClickOutside,
-                    |ui| {
-                        ui.set_min_width(300.0);
-                        // Every kind is offered: "any channel", Playing and BPM
-                        // are input-only, and the output button says so itself
-                        // rather than the list quietly hiding them.
-                        let built = ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            midi_pin_picker_fields(ui, (node_id, "midi_pick"), false)
-                        }).inner;
-                        ui.horizontal(|ui| {
-                            if can_add_input
-                                && midi_pin_add_button(ui, "Add as input", built.clone(), true).clicked()
-                            {
-                                add_input = built.clone();
-                            }
-                            if can_add_output {
-                                let ok = built.as_ref().is_some_and(|p| p.is_output_capable());
-                                if midi_pin_add_button(ui, "Add as output", built.clone(), ok).clicked() {
-                                    add_output = built.clone();
-                                }
-                            }
-                        });
-                    },
-                );
-                if let Some(pin) = add_input {
-                    let id = pin.to_id();
-                    if !new_draft_input.iter().any(|p| p == &id) {
-                        new_draft_input.push(id);
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            remapper_write_str_array(node, "draft_input", &new_draft_input);
-                            // Latch it, the way a played chord latches when it is
-                            // released: left capturing, the state machine would
-                            // replace this draft the moment the pad was touched,
-                            // and Learn would clear it to start a fresh capture.
-                            node.params.insert("ui_phase".to_string(),
-                                Value::String("ready_to_learn".to_string()));
-                            node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
-                        }
+                midi_rect = midi_btn.rect;
+                if midi_btn.clicked() || act_midi {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert(MIDI_PICK_OPEN.to_string(), Value::from(!midi_pick_open));
                     }
-                    egui::Popup::close_id(ui.ctx(), popup_id);
-                }
-                if let Some(pin) = add_output {
-                    let id = pin.to_id();
-                    if !new_draft_output.iter().any(|p| p == &id) {
-                        new_draft_output.push(id);
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            remapper_write_str_array(node, "draft_output", &new_draft_output);
-                        }
-                    }
-                    egui::Popup::close_id(ui.ctx(), popup_id);
                 }
             }
             if in_learning || learn_enabled {
@@ -679,10 +639,80 @@ pub(crate) fn show_remapper_body(
                 }
             }
         });
+        // ── MIDI pick row ───────────────────────────────────────────────────
+        // Its own row under the action buttons, so the type and channel
+        // dropdowns work (a dropdown inside a popup closes it) and every
+        // control has a rect the nav ring can sit on.
+        if midi_pick_open {
+            // An input can be added while the card is still collecting its
+            // trigger; an output once the input is latched. During output
+            // learning the input is settled, so only the output side is offered.
+            let can_add_input = !in_learning;
+            let can_add_output = in_learning || learn_enabled;
+            let mut add_input: Option<flexinput_core::midi::MidiPin> = None;
+            let mut add_output: Option<flexinput_core::midi::MidiPin> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                // Every kind is offered whichever side is open: "any channel",
+                // Playing and BPM are input-only, and the output button says so
+                // itself rather than the list quietly hiding them.
+                let f = midi_pin_picker_fields(ui, (node_id, "midi_pick"), false);
+                midi_kind_rect = f.kind_rect;
+                midi_ch_rect = f.channel_rect;
+                midi_num_rect = f.number_rect;
+                if can_add_input {
+                    let resp = midi_pin_add_button(ui, "Add as input", f.built.clone(), true);
+                    midi_in_rect = resp.rect;
+                    if resp.clicked() || act_midi_in {
+                        add_input = f.built.clone();
+                    }
+                }
+                if can_add_output {
+                    let ok = f.built.as_ref().is_some_and(|p| p.is_output_capable());
+                    let resp = midi_pin_add_button(ui, "Add as output", f.built.clone(), ok);
+                    midi_out_rect = resp.rect;
+                    if (resp.clicked() || act_midi_out) && ok {
+                        add_output = f.built.clone();
+                    }
+                }
+            });
+            if let Some(pin) = add_input {
+                let id = pin.to_id();
+                if !new_draft_input.iter().any(|p| p == &id) {
+                    new_draft_input.push(id);
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        remapper_write_str_array(node, "draft_input", &new_draft_input);
+                        // Latch it, the way a played chord latches when it is
+                        // released: left capturing, the state machine would
+                        // replace this draft the moment the pad was touched, and
+                        // Learn would clear it to start a fresh capture.
+                        node.params.insert("ui_phase".to_string(),
+                            Value::String("ready_to_learn".to_string()));
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+                    }
+                }
+            }
+            if let Some(pin) = add_output {
+                let id = pin.to_id();
+                if !new_draft_output.iter().any(|p| p == &id) {
+                    new_draft_output.push(id);
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        remapper_write_str_array(node, "draft_output", &new_draft_output);
+                    }
+                }
+            }
+        }
+
         // Publish action-button rects (global) so the nav driver can glow the
-        // focused one. Order MUST match `nav_remap_action_items` AND the visual
-        // layout: Learn, Special, Clear, Add (entries NOTHING where absent).
-        publish_nav_action_rects(ui, node_id, &[learn_rect, special_rect, clear_rect, add_rect]);
+        // focused one. Order MUST match `nav_remap_action_items`: Learn, MIDI…,
+        // then the MIDI row's own items while it is open (type, channel, number,
+        // add-as-input, add-as-output), then Special, Clear, Add. Entries are
+        // NOTHING where absent, which the publisher drops.
+        publish_nav_action_rects(ui, node_id, &[
+            learn_rect, midi_rect,
+            midi_kind_rect, midi_ch_rect, midi_num_rect, midi_in_rect, midi_out_rect,
+            special_rect, clear_rect, add_rect,
+        ]);
         remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
             "_nav_capture_armed", "ui_phase", &["capturing", "learning"]);
 

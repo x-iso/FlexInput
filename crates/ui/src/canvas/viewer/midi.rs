@@ -144,6 +144,85 @@ impl Default for PickerState {
     }
 }
 
+// ── Inline picker: the names the body and the gamepad-nav driver share ───────
+
+/// Param holding whether a Remapper's inline MIDI picker is open.
+pub const MIDI_PICK_OPEN: &str = "_midi_pick_open";
+/// One-shot nav activation flags, set by the nav driver, consumed by the body.
+pub const NAV_ACT_MIDI: &str = "_nav_act_midi";
+pub const NAV_ACT_MIDI_KIND: &str = "_nav_act_midi_kind";
+pub const NAV_ACT_MIDI_CH: &str = "_nav_act_midi_ch";
+pub const NAV_ACT_MIDI_NUM: &str = "_nav_act_midi_num";
+pub const NAV_ACT_MIDI_ADD_IN: &str = "_nav_act_midi_add_in";
+pub const NAV_ACT_MIDI_ADD_OUT: &str = "_nav_act_midi_add_out";
+
+/// Every nav flag the inline picker uses, for the body's one-shot clear.
+pub(crate) const NAV_ACT_MIDI_ALL: [&str; 6] = [
+    NAV_ACT_MIDI, NAV_ACT_MIDI_KIND, NAV_ACT_MIDI_CH, NAV_ACT_MIDI_NUM,
+    NAV_ACT_MIDI_ADD_IN, NAV_ACT_MIDI_ADD_OUT,
+];
+
+/// Which picker field a nav item addresses: 0 type, 1 channel, 2 number.
+pub fn midi_pick_field_of(action: &str) -> Option<usize> {
+    match action {
+        NAV_ACT_MIDI_KIND => Some(0),
+        NAV_ACT_MIDI_CH => Some(1),
+        NAV_ACT_MIDI_NUM => Some(2),
+        _ => None,
+    }
+}
+
+/// Where a node's inline picker keeps its selection. The body and the nav
+/// driver both address it through here, so they can never drift onto two
+/// different ids for one picker.
+fn midi_pick_state_id(node: NodeId) -> egui::Id {
+    egui::Id::new(("midi_pin_picker", (node, "midi_pick")))
+}
+
+/// Step one of the inline picker's fields. The type and channel wrap (a list
+/// with ends you can fall off is worse on a stick than one that comes round);
+/// the number clamps to its type's range, because 0 and 127 are meaningful
+/// places to sit.
+pub fn midi_pick_nav_adjust(ctx: &egui::Context, node: NodeId, field: usize, delta: i32) {
+    let id = midi_pick_state_id(node);
+    let mut st: PickerState = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
+    pick_state_adjust(&mut st, field, delta);
+    ctx.data_mut(|d| d.insert_temp(id, st));
+}
+
+/// The state transition behind [`midi_pick_nav_adjust`], split out so the
+/// stepping rules can be tested without an egui context.
+fn pick_state_adjust(st: &mut PickerState, field: usize, delta: i32) {
+    match field {
+        0 => {
+            let n = PickKind::ALL.len() as i32;
+            let cur = PickKind::ALL.iter().position(|k| *k == st.kind).unwrap_or(0) as i32;
+            st.kind = PickKind::ALL[(cur + delta).rem_euclid(n) as usize];
+            if let Some(max) = st.kind.number_range() {
+                st.number = st.number.min(max);
+            }
+        }
+        // 0 is "any channel", then 1..=16.
+        1 => st.channel = (st.channel as i32 + delta).rem_euclid(17) as u8,
+        2 => {
+            if let Some(max) = st.kind.number_range() {
+                st.number = (st.number as i32 + delta).clamp(0, max as i32) as u32;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The picker's controls and where they landed, so a caller can publish rects
+/// for the gamepad-nav ring.
+pub(crate) struct MidiPickerFields {
+    /// The pin the current selection builds, if it is complete.
+    pub(crate) built: Option<MidiPin>,
+    pub(crate) kind_rect: egui::Rect,
+    pub(crate) channel_rect: egui::Rect,
+    pub(crate) number_rect: egui::Rect,
+}
+
 /// Compact "type · channel · number · Add" row that builds one MIDI pin.
 /// `for_output` hides kinds (and the "any channel" choice) a MIDI output can't
 /// write. Returns the pin when Add is clicked with a valid selection.
@@ -151,7 +230,7 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
     let mut added = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let built = midi_pin_picker_fields(ui, id_salt, for_output);
+        let built = midi_pin_picker_fields(ui, id_salt, for_output).built;
         if midi_pin_add_button(ui, "Add", built.clone(), true).clicked() {
             added = built;
         }
@@ -190,7 +269,7 @@ pub(crate) fn midi_pin_picker_fields(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     for_output: bool,
-) -> Option<MidiPin> {
+) -> MidiPickerFields {
     let id = egui::Id::new(("midi_pin_picker", id_salt));
     let mut st: PickerState = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_default();
     if for_output && !st.kind.writable() {
@@ -201,8 +280,13 @@ pub(crate) fn midi_pin_picker_fields(
     }
 
     let built;
+    // The type combo always renders; the other two depend on the type, so they
+    // start as NOTHING and the publisher drops what never got a rect.
+    let kind_rect;
+    let mut channel_rect = egui::Rect::NOTHING;
+    let mut number_rect = egui::Rect::NOTHING;
     {
-        egui::ComboBox::from_id_salt(id.with("kind"))
+        kind_rect = egui::ComboBox::from_id_salt(id.with("kind"))
             .selected_text(egui::RichText::new(st.kind.label()).small())
             .width(110.0)
             .show_ui(ui, |ui| {
@@ -217,11 +301,12 @@ pub(crate) fn midi_pin_picker_fields(
                         }
                     }
                 }
-            });
+            })
+            .response.rect;
 
         if st.kind.has_channel() {
             let ch_text = if st.channel == 0 { "any ch".to_string() } else { format!("ch {}", st.channel) };
-            egui::ComboBox::from_id_salt(id.with("ch"))
+            channel_rect = egui::ComboBox::from_id_salt(id.with("ch"))
                 .selected_text(egui::RichText::new(ch_text).small())
                 .width(56.0)
                 .show_ui(ui, |ui| {
@@ -233,19 +318,20 @@ pub(crate) fn midi_pin_picker_fields(
                             st.channel = c;
                         }
                     }
-                });
+                })
+                .response.rect;
         }
 
         if let Some(max) = st.kind.number_range() {
             let is_note = st.kind.is_note();
-            ui.add(
+            number_rect = ui.add(
                 egui::DragValue::new(&mut st.number)
                     .range(0..=max)
                     .speed(if max > 127 { 4.0 } else { 0.25 })
                     .custom_formatter(move |v, _| {
                         if is_note { format!("{} {}", v as u32, fmidi::note_name(v as u8)) } else { format!("{}", v as u32) }
                     }),
-            );
+            ).rect;
         }
 
         if st.kind == PickKind::SysEx {
@@ -257,7 +343,7 @@ pub(crate) fn midi_pin_picker_fields(
     }
 
     ui.ctx().data_mut(|d| d.insert_temp(id, st));
-    built
+    MidiPickerFields { built, kind_rect, channel_rect, number_rect }
 }
 
 /// Key for the per-frame list of MIDI In ports a mapping card can learn from.
@@ -497,6 +583,61 @@ mod tests {
     fn a_malformed_sysex_builds_nothing() {
         assert_eq!(PickKind::SysEx.build(Channel::Any, 0, "F0 7E"), None);
         assert_eq!(PickKind::SysEx.build(Channel::Any, 0, "zz"), None);
+    }
+
+    /// The nav items and the picker fields have to agree, or a stick would
+    /// walk onto an item that edits nothing.
+    #[test]
+    fn nav_items_name_the_three_value_fields() {
+        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_KIND), Some(0));
+        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_CH), Some(1));
+        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_NUM), Some(2));
+        for other in [NAV_ACT_MIDI, NAV_ACT_MIDI_ADD_IN, NAV_ACT_MIDI_ADD_OUT, "_nav_act_learn"] {
+            assert_eq!(midi_pick_field_of(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_stick_step_walks_the_type_and_channel_round_and_clamps_the_number() {
+        let mut st = PickerState { kind: PickKind::Cc, channel: 1, number: 7, sysex: String::new() };
+
+        // Channel: 1 → any (0) → wraps to 16.
+        pick_state_adjust(&mut st, 1, -1);
+        assert_eq!(st.channel, 0, "one below ch 1 is any channel");
+        pick_state_adjust(&mut st, 1, -1);
+        assert_eq!(st.channel, 16, "and below that it comes round");
+        pick_state_adjust(&mut st, 1, 1);
+        assert_eq!(st.channel, 0);
+
+        // Number clamps at its type's ends rather than wrapping: 0 and 127 are
+        // places you want to sit.
+        st.number = 0;
+        pick_state_adjust(&mut st, 2, -1);
+        assert_eq!(st.number, 0);
+        st.number = 127;
+        pick_state_adjust(&mut st, 2, 1);
+        assert_eq!(st.number, 127);
+
+        // Type walks the whole list and comes round.
+        let first = PickKind::ALL[0];
+        st.kind = first;
+        pick_state_adjust(&mut st, 0, -1);
+        assert_eq!(st.kind, *PickKind::ALL.last().unwrap());
+        pick_state_adjust(&mut st, 0, 1);
+        assert_eq!(st.kind, first);
+    }
+
+    /// Stepping onto a narrower type pulls the number into its range — a CC 100
+    /// left behind on a 14-bit CC would build a pin that doesn't exist.
+    #[test]
+    fn narrowing_the_type_pulls_the_number_into_range() {
+        let mut st = PickerState { kind: PickKind::Cc, channel: 1, number: 100, sysex: String::new() };
+        let cc14 = PickKind::ALL.iter().position(|k| *k == PickKind::Cc14).unwrap() as i32;
+        let cur = PickKind::ALL.iter().position(|k| *k == PickKind::Cc).unwrap() as i32;
+        pick_state_adjust(&mut st, 0, cc14 - cur);
+        assert_eq!(st.kind, PickKind::Cc14);
+        assert_eq!(st.number, 31, "clamped to the 14-bit MSB range");
+        assert!(st.kind.build(Channel::Ch(0), st.number, "").is_some());
     }
 
     #[test]

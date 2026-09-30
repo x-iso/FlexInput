@@ -581,6 +581,27 @@ impl FlexInputApp {
 
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
+
+        // A MIDI pick row value (type / channel / number) takes Up/Down as its
+        // own axis: Left/Right already walks the row, and a value needs
+        // somewhere to go. Down therefore does not fall through to the cards
+        // from these three items — Left/Right off them and it does again.
+        if on_actions {
+            if let Some(field) = crate::canvas::viewer::midi_pick_field_of(actions[cur]) {
+                let delta = match step_dir {
+                    Some(NavDir::Up) => Some(1),
+                    Some(NavDir::Down) => Some(-1),
+                    _ => None,
+                };
+                if let Some(d) = delta {
+                    crate::canvas::viewer::midi_pick_nav_adjust(ctx, inner, field, d);
+                    self.nav_publish_remap_selection(ctx, outer_id, inner);
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+
         let new_cur = match step_dir {
             Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
             Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
@@ -969,9 +990,22 @@ impl FlexInputApp {
         let has_draft = in_draft || out_draft || latched;
         match mid.as_deref() {
             Some("module.remapper") => {
-                // Visual order (must match the body + published rects):
-                // Learn, Special(latched), Clear(has_draft), Add(out_draft&&latched).
-                let mut v = vec!["_nav_act_learn"];
+                // Order (must match the body + published rects): Learn, MIDI…,
+                // then the MIDI row's items while it is open, then
+                // Special(latched), Clear(has_draft), Add(out_draft&&latched).
+                use crate::canvas::viewer as mv;
+                let mut v = vec!["_nav_act_learn", mv::NAV_ACT_MIDI];
+                if self.get_subpatch_param_bool(outer_id, inner, mv::MIDI_PICK_OPEN).unwrap_or(false) {
+                    // Type / channel / number are values: Up/Down changes them
+                    // (see the step handling), Left/Right walks past them.
+                    v.push(mv::NAV_ACT_MIDI_KIND);
+                    v.push(mv::NAV_ACT_MIDI_CH);
+                    v.push(mv::NAV_ACT_MIDI_NUM);
+                    // The body offers an input until the output is being learned,
+                    // and an output once the input is latched.
+                    if phase != "learning" { v.push(mv::NAV_ACT_MIDI_ADD_IN); }
+                    if latched { v.push(mv::NAV_ACT_MIDI_ADD_OUT); }
+                }
                 if latched { v.push("_nav_act_special"); }
                 if has_draft { v.push("_nav_act_clear"); }
                 if out_draft && latched { v.push("_nav_act_add"); }
