@@ -660,20 +660,21 @@ pub(crate) fn show_remapper_body(
                 midi_kind_rect = f.kind_rect;
                 midi_ch_rect = f.channel_rect;
                 midi_num_rect = f.number_rect;
-                if can_add_input {
-                    let resp = midi_pin_add_button(ui, "Add as input", f.built.clone(), true);
-                    midi_in_rect = resp.rect;
-                    if resp.clicked() || act_midi_in {
-                        add_input = f.built.clone();
-                    }
+                // BOTH buttons always render — disabled when the phase has no
+                // use for them. The nav driver reads the phase a frame later
+                // than the body computes it, so a button that came and went
+                // with it would shift the rect list out from under the ring.
+                let resp = midi_pin_add_button(ui, "Add as input", f.built.clone(), can_add_input);
+                midi_in_rect = resp.rect;
+                if (resp.clicked() || act_midi_in) && can_add_input {
+                    add_input = f.built.clone();
                 }
-                if can_add_output {
-                    let ok = f.built.as_ref().is_some_and(|p| p.is_output_capable());
-                    let resp = midi_pin_add_button(ui, "Add as output", f.built.clone(), ok);
-                    midi_out_rect = resp.rect;
-                    if (resp.clicked() || act_midi_out) && ok {
-                        add_output = f.built.clone();
-                    }
+                let out_ok = can_add_output
+                    && f.built.as_ref().is_some_and(|p| p.is_output_capable());
+                let resp = midi_pin_add_button(ui, "Add as output", f.built.clone(), out_ok);
+                midi_out_rect = resp.rect;
+                if (resp.clicked() || act_midi_out) && out_ok {
+                    add_output = f.built.clone();
                 }
             });
             if let Some(pin) = add_input {

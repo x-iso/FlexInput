@@ -202,8 +202,12 @@ fn pick_state_adjust(st: &mut PickerState, field: usize, delta: i32) {
                 st.number = st.number.min(max);
             }
         }
-        // 0 is "any channel", then 1..=16.
-        1 => st.channel = (st.channel as i32 + delta).rem_euclid(17) as u8,
+        // 0 is "any channel", then 1..=16. A type with no channel ignores it,
+        // so walking the field there changes nothing rather than editing a
+        // value the pin will never carry.
+        1 if st.kind.has_channel() => {
+            st.channel = (st.channel as i32 + delta).rem_euclid(17) as u8
+        }
         2 => {
             if let Some(max) = st.kind.number_range() {
                 st.number = (st.number as i32 + delta).clamp(0, max as i32) as u32;
@@ -304,6 +308,16 @@ pub(crate) fn midi_pin_picker_fields(
             })
             .response.rect;
 
+        // ⚠ Every field renders SOMETHING, even when its type has no use for
+        // it. The nav rect list is compacted, so a field that disappears for
+        // one type shifts every item after it: the ring would sit on one
+        // control while South fired the next. A greyed "—" also says plainly
+        // that this type has no channel / number, rather than leaving a gap.
+        if !st.kind.has_channel() {
+            channel_rect = ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
+                .on_disabled_hover_text("This message has no channel.")
+                .rect;
+        }
         if st.kind.has_channel() {
             let ch_text = if st.channel == 0 { "any ch".to_string() } else { format!("ch {}", st.channel) };
             channel_rect = egui::ComboBox::from_id_salt(id.with("ch"))
@@ -322,6 +336,11 @@ pub(crate) fn midi_pin_picker_fields(
                 .response.rect;
         }
 
+        if st.kind.number_range().is_none() {
+            number_rect = ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
+                .on_disabled_hover_text("This message carries no number.")
+                .rect;
+        }
         if let Some(max) = st.kind.number_range() {
             let is_note = st.kind.is_note();
             number_rect = ui.add(

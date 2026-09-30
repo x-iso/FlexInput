@@ -1001,10 +1001,11 @@ impl FlexInputApp {
                     v.push(mv::NAV_ACT_MIDI_KIND);
                     v.push(mv::NAV_ACT_MIDI_CH);
                     v.push(mv::NAV_ACT_MIDI_NUM);
-                    // The body offers an input until the output is being learned,
-                    // and an output once the input is latched.
-                    if phase != "learning" { v.push(mv::NAV_ACT_MIDI_ADD_IN); }
-                    if latched { v.push(mv::NAV_ACT_MIDI_ADD_OUT); }
+                    // Both add buttons always exist (disabled when the phase
+                    // has no use for them), so both are always listed: a rect
+                    // that came and went with the phase would shift the ring.
+                    v.push(mv::NAV_ACT_MIDI_ADD_IN);
+                    v.push(mv::NAV_ACT_MIDI_ADD_OUT);
                 }
                 if latched { v.push("_nav_act_special"); }
                 if has_draft { v.push("_nav_act_clear"); }

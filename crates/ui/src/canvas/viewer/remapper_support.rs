@@ -202,6 +202,17 @@ pub(crate) fn remapper_midi_pressed_now(
             continue;
         }
         let Some(parsed) = midi::parse_pin(pin) else { continue };
+        // ⚠ Transport state and clock tempo are STATE, not gestures. While a
+        // DAW plays, `playing` is held and `bpm` changes every tick, so either
+        // would keep the pressed set non-empty for as long as the transport
+        // runs — and a capture only latches when that set empties. That left
+        // Learn armed for ever, and an armed capture holds ALL of gamepad nav
+        // inert (the flag is saved with the patch, so the widget stayed
+        // un-enterable afterwards too). They are reachable from the pick row,
+        // which is where a mapping on them belongs.
+        if matches!(parsed, midi::MidiPin::Playing | midi::MidiPin::Bpm) {
+            continue;
+        }
         if parsed.is_continuous() {
             let v = sig.as_float();
             let changed_at = match seen.get(pin) {

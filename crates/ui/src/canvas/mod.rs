@@ -228,6 +228,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
             }
         }
         migrate_midi_automap_port(&mut node.value);
+        clear_stuck_nav_arms(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -271,6 +272,42 @@ pub fn renumber_subpatch_ports(snarl: &mut Snarl<NodeData>) {
             }
         }
     }
+}
+
+/// Drop a saved capture ARM and the one-shot nav flags from a mapping node.
+///
+/// An armed capture holds ALL of gamepad nav inert until the gesture latches —
+/// that is what stops a pad walking away mid-Learn. The flag is a runtime
+/// one-shot, but it lives in `params` and so gets saved: a capture that never
+/// latched (an input that never releases, a crash mid-gesture) came back armed,
+/// and the widget could not be entered at all, on the canvas or pinned to the
+/// config overlay. Sub-patch loads already cleared this
+/// (`clear_transient_capture_state`); top-level nodes never did.
+///
+/// Drafts and `ui_phase` are deliberately left alone: a half-built mapping
+/// surviving a reload is the existing behaviour at this level, and only the arm
+/// freezes nav.
+fn clear_stuck_nav_arms(node: &mut NodeData) {
+    const ARMS: &[&str] = &[
+        "_nav_capture_armed", "_nav_arm_idle",
+        "_lean_left_armed", "_lean_left_arm_idle",
+        "_lean_right_armed", "_lean_right_arm_idle",
+    ];
+    for key in ARMS {
+        if node.params.contains_key(*key) {
+            node.params.insert((*key).to_string(), Value::Bool(false));
+        }
+    }
+    // One-shot activations, including the MIDI pick row's, plus whether that
+    // row was left open.
+    let one_shots: Vec<String> = node.params.keys()
+        .filter(|k| k.starts_with("_nav_act_"))
+        .cloned()
+        .collect();
+    for key in one_shots {
+        node.params.insert(key, Value::Bool(false));
+    }
+    node.params.remove(crate::canvas::viewer::MIDI_PICK_OPEN);
 }
 
 /// MIDI In/Out nodes gained an AutoMap port. Nodes saved before that have only
@@ -446,6 +483,38 @@ mod migration_tests {
         assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
         migrate_loaded_snarl(&mut snarl);
         assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
+    }
+
+    /// A saved capture arm freezes gamepad nav on load — the widget can't be
+    /// entered at all — so loading clears it, along with the one-shot nav flags
+    /// and the MIDI row's open state. Drafts and the phase stay.
+    #[test]
+    fn migrate_clears_a_stuck_capture_arm() {
+        let mut params = HashMap::new();
+        params.insert("_nav_capture_armed".to_string(), Value::Bool(true));
+        params.insert("_nav_act_midi_add_in".to_string(), Value::Bool(true));
+        params.insert("_midi_pick_open".to_string(), Value::Bool(true));
+        params.insert("ui_phase".to_string(), Value::from("ready_to_learn"));
+        params.insert("draft_input".to_string(), serde_json::json!(["btn_south"]));
+        let node = NodeData {
+            module_id: "module.remapper".to_string(),
+            display_name: "Remapper".to_string(),
+            category: "AutoMap".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let id = snarl.insert_node(egui::Pos2::ZERO, node);
+        migrate_loaded_snarl(&mut snarl);
+        let n = snarl.get_node(id).unwrap();
+        assert_eq!(n.params["_nav_capture_armed"], Value::Bool(false));
+        assert_eq!(n.params["_nav_act_midi_add_in"], Value::Bool(false));
+        assert!(!n.params.contains_key("_midi_pick_open"));
+        assert_eq!(n.params["ui_phase"], Value::from("ready_to_learn"), "the phase is left alone");
+        assert_eq!(n.params["draft_input"], serde_json::json!(["btn_south"]), "so is the draft");
     }
 
     /// A MIDI node saved before AutoMap ports gets its port APPENDED: existing

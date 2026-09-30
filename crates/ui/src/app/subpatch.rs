@@ -145,6 +145,10 @@ pub(crate) fn clear_transient_capture_state(sp: &mut UiSubPatch) {
         "ui_phase", "draft_input", "draft_output", "_pressed_prev",
         "_nav_capture_armed", "_nav_arm_idle", "_nav_act_learn",
         "_nav_act_special", "_nav_act_add", "_nav_act_clear",
+        // The MIDI pick row: whether it is open, and its own nav one-shots.
+        "_midi_pick_open", "_nav_act_midi", "_nav_act_midi_kind",
+        "_nav_act_midi_ch", "_nav_act_midi_num", "_nav_act_midi_add_in",
+        "_nav_act_midi_add_out",
         "_tp_click_mode", "_tp_zones",
         // Gyro Lean per-side capture transients.
         "_lean_left_phase", "_lean_left_draft", "_lean_left_pressed_prev",
