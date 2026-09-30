@@ -158,12 +158,17 @@ fn pins_this_pad_reports(
     live: &std::collections::HashMap<(String, String), Signal>,
     parent: Option<&AutomapGlowParent<'_>>,
 ) -> std::collections::HashSet<String> {
-    let dev = upstream_device(snarl, node_id, parent).unwrap_or_default();
-    if dev.is_empty() {
+    // Every device behind the input: a Combiner can merge a pad and a MIDI
+    // port, and a config reads both — so what either reports is reported.
+    let Some(idx) = snarl
+        .get_node(node_id)
+        .and_then(|n| n.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap))
+    else {
         return Default::default();
-    }
+    };
+    let devs = super::remapper_upstream_device_ids(snarl, node_id, idx, parent);
     live.keys()
-        .filter(|(d, _)| *d == dev)
+        .filter(|(d, _)| devs.contains(d))
         .map(|(_, pin)| pin.clone())
         .collect()
 }

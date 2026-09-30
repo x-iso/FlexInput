@@ -363,9 +363,10 @@ pub(crate) fn show_gyro_lean_mapping_section(
 
     // ── Read state ───────────────────────────────────────────────────────
     let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
-    let upstream_dev_id = if wired {
-        remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
-    } else { None };
+    // Every device behind the input — all of a Combiner's ports — for capture.
+    let upstream_devs: Vec<String> = if wired {
+        remapper_upstream_device_ids(snarl, node_id, 0, automap_parent)
+    } else { Vec::new() };
 
     let (phase, draft, pressed_prev, mappings) = snarl.get_node(node_id).map(|n| (
         n.params.get(phase_key).and_then(|v| v.as_str()).unwrap_or("idle").to_string(),
@@ -378,11 +379,11 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // controller drives FlexInput's UI, so capture must not begin until the
     // Learn press has been released. Mirrors the Remapper's arm/arm-idle
     // handshake but scoped per Lean side.
-    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+    let nav_active_for_device = upstream_devs.iter().any(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
         stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
-    }).unwrap_or(false);
+    });
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get(armed_key)).and_then(|v| v.as_bool()).unwrap_or(false);
     let nav_arm_idle = snarl.get_node(node_id)
@@ -399,9 +400,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // module's normal AutoMap-in wire would constantly try to capture.
     let mut pressed_now: Vec<String> = Vec::new();
     if phase == "learning" {
-        if let (Some(dev), true) = (&upstream_dev_id, wired) {
-            pressed_now = remapper_pressed_now(live_signals, dev);
-        }
+        pressed_now = remapper_upstream_pressed_now(ui, live_signals, &upstream_devs);
         // Always merge global KB/M during learning.
         for p in remapper_kbm_pressed_now(ui, panic_shortcut) {
             if !pressed_now.iter().any(|q| q == &p) { pressed_now.push(p); }
@@ -690,10 +689,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // destinations (stick axes/cardinals) on the output side. Read SOURCE pins
     // only (the upstream device) — not OS KB/M — so injected output keys don't
     // flicker the filter.
-    let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
-        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-        _ => Vec::new(),
-    };
+    let filter_live: Vec<String> = remapper_upstream_pressed_now(ui, live_signals, &upstream_devs);
     let filter = mapping_filter_row(
         ui,
         egui::Id::new(("fxi_lean_filter", node_id.0, side)),

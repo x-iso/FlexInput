@@ -2368,6 +2368,9 @@ pub(crate) fn render_touch_zone_cards(
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) != Some("split");
     let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
     let dev = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
+    // Every device behind the input (all of a Combiner's ports), for the
+    // gamepad-learn of an output; the touch gesture itself reads `dev`, the pad.
+    let devs = remapper_upstream_device_ids(snarl, node_id, 0, automap_parent);
 
     let getp = |snarl: &Snarl<NodeData>, k: &str| -> Option<Value> {
         snarl.get_node(node_id).and_then(|n| n.params.get(k).cloned())
@@ -2408,8 +2411,7 @@ pub(crate) fn render_touch_zone_cards(
         // by `run_gamepad_nav` (goes inert while the hold is fresh).
         crate::widgets::hold_nav_for_capture(ui.ctx());
         ui.ctx().request_repaint();
-        let mut pressed_now: Vec<String> = dev.as_deref()
-            .map(|d| remapper_pressed_now(live_signals, d)).unwrap_or_default();
+        let mut pressed_now: Vec<String> = remapper_upstream_pressed_now(ui, live_signals, &devs);
         // A MIDI controller works as the output's teacher too: play the message
         // and the zone sends it. Every MIDI In in the patch is listened to.
         for port in midi_learn_ref_ports(ui.ctx(), "") {

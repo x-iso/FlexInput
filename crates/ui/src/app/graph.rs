@@ -206,7 +206,23 @@ pub fn find_automap_device_ids_for_viewer(
         .map(|(i, _)| i)
         .collect();
     let upstream_of = |i: usize| snarl.in_pin(InPinId { node: src.node, input: i }).remotes.first().copied();
-    if node.module_id == "device.source" {
+    // A Fork / Selector output is its own bus key (`forksel:`), which is what
+    // the single-device resolver answers for it; a sub-patch inlet continues in
+    // the parent snarl, where a Combiner may sit.
+    let stops_here = matches!(node.module_id.as_str(), "module.automap_fork" | "module.automap_selector");
+    if node.module_id == "subpatch.inlet" {
+        if let (Some(p), Some(pin_idx)) = (
+            parent,
+            node.params.get("pin_index").and_then(|v| v.as_u64()),
+        ) {
+            let outer_in = p.snarl.in_pin(InPinId { node: p.subpatch_node_id, input: pin_idx as usize });
+            if let Some(&up) = outer_in.remotes.first() {
+                return find_automap_device_ids_for_viewer(p.snarl, up, p.prev);
+            }
+        }
+    } else if stops_here {
+        // Answered by the single-device resolver below.
+    } else if node.module_id == "device.source" {
         if let Some(id) = node.params.get("device_id").and_then(|v| v.as_str()) {
             push(id.to_string(), &mut out);
         }
@@ -328,13 +344,23 @@ pub fn find_automap_device_id_for_viewer(
             let combiner_id = format!("combiner:{}", combiner_uid);
             let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
                 .iter().map(|p| p.id.to_string()).collect();
-            let upstream_dev_id = (0..node.inputs.len())
-                .find_map(|i| {
+            // The one device a single-device reader (skin, touchpad, live analog
+            // level, the overlay's pass-through) should use: the first PAD among
+            // the ports, whatever port it is on. Taking port 0 made a MIDI port
+            // wired there hide the pad beside it. Capture reads every port
+            // instead — see `find_automap_device_ids_for_viewer`.
+            let candidates: Vec<String> = (0..node.inputs.len())
+                .filter_map(|i| {
                     if node.inputs[i].signal_type != SignalType::AutoMap { return None; }
                     let in_pin = snarl.in_pin(InPinId { node: src.node, input: i });
                     let &s = in_pin.remotes.first()?;
                     rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id))
-                });
+                })
+                .collect();
+            let upstream_dev_id = candidates.iter()
+                .find(|id| is_physical_pad_id(id))
+                .or_else(|| candidates.first())
+                .cloned();
             return Some((combiner_id, canonical_pins, upstream_dev_id));
         }
         if node.module_id == "module.remapper" {
@@ -912,18 +938,25 @@ pub(crate) fn find_automap_device_rec(
         let combiner_id = format!("combiner:{}", combiner_uid);
         let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
             .iter().map(|p| p.id.to_string()).collect();
-        // Use the first connected input's underlying physical device as the
-        // fallback so haptic-feedback reverse-routing has something to bind
-        // (matches Collector's behaviour).
-        let upstream_dev_id = (0..node.inputs.len())
-            .find_map(|i| {
+        // A connected input's underlying physical device as the fallback, so
+        // haptic-feedback reverse-routing has something to bind (matches
+        // Collector's behaviour) — the first PAD among the ports, not just port
+        // 0: a MIDI port wired there has no rumble to send back to, and taking
+        // it left the pad beside it without its feedback.
+        let candidates: Vec<String> = (0..node.inputs.len())
+            .filter_map(|i| {
                 if node.inputs[i].signal_type != SignalType::AutoMap { return None; }
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: i });
                 let &s = in_pin.remotes.first()?;
                 find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| {
                     fallback.unwrap_or(id)
                 })
-            });
+            })
+            .collect();
+        let upstream_dev_id = candidates.iter()
+            .find(|id| is_physical_pad_id(id))
+            .or_else(|| candidates.first())
+            .cloned();
         return Some((combiner_id, canonical_pins, upstream_dev_id));
     }
     if node.module_id == "module.remapper" {
@@ -1895,6 +1928,39 @@ mod subpatch_bus_tests {
 
     fn wire(s: &mut Snarl<NodeData>, from: NodeId, o: usize, to: NodeId, i: usize) {
         s.connect(OutPinId { node: from, output: o }, InPinId { node: to, input: i });
+    }
+
+    /// A Combiner merging a MIDI port (port 0) and a pad (port 1): capture has to
+    /// hear BOTH, and anything that reads one device — skin, touchpad, live level,
+    /// pass-through — has to get the pad, not whatever happens to sit on port 0.
+    #[test]
+    fn a_combiner_resolves_to_all_its_ports_and_prefers_the_pad_alone() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let src = |s: &mut Snarl<NodeData>, dev: &str| s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!(dev));
+            n.params.insert("output_pin_ids".into(), json!(["automap_out"]));
+            n
+        });
+        let midi = src(&mut s, "midi_in:0");
+        let pad = src(&mut s, "gilrs:pad:0");
+        let comb = s.insert_node(p, node(
+            "module.automap_combiner",
+            &[SignalType::AutoMap, SignalType::AutoMap],
+            &[SignalType::AutoMap],
+        ));
+        wire(&mut s, midi, 0, comb, 0);
+        wire(&mut s, pad, 0, comb, 1);
+        let out = OutPinId { node: comb, output: 0 };
+
+        let all = find_automap_device_ids_for_viewer(&s, out, None);
+        assert_eq!(all, vec!["midi_in:0".to_string(), "gilrs:pad:0".to_string()]);
+        assert_eq!(
+            find_automap_device_id_for_viewer(&s, out, None).as_deref(),
+            Some("gilrs:pad:0"),
+            "the one-device answer is the pad, though MIDI sits on port 0"
+        );
     }
 
     /// A JSM module inside a sub-patch, its bus taken out through an outlet — the

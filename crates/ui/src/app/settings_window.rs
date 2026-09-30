@@ -392,7 +392,10 @@ impl FlexInputApp {
                 }
                 let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
                 for &src in &in_pin.remotes {
-                    if let Some(dev_id) = find_automap_device_id_for_viewer(snarl, src, None) {
+                    // Every device behind the wire: a Combiner merging two pads
+                    // into one virtual sink remaps BOTH, so both are hidden — the
+                    // single-device resolver only ever named one of them.
+                    for dev_id in crate::app::find_automap_device_ids_for_viewer(snarl, src, None) {
                         // Both backend prefixes are real physical pads that need
                         // cloaking: `gilrs:` (native path) and `sdl:` (the
                         // route-all-through-SDL switch). Without `sdl:` here, a
