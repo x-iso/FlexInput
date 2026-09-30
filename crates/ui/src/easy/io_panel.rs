@@ -260,6 +260,12 @@ fn show_input_section(
     let gamepads: Vec<&PhysicalDevice> = devices.iter()
         .filter(|d| !matches!(d.kind, ControllerKind::MidiIn | ControllerKind::MidiOut))
         .collect();
+    // MIDI inputs are selectable too, and always listed AFTER every gamepad —
+    // rebuilt each frame, so a pad plugged in later still lands above them.
+    // (Order only: an inlet a device already holds is never moved for it.)
+    let midi_ins: Vec<&PhysicalDevice> = devices.iter()
+        .filter(|d| d.kind == ControllerKind::MidiIn)
+        .collect();
     // Every selected device, not just the first: a preset with several AutoMap
     // inlets accepts one input device per inlet.
     let active_dev_ids: Vec<String> =
@@ -286,7 +292,10 @@ fn show_input_section(
                     ui.label(egui::RichText::new("No gamepads detected.").weak());
                     ui.label(egui::RichText::new("Plug one in and it will appear here.").weak());
                 });
-                return;
+                if midi_ins.is_empty() {
+                    return;
+                }
+                ui.add_space(SECTION_GAP * 0.5);
             }
             for d in &gamepads {
                 let is_active = active_dev_ids.iter().any(|a| a == &d.id);
@@ -308,6 +317,21 @@ fn show_input_section(
                 }
                 if let Some(v) = nav_toggle {
                     nav_mode.insert(d.id.clone(), v);
+                }
+                ui.add_space(CARD_GAP);
+            }
+            if !midi_ins.is_empty() {
+                ui.add_space(SECTION_GAP * 0.5);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("MIDI inputs").small().weak());
+                });
+                ui.add_space(CARD_GAP * 0.5);
+            }
+            for d in &midi_ins {
+                let is_active = active_dev_ids.iter().any(|a| a == &d.id);
+                if midi_input_card(ui, d, is_active, nav_targets) && (capacity > 1 || !is_active) {
+                    toggle_source(canvas, d, default_collapsed, defaults);
+                    super::wiring::rewire(canvas);
                 }
                 ui.add_space(CARD_GAP);
             }
@@ -615,6 +639,69 @@ fn input_card(
     body_resp.clicked()
 }
 
+/// A MIDI input's card: the port's name and nothing to tune — a MIDI port has
+/// no deadzone, gyro or triggers, and can't drive the UI. Returns true when it
+/// was clicked (select / deselect, by the same rules as a gamepad card).
+fn midi_input_card(
+    ui: &mut egui::Ui,
+    d: &PhysicalDevice,
+    is_active: bool,
+    nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
+) -> bool {
+    let panel_avail = ui.available_width();
+    let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
+    let card_h = INPUT_CARD_ICON_H + 8.0;
+    let (full_row, _) = ui.allocate_exact_size(egui::vec2(panel_avail, card_h), egui::Sense::hover());
+    let card_rect = egui::Rect::from_min_size(
+        egui::pos2(full_row.left() + PANEL_PADDING, full_row.top()),
+        egui::vec2(card_w, card_h),
+    );
+    let clip = ui.clip_rect();
+    let visible = card_rect.intersect(clip);
+    let (stroke_col, stroke_w) = if is_active {
+        (ui.visuals().selection.stroke.color, 1.5)
+    } else {
+        (CARD_STROKE_INACTIVE, 1.0)
+    };
+    let fill = if is_active { active_accent_fill(ui) } else { CARD_FILL_INACTIVE };
+    ui.painter().with_clip_rect(clip).rect(
+        card_rect, CARD_ROUND, CARD_FILL_INACTIVE,
+        egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
+    ui.painter().with_clip_rect(visible).rect_filled(card_rect.shrink(1.0), CARD_ROUND, fill);
+    let resp = ui.interact(card_rect, ui.id().with(("easy_midi_card", d.id.as_str())), egui::Sense::click());
+
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(card_rect.left() + 10.0, card_rect.top() + 4.0),
+        egui::vec2(INPUT_CARD_ICON_H, INPUT_CARD_ICON_H),
+    );
+    let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon_rect));
+    icon_ui.set_clip_rect(visible);
+    crate::panels::device_icon::render_device_icon(
+        &mut icon_ui, remapper_icons::device_card_svg(d.kind), INPUT_CARD_ICON_H);
+
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right() + 8.0, card_rect.top() + (card_h - 36.0) * 0.5),
+        egui::pos2(card_rect.right() - 10.0, card_rect.bottom()),
+    );
+    let mut text_ui = ui.new_child(egui::UiBuilder::new()
+        .max_rect(text_rect)
+        .layout(egui::Layout::top_down(egui::Align::LEFT)));
+    text_ui.set_clip_rect(visible);
+    text_ui.label(egui::RichText::new(&d.display_name).size(14.0).strong());
+    text_ui.label(egui::RichText::new(if is_active {
+        "MIDI input — its notes and controls reach the preset"
+    } else {
+        "MIDI input"
+    }).small().weak());
+
+    nav_targets.push(crate::gamepad_nav::LeftNavTarget {
+        rect: card_rect,
+        action: crate::gamepad_nav::LeftNavAction::SelectInput { device_id: d.id.clone() },
+    });
+    resp.on_hover_text("Use this MIDI port as an input — alongside a gamepad, when the preset takes more than one")
+        .clicked()
+}
+
 /// Easy-mode Deadzone / Gyro × slider rows. Bigger label font (size
 /// 12, regular weight — not the tiny weak label `slider_label` uses
 /// in Advanced mode) and the slider expands to fill the row's middle
@@ -835,7 +922,7 @@ fn active_sources(canvas: &Canvas) -> Vec<(NodeId, String, usize)> {
 /// * not active, room left → add on the lowest free port
 /// * not active, full → replace the highest port, which for capacity 1 is the
 ///   old "clicking another device swaps to it" behaviour
-fn toggle_source(
+pub(crate) fn toggle_source(
     canvas: &mut Canvas,
     device: &PhysicalDevice,
     default_collapsed: bool,

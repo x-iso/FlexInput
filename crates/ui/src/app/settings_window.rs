@@ -1332,6 +1332,54 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
+                // ── MIDI ────────────────────────────────────────────────
+                // What the loop guard knows: which In/Out ports it treats as one
+                // port coming back round, and which Out ports its breaker muted.
+                ui.label(egui::RichText::new("MIDI").strong());
+                ui.add_space(4.0);
+                {
+                    use flexinput_devices::midi::PairStatus;
+                    let guard = crate::canvas::viewer::midi_guard_view(ui.ctx());
+                    let name = |id: &str| self.devices.iter()
+                        .find(|d| d.id == id)
+                        .map(|d| d.display_name.clone())
+                        .unwrap_or_else(|| id.to_string());
+                    if guard.pairs.is_empty() && guard.muted.is_empty() {
+                        ui.label(egui::RichText::new(
+                            "No MIDI ports in use are paired. A pair forms when a patch uses a MIDI In \
+                             and a MIDI Out that are the same port (same name, or echoes seen coming back).",
+                        ).small().color(egui::Color32::from_gray(140)));
+                    }
+                    for (out_id, in_id, status) in &guard.pairs {
+                        let (what, tip) = match status {
+                            PairStatus::Seeded => ("same name — echoes cancelled",
+                                "Named alike, so treated as one port until sends go unanswered."),
+                            PairStatus::Confirmed => ("echoes seen — cancelled",
+                                "Messages sent here came straight back in, so their echoes are dropped."),
+                            PairStatus::Demoted => ("no echoes — nothing cancelled",
+                                "Plenty sent and nothing came back, so this is two separate ports."),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{} → {}", name(out_id), name(in_id))).small());
+                            ui.label(egui::RichText::new(what).small().color(egui::Color32::from_gray(150)))
+                                .on_hover_text(tip);
+                        });
+                    }
+                    for out_id in &guard.muted {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("⛔ {} muted by the loop breaker", name(out_id)))
+                                .small().color(egui::Color32::from_rgb(226, 104, 92)));
+                            if ui.small_button("Unmute").clicked() {
+                                crate::canvas::viewer::request_midi_unmute(ui.ctx(), out_id);
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 // ── Easy mode ───────────────────────────────────────────
                 ui.label(egui::RichText::new("Easy mode").strong());
                 ui.add_space(4.0);

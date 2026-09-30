@@ -1608,6 +1608,31 @@ impl eframe::App for FlexInputApp {
             crate::canvas::viewer::set_midi_in_registry(ctx, ports);
         }
 
+        // The loop guard, for the MIDI Out badge and the Settings MIDI section —
+        // and any unmute asked for last frame. Never waits on the lock: the
+        // backend is busy on its own thread, and a frame without a fresh view
+        // keeps the last one.
+        {
+            let unmutes = crate::canvas::viewer::take_midi_unmutes(ctx);
+            if let Ok(mut g) = self.midi_backend.try_lock() {
+                if let Some(midi) = g.as_mut() {
+                    for id in &unmutes {
+                        midi.reset_breaker(id);
+                    }
+                    let (pairs, muted) = midi.guard_status();
+                    crate::canvas::viewer::set_midi_guard_view(ctx, crate::canvas::viewer::MidiGuardView {
+                        pairs: pairs.into_iter().map(|p| (p.out_id, p.in_id, p.status)).collect(),
+                        muted,
+                    });
+                }
+            } else if !unmutes.is_empty() {
+                // Busy this frame: ask again next frame rather than dropping it.
+                for id in &unmutes {
+                    crate::canvas::viewer::request_midi_unmute(ctx, id);
+                }
+            }
+        }
+
         // Feed learned MIDI pins into the active tab's MIDI In nodes.
         {
             let snarl = &mut self.tabs[self.active_tab].canvas.snarl;

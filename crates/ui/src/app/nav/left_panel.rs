@@ -228,29 +228,18 @@ impl FlexInputApp {
         }
     }
 
-    /// Make `device_id` the active input source (mirrors the io_panel card
-    /// click path: remove existing source nodes, add this device, rewire).
+    /// Select (or, on a multi-inlet preset, deselect) `device_id` as an input —
+    /// the card click's own rules (`toggle_source`), so the pad and the mouse
+    /// agree. This used to clear every source first, which predates presets with
+    /// several inlets: picking a MIDI port with the pad dropped the gamepad
+    /// beside it.
     pub(crate) fn nav_select_input_device(&mut self, device_id: &str) {
-        let already = {
-            let canvas = &self.tabs[self.active_tab].canvas;
-            canvas.snarl.nodes_ids_data()
-                .find(|(_, n)| n.value.module_id == "device.source")
-                .and_then(|(_, n)| n.value.params.get("device_id")
-                    .and_then(|v| v.as_str())) == Some(device_id)
-        };
-        if already { return; }
         let Some(dev) = self.devices.iter().find(|d| d.id == device_id).cloned()
         else { return; };
         let defaults = self.nav_device_defaults();
         let collapsed = self.settings.device_nodes_default_collapsed;
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let to_remove: Vec<egui_snarl::NodeId> = canvas.snarl.nodes_ids_data()
-            .filter(|(_, n)| n.value.module_id == "device.source")
-            .map(|(id, _)| id)
-            .collect();
-        for id in to_remove { canvas.snarl.remove_node(id); }
-        canvas.add_device_source(&dev, collapsed, defaults);
-        crate::easy::layout::reposition_io_nodes(canvas);
+        crate::easy::io_panel::toggle_source(canvas, &dev, collapsed, defaults);
         crate::easy::wiring::rewire(canvas);
     }
 

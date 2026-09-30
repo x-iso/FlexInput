@@ -338,6 +338,78 @@ pub fn set_midi_in_registry(ctx: &egui::Context, ports: Vec<(String, String)>) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(MIDI_IN_REGISTRY), ports));
 }
 
+/// The loop guard as the UI shows it, published by the app each frame (the
+/// backend sits behind a lock the UI must not wait on).
+#[derive(Clone, Debug, Default)]
+pub struct MidiGuardView {
+    /// `(out port, in port, status)` for every pair the guard knows about.
+    pub pairs: Vec<(String, String, flexinput_devices::midi::PairStatus)>,
+    /// Out ports the loop breaker has muted.
+    pub muted: Vec<String>,
+}
+
+const MIDI_GUARD_VIEW: &str = "fxi_midi_guard_view";
+const MIDI_UNMUTE_REQ: &str = "fxi_midi_unmute_req";
+
+pub fn set_midi_guard_view(ctx: &egui::Context, v: MidiGuardView) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(MIDI_GUARD_VIEW), v));
+}
+
+pub(crate) fn midi_guard_view(ctx: &egui::Context) -> MidiGuardView {
+    ctx.data(|d| d.get_temp::<MidiGuardView>(egui::Id::new(MIDI_GUARD_VIEW))).unwrap_or_default()
+}
+
+/// Ask the app to unmute an Out port the loop breaker muted.
+pub(crate) fn request_midi_unmute(ctx: &egui::Context, out_id: &str) {
+    ctx.data_mut(|d| {
+        let v: &mut Vec<String> = d.get_temp_mut_or_default(egui::Id::new(MIDI_UNMUTE_REQ));
+        if !v.iter().any(|x| x == out_id) {
+            v.push(out_id.to_string());
+        }
+    });
+}
+
+pub fn take_midi_unmutes(ctx: &egui::Context) -> Vec<String> {
+    ctx.data_mut(|d| d.remove_temp::<Vec<String>>(egui::Id::new(MIDI_UNMUTE_REQ))).unwrap_or_default()
+}
+
+/// Why a MIDI Out node risks feeding itself, if it does: its Thru is on, and a
+/// MIDI In placed in the same patch is paired with its port — the same port
+/// name, or echoes seen coming back — so raw MIDI can go round and round. With
+/// Thru off only what a mapping PRODUCES is sent, which can't loop by itself.
+pub(crate) fn midi_out_loop_risk(
+    snarl: &Snarl<NodeData>,
+    out_id: &str,
+    thru: bool,
+    guard: &MidiGuardView,
+) -> Option<String> {
+    use flexinput_devices::midi::PairStatus;
+    if !thru {
+        return None;
+    }
+    let placed_ins: Vec<&str> = snarl
+        .nodes_ids_data()
+        .filter(|(_, n)| n.value.module_id == "device.source")
+        .filter_map(|(_, n)| n.value.params.get("device_id").and_then(|v| v.as_str()))
+        .filter(|id| id.starts_with("midi_in:"))
+        .collect();
+    let (_, in_id, status) = guard.pairs.iter().find(|(o, i, s)| {
+        o == out_id && placed_ins.contains(&i.as_str()) && *s != PairStatus::Demoted
+    })?;
+    let cancelling = matches!(status, PairStatus::Seeded | PairStatus::Confirmed);
+    Some(format!(
+        "MIDI Thru is on, and {in_id} in this patch is the same port coming back in — \
+         raw MIDI can go round in a loop.{}\n\nTurn Thru off unless you need raw MIDI \
+         forwarded; mappings still send what they produce.",
+        if cancelling {
+            " Echo cancelling is catching the echoes for now, and the loop breaker mutes the \
+             port if it runs away."
+        } else {
+            ""
+        }
+    ))
+}
+
 /// The MIDI In ports published this frame, `(device id, name)`.
 pub(crate) fn midi_in_registry(ctx: &egui::Context) -> Vec<(String, String)> {
     ctx.data(|d| d.get_temp::<Vec<(String, String)>>(egui::Id::new(MIDI_IN_REGISTRY)))
@@ -827,21 +899,46 @@ pub(crate) fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let Some(node) = snarl.get_node(node_id) else { return };
     let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
     let mut thru = node.params.get("midi_thru").and_then(|v| v.as_bool()).unwrap_or(false);
+    let out_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     ui.vertical(|ui| {
         ui.set_min_width(180.0);
 
-        let resp = ui.checkbox(&mut thru, egui::RichText::new("MIDI Thru").small()).on_hover_text(
-            "Off (default): only MIDI that a mapping or a Collector produces is sent \
-             from the Auto-Map input.\n\
-             On: raw MIDI arriving on the Auto-Map bus is forwarded too.\n\n\
-             Leave it off when this port's MIDI In also feeds the patch: \
-             forwarding it back out is a feedback loop.",
-        );
-        if resp.changed() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("midi_thru".to_string(), Value::Bool(thru));
+        let guard = midi_guard_view(ui.ctx());
+        let risk = midi_out_loop_risk(snarl, &out_id, thru, &guard);
+        let muted = guard.muted.iter().any(|m| *m == out_id);
+        ui.horizontal(|ui| {
+            let resp = ui.checkbox(&mut thru, egui::RichText::new("MIDI Thru").small()).on_hover_text(
+                "Off (default): only MIDI that a mapping or a Collector produces is sent \
+                 from the Auto-Map input.\n\
+                 On: raw MIDI arriving on the Auto-Map bus is forwarded too.\n\n\
+                 Leave it off when this port's MIDI In also feeds the patch: \
+                 forwarding it back out is a feedback loop.",
+            );
+            if resp.changed() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("midi_thru".to_string(), Value::Bool(thru));
+                }
             }
+            if let Some(why) = &risk {
+                ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 170, 60)))
+                    .on_hover_text(why);
+            }
+        });
+        // The breaker muted this port: say so, loudly, with the way back.
+        if muted {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⛔ Muted — a feedback loop was caught")
+                    .small().color(Color32::from_rgb(226, 104, 92)))
+                    .on_hover_text(
+                        "This port was sending in a runaway loop with a MIDI In, so the loop \
+                         breaker stopped it. Break the loop (Thru off, or unwire the mapping \
+                         that answers itself), then unmute.",
+                    );
+                if ui.small_button("Unmute").clicked() {
+                    request_midi_unmute(ui.ctx(), &out_id);
+                }
+            });
         }
 
         let mut to_remove: Option<usize> = None;
@@ -1063,5 +1160,37 @@ mod tests {
         assert_eq!(midi_pin_label("cc_7"), "CC 7 – Volume");
         assert_eq!(midi_pin_label("pitch_bend"), "Pitch Bend · any ch");
         assert_eq!(midi_pin_label("midi:note:1:60"), "C4 · ch 1");
+    }
+
+    /// The ⚠ on a MIDI Out: only with Thru on, and only when a MIDI In placed
+    /// in the same patch is paired with its port — a pair shown to be two
+    /// separate ports (demoted) is no risk.
+    #[test]
+    fn a_midi_out_warns_only_when_thru_can_loop() {
+        use flexinput_devices::midi::PairStatus;
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut params = std::collections::HashMap::new();
+        params.insert("device_id".to_string(), Value::from("midi_in:loop"));
+        snarl.insert_node(egui::Pos2::ZERO, NodeData {
+            module_id: "device.source".into(),
+            display_name: "loopMIDI".into(),
+            category: "Device".into(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        });
+        let guard = |s: PairStatus| MidiGuardView {
+            pairs: vec![("midi_out:loop".into(), "midi_in:loop".into(), s)],
+            muted: vec![],
+        };
+        assert!(midi_out_loop_risk(&snarl, "midi_out:loop", true, &guard(PairStatus::Seeded)).is_some());
+        assert!(midi_out_loop_risk(&snarl, "midi_out:loop", false, &guard(PairStatus::Seeded)).is_none(),
+            "Thru off sends only what mappings produce");
+        assert!(midi_out_loop_risk(&snarl, "midi_out:loop", true, &guard(PairStatus::Demoted)).is_none());
+        assert!(midi_out_loop_risk(&snarl, "midi_out:other", true, &guard(PairStatus::Confirmed)).is_none());
+        assert!(midi_out_loop_risk(&Snarl::new(), "midi_out:loop", true, &guard(PairStatus::Confirmed)).is_none(),
+            "the paired In isn't in this patch");
     }
 }
