@@ -26,6 +26,8 @@ pub(crate) struct MidiModalOutcome {
     add_output: bool,
     /// JSM insert: write the message's name into the editor.
     insert: bool,
+    /// Add-to: put the message on the module's output draft.
+    add_to: bool,
     /// Chip editor: a row stepped by its ◀ / ▶ buttons.
     step: Option<(MidiChipRow, i32)>,
     /// Chip editor: a level dragged to a value.
@@ -74,8 +76,8 @@ impl FlexInputApp {
     fn midi_modal_row_count(&self, m: &MidiModal) -> usize {
         match &m.purpose {
             MidiModalPurpose::Add => MidiAddRow::ALL.len(),
-            // Type, channel, number, then Insert.
-            MidiModalPurpose::JsmInsert { .. } => JSM_INSERT_ROW + 1,
+            // Type, channel, number, then Insert / Add.
+            MidiModalPurpose::JsmInsert { .. } | MidiModalPurpose::AddTo { .. } => BUTTON_ROW + 1,
             MidiModalPurpose::Chip { side_out, pin_idx, .. } => self.midi_modal_card(m)
                 .and_then(|c| {
                     let key = if *side_out { "out" } else { "in" };
@@ -163,6 +165,19 @@ impl FlexInputApp {
         self.close_midi_modal();
     }
 
+    /// Add the message the editor builds to another module's output draft (a
+    /// Lean section, a Touch Zones / Virtual Menu zone), through the same path
+    /// the Special picker adds by.
+    fn midi_modal_add_to(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.gamepad_nav.midi_modal.clone() else { return };
+        let MidiModalPurpose::AddTo { ref draft_key, ref phase_key } = m.purpose else { return };
+        let Some(pin) = midi_pick_built(ctx, m.inner) else { return };
+        if !pin.is_output_capable() {
+            return;
+        }
+        self.append_output_pin(&m.path, m.inner, draft_key, phase_key.as_deref(), &pin.to_id());
+    }
+
     /// Drive the open editor from the pad.
     pub(crate) fn drive_midi_modal(
         &mut self,
@@ -197,8 +212,8 @@ impl FlexInputApp {
                             midi_pick_nav_adjust(ctx, m.inner, field, delta);
                         }
                     }
-                    MidiModalPurpose::JsmInsert { .. } => {
-                        if row < JSM_INSERT_ROW {
+                    MidiModalPurpose::JsmInsert { .. } | MidiModalPurpose::AddTo { .. } => {
+                        if row < BUTTON_ROW {
                             midi_pick_nav_adjust(ctx, m.inner, row, delta);
                         }
                     }
@@ -224,8 +239,11 @@ impl FlexInputApp {
                     MidiAddRow::AddOutput => self.midi_modal_add(ctx, true),
                     _ => {}
                 },
-                MidiModalPurpose::JsmInsert { .. } if row == JSM_INSERT_ROW => {
+                MidiModalPurpose::JsmInsert { .. } if row == BUTTON_ROW => {
                     self.midi_modal_jsm_insert(ctx);
+                }
+                MidiModalPurpose::AddTo { .. } if row == BUTTON_ROW => {
+                    self.midi_modal_add_to(ctx);
                 }
                 _ => {}
             }
@@ -251,6 +269,7 @@ impl FlexInputApp {
             MidiModalPurpose::Chip { side_out: true, .. } => "MIDI output",
             MidiModalPurpose::JsmInsert { output: true, .. } => "MIDI to play",
             MidiModalPurpose::JsmInsert { output: false, .. } => "MIDI that presses",
+            MidiModalPurpose::AddTo { .. } => "MIDI output",
         };
         let hint = match m.purpose {
             MidiModalPurpose::JsmInsert { .. } => {
@@ -282,6 +301,7 @@ impl FlexInputApp {
                     MidiModalPurpose::JsmInsert { output, .. } => {
                         self.midi_modal_jsm_ui(ui, &m, output, &mut out)
                     }
+                    MidiModalPurpose::AddTo { .. } => self.midi_modal_add_to_ui(ui, &m, &mut out),
                 }
             });
         ctx.request_repaint();
@@ -324,7 +344,7 @@ impl FlexInputApp {
     }
 
     fn midi_modal_jsm_ui(&self, ui: &mut egui::Ui, m: &MidiModal, output: bool, out: &mut MidiModalOutcome) {
-        let focused = MidiAddRow::ALL.get(m.row).copied().filter(|_| m.row < JSM_INSERT_ROW);
+        let focused = MidiAddRow::ALL.get(m.row).copied().filter(|_| m.row < BUTTON_ROW);
         let rects = midi_add_rows_ui(ui, m.inner, focused);
         for (i, r) in rects.iter().enumerate() {
             if ui.rect_contains_pointer(*r) && ui.input(|i| i.pointer.any_click()) {
@@ -345,12 +365,41 @@ impl FlexInputApp {
             let resp = ui.add_enabled(problem.is_none() && tag.is_some(),
                 egui::Button::new(egui::RichText::new("Insert").size(13.0)))
                 .on_disabled_hover_text(problem.unwrap_or("Nothing a config can name."));
-            if m.row == JSM_INSERT_ROW { ring_row(ui, resp.rect); }
+            if m.row == BUTTON_ROW { ring_row(ui, resp.rect); }
             if resp.clicked() { out.insert = true; }
             if let Some(t) = &tag {
                 ui.label(egui::RichText::new(t).monospace().small());
             }
         });
+    }
+
+    fn midi_modal_add_to_ui(&self, ui: &mut egui::Ui, m: &MidiModal, out: &mut MidiModalOutcome) {
+        let focused = MidiAddRow::ALL.get(m.row).copied().filter(|_| m.row < BUTTON_ROW);
+        let rects = midi_add_rows_ui(ui, m.inner, focused);
+        for (i, r) in rects.iter().enumerate() {
+            if ui.rect_contains_pointer(*r) && ui.input(|i| i.pointer.any_click()) {
+                out.focus = Some(i);
+            }
+        }
+        ui.add_space(6.0);
+        let sendable = midi_pick_built(ui.ctx(), m.inner).is_some_and(|p| p.is_output_capable());
+        let draft = self.picker_draft_vec(&m.path, m.inner, match &m.purpose {
+            MidiModalPurpose::AddTo { draft_key, .. } => draft_key,
+            _ => "",
+        });
+        ui.horizontal(|ui| {
+            let resp = ui.add_enabled(sendable, egui::Button::new(egui::RichText::new("Add").size(13.0)))
+                .on_disabled_hover_text(
+                    "An output has to name one channel, and be a message that can be sent.");
+            if m.row == BUTTON_ROW { ring_row(ui, resp.rect); }
+            if resp.clicked() { out.add_to = true; }
+            if !draft.is_empty() {
+                ui.label(egui::RichText::new(format!("{} in the draft", draft.len())).small().weak());
+            }
+        });
+        ui.label(egui::RichText::new(
+            "Added to the draft, like a Special pick — close this and press Add on the card to keep it.")
+            .small().weak());
     }
 
     fn midi_modal_chip_ui(
@@ -415,6 +464,7 @@ impl FlexInputApp {
         if out.add_input { self.midi_modal_add(ctx, false); }
         if out.add_output { self.midi_modal_add(ctx, true); }
         if out.insert { self.midi_modal_jsm_insert(ctx); }
+        if out.add_to { self.midi_modal_add_to(ctx); }
         if let MidiModalPurpose::Chip { side_out, pin_idx, .. } = m.purpose {
             if let Some((row, delta)) = out.step {
                 self.midi_modal_edit_card(&m, &move |c| midi_chip_step(c, side_out, pin_idx, row, delta));
@@ -458,9 +508,9 @@ impl FlexInputApp {
     }
 }
 
-/// The JSM insert editor's button row, after its type / channel / number rows
-/// (which are the Add editor's first three, stepped by the same field index).
-const JSM_INSERT_ROW: usize = 3;
+/// The JSM-insert and add-to editors' button row, after their type / channel /
+/// number rows (the Add editor's first three, stepped by the same field index).
+const BUTTON_ROW: usize = 3;
 
 /// Render `f` in the always-on-top, see-through viewport that floats over the
 /// game while the config overlay is up — the one the KB/M picker uses. Every

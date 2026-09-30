@@ -406,6 +406,13 @@ pub(crate) fn show_gyro_lean_mapping_section(
         for p in remapper_kbm_pressed_now(ui, panic_shortcut) {
             if !pressed_now.iter().any(|q| q == &p) { pressed_now.push(p); }
         }
+        // And every MIDI In in the patch: play a message to learn it as the
+        // output, as a Remapper card does.
+        for port in midi_learn_ref_ports(ui.ctx(), "") {
+            for p in remapper_midi_pressed_now(ui, live_signals, &port) {
+                if !pressed_now.iter().any(|q| q == &p) { pressed_now.push(p); }
+            }
+        }
     }
 
     // Arm-idle latch: first frame the device is empty while armed, flip arm_idle
@@ -478,7 +485,8 @@ pub(crate) fn show_gyro_lean_mapping_section(
     let ck = if side == "left" { "_nav_act_clear_left" }   else { "_nav_act_clear_right" };
     // Consume side-scoped one-shot gamepad activation flags. Mirrors the
     // Remapper/Map Action `_nav_act_*` pattern so a controller can drive
-    // Learn / Special / Clear / Add in the Lean sections too.
+    // Learn / Special / Clear / Add in the Lean sections too. (MIDI… is opened
+    // by the nav driver directly, like the Remapper's.)
     let (act_learn, act_add, act_special, act_clear) = {
         let n = snarl.get_node(node_id);
         let g = |k: &str| n.and_then(|n| n.params.get(k)).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -492,6 +500,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
             node.params.insert(ck.to_string(), Value::from(false));
         }
     }
+    let mut midi_rect = egui::Rect::NOTHING;
 
     // Status line. Before Learn: prompt to Learn or pick Special. During
     // learning: prompt for the chord (or show the draft).
@@ -582,6 +591,23 @@ pub(crate) fn show_gyro_lean_mapping_section(
             }
         }
 
+        // MIDI… — build a message for this lean to play, in the MIDI editor.
+        {
+            let midi_btn = ui.add(egui::Button::new(egui::RichText::new("MIDI…").size(13.0)))
+                .on_hover_text("Build a MIDI message for this lean to play.");
+            midi_rect = midi_btn.rect;
+            if midi_btn.clicked() {
+                crate::canvas::viewer::request_midi_modal(ui.ctx(), crate::canvas::viewer::MidiModalRequest {
+                    inner: node_id,
+                    path: crate::canvas::viewer::subpatch_path(automap_parent),
+                    purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
+                        draft_key: draft_key.to_string(),
+                        phase_key: Some(phase_key.to_string()),
+                    },
+                });
+            }
+        }
+
         // Clear button — abandons the captured/picked output and starts over
         // (back to idle, draft emptied, capture disarmed). Shown whenever a draft
         // exists so a botched capture/pick can be reset WITHOUT finishing.
@@ -634,10 +660,10 @@ pub(crate) fn show_gyro_lean_mapping_section(
     });
     // Publish action-button rects (global) so the nav driver can glow the
     // focused one. Order MUST match `nav_remap_action_items` for Lean: Learn,
-    // Special, Clear(has_draft), Add((learning||ready) && draft). Use the cards'
-    // scope.
+    // Special, MIDI…, Clear(has_draft), Add((learning||ready) && draft). Use the
+    // cards' scope.
     publish_nav_action_rects_scoped(ui, node_id, key,
-        &[learn_rect, special_rect, clear_rect, add_rect]);
+        &[learn_rect, special_rect, midi_rect, clear_rect, add_rect]);
     remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
         armed_key, phase_key, &["learning"]);
 
@@ -724,6 +750,21 @@ pub(crate) fn show_gyro_lean_mapping_section(
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }
+                    // A MIDI chip. A Lean card draws its OUTPUTS in the card's one
+                    // row (the one the renderer calls "in"), so the chip is an
+                    // output's: its channel and levels.
+                    if let Some((_, pin_idx)) = result.midi_chip_clicked {
+                        crate::canvas::viewer::request_midi_modal(ui.ctx(), crate::canvas::viewer::MidiModalRequest {
+                            inner: node_id,
+                            path: crate::canvas::viewer::subpatch_path(automap_parent),
+                            purpose: crate::canvas::viewer::MidiModalPurpose::Chip {
+                                card: i,
+                                cards_key: key.to_string(),
+                                side_out: true,
+                                pin_idx,
+                            },
+                        });
+                    }
                     rv.observe(i, &result);
                     // Per-card response curve + manual activation threshold —
                     // the lean gesture is inherently analog, so every card

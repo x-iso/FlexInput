@@ -421,10 +421,10 @@ impl FlexInputApp {
         // gamepad-button capture) AND Assign (pick a specific output) directly,
         // matching the mouse menu card. Touch Zones demonstrates a gesture first.
         let mut v = match (menu, phase) {
-            (true, "idle")  => vec!["learn", "assign"],
+            (true, "idle")  => vec!["learn", "assign", "midi"],
             (false, "idle") => vec!["learn"],
             (_, "learning") => vec!["cancel"],
-            _               => vec!["assign", "gamepad", "add", "cancel"], // captured
+            _               => vec!["assign", "midi", "gamepad", "add", "cancel"], // captured
         };
         // Order MUST match the body's act_rects push order: tp_mode, mouse_speed,
         // then hold LAST. tp_mode is a VALUE cycled with LT/RT (like mouse_speed),
@@ -831,6 +831,23 @@ impl FlexInputApp {
                             phase_key: None,
                             touch_zones: true,
                             exclude_pin_prefix,
+                        }, None);
+                    }
+                    "midi" => {
+                        // A menu zone picks its output straight from idle, as with
+                        // Assign: bind to the zone's selection first.
+                        if menu {
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                        }
+                        self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
+                            inner,
+                            path: nav_path(outer_id),
+                            purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
+                                draft_key: "_tz_draft_out".to_string(),
+                                phase_key: None,
+                            },
                         }, None);
                     }
                     "gamepad" => {

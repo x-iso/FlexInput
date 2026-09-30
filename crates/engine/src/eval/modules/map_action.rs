@@ -31,6 +31,9 @@ pub(crate) fn eval_map_action_node(
                 });
                 if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
             }
+            // MIDI pins are dynamic (never in ALL_PINS): take whatever the bus
+            // carries, so a note or a knob can trigger an action.
+            fill_upstream_midi(collector_id, dev_id, collector_sigs, dev_sigs, &mut upstream);
             // A processed Vec2 on the collector is authoritative over raw axes.
             vec2_authoritative_axis_fill(&mut upstream, collector_id, &collector_sigs);
             // Derive synthetic pins (stick cardinals + touchpad variants)

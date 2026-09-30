@@ -51,6 +51,8 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
     }
 
     let mut asserted: HashMap<String, Signal> = HashMap::new();
+    // MIDI outputs, typed and levelled the way every mapping card's are.
+    let mut midi_asserted: HashMap<String, CardMidi> = HashMap::new();
 
     for (side_idx, side_pair) in [
         (left_active, &lean_left), (right_active, &lean_right),
@@ -110,6 +112,21 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                 // Touchpad zone/swipe outputs are synthesized into touch points
                 // after this loop, not emitted as axis/button pins.
                 if touchpad_out_kind(p).is_some() { continue; }
+                // A MIDI output: in Analog mode a value follows the lean (a
+                // bend leaning left goes down); otherwise it is on while held.
+                if let Some(mp) = flexinput_core::midi::parse_pin(p) {
+                    let state = if is_analog_mode && mp.is_continuous() {
+                        let mag = analog_val_opt.unwrap_or(0.0);
+                        let bend = matches!(mp, flexinput_core::midi::MidiPin::PitchBend { .. });
+                        CardMidi::Value(if bend && side_idx == 0 { -mag } else { mag })
+                    } else if held_now {
+                        CardMidi::On
+                    } else {
+                        continue;
+                    };
+                    midi_asserted.entry(p.clone()).or_insert(state);
+                    continue;
+                }
                 // Macro-port target: Analog mode passes the live lean
                 // magnitude (unsigned — the port is bound per-side, so
                 // direction is implied by which side's mapping fires); other
@@ -197,7 +214,13 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
     }
 
     let key = format!("lean:{}", uid);
+    let all_cards: Vec<Value> = lean_left.iter().chain(lean_right.iter()).cloned().collect();
     for p in &all_out_pins {
+        if flexinput_core::midi::is_midi_pin(p) {
+            let state = midi_asserted.get(p).copied().unwrap_or(CardMidi::Off);
+            publish_card_midi(&key, p, state, card_levels_for(&all_cards, p), collector_sigs);
+            continue;
+        }
         let sig_type = automap::ALL_PINS.iter().find(|x| x.id == p.as_str())
             .map(|x| x.signal_type).unwrap_or(SignalType::Bool);
         let sig = asserted.get(p).copied().unwrap_or_else(|| {

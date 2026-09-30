@@ -487,6 +487,13 @@ pub(crate) fn eval_touch_zones_map_node(
     // is active, else write the released value only if upstream doesn't already
     // emit it (matches the Remapper release rule so passthrough stays intact).
     for (pin, on) in &button_on {
+        // A MIDI pin is typed, carries the card's levels and is marked
+        // produced — the Remapper's rules, shared.
+        if flexinput_core::midi::is_midi_pin(pin) {
+            let state = if *on { CardMidi::On } else { CardMidi::Off };
+            publish_card_midi(&key, pin, state, card_levels_for(&cards, pin), collector_sigs);
+            continue;
+        }
         let sig_type = automap::ALL_PINS.iter()
             .find(|ap| ap.id == pin.as_str())
             .map(|ap| ap.signal_type).unwrap_or(SignalType::Bool);

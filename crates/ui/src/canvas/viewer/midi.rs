@@ -485,6 +485,11 @@ pub enum MidiModalPurpose {
     /// (something that presses). `cursor` is the pad's cursor in the editor, or
     /// `None` for a mouse, whose pick goes on a line of its own.
     JsmInsert { output: bool, cursor: Option<flexinput_engine::eval::JsmCursor> },
+    /// Build a message and add it to another mapping module's OUTPUT draft — a
+    /// Lean section's (`_lean_<side>_draft`, with its phase key) or a Touch Zones
+    /// / Virtual Menu zone's (`_tz_draft_out`). The same draft the Special picker
+    /// writes, by the same rules.
+    AddTo { draft_key: String, phase_key: Option<String> },
 }
 
 /// The command-list row that opens the MIDI editor for a JSM Config editor.

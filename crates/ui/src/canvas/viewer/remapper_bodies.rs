@@ -836,6 +836,15 @@ pub(crate) fn show_map_action_body(
         (Some(dev), true) => remapper_pressed_now(live_signals, dev),
         _ => Vec::new(),
     };
+    // A MIDI port upstream: notes while held, knobs and benders while moving —
+    // the Remapper's rule, so a note can be learned as an action's trigger.
+    if let (Some(dev), true) = (&upstream_dev_id, wired) {
+        for p in remapper_midi_pressed_now(ui, live_signals, dev) {
+            if !pressed_now.iter().any(|q| q == &p) {
+                pressed_now.push(p);
+            }
+        }
+    }
 
     // Hold the latched combo while gamepad UI-nav is active for this device
     // (mirror of the Remapper guard). Pass-stamped per device by the app.
@@ -1227,6 +1236,19 @@ pub(crate) fn show_map_action_body(
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
+                                // A MIDI chip: its channel, in the MIDI editor.
+                                if let Some((side_out, pin_idx)) = result.midi_chip_clicked {
+                                    request_midi_modal(ui.ctx(), MidiModalRequest {
+                                        inner: node_id,
+                                        path: crate::canvas::viewer::subpatch_path(automap_parent),
+                                        purpose: MidiModalPurpose::Chip {
+                                            card: i,
+                                            cards_key: "mappings".to_string(),
+                                            side_out,
+                                            pin_idx,
+                                        },
+                                    });
+                                }
                                 rv.observe(i, &result);
                             },
                         );

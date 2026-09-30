@@ -618,7 +618,22 @@ impl FlexInputApp {
                     "_nav_act_special_right" => Some("_lean_right_draft"),
                     _ => None,
                 };
-                if action == crate::canvas::viewer::NAV_ACT_MIDI {
+                // A Lean section's MIDI…: the MIDI editor, adding to its draft.
+                let lean_midi = match action {
+                    "_nav_act_midi_left" => Some("left"),
+                    "_nav_act_midi_right" => Some("right"),
+                    _ => None,
+                };
+                if let Some(side) = lean_midi {
+                    self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
+                        inner,
+                        path: nav_path(outer_id),
+                        purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
+                            draft_key: format!("_lean_{side}_draft"),
+                            phase_key: Some(format!("_lean_{side}_phase")),
+                        },
+                    }, None);
+                } else if action == crate::canvas::viewer::NAV_ACT_MIDI {
                     // The MIDI editor window, opened on this card's draft. Its
                     // surface is resolved when it draws: over the game while the
                     // config overlay is up, the main window otherwise.
@@ -929,17 +944,31 @@ impl FlexInputApp {
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
         let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
-        let mut out = self.picker_draft_vec(&path, inner, &draft_key);
+        self.append_output_pin(&path, inner, &draft_key, phase_key.as_deref(), pin);
+    }
+
+    /// Add one output pin to a mapping module's output draft and move its phase
+    /// on to "picked" — the one path the Special picker and the MIDI editor
+    /// window both use, so a pick means the same whichever made it.
+    pub(crate) fn append_output_pin(
+        &mut self,
+        path: &[usize],
+        inner: egui_snarl::NodeId,
+        draft_key: &str,
+        phase_key: Option<&str>,
+        pin: &str,
+    ) {
+        let mut out = self.picker_draft_vec(path, inner, draft_key);
         if !out.iter().any(|p| p == pin) { out.push(pin.to_string()); }
-        self.picker_set_draft(&path, inner, &draft_key, &out);
+        self.picker_set_draft(path, inner, draft_key, &out);
         // Swipe outputs require analog mode; the viewer's Add detects a swipe pin
         // in the draft and stamps `mode = "analog"` on the committed mapping.
         // The `ui_phase` flip only means something to the Remapper's own state
         // machine — a TZ/menu session (draft `_tz_draft_out`) must NOT get it.
-        match phase_key.as_deref() {
-            Some(pk) => self.picker_set_param_str(&path, inner, pk, "ready"),
+        match phase_key {
+            Some(pk) => self.picker_set_param_str(path, inner, pk, "ready"),
             None if draft_key == "draft_output" => {
-                self.picker_set_param_str(&path, inner, "ui_phase", "learning");
+                self.picker_set_param_str(path, inner, "ui_phase", "learning");
             }
             None => {}
         }
@@ -962,10 +991,12 @@ impl FlexInputApp {
             // has_draft mirrors the body: any captured/picked output OR mid-learn.
             let has_draft = draft || matches!(phase.as_str(), "learning" | "ready");
             // Visual order (must match the body + published rects):
-            // Learn (always), Special (always), Clear(has_draft),
-            // Add ((learning||ready) && draft non-empty).
+            // Learn (always), Special (always), MIDI… (always), Clear(has_draft),
+            // Add ((learning||ready) && draft non-empty). MIDI… opens the MIDI
+            // editor straight from the nav driver, as the Remapper's does.
             let mut v = vec![if side == "left" { "_nav_act_learn_left" } else { "_nav_act_learn_right" }];
             v.push(if side == "left" { "_nav_act_special_left" } else { "_nav_act_special_right" });
+            v.push(if side == "left" { "_nav_act_midi_left" } else { "_nav_act_midi_right" });
             if has_draft {
                 v.push(if side == "left" { "_nav_act_clear_left" } else { "_nav_act_clear_right" });
             }
@@ -1163,12 +1194,14 @@ impl FlexInputApp {
         if order_applies {
             nav_fields.push(8);
         }
-        // MIDI chips (Remapper), in the order they sit: the in row's, then the
-        // out row's — field 100 + i is in-chip i, 200 + i out-chip i. South opens
-        // the MIDI editor on that chip. A chip with nothing to tune (transport,
-        // SysEx) is skipped, as the card skips offering it.
+        // MIDI chips, in the order they sit: the in row's, then the out row's —
+        // field 100 + i is in-chip i, 200 + i out-chip i. South opens the MIDI
+        // editor on that chip. A chip with nothing to tune (transport, SysEx) is
+        // skipped, as the card skips offering it. Every card shape but Lean's: a
+        // Lean card draws its OUTPUTS in the row the renderer publishes as the in
+        // row, so its field ids wouldn't line up — its chips stay mouse-only.
         let mut midi_chip_fields: Vec<(usize, bool, usize)> = Vec::new();
-        if self.nav_selected_is_remapper(outer_id) {
+        if self.nav_lean_side(outer_id).is_none() {
             if let Some(card) = self.nav_remap_card_json(outer_id, idx) {
                 for (side_out, key, base) in [(false, "in", 100usize), (true, "out", 200usize)] {
                     let pins = card.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();

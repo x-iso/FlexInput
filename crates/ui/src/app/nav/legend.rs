@@ -88,7 +88,10 @@ impl FlexInputApp {
         if let Some(m) = &self.gamepad_nav.midi_modal {
             let mut v = vec![(hint_vert(), "Row"), (hint_horiz(), "Change")];
             match m.purpose {
-                crate::canvas::viewer::MidiModalPurpose::Add => v.push((vec!["btn_south"], "Add")),
+                crate::canvas::viewer::MidiModalPurpose::Add
+                | crate::canvas::viewer::MidiModalPurpose::AddTo { .. } => {
+                    v.push((vec!["btn_south"], "Add"))
+                }
                 crate::canvas::viewer::MidiModalPurpose::JsmInsert { .. } => {
                     v.push((vec!["btn_south"], "Insert"))
                 }

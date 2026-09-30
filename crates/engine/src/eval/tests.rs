@@ -5036,3 +5036,109 @@ mod midi_source_tests {
         assert_eq!(out, vec![None]);
     }
 }
+
+/// MIDI outputs from the other mapping modules — Lean, Touch Zones, the Virtual
+/// Menu — go through one publisher, so a card means what it means on a
+/// Remapper; and Map Action can be triggered by MIDI.
+#[cfg(test)]
+mod midi_card_module_tests {
+    use super::*;
+
+    fn node(uid: usize, module_id: &str) -> NodeSnap {
+        NodeSnap {
+            node_uid: uid,
+            module_id: module_id.to_string(),
+            params: HashMap::new(),
+            n_outputs: 0,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn get(c: &HashMap<(String, String), Signal>, key: &str, pin: &str) -> Option<Signal> {
+        c.get(&(key.to_string(), pin.to_string())).copied()
+    }
+
+    #[test]
+    fn a_lean_card_plays_a_note_at_its_velocity_and_marks_it_produced() {
+        let mut n = node(1, "processing.gyro_3dof");
+        n.params.insert("lean_right".into(), serde_json::json!([
+            { "out": ["midi:note:2:60"], "midi_vel": 64 }
+        ]));
+        let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c, "lean:1", "midi:note:2:60"), Some(Signal::Bool(true)), "{c:?}");
+        assert_eq!(get(&c, "lean:1", "midi:vel:2:60"), Some(Signal::Float(64.0 / 127.0)));
+        assert!(c.contains_key(&("lean:1".to_string(), "__midi_out__:midi:note:2:60".to_string())));
+        c.clear();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(0.0), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c, "lean:1", "midi:note:2:60"), Some(Signal::Bool(false)), "upright, it lifts");
+    }
+
+    #[test]
+    fn an_analog_lean_card_sends_how_far_the_pad_leans() {
+        let mut n = node(1, "processing.gyro_3dof");
+        n.params.insert("lean_left".into(), serde_json::json!([
+            { "out": ["midi:cc:1:11"], "mode": "analog" },
+            { "out": ["midi:pb:1"], "mode": "analog" },
+        ]));
+        let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.6), &mut ns, &mut c, 0.016);
+        let f = |pin: &str| get(&c, "lean:1", pin).map(|s| s.as_float()).unwrap_or(f32::NAN);
+        assert!((f("midi:cc:1:11") - 0.6).abs() < 1e-4, "{c:?}");
+        assert!((f("midi:pb:1") + 0.6).abs() < 1e-4, "leaning left bends down");
+    }
+
+    #[test]
+    fn a_touch_zone_plays_midi() {
+        let mut n = node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("col_edges".into(), serde_json::json!([]));
+        n.params.insert("row_edges".into(), serde_json::json!([]));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["midi:cc:1:20"],"midi_on": 100},
+        ]));
+        let finger = |on: bool| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(on));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let mut state = HashMap::new();
+        let mut c = HashMap::new();
+        for _ in 0..3 {
+            c.clear();
+            eval_touch_zones_map_node(&n, 1, &finger(true), &mut c, &mut state, 0.016);
+        }
+        assert_eq!(get(&c, "touchmap:1", "midi:cc:1:20"), Some(Signal::Float(100.0 / 127.0)), "{c:?}");
+        assert!(c.contains_key(&("touchmap:1".to_string(), "__midi_out__:midi:cc:1:20".to_string())));
+        for _ in 0..3 {
+            c.clear();
+            eval_touch_zones_map_node(&n, 1, &finger(false), &mut c, &mut state, 0.016);
+        }
+        assert_eq!(get(&c, "touchmap:1", "midi:cc:1:20"), Some(Signal::Float(0.0)), "lifted, the off level");
+    }
+
+    #[test]
+    fn a_midi_note_triggers_a_map_action() {
+        let mut n = node(1, "module.map_action");
+        n.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
+        n.params.insert("mappings".into(), serde_json::json!([{ "in": ["midi:note:1:60"] }]));
+        let mut dev = HashMap::new();
+        dev.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
+        let out = eval_map_action_node(&n, 1, &dev, &HashMap::new(), &mut HashMap::new(), 0.016);
+        assert_eq!(out.first().copied().flatten(), Some(Signal::Bool(true)), "{out:?}");
+        let out = eval_map_action_node(&n, 1, &HashMap::new(), &HashMap::new(), &mut HashMap::new(), 0.016);
+        assert_ne!(out.first().copied().flatten(), Some(Signal::Bool(true)));
+    }
+}

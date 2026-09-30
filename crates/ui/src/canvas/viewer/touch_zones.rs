@@ -2329,6 +2329,15 @@ pub(crate) fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Open the MIDI editor on a Touch Zones / Virtual Menu zone's output draft.
+fn tz_request_midi(ctx: &egui::Context, node_id: NodeId, automap_parent: Option<&AutomapGlowParent<'_>>) {
+    request_midi_modal(ctx, MidiModalRequest {
+        inner: node_id,
+        path: subpatch_path(automap_parent),
+        purpose: MidiModalPurpose::AddTo { draft_key: "_tz_draft_out".to_string(), phase_key: None },
+    });
+}
+
 pub(crate) fn render_touch_zone_cards(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2399,8 +2408,15 @@ pub(crate) fn render_touch_zone_cards(
         // by `run_gamepad_nav` (goes inert while the hold is fresh).
         crate::widgets::hold_nav_for_capture(ui.ctx());
         ui.ctx().request_repaint();
-        let pressed_now: Vec<String> = dev.as_deref()
+        let mut pressed_now: Vec<String> = dev.as_deref()
             .map(|d| remapper_pressed_now(live_signals, d)).unwrap_or_default();
+        // A MIDI controller works as the output's teacher too: play the message
+        // and the zone sends it. Every MIDI In in the patch is listened to.
+        for port in midi_learn_ref_ports(ui.ctx(), "") {
+            for p in remapper_midi_pressed_now(ui, live_signals, &port) {
+                if !pressed_now.contains(&p) { pressed_now.push(p); }
+            }
+        }
         // Baseline: the pins already held at the instant we armed (typically the
         // button the user pressed to arm — South/🎮). We latch it once, then only
         // accept a pin that is NOT in the baseline, i.e. a FRESH press. Without
@@ -2620,6 +2636,17 @@ pub(crate) fn render_touch_zone_cards(
                         exclude_pin_prefix: menu_excl.clone(),
                     });
                 }
+                let b = ui.button("MIDI…")
+                    .on_hover_text("Build a MIDI message for this zone to play.");
+                act_rects.push(b.rect);
+                if b.clicked() {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("_tz_phase".into(), Value::from("captured"));
+                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.remove("_tz_draft_out");
+                    }
+                    tz_request_midi(ui.ctx(), node_id, automap_parent);
+                }
             }
             "idle" => {
                 let b = ui.button("Learn")
@@ -2656,6 +2683,12 @@ pub(crate) fn render_touch_zone_cards(
                         touch_zones: true,
                         exclude_pin_prefix: menu_excl.clone(),
                     });
+                }
+                let b = ui.button("MIDI…")
+                    .on_hover_text("Build a MIDI message for this zone to play.");
+                act_rects.push(b.rect);
+                if b.clicked() {
+                    tz_request_midi(ui.ctx(), node_id, automap_parent);
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
                 let b = ui.add(egui::Button::new(if armed { "🎮…" } else { "🎮" }))
@@ -2878,6 +2911,18 @@ pub(crate) fn render_touch_zone_cards(
                     card_conf.as_ref(),
                 );
                 if result.delete_clicked { remove = Some(i); }
+                if let Some((side_out, pin_idx)) = result.midi_chip_clicked {
+                    request_midi_modal(ui.ctx(), MidiModalRequest {
+                        inner: node_id,
+                        path: subpatch_path(automap_parent),
+                        purpose: MidiModalPurpose::Chip {
+                            card: i,
+                            cards_key: "zone_maps".to_string(),
+                            side_out,
+                            pin_idx,
+                        },
+                    });
+                }
                 rv.observe(slot, &result);
                 // Response curve + threshold + Rel.-center, all INSIDE the card's
                 // opened body. Analog cards shape the zone's deflection (no

@@ -425,6 +425,13 @@ pub(crate) fn eval_menu_node(
     // forever after one selection. A pin that IS on the bus keeps its passthrough
     // value (OR semantics — a real press of the same button still comes through).
     for (pin, on) in &button_on {
+        // A MIDI pin is typed, carries the card's levels and is marked
+        // produced — the Remapper's rules, shared.
+        if flexinput_core::midi::is_midi_pin(pin) {
+            let state = if *on { CardMidi::On } else { CardMidi::Off };
+            publish_card_midi(&key, pin, state, card_levels_for(&cards, pin), collector_sigs);
+            continue;
+        }
         let sig_type = automap::ALL_PINS.iter()
             .find(|ap| ap.id == pin.as_str())
             .map(|ap| ap.signal_type).unwrap_or(SignalType::Bool);

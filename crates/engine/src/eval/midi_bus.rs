@@ -86,6 +86,82 @@ pub(crate) fn fill_upstream_midi(
     }
 }
 
+/// What a mapping card is doing to one of its MIDI output pins this tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CardMidi {
+    /// Released: a note lifts, a value goes to the card's off level.
+    Off,
+    /// Held: a note sounds at the card's velocity, a value sits at its on level.
+    On,
+    /// An analog card's live value — a controller's position, a bend's (signed)
+    /// deflection, or for a note its velocity (sounding while above zero).
+    Value(f32),
+}
+
+/// Publish one MIDI output of a mapping card, the way the Remapper publishes
+/// its own: a note as a gate with its velocity riding the twin pin, a value at
+/// the card's on / off level (`midi_card_levels`), a program change or
+/// transport as a gate — and every pin MARKED produced, so a MIDI Out sends it
+/// with its Thru toggle off. Touch Zones, Lean and the Virtual Menu all publish
+/// their MIDI through here, so a card means the same thing in each.
+pub(crate) fn publish_card_midi(
+    key: &str,
+    pin_id: &str,
+    state: CardMidi,
+    levels: (f32, f32, f32),
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let Some(pin) = midi::parse_pin(pin_id) else { return };
+    let (vel, on, off) = levels;
+    let put = |id: String, sig: Signal, collector_sigs: &mut HashMap<(String, String), Signal>| {
+        collector_sigs.insert((key.to_string(), id.clone()), sig);
+        mark_produced(key, &id, collector_sigs);
+    };
+    if let midi::MidiPin::Note { ch, note } = pin {
+        let (gate, v) = match state {
+            CardMidi::Off => (false, 0.0),
+            CardMidi::On => (true, vel),
+            // Never 0 while sounding: a note-on at velocity 0 is a note-off.
+            CardMidi::Value(v) => (v > 0.0, v.clamp(1.0 / 127.0, 1.0)),
+        };
+        put(pin_id.to_string(), Signal::Bool(gate), collector_sigs);
+        if gate {
+            put(midi::MidiPin::Velocity { ch, note }.to_id(), Signal::Float(v), collector_sigs);
+        }
+        return;
+    }
+    let sig = if pin.is_continuous() {
+        let bend = matches!(pin, midi::MidiPin::PitchBend { .. });
+        Signal::Float(match state {
+            CardMidi::Off => off,
+            CardMidi::On => on,
+            CardMidi::Value(v) if bend => v.clamp(-1.0, 1.0),
+            CardMidi::Value(v) => v.clamp(0.0, 1.0),
+        })
+    } else {
+        Signal::Bool(match state {
+            CardMidi::Off => false,
+            CardMidi::On => true,
+            CardMidi::Value(v) => v > 0.0,
+        })
+    };
+    put(pin_id.to_string(), sig, collector_sigs);
+}
+
+/// The MIDI levels of the first card in `cards` that sends `pin_id` — what a
+/// released pin goes back to when no card holds it this tick.
+pub(crate) fn card_levels_for(cards: &[serde_json::Value], pin_id: &str) -> (f32, f32, f32) {
+    cards
+        .iter()
+        .find(|c| {
+            c.get("out")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|p| p.as_str() == Some(pin_id)))
+        })
+        .map(midi_card_levels)
+        .unwrap_or_else(|| midi_card_levels(&serde_json::Value::Null))
+}
+
 /// Rest value for a MIDI pin id, for publishing a claimed pin as "off".
 pub(crate) fn midi_rest(pin: &str) -> Option<Signal> {
     midi::parse_pin(pin).map(|p| p.rest_value())
