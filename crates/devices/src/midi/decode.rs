@@ -62,6 +62,11 @@ struct Slot {
     /// Pulse: when the current assertion started, and how many polls saw it.
     asserted_at: Option<Instant>,
     asserted_polls: u32,
+    /// Value: keep publishing it even at 0. A held note's aftertouch (and its
+    /// channel's pressure) is the note's live value once it has been sent, and
+    /// easing it back to nothing must read as 0 — not vanish from the bus, which
+    /// would drop the note back to the next thing in line (its velocity).
+    held: bool,
 }
 
 impl Slot {
@@ -89,6 +94,7 @@ impl Slot {
             pending: false,
             asserted_at: None,
             asserted_polls: 0,
+            held: false,
         }
     }
 
@@ -122,7 +128,7 @@ impl Slot {
             SlotKind::Value => {
                 let out = self.extreme.take().unwrap_or(self.value);
                 self.reported = out;
-                (out != 0.0).then_some(Signal::Float(out))
+                (out != 0.0 || self.held).then_some(Signal::Float(out))
             }
             SlotKind::Pulse => {
                 if std::mem::take(&mut self.pending) {
@@ -146,7 +152,9 @@ impl Slot {
     fn at_rest(&self) -> bool {
         match self.kind {
             SlotKind::Gate => self.value <= 0.0 && !self.rose,
-            SlotKind::Value => self.value == 0.0 && self.extreme.is_none() && self.reported == 0.0,
+            SlotKind::Value => {
+                !self.held && self.value == 0.0 && self.extreme.is_none() && self.reported == 0.0
+            }
             SlotKind::Pulse => !self.pending && self.asserted_at.is_none(),
         }
     }
@@ -273,14 +281,26 @@ impl InPortDecoder {
             }
             MidiMessage::NoteOff { ch, note, .. } => self.note_off(ch, note),
             MidiMessage::PolyAftertouch { ch, note, value } => {
-                self.set_both(MidiPin::PolyAftertouch { ch: Channel::Ch(ch), note }, value as f32 / 127.0);
+                let pin = MidiPin::PolyAftertouch { ch: Channel::Ch(ch), note };
+                self.set_both(pin.clone(), value as f32 / 127.0);
+                // Only for a note that is sounding: aftertouch is part of it.
+                if self.note_channels[note as usize] & (1 << ch) != 0 {
+                    self.hold(&pin, true);
+                    self.hold(&pin.with_channel(Channel::Any), true);
+                }
             }
             MidiMessage::ControlChange { ch, cc, value } => self.control_change(ch, cc, value),
             MidiMessage::ProgramChange { ch, program } => {
                 self.set_both(MidiPin::ProgramChange { ch: Channel::Ch(ch), program }, 1.0);
             }
             MidiMessage::ChannelPressure { ch, value } => {
-                self.set_both(MidiPin::ChannelPressure { ch: Channel::Ch(ch) }, value as f32 / 127.0);
+                let pin = MidiPin::ChannelPressure { ch: Channel::Ch(ch) };
+                self.set_both(pin.clone(), value as f32 / 127.0);
+                // The channel's pressure is its sounding notes' pressure.
+                if self.channel_sounding(ch) {
+                    self.hold(&pin, true);
+                    self.hold(&pin.with_channel(Channel::Any), true);
+                }
             }
             MidiMessage::PitchBend { ch, value } => {
                 self.set_both(MidiPin::PitchBend { ch: Channel::Ch(ch) }, midi::bend_from_14bit(value));
@@ -312,7 +332,9 @@ impl InPortDecoder {
     fn learnable_pin(&self, msg: &MidiMessage) -> Option<MidiPin> {
         Some(match *msg {
             MidiMessage::NoteOn { ch, note, .. } => MidiPin::Note { ch: Channel::Ch(ch), note },
-            MidiMessage::PolyAftertouch { ch, note, .. } => MidiPin::PolyAftertouch { ch: Channel::Ch(ch), note },
+            // Aftertouch is part of its note, so learning it learns the note —
+            // whose live value it then is.
+            MidiMessage::PolyAftertouch { ch, note, .. } => MidiPin::Note { ch: Channel::Ch(ch), note },
             MidiMessage::ControlChange { ch, cc, .. } => {
                 let c = Channel::Ch(ch);
                 match cc {
@@ -344,6 +366,18 @@ impl InPortDecoder {
         })
     }
 
+    /// Keep (or stop keeping) a value pin on the bus at 0 — see `Slot::held`.
+    fn hold(&mut self, pin: &MidiPin, on: bool) {
+        if let Some(slot) = self.slots.get_mut(pin) {
+            slot.held = on;
+        }
+    }
+
+    /// Is any note sounding on channel `ch`?
+    fn channel_sounding(&self, ch: u8) -> bool {
+        self.note_channels.iter().any(|m| m & (1 << ch) != 0)
+    }
+
     fn note_off(&mut self, ch: u8, note: u8) {
         let mask = &mut self.note_channels[note as usize];
         *mask &= !(1 << ch);
@@ -352,10 +386,19 @@ impl InPortDecoder {
         self.set(MidiPin::Note { ch: c, note }, 0.0);
         self.set(MidiPin::Velocity { ch: c, note }, 0.0);
         self.set(MidiPin::PolyAftertouch { ch: c, note }, 0.0);
+        self.hold(&MidiPin::PolyAftertouch { ch: c, note }, false);
         if !any_left {
             self.set(MidiPin::Note { ch: Channel::Any, note }, 0.0);
             self.set(MidiPin::Velocity { ch: Channel::Any, note }, 0.0);
             self.set(MidiPin::PolyAftertouch { ch: Channel::Any, note }, 0.0);
+            self.hold(&MidiPin::PolyAftertouch { ch: Channel::Any, note }, false);
+        }
+        // The channel's pressure lets go with its last note.
+        if !self.channel_sounding(ch) {
+            self.hold(&MidiPin::ChannelPressure { ch: c }, false);
+        }
+        if (0..16u8).all(|c| !self.channel_sounding(c)) {
+            self.hold(&MidiPin::ChannelPressure { ch: Channel::Any }, false);
         }
     }
 
@@ -536,6 +579,49 @@ mod tests {
             let now = self.at(ms);
             map(self.dec.poll(now))
         }
+    }
+
+    /// Aftertouch a sounding note has sent is its live value: easing it back to
+    /// nothing reads 0 rather than vanishing, until the note itself ends. The
+    /// channel's pressure does the same until the channel's last note ends.
+    #[test]
+    fn pressure_on_a_held_note_stays_on_the_bus_at_zero_until_it_ends() {
+        let mut r = Rig::new();
+        r.feed(&[0x92, 60, 100], 1); // note on, ch 3
+        r.feed(&[0xA2, 60, 50], 2); // poly aftertouch
+        r.feed(&[0xD2, 40], 3); // channel pressure
+        r.poll(4);
+        r.feed(&[0xA2, 60, 0], 5);
+        r.feed(&[0xD2, 0], 6);
+        let p = r.poll(7);
+        assert_eq!(p.get("midi:pat:3:60"), Some(&Signal::Float(0.0)), "{p:?}");
+        assert_eq!(p.get("midi:pat:*:60"), Some(&Signal::Float(0.0)));
+        assert_eq!(p.get("midi:cp:3"), Some(&Signal::Float(0.0)));
+        r.feed(&[0x82, 60, 0], 8); // note off
+        r.poll(9);
+        let p = r.poll(10);
+        assert!(!p.contains_key("midi:pat:3:60"), "gone with the note: {p:?}");
+        assert!(!p.contains_key("midi:cp:3"), "and the channel's last note");
+    }
+
+    /// With no note sounding, pressure is an ordinary value: at 0 it is at rest.
+    #[test]
+    fn pressure_without_a_note_rests_at_zero() {
+        let mut r = Rig::new();
+        r.feed(&[0xD0, 40], 1);
+        r.poll(2);
+        r.feed(&[0xD0, 0], 3);
+        r.poll(4);
+        assert!(!r.poll(5).contains_key("midi:cp:1"));
+    }
+
+    #[test]
+    fn learning_aftertouch_learns_its_note() {
+        let mut r = Rig::new();
+        r.feed(&[0x90, 60, 100], 1);
+        r.dec.take_last_pin();
+        r.feed(&[0xA0, 60, 70], 2);
+        assert_eq!(r.dec.take_last_pin(), Some(MidiPin::Note { ch: Channel::Ch(0), note: 60 }));
     }
 
     #[test]

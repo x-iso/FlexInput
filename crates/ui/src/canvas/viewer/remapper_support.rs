@@ -254,8 +254,10 @@ pub(crate) fn remapper_midi_pressed_now(
         // mappings match — so learning both made every note a two-pin chord.
         // And a note's velocity pin is part of the note. Learn captures the
         // message as it was sent; "any channel" is a choice made on the chip.
+        // Likewise its aftertouch: that is the note's live value, not a
+        // message of its own.
         if parsed.channel() == Some(midi::Channel::Any)
-            || matches!(parsed, midi::MidiPin::Velocity { .. })
+            || matches!(parsed, midi::MidiPin::Velocity { .. } | midi::MidiPin::PolyAftertouch { .. })
         {
             continue;
         }
@@ -273,6 +275,18 @@ pub(crate) fn remapper_midi_pressed_now(
             out.push(pin.clone());
         }
     }
+    // A channel's pressure, pressed while a key on that channel is down, is that
+    // key's pressure — part of the note (its live value when the keyboard sends
+    // no poly aftertouch), not a second message in the chord.
+    let note_channels: Vec<midi::Channel> = out.iter()
+        .filter_map(|p| midi::parse_pin(p))
+        .filter(|p| p.note_companions().is_some())
+        .filter_map(|p| p.channel())
+        .collect();
+    out.retain(|p| match midi::parse_pin(p) {
+        Some(midi::MidiPin::ChannelPressure { ch }) => !note_channels.contains(&ch),
+        _ => true,
+    });
     // A pin that stopped being published (back to rest) is forgotten, so the
     // next time it moves it reads as a fresh change rather than a stale one.
     seen.retain(|pin, _| live_signals.contains_key(&(dev_id.to_string(), pin.clone())));

@@ -113,9 +113,9 @@ or `*` for any channel — an input match only, never written by an output.
 
 | id | signal | |
 | --- | --- | --- |
-| `midi:note:<ch>:<n>` | Bool | a note gate |
+| `midi:note:<ch>:<n>` | Bool | a note gate — and, as a mapping input, a value (below) |
 | `midi:vel:<ch>:<n>` | Float 0–1 | the velocity riding a note gate |
-| `midi:pat:<ch>:<n>` | Float 0–1 | poly aftertouch |
+| `midi:pat:<ch>:<n>` | Float 0–1 | poly aftertouch of a note |
 | `midi:cc:<ch>:<n>` | Float 0–1 | 7-bit controller |
 | `midi:cc14:<ch>:<n>` | Float 0–1 | 14-bit controller, `n` 0–31 (MSB; LSB is `n + 32`) |
 | `midi:nrpn:<ch>:<p>` / `midi:rpn:<ch>:<p>` | Float 0–1 | parameter, `p` 0–16383 |
@@ -128,6 +128,15 @@ or `*` for any channel — an input match only, never written by an output.
 
 Legacy ids from before full MIDI — `cc_<n>` and `pitch_bend` — still load and mean the
 any-channel controller / bend.
+
+**A note is one thing.** Its velocity and poly aftertouch travel on the bus as the pins
+above, but a mapping card never holds them on their own: it holds the note. As a card
+INPUT the note is both a gate and a value — its live value is its aftertouch, else its
+channel's pressure, else its velocity (`MidiPin::note_companions`, read by
+`note_value`), and the card's `threshold` is the strike velocity that counts. As an
+OUTPUT from an Analog card the note sounds from the threshold, struck with the value
+then, and the value keeps going as its aftertouch. A MIDI port keeps a held note's
+pressure on the bus (at 0 included) once sent, until the note ends.
 
 **Mapping-card MIDI levels.** A Remapper, Touch Zones, Lean or Virtual Menu card that
 sends MIDI may carry `midi_vel`, `midi_on` and `midi_off` (0–127; defaults 100, 127, 0):
@@ -156,7 +165,10 @@ stick-click / menu ids on `device.source` `output_pin_ids` (`btn_lstick` → `bt
 `btn_rstick` → `btn_rs`, `btn_select` → `btn_back`, `btn_mode` → `btn_guide`). Add
 migrations here (never a version bump alone) when a param key or pin set changes.
 
-Two MIDI-era migrations run from `migrate_loaded_snarl`:
+Three MIDI-era migrations run from `migrate_loaded_snarl`:
+- `fold_note_companions_into_notes` rewrites a velocity or poly-aftertouch pin on any
+  mapping card (Remapper, Map Action, Lean, Touch Zones, Virtual Menu) as the note it
+  belongs to, dropping a duplicate of a note already on the card.
 - `migrate_midi_automap_port` APPENDS the AutoMap pin to MIDI nodes saved before they
   had one (never inserts — every existing wire keeps its pin index).
 - `drop_impossible_analog_modes` switches a Remapper / Map Action card set to the

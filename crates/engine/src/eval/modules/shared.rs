@@ -81,6 +81,13 @@ impl MappingShape {
         upstream: &HashMap<String, Signal>,
         pin: &str,
     ) -> Option<bool> {
+        // A note's threshold is on its VELOCITY — which strikes count — and is
+        // compared as struck, not through the curve, which shapes the
+        // aftertouch that follows.
+        if let Some(vel) = note_velocity(upstream, pin) {
+            let t = self.threshold?;
+            return Some(vel > 0.0 && vel >= t);
+        }
         match (self.threshold, analog_in_value(upstream, pin)) {
             (Some(t), Some(v)) => Some(self.shaped(v) >= t),
             _ => None,
@@ -123,12 +130,49 @@ pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) 
     if matches!(pin_id, "left_trigger" | "right_trigger") {
         return Some(upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0));
     }
+    if let Some(v) = note_value(upstream, pin_id) {
+        return Some(v);
+    }
     if let Some(pin) = midi_analog_in(pin_id) {
         let v = upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0);
         let bend = matches!(pin, flexinput_core::midi::MidiPin::PitchBend { .. });
         return Some(if bend { v.clamp(-1.0, 1.0) } else { v.clamp(0.0, 1.0) });
     }
     None
+}
+
+/// A MIDI note's live value, 0..1: while it sounds, its poly aftertouch, else
+/// its channel's pressure, else its velocity (`MidiPin::note_companions`); 0
+/// once it is released. `None` for anything that isn't a note.
+///
+/// "Else" means ABSENT from the bus, not zero: a MIDI port keeps a held note's
+/// pressure on the bus at 0 once it has been sent, so easing off aftertouch
+/// reads 0 rather than jumping back to the velocity.
+pub(crate) fn note_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+    let pin = flexinput_core::midi::parse_pin(pin_id)?;
+    let companions = pin.note_companions()?;
+    if !upstream.get(pin_id).is_some_and(|s| s.as_bool()) {
+        return Some(0.0);
+    }
+    Some(
+        companions
+            .iter()
+            .find_map(|c| upstream.get(&c.to_id()))
+            .map(|s| sig_scalar(*s).clamp(0.0, 1.0))
+            .unwrap_or(0.0),
+    )
+}
+
+/// A note's strike velocity while it sounds (0 once released). A card's
+/// threshold on a note input is measured against this, not the live value: it
+/// decides which strikes count, while the curve shapes the aftertouch after.
+pub(crate) fn note_velocity(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+    let pin = flexinput_core::midi::parse_pin(pin_id)?;
+    let [_, _, vel] = pin.note_companions()?;
+    if !upstream.get(pin_id).is_some_and(|s| s.as_bool()) {
+        return Some(0.0);
+    }
+    Some(upstream.get(&vel.to_id()).map(|s| sig_scalar(*s)).unwrap_or(0.0))
 }
 
 /// A MIDI pin a mapping can read as an analog magnitude: a controller, 14-bit
@@ -150,6 +194,8 @@ pub fn pin_is_analog_input(pin_id: &str) -> bool {
     analog_axis_for_cardinal(pin_id).is_some()
         || matches!(pin_id, "left_trigger" | "right_trigger")
         || midi_analog_in(pin_id).is_some()
+        // A note is a gate AND a value (its aftertouch).
+        || flexinput_core::midi::parse_pin(pin_id).is_some_and(|p| p.note_companions().is_some())
 }
 
 /// Whether a Remapper / Map Action card may use the Analog press mode: it

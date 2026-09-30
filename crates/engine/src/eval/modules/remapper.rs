@@ -156,12 +156,12 @@ pub(crate) fn eval_remapper_node(
                 if press.is_analog() {
                     // Buttons (non-cardinal) all held? Cardinals: any
                     // non-zero magnitude is enough — analog mode passes the
-                    // live magnitude through, no activation threshold.
+                    // live magnitude through, no activation threshold. A note
+                    // is the exception: its threshold picks the strikes that
+                    // count (by velocity), in this mode as in every other.
+                    let shape = MappingShape::from_card(m);
                     return analog_chord_active(&in_pins, |p| {
-                        match analog_in_value(&upstream, p) {
-                            Some(v) => v != 0.0,
-                            None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
-                        }
+                        analog_pin_active(&shape, &upstream, p, &read_upstream)
                     });
                 }
                 let raw_held = chord_raw_held(m, i, &in_pins, &upstream, ns);
@@ -217,10 +217,7 @@ pub(crate) fn eval_remapper_node(
                         if let Some(passed) = shape.analog_gate(&upstream, p) {
                             return passed;
                         }
-                        match analog_in_value(&upstream, p) {
-                            Some(v) => v != 0.0,
-                            None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
-                        }
+                        analog_pin_active(&shape, &upstream, p, &read_upstream)
                     });
                 }
                 in_pins.iter().all(|p| pin_held(p))
@@ -390,6 +387,9 @@ pub(crate) fn eval_remapper_node(
             // MIDI value pins an analog card drives, summed like the axes above
             // so two cards can push one controller.
             let mut midi_analog_acc: HashMap<String, f32> = HashMap::new();
+            // MIDI notes an analog card plays: (sounding, value) — the value is
+            // the velocity it strikes with and the aftertouch that follows.
+            let mut midi_note_acc: HashMap<String, (bool, f32, f32)> = HashMap::new();
             let mut analog_button_out: HashSet<String> = HashSet::new();
             let mut analog_out_pins: HashSet<String> = HashSet::new();
             for &t_idx in &analog_emit_idx {
@@ -445,6 +445,34 @@ pub(crate) fn eval_remapper_node(
                         // triggers like Switch Pro).
                         let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
                         *entry += mag_from_input.max(0.0);
+                    } else if flexinput_core::midi::parse_pin(out_p)
+                        .is_some_and(|p| p.note_companions().is_some())
+                    {
+                        // A note from a moving source: on once the value reaches
+                        // the card's threshold (any movement without one), its
+                        // value the strike's velocity and then its aftertouch.
+                        //
+                        // Played by a NOTE, it follows that note instead: on
+                        // while its key is down (the card already applied the
+                        // velocity threshold), struck with its velocity, and its
+                        // aftertouch the source's shaped live value.
+                        let v = mag_from_input.abs().min(1.0);
+                        let (on, vel) = match note_velocity(&upstream, in_p) {
+                            Some(src_vel) => (src_vel > 0.0, src_vel),
+                            None => (
+                                match shape.threshold {
+                                    Some(t) => v >= t && v > 0.0,
+                                    None => v > 0.0,
+                                },
+                                v,
+                            ),
+                        };
+                        let e = midi_note_acc.entry(out_p.clone()).or_insert((false, 0.0, 0.0));
+                        if on {
+                            e.0 = true;
+                            e.1 = e.1.max(vel);
+                            e.2 = e.2.max(v);
+                        }
                     } else if let Some((_, bipolar)) = midi_analog_out(out_p) {
                         // A MIDI value pin takes the input's live magnitude,
                         // and an analog TRIGGER contributes its travel rather
@@ -504,10 +532,30 @@ pub(crate) fn eval_remapper_node(
                 let outs = m.get("out").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 for v in &outs {
                     let Some(p) = v.as_str() else { continue };
+                    let is_note = flexinput_core::midi::parse_pin(p)
+                        .is_some_and(|mp| mp.note_companions().is_some());
+                    if is_note {
+                        midi_note_acc.entry(p.to_string()).or_insert((false, 0.0, 0.0));
+                        continue;
+                    }
                     if midi_analog_acc.contains_key(p) || midi_analog_out(p).is_none() { continue; }
                     collector_sigs.insert((key.clone(), p.to_string()), Signal::Float(0.0));
                     mark_produced(&key, p, collector_sigs);
                 }
+            }
+            // The notes analog cards play: the gate, the velocity riding it, and
+            // the aftertouch following the source for as long as it sounds.
+            for (pin, (on, vel_v, v)) in &midi_note_acc {
+                let Some(mp) = flexinput_core::midi::parse_pin(pin) else { continue };
+                let Some([pat, _, vel]) = mp.note_companions() else { continue };
+                let mut put = |id: String, sig: Signal| {
+                    collector_sigs.insert((key.clone(), id.clone()), sig);
+                    mark_produced(&key, &id, collector_sigs);
+                };
+                put(pin.clone(), Signal::Bool(*on));
+                // Never 0 while sounding: a note-on at velocity 0 is a note-off.
+                put(vel.to_id(), Signal::Float(if *on { vel_v.max(1.0 / 127.0) } else { 0.0 }));
+                put(pat.to_id(), Signal::Float(if *on { *v } else { 0.0 }));
             }
             // Commit axis accumulator: clamp ±1 then write.
             for (axis_pin, v) in &analog_axis_acc {
@@ -685,6 +733,8 @@ pub(crate) fn eval_remapper_node(
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
                                 && midi_analog_out(s).is_none()
+                                // Nor a note: the note pass above plays it.
+                                && !flexinput_core::midi::is_midi_pin(s)
                                 && is_bus_out_pin(s)
                             {
                                 analog_button_pins.insert(s.to_string());
@@ -874,14 +924,35 @@ pub(crate) fn chord_raw_held(
 /// undeflected cardinal just contributes zero. `pin_passes` supplies the
 /// per-pin verdict. Shared by activation (`effective`) and suppression
 /// (`held_now`) so the two can't disagree about when an analog card is live.
+/// Is one input of an Analog card active? A note while its key is down — past
+/// the card's velocity threshold, if it has one — whatever its aftertouch reads
+/// (eased right off is a value of 0, not a released key). Any other analog
+/// input while its value is off rest; a button while held.
+fn analog_pin_active(
+    shape: &MappingShape,
+    upstream: &HashMap<String, Signal>,
+    p: &str,
+    read_upstream: &dyn Fn(&str) -> Option<Signal>,
+) -> bool {
+    if let Some(vel) = note_velocity(upstream, p) {
+        return shape.analog_gate(upstream, p).unwrap_or(vel > 0.0);
+    }
+    match analog_in_value(upstream, p) {
+        Some(v) => v != 0.0,
+        None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
+    }
+}
+
 fn analog_chord_active(in_pins: &[&str], mut pin_passes: impl FnMut(&str) -> bool) -> bool {
-    // "Cardinal" here is any analog input (stick direction, trigger, MIDI
-    // value): ANY of them moving is enough, while every button must be held.
+    // ANY stick direction deflected is enough — opposite directions of one
+    // stick can never all be held — while every other input must pass: a
+    // button held, a trigger, knob or note active. Two notes chorded in Analog
+    // mode need both keys down.
     let mut has_cardinal = false;
     let mut any_cardinal = false;
     for p in in_pins {
         let passes = pin_passes(p);
-        if pin_is_analog_input(p) {
+        if analog_axis_for_cardinal(p).is_some() {
             has_cardinal = true;
             any_cardinal |= passes;
         } else if !passes {

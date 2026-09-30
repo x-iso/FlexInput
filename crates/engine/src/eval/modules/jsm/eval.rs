@@ -396,6 +396,19 @@ pub(crate) fn jsm_publish(
                     crate::eval::midi_bus::mark_produced(&key, &vel, collector_sigs);
                 }
             }
+            // Played by a value (a trigger, a knob, another note), the value
+            // keeps going after the strike as the note's aftertouch; otherwise
+            // it sits at 0. Written every tick like the gate — the MIDI Out
+            // encoder sends a change, not a repeat.
+            if let flexinput_core::midi::MidiPin::Note { ch, note } = mp {
+                let at = flexinput_core::midi::MidiPin::PolyAftertouch { ch, note }.to_id();
+                let v = match (on, fed) {
+                    (true, Some((r, _))) => r.abs().clamp(0.0, 1.0),
+                    _ => 0.0,
+                };
+                collector_sigs.insert((key.clone(), at.clone()), Signal::Float(v));
+                crate::eval::midi_bus::mark_produced(&key, &at, collector_sigs);
+            }
             collector_sigs.insert((key.clone(), pin.clone()), sig);
             crate::eval::midi_bus::mark_produced(&key, &pin, collector_sigs);
             continue;
@@ -907,7 +920,12 @@ fn analog_reading(
         BtnSource::Midi(m) => {
             use flexinput_core::midi::MidiPin;
             match m.pin(midi.in_channel) {
-                MidiPin::Note { ch, note } => Some((f(&MidiPin::Velocity { ch, note }.to_id()), false)),
+                // A note's live value: its aftertouch, else its channel's
+                // pressure, else its velocity — the same reading every mapping
+                // module takes (`note_value`).
+                p @ MidiPin::Note { .. } => {
+                    Some((crate::eval::modules::note_value(upstream, &p.to_id()).unwrap_or(0.0), false))
+                }
                 // The whole wheel is two-sided; a named half reads its own side.
                 p @ MidiPin::PitchBend { .. } => Some(match m.bend_dir() {
                     Some(_) => (m.reading(f(&p.to_id())), false),

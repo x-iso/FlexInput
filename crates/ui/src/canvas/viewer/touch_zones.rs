@@ -749,6 +749,9 @@ pub(crate) fn mapping_curve_editor(
     // Gamepad-focused curve field on this card: Some(6) = threshold (highlight the
     // line + enable row so the user sees what up/down / South act on).
     nav_curve_field: Option<u64>,
+    // The card's input is a MIDI note: its threshold is the strike VELOCITY that
+    // counts, and the curve shapes the note's aftertouch.
+    threshold_is_velocity: bool,
 ) -> bool {
     let mut changed = false;
     let w = ui.available_width().clamp(140.0, 360.0);
@@ -976,8 +979,15 @@ pub(crate) fn mapping_curve_editor(
     if let Some(slot) = threshold {
         let mut on = thr_val.is_some();
         let row = ui.horizontal(|ui| {
-            if ui.checkbox(&mut on, egui::RichText::new("Activation threshold").small())
-                .on_hover_text("Manual activation point for digital outputs: the binding is held while the curve's output sits on/above the orange line and releases the moment it dips below. Off = default behaviour (freq-modulated taps for analog mode, built-in stick threshold otherwise). Drag the line on the graph to tune it.")
+            let (label, hover) = if threshold_is_velocity {
+                ("Velocity threshold",
+                 "A note counts only when it is struck at or above this velocity; softer strikes are ignored. The curve above shapes the note's aftertouch (else the channel's pressure, else its velocity) while it is held. Off = every strike counts.")
+            } else {
+                ("Activation threshold",
+                 "Manual activation point for digital outputs: the binding is held while the curve's output sits on/above the orange line and releases the moment it dips below. Off = default behaviour (freq-modulated taps for analog mode, built-in stick threshold otherwise). Drag the line on the graph to tune it.")
+            };
+            if ui.checkbox(&mut on, egui::RichText::new(label).small())
+                .on_hover_text(hover)
                 .changed()
             {
                 thr_val = if on { Some(0.5) } else { None };
@@ -1136,10 +1146,15 @@ pub(crate) fn mapping_card_curve_section(
     let mut thr: Option<f32> = working.get("threshold").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     let vis = ui.visuals().clone();
+    let note_input = working.get("in").and_then(|v| v.as_array()).is_some_and(|a| {
+        a.iter().filter_map(|v| v.as_str()).any(|p| {
+            flexinput_core::midi::parse_pin(p).is_some_and(|m| m.note_companions().is_some())
+        })
+    });
     let mut changed = mapping_curve_editor(
         ui, open_id.with("ed"), &mut pts,
         if show_threshold { Some(&mut thr) } else { None },
-        live_mag, accent, &vis, nav_uid, nav_field,
+        live_mag, accent, &vis, nav_uid, nav_field, note_input,
     );
     if changed {
         if pts == identity_curve() {
@@ -1220,6 +1235,20 @@ pub(crate) fn live_analog_in_mag(
         } else if matches!(p.as_str(), "left_trigger" | "right_trigger") {
             live_signals.get(&(dev.to_string(), p.to_string()))
                 .map(|s| s.as_float().clamp(0.0, 1.0))
+        } else if let Some(mp) = flexinput_core::midi::parse_pin(p) {
+            let get = |id: &str| live_signals.get(&(dev.to_string(), id.to_string())).copied();
+            match mp.note_companions() {
+                // A note's live value: aftertouch, else channel pressure, else
+                // velocity — while it sounds (the engine's `note_value`).
+                Some(companions) => Some(if get(p).is_some_and(|s| s.as_bool()) {
+                    companions.iter().find_map(|c| get(&c.to_id()))
+                        .map(|s| s.as_float().clamp(0.0, 1.0)).unwrap_or(0.0)
+                } else {
+                    0.0
+                }),
+                None if mp.is_continuous() => Some(get(p).map(|s| s.as_float().abs().clamp(0.0, 1.0)).unwrap_or(0.0)),
+                None => None,
+            }
         } else {
             None
         };

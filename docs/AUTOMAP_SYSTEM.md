@@ -582,7 +582,8 @@ what a patch builds on purpose, and the MIDI Out node shows ⚠ when Thru is on
 and a MIDI In paired with its port sits in the same patch.
 
 **Every mapping module publishes MIDI one way** (`publish_card_midi`): a note as
-a gate with its velocity on the twin `midi:vel:` pin, a value at the card's on /
+a gate with its velocity on the twin `midi:vel:` pin (and, played by a value, that
+value as its `midi:pat:` aftertouch), a value at the card's on /
 off level (`midi_on` / `midi_off`, 0–127) or an analog card's live value, a
 program change or transport as a gate — each marked produced. Touch Zones, Lean
 and the Virtual Menu go through it; the Remapper's own MIDI pass

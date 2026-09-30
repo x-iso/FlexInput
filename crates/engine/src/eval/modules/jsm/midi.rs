@@ -10,7 +10,9 @@
 //! MIDI_C4  MIDI_CS4  MIDI_N60        a note (S is the sharp; N<n> by number)
 //! MIDI_CC7  MIDI_CC14_7              a controller, 7- or 14-bit
 //! MIDI_NRPN130  MIDI_RPN0            a parameter
-//! MIDI_PB  MIDI_CP  MIDI_AT_C4       bend, channel pressure, poly aftertouch
+//! MIDI_PB  MIDI_CP                   bend, channel pressure
+//!                                    (a note's aftertouch is part of the note:
+//!                                    as a value, MIDI_C4 reads it)
 //! MIDI_PB_UP  MIDI_PB_DOWN           one half of the bend: which way a trigger or
 //!                                    button pushes it, or which way presses
 //! MIDI_PC5                           a program change
@@ -31,7 +33,6 @@ pub enum Kind {
     Rpn,
     Bend,
     Pressure,
-    Aftertouch,
     Program,
     Start,
     Stop,
@@ -55,7 +56,7 @@ impl Kind {
     pub fn is_continuous(self) -> bool {
         matches!(
             self,
-            Kind::Cc | Kind::Cc14 | Kind::Nrpn | Kind::Rpn | Kind::Bend | Kind::Pressure | Kind::Aftertouch
+            Kind::Cc | Kind::Cc14 | Kind::Nrpn | Kind::Rpn | Kind::Bend | Kind::Pressure
         )
     }
 }
@@ -136,7 +137,13 @@ fn parse_body(body: &str, raw: &str) -> Result<MidiName, String> {
             } else if let Some(d) = body.strip_prefix("PC") {
                 mk(Kind::Program, num(d, 127, "a program")?)
             } else if let Some(n) = body.strip_prefix("AT_") {
-                mk(Kind::Aftertouch, note_number(n).ok_or_else(|| not_a_note(raw))?)
+                // Aftertouch is part of its note, not a message of its own.
+                let note = note_number(n).map(spell_note).unwrap_or_else(|| n.to_string());
+                return Err(format!(
+                    "`{raw}` — a note's aftertouch is part of the note: `MIDI_{note}` reads it \
+                     as its live value (its aftertouch, else the channel's pressure, else its \
+                     velocity), and plays it when a trigger or stick drives the note"
+                ));
             } else if let Some(n) = note_number(body) {
                 mk(Kind::Note, n)
             } else {
@@ -151,10 +158,6 @@ fn parse_body(body: &str, raw: &str) -> Result<MidiName, String> {
         return Err(format!("`{raw}` — this message has no channel"));
     }
     Ok(name)
-}
-
-fn not_a_note(raw: &str) -> String {
-    format!("`{raw}` — a note is a name and octave (C4, CS4, BB3 isn't one — use AS3) or N0 to N127")
 }
 
 /// `C4`, `CS4`, `N60` → a note number. C4 is 60; `S` is the sharp, since `#` is
@@ -214,7 +217,6 @@ impl MidiName {
                 _ => "PB".into(),
             },
             Kind::Pressure => "CP".into(),
-            Kind::Aftertouch => format!("AT_{}", spell_note(self.num)),
             Kind::Program => format!("PC{}", self.num),
             Kind::Start => "START".into(),
             Kind::Stop => "STOP".into(),
@@ -288,7 +290,6 @@ impl MidiName {
             Kind::Rpn => MidiPin::Rpn { ch, param: self.num },
             Kind::Bend => MidiPin::PitchBend { ch },
             Kind::Pressure => MidiPin::ChannelPressure { ch },
-            Kind::Aftertouch => MidiPin::PolyAftertouch { ch, note: n7 },
             Kind::Program => MidiPin::ProgramChange { ch, program: n7 },
             Kind::Start => MidiPin::Transport(Transport::Start),
             Kind::Stop => MidiPin::Transport(Transport::Stop),
@@ -335,7 +336,8 @@ pub fn tag_for_pin(pin_id: &str) -> Option<String> {
         MidiPin::Rpn { param, .. } => (Kind::Rpn, param),
         MidiPin::PitchBend { .. } => (Kind::Bend, 0),
         MidiPin::ChannelPressure { .. } => (Kind::Pressure, 0),
-        MidiPin::PolyAftertouch { note, .. } => (Kind::Aftertouch, note as u16),
+        // A note's companions are written as the note itself.
+        MidiPin::PolyAftertouch { note, .. } => (Kind::Note, note as u16),
         MidiPin::ProgramChange { program, .. } => (Kind::Program, program as u16),
         MidiPin::Transport(Transport::Start) => (Kind::Start, 0),
         MidiPin::Transport(Transport::Stop) => (Kind::Stop, 0),
@@ -607,7 +609,7 @@ mod tests {
     fn names_parse_and_spell_back() {
         for s in [
             "MIDI_C4", "MIDI_CS4", "MIDI_N5", "MIDI_G9", "MIDI_CC7", "MIDI_CC14_7",
-            "MIDI_NRPN130", "MIDI_RPN0", "MIDI_PB", "MIDI_CP", "MIDI_AT_C4", "MIDI_PC5",
+            "MIDI_NRPN130", "MIDI_RPN0", "MIDI_PB", "MIDI_CP", "MIDI_PC5",
             "MIDI_PB_UP", "MIDI_PB_DOWN_CH3",
             "MIDI_START", "MIDI_STOP", "MIDI_CONTINUE", "MIDI_BPM", "MIDI_PLAYING",
             "MIDI_C4_CH10", "MIDI_CC7_CHANY", "MIDI_PB_CH16",
@@ -633,7 +635,7 @@ mod tests {
     fn a_malformed_midi_name_says_why_and_others_are_left_alone() {
         assert!(parse("SPACE").is_none());
         assert!(parse("X_A").is_none());
-        for bad in ["MIDI_CC200", "MIDI_C4_CH17", "MIDI_START_CH2", "MIDI_H4", "MIDI_CC14_40"] {
+        for bad in ["MIDI_CC200", "MIDI_C4_CH17", "MIDI_START_CH2", "MIDI_H4", "MIDI_CC14_40", "MIDI_AT_C4"] {
             assert!(parse(bad).unwrap().is_err(), "{bad}");
         }
     }
@@ -664,8 +666,10 @@ mod tests {
         assert_eq!(tag_for_pin("midi:rt:start").as_deref(), Some("MIDI_START"));
         assert_eq!(tag_for_pin("midi:sx:F07E7F0601F7").as_deref(), Some("@\"midi:sx:F07E7F0601F7\""));
         assert_eq!(tag_for_pin("midi:vel:1:60"), None);
+        // A note's aftertouch is written as the note it belongs to.
+        assert_eq!(tag_for_pin("midi:pat:2:60").as_deref(), Some("MIDI_C4_CH2"));
         // And every word it writes parses back to the same pin.
-        for id in ["midi:note:3:0", "midi:nrpn:1:300", "midi:pat:16:127", "midi:pc:4:5", "midi:pb:9"] {
+        for id in ["midi:note:3:0", "midi:nrpn:1:300", "midi:note:16:127", "midi:pc:4:5", "midi:pb:9"] {
             let tag = tag_for_pin(id).unwrap();
             assert_eq!(p(&tag).pin(None).to_id(), id, "{tag}");
         }

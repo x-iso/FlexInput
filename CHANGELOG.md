@@ -49,6 +49,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   or button bends. The editor's command list has a **MIDI…** row that writes a
   name for you, and SysEx goes behind `@` as `@"midi:sx:F0…F7"`.
 
+- **A MIDI note is one thing: a key, and how hard it is pressed.** Its velocity
+  and aftertouch are no longer separate messages to pick or learn — they are
+  the note's own. On a card, a note is both a button and an analog input: its
+  response curve follows the aftertouch (or the channel's pressure, or failing
+  both the velocity) while the key is down, and its threshold sets the velocity
+  a strike needs to count. Played from a trigger or stick, a note strikes with
+  the value at the threshold and then follows it as aftertouch. Cards saved
+  with a separate velocity or aftertouch pin are switched to the note.
+
 - **Touch Zones, Lean, the Virtual Menu and Map Action speak MIDI too.** Zone,
   lean and menu cards can play MIDI (a **MIDI…** button, or learning from a MIDI
   controller), a lean can drive a controller by how far the pad leans, and a

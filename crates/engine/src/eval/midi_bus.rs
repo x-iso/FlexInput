@@ -128,6 +128,12 @@ pub(crate) fn publish_card_midi(
         if gate {
             put(midi::MidiPin::Velocity { ch, note }.to_id(), Signal::Float(v), collector_sigs);
         }
+        // Played by a value, the value keeps going after the strike as the
+        // note's aftertouch — a note is a gate and a value.
+        if let CardMidi::Value(live) = state {
+            let at = if gate { live.clamp(0.0, 1.0) } else { 0.0 };
+            put(midi::MidiPin::PolyAftertouch { ch, note }.to_id(), Signal::Float(at), collector_sigs);
+        }
         return;
     }
     let sig = if pin.is_continuous() {

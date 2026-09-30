@@ -115,7 +115,10 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                 // A MIDI output: in Analog mode a value follows the lean (a
                 // bend leaning left goes down); otherwise it is on while held.
                 if let Some(mp) = flexinput_core::midi::parse_pin(p) {
-                    let state = if is_analog_mode && mp.is_continuous() {
+                    // A note is a value too: in Analog mode it sounds while the
+                    // lean does, struck and then pressed as hard as it leans.
+                    let valued = mp.is_continuous() || mp.note_companions().is_some();
+                    let state = if is_analog_mode && valued {
                         let mag = analog_val_opt.unwrap_or(0.0);
                         let bend = matches!(mp, flexinput_core::midi::MidiPin::PitchBend { .. });
                         CardMidi::Value(if bend && side_idx == 0 { -mag } else { mag })

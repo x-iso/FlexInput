@@ -111,9 +111,20 @@ pub(crate) fn eval_map_action_node(
                     let mut any_cardinal_active = false;
                     let mut all_buttons_held = true;
                     let mut local_max: f32 = 0.0;
+                    let mut has_value = false;
                     for p in &in_pins {
-                        // Any analog input — stick direction, trigger, MIDI
-                        // value — counts as the "cardinal" side of the chord.
+                        // Stick directions: ANY deflected is enough (opposite
+                        // ones can't all be held). Every other analog input — a
+                        // trigger, a knob, a note — must be active, as a button
+                        // must be held; each still sets the magnitude.
+                        if analog_axis_for_cardinal(p).is_none() {
+                            if let Some(v) = analog_in_value(&upstream, p) {
+                                if v == 0.0 { all_buttons_held = false; }
+                                if v.abs() > local_max { local_max = v.abs(); }
+                                has_value = true;
+                                continue;
+                            }
+                        }
                         if let Some(v) = analog_in_value(&upstream, p) {
                             has_cardinal = true;
                             let mag = v.abs();
@@ -128,7 +139,7 @@ pub(crate) fn eval_map_action_node(
                     // to 1.0 while gated so the Float output reads full.
                     let mag = if !active {
                         0.0
-                    } else if has_cardinal { local_max } else { 1.0 };
+                    } else if has_cardinal || has_value { local_max } else { 1.0 };
                     // out_analog: pure magnitude (max across active mappings).
                     if mag > max_analog_mag { max_analog_mag = mag; }
                     // out (Bool): freq-modulated tap train / PWM (Hold) / ×2

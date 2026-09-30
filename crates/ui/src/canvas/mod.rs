@@ -229,6 +229,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         }
         migrate_midi_automap_port(&mut node.value);
         clear_stuck_nav_arms(&mut node.value);
+        fold_note_companions_into_notes(&mut node.value);
         drop_impossible_analog_modes(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
@@ -309,6 +310,55 @@ fn clear_stuck_nav_arms(node: &mut NodeData) {
         node.params.insert(key, Value::Bool(false));
     }
     node.params.remove(crate::canvas::viewer::MIDI_PICK_OPEN);
+}
+
+/// A note's velocity and poly aftertouch are part of the note — its strike and
+/// its live value — rather than messages of their own, so a mapping card no
+/// longer holds them separately. A card saved when they could be picked on their
+/// own has each rewritten as the note it belongs to (same channel, same note),
+/// with duplicates dropped; an Analog card stays Analog, where the note now
+/// carries the value the old pin did. Every mapping card list is covered: a
+/// Remapper's and a Map Action's (legacy bare pin lists too), a Lean section's,
+/// a Touch Zones / Virtual Menu zone's. Idempotent.
+fn fold_note_companions_into_notes(node: &mut NodeData) {
+    use flexinput_core::midi::MidiPin;
+    let keys: &[&str] = match node.module_id.as_str() {
+        "module.remapper" | "module.map_action" => &["mappings"],
+        "processing.gyro_3dof" => &["lean_left", "lean_right"],
+        "module.touch_zones" | "module.menu" => &["zone_maps"],
+        _ => return,
+    };
+    fn fold(pins: &mut Vec<Value>) {
+        let mut out: Vec<Value> = Vec::with_capacity(pins.len());
+        for v in pins.drain(..) {
+            let v = match v.as_str().and_then(flexinput_core::midi::parse_pin) {
+                Some(MidiPin::Velocity { ch, note }) | Some(MidiPin::PolyAftertouch { ch, note }) => {
+                    Value::String(MidiPin::Note { ch, note }.to_id())
+                }
+                _ => v,
+            };
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        *pins = out;
+    }
+    for key in keys {
+        let Some(Value::Array(cards)) = node.params.get_mut(*key) else { continue };
+        for card in cards.iter_mut() {
+            match card {
+                Value::Array(pins) => fold(pins),
+                Value::Object(m) => {
+                    for side in ["in", "out"] {
+                        if let Some(Value::Array(pins)) = m.get_mut(side) {
+                            fold(pins);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// A Remapper / Map Action card in the Analog press mode needs an analog input
@@ -585,6 +635,34 @@ mod migration_tests {
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
     /// and the migration recurses into sub-patches.
+    /// A velocity or aftertouch pin saved on a card becomes the note it belongs
+    /// to — the note carries both now — without duplicating a note already there.
+    #[test]
+    fn loading_folds_a_notes_velocity_and_aftertouch_into_the_note() {
+        let mut params = HashMap::new();
+        params.insert("mappings".to_string(), serde_json::json!([
+            { "in": ["midi:vel:2:60"], "out": ["btn_south"] },
+            { "in": ["midi:note:2:60", "midi:pat:2:60"], "out": ["right_trigger"], "mode": "analog" },
+            { "in": ["btn_east"], "out": ["midi:pat:1:64"], "mode": "analog" },
+        ]));
+        let mut node = NodeData {
+            module_id: "module.remapper".to_string(),
+            display_name: "Remapper".to_string(),
+            category: "Module".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        fold_note_companions_into_notes(&mut node);
+        let cards = node.params["mappings"].as_array().unwrap().clone();
+        assert_eq!(cards[0]["in"], serde_json::json!(["midi:note:2:60"]));
+        assert_eq!(cards[1]["in"], serde_json::json!(["midi:note:2:60"]), "no duplicate note");
+        assert_eq!(cards[1]["mode"], "analog");
+        assert_eq!(cards[2]["out"], serde_json::json!(["midi:note:1:64"]));
+    }
+
     /// A card of buttons alone can't be Analog: loading switches it to Normal
     /// (clearing the time gap it carried), and leaves every card that has an
     /// analog input — or isn't Analog — exactly as it was.

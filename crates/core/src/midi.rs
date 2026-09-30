@@ -159,6 +159,22 @@ impl MidiPin {
         }
     }
 
+    /// For a note, the pins that carry the rest of it, most specific first: its
+    /// poly aftertouch, its channel's pressure, its velocity. A note is one
+    /// thing with a gate and a live value — the value being its aftertouch, or
+    /// failing that the channel's pressure, or failing that how hard it was
+    /// struck — so everything that reads a note's value asks in this order.
+    pub fn note_companions(&self) -> Option<[MidiPin; 3]> {
+        match *self {
+            MidiPin::Note { ch, note } => Some([
+                MidiPin::PolyAftertouch { ch, note },
+                MidiPin::ChannelPressure { ch },
+                MidiPin::Velocity { ch, note },
+            ]),
+            _ => None,
+        }
+    }
+
     /// Bus signal type carried by this pin.
     pub fn signal_type(&self) -> SignalType {
         use MidiPin::*;

@@ -4861,7 +4861,8 @@ mod midi_source_tests {
         let ok = |card: serde_json::Value| card_allows_analog_mode(&card);
         assert!(!ok(serde_json::json!({ "in": ["btn_south"] })));
         assert!(!ok(serde_json::json!({ "in": ["btn_south", "dpad_up"] })));
-        assert!(!ok(serde_json::json!({ "in": ["midi:note:1:60"] })));
+        // A note is a gate AND a value (its aftertouch), so it is analog too.
+        assert!(ok(serde_json::json!({ "in": ["midi:note:1:60"] })));
         assert!(!ok(serde_json::json!({ "in": ["midi:rt:bpm"] })));
         assert!(!ok(serde_json::json!({})));
         assert!(ok(serde_json::json!({ "in": ["btn_l1", "left_stick_up"] })));
@@ -5034,6 +5035,142 @@ mod midi_source_tests {
         snap.device_id = Some("gilrs:xinput:0".to_string());
         let out = compute_node(&snap, &[], &mut NodeState::default(), &HashMap::new(), &HashMap::new(), 0.016);
         assert_eq!(out, vec![None]);
+    }
+
+    fn note_sigs(vel: f32, pat: Option<f32>, cp: Option<f32>) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        let d = "midi_in:0".to_string();
+        m.insert((d.clone(), "midi:note:1:60".to_string()), Signal::Bool(true));
+        m.insert((d.clone(), "midi:vel:1:60".to_string()), Signal::Float(vel));
+        if let Some(v) = pat { m.insert((d.clone(), "midi:pat:1:60".to_string()), Signal::Float(v)); }
+        if let Some(v) = cp { m.insert((d.clone(), "midi:cp:1".to_string()), Signal::Float(v)); }
+        m
+    }
+
+    fn trigger_from(graph: &ProcessingGraph, sigs: &HashMap<(String, String), Signal>) -> f32 {
+        let mut out = TickOutput::default();
+        eval_graph_tick(graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+        out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(f32::NAN)
+    }
+
+    /// A note's live value is its poly aftertouch, else its channel's pressure,
+    /// else its velocity — so an Analog card on a note follows whatever the
+    /// keyboard sends while the key is down.
+    #[test]
+    fn a_note_on_an_analog_card_gives_aftertouch_then_pressure_then_velocity() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([
+                    { "in": ["midi:note:1:60"], "out": ["right_trigger"], "mode": "analog" },
+                ])),
+                pad_sink(3, "remap:2"),
+            ],
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(near(trigger_from(&graph, &note_sigs(0.8, None, None)), 0.8), "velocity alone");
+        assert!(near(trigger_from(&graph, &note_sigs(0.8, None, Some(0.3))), 0.3), "channel pressure");
+        assert!(near(trigger_from(&graph, &note_sigs(0.8, Some(0.5), Some(0.3))), 0.5), "aftertouch");
+        let eased = trigger_from(&graph, &note_sigs(0.8, Some(0.0), None));
+        assert!(eased == 0.0 || eased.is_nan(),
+            "aftertouch eased off reads 0 (released), not the velocity — got {eased}");
+    }
+
+    /// A card's threshold on a note is its VELOCITY: soft strikes don't count.
+    #[test]
+    fn a_note_cards_threshold_is_on_velocity() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([
+                    { "in": ["midi:note:1:60"], "out": ["btn_south"], "threshold": 0.6 },
+                ])),
+                pad_sink(3, "remap:2"),
+            ],
+        };
+        let south = |sigs: &HashMap<(String, String), Signal>| {
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string()))
+                .map(|s| s.as_bool()).unwrap_or(false)
+        };
+        assert!(!south(&note_sigs(0.4, Some(0.9), None)), "a soft strike, however hard it is pressed after");
+        assert!(south(&note_sigs(0.7, Some(0.0), None)), "a hard strike, whatever its aftertouch");
+    }
+
+    /// A note played by a moving source: on at the threshold, velocity = the
+    /// value then, and poly aftertouch following it while it sounds.
+    #[test]
+    fn an_analog_card_plays_a_note_with_velocity_and_aftertouch() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                pad_source_for_midi(1),
+                pad_remapper(2, serde_json::json!([
+                    { "in": ["right_trigger"], "out": ["midi:note:1:60"], "mode": "analog", "threshold": 0.2 },
+                ])),
+                midi_out_sink(4, "remap:2", None, false),
+            ],
+        };
+        let run = |v: f32| {
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &pad_sigs(&[("right_trigger", Signal::Float(v))]), 0.016, &mut out);
+            (midi_out_of(&out, "midi:note:1:60"), midi_out_of(&out, "midi:vel:1:60"), midi_out_of(&out, "midi:pat:1:60"))
+        };
+        let (note, _, _) = run(0.1);
+        assert_ne!(note, Some(Signal::Bool(true)), "below the threshold, silent");
+        let (note, vel, pat) = run(0.5);
+        assert_eq!(note, Some(Signal::Bool(true)));
+        assert!((vel.unwrap().as_float() - 0.5).abs() < 1e-4, "{vel:?}");
+        assert!((pat.unwrap().as_float() - 0.5).abs() < 1e-4, "{pat:?}");
+    }
+
+    /// A note playing a note on an Analog card follows the key: on while it is
+    /// down even with its aftertouch eased right off, struck with the source's
+    /// velocity, its aftertouch the source's.
+    #[test]
+    fn a_note_played_by_a_note_follows_the_key() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([
+                    { "in": ["midi:note:1:60"], "out": ["midi:note:2:72"], "mode": "analog" },
+                ])),
+                midi_out_sink(4, "remap:2", Some("midi_in:0"), false),
+            ],
+        };
+        let run = |sigs: &HashMap<(String, String), Signal>| {
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            (midi_out_of(&out, "midi:note:2:72"), midi_out_of(&out, "midi:vel:2:72"), midi_out_of(&out, "midi:pat:2:72"))
+        };
+        let (note, vel, pat) = run(&note_sigs(0.7, Some(0.0), None));
+        assert_eq!(note, Some(Signal::Bool(true)), "key down, aftertouch at 0: still sounding");
+        assert!((vel.unwrap().as_float() - 0.7).abs() < 1e-4, "the source's velocity: {vel:?}");
+        assert_eq!(pat.map(|s| s.as_float()), Some(0.0));
+        let (_, _, pat) = run(&note_sigs(0.7, Some(0.4), None));
+        assert!((pat.unwrap().as_float() - 0.4).abs() < 1e-4);
+    }
+
+    /// Two notes chorded on an Analog card need BOTH keys — only stick
+    /// directions are "any one of them".
+    #[test]
+    fn an_analog_chord_of_two_notes_needs_both() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([
+                    { "in": ["midi:note:1:60", "midi:note:1:64"], "out": ["right_trigger"], "mode": "analog" },
+                ])),
+                pad_sink(3, "remap:2"),
+            ],
+        };
+        let one = note_sigs(0.8, None, None);
+        assert!(trigger_from(&graph, &one) == 0.0 || trigger_from(&graph, &one).is_nan(), "one key isn't the chord");
+        let mut both = one.clone();
+        both.insert(("midi_in:0".to_string(), "midi:note:1:64".to_string()), Signal::Bool(true));
+        both.insert(("midi_in:0".to_string(), "midi:vel:1:64".to_string()), Signal::Float(0.8));
+        assert!(trigger_from(&graph, &both) > 0.5);
     }
 
     /// A Combiner fed a MIDI port and a gamepad carries BOTH on: the pad's pins

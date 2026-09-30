@@ -706,8 +706,14 @@ pub struct ModuleDescriptor {
   - *Out:* Learn plays the message on any MIDI In in the patch (a picker chooses one when
     there are several), or **MIDI…** builds it by hand in the MIDI editor window, for
     either side of the card. Per card: `midi_vel`, `midi_on`, `midi_off` (0–127).
+  - A note is one input with two sides: its gate, and its live value — aftertouch, else
+    the channel's pressure, else velocity. On a note card the response curve shapes that
+    value and the threshold is a **velocity** threshold (which strikes count). As an
+    output from an Analog card, a note sounds from the threshold, struck with the value
+    then, and follows it as aftertouch. Velocity and poly aftertouch are no longer picked
+    or learned on their own.
   - The Analog press mode is offered only for a card with an analog input — a stick
-    direction, a trigger or a continuous MIDI value — alone or chorded with buttons
+    direction, a trigger, a note or a continuous MIDI value — alone or chorded with buttons
     (`flexinput_engine::card_allows_analog_mode`); loading resets any other card to
     Normal. An Analog card passes that input's live value, from the first bit of
     movement.

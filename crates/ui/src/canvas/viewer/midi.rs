@@ -27,10 +27,11 @@ pub(crate) fn midi_pin_label(pin_id: &str) -> String {
 
 /// The kinds of MIDI pin the picker can build, in menu order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The message types a MIDI picker offers. No velocity or poly-aftertouch
+/// type: those are part of a note — its strike and its live value — carried on
+/// the note's own card, never picked on their own.
 enum PickKind {
     Note,
-    Velocity,
-    PolyAftertouch,
     Cc,
     Cc14,
     Nrpn,
@@ -47,8 +48,8 @@ enum PickKind {
 }
 
 impl PickKind {
-    const ALL: [PickKind; 16] = [
-        PickKind::Note, PickKind::Velocity, PickKind::PolyAftertouch, PickKind::Cc,
+    const ALL: [PickKind; 14] = [
+        PickKind::Note, PickKind::Cc,
         PickKind::Cc14, PickKind::Nrpn, PickKind::Rpn, PickKind::PitchBend,
         PickKind::ChannelPressure, PickKind::ProgramChange, PickKind::Start,
         PickKind::Stop, PickKind::Continue, PickKind::Playing, PickKind::Bpm,
@@ -58,8 +59,6 @@ impl PickKind {
     fn label(self) -> &'static str {
         match self {
             PickKind::Note => "Note",
-            PickKind::Velocity => "Note velocity",
-            PickKind::PolyAftertouch => "Poly aftertouch",
             PickKind::Cc => "CC",
             PickKind::Cc14 => "CC (14-bit)",
             PickKind::Nrpn => "NRPN",
@@ -91,7 +90,7 @@ impl PickKind {
     /// Inclusive number range, when the kind has a number.
     fn number_range(self) -> Option<u32> {
         match self {
-            PickKind::Note | PickKind::Velocity | PickKind::PolyAftertouch | PickKind::Cc | PickKind::ProgramChange => Some(127),
+            PickKind::Note | PickKind::Cc | PickKind::ProgramChange => Some(127),
             PickKind::Cc14 => Some(31),
             PickKind::Nrpn | PickKind::Rpn => Some(16383),
             _ => None,
@@ -99,15 +98,13 @@ impl PickKind {
     }
 
     fn is_note(self) -> bool {
-        matches!(self, PickKind::Note | PickKind::Velocity | PickKind::PolyAftertouch)
+        matches!(self, PickKind::Note)
     }
 
     fn build(self, ch: Channel, n: u32, sysex_hex: &str) -> Option<MidiPin> {
         let n7 = n.min(127) as u8;
         Some(match self {
             PickKind::Note => MidiPin::Note { ch, note: n7 },
-            PickKind::Velocity => MidiPin::Velocity { ch, note: n7 },
-            PickKind::PolyAftertouch => MidiPin::PolyAftertouch { ch, note: n7 },
             PickKind::Cc => MidiPin::Cc { ch, cc: n7 },
             PickKind::Cc14 => MidiPin::Cc14 { ch, cc: n.min(31) as u8 },
             PickKind::Nrpn => MidiPin::Nrpn { ch, param: n.min(16383) as u16 },

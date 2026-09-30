@@ -892,7 +892,7 @@ it or it presses a key.
 | parameter | `MIDI_NRPN130`, `MIDI_RPN0` | |
 | bend / pressure | `MIDI_PB`, `MIDI_CP` | `MIDI_PB` is the whole wheel, both ways |
 | half a bend | `MIDI_PB_UP`, `MIDI_PB_DOWN` | what a one-way source (a button, a trigger, a knob, a finger) pushes, and — as an input — only that way pressing; the whole wheel from a one-way source is an error that says which to pick |
-| poly aftertouch | `MIDI_AT_C4`, `MIDI_AT_N60` | |
+| (poly aftertouch) | — | part of the note: `MIDI_C4` as a value reads its aftertouch, else the channel's pressure, else its velocity; `MIDI_AT_*` is an error saying so |
 | program change | `MIDI_PC5` | a pulse |
 | transport | `MIDI_START`, `MIDI_STOP`, `MIDI_CONTINUE` | pulses |
 | clock, transport state | `MIDI_BPM`, `MIDI_PLAYING` | inputs only — nothing to send |
