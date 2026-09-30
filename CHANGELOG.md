@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-01
+
 ### Added
 
 - **Full MIDI, both ways.** MIDI used to mean controller numbers and pitch bend,
