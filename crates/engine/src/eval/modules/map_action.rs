@@ -109,9 +109,11 @@ pub(crate) fn eval_map_action_node(
                     let mut all_buttons_held = true;
                     let mut local_max: f32 = 0.0;
                     for p in &in_pins {
-                        if analog_axis_for_cardinal(p).is_some() {
+                        // Any analog input — stick direction, trigger, MIDI
+                        // value — counts as the "cardinal" side of the chord.
+                        if let Some(v) = analog_in_value(&upstream, p) {
                             has_cardinal = true;
-                            let mag = analog_cardinal_input_value(&upstream, p);
+                            let mag = v.abs();
                             if mag > 0.0 { any_cardinal_active = true; }
                             if mag > local_max { local_max = mag; }
                         } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {

@@ -496,6 +496,22 @@ mod trigger_tests {
         assert!((v - 0.5).abs() < 0.05, "halving curve should give ~0.5 at full push, got {v}");
     }
 
+    // An analog trigger on an Analog card passes its TRAVEL, from the first
+    // bit of pull: it used to count as pressed only past half travel and then
+    // drive the target at full strength.
+    #[test]
+    fn remapper_analog_trigger_passes_its_travel() {
+        let graph = curve_remap_graph(serde_json::json!({
+            "in": ["left_trigger"], "out": ["left_stick_up"], "mode": "analog",
+        }));
+        let mut sigs = HashMap::new();
+        sigs.insert(("gilrs:switch_pro:0".to_string(), "left_trigger".to_string()), Signal::Float(0.3));
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+        let Some(Signal::Vec2(v)) = sinkv(&out, "left_stick") else { panic!("no stick output") };
+        assert!((v.y - 0.3).abs() < 1e-4, "a 30% pull should push the stick 30%, got {}", v.y);
+    }
+
     // Manual threshold on an analog→digital mapping: PLAIN HOLD above the
     // line (steady across ticks — no tap train), release the moment the
     // shaped value dips below.
@@ -4806,6 +4822,55 @@ mod midi_source_tests {
             Some(&Signal::Float(0.5)),
             "an unmapped MIDI pin passes through",
         );
+    }
+
+    /// A MIDI knob on an Analog card drives its pad target by the knob's
+    /// VALUE — not full strength the moment it leaves zero — and a bend's lower
+    /// half pushes the other way, so one card maps the whole wheel to an axis.
+    #[test]
+    fn an_analog_card_passes_a_midi_value_through() {
+        let graph = ProcessingGraph {
+            nodes: vec![
+                midi_source(&["automap_out"]),
+                remapper(2, serde_json::json!([
+                    { "in": ["midi:cc:1:7"], "out": ["right_trigger"], "mode": "analog" },
+                    { "in": ["midi:pb:1"], "out": ["left_stick_right"], "mode": "analog" },
+                ])),
+                pad_sink(3, "remap:2"),
+            ],
+        };
+        let mut sigs = HashMap::new();
+        sigs.insert(("midi_in:0".to_string(), "midi:cc:1:7".to_string()), Signal::Float(0.3));
+        sigs.insert(("midi_in:0".to_string(), "midi:pb:1".to_string()), Signal::Float(-0.4));
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+        let f = |pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string()))
+            .map(|s| s.as_float()).unwrap_or(f32::NAN);
+        assert!((f("right_trigger") - 0.3).abs() < 1e-4, "got {}", f("right_trigger"));
+        let stick = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick".to_string()));
+        let Some(Signal::Vec2(v)) = stick else { panic!("no stick: {stick:?}") };
+        assert!((v.x + 0.4).abs() < 1e-4, "bend down should push the stick left, got {}", v.x);
+    }
+
+    /// Analog mode needs an analog input: a card of buttons alone can't carry a
+    /// magnitude, while a stick / trigger / MIDI value — alone or chorded with
+    /// buttons — can. The tempo is continuous but is not a 0..1 position.
+    #[test]
+    fn analog_mode_is_allowed_only_with_an_analog_input() {
+        let ok = |card: serde_json::Value| card_allows_analog_mode(&card);
+        assert!(!ok(serde_json::json!({ "in": ["btn_south"] })));
+        assert!(!ok(serde_json::json!({ "in": ["btn_south", "dpad_up"] })));
+        assert!(!ok(serde_json::json!({ "in": ["midi:note:1:60"] })));
+        assert!(!ok(serde_json::json!({ "in": ["midi:rt:bpm"] })));
+        assert!(!ok(serde_json::json!({})));
+        assert!(ok(serde_json::json!({ "in": ["btn_l1", "left_stick_up"] })));
+        assert!(ok(serde_json::json!({ "in": ["right_trigger"] })));
+        assert!(ok(serde_json::json!({ "in": ["midi:cc:*:74"] })));
+        assert!(ok(serde_json::json!({ "in": ["midi:pb:3"] })));
+        // Map Action's legacy bare pin list.
+        assert!(ok(serde_json::json!(["left_stick_down"])));
+        assert!(!ok(serde_json::json!(["btn_east"])));
     }
 
     /// Any-channel input: a mapping on `midi:note:*:60` fires whichever channel

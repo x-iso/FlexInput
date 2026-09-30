@@ -721,12 +721,16 @@ pub(crate) fn show_remapper_body(
                                 // analog (stick cardinal / trigger), since
                                 // both analog-mode shaping and digital-mode
                                 // thresholds key off the input magnitude.
+                                //
+                                // The same test gates the Analog press mode:
+                                // without an analog input there is no
+                                // magnitude to pass on.
                                 let card_analog = in_pins.iter()
                                     .any(|p| flexinput_engine::pin_is_analog_input(p));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
-                                    true, true, reorder_enabled, drag_off, "mappings", card_analog,
+                                    card_analog, true, reorder_enabled, drag_off, "mappings", card_analog,
                                     card_conf.as_ref(),
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
@@ -1212,10 +1216,13 @@ pub(crate) fn show_map_action_body(
                             egui::vec2((BODY_W - 18.0).min(358.0), 1.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
+                                // Analog press mode only with an analog input.
+                                let card_analog = in_pins.iter()
+                                    .any(|p| flexinput_engine::pin_is_analog_input(p));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
-                                    true, false, reorder_enabled, drag_off, "mappings", false,
+                                    card_analog, false, reorder_enabled, drag_off, "mappings", false,
                                     None, // Map Action rows aren't bus writers (out_pins None)
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }

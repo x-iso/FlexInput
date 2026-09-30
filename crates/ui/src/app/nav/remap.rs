@@ -227,6 +227,13 @@ impl FlexInputApp {
     pub(crate) const REMAP_PRESS_MODES: &'static [&'static str] =
         &["down","short","long","double","on_press","on_release","sequence","analog"];
 
+    /// The two lists above without Analog, for a card with no analog input to
+    /// take a magnitude from (see `flexinput_engine::card_allows_analog_mode`).
+    const PRESS_MODES_NO_ANALOG: &'static [&'static str] =
+        &["down","short","long","double","on_press","on_release"];
+    const REMAP_PRESS_MODES_NO_ANALOG: &'static [&'static str] =
+        &["down","short","long","double","on_press","on_release","sequence"];
+
     /// Whether the selected widget is a Remapper (not Map Action / Lean / Touch
     /// Zones, which share the card machinery).
     pub(crate) fn nav_selected_is_remapper(&self, outer_id: egui_snarl::NodeId) -> bool {
@@ -235,18 +242,27 @@ impl FlexInputApp {
 
     /// Press modes offered for card `idx` of the selected widget. Sequence only
     /// on a Remapper card with two or more inputs or a single analog input (the
-    /// card popup grays it out otherwise; nav just skips it).
+    /// card popup grays it out otherwise; nav just skips it). Analog only when
+    /// the card has an analog input — always so for Lean and Touch Zones, whose
+    /// input (the lean, the touch) is analog by nature.
     pub(crate) fn nav_press_modes(&self, outer_id: egui_snarl::NodeId, idx: usize) -> &'static [&'static str] {
-        let sequence_ok = self.nav_remap_card_json(outer_id, idx)
+        let card = self.nav_remap_card_json(outer_id, idx);
+        let sequence_ok = card.as_ref()
             .and_then(|m| m.get("in").and_then(|v| v.as_array()).map(|a| match a.as_slice() {
                 [only] => only.as_str().is_some_and(flexinput_engine::pin_is_analog_input),
                 pins => pins.len() >= 2,
             }))
             .unwrap_or(false);
-        if sequence_ok && self.nav_selected_is_remapper(outer_id) {
-            Self::REMAP_PRESS_MODES
-        } else {
-            Self::PRESS_MODES
+        let gated = matches!(
+            self.nav_selected_module_id(outer_id).as_deref(),
+            Some("module.remapper" | "module.map_action")
+        );
+        let analog_ok = !gated || card.as_ref().is_some_and(flexinput_engine::card_allows_analog_mode);
+        match (sequence_ok && self.nav_selected_is_remapper(outer_id), analog_ok) {
+            (true, true) => Self::REMAP_PRESS_MODES,
+            (true, false) => Self::REMAP_PRESS_MODES_NO_ANALOG,
+            (false, true) => Self::PRESS_MODES,
+            (false, false) => Self::PRESS_MODES_NO_ANALOG,
         }
     }
 

@@ -113,7 +113,9 @@ pub(crate) fn shape_mag(pts: &[[f32; 2]], mag: f32) -> f32 {
 }
 
 /// Live analog INPUT value of a mapping in-pin: a stick cardinal's one-sided
-/// deflection or an analog trigger's travel. `None` for digital pins.
+/// deflection, an analog trigger's travel, or a MIDI knob / pressure value
+/// (0..1) or pitch bend (SIGNED, −1..1 — its two halves are one control).
+/// `None` for digital pins.
 pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
     if analog_axis_for_cardinal(pin_id).is_some() {
         return Some(analog_cardinal_input_value(upstream, pin_id));
@@ -121,16 +123,44 @@ pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) 
     if matches!(pin_id, "left_trigger" | "right_trigger") {
         return Some(upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0));
     }
+    if let Some(pin) = midi_analog_in(pin_id) {
+        let v = upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        let bend = matches!(pin, flexinput_core::midi::MidiPin::PitchBend { .. });
+        return Some(if bend { v.clamp(-1.0, 1.0) } else { v.clamp(0.0, 1.0) });
+    }
     None
 }
 
-/// True when a pin id is an analog INPUT source — a stick cardinal or an analog
-/// trigger. The Remapper/Lean UI uses this to gate analog-only outputs (e.g. the
-/// touchpad swipe bindings) so they're only offered once an analog input chord
-/// has been captured.
+/// A MIDI pin a mapping can read as an analog magnitude: a controller, 14-bit
+/// controller, (N)RPN, pressure or bend. The tempo is continuous too, but it is
+/// a BPM figure, not a 0..1 position, so it is no analog input.
+fn midi_analog_in(pin_id: &str) -> Option<flexinput_core::midi::MidiPin> {
+    flexinput_core::midi::parse_pin(pin_id)
+        .filter(|p| p.is_continuous() && !matches!(p, flexinput_core::midi::MidiPin::Bpm))
+}
+
+/// True when a pin id is an analog INPUT source — a stick cardinal, an analog
+/// trigger, or a continuous MIDI value (see [`analog_in_value`]).
+///
+/// It decides what "analog" can mean for a mapping: the Analog press mode is
+/// only offered (and only kept on load) for a card with at least one such
+/// input — see [`card_allows_analog_mode`] — and analog-only outputs (the
+/// touchpad swipes) only once an analog input has been captured.
 pub fn pin_is_analog_input(pin_id: &str) -> bool {
     analog_axis_for_cardinal(pin_id).is_some()
         || matches!(pin_id, "left_trigger" | "right_trigger")
+        || midi_analog_in(pin_id).is_some()
+}
+
+/// Whether a Remapper / Map Action card may use the Analog press mode: it
+/// needs an analog input to take the magnitude from. A card of buttons alone
+/// has no movement to pass on, so Analog there is just Normal with extra
+/// steps; an analog input chorded with buttons (hold L1, move the stick) is
+/// the case it exists for. Accepts both card forms (`{ in: [...] }` and Map
+/// Action's legacy bare pin list).
+pub fn card_allows_analog_mode(card: &Value) -> bool {
+    let pins = card.get("in").and_then(|v| v.as_array()).or_else(|| card.as_array());
+    pins.is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(pin_is_analog_input))
 }
 
 /// Synthetic Remapper/Lean OUTPUT pins that drive the virtual touchpad rather

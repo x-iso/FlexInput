@@ -229,6 +229,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         }
         migrate_midi_automap_port(&mut node.value);
         clear_stuck_nav_arms(&mut node.value);
+        drop_impossible_analog_modes(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -308,6 +309,30 @@ fn clear_stuck_nav_arms(node: &mut NodeData) {
         node.params.insert(key, Value::Bool(false));
     }
     node.params.remove(crate::canvas::viewer::MIDI_PICK_OPEN);
+}
+
+/// A Remapper / Map Action card in the Analog press mode needs an analog input
+/// to take a magnitude from. Earlier builds offered Analog on any card, so a
+/// patch can hold a card of buttons alone set to it; land those on Normal, the
+/// same reset the card's own press-mode picker does (the time gap and Hold go
+/// with it). Lean and Touch Zones inputs are analog by nature, so their cards
+/// are left alone. Idempotent.
+fn drop_impossible_analog_modes(node: &mut NodeData) {
+    if !matches!(node.module_id.as_str(), "module.remapper" | "module.map_action") {
+        return;
+    }
+    let Some(Value::Array(cards)) = node.params.get_mut("mappings") else { return };
+    for card in cards.iter_mut() {
+        if flexinput_engine::card_allows_analog_mode(card) {
+            continue;
+        }
+        let Some(m) = card.as_object_mut() else { continue };
+        if m.get("mode").and_then(|v| v.as_str()) == Some("analog") {
+            m.remove("mode");
+            m.remove("window_ms");
+            m.remove("sustain");
+        }
+    }
 }
 
 /// MIDI In/Out nodes gained an AutoMap port. Nodes saved before that have only
@@ -560,6 +585,37 @@ mod migration_tests {
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
     /// and the migration recurses into sub-patches.
+    /// A card of buttons alone can't be Analog: loading switches it to Normal
+    /// (clearing the time gap it carried), and leaves every card that has an
+    /// analog input — or isn't Analog — exactly as it was.
+    #[test]
+    fn loading_drops_analog_mode_from_cards_without_an_analog_input() {
+        let mut params = HashMap::new();
+        params.insert("mappings".to_string(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["key_a"], "mode": "analog", "window_ms": 200.0 },
+            { "in": ["btn_l1", "left_stick_up"], "out": ["key_w"], "mode": "analog" },
+            { "in": ["midi:cc:1:7"], "out": ["right_trigger"], "mode": "analog" },
+            { "in": ["btn_east"], "out": ["key_b"], "mode": "long", "window_ms": 300.0 },
+        ]));
+        let mut node = NodeData {
+            module_id: "module.remapper".to_string(),
+            display_name: "Remapper".to_string(),
+            category: "Module".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        drop_impossible_analog_modes(&mut node);
+        let cards = node.params["mappings"].as_array().unwrap().clone();
+        assert_eq!(cards[0], serde_json::json!({ "in": ["btn_south"], "out": ["key_a"] }));
+        assert_eq!(cards[1]["mode"], "analog");
+        assert_eq!(cards[2]["mode"], "analog");
+        assert_eq!(cards[3]["mode"], "long");
+        assert_eq!(cards[3]["window_ms"], 300.0);
+    }
+
     #[test]
     fn migrate_loaded_snarl_rewrites_device_nodes_and_subpatches() {
         fn device_node(module_id: &str, device_id: &str) -> NodeData {

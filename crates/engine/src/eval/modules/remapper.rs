@@ -158,10 +158,9 @@ pub(crate) fn eval_remapper_node(
                     // non-zero magnitude is enough — analog mode passes the
                     // live magnitude through, no activation threshold.
                     return analog_chord_active(&in_pins, |p| {
-                        if analog_axis_for_cardinal(p).is_some() {
-                            analog_cardinal_input_value(&upstream, p) > 0.0
-                        } else {
-                            read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                        match analog_in_value(&upstream, p) {
+                            Some(v) => v != 0.0,
+                            None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
                         }
                     });
                 }
@@ -214,7 +213,15 @@ pub(crate) fn eval_remapper_node(
                 // source stick, which then leaks through raw alongside the
                 // mapped output whenever no other card overwrites that axis.
                 if PressParams::from_card(m).is_analog() {
-                    return analog_chord_active(&in_pins, pin_held);
+                    return analog_chord_active(&in_pins, |p| {
+                        if let Some(passed) = shape.analog_gate(&upstream, p) {
+                            return passed;
+                        }
+                        match analog_in_value(&upstream, p) {
+                            Some(v) => v != 0.0,
+                            None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
+                        }
+                    });
                 }
                 in_pins.iter().all(|p| pin_held(p))
             }).collect();
@@ -406,11 +413,9 @@ pub(crate) fn eval_remapper_node(
                     // the macro namespace and skip the bus handling below
                     // (macro pins never reach sinks or the release pass).
                     if is_macro_style_target(out_p) {
-                        let mag = if analog_axis_for_cardinal(in_p).is_some() {
-                            analog_cardinal_input_value(&upstream, in_p)
-                        } else {
-                            1.0 // gate buttons all held (checked by effective[])
-                        };
+                        // Gate buttons read 1.0: effective[] already checked
+                        // they are all held.
+                        let mag = analog_in_value(&upstream, in_p).unwrap_or(1.0).abs();
                         let mag = shape.shaped(mag);
                         if mag > 0.0 {
                             merge_macro_scalar(collector_sigs, out_p, Signal::Float(mag.min(1.0)));
@@ -418,19 +423,16 @@ pub(crate) fn eval_remapper_node(
                         continue;
                     }
                     analog_out_pins.insert(out_p.clone());
-                    let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
                     let out_axis_opt    = analog_axis_for_cardinal(out_p);
                     let out_trigger     = analog_trigger_out(out_p);
-                    let mag_from_input = if in_is_cardinal {
-                        analog_cardinal_input_value(&upstream, in_p)
-                    } else {
-                        // Non-cardinal in pin in this slot — when paired with
-                        // a cardinal out, drive it at full magnitude while the
-                        // gate is open (the effective[] check guaranteed all
-                        // non-cardinal buttons are held).
-                        1.0
-                    };
-                    let mag_from_input = shape.shaped(mag_from_input);
+                    // An analog input (stick direction, trigger, MIDI knob or
+                    // bend) passes its live magnitude; a button in this slot
+                    // drives full magnitude while the gate is open (effective[]
+                    // guaranteed every button is held). A bend is signed: its
+                    // lower half pushes the target the other way, so one card
+                    // maps the whole wheel onto a stick axis.
+                    let raw = analog_in_value(&upstream, in_p).unwrap_or(1.0);
+                    let mag_from_input = raw.signum() * shape.shaped(raw.abs());
                     if let Some((axis_pin, sign)) = out_axis_opt {
                         let contrib = sign * mag_from_input;
                         // Sum across all (mapping × in/out pair) contributions.
@@ -873,11 +875,13 @@ pub(crate) fn chord_raw_held(
 /// per-pin verdict. Shared by activation (`effective`) and suppression
 /// (`held_now`) so the two can't disagree about when an analog card is live.
 fn analog_chord_active(in_pins: &[&str], mut pin_passes: impl FnMut(&str) -> bool) -> bool {
+    // "Cardinal" here is any analog input (stick direction, trigger, MIDI
+    // value): ANY of them moving is enough, while every button must be held.
     let mut has_cardinal = false;
     let mut any_cardinal = false;
     for p in in_pins {
         let passes = pin_passes(p);
-        if analog_axis_for_cardinal(p).is_some() {
+        if pin_is_analog_input(p) {
             has_cardinal = true;
             any_cardinal |= passes;
         } else if !passes {

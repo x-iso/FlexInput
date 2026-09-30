@@ -42,7 +42,8 @@ pub(crate) fn remapper_mapping_card_pixel(
     in_pins: &[String],
     out_pins: Option<&[String]>,    // None → Map Action variant (single row)
     skin: crate::canvas::remapper_icons::Skin,
-    allow_analog_mode: bool,        // true for Lean cards and Remapper/Map Action (since analog support added)
+    allow_analog_mode: bool,        // offer the Analog press mode: Lean / Touch Zones always;
+                                    // Remapper / Map Action only with an analog input
     allow_order: bool,              // Remapper only: Sequence press mode + the "in order" toggle
                                     // on the in pill
     reorder_enabled: bool,          // sense a drag on the body for reorder
