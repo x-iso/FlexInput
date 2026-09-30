@@ -146,31 +146,13 @@ impl Default for PickerState {
 
 // ── Inline picker: the names the body and the gamepad-nav driver share ───────
 
-/// Param holding whether a Remapper's inline MIDI picker is open.
+/// Param an earlier build kept open-state of the Remapper's inline MIDI row in.
+/// The row is gone (the MIDI editor is a window now); loading still strips the
+/// key from patches saved with it — see `clear_stuck_nav_arms`.
 pub const MIDI_PICK_OPEN: &str = "_midi_pick_open";
-/// One-shot nav activation flags, set by the nav driver, consumed by the body.
+/// The Remapper action-row item for the MIDI… button (the nav driver opens the
+/// MIDI editor window on it).
 pub const NAV_ACT_MIDI: &str = "_nav_act_midi";
-pub const NAV_ACT_MIDI_KIND: &str = "_nav_act_midi_kind";
-pub const NAV_ACT_MIDI_CH: &str = "_nav_act_midi_ch";
-pub const NAV_ACT_MIDI_NUM: &str = "_nav_act_midi_num";
-pub const NAV_ACT_MIDI_ADD_IN: &str = "_nav_act_midi_add_in";
-pub const NAV_ACT_MIDI_ADD_OUT: &str = "_nav_act_midi_add_out";
-
-/// Every nav flag the inline picker uses, for the body's one-shot clear.
-pub(crate) const NAV_ACT_MIDI_ALL: [&str; 6] = [
-    NAV_ACT_MIDI, NAV_ACT_MIDI_KIND, NAV_ACT_MIDI_CH, NAV_ACT_MIDI_NUM,
-    NAV_ACT_MIDI_ADD_IN, NAV_ACT_MIDI_ADD_OUT,
-];
-
-/// Which picker field a nav item addresses: 0 type, 1 channel, 2 number.
-pub fn midi_pick_field_of(action: &str) -> Option<usize> {
-    match action {
-        NAV_ACT_MIDI_KIND => Some(0),
-        NAV_ACT_MIDI_CH => Some(1),
-        NAV_ACT_MIDI_NUM => Some(2),
-        _ => None,
-    }
-}
 
 /// Where a node's inline picker keeps its selection. The body and the nav
 /// driver both address it through here, so they can never drift onto two
@@ -217,16 +199,6 @@ fn pick_state_adjust(st: &mut PickerState, field: usize, delta: i32) {
     }
 }
 
-/// The picker's controls and where they landed, so a caller can publish rects
-/// for the gamepad-nav ring.
-pub(crate) struct MidiPickerFields {
-    /// The pin the current selection builds, if it is complete.
-    pub(crate) built: Option<MidiPin>,
-    pub(crate) kind_rect: egui::Rect,
-    pub(crate) channel_rect: egui::Rect,
-    pub(crate) number_rect: egui::Rect,
-}
-
 /// Compact "type · channel · number · Add" row that builds one MIDI pin.
 /// `for_output` hides kinds (and the "any channel" choice) a MIDI output can't
 /// write. Returns the pin when Add is clicked with a valid selection.
@@ -234,7 +206,7 @@ pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, 
     let mut added = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let built = midi_pin_picker_fields(ui, id_salt, for_output).built;
+        let built = midi_pin_picker_fields(ui, id_salt, for_output);
         if midi_pin_add_button(ui, "Add", built.clone(), true).clicked() {
             added = built;
         }
@@ -273,7 +245,7 @@ pub(crate) fn midi_pin_picker_fields(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     for_output: bool,
-) -> MidiPickerFields {
+) -> Option<MidiPin> {
     let id = egui::Id::new(("midi_pin_picker", id_salt));
     let mut st: PickerState = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_default();
     if for_output && !st.kind.writable() {
@@ -284,13 +256,8 @@ pub(crate) fn midi_pin_picker_fields(
     }
 
     let built;
-    // The type combo always renders; the other two depend on the type, so they
-    // start as NOTHING and the publisher drops what never got a rect.
-    let kind_rect;
-    let mut channel_rect = egui::Rect::NOTHING;
-    let mut number_rect = egui::Rect::NOTHING;
     {
-        kind_rect = egui::ComboBox::from_id_salt(id.with("kind"))
+        egui::ComboBox::from_id_salt(id.with("kind"))
             .selected_text(egui::RichText::new(st.kind.label()).small())
             .width(110.0)
             .show_ui(ui, |ui| {
@@ -305,22 +272,17 @@ pub(crate) fn midi_pin_picker_fields(
                         }
                     }
                 }
-            })
-            .response.rect;
+            });
 
-        // ⚠ Every field renders SOMETHING, even when its type has no use for
-        // it. The nav rect list is compacted, so a field that disappears for
-        // one type shifts every item after it: the ring would sit on one
-        // control while South fired the next. A greyed "—" also says plainly
-        // that this type has no channel / number, rather than leaving a gap.
+        // A greyed "—" says plainly that this type has no channel / number,
+        // rather than the field silently vanishing.
         if !st.kind.has_channel() {
-            channel_rect = ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
-                .on_disabled_hover_text("This message has no channel.")
-                .rect;
+            ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
+                .on_disabled_hover_text("This message has no channel.");
         }
         if st.kind.has_channel() {
             let ch_text = if st.channel == 0 { "any ch".to_string() } else { format!("ch {}", st.channel) };
-            channel_rect = egui::ComboBox::from_id_salt(id.with("ch"))
+            egui::ComboBox::from_id_salt(id.with("ch"))
                 .selected_text(egui::RichText::new(ch_text).small())
                 .width(56.0)
                 .show_ui(ui, |ui| {
@@ -332,25 +294,23 @@ pub(crate) fn midi_pin_picker_fields(
                             st.channel = c;
                         }
                     }
-                })
-                .response.rect;
+                });
         }
 
-        if st.kind.number_range().is_none() {
-            number_rect = ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
-                .on_disabled_hover_text("This message carries no number.")
-                .rect;
+        if st.kind.number_range().is_none() && st.kind != PickKind::SysEx {
+            ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
+                .on_disabled_hover_text("This message carries no number.");
         }
         if let Some(max) = st.kind.number_range() {
             let is_note = st.kind.is_note();
-            number_rect = ui.add(
+            ui.add(
                 egui::DragValue::new(&mut st.number)
                     .range(0..=max)
                     .speed(if max > 127 { 4.0 } else { 0.25 })
                     .custom_formatter(move |v, _| {
                         if is_note { format!("{} {}", v as u32, fmidi::note_name(v as u8)) } else { format!("{}", v as u32) }
                     }),
-            ).rect;
+            );
         }
 
         if st.kind == PickKind::SysEx {
@@ -362,7 +322,7 @@ pub(crate) fn midi_pin_picker_fields(
     }
 
     ui.ctx().data_mut(|d| d.insert_temp(id, st));
-    MidiPickerFields { built, kind_rect, channel_rect, number_rect }
+    built
 }
 
 /// Key for the per-frame list of MIDI In ports a mapping card can learn from.
@@ -427,6 +387,326 @@ pub(crate) fn midi_set_pin_channel(pins: &mut [Value], idx: usize, new_ch: Chann
         }
     }
     true
+}
+
+// ── MIDI editor window ────────────────────────────────────────────────────────
+//
+// One editor for every place a MIDI message is chosen or tuned: the Remapper's
+// MIDI… button and a mapping card's MIDI chips. It is a WINDOW owned by the
+// app, driven by gamepad nav while it is open — never a popup, for three
+// reasons that each broke something: a dropdown inside a popup closes the
+// popup; a popup cannot be walked by a pad without threading its fields through
+// a row that was never laid out for them; and a popup opened from the config
+// overlay renders in the main window, behind the game.
+
+/// What the editor is for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MidiModalPurpose {
+    /// Build a message and add it to the card being drafted.
+    Add,
+    /// Tune a MIDI chip already on mapping card `card` of the node's
+    /// `cards_key` list (`mappings` for a Remapper): the out row when
+    /// `side_out`, else the in row; `pin_idx` is the chip's index in that row.
+    Chip { card: usize, cards_key: String, side_out: bool, pin_idx: usize },
+}
+
+/// A request to open the editor, from a node body (a mouse click) to the app,
+/// which owns the window. Nav opens it directly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MidiModalRequest {
+    /// The Remapper node, within its own snarl.
+    pub inner: NodeId,
+    /// Sub-patch path from the tab canvas down to that snarl (empty = the tab
+    /// canvas itself), as the Special picker addresses its target.
+    pub path: Vec<usize>,
+    pub purpose: MidiModalPurpose,
+}
+
+impl Default for MidiModalRequest {
+    fn default() -> Self {
+        Self { inner: NodeId(0), path: Vec::new(), purpose: MidiModalPurpose::Add }
+    }
+}
+
+const MIDI_MODAL_REQ_KEY: &str = "fxi_midi_modal_request";
+
+pub fn request_midi_modal(ctx: &egui::Context, req: MidiModalRequest) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(MIDI_MODAL_REQ_KEY), req));
+}
+
+pub fn take_midi_modal_request(ctx: &egui::Context) -> Option<MidiModalRequest> {
+    ctx.data_mut(|d| d.remove_temp::<MidiModalRequest>(egui::Id::new(MIDI_MODAL_REQ_KEY)))
+}
+
+/// A row of the Add editor, in the order a pad walks them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MidiAddRow {
+    Type,
+    Channel,
+    Number,
+    AddInput,
+    AddOutput,
+}
+
+impl MidiAddRow {
+    pub const ALL: [MidiAddRow; 5] = [
+        MidiAddRow::Type, MidiAddRow::Channel, MidiAddRow::Number,
+        MidiAddRow::AddInput, MidiAddRow::AddOutput,
+    ];
+
+    /// The picker field a value row steps (see [`midi_pick_nav_adjust`]).
+    pub fn field(self) -> Option<usize> {
+        match self {
+            MidiAddRow::Type => Some(0),
+            MidiAddRow::Channel => Some(1),
+            MidiAddRow::Number => Some(2),
+            _ => None,
+        }
+    }
+}
+
+/// The message the Add editor currently builds for `node`, if it is complete.
+pub fn midi_pick_built(ctx: &egui::Context, node: NodeId) -> Option<MidiPin> {
+    let st: PickerState = ctx.data(|d| d.get_temp(midi_pick_state_id(node))).unwrap_or_default();
+    let ch = if st.channel == 0 { Channel::Any } else { Channel::Ch(st.channel - 1) };
+    st.kind.build(ch, st.number, &st.sysex)
+}
+
+/// Draw the Add editor's value rows for `node` — type, channel, number, and a
+/// SysEx text box when that is the type — ringing `focused`. Mouse edits go
+/// through the ordinary widgets (a dropdown works in a window); the pad steps
+/// the very same state through [`midi_pick_nav_adjust`]. Returns each value
+/// row's rect, in `MidiAddRow` order, for the caller's own focus handling.
+pub(crate) fn midi_add_rows_ui(
+    ui: &mut egui::Ui,
+    node: NodeId,
+    focused: Option<MidiAddRow>,
+) -> [egui::Rect; 3] {
+    let id = midi_pick_state_id(node);
+    let mut st: PickerState = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_default();
+    let mut rects = [egui::Rect::NOTHING; 3];
+    let label = |ui: &mut egui::Ui, text: &str| {
+        ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new(text).small().weak()));
+    };
+
+    // Type
+    rects[0] = ui.horizontal(|ui| {
+        label(ui, "Type");
+        egui::ComboBox::from_id_salt(id.with("kind"))
+            .selected_text(egui::RichText::new(st.kind.label()).small())
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for k in PickKind::ALL {
+                    if ui.selectable_label(st.kind == k, egui::RichText::new(k.label()).small()).clicked() {
+                        st.kind = k;
+                        if let Some(max) = k.number_range() {
+                            st.number = st.number.min(max);
+                        }
+                    }
+                }
+            });
+    }).response.rect;
+
+    // Channel
+    rects[1] = ui.horizontal(|ui| {
+        label(ui, "Channel");
+        if st.kind.has_channel() {
+            let ch_text = if st.channel == 0 { "any channel".to_string() } else { format!("ch {}", st.channel) };
+            egui::ComboBox::from_id_salt(id.with("ch"))
+                .selected_text(egui::RichText::new(ch_text).small())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(st.channel == 0, egui::RichText::new("any channel").small()).clicked() {
+                        st.channel = 0;
+                    }
+                    for c in 1..=16u8 {
+                        if ui.selectable_label(st.channel == c, egui::RichText::new(format!("ch {c}")).small()).clicked() {
+                            st.channel = c;
+                        }
+                    }
+                });
+        } else {
+            ui.label(egui::RichText::new("— this message has no channel").small().weak());
+        }
+    }).response.rect;
+
+    // Number (or the SysEx bytes, which have no number)
+    rects[2] = ui.horizontal(|ui| {
+        match (st.kind.number_range(), st.kind) {
+            (Some(max), _) => {
+                label(ui, if st.kind.is_note() { "Note" } else { "Number" });
+                let is_note = st.kind.is_note();
+                ui.add(
+                    egui::DragValue::new(&mut st.number)
+                        .range(0..=max)
+                        .speed(if max > 127 { 4.0 } else { 0.25 })
+                        .custom_formatter(move |v, _| {
+                            if is_note { format!("{} {}", v as u32, fmidi::note_name(v as u8)) } else { format!("{}", v as u32) }
+                        }),
+                );
+            }
+            (None, PickKind::SysEx) => {
+                label(ui, "Bytes");
+                ui.add(egui::TextEdit::singleline(&mut st.sysex).desired_width(150.0).hint_text("F0 … F7"));
+            }
+            (None, _) => {
+                label(ui, "Number");
+                ui.label(egui::RichText::new("— this message carries no number").small().weak());
+            }
+        }
+    }).response.rect;
+
+    ui.ctx().data_mut(|d| d.insert_temp(id, st));
+
+    if let Some(row) = focused {
+        if let Some(r) = row.field().and_then(|f| rects.get(f)) {
+            ring_row(ui, *r);
+        }
+    }
+    rects
+}
+
+/// Paint the pad-focus ring around a row. The editor is drawn at top level by
+/// the app (never inside a node body's child layer), so painting here is safe.
+pub(crate) fn ring_row(ui: &egui::Ui, rect: egui::Rect) {
+    let accent = ui.visuals().selection.stroke.color;
+    let [r, g, b, _] = accent.to_array();
+    ui.painter().rect_filled(rect.expand(2.0), 4.0, Color32::from_rgba_unmultiplied(r, g, b, 40));
+    ui.painter().rect_stroke(rect.expand(2.0), 4.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+}
+
+/// One editable row of a MIDI chip already on a card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MidiChipRow {
+    Channel,
+    /// A note output's NoteOn velocity (the card's `midi_vel`).
+    Velocity,
+    /// The value a button sends on a value pin while pressed (`midi_on`).
+    On,
+    /// … and when released (`midi_off`).
+    Off,
+}
+
+impl MidiChipRow {
+    pub fn label(self) -> &'static str {
+        match self {
+            MidiChipRow::Channel => "Channel",
+            MidiChipRow::Velocity => "Velocity",
+            MidiChipRow::On => "On value",
+            MidiChipRow::Off => "Off value",
+        }
+    }
+
+    /// The card key, default and range of a level row.
+    fn level(self) -> Option<(&'static str, f64, f64, f64)> {
+        match self {
+            MidiChipRow::Velocity => Some(("midi_vel", 100.0, 1.0, 127.0)),
+            MidiChipRow::On => Some(("midi_on", 127.0, 0.0, 127.0)),
+            MidiChipRow::Off => Some(("midi_off", 0.0, 0.0, 127.0)),
+            MidiChipRow::Channel => None,
+        }
+    }
+}
+
+/// What a chip lets you tune. An input chip has only its channel (the message
+/// it matches); an output chip also says what it SENDS: a note its velocity, a
+/// value pin the levels a button drives it between. A transport or SysEx chip
+/// has nothing, and is not offered.
+pub fn midi_chip_rows(pin_id: &str, side_out: bool) -> Vec<MidiChipRow> {
+    let Some(p) = fmidi::parse_pin(pin_id) else { return Vec::new() };
+    let mut rows = Vec::new();
+    if p.channel().is_some() {
+        rows.push(MidiChipRow::Channel);
+    }
+    if side_out {
+        if matches!(p, MidiPin::Note { .. }) {
+            rows.push(MidiChipRow::Velocity);
+        } else if p.is_continuous() {
+            rows.push(MidiChipRow::On);
+            rows.push(MidiChipRow::Off);
+        }
+    }
+    rows
+}
+
+fn chip_pin(card: &serde_json::Map<String, Value>, side_out: bool, pin_idx: usize) -> Option<MidiPin> {
+    let key = if side_out { "out" } else { "in" };
+    card.get(key)?.as_array()?.get(pin_idx)?.as_str().and_then(fmidi::parse_pin)
+}
+
+/// A chip row's current value, as the editor shows it.
+pub fn midi_chip_value(
+    card: &serde_json::Map<String, Value>,
+    side_out: bool,
+    pin_idx: usize,
+    row: MidiChipRow,
+) -> String {
+    match row.level() {
+        Some((key, default, _, _)) => {
+            let v = card.get(key).and_then(|v| v.as_f64()).unwrap_or(default);
+            format!("{}", v.round() as i64)
+        }
+        None => match chip_pin(card, side_out, pin_idx).and_then(|p| p.channel()) {
+            Some(Channel::Any) => "any channel".to_string(),
+            Some(Channel::Ch(c)) => format!("ch {}", c + 1),
+            None => "—".to_string(),
+        },
+    }
+}
+
+/// Step a chip row by `delta` on its card. The channel comes round — an input
+/// passes through "any channel" on the way, an output has no such stop — and a
+/// level clamps to its range. Returns whether the card changed.
+pub fn midi_chip_step(
+    card: &mut serde_json::Map<String, Value>,
+    side_out: bool,
+    pin_idx: usize,
+    row: MidiChipRow,
+    delta: i32,
+) -> bool {
+    if delta == 0 {
+        return false;
+    }
+    if let Some((key, default, lo, hi)) = row.level() {
+        let cur = card.get(key).and_then(|v| v.as_f64()).unwrap_or(default);
+        let next = (cur + delta as f64).clamp(lo, hi);
+        if next == cur {
+            return false;
+        }
+        card.insert(key.to_string(), Value::from(next));
+        return true;
+    }
+    let Some(cur) = chip_pin(card, side_out, pin_idx).and_then(|p| p.channel()) else { return false };
+    let stops: Vec<Channel> = if side_out {
+        (0..16).map(Channel::Ch).collect()
+    } else {
+        std::iter::once(Channel::Any).chain((0..16).map(Channel::Ch)).collect()
+    };
+    let pos = stops.iter().position(|c| *c == cur).unwrap_or(0) as i32;
+    let next = stops[(pos + delta).rem_euclid(stops.len() as i32) as usize];
+    let key = if side_out { "out" } else { "in" };
+    match card.get_mut(key) {
+        Some(Value::Array(arr)) => midi_set_pin_channel(arr, pin_idx, next),
+        _ => false,
+    }
+}
+
+/// Set a level row outright (a mouse drag). Clamped like a step.
+pub fn midi_chip_set_level(card: &mut serde_json::Map<String, Value>, row: MidiChipRow, value: f64) -> bool {
+    let Some((key, default, lo, hi)) = row.level() else { return false };
+    let cur = card.get(key).and_then(|v| v.as_f64()).unwrap_or(default);
+    let next = value.round().clamp(lo, hi);
+    if next == cur {
+        return false;
+    }
+    card.insert(key.to_string(), Value::from(next));
+    true
+}
+
+/// Read a level row's value, for a mouse DragValue.
+pub fn midi_chip_level(card: &serde_json::Map<String, Value>, row: MidiChipRow) -> Option<f64> {
+    let (key, default, _, _) = row.level()?;
+    Some(card.get(key).and_then(|v| v.as_f64()).unwrap_or(default))
 }
 
 // ── Node bodies ───────────────────────────────────────────────────────────────
@@ -604,15 +884,73 @@ mod tests {
         assert_eq!(PickKind::SysEx.build(Channel::Any, 0, "zz"), None);
     }
 
-    /// The nav items and the picker fields have to agree, or a stick would
-    /// walk onto an item that edits nothing.
+    fn card(json: serde_json::Value) -> serde_json::Map<String, Value> {
+        json.as_object().unwrap().clone()
+    }
+
     #[test]
-    fn nav_items_name_the_three_value_fields() {
-        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_KIND), Some(0));
-        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_CH), Some(1));
-        assert_eq!(midi_pick_field_of(NAV_ACT_MIDI_NUM), Some(2));
-        for other in [NAV_ACT_MIDI, NAV_ACT_MIDI_ADD_IN, NAV_ACT_MIDI_ADD_OUT, "_nav_act_learn"] {
-            assert_eq!(midi_pick_field_of(other), None, "{other}");
+    fn a_chip_offers_what_it_can_actually_change() {
+        use MidiChipRow::*;
+        assert_eq!(midi_chip_rows("midi:note:1:60", false), vec![Channel]);
+        assert_eq!(midi_chip_rows("midi:note:1:60", true), vec![Channel, Velocity]);
+        assert_eq!(midi_chip_rows("midi:cc:1:7", true), vec![Channel, On, Off]);
+        assert_eq!(midi_chip_rows("midi:pc:1:5", true), vec![Channel], "a pulse has no level");
+        assert!(midi_chip_rows("midi:rt:start", true).is_empty(), "nothing to tune");
+        assert!(midi_chip_rows("btn_south", false).is_empty());
+    }
+
+    #[test]
+    fn an_input_channel_passes_through_any_and_an_output_never_does() {
+        let mut c = card(serde_json::json!({ "in": ["midi:cc:1:7"], "out": ["midi:cc:1:8"] }));
+        assert!(midi_chip_step(&mut c, false, 0, MidiChipRow::Channel, -1));
+        assert_eq!(c["in"][0], "midi:cc:*:7", "one below ch 1 on an input is any channel");
+        assert!(midi_chip_step(&mut c, true, 0, MidiChipRow::Channel, -1));
+        assert_eq!(c["out"][0], "midi:cc:16:8", "an output comes round to ch 16 instead");
+        assert_eq!(midi_chip_value(&c, false, 0, MidiChipRow::Channel), "any channel");
+        assert_eq!(midi_chip_value(&c, true, 0, MidiChipRow::Channel), "ch 16");
+    }
+
+    #[test]
+    fn levels_start_at_their_defaults_and_clamp() {
+        let mut c = card(serde_json::json!({ "out": ["midi:note:1:60"] }));
+        assert_eq!(midi_chip_value(&c, true, 0, MidiChipRow::Velocity), "100");
+        assert!(midi_chip_step(&mut c, true, 0, MidiChipRow::Velocity, 5));
+        assert_eq!(midi_chip_level(&c, MidiChipRow::Velocity), Some(105.0));
+        assert!(midi_chip_set_level(&mut c, MidiChipRow::Velocity, 500.0));
+        assert_eq!(midi_chip_level(&c, MidiChipRow::Velocity), Some(127.0));
+        assert!(!midi_chip_step(&mut c, true, 0, MidiChipRow::Velocity, 1), "already at the top");
+        assert!(midi_chip_set_level(&mut c, MidiChipRow::Velocity, 0.0));
+        assert_eq!(midi_chip_level(&c, MidiChipRow::Velocity), Some(1.0), "velocity 0 is a note-off");
+        assert_eq!(midi_chip_value(&c, true, 0, MidiChipRow::Off), "0");
+    }
+
+    #[test]
+    fn a_zero_step_changes_nothing() {
+        let mut c = card(serde_json::json!({ "in": ["midi:cc:1:7"] }));
+        assert!(!midi_chip_step(&mut c, false, 0, MidiChipRow::Channel, 0));
+        assert_eq!(c["in"][0], "midi:cc:1:7");
+    }
+
+    /// The editor's value rows ALWAYS lay out — a type with no channel or no
+    /// number still gets its row, saying so. A row that vanished for one type
+    /// is exactly how the pad's focus ring once came to sit on one control
+    /// while South fired the next.
+    #[test]
+    fn every_add_row_lays_out_whatever_the_type() {
+        let ctx = egui::Context::default();
+        let node = NodeId(7);
+        for kind in PickKind::ALL {
+            let id = midi_pick_state_id(node);
+            ctx.data_mut(|d| d.insert_temp(id, PickerState { kind, channel: 1, number: 1, sysex: "F0 F7".into() }));
+            let mut rects = [egui::Rect::NOTHING; 3];
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    rects = midi_add_rows_ui(ui, node, Some(MidiAddRow::Number));
+                });
+            });
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.is_finite() && r.width() > 0.5, "{kind:?}: row {i} has no rect");
+            }
         }
     }
 

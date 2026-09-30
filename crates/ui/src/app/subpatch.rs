@@ -421,6 +421,8 @@ pub(crate) fn show_subpatch_editors(
         // inside this editor requested the shared picker (opened after the
         // viewport closure returns, where `app` is mutably available again).
         let mut special_req: Option<crate::canvas::viewer::SpecialPickerRequest> = None;
+        let mut midi_req: Option<crate::canvas::viewer::MidiModalRequest> = None;
+        let mut midi_out: Option<super::nav::MidiModalOutcome> = None;
         // Picker interaction collected inside the viewport closure (which only
         // holds `&app`); applied after it returns.
         let mut picker_result: (Option<String>, bool) = (None, false);
@@ -540,6 +542,12 @@ pub(crate) fn show_subpatch_editors(
                     }
                 }
                 special_req = crate::canvas::viewer::take_special_picker_request(vctx);
+                midi_req = crate::canvas::viewer::take_midi_modal_request(vctx);
+                // This editor owns the MIDI editor session opened from it: draw
+                // it here, apply what it did after the closure.
+                if app.gamepad_nav.midi_modal.as_ref().is_some_and(|m| m.viewport == Some(viewport_id)) {
+                    midi_out = Some(app.midi_modal_window(vctx));
+                }
                 // When this editor's viewport owns the KB/M picker session,
                 // the modal is drawn HERE (immediate viewports can't share the
                 // main window's egui Windows). Interactions are applied after
@@ -562,6 +570,24 @@ pub(crate) fn show_subpatch_editors(
         // from the tab canvas at any nesting depth. The session is owned by
         // THIS viewport so the modal opens on the editor window the click
         // came from, not the main window.
+        if let Some(out) = midi_out {
+            app.apply_midi_modal_outcome(ctx, out);
+        }
+        // A MIDI… button or card chip inside this editor: prefix the ancestor
+        // editor chain onto the request's path (same as the Special picker
+        // below), and let this window own the session.
+        if let Some(mut req) = midi_req {
+            let mut full_path: Vec<usize> = Vec::new();
+            let mut cur = parent_editor_idx;
+            while let Some(p) = cur {
+                full_path.push(app.sub_patch_editors[p].node_id.0);
+                cur = app.sub_patch_editors[p].parent_editor_idx;
+            }
+            full_path.reverse();
+            full_path.extend(req.path.iter().copied());
+            req.path = full_path;
+            app.open_midi_modal(req, Some(viewport_id));
+        }
         if let Some(mut req) = special_req {
             let mut full_path: Vec<usize> = Vec::new();
             let mut cur = parent_editor_idx;

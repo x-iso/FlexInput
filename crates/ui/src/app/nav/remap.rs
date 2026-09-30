@@ -582,26 +582,6 @@ impl FlexInputApp {
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
 
-        // A MIDI pick row value (type / channel / number) takes Up/Down as its
-        // own axis: Left/Right already walks the row, and a value needs
-        // somewhere to go. Down therefore does not fall through to the cards
-        // from these three items — Left/Right off them and it does again.
-        if on_actions {
-            if let Some(field) = crate::canvas::viewer::midi_pick_field_of(actions[cur]) {
-                let delta = match step_dir {
-                    Some(NavDir::Up) => Some(1),
-                    Some(NavDir::Down) => Some(-1),
-                    _ => None,
-                };
-                if let Some(d) = delta {
-                    crate::canvas::viewer::midi_pick_nav_adjust(ctx, inner, field, d);
-                    self.nav_publish_remap_selection(ctx, outer_id, inner);
-                    ctx.request_repaint();
-                    return;
-                }
-            }
-        }
-
         let new_cur = match step_dir {
             Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
             Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
@@ -634,7 +614,16 @@ impl FlexInputApp {
                     "_nav_act_special_right" => Some("_lean_right_draft"),
                     _ => None,
                 };
-                if action == "_nav_act_special" || lean_draft.is_some() {
+                if action == crate::canvas::viewer::NAV_ACT_MIDI {
+                    // The MIDI editor window, opened on this card's draft. Its
+                    // surface is resolved when it draws: over the game while the
+                    // config overlay is up, the main window otherwise.
+                    self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
+                        inner,
+                        path: vec![outer_id.0],
+                        purpose: crate::canvas::viewer::MidiModalPurpose::Add,
+                    }, None);
+                } else if action == "_nav_act_special" || lean_draft.is_some() {
                     self.gamepad_nav.kbm_picker_open = true;
                     self.gamepad_nav.kbm_picker_idx = 0;
                     self.gamepad_nav.kbm_picker_node = Some(inner);
@@ -990,23 +979,11 @@ impl FlexInputApp {
         let has_draft = in_draft || out_draft || latched;
         match mid.as_deref() {
             Some("module.remapper") => {
-                // Order (must match the body + published rects): Learn, MIDI…,
-                // then the MIDI row's items while it is open, then
-                // Special(latched), Clear(has_draft), Add(out_draft&&latched).
-                use crate::canvas::viewer as mv;
-                let mut v = vec!["_nav_act_learn", mv::NAV_ACT_MIDI];
-                if self.get_subpatch_param_bool(outer_id, inner, mv::MIDI_PICK_OPEN).unwrap_or(false) {
-                    // Type / channel / number are values: Up/Down changes them
-                    // (see the step handling), Left/Right walks past them.
-                    v.push(mv::NAV_ACT_MIDI_KIND);
-                    v.push(mv::NAV_ACT_MIDI_CH);
-                    v.push(mv::NAV_ACT_MIDI_NUM);
-                    // Both add buttons always exist (disabled when the phase
-                    // has no use for them), so both are always listed: a rect
-                    // that came and went with the phase would shift the ring.
-                    v.push(mv::NAV_ACT_MIDI_ADD_IN);
-                    v.push(mv::NAV_ACT_MIDI_ADD_OUT);
-                }
+                // Visual order (must match the body + published rects): Learn,
+                // MIDI…, Special(latched), Clear(has_draft), Add(out_draft&&latched).
+                // MIDI… opens the MIDI editor window, which has its own rows —
+                // they are never threaded through this row.
+                let mut v = vec!["_nav_act_learn", crate::canvas::viewer::NAV_ACT_MIDI];
                 if latched { v.push("_nav_act_special"); }
                 if has_draft { v.push("_nav_act_clear"); }
                 if out_draft && latched { v.push("_nav_act_add"); }
@@ -1182,6 +1159,25 @@ impl FlexInputApp {
         if order_applies {
             nav_fields.push(8);
         }
+        // MIDI chips (Remapper), in the order they sit: the in row's, then the
+        // out row's — field 100 + i is in-chip i, 200 + i out-chip i. South opens
+        // the MIDI editor on that chip. A chip with nothing to tune (transport,
+        // SysEx) is skipped, as the card skips offering it.
+        let mut midi_chip_fields: Vec<(usize, bool, usize)> = Vec::new();
+        if self.nav_selected_is_remapper(outer_id) {
+            if let Some(card) = self.nav_remap_card_json(outer_id, idx) {
+                for (side_out, key, base) in [(false, "in", 100usize), (true, "out", 200usize)] {
+                    let pins = card.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    for (i, p) in pins.iter().enumerate() {
+                        let Some(p) = p.as_str() else { continue };
+                        if !crate::canvas::viewer::midi_chip_rows(p, side_out).is_empty() {
+                            nav_fields.push(base + i);
+                            midi_chip_fields.push((base + i, side_out, i));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(show_threshold) = curve_shape {
             nav_fields.push(4);
             if curve_open {
@@ -1341,6 +1337,23 @@ impl FlexInputApp {
                             }
                             true
                         });
+                    }
+                }
+            }
+            f if f >= 100 => {
+                // A MIDI chip: South opens the MIDI editor on it.
+                if south {
+                    if let Some(&(_, side_out, pin_idx)) = midi_chip_fields.iter().find(|(id, _, _)| *id == f) {
+                        self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
+                            inner,
+                            path: vec![outer_id.0],
+                            purpose: crate::canvas::viewer::MidiModalPurpose::Chip {
+                                card: idx,
+                                cards_key: scope.to_string(),
+                                side_out,
+                                pin_idx,
+                            },
+                        }, None);
                     }
                 }
             }

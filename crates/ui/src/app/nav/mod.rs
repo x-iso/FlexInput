@@ -13,9 +13,12 @@ mod fields;
 mod gp_settings;
 mod left_panel;
 mod legend;
+mod midi_modal;
 mod pickers;
 mod remap;
 mod touch_zones;
+
+pub(crate) use midi_modal::{show_over_game, MidiModalOutcome};
 
 // Viewport-agnostic free fns the config overlay reuses (drawn on the overlay
 // viewport, not just the main window).

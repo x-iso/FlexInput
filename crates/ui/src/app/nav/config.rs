@@ -39,6 +39,20 @@ impl FlexInputApp {
             self.drive_kbm_picker(step_dir, nav);
             return;
         }
+        // The other modals a pad can open from a pinned body. Until these were
+        // driven here, the press-mode list opened over the overlay could be
+        // neither confirmed nor dismissed: the main nav path that drives it
+        // never runs while the overlay owns nav.
+        if self.gamepad_nav.press_mode_open {
+            let step_dir = self.picker_step_dir(nav, dt);
+            self.drive_press_mode_picker(step_dir, nav);
+            return;
+        }
+        if self.gamepad_nav.midi_modal.is_some() {
+            let step_dir = self.picker_step_dir(nav, dt);
+            self.drive_midi_modal(ctx, step_dir, nav);
+            return;
+        }
 
         let targets = crate::config_overlay::config_nav_targets(ctx);
         if targets.is_empty() {

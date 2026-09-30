@@ -16,6 +16,10 @@ pub(crate) struct MappingCardResult {
     /// The card's full on-screen rect (origin + size) at its natural (un-lifted)
     /// position, in the current UI's coordinate space.
     pub(crate) rect: egui::Rect,
+    /// A MIDI chip was clicked: `(out row?, chip index)`. The card can't open the
+    /// MIDI editor itself — it doesn't know which sub-patch its node sits in — so
+    /// it hands the click to the body, which does.
+    pub(crate) midi_chip_clicked: Option<(bool, usize)>,
 }
 
 /// Render a mapping card pixel-accurate to Figma node 358:2 (Frame 1 → Group 1).
@@ -651,141 +655,35 @@ pub(crate) fn remapper_mapping_card_pixel(
         }
     }
 
-    // ── MIDI channel, on an in-chip (on top of the drag handle) ─────────────
-    // A MIDI input is captured on whatever channel the controller happened to
-    // send, which is often not the one to listen on — a pad-per-channel
-    // controller, or a config meant to work whatever the keyboard is set to.
-    // Clicking the chip picks another channel, or "any", which matches every
-    // channel (the `*` the engine resolves against each one).
-    for (pin_idx, chip_rect) in midi_in_chips {
-        let Some(pin) = in_pins.get(pin_idx).and_then(|p| flexinput_core::midi::parse_pin(p)) else {
-            continue;
-        };
-        let Some(ch) = pin.channel() else { continue };
-        let id = ui.id().with(("fxi_midi_ch", mapping_idx, pin_idx));
-        let resp = ui.interact(chip_rect, id, egui::Sense::click())
-            .on_hover_text(format!("{}\nClick to change channel.", pin.display_name()));
-        if resp.hovered() {
-            painter.rect_filled(chip_rect, RADIUS, Color32::from_white_alpha(28));
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let popup_id = id.with("popup");
-        if resp.clicked() {
-            egui::Popup::toggle_id(ui.ctx(), popup_id);
-        }
-        let mut picked: Option<flexinput_core::midi::Channel> = None;
-        popup_below_widget(
-            &resp, popup_id,
-            egui::PopupCloseBehavior::CloseOnClickOutside,
-            |ui| {
-                use flexinput_core::midi::Channel;
-                ui.set_min_width(110.0);
-                if ui.add(egui::Button::selectable(ch == Channel::Any, "any channel"))
-                    .on_hover_text("Fire whichever channel this message arrives on.")
-                    .clicked()
-                {
-                    picked = Some(Channel::Any);
-                }
-                for c in 0..16u8 {
-                    if ui.add(egui::Button::selectable(ch == Channel::Ch(c), format!("ch {}", c + 1))).clicked() {
-                        picked = Some(Channel::Ch(c));
-                    }
-                }
-            },
-        );
-        if let Some(new_ch) = picked {
-            if let Some(Value::Array(arr)) = mapping.get_mut("in") {
-                changed |= midi_set_pin_channel(arr, pin_idx, new_ch);
+    // ── MIDI chips: click to open the MIDI editor (on top of the drag handle)
+    // A chip is tuned in the app-owned MIDI editor WINDOW, not a popup here: a
+    // popup opened from a card pinned to the config overlay rendered in the main
+    // window (behind the game), and a pad could not walk it. Kept by index for
+    // the nav ring: field 100 + i is in-chip i, field 200 + i out-chip i.
+    let mut midi_chip_clicked: Option<(bool, usize)> = None;
+    let mut midi_chip_rects: Vec<(u64, egui::Rect)> = Vec::new();
+    for (side_out, chips) in [(false, &midi_in_chips), (true, &midi_out_chips)] {
+        let pins: &[String] = if side_out { out_pins.unwrap_or(&[]) } else { in_pins };
+        for &(pin_idx, chip_rect) in chips.iter() {
+            let Some(pin_id) = pins.get(pin_idx) else { continue };
+            // A chip with nothing to tune (transport, SysEx) isn't offered.
+            if midi_chip_rows(pin_id, side_out).is_empty() { continue; }
+            midi_chip_rects.push((if side_out { 200 } else { 100 } + pin_idx as u64, chip_rect));
+            let id = ui.id().with(("fxi_midi_chip", mapping_idx, side_out, pin_idx));
+            let hint = if side_out {
+                "Click for channel and what this card sends."
+            } else {
+                "Click to change the channel it listens on."
+            };
+            let resp = ui.interact(chip_rect, id, egui::Sense::click())
+                .on_hover_text(format!("{}\n{hint}", midi_pin_label(pin_id)));
+            if resp.hovered() {
+                painter.rect_filled(chip_rect, RADIUS, Color32::from_white_alpha(28));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            egui::Popup::close_id(ui.ctx(), popup_id);
-        }
-    }
-
-    // ── MIDI output settings, on an out-chip ───────────────────────────────
-    // What a card SENDS: the channel, a note's velocity, and the on / off
-    // values a value pin (CC and friends) gets when a button drives it. The
-    // levels belong to the card rather than the pin — a card is one gesture,
-    // and asking for a velocity per note of a chord is a question nobody has.
-    for (pin_idx, chip_rect) in midi_out_chips {
-        let Some(pin) = out_pins
-            .and_then(|o| o.get(pin_idx))
-            .and_then(|p| flexinput_core::midi::parse_pin(p))
-        else {
-            continue;
-        };
-        let id = ui.id().with(("fxi_midi_out", mapping_idx, pin_idx));
-        let resp = ui.interact(chip_rect, id, egui::Sense::click())
-            .on_hover_text(format!("{}\nClick for channel and levels.", pin.display_name()));
-        if resp.hovered() {
-            painter.rect_filled(chip_rect, RADIUS, Color32::from_white_alpha(28));
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let popup_id = id.with("popup");
-        if resp.clicked() {
-            egui::Popup::toggle_id(ui.ctx(), popup_id);
-        }
-        let is_note = matches!(pin, flexinput_core::midi::MidiPin::Note { .. });
-        let is_value = pin.is_continuous();
-        let (mut vel, mut on, mut off) = (
-            mapping.get("midi_vel").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
-            mapping.get("midi_on").and_then(|v| v.as_f64()).unwrap_or(127.0) as f32,
-            mapping.get("midi_off").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        );
-        let (vel0, on0, off0) = (vel, on, off);
-        let mut picked_ch: Option<flexinput_core::midi::Channel> = None;
-        popup_below_widget(
-            &resp, popup_id,
-            egui::PopupCloseBehavior::CloseOnClickOutside,
-            |ui| {
-                use flexinput_core::midi::Channel;
-                ui.set_min_width(150.0);
-                if is_note {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Velocity").size(12.0));
-                        ui.add(egui::DragValue::new(&mut vel).range(1.0..=127.0).speed(0.5));
-                    });
-                } else if is_value {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("On").size(12.0));
-                        ui.add(egui::DragValue::new(&mut on).range(0.0..=127.0).speed(0.5));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Off").size(12.0));
-                        ui.add(egui::DragValue::new(&mut off).range(0.0..=127.0).speed(0.5));
-                    })
-                    .response
-                    .on_hover_text(
-                        "A button on a controller sends these two values. \
-                         An analog card ignores them and sends its live value.",
-                    );
-                }
-                if let Some(cur) = pin.channel() {
-                    ui.separator();
-                    for c in 0..16u8 {
-                        if ui.add(egui::Button::selectable(cur == Channel::Ch(c), format!("ch {}", c + 1))).clicked() {
-                            picked_ch = Some(Channel::Ch(c));
-                        }
-                    }
-                }
-            },
-        );
-        if vel != vel0 {
-            mapping.insert("midi_vel".to_string(), Value::from(vel as f64));
-            changed = true;
-        }
-        if on != on0 {
-            mapping.insert("midi_on".to_string(), Value::from(on as f64));
-            changed = true;
-        }
-        if off != off0 {
-            mapping.insert("midi_off".to_string(), Value::from(off as f64));
-            changed = true;
-        }
-        if let Some(new_ch) = picked_ch {
-            if let Some(Value::Array(arr)) = mapping.get_mut("out") {
-                changed |= midi_set_pin_channel(arr, pin_idx, new_ch);
+            if resp.clicked() {
+                midi_chip_clicked = Some((side_out, pin_idx));
             }
-            egui::Popup::close_id(ui.ctx(), popup_id);
         }
     }
 
@@ -801,7 +699,11 @@ pub(crate) fn remapper_mapping_card_pixel(
             .unwrap_or(egui::emath::TSTransform::IDENTITY);
         let card_g = to_global * card_rect;
         let field_g = nav_card_field
-            .and_then(|f| nav_field_rects.get(f as usize).copied())
+            .and_then(|f| if f >= 100 {
+                midi_chip_rects.iter().find(|(id, _)| *id == f).map(|(_, r)| *r)
+            } else {
+                nav_field_rects.get(f as usize).copied()
+            })
             .filter(|fr| fr.is_finite() && fr.width() > 0.5)
             .map(|fr| to_global * fr);
         // Publish the card-list viewport (global) too, so the nav driver can CLIP
@@ -874,6 +776,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     MappingCardResult {
         delete_clicked, changed,
         body_drag, rect: natural_rect,
+        midi_chip_clicked,
     }
 }
 

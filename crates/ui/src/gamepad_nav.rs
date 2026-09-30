@@ -457,6 +457,10 @@ pub struct GamepadNav {
     pub press_mode_idx: usize,
     pub press_mode_card: usize,
     pub press_mode_outer: Option<egui_snarl::NodeId>,
+    /// The MIDI editor window (the Remapper's MIDI… button, a card's MIDI
+    /// chips). Modal while `Some`: Up/Down walk its rows, Left/Right change the
+    /// focused value, South acts, East closes. See `app/nav/midi_modal.rs`.
+    pub midi_modal: Option<MidiModal>,
     /// Shortcut-chord learn: which shortcut is currently capturing a gamepad
     /// button combo (None = not learning). While Some, nav input is diverted to
     /// chord capture (accumulate held buttons, latch on full release).
@@ -557,6 +561,7 @@ impl Default for GamepadNav {
             press_mode_idx: 0,
             press_mode_card: 0,
             press_mode_outer: None,
+            midi_modal: None,
             chord_learn: None,
             chord_draft: Vec::new(),
             chord_arm_idle: false,
@@ -1053,4 +1058,19 @@ mod chord_fire_tests {
         // Second press after the gap: treated as a fresh first tap, no fire.
         assert!(!chord_fire(&mut st, true, "double", 300.0, t0 + Duration::from_millis(500)));
     }
+}
+
+/// An open MIDI editor window: which node it edits (addressed like the Special
+/// picker's target, so any sub-patch depth works), what for, and the row the
+/// pad is on.
+#[derive(Clone, Debug)]
+pub struct MidiModal {
+    pub inner: egui_snarl::NodeId,
+    pub path: Vec<usize>,
+    pub purpose: crate::canvas::viewer::MidiModalPurpose,
+    pub row: usize,
+    /// The surface drawing it: `None` = the main window; the picker viewport =
+    /// over the game (config overlay); a sub-patch editor's viewport = inside
+    /// that editor window, where the click came from.
+    pub viewport: Option<egui::ViewportId>,
 }

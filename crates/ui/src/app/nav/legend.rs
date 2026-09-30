@@ -85,6 +85,14 @@ impl FlexInputApp {
                 (vec!["btn_east"], "Cancel"),
             ];
         }
+        if let Some(m) = &self.gamepad_nav.midi_modal {
+            let mut v = vec![(hint_vert(), "Row"), (hint_horiz(), "Change")];
+            if matches!(m.purpose, crate::canvas::viewer::MidiModalPurpose::Add) {
+                v.push((vec!["btn_south"], "Add"));
+            }
+            v.push((vec!["btn_east"], "Close"));
+            return v;
+        }
         if self.gamepad_nav.left_edit.is_some() {
             return vec![
                 (hint_horiz(), "Adjust"),
@@ -223,33 +231,14 @@ impl FlexInputApp {
                 (vec!["btn_west"], "Fine"),
                 (vec!["btn_east"], "Back"),
             ],
-            EditLevel::RemapScroll => {
-                // On a MIDI pick row's type / channel / number the vertical axis
-                // CHANGES the value (the horizontal one walks the row), so the
-                // hints say that instead of a flat "Navigate".
-                let midi_value = self.nav_active_outer_id()
-                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| (o, i)))
-                    .map(|(o, i)| {
-                        self.nav_remap_action_items(o, i)
-                            .get(self.gamepad_nav.card_index)
-                            .and_then(|a| crate::canvas::viewer::midi_pick_field_of(a))
-                            .is_some()
-                    })
-                    .unwrap_or(false);
-                let mut v = if midi_value {
-                    vec![(hint_horiz(), "Field"), (hint_vert(), "Change")]
-                } else {
-                    vec![(hint_move(), "Navigate")]
-                };
-                v.extend([
-                    (vec!["btn_south"], "Select / Enter"),
-                    (vec!["btn_north"], "Reset card"),
-                    (vec!["btn_west"], "Delete card"),
-                    (vec!["left_trigger", "right_trigger"], "Filter"),
-                    (vec!["btn_east"], "Back"),
-                ]);
-                v
-            }
+            EditLevel::RemapScroll => vec![
+                (hint_move(), "Navigate"),
+                (vec!["btn_south"], "Select / Enter"),
+                (vec!["btn_north"], "Reset card"),
+                (vec!["btn_west"], "Delete card"),
+                (vec!["left_trigger", "right_trigger"], "Filter"),
+                (vec!["btn_east"], "Back"),
+            ],
             EditLevel::RemapCard => vec![
                 (hint_horiz(), "Field"),
                 (hint_vert(), "Adjust"),

@@ -2127,7 +2127,14 @@ impl eframe::App for FlexInputApp {
         } else if self.gamepad_nav.kbm_picker_viewport.is_none() {
             self.draw_kbm_picker(ctx);
         }
-        self.draw_press_mode_picker(ctx);
+        // The press-mode list has the KB/M picker's problem: summoned by a pad
+        // from the config overlay, it drew in the main window — behind the game.
+        if self.gamepad_nav.press_mode_open && crate::config_overlay::config_overlay_visible(ctx) {
+            nav::show_over_game(ctx, |vctx| self.draw_press_mode_picker(vctx));
+        } else {
+            self.draw_press_mode_picker(ctx);
+        }
+        self.draw_midi_modal(ctx);
         self.draw_reinstall_confirm(ctx);
         self.draw_uninstall_confirm(ctx);
         // Modal device-op overlay — painted last so it sits above everything and
@@ -2941,6 +2948,10 @@ impl eframe::App for FlexInputApp {
         if let Some(req) = crate::canvas::viewer::take_special_picker_request(ctx) {
             self.open_special_picker(req, None);
         }
+        // Same for a MIDI… button or a card's MIDI chip: the editor window.
+        if let Some(req) = crate::canvas::viewer::take_midi_modal_request(ctx) {
+            self.open_midi_modal(req, None);
+        }
 
         // Overlay pick: a click on an exposable element of the MAIN canvas
         // (armed amber by the overlay's "Add element"). Drained here — before
@@ -2996,6 +3007,9 @@ impl eframe::App for FlexInputApp {
         if crate::config_overlay::config_overlay_visible(ctx) {
             if let Some(req) = crate::canvas::viewer::take_special_picker_request(ctx) {
                 self.open_special_picker(req, Some(crate::config_overlay::picker_viewport_id()));
+            }
+            if let Some(req) = crate::canvas::viewer::take_midi_modal_request(ctx) {
+                self.open_midi_modal(req, Some(crate::config_overlay::picker_viewport_id()));
             }
         }
 
@@ -3641,6 +3655,15 @@ impl FlexInputApp {
                 }
             }
             self.drive_press_mode_picker(step_dir, &nav);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── MIDI editor window (modal: rows, values, South add, East close) ──
+        if self.gamepad_nav.midi_modal.is_some() {
+            let step_dir = self.picker_step_dir(&nav, dt);
+            self.drive_midi_modal(ctx, step_dir, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
             return;
