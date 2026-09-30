@@ -5,6 +5,84 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Full MIDI, both ways.** MIDI used to mean controller numbers and pitch bend,
+  added to a MIDI node by hand. Every message now travels: notes with their
+  velocity, aftertouch, 7- and 14-bit controllers, NRPN / RPN, bend, channel
+  pressure, program changes, transport (start / stop / continue, plus whether the
+  DAW is playing and its tempo) and exact SysEx messages — each on its channel,
+  or on any channel. MIDI In and MIDI Out nodes have an Auto-Map port, so a MIDI
+  controller feeds a patch like a pad does, and their Learn adds a pin for each
+  message you play. A MIDI port is opened only while a patch uses it, so other
+  programs can have the rest.
+
+- **The Remapper maps MIDI to the pad, and the pad to MIDI.** A note, a knob or
+  a bender can press a button, move a stick or type a key; a button, a trigger
+  or a stick can play a note, turn a controller or send a program change. Learn
+  captures either side by playing it — the output side from any MIDI In in the
+  patch — and a **MIDI…** button builds a message by hand in a MIDI editor
+  window that the mouse and the pad both drive. Each card sets the velocity of
+  the notes it plays and the values a controller sends on and off; a card's
+  MIDI chip opens the same window on that message.
+
+- **Protection against MIDI feedback loops.** When a patch's MIDI In and MIDI
+  Out are the same port, what goes out can come straight back in. A MIDI Out now
+  sends only the MIDI a mapping produces unless its new **MIDI Thru** is on;
+  echoes of what it sent are cancelled on a port paired with it; and a runaway
+  loop mutes the port until you unmute it. The MIDI Out node shows ⚠ when Thru
+  could loop, and **Settings → MIDI** lists the pairs it knows and any port it
+  muted.
+
+- **MIDI inputs in Easy mode.** MIDI input ports are listed under the gamepads,
+  always after them, and can be chosen alongside a pad on a preset that takes
+  more than one input.
+
+- **JSM Config speaks MIDI.** `MIDI_*` names work on both sides of a binding —
+  `S = MIDI_C4` plays a note, `MIDI_CC64 = GYRO_ON` turns the gyro on from a
+  sustain pedal — with chords, modeshifts and every event modifier. New settings
+  `MIDI_CHANNEL`, `MIDI_IN_CHANNEL`, `MIDI_VELOCITY` and `MIDI_IN_THRESHOLD`
+  fill in what a name leaves out. Sticks, the touchpad (as an XY pad), the gyro
+  and the accelerometer can send MIDI values (`LEFT_STICK_MODE = MIDI`,
+  `LEFT_MIDI_X = MIDI_CC1`, …), and a trigger bound to a controller sends its
+  pull (`ZL = MIDI_CC7`). `MIDI_PB_UP` / `MIDI_PB_DOWN` say which way a trigger
+  or button bends. The editor's command list has a **MIDI…** row that writes a
+  name for you, and SysEx goes behind `@` as `@"midi:sx:F0…F7"`.
+
+- **Touch Zones, Lean, the Virtual Menu and Map Action speak MIDI too.** Zone,
+  lean and menu cards can play MIDI (a **MIDI…** button, or learning from a MIDI
+  controller), a lean can drive a controller by how far the pad leans, and a
+  note or a knob can trigger a Map Action.
+
+### Changed
+
+- **The Analog press mode is offered only where there is something analog to
+  pass on.** A Remapper or Map Action card of buttons alone has no movement for
+  Analog to follow, so it no longer offers the mode, and loading a patch switches
+  any such card back to Normal. A stick direction, a trigger or a MIDI knob —
+  alone, or held with buttons — still gets it. Lean and Touch Zones cards are
+  unchanged.
+
+- **An Analog card driven by a trigger or a MIDI knob follows it.** It used to
+  count the trigger as pressed only past half its travel and then drive the
+  target at full strength; it now passes the actual travel from the first bit of
+  pull, as a stick direction always did. Other press modes still switch at the
+  card's threshold, as before.
+
+### Fixed
+
+- **Widgets pinned to the config overlay from an Advanced-mode canvas can be
+  entered with the pad.** They could be highlighted but not opened, because only
+  widgets inside a sub-patch — the Easy-mode case — were reachable.
+
+- **The press-mode list opened from the config overlay shows over the game and
+  closes when you choose.** It opened in the main window, behind the game, and
+  the pad couldn't confirm or dismiss it.
+
+- **Choosing an input with the pad in Easy mode keeps the others.** On a preset
+  that takes several inputs, picking one with the pad removed every other input
+  first; it now follows the same rules as clicking a card.
+
 ## [0.14.9] - 2026-09-29
 
 ### Changed

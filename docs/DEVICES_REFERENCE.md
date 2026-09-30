@@ -77,27 +77,45 @@ pub enum ControllerKind {
 - SDL3 provides direct access to motion sensors
 - Filtered to avoid duplicates with gilrs devices
 
-#### 3. MIDI Backend (`midi.rs`)
+#### 3. MIDI Backend (`midi/`)
 
-**MIDI input/output support:**
-```rust
-pub struct MidiBackend {
-    inputs: Vec<MidiInputPort>,
-    outputs: Vec<MidiOutputPort>,
-    learning_devices: HashMap<String, bool>,  // device_id → is_learning
-}
+Device ids are `midi_in:{port}` and `midi_out:{port}` (midir, WinMM). Split in
+four: `mod.rs` (the `MidiBackend` — port list, open/close, poll, send, Learn),
+`decode.rs` (bytes → bus pins, per In port), `encode.rs` (bus pins → bytes, per
+Out port) and `guard.rs` (the loop guard).
 
-pub struct MidiInputPort {
-    pub id: String,           // "midi_in:{port_index}"
-    pub name: String,
-    pub cc_learned: Option<u8>,  // Last learned CC number
-}
-```
+**Every message family**, as `midi:` pins whose grammar lives in
+`flexinput_core::midi` (see `PATCH_FORMATS.md` → *MIDI pin ids*): notes with
+their velocity, poly aftertouch, 7-bit and 14-bit CC, NRPN / RPN, pitch bend,
+channel pressure, program change, transport (start / stop / continue, plus the
+derived `playing` state and clock-derived `bpm`) and exact-match SysEx. Every
+channel message also has an any-channel twin (`midi:cc:*:7`) the backend fills
+alongside the channel's own pin.
 
-**CC Learn Feature:**
-- User enables learning on a `device.source` node
-- Press any MIDI knob/fader → records CC number to node params
-- Output pin named `cc_{number}` appears in the snarl
+- **Sparse.** A port publishes only the pins away from rest; a reader that finds
+  a MIDI pin absent reads its rest value (`midi::rest_value_for_id`). Emitting
+  all 16 × 128 × several types every tick is what the old CC-only backend
+  couldn't afford.
+- **Latched.** MIDI is events and the engine samples: a note on+off inside one
+  poll still reads down for that poll, and a pulse (program change, transport,
+  SysEx) holds for at least two polls / 10 ms so press-mode timing sees it.
+- **Opened only while used.** A port opens when a node on some tab uses it (the
+  app's pinned set) and closes when none does — on legacy WinMM an open port is
+  locked away from every other program.
+- **Learn** on a MIDI In node adds a pin for each message the port receives
+  while it is on (a 14-bit pair or an NRPN arrives as one pin, not its halves).
+  Legacy `cc_<n>` / `pitch_bend` pins on older patches keep working, as
+  any-channel aliases.
+
+**Loop guard** (`guard.rs`), for a patch whose MIDI In and MIDI Out are the same
+port: each Out port fingerprints what it sends; an In port that is paired with
+it drops an arriving message matching an unconsumed fingerprint (echo cancel).
+Pairs are **seeded** by matching port names, **confirmed** by echoes actually
+seen coming back, and **demoted** when plenty is sent and nothing returns (two
+separate ports after all). A runaway loop of discrete events trips the
+**breaker**, which mutes the Out port until it is unmuted — from the MIDI Out
+node or Settings → MIDI. ⚠ Never drop a midir connection while holding the
+guard lock: its callback takes the same lock.
 
 #### 4. Joy-Con 2 Backend (`joycon2_backend.rs`)
 
@@ -534,7 +552,8 @@ Applied in I/O thread after polling, before signals reach processing thread.
 | `crates/devices/src/lib.rs` | Backend trait, initialization | ~100 |
 | `crates/devices/src/gilrs_backend.rs` | gilrs gamepad polling | ~400 |
 | `crates/devices/src/sdl_backend.rs` | SDL3 motion sensor access | ~300 |
-| `crates/devices/src/midi.rs` | MIDI input/output handling | ~250 |
+| `crates/devices/src/midi/` | MIDI ports, codec, loop guard | ~2000 |
+| `crates/core/src/midi.rs` | MIDI pin grammar, shared by every crate | ~720 |
 | `crates/devices/src/layouts.rs` | Pin definitions per controller kind | ~500 |
 | `crates/devices/src/hidhide.rs` | HidHide client wrapper | ~150 |
 | `crates/devices/src/joycon2_backend.rs` | Joy-Con 2 backend surface | ~660 |

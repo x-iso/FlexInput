@@ -552,6 +552,45 @@ if is_collector && st.device_id.starts_with("virtual.keymouse") {
 
 ---
 
+## MIDI on the Bus
+
+MIDI pins (`midi:…`, grammar in `flexinput_core::midi` and `PATCH_FORMATS.md`)
+ride the AutoMap bus beside the canonical pins, but they are **dynamic**: far
+too many to list in `ALL_PINS`, and a MIDI In port publishes only the ones away
+from rest. So they are never walked from a list — everything that reads MIDI
+takes whatever the bus actually carries (`crates/engine/src/eval/midi_bus.rs`):
+
+- **Raw fallback.** Where the bus falls back to a raw device for canonical pins,
+  a MIDI In port's live pins are copied in too (`fill_raw_midi`).
+- **Mapping modules** (Remapper, Map Action, JSM Config) add the upstream's MIDI
+  pins to their snapshot (`fill_upstream_midi`), so a note or a knob can trigger
+  a card, and the shared `remapper_pass_through_and_suppress` carries unclaimed
+  MIDI on and silences claimed MIDI like any other pin. JSM's strict mode rests
+  every upstream MIDI pin too.
+- **Rest.** An absent MIDI pin reads its rest value (`midi_rest`): off for a
+  gate, 0 for a value, centre for a bend.
+
+**Provenance, and why a MIDI Out doesn't feed itself.** A MIDI Out sink forwards
+a `midi:` pin only when something PRODUCED it — a mapping card, a Collector
+input, a JSM binding — or when the node's **MIDI Thru** toggle is on. Producers
+mark each pin with a `__midi_out__:<pin>` entry on their own bus key
+(`mark_produced`); the marker is an ordinary bus entry, so every pass-through
+that copies a collector's entries carries it along. With Thru off (the default)
+raw MIDI arriving on the same port the Out writes to can't go round in a loop;
+the device-level loop guard (`DEVICES_REFERENCE.md` → *MIDI Backend*) catches
+what a patch builds on purpose, and the MIDI Out node shows ⚠ when Thru is on
+and a MIDI In paired with its port sits in the same patch.
+
+**Every mapping module publishes MIDI one way** (`publish_card_midi`): a note as
+a gate with its velocity on the twin `midi:vel:` pin, a value at the card's on /
+off level (`midi_on` / `midi_off`, 0–127) or an analog card's live value, a
+program change or transport as a gate — each marked produced. Touch Zones, Lean
+and the Virtual Menu go through it; the Remapper's own MIDI pass
+(`eval/modules/remapper.rs`) applies the same rules, and also sums analog cards
+that push one controller together.
+
+---
+
 ## Mouse Sensitivity Scaling
 
 Virtual KB/M sinks apply a configurable mouse sensitivity multiplier:

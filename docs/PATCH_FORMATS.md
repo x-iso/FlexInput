@@ -99,6 +99,40 @@ These are ordinary `NodeData` nodes distinguished by `module_id`; their config l
   signal mask and the engine's `preprocess_dev_sigs`, so Learn and routing agree).
 - `device.sink`: `device_id` (`"virtual.{kind}.{n}"`, e.g. `"virtual.xinput.0"`), plus
   output-shaping keys (rumble floor/max/exp, mouse sensitivity for KB/M sinks, …).
+- MIDI nodes are the same two: `device.source` with `device_id = "midi_in:{port}"` and
+  `device.sink` with `"midi_out:{port}"`. Their pin ids (`output_pin_ids` /
+  `input_pin_ids`) are MIDI pin ids (below) plus one AutoMap pin, `automap_out` /
+  `automap_in`, which may sit at ANY index (it is found by type, and pins are addressed
+  by their real index). A MIDI In also keeps `learning` (bool); a MIDI Out keeps
+  `midi_thru` (bool, default false — only PRODUCED MIDI is sent).
+
+#### MIDI pin ids
+
+`midi:<type>:<ch>:<n>`, persisted as written (`flexinput_core::midi`). `<ch>` is `1`–`16`,
+or `*` for any channel — an input match only, never written by an output.
+
+| id | signal | |
+| --- | --- | --- |
+| `midi:note:<ch>:<n>` | Bool | a note gate |
+| `midi:vel:<ch>:<n>` | Float 0–1 | the velocity riding a note gate |
+| `midi:pat:<ch>:<n>` | Float 0–1 | poly aftertouch |
+| `midi:cc:<ch>:<n>` | Float 0–1 | 7-bit controller |
+| `midi:cc14:<ch>:<n>` | Float 0–1 | 14-bit controller, `n` 0–31 (MSB; LSB is `n + 32`) |
+| `midi:nrpn:<ch>:<p>` / `midi:rpn:<ch>:<p>` | Float 0–1 | parameter, `p` 0–16383 |
+| `midi:pb:<ch>` | Float −1–1 | pitch bend |
+| `midi:cp:<ch>` | Float 0–1 | channel pressure |
+| `midi:pc:<ch>:<n>` | Bool (pulse) | program change |
+| `midi:rt:start` / `stop` / `continue` | Bool (pulse) | transport |
+| `midi:rt:playing` / `midi:rt:bpm` | Bool / Float | derived state, input only |
+| `midi:sx:<HEX>` | Bool (pulse) | an exact SysEx message, `F0`…`F7` |
+
+Legacy ids from before full MIDI — `cc_<n>` and `pitch_bend` — still load and mean the
+any-channel controller / bend.
+
+**Mapping-card MIDI levels.** A Remapper, Touch Zones, Lean or Virtual Menu card that
+sends MIDI may carry `midi_vel`, `midi_on` and `midi_off` (0–127; defaults 100, 127, 0):
+the velocity of the notes it plays, and the value a controller goes to while the card
+holds it and when it lets go.
 
 ### Migration — `migrate_loaded_snarl`
 
@@ -121,6 +155,14 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
 stick-click / menu ids on `device.source` `output_pin_ids` (`btn_lstick` → `btn_ls`,
 `btn_rstick` → `btn_rs`, `btn_select` → `btn_back`, `btn_mode` → `btn_guide`). Add
 migrations here (never a version bump alone) when a param key or pin set changes.
+
+Two MIDI-era migrations run from `migrate_loaded_snarl`:
+- `migrate_midi_automap_port` APPENDS the AutoMap pin to MIDI nodes saved before they
+  had one (never inserts — every existing wire keeps its pin index).
+- `drop_impossible_analog_modes` switches a Remapper / Map Action card set to the
+  Analog press mode back to Normal when none of its inputs is analog (stick direction,
+  trigger or continuous MIDI) — there is no magnitude for it to pass on. Lean and Touch
+  Zones cards are left alone; their inputs are analog by nature.
 
 Note that `migrate_ds4_pin_ids` runs only on the `.fxp` load path, while
 `migrate_loaded_snarl` also runs on workspace restore — put anything that must survive

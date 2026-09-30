@@ -414,7 +414,12 @@ pub struct ModuleDescriptor {
 - **Parameters:**
   - `lean_left: Array<Mapping>` - Left lean mappings
   - `lean_right: Array<Mapping>` - Right lean mappings
-  - Each Mapping: `{ out, mode, window_ms, sustain, turbo }`
+  - Each Mapping: `{ out, mode, window_ms, sustain, turbo }`, plus `midi_vel` /
+    `midi_on` / `midi_off` when it sends MIDI
+- **MIDI:** a lean card can play MIDI (the section's **MIDI…** button, or Learn while
+  playing a MIDI controller). In Analog mode a controller follows how far the pad
+  leans, and a bend goes down leaning left. Published by the shared
+  `publish_card_midi` (AUTOMAP_SYSTEM.md → *MIDI on the Bus*).
 
 #### RWS Aim
 - **ID:** `processing.rws` — display name "RWS Aim"
@@ -659,6 +664,9 @@ pub struct ModuleDescriptor {
     schema with Remapper, incl. per-card `curve`/`threshold`).
   - `zone_meta: Array<Object>` - Per-zone icon + name overrides (shared with Virtual
     Menu). Icons use the shared `icon_key` scheme, including dynamic `gp:<pin>` glyphs.
+- **MIDI:** a zone card can play MIDI — the **MIDI…** button beside Assign…, or the 🎮
+  gamepad-learn while playing a MIDI controller — at the card's `midi_vel` / `midi_on` /
+  `midi_off` levels.
 
 #### Virtual Menu
 - **ID:** `module.menu`
@@ -680,6 +688,7 @@ pub struct ModuleDescriptor {
   - Session behaviour: `activation_mode` (hold/toggle/touch), `select_on`
     (release/press/click), `pointer_deadzone`, `select_linger`, `hover_sticky`.
   - Header: `menu_name`, `menu_icon`/`menu_icon_svg`.
+- **MIDI:** selecting a zone can play MIDI, exactly as a Touch Zones card does.
 
 #### Remapper
 - **ID:** `module.remapper`
@@ -690,6 +699,18 @@ pub struct ModuleDescriptor {
 - **Parameters:**
   - `mappings: Array<Mapping>` - List of source→destination mappings
   - Each Mapping: `{ src, dst, mode }`
+- **MIDI, both ways:**
+  - *In:* a MIDI port upstream is read like a pad — a note while it sounds, a knob or
+    bend while it moves (Learn captures a continuous one as an Analog card). A card's
+    MIDI in-chip picks its channel, or any channel.
+  - *Out:* Learn plays the message on any MIDI In in the patch (a picker chooses one when
+    there are several), or **MIDI…** builds it by hand in the MIDI editor window, for
+    either side of the card. Per card: `midi_vel`, `midi_on`, `midi_off` (0–127).
+  - The Analog press mode is offered only for a card with an analog input — a stick
+    direction, a trigger or a continuous MIDI value — alone or chorded with buttons
+    (`flexinput_engine::card_allows_analog_mode`); loading resets any other card to
+    Normal. An Analog card passes that input's live value, from the first bit of
+    movement.
 
 #### Map Action
 - **ID:** `module.map_action`
@@ -699,6 +720,9 @@ pub struct ModuleDescriptor {
 - **Outputs:** 
   - Output 0: Gate (Bool, true when mapping is active)
   - Output 1: Analog (Float, deflection magnitude or 0.0)
+- **MIDI:** reads the bus's MIDI pins, so a note or a knob can trigger the action; Learn
+  hears a MIDI port upstream. Analog mode follows the same analog-input rule as the
+  Remapper.
 
 #### Feedback Control
 - **ID:** `module.feedback_control`
@@ -745,6 +769,13 @@ pub struct ModuleDescriptor {
     would otherwise double the body's height unasked
   - `jsm_knob_side: "bottom" | "top" | "left" | "right"` — where the tuning strip
     sits relative to the editor. Anything unrecognised reads as `bottom`
+- **MIDI** (FlexInput's own; JSM has none — `eval/modules/jsm/midi.rs`, plan phase 10):
+  `MIDI_*` names on both sides of the `=` (`S = MIDI_C4`, `MIDI_CC64 = GYRO_ON`),
+  `MIDI_CHANNEL` / `MIDI_IN_CHANNEL` / `MIDI_VELOCITY` / `MIDI_IN_THRESHOLD`, sticks,
+  the touchpad, the gyro and the accelerometer as MIDI values (`LEFT_STICK_MODE = MIDI`
+  with `LEFT_MIDI_X`, …), and values carried through a binding where MIDI is involved
+  (`ZL = MIDI_CC7`). The editor's command list has a **MIDI…** row that builds a name in
+  the MIDI editor window.
 - **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
   `analog` (triggers and all five of JSM's sticks as its buttons), `aim` (gyro and
   sticks as mouse movement), `pad` (whatever drives a virtual pad instead),
