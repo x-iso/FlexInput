@@ -56,7 +56,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   both the velocity) while the key is down, and its threshold sets the velocity
   a strike needs to count. Played from a trigger or stick, a note strikes with
   the value at the threshold and then follows it as aftertouch. Cards saved
-  with a separate velocity or aftertouch pin are switched to the note.
+  with a separate velocity or aftertouch pin are switched to the note. A note
+  added to a MIDI node (or a Splitter / Collector) brings its velocity and
+  aftertouch pins with it, and a note card's curve says what is moving its
+  live dot — aftertouch, the channel's pressure, or just the velocity.
+
+- **Flush stuck notes.** A MIDI In node's header has a **Flush** button that
+  releases every note the port still holds — for a keyboard unplugged
+  mid-chord, whose Note Offs never arrive.
 
 - **Touch Zones, Lean, the Virtual Menu and Map Action speak MIDI too.** Zone,
   lean and menu cards can play MIDI (a **MIDI…** button, or learning from a MIDI

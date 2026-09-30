@@ -104,8 +104,13 @@ alongside the channel's own pin.
   locked away from every other program.
 - **Learn** on a MIDI In node adds a pin for each message the port receives
   while it is on (a 14-bit pair or an NRPN arrives as one pin, not its halves).
-  Legacy `cc_<n>` / `pitch_bend` pins on older patches keep working, as
-  any-channel aliases.
+  A note — learned or added by hand, on a MIDI In/Out node or a Splitter /
+  Collector — comes with its velocity and aftertouch pins. Legacy `cc_<n>` /
+  `pitch_bend` pins on older patches keep working, as any-channel aliases.
+- **Flush** in a MIDI In node's header releases every note the port still
+  holds, with its velocity, aftertouch and the channels' pressure — for notes
+  whose Note Off never came (a keyboard unplugged mid-chord). Controllers, bend
+  and transport are left where they are.
 
 **Loop guard** (`guard.rs`), for a patch whose MIDI In and MIDI Out are the same
 port: each Out port fingerprints what it sends; an In port that is paired with

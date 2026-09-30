@@ -370,6 +370,22 @@ pub fn take_midi_unmutes(ctx: &egui::Context) -> Vec<String> {
     ctx.data_mut(|d| d.remove_temp::<Vec<String>>(egui::Id::new(MIDI_UNMUTE_REQ))).unwrap_or_default()
 }
 
+const MIDI_FLUSH_REQ: &str = "fxi_midi_flush_req";
+
+/// Ask the app to release every note an In port still holds.
+pub(crate) fn request_midi_flush(ctx: &egui::Context, in_id: &str) {
+    ctx.data_mut(|d| {
+        let v: &mut Vec<String> = d.get_temp_mut_or_default(egui::Id::new(MIDI_FLUSH_REQ));
+        if !v.iter().any(|x| x == in_id) {
+            v.push(in_id.to_string());
+        }
+    });
+}
+
+pub fn take_midi_flushes(ctx: &egui::Context) -> Vec<String> {
+    ctx.data_mut(|d| d.remove_temp::<Vec<String>>(egui::Id::new(MIDI_FLUSH_REQ))).unwrap_or_default()
+}
+
 /// Why a MIDI Out node risks feeding itself, if it does: its Thru is on, and a
 /// MIDI In placed in the same patch is paired with its port — the same port
 /// name, or echoes seen coming back — so raw MIDI can go round and round. With
@@ -823,8 +839,16 @@ fn midi_pin_rows(pins: &[PinDescriptor], ids: Option<&Vec<Value>>) -> Vec<(usize
         .collect()
 }
 
-/// Append a MIDI pin to a MIDI node side (skipped if the node already has it).
+/// Append a MIDI pin to a MIDI node side — a note with its velocity and
+/// aftertouch (see [`MidiPin::node_pins`]). Pins the node already has are
+/// skipped.
 fn push_midi_pin(node: &mut NodeData, pin: &MidiPin, outputs: bool) {
+    for p in pin.node_pins() {
+        push_one_midi_pin(node, &p, outputs);
+    }
+}
+
+fn push_one_midi_pin(node: &mut NodeData, pin: &MidiPin, outputs: bool) {
     let id = pin.to_id();
     let key = if outputs { "output_pin_ids" } else { "input_pin_ids" };
     let has = node.params.get(key).and_then(|v| v.as_array())

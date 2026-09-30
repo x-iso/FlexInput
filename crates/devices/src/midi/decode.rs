@@ -508,6 +508,20 @@ impl InPortDecoder {
         self.set(MidiPin::Bpm, 0.0);
     }
 
+    /// Forget every sounding note, with its velocity, aftertouch and the
+    /// channels' pressure — for notes whose Note Off never came (a keyboard
+    /// unplugged mid-chord). Controllers, bend and transport keep their state:
+    /// those are where the hardware sits, not events left hanging. The next
+    /// poll carries none of it, so readers see the notes released.
+    pub fn flush_notes(&mut self) {
+        self.note_channels = [0; 128];
+        self.slots.retain(|pin, _| !matches!(pin,
+            MidiPin::Note { .. }
+                | MidiPin::Velocity { .. }
+                | MidiPin::PolyAftertouch { .. }
+                | MidiPin::ChannelPressure { .. }));
+    }
+
     /// Emit every pin away from rest, advancing latches and dropping slots that
     /// have returned to rest.
     pub fn poll(&mut self, now: Instant) -> Vec<(String, Signal)> {
@@ -602,6 +616,30 @@ mod tests {
         let p = r.poll(10);
         assert!(!p.contains_key("midi:pat:3:60"), "gone with the note: {p:?}");
         assert!(!p.contains_key("midi:cp:3"), "and the channel's last note");
+    }
+
+    /// A keyboard unplugged mid-chord never sends its Note Offs: Flush lets
+    /// the notes go, with everything that belongs to them, and leaves the
+    /// controllers where they are.
+    #[test]
+    fn flush_releases_stuck_notes_and_keeps_controllers() {
+        let mut r = Rig::new();
+        r.feed(&[0x90, 60, 100], 1);
+        r.feed(&[0x91, 64, 90], 2);
+        r.feed(&[0xA0, 60, 50], 3);
+        r.feed(&[0xD1, 40], 4);
+        r.feed(&[0xB0, 7, 99], 5);
+        r.poll(6);
+        r.dec.flush_notes();
+        let p = r.poll(7);
+        assert!(p.keys().all(|k| k.starts_with("midi:cc:") || k.starts_with("cc_")), "{p:?}");
+        assert!(p.contains_key("midi:cc:1:7"));
+        // A fresh note afterwards is an ordinary note, and ends normally.
+        r.feed(&[0x90, 60, 80], 8);
+        assert_eq!(r.poll(9).get("midi:note:*:60"), Some(&Signal::Bool(true)));
+        r.feed(&[0x80, 60, 0], 10);
+        r.poll(11);
+        assert!(!r.poll(12).contains_key("midi:note:*:60"));
     }
 
     /// With no note sounding, pressure is an ordinary value: at 0 it is at rest.

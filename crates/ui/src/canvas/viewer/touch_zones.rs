@@ -752,6 +752,8 @@ pub(crate) fn mapping_curve_editor(
     // The card's input is a MIDI note: its threshold is the strike VELOCITY that
     // counts, and the curve shapes the note's aftertouch.
     threshold_is_velocity: bool,
+    // That note while it sounds: what drives the dot, and its strike velocity.
+    live_note: Option<LiveNote>,
 ) -> bool {
     let mut changed = false;
     let w = ui.available_width().clamp(140.0, 360.0);
@@ -931,11 +933,26 @@ pub(crate) fn mapping_curve_editor(
     if let Some(m) = live_mag {
         let m = m.clamp(0.0, 1.0);
         let y = flexinput_engine::sample_curve(pts, m, &[]).clamp(0.0, 1.0);
-        let on = thr_val.map(|t| y >= t).unwrap_or(false);
+        // A note counts by how hard it was struck, not by where the curve is.
+        let on = match live_note {
+            Some(n) => thr_val.map(|t| n.vel > 0.0 && n.vel >= t).unwrap_or(true),
+            None => thr_val.map(|t| y >= t).unwrap_or(false),
+        };
         let col = if on { egui::Color32::from_rgb(110, 230, 130) }
                   else  { egui::Color32::from_rgb(90, 200, 255) };
         painter.circle_filled(to(m, y), 3.0, col);
         request_repaint_throttled(ui.ctx());
+    }
+    // Say what moves the dot: a keyboard that sends no aftertouch leaves it
+    // parked at the strike velocity, which otherwise looks like a dead graph.
+    if let Some(n) = live_note {
+        painter.text(
+            g.left_top(),
+            egui::Align2::LEFT_TOP,
+            format!("{} · struck {:.0}%", n.source, n.vel * 100.0),
+            egui::FontId::proportional(10.0),
+            visuals.weak_text_color(),
+        );
     }
 
     // Shared curve menu — same clipboard and .fxc files as the Response
@@ -1057,6 +1074,7 @@ pub(crate) fn mapping_card_curve_section(
     working: &mut serde_json::Map<String, Value>,
     show_threshold: bool,
     live_mag: Option<f32>,
+    live_note: Option<LiveNote>,
     nav_uid: Option<usize>,
     adaptive: Option<AdaptiveRow>,
 ) -> bool {
@@ -1155,6 +1173,7 @@ pub(crate) fn mapping_card_curve_section(
         ui, open_id.with("ed"), &mut pts,
         if show_threshold { Some(&mut thr) } else { None },
         live_mag, accent, &vis, nav_uid, nav_field, note_input,
+        live_note.filter(|_| note_input),
     );
     if changed {
         if pts == identity_curve() {
@@ -1210,13 +1229,62 @@ pub(crate) fn mapping_card_curve_section(
 }
 
 /// Largest live analog-input magnitude across a mapping's in pins, read from
-/// the upstream device's live signals — drives the editor's preview dot.
+/// every device behind the input (a Combiner can merge a MIDI port with a pad)
+/// — drives the editor's preview dot.
 pub(crate) fn live_analog_in_mag(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
-    dev: Option<&str>,
+    devs: &[String],
     in_pins: &[String],
 ) -> Option<f32> {
-    let dev = dev?;
+    devs.iter()
+        .filter_map(|d| live_analog_in_mag_one(live_signals, d, in_pins))
+        .reduce(f32::max)
+}
+
+/// What a sounding MIDI note on a card is doing right now, for the curve
+/// editor: which of its parts gives its live value, and how hard it was struck
+/// (what the velocity threshold compares).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LiveNote {
+    pub vel: f32,
+    pub source: &'static str,
+}
+
+/// The first of a card's note inputs that is sounding on any device behind
+/// the input. Mirrors the engine's `note_value` order: aftertouch, then the
+/// channel's pressure, then velocity.
+pub(crate) fn live_note_readout(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    devs: &[String],
+    in_pins: &[String],
+) -> Option<LiveNote> {
+    for dev in devs {
+        let get = |id: &str| live_signals.get(&(dev.clone(), id.to_string())).copied();
+        for p in in_pins {
+            let Some(companions) = flexinput_core::midi::parse_pin(p).and_then(|mp| mp.note_companions()) else { continue };
+            if !get(p).is_some_and(|s| s.as_bool()) {
+                continue;
+            }
+            let [pat, cp, vel] = companions;
+            let source = if get(&pat.to_id()).is_some() {
+                "aftertouch"
+            } else if get(&cp.to_id()).is_some() {
+                "channel pressure"
+            } else {
+                "velocity (no aftertouch sent)"
+            };
+            let vel = get(&vel.to_id()).map(|s| s.as_float()).unwrap_or(0.0);
+            return Some(LiveNote { vel, source });
+        }
+    }
+    None
+}
+
+fn live_analog_in_mag_one(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: &str,
+    in_pins: &[String],
+) -> Option<f32> {
     let mut best: Option<f32> = None;
     for p in in_pins {
         let v = if let Some((axis, sign)) = flexinput_engine::analog_axis_for_cardinal(p) {
@@ -2979,7 +3047,7 @@ pub(crate) fn render_touch_zone_cards(
                     };
                     mapping_card_curve_section(
                         ui, node_id, "zone_maps", i, &mut working,
-                        is_swipe, card_live_mag(&in_pins),
+                        is_swipe, card_live_mag(&in_pins), None,
                         if card_analog { nav_uid } else { None }, adaptive,
                     );
                 }

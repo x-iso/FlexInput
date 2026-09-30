@@ -1614,10 +1614,14 @@ impl eframe::App for FlexInputApp {
         // keeps the last one.
         {
             let unmutes = crate::canvas::viewer::take_midi_unmutes(ctx);
+            let flushes = crate::canvas::viewer::take_midi_flushes(ctx);
             if let Ok(mut g) = self.midi_backend.try_lock() {
                 if let Some(midi) = g.as_mut() {
                     for id in &unmutes {
                         midi.reset_breaker(id);
+                    }
+                    for id in &flushes {
+                        midi.flush_input(id);
                     }
                     let (pairs, muted) = midi.guard_status();
                     crate::canvas::viewer::set_midi_guard_view(ctx, crate::canvas::viewer::MidiGuardView {
@@ -1629,6 +1633,9 @@ impl eframe::App for FlexInputApp {
                 // Busy this frame: ask again next frame rather than dropping it.
                 for id in &unmutes {
                     crate::canvas::viewer::request_midi_unmute(ctx, id);
+                }
+                for id in &flushes {
+                    crate::canvas::viewer::request_midi_flush(ctx, id);
                 }
             }
         }

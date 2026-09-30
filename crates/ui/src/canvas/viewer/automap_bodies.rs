@@ -337,7 +337,9 @@ pub(crate) fn show_automap_split_body(
                 }
             });
 
-        if let Some(pin) = automap_midi_section(ui, node_id, "am_split", false) {
+        // A note comes with its velocity and aftertouch.
+        let picked = automap_midi_section(ui, node_id, "am_split", false);
+        for pin in picked.iter().flat_map(|p| p.node_pins()) {
             let id = pin.to_id();
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let has = node.params.get("output_pin_ids").and_then(|v| v.as_array())
@@ -448,7 +450,9 @@ pub(crate) fn show_automap_collect_body(
 
         // A MIDI pin collected here is PRODUCED: a MIDI Out sink downstream
         // sends it even with Thru off.
-        if let Some(pin) = automap_midi_section(ui, node_id, "am_collect", true) {
+        // A note comes with its velocity and aftertouch.
+        let picked = automap_midi_section(ui, node_id, "am_collect", true);
+        for pin in picked.iter().flat_map(|p| p.node_pins()) {
             let id = pin.to_id();
             if !current_ids.iter().any(|c| c == &id) {
                 if let Some(node) = snarl.get_node_mut(node_id) {

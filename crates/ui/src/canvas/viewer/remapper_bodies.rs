@@ -742,12 +742,16 @@ pub(crate) fn show_remapper_body(
                                 }
                                 rv.observe(i, &result);
                                 if card_analog {
+                                    // Every device behind the input: behind a
+                                    // Combiner the MIDI port isn't the first one.
                                     let live = live_analog_in_mag(
-                                        live_signals, upstream_dev_id.as_deref(), &in_pins);
+                                        live_signals, &upstream_devs, &in_pins);
+                                    let live_note = live_note_readout(
+                                        live_signals, &upstream_devs, &in_pins);
                                     let nav_uid = curve_nav_uid(ui.ctx(), node_id, "mappings", i);
                                     if mapping_card_curve_section(
                                         ui, node_id, "mappings", i, &mut working,
-                                        true, live, nav_uid, None,
+                                        true, live, live_note, nav_uid, None,
                                     ) {
                                         working_changed = true;
                                     }

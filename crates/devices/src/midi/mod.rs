@@ -328,6 +328,16 @@ impl MidiBackend {
         }
     }
 
+    /// Release every note an In port still holds (see
+    /// [`InPortDecoder::flush_notes`]). No-op for a port that isn't open.
+    pub fn flush_input(&mut self, in_id: &str) {
+        if let Some(e) = self.in_entries.iter().find(|e| e.device_id == in_id) {
+            if let Ok(mut s) = e.state.lock() {
+                s.flush_notes();
+            }
+        }
+    }
+
     /// Out ports the loop breaker muted since the last call.
     pub fn take_breaker_trips(&mut self) -> Vec<String> {
         self.guard.lock().map(|mut g| g.take_trips()).unwrap_or_default()

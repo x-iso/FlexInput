@@ -175,6 +175,20 @@ impl MidiPin {
         }
     }
 
+    /// The pins a MIDI node gets when this message is added to it. A note
+    /// brings its velocity and aftertouch, which are part of it; anything else
+    /// is just itself.
+    pub fn node_pins(&self) -> Vec<MidiPin> {
+        match *self {
+            MidiPin::Note { ch, note } => vec![
+                self.clone(),
+                MidiPin::Velocity { ch, note },
+                MidiPin::PolyAftertouch { ch, note },
+            ],
+            _ => vec![self.clone()],
+        }
+    }
+
     /// Bus signal type carried by this pin.
     pub fn signal_type(&self) -> SignalType {
         use MidiPin::*;
@@ -615,6 +629,16 @@ mod tests {
             MidiPin::Bpm,
             MidiPin::SysEx(vec![0xF0, 0x43, 0x10, 0x4C, 0x00, 0xF7]),
         ]
+    }
+
+    /// A note added to a node brings its velocity and aftertouch, on its own
+    /// channel; nothing else brings anything.
+    #[test]
+    fn a_note_on_a_node_comes_with_its_velocity_and_aftertouch() {
+        let ids: Vec<String> = MidiPin::Note { ch: Channel::Ch(2), note: 60 }
+            .node_pins().iter().map(MidiPin::to_id).collect();
+        assert_eq!(ids, ["midi:note:3:60", "midi:vel:3:60", "midi:pat:3:60"]);
+        assert_eq!(MidiPin::Cc { ch: Channel::Any, cc: 7 }.node_pins().len(), 1);
     }
 
     #[test]
