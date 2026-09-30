@@ -327,6 +327,17 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let has_cal_here = has_gy_c || has_st_c || has_dz_c;
                     ui.vertical(|ui| {
                         ui.label(&title);
+                        // A keyboard unplugged mid-chord never sends its Note
+                        // Offs, leaving those notes held for good.
+                        if dev_id_str.starts_with("midi_in:") {
+                            if ui.small_button("Flush")
+                                .on_hover_text("Release every note this port still holds — for notes left \
+                                                stuck when a keyboard was unplugged or dropped its Note Off.")
+                                .clicked()
+                            {
+                                request_midi_flush(ui.ctx(), dev_id_str);
+                            }
+                        }
                         if has_cal_here {
                             ui.horizontal(|ui| {
                                 let cal_resp = ui.small_button("Calibrate")

@@ -254,7 +254,7 @@ pub(crate) fn midi_pin_picker_fields(
 
     let built;
     {
-        egui::ComboBox::from_id_salt(id.with("kind"))
+        let kind_rect = egui::ComboBox::from_id_salt(id.with("kind"))
             .selected_text(egui::RichText::new(st.kind.label()).small())
             .width(110.0)
             .show_ui(ui, |ui| {
@@ -269,7 +269,12 @@ pub(crate) fn midi_pin_picker_fields(
                         }
                     }
                 }
-            });
+            })
+            .response.rect;
+        // Where the field after the type starts, from the row's left: a MIDI
+        // node's header lines its Clear unused button up with it.
+        let second_x = kind_rect.width() + ui.spacing().item_spacing.x;
+        ui.ctx().data_mut(|d| d.insert_temp(id.with("second_x"), second_x));
 
         // A greyed "—" says plainly that this type has no channel / number,
         // rather than the field silently vanishing.
@@ -890,6 +895,16 @@ fn midi_pin_list(ui: &mut egui::Ui, rows: &[(usize, String)]) -> Option<usize> {
     to_remove
 }
 
+/// Space a header row so its next button starts where the picker below starts
+/// its second field (as laid out last frame) — keeping Clear unused clear of
+/// Learn and Add — and never closer than a finger's width.
+fn space_to_picker_second_field(ui: &mut egui::Ui, picker_salt: impl std::hash::Hash) {
+    let id = egui::Id::new(("midi_pin_picker", picker_salt));
+    let target: f32 = ui.ctx().data(|d| d.get_temp(id.with("second_x"))).unwrap_or(0.0);
+    let used = ui.cursor().min.x - ui.max_rect().left();
+    ui.add_space((target - used).max(12.0));
+}
+
 /// Last frame's width of a MIDI In node's header controls.
 pub(crate) fn midi_header_w_key(node: NodeId) -> egui::Id {
     egui::Id::new(("midi_in_header_controls_w", node.0))
@@ -903,8 +918,8 @@ pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut eg
     }
 }
 
-/// A MIDI In node's header controls, under its title: Flush, Learn, Clear
-/// unused, and the picker that adds a message.
+/// A MIDI In node's header controls, under its title row: Learn, Clear
+/// unused, and the picker that adds a message. (Flush sits under the name.)
 pub(crate) fn show_midi_in_header_controls(
     node_id: NodeId,
     outputs: &[OutPin],
@@ -913,23 +928,13 @@ pub(crate) fn show_midi_in_header_controls(
 ) {
     let Some(node) = snarl.get_node(node_id) else { return };
     let is_learning = node.params.get("learning").and_then(|v| v.as_bool()).unwrap_or(false);
-    let in_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
 
     ui.horizontal(|ui| {
-        // A keyboard unplugged mid-chord never sends its Note Offs, leaving
-        // those notes held for good.
-        if ui.small_button("Flush")
-            .on_hover_text("Release every note this port still holds — for notes left \
-                            stuck when a keyboard was unplugged or dropped its Note Off.")
-            .clicked()
-        {
-            request_midi_flush(ui.ctx(), &in_id);
-        }
         let learn_label = if is_learning {
-            egui::RichText::new("● Stop").small().color(Color32::from_rgb(220, 80, 80))
+            egui::RichText::new("● Stop").color(Color32::from_rgb(220, 80, 80))
         } else {
-            egui::RichText::new("Learn").small()
+            egui::RichText::new("Learn")
         };
         let resp = ui.small_button(learn_label).on_hover_text(
             "Add a pin for each note, controller, bend, program change or \
@@ -942,6 +947,9 @@ pub(crate) fn show_midi_in_header_controls(
         }
         let has_unused = outputs.iter().enumerate()
             .any(|(i, o)| o.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
+        if has_unused {
+            space_to_picker_second_field(ui, (node_id, "midi_in_add"));
+        }
         if has_unused && ui.small_button("Clear unused").clicked() {
             clear_unused_midi_outputs(node_id, outputs, snarl);
         }
@@ -997,6 +1005,9 @@ pub(crate) fn show_midi_out_header_controls(
         }
         let has_unused = inputs.iter().enumerate()
             .any(|(i, p)| p.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
+        if has_unused {
+            space_to_picker_second_field(ui, (node_id, "midi_out_add"));
+        }
         if has_unused && ui.small_button("Clear unused").clicked() {
             clear_unused_midi_inputs(node_id, inputs, snarl);
         }
