@@ -34,6 +34,9 @@ pub enum Dest {
     /// `PS_MOTION`: the pad's own motion sensors, forwarded rather than aimed
     /// with. Nothing to do here — see the note in `parse.rs`.
     PsMotion,
+    /// `MIDI` (`GYRO_OUTPUT` only): the rotation rate goes out as MIDI values, to
+    /// `GYRO_MIDI_X` / `_Y` / `_Z`.
+    Midi,
 }
 
 impl Dest {
@@ -42,7 +45,7 @@ impl Dest {
         match self {
             Dest::LeftStick => Some(0),
             Dest::RightStick => Some(1),
-            Dest::Mouse | Dest::PsMotion => None,
+            Dest::Mouse | Dest::PsMotion | Dest::Midi => None,
         }
     }
 }

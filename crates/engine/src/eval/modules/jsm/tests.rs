@@ -6572,3 +6572,92 @@ fn midi_lines_refuse_what_cannot_work() {
     assert!(!err("S = MIDI_PC5'"));
     assert!(!err("MIDI_C4,MIDI_E4 = ^LCONTROL"), "MIDI chords like any button");
 }
+
+/// A stick in MIDI mode sends its position, centred at 64, and is the config's:
+/// the stick itself no longer passes through.
+#[test]
+fn a_stick_in_midi_mode_sends_its_position() {
+    let text = "LEFT_STICK_MODE = MIDI\nLEFT_MIDI_X = MIDI_CC1\nLEFT_MIDI_Y = MIDI_PB_CH2\n\
+                STICK_DEADZONE_INNER = 0\nSTICK_DEADZONE_OUTER = 0";
+    // A point on the stick's circle, so the stick side's length clamp leaves it be.
+    let bus = run_node_with(text, false, &[("left_stick", Signal::Vec2(glam::Vec2::new(0.6, -0.8)))], 2);
+    let Some(Signal::Float(x)) = bus.get("midi:cc:1:1") else { panic!("no cc: {bus:?}") };
+    assert!((x - 0.8).abs() < 1e-4, "0.6 right is 0.8 of the way up from 64-centred, got {x}");
+    let Some(Signal::Float(b)) = bus.get("midi:pb:2") else { panic!("no bend: {bus:?}") };
+    assert!((b + 0.8).abs() < 1e-4, "a bend takes the axis as it stands, got {b}");
+    assert!(bus.contains_key("__midi_out__:midi:cc:1:1"));
+    assert_eq!(bus.get("left_stick"), Some(&Signal::Vec2(glam::Vec2::ZERO)), "the stick is claimed");
+
+    let bus = run_node_with(text, false, &[("left_stick", Signal::Vec2(glam::Vec2::ZERO))], 2);
+    assert_eq!(bus.get("midi:cc:1:1"), Some(&Signal::Float(0.5)), "at rest it sits at 64");
+
+    // Without the mode the target is inert, and the stick passes through.
+    let bus = run_node_with("LEFT_MIDI_X = MIDI_CC1", false, &[("left_stick", Signal::Vec2(glam::Vec2::new(1.0, 0.0)))], 2);
+    assert!(!bus.contains_key("midi:cc:1:1"), "{bus:?}");
+}
+
+/// The accelerometer needs no mode: a target is enough.
+#[test]
+fn an_accel_axis_sends_with_just_a_target() {
+    // 1 g on a bus that carries fractions of 8 g, over a 2 g full scale.
+    let text = "ACCEL_MIDI_Z = MIDI_CC20";
+    let bus = run_node_with(text, false, &[("accel_z", Signal::Float(1.0 / 8.0))], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:cc:1:20") else { panic!("{bus:?}") };
+    assert!((v - 0.75).abs() < 1e-4, "half scale up from centre, got {v}");
+}
+
+/// The touchpad in MIDI mode is an XY pad: the finger's place, from the bottom
+/// left, held where it was when the finger lifts.
+#[test]
+fn the_touchpad_in_midi_mode_is_an_xy_pad() {
+    let _guard = alone();
+    let uid = 7301;
+    let snap = jsm_snap(uid, "TOUCHPAD_MODE = MIDI\nTOUCH_MIDI_X = MIDI_CC70\nTOUCH_MIDI_Y = MIDI_CC71", false);
+    let key = format!("collector:{uid}");
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut run = |finger: Option<(f32, f32)>| -> HashMap<String, Signal> {
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        if let Some((x, y)) = finger {
+            dev.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+            dev.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(x));
+            dev.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(y));
+        }
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
+        collector.into_iter().filter(|((d, _), _)| *d == key).map(|((_, p), s)| (p, s)).collect()
+    };
+    // Right edge, top edge (the bus counts y from the top).
+    let bus = run(Some((1.0, -1.0)));
+    assert_eq!(bus.get("midi:cc:1:70"), Some(&Signal::Float(1.0)), "{bus:?}");
+    assert_eq!(bus.get("midi:cc:1:71"), Some(&Signal::Float(1.0)));
+    let bus = run(None);
+    assert_eq!(bus.get("midi:cc:1:70"), Some(&Signal::Float(1.0)), "lifted, it holds");
+}
+
+/// The gyro sends its rate once GYRO_OUTPUT says MIDI, over GYRO_MIDI_SCALE —
+/// and the gyro button still turns it off.
+#[test]
+fn the_gyro_sends_midi_and_its_button_still_stops_it() {
+    let text = "GYRO_OUTPUT = MIDI\nGYRO_MIDI_Z = MIDI_CC30\nGYRO_MIDI_SCALE = 100\nGYRO_OFF = S";
+    // 50 deg/s of roll on a bus that carries fractions of 2000 deg/s.
+    let roll = ("gyro_x", Signal::Float(50.0 / 2000.0));
+    let bus = run_node_with(text, false, &[roll], 2);
+    let Some(Signal::Float(v)) = bus.get("midi:cc:1:30") else { panic!("{bus:?}") };
+    assert!((v - 0.75).abs() < 1e-3, "half scale up from centre, got {v}");
+    assert_eq!(bus.get("gyro_x"), Some(&Signal::Float(0.0)), "the gyro is the config's now");
+
+    let bus = run_node_with(text, false, &[roll, ("btn_south", Signal::Bool(true))], 2);
+    assert_eq!(bus.get("midi:cc:1:30"), Some(&Signal::Float(0.5)), "GYRO_OFF held: back to centre");
+}
+
+/// The lines say what a target or a mode word can't be.
+#[test]
+fn midi_source_lines_refuse_what_cannot_work() {
+    let err = |line: &str| matches!(one(line).status, LineStatus::Error(_));
+    assert!(err("LEFT_MIDI_X = MIDI_C4"), "a note can't follow a stick");
+    assert!(err("FLICK_STICK_OUTPUT = MIDI"));
+    assert!(!err("GYRO_OUTPUT = MIDI"));
+    assert!(!err("MOTION_STICK_MODE = MIDI"));
+    assert!(!err("TOUCHPAD_MODE = MIDI"));
+    assert!(!err("L,LEFT_MIDI_X = MIDI_CC2"), "a target can change with a chord");
+}

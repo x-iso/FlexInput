@@ -30,6 +30,9 @@ pub enum Mode {
     Mouse,
     /// The touchpad is handed to a virtual pad as a touchpad.
     PsTouchpad,
+    /// `MIDI`: the first finger's place on the pad goes out as MIDI values, to
+    /// `TOUCH_MIDI_X` / `TOUCH_MIDI_Y` — an XY pad for a synth.
+    Midi,
 }
 
 /// What the touch side of a config is configured with.
@@ -153,7 +156,9 @@ impl Touch {
                 }
                 // The pad's own touchpad passes through to a virtual pad, which is
                 // what the bus already does with `touch1_*` — nothing to do here.
-                Mode::PsTouchpad => {}
+                // The finger's position is read straight off the bus by the
+                // publish side; nothing here builds on it.
+                Mode::PsTouchpad | Mode::Midi => {}
             }
         }
         out

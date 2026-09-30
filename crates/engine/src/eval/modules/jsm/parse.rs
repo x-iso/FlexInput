@@ -1691,6 +1691,8 @@ fn stick_mode(v: &str) -> Parsed<(StickMode, Option<RingMode>)> {
         "FLICK_ONLY" => (StickMode::FlickOnly, None),
         "ROTATE_ONLY" => (StickMode::RotateOnly, None),
         "MOUSE_AREA" => (StickMode::MouseArea, None),
+        // FlexInput's own: the stick's position as MIDI values.
+        "MIDI" => (StickMode::Midi, None),
         "MOUSE_RING" => return Parsed::Later(WHY_ABSOLUTE),
         "HYBRID_AIM" => return Parsed::Later(WHY_HYBRID),
         // ── the virtual pad's own sticks ──────────────────────────────────────
@@ -2018,7 +2020,15 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
                             .to_string(),
                     ),
                 ),
-                _ => return wants("MOUSE, LEFT_STICK, RIGHT_STICK or PS_MOTION"),
+                // The flick stick is a turn, not a value; only the gyro's rate
+                // has anything to send.
+                "MIDI" if !flick => (Dest::Midi, None),
+                "MIDI" => return LineInfo::of(LineStatus::Error(
+                    "a flick is a turn to make, not a value to send — GYRO_OUTPUT can be MIDI, \
+                     FLICK_STICK_OUTPUT can't"
+                        .into(),
+                )),
+                _ => return wants("MOUSE, LEFT_STICK, RIGHT_STICK, PS_MOTION or MIDI"),
             };
             if flick {
                 p.flick_dest = dest;
@@ -2262,7 +2272,8 @@ fn motion_setting(
                 "GRID_AND_STICK" => Mode::GridAndStick,
                 "MOUSE" => Mode::Mouse,
                 "PS_TOUCHPAD" => Mode::PsTouchpad,
-                _ => return wants("GRID_AND_STICK, MOUSE or PS_TOUCHPAD"),
+                "MIDI" => Mode::Midi,
+                _ => return wants("GRID_AND_STICK, MOUSE, PS_TOUCHPAD or MIDI"),
             };
             let mut info = LineInfo::of(LineStatus::Ok);
             if t.mode == Mode::PsTouchpad {
@@ -2850,6 +2861,20 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "MIDI_IN_THRESHOLD" => Midi(super::midi::MidiId::InThreshold),
         "GYRO_MIDI_SCALE" => Midi(super::midi::MidiId::GyroScale),
         "ACCEL_MIDI_SCALE" => Midi(super::midi::MidiId::AccelScale),
+        "LEFT_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::LeftX)),
+        "LEFT_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::LeftY)),
+        "RIGHT_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::RightX)),
+        "RIGHT_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::RightY)),
+        "MOTION_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::MotionX)),
+        "MOTION_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::MotionY)),
+        "TOUCH_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::TouchX)),
+        "TOUCH_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::TouchY)),
+        "GYRO_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::GyroX)),
+        "GYRO_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::GyroY)),
+        "GYRO_MIDI_Z" => Midi(super::midi::MidiId::Target(super::midi::Source::GyroZ)),
+        "ACCEL_MIDI_X" => Midi(super::midi::MidiId::Target(super::midi::Source::AccelX)),
+        "ACCEL_MIDI_Y" => Midi(super::midi::MidiId::Target(super::midi::Source::AccelY)),
+        "ACCEL_MIDI_Z" => Midi(super::midi::MidiId::Target(super::midi::Source::AccelZ)),
 
         // Feedback.
         "RUMBLE" => Fb(FbId::Rumble),

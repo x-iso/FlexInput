@@ -98,6 +98,10 @@ pub(crate) const SETTINGS: &[&str] = &[
     "IGNORE_GYRO_DEVICES", "TELEMETRY_ENABLED", "TELEMETRY_PORT",
     "MIDI_CHANNEL", "MIDI_IN_CHANNEL", "MIDI_VELOCITY",
     "MIDI_IN_THRESHOLD", "GYRO_MIDI_SCALE", "ACCEL_MIDI_SCALE",
+    "LEFT_MIDI_X", "LEFT_MIDI_Y", "RIGHT_MIDI_X", "RIGHT_MIDI_Y",
+    "MOTION_MIDI_X", "MOTION_MIDI_Y", "TOUCH_MIDI_X", "TOUCH_MIDI_Y",
+    "GYRO_MIDI_X", "GYRO_MIDI_Y", "GYRO_MIDI_Z",
+    "ACCEL_MIDI_X", "ACCEL_MIDI_Y", "ACCEL_MIDI_Z",
     "RUMBLE", "LIGHT_BAR", "ADAPTIVE_TRIGGER",
     "LEFT_TRIGGER_EFFECT", "RIGHT_TRIGGER_EFFECT", "LEFT_TRIGGER_OFFSET",
     "LEFT_TRIGGER_RANGE", "RIGHT_TRIGGER_OFFSET", "RIGHT_TRIGGER_RANGE",
@@ -492,6 +496,9 @@ pub(crate) const VALUE_WORDS: &[&str] = &[
     // Light bar colours.
     "RED", "GREEN", "BLUE", "YELLOW", "CYAN", "MAGENTA", "PINK", "ORANGE", "PURPLE",
     "WHITE", "GREY", "BLACK",
+    // FlexInput's own: a stick, the touchpad or the gyro sending MIDI values.
+    // Last, so it never stands in front of JSM's own words in a cycle.
+    "MIDI",
 ];
 
 /// Spellings the parser accepts so existing configs load, but which cycling
@@ -885,7 +892,13 @@ mod catalogue_tests {
         assert_eq!(opts.first(), Some(&"NO_MOUSE"), "{opts:?}");
         assert!(!opts.contains(&"LEFT_STEER_X"), "steering is the motion stick's alone");
         let t = "GYRO_OUTPUT = ?";
-        assert_eq!(value_options(t, cursor_on_value(t)), ["MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION"]);
+        assert_eq!(
+            value_options(t, cursor_on_value(t)),
+            ["MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION", "MIDI"]
+        );
+        // The flick stick can't send MIDI, so its list doesn't offer it.
+        let t = "FLICK_STICK_OUTPUT = ?";
+        assert!(!value_options(t, cursor_on_value(t)).contains(&"MIDI"));
     }
 
     /// A word the parser recognises but wants numbers after is still one of the

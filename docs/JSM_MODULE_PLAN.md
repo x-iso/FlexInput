@@ -948,10 +948,19 @@ can drive two different messages without a binding for each:
 | gyro | `GYRO_OUTPUT = MIDI` | `GYRO_MIDI_X/Y/Z` |
 | accelerometer | — | `ACCEL_MIDI_X/Y/Z` |
 
-The accelerometer is the one source with no mode to switch: the module never
-claims the accel pins (they pass through so a virtual pad downstream keeps its
-motion), and sending them to MIDI doesn't change that. Setting a target is
-enough.
+The accelerometer is the one source with no mode to switch: it is only ever
+read here, never turned into something else, so setting a target is enough.
+(Whether the accel pins also pass on downstream is the gravity rule's business,
+not MIDI's: a config that reads gravity — which a motion stick left at its
+default mode does — claims them.)
+
+As built: the touchpad sends the first finger's place on the pad (an XY pad,
+0–127 from the bottom left), holding the last value when the finger lifts. The
+gyro sends its rate after the gyro space, smoothing, cutoff, the gyro button
+and the inversions, but before the sensitivity ramp — X is the turn, Y the tilt
+(up is positive), Z the pad's own roll. `FLICK_STICK_OUTPUT = MIDI` is refused:
+a flick is a turn to make, not a value to send. A target can change with a
+chord; it is a value, so nothing is left hanging.
 
 **How a value becomes a number.** A one-sided source (a trigger pull, a touch
 stick's distance) fills 0–127 from its bottom to its top. A two-sided one (a

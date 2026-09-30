@@ -285,6 +285,72 @@ impl MidiName {
     }
 }
 
+/// A continuous source a config can point at a MIDI value, one axis at a time.
+///
+/// A thumbstick, the motion stick and the gyro only send once their mode says
+/// so (`LEFT_STICK_MODE = MIDI`, `GYRO_OUTPUT = MIDI`, …), which is what hands
+/// the source over from whatever it was doing. The touchpad is the same through
+/// `TOUCHPAD_MODE = MIDI`. The accelerometer has no mode — it is only ever read
+/// here, never turned into anything else — so setting a target is all it takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    LeftX,
+    LeftY,
+    RightX,
+    RightY,
+    MotionX,
+    MotionY,
+    TouchX,
+    TouchY,
+    GyroX,
+    GyroY,
+    GyroZ,
+    AccelX,
+    AccelY,
+    AccelZ,
+}
+
+/// Every source, with the setting that names its target.
+pub(crate) const SOURCES: [(&str, Source); 14] = [
+    ("LEFT_MIDI_X", Source::LeftX),
+    ("LEFT_MIDI_Y", Source::LeftY),
+    ("RIGHT_MIDI_X", Source::RightX),
+    ("RIGHT_MIDI_Y", Source::RightY),
+    ("MOTION_MIDI_X", Source::MotionX),
+    ("MOTION_MIDI_Y", Source::MotionY),
+    ("TOUCH_MIDI_X", Source::TouchX),
+    ("TOUCH_MIDI_Y", Source::TouchY),
+    ("GYRO_MIDI_X", Source::GyroX),
+    ("GYRO_MIDI_Y", Source::GyroY),
+    ("GYRO_MIDI_Z", Source::GyroZ),
+    ("ACCEL_MIDI_X", Source::AccelX),
+    ("ACCEL_MIDI_Y", Source::AccelY),
+    ("ACCEL_MIDI_Z", Source::AccelZ),
+];
+
+impl Source {
+    /// Centred at rest (a stick, a rate, a force) rather than starting at the
+    /// bottom (a finger's place on the pad).
+    pub fn two_sided(self) -> bool {
+        !matches!(self, Source::TouchX | Source::TouchY)
+    }
+}
+
+/// Where a source's reading lands in its target's range.
+///
+/// A one-sided reading (0..1) fills the value from bottom to top. A two-sided
+/// one (−1..1) is centred: 64 at rest, 0 and 127 at the ends. A bend is
+/// two-sided in the protocol too, so it takes a two-sided reading as it stands
+/// and a one-sided one as a push up from its centre.
+pub fn value_for(target: &MidiPin, reading: f32, two_sided: bool) -> f32 {
+    let bend = matches!(target, MidiPin::PitchBend { .. });
+    match (bend, two_sided) {
+        (true, _) => reading.clamp(-1.0, 1.0),
+        (false, true) => (0.5 + 0.5 * reading).clamp(0.0, 1.0),
+        (false, false) => reading.clamp(0.0, 1.0),
+    }
+}
+
 /// The MIDI settings, as the config (or a held chord) has them.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
@@ -300,6 +366,8 @@ pub struct Settings {
     pub gyro_scale: f32,
     /// `ACCEL_MIDI_SCALE`: g that reaches the end of a MIDI value.
     pub accel_scale: f32,
+    /// Each [`Source`]'s target (`LEFT_MIDI_X = MIDI_CC1`), by `Source as usize`.
+    pub targets: [Option<MidiName>; SOURCES.len()],
 }
 
 impl Default for Settings {
@@ -311,7 +379,15 @@ impl Default for Settings {
             in_threshold: 0.5,
             gyro_scale: 360.0,
             accel_scale: 2.0,
+            targets: [None; SOURCES.len()],
         }
+    }
+}
+
+impl Settings {
+    /// The target `source` sends to, if it has one.
+    pub fn target(&self, source: Source) -> Option<MidiName> {
+        self.targets[source as usize]
     }
 }
 
@@ -324,6 +400,8 @@ pub(crate) enum MidiId {
     InThreshold,
     GyroScale,
     AccelScale,
+    /// Where one continuous source sends (`LEFT_MIDI_X` …).
+    Target(Source),
 }
 
 impl MidiId {
@@ -383,6 +461,35 @@ pub(crate) fn apply(name: &str, rhs: &str, which: MidiId, s: &mut Settings) -> R
             } else {
                 s.accel_scale = v;
             }
+        }
+        MidiId::Target(source) => {
+            if word.eq_ignore_ascii_case("NONE") {
+                s.targets[source as usize] = None;
+                return Ok(());
+            }
+            let m = match parse(word) {
+                Some(Ok(m)) => m,
+                Some(Err(why)) => return Err(why),
+                None => {
+                    return Err(format!(
+                        "`{name}` wants a MIDI controller, bend or pressure (`MIDI_CC1`, \
+                         `MIDI_PB`, `MIDI_CP` …), or NONE"
+                    ))
+                }
+            };
+            if let Some(why) = m.output_problem() {
+                return Err(why);
+            }
+            // A note or a program change is a gate; a stick sweeping through
+            // one would retrigger it on every move.
+            if !m.kind.is_continuous() {
+                return Err(format!(
+                    "`{name}` follows a moving source, so it wants a value — a controller, bend \
+                     or pressure, not `{}`",
+                    m.spell()
+                ));
+            }
+            s.targets[source as usize] = Some(m);
         }
     }
     Ok(())
@@ -458,6 +565,31 @@ mod tests {
         assert!(p("MIDI_C4").output_problem().is_none());
         assert!(p("MIDI_BPM").input_problem().is_some());
         assert!(p("MIDI_PLAYING").input_problem().is_none());
+    }
+
+    #[test]
+    fn a_reading_lands_centred_or_from_the_bottom() {
+        let cc = MidiPin::Cc { ch: Channel::Ch(0), cc: 1 };
+        let pb = MidiPin::PitchBend { ch: Channel::Ch(0) };
+        assert_eq!(value_for(&cc, 0.0, true), 0.5, "a centred stick sits at 64");
+        assert_eq!(value_for(&cc, -1.0, true), 0.0);
+        assert_eq!(value_for(&cc, 1.0, true), 1.0);
+        assert_eq!(value_for(&cc, 0.25, false), 0.25, "a finger fills from the bottom");
+        assert_eq!(value_for(&pb, -0.5, true), -0.5, "a bend is two-sided already");
+        assert_eq!(value_for(&pb, 0.5, false), 0.5, "a one-sided reading pushes up from centre");
+        assert_eq!(value_for(&cc, 3.0, true), 1.0, "past the scale it pins at the end");
+    }
+
+    #[test]
+    fn a_target_wants_a_value_it_can_send() {
+        let mut s = Settings::default();
+        assert!(apply("LEFT_MIDI_X", "MIDI_CC1", MidiId::Target(Source::LeftX), &mut s).is_ok());
+        assert_eq!(s.target(Source::LeftX), Some(p("MIDI_CC1")));
+        assert!(apply("LEFT_MIDI_X", "NONE", MidiId::Target(Source::LeftX), &mut s).is_ok());
+        assert_eq!(s.target(Source::LeftX), None);
+        for bad in ["MIDI_C4", "MIDI_PC3", "MIDI_BPM", "MIDI_CC1_CHANY", "SPACE"] {
+            assert!(apply("LEFT_MIDI_X", bad, MidiId::Target(Source::LeftX), &mut s).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -187,6 +187,11 @@ pub struct Aimed {
     pub gyro_dps: Vec2,
     /// The flick stick's camera rate in deg/s, on the same terms.
     pub flick_dps: Vec2,
+    /// With `GYRO_OUTPUT = MIDI`: the rotation rate in deg/s as (turn, tilt,
+    /// roll), up and right positive — through the gyro space, smoothing, cutoff,
+    /// the gyro button and the inversions, but NOT the sensitivity ramp, which
+    /// is a game's business. `GYRO_MIDI_SCALE` is what full scale means here.
+    pub midi_dps: glam::Vec3,
 }
 
 /// The pad's rotation this tick, in degrees per second, on our bus's axes.
@@ -422,6 +427,14 @@ impl Aim {
         let sign_y = if invert || actions.contains(&GyroAction::InvertY) { -s.axis_y } else { s.axis_y };
         let mut vel_x = gx * sign_x;
         let mut vel_y = gy * sign_y;
+        // JSM counts pitch downward (the screen's y); a MIDI value rises as the
+        // pad tilts up. Roll isn't in JSM's two-axis pipeline at all, so it is
+        // the pad's own, held at zero with the rest while the gyro is off.
+        let midi_dps = if p.gyro_dest == Dest::Midi {
+            glam::Vec3::new(vel_x, -vel_y, if blocked { 0.0 } else { gyro.roll })
+        } else {
+            glam::Vec3::ZERO
+        };
 
         // ── the brake, then the snap, then the ramp ──────────────────────────
         //
@@ -491,7 +504,7 @@ impl Aim {
         } else {
             Vec2::ZERO
         };
-        Aimed { mouse, gyro_dps, flick_dps }
+        Aimed { mouse, gyro_dps, flick_dps, midi_dps }
     }
 
     /// JSM's gyro smoother: what is over the threshold goes straight through,

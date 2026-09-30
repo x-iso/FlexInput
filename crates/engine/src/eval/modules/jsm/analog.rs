@@ -100,6 +100,9 @@ pub enum StickMode {
     /// measured from the lean angle rather than from the stick, so `motion.rs`
     /// computes it and this mode only says where it goes.
     Steer(usize),
+    /// `MIDI`: the stick's position goes out as MIDI values — its X and Y to
+    /// the targets `LEFT_MIDI_X` / `_Y` (and their siblings) name.
+    Midi,
     /// A mode a later phase owns: nothing comes from the stick here.
     Elsewhere,
     /// Doing nothing until the stick comes back to centre (JSM's `INVALID`).
@@ -134,7 +137,9 @@ impl StickMode {
     pub fn pads(self) -> bool { self.pad_side().is_some() }
 
     /// Is the stick this module's to read at all?
-    pub fn runs_here(self) -> bool { self.is_digital() || self.aims() || self.pads() }
+    pub fn runs_here(self) -> bool {
+        self.is_digital() || self.aims() || self.pads() || self == StickMode::Midi
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -646,8 +651,8 @@ impl Analog {
             // which at its default of zero comes to the same thing; the input
             // deadzone is the meaningful line to draw and is what every other
             // mode here uses.
-            StickMode::VirtualStick(_) | StickMode::AngleToAxis(..) | StickMode::Wind(_) =>
-                active = raw_len > cfg.inner_dz,
+            StickMode::VirtualStick(_) | StickMode::AngleToAxis(..) | StickMode::Wind(_)
+            | StickMode::Midi => active = raw_len > cfg.inner_dz,
             // Steering is measured from the lean angle, not from this stick's
             // deflection, so the stick itself has nothing to report here.
             StickMode::Steer(_) => {}

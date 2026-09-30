@@ -31,6 +31,8 @@ use super::parse::Compiled;
 /// The bus carries a rotation rate as a fraction of this many degrees per second
 /// (`flexinput_devices::gyro::GYRO_REF_DPS`, as the RWS module also mirrors it).
 const GYRO_REF_DPS: f32 = 2000.0;
+/// …and a force as a fraction of this many g (`flexinput_devices::gyro::ACCEL_REF_G`).
+const ACCEL_REF_G: f32 = 8.0;
 
 /// Set by the UI while a JSM editor has keyboard focus. A binding under test
 /// would otherwise type into the very editor it is being written in, so while
@@ -87,6 +89,8 @@ pub struct JsmState {
     /// original stuck-key bug in a different coat. Keeping the union costs a few
     /// pin writes a tick and makes it impossible.
     ever_claimed: HashSet<String>,
+    /// The touchpad's last MIDI position, kept while no finger is down.
+    midi_touch: (f32, f32),
 }
 
 /// Evaluate one JSM Config node.
@@ -168,6 +172,7 @@ pub(crate) fn jsm_publish(
             cal: super::cal::Measure::default(),
             cal_flick: super::cal::Flick::default(),
             ever_claimed: HashSet::new(),
+            midi_touch: (0.0, 0.0),
             cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
             analog: Analog::default(),
@@ -268,7 +273,7 @@ pub(crate) fn jsm_publish(
         pitch: f("gyro_y"),
         yaw: f("gyro_z"),
     };
-    let aimed = {
+    let aimed: super::aim::Aimed = {
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
         st.aim
@@ -452,6 +457,58 @@ pub(crate) fn jsm_publish(
     if aims_anything(&st.cfg, &res) || res.touch.mode == super::touch::Mode::Mouse {
         let m = if typing { Vec2::ZERO } else { mouse + touch_out.mouse };
         collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
+    }
+
+    // ── continuous sources, as MIDI ──────────────────────────────────────────
+    //
+    // A stick, the touchpad and the gyro send once their mode says MIDI; the
+    // accelerometer whenever it has a target. Written every tick — a value, not
+    // a gate — and marked produced so a MIDI Out sends it with Thru off.
+    {
+        use super::midi::Source as Src;
+        let m = res.midi;
+        let mut send: Vec<(Src, f32)> = Vec::new();
+        for (side, cfg, x, y) in [
+            (0, res.settings.left, Src::LeftX, Src::LeftY),
+            (1, res.settings.right, Src::RightX, Src::RightY),
+            (super::analog::MOTION, res.settings.motion, Src::MotionX, Src::MotionY),
+        ] {
+            if cfg.mode == super::analog::StickMode::Midi {
+                let o = st.analog.stick_out(side);
+                send.push((x, o.x));
+                send.push((y, o.y));
+            }
+        }
+        if res.touch.mode == super::touch::Mode::Midi {
+            // Where the first finger is, 0..1 across and 0..1 up. Lifting it
+            // leaves the value where it was, as an XY pad does.
+            let f = touch_fingers(&upstream)[0];
+            if f.active {
+                st.midi_touch = (
+                    ((f.x + 1.0) / 2.0).clamp(0.0, 1.0),
+                    // The bus counts the pad's y from the top.
+                    (1.0 - (f.y + 1.0) / 2.0).clamp(0.0, 1.0),
+                );
+            }
+            send.push((Src::TouchX, st.midi_touch.0));
+            send.push((Src::TouchY, st.midi_touch.1));
+        }
+        if res.pad.gyro_dest == super::pad::Dest::Midi {
+            let g = aimed.midi_dps / m.gyro_scale;
+            send.extend([(Src::GyroX, g.x), (Src::GyroY, g.y), (Src::GyroZ, g.z)]);
+        }
+        if let Some(a) = read_accel(&upstream) {
+            let a = a * ACCEL_REF_G / m.accel_scale;
+            send.extend([(Src::AccelX, a.x), (Src::AccelY, a.y), (Src::AccelZ, a.z)]);
+        }
+        for (src, reading) in send {
+            let Some(target) = m.target(src) else { continue };
+            let pin = target.pin(Some(m.channel));
+            let v = super::midi::value_for(&pin, reading, src.two_sided());
+            let id = pin.to_id();
+            collector_sigs.insert((key.clone(), id.clone()), Signal::Float(v));
+            crate::eval::midi_bus::mark_produced(&key, &id, collector_sigs);
+        }
     }
 
     // ── a calibration sweep, when one is running ─────────────────────────────
@@ -768,7 +825,7 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
         (StickId::Left, res.settings.left),
         (StickId::Right, res.settings.right),
     ] {
-        if s.mode.aims() || s.mode.pads() {
+        if s.mode.aims() || s.mode.pads() || s.mode == super::analog::StickMode::Midi {
             analog.extend(stick_pins(stick));
         }
         // And the virtual stick it drives is the config's to write, which may not
@@ -856,6 +913,7 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
         && (cfg.mentioned.iter().any(|b| {
             matches!(b.source(), BtnSource::Touch | BtnSource::TouchZone { .. })
         }) || res.touch.mode == super::touch::Mode::Mouse
+            || res.touch.mode == super::touch::Mode::Midi
             || res.settings.touch.mode.runs_here())
     {
         for pin in ["touch1_x", "touch1_y", "touch1_active", "touch2_x", "touch2_y", "touch2_active"] {
@@ -879,8 +937,10 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
     // with nothing, and passes the gyro on untouched — and so does `GYRO_OUTPUT =
     // PS_MOTION`, which is the whole of what that setting means here: the pad's
     // own motion goes downstream untouched, for a DualSense or DS4 sink to use.
-    if res.pad.gyro_dest != super::pad::Dest::PsMotion
-        && (res.aim.min_sens != (0.0, 0.0) || res.aim.max_sens != (0.0, 0.0))
+    // Sent as MIDI, it is the config's whatever the sensitivity says.
+    if res.pad.gyro_dest == super::pad::Dest::Midi
+        || (res.pad.gyro_dest != super::pad::Dest::PsMotion
+            && (res.aim.min_sens != (0.0, 0.0) || res.aim.max_sens != (0.0, 0.0)))
     {
         for pin in ["gyro_x", "gyro_y", "gyro_z"] {
             analog.insert(pin.to_string());
