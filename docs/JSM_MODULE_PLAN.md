@@ -985,10 +985,16 @@ than silence.
 
 ### What it costs in the code
 
-- **`Btn` cannot hold these.** Its variants are fixed and a test walks all of
-  them, which is exactly the property worth keeping. MIDI inputs parse down a
-  separate path to an owned pin (`BtnSource` gains an owned-pin variant), so the
-  exhaustive walk still means what it says.
+- **`Btn` holds them as a parametric variant.** Every press machine keys on
+  `Btn`, so a separate path would have meant a second copy of all of them.
+  Instead a MIDI name parses to a small `Copy` value (`jsm/midi.rs`,
+  `MidiName`) and rides `Btn::Midi`, the way `T(n)` rides the touch grid. It is
+  left out of `Btn::ALL` — far too many to list — and `midi.rs` round-trips its
+  own spellings, so the exhaustive walk still means what it says.
+- **Channels are the config's, not a chord's.** A binding's pin is fixed when
+  the config compiles (`settle_midi`), because a note started on one channel
+  has to stop on it; `L,MIDI_CHANNEL = 2` is an error that says so. Velocity,
+  the input threshold and the two scales still chord.
 - **Strict mode has a hole to close first.** It zeroes `ALL_PINS` only, so MIDI
   pins are simply absent from this module's key and a downstream reader falls
   back to the raw device — raw MIDI slips past a strict config today. Strict must

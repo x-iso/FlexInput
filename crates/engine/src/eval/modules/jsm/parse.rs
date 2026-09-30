@@ -126,6 +126,7 @@ pub struct Resolved {
     pub touch: super::touch::Settings,
     pub fb: super::feedback::Settings,
     pub cc: super::cc::Settings,
+    pub midi: super::midi::Settings,
     /// Per stick: a chord is supplying its mode right now. When that stops the
     /// stick has to be let alone until it comes back to centre, or releasing the
     /// chord mid-push would hand the base mode a stick already out at full.
@@ -146,6 +147,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         touch: cfg.touch,
         fb: cfg.fb,
         cc: cfg.cc,
+        midi: cfg.midi,
         stick_mode_chorded: [false; 2],
     };
     if cfg.modeshifts.is_empty() {
@@ -166,6 +168,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
                     touch: &mut r.touch,
                     fb: &mut r.fb,
                     cc: &mut r.cc,
+                    midi: &mut r.midi,
                 },
             );
             if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
@@ -219,6 +222,8 @@ pub struct Compiled {
     pub fb: super::feedback::Settings,
     /// The custom-curve fork's additions to the gyro pipeline.
     pub cc: super::cc::Settings,
+    /// MIDI channels, velocity, thresholds and scales.
+    pub midi: super::midi::Settings,
     /// A bare `SET_MOTION_STICK_NEUTRAL` line: take the pad's resting orientation
     /// as the motion stick's centre once the config is running.
     pub neutral_at_load: bool,
@@ -312,6 +317,7 @@ pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
         touch: super::touch::Settings::default(),
         fb: super::feedback::Settings::default(),
         cc: super::cc::Settings::default(),
+        midi: super::midi::Settings::default(),
         neutral_at_load: false,
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
@@ -322,7 +328,24 @@ pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
     }
     annotate_analog(&mut out);
     note_overridden_settings(&mut out, text);
+    settle_midi(&mut out);
     out
+}
+
+/// Give every MIDI output its channel, now that the whole file has been read.
+///
+/// JSM reads settings wherever they sit, so `MIDI_CHANNEL = 3` at the bottom
+/// governs a note bound at the top. After this no `Out::Midi` is left: each is
+/// the bus pin it plays, and the press machinery holds it like any key.
+fn settle_midi(out: &mut Compiled) {
+    let channel = Some(out.midi.channel);
+    for b in &mut out.bindings {
+        for step in &mut b.steps {
+            if let Out::Midi(m) = step.out {
+                step.out = Out::Pin(m.pin(channel).to_id());
+            }
+        }
+    }
 }
 
 /// Which settings a line actually writes. Almost always just itself — but
@@ -514,7 +537,9 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
                 ));
             }
             let Some(chord) = Btn::from_name(&first) else {
-                return LineInfo::of(LineStatus::Error(format!("`{first}` isn't a button")));
+                return LineInfo::of(LineStatus::Error(
+                    Btn::midi_problem(&first).unwrap_or_else(|| format!("`{first}` isn't a button")),
+                ));
             };
             out.mentioned.insert(chord);
             return modeshift_line(chord, second, rhs, support, out);
@@ -620,6 +645,7 @@ fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
     out.touch = inner.touch;
     out.fb = inner.fb;
     out.cc = inner.cc;
+    out.midi = inner.midi;
     out.neutral_at_load |= inner.neutral_at_load;
     out.modeshifts.extend(inner.modeshifts);
     out.mentioned.extend(inner.mentioned.iter().copied());
@@ -701,6 +727,7 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
             out.touch = super::touch::Settings::default();
             out.fb = super::feedback::Settings::default();
             out.cc = super::cc::Settings::default();
+            out.midi = super::midi::Settings::default();
             let mut info = LineInfo::of(LineStatus::Ok);
             if !had_anything {
                 info.notes.push(
@@ -770,6 +797,7 @@ fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> 
             touch: &mut out.touch,
             fb: &mut out.fb,
             cc: &mut out.cc,
+            midi: &mut out.midi,
         },
     )
 }
@@ -792,6 +820,17 @@ fn modeshift_line(
     let mut tp = out.touch;
     let mut fbk = out.fb;
     let mut ccs = out.cc;
+    let mut mid = out.midi;
+    // A channel decides which pin a MIDI name IS; one that changed under a held
+    // chord would start a note on one channel and stop it on another.
+    if let Support::Midi(which) = support {
+        if !which.chordable() {
+            return LineInfo::of(LineStatus::Error(format!(
+                "`{name}` can't change with a chord — a note started on one channel has to stop \
+                 on it. Name the channel on the binding instead (`MIDI_C4_CH10`)"
+            )));
+        }
+    }
     let info = apply_setting(
         name,
         rhs,
@@ -805,6 +844,7 @@ fn modeshift_line(
             touch: &mut tp,
             fb: &mut fbk,
             cc: &mut ccs,
+            midi: &mut mid,
         },
     );
     // A setting a later phase owns says so, and the modeshift waits with it.
@@ -834,11 +874,16 @@ pub(crate) struct Knobs<'a> {
     pub touch: &'a mut super::touch::Settings,
     pub fb: &'a mut super::feedback::Settings,
     pub cc: &'a mut super::cc::Settings,
+    pub midi: &'a mut super::midi::Settings,
 }
 
 pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_>) -> LineInfo {
-    let Knobs { timings, settings, aim, pad, motion, touch, fb, cc } = k;
+    let Knobs { timings, settings, aim, pad, motion, touch, fb, cc, midi } = k;
     match support {
+        Support::Midi(which) => match super::midi::apply(name, rhs, which, midi) {
+            Ok(()) => LineInfo::of(LineStatus::Ok),
+            Err(e) => LineInfo::of(LineStatus::Error(e)),
+        },
         Support::Analog(which) => analog_setting(name, rhs, which, settings),
         Support::Aim(which) => aim_setting(name, rhs, which, aim),
         Support::Pad(which) => pad_setting(name, rhs, which, pad),
@@ -884,15 +929,17 @@ fn binding_line(
     ports: Ports,
 ) -> LineInfo {
     let Some(btn) = Btn::from_name(first) else {
-        return LineInfo::of(LineStatus::Error(format!(
-            "`{first}` isn't a button, setting or command"
-        )));
+        return LineInfo::of(LineStatus::Error(Btn::midi_problem(first).unwrap_or_else(|| {
+            format!("`{first}` isn't a button, setting or command")
+        })));
     };
     let trigger = match &combo {
         None => Trigger::Simple(btn),
         Some((op, second)) => {
             let Some(other) = Btn::from_name(second) else {
-                return LineInfo::of(LineStatus::Error(format!("`{second}` isn't a button")));
+                return LineInfo::of(LineStatus::Error(
+                    Btn::midi_problem(second).unwrap_or_else(|| format!("`{second}` isn't a button")),
+                ));
             };
             match op {
                 ',' if other == btn => Trigger::Double(btn),
@@ -986,6 +1033,10 @@ fn binding_line(
     {
         notes.push(PAD_NOTE.into());
     }
+    // Same for MIDI: it goes nowhere until a MIDI Out is wired downstream.
+    if steps.iter().any(|s| matches!(s.out, Out::Midi(_))) {
+        notes.push(MIDI_OUT_NOTE.into());
+    }
 
     let status = if let Some(phase) = pending {
         LineStatus::Pending(phase)
@@ -1050,6 +1101,23 @@ pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String
             Trigger::Sim(x, y) | Trigger::Diag(x, y) => vec![x, y],
         };
         for btn in buttons {
+            // A MIDI input needs a MIDI port. A port publishes only what is
+            // away from rest, so an idle one reports nothing and can't be told
+            // apart from "not known yet" — but a device reporting pins, none of
+            // them MIDI, is a pad.
+            if let Btn::Midi(_) = btn {
+                if !available.iter().any(|p| flexinput_core::midi::is_midi_pin(p)) {
+                    notes.push((
+                        b.line,
+                        format!(
+                            "`{}` is a MIDI message, and this module is wired to a device that \
+                             isn't a MIDI port — it never fires until a MIDI In feeds the wire",
+                            btn.name()
+                        ),
+                    ));
+                }
+                continue;
+            }
             let Some(needed) = pins_a_button_needs(btn) else { continue };
             if needed.iter().any(|p| available.contains(*p)) {
                 continue;
@@ -1339,6 +1407,14 @@ pub(crate) fn parse_mapping(
                 None if key.eq_ignore_ascii_case("RESET_MAPPINGS") => Out::Reset,
                 None => Out::Command(key.clone()),
             }
+        } else if let Some(parsed) = super::midi::parse(&key) {
+            // A MIDI message to play. Its channel is filled in once the whole
+            // file is read (`settle_midi`).
+            let m = parsed?;
+            if let Some(why) = m.output_problem() {
+                return Err(why);
+            }
+            Out::Midi(m)
         } else {
             let Some(found) = out_from_name(&key) else {
                 return Err(format!(
@@ -2601,6 +2677,10 @@ const WHY_HYBRID: &str =
 
 const WHY_DEVICE_CARD: &str = "the device card owns calibration in FlexInput";
 
+/// On a line that plays MIDI.
+const MIDI_OUT_NOTE: &str = "MIDI reaches a synth or DAW through a MIDI Out wired downstream \
+    of this module — it is sent even with that node's Thru off, since this module produced it";
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum TimingId {
     Hold,
@@ -2618,6 +2698,7 @@ pub(crate) enum Support {
     Motion(MotionId),
     Fb(FbId),
     Cc(CcId),
+    Midi(super::midi::MidiId),
     Pending(&'static str),
     Ignored(&'static str),
 }
@@ -2761,6 +2842,14 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
             "the fork opens a socket so its separate GUI can draw the live curve; the editor here \
              is the GUI",
         ),
+
+        // MIDI — FlexInput's own; JSM has no MIDI. See `midi.rs`.
+        "MIDI_CHANNEL" => Midi(super::midi::MidiId::Channel),
+        "MIDI_IN_CHANNEL" => Midi(super::midi::MidiId::InChannel),
+        "MIDI_VELOCITY" => Midi(super::midi::MidiId::Velocity),
+        "MIDI_IN_THRESHOLD" => Midi(super::midi::MidiId::InThreshold),
+        "GYRO_MIDI_SCALE" => Midi(super::midi::MidiId::GyroScale),
+        "ACCEL_MIDI_SCALE" => Midi(super::midi::MidiId::AccelScale),
 
         // Feedback.
         "RUMBLE" => Fb(FbId::Rumble),

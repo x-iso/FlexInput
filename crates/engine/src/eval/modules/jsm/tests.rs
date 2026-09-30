@@ -6494,3 +6494,81 @@ fn scrubbing_a_trigger_number_keeps_to_its_range() {
         Some("LEFT_TRIGGER_EFFECT = SEMI_AUTOMATIC 6 8 5")
     );
 }
+
+// ── MIDI (plan phase 10) ─────────────────────────────────────────────────────
+
+/// A button plays a note on `MIDI_CHANNEL` — set BELOW the binding, since JSM
+/// reads settings wherever they sit — with `MIDI_VELOCITY` riding the velocity
+/// pin, and all of it marked produced so a MIDI Out sends it with Thru off.
+#[test]
+fn a_button_plays_a_note_on_the_configs_channel() {
+    let text = "S = MIDI_C4\nW = MIDI_CC7_CH10\nMIDI_CHANNEL = 3\nMIDI_VELOCITY = 127";
+    let bus = run_node(text, false, &["btn_south", "btn_west"], 2);
+    assert_eq!(bus.get("midi:note:3:60"), Some(&Signal::Bool(true)), "{bus:?}");
+    assert_eq!(bus.get("midi:vel:3:60"), Some(&Signal::Float(1.0)));
+    assert_eq!(bus.get("midi:cc:10:7"), Some(&Signal::Float(1.0)), "the name's own channel wins");
+    assert!(bus.contains_key("__midi_out__:midi:note:3:60"), "played MIDI is produced");
+    assert!(bus.contains_key("__midi_out__:midi:cc:10:7"));
+
+    let bus = run_node(text, false, &[], 2);
+    assert_eq!(bus.get("midi:note:3:60"), Some(&Signal::Bool(false)), "released, the note lifts");
+    assert_eq!(bus.get("midi:cc:10:7"), Some(&Signal::Float(0.0)));
+}
+
+/// A MIDI message is a button like any other. With nothing said it hears any
+/// channel; a name that says one hears only that one.
+#[test]
+fn a_midi_message_presses_a_key() {
+    let text = "MIDI_C4 = SPACE\nMIDI_D4_CH2 = ENTER";
+    let bus = run_node_with(text, false, &[("midi:note:*:60", Signal::Bool(true))], 2);
+    assert!(on(&bus, "key_space"), "{bus:?}");
+    let bus = run_node_with(text, false, &[("midi:note:1:62", Signal::Bool(true))], 2);
+    assert!(!on(&bus, "key_enter"), "channel 1 isn't the channel 2 the line names");
+    let bus = run_node_with(text, false, &[("midi:note:2:62", Signal::Bool(true))], 2);
+    assert!(on(&bus, "key_enter"));
+}
+
+/// `MIDI_IN_CHANNEL` narrows the inputs that don't name a channel.
+#[test]
+fn midi_in_channel_narrows_the_silent_inputs() {
+    let text = "MIDI_C4 = SPACE\nMIDI_IN_CHANNEL = 5";
+    let bus = run_node_with(text, false, &[("midi:note:*:60", Signal::Bool(true)), ("midi:note:4:60", Signal::Bool(true))], 2);
+    assert!(!on(&bus, "key_space"), "a note on channel 4 isn't channel 5");
+    let bus = run_node_with(text, false, &[("midi:note:5:60", Signal::Bool(true))], 2);
+    assert!(on(&bus, "key_space"));
+}
+
+/// A knob used as a button crosses at `MIDI_IN_THRESHOLD`.
+#[test]
+fn a_knob_presses_past_the_threshold() {
+    let text = "MIDI_CC64 = LSHIFT\nMIDI_IN_THRESHOLD = 0.7";
+    let bus = run_node_with(text, false, &[("midi:cc:*:64", Signal::Float(0.6))], 2);
+    assert!(!on(&bus, "key_lshift"));
+    let bus = run_node_with(text, false, &[("midi:cc:*:64", Signal::Float(0.8))], 2);
+    assert!(on(&bus, "key_lshift"));
+}
+
+/// Strict mode silences MIDI too. It used to zero only the pad's pins, so a MIDI
+/// pin was simply absent from this node's bus and a reader downstream fell back
+/// to the raw device — raw MIDI slipped straight past a strict config.
+#[test]
+fn strict_mode_silences_midi_as_well() {
+    let bus = run_node_with("S = SPACE", true, &[("midi:cc:1:7", Signal::Float(0.8))], 2);
+    assert_eq!(bus.get("midi:cc:1:7"), Some(&Signal::Float(0.0)), "{bus:?}");
+    let bus = run_node_with("S = SPACE", false, &[("midi:cc:1:7", Signal::Float(0.8))], 2);
+    assert_eq!(bus.get("midi:cc:1:7"), Some(&Signal::Float(0.8)), "pass-through carries it on");
+}
+
+/// What a MIDI name can't be, the line says.
+#[test]
+fn midi_lines_refuse_what_cannot_work() {
+    let err = |line: &str| matches!(one(line).status, LineStatus::Error(_));
+    assert!(err("S = MIDI_BPM"), "a tempo is not sent");
+    assert!(err("S = MIDI_C4_CHANY"), "an output picks a channel");
+    assert!(err("MIDI_BPM = SPACE"), "a tempo is not pressed");
+    assert!(err("S = MIDI_CC300"));
+    assert!(err("L,MIDI_CHANNEL = 2"), "a channel can't change under a held note");
+    assert!(!err("L,MIDI_VELOCITY = 20"), "velocity can");
+    assert!(!err("S = MIDI_PC5'"));
+    assert!(!err("MIDI_C4,MIDI_E4 = ^LCONTROL"), "MIDI chords like any button");
+}

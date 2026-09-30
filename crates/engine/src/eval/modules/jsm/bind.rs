@@ -420,7 +420,9 @@ impl Runtime {
     fn act(&mut self, action: ActionMod, out: &Out, event: EventMod, press: Option<usize>, binding: &Binding) {
         let _ = binding;
         match out {
-            Out::None | Out::Unsupported { .. } => {}
+            // `Out::Midi` never gets here: compiling settles each one into the
+            // `Out::Pin` it plays (`parse::settle_midi`).
+            Out::None | Out::Unsupported { .. } | Out::Midi(_) => {}
             Out::Gyro(g) => { self.out.gyro.insert(*g); }
             Out::Calibrate => {}
             Out::Command(c) => self.out.commands.push(c.clone()),

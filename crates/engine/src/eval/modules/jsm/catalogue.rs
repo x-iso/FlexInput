@@ -96,6 +96,8 @@ pub(crate) const SETTINGS: &[&str] = &[
     "ONE_EURO_SPEED_COEFF", "GYRO_ANGLE_SNAP", "GYRO_ANGLE_SNAP_EASE",
     "DECEL_BRAKE_STRENGTH", "DECEL_BRAKE_THRESHOLD", "ROLL_CONTRIBUTION",
     "IGNORE_GYRO_DEVICES", "TELEMETRY_ENABLED", "TELEMETRY_PORT",
+    "MIDI_CHANNEL", "MIDI_IN_CHANNEL", "MIDI_VELOCITY",
+    "MIDI_IN_THRESHOLD", "GYRO_MIDI_SCALE", "ACCEL_MIDI_SCALE",
     "RUMBLE", "LIGHT_BAR", "ADAPTIVE_TRIGGER",
     "LEFT_TRIGGER_EFFECT", "RIGHT_TRIGGER_EFFECT", "LEFT_TRIGGER_OFFSET",
     "LEFT_TRIGGER_RANGE", "RIGHT_TRIGGER_OFFSET", "RIGHT_TRIGGER_RANGE",
@@ -324,6 +326,7 @@ fn group_of(s: &Support) -> &'static str {
         Support::Motion(_) => "Motion & gravity",
         Support::Fb(_) => "Rumble & lights",
         Support::Cc(_) => "Custom-curve fork",
+        Support::Midi(_) => "MIDI",
         Support::Pending(_) => "Not live yet",
         Support::Ignored(_) => "Ignored here",
     }
@@ -584,6 +587,9 @@ fn group_order(group: &str) -> u8 {
         "Motion & gravity" => 4,
         "Rumble & lights" => 5,
         "Timings" => 6,
+        // MIDI is FlexInput's own, so it sits after JSM's groups rather than
+        // among them.
+        "MIDI" => 6,
         "Buttons" => 7,
         "Commands" => 8,
         "Not live yet" => 9,

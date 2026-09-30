@@ -140,6 +140,10 @@ pub(crate) fn jsm_publish(
             upstream.insert(ap.id.to_string(), s);
         }
     }
+    // MIDI pins are dynamic — never in ALL_PINS — so take whatever the bus
+    // carries. They are what a `MIDI_*` button reads, and what the pass-through
+    // carries on (or strict mode silences).
+    crate::eval::midi_bus::fill_upstream_midi(collector_id, dev_id, collector_sigs, dev_sigs, &mut upstream);
 
     // Compile on the first tick and after every edit; a fresh config starts from
     // a clean slate rather than inheriting half-finished presses. The generation
@@ -228,7 +232,7 @@ pub(crate) fn jsm_publish(
     }
 
     let (lean_l, lean_r) = super::motion::lean(gravity, &res.motion, res.settings.orientation);
-    let ext = Extra { lean: (lean_l, lean_r), cells: touch_out.cells };
+    let ext = Extra { lean: (lean_l, lean_r), cells: touch_out.cells, midi: res.midi };
     let analog = &st.analog;
     let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
     // A trigger handed straight to the virtual pad can still chord, but its own
@@ -298,6 +302,14 @@ pub(crate) fn jsm_publish(
                 collector_sigs.insert((key.clone(), ap.id.to_string()), off);
             }
         }
+        // MIDI too. Without this a MIDI pin was simply absent from this key and a
+        // reader downstream fell back to the raw device — so raw MIDI slipped
+        // past a strict config.
+        for pin in upstream.keys().filter(|p| flexinput_core::midi::is_midi_pin(p)) {
+            if let Some(rest) = crate::eval::midi_bus::midi_rest(pin) {
+                collector_sigs.insert((key.clone(), pin.clone()), rest);
+            }
+        }
     } else {
         remapper_pass_through_and_suppress(
             &key,
@@ -343,6 +355,30 @@ pub(crate) fn jsm_publish(
                 crate::eval::activation::merge_macro_scalar(
                     collector_sigs, &pin, on_value(&pin));
             }
+            continue;
+        }
+        // A MIDI message this config plays: a note is a gate with its velocity
+        // riding a twin pin, a controller goes to its top, and all of it is
+        // marked PRODUCED so a MIDI Out sends it with its Thru toggle off — the
+        // setting that stops a shared In/Out port feeding itself.
+        if let Some(mp) = flexinput_core::midi::parse_pin(&pin) {
+            let sig = match (on, mp.is_continuous()) {
+                (true, true) => Signal::Float(1.0),
+                (true, false) => Signal::Bool(true),
+                (false, _) => mp.rest_value(),
+            };
+            if on {
+                if let flexinput_core::midi::MidiPin::Note { ch, note } = mp {
+                    let vel = flexinput_core::midi::MidiPin::Velocity { ch, note }.to_id();
+                    collector_sigs.insert(
+                        (key.clone(), vel.clone()),
+                        Signal::Float(res.midi.velocity as f32 / 127.0),
+                    );
+                    crate::eval::midi_bus::mark_produced(&key, &vel, collector_sigs);
+                }
+            }
+            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            crate::eval::midi_bus::mark_produced(&key, &pin, collector_sigs);
             continue;
         }
         let sig = if on { on_value(&pin) } else { pin_off_value(&pin) };
@@ -670,6 +706,9 @@ struct Extra {
     lean: (bool, bool),
     /// Which grid cell each finger is in, 1-based.
     cells: [Option<u8>; 2],
+    /// The channel a `MIDI_*` button listens on when it doesn't say, and where a
+    /// continuous one counts as pressed.
+    midi: super::midi::Settings,
 }
 
 /// Is this JSM button pressed right now? Buttons read straight off a pin; the
@@ -703,6 +742,11 @@ fn button_down(
             (None, Some(_)) => analog.down(btn),
             (None, None) => false,
         },
+        // A MIDI message: a note while it sounds, a knob or bend past the
+        // threshold. An idle pin is absent from the bus, which reads released.
+        BtnSource::Midi(m) => upstream
+            .get(&m.pin(ext.midi.in_channel).to_id())
+            .is_some_and(|v| super::midi::value_pressed(m.kind, *v, ext.midi.in_threshold)),
     }
 }
 
@@ -794,6 +838,9 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
             // A name nothing on our bus reports claims nothing — there is no pin to
             // claim, and the line already says it can never fire.
             BtnSource::Absent(_) => {}
+            // A MIDI message the config reads is the config's, on every channel
+            // an any-channel name could hear it on.
+            BtnSource::Midi(m) => digital.extend(m.input_pins(res.midi.in_channel)),
             // Sources later phases read: nothing to claim while they can't fire.
             BtnSource::Motion { .. }
             | BtnSource::Lean { .. }

@@ -20,6 +20,7 @@ mod eval;
 mod feedback;
 mod help;
 mod knobs;
+mod midi;
 mod motion;
 mod names;
 mod pad;

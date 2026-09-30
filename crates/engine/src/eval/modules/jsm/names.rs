@@ -41,6 +41,10 @@ pub enum Btn {
     RTouch,
     LMini,
     RMini,
+    /// A MIDI message used as a button (`MIDI_C4 = SPACE`) — FlexInput's own
+    /// vocabulary, see [`super::midi`]. Parametric like `T(n)`, and far too
+    /// many to list in [`Btn::ALL`]; `midi.rs` round-trips its own names.
+    Midi(super::midi::MidiName),
 }
 
 /// Where a button reads from on the bus.
@@ -76,6 +80,9 @@ pub enum BtnSource {
     /// calling the name an error and guessing at a pin that might be something else
     /// entirely.
     Absent(&'static str),
+    /// A MIDI message on the bus. Its pin depends on `MIDI_IN_CHANNEL` when the
+    /// name gives none, so it is built where the settings are known.
+    Midi(super::midi::MidiName),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -115,8 +122,14 @@ impl Btn {
     ];
 
     /// Parse a JSM button name. `None` when it isn't one.
+    ///
+    /// A malformed `MIDI_*` name is `None` too; [`Btn::midi_problem`] says what
+    /// is wrong with it, for the line's error.
     pub fn from_name(name: &str) -> Option<Btn> {
         use Btn::*;
+        if let Some(parsed) = super::midi::parse(name) {
+            return parsed.ok().filter(|m| m.input_problem().is_none()).map(Btn::Midi);
+        }
         // `MISC1`…`MISC6` — the fork's names for SDL's generic extra buttons.
         if let Some(d) = name.to_ascii_uppercase().strip_prefix("MISC") {
             if let Ok(n) = d.parse::<u8>() {
@@ -149,10 +162,20 @@ impl Btn {
         })
     }
 
+    /// Why `name` — a `MIDI_*` name that [`Btn::from_name`] refused — can't be a
+    /// button. `None` for anything else.
+    pub fn midi_problem(name: &str) -> Option<String> {
+        match super::midi::parse(name)? {
+            Err(why) => Some(why),
+            Ok(m) => m.input_problem(),
+        }
+    }
+
     /// The name JSM knows this button by (for diagnostics).
     pub fn name(self) -> String {
         use Btn::*;
         match self {
+            Midi(m) => m.spell(),
             Up => "UP".into(), Down => "DOWN".into(), Left => "LEFT".into(), Right => "RIGHT".into(),
             L => "L".into(), Zl => "ZL".into(), Minus => "-".into(), E => "E".into(), S => "S".into(),
             N => "N".into(), W => "W".into(), R => "R".into(), Zr => "ZR".into(), Plus => "+".into(),
@@ -232,6 +255,7 @@ impl Btn {
                 "the bus has no pin for a mini shoulder button; try LSL / LSR / RSL / RSR for a \
                  rail button, or a MISC one for whatever your pad calls it",
             ),
+            Midi(m) => S::Midi(m),
             Tup => S::TouchZone { cell: None, dir: Some(Dir::Up) },
             Tdown => S::TouchZone { cell: None, dir: Some(Dir::Down) },
             Tleft => S::TouchZone { cell: None, dir: Some(Dir::Left) },
@@ -268,6 +292,10 @@ pub enum Out {
     None,
     /// JSM knows this name; we can't drive it yet.
     Unsupported { name: String, why: &'static str },
+    /// A MIDI message to play (`S = MIDI_C4`). Compiled into an [`Out::Pin`] once
+    /// the whole config has been read, since `MIDI_CHANNEL` may come later in
+    /// the file than the binding that relies on it.
+    Midi(super::midi::MidiName),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
