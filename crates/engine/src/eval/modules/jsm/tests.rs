@@ -3308,14 +3308,15 @@ fn the_touchpad_grid_names_the_cell_a_finger_is_in() {
     let at = |x: f32, y: f32| super::touch::Finger { active: true, x, y };
     let off = super::touch::Finger::default();
 
-    // Top-left quarter is cell 1, then across, then down: 1 2 / 3 4.
-    let out = t.tick(&s, [at(-0.5, -0.5), off], cfg);
-    assert_eq!(out.cells[0], Some(1), "top left is T1");
-    let out = t.tick(&s, [at(0.5, -0.5), off], cfg);
-    assert_eq!(out.cells[0], Some(2), "top right is T2");
+    // Top-left quarter is cell 1, then across, then down: 1 2 / 3 4. The bus's
+    // y counts up, so the top is +y.
     let out = t.tick(&s, [at(-0.5, 0.5), off], cfg);
-    assert_eq!(out.cells[0], Some(3), "bottom left is T3");
+    assert_eq!(out.cells[0], Some(1), "top left is T1");
     let out = t.tick(&s, [at(0.5, 0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(2), "top right is T2");
+    let out = t.tick(&s, [at(-0.5, -0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(3), "bottom left is T3");
+    let out = t.tick(&s, [at(0.5, -0.5), off], cfg);
     assert_eq!(out.cells[0], Some(4), "bottom right is T4");
 
     // A finger lifted is in no cell at all.
@@ -3323,8 +3324,10 @@ fn the_touchpad_grid_names_the_cell_a_finger_is_in() {
     assert_eq!(out.cells[0], None);
 
     // The far corners stay in range rather than falling off the end of T1..T25.
-    let out = t.tick(&s, [at(1.0, 1.0), off], cfg);
+    let out = t.tick(&s, [at(1.0, -1.0), off], cfg);
     assert_eq!(out.cells[0], Some(4), "the very corner is still the last cell");
+    let out = t.tick(&s, [at(-1.0, 1.0), off], cfg);
+    assert_eq!(out.cells[0], Some(1), "and the first corner the first");
 }
 
 /// A touch stick is *relative*: it measures how far the finger has been dragged
@@ -3354,8 +3357,7 @@ fn a_touch_stick_measures_the_drag_not_the_place() {
     assert_eq!(out.sticks[0], (0.0, 0.0), "a new touch starts from centre");
 }
 
-/// Dragging up the touchpad pushes the touch stick up, even though the touchpad's
-/// y counts down and a stick's counts up.
+/// Dragging up the touchpad pushes the touch stick up.
 #[test]
 fn a_touch_stick_agrees_with_a_stick_about_which_way_is_up() {
     let mut t = super::touch::Touch::default();
@@ -3364,9 +3366,9 @@ fn a_touch_stick_agrees_with_a_stick_about_which_way_is_up() {
     let at = |y: f32| super::touch::Finger { active: true, x: 0.0, y };
     let off = super::touch::Finger::default();
 
-    t.tick(&s, [at(0.5), off], cfg);
-    // Towards the top of the touchpad is a smaller y.
-    let out = t.tick(&s, [at(0.0), off], cfg);
+    t.tick(&s, [at(0.0), off], cfg);
+    // Towards the top of the touchpad is a larger y on the bus.
+    let out = t.tick(&s, [at(0.5), off], cfg);
     assert!(out.sticks[0].1 > 0.9, "dragging up pushes the stick up: {:?}", out.sticks[0]);
 }
 
@@ -3387,9 +3389,9 @@ fn the_touchpad_can_drag_the_mouse() {
     t.tick(&s, [at(0.0, 0.0), off], cfg);
     let out = t.tick(&s, [at(0.1, 0.0), off], cfg);
     assert!(out.mouse.x > 1.0, "dragging right moves the pointer right: {:?}", out.mouse);
-    // Our bus counts mouse y up and the touchpad counts down.
+    // The bus counts both the touchpad's y and the mouse's up.
     t.tick(&s, [at(0.1, 0.0), off], cfg);
-    let out = t.tick(&s, [at(0.1, 0.2), off], cfg);
+    let out = t.tick(&s, [at(0.1, -0.2), off], cfg);
     assert!(out.mouse.y < -1.0, "dragging down moves the pointer down: {:?}", out.mouse);
 
     // In grid mode the pointer stays put.

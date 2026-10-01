@@ -61,6 +61,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A JSM config's touchpad is the right way up.** `TOUCHPAD_MODE = MOUSE`
+  moved the pointer up when the finger went down, the touch stick did the same,
+  and the touch grid's `T1` was the bottom-left cell rather than the top-left —
+  on every pad with a touchpad, the DualSense and Steam Controller included.
+
 - **A JSM config's keys pause while you type in its editor, wherever it is
   open.** With the same config drawn in more than one place — its node, a pin,
   the overlay, a sub-patch window — a copy without the keyboard could undo the

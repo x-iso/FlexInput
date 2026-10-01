@@ -11,8 +11,10 @@
 //! a sweep across it is a sweep across this one — the honest choice, since nothing
 //! on the bus says how many millimetres that was.
 //!
-//! Our y counts *down* the touchpad (top edge is -1) and a stick's y counts up, so
-//! the vertical half is negated where the two meet.
+//! The bus's touch y counts *up* the touchpad (top edge is +1), as a stick's and
+//! the mouse's do — every pad's backend flips its sensor's downward count to get
+//! there — so a drag carries straight across; only the grid, whose row 1 is the
+//! top row, counts down from the top edge.
 
 use super::analog::StickCfg;
 
@@ -56,7 +58,7 @@ impl Default for Settings {
     }
 }
 
-/// One finger as the bus reports it: -1..1 on each axis, y down.
+/// One finger as the bus reports it: -1..1 on each axis, y up.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Finger {
     pub active: bool,
@@ -112,7 +114,7 @@ impl Touch {
                 continue;
             }
 
-            // How far the finger moved since last tick, in touchpad points.
+            // How far the finger moved since last tick, in touchpad points, y up.
             let (dx, dy) = if run.was_down {
                 (
                     (f.x - run.prev.0) * NOMINAL_W / 2.0,
@@ -129,17 +131,17 @@ impl Touch {
 
             match s.mode {
                 Mode::GridAndStick => {
-                    // The grid, from where the finger is: row 1 at the top.
+                    // The grid, from where the finger is: row 1 at the top, so
+                    // rows count down from the top edge.
                     let px = ((f.x + 1.0) / 2.0).clamp(0.0, 1.0);
-                    let py = ((f.y + 1.0) / 2.0).clamp(0.0, 1.0);
+                    let py = ((1.0 - f.y) / 2.0).clamp(0.0, 1.0);
                     let col = ((px * cols).ceil() - 1.0).clamp(0.0, cols - 1.0);
                     let row = ((py * rows).ceil() - 1.0).clamp(0.0, rows - 1.0);
                     out.cells[i] = Some((row * cols + col) as u8 + 1);
 
-                    // The stick, from how far the finger has been dragged. Its y
-                    // counts up where the touchpad's counts down.
+                    // The stick, from how far the finger has been dragged.
                     run.loc.0 += dx;
-                    run.loc.1 -= dy;
+                    run.loc.1 += dy;
                     let r = s.stick_radius.max(1e-6);
                     let mut sx = (run.loc.0 / r).clamp(-1.0, 1.0);
                     let mut sy = (run.loc.1 / r).clamp(-1.0, 1.0);
@@ -151,7 +153,7 @@ impl Touch {
                     // JSM takes the first finger down and ignores the second, so
                     // resting a second finger doesn't double the pointer speed.
                     if i == 0 || !fingers[0].active {
-                        out.mouse = glam::Vec2::new(dx * s.sens.0, -dy * s.sens.1);
+                        out.mouse = glam::Vec2::new(dx * s.sens.0, dy * s.sens.1);
                     }
                 }
                 // The pad's own touchpad passes through to a virtual pad, which is
