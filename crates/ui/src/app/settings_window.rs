@@ -46,6 +46,14 @@ fn shortcut_chord_widget(
     resp
 }
 
+/// Double-click on a slider. `egui::Slider` senses drag only, so egui never
+/// flags it clicked and `Response::double_clicked()` is always false — read the
+/// double-click from the pointer while the slider is hovered instead.
+fn slider_double_clicked(resp: &egui::Response) -> bool {
+    resp.hovered()
+        && resp.ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+}
+
 impl FlexInputApp {
 
 
@@ -482,7 +490,11 @@ impl FlexInputApp {
     /// values into the engine/I-O atomics, and flips `settings_dirty` so the
     /// outer update loop persists settings.json at end of frame.
     pub(crate) fn draw_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open { return; }
+        if !self.settings_open {
+            // Closing Settings discards an un-applied UI-scale pick.
+            self.ui_scale_pending = None;
+            return;
+        }
         let mut open = true;
         let mut dirty = false;
         let mut save_workspace = false;
@@ -858,7 +870,7 @@ impl FlexInputApp {
                     let resp = ui.add(egui::Slider::new(&mut c, -1.0_f32..=1.0)
                         .show_value(false)
                         .clamping(egui::SliderClamping::Always));
-                    if resp.double_clicked() { c = 0.0; }
+                    if slider_double_clicked(&resp) { c = 0.0; }
                     ui.add(egui::DragValue::new(&mut c)
                         .speed(0.01)
                         .range(-1.0_f32..=1.0)
@@ -870,6 +882,41 @@ impl FlexInputApp {
                 });
                 ui.label(egui::RichText::new(
                     "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("UI scale:")
+                        .on_hover_text("Scales the whole interface, on top of the Windows display scale. Text is re-rendered at the new size, so it stays sharp.");
+                    // Stepped like the polling-rate slider: the slider drives an
+                    // index into UI_SCALE_STEPS, so the handle snaps while
+                    // dragging. The pick stays PENDING until Apply — rescaling
+                    // live would move the slider out from under the pointer.
+                    let applied = self.settings.ui_scale;
+                    let last = settings::UI_SCALE_STEPS.len() - 1;
+                    let mut idx = settings::ui_scale_to_index(
+                        self.ui_scale_pending.unwrap_or(applied)) as i64;
+                    let resp = ui.add(egui::Slider::new(&mut idx, 0..=last as i64)
+                        .integer()
+                        .show_value(false));
+                    let picked = if slider_double_clicked(&resp) {
+                        settings::UI_SCALE_DEFAULT
+                    } else {
+                        settings::ui_scale_from_index(idx as usize)
+                    };
+                    self.ui_scale_pending = (picked != applied).then_some(picked);
+                    // Fixed width so Apply doesn't shift as the digits change.
+                    ui.add_sized([40.0, ui.spacing().interact_size.y],
+                        egui::Label::new(format!("{:.0}%", picked * 100.0)));
+                    if ui.add_enabled(picked != applied, egui::Button::new("Apply")).clicked() {
+                        self.settings.ui_scale = picked;
+                        ctx.set_zoom_factor(picked);
+                        self.ui_scale_pending = None;
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "50%–300%. Takes effect when you press Apply. Double-click the slider to return to 100%."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 // See-through opacity is set via the popover slider that

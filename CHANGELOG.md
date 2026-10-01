@@ -5,6 +5,21 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **UI scale.** Settings → Appearance scales the whole interface from 50% to
+  300%, on top of the Windows display scale, in steps that are finer near 100%.
+  The slider only picks a scale; Apply sets it, so the window doesn't rescale
+  under the pointer while you drag. Double-click the slider for 100%. Text is
+  drawn at the new size rather than stretched, so it stays sharp. The window
+  keeps its size and place across restarts at any scale. Ctrl +/−/0 no longer
+  zooms the interface; the setting is the only control.
+
+### Fixed
+
+- **Double-clicking the Contrast slider resets it to 0.** The slider never
+  registered the double-click, though the hint under it said it would.
+
 ## [0.15.0] - 2026-10-01
 
 ### Added

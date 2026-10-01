@@ -467,6 +467,10 @@ pub struct FlexInputApp {
     /// True while the Settings window is shown.
     settings_open: bool,
     /// True while the third-party licence viewer is shown. Independent of
+    /// UI scale picked on the Settings slider but not yet applied (`None` =
+    /// slider shows the applied `settings.ui_scale`). Held apart so dragging
+    /// doesn't rescale the window — and move the slider — under the pointer.
+    ui_scale_pending: Option<f32>,
     /// `settings_open` — it's opened from Credits but outlives the Settings
     /// window, so closing Settings doesn't yank the licence text away.
     licenses_open: bool,
@@ -732,6 +736,16 @@ impl FlexInputApp {
         // (the slider is now quantized to whole-ms periods).
         app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
+        // UI scale: snap a hand-edited value to a step, then apply it as egui's
+        // zoom factor (pixels_per_point = zoom × OS scale, so fonts rasterize at
+        // the scaled resolution and stay sharp). The window already exists at
+        // this point — created at zoom 1, which is why the persisted geometry is
+        // stored in unzoomed units (see `persist_window_geometry`). Keyboard
+        // zoom (Ctrl +/-/0) is turned off so this setting stays the one source
+        // of truth for the scale.
+        app_settings.ui_scale = settings::snap_ui_scale(app_settings.ui_scale);
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        cc.egui_ctx.set_zoom_factor(app_settings.ui_scale);
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
         let joycon2_pairing = Arc::new(AtomicBool::new(app_settings.joycon2_pairing));
@@ -1137,6 +1151,7 @@ impl FlexInputApp {
             settings: app_settings,
             settings_open: false,
             licenses_open: false,
+            ui_scale_pending: None,
             licenses_selected: 0,
             bluetooth: Default::default(),
             bluetooth_present: false,
@@ -3369,8 +3384,12 @@ impl FlexInputApp {
         let pos_rect = outer.or(inner);
         let size_rect = inner.or(outer);
         if let (Some(pr), Some(sr)) = (pos_rect, size_rect) {
-            let pos = [pr.min.x, pr.min.y];
-            let size = [sr.width(), sr.height()];
+            // egui reports these in ZOOMED points; scale back to 100% units so
+            // the startup window (created before the UI scale applies) restores
+            // at the same physical size and place.
+            let z = ctx.zoom_factor();
+            let pos = [pr.min.x * z, pr.min.y * z];
+            let size = [sr.width() * z, sr.height() * z];
             if size[0] < 100.0 || size[1] < 100.0 {
                 return; // ignore degenerate/transient sizes
             }

@@ -46,6 +46,36 @@ pub fn polling_hz_from_index(idx: usize) -> u32 {
     POLLING_HZ_STEPS[idx.min(POLLING_HZ_STEPS.len() - 1)]
 }
 
+/// UI scale steps exposed by the Settings slider (fraction of the OS scale,
+/// 1.0 = 100%). Finer near 100% where small nudges matter, coarser at the ends.
+/// The slider drives the step INDEX, so the handle snaps while dragging.
+pub const UI_SCALE_STEPS: [f32; 16] = [
+    0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0,
+];
+pub const UI_SCALE_DEFAULT: f32 = 1.0;
+fn default_ui_scale() -> f32 { UI_SCALE_DEFAULT }
+
+/// Index into [`UI_SCALE_STEPS`] of the step nearest `scale`.
+pub fn ui_scale_to_index(scale: f32) -> usize {
+    UI_SCALE_STEPS
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - scale).abs().total_cmp(&(*b - scale).abs()))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Scale value for a (clamped) step index. Inverse of [`ui_scale_to_index`].
+pub fn ui_scale_from_index(idx: usize) -> f32 {
+    UI_SCALE_STEPS[idx.min(UI_SCALE_STEPS.len() - 1)]
+}
+
+/// Snap an arbitrary (e.g. hand-edited) scale to the nearest exposed step.
+pub fn snap_ui_scale(scale: f32) -> f32 {
+    if !scale.is_finite() { return UI_SCALE_DEFAULT; }
+    ui_scale_from_index(ui_scale_to_index(scale))
+}
+
 pub const SAMPLE_RATE_HZ_MIN: u32 = 500;
 pub const SAMPLE_RATE_HZ_MAX: u32 = 8000;
 pub const SAMPLE_RATE_HZ_DEFAULT: u32 = 2000;
@@ -183,6 +213,12 @@ pub struct AppSettings {
     /// neutral — current default.
     #[serde(default = "default_contrast")]
     pub contrast: f32,
+    /// Whole-UI scale on top of the OS display scale (egui zoom factor), one of
+    /// [`UI_SCALE_STEPS`]. Fonts re-rasterize at the resulting pixels-per-point,
+    /// so text stays sharp at any step. Applied at startup and on the Settings
+    /// window's Apply button — never live while the slider is dragged.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     /// Background opacity when "see-through" mode is active. 0.0 = fully
     /// transparent, 1.0 = fully opaque. The translucent fill only affects
     /// panel/window backgrounds; nodes and connectors stay opaque.
@@ -459,8 +495,9 @@ pub struct AppSettings {
     #[serde(default)]
     pub joycon2_pairing: bool,
 
-    /// Persisted main-window geometry (logical points, as egui/eframe report and
-    /// consume them), restored on the next launch so the window reopens where it
+    /// Persisted main-window geometry (logical points at UI scale 100% — the
+    /// units the window is created in at startup, before `ui_scale` takes
+    /// effect), restored on the next launch so the window reopens where it
     /// was instead of cascading down-right each time. `window_pos` is the outer
     /// (top-left) position; `window_size` is the inner size. `None` until the
     /// window has been shown once. While maximized, pos/size keep the last
@@ -625,6 +662,7 @@ impl Default for AppSettings {
             default_rumble_exp: default_rumble_exp(),
             theme: Theme::Dark,
             contrast: 0.0,
+            ui_scale: UI_SCALE_DEFAULT,
             see_through_alpha: 0.55,
             see_through_active: false,
             pin_active: false,
@@ -1011,6 +1049,22 @@ mod polling_step_tests {
         // Out-of-range clamps to the ends.
         assert_eq!(snap_polling_hz(50), 125);
         assert_eq!(snap_polling_hz(5000), 1000);
+    }
+
+    #[test]
+    fn ui_scale_steps_round_trip_and_snap() {
+        for (i, &s) in UI_SCALE_STEPS.iter().enumerate() {
+            assert_eq!(ui_scale_to_index(s), i, "scale {s} should map to index {i}");
+            assert_eq!(ui_scale_from_index(i), s);
+        }
+        assert!(UI_SCALE_STEPS.contains(&UI_SCALE_DEFAULT));
+        assert_eq!(UI_SCALE_STEPS[0], 0.5);
+        assert_eq!(*UI_SCALE_STEPS.last().unwrap(), 3.0);
+        assert_eq!(snap_ui_scale(1.04), 1.0);
+        assert_eq!(snap_ui_scale(1.4), 1.5);
+        assert_eq!(snap_ui_scale(0.1), 0.5);
+        assert_eq!(snap_ui_scale(9.0), 3.0);
+        assert_eq!(snap_ui_scale(f32::NAN), UI_SCALE_DEFAULT);
     }
 
     #[test]
