@@ -159,6 +159,8 @@ pub(crate) fn jsm_publish(
     //
     // Nothing that carries `upstream` on reads these pins: the pass-through
     // walks the pad's pins and the MIDI ones by name.
+    let shown_macros = shown_macro_pins(snap);
+    let mut shown_prev: HashMap<(String, String), Signal> = HashMap::new();
     {
         use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
         let amounts = |sigs: &mut dyn Iterator<Item = (&(String, String), &Signal)>| {
@@ -179,6 +181,17 @@ pub(crate) fn jsm_publish(
             for (id, v) in amounts(&mut prev.iter()) {
                 now.entry(id).or_insert(v);
             }
+            // The macros this node shows as output pins, as they stood last
+            // tick — kept for the end of the tick, when a port nothing has
+            // written yet this tick falls back to them.
+            for (pin, _) in &shown_macros {
+                for ns in [SIGS_NS, SIGS_NS_VEC2] {
+                    let k = (ns.to_string(), pin.clone());
+                    if let Some(s) = prev.get(&k) {
+                        shown_prev.insert(k, *s);
+                    }
+                }
+            }
         }
         for (id, v) in now {
             upstream.insert(super::names::macro_btn_pin(id), Signal::Float(v));
@@ -189,8 +202,14 @@ pub(crate) fn jsm_publish(
     // a clean slate rather than inheriting half-finished presses. The generation
     // covers every tab's text, not just the live one, so editing a layer a binding
     // switches to recompiles as readily as editing the one on screen.
+    // This patch's Macro Output ports and Virtual Menu entries, as the graph
+    // builder stamped them, so a line can bind one by name with `@`. They count
+    // towards the generation too: an `@Name` gets its macro a frame after it is
+    // typed — and a renamed one its new name — with the text unchanged since,
+    // and the line waiting on it has to be compiled again to be bound.
+    let ports = macro_ports(snap);
     let ns = state.entry(uid).or_default();
-    let gen = text_gen_of(&tabs, &selected);
+    let gen = text_gen_of(&tabs, &selected, &ports);
     let text_for = |layer: &str| -> String {
         tabs.iter()
             .find(|(n, _)| n == layer)
@@ -198,9 +217,6 @@ pub(crate) fn jsm_publish(
             .unwrap_or_default()
     };
     let text = text_for(&selected);
-    // This patch's Macro Output ports and Virtual Menu entries, as the graph
-    // builder stamped them, so a line can bind one by name with `@`.
-    let ports = macro_ports(snap);
     let st = ns.jsm.get_or_insert_with(|| {
         Box::new(JsmState {
             gen,
@@ -721,21 +737,70 @@ pub(crate) fn jsm_publish(
         }
     }
 
-    // output[0] is the AutoMap pass-through, which carries no scalar. The two
-    // after it are not pins at all — they are how the calibration widget reads
-    // the sweep this node is integrating, the same trailing-output channel RWS
-    // publishes its own measurement on. See `CAL_DEG_OUT` / `CAL_PEAK_OUT`.
+    // output[0] is the AutoMap pass-through, which carries no scalar. After it
+    // come the macros this node shows as pins, each as a Macro Output node would
+    // give it: this tick's value where something has written it (this node
+    // included, just above), else last tick's.
     let mut out = vec![None; snap.n_outputs.max(1)];
+    for (i, (pin, ty)) in shown_macros.iter().enumerate() {
+        let Some(slot) = out.get_mut(i + 1) else { break };
+        let aspect = |ns: &str| {
+            let k = (ns.to_string(), pin.clone());
+            collector_sigs.get(&k).or_else(|| shown_prev.get(&k)).copied()
+        };
+        use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
+        *slot = crate::eval::macro_port_value(*ty, aspect(SIGS_NS), aspect(SIGS_NS_VEC2));
+    }
+    // The two after the pins are not pins at all — they are how the
+    // calibration widget reads the sweep this node is integrating, the same
+    // trailing-output channel RWS publishes its own measurement on. See
+    // `cal_deg_out` / `cal_peak_out`.
     out.push(Some(Signal::Float(st.cal.deg)));
     out.push(Some(Signal::Float(st.cal.peak)));
     out
 }
 
 /// Index of the measured-rotation trailing output in a JSM node's `last_out`,
-/// and of the peak stick deflection beside it. The module declares exactly one
-/// output pin (the bus), so the display-only pair sits at 1 and 2.
-pub const CAL_DEG_OUT: usize = 1;
-pub const CAL_PEAK_OUT: usize = 2;
+/// and of the peak stick deflection beside it: just past the node's pins, of
+/// which there is the bus and one per macro it shows.
+pub fn cal_deg_out(n_outputs: usize) -> usize {
+    n_outputs.max(1)
+}
+pub fn cal_peak_out(n_outputs: usize) -> usize {
+    n_outputs.max(1) + 1
+}
+
+/// The node's own macros it shows as output pins, in pin order (outputs 1…),
+/// each with its type: `jsm_macro_outs` names the pins, `jsm_macros` defines
+/// them.
+fn shown_macro_pins(snap: &NodeSnap) -> Vec<(String, SignalType)> {
+    use flexinput_core::macros as mac;
+    let defs = mac::ports_from_value(snap.params.get(JSM_MACROS_PARAM));
+    snap.params
+        .get(JSM_MACRO_OUTS_PARAM)
+        .and_then(|v| v.as_array())
+        .map(|pins| {
+            pins.iter()
+                .filter_map(|p| p.as_str())
+                .map(|pin| {
+                    let ty = defs
+                        .iter()
+                        .find(|d| mac::macro_pin_id(&d.id) == pin)
+                        .map(|d| d.signal_type)
+                        .unwrap_or(SignalType::Any);
+                    (pin.to_string(), ty)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The JSM node's own macros: the ports its config names with `@`, in the
+/// Macro Output port schema (`flexinput_core::macros`), so they are targets
+/// everywhere a Macro Output port is.
+pub const JSM_MACROS_PARAM: &str = "jsm_macros";
+/// The pins of the node's own macros it shows as outputs, in output order.
+pub const JSM_MACRO_OUTS_PARAM: &str = "jsm_macro_outs";
 
 /// Every tab the node holds, as (name, text) — what a layer switch can reach.
 fn all_tabs(snap: &NodeSnap) -> Vec<(String, String)> {
@@ -769,10 +834,12 @@ fn selected_tab(snap: &NodeSnap, tabs: &[(String, String)]) -> String {
 }
 
 /// A generation for the whole tab set plus which tab is selected, so an edit to any
-/// of them — or a different tab being opened — recompiles.
-fn text_gen_of(tabs: &[(String, String)], selected: &str) -> u64 {
+/// of them — or a different tab being opened — recompiles. And the macro names it
+/// resolves `@Name`s against, so a macro appearing or being renamed does too.
+fn text_gen_of(tabs: &[(String, String)], selected: &str, ports: &[(String, String)]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     selected.hash(&mut h);
+    ports.hash(&mut h);
     for (n, t) in tabs {
         n.hash(&mut h);
         t.hash(&mut h);

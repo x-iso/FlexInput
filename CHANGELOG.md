@@ -35,19 +35,37 @@ All notable changes to FlexInput are documented here. This project adheres to
   Bound to a value (`@Throttle = X_LT`, `@Throttle = MIDI_CC7`) it hands that
   value on and presses from any movement, as a MIDI knob does.
 
-  A config no longer needs its ports made by hand. Every `@Name` a JSM config
-  uses, on either side, that no Macro Output port or Virtual Menu entry in the
-  tab answers to becomes an Any port — carrying whatever drives it, for each
-  reader to take as it needs — on a Macro Output node beside it: the
-  first one in its patch or sub-patch, or a new one when there is none. Ports
-  are made when you leave the editor (never mid-word), for a config loaded with
-  `@Name`s as soon as it opens, and once per change to the text, so a port you
-  delete on purpose stays deleted until the config is edited again. A Virtual
-  Menu entry can still be pressed with `@`, but not read as a button, and the
-  line says so. The command list and the pad's picker offer the patch's ports on
-  the left of the `=` as well as the right.
+  **A JSM Config owns the macros its config names.** Every `@Name` it uses, on
+  either side, that no Macro Output port or Virtual Menu entry in the tab answers
+  to becomes one of the module's own macros — an Any port, carrying whatever
+  drives it — with no Macro Output node needed. They are targets everywhere a
+  Macro Output's ports are: Remapper cards, Touch Zones, every picker. The
+  header's **Macros** button lists them, to give each an icon, a type, and an
+  output pin under Auto-Map to wire like any other (a pin keeps its wires as
+  others are shown and hidden). A macro is made the moment its name is
+  finished — the caret leaves it (a space, an Enter, a click or an arrow away),
+  the editor lets go of the keyboard, a word arrives from the pad's keyboard,
+  or a config loaded with `@Name`s opens — never mid-word, and in a sub-patch
+  window as on the canvas. Until then the name shows in yellow and its line
+  waits, rather than reading as an error. Every JSM config in the tab can use
+  any of them, whichever module made it. Changing a name where it stands
+  renames its macro — the same macro, so its icon, its pin and its wires come
+  along — unless another line or config still uses the old name, which then
+  keeps it and the new name gets a macro of its own. One no config names any
+  more goes on its own, unless adopted (an icon, a pin, or something else
+  pointing at it). A config picks up a macro made or renamed after its last
+  edit without being edited again. A Virtual Menu entry can still be pressed
+  with `@`, but not read as a button, and the line says so. The command list and
+  the pad's picker offer the patch's ports on the left of the `=` as well as the
+  right.
 
 ### Fixed
+
+- **A JSM config's keys pause while you type in its editor, wherever it is
+  open.** With the same config drawn in more than one place — its node, a pin,
+  the overlay, a sub-patch window — a copy without the keyboard could undo the
+  pause the focused one had just set, so a binding under test could type into
+  the editor.
 
 - **Double-clicking the Contrast slider resets it to 0.** The slider never
   registered the double-click, though the hint under it said it would.

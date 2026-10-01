@@ -523,24 +523,29 @@ fn an_at_name_binds_one_of_flexinputs_own_targets() {
     assert_eq!(c.bindings[0].steps[0].out, pin("macro:aa11bb22"));
 }
 
-/// An `@` name that doesn't resolve is an ERROR on the line, not a note. The
-/// line does nothing, and saying so where you can still see the line is the
-/// whole point of this module.
+/// An `@` name that doesn't resolve leaves the line WAITING, not silently
+/// fine: it binds nothing until its macro exists, and says so on the line —
+/// but it isn't an error either, since the editor makes the macro once the
+/// name is finished.
 #[test]
 fn an_at_name_that_is_not_in_the_patch_says_so() {
     let c = super::parse::compile_full("S = @Nope", &[], &ports());
     match &c.lines[0].status {
-        LineStatus::Error(e) => {
+        LineStatus::Waiting(e) => {
             assert!(e.contains("Nope"), "{e}");
             assert!(e.contains("Macro Output") || e.contains("Menu"), "{e}");
         }
-        other => panic!("expected an error, got {other:?}"),
+        other => panic!("expected it to wait for its macro, got {other:?}"),
     }
+    assert!(c.bindings.is_empty());
+    // A real mistake on the same kind of line is still an error.
+    let c = super::parse::compile_full("S = @", &[], &ports());
+    assert!(matches!(c.lines[0].status, LineStatus::Error(_)));
     // With no ports at all the fix is the same — the editor makes the port —
     // so the line says that rather than send you off to add a node.
     let c = super::parse::compile_full("S = @Reload", &[], &[]);
     match &c.lines[0].status {
-        LineStatus::Error(e) => assert!(e.contains("leave the editor"), "{e}"),
+        LineStatus::Waiting(e) => assert!(e.contains("once its name is finished"), "{e}"),
         other => panic!("expected an error, got {other:?}"),
     }
     // And `@` on its own is not a name.
@@ -587,7 +592,7 @@ fn every_port_name_round_trips_through_the_tag_it_is_written_as() {
         // rather than pretending, since it is the one case the tag can't express.
         if name.contains('"') {
             assert!(
-                matches!(c.lines[0].status, LineStatus::Error(_)),
+                matches!(c.lines[0].status, LineStatus::Error(_) | LineStatus::Waiting(_)),
                 "{name}: a quote inside a name has no spelling, so it must not silently bind"
             );
             continue;
@@ -2124,13 +2129,39 @@ fn an_at_binding_drives_a_macro_port_through_the_macro_namespace() {
     );
 }
 
+/// The macro an `@Name` waits for is made a frame after the name is typed, and
+/// the text doesn't change again: the config has to pick it up regardless.
+#[test]
+fn a_macro_made_after_the_text_is_picked_up_without_another_edit() {
+    let _guard = alone();
+    let uid = 910;
+    let mut snap = jsm_snap(uid, "S = @Reload", false);
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    let pressed = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>| {
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, 0.010);
+        collector.get(&("macro".to_string(), "macro:aa11bb22".to_string())).map(|s| s.as_bool())
+    };
+    assert_eq!(pressed(&snap, &mut state), None, "no macro yet");
+    snap.params.insert(
+        "_macro_ports".to_string(),
+        serde_json::json!([{ "name": "Reload", "pin": "macro:aa11bb22" }]),
+    );
+    // A tick to compile, released, then pressed again.
+    pressed(&snap, &mut state);
+    assert_eq!(pressed(&snap, &mut state), Some(true), "bound once the macro exists");
+}
+
 /// Without the patch's table the name can't resolve, and the line says so rather
 /// than the binding quietly doing nothing.
 #[test]
 fn an_at_binding_with_no_table_is_an_error_rather_than_a_silent_no_op() {
     let c = compile("S = @Reload");
+    // Waiting for its macro, which is said on the line, not a silent no-op.
     assert!(
-        matches!(c.lines[0].status, LineStatus::Error(_)),
+        matches!(c.lines[0].status, LineStatus::Waiting(_)),
         "{:?}",
         c.lines[0].status
     );
@@ -6175,7 +6206,7 @@ fn a_sweep_publishes_the_rotation_it_has_measured() {
     // Ten ticks of 10 ms at 90°/s of yaw is 9° of turn.
     let snap = sweeping("REAL_WORLD_CALIBRATION = 40", "yaw", "mouse");
     let (_, out) = run_sweep(&snap, &[("gyro_z", 90.0)], 10, 0.010);
-    let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+    let deg = match out.get(super::eval::cal_deg_out(1)).copied().flatten() {
         Some(Signal::Float(f)) => f,
         other => panic!("the measurement should be a float, got {other:?}"),
     };
@@ -6184,7 +6215,7 @@ fn a_sweep_publishes_the_rotation_it_has_measured() {
     let idle = jsm_snap(7311, "REAL_WORLD_CALIBRATION = 40", false);
     let (_, out) = run_sweep(&idle, &[("gyro_z", 90.0)], 10, 0.010);
     assert_eq!(
-        out.get(super::eval::CAL_DEG_OUT).copied().flatten(),
+        out.get(super::eval::cal_deg_out(1)).copied().flatten(),
         Some(Signal::Float(0.0)),
         "an idle node measures nothing"
     );
@@ -6247,7 +6278,7 @@ fn a_stick_sweep_drives_the_stick_and_holds_the_mouse_still() {
     );
     // Half deflection is well inside the limit, so the result stands.
     assert_eq!(
-        out.get(super::eval::CAL_PEAK_OUT).copied().flatten(),
+        out.get(super::eval::cal_peak_out(1)).copied().flatten(),
         Some(Signal::Float(0.5))
     );
 }
@@ -6268,7 +6299,7 @@ fn turning_past_full_stick_is_reported_as_the_peak() {
         other => panic!("got {other:?}"),
     }
     assert_eq!(
-        out.get(super::eval::CAL_PEAK_OUT).copied().flatten(),
+        out.get(super::eval::cal_peak_out(1)).copied().flatten(),
         Some(Signal::Float(2.0)),
         "the UNCLAMPED deflection is what tells the widget to refuse the answer"
     );
@@ -6317,7 +6348,7 @@ fn a_circled_stick_and_the_gyro_turn_the_360_together_without_a_flick_config() {
         }
         // 90° swept + 36° turned = 126°, at 40 counts/° is 5040 counts, to the right.
         assert!((total_x - 5040.0).abs() < 1.0, "{cfg}: expected 5040 counts, got {total_x}");
-        let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+        let deg = match out.get(super::eval::cal_deg_out(1)).copied().flatten() {
             Some(Signal::Float(f)) => f,
             other => panic!("got {other:?}"),
         };
@@ -6359,7 +6390,7 @@ fn the_pitch_method_measures_the_vertical_and_blocks_the_horizontal() {
         }
         other => panic!("got {other:?}"),
     }
-    let deg = match out.get(super::eval::CAL_DEG_OUT).copied().flatten() {
+    let deg = match out.get(super::eval::cal_deg_out(1)).copied().flatten() {
         Some(Signal::Float(f)) => f,
         other => panic!("got {other:?}"),
     };
@@ -6861,12 +6892,12 @@ fn an_at_name_on_the_left_says_why_it_cant_be_read() {
     let err = |line: &str| {
         let c = super::parse::compile_full(line, &[], &ports);
         match &c.lines[0].status {
-            LineStatus::Error(e) => e.clone(),
+            LineStatus::Error(e) | LineStatus::Waiting(e) => e.clone(),
             other => panic!("`{line}` should be an error, got {other:?}"),
         }
     };
-    assert!(err("@Crouch = SPACE").contains("leave the editor"));
-    assert!(err("E,@Crouch = SPACE").contains("leave the editor"));
+    assert!(err("@Crouch = SPACE").contains("once its name is finished"));
+    assert!(err("E,@Crouch = SPACE").contains("once its name is finished"));
     assert!(err("@\"Menu — Show\" = SPACE").contains("Virtual Menu entry"));
     // And a known port reads fine, as a chord, a modeshift chord, or alone.
     for ok in ["@Jump = SPACE", "E,@Jump = SPACE", "@jump,GYRO_SENS = 2", "@\"Jump\" = A"] {
@@ -6943,7 +6974,7 @@ fn gyro_off_and_on_take_a_macro_port() {
     // A port this patch hasn't got says so the way a binding's does.
     let c = super::parse::compile_full("GYRO_OFF = @Crouch", &[], &ports);
     match &c.lines[0].status {
-        LineStatus::Error(e) => assert!(e.contains("leave the editor"), "{e}"),
+        LineStatus::Waiting(e) => assert!(e.contains("once its name is finished"), "{e}"),
         other => panic!("{other:?}"),
     }
 }
@@ -7041,4 +7072,33 @@ fn a_malformed_threshold_says_what_is_wrong() {
     let c = super::parse::compile_full("GYRO_OFF = @Jump>20", &[], &ports);
     assert!(errors(&c).is_empty(), "{:?}", errors(&c));
     assert!(format!("{:?}", c.aim.gyro_button).contains("Some(20)"), "{:?}", c.aim.gyro_button);
+}
+
+/// A macro the node owns and shows as a pin puts its value on that output, the
+/// way a Macro Output node would; the calibration readout moves past the pins.
+#[test]
+fn a_shown_macro_is_an_output_pin_of_the_node() {
+    let _guard = alone();
+    let mut snap = with_ports(jsm_snap(951, "S = @Jump", false));
+    snap.params.insert(
+        super::eval::JSM_MACROS_PARAM.to_string(),
+        serde_json::json!([{ "id": "aa11bb22", "name": "Jump", "icon": "", "type": "Any" }]),
+    );
+    snap.params.insert(super::eval::JSM_MACRO_OUTS_PARAM.to_string(), serde_json::json!(["macro:aa11bb22"]));
+    snap.n_outputs = 2;
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let run = |state: &mut HashMap<usize, NodeState>, held: bool| {
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(held));
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, state, 0.010)
+    };
+    let out = run(&mut state, true);
+    assert_eq!(out.len(), 4, "bus, one pin, then the two readouts");
+    assert_eq!(out[1].map(|s| s.as_bool()), Some(true), "held: the pin is on");
+    assert!(matches!(out[super::eval::cal_deg_out(2)], Some(Signal::Float(_))));
+    // Released, the Any pin carries nothing once last tick's value is gone.
+    run(&mut state, false);
+    let out = run(&mut state, false);
+    assert!(out[1].is_none_or(|s| !s.as_bool()), "released: {:?}", out[1]);
 }

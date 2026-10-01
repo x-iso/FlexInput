@@ -31,14 +31,25 @@ const MIN_EDITOR_W: f32 = 190.0;
 const SUMMARY_H: f32 = 18.0;
 
 /// Colour for a line's status: errors read, not-yet-live amber, ignored faint.
+/// A line waiting for a macro keeps its own colour — it isn't wrong — and the
+/// waiting names are tinted instead (`WAITING_NAME`).
 fn status_color(ui: &egui::Ui, status: &flexinput_engine::eval::JsmLineStatus) -> Option<Color32> {
     use flexinput_engine::eval::JsmLineStatus as S;
     match status {
         S::Error(_) => Some(Color32::from_rgb(226, 104, 92)),
         S::Pending(_) => Some(Color32::from_rgb(214, 168, 74)),
         S::Ignored(_) => Some(ui.visuals().weak_text_color()),
-        S::Ok | S::Blank => None,
+        S::Ok | S::Blank | S::Waiting(_) => None,
     }
+}
+
+/// An `@Name` no macro answers to yet: yellow until its name is finished and
+/// the module makes the macro.
+const WAITING_NAME: Color32 = Color32::from_rgb(236, 204, 72);
+
+/// Is this `@Name` one the tab's macros answer to?
+fn macro_known(name: &str) -> bool {
+    crate::macro_icons::registry().iter().any(|e| e.name.trim().eq_ignore_ascii_case(name.trim()))
 }
 
 pub(crate) fn show_jsm_body(
@@ -869,25 +880,42 @@ fn jsm_rows(
         let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
         let raw = buf.as_str();
         // One `append` per run, so the highlighted token can carry a background
-        // of its own without disturbing the per-line tinting around it.
+        // of its own, and a waiting `@Name` a colour of its own, without
+        // disturbing the per-line tinting around them.
         let mut at = 0usize;
         for (i, line) in raw.split_inclusive('\n').enumerate() {
             let color = statuses.get(i).and_then(|s| status_color(ui, s)).unwrap_or(plain);
-            let fmt = |bg: Color32| egui::TextFormat {
-                font_id: font.clone(),
-                color,
-                background: bg,
-                ..Default::default()
-            };
             let end = at + line.len();
-            match nav_token {
-                // The token is on this line: split it out of the run.
-                Some((ts, te)) if ts >= at && te <= end && te > ts => {
-                    job.append(&raw[at..ts], 0.0, fmt(Color32::TRANSPARENT));
-                    job.append(&raw[ts..te], 0.0, fmt(accent.gamma_multiply(0.45)));
-                    job.append(&raw[te..end], 0.0, fmt(Color32::TRANSPARENT));
+            // Read from the text being laid out — mid-typing it is a frame
+            // ahead of anything compiled.
+            let waiting: Vec<(usize, usize)> = flexinput_engine::eval::jsm_at_name_spans(line)
+                .into_iter()
+                .filter(|(_, _, name)| !macro_known(name))
+                .map(|(s, e, _)| (at + s, at + e))
+                .collect();
+            let token = nav_token.filter(|&(ts, te)| ts >= at && te <= end && te > ts);
+            let mut cuts: Vec<usize> = vec![at, end];
+            cuts.extend(waiting.iter().flat_map(|&(s, e)| [s, e]));
+            cuts.extend(token.iter().flat_map(|&(s, e)| [s, e]));
+            cuts.sort_unstable();
+            cuts.dedup();
+            for w in cuts.windows(2) {
+                let (s, e) = (w[0], w[1]);
+                if s >= e {
+                    continue;
                 }
-                _ => job.append(line, 0.0, fmt(Color32::TRANSPARENT)),
+                let in_waiting = waiting.iter().any(|&(ws, we)| s >= ws && e <= we);
+                let in_token = token.is_some_and(|(ts, te)| s >= ts && e <= te);
+                job.append(
+                    &raw[s..e],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: if in_waiting { WAITING_NAME } else { color },
+                        background: if in_token { accent.gamma_multiply(0.45) } else { Color32::TRANSPARENT },
+                        ..Default::default()
+                    },
+                );
             }
             at = end;
         }
@@ -976,7 +1004,31 @@ fn jsm_rows(
     // The box you see, bar included — not the text inside it, which is taller
     // than the box whenever the config is longer than the editor.
     let editor_rect = editor.inner_rect.with_max_x(editor.inner_rect.max.x + bar_w);
+    let caret = editor.inner.cursor_range.map(|r| r.primary.index);
     let resp = editor.inner.response;
+    // While typing, an `@Name` is finished the moment the caret leaves it —
+    // a space, an Enter, a click or an arrow away. The one the caret is still
+    // in (or just after) is the one being typed; any other this config names
+    // that no macro answers to is done, so ask for it to be made now rather
+    // than when the editor finally lets go.
+    if resp.has_focus() {
+        let typing = caret.and_then(|c| at_name_at_caret(&text, c));
+        let finished_waiting = flexinput_engine::eval::jsm_at_names(&text).into_iter().any(|n| {
+            !macro_known(&n) && typing.as_ref().is_none_or(|t| !t.eq_ignore_ascii_case(&n))
+        });
+        let now = JsmTyping { node: node_id, text: jsm_text_hash(&text), name: typing };
+        // Once per text and caret: a name that has to wait for the typing to
+        // stop (its rename reaches into another open window) would otherwise
+        // be asked about every frame.
+        let asked_id = egui::Id::new("jsm_port_sync_asked");
+        let asked = ui.ctx().data(|d| d.get_temp::<JsmTyping>(asked_id));
+        let same_ask = asked.is_some_and(|a| a.node == now.node && a.text == now.text && a.name == now.name);
+        if finished_waiting && !same_ask {
+            ui.ctx().data_mut(|d| d.insert_temp(asked_id, now.clone()));
+            request_jsm_port_sync(ui.ctx());
+        }
+        note_jsm_typing(ui.ctx(), now);
+    }
     if resp.changed() || tabbed {
         tabs[active].text = text;
         changed = true;
@@ -993,7 +1045,17 @@ fn jsm_rows(
         }
     });
     // A binding under test must not type into the editor it is being edited in.
-    flexinput_engine::eval::set_jsm_editor_focus(resp.has_focus());
+    // Only ever SAID here, never unsaid: the same node can be drawn in several
+    // places at once — its canvas body, a pin, the overlay, a sub-patch window —
+    // and the copies without the keyboard used to clear the flag the focused one
+    // had just set. The app clears it once nothing has said so for a moment.
+    if resp.has_focus() {
+        note_jsm_editor_focused(ui.ctx());
+    }
+    // Done typing: the `@Name`s it wrote can have their ports now.
+    if resp.lost_focus() {
+        request_jsm_port_sync(ui.ctx());
+    }
     // The editor is what you pin to the config overlay.
     register_exposable_element(ui, node_id, "editor", editor_rect);
 
@@ -1406,6 +1468,7 @@ fn show_line_notes(ui: &mut egui::Ui, compiled: &flexinput_engine::eval::JsmConf
         let (color, text) = match &line.status {
             S::Error(e) => (Color32::from_rgb(226, 104, 92), e.clone()),
             S::Pending(p) => (Color32::from_rgb(214, 168, 74), p.to_string()),
+            S::Waiting(w) => (WAITING_NAME, w.clone()),
             S::Ignored(w) => (ui.visuals().weak_text_color(), w.to_string()),
             S::Ok if !line.notes.is_empty() => (ui.visuals().weak_text_color(), line.notes.join("; ")),
             _ => continue,
@@ -1513,6 +1576,72 @@ mod tests {
         let mut node = node_with("DECEL_BRAKE_STRENGTH = 1\n");
         assert!(!super::nav_nudge_knob(&mut node, "DECEL_BRAKE_STRENGTH", 0.005));
         assert_eq!(text_of(&node), "DECEL_BRAKE_STRENGTH = 1\n");
+    }
+
+    // The name being typed is the one the caret is in or just after — not one it
+    // sits in front of, and not one elsewhere on the line.
+    #[test]
+    fn the_name_being_typed_is_the_one_at_the_caret() {
+        let text = "S = @Jump\n@Dash,E = @\"Long name\"";
+        let caret_at = |needle: &str, off: usize| text[..text.find(needle).unwrap() + off].chars().count();
+        assert_eq!(super::at_name_at_caret(text, caret_at("@Jump", 5)).as_deref(), Some("Jump"), "just after");
+        assert_eq!(super::at_name_at_caret(text, caret_at("@Jump", 2)).as_deref(), Some("Jump"), "inside");
+        assert_eq!(super::at_name_at_caret(text, caret_at("@Jump", 0)), None, "in front of its @");
+        assert_eq!(super::at_name_at_caret(text, caret_at("@Dash", 3)).as_deref(), Some("Dash"));
+        assert_eq!(super::at_name_at_caret(text, caret_at("Long", 2)).as_deref(), Some("Long name"));
+        assert_eq!(super::at_name_at_caret(text, caret_at(",E", 1)), None, "between names");
+    }
+
+    // Showing or hiding a macro's pin keeps every wire on its own macro: hide the
+    // first and the second's pin moves up, taking its wire with it.
+    #[test]
+    fn a_macro_pin_keeps_its_wires_as_others_come_and_go() {
+        use crate::canvas::node::{NodeData, NodeExtra};
+        use egui_snarl::{InPinId, OutPinId, Snarl};
+        use flexinput_core::macros::{self as mac, MacroPortDef};
+        use flexinput_core::{PinDescriptor, SignalType};
+        let bare = |module: &str, outputs: Vec<PinDescriptor>, inputs: Vec<PinDescriptor>| NodeData {
+            module_id: module.into(),
+            display_name: String::new(),
+            category: String::new(),
+            inputs,
+            outputs,
+            params: Default::default(),
+            subpatch: None,
+            extra: NodeExtra::default(),
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let jsm = snarl.insert_node(
+            egui::pos2(0.0, 0.0),
+            bare("module.jsm", vec![PinDescriptor::new("Auto-Map", SignalType::AutoMap)], vec![]),
+        );
+        let sink = snarl.insert_node(
+            egui::pos2(300.0, 0.0),
+            bare("module.display", vec![], vec![PinDescriptor::new("in", SignalType::Any)]),
+        );
+        let port = |id: &str, name: &str| MacroPortDef {
+            id: id.into(),
+            name: name.into(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: SignalType::Any,
+        };
+        let ports = [port("aaaaaaaa", "A"), port("bbbbbbbb", "B")];
+        let (pa, pb) = (mac::macro_pin_id("aaaaaaaa"), mac::macro_pin_id("bbbbbbbb"));
+        super::set_jsm_macros(&mut snarl, jsm, &ports, &[pa.clone(), pb.clone()]);
+        assert_eq!(snarl[jsm].outputs.len(), 3, "the bus and two pins");
+        // Wire B (output 2) to the sink.
+        snarl.connect(OutPinId { node: jsm, output: 2 }, InPinId { node: sink, input: 0 });
+        // Hide A: B moves to output 1, and its wire with it.
+        super::set_jsm_macros(&mut snarl, jsm, &ports, &[pb.clone()]);
+        assert_eq!(snarl[jsm].outputs.len(), 2);
+        assert_eq!(snarl[jsm].outputs[1].name, "B");
+        let remotes = snarl.out_pin(OutPinId { node: jsm, output: 1 }).remotes;
+        assert_eq!(remotes, [InPinId { node: sink, input: 0 }], "the wire followed B");
+        // Hide B too: its wire goes with its pin.
+        super::set_jsm_macros(&mut snarl, jsm, &ports, &[]);
+        assert_eq!(snarl[jsm].outputs.len(), 1);
+        assert!(snarl.in_pin(InPinId { node: sink, input: 0 }).remotes.is_empty());
     }
 
     // Tab in the text editor steps the value the caret is on or just after —
@@ -1731,6 +1860,298 @@ mod tests {
 
 /// Header toggle: pass the pad's unmentioned inputs through, or emit only what
 /// the config produces (how JSM behaves with the pad hidden from the game).
+fn jsm_focus_key() -> egui::Id {
+    egui::Id::new("jsm_editor_focused_at")
+}
+
+fn jsm_port_sync_key() -> egui::Id {
+    egui::Id::new("jsm_port_sync_requested")
+}
+
+/// A JSM editor has the keyboard right now.
+pub(crate) fn note_jsm_editor_focused(ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(jsm_focus_key(), now));
+}
+
+/// Has any JSM editor had the keyboard in the last moment? Wherever it is drawn:
+/// a focused editor repaints for its caret, so "recently" is never stale while
+/// one is being typed in, and a quarter second after the last keystroke's
+/// editor lets go, it isn't.
+pub(crate) fn jsm_editor_focused_recently(ctx: &egui::Context) -> bool {
+    let now = ctx.input(|i| i.time);
+    ctx.data(|d| d.get_temp::<f64>(jsm_focus_key()))
+        .is_some_and(|at| now - at < 0.25)
+}
+
+/// The `@Name` the caret (a char index) is in or just after — the one being
+/// typed. Just before its `@` isn't in it.
+pub(crate) fn at_name_at_caret(text: &str, caret: usize) -> Option<String> {
+    let at = text.char_indices().nth(caret).map(|(b, _)| b).unwrap_or(text.len());
+    let line_start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+    let col = at - line_start;
+    flexinput_engine::eval::jsm_at_name_spans(&text[line_start..line_end])
+        .into_iter()
+        .find(|(s, e, _)| *s < col && col <= *e)
+        .map(|(_, _, name)| name)
+}
+
+fn jsm_typing_key() -> egui::Id {
+    egui::Id::new("jsm_typing_at")
+}
+
+/// Where the focused JSM editor's caret is.
+#[derive(Clone, Debug)]
+pub(crate) struct JsmTyping {
+    /// The node being typed in, and its text as typed (`jsm_text_hash`) —
+    /// which says which copy of the node it is: in a sub-patch window, the tab
+    /// still holds the text from before the typing began.
+    pub(crate) node: NodeId,
+    pub(crate) text: u64,
+    /// The `@Name` the caret is in, if any: the one a sync made while typing
+    /// must leave alone.
+    pub(crate) name: Option<String>,
+}
+
+/// One config text's identity, as the editor and the macro sync both see it.
+pub(crate) fn jsm_text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+pub(crate) fn note_jsm_typing(ctx: &egui::Context, typing: JsmTyping) {
+    ctx.data_mut(|d| d.insert_temp(jsm_typing_key(), typing));
+}
+
+pub(crate) fn jsm_typing(ctx: &egui::Context) -> Option<JsmTyping> {
+    ctx.data(|d| d.get_temp::<JsmTyping>(jsm_typing_key()))
+}
+
+/// Ask for the config's `@Name`s to be given their macros — at a point where
+/// a name is finished: the caret left it, the editor let go of the keyboard,
+/// the pad typed a word.
+pub(crate) fn request_jsm_port_sync(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(jsm_port_sync_key(), true));
+    // The sync runs at the top of a frame: have the next one come now, not at
+    // the caret's next blink.
+    ctx.request_repaint();
+}
+
+/// Take the request, if one was made.
+pub(crate) fn take_jsm_port_sync_request(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(jsm_port_sync_key())).unwrap_or(false)
+}
+
+/// The JSM node's own macros — the ports its config names with `@` — and the
+/// pins of the ones it shows as outputs.
+fn jsm_macros_of(node: &NodeData) -> (Vec<flexinput_core::macros::MacroPortDef>, Vec<String>) {
+    let ports = flexinput_core::macros::ports_from_value(
+        node.params.get(flexinput_engine::eval::JSM_MACROS_PARAM),
+    );
+    let shown = node
+        .params
+        .get(flexinput_engine::eval::JSM_MACRO_OUTS_PARAM)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    (ports, shown)
+}
+
+/// Write a JSM node's macros, and the output pins of the ones `shown` — under
+/// the Auto-Map output, in the macros' own order. The macro list, the output
+/// pins and `jsm_macro_outs` are written together so the three can't drift, and
+/// every wire stays on its macro's pin wherever that pin moves to; a pin no
+/// longer shown takes its wires with it.
+pub(crate) fn set_jsm_macros(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    ports: &[flexinput_core::macros::MacroPortDef],
+    shown: &[String],
+) {
+    use flexinput_core::macros as mac;
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let (_, old) = jsm_macros_of(node);
+    let pin_count = node.outputs.len();
+    // Where each old pin's wires went.
+    let old_wires: Vec<(String, Vec<InPinId>)> = old
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i + 1 < pin_count)
+        .map(|(i, pin)| {
+            let out = OutPinId { node: node_id, output: i + 1 };
+            (pin.clone(), snarl.out_pin(out).remotes.clone())
+        })
+        .collect();
+    for i in 1..pin_count {
+        snarl.drop_outputs(OutPinId { node: node_id, output: i });
+    }
+    let new: Vec<&mac::MacroPortDef> =
+        ports.iter().filter(|p| shown.contains(&mac::macro_pin_id(&p.id))).collect();
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    node.outputs.truncate(1);
+    node.outputs.extend(new.iter().map(|p| PinDescriptor::new(p.name.clone(), p.signal_type)));
+    node.params.insert(flexinput_engine::eval::JSM_MACROS_PARAM.into(), mac::ports_to_value(ports));
+    node.params.insert(
+        flexinput_engine::eval::JSM_MACRO_OUTS_PARAM.into(),
+        Value::Array(new.iter().map(|p| Value::String(mac::macro_pin_id(&p.id))).collect()),
+    );
+    for (j, p) in new.iter().enumerate() {
+        let pin = mac::macro_pin_id(&p.id);
+        if let Some((_, remotes)) = old_wires.iter().find(|(o, _)| *o == pin) {
+            for r in remotes {
+                snarl.connect(OutPinId { node: node_id, output: j + 1 }, *r);
+            }
+        }
+    }
+}
+
+/// The header's Macros button: the macros this config owns, each with its icon
+/// (what a Remapper card or a picker shows for it), its type, whether it is an
+/// output pin under the Auto-Map one, and — once no config names it — a way to
+/// remove it. Returns whether anything changed, for the undo history.
+pub(crate) fn jsm_macros_header_button(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+) -> bool {
+    use flexinput_core::macros as mac;
+    let Some(node) = snarl.get_node(node_id) else { return false };
+    let (ports, shown) = jsm_macros_of(node);
+    // Names still in use can't be removed here: the next commit would only
+    // make them again.
+    let named: std::collections::HashSet<String> = read_tabs(snarl, node_id)
+        .iter()
+        .flat_map(|t| flexinput_engine::eval::jsm_at_names(&t.text))
+        .map(|n| n.trim().to_lowercase())
+        .collect();
+    let mut edit: Option<(Vec<mac::MacroPortDef>, Vec<String>)> = None;
+    let label = egui::RichText::new(format!("Macros ({})", ports.len())).small();
+    // Open or not is kept here rather than in egui's memory, which holds one
+    // open popup per window: the icon picker and the type list are popups of
+    // their own, and opening either took the slot from this one — it closed,
+    // and took the picker it was drawing with it. Per viewport and layer, as
+    // the node can be drawn in several places at once.
+    let open_id = egui::Id::new(("jsm_macros_open", node_id.0))
+        .with(ui.ctx().viewport_id())
+        .with(ui.layer_id());
+    let button = ui.button(label);
+    let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    if button.clicked() {
+        open = !open;
+    }
+    // A click while one of its own popups is open is that popup's.
+    let child_open = egui::Popup::is_any_open(ui.ctx());
+    let popup = egui::Popup::menu(&button)
+        .open(open)
+        .show(|ui| {
+            if ports.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No macros yet. Use `@Name` in the config — `S = @Jump` drives it, \
+                         `@Jump,E = SPACE` reads it — and it appears here.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                return;
+            }
+            let (mut p, mut s) = (ports.clone(), shown.clone());
+            let mut changed = false;
+            let mut remove: Option<usize> = None;
+            egui::Grid::new((node_id, "jsm_macros")).num_columns(5).show(ui, |ui| {
+                for (i, port) in p.iter_mut().enumerate() {
+                    if let Some((k, svg)) = crate::canvas::menu_body::icon_picker_button(
+                        ui,
+                        egui::Id::new((node_id, "jsm_macro_icon", i)),
+                        &port.icon,
+                        &port.icon_svg,
+                    ) {
+                        port.icon = k;
+                        port.icon_svg = svg;
+                        changed = true;
+                    }
+                    ui.label(&port.name).on_hover_text(
+                        "Named in the config — rename it there, and the old one goes once \
+                         nothing uses it.",
+                    );
+                    egui::ComboBox::from_id_salt((node_id, "jsm_macro_ty", i))
+                        .selected_text(port.signal_type.display_name())
+                        .width(52.0)
+                        .show_ui(ui, |ui| {
+                            for ty in [SignalType::Any, SignalType::Bool, SignalType::Float, SignalType::Vec2] {
+                                if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
+                                    && port.signal_type != ty
+                                {
+                                    port.signal_type = ty;
+                                    changed = true;
+                                }
+                            }
+                        });
+                    let pin = mac::macro_pin_id(&port.id);
+                    let mut on = s.contains(&pin);
+                    if ui
+                        .checkbox(&mut on, egui::RichText::new("pin").small())
+                        .on_hover_text("Show it as an output pin under Auto-Map, to wire like any other.")
+                        .changed()
+                    {
+                        if on {
+                            s.push(pin);
+                        } else {
+                            s.retain(|x| *x != pin);
+                        }
+                        changed = true;
+                    }
+                    let in_use = named.contains(&port.name.trim().to_lowercase());
+                    let rm = ui
+                        .add_enabled(!in_use, egui::Button::new("✕").small())
+                        .on_hover_text("Remove it")
+                        .on_disabled_hover_text("The config still uses it — take the `@` out first.");
+                    if rm.clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = remove {
+                let pin = mac::macro_pin_id(&p[i].id);
+                s.retain(|x| *x != pin);
+                p.remove(i);
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "A macro no config uses any more goes on its own — unless it has an \
+                     icon, a pin, or something pointing at it.",
+                )
+                .small()
+                .weak(),
+            );
+            if changed {
+                edit = Some((p, s));
+            }
+        });
+    // Closed by a click outside it — not on its button, which toggles — or by
+    // Escape; either goes to a popup of its own instead while one is open.
+    if let Some(popup) = popup {
+        let outside = !button.clicked() && popup.response.clicked_elsewhere();
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if !child_open && (outside || escape) {
+            open = false;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(open_id, open));
+    match edit {
+        Some((p, s)) => {
+            set_jsm_macros(snarl, node_id, &p, &s);
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn jsm_strict_header_toggle(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,

@@ -98,9 +98,11 @@ fn measured(snarl: &Snarl<NodeData>, node_id: NodeId) -> (f32, f32) {
         Some(Signal::Float(v)) if v.is_finite() => v,
         _ => 0.0,
     };
+    // Just past the node's pins — the bus and any macros it shows.
+    let n = node.outputs.len();
     (
-        f(flexinput_engine::eval::JSM_CAL_DEG_OUT),
-        f(flexinput_engine::eval::JSM_CAL_PEAK_OUT),
+        f(flexinput_engine::eval::jsm_cal_deg_out(n)),
+        f(flexinput_engine::eval::jsm_cal_peak_out(n)),
     )
 }
 

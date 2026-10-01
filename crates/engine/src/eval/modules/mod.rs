@@ -23,7 +23,7 @@ pub(crate) use automap_curve::*;
 pub(crate) use gyro3dof::*;
 pub(crate) use jsm::*;
 // Read by the UI to compile the config text it is showing.
-pub use jsm::{jsm_at_names, jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi_tag,
+pub use jsm::{jsm_at_names, jsm_at_name_spans, jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi_tag,
     jsm_input_names_by_pin,
     jsm_names_by_pin, jsm_cursor_clamped, jsm_cursor_delete,
     jsm_insert_line, jsm_insert_pick, jsm_insert_slot, jsm_kinds_at, JSM_SLOT,
@@ -33,7 +33,7 @@ pub use jsm::{jsm_at_names, jsm_bindings, jsm_catalogue, jsm_compile, jsm_compil
     jsm_selection, jsm_tokens_at, JsmCursor, JsmToken, JsmTokenKind,
     jsm_note_missing_inputs, jsm_midi_tag,
     jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, jsm_set_setting, jsm_setting_line,
-    JSM_CAL_DEG_OUT, JSM_CAL_PEAK_OUT,
+    jsm_cal_deg_out, jsm_cal_peak_out, JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM,
     jsm_set_knob_part, jsm_toggle_pair, jsm_knob_key_setting, jsm_pairable, jsm_replace_word,
     set_jsm_editor_focus, JsmConfig, JsmCurvePoint, JsmFeel,
     JsmHand, JsmItem, JsmKind, JsmKnob, JsmLineInfo, JsmLineStatus, JsmSupportState};

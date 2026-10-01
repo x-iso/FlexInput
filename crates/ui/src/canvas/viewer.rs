@@ -928,7 +928,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
             // JSM Config: pass the rest of the pad through, or only what the config says.
             if is_jsm {
-                jsm_strict_header_toggle(ui, snarl, node);
+                ui.horizontal(|ui| {
+                    jsm_strict_header_toggle(ui, snarl, node);
+                    if jsm_macros_header_button(ui, snarl, node) {
+                        self.push_undo_request = true;
+                    }
+                });
             }
 
             // AutoMap curves: the bus signal the curve reshapes.

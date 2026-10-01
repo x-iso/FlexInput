@@ -34,6 +34,10 @@ pub enum LineStatus {
     Pending(&'static str),
     /// Understood; deliberately not this module's job.
     Ignored(&'static str),
+    /// Fine but for `@Name`s no macro answers to yet — the editor makes them
+    /// once each name is finished, and the line runs from then on. Not an
+    /// error: the editor colours the waiting names, not the line.
+    Waiting(String),
     /// Not understood.
     Error(String),
 }
@@ -248,7 +252,7 @@ impl Compiled {
         for l in &self.lines {
             match l.status {
                 LineStatus::Error(_) => errors += 1,
-                LineStatus::Pending(_) => pending += 1,
+                LineStatus::Pending(_) | LineStatus::Waiting(_) => pending += 1,
                 LineStatus::Ignored(_) => ignored += 1,
                 _ => {}
             }
@@ -295,55 +299,69 @@ pub(crate) fn port_pin(name: &str, ports: Ports) -> Option<String> {
 /// console command is part of the command.
 pub fn at_names(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("");
-        let (lhs, rhs) = line.split_once('=').unwrap_or((line, ""));
-        for (part, right) in [(lhs, false), (rhs, true)] {
-            let chars: Vec<char> = part.chars().collect();
-            let mut i = 0;
-            let mut in_command = false;
-            while i < chars.len() {
-                let c = chars[i];
-                i += 1;
-                if c == '"' {
-                    in_command = !in_command;
-                    continue;
-                }
-                if c != '@' || in_command {
-                    continue;
-                }
-                let mut name = String::new();
-                if chars.get(i) == Some(&'"') {
-                    i += 1;
-                    while i < chars.len() && chars[i] != '"' {
-                        name.push(chars[i]);
-                        i += 1;
-                    }
-                    if i >= chars.len() {
-                        // No closing quote: not a name yet.
-                        break;
-                    }
-                    i += 1;
-                } else {
-                    while i < chars.len()
-                        && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '-' | '.'))
-                    {
-                        name.push(chars[i]);
-                        i += 1;
-                    }
-                    if right && name.len() > 1 && name.ends_with('_') {
-                        name.pop();
-                    }
-                }
-                let name = name.trim().to_string();
-                if name.is_empty() || flexinput_core::midi::parse_pin(&name).is_some() {
-                    continue;
-                }
-                if !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                    out.push(name);
-                }
+    for line in text.lines() {
+        for (_, _, name) in at_name_spans(line) {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                out.push(name);
             }
         }
+    }
+    out
+}
+
+/// Every `@Name` on one line, as `(start, end, name)` — the byte range of the
+/// whole reference (the `@`, the quotes, the name; not a hold modifier's `_` or
+/// a threshold) and the name it gives. Read as [`at_names`] reads them; the
+/// editor colours by the ranges.
+pub fn at_name_spans(line: &str) -> Vec<(usize, usize, String)> {
+    let body = line.split('#').next().unwrap_or("");
+    let eq = body.find('=').unwrap_or(body.len());
+    let chars: Vec<(usize, char)> = body.char_indices().collect();
+    let byte_at = |i: usize| chars.get(i).map(|(b, _)| *b).unwrap_or(body.len());
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_command = false;
+    while i < chars.len() {
+        let (at, c) = chars[i];
+        i += 1;
+        if c == '"' {
+            in_command = !in_command;
+            continue;
+        }
+        if c != '@' || in_command {
+            continue;
+        }
+        let right = at > eq;
+        let mut name = String::new();
+        if chars.get(i).map(|(_, c)| *c) == Some('"') {
+            i += 1;
+            while i < chars.len() && chars[i].1 != '"' {
+                name.push(chars[i].1);
+                i += 1;
+            }
+            if i >= chars.len() {
+                // No closing quote: not a name yet.
+                break;
+            }
+            i += 1;
+        } else {
+            while i < chars.len()
+                && (chars[i].1.is_alphanumeric() || matches!(chars[i].1, '_' | '-' | '.'))
+            {
+                name.push(chars[i].1);
+                i += 1;
+            }
+            if right && name.len() > 1 && name.ends_with('_') {
+                name.pop();
+                i -= 1;
+            }
+        }
+        let end = byte_at(i);
+        let name = name.trim().to_string();
+        if name.is_empty() || flexinput_core::midi::parse_pin(&name).is_some() {
+            continue;
+        }
+        out.push((at, end, name));
     }
     out
 }
@@ -394,7 +412,14 @@ pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
         analog_fed: HashSet::new(),
     };
     for (n, line) in text.lines().enumerate() {
-        let info = compile_line(line, n, &mut out, tabs, ports);
+        let mut info = compile_line(line, n, &mut out, tabs, ports);
+        // A line stopped only by an `@Name` that isn't a macro yet is waiting,
+        // not wrong: the name gets its macro once it is finished.
+        if let LineStatus::Error(msg) = &info.status {
+            if msg.contains(MADE_ON_LEAVE) {
+                info.status = LineStatus::Waiting(msg.clone());
+            }
+        }
         out.lines.push(info);
     }
     annotate_analog(&mut out);
@@ -1416,7 +1441,8 @@ fn split_threshold(name: &str) -> Result<(&str, Option<u8>), String> {
 
 /// What an unknown `@name` is told: the editor makes the port (`jsm_at_names`),
 /// once you are done typing it.
-const MADE_ON_LEAVE: &str = "FlexInput makes it as a Macro Output port when you leave the editor";
+const MADE_ON_LEAVE: &str =
+    "it becomes one of this module's macros (its header's Macros button) once its name is finished";
 
 /// `GYRO_OFF = @Aim` / `GYRO_ON = @Aim`: a setting whose value is a button can
 /// name a Macro Output port too. The port is resolved here, while this patch's

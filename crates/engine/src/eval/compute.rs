@@ -5,6 +5,39 @@
 
 use super::*;
 
+/// A macro port's output value, coerced to the port's declared type from the
+/// two aspects writers publish: the scalar (`SIGS_NS`) and the deflection
+/// (`SIGS_NS_VEC2`). An absent aspect is a released mapping, which reads as the
+/// type's off value — so downstream logic always sees a defined signal — except
+/// an Any port, which emits nothing when nothing drives it, like an unwired pin.
+///
+/// Shared by the Macro Output node and the JSM Config's own macro pins, so a
+/// port reads the same wherever it is shown.
+pub(crate) fn macro_port_value(
+    ty: SignalType,
+    scalar: Option<Signal>,
+    vec2: Option<Signal>,
+) -> Option<Signal> {
+    match ty {
+        SignalType::Vec2 => Some(vec2.unwrap_or(Signal::Vec2(Vec2::ZERO))),
+        // Float / Any prefer the deflection aspect when present: a Touch Zones
+        // card writes BOTH the (binary) gate and the deflection, and an
+        // analog-typed port wants the position, not a gate pinned at 1.0.
+        // Remapper/Lean write only the scalar, so they're unaffected.
+        SignalType::Float => Some(match (scalar, vec2) {
+            (_, Some(Signal::Vec2(v))) => Signal::Float(v.length().min(1.0)),
+            (Some(s), _) => Signal::Float(s.as_float().clamp(0.0, 1.0)),
+            _ => Signal::Float(0.0),
+        }),
+        SignalType::Any => vec2.or(scalar),
+        _ => Some(match (scalar, vec2) {
+            (Some(s), _) => Signal::Bool(s.as_bool()),
+            (None, Some(Signal::Vec2(v))) => Signal::Bool(v.length() >= 0.5),
+            _ => Signal::Bool(false),
+        }),
+    }
+}
+
 // ── Per-node dispatch ─────────────────────────────────────────────────────────
 pub(crate) fn compute_node(
     snap: &NodeSnap,
@@ -181,25 +214,7 @@ pub(crate) fn compute_node(
                 let ty = port_types.get(pin_id).copied().unwrap_or(SignalType::Bool);
                 let scalar = collector_sigs.get(&(mac::SIGS_NS.to_string(), pin_id.to_string())).copied();
                 let vec2 = collector_sigs.get(&(mac::SIGS_NS_VEC2.to_string(), pin_id.to_string())).copied();
-                match ty {
-                    SignalType::Vec2 => Some(vec2.unwrap_or(Signal::Vec2(Vec2::ZERO))),
-                    // Float / Any prefer the deflection aspect when present:
-                    // a Touch Zones card writes BOTH the (binary) gate and the
-                    // deflection, and an analog-typed port wants the position,
-                    // not a gate pinned at 1.0. Remapper/Lean write only the
-                    // scalar, so they're unaffected.
-                    SignalType::Float => Some(match (scalar, vec2) {
-                        (_, Some(Signal::Vec2(v))) => Signal::Float(v.length().min(1.0)),
-                        (Some(s), _) => Signal::Float(s.as_float().clamp(0.0, 1.0)),
-                        _ => Signal::Float(0.0),
-                    }),
-                    SignalType::Any => vec2.or(scalar),
-                    _ => Some(match (scalar, vec2) {
-                        (Some(s), _) => Signal::Bool(s.as_bool()),
-                        (None, Some(Signal::Vec2(v))) => Signal::Bool(v.length() >= 0.5),
-                        _ => Signal::Bool(false),
-                    }),
-                }
+                macro_port_value(ty, scalar, vec2)
             }).collect()
         }
         "module.constant" | "module.knob" => {

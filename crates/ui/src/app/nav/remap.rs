@@ -705,8 +705,17 @@ impl FlexInputApp {
             use flexinput_core::menu as fm;
             for (_, node_ref) in snarl.nodes_ids_data() {
                 let n = &node_ref.value;
-                if n.module_id == "module.macro" {
-                    for p in mac::ports_from_params(&n.params) {
+                // A JSM Config's own macros — the ports its config names with
+                // `@` — are targets like any Macro Output's.
+                let owned = match n.module_id.as_str() {
+                    "module.macro" => mac::ports_from_params(&n.params),
+                    "module.jsm" => mac::ports_from_value(
+                        n.params.get(flexinput_engine::eval::JSM_MACROS_PARAM),
+                    ),
+                    _ => Vec::new(),
+                };
+                {
+                    for p in owned {
                         out.push(crate::macro_icons::MacroDisplayEntry {
                             pin: mac::macro_pin_id(&p.id),
                             name: p.name,

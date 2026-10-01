@@ -1470,7 +1470,8 @@ impl crate::app::FlexInputApp {
                     .canvas.snarl, outer_id)
                     .and_then(|sp| sp.get_node(inner))
                     .and_then(|n| {
-                        n.extra.last_out.get(flexinput_engine::eval::JSM_CAL_DEG_OUT).copied().flatten()
+                        let at = flexinput_engine::eval::jsm_cal_deg_out(n.outputs.len());
+                        n.extra.last_out.get(at).copied().flatten()
                     })
                     .map(|s| s.as_float())
                     .unwrap_or(0.0);
@@ -1708,6 +1709,8 @@ impl crate::app::FlexInputApp {
         // Typing a trigger effect's mode gives the line that mode's numbers.
         let edited = flexinput_engine::eval::jsm_replace_word(&text, cur, &landing);
         self.nav_set_jsm_text(outer_id, &edited);
+        // A whole word arrived at once, so an `@Name` in it is finished.
+        crate::canvas::viewer::request_jsm_port_sync(ctx);
         self.gamepad_nav.jsm_cursor = flexinput_engine::eval::jsm_cursor_clamped(&edited, cur);
         crate::canvas::viewer::publish_jsm_cursor(ctx, inner, self.gamepad_nav.jsm_cursor);
     }
