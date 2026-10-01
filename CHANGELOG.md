@@ -5,6 +5,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The JSM Tune panel's graph marks the gyro speed the config actually aims
+  with.** The dot on the sensitivity curve read the pad's raw rotation, so
+  anything reshaping the gyro on its way in — an AutoMap Response Curve, say —
+  changed the aim but never moved the dot. It now shows the speed the curve is
+  read at, after the config's own gyro space and smoothing too, and rests at
+  zero while the gyro is switched off.
+
 ## [0.15.2] - 2026-10-02
 
 ### Added

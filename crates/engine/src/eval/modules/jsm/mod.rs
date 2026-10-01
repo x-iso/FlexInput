@@ -32,9 +32,10 @@ mod tests;
 
 pub(crate) use eval::{jsm_publish, JsmState};
 
-// Read by the calibration widget: where the sweep's measurement lands.
+// Read by the calibration widget: where the sweep's measurement lands. And by
+// the Tune panel's graph: where the speed its curve was read at lands.
 pub use eval::{cal_deg_out as jsm_cal_deg_out, cal_peak_out as jsm_cal_peak_out,
-    JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM};
+    curve_dps_out as jsm_curve_dps_out, JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM};
 
 // The UI pauses the config's typing while its editor has focus.
 pub use eval::{jsm_editor_focus, set_jsm_editor_focus};

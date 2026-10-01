@@ -703,33 +703,34 @@ pub(crate) fn curve_graph(
     rect
 }
 
-/// How fast the pad feeding this node is turning, in degrees per second, or `None`
-/// when it reports no gyro.
+/// How fast this node's gyro is turning, in degrees per second, where its
+/// sensitivity curve reads it — or `None` when the pad feeding it reports no
+/// gyro.
 ///
-/// This is the magnitude of the two axes JSM's defaults aim with — pitch and yaw.
-/// A config that remaps `MOUSE_X_FROM_GYRO_AXIS` is aiming with something else, so
-/// the marker is then indicative rather than exact; the curve itself is unaffected.
+/// The node says so itself (a trailing output, `jsm_curve_dps_out`), so the
+/// marker shows the rotation the config aims with: through whatever reshapes the
+/// gyro on its way in — an AutoMap Response Curve, say — and through the config's
+/// own gyro space, axis picks and smoothing. The pad's raw rate, which this used
+/// to read, sat still under all of those.
 pub(crate) fn live_turn_speed(
+    node: Option<&NodeData>,
     live: &std::collections::HashMap<(String, String), Signal>,
     dev: &str,
 ) -> Option<f32> {
     if dev.is_empty() {
         return None;
     }
-    let f = |pin: &str| {
-        live.get(&(dev.to_string(), pin.to_string()))
-            .map(|s| s.as_float())
-    };
-    let (pitch, yaw) = (f("gyro_y"), f("gyro_z"));
-    match (pitch, yaw) {
-        (None, None) => None,
-        (p, y) => {
-            // The bus carries a rate as a fraction of this many degrees per second
-            // (`flexinput_devices::gyro::GYRO_REF_DPS`).
-            const REF_DPS: f32 = 2000.0;
-            let (p, y) = (p.unwrap_or(0.0), y.unwrap_or(0.0));
-            Some((p * p + y * y).sqrt() * REF_DPS)
-        }
+    let has_gyro = ["gyro_y", "gyro_z"]
+        .iter()
+        .any(|pin| live.contains_key(&(dev.to_string(), pin.to_string())));
+    if !has_gyro {
+        return None;
+    }
+    let node = node?;
+    let at = flexinput_engine::eval::jsm_curve_dps_out(node.outputs.len());
+    match node.extra.last_out.get(at).copied().flatten() {
+        Some(Signal::Float(v)) if v.is_finite() => Some(v.max(0.0)),
+        _ => None,
     }
 }
 

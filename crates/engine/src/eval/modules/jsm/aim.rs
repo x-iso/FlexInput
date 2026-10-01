@@ -192,6 +192,12 @@ pub struct Aimed {
     /// the gyro button and the inversions, but NOT the sensitivity ramp, which
     /// is a game's business. `GYRO_MIDI_SCALE` is what full scale means here.
     pub midi_dps: glam::Vec3,
+    /// The speed the sensitivity curve is read at, in deg/s, for the Tune
+    /// panel's graph to mark: the rotation as this node has it — whatever
+    /// reshaped the gyro upstream included — after the gyro space and the
+    /// smoothing, before the cutoff, which the drawn curve applies itself. Zero
+    /// while the gyro is off.
+    pub curve_dps: f32,
 }
 
 /// The pad's rotation this tick, in degrees per second, on our bus's axes.
@@ -504,7 +510,8 @@ impl Aim {
         } else {
             Vec2::ZERO
         };
-        Aimed { mouse, gyro_dps, flick_dps, midi_dps }
+        let curve_dps = if blocked { 0.0 } else { brake_speed };
+        Aimed { mouse, gyro_dps, flick_dps, midi_dps, curve_dps }
     }
 
     /// JSM's gyro smoother: what is over the threshold goes straight through,

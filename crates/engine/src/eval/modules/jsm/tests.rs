@@ -2129,6 +2129,39 @@ fn an_at_binding_drives_a_macro_port_through_the_macro_namespace() {
     );
 }
 
+/// The Tune panel's graph marks the speed the node's own curve reads: the gyro
+/// as the node receives it — reshaped upstream, here halved by a curve on the
+/// bus — not the pad's raw rate. And nothing while the gyro is off.
+#[test]
+fn the_curve_mark_follows_the_gyro_the_node_receives() {
+    let _guard = alone();
+    let uid = 911;
+    let speed = |text: &str| {
+        let mut snap = jsm_snap(uid, text, false);
+        snap.params.insert("_automap_collector_id".to_string(), serde_json::json!("collector:77"));
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(0.1));
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        collector.insert(("collector:77".to_string(), "gyro_z".to_string()), Signal::Float(0.05));
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let mut v = 0.0;
+        for _ in 0..50 {
+            let mut c = collector.clone();
+            let out = super::eval::jsm_publish(&snap, uid, &dev, &mut c, &mut state, 0.010);
+            v = match out.get(super::eval::curve_dps_out(snap.n_outputs)).copied().flatten() {
+                Some(Signal::Float(f)) => f,
+                other => panic!("no curve speed published: {other:?}"),
+            };
+        }
+        v
+    };
+    // 0.05 of the bus's 2000°/s reference: the curve's half, not the pad's 200.
+    let on = speed("GYRO_SENS = 1");
+    assert!((on - 100.0).abs() < 1.0, "reads the curved gyro: {on}");
+    let off = speed("GYRO_SENS = 1\nGYRO_ON = R");
+    assert_eq!(off, 0.0, "the gyro is off until R is held");
+}
+
 /// The macro an `@Name` waits for is made a frame after the name is typed, and
 /// the text doesn't change again: the config has to pick it up regardless.
 #[test]
@@ -7096,9 +7129,10 @@ fn a_shown_macro_is_an_output_pin_of_the_node() {
         super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, state, 0.010)
     };
     let out = run(&mut state, true);
-    assert_eq!(out.len(), 4, "bus, one pin, then the two readouts");
+    assert_eq!(out.len(), 5, "bus, one pin, then the three readouts");
     assert_eq!(out[1].map(|s| s.as_bool()), Some(true), "held: the pin is on");
     assert!(matches!(out[super::eval::cal_deg_out(2)], Some(Signal::Float(_))));
+    assert!(matches!(out[super::eval::curve_dps_out(2)], Some(Signal::Float(_))));
     // Released, the Any pin carries nothing once last tick's value is gone.
     run(&mut state, false);
     let out = run(&mut state, false);

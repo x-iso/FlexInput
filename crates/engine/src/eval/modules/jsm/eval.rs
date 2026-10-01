@@ -757,6 +757,10 @@ pub(crate) fn jsm_publish(
     // `cal_deg_out` / `cal_peak_out`.
     out.push(Some(Signal::Float(st.cal.deg)));
     out.push(Some(Signal::Float(st.cal.peak)));
+    // And the speed the sensitivity curve was read at, for the Tune panel's
+    // graph — this node's own reading, so a curve or anything else reshaping
+    // the gyro upstream moves the mark as it moves the aim. See `curve_dps_out`.
+    out.push(Some(Signal::Float(aimed.curve_dps)));
     out
 }
 
@@ -768,6 +772,11 @@ pub fn cal_deg_out(n_outputs: usize) -> usize {
 }
 pub fn cal_peak_out(n_outputs: usize) -> usize {
     n_outputs.max(1) + 1
+}
+/// Index of the trailing output carrying the speed the sensitivity curve was
+/// read at (deg/s), after the two calibration ones.
+pub fn curve_dps_out(n_outputs: usize) -> usize {
+    n_outputs.max(1) + 2
 }
 
 /// The node's own macros it shows as output pins, in pin order (outputs 1…),

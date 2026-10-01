@@ -225,7 +225,7 @@ pub(crate) fn show_jsm_curve_sized(
         size.x,
         graph_h,
         &points,
-        super::jsm_widgets::live_turn_speed(live, &dev),
+        super::jsm_widgets::live_turn_speed(snarl.get_node(node_id), live, &dev),
         paint,
         warp,
     );
@@ -1277,7 +1277,7 @@ fn knob_rows(
         width,
         curve_h,
         &points,
-        super::jsm_widgets::live_turn_speed(live, &dev),
+        super::jsm_widgets::live_turn_speed(snarl.get_node(node_id), live, &dev),
         paint,
         warp,
     );
