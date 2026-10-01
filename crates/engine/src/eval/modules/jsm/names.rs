@@ -45,6 +45,27 @@ pub enum Btn {
     /// vocabulary, see [`super::midi`]. Parametric like `T(n)`, and far too
     /// many to list in [`Btn::ALL`]; `midi.rs` round-trips its own names.
     Midi(super::midi::MidiName),
+    /// A Macro Output port used as a button (`@Jump = SPACE`, `@Aim,R2 = ...`) —
+    /// pressed while whatever drives that port has it on, which may be another
+    /// JSM node reading a different device. By the port's stable id (the 8 hex
+    /// digits of its `macro:` pin), so the button stays `Copy`; the name it was
+    /// written with is resolved when the line compiles.
+    ///
+    /// A port carries an amount — a pull, a deflection — so "on" is a threshold:
+    /// `at` percent when the line names one (`@Throttle>30`), else 50%. One port
+    /// read at two thresholds is two buttons, the way JSM's `ZL` and `ZLF` are.
+    Macro { id: u32, at: Option<u8> },
+}
+
+/// The `Btn::Macro` id of a macro pin (`macro:1a2b3c4d`), if it has one.
+pub(crate) fn macro_btn_id(pin: &str) -> Option<u32> {
+    let id = flexinput_core::macros::parse_macro_pin(pin)?;
+    (id.len() == 8).then(|| u32::from_str_radix(id, 16).ok()).flatten()
+}
+
+/// The bus pin a `Btn::Macro` reads.
+pub(crate) fn macro_btn_pin(id: u32) -> String {
+    flexinput_core::macros::macro_pin_id(&format!("{id:08x}"))
 }
 
 /// Where a button reads from on the bus.
@@ -83,6 +104,9 @@ pub enum BtnSource {
     /// A MIDI message on the bus. Its pin depends on `MIDI_IN_CHANNEL` when the
     /// name gives none, so it is built where the settings are known.
     Midi(super::midi::MidiName),
+    /// A Macro Output port, read from the macro namespace rather than the pad's
+    /// bus — see [`Btn::Macro`].
+    Macro { id: u32, at: Option<u8> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -176,6 +200,10 @@ impl Btn {
         use Btn::*;
         match self {
             Midi(m) => m.spell(),
+            Macro { id, at } => match at {
+                Some(at) => format!("@{}>{at}", macro_btn_pin(id)),
+                None => format!("@{}", macro_btn_pin(id)),
+            },
             Up => "UP".into(), Down => "DOWN".into(), Left => "LEFT".into(), Right => "RIGHT".into(),
             L => "L".into(), Zl => "ZL".into(), Minus => "-".into(), E => "E".into(), S => "S".into(),
             N => "N".into(), W => "W".into(), R => "R".into(), Zr => "ZR".into(), Plus => "+".into(),
@@ -256,6 +284,7 @@ impl Btn {
                  rail button, or a MISC one for whatever your pad calls it",
             ),
             Midi(m) => S::Midi(m),
+            Macro { id, at } => S::Macro { id, at },
             Tup => S::TouchZone { cell: None, dir: Some(Dir::Up) },
             Tdown => S::TouchZone { cell: None, dir: Some(Dir::Down) },
             Tleft => S::TouchZone { cell: None, dir: Some(Dir::Left) },

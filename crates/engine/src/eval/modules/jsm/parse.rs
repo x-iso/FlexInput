@@ -284,6 +284,70 @@ pub(crate) fn port_pin(name: &str, ports: Ports) -> Option<String> {
         .map(|(_, pin)| pin.clone())
 }
 
+/// Every `@Name` a config mentions — bound to (`S = @Jump`) or read as a button
+/// (`@Jump,E = SPACE`) — once each, in the order first written and with the
+/// spelling first used. What the editor makes Macro Output ports for.
+///
+/// Read the way the parser reads them: comments cut first, a quoted name taken
+/// whole, an unquoted one by the same characters, and a trailing `_` on the
+/// right of the `=` left to be the hold modifier it is there. A MIDI pin written
+/// with `@` (`@"midi:sx:…"`) is a message, not a port, and a `@` inside a quoted
+/// console command is part of the command.
+pub fn at_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        let (lhs, rhs) = line.split_once('=').unwrap_or((line, ""));
+        for (part, right) in [(lhs, false), (rhs, true)] {
+            let chars: Vec<char> = part.chars().collect();
+            let mut i = 0;
+            let mut in_command = false;
+            while i < chars.len() {
+                let c = chars[i];
+                i += 1;
+                if c == '"' {
+                    in_command = !in_command;
+                    continue;
+                }
+                if c != '@' || in_command {
+                    continue;
+                }
+                let mut name = String::new();
+                if chars.get(i) == Some(&'"') {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        name.push(chars[i]);
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        // No closing quote: not a name yet.
+                        break;
+                    }
+                    i += 1;
+                } else {
+                    while i < chars.len()
+                        && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '-' | '.'))
+                    {
+                        name.push(chars[i]);
+                        i += 1;
+                    }
+                    if right && name.len() > 1 && name.ends_with('_') {
+                        name.pop();
+                    }
+                }
+                let name = name.trim().to_string();
+                if name.is_empty() || flexinput_core::midi::parse_pin(&name).is_some() {
+                    continue;
+                }
+                if !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The tab a JSM file name refers to: the base name, without directory or `.txt`.
 pub fn tab_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
@@ -296,6 +360,7 @@ pub fn tab_name(raw: &str) -> String {
 
 /// Compile a whole config, with no sibling tabs known — every layer switch then
 /// says it cannot find its tab, which is the right answer when there are none.
+#[cfg(test)]
 pub fn compile(text: &str) -> Compiled {
     compile_with(text, &[])
 }
@@ -356,11 +421,18 @@ fn settle_midi(out: &mut Compiled) {
             }
         }
     }
-    // A continuous MIDI input bound on its own to nothing but values.
+    // A continuous input bound on its own to nothing but values: a MIDI knob,
+    // or a Macro Output port whose line names no threshold of its own (one that
+    // does, `@Throttle>30`, asked to press there).
     out.analog_fed.clear();
     for b in &out.bindings {
-        let Trigger::Simple(btn @ Btn::Midi(m)) = b.trigger else { continue };
-        if m.kind.is_continuous()
+        let continuous = match b.trigger {
+            Trigger::Simple(Btn::Midi(m)) => m.kind.is_continuous(),
+            Trigger::Simple(Btn::Macro { at: None, .. }) => true,
+            _ => false,
+        };
+        let Trigger::Simple(btn) = b.trigger else { continue };
+        if continuous
             && b.steps.iter().all(|s| match &s.out {
                 Out::Pin(p) => takes_a_value(p),
                 Out::Bend { .. } => true,
@@ -550,7 +622,7 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
 
     // A line with no value: RESET_MAPPINGS, a config file name, the console-only ones.
     let Some((lhs, rhs)) = line.split_once('=') else {
-        return command_line(line, out, tabs);
+        return command_line(line, out, tabs, ports);
     };
     let (lhs, rhs) = (lhs.trim(), rhs.trim());
     let Some((first, combo)) = split_combo(lhs) else {
@@ -567,20 +639,27 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
                     "only a chord (`button,SETTING`) can change a setting".into(),
                 ));
             }
-            let Some(chord) = Btn::from_name(&first) else {
-                return LineInfo::of(LineStatus::Error(
-                    Btn::midi_problem(&first).unwrap_or_else(|| format!("`{first}` isn't a button")),
-                ));
+            let chord = match button_named(&first, ports) {
+                Ok(b) => b,
+                Err(e) => return LineInfo::of(LineStatus::Error(e)),
             };
             out.mentioned.insert(chord);
-            return modeshift_line(chord, second, rhs, support, out);
+            let rhs = match settle_button_value(support, rhs, ports) {
+                Ok(r) => r,
+                Err(e) => return LineInfo::of(LineStatus::Error(e)),
+            };
+            return modeshift_line(chord, second, &rhs, support, out);
         }
     }
 
     // `SETTING = value`.
     if combo.is_none() {
         if let Some(support) = setting_support(&first) {
-            return setting_line(&first, rhs, support, out);
+            let rhs = match settle_button_value(support, rhs, ports) {
+                Ok(r) => r,
+                Err(e) => return LineInfo::of(LineStatus::Error(e)),
+            };
+            return setting_line(&first, &rhs, support, out);
         }
     }
 
@@ -659,15 +738,17 @@ fn layer_target(name: &str, tabs: Tabs) -> Option<Result<String, String>> {
 ///
 /// Its own line statuses are NOT merged: they belong to that tab's text and are
 /// shown when that tab is open. What comes across is what it does.
-fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
+fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs, ports: Ports) -> LineInfo {
     let Some((_, text)) = tabs.iter().find(|(n, _)| n == tab) else {
         return LineInfo::of(LineStatus::Error(format!("no tab called `{tab}`")));
     };
     // Compiled WITHOUT the tab list, so a pair of configs naming each other cannot
     // loop for ever. One level of include is what a JSM config actually uses (a
     // base and a layer); deeper nesting would need a visited set, and saying plainly
-    // that it stops here beats a stack overflow.
-    let inner = compile(text);
+    // that it stops here beats a stack overflow. The patch's ports DO come along:
+    // they can't loop, and without them every `@Name` in the included tab would
+    // fail to resolve here while working in the tab itself.
+    let inner = compile_full(text, &[], ports);
     out.timings = inner.timings;
     out.settings = inner.settings;
     out.aim = inner.aim;
@@ -707,7 +788,7 @@ fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
 }
 
 
-fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
+fn command_line(name: &str, out: &mut Compiled, tabs: Tabs, ports: Ports) -> LineInfo {
     let name = name.trim();
     let upper = name.to_ascii_uppercase();
     // Take the gyro's on/off button away again, so the gyro is simply always on.
@@ -806,7 +887,7 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
             // there — so everything in it applies as if pasted in. We resolve the
             // name to a tab and fold that tab's compiled result in at this point.
             match layer_target(name, tabs) {
-                Some(Ok(tab)) => include_tab(&tab, out, tabs),
+                Some(Ok(tab)) => include_tab(&tab, out, tabs, ports),
                 Some(Err(missing)) => LineInfo::of(LineStatus::Error(missing)),
                 None => LineInfo::of(LineStatus::Error(format!(
                     "`{name}` isn't a button, setting or command"
@@ -961,18 +1042,23 @@ fn binding_line(
     tabs: Tabs,
     ports: Ports,
 ) -> LineInfo {
-    let Some(btn) = Btn::from_name(first) else {
-        return LineInfo::of(LineStatus::Error(Btn::midi_problem(first).unwrap_or_else(|| {
-            format!("`{first}` isn't a button, setting or command")
-        })));
+    let btn = match button_named(first, ports) {
+        Ok(b) => b,
+        // A plain word that is nothing at all could have been meant as any of
+        // the three, so the line says all three.
+        Err(_) if !first.starts_with('@') && Btn::midi_problem(first).is_none() => {
+            return LineInfo::of(LineStatus::Error(format!(
+                "`{first}` isn't a button, setting or command"
+            )));
+        }
+        Err(e) => return LineInfo::of(LineStatus::Error(e)),
     };
     let trigger = match &combo {
         None => Trigger::Simple(btn),
         Some((op, second)) => {
-            let Some(other) = Btn::from_name(second) else {
-                return LineInfo::of(LineStatus::Error(
-                    Btn::midi_problem(second).unwrap_or_else(|| format!("`{second}` isn't a button")),
-                ));
+            let other = match button_named(second, ports) {
+                Ok(b) => b,
+                Err(e) => return LineInfo::of(LineStatus::Error(e)),
             };
             match op {
                 ',' if other == btn => Trigger::Double(btn),
@@ -1010,7 +1096,7 @@ fn binding_line(
 
     out.mentioned.insert(btn);
     if let Some((_, second)) = &combo {
-        if let Some(other) = Btn::from_name(second) {
+        if let Ok(other) = button_named(second, ports) {
             out.mentioned.insert(other);
         }
     }
@@ -1261,6 +1347,47 @@ fn read_token(chars: &[char], i: &mut usize) -> Option<String> {
         *i += 1;
     }
     let mut tok = String::new();
+    // `@Name` / `@"Name with spaces"` — a Macro Output port read as a button.
+    // Comes back as `@` and the bare name; the same characters an `@` name
+    // takes on the right of the `=`, less the `+` that joins a chord here.
+    if chars.get(*i) == Some(&'@') {
+        *i += 1;
+        tok.push('@');
+        if chars.get(*i) == Some(&'"') {
+            *i += 1;
+            while *i < chars.len() && chars[*i] != '"' {
+                tok.push(chars[*i]);
+                *i += 1;
+            }
+            // A missing closing quote is no name at all.
+            if *i >= chars.len() {
+                return None;
+            }
+            *i += 1;
+        } else {
+            while *i < chars.len()
+                && (chars[*i].is_alphanumeric() || matches!(chars[*i], '_' | '-' | '.'))
+            {
+                tok.push(chars[*i]);
+                *i += 1;
+            }
+        }
+        if tok.len() < 2 {
+            return None;
+        }
+        // `@Throttle>30`: pressed from 30%. Kept on the token, for
+        // `split_threshold` to read — a `>` and whatever digits follow, so a
+        // malformed one reaches it to be named rather than silently dropped.
+        if chars.get(*i) == Some(&'>') {
+            tok.push('>');
+            *i += 1;
+            while *i < chars.len() && chars[*i].is_ascii_digit() {
+                tok.push(chars[*i]);
+                *i += 1;
+            }
+        }
+        return Some(tok);
+    }
     if *i < chars.len() && matches!(chars[*i], '+' | '-') {
         tok.push(chars[*i]);
         *i += 1;
@@ -1270,6 +1397,76 @@ fn read_token(chars: &[char], i: &mut usize) -> Option<String> {
         *i += 1;
     }
     (!tok.is_empty()).then_some(tok)
+}
+
+/// An `@` button's name and its press threshold: `Throttle>30` is the port
+/// `Throttle`, pressed from 30%. No `>` is `None` — the 50% default, or "any
+/// movement" where the port only feeds a value. The `>` is the last one with
+/// digits after it, so a quoted name can still hold one of its own.
+fn split_threshold(name: &str) -> Result<(&str, Option<u8>), String> {
+    let Some((port, pct)) = name.rsplit_once('>') else { return Ok((name, None)) };
+    if pct.is_empty() {
+        return Err(format!("`@{port}>` needs a percent after the `>` — `@{port}>30` presses from 30%"));
+    }
+    match pct.parse::<u32>() {
+        Ok(v) if v <= 100 => Ok((port, Some(v as u8))),
+        _ => Err(format!("`@{port}>{pct}`: the threshold is a percent, 0 to 100")),
+    }
+}
+
+/// What an unknown `@name` is told: the editor makes the port (`jsm_at_names`),
+/// once you are done typing it.
+const MADE_ON_LEAVE: &str = "FlexInput makes it as a Macro Output port when you leave the editor";
+
+/// `GYRO_OFF = @Aim` / `GYRO_ON = @Aim`: a setting whose value is a button can
+/// name a Macro Output port too. The port is resolved here, while this patch's
+/// ports are in hand, and the value rewritten to the port's stable pin
+/// (`@macro:aa11bb22`) — the form [`aim_setting`] reads without them. A
+/// modeshift re-applies its value every tick it is held, long after the ports
+/// were last seen, so it has to carry the pin rather than the name.
+///
+/// Any other value comes back as it was.
+fn settle_button_value<'a>(
+    support: Support,
+    rhs: &'a str,
+    ports: Ports,
+) -> Result<std::borrow::Cow<'a, str>, String> {
+    use std::borrow::Cow;
+    if !matches!(support, Support::Aim(AimId::GyroButton(_))) || !rhs.trim_start().starts_with('@') {
+        return Ok(Cow::Borrowed(rhs));
+    }
+    let chars: Vec<char> = rhs.chars().collect();
+    let mut i = 0;
+    let Some(name) = read_token(&chars, &mut i) else {
+        return Err("`@` needs the name of a Macro Output port after it".into());
+    };
+    match button_named(&name, ports)? {
+        // `Btn::name` writes the pin, and the threshold when there is one.
+        btn @ Btn::Macro { .. } => {
+            let rest: String = chars[i..].iter().collect();
+            Ok(Cow::Owned(format!("{}{rest}", btn.name())))
+        }
+        // `button_named` reads an `@` name as a port or not at all.
+        _ => Err(format!("`{name}` isn't a Macro Output port")),
+    }
+}
+
+/// The button a name on the left of the `=` stands for: one of JSM's (or a
+/// `MIDI_*` message), or — with an `@` — a Macro Output port in this patch,
+/// pressed while whatever drives it has it on. The error says what is wrong.
+fn button_named(name: &str, ports: Ports) -> Result<Btn, String> {
+    if let Some(port) = name.strip_prefix('@') {
+        let (port, at) = split_threshold(port)?;
+        let Some(pin) = port_pin(port, ports) else {
+            return Err(format!("`@{port}` isn't a Macro Output port in this patch yet — {MADE_ON_LEAVE}"));
+        };
+        return super::names::macro_btn_id(&pin).map(|id| Btn::Macro { id, at }).ok_or_else(|| {
+            format!("`@{port}` is a Virtual Menu entry — something to press, not a button to read")
+        });
+    }
+    Btn::from_name(name).ok_or_else(|| {
+        Btn::midi_problem(name).unwrap_or_else(|| format!("`{name}` isn't a button"))
+    })
 }
 
 // ── the right-hand side ──────────────────────────────────────────────────────
@@ -1444,11 +1641,9 @@ pub(crate) fn parse_mapping(
                 // say so at the point you can still see the line.
                 match port_pin(&key, ports) {
                     Some(pin) => Out::Pin(pin),
-                    None if ports.is_empty() => return Err(format!(
-                        "`@{key}` — this patch has no Macro Output ports or Virtual Menu entries to bind to"
-                    )),
                     None => return Err(format!(
-                        "`@{key}` isn't a Macro Output port or Virtual Menu entry in this patch"
+                        "`@{key}` isn't a Macro Output port or Virtual Menu entry in this patch \
+                         yet — {MADE_ON_LEAVE}"
                     )),
                 }
             }
@@ -1960,14 +2155,28 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
             ok
         }
         AimId::GyroButton(on) => {
-            let source = match value.as_str() {
+            // A Macro Output port, already resolved to its pin by
+            // `settle_button_value` (`@macro:aa11bb22`).
+            let raw = rhs.split_whitespace().next().unwrap_or("");
+            let source = if let Some(pin) = raw.strip_prefix('@') {
+                let (pin, at) = match split_threshold(pin) {
+                    Ok(v) => v,
+                    Err(e) => return LineInfo::of(LineStatus::Error(e)),
+                };
+                match super::names::macro_btn_id(&pin.to_ascii_lowercase()) {
+                    Some(id) => GyroSource::Button(Btn::Macro { id, at }),
+                    None => return wants("a button, LEFT_STICK, RIGHT_STICK, NONE or an @port"),
+                }
+            } else {
+                match value.as_str() {
                 "NONE" => GyroSource::Never,
                 "LEFT_STICK" => GyroSource::LeftStick,
                 "RIGHT_STICK" => GyroSource::RightStick,
                 _ => match Btn::from_name(&value) {
                     Some(b) => GyroSource::Button(b),
-                    None => return wants("a button, LEFT_STICK, RIGHT_STICK or NONE"),
+                    None => return wants("a button, LEFT_STICK, RIGHT_STICK, NONE or an @port"),
                 },
+                }
             };
             // `GYRO_ON = X` means off until X is held; `GYRO_OFF = X` the reverse.
             s.gyro_button = Some(GyroButton {

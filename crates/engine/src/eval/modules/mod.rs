@@ -21,7 +21,7 @@ mod touch_zones;
 pub(crate) use gyro3dof::*;
 pub(crate) use jsm::*;
 // Read by the UI to compile the config text it is showing.
-pub use jsm::{jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi_tag,
+pub use jsm::{jsm_at_names, jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi_tag,
     jsm_input_names_by_pin,
     jsm_names_by_pin, jsm_cursor_clamped, jsm_cursor_delete,
     jsm_insert_line, jsm_insert_pick, jsm_insert_slot, jsm_kinds_at, JSM_SLOT,

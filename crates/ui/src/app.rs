@@ -36,6 +36,7 @@ mod config_route;
 mod devices_pool;
 pub(crate) mod graph;
 mod hidhide_ui;
+mod jsm_ports;
 mod nav;
 mod persistence;
 mod settings_window;
@@ -466,11 +467,11 @@ pub struct FlexInputApp {
     settings: AppSettings,
     /// True while the Settings window is shown.
     settings_open: bool,
-    /// True while the third-party licence viewer is shown. Independent of
     /// UI scale picked on the Settings slider but not yet applied (`None` =
     /// slider shows the applied `settings.ui_scale`). Held apart so dragging
     /// doesn't rescale the window — and move the slider — under the pointer.
     ui_scale_pending: Option<f32>,
+    /// True while the third-party licence viewer is shown. Independent of
     /// `settings_open` — it's opened from Credits but outlives the Settings
     /// window, so closing Settings doesn't yank the licence text away.
     licenses_open: bool,
@@ -735,7 +736,6 @@ impl FlexInputApp {
         // Migrate any previously-saved arbitrary polling rate to a valid step
         // (the slider is now quantized to whole-ms periods).
         app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
-        let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         // UI scale: snap a hand-edited value to a step, then apply it as egui's
         // zoom factor (pixels_per_point = zoom × OS scale, so fonts rasterize at
         // the scaled resolution and stay sharp). The window already exists at
@@ -746,6 +746,7 @@ impl FlexInputApp {
         app_settings.ui_scale = settings::snap_ui_scale(app_settings.ui_scale);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         cc.egui_ctx.set_zoom_factor(app_settings.ui_scale);
+        let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
         let joycon2_pairing = Arc::new(AtomicBool::new(app_settings.joycon2_pairing));
@@ -1150,8 +1151,8 @@ impl FlexInputApp {
             panic_shortcut_shared,
             settings: app_settings,
             settings_open: false,
-            licenses_open: false,
             ui_scale_pending: None,
+            licenses_open: false,
             licenses_selected: 0,
             bluetooth: Default::default(),
             bluetooth_present: false,
@@ -1212,6 +1213,9 @@ impl eframe::App for FlexInputApp {
         // KB/M picker, and Touch Zones' analog-output checks can resolve
         // "macro:{id}" pins to names/icons/types anywhere without threading
         // the table through signatures.
+        // The `@Name`s JSM configs use but no port answers to get one — before
+        // the table goes out, so they resolve on the next compile.
+        self.sync_jsm_macro_ports(ctx);
         crate::macro_icons::publish_registry(
             std::sync::Arc::new(self.macro_display_entries()));
 

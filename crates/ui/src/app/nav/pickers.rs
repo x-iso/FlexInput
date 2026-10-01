@@ -724,19 +724,27 @@ impl JsmVocab {
             return Some(n.clone());
         }
         // `Neither` needs no guard of its own: it builds no vocabulary, so the
-        // lookup above finds nothing and a FlexInput target is a value.
-        fi_insert(self.slot, &crate::macro_icons::registry_entry(pin)?.name)
+        // lookup above finds nothing and `fi_insert` refuses it.
+        let entry = crate::macro_icons::registry_entry(pin)?;
+        let is_port = flexinput_core::macros::parse_macro_pin(&entry.pin).is_some();
+        fi_insert(self.slot, &entry.name, is_port)
     }
 }
 
 /// How one of OUR targets goes into a config, on this side of a line.
 ///
-/// A Macro Output port or a Virtual Menu entry is something a mapping ENDS at,
-/// so it belongs right of the `=` and nowhere else. Split out from the registry
-/// lookup so the rule can be tested without a patch.
-fn fi_insert(slot: crate::gamepad_nav::JsmSlot, name: &str) -> Option<String> {
-    (slot == crate::gamepad_nav::JsmSlot::Value)
-        .then(|| flexinput_engine::eval::jsm_fi_tag(name))
+/// Right of the `=`, a Macro Output port or a Virtual Menu entry is something
+/// the binding drives. Left of it, a Macro Output port is also a button to read
+/// (`@Jump,E = SPACE`) — but a menu entry can only be pressed, never read, so
+/// it has no place there. Split out from the registry lookup so the rule can be
+/// tested without a patch.
+fn fi_insert(slot: crate::gamepad_nav::JsmSlot, name: &str, is_port: bool) -> Option<String> {
+    use crate::gamepad_nav::JsmSlot;
+    match slot {
+        JsmSlot::Value => Some(flexinput_engine::eval::jsm_fi_tag(name)),
+        JsmSlot::Name if is_port => Some(flexinput_engine::eval::jsm_fi_tag(name)),
+        _ => None,
+    }
 }
 
 /// Does this cell do anything for what the picker is being used for?
@@ -763,18 +771,21 @@ mod vocab_tests {
     use super::{fi_insert, JsmVocab};
     use crate::gamepad_nav::JsmSlot;
 
-    /// One of our own targets is something a mapping ENDS at, so it belongs
-    /// right of the `=` and nowhere else — a line can't START with a macro port.
+    /// Right of the `=`, any of our targets is something the binding drives.
+    /// Left of it, a Macro Output port is a button to read — but a Virtual Menu
+    /// entry can only be pressed, so it isn't offered there.
     #[test]
-    fn one_of_our_targets_is_a_value_and_not_a_name() {
-        assert_eq!(fi_insert(JsmSlot::Value, "Reload").as_deref(), Some("@Reload"));
+    fn a_port_is_a_value_or_a_name_and_a_menu_entry_only_a_value() {
+        assert_eq!(fi_insert(JsmSlot::Value, "Reload", true).as_deref(), Some("@Reload"));
         assert_eq!(
-            fi_insert(JsmSlot::Value, "Reload sequence").as_deref(),
+            fi_insert(JsmSlot::Value, "Reload sequence", true).as_deref(),
             Some("@\"Reload sequence\""),
             "and it is written the way the parser reads it back"
         );
-        assert_eq!(fi_insert(JsmSlot::Name, "Reload"), None);
-        assert_eq!(fi_insert(JsmSlot::Neither, "Reload"), None);
+        assert_eq!(fi_insert(JsmSlot::Value, "Menu — Show", false).as_deref(), Some("@\"Menu — Show\""));
+        assert_eq!(fi_insert(JsmSlot::Name, "Reload", true).as_deref(), Some("@Reload"));
+        assert_eq!(fi_insert(JsmSlot::Name, "Menu — Show", false), None);
+        assert_eq!(fi_insert(JsmSlot::Neither, "Reload", true), None);
     }
 
     /// Which side of the line the pick lands on decides what the board's keys

@@ -15,10 +15,46 @@ All notable changes to FlexInput are documented here. This project adheres to
   keeps its size and place across restarts at any scale. Ctrl +/−/0 no longer
   zooms the interface; the setting is the only control.
 
+- **JSM configs can read Macro Output ports as buttons, and make the ports they
+  name.** `@Name` now works on the left of the `=` too — alone (`@Jump = SPACE`),
+  in a chord with this pad's buttons (`@Jump,E = SPACE`, `E,@Jump = SPACE`), as
+  a modeshift (`@Aim,GYRO_SENS = 2`), or as the gyro's switch (`GYRO_OFF = @Aim`,
+  `GYRO_ON = @Aim`, chorded too). A binding on it can switch config tabs like any
+  other (`@Vehicle = "vehicle"`). Typically another JSM node bound to a
+  different device drives the port (`S = @Jump`), so one config can turn a
+  second device's inputs into chord buttons for another. The two nodes can run
+  in either order: a port read before its driver runs takes the driver's value
+  from the tick before.
+
+  A port carries an amount, not just on and off. Written from a trigger, a MIDI
+  knob or another port, it carries the pull (`ZL = @Throttle`); a bool is full
+  on; a Vec2 — a stick or touch deflection a Touch Zones card writes — counts
+  by its length. Read as a button it presses from halfway, or from the line's
+  own threshold: `@Throttle>30` presses from 30%, `@Throttle>0` from any
+  movement, and the threshold travels into chords and `GYRO_OFF = @Aim>20`.
+  Bound to a value (`@Throttle = X_LT`, `@Throttle = MIDI_CC7`) it hands that
+  value on and presses from any movement, as a MIDI knob does.
+
+  A config no longer needs its ports made by hand. Every `@Name` a JSM config
+  uses, on either side, that no Macro Output port or Virtual Menu entry in the
+  tab answers to becomes an Any port — carrying whatever drives it, for each
+  reader to take as it needs — on a Macro Output node beside it: the
+  first one in its patch or sub-patch, or a new one when there is none. Ports
+  are made when you leave the editor (never mid-word), for a config loaded with
+  `@Name`s as soon as it opens, and once per change to the text, so a port you
+  delete on purpose stays deleted until the config is edited again. A Virtual
+  Menu entry can still be pressed with `@`, but not read as a button, and the
+  line says so. The command list and the pad's picker offer the patch's ports on
+  the left of the `=` as well as the right.
+
 ### Fixed
 
 - **Double-clicking the Contrast slider resets it to 0.** The slider never
   registered the double-click, though the hint under it said it would.
+
+- **A JSM tab pulled in by naming it (`base.txt` on a line of its own) resolves
+  its `@Name`s.** It was compiled without the patch's ports, so every `@` binding
+  in it failed there while working in the tab itself.
 
 ## [0.15.0] - 2026-10-01
 

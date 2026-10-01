@@ -431,8 +431,8 @@ fn line_binds_a_button(text: &str, line: usize) -> bool {
     let name = tok.text(l);
     let last = name.rsplit([',', '+']).next().unwrap_or(name).to_ascii_uppercase();
     // `from_name` rather than a walk of `Btn::ALL`: a MIDI name is a button too,
-    // and far too many to list.
-    Btn::from_name(&last).is_some()
+    // and far too many to list. `@Name` is a Macro Output port read as one.
+    last.starts_with('@') || Btn::from_name(&last).is_some()
 }
 
 /// What picking `name` from the list puts under the cursor, and where the

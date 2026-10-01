@@ -536,10 +536,11 @@ fn an_at_name_that_is_not_in_the_patch_says_so() {
         }
         other => panic!("expected an error, got {other:?}"),
     }
-    // With no ports at all the reason is different, because the fix is.
+    // With no ports at all the fix is the same — the editor makes the port —
+    // so the line says that rather than send you off to add a node.
     let c = super::parse::compile_full("S = @Reload", &[], &[]);
     match &c.lines[0].status {
-        LineStatus::Error(e) => assert!(e.contains("no Macro Output"), "{e}"),
+        LineStatus::Error(e) => assert!(e.contains("leave the editor"), "{e}"),
         other => panic!("expected an error, got {other:?}"),
     }
     // And `@` on its own is not a name.
@@ -6783,4 +6784,261 @@ fn a_midi_line_takes_bindings_on_its_right() {
         super::catalogue::kinds_at(&format!("{text}{}", super::cursor::SLOT), cur),
         &[super::catalogue::Kind::Binding]
     );
+}
+
+fn with_ports(mut snap: NodeSnap) -> NodeSnap {
+    snap.params.insert(
+        "_macro_ports".to_string(),
+        serde_json::json!([
+            { "name": "Jump", "pin": "macro:aa11bb22" },
+            { "name": "Menu — Show", "pin": "menu:feedf00d_show" },
+        ]),
+    );
+    snap
+}
+
+fn key_space_on(collector: &HashMap<(String, String), Signal>, uid: usize) -> bool {
+    collector
+        .get(&(format!("collector:{uid}"), "key_space".to_string()))
+        .is_some_and(|s| s.as_bool())
+}
+
+/// A Macro Output port read as a button bridges two JSM nodes: one presses
+/// `@Jump` from its pad, and the other — reading a different device — uses it
+/// as the chord button of `@Jump,E`. Nothing about the port is claimed off the
+/// second node's own bus.
+#[test]
+fn an_at_name_on_the_left_reads_a_port_another_node_drives() {
+    let _guard = alone();
+    let writer = with_ports(jsm_snap(921, "S = @Jump", false));
+    let reader = with_ports(jsm_snap(922, "@Jump,E = SPACE", false));
+    let c = compile_full_with_ports("@Jump,E = SPACE");
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let run = |state: &mut HashMap<usize, NodeState>, pins: &[&str]| {
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        for p in pins {
+            dev.insert((PAD.to_string(), (*p).to_string()), Signal::Bool(true));
+        }
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        super::eval::jsm_publish(&writer, writer.node_uid, &dev, &mut collector, state, 0.010);
+        super::eval::jsm_publish(&reader, reader.node_uid, &dev, &mut collector, state, 0.010);
+        collector
+    };
+    // East alone: no chord, so no SPACE.
+    assert!(!key_space_on(&run(&mut state, &["btn_east"]), 922));
+    // South holds @Jump on the writer; then East with it fires the chord.
+    run(&mut state, &["btn_south"]);
+    let both = run(&mut state, &["btn_south", "btn_east"]);
+    assert!(key_space_on(&both, 922), "the chord through the port fires: {both:?}");
+}
+
+/// Evaluated before the node that drives it, a port still reads — last tick's
+/// value, carried over — so the order the two run in doesn't matter.
+#[test]
+fn an_at_name_reads_last_ticks_value_when_its_driver_runs_later() {
+    let _guard = alone();
+    let reader = with_ports(jsm_snap(923, "@Jump = SPACE", false));
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    state
+        .entry(crate::eval::MACRO_CARRY_UID)
+        .or_default()
+        .macro_prev
+        .insert(("macro".to_string(), "macro:aa11bb22".to_string()), Signal::Bool(true));
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    super::eval::jsm_publish(&reader, reader.node_uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    assert!(key_space_on(&collector, 923), "{collector:?}");
+}
+
+/// What the left of the `=` says about an `@Name` it can't read.
+#[test]
+fn an_at_name_on_the_left_says_why_it_cant_be_read() {
+    let ports = [
+        ("Jump".to_string(), "macro:aa11bb22".to_string()),
+        ("Menu — Show".to_string(), "menu:feedf00d_show".to_string()),
+    ];
+    let err = |line: &str| {
+        let c = super::parse::compile_full(line, &[], &ports);
+        match &c.lines[0].status {
+            LineStatus::Error(e) => e.clone(),
+            other => panic!("`{line}` should be an error, got {other:?}"),
+        }
+    };
+    assert!(err("@Crouch = SPACE").contains("leave the editor"));
+    assert!(err("E,@Crouch = SPACE").contains("leave the editor"));
+    assert!(err("@\"Menu — Show\" = SPACE").contains("Virtual Menu entry"));
+    // And a known port reads fine, as a chord, a modeshift chord, or alone.
+    for ok in ["@Jump = SPACE", "E,@Jump = SPACE", "@jump,GYRO_SENS = 2", "@\"Jump\" = A"] {
+        let c = super::parse::compile_full(ok, &[], &ports);
+        assert!(errors(&c).is_empty(), "{ok}: {:?}", errors(&c));
+    }
+}
+
+/// The `@Name`s a config uses, from both sides of the `=`, once each.
+#[test]
+fn at_names_finds_every_port_a_config_uses() {
+    let text = "S = @Jump @\"Dash left\" # @NotThis\n\
+                @jump,E = SPACE\n\
+                N = @Hold_\n\
+                W = @\"midi:sx:F07E7F0601F7\"\n\
+                \"say @nope\"";
+    assert_eq!(super::parse::at_names(text), ["Jump", "Dash left", "Hold"]);
+}
+
+fn compile_full_with_ports(text: &str) -> super::parse::Compiled {
+    let ports = [("Jump".to_string(), "macro:aa11bb22".to_string())];
+    super::parse::compile_full(text, &[], &ports)
+}
+
+/// Mouse travel over a few ticks of steady yaw, with the `Aim` port held or not.
+fn gyro_travel(text: &str, aim_held: bool) -> f32 {
+    let snap = with_ports(jsm_snap(931, text, false));
+    let key = format!("collector:{}", snap.node_uid);
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(90.0 / 2000.0));
+    let mut total = 0.0;
+    for _ in 0..20 {
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        if aim_held {
+            collector.insert(("macro".to_string(), "macro:aa11bb22".to_string()), Signal::Bool(true));
+        }
+        super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, &mut state, 0.010);
+        if let Some(Signal::Vec2(m)) = collector.get(&(key.clone(), "mouse_move".to_string())) {
+            total += m.length();
+        }
+    }
+    total
+}
+
+/// `GYRO_OFF = @Name` / `GYRO_ON = @Name` gate the gyro from a Macro Output
+/// port — so another device, through another JSM node, can hold the gyro off
+/// or on. As a modeshift too, which re-applies the value every tick it is held.
+#[test]
+fn gyro_off_and_on_take_a_macro_port() {
+    let _guard = alone();
+    // The port is named `Jump` in `with_ports`; read it as an aim switch.
+    let off = format!("{AIM_CFG}\nGYRO_OFF = @Jump");
+    assert!(gyro_travel(&off, false) > 0.1, "not held: the gyro aims");
+    assert_eq!(gyro_travel(&off, true), 0.0, "held: GYRO_OFF stops it");
+    let on = format!("{AIM_CFG}\nGYRO_ON = @Jump");
+    assert_eq!(gyro_travel(&on, false), 0.0, "GYRO_ON: off until the port is held");
+    assert!(gyro_travel(&on, true) > 0.1);
+
+    // The compiled source is the port, by its id.
+    let ports = [("Jump".to_string(), "macro:aa11bb22".to_string())];
+    let c = super::parse::compile_full("GYRO_OFF = @jump", &[], &ports);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    // As a modeshift, the held chord's copy carries the port, not the name.
+    let c = super::parse::compile_full("E,GYRO_ON = @Jump", &[], &ports);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert!(c.modeshifts[0].value.starts_with("@macro:aa11bb22"), "{:?}", c.modeshifts[0].value);
+    let held = super::parse::resolve(&c, &[Btn::E]);
+    assert!(
+        format!("{:?}", held.aim.gyro_button).contains("Macro"),
+        "resolved without the ports: {:?}",
+        held.aim.gyro_button
+    );
+    // A port this patch hasn't got says so the way a binding's does.
+    let c = super::parse::compile_full("GYRO_OFF = @Crouch", &[], &ports);
+    match &c.lines[0].status {
+        LineStatus::Error(e) => assert!(e.contains("leave the editor"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A tab pulled in by naming it compiles against this patch's ports too, so an
+/// `@Name` in it works there just as it does in the tab itself.
+#[test]
+fn an_included_tab_resolves_its_ports() {
+    let tabs = [("base".to_string(), "S = @Jump\n@Jump,E = SPACE".to_string())];
+    let ports = [("Jump".to_string(), "macro:aa11bb22".to_string())];
+    let c = super::parse::compile_full("base.txt\nN = B", &tabs, &ports);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    let notes = c.lines[0].notes.join(" ");
+    assert!(!notes.contains("errors of its own"), "the included tab compiled clean: {notes}");
+    assert_eq!(c.bindings.len(), 3, "both of the base tab's bindings, and this one");
+}
+
+/// Run a reader node once with the `Jump` port carrying `sig` in namespace `ns`.
+fn read_port(text: &str, ns: &str, sig: Signal) -> HashMap<(String, String), Signal> {
+    let snap = with_ports(jsm_snap(941, text, false));
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    collector.insert((ns.to_string(), "macro:aa11bb22".to_string()), sig);
+    super::eval::jsm_publish(&snap, snap.node_uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    collector
+}
+
+/// A port read as a button presses from halfway by default, from the line's
+/// own threshold when it names one, and reads a Vec2 by its length — so a
+/// stick or touch deflection written to a port works as a button too.
+#[test]
+fn a_port_presses_at_its_threshold() {
+    let _guard = alone();
+    let f = |v: f32| Signal::Float(v);
+    assert!(!key_space_on(&read_port("@Jump = SPACE", "macro", f(0.4)), 941), "below half");
+    assert!(key_space_on(&read_port("@Jump = SPACE", "macro", f(0.6)), 941), "past half");
+    assert!(key_space_on(&read_port("@Jump>30 = SPACE", "macro", f(0.4)), 941), "past its own 30%");
+    assert!(!key_space_on(&read_port("@Jump>30 = SPACE", "macro", f(0.2)), 941));
+    assert!(key_space_on(&read_port("@Jump>0 = SPACE", "macro", f(0.01)), 941), ">0 is any movement");
+    assert!(key_space_on(&read_port("@Jump = SPACE", "macro", Signal::Bool(true)), 941), "a bool is full");
+    let v = |x: f32, y: f32| Signal::Vec2(glam::Vec2::new(x, y));
+    assert!(key_space_on(&read_port("@Jump = SPACE", "macro#v2", v(0.6, 0.6)), 941), "length 0.85");
+    assert!(!key_space_on(&read_port("@Jump = SPACE", "macro#v2", v(0.2, 0.2)), 941));
+    // In a chord the threshold travels with the name.
+    let ports = [("Jump".to_string(), "macro:aa11bb22".to_string())];
+    let c = super::parse::compile_full("E,@\"Jump\">75 = A", &[], &ports);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+}
+
+/// A port feeding a value hands on its amount, pressing from any movement as a
+/// MIDI knob does — `@Throttle = X_LT` is a throttle, not a switch.
+#[test]
+fn a_port_feeds_its_amount_to_a_value() {
+    let _guard = alone();
+    let out = read_port("@Jump = X_LT", "macro", Signal::Float(0.3));
+    let pull = out
+        .get(&("collector:941".to_string(), "left_trigger".to_string()))
+        .map(|s| s.as_float());
+    assert!(pull.is_some_and(|p| (p - 0.3).abs() < 1e-4), "the pull, not full: {pull:?}");
+}
+
+/// Written from something with a reading — a trigger's pull — a port carries
+/// that amount, so another node can read it as one.
+#[test]
+fn a_trigger_writes_its_pull_into_a_port() {
+    let _guard = alone();
+    let snap = with_ports(jsm_snap(942, "ZL = @Jump\nS = @\"Menu — Show\"", false));
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "left_trigger".to_string()), Signal::Float(0.3));
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, &mut state, 0.010);
+    let port = collector.get(&("macro".to_string(), "macro:aa11bb22".to_string())).copied();
+    assert!(
+        port.is_some_and(|s| (s.as_float() - 0.3).abs() < 1e-4),
+        "the trigger's pull: {port:?}"
+    );
+    // A Virtual Menu entry is a press either way.
+    let menu = collector.get(&("macro".to_string(), "menu:feedf00d_show".to_string())).copied();
+    assert_eq!(menu.map(|s| s.as_bool()), Some(true), "{collector:?}");
+}
+
+#[test]
+fn a_malformed_threshold_says_what_is_wrong() {
+    let ports = [("Jump".to_string(), "macro:aa11bb22".to_string())];
+    for (line, want) in [("@Jump> = A", "needs a percent"), ("@Jump>150 = A", "0 to 100")] {
+        let c = super::parse::compile_full(line, &[], &ports);
+        match &c.lines[0].status {
+            LineStatus::Error(e) => assert!(e.contains(want), "{line}: {e}"),
+            other => panic!("`{line}` should be an error, got {other:?}"),
+        }
+    }
+    // And the gyro switch takes one too.
+    let c = super::parse::compile_full("GYRO_OFF = @Jump>20", &[], &ports);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert!(format!("{:?}", c.aim.gyro_button).contains("Some(20)"), "{:?}", c.aim.gyro_button);
 }

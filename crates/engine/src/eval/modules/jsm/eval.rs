@@ -149,6 +149,42 @@ pub(crate) fn jsm_publish(
     // carries on (or strict mode silences).
     crate::eval::midi_bus::fill_upstream_midi(collector_id, dev_id, collector_sigs, dev_sigs, &mut upstream);
 
+    // How far on each Macro Output port is — what an `@Name` button reads, as
+    // an amount 0..1 under the port's own pin. A port can carry anything: a
+    // bool is 0 or 1, a pull is itself, a stick or a touch deflection is its
+    // length. This tick's value where whatever drives the port has already run,
+    // else last tick's carry-over, so the order two JSM nodes evaluate in
+    // doesn't matter: one reading the other is at most a tick behind, as the
+    // Virtual Menu is. Taken here, before this node's own state is borrowed.
+    //
+    // Nothing that carries `upstream` on reads these pins: the pass-through
+    // walks the pad's pins and the MIDI ones by name.
+    {
+        use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
+        let amounts = |sigs: &mut dyn Iterator<Item = (&(String, String), &Signal)>| {
+            let mut out: HashMap<u32, f32> = HashMap::new();
+            for ((ns, pin), sig) in sigs {
+                if ns != SIGS_NS && ns != SIGS_NS_VEC2 {
+                    continue;
+                }
+                let Some(id) = super::names::macro_btn_id(pin) else { continue };
+                let v = macro_amount(*sig);
+                let e = out.entry(id).or_insert(0.0);
+                *e = e.max(v);
+            }
+            out
+        };
+        let mut now = amounts(&mut collector_sigs.iter());
+        if let Some(prev) = state.get(&crate::eval::MACRO_CARRY_UID).map(|s| &s.macro_prev) {
+            for (id, v) in amounts(&mut prev.iter()) {
+                now.entry(id).or_insert(v);
+            }
+        }
+        for (id, v) in now {
+            upstream.insert(super::names::macro_btn_pin(id), Signal::Float(v));
+        }
+    }
+
     // Compile on the first tick and after every edit; a fresh config starts from
     // a clean slate rather than inheriting half-finished presses. The generation
     // covers every tab's text, not just the live one, so editing a layer a binding
@@ -364,8 +400,24 @@ pub(crate) fn jsm_publish(
         // mapping modules do, and would fight them.
         if crate::eval::activation::is_macro_style_target(&pin) {
             if on {
-                crate::eval::activation::merge_macro_scalar(
-                    collector_sigs, &pin, on_value(&pin));
+                // A Macro Output port carries an amount, so one held by
+                // something with a reading — a trigger's pull, a MIDI knob,
+                // another port — passes that on (the strongest holder's), and
+                // a node reading it gets the pull rather than a switch. Held by
+                // a plain button, or by nobody (a toggle, a tap), it is full on.
+                // A Virtual Menu entry is a press either way.
+                let amount = flexinput_core::macros::parse_macro_pin(&pin)
+                    .and_then(|_| held_by.get(&pin))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(b, _)| analog_reading(*b, &upstream, &res.midi))
+                    .map(|(r, _)| r.abs().clamp(0.0, 1.0))
+                    .reduce(f32::max);
+                let sig = match amount {
+                    Some(a) => Signal::Float(a),
+                    None => on_value(&pin),
+                };
+                crate::eval::activation::merge_macro_scalar(collector_sigs, &pin, sig);
             }
             continue;
         }
@@ -420,7 +472,9 @@ pub(crate) fn jsm_publish(
         let fed = held_by
             .get(&pin)
             .and_then(|h| h.first())
-            .filter(|(b, _)| matches!(b, Btn::Midi(_)) && super::parse::takes_a_value(&pin))
+            .filter(|(b, _)| {
+                matches!(b, Btn::Midi(_) | Btn::Macro { .. }) && super::parse::takes_a_value(&pin)
+            })
             .and_then(|(b, _)| analog_reading(*b, &upstream, &res.midi));
         let sig = match (on, fed) {
             (true, Some((r, _))) => Signal::Float(r.abs().clamp(0.0, 1.0)),
@@ -806,8 +860,26 @@ struct Extra {
     /// The channel a `MIDI_*` button listens on when it doesn't say, and where a
     /// continuous one counts as pressed.
     midi: super::midi::Settings,
-    /// MIDI inputs that only feed a value, and so press from any movement.
+    /// MIDI inputs and ports that only feed a value, and so press from any
+    /// movement.
     analog_fed: HashSet<Btn>,
+}
+
+/// How far on a value written to a Macro Output port is, 0..1: a bool is 0 or
+/// 1, a number is its size, a Vec2 its length.
+fn macro_amount(sig: Signal) -> f32 {
+    match sig {
+        Signal::Bool(b) => b as u8 as f32,
+        Signal::Vec2(v) => v.length(),
+        other => other.as_float().abs(),
+    }
+    .clamp(0.0, 1.0)
+}
+
+/// The amount a Macro Output port carries this tick, as `jsm_publish` put it
+/// into `upstream`.
+fn port_amount(upstream: &HashMap<String, Signal>, id: u32) -> f32 {
+    upstream.get(&super::names::macro_btn_pin(id)).map(|s| s.as_float()).unwrap_or(0.0)
 }
 
 /// Is this JSM button pressed right now? Buttons read straight off a pin; the
@@ -848,6 +920,17 @@ fn button_down(
             upstream
                 .get(&m.pin(ext.midi.in_channel).to_id())
                 .is_some_and(|v| super::midi::value_pressed(m, *v, threshold))
+        }
+        // A Macro Output port: on from its threshold — the line's own (`>30`),
+        // any movement where it only feeds a value, else halfway.
+        BtnSource::Macro { id, at } => {
+            let amount = port_amount(upstream, id);
+            match at {
+                Some(0) => amount > 0.0,
+                Some(pct) => amount >= pct as f32 / 100.0,
+                None if ext.analog_fed.contains(&btn) => amount > 0.0,
+                None => amount >= 0.5,
+            }
         }
     }
 }
@@ -935,6 +1018,9 @@ fn analog_reading(
                 _ => None,
             }
         }
+        // A port's amount — so `@Throttle = MIDI_CC7` hands on the pull, not
+        // just on and off.
+        BtnSource::Macro { id, .. } => Some((port_amount(upstream, id), false)),
         _ => None,
     }
 }
@@ -983,6 +1069,9 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
     }
     for &btn in &cfg.mentioned {
         match btn.source() {
+            // A Macro Output port isn't on this pad's bus, so reading one claims
+            // nothing of it.
+            BtnSource::Macro { .. } => {}
             BtnSource::Pin(pin) => {
                 digital.insert(pin.to_string());
             }

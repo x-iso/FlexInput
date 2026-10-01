@@ -1012,6 +1012,27 @@ pub(crate) fn command_list(
             });
         }
     }
+    // Left of the `=`, a Macro Output port reads as a button — pressed while
+    // whatever drives it holds it. A Virtual Menu entry can only be pressed, so
+    // it isn't offered here.
+    if kinds.contains(&flexinput_engine::eval::JsmKind::Trigger) {
+        for e in crate::macro_icons::registry().iter() {
+            if flexinput_core::macros::parse_macro_pin(&e.pin).is_none() {
+                continue;
+            }
+            items.push(flexinput_engine::eval::JsmItem {
+                name: flexinput_engine::eval::jsm_fi_tag(&e.name),
+                kind: flexinput_engine::eval::JsmKind::Trigger,
+                group: "FlexInput",
+                state: flexinput_engine::eval::JsmSupportState::Live,
+                help: Some(
+                    "A Macro Output port, pressed while whatever drives it holds it on — \
+                     another JSM node bound to it (`S = @Name`), a Remapper card, a Touch \
+                     Zones zone. Use it on its own or in a chord with this pad's buttons.",
+                ),
+            });
+        }
+    }
     let mut picked = None;
     let mut close = false;
 
