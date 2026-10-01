@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-10-02
+
 ### Added
 
 - **UI scale.** Settings → Appearance scales the whole interface from 50% to
@@ -14,6 +16,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   drawn at the new size rather than stretched, so it stays sharp. The window
   keeps its size and place across restarts at any scale. Ctrl +/−/0 no longer
   zooms the interface; the setting is the only control.
+
+- **AutoMap Response Curve and AutoMap Two-way Curve.** Two modules that sit on
+  a device's AutoMap bus and reshape one signal of it in place, passing every
+  other signal through untouched. A dropdown in the header picks what to shape:
+  a trigger or an axis gets the plain curve; a stick is shaped by its length,
+  like the Vec Response Curve, with its X and Y pins kept in step; and Gyro,
+  Accel, Touch 1 and Touch 2 are curved whole, one channel per axis, drawn on
+  one graph with a legend naming the axes. Changing the pick keeps the curve as
+  drawn, and can be undone. They pin, and the pad's navigation tunes them like
+  any curve; tuned from the config overlay, only the picked signal passes
+  through to the game — with a touch point's finger-down flag, so the game sees
+  the finger land.
 
 - **JSM configs can read Macro Output ports as buttons, and make the ports they
   name.** `@Name` now works on the left of the `=` too — alone (`@Jump = SPACE`),
