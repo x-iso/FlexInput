@@ -378,8 +378,7 @@ pub(crate) fn graph_channels_of_node(inner: &NodeData) -> usize {
     match curve_ui_module_id(inner) {
         "module.response_curve"
         | "module.vec_response_curve"
-        | "module.twoway_response_curve" =>
-            inner.inputs.len().min(inner.outputs.len()).max(1),
+        | "module.twoway_response_curve" => curve_channels(inner),
         "display.trigscope" => inner.inputs.len().saturating_sub(1).max(1),
         "generator.envelope" => 1,
         // Sensitivity, and the camera speed it produces.

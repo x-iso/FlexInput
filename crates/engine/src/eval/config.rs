@@ -44,6 +44,19 @@ pub const AUTOMAP_TWOWAY_CURVE_ID: &str = "module.automap_twoway_response_curve"
 /// The pin an AutoMap curve node reshapes, as picked in its header.
 pub const AUTOMAP_CURVE_PIN_PARAM: &str = "am_curve_pin";
 
+/// The multi-axis signals an AutoMap curve can take as one pick (`gyro`,
+/// `accel`, `touch1`, `touch2` — names no single bus pin uses), curving each
+/// axis as its own channel. Returns the axis pins in channel order (X, Y, Z).
+pub fn automap_curve_group(pick: &str) -> Option<&'static [&'static str]> {
+    match pick {
+        "gyro"   => Some(&["gyro_x", "gyro_y", "gyro_z"]),
+        "accel"  => Some(&["accel_x", "accel_y", "accel_z"]),
+        "touch1" => Some(&["touch1_x", "touch1_y"]),
+        "touch2" => Some(&["touch2_x", "touch2_y"]),
+        _ => None,
+    }
+}
+
 /// Build a [`NetNodeConfig`](flexinput_net::NetNodeConfig) from a network node's
 /// params, or `None` if the module id isn't a network node. Shared param keys:
 /// `net_transport` ("udp"|"psk"|"quic"), `net_psk`. Send adds `net_host`,

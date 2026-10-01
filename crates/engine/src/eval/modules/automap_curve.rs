@@ -8,8 +8,10 @@
 
 use super::*;
 
-/// Evaluate one AutoMap curve node. Returns the picked pin's value before and
-/// after the curve — what the body's live dot is drawn from.
+/// Evaluate one AutoMap curve node. Returns the picked signal's values before
+/// and after the curve, one per channel — what the body's live dots are drawn
+/// from. A single pin is one channel; a sensor group (`automap_curve_group`) is
+/// three, each axis curved on its own as a multi-channel Response Curve does.
 pub(crate) fn eval_automap_curve_node(
     snap: &NodeSnap,
     uid: usize,
@@ -17,39 +19,47 @@ pub(crate) fn eval_automap_curve_node(
     collector_sigs: &mut HashMap<(String, String), Signal>,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
-) -> (Option<Signal>, Option<Signal>) {
+) -> (Vec<Option<Signal>>, Vec<Option<Signal>>) {
     republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
-    let pin = snap.params.get(AUTOMAP_CURVE_PIN_PARAM).and_then(|v| v.as_str()).unwrap_or("");
-    if pin.is_empty() {
-        return (None, None);
+    let pick = snap.params.get(AUTOMAP_CURVE_PIN_PARAM).and_then(|v| v.as_str()).unwrap_or("");
+    if pick.is_empty() {
+        return (vec![None], vec![None]);
     }
-    let key = format!("collector:{uid}");
-    let Some(input) = collector_sigs.get(&(key.clone(), pin.to_string())).copied() else {
-        return (None, None);
+    let pins: Vec<&str> = match automap_curve_group(pick) {
+        Some(axes) => axes.to_vec(),
+        None => vec![pick],
     };
+    let key = format!("collector:{uid}");
+    let inputs: Vec<Option<Signal>> = pins.iter()
+        .map(|p| collector_sigs.get(&(key.clone(), p.to_string())).copied())
+        .collect();
     // The picked signal decides the curve's mode — a stick is shaped by its
     // length, so always absolute — and never the stored params: switching the
     // pick between a stick and a trigger must leave the curve as drawn.
-    let output = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
-        let is_vec = matches!(input, Signal::Vec2(_));
+    let outputs: Vec<Option<Signal>> = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
+        let is_vec = matches!(inputs.as_slice(), [Some(Signal::Vec2(_))]);
         let abs = is_vec || snap.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
         let ns = state.entry(uid).or_default();
-        compute_twoway_response_curve_as(&[Some(input)], ns, &snap.params, dt, abs, is_vec)
-            .into_iter().next().flatten()
+        compute_twoway_response_curve_as(&inputs, ns, &snap.params, dt, abs, is_vec)
     } else {
         // A stick is shaped by its length, as the Vec Response Curve does; an
         // axis or a trigger by its value.
-        let base = match input {
-            Signal::Vec2(_) => "module.vec_response_curve",
-            Signal::Float(_) => "module.response_curve",
-            _ => return (Some(input), None),
-        };
-        eval_pure(base, 0, &[Some(input)], &snap.params, 1)
+        inputs.iter().map(|input| {
+            let base = match input {
+                Some(Signal::Vec2(_)) => "module.vec_response_curve",
+                Some(Signal::Float(_)) => "module.response_curve",
+                _ => return None,
+            };
+            eval_pure(base, 0, &[*input], &snap.params, 1)
+        }).collect()
     };
-    let Some(output) = output else { return (Some(input), None) };
-    write_curved_pin(&key, pin, output, collector_sigs);
-    mark_produced(&key, pin, collector_sigs);
-    (Some(input), Some(output))
+    for (pin, output) in pins.iter().zip(&outputs) {
+        if let Some(output) = output {
+            write_curved_pin(&key, pin, *output, collector_sigs);
+            mark_produced(&key, pin, collector_sigs);
+        }
+    }
+    (inputs, outputs)
 }
 
 /// Write the curved value back over `pin`, keeping a stick's two views of itself

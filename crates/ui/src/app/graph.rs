@@ -625,8 +625,9 @@ pub(crate) fn config_passthrough_pins_for(
 }
 
 /// Config-overlay passthrough for an AutoMap curve: the one signal it reshapes,
-/// with the rest of its stick (see [`expand_pin_group`]), so you feel the curve
-/// you're shaping and nothing else gets out. It comes from the device that
+/// with the rest of its stick or sensor (see [`expand_pin_group`]), so you feel
+/// the curve you're shaping and nothing else gets out. A touch point brings its
+/// `_active` flag, without which the game sees the finger move but never land. It comes from the device that
 /// carries it — the MIDI port for a MIDI controller, else the pad — since a
 /// Combiner can put both on one bus. Nothing passes until a signal is picked.
 ///
@@ -661,7 +662,11 @@ fn automap_curve_passthrough(
         .into_iter()
         .find(|d| if is_midi { d.starts_with("midi_in:") } else { is_physical_pad_id(d) })
         .or(fallback)?;
-    Some((device, expand_pin_group(&pin)))
+    let mut pins = expand_pin_group(&pin);
+    if let Some(finger) = ["touch1", "touch2"].into_iter().find(|t| pin.starts_with(t)) {
+        pins.push(format!("{finger}_active"));
+    }
+    Some((device, pins))
 }
 
 /// The `module_id` of the node a config pin references (resolved through the
@@ -2002,6 +2007,61 @@ mod subpatch_bus_tests {
             let snap = graph.nodes.iter().find(|n| n.module_id == module).expect("curve in graph");
             assert_eq!(snap.params.get("_automap_device_id").and_then(|v| v.as_str()), Some("gilrs:pad:0"), "{module}");
         }
+    }
+
+    /// A gyro / accel pick draws its three axes as three labelled channels on the
+    /// one graph, and tuning it from the config overlay passes that sensor alone.
+    #[test]
+    fn a_gyro_pick_is_three_labelled_channels_and_passes_only_the_gyro() {
+        use crate::canvas::viewer::{curve_channel_labels, curve_channels, curve_ui_module_id};
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let dev = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let curve = s.insert_node(p, {
+            let mut n = node("module.automap_response_curve", &[SignalType::AutoMap], &[SignalType::AutoMap]);
+            n.params.insert("am_curve_pin".into(), json!("gyro"));
+            n
+        });
+        wire(&mut s, dev, 0, curve, 0);
+
+        let n = s.get_node(curve).unwrap();
+        assert_eq!(curve_channels(n), 3);
+        assert_eq!(curve_channel_labels(n).map(|l| l.len()), Some(3));
+        assert_eq!(curve_ui_module_id(n), "module.response_curve", "three floats, not a vec");
+
+        let (_, pins) = config_passthrough_pins_for(&s, &[], curve.0, None, None).expect("a passthrough");
+        for p in ["gyro_x", "gyro_y", "gyro_z"] {
+            assert!(pins.contains(&p.to_string()), "{p} in {pins:?}");
+        }
+        assert!(!pins.iter().any(|p| p.starts_with("accel")), "{pins:?}");
+
+        // A touch point is X and Y, and passes with its touch flag — the game
+        // has to see the finger land, not just move.
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("touch1"));
+        let n = s.get_node(curve).unwrap();
+        assert_eq!(curve_channels(n), 2);
+        assert_eq!(curve_channel_labels(n), Some(&["X", "Y"][..]));
+        let (_, pins) = config_passthrough_pins_for(&s, &[], curve.0, None, None).expect("a passthrough");
+        for p in ["touch1_x", "touch1_y", "touch1_active"] {
+            assert!(pins.contains(&p.to_string()), "{p} in {pins:?}");
+        }
+        assert!(!pins.iter().any(|p| p.starts_with("touch2")), "{pins:?}");
+
+        // One touch axis alone brings the flag too.
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("touch2_y"));
+        let (_, pins) = config_passthrough_pins_for(&s, &[], curve.0, None, None).expect("a passthrough");
+        assert!(pins.contains(&"touch2_active".to_string()), "{pins:?}");
+
+        // A single pin is one channel, with no legend.
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("left_trigger"));
+        let n = s.get_node(curve).unwrap();
+        assert_eq!(curve_channels(n), 1);
+        assert!(curve_channel_labels(n).is_none());
     }
 
     /// Moving an AutoMap curve between a trigger and a stick changes which curve

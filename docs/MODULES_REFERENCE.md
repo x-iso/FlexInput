@@ -646,10 +646,14 @@ pub struct ModuleDescriptor {
   passes through unchanged. A Float is shaped like the Response Curve; a Vec2 (stick,
   D-pad) by its length like the Vec Response Curve, and its `_x`/`_y` axis pins on the
   bus are rewritten to match (curving an axis updates its stick's Vec2 the same way).
+  **Gyro (X, Y, Z)** / **Accel (X, Y, Z)** / **Touch 1 (X, Y)** / **Touch 2 (X, Y)** pick
+  a whole sensor or touch point: each axis is curved as its own channel (like a 3-channel Response Curve), drawn on one graph with a colour
+  legend naming the axes.
 - **Inputs:** AutoMap bus
 - **Outputs:** AutoMap bus (republished under `collector:{uid}`)
 - **Parameters:**
-  - `am_curve_pin: String` - The bus pin to reshape (empty = pure pass-through)
+  - `am_curve_pin: String` - The bus pin to reshape, or `gyro` / `accel` / `touch1` /
+    `touch2` for every axis of that sensor or touch point (empty = pure pass-through)
   - Curve params as Response Curve / Vec Response Curve; picking a Vec2 sets `absolute`
 
 #### AutoMap Two-way Curve

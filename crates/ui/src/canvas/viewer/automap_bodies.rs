@@ -284,7 +284,9 @@ fn bus_pin_neutral_label(pin_id: &str) -> String {
 /// (`am_curve_pin`). Offers the Float and Vec2 signals the bus's devices carry
 /// — what they report right now, so a pad without analog triggers offers none —
 /// or, with no device resolvable upstream, every canonical one. A MIDI port's
-/// controllers show up once they move.
+/// controllers show up once they move. Gyro, Accel and each touch point are
+/// offered whole too, ahead of their single axes: every axis on one graph, one
+/// channel each.
 ///
 /// Only the pick is stored: the curve stays exactly as drawn whatever signal it
 /// is moved to (the engine reads a Vec2 by its length on its own). Returns true
@@ -311,6 +313,13 @@ pub(crate) fn automap_curve_pin_picker(
             .map(|p| p.id.to_string())
             .collect();
     }
+    // A multi-axis signal as one pick, ahead of its first axis.
+    for group in ["gyro", "accel", "touch1", "touch2"] {
+        let Some(first) = flexinput_engine::eval::automap_curve_group(group).and_then(|a| a.first()) else { continue };
+        if let Some(at) = options.iter().position(|p| p == first) {
+            options.insert(at, group.to_string());
+        }
+    }
     let mut midi: Vec<String> = live_signals.iter()
         .filter(|((d, pin), sig)| devs.contains(d)
             && flexinput_core::midi::is_midi_pin(pin)
@@ -321,7 +330,13 @@ pub(crate) fn automap_curve_pin_picker(
     options.extend(midi);
 
     let current = snarl.get_node(node).map(|n| automap_curve_pin(n).to_string()).unwrap_or_default();
-    let label_of = |pin: &str| splitter_pin_label(pin, &bus_pin_neutral_label(pin), family);
+    let label_of = |pin: &str| match pin {
+        "gyro"  => "Gyro (X, Y, Z)".to_string(),
+        "accel" => "Accel (X, Y, Z)".to_string(),
+        "touch1" => "Touch 1 (X, Y)".to_string(),
+        "touch2" => "Touch 2 (X, Y)".to_string(),
+        _ => splitter_pin_label(pin, &bus_pin_neutral_label(pin), family),
+    };
     let selected = if current.is_empty() { "Pick signal…".to_string() } else { label_of(&current) };
 
     let mut picked: Option<String> = None;

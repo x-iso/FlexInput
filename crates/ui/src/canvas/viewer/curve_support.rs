@@ -312,9 +312,8 @@ pub(crate) fn paint_response_curve_graph(
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
-    let n_channels = snarl.get_node(node_id)
-        .map(|n| n.inputs.len().min(n.outputs.len()))
-        .unwrap_or(1).max(1);
+    let n_channels = snarl.get_node(node_id).map(curve_channels).unwrap_or(1);
+    let legend = snarl.get_node(node_id).and_then(curve_channel_labels);
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id)
             .and_then(|n| n.extra.last_signals.get(ch)?.as_ref())
@@ -679,6 +678,9 @@ pub(crate) fn paint_response_curve_graph(
         painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
     }
     if has_active { request_repaint_throttled(ui.ctx()); }
+    if let Some(labels) = legend {
+        paint_curve_legend(&painter, rect, labels, |ch| graph_channel_color(graph_ov, ch));
+    }
 
     // Optional override frame, painted last so it sits above the graph content.
     if let Some(stroke) = graph_outline {
@@ -769,6 +771,60 @@ pub(crate) fn twoway_vec_mode(node: &NodeData) -> bool {
         automap_curve_pin_is_vec(node)
     } else {
         node.params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+}
+
+/// How many channels a curve node draws: an AutoMap curve one per picked axis
+/// (three for a gyro / accel pick, two for a touch point, else one), any other
+/// curve its parallel
+/// In/Out pairs.
+pub(crate) fn curve_channels(node: &NodeData) -> usize {
+    if is_automap_curve(&node.module_id) {
+        flexinput_engine::eval::automap_curve_group(automap_curve_pin(node)).map_or(1, |g| g.len())
+    } else {
+        node.inputs.len().min(node.outputs.len()).max(1)
+    }
+}
+
+/// Names for a curve's channels, shown in their colours as a legend on the
+/// graph. Set where several axes share one graph without pins to tell them
+/// apart: an AutoMap curve's gyro / accel / touch-point pick.
+pub(crate) fn curve_channel_labels(node: &NodeData) -> Option<&'static [&'static str]> {
+    if !is_automap_curve(&node.module_id) {
+        return None;
+    }
+    match automap_curve_pin(node) {
+        "gyro"  => Some(&["X roll", "Y pitch", "Z yaw"]),
+        "accel" => Some(&["X", "Y", "Z"]),
+        "touch1" | "touch2" => Some(&["X", "Y"]),
+        _ => None,
+    }
+}
+
+/// Paint a channel legend in the graph's top-left corner: each label in its
+/// channel's colour, stacked, on a dark backing so it reads over the grid.
+pub(crate) fn paint_curve_legend(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    labels: &[&str],
+    color_of: impl Fn(usize) -> Color32,
+) {
+    if labels.is_empty() {
+        return;
+    }
+    let font = egui::FontId::proportional(10.0);
+    let galleys: Vec<_> = labels.iter().enumerate()
+        .map(|(ch, l)| painter.layout_no_wrap(l.to_string(), font.clone(), color_of(ch)))
+        .collect();
+    let pad = 3.0;
+    let row_h = galleys.iter().map(|g| g.size().y).fold(0.0, f32::max);
+    let w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max) + pad * 2.0;
+    let h = row_h * galleys.len() as f32 + pad * 2.0;
+    let bg = egui::Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 4.0), egui::vec2(w, h));
+    painter.rect_filled(bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+    for (i, g) in galleys.into_iter().enumerate() {
+        let pos = bg.left_top() + egui::vec2(pad, pad + row_h * i as f32);
+        painter.galley(pos, g, Color32::WHITE);
     }
 }
 

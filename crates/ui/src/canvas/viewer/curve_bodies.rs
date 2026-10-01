@@ -75,10 +75,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
-    let n_channels = snarl.get_node(node_id)
-        .map(|n| n.inputs.len().min(n.outputs.len()))
-        .unwrap_or(1)
-        .max(1);
+    let n_channels = snarl.get_node(node_id).map(curve_channels).unwrap_or(1);
+    let legend = snarl.get_node(node_id).and_then(curve_channel_labels);
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id)
             .and_then(|n| n.extra.last_signals.get(ch)?.as_ref())
@@ -468,6 +466,9 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 if has_active {
                     request_repaint_throttled(ui.ctx());
                 }
+                if let Some(labels) = legend {
+                    paint_curve_legend(&painter, rect, labels, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                }
 
                 // Right-click on empty graph space → save/load/copy/paste/reset
                 // (same handlers the header buttons use, so file format and
@@ -699,9 +700,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], 1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
-    let n_channels = snarl.get_node(node_id)
-        .map(|n| n.inputs.len().min(n.outputs.len()))
-        .unwrap_or(1).max(1);
+    let n_channels = snarl.get_node(node_id).map(curve_channels).unwrap_or(1);
     // sig_f32 returns v.length() for Vec2, giving deflection magnitude
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id)
@@ -1209,7 +1208,8 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let show_scaled_grid = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
     let show_grid_labels = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let n_channels = node_data.inputs.len().min(node_data.outputs.len()).max(1);
+    let n_channels = curve_channels(&node_data);
+    let legend = curve_channel_labels(&node_data);
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id).and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32))
         .collect();
@@ -1553,6 +1553,9 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
                 }
                 if has_active { request_repaint_throttled(ui.ctx()); }
+                if let Some(labels) = legend {
+                    paint_curve_legend(&painter, rect, labels, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                }
 
                 // Right-click on empty graph → save/load/copy/paste/reset for
                 // the *currently-selected* lane only (resolved via
@@ -1838,7 +1841,8 @@ pub(crate) fn paint_twoway_curve_graph(
     let y_range = y_hi - y_lo;
     let lane_up = active_lane == "up";
 
-    let n_channels = node_data.inputs.len().min(node_data.outputs.len()).max(1);
+    let n_channels = curve_channels(&node_data);
+    let legend = curve_channel_labels(&node_data);
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id).and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32))
         .collect();
@@ -2107,6 +2111,9 @@ pub(crate) fn paint_twoway_curve_graph(
         painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
     }
     if has_active { request_repaint_throttled(ui.ctx()); }
+    if let Some(labels) = legend {
+        paint_curve_legend(&painter, rect, labels, |ch| graph_channel_color(graph_ov, ch));
+    }
 
     // Optional override frame, drawn last so it sits above the graph content.
     if let Some(stroke) = graph_outline {

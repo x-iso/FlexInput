@@ -5448,6 +5448,67 @@ mod automap_curve_tests {
         assert!(close(c.get(&key("left_stick")).copied(), Signal::Vec2(Vec2::new(0.3, 0.8))));
     }
 
+    fn imu() -> HashMap<(String, String), Signal> {
+        let mut m = pad(0.0, Vec2::ZERO);
+        for (pin, v) in [("gyro_x", 0.2), ("gyro_y", -0.4), ("gyro_z", 0.8),
+                         ("accel_x", 0.1), ("accel_y", 0.3), ("accel_z", -0.5)] {
+            m.insert((PAD.to_string(), pin.to_string()), Signal::Float(v));
+        }
+        m
+    }
+
+    fn bus_value(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+        c.get(&("collector:5".to_string(), pin.to_string())).copied()
+    }
+
+    // Gyro picked whole: each axis is its own channel through the same curve
+    // (sign kept), the accelerometer passes through, and all three channels are
+    // reported for the body's dots.
+    #[test]
+    fn a_gyro_pick_curves_all_three_axes() {
+        for module in [AUTOMAP_CURVE_ID, AUTOMAP_TWOWAY_CURVE_ID] {
+            let mut c = HashMap::new();
+            let (ins, outs) = eval_automap_curve_node(&curve(5, module, "gyro"), 5,
+                &imu(), &mut c, &mut HashMap::new(), 0.016);
+            assert_eq!(ins.len(), 3, "{module}");
+            assert_eq!(outs.len(), 3, "{module}");
+            for (pin, want) in [("gyro_x", 0.1), ("gyro_y", -0.2), ("gyro_z", 0.4)] {
+                assert!(close(bus_value(&c, pin), Signal::Float(want)), "{module} {pin}: {:?}", bus_value(&c, pin));
+            }
+            for (pin, raw) in [("accel_x", 0.1), ("accel_y", 0.3), ("accel_z", -0.5)] {
+                assert!(close(bus_value(&c, pin), Signal::Float(raw)), "{module} {pin} untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn an_accel_pick_leaves_the_gyro_alone() {
+        let mut c = HashMap::new();
+        eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "accel"), 5,
+            &imu(), &mut c, &mut HashMap::new(), 0.016);
+        assert!(close(bus_value(&c, "accel_z"), Signal::Float(-0.25)));
+        assert!(close(bus_value(&c, "gyro_z"), Signal::Float(0.8)), "untouched");
+    }
+
+    // A touch point picked whole: X and Y are two channels through the curve;
+    // the other finger and the touch flag pass through.
+    #[test]
+    fn a_touch_pick_curves_its_x_and_y() {
+        let mut sigs = pad(0.0, Vec2::ZERO);
+        for (pin, v) in [("touch1_x", 0.6), ("touch1_y", -0.8), ("touch2_x", 0.4)] {
+            sigs.insert((PAD.to_string(), pin.to_string()), Signal::Float(v));
+        }
+        sigs.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+        let mut c = HashMap::new();
+        let (ins, _) = eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "touch1"), 5,
+            &sigs, &mut c, &mut HashMap::new(), 0.016);
+        assert_eq!(ins.len(), 2);
+        assert!(close(bus_value(&c, "touch1_x"), Signal::Float(0.3)));
+        assert!(close(bus_value(&c, "touch1_y"), Signal::Float(-0.4)));
+        assert!(close(bus_value(&c, "touch2_x"), Signal::Float(0.4)), "the other finger is untouched");
+        assert_eq!(bus_value(&c, "touch1_active"), Some(Signal::Bool(true)));
+    }
+
     // Until a signal is picked the node is a plain pass-through.
     #[test]
     fn nothing_picked_passes_everything_through() {

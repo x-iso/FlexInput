@@ -244,9 +244,9 @@ fn eval_subgraph(
         // AutoMap curves nested in a sub-patch — publish under the NAMESPACED uid
         // so a downstream sink's `collector:` lookup finds the curved bus.
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
-            let (input, output) = eval_automap_curve_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
-            last_inputs.insert(ns_uid, vec![input]);
-            last_outputs.insert(ns_uid, vec![output]);
+            let (inputs, outputs) = eval_automap_curve_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            last_inputs.insert(ns_uid, inputs);
+            last_outputs.insert(ns_uid, outputs);
             computed[idx] = vec![None];
             continue;
         }
@@ -545,12 +545,13 @@ pub fn eval_graph_tick(
         }
 
         // ── AutoMap curves: hand the bus on with one picked pin reshaped. The
-        // picked pin's raw and curved values stand in for the plain curve's
-        // input/output channel 0, which the curve body draws its live dot from.
+        // picked signal's raw and curved values stand in for the plain curve's
+        // input/output channels (three for a gyro / accel pick), which the curve
+        // body draws its live dots from.
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
-            let (input, output) = eval_automap_curve_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
-            last_inputs.insert(snap.node_uid, vec![input]);
-            last_outputs.insert(snap.node_uid, vec![output]);
+            let (inputs, outputs) = eval_automap_curve_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
+            last_inputs.insert(snap.node_uid, inputs);
+            last_outputs.insert(snap.node_uid, outputs);
             computed[idx] = vec![None];
             continue;
         }
