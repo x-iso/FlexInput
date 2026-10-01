@@ -639,6 +639,29 @@ pub struct ModuleDescriptor {
   - `combiner_pin_policy: Object<String, String>` - Per-pin merge policy
   - Policies: "OR", "AND", "XOR", "ADD", "MULT"
 
+#### AutoMap Response Curve
+- **ID:** `module.automap_response_curve`
+- **Purpose:** Response Curve on one signal of an AutoMap bus. The header's **Signal**
+  dropdown picks a Float or Vec2 signal the connected bus carries; every other signal
+  passes through unchanged. A Float is shaped like the Response Curve; a Vec2 (stick,
+  D-pad) by its length like the Vec Response Curve, and its `_x`/`_y` axis pins on the
+  bus are rewritten to match (curving an axis updates its stick's Vec2 the same way).
+- **Inputs:** AutoMap bus
+- **Outputs:** AutoMap bus (republished under `collector:{uid}`)
+- **Parameters:**
+  - `am_curve_pin: String` - The bus pin to reshape (empty = pure pass-through)
+  - Curve params as Response Curve / Vec Response Curve; picking a Vec2 sets `absolute`
+
+#### AutoMap Two-way Curve
+- **ID:** `module.automap_twoway_response_curve`
+- **Purpose:** Two-way Response Curve on one signal of an AutoMap bus — same pick and
+  pass-through as the AutoMap Response Curve, with separate rising/falling lanes.
+- **Inputs:** AutoMap bus
+- **Outputs:** AutoMap bus (republished under `collector:{uid}`)
+- **Parameters:**
+  - `am_curve_pin: String` - The bus pin to reshape
+  - Curve params as Two-way Response Curve; `vec_mode` follows the picked pin's type
+
 #### Touch Zones
 - **ID:** `module.touch_zones`
 - **Purpose:** Divides touchpad into configurable zones with typed outputs

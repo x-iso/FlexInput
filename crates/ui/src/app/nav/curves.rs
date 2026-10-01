@@ -147,7 +147,7 @@ impl FlexInputApp {
             return if gain { ("gain_pts", Some("gain_biases")) } else { ("boundary_pts", None) };
         }
         let lane_dn = node
-            .filter(|node| node.module_id == "module.twoway_response_curve")
+            .filter(|node| crate::canvas::viewer::curve_ui_module_id(node) == "module.twoway_response_curve")
             .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
             == Some("dn");
         if lane_dn { ("points_dn", Some("biases_dn")) } else { ("points", Some("biases")) }

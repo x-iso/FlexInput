@@ -116,6 +116,12 @@ pub(crate) fn render_pinned_element_impl(
     ui.ctx().data_mut(|d| d.insert_temp(
         egui::Id::new(("gp_nav_cur_element", inner_id.0)), element_id.to_string()));
 
+    // An AutoMap curve pins as the plain curve it runs (same elements, same
+    // renderers).
+    let alias = inner_snarl.get_node(inner_id)
+        .filter(|n| is_automap_curve(&n.module_id))
+        .map(|n| curve_ui_module_id(n).to_string());
+    let module_id = alias.as_deref().unwrap_or(module_id);
     match (module_id, element_id) {
         ("module.remapper", "whole_module") => {
             render_remapper_whole_module(

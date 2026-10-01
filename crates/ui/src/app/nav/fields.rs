@@ -509,7 +509,8 @@ impl FlexInputApp {
         use crate::canvas::node::LayoutItem;
         let Some(LayoutItem::Module(m)) = sp.items.get(idx) else { return false; };
         let inner = egui_snarl::NodeId(m.inner_node_id);
-        let Some(mid) = sp.snarl.get_node(inner).map(|n| n.module_id.clone()) else { return false; };
+        let Some(mid) = sp.snarl.get_node(inner)
+            .map(|n| crate::canvas::viewer::curve_ui_module_id(n).to_string()) else { return false; };
         Self::elem_is_nav_target(&mid, &m.element_id)
     }
 
@@ -652,7 +653,8 @@ impl FlexInputApp {
         }
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = nav_scope(&canvas.snarl, outer_id)?;
-        let mid = sp.get_node(*inner)?.module_id.clone();
+        // An AutoMap curve navigates as the plain curve it runs.
+        let mid = crate::canvas::viewer::curve_ui_module_id(sp.get_node(*inner)?).to_string();
         Some((*inner, mid, elem.clone()))
     }
 
@@ -669,7 +671,7 @@ impl FlexInputApp {
         let item = sp.items.get(sel)?;
         if let crate::canvas::node::LayoutItem::Module(m) = item {
             let inner = egui_snarl::NodeId(m.inner_node_id);
-            sp.snarl.get_node(inner).map(|n| n.module_id.clone())
+            sp.snarl.get_node(inner).map(|n| crate::canvas::viewer::curve_ui_module_id(n).to_string())
         } else {
             None
         }

@@ -85,7 +85,7 @@ pub(crate) fn overlay_selected_module_info(
     let idx = overlay.selected_item?;
     let LayoutItem::Module(m) = overlay.items.get(idx)? else { return None };
     let inner = resolve_overlay_module(tab_snarl, &m.source_path, m.inner_node_id)?;
-    Some((inner.module_id.clone(), graph_channels_of_node(inner)))
+    Some((crate::canvas::viewer::curve_ui_module_id(inner).to_string(), graph_channels_of_node(inner)))
 }
 
 /// Render + (in edit mode) run interactions for the overlay layout. `rect` is

@@ -21,6 +21,8 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapFork>(),
         reg::<AutoMapSelector>(),
         reg::<AutoMapCombiner>(),
+        reg::<AutoMapResponseCurveModule>(),
+        reg::<AutoMapTwowayResponseCurveModule>(),
         reg::<RemapperModule>(),
         reg::<MapActionModule>(),
         reg::<FeedbackControlModule>(),
@@ -484,6 +486,48 @@ impl Module for AutoMapCombiner {
         r.push(Signal::Float(0.0));
         r
     }
+}
+
+// ── AutoMap Response Curves ───────────────────────────────────────────────────
+
+/// Response Curve on one signal of an AutoMap bus. The header picks the signal
+/// (`am_curve_pin`) from what the connected bus carries; a Float is shaped like
+/// the Response Curve, a Vec2 (stick) by its length like the Vec Response Curve.
+/// Every other signal passes through. Evaluated in the engine
+/// (`eval_automap_curve_node`), which republishes the bus under `collector:{uid}`.
+#[derive(Default)]
+pub struct AutoMapResponseCurveModule;
+
+impl Module for AutoMapResponseCurveModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_response_curve",
+            display_name: "AutoMap Response Curve",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+/// Two-way Response Curve on one signal of an AutoMap bus — same pick and
+/// pass-through as the AutoMap Response Curve, with the two-way curve's
+/// separate rising / falling lanes. A Vec2 runs in the curve's Vec mode.
+#[derive(Default)]
+pub struct AutoMapTwowayResponseCurveModule;
+
+impl Module for AutoMapTwowayResponseCurveModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_twoway_response_curve",
+            display_name: "AutoMap Two-way Curve",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
 }
 
 // ── Gyro 3DOF to 2D ───────────────────────────────────────────────────────────

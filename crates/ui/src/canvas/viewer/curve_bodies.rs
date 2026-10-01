@@ -2,7 +2,19 @@
 
 use super::*;
 
+/// AutoMap Response Curve / AutoMap Two-way Curve: the plain curve's body, run
+/// on the signal picked in the header (see `curve_ui_module_id`).
+pub(crate) fn show_automap_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let Some(node) = snarl.get_node(node_id) else { return false };
+    match curve_ui_module_id(node) {
+        "module.vec_response_curve"    => show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl),
+        "module.twoway_response_curve" => show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl),
+        _                              => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
+    }
+}
+
 pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
     // Curve graphs intentionally do NOT force vsync repaint. The curve
     // itself is static and the only animated element is the input/output
     // tracer dot, which is plenty smooth at the user's chosen base
@@ -619,7 +631,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
             }
         }
 
-        ui.horizontal(|ui| {
+        // An AutoMap curve has the one channel its picked signal makes.
+        if !automap { ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Ch").small().weak());
             if ui.small_button("+").on_hover_text("Add parallel channel").clicked() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -632,7 +645,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 remove_input_pin(node_id, n_channels - 1, inputs, snarl);
                 remove_output_pin(node_id, n_channels - 1, outputs, snarl);
             }
-        });
+        }); }
     });
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
@@ -641,6 +654,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
 }
 
 pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -1104,7 +1118,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
             }
         }
 
-        ui.horizontal(|ui| {
+        if !automap { ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Ch").small().weak());
             if ui.small_button("+").on_hover_text("Add Vec2 channel").clicked() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1117,7 +1131,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 remove_input_pin(node_id, n_channels - 1, inputs, snarl);
                 remove_output_pin(node_id, n_channels - 1, outputs, snarl);
             }
-        });
+        }); }
     });
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
@@ -1129,6 +1143,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
     // No vsync bypass — same rationale as show_response_curve_body.
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -1187,7 +1202,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let scale_t   = node_data.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
     let trail_ms  = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
-    let vec_mode  = node_data.params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    let vec_mode  = twoway_vec_mode(&node_data);
     let hyst_pct  = node_data.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
     let hyst_ms   = node_data.params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
     let interp_ms = node_data.params.get("interp_ms")     .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
@@ -1614,7 +1629,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
             ui.add_enabled_ui(!vm, |ui| { ui.checkbox(&mut abs_on, egui::RichText::new("Abs").small()).on_hover_text("Absolute mode: ignore sign of input"); });
             if abs_on != ab { changed = true; }
             let vmb = vm;
-            ui.checkbox(&mut vm, egui::RichText::new("Vec").small()).on_hover_text("Vec2 mode: process magnitude. Forces Abs on.");
+            // On an AutoMap curve the picked signal's type sets Vec mode, and the
+            // pins are AutoMap, so there is nothing to retype.
+            if !automap {
+                ui.checkbox(&mut vm, egui::RichText::new("Vec").small()).on_hover_text("Vec2 mode: process magnitude. Forces Abs on.");
+            }
             if vm != vmb {
                 changed = true;
                 let tgt = if vm { SignalType::Vec2 } else { SignalType::Float };
@@ -1680,14 +1699,15 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 node.params.insert("snap".into(),Value::Bool(snap_on));
                 node.params.insert("trail_ms".into(),serde_json::json!(tm));
                 node.params.insert("absolute".into(),Value::Bool(abs_on));
-                node.params.insert("vec_mode".into(),Value::Bool(vm));
+                // An AutoMap curve's Vec mode is its picked signal's, not a param.
+                if !automap { node.params.insert("vec_mode".into(),Value::Bool(vm)); }
                 node.params.insert("active_lane".into(),Value::String(lane_sel.clone()));
                 node.params.insert("show_scaled_grid".into(),Value::Bool(ssg));
                 node.params.insert("show_grid_labels".into(),Value::Bool(sgl));
             }
         }
 
-        ui.horizontal(|ui| {
+        if !automap { ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Ch").small().weak());
             if ui.small_button("+").on_hover_text("Add channel").clicked() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1701,7 +1721,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 remove_input_pin(node_id, n_channels - 1, inputs, snarl);
                 remove_output_pin(node_id, n_channels - 1, outputs, snarl);
             }
-        });
+        }); }
     });
 
     if let Some(rect) = curve_graph_rect {
@@ -1794,7 +1814,7 @@ pub(crate) fn paint_twoway_curve_graph(
     let biases_dn = read_biases("biases_dn");
 
     let absolute   = node_data.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
-    let vec_mode   = node_data.params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    let vec_mode   = twoway_vec_mode(&node_data);
     let in_max     = node_data.params.get("in_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let in_min     = node_data.params.get("in_min").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
     let out_max    = node_data.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;

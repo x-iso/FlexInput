@@ -7,6 +7,7 @@
 
 use super::*;
 
+mod automap_curve;
 mod gyro3dof;
 mod jsm;
 mod lean;
@@ -18,6 +19,7 @@ mod rws;
 mod shared;
 mod touch_zones;
 
+pub(crate) use automap_curve::*;
 pub(crate) use gyro3dof::*;
 pub(crate) use jsm::*;
 // Read by the UI to compile the config text it is showing.

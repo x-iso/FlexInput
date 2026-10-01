@@ -605,6 +605,11 @@ pub(crate) fn config_passthrough_pins_for(
             .unwrap_or(flexinput_engine::eval::JsmFeel::Nothing);
         return Some((device, jsm_tuning_passthrough(feel).0));
     }
+    if pin_module_id(tab_snarl, source_path, inner_node_id)
+        .is_some_and(|m| crate::canvas::viewer::is_automap_curve(&m))
+    {
+        return automap_curve_passthrough(tab_snarl, source_path, inner_node_id);
+    }
     let is_mapping = matches!(
         pin_module_id(tab_snarl, source_path, inner_node_id).as_deref(),
         Some("module.remapper") | Some("module.map_action")
@@ -617,6 +622,46 @@ pub(crate) fn config_passthrough_pins_for(
         return Some((device, pins));
     }
     config_passthrough_pins(tab_snarl, source_path, inner_node_id)
+}
+
+/// Config-overlay passthrough for an AutoMap curve: the one signal it reshapes,
+/// with the rest of its stick (see [`expand_pin_group`]), so you feel the curve
+/// you're shaping and nothing else gets out. It comes from the device that
+/// carries it — the MIDI port for a MIDI controller, else the pad — since a
+/// Combiner can put both on one bus. Nothing passes until a signal is picked.
+///
+/// The general walk can't find this: it follows the node's AutoMap input to the
+/// device's bus pin, which names no signal, and then blocks everything.
+fn automap_curve_passthrough(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<(String, Vec<String>)> {
+    let (snarl, node_id) = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)?;
+    let pin = crate::canvas::viewer::automap_curve_pin(snarl.get_node(node_id)?).to_string();
+    let fallback = config_passthrough_device(tab_snarl, source_path, inner_node_id);
+    if pin.is_empty() {
+        return fallback.map(|d| (d, vec![CONFIG_BLOCK_ALL_PIN.to_string()]));
+    }
+    let upstream = snarl.in_pin(InPinId { node: node_id, input: 0 }).remotes.first().copied();
+    let devs = match (upstream, source_path) {
+        (Some(src), []) => find_automap_device_ids_for_viewer(snarl, src, None),
+        (Some(src), [sp]) => {
+            let frame = crate::canvas::viewer::AutomapGlowParent {
+                snarl: tab_snarl,
+                subpatch_node_id: NodeId(*sp),
+                prev: None,
+            };
+            find_automap_device_ids_for_viewer(snarl, src, Some(&frame))
+        }
+        _ => Vec::new(),
+    };
+    let is_midi = flexinput_core::midi::is_midi_pin(&pin);
+    let device = devs
+        .into_iter()
+        .find(|d| if is_midi { d.starts_with("midi_in:") } else { is_physical_pad_id(d) })
+        .or(fallback)?;
+    Some((device, expand_pin_group(&pin)))
 }
 
 /// The `module_id` of the node a config pin references (resolved through the
@@ -1357,7 +1402,8 @@ pub(crate) fn build_processing_graph_rec(
             | "module.remapper" | "module.map_action"
             | "module.automap_collect" | "module.audio_stream_haptics"
             | "module.touch_zones" | "module.menu" | "module.jsm"
-            | "module.network_send")
+            | "module.network_send"
+            | "module.automap_response_curve" | "module.automap_twoway_response_curve")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -1928,6 +1974,95 @@ mod subpatch_bus_tests {
 
     fn wire(s: &mut Snarl<NodeData>, from: NodeId, o: usize, to: NodeId, i: usize) {
         s.connect(OutPinId { node: from, output: o }, InPinId { node: to, input: i });
+    }
+
+    /// An AutoMap curve republishes the bus it reshapes: it is stamped with the
+    /// pad it reads, and a sink behind it reads the curve's bus — never the raw
+    /// pad, which would skip the curve.
+    #[test]
+    fn a_sink_behind_an_automap_curve_reads_the_curved_bus() {
+        for module in ["module.automap_response_curve", "module.automap_twoway_response_curve"] {
+            let p = egui::Pos2::ZERO;
+            let mut s: Snarl<NodeData> = Snarl::new();
+            let dev = s.insert_node(p, {
+                let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+                n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+                n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+                n
+            });
+            let curve = s.insert_node(p, node(module, &[SignalType::AutoMap], &[SignalType::AutoMap]));
+            wire(&mut s, dev, 0, curve, 0);
+
+            let (id, _, upstream) = find_automap_device_rec(&s, OutPinId { node: curve, output: 0 }, None)
+                .expect("the curve's output resolves");
+            assert_eq!(id, format!("collector:{}", curve.0), "{module}");
+            assert_eq!(upstream.as_deref(), Some("gilrs:pad:0"), "{module}");
+
+            let (graph, _) = build_processing_graph(&s, Default::default());
+            let snap = graph.nodes.iter().find(|n| n.module_id == module).expect("curve in graph");
+            assert_eq!(snap.params.get("_automap_device_id").and_then(|v| v.as_str()), Some("gilrs:pad:0"), "{module}");
+        }
+    }
+
+    /// Moving an AutoMap curve between a trigger and a stick changes which curve
+    /// it draws as — never the curve itself.
+    #[test]
+    fn switching_an_automap_curves_signal_keeps_the_curve() {
+        use crate::canvas::viewer::{curve_ui_module_id, twoway_vec_mode};
+        for (module, float_as, vec_as) in [
+            ("module.automap_response_curve", "module.response_curve", "module.vec_response_curve"),
+            ("module.automap_twoway_response_curve", "module.twoway_response_curve", "module.twoway_response_curve"),
+        ] {
+            let mut n = node(module, &[SignalType::AutoMap], &[SignalType::AutoMap]);
+            n.params.insert("points".into(), json!([[0.0, 0.0], [0.3, 0.7], [1.0, 1.0]]));
+            n.params.insert("absolute".into(), json!(false));
+            n.params.insert("am_curve_pin".into(), json!("left_trigger"));
+            let before = n.params.clone();
+            assert_eq!(curve_ui_module_id(&n), float_as);
+            assert!(!twoway_vec_mode(&n));
+
+            n.params.insert("am_curve_pin".into(), json!("right_stick"));
+            assert_eq!(curve_ui_module_id(&n), vec_as);
+            assert!(twoway_vec_mode(&n));
+
+            n.params.insert("am_curve_pin".into(), json!("left_trigger"));
+            assert_eq!(n.params, before, "{module}: the curve is untouched by the round trip");
+        }
+    }
+
+    /// Tuning an AutoMap curve from the config overlay lets exactly its picked
+    /// signal (with the rest of its stick) through to the game, and nothing at
+    /// all before a signal is picked.
+    #[test]
+    fn an_automap_curve_passes_its_picked_signal_through_the_config_overlay() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let dev = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let curve = s.insert_node(p, node("module.automap_response_curve", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        wire(&mut s, dev, 0, curve, 0);
+
+        assert_eq!(
+            config_passthrough_pins_for(&s, &[], curve.0, None, None),
+            Some(("gilrs:pad:0".to_string(), vec![CONFIG_BLOCK_ALL_PIN.to_string()])),
+            "nothing picked, nothing passes",
+        );
+
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("right_trigger"));
+        let (d, pins) = config_passthrough_pins_for(&s, &[], curve.0, None, None).expect("a passthrough");
+        assert_eq!(d, "gilrs:pad:0");
+        assert!(pins.contains(&"right_trigger".to_string()), "{pins:?}");
+        assert!(!pins.contains(&"left_trigger".to_string()), "{pins:?}");
+
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("left_stick_x"));
+        let (_, pins) = config_passthrough_pins_for(&s, &[], curve.0, None, None).expect("a passthrough");
+        for p in ["left_stick", "left_stick_x", "left_stick_y"] {
+            assert!(pins.contains(&p.to_string()), "{p} in {pins:?}");
+        }
     }
 
     /// A Combiner merging a MIDI port (port 0) and a pad (port 1): capture has to

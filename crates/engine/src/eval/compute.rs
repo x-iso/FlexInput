@@ -1118,6 +1118,22 @@ pub(crate) fn compute_twoway_response_curve(
     params: &HashMap<String, Value>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
+    let abs      = params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
+    let vec_mode = params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    compute_twoway_response_curve_as(inputs, state, params, dt, abs, vec_mode)
+}
+
+/// The two-way curve with its Abs and Vec modes given rather than read from
+/// `params` — for a caller that decides them from the signal it is handed (the
+/// AutoMap Two-way Curve, whose picked signal may be a stick or a trigger).
+pub(crate) fn compute_twoway_response_curve_as(
+    inputs: &[Option<Signal>],
+    state: &mut NodeState,
+    params: &HashMap<String, Value>,
+    dt: f32,
+    abs: bool,
+    vec_mode: bool,
+) -> Vec<Option<Signal>> {
     let n_ch = inputs.len();
 
     // Grow per-channel state vectors lazily.
@@ -1128,14 +1144,11 @@ pub(crate) fn compute_twoway_response_curve(
     while state.twoway_old_output.len() < n_ch { state.twoway_old_output.push(0.0); }
 
     // Shared params (applied to both curves).
-    let abs     = params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
     let in_max  = params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
     let in_min  = params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
     let out_max = params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
     let out_min = params.get("out_min").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
     let scale_t = read_scale_t(params);
-
-    let vec_mode = params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Up-lane (rising) curve params.
     let pts_up   = curve_points_from_params(params);

@@ -368,14 +368,14 @@ pub(crate) fn subpatch_selected_module_info(
     let idx = sp.selected_item?;
     let LayoutItem::Module(m) = sp.items.get(idx)? else { return None };
     let inner = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?;
-    Some((inner.module_id.clone(), graph_channels_of_node(inner)))
+    Some((curve_ui_module_id(inner).to_string(), graph_channels_of_node(inner)))
 }
 
 /// Channel count for a graph pin's per-channel color row. Response curves
 /// expose `min(inputs, outputs)` channels; scopes one per input; the
 /// trigscope's index 0 is the trigger; envelope has a single trail color.
 pub(crate) fn graph_channels_of_node(inner: &NodeData) -> usize {
-    match inner.module_id.as_str() {
+    match curve_ui_module_id(inner) {
         "module.response_curve"
         | "module.vec_response_curve"
         | "module.twoway_response_curve" =>

@@ -743,12 +743,55 @@ pub(crate) fn default_1()     -> f64  {  1.0  }
 pub(crate) fn default_4()     -> i64  {  4    }
 pub(crate) fn default_300()   -> i64  { 300   }
 
+/// Is this one of the curves that reshape a signal picked off an AutoMap bus?
+pub(crate) fn is_automap_curve(module_id: &str) -> bool {
+    matches!(module_id, "module.automap_response_curve" | "module.automap_twoway_response_curve")
+}
+
+/// The bus pin an AutoMap curve node reshapes ("" until one is picked).
+pub(crate) fn automap_curve_pin(node: &NodeData) -> &str {
+    node.params.get(flexinput_engine::eval::AUTOMAP_CURVE_PIN_PARAM)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Whether an AutoMap curve's picked pin is a Vec2 (a stick or the D-pad).
+pub(crate) fn automap_curve_pin_is_vec(node: &NodeData) -> bool {
+    let pin = automap_curve_pin(node);
+    am_canon::ALL_PINS.iter().any(|p| p.id == pin && p.signal_type == SignalType::Vec2)
+}
+
+/// Whether a two-way curve runs in Vec mode. An AutoMap one is exactly while a
+/// Vec2 is picked — the engine decides it the same way, so the stored `vec_mode`
+/// param is never consulted (or changed) for it; a plain one follows its toggle.
+pub(crate) fn twoway_vec_mode(node: &NodeData) -> bool {
+    if is_automap_curve(&node.module_id) {
+        automap_curve_pin_is_vec(node)
+    } else {
+        node.params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+}
+
+/// The module an AutoMap curve node renders, pins and navigates as: its body IS
+/// the plain curve's body, run on one picked bus signal, so every place that
+/// dispatches on a curve's module id asks this instead. The AutoMap Response
+/// Curve is the Vec Response Curve while a Vec2 is picked, the Response Curve
+/// otherwise. Any other node is itself.
+pub(crate) fn curve_ui_module_id(node: &NodeData) -> &str {
+    match node.module_id.as_str() {
+        "module.automap_twoway_response_curve" => "module.twoway_response_curve",
+        "module.automap_response_curve" if automap_curve_pin_is_vec(node) => "module.vec_response_curve",
+        "module.automap_response_curve" => "module.response_curve",
+        other => other,
+    }
+}
+
 /// Resolves the (points, biases) param keys to operate on for a given node.
 /// For two-way curves this respects `active_lane` so the user only touches
 /// the lane they're currently editing — keeps the file format identical to
 /// regular curves and avoids needing a two-lane file variant.
 pub(crate) fn curve_param_keys(node: &NodeData) -> (&'static str, &'static str) {
-    if node.module_id == "module.twoway_response_curve" {
+    if curve_ui_module_id(node) == "module.twoway_response_curve" {
         let lane = node.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up");
         if lane == "dn" { ("points_dn", "biases_dn") } else { ("points", "biases") }
     } else {

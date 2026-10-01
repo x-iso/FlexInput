@@ -280,12 +280,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let is_map_action     = snarl.get_node(node).map(|n| n.module_id == "module.map_action").unwrap_or(false);
         let is_input_viewer   = snarl.get_node(node).map(|n| n.module_id == "module.input_viewer").unwrap_or(false);
         let is_menu           = snarl.get_node(node).map(|n| n.module_id == "module.menu").unwrap_or(false);
+        let is_automap_curve  = snarl.get_node(node).is_some_and(|n| is_automap_curve(&n.module_id));
         let is_response_curve = snarl.get_node(node).map(|n| {
-            n.module_id == "module.response_curve"
-                || n.module_id == "module.vec_response_curve"
-                || n.module_id == "module.twoway_response_curve"
+            matches!(curve_ui_module_id(n),
+                "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
         }).unwrap_or(false);
-        let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
+        let curve_is_float    = snarl.get_node(node).map(|n| curve_ui_module_id(n) == "module.response_curve").unwrap_or(false);
         let is_rws            = snarl.get_node(node).map(|n| n.module_id == "processing.rws").unwrap_or(false);
         let is_feedback_control = snarl.get_node(node).map(|n| n.module_id == "module.feedback_control").unwrap_or(false);
         let is_jsm            = snarl.get_node(node).map(|n| n.module_id == "module.jsm").unwrap_or(false);
@@ -931,6 +931,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 jsm_strict_header_toggle(ui, snarl, node);
             }
 
+            // AutoMap curves: the bus signal the curve reshapes.
+            if is_automap_curve {
+                if automap_curve_pin_picker(ui, snarl, node, self.live_signals, self.automap_parent.as_ref()) {
+                    self.push_undo_request = true;
+                }
+            }
+
             // Second header row — only visible while in Layout mode for this
             // sub-patch. Snap settings live on the sub-patch itself (they
             // belong to its body's drag/resize behavior, not to the editor).
@@ -1155,6 +1162,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             }
             "module.twoway_response_curve" => {
                 if show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                    self.push_undo_request = true;
+                }
+            }
+            "module.automap_response_curve" | "module.automap_twoway_response_curve" => {
+                if show_automap_curve_body(node_id, inputs, outputs, ui, snarl) {
                     self.push_undo_request = true;
                 }
             }
@@ -1436,6 +1448,7 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
         | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
         | "display.controller3d"
         | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
+        | "module.automap_response_curve" | "module.automap_twoway_response_curve"
         | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
         | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
         | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
@@ -1461,7 +1474,8 @@ mod body_gate_tests {
     #[test]
     fn modules_with_a_body_are_gated_in() {
         for m in ["module.jsm", "module.remapper", "module.audio_stream_haptics",
-                  "module.label", "module.touch_zones", "processing.rws"] {
+                  "module.label", "module.touch_zones", "processing.rws",
+                  "module.automap_response_curve", "module.automap_twoway_response_curve"] {
             assert!(module_has_body(m), "{m} draws a body");
         }
         assert!(!module_has_body("module.feedback_control"), "a pins-only module draws none");

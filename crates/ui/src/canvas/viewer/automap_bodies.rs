@@ -280,6 +280,74 @@ fn bus_pin_neutral_label(pin_id: &str) -> String {
     pin_id.to_string()
 }
 
+/// AutoMap curve header: which signal on the connected bus the curve reshapes
+/// (`am_curve_pin`). Offers the Float and Vec2 signals the bus's devices carry
+/// — what they report right now, so a pad without analog triggers offers none —
+/// or, with no device resolvable upstream, every canonical one. A MIDI port's
+/// controllers show up once they move.
+///
+/// Only the pick is stored: the curve stays exactly as drawn whatever signal it
+/// is moved to (the engine reads a Vec2 by its length on its own). Returns true
+/// when the pick changed, so the caller can make it an undo step.
+pub(crate) fn automap_curve_pin_picker(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node: NodeId,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> bool {
+    let devs = remapper_upstream_device_ids(snarl, node, 0, automap_parent);
+    let family = devs.iter().find_map(|d| family_slug_from_device_id(d));
+    let carried = |pin: &str| devs.iter().any(|d| live_signals.contains_key(&(d.clone(), pin.to_string())));
+    let shapeable = |t: SignalType| matches!(t, SignalType::Float | SignalType::Vec2);
+
+    let mut options: Vec<String> = am_canon::ALL_PINS.iter()
+        .filter(|p| shapeable(p.signal_type) && carried(p.id))
+        .map(|p| p.id.to_string())
+        .collect();
+    if options.is_empty() {
+        options = am_canon::ALL_PINS.iter()
+            .filter(|p| shapeable(p.signal_type))
+            .map(|p| p.id.to_string())
+            .collect();
+    }
+    let mut midi: Vec<String> = live_signals.iter()
+        .filter(|((d, pin), sig)| devs.contains(d)
+            && flexinput_core::midi::is_midi_pin(pin)
+            && matches!(sig, Signal::Float(_)))
+        .map(|((_, pin), _)| pin.clone())
+        .collect();
+    midi.sort();
+    options.extend(midi);
+
+    let current = snarl.get_node(node).map(|n| automap_curve_pin(n).to_string()).unwrap_or_default();
+    let label_of = |pin: &str| splitter_pin_label(pin, &bus_pin_neutral_label(pin), family);
+    let selected = if current.is_empty() { "Pick signal…".to_string() } else { label_of(&current) };
+
+    let mut picked: Option<String> = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Signal").small().weak());
+        egui::ComboBox::from_id_salt((node, "am_curve_pin"))
+            .selected_text(egui::RichText::new(selected).small())
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for pin in &options {
+                    let text = egui::RichText::new(label_of(pin)).small();
+                    if ui.selectable_label(*pin == current, text).clicked() && *pin != current {
+                        picked = Some(pin.clone());
+                    }
+                }
+            })
+            .response
+            .on_hover_text("The signal on the AutoMap bus this curve reshapes. Every other signal passes through unchanged.");
+    });
+
+    let Some(pin) = picked else { return false };
+    let Some(n) = snarl.get_node_mut(node) else { return false };
+    n.params.insert(flexinput_engine::eval::AUTOMAP_CURVE_PIN_PARAM.into(), Value::String(pin));
+    true
+}
+
 pub(crate) fn show_automap_split_body(
     node_id: NodeId,
     outputs: &[OutPin],
@@ -637,6 +705,8 @@ pub(crate) fn bus_label(module_id: &str) -> Option<&'static str> {
         "module.audio_stream_haptics" => "Audio Haptics",
         "module.network_send" => "Network Send",
         "module.network_recv" => "Network Receive",
+        "module.automap_response_curve" => "Response Curve",
+        "module.automap_twoway_response_curve" => "Two-way Curve",
         _ => return None,
     })
 }

@@ -5317,3 +5317,157 @@ mod midi_card_module_tests {
         assert_ne!(out.first().copied().flatten(), Some(Signal::Bool(true)));
     }
 }
+
+#[cfg(test)]
+mod automap_curve_tests {
+    use super::*;
+    use crate::graph::SinkTarget;
+
+    const PAD: &str = "sdl:dualsense:0";
+    const VIRT: &str = "virtual.xinput:0";
+    /// Halves its input: a straight line from (0,0) to (1,0.5).
+    const HALF: [[f64; 2]; 2] = [[0.0, 0.0], [1.0, 0.5]];
+
+    fn canonical_pins() -> Vec<String> {
+        automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect()
+    }
+
+    fn node(uid: usize, module_id: &str) -> NodeSnap {
+        NodeSnap {
+            node_uid: uid,
+            module_id: module_id.to_string(),
+            params: HashMap::new(),
+            n_outputs: 0,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    /// An AutoMap curve straight off the pad, reshaping `pin` with `HALF`.
+    fn curve(uid: usize, module_id: &str, pin: &str) -> NodeSnap {
+        let mut n = node(uid, module_id);
+        n.params.insert("_automap_device_id".into(), Value::String(PAD.into()));
+        n.params.insert(AUTOMAP_CURVE_PIN_PARAM.into(), Value::String(pin.into()));
+        n.params.insert("points".into(), serde_json::json!(HALF));
+        n.params.insert("biases".into(), serde_json::json!([0.0]));
+        n.n_outputs = 1;
+        n
+    }
+
+    fn sink(uid: usize, src: &str) -> NodeSnap {
+        let mut n = node(uid, "device.sink");
+        n.sink_target = Some(SinkTarget {
+            device_id: VIRT.to_string(),
+            pin_ids: canonical_pins(),
+            multi_sources: vec![Vec::new(); canonical_pins().len()],
+            automap_source: Some((src.to_string(), canonical_pins())),
+            automap_fallback_dev: Some(PAD.to_string()),
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        n
+    }
+
+    fn pad(lt: f32, stick: Vec2) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
+        put("left_trigger", Signal::Float(lt));
+        put("right_trigger", Signal::Float(0.6));
+        put("left_stick", Signal::Vec2(stick));
+        put("left_stick_x", Signal::Float(stick.x));
+        put("left_stick_y", Signal::Float(stick.y));
+        put("btn_south", Signal::Bool(true));
+        m
+    }
+
+    fn tick(nodes: Vec<NodeSnap>, sigs: &HashMap<(String, String), Signal>) -> TickOutput {
+        let graph = ProcessingGraph { nodes };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut state, sigs, 0.016, &mut out);
+        out
+    }
+
+    fn at_sink(out: &TickOutput, pin: &str) -> Option<Signal> {
+        out.sink_outputs.get(&(VIRT.to_string(), pin.to_string())).copied()
+    }
+
+    fn close(a: Option<Signal>, b: Signal) -> bool {
+        match (a, b) {
+            (Some(Signal::Float(x)), Signal::Float(y)) => (x - y).abs() < 1e-4,
+            (Some(Signal::Vec2(x)), Signal::Vec2(y)) => (x - y).length() < 1e-4,
+            _ => false,
+        }
+    }
+
+    // The picked trigger is curved; the other trigger and a button pass through.
+    #[test]
+    fn reshapes_the_picked_signal_and_passes_the_rest() {
+        let out = tick(
+            vec![curve(5, AUTOMAP_CURVE_ID, "left_trigger"), sink(6, "collector:5")],
+            &pad(0.8, Vec2::ZERO),
+        );
+        assert!(close(at_sink(&out, "left_trigger"), Signal::Float(0.4)), "{:?}", at_sink(&out, "left_trigger"));
+        assert!(close(at_sink(&out, "right_trigger"), Signal::Float(0.6)), "untouched");
+        assert_eq!(at_sink(&out, "btn_south"), Some(Signal::Bool(true)), "untouched");
+        // The body draws its live dot from these.
+        assert_eq!(out.last_inputs.get(&5), Some(&vec![Some(Signal::Float(0.8))]));
+        assert!(close(out.last_outputs.get(&5).and_then(|v| v[0]), Signal::Float(0.4)));
+    }
+
+    // A stick is shaped by its length, keeping its direction.
+    #[test]
+    fn a_stick_is_shaped_by_its_length() {
+        let out = tick(
+            vec![curve(5, AUTOMAP_CURVE_ID, "left_stick"), sink(6, "collector:5")],
+            &pad(0.0, Vec2::new(0.6, 0.8)),
+        );
+        assert!(close(at_sink(&out, "left_stick"), Signal::Vec2(Vec2::new(0.3, 0.4))), "{:?}", at_sink(&out, "left_stick"));
+    }
+
+    // The bus carries a stick twice — as a Vec2 and as two axes — and both
+    // views come out curved, whichever one was picked.
+    #[test]
+    fn a_stick_and_its_axes_stay_in_step() {
+        let key = |pin: &str| ("collector:5".to_string(), pin.to_string());
+        let mut c = HashMap::new();
+        eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick"), 5,
+            &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
+        assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
+        assert!(close(c.get(&key("left_stick_y")).copied(), Signal::Float(0.4)));
+
+        let mut c = HashMap::new();
+        eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick_x"), 5,
+            &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
+        assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
+        assert!(close(c.get(&key("left_stick")).copied(), Signal::Vec2(Vec2::new(0.3, 0.8))));
+    }
+
+    // Until a signal is picked the node is a plain pass-through.
+    #[test]
+    fn nothing_picked_passes_everything_through() {
+        let mut n = curve(5, AUTOMAP_CURVE_ID, "");
+        n.params.remove(AUTOMAP_CURVE_PIN_PARAM);
+        let out = tick(vec![n, sink(6, "collector:5")], &pad(0.8, Vec2::ZERO));
+        assert!(close(at_sink(&out, "left_trigger"), Signal::Float(0.8)));
+        assert_eq!(out.last_inputs.get(&5), Some(&vec![None]));
+    }
+
+    // The two-way curve runs its rising lane on a fresh push, in Vec mode for a
+    // stick — decided by the stick itself, not by stored params, which keep
+    // whatever the curve had when it shaped a trigger.
+    #[test]
+    fn two_way_curve_on_a_stick() {
+        let mut n = curve(5, AUTOMAP_TWOWAY_CURVE_ID, "left_stick");
+        n.params.insert("vec_mode".into(), Value::Bool(false));
+        n.params.insert("absolute".into(), Value::Bool(false));
+        let out = tick(vec![n, sink(6, "collector:5")], &pad(0.0, Vec2::new(0.6, 0.8)));
+        assert!(close(at_sink(&out, "left_stick"), Signal::Vec2(Vec2::new(0.3, 0.4))), "{:?}", at_sink(&out, "left_stick"));
+        assert!(close(at_sink(&out, "left_trigger"), Signal::Float(0.0)), "untouched");
+    }
+}

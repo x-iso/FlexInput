@@ -447,7 +447,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     let editable = crate::canvas::overlay_body::resolve_overlay_module(
                         tab_snarl, &m.source_path, m.inner_node_id,
                     )
-                    .map(|n| FlexInputApp::elem_is_nav_target(&n.module_id, &m.element_id))
+                    .map(|n| FlexInputApp::elem_is_nav_target(
+                        crate::canvas::viewer::curve_ui_module_id(n), &m.element_id))
                     .unwrap_or(false);
                     editable.then(|| (i, item_rect(i)))
                 })

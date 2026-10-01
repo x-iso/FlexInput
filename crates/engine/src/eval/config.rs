@@ -37,6 +37,13 @@ pub const JSM_ID: &str = "module.jsm";
 pub const NET_SEND_ID: &str = "module.network_send";
 pub const NET_RECV_ID: &str = "module.network_recv";
 
+/// Stable module ids for the curves that reshape one signal of an AutoMap bus.
+pub const AUTOMAP_CURVE_ID: &str = "module.automap_response_curve";
+pub const AUTOMAP_TWOWAY_CURVE_ID: &str = "module.automap_twoway_response_curve";
+
+/// The pin an AutoMap curve node reshapes, as picked in its header.
+pub const AUTOMAP_CURVE_PIN_PARAM: &str = "am_curve_pin";
+
 /// Build a [`NetNodeConfig`](flexinput_net::NetNodeConfig) from a network node's
 /// params, or `None` if the module id isn't a network node. Shared param keys:
 /// `net_transport` ("udp"|"psk"|"quic"), `net_psk`. Send adds `net_host`,
