@@ -394,6 +394,14 @@ pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
 /// nothing needs the ports, and a test that doesn't care shouldn't have to say
 /// so.
 pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
+    compile_onto(text, tabs, ports, None)
+}
+
+/// Compile `text`, its settings starting from `base`'s rather than JSM's
+/// defaults when there is one — a tab pulled in mid-config changes what it
+/// names and leaves the rest as the config had it, the way JSM running that
+/// file's lines would.
+fn compile_onto(text: &str, tabs: Tabs, ports: Ports, base: Option<&Compiled>) -> Compiled {
     let mut out = Compiled {
         lines: Vec::new(),
         bindings: Vec::new(),
@@ -411,6 +419,17 @@ pub fn compile_full(text: &str, tabs: Tabs, ports: Ports) -> Compiled {
         mentioned: HashSet::new(),
         analog_fed: HashSet::new(),
     };
+    if let Some(b) = base {
+        out.timings = b.timings;
+        out.settings = b.settings;
+        out.aim = b.aim;
+        out.pad = b.pad;
+        out.motion = b.motion;
+        out.touch = b.touch;
+        out.fb = b.fb;
+        out.cc = b.cc;
+        out.midi = b.midi;
+    }
     for (n, line) in text.lines().enumerate() {
         let mut info = compile_line(line, n, &mut out, tabs, ports);
         // A line stopped only by an `@Name` that isn't a macro yet is waiting,
@@ -773,7 +792,13 @@ fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs, ports: Ports) -> LineI
     // that it stops here beats a stack overflow. The patch's ports DO come along:
     // they can't loop, and without them every `@Name` in the included tab would
     // fail to resolve here while working in the tab itself.
-    let inner = compile_full(text, &[], ports);
+    //
+    // Its settings start from this config's so far, not from JSM's defaults:
+    // JSM loading the file runs its lines over what is already set, so a setting
+    // the tab doesn't name keeps its value. Compiled from scratch, a second
+    // include (`FF14.txt` then `Gyro.txt`) put everything the second one doesn't
+    // mention back to its default — ZR_MODE back to NO_FULL among them.
+    let inner = compile_onto(text, &[], ports, Some(out));
     out.timings = inner.timings;
     out.settings = inner.settings;
     out.aim = inner.aim;

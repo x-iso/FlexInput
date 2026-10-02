@@ -4566,6 +4566,31 @@ fn an_included_tab_replaces_a_binding_made_above_it() {
     );
 }
 
+/// A tab pulled in changes only the settings it names: a second include doesn't
+/// put back the defaults of everything the first one set. A user's layer read
+/// `FF14.txt` then `Gyro.txt`, and lost FF14's trigger modes to the second.
+#[test]
+fn a_second_include_keeps_the_settings_it_does_not_name() {
+    use super::analog::TriggerMode;
+    let tabs = vec![
+        ("FF14".to_string(), "ZR_MODE = NO_SKIP\nZL_MODE = NO_SKIP\nZRF = A".to_string()),
+        ("Gyro".to_string(), "GYRO_SENS = 2".to_string()),
+    ];
+    let c = compile_with("FF14.txt\nGyro.txt\nW = RMOUSE", &tabs);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert_eq!(c.settings.zr, TriggerMode::NoSkip, "FF14's ZR_MODE survives Gyro.txt");
+    assert_eq!(c.settings.zl, TriggerMode::NoSkip);
+    assert_eq!(c.aim.min_sens.0, 2.0, "and Gyro's own setting lands");
+    let notes: String = c.lines.iter().flat_map(|l| l.notes.clone()).collect();
+    assert!(!notes.contains("never fires"), "ZRF isn't called dead: {notes}");
+
+    // What the host set above an include stays too, unless the tab names it.
+    let c = compile_with("ZR_MODE = MAY_SKIP\nGyro.txt", &tabs);
+    assert_eq!(c.settings.zr, TriggerMode::MaySkip);
+    let c = compile_with("ZR_MODE = MAY_SKIP\nFF14.txt", &tabs);
+    assert_eq!(c.settings.zr, TriggerMode::NoSkip, "a setting the tab names is its");
+}
+
 /// Editing a tab the editor does NOT have open still recompiles — a layer a binding
 /// can reach is as live as the one on screen.
 #[test]

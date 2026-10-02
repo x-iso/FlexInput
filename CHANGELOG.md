@@ -7,12 +7,13 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
-- **The JSM Tune panel's graph marks the gyro speed the config actually aims
-  with.** The dot on the sensitivity curve read the pad's raw rotation, so
-  anything reshaping the gyro on its way in — an AutoMap Response Curve, say —
-  changed the aim but never moved the dot. It now shows the speed the curve is
-  read at, after the config's own gyro space and smoothing too, and rests at
-  zero while the gyro is switched off.
+- **A JSM tab pulled into another changes only the settings it names.** A
+  config naming two tabs on lines of their own (`FF14.txt`, then `Gyro.txt`)
+  lost every setting the first one made that the second doesn't mention — each
+  went back to JSM's default, so `ZR_MODE = NO_SKIP` from the first tab read as
+  `NO_FULL` and its full-pull bindings never fired. Settings the config itself
+  made above an include were lost the same way. A tab now applies its lines
+  over what is already set, as JSM loading that file does.
 
 ## [0.15.2] - 2026-10-02
 
@@ -101,6 +102,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **A JSM tab pulled in by naming it (`base.txt` on a line of its own) resolves
   its `@Name`s.** It was compiled without the patch's ports, so every `@` binding
   in it failed there while working in the tab itself.
+  
+- **The JSM Tune panel's graph marks the gyro speed the config actually aims
+  with.** The dot on the sensitivity curve read the pad's raw rotation, so
+  anything reshaping the gyro on its way in — an AutoMap Response Curve, say —
+  changed the aim but never moved the dot. It now shows the speed the curve is
+  read at, after the config's own gyro space and smoothing too, and rests at
+  zero while the gyro is switched off.
+  
 
 ## [0.15.0] - 2026-10-01
 
