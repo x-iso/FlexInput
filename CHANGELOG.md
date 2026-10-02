@@ -7,6 +7,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **JSM holds, taps and trigger timing keep working in a long session.** A JSM
+  config's clock, counting from its last edit, lost its precision as it grew: at
+  the 8 kHz processing rate it ran double speed after about half an hour and
+  stopped after about an hour (at the default 2 kHz, after about two and four
+  and a half hours). From then on no hold ever fired, a tap's key stayed down,
+  and the trigger skip modes and flick stick lost their timing too. The clock
+  now keeps time for as long as FlexInput runs.
+
 - **A JSM tab pulled into another changes only the settings it names.** A
   config naming two tabs on lines of their own (`FF14.txt`, then `Gyro.txt`)
   lost every setting the first one made that the second doesn't mention — each

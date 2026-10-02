@@ -22,19 +22,29 @@ use std::collections::{HashMap, HashSet};
 use super::names::{Btn, GyroAction, Out};
 use super::parse::{ActionMod, Binding, Compiled, EventMod, Timings, Trigger};
 
+/// A moment on the runtime's clock, in seconds since the config was compiled.
+///
+/// `f64`, never `f32`: the clock adds one tick at a time, and an `f32` this
+/// far from zero can't hold a step that small. At 8 kHz it ran double speed
+/// after about half an hour and stopped dead after about an hour (2.3 h and
+/// 4.5 h at the default 2 kHz) — every hold waiting for a time that never
+/// came, every tap's key down for good. `f64` keeps a tick for longer than a
+/// session lasts.
+type Secs = f64;
+
 /// How long a tap's key stays down (JSM's `MAGIC_TAP_DURATION`), and how long an
 /// instant press stays down (`MAGIC_INSTANT_DURATION`). Gyro actions and
 /// calibration hold far longer (`MAGIC_EXTENDED_TAP_DURATION`).
-const TAP_HOLD: f32 = 0.040;
-const INSTANT_HOLD: f32 = 0.040;
-const EXTENDED_TAP_HOLD: f32 = 0.500;
+const TAP_HOLD: Secs = 0.040;
+const INSTANT_HOLD: Secs = 0.040;
+const EXTENDED_TAP_HOLD: Secs = 0.500;
 
 /// What one press of a button is doing.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {
     Idle,
     /// Down, waiting to see whether a simultaneous partner joins in time.
-    WaitSim { until: f32 },
+    WaitSim { until: Secs },
     /// Down and driving press `usize`.
     Active(usize),
     /// Down, but another button's pair press (simultaneous or diagonal) owns it.
@@ -50,10 +60,10 @@ struct BtnRun {
     down: bool,
     role: Role,
     /// When this button last went down — the double-press window measures from it.
-    last_down: f32,
+    last_down: Secs,
     /// A tap held back to see whether a second press turns it into a double
     /// press: (binding, when to give up waiting).
-    pending_tap: Option<(usize, f32)>,
+    pending_tap: Option<(usize, Secs)>,
 }
 
 /// An active press: a binding, and how far through it we are.
@@ -61,9 +71,9 @@ struct Press {
     binding: usize,
     owner: Btn,
     partner: Option<Btn>,
-    start: f32,
+    start: Secs,
     hold_fired: bool,
-    turbo_next: f32,
+    turbo_next: Secs,
     /// Pins this press is holding down, so they release when it ends.
     held: Vec<String>,
     /// Released already: its keys are up and it fires nothing more.
@@ -74,7 +84,7 @@ struct Press {
 /// pulse, a scroll notch.
 struct Timed {
     pin: String,
-    until: f32,
+    until: Secs,
 }
 
 /// Everything the config asks for right now.
@@ -96,7 +106,7 @@ pub struct Outputs {
 
 /// The run-time state of one JSM Config node.
 pub struct Runtime {
-    t: f32,
+    t: Secs,
     buttons: HashMap<Btn, BtnRun>,
     presses: Vec<Press>,
     /// Chord buttons currently held, oldest first — the latest chord wins.
@@ -145,6 +155,13 @@ impl Runtime {
         out
     }
 
+    /// Start the clock this far in, for a test of a long session without
+    /// ticking through it.
+    #[cfg(test)]
+    pub(crate) fn wind_clock(&mut self, secs: Secs) {
+        self.t = secs;
+    }
+
     /// Advance one tick. `down` answers "is this JSM button pressed right now?".
     ///
     /// `chord_only` names buttons that may stack a chord but must not run a
@@ -159,7 +176,7 @@ impl Runtime {
         down: &dyn Fn(Btn) -> bool,
         chord_only: &dyn Fn(Btn) -> bool,
     ) -> &Outputs {
-        self.t += dt;
+        self.t += dt as Secs;
         self.out = Outputs::default();
         self.timed.retain(|t| t.until > self.t);
 
@@ -243,7 +260,7 @@ impl Runtime {
 
         // A second press inside the window turns into the double-press binding.
         let last_down = self.buttons[&b].last_down;
-        let repeat = self.buttons[&b].last_down > 0.0 && self.t - last_down <= timings.double;
+        let repeat = self.buttons[&b].last_down > 0.0 && self.t - last_down <= Secs::from(timings.double);
         self.buttons.entry(b).or_default().last_down = self.t;
         if repeat {
             if let Some(i) = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)) {
@@ -262,7 +279,7 @@ impl Runtime {
                 self.start(i, b, Some(partner), cfg, timings);
                 return;
             }
-            self.buttons.entry(b).or_default().role = Role::WaitSim { until: self.t + timings.sim };
+            self.buttons.entry(b).or_default().role = Role::WaitSim { until: self.t + Secs::from(timings.sim) };
             return;
         }
         self.resolve(b, cfg, timings);
@@ -304,7 +321,7 @@ impl Runtime {
             partner,
             start: self.t,
             hold_fired: false,
-            turbo_next: self.t + timings.hold,
+            turbo_next: self.t + Secs::from(timings.hold),
             held: Vec::new(),
             ended: false,
         });
@@ -364,13 +381,13 @@ impl Runtime {
         if press.ended { return; }
         let (binding, held_long, start) = (press.binding, press.hold_fired, press.start);
         self.fire(binding, EventMod::Release, cfg, None);
-        if !held_long && self.t - start < timings.hold {
+        if !held_long && self.t - start < Secs::from(timings.hold) {
             // A tap waits out the double-press window when the button has a
             // double-press binding, so the two don't both fire.
             let has_double = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)).is_some();
             if has_double {
                 self.buttons.entry(b).or_default().pending_tap =
-                    Some((binding, self.t + timings.double));
+                    Some((binding, self.t + Secs::from(timings.double)));
             } else {
                 self.fire(binding, EventMod::Tap, cfg, None);
             }
@@ -402,14 +419,14 @@ impl Runtime {
                 let p = &self.presses[i];
                 (p.binding, p.start, p.hold_fired, p.turbo_next)
             };
-            if !hold_fired && self.t - start >= timings.hold {
+            if !hold_fired && self.t - start >= Secs::from(timings.hold) {
                 self.presses[i].hold_fired = true;
                 self.fire(binding, EventMod::Hold, cfg, Some(i));
             }
             // Turbo pulses only once the button has been held: `turbo_next`
             // starts one hold time in, then moves on by a turbo period each time.
             if self.t >= turbo_next {
-                self.presses[i].turbo_next = self.t + timings.turbo;
+                self.presses[i].turbo_next = self.t + Secs::from(timings.turbo);
                 self.fire(binding, EventMod::Turbo, cfg, None);
             }
         }

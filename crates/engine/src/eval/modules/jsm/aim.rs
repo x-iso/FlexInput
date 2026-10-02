@@ -219,7 +219,7 @@ struct Flick {
     /// is also true for a stick that has never flicked at all (it starts at
     /// zero) — so the fact of a flick being underway is tracked outright.
     paying_out: bool,
-    since: f32,
+    since: f64,
     samples: Box<[f32; FLICK_SAMPLES]>,
     front: usize,
 }
@@ -247,7 +247,9 @@ struct StickAim {
 
 /// The aiming state of one JSM Config node.
 pub struct Aim {
-    t: f32,
+    /// Seconds since the config was compiled. `f64`: an `f32` this far from
+    /// zero stops taking a tick's step after an hour or so (see `bind.rs`).
+    t: f64,
     gyro_samples: Box<[(f32, f32); GYRO_SAMPLES]>,
     gyro_front: usize,
     trackball_x: Box<[f32; TRACKBALL_SAMPLES]>,
@@ -308,7 +310,7 @@ impl Aim {
         actions: &HashSet<GyroAction>,
         down: &dyn Fn(Btn) -> bool,
     ) -> Aimed {
-        self.t += dt;
+        self.t += dt as f64;
         // JSM's frame, from the note at the top of this file.
         let (in_x, in_y, in_z) = (gyro.pitch, -gyro.yaw, gyro.roll);
 
@@ -726,7 +728,7 @@ impl Aim {
             } else {
                 0.0
             };
-            let paying_out = self.t - f.since <= flick_time && flick_time > 0.0;
+            let paying_out = ((self.t - f.since) as f32) <= flick_time && flick_time > 0.0;
             f.paying_out = paying_out;
             if paying_out {
                 cam -= if f.delta >= 0.0 { speed } else { -speed };
@@ -735,7 +737,7 @@ impl Aim {
         }
 
         // The flick itself, eased over `FLICK_TIME` and paid out a tick at a time.
-        let mut percent = (self.t - f.since) / s.flick_time.max(1e-6);
+        let mut percent = ((self.t - f.since) as f32) / s.flick_time.max(1e-6);
         if f.delta.abs() > 0.0 {
             percent /= (f.delta.abs() / PI).powf(s.flick_time_exponent);
         }

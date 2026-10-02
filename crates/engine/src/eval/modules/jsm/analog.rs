@@ -278,7 +278,7 @@ enum Dst {
 struct TriggerRun {
     state: Dst,
     /// When the current soft press started (the skip delay measures from it).
-    since: f32,
+    since: f64,
     /// The last few positions, for the hair trigger's rolling averages.
     hist: [f32; 5],
     hair_down: bool,
@@ -305,7 +305,7 @@ struct StickRun {
     /// Degrees of turn not yet spent on a notch.
     leftovers: f32,
     /// The direction a notch is holding, and until when.
-    notch: Option<(Btn, f32)>,
+    notch: Option<(Btn, f64)>,
 }
 
 /// One stick as the aiming side needs to see it.
@@ -327,7 +327,9 @@ pub struct StickOut {
 /// The analog state of one JSM Config node.
 #[derive(Default)]
 pub struct Analog {
-    t: f32,
+    /// Seconds since the config was compiled. `f64`: an `f32` this far from
+    /// zero stops taking a tick's step after an hour or so (see `bind.rs`).
+    t: f64,
     triggers: [TriggerRun; 3],
     sticks: [StickRun; STICKS],
     down: HashSet<Btn>,
@@ -340,7 +342,7 @@ pub struct Analog {
 impl Analog {
     /// Advance one tick and work out which analog-derived buttons are down.
     pub fn tick(&mut self, s: &Settings, dt: f32, pad: &Pad) {
-        self.t += dt;
+        self.t += dt as f64;
         self.down.clear();
         self.pad_triggers = [None; 2];
         for side in 0..2 {
@@ -453,7 +455,7 @@ impl Analog {
                 } else if full {
                     run.state = Dst::QuickFullPress;
                     full_on = true;
-                } else if self.t - run.since >= s.skip_delay {
+                } else if ((self.t - run.since) as f32) >= s.skip_delay {
                     run.state = Dst::SoftPress;
                     run.since = self.t;
                     soft_on = true;
@@ -467,7 +469,7 @@ impl Analog {
                     run.state = Dst::QuickFullPress;
                     full_on = true;
                 } else {
-                    if self.t - run.since >= s.skip_delay {
+                    if ((self.t - run.since) as f32) >= s.skip_delay {
                         run.state = Dst::SoftPress;
                     }
                     soft_on = true;
@@ -740,7 +742,7 @@ impl Analog {
             let dir = if run.leftovers > 0.0 { Dir::Left } else { Dir::Right };
             run.leftovers -= sens * run.leftovers.signum();
             let btn = btn_for(side, dir);
-            run.notch = Some((btn, t + SCROLL_TAP));
+            run.notch = Some((btn, t + f64::from(SCROLL_TAP)));
             self.down.insert(btn);
         }
     }

@@ -795,6 +795,43 @@ fn tap_fires_on_release_and_hold_fires_while_held() {
     assert!(!pins.contains("key_r"), "a held press never taps");
 }
 
+// Holds and taps keep their timing however long the config has run. The
+// runtime's clock was an f32 adding one tick at a time: at the 8 kHz the
+// settings allow it ran double speed after ~34 minutes and stopped after ~68,
+// and from then on no hold ever came due and a tap's key never let go. A
+// user's `- = R_ 3'` stopped holding half an hour into a game.
+#[test]
+fn holds_and_taps_keep_time_in_a_long_session() {
+    const DT_8K: f32 = 1.0 / 8000.0;
+    for minutes in [0.0, 35.0, 70.0, 330.0] {
+        let cfg = compile("- = R_ 3'");
+        let mut rt = Runtime::default();
+        rt.wind_clock(minutes * 60.0);
+        let mut run = |held: bool, secs: f32| {
+            let timings = resolve(&cfg, rt.chords()).timings;
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..(secs / DT_8K) as usize {
+                let pins = rt.tick(&cfg, &timings, DT_8K, &|b| held && b == Btn::Minus, &|_| false).pins.clone();
+                seen.extend(pins);
+            }
+            seen
+        };
+        // Held past the 150 ms hold time: R goes down, and only then.
+        let early = run(true, 0.120);
+        assert!(!early.contains("key_r"), "{minutes} min: not before the hold time");
+        let held = run(true, 0.100);
+        assert!(held.contains("key_r"), "{minutes} min: the hold fires: {held:?}");
+        assert!(!run(false, 0.100).contains("key_r"), "{minutes} min: and lets go");
+        // A tap: 3 pressed on release, and let go again shortly after.
+        run(true, 0.050);
+        let tapped = run(false, 0.020);
+        assert!(tapped.contains("key_3"), "{minutes} min: the tap fires: {tapped:?}");
+        run(false, 0.100);
+        let after = run(false, 0.001);
+        assert!(!after.contains("key_3"), "{minutes} min: a tap's key lets go: {after:?}");
+    }
+}
+
 // Turbo only starts once the button has been held, then pulses.
 #[test]
 fn turbo_pulses_after_the_hold_time() {
