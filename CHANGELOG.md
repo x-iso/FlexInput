@@ -15,6 +15,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   made above an include were lost the same way. A tab now applies its lines
   over what is already set, as JSM loading that file does.
 
+- **A JSM config's keyboard and mouse bindings keep working after you switch
+  to the game.** Its keys and mouse pause while you type in its editor, so a
+  binding under test doesn't type into it — but an editor clicked into before
+  switching windows still counted as being typed in, and held every keyboard
+  and mouse binding released for as long as FlexInput was in the background.
+  The pause now needs FlexInput's window to have the focus too.
+
+- **Modules in series on an AutoMap bus still know which pad they come from.**
+  Behind two modules that republish the bus — two AutoMap curves, say — a node
+  took the first one for its pad. A JSM node's Tune graph lost its gyro dot
+  there, and anything else asking about the pad itself (the buttons it has,
+  where rumble goes) asked a device that doesn't exist. Remappers, Touch Zones
+  and Virtual Menus in a chain had the same fault.
+
 ## [0.15.2] - 2026-10-02
 
 ### Added

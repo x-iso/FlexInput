@@ -285,7 +285,7 @@ pub fn find_automap_device_id_for_viewer(
                     let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                     in_pin.remotes.first().copied()
                 })
-                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
             let map_uid = match parents {
                 None => src.node.0,
                 Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
@@ -326,7 +326,7 @@ pub fn find_automap_device_id_for_viewer(
                     let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                     in_pin.remotes.first().copied()
                 })
-                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
             let collector_uid = match parents {
                 None => src.node.0,
                 Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
@@ -370,7 +370,7 @@ pub fn find_automap_device_id_for_viewer(
                     let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                     in_pin.remotes.first().copied()
                 })
-                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
             let remap_uid = match parents {
                 None => src.node.0,
                 Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
@@ -913,7 +913,7 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, _)| id));
+            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         let map_uid = match parents {
             None => src.node.0,
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
@@ -964,7 +964,7 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, _)| id));
+            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         // The collector ID must match the key the eval thread uses when injecting
         // signals: root-level collectors use NodeId.0, subpatch-nested collectors
         // use namespaced_uid folded through the parent chain.
@@ -1019,7 +1019,7 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, _)| id));
+            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         let remap_uid = match parents {
             None => src.node.0,
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
@@ -2007,6 +2007,52 @@ mod subpatch_bus_tests {
             let snap = graph.nodes.iter().find(|n| n.module_id == module).expect("curve in graph");
             assert_eq!(snap.params.get("_automap_device_id").and_then(|v| v.as_str()), Some("gilrs:pad:0"), "{module}");
         }
+    }
+
+    /// Two curves in series, then a JSM node: each still knows the PAD it comes
+    /// from, not the curve before it. The second curve used to hand on the
+    /// first's `collector:` key as the device, so the JSM node read pad facts
+    /// (its Tune graph's gyro dot, the buttons it has) off a device that
+    /// doesn't exist.
+    #[test]
+    fn a_chain_of_republishers_still_knows_its_pad() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let dev = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let am = |m: &str| node(m, &[SignalType::AutoMap], &[SignalType::AutoMap]);
+        let c1 = s.insert_node(p, am("module.automap_response_curve"));
+        let c2 = s.insert_node(p, am("module.automap_response_curve"));
+        let remap = s.insert_node(p, am("module.remapper"));
+        let jsm = s.insert_node(p, am("module.jsm"));
+        wire(&mut s, dev, 0, c1, 0);
+        wire(&mut s, c1, 0, c2, 0);
+        wire(&mut s, c2, 0, remap, 0);
+        wire(&mut s, remap, 0, jsm, 0);
+
+        for (at, key) in [(c2, format!("collector:{}", c2.0)), (remap, format!("remap:{}", remap.0))] {
+            let (id, _, upstream) = find_automap_device_rec(&s, OutPinId { node: at, output: 0 }, None)
+                .expect("resolves");
+            assert_eq!(id, key);
+            assert_eq!(upstream.as_deref(), Some("gilrs:pad:0"), "{key}: the pad, not the hop before");
+            assert_eq!(
+                find_automap_device_id_for_viewer(&s, OutPinId { node: at, output: 0 }, None).as_deref(),
+                Some("gilrs:pad:0"),
+                "{key}: the viewer agrees"
+            );
+        }
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.module_id == "module.jsm").expect("jsm in graph");
+        assert_eq!(snap.params.get("_automap_device_id").and_then(|v| v.as_str()), Some("gilrs:pad:0"));
+        assert_eq!(
+            snap.params.get("_automap_collector_id").and_then(|v| v.as_str()),
+            Some(format!("remap:{}", remap.0).as_str()),
+            "and still reads the bus from the node right before it"
+        );
     }
 
     /// A gyro / accel pick draws its three axes as three labelled channels on the

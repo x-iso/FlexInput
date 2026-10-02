@@ -1049,7 +1049,13 @@ fn jsm_rows(
     // places at once — its canvas body, a pin, the overlay, a sub-patch window —
     // and the copies without the keyboard used to clear the flag the focused one
     // had just set. The app clears it once nothing has said so for a moment.
-    if resp.has_focus() {
+    //
+    // And only while its window has the OS's focus. egui keeps a widget focused
+    // when the window loses it, so an editor clicked into before switching to the
+    // game held the pause on through the whole session, every keyboard and mouse
+    // binding released — and nothing can type into an editor whose window
+    // isn't focused anyway.
+    if resp.has_focus() && ui.input(|i| i.focused) {
         note_jsm_editor_focused(ui.ctx());
     }
     // Done typing: the `@Name`s it wrote can have their ports now.

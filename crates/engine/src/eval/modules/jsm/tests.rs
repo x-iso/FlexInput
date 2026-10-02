@@ -2129,6 +2129,78 @@ fn an_at_binding_drives_a_macro_port_through_the_macro_namespace() {
     );
 }
 
+/// A tap/hold binding behind AutoMap curves — one, or two in series — taps and
+/// holds as it does straight off the pad.
+#[test]
+fn a_hold_works_behind_automap_curves() {
+    use crate::eval::{eval_automap_curve_node, AUTOMAP_CURVE_ID, AUTOMAP_CURVE_PIN_PARAM};
+    let _guard = alone();
+    let curve = |uid: usize, pin: &str, dev: &str, from: Option<&str>| {
+        let mut n = jsm_snap(uid, "", false);
+        n.module_id = AUTOMAP_CURVE_ID.to_string();
+        n.params.clear();
+        n.params.insert("_automap_device_id".into(), serde_json::json!(dev));
+        if let Some(c) = from {
+            n.params.insert("_automap_collector_id".into(), serde_json::json!(c));
+        }
+        n.params.insert(AUTOMAP_CURVE_PIN_PARAM.into(), serde_json::json!(pin));
+        n.params.insert("points".into(), serde_json::json!([[0.0, 0.0], [1.0, 0.5]]));
+        n.params.insert("biases".into(), serde_json::json!([0.0]));
+        n
+    };
+    // (curves, the JSM node's device, its collector), as the graph wires them.
+    let chains: Vec<(Vec<NodeSnap>, &str, &str)> = vec![
+        (vec![curve(31, "left_stick", PAD, None)], PAD, "collector:31"),
+        (
+            vec![
+                curve(31, "left_stick", PAD, None),
+                curve(32, "gyro", PAD, Some("collector:31")),
+            ],
+            // What the graph builder gave it until now: the FIRST curve's key
+            // as its "device", one hop short of the pad.
+            "collector:31",
+            "collector:32",
+        ),
+    ];
+    for (curves, dev_id, from) in chains {
+        let mut jsm = jsm_snap(4243, "W = R E\nS = SPACE", false);
+        jsm.params.insert("_automap_device_id".into(), serde_json::json!(dev_id));
+        jsm.params.insert("_automap_collector_id".into(), serde_json::json!(from));
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let mut run = |held: &[&str], ticks: usize| {
+            let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+            for p in ["btn_west", "btn_south"] {
+                dev.insert((PAD.to_string(), p.to_string()), Signal::Bool(held.contains(&p)));
+            }
+            dev.insert((PAD.to_string(), "left_stick".to_string()), Signal::Vec2(glam::Vec2::ZERO));
+            dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(0.0));
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..ticks {
+                let mut col: HashMap<(String, String), Signal> = HashMap::new();
+                for c in &curves {
+                    eval_automap_curve_node(c, c.node_uid, &dev, &mut col, &mut state, 0.010);
+                }
+                super::eval::jsm_publish(&jsm, 4243, &dev, &mut col, &mut state, 0.010);
+                for ((d, p), s) in &col {
+                    if d == "collector:4243" && s.as_bool() {
+                        seen.insert(p.clone());
+                    }
+                }
+            }
+            seen
+        };
+        let n = curves.len();
+        assert!(run(&["btn_south"], 3).contains("key_space"), "{n} curve(s): a plain press");
+        run(&[], 5);
+        let held = run(&["btn_west"], 25);
+        assert!(held.contains("key_e"), "{n} curve(s): the hold fires: {held:?}");
+        assert!(!held.contains("key_r"), "{n} curve(s): a held press never taps");
+        run(&[], 5);
+        run(&["btn_west"], 3);
+        assert!(run(&[], 5).contains("key_r"), "{n} curve(s): a tap fires on release");
+    }
+}
+
 /// The Tune panel's graph marks the speed the node's own curve reads: the gyro
 /// as the node receives it — reshaped upstream, here halved by a curve on the
 /// bus — not the pad's raw rate. And nothing while the gyro is off.
