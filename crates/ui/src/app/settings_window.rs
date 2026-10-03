@@ -1594,9 +1594,8 @@ impl FlexInputApp {
                 // ── Renderer ─────────────────────────────────────────────
                 // Backend is fixed at startup (the wgpu instance/surface can't
                 // be swapped live), so changes here take effect on restart.
-                // Auto steers AMD GPUs on Windows to OpenGL — their Vulkan
-                // swapchain stalls for seconds on window resize/restore
-                // (see `auto_backends` in app/src/main.rs).
+                // Auto leads with DirectX 12 on Windows (see `auto_cascade` in
+                // app/src/main.rs).
                 {
                     ui.add_space(10.0);
                     ui.separator();
@@ -1625,13 +1624,13 @@ impl FlexInputApp {
                         dirty = true;
                     }
                     ui.label(egui::RichText::new(
-                        "Takes effect after restarting FlexInput. Auto leads with \
-                         DirectX 12 on AMD (the only backend there that both shows \
-                         see-through mode and survives sleep/wake) and Vulkan on \
-                         other GPUs, then falls back automatically if a backend fails \
-                         to start. On AMD, see-through mode needs DirectX 12 — the AMD \
-                         Vulkan driver doesn't support transparent windows and its \
-                         OpenGL path crashes on wake from sleep."
+                        "Takes effect after restarting FlexInput. On Windows, Auto \
+                         uses DirectX 12, falling back to Vulkan and then OpenGL only \
+                         if it fails to start — Vulkan drivers on Windows have proved \
+                         unreliable across versions and devices. On AMD, see-through \
+                         mode needs DirectX 12 — the AMD Vulkan driver doesn't support \
+                         transparent windows and its OpenGL path crashes on wake from \
+                         sleep."
                     ).small().weak());
                 }
 

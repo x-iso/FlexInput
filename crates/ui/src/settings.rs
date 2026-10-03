@@ -324,11 +324,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub hidhide_sticky: bool,
     /// Render backend selection, applied at startup in `app/src/main.rs`
-    /// (changing it requires an app restart). Auto = Vulkan except when the
-    /// machine's GPU is AMD on Windows, where the Vulkan swapchain stalls for
-    /// seconds on resize/restore-from-minimize (groundtruthed on Win11 26H1 +
-    /// Radeon, 2026-07) — those get OpenGL. The `WGPU_BACKEND` env var
-    /// overrides this setting (dev escape hatch).
+    /// (changing it requires an app restart). Auto = DirectX 12 on Windows
+    /// (falling back to Vulkan, then OpenGL, if it fails to start) — Vulkan's
+    /// Windows drivers proved unreliable across versions and devices; elsewhere
+    /// wgpu's primary backends. The `WGPU_BACKEND` env var overrides this
+    /// setting (dev escape hatch).
     #[serde(default)]
     pub renderer: RendererChoice,
     /// What to do with the camera when a patch is loaded into a tab.
@@ -570,8 +570,8 @@ pub fn braid_rate_label(hz: u32) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RendererChoice {
-    /// Vulkan, except AMD GPUs on Windows get OpenGL (slow Vulkan swapchain
-    /// reconfigure: multi-second resize/restore stalls).
+    /// DirectX 12 on Windows, then Vulkan, then OpenGL if a backend fails to
+    /// start (see `auto_cascade` in app/src/main.rs).
     #[default]
     Auto,
     /// Force Vulkan.

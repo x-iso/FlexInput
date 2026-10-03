@@ -187,40 +187,19 @@ fn run_as_helper_if_requested() -> bool {
 /// out of `run_native`), the process advances to the next element and relaunches
 /// (see `main` and `flexinput_ui::{read,write,clear}_render_attempt`).
 ///
-/// AMD-on-Windows leads with **DX12**: it's the only AMD backend that both
-/// composites the transparent window AND survives sleep/wake. Their Vulkan
-/// win32 surface is opaque-only (no see-through), and their GL/WGL context is
-/// invalidated on wake — wgpu-hal then hard-`unwrap()`s `wglMakeCurrent` and the
-/// process aborts (the crash this cascade exists to escape). Order for AMD:
-/// DX12 (transparency + wake-safe) → Vulkan (stable, opaque) → GL (transparency
-/// but wake-crash) as the last resort. NVIDIA/Intel keep Vulkan first (healthy
-/// there, transparency included) with DX12/GL as fallbacks.
+/// Windows leads with **DX12** on every GPU. Vulkan's Windows drivers have
+/// proved unreliable across driver versions and devices, and on AMD its win32
+/// surface is opaque-only (no see-through). DX12 composites the transparent
+/// window through DirectComposition and survives sleep/wake. GL comes last:
+/// AMD's WGL context is invalidated on wake, wgpu-hal then hard-`unwrap()`s
+/// `wglMakeCurrent` and the process aborts. Order: DX12 → Vulkan → GL.
 ///
-/// The Vulkan probe below only enumerates adapters (vendor id) — it never
-/// creates a surface, so it's cheap and safe even when Vulkan is the flaky path.
+/// ❗ No vendor probe: enumerating Vulkan adapters still loads the Vulkan ICDs,
+/// the very drivers this order exists to stay away from.
 /// `WGPU_BACKEND` and a non-Auto Settings choice both bypass this entirely.
 #[cfg(windows)]
 fn auto_cascade() -> Vec<wgpu::Backends> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..Default::default()
-    });
-    let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
-    // Emulate the HighPerformance default: a discrete GPU wins over integrated.
-    let pick = adapters
-        .iter()
-        .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
-        .or_else(|| adapters.first());
-    const VENDOR_AMD: u32 = 0x1002;
-    let is_amd = pick.map(|a| a.get_info().vendor == VENDOR_AMD).unwrap_or(false);
-    if is_amd {
-        if let Some(a) = pick {
-            eprintln!("[gpu] auto: AMD adapter \"{}\" — cascade DX12 → Vulkan → GL", a.get_info().name);
-        }
-        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
-    } else {
-        vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12, wgpu::Backends::GL]
-    }
+    vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
 }
 
 #[cfg(not(windows))]
