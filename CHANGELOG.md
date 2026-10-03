@@ -3,22 +3,6 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-### Fixed
-
-- **A Switch Pro Controller on the Bluetooth dongle connects reliably when you
-  turn it on.** Some connections dropped straight after the security handshake
-  and the controller then stopped trying until power-cycled, sometimes several
-  times in a row. The dongle no longer starts its own handshake on top of the
-  controller's when the controller calls in; it waits and only steps in if the
-  controller doesn't.
-
-- **The Bluetooth dongle no longer garbles or loses messages from the radio.**
-  A long message that arrived over two reads was split in half: its start was
-  lost and the rest read as nonsense, sometimes taking the next real message
-  with it. This affected Joy-Con 2 and Switch Pro connections on the dongle.
-
 ## [0.15.4] - 2026-10-03
 
 ### Added
@@ -57,13 +41,50 @@ All notable changes to FlexInput are documented here. This project adheres to
   panel shows the same live circle. These are FlexInput's own and the editor
   says so on the line — a config using them won't load in JoyShockMapper.
 
+- **Gamepad shortcuts keep their buttons to themselves.** The buttons of a
+  shortcut you're pressing no longer reach the game or move FlexInput's gamepad
+  navigation; each is released back when you let go of it. Home and Capture
+  are held back whenever they belong to a shortcut, and so are the other
+  buttons of their shortcuts while you hold them, so Home+D-pad never sends
+  the D-pad to the game. A Home or Capture press no shortcut used reaches the
+  game as a tap when you let go (after the gap of a Home double-tap shortcut,
+  if you have one). New setting **Home button is FlexInput's only** (Settings,
+  and the gamepad settings panel) keeps unused Home presses from the game
+  altogether. Mic-mute can still be a shortcut on its own but isn't held back,
+  as games bind it themselves.
+
+### Changed
+
+- **Auto renderer uses DirectX 12 on Windows on every GPU**, falling back to
+  Vulkan and then OpenGL only if it fails to start. Vulkan drivers on Windows
+  proved unreliable across versions and devices; it used to be the first
+  choice on NVIDIA and Intel. A renderer picked by hand in Settings is kept.
+
 ### Fixed
+
+- **A gamepad shortcut no longer also fires a shorter one inside it.** With
+  Home long-press for the config overlay and Home+D-pad for Pin, holding
+  Home+D-pad long enough did both. Holding the longer chord now cancels the
+  shorter one for that press, and a shorter one set to fire on press waits for
+  the release instead, firing only if the longer chord never happened.
 
 - **JSM editor notes no longer have a gap in the middle.** Eight of the notes
   the editor puts on a line (on `SET_MOTION_STICK_NEUTRAL`, a rebound trigger,
   `ZL_MODE = X_LT`, `REAL_WORLD_CALIBRATION` and `IN_GAME_SENS`,
   `ROLL_CONTRIBUTION`, FlexInput's own settings and virtual-pad outputs) showed
   a long run of spaces mid-sentence.
+
+- **A Switch Pro Controller on the Bluetooth dongle connects reliably when you
+  turn it on.** Some connections dropped straight after the security handshake
+  and the controller then stopped trying until power-cycled, sometimes several
+  times in a row. The dongle no longer starts its own handshake on top of the
+  controller's when the controller calls in; it waits and only steps in if the
+  controller doesn't.
+
+- **The Bluetooth dongle no longer garbles or loses messages from the radio.**
+  A long message that arrived over two reads was split in half: its start was
+  lost and the rest read as nonsense, sometimes taking the next real message
+  with it. This affected Joy-Con 2 and Switch Pro connections on the dongle.
 
 ## [0.15.3] - 2026-10-03
 
