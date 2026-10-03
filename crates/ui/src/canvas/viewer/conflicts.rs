@@ -45,9 +45,18 @@ fn writer_sources(module_id: &str) -> Option<(&'static str, &'static [&'static s
         "module.remapper"    => Some(("Remapper",    &["mappings"])),
         "module.touch_zones" => Some(("Touch Zones", &["zone_maps"])),
         "module.menu"        => Some(("Menu",        &["zone_maps"])),
+        "module.area_mapper" => Some((AREA_MAPPER_LABEL, &["zone_maps"])),
         "module.lean"        => Some(("Lean",        &["lean_left", "lean_right"])),
         _ => None,
     }
+}
+
+const AREA_MAPPER_LABEL: &str = "Area Mapper";
+
+/// An Area Mapper ORs its own cards' outputs — W in both the up and up-right
+/// cells is the point of it — so one of its cards never overrides another.
+fn merges_own_cards(label: &str) -> bool {
+    label == AREA_MAPPER_LABEL
 }
 
 /// A pin worth flagging for collisions: a real bus/sink pin, NOT a macro-port or
@@ -132,6 +141,7 @@ pub(crate) fn card_conflict_for(
         for w in writers {
             let is_self = w.node == node && w.param_key == param_key && w.idx == idx;
             if is_self { continue; }
+            if w.node == node && merges_own_cards(w.module_label) { continue; }
             if !labels.iter().any(|l| l == w.module_label) {
                 labels.push(w.module_label.to_string());
             }
@@ -203,6 +213,21 @@ mod tests {
         ]);
         let out = vec!["mouse_left".to_string()];
         let cf = card_conflict_for(&map, NodeId(1), "mappings", 0, &out).unwrap();
+        assert_eq!(cf.pins[0].1, vec!["Remapper".to_string()]);
+    }
+
+    #[test]
+    fn an_area_mappers_own_cells_sharing_a_key_are_no_conflict() {
+        let mut map: ConflictMap = std::collections::HashMap::new();
+        map.insert("key_w".into(), vec![
+            writer(1, "zone_maps", 0, AREA_MAPPER_LABEL), // up: this card
+            writer(1, "zone_maps", 1, AREA_MAPPER_LABEL), // up-right, same node
+        ]);
+        let out = vec!["key_w".to_string()];
+        assert!(card_conflict_for(&map, NodeId(1), "zone_maps", 0, &out).is_none());
+        // Another node writing it still is.
+        map.get_mut("key_w").unwrap().push(writer(2, "mappings", 0, "Remapper"));
+        let cf = card_conflict_for(&map, NodeId(1), "zone_maps", 0, &out).expect("flagged");
         assert_eq!(cf.pins[0].1, vec!["Remapper".to_string()]);
     }
 

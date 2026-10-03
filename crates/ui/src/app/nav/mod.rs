@@ -7,6 +7,7 @@
 
 use super::*;
 
+mod area;
 mod config;
 mod curves;
 mod fields;

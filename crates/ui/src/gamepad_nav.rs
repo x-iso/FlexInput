@@ -394,6 +394,10 @@ pub struct GamepadNav {
     /// Which field element the spatial walk has focused (Border reuses
     /// tz_axis/tz_line; Zone/Seam are the new targets). See [`TzFocus`].
     pub tz_focus: TzFocus,
+    /// Where the walk last landed on the focused target (global space). An
+    /// Area Mapper ring or row border is reachable at several points along it,
+    /// so the next step starts from the one you arrived at, not its first.
+    pub tz_anchor: Option<egui::Pos2>,
     /// Virtual KB/M picker (opened from a Remapper's Special slot). When open,
     /// the modal grid captures nav input: LS/dpad move the cursor, South appends
     /// the focused pin to the output chord, North resets it, East closes.
@@ -543,6 +547,7 @@ impl Default for GamepadNav {
             tz_axis: 0,
             tz_line: 0,
             tz_focus: TzFocus::Zone(0),
+            tz_anchor: None,
             kbm_picker_open: false,
             kbm_picker_use: PickerUse::default(),
             kbm_slot: JsmSlot::default(),

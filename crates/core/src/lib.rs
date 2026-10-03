@@ -1,3 +1,4 @@
+pub mod area;
 pub mod frames;
 pub mod automap;
 pub mod macros;

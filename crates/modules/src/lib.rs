@@ -1,4 +1,5 @@
 mod util;
+pub mod area;
 pub mod controls;
 pub mod display;
 pub mod generator;
@@ -31,6 +32,7 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(input_viewer::registrations());
     modules.extend(jsm::registrations());
     modules.extend(menu::registrations());
+    modules.extend(area::registrations());
     modules.extend(macro_module::registrations());
     modules.extend(subpatch::registrations());
     modules

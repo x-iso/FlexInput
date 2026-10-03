@@ -108,7 +108,8 @@ impl FlexInputApp {
             // scroll, field editing) operate on them unchanged. (Missing the menu
             // case published the selection highlight under the wrong scope, so the
             // menu's card glow never matched — the recurring "no highlight" report.)
-            Some(("module.touch_zones", "cards")) | Some(("module.menu", "cards")) => "zone_maps",
+            Some(("module.touch_zones", "cards")) | Some(("module.menu", "cards"))
+            | Some(("module.area_mapper", "cards")) => "zone_maps",
             _ => "mappings",
         }
     }
@@ -320,7 +321,7 @@ impl FlexInputApp {
     pub(crate) fn nav_remap_nudge_window(&mut self, outer_id: egui_snarl::NodeId, idx: usize, delta: f32) {
         self.nav_remap_card_obj_mut(outer_id, idx, |m| {
             let cur = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-            let next = (cur + delta).clamp(10.0, 5000.0);
+            let next = (cur + delta).clamp(1.0, 5000.0);
             m.insert("window_ms".into(), serde_json::json!(next as f64));
             true
         });
@@ -1237,6 +1238,11 @@ impl FlexInputApp {
         if is_tz && self.nav_tz_card_shows_adaptive(outer_id, inner, idx) {
             nav_fields.push(7);
         }
+        // Field 9 (Area Mapper only): the card's trigger — In / Enter / Leave —
+        // on the "Fires" row under it.
+        if is_tz && self.nav_is_area(outer_id) {
+            nav_fields.push(9);
+        }
 
         // Left/right move within the reachable field list (wrapping).
         let move_dir = match step_dir {
@@ -1401,6 +1407,21 @@ impl FlexInputApp {
                             },
                         }, None);
                     }
+                }
+            }
+            9 => {
+                // Area Mapper trigger: South steps it on, up/down step either way.
+                let dir = if south { 1 } else { edit_press };
+                if dir != 0 {
+                    const TRIGS: [&str; 3] = ["area_in", "area_enter", "area_leave"];
+                    self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+                        let cur = m.get("in").and_then(|v| v.as_array())
+                            .and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("area_in");
+                        let at = TRIGS.iter().position(|t| *t == cur).unwrap_or(0) as i32;
+                        let next = TRIGS[(at + dir).rem_euclid(3) as usize];
+                        m.insert("in".into(), serde_json::json!([next]));
+                        true
+                    });
                 }
             }
             7 => {

@@ -5532,3 +5532,494 @@ mod automap_curve_tests {
         assert!(close(at_sink(&out, "left_trigger"), Signal::Float(0.0)), "untouched");
     }
 }
+
+mod area_mapper_tests {
+    use super::*;
+    use crate::graph::SinkTarget;
+    use flexinput_core::area::{AreaLayout, BorderRef, DigitalMode, Gradient, Phase};
+    use serde_json::json;
+
+    const PAD: &str = "sdl:dualsense:0";
+    const VIRT: &str = "virtual.xinput:0";
+    const DT: f32 = 0.001;
+
+    fn mapper(cards: Value) -> NodeSnap {
+        let mut params = HashMap::new();
+        params.insert("_automap_device_id".to_string(), json!(PAD));
+        params.insert("zone_maps".to_string(), cards);
+        // These tests were written against the 8-way ring.
+        params.insert(AREA_LAYOUT_PARAM.to_string(), AreaLayout::circle_ways(8).to_value());
+        NodeSnap {
+            node_uid: 5,
+            module_id: AREA_MAPPER_ID.to_string(),
+            params,
+            n_outputs: 1,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn with_layout(mut n: NodeSnap, l: &AreaLayout) -> NodeSnap {
+        n.params.insert(AREA_LAYOUT_PARAM.into(), l.to_value());
+        n
+    }
+
+    fn stick(v: Vec2) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
+        put("left_stick", Signal::Vec2(v));
+        put("left_stick_x", Signal::Float(v.x));
+        put("left_stick_y", Signal::Float(v.y));
+        put("btn_south", Signal::Bool(true));
+        m
+    }
+
+    fn dir(deg: f32, r: f32) -> Vec2 {
+        let a = deg.to_radians();
+        Vec2::new(a.sin() * r, a.cos() * r)
+    }
+
+    /// One tick; returns the published bus and the live mirror.
+    fn run(
+        n: &NodeSnap,
+        sigs: &HashMap<(String, String), Signal>,
+        state: &mut HashMap<usize, NodeState>,
+    ) -> (HashMap<(String, String), Signal>, Vec<Option<Signal>>) {
+        let mut c = HashMap::new();
+        let out = eval_area_mapper_node(n, 5, sigs, &mut c, state, DT);
+        (c, out)
+    }
+
+    fn bus(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+        c.get(&("collector:5".to_string(), pin.to_string())).copied()
+    }
+
+    fn on(c: &HashMap<(String, String), Signal>, pin: &str) -> bool {
+        bus(c, pin).is_some_and(|s| s.as_bool())
+    }
+
+    /// Up (cell 1) → W, up-right (cell 2) → W + D, right (cell 3) → D.
+    fn wasd() -> Value {
+        json!([
+            { "z": 1, "in": ["area_in"], "out": ["key_w"] },
+            { "z": 2, "in": ["area_in"], "out": ["key_w", "key_d"] },
+            { "z": 3, "in": ["area_in"], "out": ["key_d"] },
+        ])
+    }
+
+    #[test]
+    fn the_cell_under_the_stick_drives_its_cards_and_the_stick_is_consumed() {
+        let n = mapper(wasd());
+        let mut st = HashMap::new();
+        let (c, _) = run(&n, &stick(dir(0.0, 0.9)), &mut st);
+        assert!(on(&c, "key_w") && !on(&c, "key_d"));
+        assert_eq!(bus(&c, "left_stick"), Some(Signal::Vec2(Vec2::ZERO)), "consumed");
+        assert_eq!(bus(&c, "left_stick_up"), Some(Signal::Bool(false)), "no cardinal leaks");
+        assert_eq!(bus(&c, "btn_south"), Some(Signal::Bool(true)), "everything else passes");
+
+        let (c, _) = run(&n, &stick(dir(45.0, 0.9)), &mut st);
+        assert!(on(&c, "key_w") && on(&c, "key_d"), "the diagonal holds both");
+
+        // Back to the centre (cell 0, unmapped): released, and written off
+        // since the pad never carries the keys.
+        let (c, _) = run(&n, &stick(Vec2::ZERO), &mut st);
+        assert_eq!(bus(&c, "key_w"), Some(Signal::Bool(false)));
+    }
+
+    #[test]
+    fn pass_source_keeps_the_stick_on_the_bus() {
+        let mut n = mapper(wasd());
+        n.params.insert(AREA_PASS_SOURCE_PARAM.into(), json!(true));
+        let (c, _) = run(&n, &stick(dir(0.0, 0.9)), &mut HashMap::new());
+        assert_eq!(bus(&c, "left_stick"), Some(Signal::Vec2(dir(0.0, 0.9))));
+        assert!(on(&c, "key_w"));
+    }
+
+    #[test]
+    fn the_mirror_carries_the_point_and_the_cell_weights() {
+        let n = mapper(wasd());
+        let (_, out) = run(&n, &stick(dir(90.0, 0.9)), &mut HashMap::new());
+        assert_eq!(out[0], None, "the AutoMap port");
+        assert!(matches!(out[1], Some(Signal::Vec2(p)) if (p - dir(90.0, 0.9)).length() < 1e-5));
+        assert_eq!(out[2..], [Some(Signal::Vec2(Vec2::new(3.0, 1.0)))]);
+    }
+
+    #[test]
+    fn a_gradient_ring_drives_an_analog_output_by_deflection() {
+        let mut l = AreaLayout::circle_ways(8);
+        l.set_gradient(BorderRef::Edge(0), Some(Gradient::with_width(0.4)), false);
+        // Ring edge 0.3 ± 0.2: up at radius 0.4 is 3/4 of the way out.
+        let n = with_layout(mapper(json!([{ "z": 1, "out": ["right_stick_up"] }])), &l);
+        let (c, _) = run(&n, &stick(dir(0.0, 0.4)), &mut HashMap::new());
+        let y = bus(&c, "right_stick_y").map(|s| s.as_float()).unwrap_or(0.0);
+        assert!((y - 0.75).abs() < 1e-3, "{y}");
+        assert_eq!(bus(&c, "right_stick"), Some(Signal::Vec2(Vec2::new(0.0, y))), "Vec2 kept in step");
+    }
+
+    /// Two keys across an Alternate PWM gradient take turns: never both on,
+    /// and each on for its weight's share of the time.
+    #[test]
+    fn alternate_pwm_cells_take_turns() {
+        let mut l = AreaLayout::circle_ways(8);
+        let mut g = Gradient::with_width(0.1);
+        g.period_ms = 50.0;
+        // Cut 1 sits at 67.5°, between up-right (2) and right (3).
+        l.set_gradient(BorderRef::Cut { band: 1, cut: 1 }, Some(g), false);
+        let n = with_layout(mapper(json!([
+            { "z": 2, "out": ["key_w"] },
+            { "z": 3, "out": ["key_d"] },
+        ])), &l);
+        // A quarter of the band toward right: up-right 0.25, right 0.75.
+        let p = dir(67.5 + 0.025 * 360.0, 0.9);
+        let mut st = HashMap::new();
+        let (mut w_on, mut d_on) = (0, 0);
+        for _ in 0..500 {
+            let (c, _) = run(&n, &stick(p), &mut st);
+            let (w, d) = (on(&c, "key_w"), on(&c, "key_d"));
+            assert!(!(w && d), "alternating cells never overlap");
+            w_on += w as i32;
+            d_on += d as i32;
+        }
+        // 1/4 and 3/4 of the time, within the f32 phase clock's drift.
+        assert!((w_on - 125).abs() <= 8 && (d_on - 375).abs() <= 8, "w {w_on} d {d_on}");
+    }
+
+    #[test]
+    fn independent_pwm_and_threshold_follow_their_border() {
+        let mut l = AreaLayout::circle_ways(8);
+        let mut g = Gradient::with_width(0.1);
+        g.phase = Phase::Independent;
+        g.period_ms = 50.0;
+        l.set_gradient(BorderRef::Cut { band: 1, cut: 1 }, Some(g.clone()), false);
+        let cards = json!([{ "z": 2, "out": ["key_w"] }, { "z": 3, "out": ["key_d"] }]);
+        let n = with_layout(mapper(cards.clone()), &l);
+        let p = dir(67.5 + 0.025 * 360.0, 0.9);
+        let mut st = HashMap::new();
+        let mut both = 0;
+        for _ in 0..500 {
+            let (c, _) = run(&n, &stick(p), &mut st);
+            both += (on(&c, "key_w") && on(&c, "key_d")) as i32;
+        }
+        assert!(both > 0, "independent clocks overlap");
+
+        g.digital = DigitalMode::Threshold;
+        g.threshold = 0.6;
+        l.set_gradient(BorderRef::Cut { band: 1, cut: 1 }, Some(g), false);
+        let n = with_layout(mapper(cards), &l);
+        let (c, _) = run(&n, &stick(p), &mut HashMap::new());
+        assert!(!on(&c, "key_w") && on(&c, "key_d"), "0.25 < 0.6 <= 0.75");
+    }
+
+    #[test]
+    fn enter_and_leave_pulse_once_per_crossing() {
+        let n = mapper(json!([
+            { "z": 1, "in": ["area_enter"], "out": ["key_e"], "window_ms": 20.0 },
+            { "z": 1, "in": ["area_leave"], "out": ["key_q"], "window_ms": 20.0 },
+        ]));
+        let mut st = HashMap::new();
+        let mut entered = 0;
+        for _ in 0..60 {
+            let (c, _) = run(&n, &stick(dir(0.0, 0.9)), &mut st);
+            entered += on(&c, "key_e") as i32;
+            assert!(!on(&c, "key_q"));
+        }
+        assert!((20..=21).contains(&entered), "a 20 ms pulse at 1 ms ticks, got {entered}");
+        let mut left = 0;
+        for _ in 0..60 {
+            let (c, _) = run(&n, &stick(dir(90.0, 0.9)), &mut st);
+            left += on(&c, "key_q") as i32;
+            assert!(!on(&c, "key_e"));
+        }
+        assert!((20..=21).contains(&left), "got {left}");
+    }
+
+    /// A whole-stick or mouse target in a cell gets the point itself, scaled
+    /// by the cell's share.
+    #[test]
+    fn a_cell_can_pass_the_point_on_as_a_stick_or_the_mouse() {
+        let n = mapper(json!([
+            { "z": 3, "out": ["right_stick"] },
+            { "z": 3, "out": ["mouse"] },
+        ]));
+        let p = dir(90.0, 0.8);
+        let (c, _) = run(&n, &stick(p), &mut HashMap::new());
+        assert_eq!(bus(&c, "right_stick"), Some(Signal::Vec2(p)));
+        assert_eq!(bus(&c, "right_stick_right"), Some(Signal::Bool(true)), "cardinals follow");
+        let m = match bus(&c, "mouse") { Some(Signal::Vec2(v)) => v, other => panic!("{other:?}") };
+        assert!((m - p * 0.03).length() < 1e-5, "{m:?}");
+        // Outside the cell: nothing written, the bus's own values stand.
+        let (c, _) = run(&n, &stick(dir(0.0, 0.8)), &mut HashMap::new());
+        assert_eq!(bus(&c, "mouse"), None);
+    }
+
+    #[test]
+    fn a_touchpad_maps_only_while_a_finger_is_down() {
+        let mut n = mapper(json!([
+            { "z": 1, "out": ["key_w"] },
+            { "z": 1, "in": ["area_leave"], "out": ["key_q"] },
+        ]));
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+        let touch = |active: bool| {
+            let mut m = HashMap::new();
+            // Top middle of the pad: +Y is up on the bus.
+            m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.0));
+            m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(0.95));
+            m.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(active));
+            m
+        };
+        let mut st = HashMap::new();
+        let (c, out) = run(&n, &touch(true), &mut st);
+        assert!(on(&c, "key_w"), "finger at the top");
+        assert_eq!(bus(&c, "touch1_active"), Some(Signal::Bool(false)), "consumed");
+        assert!(out[1].is_some());
+        let (c, out) = run(&n, &touch(false), &mut st);
+        assert!(!on(&c, "key_w"));
+        assert!(on(&c, "key_q"), "lifting leaves the cell");
+        assert_eq!(out[1], None, "no point while lifted");
+    }
+
+    #[test]
+    fn a_touch_gated_cell_needs_the_stick_touched() {
+        let mut n = mapper(json!([{ "z": 1, "out": ["key_w"] }]));
+        n.params.insert(AREA_TOUCH_CELLS_PARAM.into(), json!([1]));
+        let mut sigs = stick(dir(0.0, 0.9));
+        let (c, _) = run(&n, &sigs, &mut HashMap::new());
+        assert!(!on(&c, "key_w"), "not touched");
+        sigs.insert((PAD.to_string(), "left_stick_touch".to_string()), Signal::Bool(true));
+        let (c, _) = run(&n, &sigs, &mut HashMap::new());
+        assert!(on(&c, "key_w"));
+    }
+
+    /// A second layer acts on the same point: an outer ring holds Shift
+    /// whichever way the stick points, alongside the direction keys.
+    #[test]
+    fn layers_act_together() {
+        let mut n = mapper(json!([
+            { "z": 1, "out": ["key_w"] },
+            { "f": 1, "z": 1, "out": ["key_shift"] },
+        ]));
+        let ring = AreaLayout::circle_rings(0.8);
+        n.params.insert(AREA_LAYERS_PARAM.into(), json!([
+            { AREA_LAYOUT_PARAM: AreaLayout::circle_ways(8).to_value() },
+            { AREA_LAYOUT_PARAM: ring.to_value() },
+        ]));
+        n.params.insert(AREA_LAYER_LOADED_PARAM.into(), json!(0));
+        let (c, out) = run(&n, &stick(dir(0.0, 0.6)), &mut HashMap::new());
+        assert!(on(&c, "key_w") && !on(&c, "key_shift"), "walking");
+        let (c, _) = run(&n, &stick(dir(0.0, 0.95)), &mut HashMap::new());
+        assert!(on(&c, "key_w") && on(&c, "key_shift"), "running");
+        let (c, _) = run(&n, &stick(dir(200.0, 0.95)), &mut HashMap::new());
+        assert!(!on(&c, "key_w") && on(&c, "key_shift"), "running any way");
+        // The mirror tags each layer's cells.
+        assert!(out[2..].iter().any(|s| matches!(s, Some(Signal::Vec2(v)) if v.x as u32 == 1)));
+        let (_, out) = run(&n, &stick(dir(0.0, 0.95)), &mut HashMap::new());
+        assert!(out[2..].iter().any(|s| matches!(s, Some(Signal::Vec2(v)) if v.x as u32 == AREA_LAYER_STRIDE + 1)));
+    }
+
+    /// The loaded layer is read from the loaded keys, not its stored copy.
+    #[test]
+    fn the_loaded_layer_reads_the_live_keys() {
+        let mut n = mapper(json!([{ "f": 1, "z": 1, "out": ["key_shift"] }]));
+        n.params.insert(AREA_LAYERS_PARAM.into(), json!([
+            { AREA_LAYOUT_PARAM: AreaLayout::circle_ways(8).to_value() },
+            { AREA_LAYOUT_PARAM: AreaLayout::circle_ways(8).to_value() }, // stale
+        ]));
+        n.params.insert(AREA_LAYER_LOADED_PARAM.into(), json!(1));
+        n.params.insert(AREA_LAYOUT_PARAM.into(), AreaLayout::circle_rings(0.5).to_value());
+        let (c, _) = run(&n, &stick(dir(90.0, 0.7)), &mut HashMap::new());
+        assert!(on(&c, "key_shift"), "cell 1 is the outer ring in the live copy");
+    }
+
+    /// With the press mode locked, every card follows the global one.
+    #[test]
+    fn a_locked_press_mode_rules_every_card() {
+        let mut n = mapper(json!([{ "z": 1, "out": ["key_w"], "mode": "down" }]));
+        n.params.insert(AREA_PRESS_LOCK_PARAM.into(), json!(true));
+        n.params.insert(AREA_PRESS_MODE_PARAM.into(), json!("on_press"));
+        n.params.insert(AREA_PRESS_MS_PARAM.into(), json!(20.0));
+        let mut st = HashMap::new();
+        let mut held = 0;
+        for _ in 0..60 {
+            let (c, _) = run(&n, &stick(dir(0.0, 0.9)), &mut st);
+            held += on(&c, "key_w") as i32;
+        }
+        assert!((20..=21).contains(&held), "a 20 ms pulse, not a hold: {held}");
+    }
+
+    /// An analog layer pulses W and D by the stick's axes, ignoring borders.
+    #[test]
+    fn an_analog_layer_pulses_each_axis() {
+        let mut n = mapper(json!([
+            { "z": 1, "out": ["key_w"] },
+            { "z": 3, "out": ["key_d"] },
+        ]));
+        n.params.insert(AREA_LAYOUT_PARAM.into(), AreaLayout::circle_ways(4).to_value());
+        n.params.insert(AREA_LAYER_ANALOG_PARAM.into(), json!(true));
+        n.params.insert(AREA_LAYER_MS_PARAM.into(), json!(50.0));
+        n.params.insert(AREA_LAYER_MIX_PARAM.into(), json!("keys"));
+        n.params.insert(AREA_LAYER_PULSE_PARAM.into(), json!("pwm"));
+        // Up 30° to the right, full deflection: W ≈ 0.87, D = 0.5.
+        let p = dir(30.0, 1.0);
+        let mut st = HashMap::new();
+        let (mut w, mut d) = (0, 0);
+        for _ in 0..1000 {
+            let (c, _) = run(&n, &stick(p), &mut st);
+            w += on(&c, "key_w") as i32;
+            d += on(&c, "key_d") as i32;
+        }
+        assert!((w - 866).abs() <= 25 && (d - 500).abs() <= 25, "w {w} d {d}");
+    }
+
+    /// The lengths of each run of presses (ms at the 1 ms test tick).
+    fn press_runs(states: &[bool]) -> Vec<usize> {
+        let mut runs = Vec::new();
+        let mut cur = 0;
+        for &on in states {
+            if on {
+                cur += 1;
+            } else if cur > 0 {
+                runs.push(cur);
+                cur = 0;
+            }
+        }
+        runs
+    }
+
+    fn analog_mapper(mix: &str, pulse: &str) -> NodeSnap {
+        let mut n = mapper(json!([
+            { "z": 1, "out": ["key_w"] },
+            { "z": 3, "out": ["key_d"] },
+        ]));
+        n.params.insert(AREA_LAYOUT_PARAM.into(), AreaLayout::circle_ways(4).to_value());
+        n.params.insert(AREA_LAYER_ANALOG_PARAM.into(), json!(true));
+        n.params.insert(AREA_LAYER_MIX_PARAM.into(), json!(mix));
+        n.params.insert(AREA_LAYER_PULSE_PARAM.into(), json!(pulse));
+        n.params.insert(AREA_LAYER_HOLD_PARAM.into(), json!(34.0));
+        n.params.insert(AREA_LAYER_FULL_PARAM.into(), json!(1.0));
+        n
+    }
+
+    /// With the game's ramp modelled, the game's own speed (simulated with
+    /// the same ramp) settles at the push — not stop-and-go — and every
+    /// press still lasts the minimum.
+    #[test]
+    fn a_modelled_ramp_holds_the_game_at_the_push() {
+        let mut n = analog_mapper("keys", "smooth");
+        n.params.insert(AREA_LAYER_RAMP_PARAM.into(), json!(300.0));
+        // Straight right, 40 % past the deadzone (0.3).
+        let p = Vec2::new(0.3 + 0.7 * 0.4, 0.0);
+        let mut st = HashMap::new();
+        let (mut v, mut sum, mut lo, mut hi) = (0.0f32, 0.0f32, 1.0f32, 0.0f32);
+        let mut d = Vec::new();
+        for t in 0..6000 {
+            let down = on(&run(&n, &stick(p), &mut st).0, "key_d");
+            d.push(down);
+            v = if down { (v + DT / 0.3).min(1.0) } else { (v - DT / 0.3).max(0.0) };
+            if t >= 1000 {
+                sum += v;
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        let avg = sum / 5000.0;
+        assert!((avg - 0.4).abs() < 0.03, "game speed {avg}");
+        assert!(lo > 0.2 && hi < 0.6, "the game never stops: {lo}..{hi}");
+        assert!(press_runs(&d[1000..]).iter().all(|r| *r >= 34));
+    }
+
+    /// The full zone and the midpoint shape the push.
+    #[test]
+    fn the_full_zone_and_midpoint_shape_the_push() {
+        let mut n = analog_mapper("keys", "smooth");
+        n.params.insert(AREA_LAYER_FULL_PARAM.into(), json!(0.8));
+        // Past the full radius: D held throughout.
+        let mut st = HashMap::new();
+        for _ in 0..500 {
+            assert!(on(&run(&n, &stick(Vec2::new(0.85, 0.0)), &mut st).0, "key_d"));
+        }
+        // Half at a quarter push: a quarter push holds half the time.
+        n.params.insert(AREA_LAYER_FULL_PARAM.into(), json!(1.0));
+        n.params.insert(AREA_LAYER_MID_PARAM.into(), json!(0.25));
+        let p = Vec2::new(0.3 + 0.7 * 0.25, 0.0);
+        let mut st = HashMap::new();
+        let held = (0..3000).filter(|_| on(&run(&n, &stick(p), &mut st).0, "key_d")).count();
+        assert!((held as f32 / 3000.0 - 0.5).abs() < 0.03, "{held}");
+    }
+
+    /// Smooth pulses: the duty holds, and no press or gap is under the
+    /// minimum — a light push gives short presses far apart, not slivers.
+    #[test]
+    fn smooth_pulses_keep_every_press_long_enough() {
+        let n = analog_mapper("keys", "smooth");
+        // Straight right, 20 % past the deadzone (0.3): D at 0.2.
+        let p = Vec2::new(0.3 + 0.7 * 0.2, 0.0);
+        let mut st = HashMap::new();
+        let d: Vec<bool> = (0..3000).map(|_| on(&run(&n, &stick(p), &mut st).0, "key_d")).collect();
+        let duty = d.iter().filter(|x| **x).count() as f32 / d.len() as f32;
+        assert!((duty - 0.2).abs() < 0.02, "duty {duty}");
+        let runs = press_runs(&d);
+        assert!(runs.len() >= 10 && runs.iter().all(|r| *r >= 34), "{runs:?}");
+        // Letting go releases at once.
+        let (c, _) = run(&n, &stick(Vec2::ZERO), &mut st);
+        assert!(!on(&c, "key_d"));
+    }
+
+    /// By direction, a full push between W and the diagonal never lets go of
+    /// W — it only adds D for its share of the time.
+    #[test]
+    fn a_direction_mix_steers_without_stopping() {
+        let n = analog_mapper("direction", "smooth");
+        let p = dir(30.0, 1.0);
+        let mut st = HashMap::new();
+        let (mut w, mut d) = (Vec::new(), Vec::new());
+        for _ in 0..3000 {
+            let (c, _) = run(&n, &stick(p), &mut st);
+            w.push(on(&c, "key_w"));
+            d.push(on(&c, "key_d"));
+        }
+        assert!(w.iter().all(|x| *x), "W held throughout");
+        let duty = d.iter().filter(|x| **x).count() as f32 / d.len() as f32;
+        assert!((duty - 2.0 / 3.0).abs() < 0.03, "D duty {duty}");
+        assert!(press_runs(&d).iter().all(|r| *r >= 34));
+        // Fixed PWM by direction: the same shares within one period.
+        let mut n = analog_mapper("direction", "pwm");
+        n.params.insert(AREA_LAYER_MS_PARAM.into(), json!(60.0));
+        let mut st = HashMap::new();
+        let mut dd = 0;
+        for _ in 0..3000 {
+            let (c, _) = run(&n, &stick(p), &mut st);
+            assert!(on(&c, "key_w"));
+            dd += on(&c, "key_d") as i32;
+        }
+        assert!((dd - 2000).abs() <= 60, "D {dd}");
+    }
+
+    #[test]
+    fn a_sink_behind_the_mapper_reads_the_mapped_bus() {
+        let pins: Vec<String> = automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect();
+        let mut sink = mapper(json!([]));
+        sink.node_uid = 6;
+        sink.module_id = "device.sink".into();
+        sink.sink_target = Some(SinkTarget {
+            device_id: VIRT.to_string(),
+            pin_ids: pins.clone(),
+            multi_sources: vec![Vec::new(); pins.len()],
+            automap_source: Some(("collector:5".to_string(), pins.clone())),
+            automap_fallback_dev: Some(PAD.to_string()),
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        let graph = ProcessingGraph { nodes: vec![mapper(json!([{ "z": 1, "out": ["btn_north"] }])), sink] };
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &stick(dir(0.0, 0.9)), DT, &mut out);
+        let at = |pin: &str| out.sink_outputs.get(&(VIRT.to_string(), pin.to_string())).copied();
+        assert_eq!(at("btn_north"), Some(Signal::Bool(true)));
+        assert_eq!(at("left_stick"), Some(Signal::Vec2(Vec2::ZERO)));
+        assert!(out.last_outputs.get(&5).is_some_and(|v| v.len() == 3), "the live mirror");
+    }
+}

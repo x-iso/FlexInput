@@ -7,6 +7,7 @@
 
 use super::*;
 
+mod area_mapper;
 mod automap_curve;
 mod gyro3dof;
 mod jsm;
@@ -19,6 +20,8 @@ mod rws;
 mod shared;
 mod touch_zones;
 
+// The param names and helpers are read by the UI too.
+pub use area_mapper::*;
 pub(crate) use automap_curve::*;
 pub(crate) use gyro3dof::*;
 pub(crate) use jsm::*;

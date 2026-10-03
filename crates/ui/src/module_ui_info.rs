@@ -26,6 +26,7 @@ pub(crate) fn republishes_automap_bus(module_id: &str) -> bool {
             | "module.network_recv"
             | "module.automap_response_curve"
             | "module.automap_twoway_response_curve"
+            | "module.area_mapper"
     )
 }
 
@@ -44,6 +45,7 @@ pub(crate) fn glows_from_automap_input(module_id: &str) -> bool {
             | "module.touch_zones"
             | "module.automap_response_curve"
             | "module.automap_twoway_response_curve"
+            | "module.area_mapper"
     )
 }
 
@@ -108,7 +110,8 @@ mod tests {
         for module in ["module.automap_collect", "module.audio_stream_haptics",
                        "module.jsm", "module.network_send", "module.network_recv",
                        "module.automap_response_curve",
-                       "module.automap_twoway_response_curve"] {
+                       "module.automap_twoway_response_curve",
+                       "module.area_mapper"] {
             assert!(republishes_automap_bus(module), "{module} should republish");
             assert!(
                 crate::canvas::viewer::bus_label(module).is_some(),

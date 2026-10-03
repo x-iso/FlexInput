@@ -251,6 +251,15 @@ fn eval_subgraph(
             continue;
         }
 
+        // Area Mapper nested in a sub-patch — publish under the NAMESPACED uid
+        // so a downstream sink's `collector:` lookup finds the mapped bus.
+        if snap.module_id == AREA_MAPPER_ID {
+            let out = eval_area_mapper_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            last_outputs.insert(ns_uid, out);
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // module.map_action inside subpatch: mirror top-level behaviour but
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
@@ -552,6 +561,15 @@ pub fn eval_graph_tick(
             let (inputs, outputs) = eval_automap_curve_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             last_inputs.insert(snap.node_uid, inputs);
             last_outputs.insert(snap.node_uid, outputs);
+            computed[idx] = vec![None];
+            continue;
+        }
+
+        // ── Area Mapper: hand the bus on with the picked XY pair mapped onto
+        // its cells. The live point and cell weights ride in last_outputs.
+        if snap.module_id == AREA_MAPPER_ID {
+            let out = eval_area_mapper_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
+            last_outputs.insert(snap.node_uid, out);
             computed[idx] = vec![None];
             continue;
         }

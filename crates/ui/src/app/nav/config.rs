@@ -364,7 +364,18 @@ impl FlexInputApp {
             return ControlInput::LeftStick;
         };
         let snarl = &self.tabs[self.active_tab].canvas.snarl;
-        match crate::app::config_passthrough_pins(snarl, &super::nav_path(*outer), inner.0) {
+        let path = super::nav_path(*outer);
+        // A module that reads a PICKED signal off its AutoMap input (a curve,
+        // an Area Mapper) passes that signal: the general walk can't see it.
+        let picked = self.picker_node(&path, *inner).is_some_and(|n| {
+            n.module_id == "module.area_mapper" || crate::canvas::viewer::is_automap_curve(&n.module_id)
+        });
+        let pins = if picked {
+            crate::app::config_passthrough_pins_for(snarl, &path, inner.0, None, None)
+        } else {
+            crate::app::config_passthrough_pins(snarl, &path, inner.0)
+        };
+        match pins {
             Some((_, pins)) => crate::app::control_input_from_pins(&pins),
             None => ControlInput::LeftStick,
         }

@@ -666,6 +666,151 @@ pub struct ModuleDescriptor {
   - `am_curve_pin: String` - The bus pin to reshape
   - Curve params as Two-way Response Curve; `vec_mode` follows the picked pin's type
 
+#### Area Mapper
+- **ID:** `module.area_mapper`
+- **Purpose:** Lays one XY pair of an AutoMap bus (the header's **Input**: left stick,
+  right stick, Touch 1 or Touch 2) onto cells, and fires each cell's mapping cards.
+  The area is **circular** (default: a centre and a 4-way ring; rings each cut into
+  their own sectors) or **rectangular** (rows, each cut into its own columns), so a
+  circle can be 4-way near the centre and 8-way at the rim. Cells are numbered by
+  direction — 0 the centre, 1 up, then clockwise in eighths to 8 up-left (a 4-way ring
+  uses 1, 3, 5, 7) — so cards keep their direction across shapes and presets. The
+  geometry lives in `flexinput_core::area`.
+  - **Layers:** tabs under the options row; each layer has its own layout, cards,
+    cell names and touch gates, and a colour. The other layers show faintly in theirs:
+    their borders, and their mappings where their own cells are, tinted (the edited
+    layer's mappings stay white).
+    All layers act on the same input together — e.g. an inner/outer ring layer holding
+    Shift whichever way the stick points, alongside a 4-way direction layer.
+  - **Presets** (options row): Circle 4-way / 8-way / inner-outer, Rectangle 3×3 for the
+    edited layer; **Save… / Load…** the whole module (every layer, its cards and
+    settings) as a `.fxarea` file.
+  - **One press mode for all** (row above the cards): its mode, time, Hold and Turbo
+    rule every card of every layer.
+  - **Analog layers:** a layer's **Analog** switch drives its keys from the stick's
+    deflection instead of its borders and gradients. The field then shows the deadzone
+    (the centre disc, its ring still draggable) and each direction's mapping out along
+    its spoke, lit as far as that key is held. Past the deadzone:
+    - **Mix — Direction** (default): the stick's angle falls between two moves the ring
+      offers, a key alone or two neighbouring keys a right angle apart together (W+D),
+      split by how close it is to each; the push past the deadzone is how much of the
+      time either holds. A full push never stops walking, only steers. For games that
+      walk every way at the same speed.
+    - **Mix — Per key:** each direction cell gets the stick's push toward it (W and D
+      0.71 each on a full diagonal). For games whose diagonal is faster.
+    - **Pulse — Smooth** (default): error diffusion. Every press and every gap lasts at
+      least **Min** (1–500 ms, default 34 = two frames at 60 fps), they come as often as
+      that allows, and owed time is paid back at once, so a change of push shows
+      immediately. Letting go releases at once.
+    - **Pulse — Fixed PWM:** one press per period (1–1000 ms), its length the push.
+    - **Ramp** (Smooth, 0–1000 ms, default 0): how long the game takes from standing to
+      full speed. When set, presses are timed against a model of that acceleration, so
+      the game's own smoothing holds its speed at the push instead of stopping and
+      starting. With a Direction mix the keys then follow the direction's per-key shares.
+    - **Half at** (5–95 %, default 50): the push that holds half the time; lower lifts
+      light pushes.
+    - **Full** (default 95 %): from this radius out the push counts as full, a stable
+      zone for holding the keys. It is the outer ring on the field: drag it like the
+      deadzone's; with the gamepad, walk to it, South grabs, the stick sizes it, North
+      resets it.
+  - **Editing:** drag a border to move it, double-click to centre it between its
+    neighbours, right-click to add a border through the point or remove the one under
+    it; the field's corner grip resizes it. With **Sym** on (default) every edit applies
+    to the border's mirror images across the vertical and horizontal axes, and they
+    move together; a border lying on an axis is pinned. A whole circle ring has no
+    border at all: its first cut is a diameter, halving it, which under Sym turns as
+    one (double-click squares it to the nearest 45°); the next cut under Sym makes four
+    (the diameter's mirror image, or the perpendicular diameter when it lies on an
+    axis). A ring cut back down to one border is whole again. Centring under Sym counts a
+    neighbouring mirror image as moving along with the border: a lone cut in a
+    quarter goes to 45°, and a cut beside its own mirror splits the cell they share
+    into three equal parts.
+  - **Pinnable elements:** `options` (Input, Shape, Sym, Pass, the selected cell's
+    Touched gate), `field` (editable like the body), `border` (the selected border's
+    gradient settings; the curve editor stays in the node body, its presets pin) and
+    `cards`.
+  - **Gamepad (Easy mode / config overlay):** on the field, the dpad / left stick walks
+    cell ↔ border and the cursor picks directly; on a cell RT adds a sector / column
+    border through it and LT a ring / row border through its band; on a border South
+    grabs it (then the dpad moves it), North centres, West removes, RT toggles its
+    gradient. In the config overlay, an Area Mapper reading the left stick passes it
+    through to be felt, so the right stick drives the editor (as with AutoMap curves).
+    Focusing a border selects it for the `border` element; focusing a cell
+    selects it for the cards. Cards work as the Virtual Menu's, with the trigger as the
+    last action-row item and as field 9 of an entered card.
+  - **Squareness / roundness:** a circle's ring border has a **Square** setting
+    (border settings) taking it from a circle to a square — e.g. a square deadzone
+    inside round outer rings — either by blending the round and the square distance,
+    or with **Round corners** on as a square whose corners are rounded off (corner
+    radius shrinking from the whole circle to nothing). Its gradient follows the shape,
+    and it stops short where it would touch a neighbouring ring in any direction; a new
+    ring takes the shape of the ring inside it. A rectangle's cell has a **Round**
+    and a **Pressure** setting (options row, for the selected cell). Round makes it a
+    bubble: its rectangle becomes a rounded one of the same area, up to an ellipse (a
+    circle for a square cell). Where shapes overlap (a bubble bulging past its sides
+    into its neighbours' rectangles, or two bubbles meeting), the higher-pressure cell
+    pushes into the lower; at equal pressure they share the overlap. So a round cell at
+    no pressure among plain ones rounds only as far as they let it, at full pressure it
+    takes its whole circle (a round deadzone in a square grid), equal bubbles meet in
+    flat seams and rows cut differently interlock honeycomb-like. The corners a bubble
+    gives up go to the plain cells around it (bubbles share a gap only among
+    themselves). Gradients crossfade across the seams. The field draws the seams; the
+    grid stays as faint lines you drag.
+  - **Gradient borders:** any border can crossfade the cells on either side across a
+    band of its own width. A cell's *share* of the point is 1 inside it, 0 outside, and
+    in between across a gradient, shaped by the border's crossfade curve; at a corner of
+    two gradients the shares multiply and still sum to 1. Analog outputs (stick
+    directions, triggers) take the share; keys follow the border's own settings — PWM
+    (duty = share; **Alternate** phase-locks the cells so they take turns, never both on,
+    or **Independent** clocks), a tap train, or a threshold. A cell bounded by two
+    gradients follows the one fading it more. A gradient on the centre ring's border
+    makes outputs proportional to deflection.
+  - **Cards:** the Touch Zones / Virtual Menu cards, keyed by cell id, each firing
+    **While inside**, **On enter** or **On leave** (pulses for the card's window as the
+    point crosses the cell's border; lifting a finger leaves). A whole-stick, mouse or
+    scroll target gets the point itself, scaled by the share, so a cell can pass the
+    stick on as aim. Cards in one Area Mapper OR their outputs (W in both the up and
+    up-right cells is no conflict).
+  - **Touch:** a touchpad point exists only while touched. A cell marked **Touched**
+    counts only while the stick reports touch (`{stick}_touch`, a capacitive stick);
+    no backend publishes that pin yet.
+- **Inputs:** AutoMap bus
+- **Outputs:** AutoMap bus (republished under `collector:{uid}`; the picked pair is
+  consumed — carried on at rest — unless `area_pass_source`)
+- **Parameters:**
+  - `area_input: String` - `left_stick` | `right_stick` | `touch1` | `touch2`
+  - `area_layout: Object` - `AreaLayout::to_value`: `shape`, `edges` (band borders),
+    `bands` (`cuts` + stable `cells` ids), `cell_round` / `cell_pressure` (rectangle
+    cell id → 0..1); a circle edge may carry `sq` (squareness, 0..1) and `rc` (square by
+    rounding corners); a border may carry `g` (gradient: `w` width,
+    `curve`, `dig` = `pwm`|`taps`|`threshold`, `period_ms`, `thr`, `phase` =
+    `alternate`|`independent`)
+  - `area_sym: bool` - Symmetric editing (UI only, default true)
+  - `area_pass_source: bool` - Keep the picked pair on the bus (default false)
+  - `area_touch_cells: Array<u32>` - Cells that only count while the stick is touched
+  - `zone_maps: Array` - Cards `{ f: layer, z: cell id, in: ["area_in"|"area_enter"|"area_leave"], out, … }`
+  - `area_layers: Array` - Every layer: `{ area_layout, zone_meta, area_touch_cells,
+    area_layer_color, area_layer_analog, area_layer_ms (Fixed PWM period),
+    area_layer_mix (`direction`|`keys`), area_layer_pulse (`smooth`|`pwm`),
+    area_layer_hold_ms (Smooth minimum), area_layer_ramp_ms, area_layer_mid,
+    area_layer_full }`; the edited layer also lives
+    under those plain keys (`_area_layer_loaded` says which), `area_layer` asks for one
+  - `area_press_lock`, `area_press_mode`, `area_press_ms`, `area_press_hold`,
+    `area_press_turbo` - One press mode for all cards
+  - `zone_meta: Object` - Per-cell icon / name override (as the Virtual Menu)
+  - `area_shape: String` - The shape as a request the layout follows (switching starts
+    the layout over); `area_sq` / `area_sq_rc` mirror the selected ring border's
+    squareness and corner mode, `area_cell_round` / `area_cell_press` the selected cell's
+    rounding and pressure, `area_g_on` / `area_g_w` / `area_g_curve` / `area_g_keys` /
+    `area_g_ms` / `area_g_thr` / `area_g_phase` mirror the selected border's gradient and
+    `area_cell_touch` the selected cell's gate. The gamepad's field editor writes only
+    params, so `area_sync` carries an edited mirror into `area_layout` and otherwise
+    rewrites it from the layout.
+- **Config overlay:** tuning it passes its picked pair (with the stick's axes and touch
+  flag) through to the game, like the AutoMap curves.
+- **Live mirror:** `last_out[1]` the point (centred, +Y up), `last_out[2..]` one
+  `Vec2(layer · 4096 + cell id, share)` per cell with a share.
+
 #### Touch Zones
 - **ID:** `module.touch_zones`
 - **Purpose:** Divides touchpad into configurable zones with typed outputs

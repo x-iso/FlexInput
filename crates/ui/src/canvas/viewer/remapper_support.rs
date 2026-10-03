@@ -463,6 +463,20 @@ pub(crate) fn paint_chord_chip_to_rect(
     pin_id: &str,
     skin: crate::canvas::remapper_icons::Skin,
 ) -> f32 {
+    paint_chord_chip_tinted(painter, ctx, top_left, chip_h, pin_id, skin, Color32::WHITE)
+}
+
+/// [`paint_chord_chip_to_rect`] with its icon multiplied by `tint` (e.g. an
+/// Area Mapper layer's colour); text pills stay as they are.
+pub(crate) fn paint_chord_chip_tinted(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    top_left: egui::Pos2,
+    chip_h: f32,
+    pin_id: &str,
+    skin: crate::canvas::remapper_icons::Skin,
+    tint: Color32,
+) -> f32 {
     use crate::canvas::remapper_icons::{self, Skin};
 
     // Macro-port pins (and macro-style Virtual-Menu targets): registry icon,
@@ -480,7 +494,7 @@ pub(crate) fn paint_chord_chip_to_rect(
                     let rect = egui::Rect::from_min_size(top_left, egui::vec2(chip_h, chip_h));
                     painter.image(tex.id(), rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE);
+                        tint);
                     return chip_h;
                 }
                 return paint_text_pill(painter, top_left, chip_h, entry.name, false);
@@ -528,8 +542,8 @@ pub(crate) fn paint_chord_chip_to_rect(
             });
         if let Some(tex) = tex {
             let rect = egui::Rect::from_min_size(top_left, egui::vec2(chip_h, chip_h));
-            let tint = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) }
-                       else  { Color32::WHITE };
+            let tint = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) * tint }
+                       else  { tint };
             painter.image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint);
@@ -690,6 +704,10 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
         // Virtual Menu card trigger tokens (the zone's selection / highlight).
         "menu_sel"          => return "Select".into(),
         "menu_hover"        => return "Hover".into(),
+        // Area Mapper card trigger tokens.
+        "area_in"           => return "In".into(),
+        "area_enter"        => return "Enter".into(),
+        "area_leave"        => return "Leave".into(),
         _ => {}
     }
     // Macro ports and Virtual-Menu targets: the raw "macro:{id}" /

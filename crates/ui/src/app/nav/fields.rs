@@ -541,6 +541,9 @@ impl FlexInputApp {
             // MUST mirror the corresponding arms in `nav_selected_kind`.
             ("module.touch_zones", "field") | ("module.touch_zones", "cards")
             | ("module.menu", "field") | ("module.menu", "cards") => true,
+            // Area Mapper: the field drives the same line-editing levels with its
+            // own geometry (`nav_drive_area_field`); the cards are TZ cards.
+            ("module.area_mapper", "field") | ("module.area_mapper", "cards") => true,
             ("processing.gyro_3dof", "lean_left")
             | ("processing.gyro_3dof", "lean_right") => true,
             // JSM Config: a pinned setting's fader is driven like a Knob. The
@@ -604,6 +607,8 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_swap_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
+            | ("module.area_mapper", "options") | ("module.area_mapper", "border")
+            | ("module.area_mapper", "layers") | ("module.area_mapper", "press")
             | ("processing.rws", "scale") | ("processing.rws", "rws")
             | ("processing.rws", "stick_dps") | ("processing.rws", "vh")
             | ("processing.rws", "measure")
@@ -1079,6 +1084,117 @@ impl FlexInputApp {
                 fs.push(f!("Sticky", Toggle{key:"hover_sticky"}));
                 fs
             }
+            // ── Area Mapper "options" row ── order MUST match
+            // `show_area_options_row`'s published rects, including the stick-only
+            // touch gate and the rectangle-only cell rounding.
+            ("module.area_mapper", "options") => {
+                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
+                let input = self.get_subpatch_param_str(outer_id, inner, "area_input")
+                    .unwrap_or_else(|| "left_stick".to_string());
+                let mut fs = vec![
+                    f!("Input", Enum{key:"area_input",opts:flexinput_engine::eval::AREA_INPUTS}),
+                    f!("Shape", Enum{key:crate::canvas::area_body::AREA_SHAPE_PARAM,opts:&["circle","rect"]}),
+                    f!("Sym", Toggle{key:crate::canvas::area_body::AREA_SYM_PARAM}),
+                    f!("Pass", Toggle{key:"area_pass_source"}),
+                ];
+                if !input.starts_with("touch") {
+                    fs.push(f!("Touched", Toggle{key:crate::canvas::area_body::AREA_CELL_TOUCH}));
+                }
+                if self.get_subpatch_param_str(outer_id, inner, crate::canvas::area_body::AREA_SHAPE_PARAM).as_deref()
+                    == Some("rect")
+                {
+                    fs.push(f!("Round", v(crate::canvas::area_body::AREA_CELL_ROUND, 0.0, 1.0, 0.0,
+                        FixedScaled { coarse: 5.0, factor: 100.0 })));
+                    fs.push(f!("Pressure", v(crate::canvas::area_body::AREA_CELL_PRESSURE, 0.0, 1.0, 0.0,
+                        FixedScaled { coarse: 5.0, factor: 100.0 })));
+                }
+                fs
+            }
+            // ── Area Mapper "layers" row ── order MUST match `show_area_layer_row`:
+            // the tabs as one Layer value, Analog, then its period while analog.
+            ("module.area_mapper", "layers") => {
+                use crate::canvas::area_body as ab;
+                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
+                let canvas = &self.tabs[self.active_tab].canvas;
+                let count = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
+                    .map(ab::layer_count).unwrap_or(1);
+                let mut fs = vec![
+                    f!("Layer", v(ab::AREA_LAYER_PARAM, 0.0, (count - 1) as f32, 0.0, Fixed(1.0))),
+                    f!("Analog", Toggle{key:flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM}),
+                ];
+                if self.get_subpatch_param_bool(outer_id, inner, flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM)
+                    .unwrap_or(false)
+                {
+                    use flexinput_engine::eval as ev;
+                    fs.push(f!("Mix", Enum{key:ev::AREA_LAYER_MIX_PARAM,opts:&["direction","keys"]}));
+                    fs.push(f!("Pulse", Enum{key:ev::AREA_LAYER_PULSE_PARAM,opts:&["smooth","pwm"]}));
+                    let smooth = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
+                        .and_then(|n| n.params.get(ev::AREA_LAYER_PULSE_PARAM).and_then(|v| v.as_str()).map(|s| s != "pwm"))
+                        .unwrap_or(true);
+                    if smooth {
+                        fs.push(f!("Min", v(ev::AREA_LAYER_HOLD_PARAM, 1.0, 500.0, 34.0, Fixed(1.0))));
+                        fs.push(f!("Ramp", v(ev::AREA_LAYER_RAMP_PARAM, 0.0, 1000.0, 0.0, Fixed(10.0))));
+                    } else {
+                        fs.push(f!("PWM", v(ev::AREA_LAYER_MS_PARAM, 1.0, 1000.0, 50.0, Fixed(5.0))));
+                    }
+                    fs.push(f!("Half at", v(ev::AREA_LAYER_MID_PARAM, 0.05, 0.95, 0.5, Fixed(0.01))));
+                }
+                fs
+            }
+            // ── Area Mapper "press" row ── order MUST match `show_area_press_row`.
+            ("module.area_mapper", "press") => {
+                use flexinput_engine::eval as ev;
+                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
+                let mut fs = vec![f!("One mode", Toggle{key:ev::AREA_PRESS_LOCK_PARAM})];
+                if self.get_subpatch_param_bool(outer_id, inner, ev::AREA_PRESS_LOCK_PARAM).unwrap_or(false) {
+                    fs.push(f!("Mode", Enum{key:ev::AREA_PRESS_MODE_PARAM,opts:ev::AREA_PRESS_MODES}));
+                    fs.push(f!("Time", v(ev::AREA_PRESS_MS_PARAM, 1.0, 5000.0, 200.0, Fixed(5.0))));
+                    fs.push(f!("Hold", Toggle{key:ev::AREA_PRESS_HOLD_PARAM}));
+                    fs.push(f!("Turbo", Toggle{key:ev::AREA_PRESS_TURBO_PARAM}));
+                }
+                fs
+            }
+            // ── Area Mapper "border" settings ── the selected border's gradient,
+            // through its param mirrors (`area_sync` carries them into the
+            // layout). Order MUST match `border_settings`' published rects:
+            // nothing until a border is selected, Gradient alone while it's hard.
+            ("module.area_mapper", "border") => {
+                use crate::canvas::area_body as ab;
+                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
+                let canvas = &self.tabs[self.active_tab].canvas;
+                let Some(node) = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner)) else {
+                    return vec![];
+                };
+                let layout = ab::area_layout(node);
+                let Some(r) = ab::selected_border(node, &layout) else { return vec![]; };
+                let mut fs = vec![f!("Gradient", Toggle{key:ab::AREA_G_ON})];
+                if layout.shape == flexinput_core::area::Shape::Circle
+                    && matches!(r, flexinput_core::area::BorderRef::Edge(_))
+                {
+                    fs.push(f!("Square", v(ab::AREA_G_SQ, 0.0, 1.0, 0.0, FixedScaled { coarse: 5.0, factor: 100.0 })));
+                    fs.push(f!("Corners", Toggle{key:ab::AREA_G_RC}));
+                }
+                if !self.get_subpatch_param_bool(outer_id, inner, ab::AREA_G_ON).unwrap_or(false) {
+                    return fs;
+                }
+                fs.push(f!("Width", if ab::border_width_in_degrees(layout.shape, r) {
+                    v(ab::AREA_G_W, 0.01, 1.0 / 3.0, 0.05, FixedScaled { coarse: 1.0, factor: 360.0 })
+                } else {
+                    v(ab::AREA_G_W, 0.01, 1.0, 0.1, FixedScaled { coarse: 1.0, factor: 100.0 })
+                }));
+                fs.push(f!("Curve", Enum{key:ab::AREA_G_CURVE,opts:&["linear","ease_in","ease_out","s_curve"]}));
+                fs.push(f!("Keys", Enum{key:ab::AREA_G_KEYS,opts:ab::KEY_MODES}));
+                let keys = self.get_subpatch_param_str(outer_id, inner, ab::AREA_G_KEYS).unwrap_or_default();
+                if keys == "threshold" {
+                    fs.push(f!("Level", v(ab::AREA_G_THR, 0.0, 1.0, 0.5, Linear)));
+                } else {
+                    fs.push(f!("Period", v(ab::AREA_G_MS, 1.0, 1000.0, 100.0, Fixed(5.0))));
+                }
+                if keys == "pwm" {
+                    fs.push(f!("Phase", Enum{key:ab::AREA_G_PHASE,opts:ab::PHASES}));
+                }
+                fs
+            }
             _ => vec![],
         }
     }
@@ -1116,9 +1232,9 @@ impl FlexInputApp {
             // "cards" element = the mapping list → zone-tab + Learn/Assign flow.
             // Virtual Menu shares both: its field (grid OR radial ring) and its
             // zone-tab cards drive the same TZ nav over the same storage.
-            Some("module.touch_zones") | Some("module.menu")
+            Some("module.touch_zones") | Some("module.menu") | Some("module.area_mapper")
                 if elem.as_deref() == Some("field") => NavWidgetKind::TouchZones,
-            Some("module.touch_zones") | Some("module.menu")
+            Some("module.touch_zones") | Some("module.menu") | Some("module.area_mapper")
                 if elem.as_deref() == Some("cards") => NavWidgetKind::TouchZoneCards,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
             // filter), unlike gyro's other elements which are plain field rows.

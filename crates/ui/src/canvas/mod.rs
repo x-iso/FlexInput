@@ -1,3 +1,4 @@
+pub(crate) mod area_body;
 mod curve;
 pub mod header_controls;
 pub(crate) mod input_viewer;
@@ -325,7 +326,7 @@ fn fold_note_companions_into_notes(node: &mut NodeData) {
     let keys: &[&str] = match node.module_id.as_str() {
         "module.remapper" | "module.map_action" => &["mappings"],
         "processing.gyro_3dof" => &["lean_left", "lean_right"],
-        "module.touch_zones" | "module.menu" => &["zone_maps"],
+        "module.touch_zones" | "module.menu" | "module.area_mapper" => &["zone_maps"],
         _ => return,
     };
     fn fold(pins: &mut Vec<Value>) {

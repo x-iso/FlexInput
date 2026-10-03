@@ -253,6 +253,24 @@ impl FlexInputApp {
                 (vec!["btn_north"], "Reset card"),
                 (vec!["btn_east"], "Back"),
             ],
+            EditLevel::TzLines if self.nav_driving_outer_id().is_some_and(|o| self.nav_is_area(o)) => {
+                use crate::gamepad_nav::TzFocus;
+                let mut v = vec![(hint_move(), "Walk cells/borders")];
+                match self.gamepad_nav.tz_focus {
+                    TzFocus::Border => {
+                        v.push((vec!["btn_south"], "Grab"));
+                        v.push((vec!["btn_north"], "Centre"));
+                        v.push((vec!["btn_west"], "Remove"));
+                        v.push((vec!["right_trigger"], "Gradient"));
+                    }
+                    _ => {
+                        v.push((vec!["right_trigger"], "Split across"));
+                        v.push((vec!["left_trigger"], "Split along"));
+                    }
+                }
+                v.push((vec!["btn_east"], "Back"));
+                v
+            }
             EditLevel::TzLines => {
                 // The spatial walk alternates zone ↔ border/seam; the hints track
                 // what's currently focused. Add/remove/divide only in mapping mode.
@@ -289,6 +307,13 @@ impl FlexInputApp {
                         (hint_move(), "Rotate"),
                         (vec!["btn_south"], "Done"),
                         (vec!["btn_east"], "Done"),
+                    ]
+                } else if self.nav_driving_outer_id().is_some_and(|o| self.nav_is_area(o)) {
+                    vec![
+                        (hint_move(), "Move border"),
+                        (vec!["btn_north"], "Centre"),
+                        (vec!["btn_south"], "Drop"),
+                        (vec!["btn_east"], "Drop"),
                     ]
                 } else {
                     vec![

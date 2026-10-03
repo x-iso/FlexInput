@@ -610,6 +610,9 @@ pub(crate) fn config_passthrough_pins_for(
     {
         return automap_curve_passthrough(tab_snarl, source_path, inner_node_id);
     }
+    if pin_module_id(tab_snarl, source_path, inner_node_id).as_deref() == Some("module.area_mapper") {
+        return area_mapper_passthrough(tab_snarl, source_path, inner_node_id);
+    }
     let is_mapping = matches!(
         pin_module_id(tab_snarl, source_path, inner_node_id).as_deref(),
         Some("module.remapper") | Some("module.map_action")
@@ -640,10 +643,54 @@ fn automap_curve_passthrough(
 ) -> Option<(String, Vec<String>)> {
     let (snarl, node_id) = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)?;
     let pin = crate::canvas::viewer::automap_curve_pin(snarl.get_node(node_id)?).to_string();
-    let fallback = config_passthrough_device(tab_snarl, source_path, inner_node_id);
     if pin.is_empty() {
+        let fallback = config_passthrough_device(tab_snarl, source_path, inner_node_id);
         return fallback.map(|d| (d, vec![CONFIG_BLOCK_ALL_PIN.to_string()]));
     }
+    let mut pins = expand_pin_group(&pin);
+    if let Some(finger) = ["touch1", "touch2"].into_iter().find(|t| pin.starts_with(t)) {
+        pins.push(format!("{finger}_active"));
+    }
+    let is_midi = flexinput_core::midi::is_midi_pin(&pin);
+    picked_signal_passthrough(tab_snarl, source_path, inner_node_id, is_midi, pins)
+}
+
+/// Config-overlay passthrough for an Area Mapper: its picked XY pair (a stick
+/// with its axes and touch flag, or a touch point with its active flag), so
+/// you feel the area you're tuning and nothing else gets out.
+fn area_mapper_passthrough(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<(String, Vec<String>)> {
+    let (snarl, node_id) = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)?;
+    let input = crate::canvas::area_body::area_input(snarl.get_node(node_id)?);
+    let mut pins: Vec<String> = if input.starts_with("touch") {
+        vec![format!("{input}_x"), format!("{input}_y")]
+    } else {
+        expand_pin_group(&input)
+    };
+    pins.push(flexinput_engine::eval::area_touch_pin(&input));
+    pins.sort();
+    pins.dedup();
+    picked_signal_passthrough(tab_snarl, source_path, inner_node_id, false, pins)
+}
+
+/// The passthrough of a module that reads chosen signals off its AutoMap
+/// input: those `pins`, from the device that carries them — the MIDI port for
+/// a MIDI pick, else the pad — since a Combiner can put both on one bus.
+///
+/// The general walk can't find this: it follows the node's AutoMap input to the
+/// device's bus pin, which names no signal, and then blocks everything.
+fn picked_signal_passthrough(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+    is_midi: bool,
+    pins: Vec<String>,
+) -> Option<(String, Vec<String>)> {
+    let (snarl, node_id) = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)?;
+    let fallback = config_passthrough_device(tab_snarl, source_path, inner_node_id);
     let upstream = snarl.in_pin(InPinId { node: node_id, input: 0 }).remotes.first().copied();
     let devs = match (upstream, source_path) {
         (Some(src), []) => find_automap_device_ids_for_viewer(snarl, src, None),
@@ -657,15 +704,10 @@ fn automap_curve_passthrough(
         }
         _ => Vec::new(),
     };
-    let is_midi = flexinput_core::midi::is_midi_pin(&pin);
     let device = devs
         .into_iter()
         .find(|d| if is_midi { d.starts_with("midi_in:") } else { is_physical_pad_id(d) })
         .or(fallback)?;
-    let mut pins = expand_pin_group(&pin);
-    if let Some(finger) = ["touch1", "touch2"].into_iter().find(|t| pin.starts_with(t)) {
-        pins.push(format!("{finger}_active"));
-    }
     Some((device, pins))
 }
 
@@ -1408,7 +1450,8 @@ pub(crate) fn build_processing_graph_rec(
             | "module.automap_collect" | "module.audio_stream_haptics"
             | "module.touch_zones" | "module.menu" | "module.jsm"
             | "module.network_send"
-            | "module.automap_response_curve" | "module.automap_twoway_response_curve")
+            | "module.automap_response_curve" | "module.automap_twoway_response_curve"
+            | "module.area_mapper")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -1859,7 +1902,7 @@ pub(crate) fn build_processing_graph_rec(
         })
     }
     let is_macro_publisher = |mid: &str| matches!(mid,
-        "module.remapper" | "module.touch_zones" | "processing.gyro_3dof");
+        "module.remapper" | "module.touch_zones" | "processing.gyro_3dof" | "module.area_mapper");
     // Virtual Menus read their macro-style Show/Select targets from the same
     // namespaces, so they order after the publishers exactly like Macro nodes.
     let is_macro_reader = |mid: &str| mid == "module.macro" || mid == "module.menu";
@@ -2108,6 +2151,59 @@ mod subpatch_bus_tests {
         let n = s.get_node(curve).unwrap();
         assert_eq!(curve_channels(n), 1);
         assert!(curve_channel_labels(n).is_none());
+    }
+
+    /// The Area Mapper republishes the bus it maps: stamped with the pad it
+    /// reads, and a sink behind it reads its bus, never the raw pad.
+    #[test]
+    fn a_sink_behind_an_area_mapper_reads_the_mapped_bus() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let dev = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let area = s.insert_node(p, node("module.area_mapper", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        wire(&mut s, dev, 0, area, 0);
+
+        let (id, _, upstream) = find_automap_device_rec(&s, OutPinId { node: area, output: 0 }, None)
+            .expect("the mapper's output resolves");
+        assert_eq!(id, format!("collector:{}", area.0));
+        assert_eq!(upstream.as_deref(), Some("gilrs:pad:0"));
+
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.module_id == "module.area_mapper").expect("mapper in graph");
+        assert_eq!(snap.params.get("_automap_device_id").and_then(|v| v.as_str()), Some("gilrs:pad:0"));
+    }
+
+    /// Tuning an Area Mapper from the config overlay passes its picked pair
+    /// through, and nothing else.
+    #[test]
+    fn an_area_mapper_passes_its_input_through_the_config_overlay() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let dev = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let area = s.insert_node(p, node("module.area_mapper", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        wire(&mut s, dev, 0, area, 0);
+        let (d, pins) = config_passthrough_pins_for(&s, &[], area.0, None, None).expect("a passthrough");
+        assert_eq!(d, "gilrs:pad:0");
+        for p in ["left_stick", "left_stick_x", "left_stick_y", "left_stick_touch"] {
+            assert!(pins.contains(&p.to_string()), "{p} in {pins:?}");
+        }
+        assert!(!pins.iter().any(|p| p.starts_with("right_")), "{pins:?}");
+        // The left stick is felt, so the right one drives the editor.
+        assert_eq!(control_input_from_pins(&pins), ControlInput::RightStick);
+
+        s.get_node_mut(area).unwrap().params.insert("area_input".into(), json!("touch2"));
+        let (_, pins) = config_passthrough_pins_for(&s, &[], area.0, None, None).expect("a passthrough");
+        assert_eq!(pins, vec!["touch2_active", "touch2_x", "touch2_y"]);
     }
 
     /// Moving an AutoMap curve between a trigger and a stick changes which curve

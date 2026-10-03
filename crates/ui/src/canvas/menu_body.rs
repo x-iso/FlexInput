@@ -569,10 +569,20 @@ pub(crate) fn radial_sector_shapes(
         shapes.push(egui::Shape::mesh(mesh));
     }
     if stroke.width > 0.0 {
-        let mut pts = outer;
-        inner.reverse();
-        pts.extend(inner);
-        shapes.push(egui::Shape::closed_line(pts, stroke));
+        if (a1 - a0).abs() >= std::f32::consts::TAU - 1e-3 {
+            // A whole ring has no sides: its two circles alone, no seam.
+            outer.pop();
+            shapes.push(egui::Shape::closed_line(outer, stroke));
+            if r_in > 2.5 {
+                inner.pop();
+                shapes.push(egui::Shape::closed_line(inner, stroke));
+            }
+        } else {
+            let mut pts = outer;
+            inner.reverse();
+            pts.extend(inner);
+            shapes.push(egui::Shape::closed_line(pts, stroke));
+        }
     }
     shapes
 }

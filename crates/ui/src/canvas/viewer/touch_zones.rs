@@ -2409,7 +2409,10 @@ pub(crate) fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     f: usize, z: usize, trigger: &str, draft_out: &[String])
 {
     let is_analog = tz_out_pin_is_analog;
-    let mode = if draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
+    // An Area Mapper card is never in Analog mode: its cell's share drives
+    // analog outputs.
+    let area = snarl.get_node(node_id).is_some_and(|n| n.module_id == "module.area_mapper");
+    let mode = if !area && draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
     if let Some(node) = snarl.get_node_mut(node_id) {
         let mut m = serde_json::Map::new();
         m.insert("f".into(), Value::from(f as u64));
@@ -2423,6 +2426,31 @@ pub(crate) fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
         node.params.insert("_tz_phase".into(), Value::from("idle"));
         for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
     }
+}
+
+/// The Area Mapper card trigger dropdown: In / Enter / Leave. Returns the new
+/// token when the user picks a different one.
+fn area_trigger_picker(ui: &mut egui::Ui, salt: impl std::hash::Hash, current: &str) -> (Option<&'static str>, egui::Rect) {
+    const TRIGGERS: [(&str, &str, &str); 3] = [
+        ("area_in", "While inside", "Held while the point is in this cell (a key in a fading cell follows its gradient border's settings)."),
+        ("area_enter", "On enter", "A pulse as the point crosses into this cell, for the card's window."),
+        ("area_leave", "On leave", "A pulse as the point leaves this cell (or the finger lifts), for the card's window."),
+    ];
+    let label = TRIGGERS.iter().find(|t| t.0 == current).map(|t| t.1).unwrap_or("While inside");
+    let mut picked = None;
+    let r = egui::ComboBox::from_id_salt(("area_trig", egui::Id::new(salt)))
+        .selected_text(egui::RichText::new(label).small())
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            for (tok, name, tip) in TRIGGERS {
+                if ui.selectable_label(tok == current, name).on_hover_text(tip).clicked() && tok != current {
+                    picked = Some(tok);
+                }
+            }
+        })
+        .response
+        .on_hover_text("When this mapping fires: while the point is inside the cell, as it enters, or as it leaves.");
+    (picked, r.rect)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2453,6 +2481,12 @@ pub(crate) fn render_touch_zone_cards(
     // arms the gamepad DESTINATION capture directly and "Assign…" opens the
     // picker with this menu's own target pins disabled (no self-targeting).
     let menu_mode = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
+    // Area Mapper variant: like the menu, the cell is the trigger — picked
+    // per card from In / Enter / Leave rather than demonstrated — and a cell's
+    // analog shaping lives on its gradient borders, not on the cards.
+    let area_mode = snarl.get_node(node_id).is_some_and(|n| n.module_id == "module.area_mapper");
+    let implicit_trig = menu_mode || area_mode;
+    let default_trig = if area_mode { "area_in" } else { "menu_sel" };
     let menu_excl: Option<String> = if menu_mode {
         snarl.get_node(node_id)
             .and_then(|n| n.params.get("menu_id").and_then(|v| v.as_str()))
@@ -2477,7 +2511,7 @@ pub(crate) fn render_touch_zone_cards(
     // ── Learn state machine ───────────────────────────────────────────────
     // idle → Learn → (demonstrate on pad) → captured → Assign / gamepad → commit.
     // (Menu nodes never enter "learning" — their trigger is fixed.)
-    if !menu_mode && phase == "learning" {
+    if !implicit_trig && phase == "learning" {
         if let Some((trig, field)) =
             tz_learn_capture(snarl, node_id, live_signals, dev.as_deref(), !single, sel_f)
         {
@@ -2586,6 +2620,11 @@ pub(crate) fn render_touch_zone_cards(
         .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
         .unwrap_or_default();
     let trigger = getp(snarl, "_tz_trig").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+    let idle_trig: String = if area_mode && trigger.starts_with("area_") {
+        trigger.clone()
+    } else {
+        default_trig.to_string()
+    };
 
     // Gamepad "Add": the nav driver sets `_tz_commit_add` to commit the captured
     // mapping (same path as the ＋ Add button).
@@ -2626,7 +2665,8 @@ pub(crate) fn render_touch_zone_cards(
     // Row 1: which zone + capture STATUS (listening / registered trigger →
     // picked output). Row 2 (below): the action BUTTONS + mouse multiplier.
     // Split so they stop competing for the pinned widget's limited width.
-    let label = if single { format!("Zone {sel_z}") }
+    let label = if area_mode { format!("Cell {sel_z}") }
+                else if single { format!("Zone {sel_z}") }
                 else { format!("{}{}", tz::field_letter(sel_f), sel_z) };
     // Rect of the Hold checkbox — published LAST in the action-rect list so
     // gamepad nav can focus + toggle it (see `nav_tz_action_items`).
@@ -2637,7 +2677,7 @@ pub(crate) fn render_touch_zone_cards(
         // even if the finger slides into a neighbour (so the neighbour's mapping
         // doesn't also fire). Affects touch/click triggers — a touch-gesture
         // concept, so hidden on menu nodes (a menu pointer just highlights).
-        if !menu_mode {
+        if !implicit_trig {
             let mut hold = tz_zone_held(snarl, node_id, sel_f, sel_z);
             let cb = ui.checkbox(&mut hold, "Hold")
                 .on_hover_text("Hold zone: a touch that starts in this zone stays bound to it for the whole gesture, even if the finger slides into another zone — so the other zone won't trigger. Gamepad: focus it and press South to toggle.");
@@ -2671,7 +2711,7 @@ pub(crate) fn render_touch_zone_cards(
                     ui.label(egui::RichText::new("→").weak());
                 }
                 if draft_out.is_empty() {
-                    let hint = if menu_mode
+                    let hint = if implicit_trig
                         && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
                     {
                         "press a gamepad button…"
@@ -2703,7 +2743,7 @@ pub(crate) fn render_touch_zone_cards(
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
         match phase.as_str() {
-            "idle" if menu_mode => {
+            "idle" if implicit_trig => {
                 // Menu: the trigger is this zone's selection — go straight to
                 // picking the DESTINATION (gamepad learn or the picker).
                 let b = ui.button("Learn")
@@ -2712,7 +2752,7 @@ pub(crate) fn render_touch_zone_cards(
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
-                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.insert("_tz_gp_arm".into(), Value::from(true));
                         for k in ["_tz_draft_out", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
@@ -2723,7 +2763,7 @@ pub(crate) fn render_touch_zone_cards(
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
-                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.remove("_tz_draft_out");
                     }
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
@@ -2741,7 +2781,7 @@ pub(crate) fn render_touch_zone_cards(
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
-                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.remove("_tz_draft_out");
                     }
                     tz_request_midi(ui.ctx(), node_id, automap_parent);
@@ -2816,11 +2856,20 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
         }
+        if area_mode && phase != "learning" {
+            let (picked, r) = area_trigger_picker(ui, (node_id, "draft"), &idle_trig);
+            act_rects.push(r);
+            if let Some(t) = picked {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("_tz_trig".into(), Value::from(t));
+                }
+            }
+        }
         // Node-global analog controls, right-aligned: the "Touchpad mode" dropdown
         // (relative/absolute + touchpad, shown for any analog card) and the mouse-
         // speed multiplier (only when a card drives the mouse). Both are gamepad
         // targets; rects publish mode → mouse → hold, matching nav_tz_action_items.
-        if has_analog_card || has_mouse_card {
+        if (has_analog_card || has_mouse_card) && !area_mode {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mouse-speed sits rightmost (added first in a right-to-left row).
                 // Shown for a mouse card, OR for a touchpad-mode stick zone — there the
@@ -2925,7 +2974,9 @@ pub(crate) fn render_touch_zone_cards(
     let mut dirty = false;
     let mut remove: Option<usize> = None; // full-array index
     if display.is_empty() && phase == "idle" {
-        let hint = if menu_mode {
+        let hint = if area_mode {
+            "No mappings — Learn a gamepad output or Assign… one for this cell."
+        } else if menu_mode {
             "No mappings — Learn a gamepad output or Assign… one for this zone."
         } else {
             "No mappings — press Learn, then demonstrate on a zone."
@@ -2941,7 +2992,7 @@ pub(crate) fn render_touch_zone_cards(
     // swipe-direction card is a 1-D gesture — it must show only the component along
     // its own axis (matching the engine's `dir`), so the preview dot and the
     // threshold line agree with what actually fires.
-    let tz_live_defl: Option<(f32, f32)> = if menu_mode {
+    let tz_live_defl: Option<(f32, f32)> = if implicit_trig {
         // Menu zones have no touch deflection; the curve preview dot stays put.
         None
     } else {
@@ -2989,7 +3040,9 @@ pub(crate) fn render_touch_zone_cards(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
         let card_conf = card_conflict_for(&conflicts, node_id, "zone_maps", i, &out_pins);
         let drag_off = rv.offset_for(slot);
-        let card_analog = out_pins.iter().any(|p| tz_out_pin_is_analog(p));
+        // An Area Mapper card has no analog mode of its own: its cell's share
+        // drives analog outputs, shaped on the gradient border.
+        let card_analog = !area_mode && out_pins.iter().any(|p| tz_out_pin_is_analog(p));
         let nav_uid = if card_analog && !nav_curve_given {
             nav_curve_given = true;
             Some(node_id.0)
@@ -3023,6 +3076,31 @@ pub(crate) fn render_touch_zone_cards(
                     });
                 }
                 rv.observe(slot, &result);
+                // Area Mapper: the card's trigger, changeable after the fact.
+                if area_mode {
+                    let cur = in_pins.first().cloned().unwrap_or_else(|| "area_in".into());
+                    // Gamepad: card field 9 while this card is entered.
+                    let ctx = ui.ctx().clone();
+                    let entered = ctx.data(|d| d.get_temp::<(u64, usize, bool)>(
+                            egui::Id::new(("gp_nav_remap_card", node_id.0, "zone_maps"))))
+                        .is_some_and(|(p, sel, ent)| ent && sel == i && crate::widgets::nav_pass_matches(&ctx, p));
+                    let focused = entered && ctx.data(|d| d.get_temp::<(u64, u64)>(
+                            egui::Id::new(("gp_nav_remap_card_field", node_id.0, "zone_maps"))))
+                        .is_some_and(|(p, f)| f == 9 && crate::widgets::nav_pass_matches(&ctx, p));
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Fires").small().weak());
+                        let (picked, r) = area_trigger_picker(ui, (node_id, i), &cur);
+                        if let Some(t) = picked {
+                            working.insert("in".into(), Value::Array(vec![Value::from(t)]));
+                        }
+                        if focused {
+                            let accent = crate::widgets::NavHighlightStyle::of(&ctx).accent;
+                            ui.painter().rect_stroke(r.expand(2.0), 4.0,
+                                egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                        }
+                    });
+                }
                 // Response curve + threshold + Rel.-center, all INSIDE the card's
                 // opened body. Analog cards shape the zone's deflection (no
                 // threshold — the gate is touch presence). Swipe cards ALSO get the

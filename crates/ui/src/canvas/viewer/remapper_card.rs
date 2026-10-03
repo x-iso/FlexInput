@@ -352,7 +352,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             ui.spacing_mut().interact_size.y = 18.0 * s;
             let resp = ui.add(
                 egui::DragValue::new(&mut gap_ms)
-                    .speed(5.0).range(10.0f32..=5000.0)
+                    .speed(5.0).range(1.0f32..=5000.0)
                     .custom_formatter(|n, _| format!("{n:.0} ms")),
             );
             if resp.changed() {

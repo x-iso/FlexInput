@@ -446,9 +446,9 @@ pub(crate) fn analog_digital_pulse(
         // ── Hold = PWM: duty cycle tracks amplitude ──────────────────────
         // Period is fixed by window_ms; Turbo additionally scales it down
         // with amplitude so a harder push pulses faster as well as wider.
-        let base_period = (window_ms / 1000.0).max(0.020);
+        let base_period = (window_ms / 1000.0).max(0.001);
         let period = if turbo {
-            (1.0 / (mag * max_freq)).clamp(0.020, base_period)
+            (1.0 / (mag * max_freq)).clamp(0.001, base_period)
         } else {
             base_period
         };

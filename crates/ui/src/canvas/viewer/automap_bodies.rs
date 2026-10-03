@@ -722,6 +722,7 @@ pub(crate) fn bus_label(module_id: &str) -> Option<&'static str> {
         "module.network_recv" => "Network Receive",
         "module.automap_response_curve" => "Response Curve",
         "module.automap_twoway_response_curve" => "Two-way Curve",
+        "module.area_mapper" => "Area Mapper",
         _ => return None,
     })
 }

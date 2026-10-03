@@ -288,6 +288,37 @@ pub(crate) fn render_pinned_element_impl(
             crate::canvas::menu_body::render_menu_options_pinned(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Area Mapper: the field (whole-container, editable like the body), its
+        // option and border-settings rows, and its cards (the shared card
+        // list's whole-module renderer, as Touch Zones and the menu use).
+        ("module.area_mapper", "field") => {
+            crate::canvas::area_body::render_area_field_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.area_mapper", "options") => {
+            crate::canvas::area_body::render_area_options_pinned(
+                inner_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
+            return;
+        }
+        ("module.area_mapper", "layers") => {
+            crate::canvas::area_body::render_area_layers_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.area_mapper", "press") => {
+            crate::canvas::area_body::render_area_press_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.area_mapper", "border") => {
+            crate::canvas::area_body::render_area_border_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.area_mapper", "cards") => {
+            render_touch_zone_cards_whole_module(
+                inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
         ("module.menu", "cards") => {
             render_touch_zone_cards_whole_module(
                 inner_id, ui, inner_snarl, container_size,

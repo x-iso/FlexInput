@@ -7,7 +7,7 @@ use super::*;
 /// `cur`, using the same primary-axis + cross-penalty scorer the picker/left-panel
 /// nav use. Returns the index into `cands`. Screen-space, so radial angular wrap
 /// is handled naturally (a sector across 12 o'clock is just screen-adjacent).
-fn nav_tz_nearest_in_dir(cur: egui::Pos2, dir: crate::gamepad_nav::NavDir,
+pub(super) fn nav_tz_nearest_in_dir(cur: egui::Pos2, dir: crate::gamepad_nav::NavDir,
     cands: &[(usize, egui::Pos2)]) -> Option<usize>
 {
     use crate::gamepad_nav::NavDir;
@@ -33,6 +33,10 @@ impl FlexInputApp {
     /// pad 0 and snapshot for one coalesced undo entry across the whole edit.
     pub(crate) fn nav_tz_enter(&mut self, outer_id: egui_snarl::NodeId) {
         use crate::gamepad_nav::EditLevel;
+        if self.nav_is_area(outer_id) {
+            self.nav_area_enter(outer_id);
+            return;
+        }
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         self.gamepad_nav.tz_field = 0;
         let (cols, rows) = if self.tz_is_mapping(outer_id, inner) {
@@ -184,6 +188,11 @@ impl FlexInputApp {
         _mag: f32,
     ) {
         use crate::gamepad_nav::{EditLevel, NavDir};
+        // The Area Mapper rides the same levels with its own geometry.
+        if self.nav_is_area(outer_id) {
+            self.nav_drive_area_field(ctx, outer_id, nav, step_dir, rt_rising, lt_rising);
+            return;
+        }
         let Some(inner) = self.nav_selected_inner_node(outer_id) else {
             self.nav_tz_exit();
             return;
@@ -395,6 +404,20 @@ impl FlexInputApp {
     /// within the current pad's zone count.
     pub(crate) fn nav_tz_cycle_zone(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, dir: i32) {
         let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
+        // An Area Mapper's cells are its layout's ids, not a grid count.
+        if let Some(n) = node.filter(|n| n.module_id == "module.area_mapper") {
+            let layout = crate::canvas::area_body::area_layout(n);
+            let ids = layout.cell_ids();
+            let cur = crate::canvas::area_body::selected_cell(n, &layout);
+            let at = ids.iter().position(|c| *c == cur).unwrap_or(0) as i32;
+            let next = ids[(at + dir).rem_euclid(ids.len().max(1) as i32) as usize];
+            if let Some(n) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer)
+                .and_then(|sp| sp.get_node_mut(inner))
+            {
+                n.params.insert("sel_zone".into(), serde_json::Value::from(next as u64));
+            }
+            return;
+        }
         let field = node.and_then(|n| n.params.get("sel_field").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
         let zone = node.and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
         let col = self.tz_edges(outer, inner, field, "col_edges");
@@ -415,7 +438,19 @@ impl FlexInputApp {
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
     /// keeps the nav glow on the right item.
-    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool, menu: bool) -> Vec<&'static str> {
+    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool, menu: bool, area: bool) -> Vec<&'static str> {
+        // An Area Mapper cell is triggered like a menu zone (no gesture to
+        // demonstrate), plus a trigger picker after the buttons — a VALUE item
+        // cycled with up/down, like tp_mode. It has no hold or touchpad mode.
+        if area {
+            let mut v = match phase {
+                "idle" => vec!["learn", "assign", "midi"],
+                "learning" => vec!["cancel"],
+                _ => vec!["assign", "midi", "gamepad", "add", "cancel"],
+            };
+            if phase != "learning" { v.push("area_trig"); }
+            return v;
+        }
         // A Virtual Menu zone is triggered by its own selection (no touch/swipe),
         // so it skips the touch-"learning" phase: idle offers Learn (arm a
         // gamepad-button capture) AND Assign (pick a specific output) directly,
@@ -477,6 +512,7 @@ impl FlexInputApp {
     /// (gates the mouse-speed nav item, mirroring the body's `has_mouse_card`).
     pub(crate) fn nav_tz_has_mouse_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
         nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
+            .filter(|n| n.module_id != "module.area_mapper")
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
             .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
                 .map(|a| a.iter().any(|p| matches!(p.as_str(),
@@ -605,6 +641,7 @@ impl FlexInputApp {
     /// tp_mode nav item, mirroring the body's `has_analog_card`.
     pub(crate) fn nav_tz_has_analog_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
         nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner))
+            .filter(|n| n.module_id != "module.area_mapper")
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
             .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
                 .map(|a| a.iter().any(|p| p.as_str()
@@ -643,7 +680,8 @@ impl FlexInputApp {
         let has_analog = self.nav_tz_has_analog_card(outer, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
         let menu = self.nav_selected_module_id(outer).as_deref() == Some("module.menu");
-        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed, menu).len();
+        let area = self.nav_is_area(outer);
+        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed, menu, area).len();
         let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
         let sel = self.gamepad_nav.card_index;
         let entered = matches!(self.gamepad_nav.edit_level,
@@ -694,7 +732,17 @@ impl FlexInputApp {
             .unwrap_or_else(|| "idle".into());
         let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer_id, inner);
-        let menu = self.nav_selected_module_id(outer_id).as_deref() == Some("module.menu");
+        let area = self.nav_is_area(outer_id);
+        // An Area Mapper cell takes the menu's trigger-less flow; its trigger is
+        // the one picked in the action row (kept across cards), not menu_sel.
+        let menu = area || self.nav_selected_module_id(outer_id).as_deref() == Some("module.menu");
+        let trig: String = if area {
+            self.get_subpatch_param_str(outer_id, inner, "_tz_trig")
+                .filter(|t| t.starts_with("area_"))
+                .unwrap_or_else(|| "area_in".to_string())
+        } else {
+            "menu_sel".to_string()
+        };
 
         // INERT while gamepad-learn is armed: the raw button must reach the body's
         // capture (baseline-ignore there stops the arming button self-capturing).
@@ -726,7 +774,7 @@ impl FlexInputApp {
 
         // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
         // the selected zone's cards.
-        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed, menu);
+        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed, menu && !area, area);
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();
@@ -747,13 +795,19 @@ impl FlexInputApp {
         // Mode / mouse-speed are VALUE items in the action row: focus them with
         // left/right like the buttons, then change with up/down (dpad or left
         // stick) — the same select-then-U/D pattern as the entered-card fields.
-        let cur_is_value = on_actions && matches!(actions[cur], "tp_mode" | "mouse_speed");
+        let cur_is_value = on_actions && matches!(actions[cur], "tp_mode" | "mouse_speed" | "area_trig");
         if cur_is_value {
             let d = match step_dir { Some(NavDir::Up) => 1i32, Some(NavDir::Down) => -1, _ => 0 };
             if d != 0 {
                 match actions[cur] {
                     "tp_mode" => self.nav_tz_cycle_mode(outer_id, inner, d),
                     "mouse_speed" => self.nav_tz_nudge_mouse_speed(outer_id, inner, d as f32 * 0.1),
+                    "area_trig" => {
+                        const TRIGS: [&str; 3] = ["area_in", "area_enter", "area_leave"];
+                        let at = TRIGS.iter().position(|t| *t == trig).unwrap_or(0) as i32;
+                        let next = TRIGS[(at - d).rem_euclid(3) as usize];
+                        self.set_subpatch_param_str(outer_id, inner, "_tz_trig", next);
+                    }
                     _ => {}
                 }
             }
@@ -786,7 +840,7 @@ impl FlexInputApp {
                             // next button press reaches the body's capture; clear
                             // the stale baseline/seen so it re-captures fresh.
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", true);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
                             self.remove_subpatch_param(outer_id, inner, "_tz_gp_base");
@@ -810,12 +864,12 @@ impl FlexInputApp {
                         // selection. Touch Zones is already in `captured` here.
                         if menu {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
                         }
                         // Exclude the menu's OWN output pins so a zone can't map to
                         // itself (mirrors the mouse menu path's `menu_excl`).
-                        let exclude_pin_prefix = if menu {
+                        let exclude_pin_prefix = if menu && !area {
                             self.get_subpatch_param_str(outer_id, inner, "menu_id")
                                 .map(|id| format!("menu:{id}"))
                         } else {
@@ -838,7 +892,7 @@ impl FlexInputApp {
                         // Assign: bind to the zone's selection first.
                         if menu {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
                         }
                         self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
