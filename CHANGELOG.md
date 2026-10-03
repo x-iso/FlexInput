@@ -14,6 +14,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   controller's when the controller calls in; it waits and only steps in if the
   controller doesn't.
 
+- **The Bluetooth dongle no longer garbles or loses messages from the radio.**
+  A long message that arrived over two reads was split in half: its start was
+  lost and the rest read as nonsense, sometimes taking the next real message
+  with it. This affected Joy-Con 2 and Switch Pro connections on the dongle.
+
 ## [0.15.4] - 2026-10-03
 
 ### Added

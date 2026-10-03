@@ -438,6 +438,151 @@ fn parse_inquiry_results(code: u8, params: &[u8]) -> Vec<InquiryResult> {
     out
 }
 
+/// Whether an event with this code can carry `len` parameter bytes.
+///
+/// ⭐ **The test that tells a real event from the middle of one.** A transfer
+/// that starts partway through an event — its head lost to a cut-off read —
+/// has no header; its first bytes are payload, read as a code and a length.
+/// Most events have a FIXED length in the spec, so payload read as a header
+/// almost never agrees with it. Every junk event in a real trace failed this:
+/// `0x00` (no such event), Inquiry Complete with no status, Page Scan
+/// Repetition Mode Change with 2 bytes instead of 7, an empty Inquiry Result.
+///
+/// Unknown codes pass: a code this does not know is not evidence of junk, and
+/// vendor events (`0xFF`) are real.
+pub fn event_length_plausible(code: u8, len: usize, first: Option<u8>) -> bool {
+    // Count-prefixed events: `first` is the count, each entry a fixed size.
+    // A count of zero is never sent.
+    let counted = |each: usize| match first {
+        Some(n) => n >= 1 && len == 1 + each * n as usize,
+        None => len >= 1 + each,
+    };
+    match code {
+        0x00 => false,
+        0x01 => len == 1,                       // Inquiry Complete
+        EVT_INQUIRY_RESULT | EVT_INQUIRY_RESULT_RSSI => counted(14),
+        0x03 => len == 11,                      // Connection Complete
+        0x04 => len == 10,                      // Connection Request
+        0x05 => len == 4,                       // Disconnection Complete
+        0x06 => len == 3,                       // Authentication Complete
+        0x07 => len == 255,                     // Remote Name Request Complete
+        0x08 => len == 4,                       // Encryption Change
+        0x0E => len >= 3,                       // Command Complete
+        0x0F => len == 4,                       // Command Status
+        0x10 => len == 1,                       // Hardware Error
+        0x11 => len == 2,                       // Flush Occurred
+        0x12 => len == 8,                       // Role Change
+        0x13 => counted(4),                     // Number Of Completed Packets
+        0x14 => len == 6,                       // Mode Change
+        0x16 | 0x17 => len == 6,                // PIN Code / Link Key Request
+        0x18 => len == 23,                      // Link Key Notification
+        0x1B => len == 3,                       // Max Slots Change
+        0x1C | 0x1D => len == 5,                // Clock Offset / Packet Type
+        0x20 => len == 7,                       // Page Scan Repetition Mode Change
+        0x21 => len == 22,                      // Flow Specification Complete
+        EVT_EXTENDED_INQUIRY_RESULT => len == 255,
+        0x30 => len == 3,                       // Encryption Key Refresh Complete
+        0x31 => len == 6,                       // IO Capability Request
+        0x32 => len == 9,                       // IO Capability Response
+        0x33 => len == 10,                      // User Confirmation Request
+        0x36 => len == 7,                       // Simple Pairing Complete
+        0x38 => len == 4,                       // Link Supervision Timeout Changed
+        EVT_LE_META => len >= 1,
+        _ => true,
+    }
+}
+
+/// What one transfer from the event endpoint held.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EventSplit {
+    /// Complete events, each with its 2-byte header.
+    pub events: Vec<Vec<u8>>,
+    /// An event whose start arrived but whose end has not — to be completed by
+    /// the next transfer.
+    pub head: Option<Vec<u8>>,
+    /// Bytes at the start that were the rest of an event whose start was lost.
+    pub skipped: usize,
+}
+
+/// Split one event-endpoint transfer into events, carrying a cut-off one over.
+///
+/// ⛔ **Why this is not "one transfer, one event".** A read that times out
+/// partway through an event is cancelled, and the event's remaining packets
+/// arrive as the NEXT transfer — a transfer that starts mid-event. Parsing that
+/// as events produced a steady stream of phantom ones (`code 0x00`, a Page Scan
+/// Repetition Mode Change with two bytes), and when the leftover was exactly
+/// one packet long the real event behind it shared the transfer and was
+/// misparsed along with it. The radio polls with millisecond timeouts, so long
+/// events — LE advertising reports above all — were cut constantly.
+///
+/// Three rules, from how USB delivers interrupt data in `mps`-byte packets:
+/// * `carry` (an event cut off last time) is completed by this transfer when
+///   the two join into valid events. If they do not, it is dropped.
+/// * A transfer starting mid-event is recognised by an implausible header (see
+///   [`event_length_plausible`]). The real events after it start on a PACKET
+///   boundary — a leftover is whole packets, ended by its short last one or
+///   joined by the next event — so parsing is retried at each one.
+/// * An incomplete event at the end is kept only when the transfer ended on a
+///   packet boundary, i.e. was cut off. A transfer ended by a short packet
+///   ends an event, so anything incomplete there is junk.
+pub fn split_event_transfer(carry: &[u8], data: &[u8], mps: usize) -> EventSplit {
+    let mps = mps.max(1);
+    let cut_off = !data.is_empty() && data.len() % mps == 0;
+    let finish = |mut s: EventSplit| {
+        if !cut_off {
+            s.head = None;
+        }
+        s
+    };
+    if !carry.is_empty() {
+        let mut joined = carry.to_vec();
+        joined.extend_from_slice(data);
+        // Still incomplete after a transfer that ENDED (short packet) means
+        // the carry was not this event's start after all.
+        if let Some(s) = try_split(&joined).filter(|s| s.head.is_none() || cut_off) {
+            return finish(s);
+        }
+    }
+    let mut start = 0;
+    while start < data.len() {
+        if let Some(mut s) = try_split(&data[start..]) {
+            s.skipped = start;
+            return finish(s);
+        }
+        start += mps;
+    }
+    EventSplit { skipped: data.len(), ..EventSplit::default() }
+}
+
+/// Parse `d` as back-to-back events from its first byte, or `None` if any
+/// header in it is implausible.
+fn try_split(d: &[u8]) -> Option<EventSplit> {
+    let mut out = EventSplit::default();
+    let mut i = 0;
+    while i < d.len() {
+        let code = d[i];
+        let Some(&len) = d.get(i + 1) else {
+            if code == 0 {
+                return None;
+            }
+            out.head = Some(d[i..].to_vec());
+            return Some(out);
+        };
+        let len = len as usize;
+        let first = if len > 0 { d.get(i + 2).copied() } else { None };
+        if !event_length_plausible(code, len, first) {
+            return None;
+        }
+        if i + 2 + len > d.len() {
+            out.head = Some(d[i..].to_vec());
+            return Some(out);
+        }
+        out.events.push(d[i..i + 2 + len].to_vec());
+        i += 2 + len;
+    }
+    Some(out)
+}
+
 pub fn parse_event(buf: &[u8]) -> crate::Result<Event> {
     if buf.len() < 2 {
         return Err(crate::Error::Protocol(format!(
@@ -982,5 +1127,89 @@ mod inquiry_tests {
         assert_eq!(Opcode::IO_CAPABILITY_REQUEST_REPLY.0, 0x042B);
         assert_eq!(Opcode::USER_CONFIRMATION_REQUEST_REPLY.0, 0x042C);
         assert_eq!(Opcode::WRITE_SIMPLE_PAIRING_MODE.0, 0x0C56);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    const MPS: usize = 16;
+
+    /// Connection Request for the Pro, as the trace showed it.
+    fn conn_request() -> Vec<u8> {
+        let mut v = vec![0x04, 10, 0x69, 0x01, 0x0f, 0x16, 0x2d, 0xda, 0x08, 0x25, 0x00, 0x01];
+        v.truncate(12);
+        v
+    }
+
+    #[test]
+    fn whole_events_split_as_before() {
+        let mut d = conn_request();
+        d.extend([0x13, 5, 1, 2, 0, 1, 0]);
+        let s = split_event_transfer(&[], &d, MPS);
+        assert_eq!(s.events.len(), 2);
+        assert_eq!(s.head, None);
+        assert_eq!(s.skipped, 0);
+    }
+
+    /// The junk from the trace: every one of these is the rest of an event
+    /// whose start was lost, and none may come out as an event.
+    #[test]
+    fn leftovers_from_the_trace_are_not_events() {
+        for junk in [
+            vec![0x00, 0x01, 0x09],
+            vec![0x00, 0x00],
+            vec![0x01, 0x00],
+            vec![0x02, 0x01, 0x00],
+            vec![0x20, 0x02, 73, 161],
+            vec![0x21, 10, 179, 190, 246, 70, 199, 188, 88, 84, 79, 87],
+            vec![0x11, 7, 47, 138, 127, 145, 120, 98, 22],
+        ] {
+            let s = split_event_transfer(&[], &junk, MPS);
+            assert!(s.events.is_empty(), "{junk:02x?} came out as {:02x?}", s.events);
+        }
+    }
+
+    /// ⛔ The case that LOST real events: a leftover of exactly one packet,
+    /// with the next event joined onto it in the same transfer.
+    #[test]
+    fn a_real_event_behind_a_one_packet_leftover_is_recovered() {
+        let mut d = vec![0x00; MPS];
+        d[1] = 0x01;
+        d.extend(conn_request());
+        let s = split_event_transfer(&[], &d, MPS);
+        assert_eq!(s.events, vec![conn_request()]);
+        assert_eq!(s.skipped, MPS);
+    }
+
+    #[test]
+    fn a_cut_off_event_is_carried_and_completed() {
+        // A 40-byte LE event cut after one packet.
+        let mut ev = vec![0x3E, 38];
+        ev.extend((0..38).map(|i| i as u8));
+        let first = split_event_transfer(&[], &ev[..MPS], MPS);
+        assert!(first.events.is_empty());
+        let carry = first.head.expect("cut off on a packet boundary — kept");
+        let second = split_event_transfer(&carry, &ev[MPS..], MPS);
+        assert_eq!(second.events, vec![ev]);
+        assert_eq!(second.head, None);
+    }
+
+    #[test]
+    fn an_incomplete_event_ended_by_a_short_packet_is_junk() {
+        // 12 bytes is a short packet: the transfer ENDED there, so an event
+        // claiming more cannot be continued by anything.
+        let d = [0x3E, 38, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let s = split_event_transfer(&[], &d, MPS);
+        assert_eq!(s.head, None);
+    }
+
+    #[test]
+    fn a_carry_that_does_not_fit_is_dropped() {
+        // Carry claims 38 bytes, but the next transfer is a fresh event.
+        let carry = vec![0x3E, 38, 0, 0];
+        let s = split_event_transfer(&carry, &conn_request(), MPS);
+        assert_eq!(s.events, vec![conn_request()]);
     }
 }

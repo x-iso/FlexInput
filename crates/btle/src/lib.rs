@@ -176,6 +176,11 @@ pub struct ClassicLink {
 pub struct Dongle {
     handle: rusb::DeviceHandle<rusb::GlobalContext>,
     event_ep: u8,
+    /// See [`hci::split_event_transfer`].
+    event_mps: usize,
+    /// An event cut off by a read's timeout, waiting for its remaining
+    /// packets, and when it was read. See [`Dongle::read_event_timeout`].
+    event_carry: Mutex<Option<(Vec<u8>, std::time::Instant)>>,
     acl_in_ep: u8,
     acl_out_ep: u8,
     interface: u8,
@@ -614,6 +619,8 @@ impl Dongle {
         Ok(Self {
             handle,
             event_ep: eps.event,
+            event_mps: eps.event_mps,
+            event_carry: Mutex::new(None),
             acl_in_ep: eps.acl_in,
             acl_out_ep: eps.acl_out,
             interface,
@@ -698,46 +705,98 @@ impl Dongle {
         }
 
         let mut buf = [0u8; 512];
-        let n = match self.handle.read_interrupt(self.event_ep, &mut buf, timeout) {
+        let n = match self.read_events_keeping_partial(&mut buf, timeout) {
             Ok(n) => n,
             Err(rusb::Error::Timeout) => return Ok(None),
             Err(e) => return Err(Error::Usb(e)),
         };
 
-        // Split the transfer into every complete event it holds.
+        // ⛔ **A transfer is not one event, and need not start at one.**
         //
-        // ⭐ One read is USUALLY one event — the USB transport terminates each
-        // with a short packet — but not always: an event whose length is an
-        // exact multiple of the endpoint's packet size has no short packet to
-        // end it, so the next event is appended to the same transfer. Parsing
-        // only the first one swallowed the rest, which is how advertising
-        // reports went missing and how phantom events appeared for handles the
-        // host never issued.
+        // The polls here time out after a millisecond or two, and a read that
+        // times out partway through an event is cancelled: the event's start
+        // ends that read and its remaining packets arrive as the NEXT one,
+        // starting mid-event. Treated as events, those leftovers were a
+        // constant stream of phantoms in every trace (`code 0x00`, a two-byte
+        // Page Scan Repetition Mode Change, empty inquiry results), and a
+        // leftover of exactly one packet took the real event joined behind it
+        // down with it. Long events — LE advertising reports — were cut all
+        // the time.
         //
-        // ❗ A truncated TAIL is dropped, deliberately, and this is the second
-        // attempt at this function. The first carried the tail forward to be
-        // completed by the next read, which is more correct in principle and
-        // was a disaster in practice: when a tail never completed, every event
-        // behind it queued up and the transport went deaf. That surfaced as
-        // commands timing out — first scan-parameters, then HCI_Reset itself —
-        // and cost several rounds of testing.
+        // So the start of a cut-off event is carried to the next read and
+        // completed there, and a transfer that starts mid-event is recognised
+        // and skipped up to the next real event. See `hci::split_event_transfer`.
         //
-        // Losing an occasional partial event is cheap: advertisements repeat,
-        // and anything that matters is retried. Stalling the command stream is
-        // not recoverable, so the simpler behaviour is the safer one.
+        // ❗ The carry EXPIRES. An earlier version carried tails with no limit
+        // and no validation, and a tail that never completed swallowed every
+        // event behind it until the transport went deaf. Now the carry must
+        // join into valid events or it is dropped, and after `CARRY_MAX` it is
+        // dropped regardless — an event's packets arrive milliseconds apart.
+        const CARRY_MAX: Duration = Duration::from_millis(50);
+        let mut carry_slot = self.event_carry.lock().unwrap();
+        let carry = carry_slot
+            .take()
+            .filter(|(_, at)| at.elapsed() < CARRY_MAX)
+            .map(|(c, _)| c)
+            .unwrap_or_default();
+        let split = hci::split_event_transfer(&carry, &buf[..n], self.event_mps);
+        if let Some(head) = split.head {
+            *carry_slot = Some((head, std::time::Instant::now()));
+        }
+        drop(carry_slot);
+
         let mut queue = self.pending.lock().unwrap();
-        let mut i = 0usize;
-        while i + 2 <= n {
-            let want = 2 + buf[i + 1] as usize;
-            if i + want > n {
-                break;
-            }
-            if let Ok(e) = hci::parse_event(&buf[i..i + want]) {
+        for raw in &split.events {
+            if let Ok(e) = hci::parse_event(raw) {
                 queue.push_back(e);
             }
-            i += want;
         }
         Ok(queue.pop_front())
+    }
+
+    /// Read the event endpoint, KEEPING what arrived before a timeout.
+    ///
+    /// ⛔ rusb's `read_interrupt` reports a timeout as an error and throws
+    /// away the bytes the transfer had already received — the first packets
+    /// of an event that was still arriving. Those bytes are the start of the
+    /// event, and without them its remaining packets can never be parsed.
+    /// This calls libusb directly and returns them.
+    fn read_events_keeping_partial(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> std::result::Result<usize, rusb::Error> {
+        use rusb::constants::*;
+        let mut transferred: std::os::raw::c_int = 0;
+        // 0 means "wait forever" to libusb; never pass it by accident.
+        let ms = timeout.as_millis().clamp(1, u32::MAX as u128) as std::os::raw::c_uint;
+        // SAFETY: the handle is open for the life of `self`, `buf` is valid
+        // for `buf.len()` bytes, and `transferred` outlives the call.
+        let rc = unsafe {
+            rusb::ffi::libusb_interrupt_transfer(
+                self.handle.as_raw(),
+                self.event_ep,
+                buf.as_mut_ptr(),
+                buf.len() as std::os::raw::c_int,
+                &mut transferred,
+                ms,
+            )
+        };
+        let got = transferred.max(0) as usize;
+        match rc {
+            0 => Ok(got),
+            LIBUSB_ERROR_TIMEOUT | LIBUSB_ERROR_INTERRUPTED if got > 0 => Ok(got),
+            LIBUSB_ERROR_TIMEOUT => Err(rusb::Error::Timeout),
+            LIBUSB_ERROR_INTERRUPTED => Err(rusb::Error::Interrupted),
+            LIBUSB_ERROR_IO => Err(rusb::Error::Io),
+            LIBUSB_ERROR_NO_DEVICE => Err(rusb::Error::NoDevice),
+            LIBUSB_ERROR_PIPE => Err(rusb::Error::Pipe),
+            LIBUSB_ERROR_OVERFLOW => Err(rusb::Error::Overflow),
+            LIBUSB_ERROR_BUSY => Err(rusb::Error::Busy),
+            LIBUSB_ERROR_ACCESS => Err(rusb::Error::Access),
+            LIBUSB_ERROR_NOT_FOUND => Err(rusb::Error::NotFound),
+            _ => Err(rusb::Error::Other),
+        }
     }
 
     /// Throw away any events already queued or waiting on the wire.
@@ -748,6 +807,7 @@ impl Dongle {
     /// that exited without closing its links.
     pub fn drain_events(&self) {
         self.pending.lock().unwrap().clear();
+        *self.event_carry.lock().unwrap() = None;
         // ❗ The ACL backlog goes too. Connection handles are REUSED, so data
         // queued for a link that no longer exists would otherwise be delivered
         // to whichever link inherits its handle — one controller's motion
@@ -3028,6 +3088,8 @@ impl Drop for Dongle {
 
 struct Endpoints {
     event: u8,
+    /// The event endpoint's max packet size — the unit events arrive in.
+    event_mps: usize,
     acl_in: u8,
     acl_out: u8,
 }
@@ -3040,6 +3102,7 @@ struct Endpoints {
 fn find_endpoints(device: rusb::Device<rusb::GlobalContext>, interface: u8) -> Result<Endpoints> {
     let config = device.active_config_descriptor()?;
     let (mut event, mut acl_in, mut acl_out) = (None, None, None);
+    let mut event_mps = 16;
     for iface in config.interfaces() {
         if iface.number() != interface {
             continue;
@@ -3048,6 +3111,10 @@ fn find_endpoints(device: rusb::Device<rusb::GlobalContext>, interface: u8) -> R
             for ep in desc.endpoint_descriptors() {
                 match (ep.transfer_type(), ep.direction()) {
                     (rusb::TransferType::Interrupt, rusb::Direction::In) => {
+                        if event.is_none() {
+                            // Low 11 bits; the rest is a high-speed multiplier.
+                            event_mps = (ep.max_packet_size() & 0x7FF).max(1) as usize;
+                        }
                         event.get_or_insert(ep.address());
                     }
                     (rusb::TransferType::Bulk, rusb::Direction::In) => {
@@ -3063,6 +3130,7 @@ fn find_endpoints(device: rusb::Device<rusb::GlobalContext>, interface: u8) -> R
     }
     Ok(Endpoints {
         event: event.ok_or(Error::NoEndpoint("interrupt IN"))?,
+        event_mps,
         acl_in: acl_in.ok_or(Error::NoEndpoint("bulk IN"))?,
         acl_out: acl_out.ok_or(Error::NoEndpoint("bulk OUT"))?,
     })
