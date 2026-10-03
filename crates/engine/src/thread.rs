@@ -294,6 +294,14 @@ pub fn spawn_processing_thread(
     sink_bus: SinkBus,
     sample_rate: Arc<AtomicU32>,
     ui_source_block: UiSourceBlock,
+    // Same channel, second writer: the gamepad-shortcut watcher's owned
+    // buttons (a chord's buttons must not also reach the game). Kept separate
+    // so neither writer clobbers the other's set.
+    shortcut_source_block: UiSourceBlock,
+    // Bool pins the shortcut watcher is replaying to the game: a held-back
+    // Home tap no shortcut used. Shown pressed, and let through the shortcut
+    // block (not the UI's — an open config overlay still withholds them).
+    shortcut_replay: UiSourceBlock,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Raise this thread above the UI/render threads. The engine ticks at
@@ -378,6 +386,23 @@ pub fn spawn_processing_thread(
                     puffin::profile_scope!("dev_sigs_load");
                     device_signals.load_full()
                 };
+                // A replayed shortcut-leader tap: the button is physically up
+                // by now, so press it on our copy. Only clones the map for the
+                // ~0.1 s a replay lasts. Read once per wakeup — the block below
+                // lets the same keys through.
+                let replay: HashSet<(String, String)> = shortcut_replay
+                    .read()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                let dev_sigs = if replay.is_empty() {
+                    dev_sigs
+                } else {
+                    let mut m = (*dev_sigs).clone();
+                    for k in &replay {
+                        m.insert(k.clone(), Signal::Bool(true));
+                    }
+                    Arc::new(m)
+                };
 
                 // Reconcile WASAPI loopback captures for Audio Stream Haptics
                 // nodes once per wakeup (before the eval ticks read their params).
@@ -414,10 +439,13 @@ pub fn spawn_processing_thread(
                 // injection would only cover the first tick of a catch-up burst,
                 // and the LAST tick (whose sink outputs are published) could
                 // leak the blocked input to the game.
-                let ui_block: Vec<(String, String)> = ui_source_block
+                let mut ui_block: Vec<(String, String)> = ui_source_block
                     .read()
                     .map(|s| s.iter().cloned().collect())
                     .unwrap_or_default();
+                if let Ok(s) = shortcut_source_block.read() {
+                    ui_block.extend(s.iter().filter(|k| !replay.contains(*k)).cloned());
+                }
 
                 {
                     puffin::profile_scope!("eval_ticks");

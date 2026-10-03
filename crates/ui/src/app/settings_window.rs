@@ -1206,6 +1206,17 @@ impl FlexInputApp {
                 {
                     dirty = true;
                 }
+                if ui.checkbox(&mut self.settings.gamepad_home_exclusive,
+                    "Home button is FlexInput's only")
+                    .on_hover_text(
+                        "Applies when Home/Guide/PS is part of a shortcut.\n\
+                         On: the game never sees Home.\n\
+                         Off: Home is held back while it might still become a shortcut; \
+                         if no shortcut used it, the game gets a Home tap when you let go.")
+                    .changed()
+                {
+                    dirty = true;
+                }
 
                 ui.add_space(10.0);
                 ui.separator();

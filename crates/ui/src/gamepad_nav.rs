@@ -56,6 +56,16 @@ pub struct ChordFireState {
     fired_this_hold: bool,
 }
 
+impl ChordFireState {
+    /// Give the current hold away: a `long` press can no longer fire from it,
+    /// and it doesn't count as the first tap of a `double`. Used when a larger
+    /// shortcut built on this combo claims the press.
+    pub fn cancel_hold(&mut self) {
+        self.fired_this_hold = true;
+        self.last_tap_at = None;
+    }
+}
+
 /// Decide whether a shortcut chord should fire this frame.
 ///
 /// `held` = every button in the chord is currently pressed. `mode` selects the
@@ -733,6 +743,17 @@ pub fn read_nav_input(
         gyro_pitch: sig_float(signals, dev_id, "gyro_y"),
         gyro_yaw: sig_float(signals, dev_id, "gyro_z"),
     }
+}
+
+/// Drop the buttons a gamepad shortcut currently owns on `dev_id` (published
+/// by `guide_watcher`), so e.g. the D-pad half of a Home+D-pad chord doesn't
+/// also step the selection. An owned button stays owned until it's released,
+/// so it can't produce a stray rising edge when the mask lifts.
+pub fn mask_owned(nav: &mut NavInput, dev_id: &str, owned: &HashSet<(String, String)>) {
+    if owned.is_empty() { return; }
+    let is_owned = |p: &String| owned.contains(&(dev_id.to_string(), p.clone()));
+    nav.pressed.retain(|p| !is_owned(p));
+    nav.rising.retain(|p| !is_owned(p));
 }
 
 /// True if the device shows any nav activity this frame (used to pick the

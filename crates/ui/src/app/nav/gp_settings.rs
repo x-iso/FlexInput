@@ -51,6 +51,8 @@ impl FlexInputApp {
                     key: GpSettingKey::DefMouseSens }, suffix: "" },
             GpSettingRow { label: "Shortcuts: nav-only".into(),
                 kind: Toggle { key: GpSettingKey::ChordsNavOnly }, suffix: "" },
+            GpSettingRow { label: "Shortcuts: Home is FlexInput's only".into(),
+                kind: Toggle { key: GpSettingKey::HomeExclusive }, suffix: "" },
             GpSettingRow { label: "Shortcut: See-through".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::SeeThrough }, suffix: "" },
             GpSettingRow { label: "Shortcut: Panic".into(),
@@ -82,6 +84,7 @@ impl FlexInputApp {
             DefGyroMult => self.settings.default_gyro_mult,
             DefMouseSens => self.settings.default_mouse_sensitivity,
             ChordsNavOnly => self.settings.gamepad_chords_nav_only as i32 as f32,
+            HomeExclusive => self.settings.gamepad_home_exclusive as i32 as f32,
         }
     }
 
@@ -123,6 +126,7 @@ impl FlexInputApp {
             DefGyroMult => self.settings.default_gyro_mult = val.clamp(0.1, 50.0),
             DefMouseSens => self.settings.default_mouse_sensitivity = val.clamp(0.0, 3000.0),
             ChordsNavOnly => self.settings.gamepad_chords_nav_only = val != 0.0,
+            HomeExclusive => self.settings.gamepad_home_exclusive = val != 0.0,
         }
         self.settings_dirty = true;
     }

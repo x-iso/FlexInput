@@ -446,6 +446,11 @@ pub struct AppSettings {
     /// FlexInput is focused and a nav-eligible gamepad is connected.
     #[serde(default = "default_true")]
     pub gamepad_chords_nav_only: bool,
+    /// When true, a Home/Guide/PS press that no gamepad shortcut used is
+    /// swallowed. When false (default), it's held back while it might still
+    /// become a shortcut and replayed to the game as a tap on release.
+    #[serde(default)]
+    pub gamepad_home_exclusive: bool,
     /// Repaint rate applied while the window is unfocused / minimized.
     /// Focused window always paints at vsync. Range BG_REPAINT_HZ_MIN..=MAX.
     #[serde(default = "default_bg_repaint_hz")]
@@ -710,6 +715,7 @@ impl Default for AppSettings {
             config_overlay_shortcut: default_config_overlay_shortcut(),
             config_overlay_passthrough_default: false,
             gamepad_chords_nav_only: true,
+            gamepad_home_exclusive: false,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
             mouse_suppression_enabled: true,
             mouse_suppress_release_ms: MOUSE_SUPPRESS_RELEASE_MS_DEFAULT,

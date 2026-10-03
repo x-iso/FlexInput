@@ -72,6 +72,7 @@ fn shortcut_spec_from(
 fn chord_watch_config_from(s: &AppSettings) -> ChordWatchConfig {
     ChordWatchConfig {
         nav_only:   s.gamepad_chords_nav_only,
+        home_exclusive: s.gamepad_home_exclusive,
         seethrough: shortcut_spec_from(&s.seethrough_chord, &s.seethrough_chord_mode, s.seethrough_chord_gap_ms),
         panic:      shortcut_spec_from(&s.panic_chord, &s.panic_chord_mode, s.panic_chord_gap_ms),
         overlay:    shortcut_spec_from(&s.overlay_chord, &s.overlay_chord_mode, s.overlay_chord_gap_ms),
@@ -387,6 +388,10 @@ pub struct FlexInputApp {
     /// lock when the block set actually changes (device connect/disconnect or
     /// the overlay opening/closing) rather than every frame.
     ui_source_block_cache: std::collections::HashSet<(String, String)>,
+    /// Physical buttons a gamepad shortcut currently owns, written by the
+    /// shortcut watcher (`guide_watcher::owned_pins`). The engine blocks them
+    /// from the game; gamepad nav masks them so a chord doesn't also navigate.
+    shortcut_owned: flexinput_engine::UiSourceBlock,
     // ── I/O thread shared state ───────────────────────────────────────────────
     /// App-level shared pool of virtual output devices. Same instance of
     /// `virtual.xinput.0` is reused across every tab that references it.
@@ -785,6 +790,8 @@ impl FlexInputApp {
         let proc_outputs        = Arc::new(Mutex::new(ProcessingOutput::default()));
         let sink_bus: SinkBus   = Arc::new(RwLock::new(HashMap::new()));
         let ui_source_block     = flexinput_engine::new_ui_source_block();
+        let shortcut_owned      = flexinput_engine::new_ui_source_block();
+        let shortcut_replay     = flexinput_engine::new_ui_source_block();
         spawn_processing_thread(
             Arc::clone(&proc_graph),
             Arc::clone(&proc_device_signals),
@@ -792,6 +799,8 @@ impl FlexInputApp {
             Arc::clone(&sink_bus),
             Arc::clone(&sample_rate_hz),
             Arc::clone(&ui_source_block),
+            Arc::clone(&shortcut_owned),
+            Arc::clone(&shortcut_replay),
         );
 
         // Restore workspace if the user opted in; otherwise start with one empty tab.
@@ -1046,6 +1055,8 @@ impl FlexInputApp {
             },
             Arc::clone(&nav_enabled_devices),
             Arc::clone(&proc_device_signals),
+            Arc::clone(&shortcut_owned),
+            shortcut_replay,
         );
         // Seed the see-through data slot so the eye button reflects the
         // persisted value on first frame.
@@ -1123,6 +1134,7 @@ impl FlexInputApp {
             sink_bus: Arc::clone(&sink_bus),
             ui_source_block,
             ui_source_block_cache: std::collections::HashSet::new(),
+            shortcut_owned,
             shared_virtual_devices,
             device_ops,
             pending_device_ids,
@@ -3263,6 +3275,7 @@ pub(crate) enum GpSettingKey {
     DefGyroMult,
     DefMouseSens,
     ChordsNavOnly,
+    HomeExclusive,
 }
 
 /// Stepping model for a generic numeric nav param.
@@ -3490,10 +3503,19 @@ impl FlexInputApp {
             // wins; otherwise keep the sticky one.
             const STICK_DZ: f32 = 0.35;
             const TRIG_DZ: f32 = 0.5;
+            // Buttons a gamepad shortcut is using never reach nav: the D-pad
+            // of a Home+D-pad chord must not also step the selection.
+            let shortcut_owned = self.shortcut_owned.read()
+                .map(|s| s.clone()).unwrap_or_default();
+            let read_nav = |id: &str, prev: &std::collections::HashSet<String>| {
+                let mut nav = gn::read_nav_input(&self.last_signals, id, prev);
+                gn::mask_owned(&mut nav, id, &shortcut_owned);
+                nav
+            };
             let prev_pressed = self.gamepad_nav.prev_pressed.clone();
             let mut newly_active: Option<String> = None;
             for id in &eligible {
-                let nav = gn::read_nav_input(&self.last_signals, id, &prev_pressed);
+                let nav = read_nav(id, &prev_pressed);
                 let rising = nav.pressed.iter().any(|p| !prev_pressed.contains(p));
                 let moved = nav.lstick.length() > STICK_DZ
                     || nav.rstick.length() > STICK_DZ
@@ -3522,7 +3544,7 @@ impl FlexInputApp {
                 });
 
             if let Some(dev) = chosen {
-                let nav = gn::read_nav_input(&self.last_signals, &dev, &self.gamepad_nav.prev_pressed);
+                let nav = read_nav(&dev, &self.gamepad_nav.prev_pressed);
                 active_dev = Some(dev);
                 active_input = Some(nav);
             }
@@ -4295,7 +4317,7 @@ impl FlexInputApp {
     /// never used by in-game mappings, so a single press is safe — unless the
     /// user HAS mapped one, in which case `chord_draft_acceptable` still requires
     /// a combo. Every other button must be part of a 2+ combo.
-    const STANDALONE_CHORD_PINS: &[&str] = &["btn_guide", "btn_mute", "btn_capture"];
+    const STANDALONE_CHORD_PINS: &[&str] = crate::guide_watcher::STANDALONE_CHORD_PINS;
 
     /// True when a captured chord draft may be committed: a 2+ combo always, or a
     /// single standalone-allowed system button that isn't already used by a
