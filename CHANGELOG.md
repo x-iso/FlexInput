@@ -5,6 +5,52 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-10-03
+
+### Added
+
+- **Gyro to Stick Rotation.** A module on a device's AutoMap bus for finer aim
+  in twin-stick games: turning the pad turns a stick that is already pushed —
+  the thumb picks the direction, the wrist fine-tunes it. The stick keeps its
+  length; turning right turns it clockwise. Pick the stick (right by default)
+  and what counts as turning: **Yaw**, the pad's own vertical however it is
+  held, or **World**, the turn about gravity, so a pad pitched up towards you
+  turns by rolling. **Sens** is degrees of stick per degree of pad, with
+  **Invert**.
+
+  While the stick is inside the **inner deadzone** it passes through untouched
+  and the turn is dropped, so the next push starts from your thumb; a deadzone
+  of 0 never drops it, and the turn keeps building even with the stick centred.
+  **Absolute** (the default) holds the turn; **Relative** lets it fold back to
+  your thumb once the pad stops turning, over a **Return** time — a quick flick
+  of the wrist registers nearly in full, a steady turn holds the stick turned by
+  its speed times the return time. **Stabilise** steadies a shaky thumb by
+  smoothing the stick's direction: small back-and-forth wobble is held back
+  while a deliberate sweep goes through, and the gyro's turn is never smoothed.
+
+  A live circle shows the deadzone, the stick where your thumb has it and where
+  the gyro has taken it, and the turn in degrees. Every row and the circle pin,
+  the pad's navigation edits them, and tuned from the config overlay the stick
+  and the motion sensors pass through to be felt.
+
+- **The same in the JSM Config module:** `GYRO_OUTPUT = RIGHT_STICK_ROTATION`
+  (or `LEFT_STICK_ROTATION`) turns that stick with the gyro instead of pushing
+  it, at `GYRO_SENS` degrees per degree, with `GYRO_SPACE` (`LOCAL` for yaw,
+  `WORLD_TURN` about gravity), smoothing, cutoff and `GYRO_OFF` all applying.
+  New settings `GYRO_STICK_ROTATION_DEADZONE`, `GYRO_STICK_ROTATION_MODE`
+  (`ABSOLUTE` / `RELATIVE`), `GYRO_STICK_ROTATION_RETURN_TIME` and
+  `GYRO_STICK_ROTATION_SMOOTH_TIME`, each with help and a Tune slider. The Tune
+  panel shows the same live circle. These are FlexInput's own and the editor
+  says so on the line — a config using them won't load in JoyShockMapper.
+
+### Fixed
+
+- **JSM editor notes no longer have a gap in the middle.** Eight of the notes
+  the editor puts on a line (on `SET_MOTION_STICK_NEUTRAL`, a rebound trigger,
+  `ZL_MODE = X_LT`, `REAL_WORLD_CALIBRATION` and `IN_GAME_SENS`,
+  `ROLL_CONTRIBUTION`, FlexInput's own settings and virtual-pad outputs) showed
+  a long run of spaces mid-sentence.
+
 ## [0.15.3] - 2026-10-03
 
 ### Added
