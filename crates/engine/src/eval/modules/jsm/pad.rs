@@ -37,6 +37,11 @@ pub enum Dest {
     /// `MIDI` (`GYRO_OUTPUT` only): the rotation rate goes out as MIDI values, to
     /// `GYRO_MIDI_X` / `_Y` / `_Z`.
     Midi,
+    /// `LEFT_STICK_ROTATION` / `RIGHT_STICK_ROTATION` (`GYRO_OUTPUT` only,
+    /// FlexInput's own): the gyro's turn rotates that stick while it is pushed,
+    /// rather than adding to it — see `stick_rotation.rs`.
+    LeftStickRotation,
+    RightStickRotation,
 }
 
 impl Dest {
@@ -45,7 +50,16 @@ impl Dest {
         match self {
             Dest::LeftStick => Some(0),
             Dest::RightStick => Some(1),
-            Dest::Mouse | Dest::PsMotion | Dest::Midi => None,
+            _ => None,
+        }
+    }
+
+    /// Which virtual stick the gyro turns, if it turns one.
+    pub fn rotation_side(self) -> Option<usize> {
+        match self {
+            Dest::LeftStickRotation => Some(0),
+            Dest::RightStickRotation => Some(1),
+            _ => None,
         }
     }
 }
@@ -84,6 +98,17 @@ pub struct Settings {
     pub wind_power: f32,
     /// `UNWIND_RATE`: degrees per second the winding unwinds at a centred stick.
     pub unwind_rate: f32,
+    /// `GYRO_STICK_ROTATION_DEADZONE`: inside it, the stick the gyro turns passes
+    /// through untouched and the turn is dropped. A fraction of stick travel.
+    pub rotation_deadzone: f32,
+    /// `GYRO_STICK_ROTATION_SMOOTH_TIME`: the stabiliser on that stick's direction, in
+    /// seconds; 0 is off.
+    pub rotation_smooth: f32,
+    /// `GYRO_STICK_ROTATION_MODE = RELATIVE`: the turn folds back to the thumb once
+    /// the pad stops, rather than holding.
+    pub rotation_relative: bool,
+    /// `GYRO_STICK_ROTATION_RETURN_TIME`: how fast it folds back, seconds.
+    pub rotation_return: f32,
 }
 
 impl Default for Settings {
@@ -98,6 +123,10 @@ impl Default for Settings {
             wind_range: 900.0,
             wind_power: 1.0,
             unwind_rate: 1800.0,
+            rotation_deadzone: crate::eval::STICK_ROT_DEADZONE_DEFAULT,
+            rotation_smooth: 0.0,
+            rotation_relative: false,
+            rotation_return: crate::eval::STICK_ROT_RETURN_DEFAULT_MS / 1000.0,
         }
     }
 }

@@ -614,6 +614,10 @@ impl FlexInputApp {
             | ("processing.rws", "measure")
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
+            | ("module.stick_rotation", "options") | ("module.stick_rotation", "sens")
+            | ("module.stick_rotation", "deadzone") | ("module.stick_rotation", "stabilise")
+            | ("module.stick_rotation", "hold")
+            | ("module.stick_rotation", "field")
             | ("math.negate", "unipolar")
             | ("math.quantize", "factor") | ("math.quantize", "mode")
             | ("module.vec_to_deflection", "angle_unit")
@@ -881,6 +885,32 @@ impl FlexInputApp {
             ],
             ("processing.rws", "suppress") => vec![
                 f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
+            ],
+            // ── Gyro to Stick Rotation ──
+            // Each option lists its default first, so an untouched node shows it.
+            // The pinned circle carries every setting, so it can be tuned from
+            // the pad with nothing else pinned.
+            ("module.stick_rotation", "options") => vec![
+                f!("Stick", Enum{key:"rot_stick",opts:&["right_stick","left_stick"]}),
+                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
+            ],
+            ("module.stick_rotation", "sens") => vec![
+                f!("Sens", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Invert", Toggle{key:"rot_invert"}),
+            ],
+            ("module.stick_rotation", "hold") => vec![
+                f!("Relative", Toggle{key:"rot_relative"}),
+                f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
+            ],
+            ("module.stick_rotation", "deadzone") => vec![f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05)))],
+            ("module.stick_rotation", "stabilise") => vec![f!("Stabilise ms", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0)))],
+            ("module.stick_rotation", "field") => vec![
+                f!("Sens", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05))),
+                f!("Stabilise ms", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0))),
+                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
+                f!("Relative", Toggle{key:"rot_relative"}),
+                f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
             ],
             // ── multi-field rows ──
             ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
@@ -2143,7 +2173,7 @@ impl crate::app::FlexInputApp {
         let cfg = flexinput_engine::eval::jsm_compile(&text, &[]);
         matches!(
             flexinput_engine::eval::jsm_feel_of(&cfg, name),
-            JsmFeel::Stick(JsmHand::Left)
+            JsmFeel::Stick(JsmHand::Left) | JsmFeel::GyroAndStick(JsmHand::Left)
         )
     }
 

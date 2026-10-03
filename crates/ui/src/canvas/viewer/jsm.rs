@@ -1290,6 +1290,16 @@ fn knob_rows(
     register_exposable_element(ui, node_id, "curve", rect);
     let new_warp = super::jsm_widgets::warp_slider(ui, width, warp, paint);
 
+    // `GYRO_OUTPUT = *_ROTATION`: the stick the gyro turns, live — where the
+    // thumb has it and where the gyro has taken it. On the canvas only; pinned,
+    // the strip's budget is the faders', and the circle pins on its own.
+    if budget.is_none() {
+        let side = width.min(160.0);
+        if let Some(r) = super::render_jsm_rotation(node_id, ui, snarl, &compiled, egui::vec2(side, side)) {
+            register_exposable_element(ui, node_id, "rotation", r);
+        }
+    }
+
     // Calibration sits directly under the curve and above the faders: it is the
     // thing that decides what the curve's speeds MEAN, and it stays put while the
     // faders scroll for the same reason the curve does. Pinnable on its own, so a

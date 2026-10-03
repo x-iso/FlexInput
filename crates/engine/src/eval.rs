@@ -260,6 +260,15 @@ fn eval_subgraph(
             continue;
         }
 
+        // Gyro to Stick Rotation nested in a sub-patch — the same, keyed by the
+        // namespaced uid. Its live values ride in last_outputs for the body.
+        if snap.module_id == STICK_ROT_ID {
+            let out = eval_stick_rotation_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            last_outputs.insert(ns_uid, out);
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // module.map_action inside subpatch: mirror top-level behaviour but
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
@@ -569,6 +578,16 @@ pub fn eval_graph_tick(
         // its cells. The live point and cell weights ride in last_outputs.
         if snap.module_id == AREA_MAPPER_ID {
             let out = eval_area_mapper_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
+            last_outputs.insert(snap.node_uid, out);
+            computed[idx] = vec![None];
+            continue;
+        }
+
+        // ── Gyro to Stick Rotation: hand the bus on with the picked stick turned
+        // by the gyro. The stick in and out, and the offset, ride in last_outputs
+        // for the body's circle.
+        if snap.module_id == STICK_ROT_ID {
+            let out = eval_stick_rotation_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             last_outputs.insert(snap.node_uid, out);
             computed[idx] = vec![None];
             continue;

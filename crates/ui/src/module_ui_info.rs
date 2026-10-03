@@ -27,6 +27,7 @@ pub(crate) fn republishes_automap_bus(module_id: &str) -> bool {
             | "module.automap_response_curve"
             | "module.automap_twoway_response_curve"
             | "module.area_mapper"
+            | "module.stick_rotation"
     )
 }
 
@@ -46,6 +47,7 @@ pub(crate) fn glows_from_automap_input(module_id: &str) -> bool {
             | "module.automap_response_curve"
             | "module.automap_twoway_response_curve"
             | "module.area_mapper"
+            | "module.stick_rotation"
     )
 }
 
@@ -111,7 +113,7 @@ mod tests {
                        "module.jsm", "module.network_send", "module.network_recv",
                        "module.automap_response_curve",
                        "module.automap_twoway_response_curve",
-                       "module.area_mapper"] {
+                       "module.area_mapper", "module.stick_rotation"] {
             assert!(republishes_automap_bus(module), "{module} should republish");
             assert!(
                 crate::canvas::viewer::bus_label(module).is_some(),

@@ -666,6 +666,48 @@ pub struct ModuleDescriptor {
   - `am_curve_pin: String` - The bus pin to reshape
   - Curve params as Two-way Response Curve; `vec_mode` follows the picked pin's type
 
+#### Gyro to Stick Rotation
+- **ID:** `module.stick_rotation`
+- **Purpose:** Turning the pad turns one stick of an AutoMap bus that is already
+  pushed, for finer aim in twin-stick games: the thumb picks the direction, the wrist
+  fine-tunes it. While the stick is out past the inner deadzone the pad's turn rate
+  winds up an offset angle and the stick goes out rotated by it, its length unchanged.
+  Turning right turns the stick clockwise. Back inside the deadzone the stick passes
+  through untouched and the offset is dropped, so the next push starts from the thumb.
+  A deadzone of 0 means none: the offset is never dropped and keeps building and
+  applying with the stick centred.
+- **Absolute / Relative** — Absolute (default) holds the offset: the stick stays turned
+  by however far the pad has turned. Relative is the same sum leaking away with the
+  **Return** time constant: a quick turn registers nearly whole, a steady turn holds
+  an offset of its rate times the return time, and when the pad stops the stick folds
+  back to the thumb (about a third left after one return time).
+  Every other signal passes through. The body's circle shows the deadzone, the stick
+  where the thumb has it (hollow), where the gyro has taken it (filled, with the arc
+  between) and the offset in degrees. Every row and the circle pin on their own, and a
+  pinned one passes the stick and the motion sensors through the config overlay.
+- **Turn** — **Yaw**: the pad's own vertical (`gyro_z`), however it is held.
+  **World**: the turn about gravity (low-passed accelerometer, with the accel/gyro
+  basis difference accounted for), so a pad pitched up towards you turns by rolling;
+  without an accelerometer it falls back to Yaw.
+- **Stabilise** smooths the thumb's DIRECTION with a one-euro filter (never the
+  length, never the gyro's offset): a tremor reverses too fast to open it, a deliberate
+  sweep opens it. A plain speed threshold would do the reverse — tremor is fast.
+- **Inputs:** AutoMap bus
+- **Outputs:** AutoMap bus (republished under `collector:{uid}`, the stick in all
+  three forms); live values in `last_out` (`STICK_ROT_OUT_*`)
+- **Parameters:**
+  - `rot_stick: String` - `right_stick` (default) or `left_stick`
+  - `rot_mode: String` - `yaw` (default) or `world`
+  - `rot_sens: f32` - degrees of stick turn per degree of pad turn (default 1.0)
+  - `rot_invert: bool` - turn the other way
+  - `rot_deadzone: f32` - inner deadzone, 0..1 of stick travel (default 0.2)
+  - `rot_smooth_ms: f32` - stabilising time, ms (default 0 = off)
+  - `rot_relative: bool` - relative mode (default off = absolute)
+  - `rot_return_ms: f32` - relative mode's return time constant, ms (default 250)
+- **The same rotation in the JSM Config module:** `GYRO_OUTPUT = RIGHT_STICK_ROTATION`
+  (or `LEFT_`), with `GYRO_STICK_ROTATION_DEADZONE` and `GYRO_STICK_ROTATION_SMOOTH_TIME` — see
+  JSM Config below. Both run `eval/modules/stick_rotation.rs`.
+
 #### Area Mapper
 - **ID:** `module.area_mapper`
 - **Purpose:** Lays one XY pair of an AutoMap bus (the header's **Input**: left stick,
@@ -1101,6 +1143,18 @@ pub struct ModuleDescriptor {
   its `MISC1`-`MISC6` buttons. Every fork line says it is the fork's, since a config
   using one won't load in a stock JSM. Only `MOUSE_RING` and `HYBRID_AIM` are still
   pending, and their lines say why.
+  FlexInput's own addition: `GYRO_OUTPUT = LEFT_STICK_ROTATION` / `RIGHT_STICK_ROTATION`
+  turns that stick by the gyro while it is pushed past `GYRO_STICK_ROTATION_DEADZONE`
+  (default 0.2), instead of pushing it — the Gyro to Stick Rotation module's behaviour,
+  fed JSM's own horizontal gyro rate, so `GYRO_SENS` (degrees of stick per degree of
+  pad), `GYRO_SPACE` (`LOCAL` = yaw, `WORLD_TURN` = about gravity), smoothing, cutoff
+  and `GYRO_OFF` all apply. `GYRO_STICK_ROTATION_SMOOTH_TIME` (seconds) stabilises the
+  thumb's direction; `GYRO_STICK_ROTATION_MODE = ABSOLUTE | RELATIVE` and
+  `GYRO_STICK_ROTATION_RETURN_TIME` (seconds, default 0.25) are the module's
+  Absolute/Relative and Return. A deadzone of 0 never drops the turn. It turns whatever that stick is about to send — passed through,
+  or routed by a stick mode — and, like any non-mouse `GYRO_OUTPUT`, silences the
+  gyro mouse. The Tune panel shows the same live circle as the module (pinnable as
+  `rotation`); tuning one of these settings lets the gyro and that stick through.
 - **What it takes over:** only what it actually runs. A stick left in a mode a
   later phase owns, and a full pull the trigger mode never fires, keep passing
   through rather than going quiet for a binding that can't run; the line says why.

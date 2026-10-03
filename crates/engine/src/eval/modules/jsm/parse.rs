@@ -915,7 +915,9 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs, ports: Ports) -> Lin
             out.neutral_at_load = true;
             let mut info = LineInfo::of(LineStatus::Ok);
             info.notes.push(
-                "runs once, as the config loads, so it takes however the pad is being held                  then. Bind it to a button instead (`HOME = \"SET_MOTION_STICK_NEUTRAL\"`) to                  re-centre whenever you like."
+                "runs once, as the config loads, so it takes however the pad is being held \
+                 then. Bind it to a button instead (`HOME = \"SET_MOTION_STICK_NEUTRAL\"`) to \
+                 re-centre whenever you like."
                     .to_string(),
             );
             info
@@ -1248,7 +1250,8 @@ fn binding_line(
             // button doesn't look like it has two.
             if let Some(info) = out.lines.get_mut(old_line) {
                 info.notes.push(format!(
-                    "replaced by the binding on line {} — a second one for the same trigger                      wins, as in JSM",
+                    "replaced by the binding on line {} — a second one for the same trigger \
+                     wins, as in JSM",
                     line + 1
                 ));
             }
@@ -1841,7 +1844,8 @@ fn analog_setting(name: &str, rhs: &str, which: AnalogId, s: &mut Settings) -> L
                 if m.pad_side().is_some() {
                     info.notes.push(PAD_NOTE.to_string());
                     info.notes.push(
-                        "this trigger's own bindings stop running, as in JSM — its pull goes                          straight to the pad. It still works as a chord for a modeshift."
+                        "this trigger's own bindings stop running, as in JSM — its pull goes \
+                         straight to the pad. It still works as a chord for a modeshift."
                             .to_string(),
                     );
                 }
@@ -2136,7 +2140,8 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
                         // in the message, since a reader who takes it for per-turn is
                         // 360 times out.
                         return wants(
-                            "a number above zero — it is how many mouse counts the game turns                              the camera by for each degree the pad rotates",
+                            "a number above zero — it is how many mouse counts the game turns \
+                             the camera by for each degree the pad rotates",
                         );
                     }
                     s.real_world_calibration = v;
@@ -2161,7 +2166,10 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
             if matches!(which, AimId::RealWorldCalibration | AimId::InGameSens) {
                 let mut info = LineInfo::of(LineStatus::Ok);
                 info.notes.push(
-                    "REAL_WORLD_CALIBRATION is mouse counts per DEGREE, and IN_GAME_SENS                      divides it. A calibration you measured in-game already includes your                      in-game sensitivity, so leave IN_GAME_SENS at 1 for it — setting both                      makes the aim exactly IN_GAME_SENS times too slow."
+                    "REAL_WORLD_CALIBRATION is mouse counts per DEGREE, and IN_GAME_SENS \
+                     divides it. A calibration you measured in-game already includes your \
+                     in-game sensitivity, so leave IN_GAME_SENS at 1 for it — setting both \
+                     makes the aim exactly IN_GAME_SENS times too slow."
                         .to_string(),
                 );
                 return info;
@@ -2279,6 +2287,14 @@ pub(crate) enum PadId {
     WindRange,
     WindPower,
     UnwindRate,
+    /// `GYRO_STICK_ROTATION_DEADZONE` — FlexInput's own, for `GYRO_OUTPUT = *_ROTATION`.
+    RotationDeadzone,
+    /// `GYRO_STICK_ROTATION_SMOOTH_TIME` — likewise.
+    RotationSmoothTime,
+    /// `GYRO_STICK_ROTATION_MODE` (`ABSOLUTE` / `RELATIVE`) — likewise.
+    RotationMode,
+    /// `GYRO_STICK_ROTATION_RETURN_TIME` — likewise.
+    RotationReturnTime,
 }
 
 /// Apply one virtual-pad setting.
@@ -2350,7 +2366,20 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
                      FLICK_STICK_OUTPUT can't"
                         .into(),
                 )),
-                _ => return wants("MOUSE, LEFT_STICK, RIGHT_STICK, PS_MOTION or MIDI"),
+                // FlexInput's own: the gyro turns a pushed stick rather than
+                // pushing it. See `stick_rotation.rs`.
+                "LEFT_STICK_ROTATION" if !flick => (Dest::LeftStickRotation, Some(FLEXINPUT_NOTE.to_string())),
+                "RIGHT_STICK_ROTATION" if !flick => (Dest::RightStickRotation, Some(FLEXINPUT_NOTE.to_string())),
+                "LEFT_STICK_ROTATION" | "RIGHT_STICK_ROTATION" => return LineInfo::of(LineStatus::Error(
+                    "a flick already says where the stick points — only GYRO_OUTPUT can turn a \
+                     stick by a rotation"
+                        .into(),
+                )),
+                _ if flick => return wants("MOUSE, LEFT_STICK, RIGHT_STICK or PS_MOTION"),
+                _ => return wants(
+                    "MOUSE, LEFT_STICK, RIGHT_STICK, PS_MOTION, MIDI, LEFT_STICK_ROTATION or \
+                     RIGHT_STICK_ROTATION",
+                ),
             };
             if flick {
                 p.flick_dest = dest;
@@ -2371,8 +2400,17 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
                         .to_string(),
                 );
             }
-            if dest.side().is_some() {
+            if dest.side().is_some() || dest.rotation_side().is_some() {
                 info.notes.push(PAD_NOTE.to_string());
+            }
+            if dest.rotation_side().is_some() {
+                info.notes.push(
+                    "the stick turns while it is pushed past GYRO_STICK_ROTATION_DEADZONE (0.2 unless \
+                     set), by GYRO_SENS degrees per degree the pad turns — GYRO_SPACE, the gyro \
+                     button, smoothing and cutoff all apply. Inside the deadzone the turn is \
+                     dropped and the stick passes through untouched"
+                        .to_string(),
+                );
             }
             info
         }
@@ -2408,6 +2446,60 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
             }
             _ => wants("a number of degrees per second, zero or more"),
         },
+        PadId::RotationDeadzone
+        | PadId::RotationSmoothTime
+        | PadId::RotationMode
+        | PadId::RotationReturnTime => {
+            let mut info = LineInfo::of(LineStatus::Ok);
+            match which {
+                PadId::RotationDeadzone => match in_range(0.0, 1.0) {
+                    Some(v) => {
+                        p.rotation_deadzone = v;
+                        if v == 0.0 {
+                            info.notes.push(
+                                "no deadzone: the turn is never dropped, and keeps applying with \
+                                 the stick centred"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    None => return wants("a fraction of stick travel, 0 to 1 (0 means none)"),
+                },
+                PadId::RotationSmoothTime => match num().filter(|v| *v >= 0.0) {
+                    Some(v) => p.rotation_smooth = v,
+                    None => return wants("a time in seconds, zero or more (zero means no stabilising)"),
+                },
+                PadId::RotationMode => {
+                    match rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str() {
+                        "ABSOLUTE" => p.rotation_relative = false,
+                        "RELATIVE" => p.rotation_relative = true,
+                        _ => return wants("ABSOLUTE or RELATIVE"),
+                    }
+                }
+                _ => match num().filter(|v| *v >= 0.0) {
+                    Some(v) => {
+                        p.rotation_return = v;
+                        // Against the mode as parsed so far, like the note below.
+                        if !p.rotation_relative {
+                            info.notes.push(
+                                "only does anything with `GYRO_STICK_ROTATION_MODE = RELATIVE`".to_string(),
+                            );
+                        }
+                    }
+                    None => return wants("a time in seconds, zero or more"),
+                },
+            }
+            info.notes.insert(0, FLEXINPUT_NOTE.to_string());
+            // Said against the output as parsed so far, like `LOCAL_AXIS_OFFSET`.
+            if p.gyro_dest.rotation_side().is_none() {
+                info.notes.push(
+                    "only does anything with `GYRO_OUTPUT = LEFT_STICK_ROTATION` or \
+                     `RIGHT_STICK_ROTATION`"
+                        .to_string(),
+                );
+            }
+            info
+        }
     }
 }
 
@@ -2968,7 +3060,8 @@ fn cc_setting(
                     // masks picked for the turn. Said, because the same line in the
                     // fork does nothing under LOCAL.
                     super::motion::Space::Local => info.notes.push(
-                        "FlexInput also mixes this into `GYRO_SPACE = LOCAL`; the fork                          only honours it with `YAW_PLUS_ROLL`"
+                        "FlexInput also mixes this into `GYRO_SPACE = LOCAL`; the fork \
+                         only honours it with `YAW_PLUS_ROLL`"
                             .to_string(),
                     ),
                     _ => info.notes.push(
@@ -2985,7 +3078,8 @@ fn cc_setting(
 
 /// Said on a setting FlexInput adds of its own — neither stock JSM nor the fork has
 /// it, so a config using it is one to keep here.
-const FLEXINPUT_NOTE: &str = "FlexInput's own setting, not JoyShockMapper's — a config using it                               won't load in JSM or the custom-curve fork";
+const FLEXINPUT_NOTE: &str = "FlexInput's own setting, not JoyShockMapper's — a config using it \
+                              won't load in JSM or the custom-curve fork";
 
 /// Said on a line that comes from the custom-curve fork rather than from JSM itself,
 /// so nobody is surprised that a stock JSM build doesn't know it.
@@ -2997,7 +3091,9 @@ const FORK_NOTE: &str = "from the JSM_custom_curve fork, not stock JoyShockMappe
 /// Said on every line whose output can only land on a virtual pad. A config full
 /// of `X_*` bindings does nothing at all until one is wired up, which is worth
 /// saying on the line rather than leaving someone to wonder.
-const PAD_NOTE: &str = "needs a virtual pad wired downstream to reach anything; `X_` and `PS_`                         names are the same pin (as in JSM), so wiring decides which pad it                         reaches";
+const PAD_NOTE: &str = "needs a virtual pad wired downstream to reach anything; `X_` and `PS_` \
+                        names are the same pin (as in JSM), so wiring decides which pad it \
+                        reaches";
 
 /// Why something isn't live. These say what is MISSING, never when it might
 /// arrive: the module was built in phases and the messages used to name them, so
@@ -3131,6 +3227,11 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "UNWIND_RATE" => Pad(PadId::UnwindRate),
         "ANGLE_TO_AXIS_DEADZONE_INNER" => Pad(PadId::AngleDeadzone(true)),
         "ANGLE_TO_AXIS_DEADZONE_OUTER" => Pad(PadId::AngleDeadzone(false)),
+        // FlexInput's own: the gyro turning a pushed stick.
+        "GYRO_STICK_ROTATION_DEADZONE" => Pad(PadId::RotationDeadzone),
+        "GYRO_STICK_ROTATION_SMOOTH_TIME" => Pad(PadId::RotationSmoothTime),
+        "GYRO_STICK_ROTATION_MODE" => Pad(PadId::RotationMode),
+        "GYRO_STICK_ROTATION_RETURN_TIME" => Pad(PadId::RotationReturnTime),
 
         // Touchpad and motion stick.
         "TOUCHPAD_MODE" => Motion(MotionId::TouchpadMode),

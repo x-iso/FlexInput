@@ -65,6 +65,8 @@ pub struct JsmState {
     aim: Aim,
     /// The sticks and rates pointed at a virtual pad instead.
     pad: PadOut,
+    /// `GYRO_OUTPUT = *_ROTATION`: the turn the gyro has put on that stick.
+    rotation: crate::eval::StickRotation,
     /// Which way is down, and the motion stick built from it.
     motion: super::motion::Motion,
     /// The touchpad: its grid, its two relative sticks, its mouse mode.
@@ -230,6 +232,7 @@ pub(crate) fn jsm_publish(
             analog: Analog::default(),
             aim: Aim::default(),
             pad: PadOut::default(),
+            rotation: Default::default(),
             motion: super::motion::Motion::default(),
             touch: super::touch::Touch::default(),
         })
@@ -244,6 +247,7 @@ pub(crate) fn jsm_publish(
         st.analog = Analog::default();
         st.aim = Aim::default();
         st.pad = PadOut::default();
+        st.rotation = Default::default();
         st.motion = super::motion::Motion::default();
         st.touch = super::touch::Touch::default();
     }
@@ -559,6 +563,35 @@ pub(crate) fn jsm_publish(
         }
     }
 
+    // ── a stick turned by the gyro (`GYRO_OUTPUT = *_ROTATION`) ──────────────
+    //
+    // FlexInput's own. Last of the stick writers, so it turns whatever that stick
+    // is about to send — the pad's own passed through, or one this config shapes
+    // in a virtual-stick mode — and its deadzone is measured on that same stick.
+    // All three forms again, for the reason above. See `stick_rotation.rs`.
+    let mut rotation_live = (Vec2::ZERO, crate::eval::Rotated::default());
+    if let Some(side) = res.pad.gyro_dest.rotation_side() {
+        let name = if side == 0 { "left_stick" } else { "right_stick" };
+        let stick = match collector_sigs.get(&(key.clone(), name.to_string())) {
+            Some(Signal::Vec2(v)) => *v,
+            _ => Vec2::ZERO,
+        };
+        let settings = crate::eval::RotationSettings {
+            deadzone: res.pad.rotation_deadzone,
+            smooth_s: res.pad.rotation_smooth,
+            return_s: res.pad.rotation_relative.then_some(res.pad.rotation_return),
+        };
+        let r = st.rotation.tick(stick, aimed.turn_dps, dt, &settings);
+        if r.engaged {
+            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(r.out));
+            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(r.out.x));
+            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(r.out.y));
+        }
+        rotation_live = (stick, r);
+    } else {
+        st.rotation = Default::default();
+    }
+
     // Aiming, as one displacement for this tick. `mouse_move` is applied as it
     // stands rather than integrated, which is what JSM computes; the axis pins
     // are left alone so a sink wired to both doesn't move twice. It is published
@@ -729,6 +762,7 @@ pub(crate) fn jsm_publish(
             st.analog = Analog::default();
             st.aim = Aim::default();
             st.pad = PadOut::default();
+            st.rotation = Default::default();
             st.touch = super::touch::Touch::default();
             // The gravity estimate and its neutral are the PAD's state, not the
             // config's — how the pad is being held doesn't change because a layer
@@ -761,6 +795,13 @@ pub(crate) fn jsm_publish(
     // graph — this node's own reading, so a curve or anything else reshaping
     // the gyro upstream moves the mark as it moves the aim. See `curve_dps_out`.
     out.push(Some(Signal::Float(aimed.curve_dps)));
+    // And the stick the gyro turns, for the Tune panel's circle — the same four
+    // values the Gyro to Stick Rotation module shows. See `rotation_out`.
+    let (raw, r) = rotation_live;
+    out.push(Some(Signal::Vec2(raw)));
+    out.push(Some(Signal::Vec2(r.out)));
+    out.push(Some(Signal::Float(r.offset_deg)));
+    out.push(Some(Signal::Bool(r.engaged)));
     out
 }
 
@@ -777,6 +818,13 @@ pub fn cal_peak_out(n_outputs: usize) -> usize {
 /// read at (deg/s), after the two calibration ones.
 pub fn curve_dps_out(n_outputs: usize) -> usize {
     n_outputs.max(1) + 2
+}
+/// Index of the first of the four trailing outputs carrying the gyro-turned
+/// stick (`GYRO_OUTPUT = *_ROTATION`), after the curve speed: the stick as it
+/// came, as it goes out, the offset in degrees, and whether it is engaged — in
+/// the order of the module's `STICK_ROT_OUT_*`.
+pub fn rotation_out(n_outputs: usize) -> usize {
+    n_outputs.max(1) + 3
 }
 
 /// The node's own macros it shows as output pins, in pin order (outputs 1…),

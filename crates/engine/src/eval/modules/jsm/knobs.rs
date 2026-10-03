@@ -559,6 +559,9 @@ pub enum Hand {
 pub enum Feel {
     Gyro,
     Stick(Hand),
+    /// The gyro AND that stick: what `GYRO_OUTPUT = *_ROTATION` needs, since the
+    /// gyro only turns the stick while it is pushed.
+    GyroAndStick(Hand),
     Triggers,
     /// Nothing to feel while dragging it — a press timing, a binding window.
     /// Everything stays blocked.
@@ -593,6 +596,23 @@ fn aiming_hand(cfg: &Compiled) -> Hand {
 /// gyro. Guessing would hand the game the wrong input at the exact moment the
 /// user is judging feel.
 pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
+    let feel = feel_by_name(cfg, name);
+    // With the gyro turning a stick (`GYRO_OUTPUT = *_ROTATION`), the gyro alone
+    // turns nothing you can see: the stick it turns has to get out with it.
+    match (feel, cfg.pad.gyro_dest.rotation_side()) {
+        (Feel::Gyro, Some(side)) => Feel::GyroAndStick(if side == 0 { Hand::Left } else { Hand::Right }),
+        _ => feel,
+    }
+}
+
+/// `GYRO_OUTPUT = *_ROTATION`: which stick the gyro turns (0 left, 1 right) and
+/// its `GYRO_STICK_ROTATION_DEADZONE`, for the Tune panel's circle. `None` when the
+/// gyro turns no stick.
+pub fn rotation_of(cfg: &Compiled) -> Option<(usize, f32)> {
+    cfg.pad.gyro_dest.rotation_side().map(|side| (side, cfg.pad.rotation_deadzone))
+}
+
+fn feel_by_name(cfg: &Compiled, name: &str) -> Feel {
     // A pair's second fader is keyed `NAME/2`; it feels like the setting it is.
     let upper = key_setting(name).to_ascii_uppercase();
     // A setting that names its side means that side.
@@ -614,6 +634,9 @@ pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
         | "ONE_EURO_MIN_CUTOFF" | "ONE_EURO_SPEED_COEFF" | "GYRO_ANGLE_SNAP"
         | "DECEL_BRAKE_STRENGTH" | "DECEL_BRAKE_THRESHOLD" | "ROLL_CONTRIBUTION"
         | "LOCAL_AXIS_OFFSET"
+        // FlexInput's own: the gyro turning a pushed stick (see `feel_of`).
+        | "GYRO_STICK_ROTATION_DEADZONE" | "GYRO_STICK_ROTATION_SMOOTH_TIME"
+        | "GYRO_STICK_ROTATION_MODE" | "GYRO_STICK_ROTATION_RETURN_TIME"
         | "LEAN_THRESHOLD" | "MOTION_DEADZONE_INNER" | "MOTION_DEADZONE_OUTER" => Feel::Gyro,
 
         // The winding settings shape whatever was routed to a virtual stick,
@@ -885,6 +908,13 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         // A neutral hold's pitch: the whole band the parser takes, since a grip
         // anywhere from flat to well past 45 degrees is ordinary.
         "LOCAL_AXIS_OFFSET" => (-90.0, 90.0, false),
+        // The gyro turning a stick: a fraction of stick travel, and a stabilising
+        // time in seconds where a fifth of one is already heavy.
+        "GYRO_STICK_ROTATION_DEADZONE" => (0.0, 1.0, false),
+        "GYRO_STICK_ROTATION_SMOOTH_TIME" => (0.0, 0.5, false),
+        // How fast a relative turn folds back; past a couple of seconds it is
+        // all but absolute.
+        "GYRO_STICK_ROTATION_RETURN_TIME" => (0.0, 2.0, false),
         _ => return None,
     };
     Some(r)

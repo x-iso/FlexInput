@@ -35,7 +35,7 @@ pub(crate) use eval::{jsm_publish, JsmState};
 // Read by the calibration widget: where the sweep's measurement lands. And by
 // the Tune panel's graph: where the speed its curve was read at lands.
 pub use eval::{cal_deg_out as jsm_cal_deg_out, cal_peak_out as jsm_cal_peak_out,
-    curve_dps_out as jsm_curve_dps_out, JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM};
+    curve_dps_out as jsm_curve_dps_out, rotation_out as jsm_rotation_out, JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM};
 
 // The UI pauses the config's typing while its editor has focus.
 pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
@@ -54,7 +54,7 @@ pub use catalogue::{bindings as jsm_bindings, catalogue as jsm_catalogue, fi_tag
     cycle_value as jsm_cycle_value,
     kinds_at as jsm_kinds_at, Item as JsmItem, Kind as JsmKind,
     State as JsmSupportState};
-pub use knobs::{feel_of as jsm_feel_of, knobs as jsm_knobs, scrub as jsm_scrub_number,
+pub use knobs::{feel_of as jsm_feel_of, rotation_of as jsm_rotation_of, knobs as jsm_knobs, scrub as jsm_scrub_number,
     line_of as jsm_setting_line, set_setting as jsm_set_setting,
     set_knob_part as jsm_set_knob_part, toggle_pair as jsm_toggle_pair,
     key_setting as jsm_knob_key_setting, pairable as jsm_pairable,

@@ -187,6 +187,11 @@ pub struct Aimed {
     pub gyro_dps: Vec2,
     /// The flick stick's camera rate in deg/s, on the same terms.
     pub flick_dps: Vec2,
+    /// With `GYRO_OUTPUT = *_ROTATION`: how fast to turn that stick, in deg/s
+    /// clockwise — the gyro's horizontal camera rate, through everything above
+    /// (space, smoothing, cutoff, the gyro button, the sensitivity ramp). Zero
+    /// otherwise.
+    pub turn_dps: f32,
     /// With `GYRO_OUTPUT = MIDI`: the rotation rate in deg/s as (turn, tilt,
     /// roll), up and right positive — through the gyro space, smoothing, cutoff,
     /// the gyro button and the inversions, but NOT the sensitivity ramp, which
@@ -494,6 +499,10 @@ impl Aim {
             Some(_) => Vec2::new(vel_x, vel_y),
             None => Vec2::ZERO,
         };
+        // A stick turned by the gyro takes the horizontal turn only: a camera
+        // turning right is the stick turning clockwise, and pitch has no part in
+        // a direction on a flat circle.
+        let turn_dps = if p.gyro_dest.rotation_side().is_some() { vel_x } else { 0.0 };
 
         // ── one displacement, in our bus's terms ─────────────────────────────
         //
@@ -513,7 +522,7 @@ impl Aim {
             Vec2::ZERO
         };
         let curve_dps = if blocked { 0.0 } else { brake_speed };
-        Aimed { mouse, gyro_dps, flick_dps, midi_dps, curve_dps }
+        Aimed { mouse, gyro_dps, flick_dps, turn_dps, midi_dps, curve_dps }
     }
 
     /// JSM's gyro smoother: what is over the threshold goes straight through,

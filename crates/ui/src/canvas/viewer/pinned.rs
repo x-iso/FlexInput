@@ -291,6 +291,35 @@ pub(crate) fn render_pinned_element_impl(
         // Area Mapper: the field (whole-container, editable like the body), its
         // option and border-settings rows, and its cards (the shared card
         // list's whole-module renderer, as Touch Zones and the menu use).
+        // Gyro to Stick Rotation: the live circle (whole-container) and its
+        // settings rows.
+        ("module.stick_rotation", "field") => {
+            let _ = render_stick_rotation_field(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.stick_rotation", "options") => {
+            render_stick_rotation_options_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.stick_rotation", "hold") => {
+            render_stick_rotation_hold_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.stick_rotation", "sens") => {
+            render_stick_rotation_sens_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.stick_rotation", "deadzone") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "Deadzone", flexinput_engine::eval::STICK_ROT_DEADZONE_PARAM,
+                flexinput_engine::eval::STICK_ROT_DEADZONE_DEFAULT, 0.005, 0.0..=0.95, Some(2));
+            return;
+        }
+        ("module.stick_rotation", "stabilise") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "Stabilise ms", flexinput_engine::eval::STICK_ROT_SMOOTH_PARAM, 0.0, 1.0, 0.0..=500.0, Some(0));
+            return;
+        }
         ("module.area_mapper", "field") => {
             crate::canvas::area_body::render_area_field_pinned(inner_id, ui, inner_snarl, container_size);
             return;
@@ -435,6 +464,16 @@ pub(crate) fn render_pinned_element_impl(
         // the config overlay's sweep handling keys on the element name.
         ("module.jsm", "measure") => {
             super::jsm::show_jsm_measure_sized(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // The stick the gyro turns (`GYRO_OUTPUT = *_ROTATION`), live. Says so
+        // rather than going blank when the config no longer turns one.
+        ("module.jsm", "rotation") => {
+            let text = inner_snarl.get_node(inner_id).map(super::jsm_active_text).unwrap_or_default();
+            let cfg = flexinput_engine::eval::jsm_compile(&text, &[]);
+            if render_jsm_rotation(inner_id, ui, inner_snarl, &cfg, container_size).is_none() {
+                ui.label(egui::RichText::new("GYRO_OUTPUT turns no stick").small().weak());
+            }
             return;
         }
         ("module.jsm", k) if super::jsm_widgets::knob_name_of(k).is_some() => {

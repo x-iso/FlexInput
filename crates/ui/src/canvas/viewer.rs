@@ -58,6 +58,7 @@ mod reshape;
 mod rws;
 mod scale;
 mod simple_bodies;
+mod stick_rotation;
 mod subpatch_body;
 mod touch_zones;
 pub(crate) use asth::*;
@@ -85,6 +86,7 @@ pub(crate) use remapper_reorder::*;
 pub(crate) use remapper_support::*;
 pub(crate) use reshape::*;
 pub(crate) use rws::*;
+pub(crate) use stick_rotation::*;
 pub(crate) use scale::*;
 pub(crate) use simple_bodies::*;
 pub(crate) use subpatch_body::*;
@@ -1214,6 +1216,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "module.menu" => super::menu_body::show_menu_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            "module.stick_rotation" => {
+                if show_stick_rotation_body(node_id, ui, snarl) {
+                    self.push_undo_request = true;
+                }
+            }
             "module.area_mapper" => {
                 if super::area_body::show_area_mapper_body(
                     node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(),
@@ -1461,7 +1468,7 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
         | "display.controller3d"
         | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
         | "module.automap_response_curve" | "module.automap_twoway_response_curve"
-        | "module.area_mapper"
+        | "module.area_mapper" | "module.stick_rotation"
         | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
         | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
         | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
@@ -1489,7 +1496,7 @@ mod body_gate_tests {
         for m in ["module.jsm", "module.remapper", "module.audio_stream_haptics",
                   "module.label", "module.touch_zones", "processing.rws",
                   "module.automap_response_curve", "module.automap_twoway_response_curve",
-                  "module.area_mapper"] {
+                  "module.area_mapper", "module.stick_rotation"] {
             assert!(module_has_body(m), "{m} draws a body");
         }
         assert!(!module_has_body("module.feedback_control"), "a pins-only module draws none");

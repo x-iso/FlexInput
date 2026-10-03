@@ -89,7 +89,8 @@ pub(crate) const SETTINGS: &[&str] = &[
     "TOUCH_DEADZONE_INNER", "TOUCH_RING_MODE", "TOUCH_STICK_AXIS",
     "MOTION_STICK_MODE", "MOTION_RING_MODE", "MOTION_DEADZONE_INNER",
     "MOTION_DEADZONE_OUTER", "MOTION_STICK_AXIS", "LEAN_THRESHOLD",
-    "LOCAL_AXIS_OFFSET",
+    "LOCAL_AXIS_OFFSET", "GYRO_STICK_ROTATION_DEADZONE", "GYRO_STICK_ROTATION_SMOOTH_TIME",
+    "GYRO_STICK_ROTATION_MODE", "GYRO_STICK_ROTATION_RETURN_TIME",
     "ACCEL_CURVE", "ACCEL_NATURAL_VHALF", "ACCEL_POWER_VREF",
     "ACCEL_POWER_EXPONENT", "ACCEL_SIGMOID_MID", "ACCEL_SIGMOID_WIDTH",
     "ACCEL_JUMP_TAU", "GYRO_SMOOTHING_DECAY", "ONE_EURO_MIN_CUTOFF",
@@ -501,6 +502,8 @@ pub(crate) const VALUE_WORDS: &[&str] = &[
     // FlexInput's own: a stick, the touchpad or the gyro sending MIDI values.
     // Last, so it never stands in front of JSM's own words in a cycle.
     "MIDI",
+    // FlexInput's own: the gyro turning a pushed stick.
+    "LEFT_STICK_ROTATION", "RIGHT_STICK_ROTATION", "ABSOLUTE", "RELATIVE",
 ];
 
 /// Spellings the parser accepts so existing configs load, but which cycling
@@ -896,11 +899,16 @@ mod catalogue_tests {
         let t = "GYRO_OUTPUT = ?";
         assert_eq!(
             value_options(t, cursor_on_value(t)),
-            ["MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION", "MIDI"]
+            ["MOUSE", "LEFT_STICK", "RIGHT_STICK", "PS_MOTION", "MIDI",
+             "LEFT_STICK_ROTATION", "RIGHT_STICK_ROTATION"]
         );
-        // The flick stick can't send MIDI, so its list doesn't offer it.
+        // The flick stick can't send MIDI or turn a stick, so its list offers neither.
         let t = "FLICK_STICK_OUTPUT = ?";
-        assert!(!value_options(t, cursor_on_value(t)).contains(&"MIDI"));
+        let opts = value_options(t, cursor_on_value(t));
+        assert!(!opts.contains(&"MIDI"));
+        assert!(!opts.contains(&"RIGHT_STICK_ROTATION"), "{opts:?}");
+        let t = "GYRO_STICK_ROTATION_MODE = ?";
+        assert_eq!(value_options(t, cursor_on_value(t)), ["ABSOLUTE", "RELATIVE"]);
     }
 
     /// A word the parser recognises but wants numbers after is still one of the

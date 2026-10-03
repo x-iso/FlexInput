@@ -13,6 +13,9 @@ pub struct NodeState {
     /// JSM Config: the compiled config plus its running button state. Boxed and
     /// created on first use, so no other node pays for it.
     pub jsm: Option<Box<crate::eval::JsmState>>,
+    /// Gyro to Stick Rotation: the offset, the stabiliser and the gravity
+    /// estimate. Created on first use.
+    pub stick_rotation: Option<Box<crate::eval::StickRotationState>>,
     /// Per-channel ring buffers of (timestamp, value) pairs for the delay module.
     pub delay_bufs: Vec<VecDeque<(Instant, f32)>>,
     /// Per-channel sample ring buffers for the moving-average module (float inputs).

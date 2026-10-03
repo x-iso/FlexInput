@@ -7263,12 +7263,244 @@ fn a_shown_macro_is_an_output_pin_of_the_node() {
         super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, state, 0.010)
     };
     let out = run(&mut state, true);
-    assert_eq!(out.len(), 5, "bus, one pin, then the three readouts");
+    assert_eq!(out.len(), 9, "bus, one pin, the three readouts, then the stick rotation's four");
     assert_eq!(out[1].map(|s| s.as_bool()), Some(true), "held: the pin is on");
     assert!(matches!(out[super::eval::cal_deg_out(2)], Some(Signal::Float(_))));
     assert!(matches!(out[super::eval::curve_dps_out(2)], Some(Signal::Float(_))));
+    assert!(matches!(out[super::eval::rotation_out(2) + 3], Some(Signal::Bool(false))));
     // Released, the Any pin carries nothing once last tick's value is gone.
     run(&mut state, false);
     let out = run(&mut state, false);
     assert!(out[1].is_none_or(|s| !s.as_bool()), "released: {:?}", out[1]);
+}
+
+// ── GYRO_OUTPUT = *_STICK_ROTATION (FlexInput's own) ─────────────────────────
+
+const ROT_CFG: &str = "GYRO_SENS = 1\nGYRO_SMOOTH_TIME = 0\nGYRO_OUTPUT = RIGHT_STICK_ROTATION";
+
+/// The pad's pins for a stick held at `v` on `side` (all three forms) while the
+/// pad turns right at `yaw` deg/s.
+fn rot_pad(side: &str, v: glam::Vec2, yaw: f32) -> Vec<(String, Signal)> {
+    let mut sigs = Vec::new();
+    for s in ["left_stick", "right_stick"] {
+        let v = if s == side { v } else { glam::Vec2::ZERO };
+        sigs.push((s.to_string(), Signal::Vec2(v)));
+        sigs.push((format!("{s}_x"), Signal::Float(v.x)));
+        sigs.push((format!("{s}_y"), Signal::Float(v.y)));
+    }
+    sigs.push(("gyro_x".into(), Signal::Float(0.0)));
+    sigs.push(("gyro_y".into(), Signal::Float(0.0)));
+    sigs.push(("gyro_z".into(), Signal::Float(yaw / 2000.0)));
+    sigs
+}
+
+/// Run the node over `ticks` of 10 ms with a FRESH bus each tick, as the engine
+/// does, and return the last tick's bus and outputs.
+fn run_rotation(
+    text: &str,
+    strict: bool,
+    sigs: &[(String, Signal)],
+    ticks: usize,
+) -> (HashMap<String, Signal>, Vec<Option<Signal>>) {
+    let _guard = alone();
+    let uid = 4243;
+    let snap = jsm_snap(uid, text, strict);
+    let dev: HashMap<(String, String), Signal> =
+        sigs.iter().map(|(p, s)| ((PAD.to_string(), p.clone()), *s)).collect();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut last = (HashMap::new(), Vec::new());
+    for _ in 0..ticks {
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let out = super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
+        let key = format!("collector:{uid}");
+        let bus = collector.into_iter().filter(|((d, _), _)| *d == key).map(|((_, p), s)| (p, s)).collect();
+        last = (bus, out);
+    }
+    last
+}
+
+fn bearing_of(bus: &HashMap<String, Signal>, stick: &str) -> (f32, glam::Vec2) {
+    let Some(Signal::Vec2(v)) = bus.get(stick) else { panic!("{stick} is published as a vector") };
+    (v.x.atan2(v.y).to_degrees(), *v)
+}
+
+#[test]
+fn rotation_turns_the_pushed_right_stick_with_the_pad() {
+    // 100°/s for a tenth of a second, at GYRO_SENS 1: ten degrees clockwise.
+    let (bus, out) = run_rotation(ROT_CFG, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 0.9), 100.0), 10);
+    let (deg, v) = bearing_of(&bus, "right_stick");
+    assert!((deg - 10.0).abs() < 0.2, "turned clockwise by the turn: {deg} {v:?}");
+    assert!((v.length() - 0.9).abs() < 1e-4, "its length untouched: {v:?}");
+    assert_eq!(bus.get("right_stick_x").map(|s| s.as_float()), Some(v.x), "the axes agree");
+    assert_eq!(bus.get("right_stick_y").map(|s| s.as_float()), Some(v.y));
+    // The left stick is nobody's business here.
+    assert_eq!(bus.get("left_stick"), Some(&Signal::Vec2(glam::Vec2::ZERO)));
+    // The Tune panel's circle reads the same four values the module shows.
+    let at = super::eval::rotation_out(1);
+    assert_eq!(out[at], Some(Signal::Vec2(glam::Vec2::new(0.0, 0.9))), "the stick as it came");
+    assert_eq!(out[at + 1], Some(Signal::Vec2(v)), "the stick as it goes");
+    let Some(Signal::Float(off)) = out[at + 2] else { panic!("an offset") };
+    assert!((off - 10.0).abs() < 0.2, "{off}");
+    assert_eq!(out[at + 3], Some(Signal::Bool(true)));
+}
+
+#[test]
+fn rotation_is_scaled_by_gyro_sens_and_turns_left_too() {
+    let cfg = "GYRO_SENS = 0.5\nGYRO_SMOOTH_TIME = 0\nGYRO_OUTPUT = RIGHT_STICK_ROTATION";
+    let (bus, _) = run_rotation(cfg, false, &rot_pad("right_stick", glam::Vec2::new(1.0, 0.0), -100.0), 10);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    // Pointing right (90°), turned left by half of ten degrees.
+    assert!((deg - 85.0).abs() < 0.2, "{deg}");
+}
+
+#[test]
+fn rotation_leaves_a_stick_inside_its_deadzone_exactly_as_it_came() {
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_DEADZONE = 0.5");
+    let (bus, out) = run_rotation(&cfg, false, &rot_pad("right_stick", glam::Vec2::new(0.3, 0.3), 300.0), 10);
+    assert_eq!(bus.get("right_stick"), Some(&Signal::Vec2(glam::Vec2::new(0.3, 0.3))));
+    assert_eq!(bus.get("right_stick_x"), Some(&Signal::Float(0.3)));
+    assert_eq!(out[super::eval::rotation_out(1) + 3], Some(Signal::Bool(false)));
+    // At the default 0.2 the same stick is out, and turns.
+    let (bus, _) = run_rotation(ROT_CFG, false, &rot_pad("right_stick", glam::Vec2::new(0.3, 0.3), 300.0), 10);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 75.0).abs() < 0.5, "45° + 30°: {deg}");
+}
+
+#[test]
+fn rotation_turns_the_left_stick_when_told_to() {
+    let cfg = "GYRO_SENS = 1\nGYRO_SMOOTH_TIME = 0\nGYRO_OUTPUT = LEFT_STICK_ROTATION";
+    let (bus, _) = run_rotation(cfg, false, &rot_pad("left_stick", glam::Vec2::new(0.0, 1.0), 100.0), 10);
+    let (deg, _) = bearing_of(&bus, "left_stick");
+    assert!((deg - 10.0).abs() < 0.2, "{deg}");
+    // And a right stick pushed meanwhile is the pad's own, untouched.
+    let (bus, _) = run_rotation(cfg, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 100.0), 10);
+    assert_eq!(bus.get("right_stick"), Some(&Signal::Vec2(glam::Vec2::new(0.0, 1.0))));
+}
+
+#[test]
+fn rotation_stops_while_the_gyro_is_switched_off() {
+    let cfg = format!("{ROT_CFG}\nGYRO_OFF = E");
+    let mut sigs = rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 100.0);
+    sigs.push(("btn_east".into(), Signal::Bool(true)));
+    let (bus, _) = run_rotation(&cfg, false, &sigs, 10);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!(deg.abs() < 0.01, "GYRO_OFF holds the turn where it is: {deg}");
+}
+
+#[test]
+fn rotation_silences_the_gyro_mouse_as_any_stick_output_does() {
+    let (bus, _) = run_rotation(ROT_CFG, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 100.0), 10);
+    if let Some(Signal::Vec2(m)) = bus.get("mouse_move") {
+        assert_eq!(*m, glam::Vec2::ZERO, "the gyro turns the stick, not the mouse");
+    }
+}
+
+#[test]
+fn rotation_turns_a_stick_this_config_drives_in_strict_mode() {
+    // Strict: nothing passes unless the config says so, so the stick has to be
+    // routed to the virtual pad — and the turn lands on what is routed.
+    let cfg = format!("{ROT_CFG}\nRIGHT_STICK_MODE = RIGHT_STICK");
+    let (bus, _) = run_rotation(&cfg, true, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 100.0), 10);
+    let (deg, v) = bearing_of(&bus, "right_stick");
+    // Nine ticks' worth, not ten: a virtual stick takes the PREVIOUS tick's
+    // direction (JSM's own lag, kept on purpose — see `pad.rs`), so on the first
+    // tick it is still centred and has nothing to turn.
+    assert!((deg - 9.0).abs() < 0.2, "{deg} {v:?}");
+    assert!(v.length() > 0.9, "{v:?}");
+}
+
+#[test]
+fn rotation_lines_say_they_are_flexinputs_own() {
+    let c = compile("GYRO_OUTPUT = RIGHT_STICK_ROTATION");
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert!(c.lines[0].notes.iter().any(|n| n.contains("FlexInput's own")), "{:?}", c.lines[0].notes);
+    assert!(
+        c.lines[0].notes.iter().all(|n| !n.contains("     ")),
+        "no broken line continuations: {:?}",
+        c.lines[0].notes
+    );
+    // A flick says where the stick points — there is nothing to turn.
+    let c = compile("FLICK_STICK_OUTPUT = RIGHT_STICK_ROTATION");
+    assert!(matches!(c.lines[0].status, LineStatus::Error(_)), "{:?}", c.lines[0].status);
+    // The two settings, alone, say they do nothing yet.
+    for line in ["GYRO_STICK_ROTATION_DEADZONE = 0.3", "GYRO_STICK_ROTATION_SMOOTH_TIME = 0.1"] {
+        let c = compile(line);
+        assert_eq!(c.lines[0].status, LineStatus::Ok, "{line}");
+        assert!(
+            c.lines[0].notes.iter().any(|n| n.contains("only does anything")),
+            "{line}: {:?}",
+            c.lines[0].notes
+        );
+        let c = compile(&format!("GYRO_OUTPUT = LEFT_STICK_ROTATION\n{line}"));
+        assert!(c.lines[1].notes.iter().all(|n| !n.contains("only does anything")), "{line}");
+    }
+    assert!(matches!(compile("GYRO_STICK_ROTATION_DEADZONE = 2").lines[0].status, LineStatus::Error(_)));
+    assert!(matches!(compile("GYRO_STICK_ROTATION_SMOOTH_TIME = -1").lines[0].status, LineStatus::Error(_)));
+    for name in ["GYRO_STICK_ROTATION_DEADZONE", "GYRO_STICK_ROTATION_SMOOTH_TIME"] {
+        assert!(super::help::help_for(name).is_some(), "{name} has help");
+    }
+}
+
+#[test]
+fn tuning_a_rotation_lets_the_gyro_and_its_stick_out() {
+    use super::knobs::{feel_of, Feel, Hand};
+    let c = compile(ROT_CFG);
+    assert_eq!(feel_of(&c, "GYRO_SENS"), Feel::GyroAndStick(Hand::Right));
+    assert_eq!(feel_of(&c, "GYRO_STICK_ROTATION_DEADZONE"), Feel::GyroAndStick(Hand::Right));
+    let c = compile("GYRO_OUTPUT = LEFT_STICK_ROTATION");
+    assert_eq!(feel_of(&c, "GYRO_STICK_ROTATION_SMOOTH_TIME"), Feel::GyroAndStick(Hand::Left));
+    // Aiming the mouse, the gyro is still just the gyro.
+    assert_eq!(feel_of(&compile("GYRO_SENS = 1"), "GYRO_SENS"), Feel::Gyro);
+}
+
+#[test]
+fn rotation_relative_holds_the_turn_rate_times_the_return_time() {
+    // 40°/s for two seconds against a 0.1 s return: 4°, where absolute would be 80°.
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_MODE = RELATIVE\nGYRO_STICK_ROTATION_RETURN_TIME = 0.1");
+    let (bus, _) = run_rotation(&cfg, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 40.0), 200);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 4.0).abs() < 0.05, "{deg}");
+    // Left at its default return time (0.25 s): 10°.
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_MODE = RELATIVE");
+    let (bus, _) = run_rotation(&cfg, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 40.0), 200);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 10.0).abs() < 0.1, "{deg}");
+    // Back to absolute, the same turn adds up.
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_MODE = ABSOLUTE");
+    let (bus, _) = run_rotation(&cfg, false, &rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), 40.0), 200);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 80.0).abs() < 0.2, "{deg}");
+}
+
+#[test]
+fn rotation_with_no_deadzone_keeps_its_turn_with_the_stick_centred() {
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_DEADZONE = 0");
+    let (bus, out) = run_rotation(&cfg, false, &rot_pad("right_stick", glam::Vec2::ZERO, 100.0), 10);
+    assert_eq!(bus.get("right_stick"), Some(&Signal::Vec2(glam::Vec2::ZERO)), "centred stays centred");
+    let at = super::eval::rotation_out(1);
+    assert_eq!(out[at + 3], Some(Signal::Bool(true)), "but the turn is on");
+    let Some(Signal::Float(off)) = out[at + 2] else { panic!("an offset") };
+    assert!((off - 10.0).abs() < 0.2, "{off}");
+    assert!(compile("GYRO_STICK_ROTATION_DEADZONE = 0").lines[0].notes.iter().any(|n| n.contains("never dropped")));
+}
+
+#[test]
+fn rotation_mode_and_return_time_parse_and_say_when_they_do_nothing() {
+    for (line, ok) in [
+        ("GYRO_STICK_ROTATION_MODE = RELATIVE", true),
+        ("GYRO_STICK_ROTATION_MODE = absolute", true),
+        ("GYRO_STICK_ROTATION_MODE = SIDEWAYS", false),
+        ("GYRO_STICK_ROTATION_RETURN_TIME = 0.3", true),
+        ("GYRO_STICK_ROTATION_RETURN_TIME = -1", false),
+    ] {
+        let c = compile(line);
+        assert_eq!(c.lines[0].status == LineStatus::Ok, ok, "{line}: {:?}", c.lines[0].status);
+    }
+    let c = compile("GYRO_STICK_ROTATION_RETURN_TIME = 0.3");
+    assert!(c.lines[0].notes.iter().any(|n| n.contains("RELATIVE")), "{:?}", c.lines[0].notes);
+    let c = compile("GYRO_OUTPUT = RIGHT_STICK_ROTATION\nGYRO_STICK_ROTATION_MODE = RELATIVE\nGYRO_STICK_ROTATION_RETURN_TIME = 0.3");
+    assert!(c.lines[2].notes.iter().all(|n| !n.contains("only does anything")), "{:?}", c.lines[2].notes);
+    for name in ["GYRO_STICK_ROTATION_MODE", "GYRO_STICK_ROTATION_RETURN_TIME"] {
+        assert!(super::help::help_for(name).is_some(), "{name} has help");
+    }
 }

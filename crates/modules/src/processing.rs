@@ -23,6 +23,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapCombiner>(),
         reg::<AutoMapResponseCurveModule>(),
         reg::<AutoMapTwowayResponseCurveModule>(),
+        reg::<StickRotationModule>(),
         reg::<RemapperModule>(),
         reg::<MapActionModule>(),
         reg::<FeedbackControlModule>(),
@@ -522,6 +523,39 @@ impl Module for AutoMapTwowayResponseCurveModule {
         ModuleDescriptor {
             id: "module.automap_twoway_response_curve",
             display_name: "AutoMap Two-way Curve",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Gyro to Stick Rotation ────────────────────────────────────────────────────
+
+/// Gyro to Stick Rotation: turning the pad turns one stick of an AutoMap bus
+/// that is already pushed, for finer aim in twin-stick games — the thumb picks
+/// the direction, the wrist fine-tunes it. The offset the gyro winds up resets
+/// whenever the stick comes back inside its inner deadzone.
+///
+/// Persisted params (all optional; ids are save-format):
+///   rot_stick      — "right_stick" (default) | "left_stick"
+///   rot_mode       — "yaw" (the pad's own vertical, default) | "world" (gravity)
+///   rot_sens       — degrees of stick turn per degree of pad turn (1.0)
+///   rot_invert     — turn the other way
+///   rot_deadzone   — inner deadzone, 0..1 of stick travel (0.2)
+///   rot_smooth_ms  — stabilising time on the stick's direction, ms (0 = off)
+///
+/// process() returns empty — the evaluator lives in the engine
+/// (`eval_stick_rotation_node`), republishing the bus under `collector:{uid}`.
+#[derive(Default)]
+pub struct StickRotationModule;
+
+impl Module for StickRotationModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.stick_rotation",
+            display_name: "Gyro to Stick Rotation",
             category: "AutoMap",
             inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
             outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
