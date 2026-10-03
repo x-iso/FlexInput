@@ -516,6 +516,14 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var("FLEXINPUT_BT_TRACE").is_ok())
 }
 
+/// Milliseconds since the transport started, for trace lines. A setup that
+/// fails is a question of ORDER and TIMING — what came 50 ms before the drop
+/// — and untimed lines answer neither.
+fn ms() -> u128 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
 fn set_status(shared: &Arc<Shared>, s: Status) {
     if let Ok(mut g) = shared.status.lock() {
         if *g != s {
@@ -815,7 +823,7 @@ fn run_inner(shared: &Arc<Shared>) {
             // subscription delivers, so "the controller never called" can be
             // told apart from "the call was delivered and dropped".
             if trace() {
-                eprintln!("[bt-classic] evt {evt:?}");
+                eprintln!("[bt-classic] {:>7} evt {evt:?}", ms());
             }
             let address = match evt {
                 flexinput_btle::Event::ConnectionRequest { address, .. } => address,
@@ -1364,7 +1372,7 @@ fn bring_up(
     };
     let mut quiet = |m: &str| {
         if trace() {
-            eprintln!("[bt-classic]   {m}");
+            eprintln!("[bt-classic] {:>7}   {m}", ms());
         }
     };
     // ⭐ ONE lease for accept/page, pairing and both L2CAP channels. Each step

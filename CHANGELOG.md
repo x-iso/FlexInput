@@ -5,6 +5,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Switch Pro Controller on the Bluetooth dongle connects reliably when you
+  turn it on.** Some connections dropped straight after the security handshake
+  and the controller then stopped trying until power-cycled, sometimes several
+  times in a row. The dongle no longer starts its own handshake on top of the
+  controller's when the controller calls in; it waits and only steps in if the
+  controller doesn't.
+
 ## [0.15.4] - 2026-10-03
 
 ### Added

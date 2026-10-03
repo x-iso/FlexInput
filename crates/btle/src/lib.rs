@@ -141,6 +141,10 @@ impl LinkParams {
 /// link is already coming in".
 pub const NO_PAGE: u8 = 0xFF;
 
+/// How long an incoming link's caller gets to authenticate, and then to
+/// encrypt, before this side asks for it — see `page_and_pair_inner`.
+const REMOTE_SECURITY_GRACE: Duration = Duration::from_millis(1000);
+
 /// How many times to repeat an authentication or encryption request that lost
 /// an LMP transaction collision, before treating the failure as real.
 const COLLISION_RETRIES: u8 = 3;
@@ -2075,11 +2079,43 @@ impl Dongle {
         // Retries left after an LMP transaction collision — see below.
         let mut auth_retries = COLLISION_RETRIES;
         let mut crypt_retries = COLLISION_RETRIES;
+        // ⛔ **On a link the REMOTE opened, the remote secures it — we wait.**
+        //
+        // A controller that calls its host authenticates and encrypts the link
+        // itself, as it would with its console. This side used to ask for both
+        // as well, the instant the link came up, so two security procedures
+        // ran over one link. When they crossed, the link was torn down with
+        // `0x24` (LMP PDU Not Allowed) straight after "link encrypted" — with
+        // a host-side trace identical to a success, because the race is below
+        // the host. Intermittent by construction: it depended on timing alone.
+        //
+        // BlueZ and Windows leave an incoming link to the remote the same way.
+        // These are the fallbacks for a remote that does NOT: when each runs
+        // out with the link still unencrypted, we take that step ourselves.
+        let mut auth_at: Option<std::time::Instant> = None;
+        let mut crypt_at: Option<std::time::Instant> = None;
+        let mut we_asked_auth = false;
         // Paging a controller that is awake is quick; one that has to be woken
         // by its Sync button can take most of this.
         let deadline = std::time::Instant::now() + patience;
         while std::time::Instant::now() < deadline {
-            let Some(evt) = self.read_event_timeout(Duration::from_millis(250))? else {
+            let now = std::time::Instant::now();
+            if auth_at.is_some_and(|t| now >= t) && !link.encrypted {
+                auth_at = None;
+                on_event("remote has not authenticated — asking for it");
+                self.send_command(Opcode::AUTHENTICATION_REQUESTED, &link.conn_handle.to_le_bytes())?;
+                we_asked_auth = true;
+            }
+            if crypt_at.is_some_and(|t| now >= t) && !link.encrypted {
+                crypt_at = None;
+                on_event("remote has not encrypted — asking for it");
+                let mut p = Vec::with_capacity(3);
+                p.extend_from_slice(&link.conn_handle.to_le_bytes());
+                p.push(0x01);
+                self.send_command(Opcode::SET_CONNECTION_ENCRYPTION, &p)?;
+            }
+            // Short, so the fallbacks above fire close to on time.
+            let Some(evt) = self.read_event_timeout(Duration::from_millis(50))? else {
                 continue;
             };
             match evt {
@@ -2093,14 +2129,22 @@ impl Dongle {
                     connected = true;
                     *up = Some(conn_handle);
                     on_event(&format!("ACL link up, handle {conn_handle:#06x}"));
-                    // Nothing else demands authentication on a Just Works pair,
-                    // so ask for it — otherwise the link sits unencrypted and
-                    // the HID interrupt channel will be refused later.
-                    if let Err(e) = self.send_command(
-                        Opcode::AUTHENTICATION_REQUESTED,
-                        &conn_handle.to_le_bytes(),
-                    ) {
-                        on_event(&format!("authentication request failed: {e}"));
+                    if link.incoming {
+                        // See `auth_at`: the caller goes first.
+                        auth_at = Some(std::time::Instant::now() + REMOTE_SECURITY_GRACE);
+                        on_event("incoming link — leaving security to the remote");
+                    } else {
+                        // We paged, so we drive. Nothing else demands
+                        // authentication on a Just Works pair, so ask for it —
+                        // otherwise the link sits unencrypted and the HID
+                        // interrupt channel will be refused later.
+                        if let Err(e) = self.send_command(
+                            Opcode::AUTHENTICATION_REQUESTED,
+                            &conn_handle.to_le_bytes(),
+                        ) {
+                            on_event(&format!("authentication request failed: {e}"));
+                        }
+                        we_asked_auth = true;
                     }
                 }
                 // ⛔ **The collision that made reconnection impossible.**
@@ -2123,6 +2167,11 @@ impl Dongle {
                     link.incoming = true;
                 }
                 Event::LinkKeyRequest { address } if address == addr => {
+                    // The remote is authenticating right now — do not start a
+                    // second authentication on top of it.
+                    if auth_at.is_some() {
+                        auth_at = Some(std::time::Instant::now() + REMOTE_SECURITY_GRACE);
+                    }
                     match link.link_key {
                         Some(k) => {
                             on_event("remote asked for a stored link key — supplying it");
@@ -2189,6 +2238,7 @@ impl Dongle {
                         on_event(&format!(
                             "authentication collided ({status:#04x}) — asking again"
                         ));
+                        we_asked_auth = true;
                         self.send_command(
                             Opcode::AUTHENTICATION_REQUESTED,
                             &conn_handle.to_le_bytes(),
@@ -2200,11 +2250,19 @@ impl Dongle {
                             "authentication failed: status {status:#04x}"
                         )));
                     }
-                    on_event("authenticated — enabling encryption");
-                    let mut p = Vec::with_capacity(3);
-                    p.extend_from_slice(&conn_handle.to_le_bytes());
-                    p.push(0x01);
-                    self.send_command(Opcode::SET_CONNECTION_ENCRYPTION, &p)?;
+                    auth_at = None;
+                    if we_asked_auth {
+                        on_event("authenticated — enabling encryption");
+                        let mut p = Vec::with_capacity(3);
+                        p.extend_from_slice(&conn_handle.to_le_bytes());
+                        p.push(0x01);
+                        self.send_command(Opcode::SET_CONNECTION_ENCRYPTION, &p)?;
+                    } else {
+                        // The remote authenticated; encrypting is its next
+                        // step, not ours — see `auth_at`.
+                        on_event("remote authenticated — waiting for it to encrypt");
+                        crypt_at = Some(std::time::Instant::now() + REMOTE_SECURITY_GRACE);
+                    }
                 }
                 Event::EncryptionChange { status, conn_handle, enabled }
                     if connected && conn_handle == link.conn_handle =>
@@ -2242,7 +2300,12 @@ impl Dongle {
                         link.encrypted
                     )));
                 }
-                _ => {}
+                // ⭐ Shown, not silently dropped: a Role Change, a Command
+                // Status arriving after the event it caused, a mode change —
+                // the order of these is the only host-side view of what the
+                // two radios were doing when a setup fails.
+                Event::LeAdvertisingReport(_) => {}
+                other => on_event(&format!("(event {other:?})")),
             }
         }
         // A link that came up is closed by `page_and_pair`, which waits for
