@@ -5,6 +5,52 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-10-03
+
+### Added
+
+- **Area Mapper.** A module on a device's AutoMap bus that lays one stick or
+  touch point (picked in the header) onto an area of cells — a circle by
+  default, or a rectangle — and gives each cell its own mappings, the Touch
+  Zones / Virtual Menu cards, firing while the point is inside, as it enters, or
+  as it leaves. The picked input is consumed; everything else on the bus passes
+  through. A cell can count only while a touchpad is touched.
+
+  Cells are laid out in rings (a circle) or rows (a rectangle), each split by
+  its own borders. Drag a border to move it, double-click to centre it,
+  right-click to add or remove one. With **Sym** on (the default) every edit is
+  mirrored into the other quarters. A whole ring is one zone: its first border
+  is a diameter that turns as one, the next makes four. A circle's ring border
+  can be squared off toward a square, by blend or by rounding the corners; a
+  rectangle's cell can be rounded into a bubble that pushes its neighbours'
+  seams by its pressure.
+
+  Any border can be a **gradient**: the cells either side crossfade across it,
+  analog outputs taking the share and keys following the border's own PWM
+  (alternating or independent), tap train or threshold.
+
+  **Layers** (tabs, each with its own colour, cells and mappings) act on the
+  same input together — an outer ring holding Shift whichever way you push,
+  over a 4-way direction layer. The other layers show faintly, their mappings
+  tinted in their colour. An **Analog** layer drives its keys from the push
+  instead of its borders, for WASD that moves like a stick: by direction
+  (steering between a key and the diagonal, so a full push never stops) or per
+  key, with smooth pulses (every press and gap at least a minimum, so the game
+  sees each one), a model of the game's own acceleration, or fixed PWM; the
+  deadzone and the full-push ring are dragged on the field. One press mode can
+  rule every card, and the whole module saves to and loads from a `.fxarea`
+  preset. It pins, and the pad's navigation edits the field, the borders and
+  the cards; tuned from the config overlay, the picked stick passes through to
+  be felt and the other stick drives the editor.
+
+### Changed
+
+- **Analog time gaps go down to 1 ms.** A Remapper card's analog-mode time gap
+  was floored at 10 ms, and its analog pulses at 20 ms.
+
+- **A Virtual Menu ring that is one whole zone has no seam.** Its outline no
+  longer draws a line from the centre to the rim.
+
 ### Fixed
 
 - **JSM holds, taps and trigger timing keep working in a long session.** A JSM
