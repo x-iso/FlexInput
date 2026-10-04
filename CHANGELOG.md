@@ -3,6 +3,71 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.15.5] - 2026-10-04
+
+### Added
+
+- **Two-way Response Curve: a Hyst graph.** Next to the Up and Down tabs, the
+  **Hyst** tab draws how wide the hysteresis band is along the input — e.g. a
+  narrow band near rest and a wide one across a noisy adaptive-trigger
+  resistance shelf. One dot is a flat band set by the Hyst value (dragging it
+  is the same setting); with two dots or more the value box greys out until
+  you remove dots down to one. Both curves show dimmed behind it.
+
+- **Two-way Response Curve: Peak hold.** A pad reports every few ms, so a fast
+  pull steps right over a narrow peak on the curve (a short pulse at the top of
+  a trigger pull), and a single report on it is too short for a game to catch.
+  **Peak hold** puts out the highest the curve got across each step and keeps
+  it up for at least the set time; a press that had to clear the band still
+  catches the peak it came up through. Its own ↕ ↑ ↓ picks the curve it holds
+  on — the press (Up) by default, as a hold on the Down curve would also delay
+  a release. A flip between curves drops it at once.
+
+- **Two-way Response Curve: which flip the band guards, and Start on Up.** ↕ ↑
+  ↓ on the Hyst row picks whether a press, a release or both have to clear the
+  band (the other flips at once). **Start ↑** puts the curve on Up whenever the
+  input is at rest, so a pull from rest follows the Up curve from its first
+  sample with no band to clear.
+
+- **Easy mode: each input device's preset port.** On presets with several
+  AutoMap inlets, device cards gain a **Port** row under Calibrate, named after
+  the sub-patch's inlet; picking a port another device holds swaps the two, and
+  the pad's navigation steps through them. MIDI input cards get the same row.
+
+### Changed
+
+- **Two-way Response Curve hysteresis reworked.** The curves are now read at a
+  held point that follows the input with no lag in the direction it's moving
+  and stays put while the input comes back by less than the band, so input
+  noise smaller than the band never moves the output; coming back further
+  flips to the other curve. Slow reversals are caught however slowly they come
+  (the old detector's time window is gone, and with it the Hyst ms field). The
+  graph shows the band live behind the point, the raw input as a tick under
+  the graph, and the point on the curve the engine is actually on.
+
+- **Two-way Response Curve presets save the whole setup.** A `.fxc` preset
+  held only the lane being edited; it now carries both curves, the Hyst graph
+  and every hysteresis and Peak hold setting, and Load restores them all.
+  Older presets load into the edited lane as before.
+
+### Fixed
+
+- **Two-way Response Curve fired its short pulse on release, and missed it on
+  the pull.** The old direction detector switched curves late and read the
+  previous curve at the new input on the way, so a quick pull lost a pulse at
+  the start of the travel and a release could fire one.
+
+- **Selector with Interp on blended Vec2 inputs to zero.** It now interpolates
+  sticks component-wise.
+
+- **A device keeps its Easy-mode port when another device is removed.** A
+  device on port 2 no longer slides to port 1 when the device on port 1 goes.
+
+- **RWS Aim's stick aim no longer mutes the flick stick for every other
+  module.** Outside a calibration sweep, only "Suppress flick stick" decides
+  whether it's held back. The 360° calibration sweep also counts the flick
+  stick circled round its edge on top of the gyro.
+
 ## [0.15.4] - 2026-10-03
 
 ### Added
