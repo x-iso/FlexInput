@@ -426,6 +426,13 @@ pub struct ModuleDescriptor {
   - Output 0: Orientation quaternion (Vec4)
   - Outputs 1..N: Lean mappings (Bool/Float per configured mapping)
 - **Parameters:**
+  - `roll_contribution: f64` - Roll mix, % (−100..100, default 0). Pitch+Yaw only:
+    X = yaw − roll × share, the JSM module's `ROLL_CONTRIBUTION` (same sign)
+  - `hold_pitch` / `hold_yaw` / `hold_roll: f64` - Neutral hold, degrees (default 0;
+    + = far edge raised / nose right / right grip down). The 2D outputs and Lean
+    are measured from this hold: Pitch+Yaw / Pitch+Roll rotate gyro AND gravity
+    (JSM's `LOCAL_AXIS_OFFSET` on three axes); Player / World rotate gravity only.
+    The Orientation output ignores it. All zero = stock, bit-exact
   - `lean_left: Array<Mapping>` - Left lean mappings
   - `lean_right: Array<Mapping>` - Right lean mappings
   - Each Mapping: `{ out, mode, window_ms, sustain, turbo }`, plus `midi_vel` /

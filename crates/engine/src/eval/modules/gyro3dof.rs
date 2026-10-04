@@ -26,6 +26,27 @@ pub(crate) fn gyro_resolve_mode(params: &HashMap<String, Value>) -> (&'static st
     }
 }
 
+/// The neutral hold named by `hold_pitch` / `hold_yaw` / `hold_roll` (degrees), as
+/// the rotation that takes a vector measured on the pad into the frame of that
+/// hold. `None` when all three are zero, so the stock module stays bit-exact.
+///
+/// Written in the gyro's body basis (forward, right, down), which is right-handed,
+/// as an aircraft attitude: yaw about down (+ nose turned right), then pitch about
+/// right (+ far edge raised — the sign of the JSM module's `LOCAL_AXIS_OFFSET`),
+/// then roll about forward (+ right grip down — the sign of Lean).
+pub(crate) fn gyro_hold_rotation(params: &HashMap<String, Value>) -> Option<glam::Quat> {
+    let deg = |k: &str| params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let (pitch, yaw, roll) = (deg("hold_pitch"), deg("hold_yaw"), deg("hold_roll"));
+    if pitch == 0.0 && yaw == 0.0 && roll == 0.0 {
+        return None;
+    }
+    Some(
+        glam::Quat::from_rotation_z(yaw.to_radians())
+            * glam::Quat::from_rotation_y(pitch.to_radians())
+            * glam::Quat::from_rotation_x(roll.to_radians()),
+    )
+}
+
 pub(crate) fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -108,6 +129,57 @@ pub(crate) fn compute_gyro_3dof(
     // `flexinput_devices::gyro::apply_spike_filter`. The engine sees an
     // already-clean IMU stream.)
 
+    // ── Neutral hold: the readings the 2D outputs and Lean measure ────────
+    //
+    // The hold offsets name how the pad sits when it is held at rest, and
+    // everything below the Orientation block is measured from there instead of
+    // from flat. What that means depends on whether the mode measures against
+    // gravity:
+    //
+    //   Pitch+Yaw / Pitch+Roll  gyro AND gravity are re-measured about the
+    //       neutral hold — `LOCAL_AXIS_OFFSET` from the JSM module, on all three
+    //       axes. A handheld tilted back 40°: yaw becomes the turn about the
+    //       tilted hold's up rather than the face normal, and Lean stops reading
+    //       the tilt as half a lean.
+    //   Player / World          gravity ONLY. These already adapt to how the
+    //       pad is held, and rotating the gyro with gravity would cancel out of
+    //       their projection anyway. What the offset changes is which way is
+    //       "down": lying on your right side with the pad held normally in front
+    //       of you, the pad IS rolled 90° right, and naming that makes turns
+    //       about your own up axis read as turns again.
+    //
+    // The Orientation output keeps the physical readings: it is a pose, not an
+    // aim, and the 3D viewer should show the pad as it really is.
+    let hold = gyro_hold_rotation(params);
+    let measures_gravity = matches!(axis, "player" | "world");
+    let (hgx, hgy, hgz) = match hold {
+        // The gyro tuple is already in the right-handed body basis the rotation
+        // is written in: (forward, right, down).
+        Some(q) if !measures_gravity => {
+            let v = q * glam::Vec3::new(gx, gy, gz);
+            (v.x, v.y, v.z)
+        }
+        _ => (gx, gy, gz),
+    };
+    let (hax, hay, haz) = match hold {
+        // The accel tuple is in (forward, left, up) — `diag(1, -1, -1)` from the
+        // gyro's basis — so it goes into the gyro basis for the rotation and
+        // comes back out after it. That flip is a half turn about forward, so
+        // rotating the raw components would still get roll right but turn the
+        // pitch and yaw offsets the wrong way.
+        Some(q) => {
+            let v = q * glam::Vec3::new(ax, -ay, -az);
+            (v.x, -v.y, -v.z)
+        }
+        None => (ax, ay, az),
+    };
+    // `ROLL_CONTRIBUTION` from the JSM module (and its custom-curve fork's
+    // `YAW_PLUS_ROLL`): a share of roll joins the turn, Pitch+Yaw only. Same
+    // percentage and same sign — positive is the share a far-edge-raised hold
+    // loses from yaw into roll, so turning the body comes back whole; negative
+    // makes rolling right turn right, like a wheel.
+    let roll_share = pf("roll_contribution", 0.0).clamp(-100.0, 100.0) / 100.0;
+
     // aux_f32 layout:
     //   [0] integrated steering X
     //   [1] integrated steering Y
@@ -147,7 +219,7 @@ pub(crate) fn compute_gyro_3dof(
         "player" => 1.0_f32,
         _ => 2.0_f32,
     };
-    let accel_v = glam::Vec3::new(ax, ay, az);
+    let accel_v = glam::Vec3::new(hax, hay, haz);
     let acc_len = accel_v.length();
     if acc_len > 0.01 {
         let alpha = 1.0 - (-dt / tau).exp();
@@ -170,14 +242,15 @@ pub(crate) fn compute_gyro_3dof(
     // and rocking back through center doesn't produce a spurious opposite
     // lean. See the lean derivation block after this match.
     let (raw_x, raw_y, _raw_lean_unused) = match axis {
-        "pitch_roll" => (gx, gy, gz),
+        "pitch_roll" => (hgx, hgy, hgz),
         "player" | "world" => {
-            let gyro  = glam::Vec3::new(gx, gy, gz);
+            let gyro  = glam::Vec3::new(hgx, hgy, hgz);
             let world_yaw   = gyro.dot(g_hat);
             let gyro_no_yaw = gyro - world_yaw * g_hat;
             (world_yaw, gyro_no_yaw.y, 0.0)
         }
-        _ => (gz, gy, 0.0), // pitch_yaw: gz=yaw→X, gy=pitch→Y
+        // pitch_yaw: gz=yaw→X (plus the roll share), gy=pitch→Y
+        _ => (hgz - hgx * roll_share, hgy, 0.0),
     };
 
     // ── Steering integration + auto-recentering ───────────────────────────
@@ -215,6 +288,8 @@ pub(crate) fn compute_gyro_3dof(
         // continuous 3DOF pose estimate projecting both axes; pending. Until
         // then, Y centers only via the manual reset (ease_in).
         if recenter_strength > 0.0 && (axis == "pitch_yaw" || axis == "pitch_roll") {
+            // Measured from the neutral hold, like everything else 2D.
+            let (ax, ay, az) = (hax, hay, haz);
             let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
             let (heading, weight) = if axis == "pitch_roll" {
                 let w = (ax * ax + az * az).sqrt() / acc_mag;
@@ -289,10 +364,12 @@ pub(crate) fn compute_gyro_3dof(
     //
     // Gating scales rather than cuts, so a pad drifting out of its assumed
     // orientation loses lean smoothly instead of dropping it at a boundary.
-    let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
+    // Measured from the neutral hold, so a hold rolled to one side leans from
+    // there rather than reading as a permanent lean.
+    let acc_mag_full = (hax * hax + hay * hay + haz * haz).sqrt().max(1e-3);
     // Lean is the side component: canonical `ay`, + when the right grip drops =
     // + right lean. (Verified against a physical pad and pinned by a test.)
-    let lean_side = ay / acc_mag_full;
+    let lean_side = hay / acc_mag_full;
     // Confidence that the pad is held as the mode assumes, from the smoothed
     // gravity — using the forward (x) and vertical (z) components and ignoring
     // side (y), which is the axis the lean gesture itself moves:
@@ -577,6 +654,124 @@ pub(crate) fn compute_gyro_3dof(
 }
 
 // ── Curve helpers ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod hold_offset_tests {
+    use super::compute_gyro_3dof;
+    use crate::NodeState;
+    use flexinput_core::Signal;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    /// Feed a constant canonical gyro + accel reading for a second and return
+    /// the module's (X, Y, Lean, Orientation).
+    fn run(params: &[(&str, Value)], gyro: [f32; 3], accel: [f32; 3]) -> (f32, f32, f32, glam::Vec4) {
+        let mut state = NodeState::default();
+        let mut p: HashMap<String, Value> = HashMap::new();
+        for (k, v) in params {
+            p.insert((*k).into(), v.clone());
+        }
+        let (dev, coll) = (HashMap::new(), HashMap::new());
+        let inputs: Vec<Option<Signal>> = vec![
+            None,
+            None,
+            Some(Signal::Float(gyro[0])),
+            Some(Signal::Float(gyro[1])),
+            Some(Signal::Float(gyro[2])),
+            Some(Signal::Float(accel[0])),
+            Some(Signal::Float(accel[1])),
+            Some(Signal::Float(accel[2])),
+        ];
+        let mut out = Vec::new();
+        for _ in 0..250 {
+            out = compute_gyro_3dof(&inputs, &mut state, &p, &dev, &coll, 1.0 / 250.0);
+        }
+        let f = |i: usize| match out[i] {
+            Some(Signal::Float(v)) => v,
+            ref other => panic!("slot {i}: {other:?}"),
+        };
+        let q = match out[5] {
+            Some(Signal::Vec4(v)) => v,
+            ref other => panic!("orientation: {other:?}"),
+        };
+        (f(1), f(2), f(3), q)
+    }
+
+    /// A pad held `deg` nose-up, turning right about the WORLD's up at `w`:
+    /// canonical gyro + accel. Gyro is (forward, right, down), so the turn
+    /// splits into yaw `w·cos` and a roll of `-w·sin`; accel reads up in
+    /// (forward, left, up).
+    fn nose_up_turn(deg: f32, w: f32) -> ([f32; 3], [f32; 3]) {
+        let (s, c) = deg.to_radians().sin_cos();
+        ([-w * s, 0.0, w * c], [s, 0.0, c])
+    }
+
+    #[test]
+    fn a_pitch_offset_recovers_the_whole_turn_of_a_tilted_hold() {
+        let w = 0.1;
+        let (g, a) = nose_up_turn(30.0, w);
+        let (x0, _, _, _) = run(&[], g, a);
+        assert!((x0 - w * 30f32.to_radians().cos()).abs() < 1e-4, "stock reads yaw only: {x0}");
+        let (x, y, _, _) = run(&[("hold_pitch", json!(30.0))], g, a);
+        assert!((x - w).abs() < 1e-4, "the turn about the tilted hold's up, whole: {x}");
+        assert!(y.abs() < 1e-4, "and none of it leaks into pitch: {y}");
+    }
+
+    #[test]
+    fn roll_contribution_adds_the_lost_share_with_the_jsm_sign() {
+        // Positive is the share a far-edge-raised hold loses into roll, so it
+        // must ADD to a body turn there, exactly as `YAW_PLUS_ROLL` does.
+        let w = 0.1;
+        let (g, a) = nose_up_turn(30.0, w);
+        let (x, _, _, _) = run(&[("roll_contribution", json!(50.0))], g, a);
+        let (s, c) = 30f32.to_radians().sin_cos();
+        assert!((x - w * (c + 0.5 * s)).abs() < 1e-4, "{x}");
+        // Pitch+Yaw only: Pitch+Roll's X is roll itself.
+        let (xr, _, _, _) =
+            run(&[("axis", json!("pitch_roll")), ("family", json!("pointer")), ("roll_contribution", json!(50.0))], g, a);
+        assert!((xr - g[0]).abs() < 1e-4, "{xr}");
+    }
+
+    #[test]
+    fn a_roll_offset_makes_a_sideways_hold_neutral_for_lean_and_player() {
+        // Lying on your right side, pad held normally in front of you: the pad
+        // is rolled 90° right (right grip down → canonical accel +y), and the
+        // turns you make about your own up are the pad's own yaw.
+        let w = 0.1;
+        let player = [("family", json!("pointer")), ("axis", json!("player"))];
+        let (x0, _, lean0, _) = run(&player, [0.0, 0.0, w], [0.0, 1.0, 0.0]);
+        assert!(lean0 > 0.99, "stock reads a full right lean: {lean0}");
+        assert!(x0.abs() < 1e-4, "and a turn about your up as nothing: {x0}");
+        let mut p = player.to_vec();
+        p.push(("hold_roll", json!(90.0)));
+        let (x, _, lean, _) = run(&p, [0.0, 0.0, w], [0.0, 1.0, 0.0]);
+        assert!(lean.abs() < 1e-3, "lean measured from the hold: {lean}");
+        assert!((x - w).abs() < 1e-4, "the turn reads again: {x}");
+    }
+
+    #[test]
+    fn player_rotates_gravity_only_and_pitch_turns_the_right_way() {
+        // Pad 30° nose-up, offset naming that hold: in Player the offset moves
+        // "down" to the pad's own face normal, so a pure pad-local yaw reads
+        // whole. Rotating the gyro too would cancel out (w·cos 30°), and
+        // rotating the accel tuple without its basis flip would tilt gravity to
+        // 60° instead of flat (w·cos 60°).
+        let w = 0.1;
+        let (s, c) = 30f32.to_radians().sin_cos();
+        let p = [("family", json!("pointer")), ("axis", json!("player")), ("hold_pitch", json!(30.0))];
+        let (x, _, _, _) = run(&p, [0.0, 0.0, w], [s, 0.0, c]);
+        assert!((x - w).abs() < 1e-4, "{x}");
+    }
+
+    #[test]
+    fn hold_offsets_leave_the_orientation_output_physical() {
+        let (g, a) = nose_up_turn(30.0, 0.1);
+        let (_, _, _, q0) = run(&[], g, a);
+        let (_, _, _, q) =
+            run(&[("hold_pitch", json!(30.0)), ("hold_yaw", json!(20.0)), ("hold_roll", json!(-15.0))], g, a);
+        assert!((q - q0).length() < 1e-6, "{q:?} vs {q0:?}");
+    }
+}
 
 #[cfg(test)]
 mod orientation_frame_tests {

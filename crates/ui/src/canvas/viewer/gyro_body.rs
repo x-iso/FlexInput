@@ -52,6 +52,8 @@ pub(crate) fn show_gyro_3dof_body(
     let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
     let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
+    let roll_mix          = snap.and_then(|n| n.params.get("roll_contribution").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+    let hold = snap.map(gyro_read_hold).unwrap_or([0.0; 3]);
     let out_x = snap.and_then(|n| match n.extra.last_out.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let out_y = snap.and_then(|n| match n.extra.last_out.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let lean_v = snap.and_then(|n| match n.extra.last_out.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -68,6 +70,8 @@ pub(crate) fn show_gyro_3dof_body(
     let mut orient_drift = orient_drift;
     let mut yaw_recenter = yaw_recenter;
     let mut yaw_thresh   = yaw_thresh;
+    let mut roll_mix     = roll_mix;
+    let mut hold         = hold;
     let mut changed   = false;
 
     const GYR_LABELS: [(&str, &str); 3] = [
@@ -104,6 +108,8 @@ pub(crate) fn show_gyro_3dof_body(
     let mut pointer_rect:    Option<egui::Rect> = None;
     let mut steering_rect:   Option<egui::Rect> = None;
     let mut stopts_rect:     Option<egui::Rect> = None;
+    let mut roll_mix_rect:   Option<egui::Rect> = None;
+    let mut hold_rect:       Option<egui::Rect> = None;
     let mut gyr_rect:        Option<egui::Rect> = None;
     let mut acc_rect:        Option<egui::Rect> = None;
     let mut lean_rect:       Option<egui::Rect> = None;
@@ -145,6 +151,41 @@ pub(crate) fn show_gyro_3dof_body(
             });
         });
         stopts_rect = Some(r.response.rect);
+
+        // Roll mix (Pitch+Yaw only) and the neutral hold. Both shape the 2D
+        // outputs and Lean, never the 3D Orientation.
+        let r = ui.scope(|ui| {
+            ui.add_enabled_ui(axis == "pitch_yaw", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(egui::RichText::new("Roll mix").small().weak())
+                        .on_hover_text(GYRO_ROLL_MIX_TIP);
+                    if ui.add(egui::DragValue::new(&mut roll_mix)
+                        .speed(0.5).range(-100.0..=100.0).suffix(" %"))
+                        .on_hover_text(GYRO_ROLL_MIX_TIP)
+                        .changed() { changed = true; }
+                });
+            });
+        });
+        roll_mix_rect = Some(r.response.rect);
+
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(egui::RichText::new("Hold°").small().weak())
+                .on_hover_text(GYRO_HOLD_TIP);
+            for (i, lbl) in ["P", "Y", "R"].into_iter().enumerate() {
+                ui.label(egui::RichText::new(lbl).small().weak());
+                if ui.add(egui::DragValue::new(&mut hold[i])
+                    .speed(0.5).range(-180.0..=180.0).suffix("°"))
+                    .on_hover_text(GYRO_HOLD_AXIS_TIPS[i])
+                    .changed() { changed = true; }
+            }
+            if ui.small_button("⟲").on_hover_text("Reset the hold to flat").clicked() {
+                hold = [0.0; 3];
+                changed = true;
+            }
+        });
+        hold_rect = Some(r.response.rect);
 
         // 3D Orientation display scale (applied to the integration rate, so it's
         // continuous — no flipping at 180°). Affects the Orientation output that
@@ -269,6 +310,8 @@ pub(crate) fn show_gyro_3dof_body(
     if let Some(r) = pointer_rect    { register_exposable_element(ui, node_id, "pointer_mode",  r); }
     if let Some(r) = steering_rect   { register_exposable_element(ui, node_id, "steering_mode", r); }
     if let Some(r) = stopts_rect     { register_exposable_element(ui, node_id, "steering_opts", r); }
+    if let Some(r) = roll_mix_rect   { register_exposable_element(ui, node_id, "roll_mix",      r); }
+    if let Some(r) = hold_rect       { register_exposable_element(ui, node_id, "hold_offset",   r); }
     if let Some(r) = gyr_rect        { register_exposable_element(ui, node_id, "gyro_invert",   r); }
     if let Some(r) = acc_rect        { register_exposable_element(ui, node_id, "accel_invert",  r); }
     if let Some(r) = lean_rect       { register_exposable_element(ui, node_id, "lean_threshold", r); }
@@ -308,7 +351,49 @@ pub(crate) fn show_gyro_3dof_body(
             node.params.insert("orient_auto_recenter".into(), Value::Bool(yaw_recenter));
             node.params.insert("orient_recenter_thresh".into(),
                 serde_json::Number::from_f64(yaw_thresh as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("roll_contribution".into(),
+                serde_json::Number::from_f64(roll_mix as f64).map(Value::Number).unwrap_or(Value::Null));
+            gyro_write_hold(node, hold);
         }
+    }
+}
+
+pub(crate) const GYRO_ROLL_MIX_TIP: &str =
+    "Pitch+Yaw only: mix a share of roll into the turn (X).\n\
+     Same setting as the JSM module's ROLL_CONTRIBUTION.\n\
+     Positive puts back the turn a far-edge-raised grip loses\n\
+     into roll; negative makes rolling right turn right, like\n\
+     a wheel. 0 = off.";
+
+pub(crate) const GYRO_HOLD_TIP: &str =
+    "Neutral hold: how the pad sits when you hold it at rest.\n\
+     The 2D outputs and Lean are measured from this hold\n\
+     instead of from flat. The 3D Orientation output is not.\n\
+     \n\
+     Pitch+Yaw / Pitch+Roll: gyro axes and gravity are both\n\
+     re-measured about the hold (JSM's LOCAL_AXIS_OFFSET, on\n\
+     all three axes). E.g. a handheld tilted back 40° → P 40.\n\
+     \n\
+     Player / World: only gravity is rotated, shifting which\n\
+     way counts as down. E.g. lying on your right side with\n\
+     the pad held normally → R 90.";
+
+pub(crate) const GYRO_HOLD_AXIS_TIPS: [&str; 3] = [
+    "Pitch: + = far (trigger) edge raised",
+    "Yaw: + = nose turned right",
+    "Roll: + = right grip down",
+];
+
+/// The neutral hold offsets `[pitch, yaw, roll]` in degrees.
+pub(crate) fn gyro_read_hold(n: &NodeData) -> [f32; 3] {
+    let g = |k: &str| n.params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    [g("hold_pitch"), g("hold_yaw"), g("hold_roll")]
+}
+
+pub(crate) fn gyro_write_hold(node: &mut NodeData, hold: [f32; 3]) {
+    for (k, v) in ["hold_pitch", "hold_yaw", "hold_roll"].into_iter().zip(hold) {
+        node.params.insert(k.into(),
+            serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null));
     }
 }
 

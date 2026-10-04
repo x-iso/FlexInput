@@ -517,6 +517,14 @@ pub(crate) fn render_pinned_element_impl(
             render_gyro_lean_threshold_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("processing.gyro_3dof", "roll_mix") => {
+            render_gyro_roll_mix_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("processing.gyro_3dof", "hold_offset") => {
+            render_gyro_hold_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("processing.gyro_3dof", "gyro_invert") => {
             render_gyro_invert_row(inner_id, ui, inner_snarl, container_size);
             return;
@@ -1995,6 +2003,61 @@ pub(crate) fn render_gyro_lean_threshold_row(
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("lean_threshold".into(),
                 serde_json::Number::from_f64(threshold as f64).map(Value::Number).unwrap_or(Value::Null));
+        }
+    }
+}
+
+pub(crate) fn render_gyro_roll_mix_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let snap = snarl.get_node(inner_id);
+    let mut mix = snap.and_then(|n| n.params.get("roll_contribution").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+    let pitch_yaw = snap.map(|n| super::gyro_body::gyro_read_family_axis(n).1 == "pitch_yaw").unwrap_or(true);
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(140.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 1];
+    ui.add_enabled_ui(pitch_yaw, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("Roll mix").weak())
+                .on_hover_text(super::gyro_body::GYRO_ROLL_MIX_TIP);
+            let r = ui.add(egui::DragValue::new(&mut mix).speed(0.5).range(-100.0..=100.0).suffix(" %"));
+            fr[0] = r.rect; changed |= r.changed();
+        });
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("roll_contribution".into(),
+                serde_json::Number::from_f64(mix as f64).map(Value::Number).unwrap_or(Value::Null));
+        }
+    }
+}
+
+pub(crate) fn render_gyro_hold_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let mut hold = snarl.get_node(inner_id).map(super::gyro_body::gyro_read_hold).unwrap_or([0.0; 3]);
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 3];
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.label(egui::RichText::new("Hold°").weak())
+            .on_hover_text(super::gyro_body::GYRO_HOLD_TIP);
+        for (i, lbl) in ["P", "Y", "R"].into_iter().enumerate() {
+            ui.label(egui::RichText::new(lbl).weak());
+            let r = ui.add(egui::DragValue::new(&mut hold[i]).speed(0.5).range(-180.0..=180.0).suffix("°"))
+                .on_hover_text(super::gyro_body::GYRO_HOLD_AXIS_TIPS[i]);
+            fr[i] = r.rect; changed |= r.changed();
+        }
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            super::gyro_body::gyro_write_hold(node, hold);
         }
     }
 }

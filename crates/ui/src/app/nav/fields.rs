@@ -577,6 +577,7 @@ impl FlexInputApp {
             | ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode")
             | ("processing.gyro_3dof", "steering_mode")
             | ("processing.gyro_3dof", "steering_opts")
+            | ("processing.gyro_3dof", "roll_mix") | ("processing.gyro_3dof", "hold_offset")
             | ("processing.gyro_3dof", "gyro_invert") | ("processing.gyro_3dof", "accel_invert")
             | ("logic.counter", "mode") | ("logic.counter", "range_mode")
             | ("logic.counter", "step") | ("logic.counter", "min_max")
@@ -949,6 +950,13 @@ impl FlexInputApp {
                 f!("excl. Y", Toggle{key:"steering_exclude_y"}),
                 f!("re-center", v("recenter_strength",0.0,4.0,0.0,Linear)),
                 f!("ease", v("reset_ease_in",0.0,2.0,0.25,Linear)),
+            ],
+            ("processing.gyro_3dof", "roll_mix") =>
+                vec![f!("Roll mix %", v("roll_contribution",-100.0,100.0,0.0,Fixed(5.0)))],
+            ("processing.gyro_3dof", "hold_offset") => vec![
+                f!("Pitch°", v("hold_pitch",-180.0,180.0,0.0,Fixed(5.0))),
+                f!("Yaw°", v("hold_yaw",-180.0,180.0,0.0,Fixed(5.0))),
+                f!("Roll°", v("hold_roll",-180.0,180.0,0.0,Fixed(5.0))),
             ],
             ("processing.gyro_3dof", "gyro_invert") => vec![
                 f!("yaw", Toggle{key:"inv_yaw"}),

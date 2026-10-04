@@ -34,6 +34,58 @@ All notable changes to FlexInput are documented here. This project adheres to
   the sub-patch's inlet; picking a port another device holds swaps the two, and
   the pad's navigation steps through them. MIDI input cards get the same row.
 
+- **RWS Aim: a Flick output.** The flick can go out on its own pin, so it can
+  drive something other than the aim. **out** picks where it goes: the
+  **Flick** pin in mouse counts (the default), the Flick pin as stick
+  deflection — a flick faster than full tilt carries the rest of its turn
+  over, so it still lands where you pointed — or **Mouse + Stick**, added into
+  both aim outputs as before.
+
+- **RWS Aim: a Flick On input.** Switching it off hands the flick stick back:
+  no flick, no Stick aim, and no suppression of the stick, so it behaves as a
+  plain stick again — for a mode shift such as a weapon wheel. Unwired, it's
+  on.
+
+- **RWS Aim: a speed gate between Stick aim and the flick.** With **flick
+  within** set, every push out of the centre is judged by how fast it reaches
+  the flick deadzone. Within the time it's a flick: the Stick aim it made on
+  the way out is dropped, so the flick lands clean, and Stick aim stays off
+  until the stick is back at the centre. Slower, it's steering: the aim held
+  back while deciding catches up over the smoothing time. **slow = aim only**
+  keeps a steering push from flicking until the centre — past the deadzone it
+  aims at full rate — so the stick steers like a normal aim stick and a fast
+  push still flicks.
+
+- **RWS Aim: flick stabilise and forward deadzone.** **stab** steadies a
+  thumb's tremor while the flick stick is held out and rotated; a deliberate
+  sweep opens it up, and whatever it is still holding back is turned when you
+  let go. **fwd ±** lets a flick pushed near straight up engage without
+  snapping, so the stick is primed to rotate — a 360° with the stick, say.
+
+- **Stick rebound filter.** A stick let go from a push springs back fast enough
+  to overshoot the centre, reading for a moment as pushed the other way — a
+  flick stick turns back, a stick → key mapping taps the opposite key.
+  **Rebound filter** in the Calibration window's stick section treats a stick
+  that springs back to the centre as centred on the far side for the set
+  window, then inside the inner 15% for three windows more. Steering slowly
+  through the centre is never filtered, and pushing back out the way you let
+  go passes at once.
+
+- **3DOF to 2D: Roll mix.** Pitch+Yaw can mix a share of roll into the turn,
+  the JSM module's `ROLL_CONTRIBUTION` with the same percentage and sign:
+  positive puts back the turn a grip with the far edge raised loses into roll,
+  negative makes rolling right turn right, like a wheel.
+
+- **3DOF to 2D: a neutral hold.** **Hold°** P / Y / R says how the pad sits
+  when you hold it at rest, and the 2D outputs and Lean are measured from
+  there instead of from flat. In Pitch+Yaw and Pitch+Roll the gyro axes and
+  gravity are both re-measured about the hold (the JSM module's
+  `LOCAL_AXIS_OFFSET`, on all three axes) — a handheld tilted back 40° takes
+  P 40. In Player and World only gravity turns, moving which way counts as
+  down — lying on your right side with the pad held normally takes R 90. The
+  3D Orientation output stays physical. Both rows can be pinned and driven
+  from a pad.
+
 ### Changed
 
 - **Two-way Response Curve hysteresis reworked.** The curves are now read at a
@@ -49,6 +101,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   held only the lane being edited; it now carries both curves, the Hyst graph
   and every hysteresis and Peak hold setting, and Load restores them all.
   Older presets load into the edited lane as before.
+
+- **RWS Aim's flick has no checkbox any more.** It's on wherever its output
+  goes — Mouse + Stick, or a wired Flick pin — and a line under the flick rows
+  says when it's off and why. Patches and presets with Flick ticked become
+  Mouse + Stick; unticked ones get the Flick pin, which stays off until you
+  wire it, so Stick aim keeps the stick's whole range as before.
 
 ### Fixed
 
@@ -67,6 +125,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   module.** Outside a calibration sweep, only "Suppress flick stick" decides
   whether it's held back. The 360° calibration sweep also counts the flick
   stick circled round its edge on top of the gyro.
+
+- **The config overlay let the wrong device through on patches combining
+  devices.** Tweaking a gyro curve — or running an RWS calibration sweep —
+  passed through the first device on the tab (a MIDI port, say) instead of the
+  pad the gyro comes from, so the gyro never reached the game.
+
+- **A 180° flick no longer turns straight back.** Let go, the stick springs
+  past the centre to the opposite side while the flick is still held through
+  the dip, and that was tracked as a half turn back.
+
+- **RWS Aim's flick rows work from the pad.** The focused field gets its
+  highlight, and Stick aim and its multiplier can be reached.
 
 ## [0.15.4] - 2026-10-03
 
