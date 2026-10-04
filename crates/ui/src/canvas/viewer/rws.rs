@@ -261,7 +261,7 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         // inside the deadzone; without, it uses the full stick range).
         let mut ae = aim_on;
         if ui.checkbox(&mut ae, egui::RichText::new("Stick aim").small())
-            .on_hover_text("Use the stick wired to the Flick input as a rate aim feeding BOTH\noutputs (its own RWS + the stick V/H bias). With Flick on it acts INSIDE\nthe deadzone (past → flick); with Flick off it uses the full stick range.\nThe stick is suppressed from its default mapping while aiming.")
+            .on_hover_text("Use the stick wired to the Flick input as a rate aim feeding BOTH\noutputs (its own RWS + the stick V/H bias). With Flick on it acts INSIDE\nthe deadzone (past → flick); with Flick off it uses the full stick range.\nThe stick still reaches its default mapping unless\n“Suppress flick stick” blocks it.")
             .changed()
         {
             set.push(("stick_aim_enabled", Value::Bool(ae)));
@@ -286,7 +286,7 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         .unwrap_or("off").to_string();
     let r_sup = ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Suppress flick stick").small().weak())
-            .on_hover_text("Block the stick wired into Flick from leaking to its default\nmapping (e.g. the virtual Right Stick). Auto-detected from the wire;\nthis module still reads it (via the pre-block snapshot, like the\nVirtual Menu).\n• Off — no block.\n• Full — always block while Flick is enabled.\n• In deadzone — block only past the deadzone, so small movements\n  inside the deadzone still reach the default mapping.");
+            .on_hover_text("Block the stick wired into Flick from leaking to its default\nmapping (e.g. the virtual Right Stick). Auto-detected from the wire;\nthis module still reads it (via the pre-block snapshot, like the\nVirtual Menu).\n• Off — no block.\n• Full — always block while Flick or Stick aim is enabled.\n• In deadzone — block only past the Flick deadzone, so small\n  movements inside it still reach the default mapping.\nAn Auto-cal sweep always blocks it, whatever this is set to.");
         egui::ComboBox::from_id_salt((node_id, "rws_suppress"))
             .selected_text(match suppress.as_str() {
                 "full" => "Full", "deadzone" => "In deadzone", _ => "Off",
@@ -689,11 +689,16 @@ pub(crate) fn rws_measure_controls(
             ui.label(egui::RichText::new(format!("⚠ Too fast — the stick maxed out ({peak_defl:.1}×). Cancel and turn slower."))
                 .small().color(egui::Color32::from_rgb(230, 150, 110)));
         }
-        let instruction = match (axis.as_str(), is_stick) {
-            ("pitch", false) => "Turn the camera fully UP, then Finish",
-            ("pitch", true) => "Turn the camera fully UP (steadily, not too fast), then Finish",
-            (_, false) => "Turn one full 360°, then Finish",
-            (_, true) => "Turn one full 360° (steadily, not too fast), then Finish",
+        // The 360° also counts the stick on the Flick input circled round its edge
+        // (the engine adds it to the gyro), so say so when one is wired.
+        let flick_wired = !snarl.in_pin(InPinId { node: node_id, input: 1 }).remotes.is_empty();
+        let instruction = match (axis.as_str(), is_stick, flick_wired) {
+            ("pitch", false, _) => "Turn the camera fully UP, then Finish",
+            ("pitch", true, _) => "Turn the camera fully UP (steadily, not too fast), then Finish",
+            (_, false, false) => "Turn one full 360°, then Finish",
+            (_, true, false) => "Turn one full 360° (steadily, not too fast), then Finish",
+            (_, false, true) => "Turn one full 360° — circle the flick stick for the bulk, the pad to line up — then Finish",
+            (_, true, true) => "Turn one full 360°, steadily — circle the flick stick for the bulk, the pad to line up — then Finish",
         };
         guide(ui, instruction, "{btn_south} Finish · {btn_east} Cancel");
     } else {
@@ -704,7 +709,7 @@ pub(crate) fn rws_measure_controls(
             let r_p = ui.selectable_label(pending == "pitch", egui::RichText::new("↕180°").small())
                 .on_hover_text("Vertical: aim straight DOWN, then turn straight UP (horizontal blocked).");
             let r_y = ui.selectable_label(pending == "yaw", egui::RichText::new("↔360°").small())
-                .on_hover_text("Horizontal: turn one full 360° (vertical blocked).");
+                .on_hover_text("Horizontal: turn one full 360° (vertical blocked). Circling the\nstick on the Flick input round its edge turns it too, on top of the gyro.");
             if r_p.clicked() { set.push(("cal_measure", Value::String("pitch".into()))); }
             if r_y.clicked() { set.push(("cal_measure", Value::String("yaw".into()))); }
             method_rect = r_p.rect.union(r_y.rect);

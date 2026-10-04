@@ -16,6 +16,9 @@ pub struct NodeState {
     /// Gyro to Stick Rotation: the offset, the stabiliser and the gravity
     /// estimate. Created on first use.
     pub stick_rotation: Option<Box<crate::eval::StickRotationState>>,
+    /// RWS Aim: the flick stick being circled during a 360° calibration sweep.
+    /// Created when a sweep starts, dropped when it ends.
+    pub rws_cal_flick: Option<Box<crate::eval::CalFlick>>,
     /// Per-channel ring buffers of (timestamp, value) pairs for the delay module.
     pub delay_bufs: Vec<VecDeque<(Instant, f32)>>,
     /// Per-channel sample ring buffers for the moving-average module (float inputs).

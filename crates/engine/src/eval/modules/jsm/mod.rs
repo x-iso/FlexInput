@@ -31,6 +31,8 @@ mod touch;
 mod tests;
 
 pub(crate) use eval::{jsm_publish, JsmState};
+// RWS Aim's 360° sweep follows a circled flick stick the same way.
+pub(crate) use cal::Flick as CalFlick;
 
 // Read by the calibration widget: where the sweep's measurement lands. And by
 // the Tune panel's graph: where the speed its curve was read at lands.

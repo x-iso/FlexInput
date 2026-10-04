@@ -25,9 +25,15 @@ pub(crate) const GYRO_REF_DPS: f32 = 2000.0;
 /// virtual Right Stick), while THIS module keeps steering from it via the
 /// pre-block snapshot (`unblocked_src`). `suppress_source`:
 /// - `off`      — no block (plain passthrough).
-/// - `full`     — block whenever flick is enabled.
+/// - `full`     — block whenever flick or stick-aim is enabled.
 /// - `deadzone` — block only while the stick is past the flick deadzone, so small
-///   movements inside the deadzone still reach the default mapping.
+///   movements inside the deadzone still reach the default mapping (flick only).
+///
+/// A calibration sweep blocks the stick whatever the mode: the sweep drives the
+/// game from this module alone (the 360° also counts the stick circled round its
+/// edge), so the stick must not turn the camera a second time through its
+/// default mapping. Outside a sweep only `suppress_source` decides — stick-aim
+/// never mutes the stick for other modules on its own.
 pub(crate) fn eval_rws_node(
     snap: &NodeSnap,
     uid: usize,
@@ -42,11 +48,11 @@ pub(crate) fn eval_rws_node(
     let sup_mode = snap.params.get("suppress_source").and_then(|v| v.as_str()).unwrap_or("off").to_string();
     let deadzone = snap.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
     let stick_aim = snap.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let measuring = matches!(snap.params.get("cal_measure").and_then(|v| v.as_str()), Some("pitch" | "yaw"));
 
-    // Stick-aim needs the stick suppressed even with suppress_source "off" (and
-    // even when flick is off), so it doesn't double-drive its default mapping.
-    let can_suppress =
-        (flick_enabled || stick_aim) && (sup_mode != "off" || stick_aim) && !dev_id.is_empty() && !stick.is_empty();
+    let can_suppress = (measuring || ((flick_enabled || stick_aim) && sup_mode != "off"))
+        && !dev_id.is_empty()
+        && !stick.is_empty();
 
     // Recover the flick stick from the pre-block snapshot (we're the reason it's
     // blocked, so we must still read it); falls back to the resolved input when
@@ -93,12 +99,9 @@ pub(crate) fn eval_rws_node(
     if can_suppress {
         let mag = live_flick.map(|v| v.length()).unwrap_or(0.0);
         let past = mag >= deadzone.max(0.05);
-        let inside = mag > 0.05 && !past; // deflected but within the deadzone
-        // Stick-aim owns the whole stick while deflected (inside for aim, past for
-        // the flick); otherwise honour the plain suppression mode.
-        let do_block = sup_mode == "full"
-            || (sup_mode == "deadzone" && past)
-            || (stick_aim && (inside || past));
+        let do_block = measuring
+            || sup_mode == "full"
+            || (sup_mode == "deadzone" && flick_enabled && past);
         if do_block {
             let bk = format!("{SRC_BLOCK_PREFIX}{dev_id}");
             for p in [
@@ -199,10 +202,27 @@ pub(crate) fn compute_rws(
             // so the UI's integral back-solves the ground-truth constant.
             rws = 1.0;
             match cal_measure.as_str() {
-                "pitch" => (0.0, rot.y * k),
-                _ => (rot.x * k, 0.0), // "yaw"
+                "pitch" => {
+                    state.rws_cal_flick = None;
+                    (0.0, rot.y * k)
+                }
+                _ => {
+                    // "yaw": the 360° can also be turned by circling the stick on
+                    // the Flick input round its edge (as JSM's sweep does) — the
+                    // stick for the bulk, the pad to line up. Each degree swept
+                    // turns the game one degree at the base scale, just as a degree
+                    // of pad rotation does, so the two add. eval_rws_node blocks
+                    // the stick from its default mapping for the sweep.
+                    let stick = match inputs.get(1).and_then(|s| *s) {
+                        Some(Signal::Vec2(v)) => v,
+                        _ => glam::Vec2::ZERO,
+                    };
+                    let flick = state.rws_cal_flick.get_or_insert_with(Default::default);
+                    (rot.x * k + flick.rate([glam::Vec2::ZERO, stick], dt), 0.0)
+                }
             }
         } else {
+            state.rws_cal_flick = None;
             // Apply the gyro V/H bias to the vertical (pitch) axis.
             (rot.x * k, rot.y * k * gyro_vh_ratio)
         }

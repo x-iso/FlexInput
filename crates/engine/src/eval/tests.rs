@@ -4565,6 +4565,78 @@ mod rws_tests {
             _ => panic!("expected Vec2 output"),
         }
     }
+
+    // Stick-aim alone never mutes the stick for other modules: with suppression
+    // Off the stick stays unblocked however far it is pushed.
+    #[test]
+    fn rws_stick_aim_honours_suppress_off() {
+        let mut snap = rws_snap(25, "off");
+        snap.params.insert("stick_aim_enabled".into(), Value::Bool(true));
+        for v in [glam::Vec2::new(0.3, 0.0), glam::Vec2::new(1.0, 0.0)] {
+            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut state = HashMap::new();
+            let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(v))];
+            eval_rws_node(&snap, 25, &inputs, &mut c, &mut state, 0.016);
+            assert!(c.is_empty(), "stick-aim with suppression off must not block (stick {v:?})");
+        }
+    }
+
+    // A calibration sweep blocks the stick whatever the suppression mode, so it
+    // can't turn the camera a second time through its default mapping.
+    #[test]
+    fn rws_sweep_blocks_stick_even_with_suppress_off() {
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        for axis in ["yaw", "pitch"] {
+            let mut snap = rws_snap(26, "off");
+            snap.params.insert("flick_enabled".into(), Value::Bool(false));
+            snap.params.insert("cal_measure".into(), Value::String(axis.into()));
+            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut state = HashMap::new();
+            let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
+            eval_rws_node(&snap, 26, &inputs, &mut c, &mut state, 0.016);
+            assert_eq!(
+                c.get(&(sk.clone(), "right_stick".to_string())).map(|s| s.as_bool()),
+                Some(true), "{axis} sweep must block the flick stick",
+            );
+        }
+    }
+
+    // The 360° sweep counts the Flick stick circled round its edge on top of the
+    // gyro, and drives the game by it at the base scale; pitch ignores the stick.
+    #[test]
+    fn measure_yaw_counts_a_circled_flick_stick() {
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            Some(Signal::Vec2(glam::Vec2::new(r.sin(), r.cos())))
+        };
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let p = params(&[("cal_measure", serde_json::json!("yaw")), ("scale", serde_json::json!(2.0))]);
+        let mut st = NodeState::default();
+        let mut dx = 0.0;
+        let mut out = Vec::new();
+        // Push out (picks the start, turns nothing), then circle a full turn
+        // clockwise in 10° steps, then let the pay-out settle.
+        for i in 0..=36 {
+            for _ in 0..5 {
+                out = compute_rws(&[gyro, at(i as f32 * 10.0)], &mut st, &p, 0.001);
+                if let Some(Signal::Vec2(v)) = out[0] { dx += v.x; }
+            }
+        }
+        for _ in 0..500 {
+            out = compute_rws(&[gyro, at(0.0)], &mut st, &p, 0.001);
+            if let Some(Signal::Vec2(v)) = out[0] { dx += v.x; }
+        }
+        assert!((float_at(&out, 2) - 360.0).abs() < 0.1, "measured {}", float_at(&out, 2));
+        assert!((dx - 720.0).abs() < 0.5, "drove {dx} counts, expected 360° × scale 2");
+
+        // The pitch sweep has no stick form.
+        let pitch = params(&[("cal_measure", serde_json::json!("pitch"))]);
+        let mut st = NodeState::default();
+        for i in 0..=36 {
+            out = compute_rws(&[gyro, at(i as f32 * 10.0)], &mut st, &pitch, 0.001);
+        }
+        assert!(float_at(&out, 2).abs() < 1e-6, "pitch measured {}", float_at(&out, 2));
+    }
 }
 
 #[cfg(test)]
