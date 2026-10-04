@@ -2288,6 +2288,44 @@ mod subpatch_bus_tests {
         assert!(pins.contains(&"left_stick".to_string()) && !pins.iter().any(|p| p.starts_with("right_")), "{pins:?}");
     }
 
+    /// A Two-way Curve's `.fxc` preset carries both lanes, the Hyst graph and
+    /// every hysteresis / peak-hold setting, and loading it replaces them all;
+    /// a plain curve's preset has no two-way section.
+    #[test]
+    fn a_two_way_preset_round_trips_its_whole_setup() {
+        use crate::canvas::viewer::{apply_twoway_preset, twoway_preset_section, CurveFile};
+        let mut src = node("module.twoway_response_curve", &[SignalType::Float], &[SignalType::Float]);
+        for (k, v) in [
+            ("points", json!([[0.0, 0.0], [0.02, 1.0], [1.0, 1.0]])), ("biases", json!([0.0, 0.0])),
+            ("points_dn", json!([[0.0, 0.0], [0.84, 0.0], [1.0, 1.0]])), ("biases_dn", json!([0.0, 0.0])),
+            ("hyst_points", json!([[0.0, 0.0], [0.5, 0.4]])), ("hyst_biases", json!([0.0])),
+            ("hysteresis_pct", json!(1.5)), ("hyst_dir", json!("down")), ("hyst_start_up", json!(true)),
+            ("interp_ms", json!(0.0)), ("peak_hold_ms", json!(25.0)), ("peak_hold_dir", json!("up")),
+        ] { src.params.insert(k.into(), v); }
+
+        let section = twoway_preset_section(&src).expect("a two-way section");
+        let file = CurveFile {
+            points: vec![[0.0, 0.0], [1.0, 1.0]], biases: vec![], absolute: true,
+            in_min: -1.0, in_max: 1.0, out_min: -1.0, out_max: 1.0, grid_x: 4, grid_y: 4,
+            snap: false, scale_t: 0.0, trail_ms: 300, show_scaled_grid: false, show_grid_labels: false,
+            twoway: Some(section),
+        };
+        let back: CurveFile = serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+
+        let mut dst = node("module.twoway_response_curve", &[SignalType::Float], &[SignalType::Float]);
+        dst.params.insert("hyst_points".into(), json!([[0.0, 0.9], [1.0, 0.9]]));
+        dst.params.insert("hyst_biases".into(), json!([0.0]));
+        apply_twoway_preset(&mut dst, back.twoway.as_ref().unwrap());
+        for k in crate::canvas::viewer::TWOWAY_PRESET_KEYS {
+            assert_eq!(dst.params.get(*k), src.params.get(*k), "{k}");
+        }
+
+        let plain = node("module.response_curve", &[SignalType::Float], &[SignalType::Float]);
+        assert!(twoway_preset_section(&plain).is_none());
+        let old: CurveFile = serde_json::from_str(r#"{"points":[[0,0],[1,1]]}"#).unwrap();
+        assert!(old.twoway.is_none(), "an older file still loads");
+    }
+
     /// Moving an AutoMap curve between a trigger and a stick changes which curve
     /// it draws as — never the curve itself.
     #[test]

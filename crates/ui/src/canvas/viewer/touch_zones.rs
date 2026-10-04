@@ -692,6 +692,7 @@ pub(crate) fn card_curve_save(pts: &[[f32; 2]]) {
         trail_ms: 300,
         show_scaled_grid: false,
         show_grid_labels: false,
+        twoway: None,
     };
     if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
         rfd::FileDialog::new()

@@ -738,6 +738,39 @@ pub(crate) struct CurveFile {
     pub(crate) show_scaled_grid: bool,
     #[serde(default)]
     pub(crate) show_grid_labels: bool,
+    /// A Two-way Curve's whole setup — both lanes, the Hyst graph and its
+    /// settings — as its params (`TWOWAY_PRESET_KEYS`). `points` / `biases`
+    /// above still hold the lane being edited, so the file loads into a plain
+    /// curve too; files without it load into a Two-way Curve's edited lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) twoway: Option<serde_json::Map<String, Value>>,
+}
+
+/// The Two-way Curve params a `.fxc` preset carries beyond the shared ones.
+pub(crate) const TWOWAY_PRESET_KEYS: &[&str] = &[
+    "points", "biases", "points_dn", "biases_dn", "hyst_points", "hyst_biases",
+    "hysteresis_pct", "hyst_dir", "hyst_start_up", "interp_ms", "peak_hold_ms", "peak_hold_dir",
+];
+
+/// A Two-way Curve's preset section, or None for any other curve.
+pub(crate) fn twoway_preset_section(n: &NodeData) -> Option<serde_json::Map<String, Value>> {
+    (curve_ui_module_id(n) == "module.twoway_response_curve").then(|| {
+        TWOWAY_PRESET_KEYS.iter()
+            .filter_map(|k| n.params.get(*k).map(|v| (k.to_string(), v.clone())))
+            .collect()
+    })
+}
+
+/// Load a preset's two-way section into a Two-way Curve. A key the file lacks
+/// is cleared back to its default, so nothing from the old setup lingers
+/// (a stale Hyst graph would otherwise override the loaded Hyst value).
+pub(crate) fn apply_twoway_preset(n: &mut NodeData, section: &serde_json::Map<String, Value>) {
+    for k in TWOWAY_PRESET_KEYS {
+        match section.get(*k) {
+            Some(v) => { n.params.insert(k.to_string(), v.clone()); }
+            None => { n.params.remove(*k); }
+        }
+    }
 }
 pub(crate) fn default_true()  -> bool { true  }
 pub(crate) fn default_neg1()  -> f64  { -1.0  }
@@ -884,6 +917,7 @@ pub(crate) fn curve_header_save(node_id: NodeId, snarl: &Snarl<NodeData>) {
         trail_ms:         n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300),
         show_scaled_grid: n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false),
         show_grid_labels: n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false),
+        twoway:           twoway_preset_section(n),
     };
     if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
         rfd::FileDialog::new()
@@ -933,6 +967,10 @@ pub(crate) fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Sna
     } else {
         if let Some(n) = Number::from_f64(cf.in_max)  { node.params.insert("in_max".into(),  Value::Number(n)); }
         if let Some(n) = Number::from_f64(cf.out_max) { node.params.insert("out_max".into(), Value::Number(n)); }
+    }
+    // A two-way preset into a Two-way Curve: both lanes and every setting.
+    if let Some(section) = cf.twoway.as_ref().filter(|_| twoway_preset_section(node).is_some()) {
+        apply_twoway_preset(node, section);
     }
 }
 
