@@ -221,62 +221,23 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     });
     register_exposable_element(ui, node_id, "style", r_style.response.rect);
 
-    // Flick stick (input 2, optional): push to flick, hold + rotate to track.
-    let (flick_on, flick_dz, flick_sm, aim_on, aim_rws) = snarl.get_node(node_id).map(|n| {
-        (
-            n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
-            n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
-            n.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            n.params.get("stick_aim_rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-        )
-    }).unwrap_or((false, 0.85, 100.0, false, 1.0));
-    let r_flick = ui.horizontal(|ui| {
-        let mut fe = flick_on;
-        if ui.checkbox(&mut fe, egui::RichText::new("Flick").small())
-            .on_hover_text("Flick stick on input 2: push the stick past the deadzone to\nsnap the camera to that direction; hold it out and rotate to track.\nFlicks are 1:1 (RWS does not apply).")
-            .changed()
-        {
-            set.push(("flick_enabled", Value::Bool(fe)));
-        }
-        if flick_on {
-            ui.label(egui::RichText::new("dz").small().weak());
-            let mut dz = flick_dz;
-            if ui.add(egui::DragValue::new(&mut dz).speed(0.01).range(0.1..=0.99))
-                .on_hover_text("Deadzone — stick magnitude needed to engage a flick.")
-                .changed()
-            {
-                if let Some(n) = Number::from_f64(dz as f64) { set.push(("flick_deadzone", Value::Number(n))); }
-            }
-            ui.label(egui::RichText::new("smooth").small().weak());
-            let mut sm = flick_sm;
-            if ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0).suffix(" ms"))
-                .on_hover_text("Smoothing window for the initial flick snap (0 = instant).")
-                .changed()
-            {
-                if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
-            }
-        }
-        // Stick-aim — available whether or not Flick is on (with Flick it lives
-        // inside the deadzone; without, it uses the full stick range).
-        let mut ae = aim_on;
-        if ui.checkbox(&mut ae, egui::RichText::new("Stick aim").small())
-            .on_hover_text("Use the stick wired to the Flick input as a rate aim feeding BOTH\noutputs (its own RWS + the stick V/H bias). With Flick on it acts INSIDE\nthe deadzone (past → flick); with Flick off it uses the full stick range.\nThe stick still reaches its default mapping unless\n“Suppress flick stick” blocks it.")
-            .changed()
-        {
-            set.push(("stick_aim_enabled", Value::Bool(ae)));
-        }
-        if aim_on {
-            let mut ar = aim_rws;
-            if ui.add(egui::DragValue::new(&mut ar).speed(0.01).range(0.01..=50.0).prefix("×"))
-                .on_hover_text("Stick-aim RWS multiplier (independent of the main RWS).")
-                .changed()
-            {
-                if let Some(n) = Number::from_f64(ar as f64) { set.push(("stick_aim_rws", Value::Number(n))); }
-            }
-        }
-    });
+    // Flick stick (the stick on the Flick input): push to flick, hold + rotate
+    // to track. On wherever its output goes (see `rws_flick_hint`), and off
+    // while the Flick On control input is.
+    let r_flick = ui.horizontal(|ui| set.extend(rws_flick_row(node_id, ui, snarl).0));
     register_exposable_element(ui, node_id, "flick", r_flick.response.rect);
+
+    // Flick options (stabilise, forward deadzone, where the flick goes). A row
+    // of its own, and a pinnable element of its own, so a flick row already
+    // pinned keeps the size it was laid out for.
+    let r_opts = ui.horizontal(|ui| set.extend(rws_flick_opts_row(node_id, ui, snarl).0));
+    register_exposable_element(ui, node_id, "flick_opts", r_opts.response.rect);
+    // The speed gate between Stick aim and the flick.
+    let r_speed = ui.horizontal(|ui| set.extend(rws_flick_speed_row(node_id, ui, snarl).0));
+    register_exposable_element(ui, node_id, "flick_speed", r_speed.response.rect);
+    if let Some(hint) = rws_flick_hint(snarl, node_id) {
+        ui.label(egui::RichText::new(hint).small().weak());
+    }
 
     // Flick-stick source suppression: the stick wired into Flick is auto-detected
     // and blocked downstream (so it can't leak to its default mapping, e.g. the
@@ -315,54 +276,246 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     }
 }
 
-/// Flick-stick row (enable + deadzone + smoothing), as a standalone pinnable
-/// element.
+/// Whether the flick reaches anything, from the module's own settings and
+/// wiring: merged into the outputs ("Mouse + Stick"), or through a wired Flick
+/// pin. The engine decides the same from the same two facts
+/// (`rws_stick_uses`), so the body can say when the flick is off and why.
+fn rws_flick_reaches(snarl: &Snarl<NodeData>, node_id: NodeId) -> bool {
+    let Some(n) = snarl.get_node(node_id) else { return false };
+    flexinput_engine::eval::rws_flick_mode(&n.params) == "both"
+        || !snarl.out_pin(OutPinId { node: node_id, output: 2 }).remotes.is_empty()
+}
+
+/// A line under the flick rows when the flick is off because its output goes
+/// nowhere — there is no checkbox for it any more, so say what turns it on.
+fn rws_flick_hint(snarl: &Snarl<NodeData>, node_id: NodeId) -> Option<&'static str> {
+    (!rws_flick_reaches(snarl, node_id))
+        .then_some("Flick off: wire the Flick output, or set out to Mouse + Stick")
+}
+
+/// The flick row, laid out into an existing horizontal row: the flick deadzone
+/// and snap smoothing, then Stick aim and its multiplier. Returns the params to
+/// write and the rects of its gamepad fields, in their order (`nav/fields.rs`):
+/// Deadzone, Smooth, Stick aim, Aim ×. The multiplier is always drawn (greyed
+/// while Stick aim is off) so every field has a place to glow.
+fn rws_flick_row(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+) -> (Vec<(&'static str, Value)>, [egui::Rect; 4]) {
+    let (flick_dz, flick_sm, aim_on, aim_rws) = snarl.get_node(node_id).map(|n| {
+        (
+            n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
+            n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+            n.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            n.params.get("stick_aim_rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        )
+    }).unwrap_or((0.85, 100.0, false, 1.0));
+    let mut set: Vec<(&'static str, Value)> = Vec::new();
+    let mut fr = [egui::Rect::NOTHING; 4];
+    ui.label(egui::RichText::new("Flick dz").small().weak())
+        .on_hover_text("Flick stick, on the stick wired to the Flick input: push it past the\ndeadzone to snap the camera to that direction; hold it out and rotate\nto track. Flicks are 1:1 (RWS does not apply). On wherever its output\ngoes (out, below); the Flick On input turns it off for a mode shift.");
+    let mut dz = flick_dz;
+    let r = ui.add(egui::DragValue::new(&mut dz).speed(0.01).range(0.1..=0.99))
+        .on_hover_text("Deadzone — stick magnitude needed to engage a flick.");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(dz as f64) { set.push(("flick_deadzone", Value::Number(n))); }
+    }
+    fr[0] = r.rect;
+    ui.label(egui::RichText::new("smooth").small().weak());
+    let mut sm = flick_sm;
+    let r = ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0).suffix(" ms"))
+        .on_hover_text("Smoothing window for the initial flick snap (0 = instant).");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
+    }
+    fr[1] = r.rect;
+    // Stick-aim — with the flick on it lives inside the deadzone; with it off,
+    // it uses the full stick range.
+    let mut ae = aim_on;
+    let r = ui.checkbox(&mut ae, egui::RichText::new("Stick aim").small())
+        .on_hover_text("Use the stick wired to the Flick input as a rate aim feeding BOTH\noutputs (its own RWS + the stick V/H bias). With the flick on it acts\nINSIDE the deadzone (past → flick); with it off it uses the full stick\nrange. The stick still reaches its default mapping unless\n“Suppress flick stick” blocks it. The Flick On input turns it off too.");
+    if r.changed() {
+        set.push(("stick_aim_enabled", Value::Bool(ae)));
+    }
+    fr[2] = r.rect;
+    let mut ar = aim_rws;
+    let r = ui.add_enabled(aim_on, egui::DragValue::new(&mut ar).speed(0.01).range(0.01..=50.0).prefix("×"))
+        .on_hover_text("Stick-aim RWS multiplier (independent of the main RWS).");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(ar as f64) { set.push(("stick_aim_rws", Value::Number(n))); }
+    }
+    fr[3] = r.rect;
+    (set, fr)
+}
+
+/// Flick row (deadzone, smoothing, Stick aim), as a standalone pinnable element.
 pub(crate) fn render_rws_flick(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let (flick_on, flick_dz, flick_sm, aim_on, aim_rws) = snarl.get_node(node_id).map(|n| {
-        (
-            n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
-            n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
-            n.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            n.params.get("stick_aim_rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-        )
-    }).unwrap_or((false, 0.85, 100.0, false, 1.0));
-    let mut set: Vec<(&str, Value)> = Vec::new();
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(190.0, 22.0));
-    ui.horizontal(|ui| {
-        let mut fe = flick_on;
-        if ui.checkbox(&mut fe, egui::RichText::new("Flick").small()).changed() {
-            set.push(("flick_enabled", Value::Bool(fe)));
+    apply_widget_scale(ui, container, egui::vec2(260.0, 22.0));
+    let (set, fr) = ui.horizontal(|ui| rws_flick_row(node_id, ui, snarl)).inner;
+    publish_nav_field_rects(ui, node_id, &fr);
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
-        if flick_on {
-            ui.label(egui::RichText::new("dz").small().weak());
-            let mut dz = flick_dz;
-            if ui.add(egui::DragValue::new(&mut dz).speed(0.01).range(0.1..=0.99)).changed() {
-                if let Some(n) = Number::from_f64(dz as f64) { set.push(("flick_deadzone", Value::Number(n))); }
+    }
+}
+
+/// The flick's options, laid out into an existing horizontal row: the tracking
+/// stabiliser (holds back a thumb's tremor while the stick is held out), the
+/// forward deadzone (a flick that engages within ±this many degrees of straight up
+/// doesn't snap — it only primes the stick for rotating) and where the flick goes
+/// (the Flick pin alone as mouse counts or stick deflection, or merged into the
+/// Mouse and Stick outputs). Returns the params to write and the rects of its
+/// gamepad fields, in their order: Stabilise, Fwd, Flick out.
+fn rws_flick_opts_row(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+) -> (Vec<(&'static str, Value)>, [egui::Rect; 3]) {
+    let (stab, fwd, out) = snarl.get_node(node_id).map(|n| (
+        n.params.get("flick_stabilise_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        n.params.get("flick_fwd_dz_deg").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        flexinput_engine::eval::rws_flick_mode(&n.params),
+    )).unwrap_or((0.0, 0.0, "mouse"));
+    let mut set: Vec<(&'static str, Value)> = Vec::new();
+    let mut fr = [egui::Rect::NOTHING; 3];
+    ui.label(egui::RichText::new("stab").small().weak());
+    let mut s = stab;
+    let r = ui.add(egui::DragValue::new(&mut s).speed(1.0).range(0.0..=300.0).suffix(" ms"))
+        .on_hover_text("Stabilise: hold back a thumb's tremor while the stick is held out\nand rotated. A deliberate sweep opens it up; whatever it is still\nholding back when you let go is turned then, so the camera still\nends where the stick pointed. 0 = off.");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(s.round() as f64) { set.push(("flick_stabilise_ms", Value::Number(n))); }
+    }
+    fr[0] = r.rect;
+    ui.label(egui::RichText::new("fwd ±").small().weak());
+    let mut f = fwd;
+    let r = ui.add(egui::DragValue::new(&mut f).speed(1.0).range(0.0..=90.0).suffix("°"))
+        .on_hover_text("Forward deadzone: a flick that engages within this many degrees of\nstraight up doesn't snap the camera — the stick only engages, so\nrotating it from there turns the camera (e.g. a 360° with the stick).\n0 = every flick snaps.");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(f.round() as f64) { set.push(("flick_fwd_dz_deg", Value::Number(n))); }
+    }
+    fr[1] = r.rect;
+    ui.label(egui::RichText::new("out").small().weak());
+    let r = egui::ComboBox::from_id_salt((node_id, "rws_flick_out"))
+        .selected_text(rws_flick_out_label(out))
+        .width(116.0)
+        .show_ui(ui, |ui| {
+            for val in RWS_FLICK_OUT_OPTS {
+                if ui.selectable_label(out == *val, rws_flick_out_label(val)).clicked() {
+                    set.push(("flick_output", Value::String(val.to_string())));
+                }
             }
-            ui.label(egui::RichText::new("ms").small().weak());
-            let mut sm = flick_sm;
-            if ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0)).changed() {
-                if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
-            }
+        })
+        .response
+        .on_hover_text("Where the flick goes.\n• Flick pin · mouse — ONLY the Flick output, in mouse counts (Mouse Scale).\n• Flick pin · stick — ONLY the Flick output, as stick deflection (Stick °/s).\n  Past full tilt the rest of the turn carries over to the next ticks,\n  so a flick still lands where you pointed, just over a longer time.\n• Mouse + Stick — added into BOTH the Mouse Move and Stick outputs.\nWith a Flick pin option and the pin unwired, the flick is off.");
+    fr[2] = r.rect;
+    (set, fr)
+}
+
+/// The speed gate, laid out into an existing horizontal row: how fast a push
+/// out of the centre must reach the flick zone to flick (0 = off), and whether
+/// a slower push keeps the flick zone off until the stick is back at the centre.
+/// Returns the params to write and the rects of its gamepad fields, in their
+/// order: Speed, Slow lock.
+fn rws_flick_speed_row(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+) -> (Vec<(&'static str, Value)>, [egui::Rect; 2]) {
+    let (speed, lock) = snarl.get_node(node_id).map(|n| (
+        n.params.get("flick_speed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        n.params.get("flick_slow_lock").and_then(|v| v.as_bool()).unwrap_or(false),
+    )).unwrap_or((0.0, false));
+    let mut set: Vec<(&'static str, Value)> = Vec::new();
+    let mut fr = [egui::Rect::NOTHING; 2];
+    ui.label(egui::RichText::new("flick within").small().weak());
+    let mut s = speed;
+    let r = ui.add(egui::DragValue::new(&mut s).speed(1.0).range(0.0..=300.0).suffix(" ms"))
+        .on_hover_text("Speed gate between Stick aim and the flick. Every push out of the\ncentre is judged by how fast it reaches the flick deadzone:\n• within this time — a flick. The Stick aim it made on the way out is\n  thrown away, so the flick lands clean, and Stick aim stays off until\n  the stick is back at the centre.\n• slower — steering. The aim held back while deciding catches up\n  over the flick's smoothing time, so none of it is lost.\n0 = off (the deadzone alone decides).");
+    if r.changed() {
+        if let Some(n) = Number::from_f64(s.round() as f64) { set.push(("flick_speed_ms", Value::Number(n))); }
+    }
+    fr[0] = r.rect;
+    let mut l = lock;
+    let r = ui.add_enabled(speed > 0.0, egui::Checkbox::new(&mut l, egui::RichText::new("slow = aim only").small()))
+        .on_hover_text("A push too slow to flick keeps the flick zone off until the stick is\nback at the centre: out past the deadzone it just aims, at full rate.\nSo the stick steers like a normal aim stick, and a fast push still\nflicks.");
+    if r.changed() {
+        set.push(("flick_slow_lock", Value::Bool(l)));
+    }
+    fr[1] = r.rect;
+    (set, fr)
+}
+
+/// Speed-gate row (flick within / slow = aim only), as a standalone pinnable
+/// element.
+pub(crate) fn render_rws_flick_speed(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let (set, fr) = ui.horizontal(|ui| rws_flick_speed_row(node_id, ui, snarl)).inner;
+    publish_nav_field_rects(ui, node_id, &fr);
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
-        let mut ae = aim_on;
-        if ui.checkbox(&mut ae, egui::RichText::new("aim").small()).changed() {
-            set.push(("stick_aim_enabled", Value::Bool(ae)));
-        }
-        if aim_on {
-            let mut ar = aim_rws;
-            if ui.add(egui::DragValue::new(&mut ar).speed(0.01).range(0.01..=50.0).prefix("×")).changed() {
-                if let Some(n) = Number::from_f64(ar as f64) { set.push(("stick_aim_rws", Value::Number(n))); }
-            }
-        }
-    });
+    }
+}
+
+/// The `flick_output` values, in the order the dropdown and the gamepad cycle
+/// them. The first is the default.
+pub(crate) const RWS_FLICK_OUT_OPTS: &[&str] = &["mouse", "stick", "both"];
+
+fn rws_flick_out_label(o: &str) -> &'static str {
+    match o {
+        "stick" => "Flick pin · stick",
+        "both" => "Mouse + Stick",
+        _ => "Flick pin · mouse",
+    }
+}
+
+/// The flick used to be switched on by a `flick_enabled` checkbox; it is now on
+/// wherever its output goes. Ticked with the old merged output ("main", or the
+/// key absent) → "both", which merges it into the outputs as before; unticked →
+/// the pin-only default, inert until the Flick pin is wired — so Stick aim keeps
+/// the stick's whole range, as it did. A pin mode picked since is kept.
+/// Idempotent: only acts while the old key is there.
+pub(crate) fn migrate_rws_flick_params(params: &mut std::collections::HashMap<String, Value>) {
+    let Some(enabled) = params.remove("flick_enabled") else { return };
+    let enabled = enabled.as_bool().unwrap_or(false);
+    let picked = params.get("flick_output").and_then(|v| v.as_str())
+        .filter(|o| *o == "mouse" || *o == "stick")
+        .map(str::to_string);
+    let new = match (picked, enabled) {
+        (Some(o), _) => o,
+        (None, true) => "both".to_string(),
+        (None, false) => "mouse".to_string(),
+    };
+    params.insert("flick_output".into(), Value::String(new));
+}
+
+/// Flick options row (stabilise + forward deadzone + output), as a standalone pinnable
+/// element.
+pub(crate) fn render_rws_flick_opts(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(300.0, 22.0));
+    let (set, fr) = ui.horizontal(|ui| rws_flick_opts_row(node_id, ui, snarl)).inner;
+    publish_nav_field_rects(ui, node_id, &fr);
     if !set.is_empty() {
         if let Some(node) = snarl.get_node_mut(node_id) {
             for (k, v) in set { node.params.insert(k.to_string(), v); }
@@ -443,7 +596,8 @@ pub(crate) fn render_rws_scale(
 pub(crate) const RWS_PRESET_KEYS: &[&str] = &[
     "scale", "rws", "stick_out_dps", "max_rate_dps",
     "gyro_vh_ratio", "stick_vh_ratio",
-    "flick_enabled", "flick_deadzone", "flick_smooth_ms",
+    "flick_deadzone", "flick_smooth_ms", "flick_fwd_dz_deg", "flick_output",
+    "flick_stabilise_ms", "flick_speed_ms", "flick_slow_lock",
     "stick_aim_enabled", "stick_aim_rws", "suppress_source",
 ];
 
@@ -499,6 +653,15 @@ pub(crate) fn rws_load_preset(
             if let Some(v) = params.get(*k) {
                 node.params.insert((*k).to_string(), v.clone());
             }
+        }
+        // A preset saved while the flick had its checkbox: read it the way a
+        // saved node's is (see `migrate_rws_flick_params`).
+        if let Some(v) = params.get("flick_enabled") {
+            node.params.insert("flick_enabled".into(), v.clone());
+            if !params.contains_key("flick_output") {
+                node.params.remove("flick_output");
+            }
+            migrate_rws_flick_params(&mut node.params);
         }
     }
     Ok(())
@@ -561,7 +724,12 @@ fn rws_measure_state(node_id: NodeId, snarl: &Snarl<NodeData>) -> (String, f32, 
         Some(Signal::Float(f)) if f.is_finite() => f,
         _ => 0.0,
     };
-    (axis, float_out(2), float_out(3))
+    let n = node.outputs.len();
+    (
+        axis,
+        float_out(flexinput_engine::eval::rws_cal_deg_out(n)),
+        float_out(flexinput_engine::eval::rws_cal_peak_out(n)),
+    )
 }
 
 /// Which output the measure calibrates — chosen EXPLICITLY by the user via the

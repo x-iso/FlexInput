@@ -49,6 +49,8 @@ pub(crate) use remapper_hold_back::*;
 // Read by the UI to decide when a card offers its "in order" toggle.
 pub use remapper_hold_back::in_order_applies;
 pub(crate) use rws::*;
+// Where the calibration readouts land, read by the UI's measure widget.
+pub use rws::{rws_cal_deg_out, rws_cal_peak_out, rws_flick_mode};
 // The param names and live-output slots are read by the UI too; the JSM module
 // shares the rotation itself.
 pub use stick_rotation::*;

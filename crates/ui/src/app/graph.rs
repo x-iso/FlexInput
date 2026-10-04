@@ -451,28 +451,56 @@ pub(crate) fn config_passthrough_device(
     source_path: &[usize],
     inner_node_id: usize,
 ) -> Option<String> {
-    // Trace the module's FIRST connected input back to a physical device. A
-    // module reads its driving signal on that input (a Response Curve's scalar,
-    // a Reshaper's Vec, a gyro's AutoMap bus…); source-like modules with no
-    // inputs (Knob/Constant) simply resolve to None.
+    // Trace the module's inputs back to a physical device, depth first in the
+    // order the consumed-pin walk follows (`config_consumed_pins`): a gate's
+    // ACTIVE data branch first, else the inputs in order. A module reads its
+    // driving signal there (a Response Curve's scalar, a Reshaper's Vec, a gyro's
+    // AutoMap bus…), often through plain signal nodes — a curve fed by
+    // `multiply ← gyro_3dof ← Combiner` names no device until the walk reaches
+    // the gyro's bus. Stopping at the direct upstream fell back to the tab's
+    // FIRST device, which on a patch combining a MIDI port with the pad passed
+    // the MIDI port's gyro pins and left the pad's gyro blocked. Source-like
+    // modules with no inputs (Knob/Constant) simply resolve to None.
     fn trace(
         snarl: &Snarl<NodeData>,
         node_id: NodeId,
         parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+        seen: &mut std::collections::HashSet<usize>,
     ) -> Option<String> {
+        if !seen.insert(node_id.0) || seen.len() > 64 {
+            return None;
+        }
         let node = snarl.get_node(node_id)?;
+        let mut order: Vec<usize> = match node.module_id.as_str() {
+            "module.selector" => super::config_route::selector_active_ins(snarl, node_id)
+                .into_iter()
+                .map(|i| i + 1) // skip the select input
+                .collect(),
+            "module.split" => vec![1],
+            _ => Vec::new(),
+        };
         for i in 0..node.inputs.len() {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        for i in order {
             let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
-            if let Some(&remote) = in_pin.remotes.first() {
-                if let Some(dev) = find_automap_device_id_for_viewer(snarl, remote, parent) {
-                    if is_physical_input_device(&dev) {
-                        return Some(dev);
-                    }
+            let Some(&remote) = in_pin.remotes.first() else { continue };
+            if let Some(dev) = find_automap_device_id_for_viewer(snarl, remote, parent) {
+                if is_physical_input_device(&dev) {
+                    return Some(dev);
                 }
+            }
+            if let Some(dev) = trace(snarl, remote.node, parent, seen) {
+                return Some(dev);
             }
         }
         None
     }
+    let trace = |snarl: &Snarl<NodeData>, node_id: NodeId, parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>| {
+        trace(snarl, node_id, parent, &mut std::collections::HashSet::new())
+    };
     let traced = match source_path {
         [] => trace(tab_snarl, NodeId(inner_node_id), None),
         [sp] => {
@@ -1471,6 +1499,9 @@ pub(crate) fn build_processing_graph_rec(
                 params.insert("_rws_flick_device".to_string(), serde_json::Value::String(dev));
                 params.insert("_rws_flick_stick".to_string(), serde_json::Value::String(stick));
             }
+            // A pin-only flick is on only when its Flick pin goes somewhere.
+            let wired = !snarl.out_pin(OutPinId { node: *node_id, output: 2 }).remotes.is_empty();
+            params.insert("_rws_flick_out_wired".to_string(), serde_json::Value::Bool(wired));
         }
         if matches!(node.module_id.as_str(),
             "processing.gyro_3dof" | "module.automap_split"
@@ -2588,5 +2619,51 @@ mod subpatch_bus_tests {
         let fixed = &parent.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl;
         assert_eq!(fixed.get_node(outlet).unwrap().params["pin_index"], json!(0));
         assert_eq!(fixed.get_node(inlet).unwrap().params["pin_index"], json!(0));
+    }
+
+    /// A gyro curve's pass-through names the pad the gyro module reads, however
+    /// many plain signal nodes sit between them. The walk used to stop at the
+    /// curve's direct upstream (a Multiply, which names no device) and fall back
+    /// to the tab's FIRST device — here a MIDI port — so tweaking the curve, or
+    /// running an RWS sweep, passed the MIDI port's gyro and left the pad's
+    /// blocked.
+    #[test]
+    fn a_gyro_curve_passes_the_pad_its_gyro_module_reads() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let source = |s: &mut Snarl<NodeData>, id: &str| {
+            s.insert_node(p, {
+                let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+                n.params.insert("device_id".into(), json!(id));
+                n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+                n
+            })
+        };
+        // The MIDI port is the tab's first device, and on the Combiner's port 0.
+        let midi = source(&mut s, "midi_in:1");
+        let pad = source(&mut s, "gilrs:pad:0");
+        let comb = s.insert_node(p, node("module.automap_combiner",
+            &[SignalType::AutoMap, SignalType::AutoMap], &[SignalType::AutoMap]));
+        let gyro = s.insert_node(p, node("processing.gyro_3dof",
+            &[SignalType::AutoMap], &[SignalType::Vec2]));
+        let mul = s.insert_node(p, node("math.multiply",
+            &[SignalType::Vec2, SignalType::Float], &[SignalType::Vec2]));
+        let curve = s.insert_node(p, node("module.vec_response_curve",
+            &[SignalType::Vec2], &[SignalType::Vec2]));
+        let rws = s.insert_node(p, node("processing.rws",
+            &[SignalType::Vec2, SignalType::Vec2], &[SignalType::Vec2, SignalType::Vec2]));
+        wire(&mut s, midi, 0, comb, 0);
+        wire(&mut s, pad, 0, comb, 1);
+        wire(&mut s, comb, 0, gyro, 0);
+        wire(&mut s, gyro, 0, mul, 0);
+        wire(&mut s, mul, 0, curve, 0);
+        wire(&mut s, curve, 0, rws, 0);
+
+        for n in [curve, rws] {
+            let (dev, pins) = config_passthrough_pins_for(&s, &[], n.0, None, None).expect("a passthrough");
+            assert_eq!(dev, "gilrs:pad:0", "node {}", n.0);
+            assert!(pins.contains(&"gyro_x".to_string()), "{pins:?}");
+            assert_eq!(config_passthrough_device(&s, &[], n.0).as_deref(), Some("gilrs:pad:0"));
+        }
     }
 }

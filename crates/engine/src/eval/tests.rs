@@ -4177,7 +4177,7 @@ mod rws_tests {
             ("rws", serde_json::json!(1.0)),
             ("stick_out_dps", serde_json::json!(360.0)),
             ("max_rate_dps", serde_json::json!(360.0)),
-            ("flick_enabled", serde_json::json!(true)),
+            ("flick_output", serde_json::json!("both")),
             ("flick_deadzone", serde_json::json!(0.85)),
             ("stick_aim_enabled", serde_json::json!(true)),
             ("stick_aim_rws", serde_json::json!(1.0)),
@@ -4211,7 +4211,7 @@ mod rws_tests {
             ("scale", serde_json::json!(1.0)),
             ("rws", serde_json::json!(1.0)),
             ("max_rate_dps", serde_json::json!(360.0)),
-            ("flick_enabled", serde_json::json!(true)),
+            ("flick_output", serde_json::json!("both")),
             ("flick_deadzone", serde_json::json!(0.85)),
             ("flick_smooth_ms", serde_json::json!(0.0)),
             ("stick_aim_enabled", serde_json::json!(true)),
@@ -4232,6 +4232,10 @@ mod rws_tests {
         }
     }
 
+    // Where compute_rws's display-only readouts sit (after all three pins).
+    const DEG: usize = 3;
+    const PEAK: usize = 4;
+
     fn float_at(out: &[Option<Signal>], i: usize) -> f32 {
         match out.get(i).copied().flatten() {
             Some(Signal::Float(f)) => f,
@@ -4249,11 +4253,11 @@ mod rws_tests {
         let fwd = vec![Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
         let mut out = Vec::new();
         for _ in 0..100 { out = compute_rws(&fwd, &mut st, &p, 0.01); }
-        assert!((float_at(&out, 2) - 200.0).abs() < 1e-2, "fwd {}", float_at(&out, 2));
+        assert!((float_at(&out, DEG) - 200.0).abs() < 1e-2, "fwd {}", float_at(&out, DEG));
         // Overshoot correction: 25 ticks back → −50° → 150° net.
         let back = vec![Some(Signal::Vec2(glam::Vec2::new(-0.1, 0.0)))];
         for _ in 0..25 { out = compute_rws(&back, &mut st, &p, 0.01); }
-        assert!((float_at(&out, 2) - 150.0).abs() < 1e-2, "after backtrack {}", float_at(&out, 2));
+        assert!((float_at(&out, DEG) - 150.0).abs() < 1e-2, "after backtrack {}", float_at(&out, DEG));
     }
 
     // The count restarts when the sweep switches axis, and is HELD while off so a
@@ -4266,11 +4270,11 @@ mod rws_tests {
         for _ in 0..50 { compute_rws(&rot, &mut st, &yaw, 0.01); }
         let off = params(&[("cal_measure", serde_json::json!("off"))]);
         let held = compute_rws(&rot, &mut st, &off, 0.01);
-        assert!((float_at(&held, 2) - 100.0).abs() < 1e-2, "held {}", float_at(&held, 2));
+        assert!((float_at(&held, DEG) - 100.0).abs() < 1e-2, "held {}", float_at(&held, DEG));
         let pitch = params(&[("cal_measure", serde_json::json!("pitch"))]);
         let restarted = compute_rws(&rot, &mut st, &pitch, 0.01);
         // One tick of pitch after the switch: 200 °/s × 10 ms = 2°.
-        assert!((float_at(&restarted, 2) - 2.0).abs() < 1e-3, "restart {}", float_at(&restarted, 2));
+        assert!((float_at(&restarted, DEG) - 2.0).abs() < 1e-3, "restart {}", float_at(&restarted, DEG));
     }
 
     // Stick calibration: out[3] reports the peak UNclamped deflection so the UI can
@@ -4286,7 +4290,7 @@ mod rws_tests {
         // 200 °/s against a 100 °/s full-stick rate → 2× full deflection.
         let fast = vec![Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
         let out = compute_rws(&fast, &mut st, &p, 0.01);
-        assert!((float_at(&out, 3) - 2.0).abs() < 1e-3, "peak {}", float_at(&out, 3));
+        assert!((float_at(&out, PEAK) - 2.0).abs() < 1e-3, "peak {}", float_at(&out, PEAK));
         match out[1] {
             Some(Signal::Vec2(v)) => assert!((v.x - 1.0).abs() < 1e-6, "stick clamps, got {}", v.x),
             _ => panic!("expected Stick Vec2"),
@@ -4296,7 +4300,7 @@ mod rws_tests {
 
     fn flick_params(smooth_ms: f32, scale: f32, rws: f32) -> HashMap<String, serde_json::Value> {
         params(&[
-            ("flick_enabled", serde_json::json!(true)),
+            ("flick_output", serde_json::json!("both")),
             ("flick_deadzone", serde_json::json!(0.85)),
             ("flick_smooth_ms", serde_json::json!(smooth_ms)),
             ("scale", serde_json::json!(scale)),
@@ -4320,6 +4324,294 @@ mod rws_tests {
             Some(Signal::Vec2(v)) => assert!((v.x - 180.0).abs() < 1e-1, "x {}", v.x),
             _ => panic!("expected Vec2 output"),
         }
+    }
+
+    fn vec_at(out: &[Option<Signal>], i: usize) -> glam::Vec2 {
+        match out.get(i).copied().flatten() {
+            Some(Signal::Vec2(v)) => v,
+            other => panic!("expected Vec2 at out[{i}], got {other:?}"),
+        }
+    }
+
+    fn stick_at(deg: f32) -> Option<Signal> {
+        let r = deg.to_radians();
+        Some(Signal::Vec2(glam::Vec2::new(r.sin(), r.cos())))
+    }
+
+    // Inside the forward deadzone a flick engages WITHOUT the snap, so rotating
+    // the stick from there turns the camera; outside it snaps as before.
+    #[test]
+    fn flick_forward_deadzone_primes_without_snapping() {
+        let mut p = flick_params(0.0, 1.0, 1.0);
+        p.insert("flick_fwd_dz_deg".into(), serde_json::json!(20.0));
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let mut st = NodeState::default();
+        // A shallow push 15° right of forward: engaged, camera still.
+        let out = compute_rws(&[gyro, stick_at(15.0)], &mut st, &p, 0.001);
+        assert!(vec_at(&out, 0).x.abs() < 1e-6, "no snap inside the forward deadzone");
+        // Rotating on to 105° tracks the 90° turned (paid out over the smoothing).
+        let mut dx = 0.0;
+        for _ in 0..500 {
+            dx += vec_at(&compute_rws(&[gyro, stick_at(105.0)], &mut st, &p, 0.001), 0).x;
+        }
+        assert!((dx - 90.0).abs() < 0.1, "tracked {dx}");
+
+        // Outside the deadzone the flick snaps to the stick's heading.
+        let mut st = NodeState::default();
+        let out = compute_rws(&[gyro, stick_at(40.0)], &mut st, &p, 0.001);
+        assert!((vec_at(&out, 0).x - 40.0).abs() < 0.1, "snap {}", vec_at(&out, 0).x);
+    }
+
+    // Flick a stick down (180°) and let go: it springs back past the centre to
+    // straight up before the release hold lets go. That is not a turn — tracking
+    // it as one turned the camera 180° straight back.
+    #[test]
+    fn a_stick_springing_past_the_centre_does_not_turn_the_flick_back() {
+        let p = flick_params(0.0, 1.0, 1.0);
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let mut st = NodeState::default();
+        let mut dx = 0.0;
+        let feed = |stick: Option<Signal>, ms: usize, st: &mut NodeState, dx: &mut f32| {
+            for _ in 0..ms {
+                *dx += vec_at(&compute_rws(&[gyro, stick], st, &p, 0.001), 0).x.abs();
+            }
+        };
+        feed(stick_at(180.0), 50, &mut st, &mut dx); // the flick: 180°
+        let flicked = dx;
+        assert!((flicked - 180.0).abs() < 0.1, "flicked {flicked}");
+        feed(Some(Signal::Vec2(glam::Vec2::ZERO)), 10, &mut st, &mut dx); // springs to the centre
+        feed(stick_at(0.0).map(|s| match s { Signal::Vec2(v) => Signal::Vec2(v * 0.6), o => o }), 15, &mut st, &mut dx); // overshoots up
+        feed(Some(Signal::Vec2(glam::Vec2::ZERO)), 200, &mut st, &mut dx); // settles
+        assert!((dx - flicked).abs() < 1e-3, "the bounce turned the camera {}°", dx - flicked);
+    }
+
+    // The stabiliser holds back a tremor on a held flick, and still lands a
+    // deliberate rotation in full once the stick is let go.
+    #[test]
+    fn flick_stabilise_damps_tremor_and_conserves_the_turn() {
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        // Tremor: ±3° at 8 Hz around straight right, for half a second.
+        let tremor_out = |stab_ms: f32| -> f32 {
+            let mut p = flick_params(0.0, 1.0, 1.0);
+            p.insert("flick_stabilise_ms".into(), serde_json::json!(stab_ms));
+            let mut st = NodeState::default();
+            compute_rws(&[gyro, stick_at(90.0)], &mut st, &p, 0.001); // engage
+            let mut travel = 0.0;
+            for i in 0..500 {
+                let a = 90.0 + 3.0 * (i as f32 * 0.001 * 8.0 * std::f32::consts::TAU).sin();
+                travel += vec_at(&compute_rws(&[gyro, stick_at(a)], &mut st, &p, 0.001), 0).x.abs();
+            }
+            travel
+        };
+        let (raw, stab) = (tremor_out(0.0), tremor_out(150.0));
+        assert!(stab < raw * 0.5, "tremor travel {stab} stabilised vs {raw} raw");
+
+        // A deliberate quarter turn, then let go: the full 90° arrives.
+        let mut p = flick_params(0.0, 1.0, 1.0);
+        p.insert("flick_stabilise_ms".into(), serde_json::json!(150.0));
+        let mut st = NodeState::default();
+        compute_rws(&[gyro, stick_at(0.0)], &mut st, &p, 0.001);
+        let mut dx = 0.0;
+        for i in 0..=90 {
+            dx += vec_at(&compute_rws(&[gyro, stick_at(i as f32)], &mut st, &p, 0.001), 0).x;
+        }
+        for _ in 0..1000 {
+            dx += vec_at(&compute_rws(&[gyro, Some(Signal::Vec2(glam::Vec2::ZERO))], &mut st, &p, 0.001), 0).x;
+        }
+        assert!((dx - 90.0).abs() < 0.05, "turned {dx}");
+    }
+
+    // ── Speed-gated flick ──
+    // Stick aim at 100 °/s full rate, flick deadzone 0.8, speed gate 60 ms,
+    // merged into the Mouse output at 1 count/degree, catch-up over 50 ms.
+    fn gated_params(lock: bool) -> HashMap<String, serde_json::Value> {
+        params(&[
+            ("flick_output", serde_json::json!("both")),
+            ("flick_deadzone", serde_json::json!(0.8)),
+            ("flick_smooth_ms", serde_json::json!(50.0)),
+            ("flick_speed_ms", serde_json::json!(60.0)),
+            ("flick_slow_lock", serde_json::json!(lock)),
+            ("stick_aim_enabled", serde_json::json!(true)),
+            ("max_rate_dps", serde_json::json!(100.0)),
+            ("scale", serde_json::json!(1.0)),
+        ])
+    }
+
+    /// Feed `ms` 1 ms ticks of the Flick stick at `v`; the Mouse x turned.
+    fn gated_feed(st: &mut NodeState, p: &HashMap<String, serde_json::Value>, v: glam::Vec2, ms: usize) -> f32 {
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        (0..ms).map(|_| vec_at(&compute_rws(&[gyro, Some(Signal::Vec2(v))], st, p, 0.001), 0).x).sum()
+    }
+
+    // A fast push to the flick zone is a flick: the aim it made crossing the
+    // aim zone is thrown away, so only the flick turns the camera — and the
+    // stick springing back through the aim zone turns nothing either.
+    #[test]
+    fn a_fast_push_flicks_clean() {
+        let p = gated_params(false);
+        let mut st = NodeState::default();
+        let mut dx = gated_feed(&mut st, &p, glam::Vec2::new(0.5, 0.0), 20); // crossing the aim zone
+        dx += gated_feed(&mut st, &p, glam::Vec2::new(1.0, 0.0), 300);      // the flick: 90°
+        dx += gated_feed(&mut st, &p, glam::Vec2::new(0.5, 0.0), 10);       // springing back
+        dx += gated_feed(&mut st, &p, glam::Vec2::ZERO, 300);
+        assert!((dx - 90.0).abs() < 0.01, "turned {dx}°, the flick alone is 90°");
+    }
+
+    // A slow push is steering: the aim held back while deciding catches up, so
+    // the whole aim arrives — as much as an ungated stick would have turned.
+    #[test]
+    fn a_slow_push_steers_and_catches_up_in_full() {
+        let mut ungated = gated_params(false);
+        ungated.insert("flick_speed_ms".into(), serde_json::json!(0.0));
+        let turned = |p: &HashMap<String, serde_json::Value>| {
+            let mut st = NodeState::default();
+            gated_feed(&mut st, p, glam::Vec2::new(0.4, 0.0), 200)
+                + gated_feed(&mut st, p, glam::Vec2::ZERO, 300)
+        };
+        let (gated, plain) = (turned(&gated_params(false)), turned(&ungated));
+        // 0.4 of a 0.8 deadzone = half rate: 50 °/s for 0.2 s.
+        assert!((plain - 10.0).abs() < 0.01, "plain {plain}");
+        assert!((gated - plain).abs() < 0.01, "gated {gated} vs plain {plain}");
+    }
+
+    // With the lock, a slow push that goes on into the flick zone doesn't flick
+    // — it aims at full rate until the stick is back at the centre. Without the
+    // lock it flicks.
+    #[test]
+    fn the_slow_lock_keeps_a_steering_push_from_flicking() {
+        let run = |lock: bool| {
+            let p = gated_params(lock);
+            let mut st = NodeState::default();
+            gated_feed(&mut st, &p, glam::Vec2::new(0.4, 0.0), 100) // slow: steering
+                + gated_feed(&mut st, &p, glam::Vec2::new(1.0, 0.0), 1000) // on past the deadzone
+        };
+        let locked = run(true);
+        // Half rate (50 °/s) for 0.1 s, then full rate (100 °/s) for 1 s.
+        assert!((locked - 105.0).abs() < 0.01, "locked turned {locked}°");
+        let unlocked = run(false);
+        // The 5° of steering, then a 90° flick (the aim zone is past it).
+        assert!((unlocked - 95.0).abs() < 0.01, "unlocked steers then flicks: {unlocked}");
+
+        // Back at the centre, the next fast push flicks again.
+        let p = gated_params(true);
+        let mut st = NodeState::default();
+        gated_feed(&mut st, &p, glam::Vec2::new(0.4, 0.0), 100);
+        gated_feed(&mut st, &p, glam::Vec2::ZERO, 50);
+        let flick = gated_feed(&mut st, &p, glam::Vec2::new(1.0, 0.0), 300);
+        assert!((flick - 90.0).abs() < 0.01, "flick after the centre: {flick}");
+    }
+
+    // A quick nudge that comes back before the gate decides is aim, not a
+    // flick: it isn't thrown away.
+    #[test]
+    fn a_quick_nudge_still_aims() {
+        let p = gated_params(true);
+        let mut st = NodeState::default();
+        let dx = gated_feed(&mut st, &p, glam::Vec2::new(0.4, 0.0), 30)
+            + gated_feed(&mut st, &p, glam::Vec2::ZERO, 300);
+        // 50 °/s for 0.03 s.
+        assert!((dx - 1.5).abs() < 0.01, "nudge turned {dx}");
+    }
+
+    // `flick_output` "mouse" (the default) puts the flick on the Flick pin alone,
+    // in mouse counts; "both" merges it into the Mouse AND Stick outputs and
+    // leaves the pin at zero.
+    #[test]
+    fn flick_pin_mouse_mode_takes_the_flick_off_the_mouse_output() {
+        let inputs = [Some(Signal::Vec2(glam::Vec2::ZERO)), stick_at(90.0)];
+        let mut both_p = flick_params(0.0, 2.0, 1.0);
+        both_p.insert("stick_out_dps".into(), serde_json::json!(360.0));
+        let both = compute_rws(&inputs, &mut NodeState::default(), &both_p, 0.01);
+        assert!((vec_at(&both, 0).x - 180.0).abs() < 0.1);
+        assert!((vec_at(&both, 1).x - 1.0).abs() < 1e-4, "the Stick output turns at full tilt");
+        assert_eq!(vec_at(&both, 2), glam::Vec2::ZERO);
+
+        let mut p = flick_params(0.0, 2.0, 1.0);
+        p.insert("flick_output".into(), serde_json::json!("mouse"));
+        p.insert("_rws_flick_out_wired".into(), serde_json::json!(true));
+        let pin = compute_rws(&inputs, &mut NodeState::default(), &p, 0.01);
+        assert!(vec_at(&pin, 0).x.abs() < 1e-6, "the Mouse output no longer carries it");
+        assert!((vec_at(&pin, 2).x - 180.0).abs() < 0.1, "flick pin {}", vec_at(&pin, 2).x);
+    }
+
+    // A pin-only flick whose Flick pin isn't wired reaches nothing, so it is off:
+    // Stick aim keeps the stick's whole range (as with the old Flick checkbox
+    // unticked) and the flick doesn't engage.
+    #[test]
+    fn an_unwired_flick_pin_leaves_stick_aim_the_whole_range() {
+        let p = params(&[
+            ("stick_aim_enabled", serde_json::json!(true)),
+            ("flick_deadzone", serde_json::json!(0.5)),
+            ("max_rate_dps", serde_json::json!(100.0)),
+            ("scale", serde_json::json!(1.0)),
+        ]);
+        let inputs = [Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        let out = compute_rws(&inputs, &mut NodeState::default(), &p, 0.01);
+        // Full right = full rate: 100 °/s × 10 ms × scale 1.
+        assert!((vec_at(&out, 0).x - 1.0).abs() < 1e-4, "aim {}", vec_at(&out, 0).x);
+        assert_eq!(vec_at(&out, 2), glam::Vec2::ZERO, "no flick");
+    }
+
+    // The Flick On control (input 2) off: no flick, no Stick aim, and the stick
+    // isn't suppressed — it behaves as a plain stick again (a weapon wheel).
+    #[test]
+    fn flick_on_control_off_hands_the_stick_back() {
+        let mut snap = rws_snap(27, "full");
+        snap.params.insert("stick_aim_enabled".into(), Value::Bool(true));
+        snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let push = Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)));
+        let run = |ctl: Option<Signal>| {
+            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut state = HashMap::new();
+            let out = eval_rws_node(&snap, 27, &[gyro, push, ctl], &mut c, &mut state, 0.01);
+            (vec_at(&out, 0), c.is_empty())
+        };
+        let (on_mouse, on_unblocked) = run(Some(Signal::Bool(true)));
+        assert!(on_mouse.x > 1.0 && !on_unblocked, "on: flicks and blocks");
+        let (off_mouse, off_unblocked) = run(Some(Signal::Bool(false)));
+        assert_eq!(off_mouse, glam::Vec2::ZERO, "off: the stick turns nothing");
+        assert!(off_unblocked, "off: the stick is not suppressed");
+        let (unwired, _) = run(None);
+        assert_eq!(unwired, on_mouse, "unwired = on");
+    }
+
+    // As stick deflection a flick is capped at full tilt, and what a tick can't
+    // carry is owed to the next: the turn is conserved.
+    #[test]
+    fn flick_pin_stick_mode_conserves_the_turn_past_full_tilt() {
+        let mut p = flick_params(0.0, 2.0, 1.0);
+        p.insert("flick_output".into(), serde_json::json!("stick"));
+        p.insert("_rws_flick_out_wired".into(), serde_json::json!(true));
+        p.insert("stick_out_dps".into(), serde_json::json!(360.0));
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let mut st = NodeState::default();
+        let dt = 0.001;
+        let mut turned = 0.0;
+        // An instant 90° flick, then hold: 360°/s at full tilt → 0.25 s to pay out.
+        for i in 0..400 {
+            let out = compute_rws(&[gyro, stick_at(90.0)], &mut st, &p, dt);
+            let v = vec_at(&out, 2);
+            assert!(v.x <= 1.0 + 1e-6 && v.y == 0.0, "tick {i}: {v:?}");
+            assert!(vec_at(&out, 0).x.abs() < 1e-6, "the Mouse output carries nothing");
+            if i == 100 { assert!((v.x - 1.0).abs() < 1e-4, "still at full tilt mid-flick: {}", v.x); }
+            turned += v.x * 360.0 * dt;
+        }
+        assert!((turned - 90.0).abs() < 0.01, "stick turned {turned}°");
+    }
+
+    // A node saved before the Flick pin has two pins: the engine drops the Flick
+    // entry so the display-only readouts still sit right after its pins.
+    #[test]
+    fn two_pin_nodes_keep_the_readouts_after_their_pins() {
+        let full: Vec<Option<Signal>> = (0..5).map(|i| Some(Signal::Float(i as f32))).collect();
+        let old = rws_fit_outputs(full.clone(), 2);
+        assert_eq!(old.len(), 4);
+        assert_eq!(old[rws_cal_deg_out(2)], Some(Signal::Float(3.0)));
+        assert_eq!(old[rws_cal_peak_out(2)], Some(Signal::Float(4.0)));
+        let new = rws_fit_outputs(full, 3);
+        assert_eq!(new[rws_cal_deg_out(3)], Some(Signal::Float(3.0)));
+        assert_eq!(new[rws_cal_peak_out(3)], Some(Signal::Float(4.0)));
     }
 
     // While engaged, rotating the stick tracks the camera 1:1 by the shortest arc
@@ -4484,7 +4776,7 @@ mod rws_tests {
             sink_target: None,
             inline_subgraph: None,
         };
-        n.params.insert("flick_enabled".into(), Value::Bool(true));
+        n.params.insert("flick_output".into(), Value::String("both".into()));
         n.params.insert("suppress_source".into(), Value::String(suppress.into()));
         n.params.insert("_rws_flick_device".into(), Value::String("dev".into()));
         n.params.insert("_rws_flick_stick".into(), Value::String("right_stick".into()));
@@ -4588,7 +4880,7 @@ mod rws_tests {
         let sk = format!("{SRC_BLOCK_PREFIX}dev");
         for axis in ["yaw", "pitch"] {
             let mut snap = rws_snap(26, "off");
-            snap.params.insert("flick_enabled".into(), Value::Bool(false));
+            snap.params.insert("flick_output".into(), Value::String("mouse".into()));
             snap.params.insert("cal_measure".into(), Value::String(axis.into()));
             let mut c: HashMap<(String, String), Signal> = HashMap::new();
             let mut state = HashMap::new();
@@ -4626,7 +4918,7 @@ mod rws_tests {
             out = compute_rws(&[gyro, at(0.0)], &mut st, &p, 0.001);
             if let Some(Signal::Vec2(v)) = out[0] { dx += v.x; }
         }
-        assert!((float_at(&out, 2) - 360.0).abs() < 0.1, "measured {}", float_at(&out, 2));
+        assert!((float_at(&out, DEG) - 360.0).abs() < 0.1, "measured {}", float_at(&out, DEG));
         assert!((dx - 720.0).abs() < 0.5, "drove {dx} counts, expected 360° × scale 2");
 
         // The pitch sweep has no stick form.
@@ -4635,7 +4927,7 @@ mod rws_tests {
         for i in 0..=36 {
             out = compute_rws(&[gyro, at(i as f32 * 10.0)], &mut st, &pitch, 0.001);
         }
-        assert!(float_at(&out, 2).abs() < 1e-6, "pitch measured {}", float_at(&out, 2));
+        assert!(float_at(&out, DEG).abs() < 1e-6, "pitch measured {}", float_at(&out, DEG));
     }
 }
 

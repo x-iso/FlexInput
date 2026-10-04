@@ -614,6 +614,7 @@ impl FlexInputApp {
             | ("processing.rws", "measure")
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
+            | ("processing.rws", "flick_opts") | ("processing.rws", "flick_speed")
             | ("module.stick_rotation", "options") | ("module.stick_rotation", "sens")
             | ("module.stick_rotation", "deadzone") | ("module.stick_rotation", "stabilise")
             | ("module.stick_rotation", "hold")
@@ -878,10 +879,22 @@ impl FlexInputApp {
                 f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Fixed(5.0))),
                 f!("Labels", Toggle{key:"field_labels"}),
             ],
+            // Field order = the rects `rws_flick_row` / `rws_flick_opts_row`
+            // publish, so the glow lands on the field being edited.
             ("processing.rws", "flick") => vec![
-                f!("Flick", Toggle{key:"flick_enabled"}),
-                f!("Deadzone", v("flick_deadzone",0.1,0.99,0.85,Linear)),
+                f!("Flick dz", v("flick_deadzone",0.1,0.99,0.85,Fixed(0.1))),
                 f!("Smooth ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
+                f!("Stick aim", Toggle{key:"stick_aim_enabled"}),
+                f!("Aim ×", v("stick_aim_rws",0.01,50.0,1.0,Fixed(0.1))),
+            ],
+            ("processing.rws", "flick_opts") => vec![
+                f!("Stabilise ms", v("flick_stabilise_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Fwd ±°", v("flick_fwd_dz_deg",0.0,90.0,0.0,Fixed(5.0))),
+                f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
+            ],
+            ("processing.rws", "flick_speed") => vec![
+                f!("Flick within ms", v("flick_speed_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Slow = aim only", Toggle{key:"flick_slow_lock"}),
             ],
             ("processing.rws", "suppress") => vec![
                 f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),

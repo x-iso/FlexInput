@@ -2416,6 +2416,43 @@ fn sticks_section(
                     }
                 }
             });
+            // Rebound filter — the device-level `stick_rebound_*` params the
+            // engine's `filter_stick_rebound` reads: a stick let go that springs
+            // past the centre reads as the centre for this long.
+            let (rb_on, rb_ms) = canvas.snarl.get_node(node_id).map(|n| (
+                n.params.get("stick_rebound_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                n.params.get("stick_rebound_ms").and_then(|v| v.as_f64()).map(|v| v as f32)
+                    .unwrap_or(flexinput_engine::eval::STICK_REBOUND_MS_DEFAULT),
+            )).unwrap_or((false, flexinput_engine::eval::STICK_REBOUND_MS_DEFAULT));
+            ui.horizontal(|ui| {
+                let mut on = rb_on;
+                let toggled = ui.checkbox(&mut on, egui::RichText::new("Rebound filter")
+                    .size(INSTRUCT_SIZE).color(ORANGE))
+                    .on_hover_text("A stick let go from a push springs back fast enough to overshoot\n\
+                                    the centre — for a moment it reads as pushed the OTHER way. A flick\n\
+                                    stick turns back, a stick → key mapping taps the opposite key.\n\n\
+                                    With this on, when a stick springs back to the centre (within ~35 ms\n\
+                                    of being held out), whatever lands on the far side for the next\n\
+                                    window reads as the centre. For three windows more, the smaller\n\
+                                    ringing inside the inner 15% still reads as the centre. Pushing back\n\
+                                    out the way you let go passes at once; a real push the other way\n\
+                                    passes once the window ends. Steering slowly through the centre is\n\
+                                    never filtered.")
+                    .changed();
+                let mut ms = rb_ms;
+                let changed = ui.add_enabled(on, egui::DragValue::new(&mut ms)
+                    .speed(1.0)
+                    .range(5.0_f32..=150.0)
+                    .suffix(" ms"))
+                    .on_hover_text("How long after a release the far side is held at the centre.")
+                    .changed();
+                if toggled || changed {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("stick_rebound_enabled".into(), Value::Bool(on));
+                        n.params.insert("stick_rebound_ms".into(), Value::from(ms.round().clamp(5.0, 150.0) as f64));
+                    }
+                }
+            });
         });
     });
 }

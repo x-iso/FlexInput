@@ -349,7 +349,7 @@ pub(crate) fn compute_node(
             out
         }
         "processing.rws" => {
-            let out = compute_rws(inputs, state, &snap.params, dt);
+            let out = rws_fit_outputs(compute_rws(inputs, state, &snap.params, dt), snap.n_outputs);
             state.last_signals = out.clone();
             out
         }

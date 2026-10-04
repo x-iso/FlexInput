@@ -457,6 +457,14 @@ pub fn eval_graph_tick(
         puffin::profile_scope!("preprocess_dev_sigs");
         preprocess_dev_sigs(graph, dev_sigs)
     };
+    // Device-level stick rebound filter (opt-in per device.source): on the
+    // calibrated sticks, before anything — the source-block snapshot included —
+    // reads them.
+    {
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        let st = carry.stick_rebound.get_or_insert_with(Default::default);
+        filter_stick_rebound(graph, &mut dev_sigs_owned, st, dt);
+    }
     // Apply the Virtual Menu SOURCE-BLOCK (one tick stale): zero every pointer
     // pin an open menu asked to block last tick, so those analog inputs reach
     // ONLY the menu's navigation — not a mouse mapping, another module, or a

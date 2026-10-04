@@ -218,9 +218,10 @@ fn wrap_pi(a: f32) -> f32 {
 }
 
 /// A one-euro filter on an angle (see the module docs), its own rather than the
-/// JSM module's because it has to be shiftable by whole turns.
+/// JSM module's because it has to be shiftable by whole turns. RWS Aim's flick
+/// stabiliser runs the same filter on its tracked heading.
 #[derive(Clone, Copy, Debug, Default)]
-struct AngleFilter {
+pub struct AngleFilter {
     value: f32,
     speed: f32,
     prev: f32,
@@ -228,7 +229,9 @@ struct AngleFilter {
 }
 
 impl AngleFilter {
-    fn filter(&mut self, x: f32, dt: f32, min_cutoff: f32) -> f32 {
+    /// Filter one tick of the (unwrapped, radians) angle `x`. `min_cutoff` is
+    /// the cutoff in Hz at rest; it opens with the turning speed.
+    pub(crate) fn filter(&mut self, x: f32, dt: f32, min_cutoff: f32) -> f32 {
         if !self.started {
             *self = AngleFilter { value: x, speed: 0.0, prev: x, started: true };
             return x;

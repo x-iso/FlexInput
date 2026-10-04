@@ -445,7 +445,12 @@ pub struct ModuleDescriptor {
   - Input 0: `Rotation` (Vec2) — the aim rate. In `gyro` mode it's a true angular
     rate (`±1 == ±GYRO_REF_DPS` = ±2000 °/s); in `stick_rate` mode a stick
     deflection treated as a rate up to `max_rate_dps` at full tilt.
-  - Input 1: `Flick` (Vec2, optional) — stick position for flick-stick.
+  - Input 1: `Flick` (Vec2, optional) — stick position for flick-stick and
+    Stick aim.
+  - Input 2: `Flick On` (Bool, optional; unwired = on, added to older nodes on
+    load) — a mode-shift control for everything done with the Flick stick: off
+    turns off the flick, Stick aim and the stick's suppression, so the stick
+    behaves normally again (a weapon wheel, say).
 - **Outputs:**
   - Output 0: `Mouse Move (XY)` (Vec2; formerly `Mouse`, renamed on load) —
     per-tick mouse **displacement**; wire to the KB/M
@@ -454,6 +459,8 @@ pub struct ModuleDescriptor {
   - Output 1: `Stick` (Vec2) — right-stick **deflection** (unit range) for
     stick-aim games: desired turn rate ÷ `stick_out_dps`, clamped to ±1. Wire to
     a virtual Right Stick.
+  - Output 2: `Flick` (Vec2; added to older nodes on load) — the flick alone,
+    when `flick_output` sends it there.
 - **Key parameters:**
   - `scale: f32` (default 100) — mouse counts per degree (THE calibrated value).
   - `scale_unit: "deg" | "360"` (default `"deg"`) — header toggle for how `scale`
@@ -464,8 +471,30 @@ pub struct ModuleDescriptor {
   - `stick_out_dps: f32` (default 360) — game camera turn rate at full stick, for
     the Stick output.
   - `calibrating: bool`, `cal_speed: f32` (rev/s) — calibration spin (below).
-  - `flick_enabled: bool`, `flick_deadzone: f32` (default 0.85),
-    `flick_smooth_ms: f32` (default 100) — flick-stick.
+  - `flick_output: "mouse" | "stick" | "both"` (default `"mouse"`) — where the
+    flick goes: the `Flick` pin alone in mouse counts, the `Flick` pin alone as
+    stick deflection (past full tilt the rest of the turn carries over, so it is
+    conserved), or merged into BOTH the Mouse Move and Stick outputs. The flick
+    is on only where it reaches something — `"both"`, or a wired `Flick` pin
+    (`_rws_flick_out_wired`, injected at build time) — and while `Flick On` is.
+    Replaces the old `flick_enabled` checkbox (migrated on load: ticked → `"both"`,
+    unticked → `"mouse"`).
+  - `flick_deadzone: f32` (default 0.85), `flick_smooth_ms: f32` (default 100) —
+    flick engage deadzone and initial-snap smoothing.
+  - `flick_stabilise_ms: f32` (default 0) — one-euro stabiliser on the tracked
+    heading (the Gyro to Stick Rotation's); lag still held back at release is
+    turned then.
+  - `flick_fwd_dz_deg: f32` (default 0) — forward deadzone: a flick engaging
+    within ±this of straight up doesn't snap, only engages (primes a rotation).
+  - `stick_aim_enabled: bool`, `stick_aim_rws: f32` — Stick aim on the Flick
+    stick (inside the flick deadzone while the flick is on, else full range).
+  - `flick_speed_ms: f32` (default 0 = off) — speed gate: each push out of the
+    centre (past 10%) is a gesture. Reaching the flick deadzone within this time
+    is a flick — the Stick aim held back on the way out is discarded and Stick
+    aim stays off until the centre; slower is steering — the held-back aim
+    catches up over `flick_smooth_ms`. `flick_slow_lock: bool` — a steering
+    gesture keeps the flick zone off until the centre (past the deadzone it aims
+    at full rate). Gesture state: `NodeState::aux_f32[12..19]`.
   - `suppress_source: "off" | "full" | "deadzone"` — flick-stick source suppression.
   - `field_mode: "ruler" | "room" | "both"`, `field_fov`, `field_bg_alpha`,
     `field_tick_deg`, `field_labels` — the calibration viewport style.

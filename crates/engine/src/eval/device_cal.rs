@@ -591,6 +591,259 @@ pub(crate) fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
     }
 }
 
+// ── Stick rebound filter ─────────────────────────────────────────────────────
+//
+// A stick let go from a deflection springs back to the centre fast enough to
+// overshoot it: for a few tens of milliseconds it reads as pushed the OTHER way,
+// then settles. Anything reading direction sees that as a real input — a flick
+// stick turns back the way it came, a stick → key mapping taps the opposite key.
+//
+// Opt-in per device (`stick_rebound_enabled` on the device.source, window
+// `stick_rebound_ms`). A RELEASE is a stick that was held out (past
+// `REBOUND_HELD`) and is back at the centre — or already past it — within
+// `REBOUND_SNAP_S`: a spring return, far faster than a thumb steering through
+// the middle. For the window after a release, whatever lands on the far side
+// of the centre reads as the centre, and so does anything inside the centre
+// radius. Pushing back out the way it was released ends the window at once
+// (that's a real input); a push the other way that outlasts the window passes
+// as soon as the window ends.
+//
+// After the window the spring is still ringing, at a smaller amplitude: for
+// `REBOUND_SETTLE_X` windows more, a reading inside the centre radius still
+// reads as the centre. Anything past it is a real move — it passes, and ends
+// the settling.
+
+/// How far out a stick must be to count as held, so that springing back from
+/// there is a release.
+const REBOUND_HELD: f32 = 0.25;
+/// Back at the centre: inside this.
+const REBOUND_CENTRE: f32 = 0.15;
+/// A spring return gets from held to the centre within this long — a poll or
+/// two even on a 66 Hz Bluetooth pad. A thumb steering through the middle takes
+/// longer and is left alone.
+const REBOUND_SNAP_S: f64 = 0.035;
+/// The settling after the window, in windows.
+const REBOUND_SETTLE_X: f64 = 3.0;
+/// The window when a device has the filter on and no window of its own.
+pub const STICK_REBOUND_MS_DEFAULT: f32 = 40.0;
+
+/// One stick's rebound tracker.
+#[derive(Clone, Copy, Debug)]
+struct StickRebound {
+    /// Which way the stick was last held out (unit), and when.
+    held_dir: Vec2,
+    held_t: f64,
+    /// The release being filtered — the side it was let go from — when the
+    /// window ends, and when the settling after it ends.
+    release_dir: Vec2,
+    until: f64,
+    settle_until: f64,
+}
+
+impl Default for StickRebound {
+    fn default() -> Self {
+        Self {
+            held_dir: Vec2::ZERO,
+            held_t: f64::NEG_INFINITY,
+            release_dir: Vec2::ZERO,
+            until: f64::NEG_INFINITY,
+            settle_until: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl StickRebound {
+    /// Filter one reading `p` at time `t` (seconds) with a `window_s` window.
+    fn step(&mut self, p: Vec2, t: f64, window_s: f64) -> Vec2 {
+        let m = p.length();
+        if t < self.until {
+            if m >= REBOUND_HELD && p.dot(self.release_dir) > 0.0 {
+                // Pushed out again the way it was let go: real, and held anew.
+                self.until = f64::NEG_INFINITY;
+                self.settle_until = f64::NEG_INFINITY;
+                self.held_dir = p / m;
+                self.held_t = t;
+                return p;
+            }
+            if p.dot(self.release_dir) < 0.0 || m < REBOUND_CENTRE {
+                return Vec2::ZERO;
+            }
+            return p;
+        }
+        if t < self.settle_until {
+            if m < REBOUND_CENTRE {
+                return Vec2::ZERO;
+            }
+            // Out past the ringing: a real move.
+            self.settle_until = f64::NEG_INFINITY;
+        }
+        if m >= REBOUND_HELD {
+            self.held_dir = p / m;
+            self.held_t = t;
+            return p;
+        }
+        let sprang = t - self.held_t <= REBOUND_SNAP_S;
+        if sprang && (m < REBOUND_CENTRE || p.dot(self.held_dir) < 0.0) {
+            self.release_dir = self.held_dir;
+            self.until = t + window_s;
+            self.settle_until = self.until + window_s * REBOUND_SETTLE_X;
+            self.held_t = f64::NEG_INFINITY;
+            return Vec2::ZERO;
+        }
+        p
+    }
+}
+
+/// Every device's stick rebound trackers, and the clock they run on (f64: it
+/// runs for the life of the engine). Kept on the reserved carry entry's state.
+#[derive(Default)]
+pub struct StickReboundState {
+    clock: f64,
+    sticks: HashMap<(String, &'static str), StickRebound>,
+}
+
+/// Apply the rebound filter to the calibrated device signals, once per tick,
+/// for each device.source that has it on. Writes every form of a filtered stick
+/// (the Vec2 and its two axes) so no reader sees the bounce through another.
+pub(crate) fn filter_stick_rebound(
+    graph: &ProcessingGraph,
+    sigs: &mut HashMap<(String, String), Signal>,
+    st: &mut StickReboundState,
+    dt: f32,
+) {
+    st.clock += dt as f64;
+    let t = st.clock;
+    let mut done: HashSet<&str> = HashSet::new();
+    for snap in &graph.nodes {
+        if snap.module_id != "device.source" { continue; }
+        let Some(dev) = snap.device_id.as_deref() else { continue };
+        if !snap.params.get("stick_rebound_enabled").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
+        if !done.insert(dev) { continue; }
+        let ms = snap.params.get("stick_rebound_ms").and_then(|v| v.as_f64())
+            .map(|v| v as f32).unwrap_or(STICK_REBOUND_MS_DEFAULT).clamp(0.0, 1000.0);
+        let window_s = ms as f64 / 1000.0;
+        for stick in ["left_stick", "right_stick"] {
+            let key = |pin: String| (dev.to_string(), pin);
+            let vec_key = key(stick.to_string());
+            let (x_key, y_key) = (key(format!("{stick}_x")), key(format!("{stick}_y")));
+            let p = match sigs.get(&vec_key) {
+                Some(Signal::Vec2(v)) => *v,
+                _ => match (sigs.get(&x_key), sigs.get(&y_key)) {
+                    (Some(Signal::Float(x)), Some(Signal::Float(y))) => Vec2::new(*x, *y),
+                    _ => continue,
+                },
+            };
+            let r = st.sticks.entry((dev.to_string(), stick)).or_default();
+            let q = r.step(p, t, window_s);
+            if q != p {
+                if sigs.contains_key(&vec_key) { sigs.insert(vec_key, Signal::Vec2(q)); }
+                if sigs.contains_key(&x_key) { sigs.insert(x_key, Signal::Float(q.x)); }
+                if sigs.contains_key(&y_key) { sigs.insert(y_key, Signal::Float(q.y)); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stick_rebound_tests {
+    use super::*;
+
+    // 1 ms ticks: a stick held right, let go, overshooting left and settling.
+    fn run(r: &mut StickRebound, t: &mut f64, p: Vec2, ms: usize, window_s: f64) -> Vec<Vec2> {
+        (0..ms).map(|_| { *t += 0.001; r.step(p, *t, window_s) }).collect()
+    }
+
+    #[test]
+    fn a_spring_release_past_the_centre_reads_as_the_centre() {
+        let (mut r, mut t) = (StickRebound::default(), 0.0);
+        run(&mut r, &mut t, Vec2::new(1.0, 0.0), 100, 0.04);
+        // Let go: centre within a few ms, then the bounce to the left.
+        run(&mut r, &mut t, Vec2::new(0.05, 0.0), 5, 0.04);
+        let bounce = run(&mut r, &mut t, Vec2::new(-0.5, 0.05), 20, 0.04);
+        assert!(bounce.iter().all(|v| *v == Vec2::ZERO), "{bounce:?}");
+        // The window over, a stick still pushed left is a real input.
+        run(&mut r, &mut t, Vec2::new(-0.5, 0.0), 30, 0.04);
+        assert_eq!(r.step(Vec2::new(-0.5, 0.0), t + 0.001, 0.04), Vec2::new(-0.5, 0.0));
+    }
+
+    #[test]
+    fn the_ringing_after_the_window_settles_at_the_centre() {
+        let (mut r, mut t) = (StickRebound::default(), 0.0);
+        run(&mut r, &mut t, Vec2::new(1.0, 0.0), 100, 0.04);
+        run(&mut r, &mut t, Vec2::new(0.05, 0.0), 3, 0.04);
+        run(&mut r, &mut t, Vec2::new(-0.4, 0.0), 30, 0.04);
+        // Past the window, still ringing inside the centre, both ways.
+        for p in [Vec2::new(0.08, 0.0), Vec2::new(-0.06, 0.02), Vec2::new(0.03, 0.0)] {
+            let out = run(&mut r, &mut t, p, 20, 0.04);
+            assert!(out.iter().all(|v| *v == Vec2::ZERO), "{p:?} → {out:?}");
+        }
+        // A real move out of the centre passes, and ends the settling.
+        assert_eq!(run(&mut r, &mut t, Vec2::new(0.2, 0.0), 1, 0.04)[0], Vec2::new(0.2, 0.0));
+        assert_eq!(run(&mut r, &mut t, Vec2::new(0.05, 0.0), 1, 0.04)[0], Vec2::new(0.05, 0.0));
+    }
+
+    #[test]
+    fn a_slow_steer_through_the_centre_is_left_alone() {
+        let (mut r, mut t) = (StickRebound::default(), 0.0);
+        run(&mut r, &mut t, Vec2::new(0.8, 0.0), 50, 0.04);
+        // 200 ms to cross from held to the far side: a thumb, not a spring.
+        for i in 0..200 {
+            t += 0.001;
+            let x = 0.3 - 0.6 * (i as f32 / 200.0);
+            let p = Vec2::new(x, 0.0);
+            assert_eq!(r.step(p, t, 0.04), p, "at x={x}");
+        }
+    }
+
+    #[test]
+    fn pushing_back_out_the_same_way_passes_at_once() {
+        let (mut r, mut t) = (StickRebound::default(), 0.0);
+        run(&mut r, &mut t, Vec2::new(0.0, 1.0), 50, 0.04);
+        run(&mut r, &mut t, Vec2::ZERO, 3, 0.04);
+        let back = run(&mut r, &mut t, Vec2::new(0.0, 0.9), 5, 0.04);
+        assert!(back.iter().all(|v| *v == Vec2::new(0.0, 0.9)));
+    }
+
+    #[test]
+    fn every_form_of_the_stick_is_filtered_and_only_when_on() {
+        let mut snap = NodeSnap {
+            node_uid: 1,
+            module_id: "device.source".into(),
+            params: HashMap::new(),
+            n_outputs: 0,
+            input_sources: Vec::new(),
+            device_id: Some("pad".into()),
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        };
+        let sigs_at = |x: f32| -> HashMap<(String, String), Signal> {
+            [
+                (("pad".into(), "right_stick".into()), Signal::Vec2(Vec2::new(x, 0.0))),
+                (("pad".into(), "right_stick_x".into()), Signal::Float(x)),
+                (("pad".into(), "right_stick_y".into()), Signal::Float(0.0)),
+            ].into_iter().collect()
+        };
+        let drive = |graph: &ProcessingGraph| {
+            let mut st = StickReboundState::default();
+            for _ in 0..50 { filter_stick_rebound(graph, &mut sigs_at(1.0), &mut st, 0.001); }
+            filter_stick_rebound(graph, &mut sigs_at(0.0), &mut st, 0.001);
+            let mut bounce = sigs_at(-0.4);
+            filter_stick_rebound(graph, &mut bounce, &mut st, 0.001);
+            bounce
+        };
+        let off = drive(&ProcessingGraph { nodes: vec![snap.clone()] });
+        assert_eq!(off[&("pad".to_string(), "right_stick_x".to_string())], Signal::Float(-0.4), "off by default");
+
+        snap.params.insert("stick_rebound_enabled".into(), Value::Bool(true));
+        let on = drive(&ProcessingGraph { nodes: vec![snap] });
+        assert_eq!(on[&("pad".to_string(), "right_stick".to_string())], Signal::Vec2(Vec2::ZERO));
+        assert_eq!(on[&("pad".to_string(), "right_stick_x".to_string())], Signal::Float(0.0));
+        assert_eq!(on[&("pad".to_string(), "right_stick_y".to_string())], Signal::Float(0.0));
+    }
+}
+
 #[cfg(test)]
 mod orientation_baseline_tests {
     use super::*;

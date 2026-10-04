@@ -620,15 +620,33 @@ impl Module for Gyro3DOFModule {
 // it to a virtual Right Stick. Real evaluation is `compute_rws` in the engine
 // (eval/modules/rws.rs); process() stays empty.
 //
-// Params (node.params): scale, rws, input_mode ("gyro"|"stick_rate"),
-// max_rate_dps, cal_speed, calibrating, flick_enabled, flick_deadzone,
-// flick_smooth_ms, stick_out_dps.
+// The "Flick" output carries the flick alone when `flick_output` is "mouse"
+// (mouse counts, the default) or "stick" (stick deflection); with "both" the
+// flick is merged into the Mouse and Stick outputs and this pin stays at zero.
+// The flick is on wherever it reaches something — merged, or through a wired
+// Flick pin — and the "Flick On" input (unwired = on) turns off the flick, Stick
+// aim and the stick's suppression for a mode shift.
+//
+// Params (node.params): scale, rws, max_rate_dps, flick_deadzone,
+// flick_smooth_ms, flick_stabilise_ms, flick_fwd_dz_deg, flick_output,
+// stick_aim_enabled, stick_aim_rws, suppress_source, stick_out_dps.
 #[derive(Default)]
 pub struct RwsModule;
 
 /// Name of RWS Aim's output 0. Pin names persist with each node, so patches saved
 /// before the rename (as "Mouse") are migrated to this on load.
 pub const RWS_MOUSE_OUT_NAME: &str = "Mouse Move (XY)";
+
+/// Name of RWS Aim's output 2: the flick alone, when `flick_output` sends it
+/// there ("mouse" / "stick"). Nodes saved before it existed get it appended on
+/// load.
+pub const RWS_FLICK_OUT_NAME: &str = "Flick";
+
+/// Name of RWS Aim's input 2: a mode-shift control for everything the module
+/// does with the stick on its Flick input (the flick, Stick aim, and the
+/// suppression of that stick). Unwired = on. Nodes saved before it existed get
+/// it appended on load.
+pub const RWS_FLICK_ON_IN_NAME: &str = "Flick On";
 
 impl Module for RwsModule {
     fn descriptor() -> ModuleDescriptor {
@@ -639,10 +657,12 @@ impl Module for RwsModule {
             inputs: vec![
                 PinDescriptor::new("Rotation", SignalType::Vec2),
                 PinDescriptor::new("Flick", SignalType::Vec2).optional(),
+                PinDescriptor::new(RWS_FLICK_ON_IN_NAME, SignalType::Bool).optional(),
             ],
             outputs: vec![
                 PinDescriptor::new(RWS_MOUSE_OUT_NAME, SignalType::Vec2),
                 PinDescriptor::new("Stick", SignalType::Vec2),
+                PinDescriptor::new(RWS_FLICK_OUT_NAME, SignalType::Vec2),
             ],
         }
     }

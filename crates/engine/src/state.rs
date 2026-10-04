@@ -19,6 +19,11 @@ pub struct NodeState {
     /// RWS Aim: the flick stick being circled during a 360° calibration sweep.
     /// Created when a sweep starts, dropped when it ends.
     pub rws_cal_flick: Option<Box<crate::eval::CalFlick>>,
+    /// RWS Aim: the flick's tracking stabiliser, while a flick is engaged.
+    pub rws_flick_stab: Option<crate::eval::AngleFilter>,
+    /// Device stick rebound filter (on the reserved carry entry only): every
+    /// device's trackers and their clock. See `eval::filter_stick_rebound`.
+    pub stick_rebound: Option<Box<crate::eval::StickReboundState>>,
     /// Per-channel ring buffers of (timestamp, value) pairs for the delay module.
     pub delay_bufs: Vec<VecDeque<(Instant, f32)>>,
     /// Per-channel sample ring buffers for the moving-average module (float inputs).

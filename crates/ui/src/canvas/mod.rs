@@ -211,11 +211,28 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
             node.value.display_name = "Inverse".to_string();
         }
         // RWS Aim's output 0 was renamed "Mouse" → "Mouse Move (XY)". Pin names
-        // persist with the node; same position, so wires stay. Idempotent.
+        // persist with the node; same position, so wires stay. Its third output
+        // ("Flick") came later: appended after the two older pins, so their
+        // wires stay too. Idempotent.
         if node.value.module_id == "processing.rws" {
             if let Some(pin) = node.value.outputs.first_mut().filter(|p| p.name == "Mouse") {
                 pin.name = flexinput_modules::processing::RWS_MOUSE_OUT_NAME.to_string();
             }
+            if node.value.outputs.len() == 2 {
+                node.value.outputs.push(PinDescriptor::new(
+                    flexinput_modules::processing::RWS_FLICK_OUT_NAME,
+                    SignalType::Vec2,
+                ));
+            }
+            // The Flick On control input came later still, after Rotation and
+            // Flick.
+            if node.value.inputs.len() == 2 {
+                node.value.inputs.push(PinDescriptor::new(
+                    flexinput_modules::processing::RWS_FLICK_ON_IN_NAME,
+                    SignalType::Bool,
+                ).optional());
+            }
+            viewer::migrate_rws_flick_params(&mut node.value.params);
         }
         // Generic-pad stick-click / menu pins → positional names. Applies to
         // ANY device.source (the old ids only ever existed on Generic pads, so
@@ -532,33 +549,61 @@ mod migration_tests {
     }
 
     /// RWS Aim nodes saved with the old "Mouse" output name are renamed in place
-    /// (Stick untouched); a second pass is a no-op.
+    /// (Stick untouched), gain the later Flick output after it and the Flick On
+    /// input after their two, and trade the old flick checkbox for an output
+    /// mode; a second pass is a no-op.
     #[test]
     fn migrate_renames_rws_mouse_output() {
-        use flexinput_modules::processing::RWS_MOUSE_OUT_NAME;
-        let rws = NodeData {
+        use flexinput_modules::processing::{RWS_FLICK_ON_IN_NAME, RWS_FLICK_OUT_NAME, RWS_MOUSE_OUT_NAME};
+        let rws = |flick: Option<bool>, out: Option<&str>| NodeData {
             module_id: "processing.rws".to_string(),
             display_name: "RWS Aim".to_string(),
             category: "Processing".to_string(),
-            inputs: vec![],
+            inputs: vec![
+                PinDescriptor::new("Rotation", SignalType::Vec2),
+                PinDescriptor::new("Flick", SignalType::Vec2),
+            ],
             outputs: vec![
                 PinDescriptor::new("Mouse", SignalType::Vec2),
                 PinDescriptor::new("Stick", SignalType::Vec2),
             ],
-            params: HashMap::new(),
+            params: flick.map(|f| ("flick_enabled".to_string(), Value::Bool(f)))
+                .into_iter()
+                .chain(out.map(|o| ("flick_output".to_string(), Value::String(o.into()))))
+                .collect(),
             subpatch: None,
             extra: Default::default(),
         };
         let mut snarl: Snarl<NodeData> = Snarl::new();
-        let id = snarl.insert_node(egui::Pos2::ZERO, rws);
-        let names = |s: &Snarl<NodeData>| -> Vec<String> {
-            s.get_node(id).unwrap().outputs.iter().map(|p| p.name.clone()).collect()
+        let id = snarl.insert_node(egui::Pos2::ZERO, rws(Some(true), None));
+        let names = |s: &Snarl<NodeData>| -> (Vec<String>, Vec<String>) {
+            let n = s.get_node(id).unwrap();
+            (n.inputs.iter().map(|p| p.name.clone()).collect(), n.outputs.iter().map(|p| p.name.clone()).collect())
         };
 
-        migrate_loaded_snarl(&mut snarl);
-        assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
-        migrate_loaded_snarl(&mut snarl);
-        assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
+        for _ in 0..2 {
+            migrate_loaded_snarl(&mut snarl);
+            let (ins, outs) = names(&snarl);
+            assert_eq!(outs, [RWS_MOUSE_OUT_NAME, "Stick", RWS_FLICK_OUT_NAME]);
+            assert_eq!(ins, ["Rotation", "Flick", RWS_FLICK_ON_IN_NAME]);
+        }
+
+        // The old flick checkbox becomes an output mode: ticked with the merged
+        // output → both outputs; unticked → the pin-only default (inert while the
+        // pin is unwired); a pin mode picked since is kept.
+        for (flick, out, want) in [
+            (Some(true), None, "both"),
+            (Some(true), Some("main"), "both"),
+            (Some(false), None, "mouse"),
+            (Some(true), Some("stick"), "stick"),
+        ] {
+            let mut s: Snarl<NodeData> = Snarl::new();
+            let id = s.insert_node(egui::Pos2::ZERO, rws(flick, out));
+            migrate_loaded_snarl(&mut s);
+            let p = &s.get_node(id).unwrap().params;
+            assert_eq!(p.get("flick_output"), Some(&Value::String(want.into())), "{flick:?} {out:?}");
+            assert!(!p.contains_key("flick_enabled"));
+        }
     }
 
     /// A saved capture arm freezes gamepad nav on load — the widget can't be

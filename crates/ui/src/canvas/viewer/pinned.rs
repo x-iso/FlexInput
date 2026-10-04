@@ -410,6 +410,16 @@ pub(crate) fn render_pinned_element_impl(
             render_rws_flick(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Flick options (stabilise / forward deadzone / where the flick goes).
+        ("processing.rws", "flick_opts") => {
+            render_rws_flick_opts(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Speed gate between Stick aim and the flick.
+        ("processing.rws", "flick_speed") => {
+            render_rws_flick_speed(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Source stick suppression (None / Left / Right / Both).
         ("processing.rws", "suppress") => {
             render_rws_suppress(inner_id, ui, inner_snarl, container_size);
