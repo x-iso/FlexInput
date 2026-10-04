@@ -92,6 +92,8 @@ const CARD_ROUND:    f32 = 12.0;
 
 // Input card geometry
 const INPUT_CARD_ICON_H: f32 = 48.0;
+// The header's Port row, shown on presets that take several inputs.
+const PORT_ROW_H: f32 = 22.0;
 
 // Output card geometry
 const OUTPUT_CARD_ICON_H:    f32 = 36.0;
@@ -271,6 +273,7 @@ fn show_input_section(
     let active_dev_ids: Vec<String> =
         active_sources(canvas).into_iter().map(|(_, d, _)| d).collect();
     let capacity = input_capacity(canvas);
+    let ports = PortTable::read(canvas, devices);
 
     // Snapshot the actual viewport rect from INSIDE the ScrollArea's
     // closure (= the same clip rect the input_card painter calls see).
@@ -308,15 +311,20 @@ fn show_input_section(
                     *nav_mode.entry(d.id.clone()).or_insert(nav_mode_default)
                 };
                 let mut nav_toggle: Option<bool> = None;
+                let mut port_pick: Option<usize> = None;
                 if input_card(
                     ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
-                    ping_requests, nav_on, nav_disabled, &mut nav_toggle, nav_targets,
+                    ping_requests, nav_on, nav_disabled, &mut nav_toggle, &ports,
+                    &mut port_pick, nav_targets,
                 ) && (capacity > 1 || !is_active) {
                     toggle_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
                 }
                 if let Some(v) = nav_toggle {
                     nav_mode.insert(d.id.clone(), v);
+                }
+                if let Some(p) = port_pick {
+                    set_source_port(canvas, &d.id, p);
                 }
                 ui.add_space(CARD_GAP);
             }
@@ -329,9 +337,15 @@ fn show_input_section(
             }
             for d in &midi_ins {
                 let is_active = active_dev_ids.iter().any(|a| a == &d.id);
-                if midi_input_card(ui, d, is_active, nav_targets) && (capacity > 1 || !is_active) {
+                let mut port_pick: Option<usize> = None;
+                if midi_input_card(ui, d, is_active, &ports, &mut port_pick, nav_targets)
+                    && (capacity > 1 || !is_active)
+                {
                     toggle_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
+                }
+                if let Some(p) = port_pick {
+                    set_source_port(canvas, &d.id, p);
                 }
                 ui.add_space(CARD_GAP);
             }
@@ -358,6 +372,7 @@ fn active_accent_fill(ui: &egui::Ui) -> egui::Color32 {
 ///   ┌─────────────────────────────────────┐
 ///   │ ICON   Name             Calibrate  │  ← active accent fill (top half)
 ///   │                          261 Hz     │
+///   │        Port [Player 2         ▾]   │  ← only when the preset takes >1 input
 ///   ├─────────────────────────────────────┤
 ///   │  Deadzone ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 0.06     │  ← inactive fill (sliders)
 ///   │  Gyro ×   ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 3.50     │
@@ -374,14 +389,20 @@ fn input_card(
     nav_on: bool,
     nav_disabled: bool,
     nav_toggle: &mut Option<bool>,
+    ports: &PortTable,
+    port_pick: &mut Option<usize>,
     nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) -> bool {
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
-    // Top: icon (48 px) + tight inset. Bottom: two slider rows ~22 px
-    // each + small gap + insets, plus a digital-trigger toggle row, plus the
-    // capacitive-touch mute row on pads that have capacitive sensors.
-    let top_h = INPUT_CARD_ICON_H + 8.0;
+    // Right column beside the icon: name + Calibrate/Hz (~36 px), plus the
+    // Port row on presets that take several inputs.
+    let right_col_h = 36.0 + if ports.shown() { PORT_ROW_H } else { 0.0 };
+    // Top: icon (48 px) or the right column, whichever is taller, + tight
+    // inset. Bottom: two slider rows ~22 px each + small gap + insets, plus a
+    // digital-trigger toggle row, plus the capacitive-touch mute row on pads
+    // that have capacitive sensors.
+    let top_h = INPUT_CARD_ICON_H.max(right_col_h) + 8.0;
     let trigger_row_h = 22.0;
     let has_touch_misc = crate::canvas::viewer::has_capacitive_suppression(d);
     let touch_row_h = if has_touch_misc { 22.0 } else { 0.0 };
@@ -456,7 +477,7 @@ fn input_card(
     // Top section: icon on the left, with a vertically-centered right
     // column carrying (name, Calibrate+Hz).
     let icon_x = top_rect.left() + CARD_HPAD;
-    let icon_y = top_rect.top() + 4.0;
+    let icon_y = top_rect.top() + 4.0 + ((right_col_h - INPUT_CARD_ICON_H) * 0.5).max(0.0);
     let icon_w = INPUT_CARD_ICON_H;
     let icon_rect = egui::Rect::from_min_size(
         egui::pos2(icon_x, icon_y),
@@ -482,11 +503,10 @@ fn input_card(
         }
     }
 
-    // Right column: name (row 1) + Calibrate+Hz (row 2), y-centered
-    // against the icon. ~36 px tall → indent top by (icon_h - 36) / 2.
-    let right_col_h = 36.0_f32;
+    // Right column: name (row 1) + Calibrate+Hz (row 2) [+ Port (row 3)],
+    // y-centered against the icon (or the icon against it, when taller).
     let right_col_top = top_rect.top() + 4.0
-        + (INPUT_CARD_ICON_H - right_col_h) * 0.5;
+        + ((INPUT_CARD_ICON_H - right_col_h) * 0.5).max(0.0);
     let right_col_left = icon_rect.right() + 8.0;
     let right_col_rect = egui::Rect::from_min_max(
         egui::pos2(right_col_left, right_col_top),
@@ -525,6 +545,8 @@ fn input_card(
             *nav_toggle = Some(v);
         }
     });
+    let port_rect = ports.shown()
+        .then(|| port_row(&mut top_right, &d.id, is_active, ports, port_pick));
 
     // Bottom section: two stacked slider rows with bigger, more
     // readable labels. Layout per row: [LABEL  | slider fills | value].
@@ -573,11 +595,20 @@ fn input_card(
     // cursor hit-test lands where the user sees the control.
     {
         use crate::gamepad_nav::{LeftNavAction, LeftNavTarget};
-        // Select target: the header band only (avoid covering the sliders).
+        // Select target: the header band only (avoid covering the sliders),
+        // stopping above the Port row so the two never overlap.
+        let mut select_rect = top_rect;
+        if let Some(r) = port_rect { select_rect.max.y = r.top(); }
         nav_targets.push(LeftNavTarget {
-            rect: top_rect,
+            rect: select_rect,
             action: LeftNavAction::SelectInput { device_id: d.id.clone() },
         });
+        if let (true, Some(r)) = (is_active, port_rect) {
+            nav_targets.push(LeftNavTarget {
+                rect: egui::Rect::from_x_y_ranges(top_rect.x_range(), r.y_range()),
+                action: LeftNavAction::CycleInputPort { device_id: d.id.clone() },
+            });
+        }
         if is_active {
             if let Some(node_id) = find_source_node_for(canvas, &d.id) {
                 use crate::canvas::viewer::device_source_caps;
@@ -646,11 +677,21 @@ fn midi_input_card(
     ui: &mut egui::Ui,
     d: &PhysicalDevice,
     is_active: bool,
+    ports: &PortTable,
+    port_pick: &mut Option<usize>,
     nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) -> bool {
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
-    let card_h = INPUT_CARD_ICON_H + 8.0;
+    // The text column's height is whatever it measured last frame: the active
+    // subtitle wraps onto a second line at narrower panel widths, and a fixed
+    // estimate left the Port row hanging off the card's bottom edge.
+    let text_h_id = ui.id().with(("easy_midi_card_text_h", d.id.as_str()));
+    let text_h = ui.data(|m| m.get_temp::<f32>(text_h_id))
+        .unwrap_or(36.0 + if ports.shown() { PORT_ROW_H } else { 0.0 });
+    // Taller inset under a Port row, so the dropdown doesn't sit on the border.
+    let inset = if ports.shown() { 12.0 } else { 8.0 };
+    let card_h = INPUT_CARD_ICON_H.max(text_h) + inset;
     let (full_row, _) = ui.allocate_exact_size(egui::vec2(panel_avail, card_h), egui::Sense::hover());
     let card_rect = egui::Rect::from_min_size(
         egui::pos2(full_row.left() + PANEL_PADDING, full_row.top()),
@@ -671,7 +712,7 @@ fn midi_input_card(
     let resp = ui.interact(card_rect, ui.id().with(("easy_midi_card", d.id.as_str())), egui::Sense::click());
 
     let icon_rect = egui::Rect::from_min_size(
-        egui::pos2(card_rect.left() + 10.0, card_rect.top() + 4.0),
+        egui::pos2(card_rect.left() + 10.0, card_rect.top() + (card_h - INPUT_CARD_ICON_H) * 0.5),
         egui::vec2(INPUT_CARD_ICON_H, INPUT_CARD_ICON_H),
     );
     let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon_rect));
@@ -680,7 +721,7 @@ fn midi_input_card(
         &mut icon_ui, remapper_icons::device_card_svg(d.kind), INPUT_CARD_ICON_H);
 
     let text_rect = egui::Rect::from_min_max(
-        egui::pos2(icon_rect.right() + 8.0, card_rect.top() + (card_h - 36.0) * 0.5),
+        egui::pos2(icon_rect.right() + 8.0, card_rect.top() + (card_h - text_h) * 0.5),
         egui::pos2(card_rect.right() - 10.0, card_rect.bottom()),
     );
     let mut text_ui = ui.new_child(egui::UiBuilder::new()
@@ -693,13 +734,75 @@ fn midi_input_card(
     } else {
         "MIDI input"
     }).small().weak());
+    let port_rect = ports.shown()
+        .then(|| port_row(&mut text_ui, &d.id, is_active, ports, port_pick));
+    let measured = text_ui.min_rect().height();
+    if (measured - text_h).abs() > 0.5 {
+        ui.data_mut(|m| m.insert_temp(text_h_id, measured));
+        ui.ctx().request_repaint();
+    }
 
+    let mut select_rect = card_rect;
+    if let Some(r) = port_rect { select_rect.max.y = r.top(); }
     nav_targets.push(crate::gamepad_nav::LeftNavTarget {
-        rect: card_rect,
+        rect: select_rect,
         action: crate::gamepad_nav::LeftNavAction::SelectInput { device_id: d.id.clone() },
     });
+    if let (true, Some(r)) = (is_active, port_rect) {
+        nav_targets.push(crate::gamepad_nav::LeftNavTarget {
+            rect: egui::Rect::from_x_y_ranges(card_rect.x_range(), r.y_range()),
+            action: crate::gamepad_nav::LeftNavAction::CycleInputPort { device_id: d.id.clone() },
+        });
+    }
     resp.on_hover_text("Use this MIDI port as an input — alongside a gamepad, when the preset takes more than one")
         .clicked()
+}
+
+/// The card header's "Port" row: which of the preset's AutoMap inlets this
+/// device feeds, under the sub-patch's own name for it. Picking another port
+/// lands in `port_pick` (applied by the caller, which swaps with the holder).
+/// Inactive cards show it disabled, so every card keeps the same height.
+/// Returns the row's rect for the gamepad-nav target.
+fn port_row(
+    ui: &mut egui::Ui,
+    device_id: &str,
+    is_active: bool,
+    ports: &PortTable,
+    port_pick: &mut Option<usize>,
+) -> egui::Rect {
+    let mine = if is_active { ports.slot_of(device_id) } else { None };
+    let current = match mine {
+        Some(p) => ports.names[p].clone(),
+        None if is_active => "none — every port is taken".into(),
+        None => "—".into(),
+    };
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Port").size(11.0).weak());
+        ui.add_enabled_ui(is_active, |ui| {
+            egui::ComboBox::from_id_salt(("easy_input_port", device_id))
+                .selected_text(egui::RichText::new(current).small())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for (p, name) in ports.names.iter().enumerate() {
+                        // Say who'd be displaced, so a swap is never a surprise.
+                        let text = match &ports.holders[p] {
+                            Some((holder, label)) if holder != device_id =>
+                                format!("{name}  ·  {label}"),
+                            _ => name.clone(),
+                        };
+                        if ui.selectable_label(mine == Some(p), text).clicked() && mine != Some(p) {
+                            *port_pick = Some(p);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Which of the preset's inputs this device feeds.\n\
+                    Picking a port another device holds swaps the two.");
+        });
+    })
+    .response
+    .rect
 }
 
 /// Easy-mode Deadzone / Gyro × slider rows. Bigger label font (size
@@ -956,6 +1059,87 @@ pub(crate) fn toggle_source(
         }
     }
     super::layout::reposition_io_nodes(canvas);
+}
+
+/// The preset's AutoMap inlets as the cards' Port rows show them.
+struct PortTable {
+    /// Each inlet's name exactly as the preset's sub-patch declares it.
+    names: Vec<String>,
+    /// The device id wired into each inlet, with that device's display name.
+    holders: Vec<Option<(String, String)>>,
+}
+
+impl PortTable {
+    fn read(canvas: &Canvas, devices: &[PhysicalDevice]) -> Self {
+        let Some(sp) = canvas.snarl.nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "subpatch")
+            .map(|(id, _)| id)
+        else {
+            return Self { names: Vec::new(), holders: Vec::new() };
+        };
+        let node = canvas.snarl.get_node(sp);
+        let names: Vec<String> = super::wiring::automap_input_indices(node).iter()
+            .enumerate()
+            .map(|(p, &pin)| {
+                let name = node.map(|n| n.inputs[pin].name.trim()).unwrap_or("");
+                if name.is_empty() { format!("Port {}", p + 1) } else { name.to_string() }
+            })
+            .collect();
+        let mut holders = vec![None; names.len()];
+        for (id, dev, _) in active_sources(canvas) {
+            let Some(slot) = super::wiring::source_slot(canvas, id) else { continue; };
+            let Some(h) = holders.get_mut(slot) else { continue; };
+            let label = devices.iter().find(|d| d.id == dev)
+                .map(|d| d.display_name.clone())
+                .unwrap_or_else(|| dev.clone());
+            *h = Some((dev, label));
+        }
+        Self { names, holders }
+    }
+
+    /// Only presets taking several inputs get a Port row; with one inlet there
+    /// is nothing to choose.
+    fn shown(&self) -> bool {
+        self.names.len() > 1
+    }
+
+    fn slot_of(&self, device_id: &str) -> Option<usize> {
+        self.holders.iter().position(|h| h.as_ref().is_some_and(|(d, _)| d == device_id))
+    }
+}
+
+/// Move `device_id`'s source onto AutoMap `port`, and rewire. Whichever source
+/// already holds that port takes this one's old port instead — a swap — so two
+/// devices never end up sharing an inlet. A device left unwired (surplus on a
+/// full preset) that takes a port pushes the holder out to surplus in its place.
+pub(crate) fn set_source_port(canvas: &mut Canvas, device_id: &str, port: usize) {
+    let Some(mine) = find_source_node_for(canvas, device_id) else { return; };
+    let my_slot = super::wiring::source_slot(canvas, mine);
+    if my_slot == Some(port) { return; }
+    // Out of range = surplus: `resolve_ports` only hands it an inlet if one is
+    // free, and the one this device just took was the last.
+    let vacated = my_slot.unwrap_or(input_capacity(canvas));
+    let holder = active_sources(canvas).into_iter()
+        .map(|(id, _, _)| id)
+        .find(|&id| id != mine && super::wiring::source_slot(canvas, id) == Some(port));
+    let mut set = |id: NodeId, p: usize| {
+        if let Some(n) = canvas.snarl.get_node_mut(id) {
+            n.params.insert("automap_port".into(), Value::from(p as u64));
+        }
+    };
+    if let Some(h) = holder { set(h, vacated); }
+    set(mine, port);
+    super::wiring::rewire(canvas);
+}
+
+/// Step `device_id` to the next port (wrapping), swapping with its holder —
+/// the gamepad-nav twin of picking from the Port dropdown.
+pub(crate) fn cycle_source_port(canvas: &mut Canvas, device_id: &str) {
+    let Some(mine) = find_source_node_for(canvas, device_id) else { return; };
+    let n = input_capacity(canvas);
+    if n < 2 { return; }
+    let next = super::wiring::source_slot(canvas, mine).map_or(0, |s| (s + 1) % n);
+    set_source_port(canvas, device_id, next);
 }
 
 /// The `device.source` node driving a SPECIFIC device.

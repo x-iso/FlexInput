@@ -32,7 +32,8 @@ use crate::canvas::{Canvas, NodeData};
 ///    subpatch node's own outer pins (`inputs` / `outputs` on the
 ///    snarl-side NodeData mirror the subpatch's declared
 ///    `pins_in` / `pins_out`).
-/// 4. Wire source[i].AutoMap-out → subpatch.AutoMap-in[i] and
+/// 4. Wire each source's AutoMap-out → the subpatch AutoMap inlet its
+///    `automap_port` names (see [`resolve_ports`]) and
 ///    subpatch.AutoMap-out[0] → each sink.AutoMap-in.
 pub fn rewire(canvas: &mut Canvas) {
     let snarl = &mut canvas.snarl;
@@ -68,12 +69,21 @@ pub fn rewire(canvas: &mut Canvas) {
 
     let Some(sp_id) = subpatch else { return; };
 
-    // Each source gets its own inlet, in port order. Surplus devices beyond the
-    // preset's inlet count are left unwired rather than doubled up on the last
-    // inlet — silently sharing a port would look like it worked and then
-    // deliver two devices' signals fighting over the same pins.
+    // Each source gets its own inlet: the port it asked for when that one is
+    // free, else the lowest free one. Surplus devices beyond the preset's inlet
+    // count are left unwired rather than doubled up on the last inlet —
+    // silently sharing a port would look like it worked and then deliver two
+    // devices' signals fighting over the same pins.
     let sp_inlets = automap_input_indices(snarl.get_node(sp_id));
-    for (slot, (_, src_id)) in sources.iter().enumerate() {
+    let wanted: Vec<usize> = sources.iter().map(|(port, _)| *port).collect();
+    let slots = resolve_ports(&wanted, sp_inlets.len());
+    for ((_, src_id), slot) in sources.iter().zip(slots) {
+        let Some(slot) = slot else { continue; };
+        // Store where it actually landed, so the Port row, a later swap and the
+        // next rewire all agree on it.
+        if let Some(n) = snarl.get_node_mut(*src_id) {
+            n.params.insert("automap_port".into(), serde_json::Value::from(slot as u64));
+        }
         let (Some(src_pin), Some(sp_in_pin)) =
             (first_automap_output_idx(snarl.get_node(*src_id)), sp_inlets.get(slot).copied())
         else {
@@ -106,6 +116,50 @@ fn source_port(node: &NodeData) -> usize {
         .get("automap_port")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize
+}
+
+/// The inlet slot each source lands on, given the ports they ask for (in the
+/// same order) and how many AutoMap inlets the preset declares.
+///
+/// A requested port is honoured when it exists and nobody earlier claimed it;
+/// everyone else takes the lowest free slot, and once the inlets run out the
+/// rest get `None`. So an explicit pick from the Port row sticks — a device on
+/// port 2 stays there when the device on port 1 is removed — while a patch
+/// whose ports no longer fit (a preset swapped for one with fewer inlets, or an
+/// old save where every source defaulted to 0) still packs onto what exists.
+pub(crate) fn resolve_ports(wanted: &[usize], inlet_count: usize) -> Vec<Option<usize>> {
+    let mut order: Vec<usize> = (0..wanted.len()).collect();
+    order.sort_by_key(|&i| wanted[i]);
+    let mut taken = vec![false; inlet_count];
+    let mut slots = vec![None; wanted.len()];
+    for &i in &order {
+        let p = wanted[i];
+        if p < inlet_count && !taken[p] {
+            taken[p] = true;
+            slots[i] = Some(p);
+        }
+    }
+    for &i in &order {
+        if slots[i].is_some() { continue; }
+        if let Some(f) = taken.iter().position(|t| !t) {
+            taken[f] = true;
+            slots[i] = Some(f);
+        }
+    }
+    slots
+}
+
+/// Which AutoMap port of the sub-patch a source node is wired into, read off
+/// the wire itself — `None` when it is unwired (surplus on a full preset).
+pub fn source_slot(canvas: &Canvas, src: NodeId) -> Option<usize> {
+    let snarl = &canvas.snarl;
+    let sp_id = snarl.nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "subpatch")
+        .map(|(id, _)| id)?;
+    let sp_inlets = automap_input_indices(snarl.get_node(sp_id));
+    snarl.wires()
+        .filter(|(o, i)| o.node == src && i.node == sp_id)
+        .find_map(|(_, i)| sp_inlets.iter().position(|&pin| pin == i.input))
 }
 
 /// Every AutoMap inlet on a node, in declaration order — this is what caps how
@@ -179,5 +233,24 @@ mod tests {
     #[test]
     fn an_explicit_port_is_honoured() {
         assert_eq!(source_port(&node(Vec::new(), Some(2))), 2);
+    }
+
+    /// The Port row's pick has to survive the rewire: a lone device on port 2
+    /// must not slide down to port 0 just because 0 and 1 are empty.
+    #[test]
+    fn a_requested_free_port_is_kept() {
+        assert_eq!(resolve_ports(&[2], 3), vec![Some(2)]);
+        assert_eq!(resolve_ports(&[1, 0], 2), vec![Some(1), Some(0)]);
+    }
+
+    /// Old saves default every source to 0, and a swapped-in preset may have
+    /// fewer inlets than the stored ports: both pack onto the free inlets, and
+    /// once those run out the rest stay unwired rather than sharing one.
+    #[test]
+    fn clashing_or_missing_ports_pack_and_surplus_stays_unwired() {
+        assert_eq!(resolve_ports(&[0, 0], 2), vec![Some(0), Some(1)]);
+        assert_eq!(resolve_ports(&[3, 1], 2), vec![Some(0), Some(1)]);
+        assert_eq!(resolve_ports(&[0, 0, 1], 2), vec![Some(0), None, Some(1)]);
+        assert_eq!(resolve_ports(&[0], 0), vec![None]);
     }
 }

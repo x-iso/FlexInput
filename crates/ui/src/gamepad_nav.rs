@@ -185,6 +185,9 @@ pub enum EditLevel {
 pub enum LeftNavAction {
     /// Make this physical device the active input source (card click).
     SelectInput { device_id: String },
+    /// Move this active input device to the preset's next AutoMap port,
+    /// swapping with whichever device held it (the card's Port row).
+    CycleInputPort { device_id: String },
     /// Toggle a virtual output sink on/off by kind prefix.
     ToggleOutput { kind: String },
     /// Cycle the single gamepad output card to the next model (Xbox 360 → DS4 →

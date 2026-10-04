@@ -206,6 +206,10 @@ impl FlexInputApp {
             LeftNavAction::SelectInput { device_id } => {
                 self.nav_select_input_device(&device_id);
             }
+            LeftNavAction::CycleInputPort { device_id } => {
+                let canvas = &mut self.tabs[self.active_tab].canvas;
+                crate::easy::io_panel::cycle_source_port(canvas, &device_id);
+            }
             LeftNavAction::ToggleOutput { kind } => {
                 self.nav_toggle_output_sink(&kind);
             }
