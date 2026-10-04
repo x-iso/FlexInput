@@ -6023,3 +6023,43 @@ mod area_mapper_tests {
         assert!(out.last_outputs.get(&5).is_some_and(|v| v.len() == 3), "the live mirror");
     }
 }
+
+#[cfg(test)]
+mod gate_interp_tests {
+    use super::*;
+
+    fn interp() -> HashMap<String, serde_json::Value> {
+        [("interpolate".to_string(), serde_json::Value::Bool(true))].into_iter().collect()
+    }
+
+    fn v2(x: f32, y: f32) -> Option<Signal> { Some(Signal::Vec2(Vec2::new(x, y))) }
+
+    #[test]
+    fn selector_interpolates_vec2_inputs() {
+        let ins = [Some(Signal::Float(0.25)), v2(0.0, 0.0), v2(1.0, -1.0), v2(1.0, 1.0)];
+        // 3 inputs → pos = 0.25 · 2 = 0.5, halfway between in_0 and in_1.
+        assert_eq!(eval_pure("module.selector", 0, &ins, &interp(), 1), v2(0.5, -0.5));
+        let ins = [Some(Signal::Float(0.75)), ins[1], ins[2], ins[3]];
+        assert_eq!(eval_pure("module.selector", 0, &ins, &interp(), 1), v2(1.0, 0.0));
+    }
+
+    #[test]
+    fn selector_vec2_beside_unwired_reads_centred() {
+        let ins = [Some(Signal::Float(0.5)), v2(1.0, 1.0), None];
+        assert_eq!(eval_pure("module.selector", 0, &ins, &interp(), 1), v2(0.5, 0.5));
+    }
+
+    #[test]
+    fn selector_float_interp_unchanged() {
+        let ins = [Some(Signal::Float(0.5)), Some(Signal::Float(0.0)), Some(Signal::Float(1.0))];
+        assert_eq!(eval_pure("module.selector", 0, &ins, &interp(), 1), Some(Signal::Float(0.5)));
+    }
+
+    #[test]
+    fn split_crossfades_vec2_input() {
+        let ins = [Some(Signal::Float(0.25)), v2(1.0, -1.0)];
+        // 2 outputs → pos = 0.25: out_0 gets 75 %, out_1 25 %.
+        assert_eq!(eval_pure("module.split", 0, &ins, &interp(), 2), v2(0.75, -0.75));
+        assert_eq!(eval_pure("module.split", 1, &ins, &interp(), 2), v2(0.25, -0.25));
+    }
+}

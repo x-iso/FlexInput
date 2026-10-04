@@ -573,9 +573,22 @@ pub fn eval_pure(
                 let lo = pos.floor() as usize;
                 let hi = (lo + 1).min(n_inputs - 1);
                 let t = pos.fract();
-                let lo_v = inputs.get(lo + 1).and_then(|s| *s).map(|s| s.as_float()).unwrap_or(0.0);
-                let hi_v = inputs.get(hi + 1).and_then(|s| *s).map(|s| s.as_float()).unwrap_or(0.0);
-                Some(Signal::Float(lo_v * (1.0 - t) + hi_v * t))
+                let lo_s = inputs.get(lo + 1).and_then(|s| *s);
+                let hi_s = inputs.get(hi + 1).and_then(|s| *s);
+                // Blend as Vec2 when either neighbour is one (an unwired or
+                // non-Vec2 neighbour reads as centred); everything else blends
+                // as Float, as before.
+                if matches!(lo_s, Some(Signal::Vec2(_))) || matches!(hi_s, Some(Signal::Vec2(_))) {
+                    let as_v2 = |s: Option<Signal>| match s {
+                        Some(Signal::Vec2(v)) => v,
+                        _ => Vec2::ZERO,
+                    };
+                    Some(Signal::Vec2(as_v2(lo_s).lerp(as_v2(hi_s), t)))
+                } else {
+                    let lo_v = lo_s.map(|s| s.as_float()).unwrap_or(0.0);
+                    let hi_v = hi_s.map(|s| s.as_float()).unwrap_or(0.0);
+                    Some(Signal::Float(lo_v * (1.0 - t) + hi_v * t))
+                }
             } else {
                 let n = n_inputs as f32;
                 let idx = (sel.clamp(0.0, 1.0) * n).floor() as usize;
