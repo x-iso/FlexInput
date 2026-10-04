@@ -849,7 +849,7 @@ pub(crate) fn curve_ui_module_id(node: &NodeData) -> &str {
 pub(crate) fn curve_param_keys(node: &NodeData) -> (&'static str, &'static str) {
     if curve_ui_module_id(node) == "module.twoway_response_curve" {
         let lane = node.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up");
-        if lane == "dn" { ("points_dn", "biases_dn") } else { ("points", "biases") }
+        match lane { "dn" => ("points_dn", "biases_dn"), "hy" => ("hyst_points", "hyst_biases"), _ => ("points", "biases") }
     } else {
         ("points", "biases")
     }
@@ -967,8 +967,11 @@ pub(crate) fn curve_graph_load(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
 pub(crate) fn curve_graph_reset(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     let (pts_key, bias_key) = curve_param_keys(node);
-    node.params.insert(pts_key.into(),  serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
-    node.params.insert(bias_key.into(), serde_json::json!([0.0]));
+    // A two-way curve's Hyst graph resets to one dot — the flat Hyst value.
+    let (pts, bss) = if pts_key == "hyst_points" { (serde_json::json!([]), serde_json::json!([])) }
+        else { (serde_json::json!([[0.0, 0.0], [1.0, 1.0]]), serde_json::json!([0.0])) };
+    node.params.insert(pts_key.into(),  pts);
+    node.params.insert(bias_key.into(), bss);
 }
 
 pub(crate) fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
@@ -978,8 +981,11 @@ pub(crate) fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Sn
     // still reset together. For regular/vec curves `curve_param_keys` returns
     // `("points", "biases")` so the behaviour is unchanged.
     let (pts_key, bias_key) = curve_param_keys(node);
-    node.params.insert(pts_key.into(),             serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
-    node.params.insert(bias_key.into(),            serde_json::json!([0.0]));
+    // A two-way curve's Hyst graph resets to one dot — the flat Hyst value.
+    let (pts, bss) = if pts_key == "hyst_points" { (serde_json::json!([]), serde_json::json!([])) }
+        else { (serde_json::json!([[0.0, 0.0], [1.0, 1.0]]), serde_json::json!([0.0])) };
+    node.params.insert(pts_key.into(),             pts);
+    node.params.insert(bias_key.into(),            bss);
     node.params.insert("grid_x".into(),            serde_json::json!(4i64));
     node.params.insert("grid_y".into(),            serde_json::json!(4i64));
     node.params.insert("snap".into(),              Value::Bool(false));

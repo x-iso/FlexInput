@@ -6135,3 +6135,318 @@ mod gate_interp_tests {
         assert_eq!(eval_pure("module.split", 1, &ins, &interp(), 2), v2(0.25, -0.25));
     }
 }
+
+#[cfg(test)]
+mod twoway_curve_tests {
+    use super::*;
+    use serde_json::json;
+
+    const DT: f32 = 0.001;
+
+    /// The trigger setup that motivated the tracker: a short pulse at the top of
+    /// a pull (peak at 2 %), nothing across the ~10 % resistance shelf, then a
+    /// shortened ramp; the down lane stays at zero until 84 %.
+    fn pulse_curve(band_pct: f64) -> HashMap<String, Value> {
+        let mut p = HashMap::new();
+        p.insert("points".into(), json!([[0.0, 0.0], [0.02, 1.0], [0.07, 0.0], [0.27, 0.0], [1.0, 1.0]]));
+        p.insert("biases".into(), json!([0.0, 0.0, 0.0, 0.0]));
+        p.insert("points_dn".into(), json!([[0.0, 0.0], [0.84, 0.0], [1.0, 1.0]]));
+        p.insert("biases_dn".into(), json!([0.0, 0.0]));
+        p.insert("hysteresis_pct".into(), json!(band_pct));
+        p.insert("interp_ms".into(), json!(0.0));
+        p
+    }
+
+    fn run(params: &HashMap<String, Value>, state: &mut NodeState, xs: &[f32]) -> Vec<f32> {
+        xs.iter().map(|&x| {
+            match compute_twoway_response_curve(&[Some(Signal::Float(x))], state, params, DT)[0] {
+                Some(Signal::Float(f)) => f,
+                other => panic!("{other:?}"),
+            }
+        }).collect()
+    }
+
+    fn ramp(from: f32, to: f32, steps: usize) -> Vec<f32> {
+        (1..=steps).map(|i| from + (to - from) * i as f32 / steps as f32).collect()
+    }
+
+    /// Jitter of up to ±`amp` around `at` — the trigger's noise.
+    fn jitter(at: f32, amp: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| at + amp * [0.0, 1.0, -0.75, 0.5, -1.0, 0.25][i % 6]).collect()
+    }
+
+    #[test]
+    fn a_short_pull_pulses_once_and_the_release_stays_silent() {
+        let p = pulse_curve(1.5);
+        let mut st = NodeState::default();
+        run(&p, &mut st, &[0.0; 20]);
+        let pull = run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        assert!(pull.iter().cloned().fold(0.0, f32::max) > 0.5, "pulse on the pull: {pull:?}");
+        assert!(pull.last().unwrap().abs() < 1e-6, "silent on the shelf");
+        let shelf = run(&p, &mut st, &jitter(0.10, 0.008, 60));
+        assert!(shelf.iter().all(|v| v.abs() < 1e-6), "shelf noise: {shelf:?}");
+        let release = run(&p, &mut st, &ramp(0.10, 0.0, 20));
+        assert!(release.iter().all(|v| v.abs() < 1e-6), "no pulse on release: {release:?}");
+        // Resting noise must stay under the band (1.2 % peak to peak here) —
+        // noise wider than the band at rest re-fires the pulse.
+        let rest = run(&p, &mut st, &jitter(0.006, 0.006, 60));
+        assert!(rest.iter().all(|v| v.abs() < 1e-6), "rest noise below the band: {rest:?}");
+    }
+
+    // Even a release so fast it lands inside the pulse in one sample: the old
+    // detector read the UP curve there on its way to switching.
+    #[test]
+    fn a_release_that_jumps_into_the_pulse_zone_stays_silent() {
+        let p = pulse_curve(1.5);
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        let out = run(&p, &mut st, &[0.03, 0.01, 0.0]);
+        assert!(out.iter().all(|v| v.abs() < 1e-6), "{out:?}");
+    }
+
+    // Noise smaller than the band never moves the output, on any slope.
+    #[test]
+    fn noise_inside_the_band_holds_the_output() {
+        let mut p = HashMap::new();
+        p.insert("hysteresis_pct".into(), json!(2.0));
+        p.insert("interp_ms".into(), json!(0.0));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.5, 50));
+        // The held point climbs to the noise's top within the first swing,
+        // then never moves again.
+        let held = run(&p, &mut st, &jitter(0.5, 0.008, 120));
+        assert!(held[2..].iter().all(|v| (v - 0.508).abs() < 1e-6), "{held:?}");
+    }
+
+    // A reversal is caught however slowly it comes: the band is measured from
+    // the held point, not over a time window.
+    #[test]
+    fn a_slow_reversal_still_switches_lanes() {
+        let mut p = HashMap::new();
+        p.insert("points_dn".into(), json!([[0.0, 0.0], [1.0, 0.0]]));
+        p.insert("biases_dn".into(), json!([0.0]));
+        p.insert("hysteresis_pct".into(), json!(1.0));
+        p.insert("interp_ms".into(), json!(0.0));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.5, 50));
+        let fall = run(&p, &mut st, &ramp(0.5, 0.48, 2000));
+        assert!((fall[0] - 0.5).abs() < 1e-6, "held at first");
+        assert!(fall.last().unwrap().abs() < 1e-6, "down lane after 2 % back: {:?}", fall.last());
+    }
+
+    // A lane switch blends from what was emitted, never from the old lane read
+    // at the new input.
+    #[test]
+    fn interp_blends_from_the_emitted_output() {
+        let mut p = pulse_curve(1.5);
+        p.insert("interp_ms".into(), json!(10.0));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        let out = run(&p, &mut st, &[0.03, 0.02, 0.01, 0.0]);
+        assert!(out.iter().all(|v| v.abs() < 1e-6), "{out:?}");
+    }
+
+    // A band wider than the pulse's peak: without "Start on Up" a pull from rest
+    // gets nothing until it clears the band (by then past the peak), with it
+    // the pulse fires from the first sample — and the band still guards the
+    // release.
+    #[test]
+    fn start_on_up_skips_the_band_on_a_pull_from_rest() {
+        let mut p = pulse_curve(4.0);
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.10, 0.0, 20));
+        let pull = run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        assert!(pull[..8].iter().all(|v| v.abs() < 1e-6), "held inside the band: {pull:?}");
+        assert!(pull.iter().cloned().fold(0.0, f32::max) < 0.6, "peak missed: {pull:?}");
+
+        p.insert("hyst_start_up".into(), json!(true));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.10, 0.0, 20));
+        let pull = run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        assert!(pull[0] > 0.2, "on the Up curve from the first sample: {pull:?}");
+        assert!(pull.iter().cloned().fold(0.0, f32::max) > 0.9, "full pulse: {pull:?}");
+        let release = run(&p, &mut st, &ramp(0.10, 0.0, 20));
+        assert!(release.iter().all(|v| v.abs() < 1e-6), "release still silent: {release:?}");
+    }
+
+    // Away from rest "Start on Up" changes nothing: a re-press from mid-travel
+    // still has to clear the band.
+    #[test]
+    fn start_on_up_only_applies_at_rest() {
+        let mut p = HashMap::new();
+        p.insert("points_dn".into(), json!([[0.0, 0.0], [1.0, 0.0]]));
+        p.insert("biases_dn".into(), json!([0.0]));
+        p.insert("hysteresis_pct".into(), json!(2.0));
+        p.insert("interp_ms".into(), json!(0.0));
+        p.insert("hyst_start_up".into(), json!(true));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.5, 50));
+        run(&p, &mut st, &ramp(0.5, 0.3, 20));
+        let repress = run(&p, &mut st, &[0.31, 0.315, 0.33]);
+        assert!(repress[..2].iter().all(|v| v.abs() < 1e-6), "inside the band: {repress:?}");
+        assert!((repress[2] - 0.33).abs() < 1e-6, "past it: {repress:?}");
+    }
+
+    // "Down" guards only the release: a press flips to Up at once, while a
+    // release has to clear the band. "Up" is the mirror.
+    #[test]
+    fn hyst_dir_guards_one_movement_only() {
+        let mut p = HashMap::new();
+        p.insert("points_dn".into(), json!([[0.0, 0.0], [1.0, 0.0]]));
+        p.insert("biases_dn".into(), json!([0.0]));
+        p.insert("hysteresis_pct".into(), json!(2.0));
+        p.insert("interp_ms".into(), json!(0.0));
+
+        p.insert("hyst_dir".into(), json!("down"));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.5, 50));
+        let rel = run(&p, &mut st, &[0.49, 0.47]);
+        assert!((rel[0] - 0.5).abs() < 1e-6 && rel[1].abs() < 1e-6, "release guarded: {rel:?}");
+        let press = run(&p, &mut st, &[0.471]);
+        assert!((press[0] - 0.471).abs() < 1e-6, "press instant: {press:?}");
+
+        p.insert("hyst_dir".into(), json!("up"));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.5, 50));
+        let rel = run(&p, &mut st, &[0.499]);
+        assert!(rel[0].abs() < 1e-6, "release instant: {rel:?}");
+        let press = run(&p, &mut st, &[0.51, 0.52]);
+        assert!(press[0].abs() < 1e-6 && (press[1] - 0.52).abs() < 1e-6, "press guarded: {press:?}");
+    }
+
+    // A Hyst graph with no band near rest and a wide one from the shelf on: a
+    // pull from a rest that never quite reaches 0 still catches the whole
+    // pulse, while shelf noise wider than any flat band that small is held.
+    #[test]
+    fn a_hyst_graph_varies_the_band_over_the_input() {
+        let mut p = pulse_curve(0.5);
+        // Y 0.4 = 4 % (the graph's top is TWOWAY_HYST_MAX_PCT = 10 %).
+        p.insert("hyst_points".into(), json!([[0.0, 0.0], [0.04, 0.0], [0.06, 0.4], [1.0, 0.4]]));
+        p.insert("hyst_biases".into(), json!([0.0, 0.0, 0.0]));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.10, 0.006, 20));
+        run(&p, &mut st, &jitter(0.006, 0.002, 30));
+        let pull = run(&p, &mut st, &ramp(0.006, 0.10, 47));
+        assert!(pull.iter().cloned().fold(0.0, f32::max) > 0.95, "full pulse: {pull:?}");
+        let shelf = run(&p, &mut st, &jitter(0.10, 0.015, 60));
+        assert!(shelf.iter().all(|v| v.abs() < 1e-6), "3 % shelf noise held: {shelf:?}");
+        let release = run(&p, &mut st, &ramp(0.10, 0.0, 20));
+        assert!(release.iter().all(|v| v.abs() < 1e-6), "release silent: {release:?}");
+    }
+
+    // One dot is no graph: the flat `hysteresis_pct` band applies.
+    #[test]
+    fn a_single_hyst_dot_defers_to_the_value() {
+        let mut p = pulse_curve(2.0);
+        p.insert("hyst_points".into(), json!([[0.0, 0.9]]));
+        let h = TwowayHyst::from_params(&p, true);
+        assert!((h.band_at(0.5) - 0.02).abs() < 1e-6);
+        assert!((h.band_for(true, 0.5) - 0.02).abs() < 1e-6);
+    }
+
+    /// A pull the way a pad reports it: the input steps every `report_ms`,
+    /// the engine ticks at 1 kHz in between.
+    fn reported(xs: &[f32], report_ms: usize) -> Vec<f32> {
+        xs.iter().flat_map(|&x| std::iter::repeat_n(x, report_ms)).collect()
+    }
+
+    // A 4 ms report rate stepping 1.5 % → 3.5 % straddles the 2 % peak: no
+    // report reads it. Peak hold puts the peak out anyway, for its hold time.
+    #[test]
+    fn peak_hold_catches_a_peak_between_reports() {
+        let mut p = pulse_curve(0.5);
+        p.insert("hyst_start_up".into(), json!(true));
+        let steps = reported(&[0.0, 0.015, 0.035, 0.06, 0.09, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 4);
+
+        let mut st = NodeState::default();
+        let out = run(&p, &mut st, &steps);
+        assert!(out.iter().cloned().fold(0.0, f32::max) < 0.8, "no hold, peak lost: {out:?}");
+
+        p.insert("peak_hold_ms".into(), json!(20.0));
+        let mut st = NodeState::default();
+        let out = run(&p, &mut st, &steps);
+        let full = out.iter().filter(|v| (**v - 1.0).abs() < 1e-4).count();
+        assert!((20..=22).contains(&full), "full peak held ~20 ms: {full} ticks, {out:?}");
+        assert!(out.last().unwrap().abs() < 1e-6, "then the shelf's 0");
+    }
+
+    // A release drops a held peak at once.
+    #[test]
+    fn a_release_cancels_peak_hold() {
+        let mut p = pulse_curve(0.5);
+        p.insert("hyst_start_up".into(), json!(true));
+        p.insert("peak_hold_ms".into(), json!(50.0));
+        let mut st = NodeState::default();
+        let out = run(&p, &mut st, &reported(&[0.0, 0.015, 0.035], 4));
+        assert!((out.last().unwrap() - 1.0).abs() < 1e-4, "held: {out:?}");
+        let rel = run(&p, &mut st, &reported(&[0.02, 0.0], 4));
+        assert!(rel.iter().all(|v| v.abs() < 1e-6), "release silent: {rel:?}");
+    }
+
+    // A press from a rest that never got under "Start on Up"'s threshold has to
+    // clear the band — 4 % here, past the 2 % peak. The sweep from the low it
+    // came up from still catches the pulse.
+    #[test]
+    fn peak_hold_catches_the_pulse_on_a_press_that_clears_the_band() {
+        let mut p = pulse_curve(4.0);
+        p.insert("peak_hold_ms".into(), json!(20.0));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &reported(&[0.10, 0.05, 0.006, 0.006, 0.006], 4));
+        let out = run(&p, &mut st, &reported(&[0.006, 0.03, 0.06, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 4));
+        let full = out.iter().filter(|v| (**v - 1.0).abs() < 1e-4).count();
+        assert!(full >= 20, "full pulse held: {full} ticks, {out:?}");
+    }
+
+    // The trap the zero-band zone set: a slow release, jittering ±0.4 % at 4 ms
+    // reports through the pulse zone. With a flat band over the jitter it never
+    // flips back to Up, held peaks or not.
+    #[test]
+    fn a_jittery_release_through_the_pulse_zone_never_retriggers() {
+        let mut p = pulse_curve(1.5);
+        p.insert("hyst_start_up".into(), json!(true));
+        p.insert("peak_hold_ms".into(), json!(20.0));
+        let mut st = NodeState::default();
+        run(&p, &mut st, &reported(&(0..=25).map(|i| i as f32 * 0.004).collect::<Vec<_>>(), 4));
+        run(&p, &mut st, &[0.10; 100]);
+        let rel: Vec<f32> = (0..50)
+            .map(|i| (0.10 - i as f32 * 0.002 + [0.0, 0.004, -0.003, 0.002][i % 4]).max(0.0))
+            .collect();
+        let out = run(&p, &mut st, &reported(&rel, 4));
+        assert!(out.iter().all(|v| v.abs() < 1e-6), "{out:?}");
+    }
+
+    // By default peaks are held on the press only: down a sloped Down curve a
+    // release follows it at once; "both" holds there too.
+    #[test]
+    fn peak_hold_is_press_only_by_default() {
+        let mut p = HashMap::new();
+        p.insert("hysteresis_pct".into(), json!(1.0));
+        p.insert("interp_ms".into(), json!(0.0));
+        p.insert("peak_hold_ms".into(), json!(20.0));
+        let release = |p: &HashMap<String, Value>| {
+            let mut st = NodeState::default();
+            run(p, &mut st, &ramp(0.0, 0.8, 80));
+            run(p, &mut st, &reported(&[0.7, 0.6, 0.5], 4))
+        };
+        let out = release(&p);
+        assert!((out.last().unwrap() - 0.5).abs() < 1e-6, "follows the release: {out:?}");
+        p.insert("peak_hold_dir".into(), json!("both"));
+        let out = release(&p);
+        assert!(*out.last().unwrap() > 0.55, "held on the way down: {out:?}");
+    }
+
+    // The UI gets one Vec2(held, lane) per channel after the inputs.
+    #[test]
+    fn live_inputs_carry_the_tracker() {
+        let p = pulse_curve(1.5);
+        let mut st = NodeState::default();
+        run(&p, &mut st, &ramp(0.0, 0.10, 20));
+        run(&p, &mut st, &[0.09]);
+        let live = twoway_live_inputs(&[Some(Signal::Float(0.09))], Some(&st));
+        assert_eq!(live.len(), 2);
+        match live[1] {
+            Some(Signal::Vec2(v)) => { assert!((v.x - 0.10).abs() < 1e-6); assert_eq!(v.y, 1.0); }
+            other => panic!("{other:?}"),
+        }
+    }
+}

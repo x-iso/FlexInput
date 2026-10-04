@@ -245,6 +245,7 @@ fn eval_subgraph(
         // so a downstream sink's `collector:` lookup finds the curved bus.
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
             let (inputs, outputs) = eval_automap_curve_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            let inputs = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID { twoway_live_inputs(&inputs, state.get(&ns_uid)) } else { inputs };
             last_inputs.insert(ns_uid, inputs);
             last_outputs.insert(ns_uid, outputs);
             computed[idx] = vec![None];
@@ -411,7 +412,7 @@ fn eval_subgraph(
                 last_inputs.insert(ns_uid, inputs.clone());
             }
             "module.twoway_response_curve" => {
-                last_inputs.insert(ns_uid, inputs.clone());
+                last_inputs.insert(ns_uid, twoway_live_inputs(&inputs, Some(node_state)));
             }
             "generator.envelope" => {
                 last_inputs.insert(ns_uid, node_state.last_signals.clone());
@@ -568,6 +569,7 @@ pub fn eval_graph_tick(
         // body draws its live dots from.
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
             let (inputs, outputs) = eval_automap_curve_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
+            let inputs = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID { twoway_live_inputs(&inputs, state.get(&snap.node_uid)) } else { inputs };
             last_inputs.insert(snap.node_uid, inputs);
             last_outputs.insert(snap.node_uid, outputs);
             computed[idx] = vec![None];
@@ -1069,7 +1071,7 @@ pub fn eval_graph_tick(
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
             "module.twoway_response_curve" => {
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                last_inputs.insert(snap.node_uid, twoway_live_inputs(&inputs, Some(node_state)));
             }
             "generator.envelope" => {
                 // last_signals = [output, phase]; UI reads phase from index 1 for playhead

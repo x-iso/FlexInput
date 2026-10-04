@@ -1030,14 +1030,17 @@ impl FlexInputApp {
                 f!("Uni", Toggle{key:"ts_uni"}),
             ],
             ("module.twoway_response_curve", "hyst_row") => vec![
-                f!("Hyst %", v("hysteresis_pct",0.001,10.0,0.5,Linear)),
-                f!("Hyst ms", v("hysteresis_ms",0.02,50.0,20.0,Linear)),
+                f!("Hyst %", v("hysteresis_pct",0.0,10.0,0.5,Linear)),
+                f!("Hyst on", Enum{key:"hyst_dir",opts:&["both","up","down"]}),
+                f!("Start Up", Toggle{key:"hyst_start_up"}),
             ],
             ("module.twoway_response_curve", "interp_row") => vec![
                 f!("Interp ms", v("interp_ms",0.0,500.0,50.0,Decade)),
+                f!("Peak hold ms", v("peak_hold_ms",0.0,200.0,0.0,Linear)),
+                f!("Hold on", Enum{key:"peak_hold_dir",opts:&["up","both","down"]}),
             ],
             ("module.twoway_response_curve", "lane_toggle") => vec![
-                f!("Lane", Enum{key:"active_lane",opts:&["up","dn"]}),
+                f!("Lane", Enum{key:"active_lane",opts:&["up","dn","hy"]}),
             ],
             // Oscilloscope controls row: Win (log ms) / Scale / Auto / Bi-Uni.
             ("display.oscilloscope", "controls") => vec![

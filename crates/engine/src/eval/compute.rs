@@ -1166,10 +1166,12 @@ pub(crate) fn compute_twoway_response_curve_as(
 
     // Grow per-channel state vectors lazily.
     while state.twoway_lane.len()       < n_ch { state.twoway_lane.push(1); }
-    while state.twoway_dir_buf.len()    < n_ch { state.twoway_dir_buf.push(VecDeque::new()); }
+    while state.twoway_held.len()       < n_ch { state.twoway_held.push(f32::NAN); }
     while state.twoway_blend.len()      < n_ch { state.twoway_blend.push(1.0); }
-    while state.twoway_prev_input.len() < n_ch { state.twoway_prev_input.push(0.0); }
+    while state.twoway_last_out.len()   < n_ch { state.twoway_last_out.push(0.0); }
     while state.twoway_old_output.len() < n_ch { state.twoway_old_output.push(0.0); }
+    while state.twoway_peak_y.len()     < n_ch { state.twoway_peak_y.push(f32::NAN); }
+    while state.twoway_peak_age.len()   < n_ch { state.twoway_peak_age.push(0.0); }
 
     // Shared params (applied to both curves).
     let in_max  = params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
@@ -1195,16 +1197,11 @@ pub(crate) fn compute_twoway_response_curve_as(
         .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
         .unwrap_or_else(|| biases_up.clone());
 
-    // Hysteresis params.
-    let hyst_pct  = params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-    let hyst_ms   = params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
-    let interp_ms = params.get("interp_ms")     .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
-
-    let hyst_ticks = ((hyst_ms / 1000.0) / dt).ceil() as usize;
-    let hyst_ticks = hyst_ticks.max(1);
-
-    let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-    let threshold = hyst_pct / 100.0 * abs_max;
+    let hyst = TwowayHyst::from_params(params, abs || vec_mode);
+    let interp_ms = params.get("interp_ms").and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
+    let peak_hold = params.get("peak_hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as f32 / 1000.0;
+    // Which lane holds peaks: "up" (the press, default), "down" or "both".
+    let peak_dir = params.get("peak_hold_dir").and_then(|v| v.as_str()).unwrap_or("up");
 
     let interp_step = if interp_ms > 0.0 { dt / (interp_ms / 1000.0) } else { 1.0 };
 
@@ -1227,51 +1224,87 @@ pub(crate) fn compute_twoway_response_curve_as(
         // Use magnitude in abs/vec mode; signed value in bipolar mode.
         let hyst_input = if abs || vec_mode { raw_input.abs() } else { raw_input };
 
-        // Hysteresis: sliding-window peak/trough detector.
-        // twoway_dir_buf stores the last hyst_ticks samples of hyst_input.
-        // running_max = highest value in window → if current falls threshold below it → Down.
-        // running_min = lowest  value in window → if current rises threshold above it → Up.
-        // Works at any speed: a fast release immediately shows a large gap from the window max.
-        let win = &mut state.twoway_dir_buf[ch];
-        win.push_back(hyst_input);
-        while win.len() > hyst_ticks { win.pop_front(); }
-
-        let running_max = win.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let running_min = win.iter().copied().fold(f32::INFINITY,     f32::min);
-
-        // Use a minimum window of 1 tick so single-tick reversals are detected immediately.
-        let fell_from_peak = hyst_input < running_max - threshold;
-        let rose_from_trough = hyst_input > running_min + threshold;
-
-        let prev_lane = state.twoway_lane[ch];
-        if rose_from_trough && prev_lane != 1 {
-            state.twoway_old_output[ch] = apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t);
-            state.twoway_lane[ch]  =  1;
+        // Hysteresis + denoise in one: track the input, but read the curves at
+        // a held point that only follows the input in the lane's direction.
+        // The lane flips once the input has come back more than the lane's band
+        // from that point. Noise smaller than the band never moves the output,
+        // and movement in the lane's direction passes through with no lag.
+        let prev_held = state.twoway_held[ch];
+        let switched = if hyst.start_up && hyst.at_rest(hyst_input) {
+            // At rest with "Start on Up": already on the Up lane, nothing held,
+            // so a pull from rest follows the Up curve from its first sample.
+            let was_down = state.twoway_lane[ch] < 0;
+            state.twoway_lane[ch] = 1;
+            state.twoway_held[ch] = hyst_input;
+            was_down
+        } else {
+            // The bands where the input stands now — the Hyst graph can vary
+            // them along the travel.
+            let at = state.twoway_held[ch];
+            twoway_track(&mut state.twoway_held[ch], &mut state.twoway_lane[ch], hyst_input,
+                hyst.band_for(true, at), hyst.band_for(false, at))
+        };
+        if switched {
+            // Blend from what was actually emitted, so a switch never jumps to
+            // a value neither lane gave at the held point.
+            state.twoway_old_output[ch] = state.twoway_last_out[ch];
             state.twoway_blend[ch] = 0.0;
-            state.twoway_dir_buf[ch].clear();
-            state.twoway_dir_buf[ch].push_back(hyst_input);
-        } else if fell_from_peak && prev_lane != -1 {
-            state.twoway_old_output[ch] = apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t);
-            state.twoway_lane[ch]  = -1;
-            state.twoway_blend[ch] = 0.0;
-            state.twoway_dir_buf[ch].clear();
-            state.twoway_dir_buf[ch].push_back(hyst_input);
         }
+        let held = state.twoway_held[ch];
+        // Abs mode tracks the magnitude; the curve takes the input's sign back.
+        let curve_input = if abs && !vec_mode && raw_input < 0.0 { -held } else { held };
 
         // Advance blend.
         state.twoway_blend[ch] = (state.twoway_blend[ch] + interp_step).min(1.0);
         let blend = state.twoway_blend[ch];
 
-        // Evaluate active-lane curve at current input.
+        // Evaluate the active lane's curve at the held input.
         let new_output = if state.twoway_lane[ch] >= 0 {
-            apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t)
+            apply_curve(curve_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t)
         } else {
-            apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t)
+            apply_curve(curve_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t)
         };
 
-        // Blend from old-lane-output-at-switch-point toward new-lane-output-at-current-input.
-        // When both curves are identical, old_output == new_output so blend has no effect.
-        let output = blend * new_output + (1.0 - blend) * state.twoway_old_output[ch];
+        let mut output = blend * new_output + (1.0 - blend) * state.twoway_old_output[ch];
+
+        // Peak hold. The device reports far slower than this ticks, so a fast
+        // pull lands on either side of a narrow peak and never reads it — and
+        // one report on it is too short for a game to see. Take the highest
+        // the curve got over the stretch the held point just moved across, and
+        // keep it up for `peak_hold`. Only on the lane(s) `peak_dir` picks: a
+        // hold on the Down lane would also lag a release down a sloped curve.
+        // A flip drops whatever was held at once.
+        let lane_up = state.twoway_lane[ch] >= 0;
+        let hold_here = match peak_dir { "both" => true, "down" => !lane_up, _ => lane_up };
+        if peak_hold > 0.0 && hold_here {
+            let (lp, lb) = if lane_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+            let g = hyst.graph_x(held);
+            let cur_y = sample_curve(lp, g, lb);
+            // On a flip the sweep starts where the old lane was frozen: a press
+            // that had to clear the band still came up through every point
+            // from its low, and a flip only happens on a real reversal. Only
+            // movement the lane's way counts — "Start on Up" puts a release
+            // that reaches rest on the Up lane, moving down.
+            let with_lane = if lane_up { held > prev_held } else { held < prev_held };
+            let swept = if prev_held.is_nan() || !with_lane { cur_y }
+                else { curve_max_between(lp, lb, hyst.graph_x(prev_held), g) };
+            let (pk, age) = (&mut state.twoway_peak_y[ch], &mut state.twoway_peak_age[ch]);
+            if switched { *pk = f32::NAN; }
+            if swept > cur_y + 1e-6 && (pk.is_nan() || swept >= *pk) {
+                *pk = swept;
+                *age = 0.0;
+            } else if !pk.is_nan() {
+                *age += dt;
+                if *age >= peak_hold || *pk <= cur_y { *pk = f32::NAN; }
+            }
+            if !pk.is_nan() {
+                let sign = if abs && !vec_mode && raw_input < 0.0 { -1.0 } else { 1.0 };
+                output = curve_y_to_output(*pk, sign, abs, out_min, out_max, scale_t);
+            }
+        } else {
+            state.twoway_peak_y[ch] = f32::NAN;
+        }
+        state.twoway_last_out[ch] = output;
 
         let sig = if vec_mode {
             match inputs.get(ch).and_then(|s| *s) {
@@ -1290,6 +1323,140 @@ pub(crate) fn compute_twoway_response_curve_as(
     }
 
     results
+}
+
+/// Top of the two-way curve's Hyst graph: its Y runs 0..1 for a band of
+/// 0..`TWOWAY_HYST_MAX_PCT` % of the input range — the Hyst value box's range.
+pub const TWOWAY_HYST_MAX_PCT: f32 = 10.0;
+
+/// The two-way curve's hysteresis settings, in input units. Shared with the
+/// UI so the band it draws is the one the engine applies.
+#[derive(Clone, Debug)]
+pub struct TwowayHyst {
+    /// The Up → Down flip is guarded (the release must clear the band).
+    pub guard_down: bool,
+    /// The Down → Up flip is guarded (the press must clear the band).
+    pub guard_up: bool,
+    /// The band when the Hyst graph is a single dot (`hysteresis_pct`).
+    pub band: f32,
+    /// The Hyst graph when it has two dots or more: band over the input, on the
+    /// curves' own X axis (range + Log/Exp), Y 0..1 = 0..`TWOWAY_HYST_MAX_PCT` %.
+    pub points: Vec<[f32; 2]>,
+    pub biases: Vec<f32>,
+    /// "Start on Up": at rest the tracker sits on the Up lane, unheld.
+    pub start_up: bool,
+    /// Bottom of the tracked range — 0 for a magnitude, `in_min` when bipolar.
+    pub rest: f32,
+    /// How close to `rest` still counts as resting.
+    pub rest_eps: f32,
+    magnitude: bool,
+    in_min: f32,
+    in_max: f32,
+    abs_max: f32,
+    scale_t: f32,
+}
+
+impl TwowayHyst {
+    /// `hysteresis_pct` sets a flat band; `hyst_points` / `hyst_biases` with
+    /// two dots or more replace it with a band that varies over the input
+    /// (`hysteresis_ms` from the old windowed detector is no longer read).
+    /// `hyst_dir` ("both" / "up" / "down") picks which movement must clear it,
+    /// the other flipping at once; `hyst_start_up` is "Start on Up".
+    /// `magnitude` is the Abs / Vec mode the curve runs in.
+    pub fn from_params(params: &HashMap<String, Value>, magnitude: bool) -> Self {
+        let f = |k: &str, d: f64| params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        let (in_min, in_max) = (f("in_min", -1.0), f("in_max", 1.0));
+        let abs_max = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+        let dir = params.get("hyst_dir").and_then(|v| v.as_str()).unwrap_or("both");
+        let (rest, span) = if magnitude { (0.0, abs_max) } else { (in_min, (in_max - in_min).abs()) };
+        let points: Vec<[f32; 2]> = params.get("hyst_points").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|p| {
+                let a = p.as_array()?;
+                Some([a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+            }).collect())
+            .unwrap_or_default();
+        let biases: Vec<f32> = params.get("hyst_biases").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        TwowayHyst {
+            guard_down: dir != "up",
+            guard_up: dir != "down",
+            band: (f("hysteresis_pct", 0.5) / 100.0 * abs_max).max(0.0),
+            points: if points.len() >= 2 { points } else { Vec::new() },
+            biases,
+            start_up: params.get("hyst_start_up").and_then(|v| v.as_bool()).unwrap_or(false),
+            rest,
+            rest_eps: 0.002 * span.max(f32::EPSILON),
+            magnitude, in_min, in_max, abs_max,
+            scale_t: read_scale_t(params),
+        }
+    }
+    pub fn at_rest(&self, x: f32) -> bool { x <= self.rest + self.rest_eps }
+    /// An input value's X on the curves' graph (range, then Log/Exp) — where
+    /// the Hyst graph is read.
+    pub fn graph_x(&self, x: f32) -> f32 {
+        if self.magnitude {
+            curve_scale((x.abs() / self.abs_max).clamp(0.0, 1.0), self.scale_t)
+        } else {
+            let range = (self.in_max - self.in_min).abs().max(f32::EPSILON);
+            let norm = ((x - self.in_min) / range * 2.0 - 1.0).clamp(-1.0, 1.0);
+            norm.signum() * curve_scale(norm.abs(), self.scale_t)
+        }
+    }
+    /// The band at input `x`, before the direction setting.
+    pub fn band_at(&self, x: f32) -> f32 {
+        if self.points.is_empty() || x.is_nan() { return self.band; }
+        let y = sample_curve(&self.points, self.graph_x(x), &self.biases).clamp(0.0, 1.0);
+        y * TWOWAY_HYST_MAX_PCT / 100.0 * self.abs_max
+    }
+    /// The band guarding a flip away from the lane (`lane_up` = rising), with
+    /// the held point at `at`.
+    pub fn band_for(&self, lane_up: bool, at: f32) -> f32 {
+        if (lane_up && self.guard_down) || (!lane_up && self.guard_up) { self.band_at(at) } else { 0.0 }
+    }
+}
+
+/// One step of the two-way curve's direction tracker. `held` follows `x` while
+/// `x` moves in the `lane`'s direction (+1 rising, -1 falling) and stays put
+/// while `x` comes back by up to that lane's band (`to_down` on the rising lane,
+/// `to_up` on the falling one); past that the lane flips and `held` jumps to
+/// `x`. Returns whether the lane flipped. A NaN `held` (first sample) takes `x`
+/// without flipping.
+pub(crate) fn twoway_track(held: &mut f32, lane: &mut i8, x: f32, to_down: f32, to_up: f32) -> bool {
+    if held.is_nan() {
+        *held = x;
+        return false;
+    }
+    let rising = *lane >= 0;
+    let ahead = if rising { x >= *held } else { x <= *held };
+    if ahead {
+        *held = x;
+        return false;
+    }
+    let band = if rising { to_down } else { to_up };
+    if (x - *held).abs() > band {
+        *held = x;
+        *lane = if rising { -1 } else { 1 };
+        return true;
+    }
+    false
+}
+
+/// What a two-way curve node shows the UI per tick: its inputs, then one
+/// `Vec2(held, lane)` per channel from the tracker, so the body can draw the
+/// point the curves are actually read at and the band around it.
+pub(crate) fn twoway_live_inputs(inputs: &[Option<Signal>], state: Option<&NodeState>) -> Vec<Option<Signal>> {
+    let mut out = inputs.to_vec();
+    if let Some(st) = state {
+        for ch in 0..inputs.len() {
+            let track = match (st.twoway_held.get(ch), st.twoway_lane.get(ch)) {
+                (Some(&h), Some(&l)) if !h.is_nan() => Some(Signal::Vec2(glam::Vec2::new(h, l as f32))),
+                _ => None,
+            };
+            out.push(track);
+        }
+    }
+    out
 }
 
 pub(crate) fn compute_has_changed(

@@ -79,20 +79,43 @@ pub fn apply_curve(
         let abs_max  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
         let abs_norm = (x.abs() / abs_max).clamp(0.0, 1.0);
         let scaled   = curve_scale(abs_norm, scale_t);
-        let curve_y  = sample_curve(pts, scaled, biases).clamp(0.0, 1.0);
-        let out_y    = curve_scale_inv(curve_y, scale_t);
-        sign * out_y * out_max.abs().max(out_min.abs())
+        curve_y_to_output(sample_curve(pts, scaled, biases), sign, true, out_min, out_max, scale_t)
     } else {
         let in_range  = (in_max - in_min).abs().max(f32::EPSILON);
-        let out_range = out_max - out_min;
         let norm      = ((x - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
         let sign      = if norm < 0.0 { -1.0f32 } else { 1.0 };
         let scaled    = sign * curve_scale(norm.abs(), scale_t);
-        let curve_y   = sample_curve(pts, scaled, biases);
-        let sign_out  = if curve_y < 0.0 { -1.0f32 } else { 1.0 };
-        let out_y     = sign_out * curve_scale_inv(curve_y.abs(), scale_t);
-        out_min + (out_y.clamp(-1.0, 1.0) + 1.0) * 0.5 * out_range
+        curve_y_to_output(sample_curve(pts, scaled, biases), sign, false, out_min, out_max, scale_t)
     }
+}
+
+/// The second half of `apply_curve`: a height read off the curve graph, to
+/// the output range. `sign` is the input's (Abs mode gives it back).
+pub fn curve_y_to_output(curve_y: f32, sign: f32, absolute: bool, out_min: f32, out_max: f32, scale_t: f32) -> f32 {
+    if absolute {
+        let out_y = curve_scale_inv(curve_y.clamp(0.0, 1.0), scale_t);
+        sign * out_y * out_max.abs().max(out_min.abs())
+    } else {
+        let sign_out = if curve_y < 0.0 { -1.0f32 } else { 1.0 };
+        let out_y    = sign_out * curve_scale_inv(curve_y.abs(), scale_t);
+        out_min + (out_y.clamp(-1.0, 1.0) + 1.0) * 0.5 * (out_max - out_min)
+    }
+}
+
+/// The highest the curve gets between graph X `a` and `b` (either order):
+/// both ends, every dot between, and a few points along each segment for the
+/// bias bulges — so a peak narrower than the step between them isn't missed.
+pub fn curve_max_between(pts: &[[f32; 2]], biases: &[f32], a: f32, b: f32) -> f32 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    let mut best = sample_curve(pts, lo, biases).max(sample_curve(pts, hi, biases));
+    for w in pts.windows(2) {
+        let (s0, s1) = (w[0][0].max(lo), w[1][0].min(hi));
+        if s0 > s1 { continue; }
+        for k in 0..=8 {
+            best = best.max(sample_curve(pts, s0 + (s1 - s0) * k as f32 / 8.0, biases));
+        }
+    }
+    best
 }
 
 pub fn curve_scale(x: f32, t: f32) -> f32 {

@@ -146,11 +146,14 @@ impl FlexInputApp {
                 != Some("boundary");
             return if gain { ("gain_pts", Some("gain_biases")) } else { ("boundary_pts", None) };
         }
-        let lane_dn = node
+        let lane = node
             .filter(|node| crate::canvas::viewer::curve_ui_module_id(node) == "module.twoway_response_curve")
-            .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
-            == Some("dn");
-        if lane_dn { ("points_dn", Some("biases_dn")) } else { ("points", Some("biases")) }
+            .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()));
+        match lane {
+            Some("dn") => ("points_dn", Some("biases_dn")),
+            Some("hy") => ("hyst_points", Some("hyst_biases")),
+            _ => ("points", Some("biases")),
+        }
     }
 
     /// Read/parse the selected curve node's `points` (Vec<[f32;2]>), if the

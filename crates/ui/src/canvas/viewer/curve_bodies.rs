@@ -1,6 +1,7 @@
 //! Response Curve / Vec Response Curve / Two-way Response Curve bodies.
 
 use super::*;
+use flexinput_engine::eval::{TwowayHyst, TWOWAY_HYST_MAX_PCT};
 
 /// AutoMap Response Curve / AutoMap Two-way Curve: the plain curve's body, run
 /// on the signal picked in the header (see `curve_ui_module_id`).
@@ -1164,7 +1165,6 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
             node.params.insert("active_lane".into(), Value::String("up".into()));
             node.params.insert("vec_mode".into(),    Value::Bool(false));
             node.params.insert("hysteresis_pct".into(), serde_json::json!(0.5f64));
-            node.params.insert("hysteresis_ms".into(),  serde_json::json!(20.0f64));
             node.params.insert("interp_ms".into(),      serde_json::json!(50.0f64));
         }
     }
@@ -1203,23 +1203,22 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
     let vec_mode  = twoway_vec_mode(&node_data);
     let hyst_pct  = node_data.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-    let hyst_ms   = node_data.params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
     let interp_ms = node_data.params.get("interp_ms")     .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
     let show_scaled_grid = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
     let show_grid_labels = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let n_channels = curve_channels(&node_data);
     let legend = curve_channel_labels(&node_data);
-    let live_inputs: Vec<Option<f32>> = (0..n_channels)
-        .map(|ch| snarl.get_node(node_id).and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32))
-        .collect();
 
     let absolute_eff = absolute || vec_mode;
     let (x_lo, x_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
-    let (y_lo, y_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // The Hyst graph's Y is a band width, 0..TWOWAY_HYST_MAX_PCT, in any mode.
+    let hyst_lane = active_lane == "hy";
+    let (y_lo, y_hi): (f32, f32) = if absolute_eff || hyst_lane { (0.0, 1.0) } else { (-1.0, 1.0) };
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
     let lane_up  = active_lane == "up";
+    let lane_ix: u8 = if lane_up { 0 } else if hyst_lane { 2 } else { 1 };
 
     let mut new_pts_up    = pts_up.clone();
     let mut new_biases_up = biases_up.clone();
@@ -1229,6 +1228,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let mut bias_up_changed = false;
     let mut pts_dn_changed  = false;
     let mut bias_dn_changed = false;
+    let (pts_hy, biases_hy) = twoway_hyst_points(&node_data);
+    let mut new_pts_hy    = pts_hy.clone();
+    let mut new_biases_hy = biases_hy.clone();
+    let mut pts_hy_changed  = false;
+    let mut bias_hy_changed = false;
     let mut params_changed  = false;
     let mut undo_requested  = false;
 
@@ -1241,8 +1245,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let mut abs_on  = absolute;
     let mut vm      = vec_mode;
     let mut h_pct   = hyst_pct;
-    let mut h_ms    = hyst_ms;
+    let mut h_dir   = node_data.params.get("hyst_dir").and_then(|v| v.as_str()).unwrap_or("both").to_string();
+    let mut h_start = node_data.params.get("hyst_start_up").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut i_ms    = interp_ms;
+    let mut ph_ms   = node_data.params.get("peak_hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let mut ph_dir  = node_data.params.get("peak_hold_dir").and_then(|v| v.as_str()).unwrap_or("up").to_string();
     let mut tm      = trail_ms;
     let mut ssg     = show_scaled_grid;
     let mut sgl     = show_grid_labels;
@@ -1257,6 +1264,8 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
             let dn_sel = lane_sel == "dn";
             if ui.selectable_label(up_sel, egui::RichText::new("↑ Up").small()).on_hover_text("Edit the rising-input curve").clicked() && !up_sel { lane_sel = "up".into(); params_changed = true; }
             if ui.selectable_label(dn_sel, egui::RichText::new("↓ Down").small()).on_hover_text("Edit the falling-input curve").clicked() && !dn_sel { lane_sel = "dn".into(); params_changed = true; }
+            let hy_sel = lane_sel == "hy";
+            if ui.selectable_label(hy_sel, egui::RichText::new("Hyst").small()).on_hover_text(HYST_GRAPH_TAB_HINT).clicked() && !hy_sel { lane_sel = "hy".into(); params_changed = true; }
         });
         register_exposable_element(ui, node_id, "lane_toggle", lane_toggle_resp.response.rect);
 
@@ -1350,7 +1359,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let gs = egui::Stroke::new(0.5, grid_faint);
                 for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
                 for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis));
+                if !hyst_lane { painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis)); }
 
                 if sgl {
                     const MPX: f32 = 20.0;
@@ -1361,25 +1370,29 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     let mut lsx = f32::NEG_INFINITY;
                     for &x in &gxp { let sx2 = c2s(x, y_hi).x; if sx2-lsx < MPX { continue; } lsx = sx2; let val = gri((x-x_lo)/x_range); let lbl = if abs_max_in<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(sx2+1.0, rect.top()+1.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
                     let mut lsy = f32::INFINITY;
-                    for &y in &gyp { let sy2 = c2s(x_lo, y).y; if lsy-sy2 < MPX { continue; } lsy = sy2; let val = gro((y-y_lo)/y_range); let lbl = if abs_max_out<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(rect.left()+1.0, sy2-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
+                    for &y in &gyp { let sy2 = c2s(x_lo, y).y; if lsy-sy2 < MPX { continue; } lsy = sy2; let val = gro((y-y_lo)/y_range); let lbl = if hyst_lane{format!("{:.1}%",(y-y_lo)/y_range*TWOWAY_HYST_MAX_PCT)}else if abs_max_out<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(rect.left()+1.0, sy2-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
                 }
 
                 // Inactive lane (dimmed)
-                let (inact_pts, inact_bias) = if lane_up { (&pts_dn, &biases_dn) } else { (&pts_up, &biases_up) };
+                for (inact_pts, inact_bias) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
                 if inact_pts.len() >= 2 {
                     let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
                     let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
                     for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0, ic)); pp = np; }
                 }
+                }
 
                 // Active lane (solid gray, same as float body)
-                let edit_pts_r = if lane_up { &pts_up } else { &pts_dn };
-                let (new_edit_pts, new_edit_biases, pts_changed_ref, bias_changed_ref) = if lane_up {
+                let edit_pts_r = if hyst_lane { &pts_hy } else if lane_up { &pts_up } else { &pts_dn };
+                let (new_edit_pts, new_edit_biases, pts_changed_ref, bias_changed_ref) = if hyst_lane {
+                    (&mut new_pts_hy, &mut new_biases_hy, &mut pts_hy_changed, &mut bias_hy_changed)
+                } else if lane_up {
                     (&mut new_pts_up, &mut new_biases_up, &mut pts_up_changed, &mut bias_up_changed)
                 } else {
                     (&mut new_pts_dn, &mut new_biases_dn, &mut pts_dn_changed, &mut bias_dn_changed)
                 };
-                if new_edit_pts.len() >= 2 {
+                // A one-dot Hyst graph draws as its flat band.
+                if !new_edit_pts.is_empty() {
                     let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(new_edit_pts, x, new_edit_biases).clamp(y_lo, y_hi)) }).collect();
                     for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
                 }
@@ -1395,7 +1408,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         let mid_x = (new_edit_pts[seg][0] + new_edit_pts[seg+1][0]) * 0.5;
                         let mid_y = sample_curve(new_edit_pts, mid_x, new_edit_biases).clamp(y_lo, y_hi);
                         let hpos  = c2s(mid_x, mid_y);
-                        let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh", node_id, lane_up, seg as u32)), egui::Sense::click_and_drag());
+                        let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
                         if hresp.double_clicked() { new_edit_biases[seg] = 0.0; *bias_changed_ref = true; }
                         else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
                         let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
@@ -1409,9 +1422,9 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 for i in 0..edit_pts_r.len() {
                     let [px, py] = edit_pts_r[i];
                     let screen   = c2s(px, py);
-                    let pt_id    = ui.id().with(("twpt", node_id, lane_up, i as u32));
+                    let pt_id    = ui.id().with(("twpt", node_id, lane_ix, i as u32));
                     let pt_resp  = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
-                    let oid      = ui.id().with(("twpt_orig", node_id, lane_up, i as u32));
+                    let oid      = ui.id().with(("twpt_orig", node_id, lane_ix, i as u32));
                     if pt_resp.drag_started() && !alt_held { ui.ctx().data_mut(|d| d.insert_temp(oid, [px, py, 0.0f32, 0.0f32])); }
                     if pt_resp.dragged() && !alt_held {
                         let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(oid)).unwrap_or([px, py, 0.0, 0.0]);
@@ -1427,7 +1440,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         *pts_changed_ref = true;
                     }
                     if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
-                    if pt_resp.secondary_clicked() && edit_pts_r.len() > 2 { remove_idx = Some(i); *pts_changed_ref = true; }
+                    if pt_resp.secondary_clicked() && edit_pts_r.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); *pts_changed_ref = true; }
                     // Gamepad-nav selected-dot highlight (active lane only).
                     if nav_sel_dot == Some(i) {
                         let accent = ui.visuals().selection.stroke.color;
@@ -1462,96 +1475,12 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     }
                 }
 
-                // Live arrow marker — X from input, Y from actual engine output (last_signals)
-                let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-                let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
-                let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
-                let now       = std::time::Instant::now();
-                let mut has_active = false;
-                for (ch, raw_opt) in live_inputs.iter().enumerate() {
-                    let Some(raw) = raw_opt else { continue; };
-                    has_active = true;
-                    // X position: scaled input
-                    let graph_x = if absolute_eff {
-                        curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), sc_t)
-                    } else {
-                        let inr = (in_max-in_min).abs().max(f32::EPSILON);
-                        let norm = ((raw-in_min)/inr*2.0-1.0).clamp(-1.0, 1.0);
-                        let sign = if norm < 0.0 { -1.0f32 } else { 1.0 };
-                        sign * curve_scale(norm.abs(), sc_t)
-                    };
-                    // Determine active lane from last_out vs curve to detect which lane engine is on.
-                    // Trail stores x positions; between samples we resample the curve (like regular module).
-                    // Active lane: use last_out to pick up/dn curve for the dot position.
-                    let actual_out = snarl.get_node(node_id)
-                        .and_then(|n| n.extra.last_out.get(ch)?.as_ref()).map(sig_f32);
-                    // Pick whichever lane's curve output is closer to actual engine output.
-                    let (apts, abias) = if let Some(out_val) = actual_out {
-                        let y_up = sample_curve(&pts_up, graph_x, &biases_up).clamp(y_lo, y_hi);
-                        let y_dn = sample_curve(&pts_dn, graph_x, &biases_dn).clamp(y_lo, y_hi);
-                        let up_out = if absolute_eff { y_up * abs_max_out } else { out_min + (y_up + 1.0) * 0.5 * (out_max - out_min) };
-                        let dn_out = if absolute_eff { y_dn * abs_max_out } else { out_min + (y_dn + 1.0) * 0.5 * (out_max - out_min) };
-                        if (out_val - up_out).abs() <= (out_val - dn_out).abs() { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) }
-                    } else {
-                        (&pts_up, &biases_up)
-                    };
-                    let graph_y = sample_curve(apts, graph_x, abias).clamp(y_lo, y_hi);
-
-                    let lane_id: u8 = if std::ptr::eq(apts as *const _, &pts_up as *const _) { 0 } else { 1 };
-                    type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
-                    let tid  = ui.id().with(("twtrail",      node_id, ch as u32));
-                    let tlid = ui.id().with(("twtrail_lane", node_id, ch as u32));
-                    let prev_lane_id = ui.data(|d| d.get_temp::<u8>(tlid)).unwrap_or(lane_id);
-                    let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).clone().unwrap_or_default());
-                    if prev_lane_id != lane_id { tbuf.clear(); }
-                    if trail_ms > 0 {
-                        tbuf.push_back((graph_x, now));
-                        while tbuf.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) { tbuf.pop_front(); }
-                    } else { tbuf.clear(); }
-                    let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
-                    ui.data_mut(|d| { d.insert_temp(tid, tbuf); d.insert_temp(tlid, lane_id); });
-                    let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
-
-                    // Trail resamples the curve between x positions (follows curve shape through Log/Exp)
-                    for w in tlist.windows(2) {
-                        let (x0, _) = w[0]; let (x1, t1) = w[1];
-                        let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
-                        let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 220.0) as u8;
-                        let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
-                        let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
-                        let mut pp = c2s(x0, sample_curve(apts, x0, abias).clamp(y_lo, y_hi));
-                        for s in 1..=steps {
-                            let t = s as f32 / steps as f32;
-                            let ix = x0 + (x1 - x0) * t;
-                            let np = c2s(ix, sample_curve(apts, ix, abias).clamp(y_lo, y_hi));
-                            painter.line_segment([pp, np], egui::Stroke::new(1.5, tc));
-                            pp = np;
-                        }
-                    }
-
-                    // Arrow tangent-aligned to curve at current position
-                    let dir_up = if tlist.len() >= 2 {
-                        tlist.last().map(|(x,_)| *x).unwrap_or(graph_x) >= tlist.first().map(|(x,_)| *x).unwrap_or(graph_x)
-                    } else { true };
-                    let head = c2s(graph_x, graph_y);
-                    let eps = x_range * 0.015;
-                    let (x_a, x_b) = if dir_up {
-                        ((graph_x - eps).clamp(x_lo, x_hi), (graph_x + eps).clamp(x_lo, x_hi))
-                    } else {
-                        ((graph_x + eps).clamp(x_lo, x_hi), (graph_x - eps).clamp(x_lo, x_hi))
-                    };
-                    let p_a = c2s(x_a, sample_curve(apts, x_a, abias).clamp(y_lo, y_hi));
-                    let p_b = c2s(x_b, sample_curve(apts, x_b, abias).clamp(y_lo, y_hi));
-                    let tangent = p_b - p_a;
-                    let tang_len = tangent.length().max(0.001);
-                    let fwd  = tangent / tang_len;
-                    let perp = egui::vec2(-fwd.y, fwd.x);
-                    let r = 6.0f32;
-                    let tip = head + fwd * r;
-                    let l   = head - fwd * (r * 0.5) + perp * (r * 0.7);
-                    let rp  = head - fwd * (r * 0.5) - perp * (r * 0.7);
-                    painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
-                }
+                // Live layer: band, raw tick, and the held point on the engine's lane.
+                let geom = TwowayGeom::from_params(rect, &node_data);
+                let has_active = paint_twoway_live(ui, &painter, &geom, node_id, &node_data,
+                    (&pts_up, &biases_up), (&pts_dn, &biases_dn),
+                    hyst_lane.then_some((pts_hy.as_slice(), biases_hy.as_slice())), "twtrail",
+                    |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
                 if has_active { request_repaint_throttled(ui.ctx()); }
                 if let Some(labels) = legend {
                     paint_curve_legend(&painter, rect, labels, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
@@ -1563,7 +1492,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 // curve into a two-way only replaces the active lane, so a
                 // user editing the Down lane can paste/load a single-lane
                 // curve into it without touching the Up lane.
-                let lane_name = if lane_up { "Up" } else { "Down" };
+                let lane_name = if hyst_lane { "Hyst" } else if lane_up { "Up" } else { "Down" };
                 let mut menu_mutated = false;
                 bg_resp.context_menu(|ui| {
                     // Graph-only: only points/biases for the active lane are
@@ -1584,7 +1513,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         let new_bss: Vec<f32> = node.params.get(bk).and_then(|v| v.as_array())
                             .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
                             .unwrap_or_default();
-                        if lane_up {
+                        if hyst_lane {
+                            (new_pts_hy, new_biases_hy) = twoway_hyst_points(node);
+                            pts_hy_changed  = false;
+                            bias_hy_changed = false;
+                        } else if lane_up {
                             new_pts_up    = new_pts;
                             new_biases_up = new_bss;
                             pts_up_changed  = false;
@@ -1612,6 +1545,15 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let bj: Vec<Value> = new_biases_dn.iter().filter_map(|&b| Number::from_f64(b as f64).map(Value::Number)).collect(); node.params.insert("biases_dn".into(), Value::Array(bj));
             }
         }
+
+        if pts_hy_changed || bias_hy_changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                twoway_write_hyst_points(node, &new_pts_hy, &new_biases_hy);
+            }
+            // A single dot IS the Hyst value.
+            if new_pts_hy.len() == 1 { h_pct = new_pts_hy[0][1] * TWOWAY_HYST_MAX_PCT; }
+        }
+        let hyst_single = new_pts_hy.len() < 2;
 
         // Controls — each row wrapped so it can be registered as a pinnable element
         let mut changed = false;
@@ -1677,15 +1619,19 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
 
         let hyst_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
-            let (hpb,hmb)=(h_pct,h_ms);
-            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
-            ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
-            if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
+            let hpb=h_pct;
+            ui.add_enabled(hyst_single, egui::DragValue::new(&mut h_pct).speed(0.01).range(0.0f32..=TWOWAY_HYST_MAX_PCT).suffix("%"))
+                .on_hover_text(HYST_HINT).on_disabled_hover_text(HYST_GRAPH_HINT);
+            if (h_pct-hpb).abs()>1e-5{changed=true;}
+            if twoway_hyst_extras(ui, &mut h_dir, &mut h_start, true).0 { changed = true; }
         });
         register_exposable_element(ui, node_id, "hyst_row", hyst_resp.response.rect);
 
         let interp_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Peak hold").small().weak()).on_hover_text(PEAK_HOLD_HINT);
+            let phb=ph_ms; ui.add(egui::DragValue::new(&mut ph_ms).speed(0.5).range(0.0f32..=200.0f32).suffix("ms")).on_hover_text(PEAK_HOLD_HINT); if (ph_ms-phb).abs()>1e-5{changed=true;}
+            if twoway_dir_picker(ui, &mut ph_dir, PEAK_DIR_HINTS, true).0 { changed = true; }
         });
         register_exposable_element(ui, node_id, "interp_row", interp_resp.response.rect);
 
@@ -1695,8 +1641,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 if let Some(n)=Number::from_f64(o1 as f64){node.params.insert("out_max".into(),Value::Number(n));}
                 if let Some(n)=Number::from_f64(sc_t as f64){node.params.insert("scale_t".into(),Value::Number(n));}
                 if let Some(n)=Number::from_f64(h_pct as f64){node.params.insert("hysteresis_pct".into(),Value::Number(n));}
-                if let Some(n)=Number::from_f64(h_ms as f64){node.params.insert("hysteresis_ms".into(),Value::Number(n));}
+                node.params.insert("hyst_dir".into(),Value::String(h_dir.clone()));
+                node.params.insert("hyst_start_up".into(),Value::Bool(h_start));
                 if let Some(n)=Number::from_f64(i_ms as f64){node.params.insert("interp_ms".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(ph_ms as f64){node.params.insert("peak_hold_ms".into(),Value::Number(n));}
+                node.params.insert("peak_hold_dir".into(),Value::String(ph_dir.clone()));
                 node.params.insert("grid_x".into(),serde_json::json!(gx_f as i64));
                 node.params.insert("grid_y".into(),serde_json::json!(gy_f as i64));
                 node.params.insert("snap".into(),Value::Bool(snap_on));
@@ -1731,7 +1680,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
         register_exposable_element(ui, node_id, "curve", rect);
     }
 
-    undo_requested || pts_up_changed || pts_dn_changed
+    undo_requested || pts_up_changed || pts_dn_changed || pts_hy_changed
 }
 
 pub(crate) fn render_twoway_lane_toggle(
@@ -1752,6 +1701,8 @@ pub(crate) fn render_twoway_lane_toggle(
         let dn = lane == "dn";
         if ui.selectable_label(up, egui::RichText::new("↑ Up")).clicked() && !up { lane = "up".into(); changed = true; }
         if ui.selectable_label(dn, egui::RichText::new("↓ Down")).clicked() && !dn { lane = "dn".into(); changed = true; }
+        let hy = lane == "hy";
+        if ui.selectable_label(hy, egui::RichText::new("Hyst")).on_hover_text(HYST_GRAPH_TAB_HINT).clicked() && !hy { lane = "hy".into(); changed = true; }
     });
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
@@ -1778,7 +1729,7 @@ pub(crate) fn render_twoway_curve_only(
     // "lane_toggle" pinned row if also pinned).
     let lane_name = snarl.get_node(inner_id)
         .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()))
-        .map(|s| if s == "dn" { "Down" } else { "Up" })
+        .map(|s| match s { "dn" => "Down", "hy" => "Hyst", _ => "Up" })
         .unwrap_or("Up");
     bg_for_menu.context_menu(|ui| {
         curve_context_menu(ui, inner_id, snarl, Some(lane_name));
@@ -1826,7 +1777,6 @@ pub(crate) fn paint_twoway_curve_graph(
     let grid_x     = node_data.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
     let grid_y     = node_data.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
     let snap       = node_data.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
-    let trail_ms   = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
     // TODO: scaled-grid overlay (`show_scaled_grid`) is not implemented for
     // this up/dn-lane renderer yet — the toggle exists and other curve
@@ -1836,16 +1786,15 @@ pub(crate) fn paint_twoway_curve_graph(
 
     let absolute_eff = absolute || vec_mode;
     let (x_lo, x_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
-    let (y_lo, y_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // The Hyst graph's Y is a band width, 0..TWOWAY_HYST_MAX_PCT, in any mode.
+    let hyst_lane = active_lane == "hy";
+    let (y_lo, y_hi): (f32, f32) = if absolute_eff || hyst_lane { (0.0, 1.0) } else { (-1.0, 1.0) };
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
     let lane_up = active_lane == "up";
+    let lane_ix: u8 = if lane_up { 0 } else if hyst_lane { 2 } else { 1 };
 
-    let n_channels = curve_channels(&node_data);
     let legend = curve_channel_labels(&node_data);
-    let live_inputs: Vec<Option<f32>> = (0..n_channels)
-        .map(|ch| snarl.get_node(node_id).and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32))
-        .collect();
 
     let c2s = |x: f32, y: f32| egui::pos2(
         rect.left() + (x - x_lo) / x_range * rect.width(),
@@ -1894,7 +1843,7 @@ pub(crate) fn paint_twoway_curve_graph(
     let gs = egui::Stroke::new(0.5, grid_faint);
     for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-    painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis));
+    if !hyst_lane { painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis)); }
 
     if sgl {
         let lc = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
@@ -1914,27 +1863,31 @@ pub(crate) fn paint_twoway_curve_graph(
             if lsy - sy < 20.0 { continue; } lsy = sy;
             let v = (y - y_lo) / y_range;
             let val = if absolute_eff { curve_scale_inv(v, scale_t) * abs_max_out } else { let c = v*2.0-1.0; (if c<0.0{-1.0f32}else{1.0})*curve_scale_inv(c.abs(),scale_t)*abs_max_out };
-            let lbl = if abs_max_out <= 1.01 { format!("{:.0}%", val*100.0) } else { format!("{:.2}", val) };
+            let lbl = if hyst_lane { format!("{:.1}%", v * TWOWAY_HYST_MAX_PCT) } else if abs_max_out <= 1.01 { format!("{:.0}%", val*100.0) } else { format!("{:.2}", val) };
             painter.text(egui::pos2(rect.left()+1.0, sy-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc);
         }
     }
 
     // Inactive lane (dimmed)
-    let (inact_pts, inact_bias) = if lane_up { (&pts_dn, &biases_dn) } else { (&pts_up, &biases_up) };
+    for (inact_pts, inact_bias) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
     if inact_pts.len() >= 2 {
         let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
         let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
         for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0, ic)); pp = np; }
     }
+    }
 
     // Active lane — mutable for editing
-    let (edit_pts, edit_biases) = if lane_up { (pts_up.clone(), biases_up.clone()) } else { (pts_dn.clone(), biases_dn.clone()) };
+    let (pts_hy, biases_hy) = twoway_hyst_points(&node_data);
+    let (edit_pts, edit_biases) = if hyst_lane { (pts_hy.clone(), biases_hy.clone()) }
+        else if lane_up { (pts_up.clone(), biases_up.clone()) } else { (pts_dn.clone(), biases_dn.clone()) };
     let mut new_edit_pts = edit_pts.clone();
     let mut new_edit_biases = edit_biases.clone();
     let mut pts_changed = false;
     let mut bias_changed = false;
 
-    if new_edit_pts.len() >= 2 {
+    // A one-dot Hyst graph draws as its flat band.
+    if !new_edit_pts.is_empty() {
         let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(&new_edit_pts, x, &new_edit_biases).clamp(y_lo, y_hi)) }).collect();
         for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
     }
@@ -1947,7 +1900,7 @@ pub(crate) fn paint_twoway_curve_graph(
             let mid_x = (new_edit_pts[seg][0]+new_edit_pts[seg+1][0])*0.5;
             let mid_y = sample_curve(&new_edit_pts, mid_x, &new_edit_biases).clamp(y_lo, y_hi);
             let hpos = c2s(mid_x, mid_y);
-            let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh_pin", node_id, lane_up, seg as u32)), egui::Sense::click_and_drag());
+            let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh_pin", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
             if hresp.double_clicked() { new_edit_biases[seg] = 0.0; bias_changed = true; }
             else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); bias_changed = true; }
             let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
@@ -1961,9 +1914,9 @@ pub(crate) fn paint_twoway_curve_graph(
     for i in 0..edit_pts.len() {
         let [px, py] = edit_pts[i];
         let screen = c2s(px, py);
-        let pt_id  = ui.id().with(("twpt_pin", node_id, lane_up, i as u32));
+        let pt_id  = ui.id().with(("twpt_pin", node_id, lane_ix, i as u32));
         let pt_resp = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
-        let oid = ui.id().with(("twpt_orig_pin", node_id, lane_up, i as u32));
+        let oid = ui.id().with(("twpt_orig_pin", node_id, lane_ix, i as u32));
         if pt_resp.drag_started() && !alt_held { ui.ctx().data_mut(|d| d.insert_temp(oid, [px, py, 0.0f32, 0.0f32])); }
         if pt_resp.dragged() && !alt_held {
             let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(oid)).unwrap_or([px, py, 0.0, 0.0]);
@@ -1979,7 +1932,7 @@ pub(crate) fn paint_twoway_curve_graph(
             pts_changed = true;
         }
         if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
-        if pt_resp.secondary_clicked() && edit_pts.len() > 2 { remove_idx = Some(i); pts_changed = true; }
+        if pt_resp.secondary_clicked() && edit_pts.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); pts_changed = true; }
         // Gamepad-nav selected-dot highlight (active lane).
         if nav_sel_dot == Some(i) {
             let accent = ui.visuals().selection.stroke.color;
@@ -2016,7 +1969,11 @@ pub(crate) fn paint_twoway_curve_graph(
     }
 
     // Write back
-    if pts_changed || bias_changed {
+    if (pts_changed || bias_changed) && hyst_lane {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            twoway_write_hyst_points(node, &new_edit_pts, &new_edit_biases);
+        }
+    } else if pts_changed || bias_changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
             let pts_key   = if lane_up { "points" }    else { "points_dn" };
             let bias_key  = if lane_up { "biases" }    else { "biases_dn" };
@@ -2030,86 +1987,12 @@ pub(crate) fn paint_twoway_curve_graph(
         }
     }
 
-    // Live arrow marker — follows curve path like regular response curve module
-    let abs_max     = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-    let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
-    let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
-    let now       = std::time::Instant::now();
-    let mut has_active = false;
-    for (ch, raw_opt) in live_inputs.iter().enumerate() {
-        let Some(raw) = raw_opt else { continue; };
-        has_active = true;
-        let graph_x = if absolute_eff {
-            curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t)
-        } else {
-            let inr = (in_max - in_min).abs().max(f32::EPSILON);
-            let norm = ((raw - in_min) / inr * 2.0 - 1.0).clamp(-1.0, 1.0);
-            let sign = if norm < 0.0 { -1.0f32 } else { 1.0 };
-            sign * curve_scale(norm.abs(), scale_t)
-        };
-        // Pick active lane by comparing last_out to each lane's curve output
-        let actual_out = snarl.get_node(node_id)
-            .and_then(|n| n.extra.last_out.get(ch)?.as_ref()).map(sig_f32);
-        let (apts, abias) = if let Some(out_val) = actual_out {
-            let y_up = sample_curve(&pts_up, graph_x, &biases_up).clamp(y_lo, y_hi);
-            let y_dn = sample_curve(&pts_dn, graph_x, &biases_dn).clamp(y_lo, y_hi);
-            let up_out = if absolute_eff { y_up * abs_max_out } else { out_min + (y_up + 1.0) * 0.5 * (out_max - out_min) };
-            let dn_out = if absolute_eff { y_dn * abs_max_out } else { out_min + (y_dn + 1.0) * 0.5 * (out_max - out_min) };
-            if (out_val - up_out).abs() <= (out_val - dn_out).abs() { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) }
-        } else { (&pts_up, &biases_up) };
-        let graph_y = sample_curve(apts, graph_x, abias).clamp(y_lo, y_hi);
-
-        let lane_id: u8 = if std::ptr::eq(apts as *const _, &pts_up as *const _) { 0 } else { 1 };
-        type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
-        let tid  = ui.id().with(("twtrail_pin",      node_id, ch as u32));
-        let tlid = ui.id().with(("twtrail_pin_lane", node_id, ch as u32));
-        let prev_lane_id = ui.data(|d| d.get_temp::<u8>(tlid)).unwrap_or(lane_id);
-        let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).clone().unwrap_or_default());
-        if prev_lane_id != lane_id { tbuf.clear(); }
-        if trail_ms > 0 {
-            tbuf.push_back((graph_x, now));
-            while tbuf.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) { tbuf.pop_front(); }
-        } else { tbuf.clear(); }
-        let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
-        ui.data_mut(|d| { d.insert_temp(tid, tbuf); d.insert_temp(tlid, lane_id); });
-        let ch_col = graph_channel_color(graph_ov, ch);
-
-        // Trail resamples curve between x positions to follow curve shape
-        for w in tlist.windows(2) {
-            let (x0, _) = w[0]; let (x1, t1) = w[1];
-            let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
-            let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 220.0) as u8;
-            let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
-            let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
-            let mut pp = c2s(x0, sample_curve(apts, x0, abias).clamp(y_lo, y_hi));
-            for s in 1..=steps {
-                let t = s as f32 / steps as f32;
-                let ix = x0 + (x1 - x0) * t;
-                let np = c2s(ix, sample_curve(apts, ix, abias).clamp(y_lo, y_hi));
-                painter.line_segment([pp, np], egui::Stroke::new(1.5, tc));
-                pp = np;
-            }
-        }
-
-        // Arrow tangent-aligned to curve
-        let dir_up = if tlist.len() >= 2 {
-            tlist.last().map(|(x,_)| *x).unwrap_or(graph_x) >= tlist.first().map(|(x,_)| *x).unwrap_or(graph_x)
-        } else { true };
-        let head = c2s(graph_x, graph_y);
-        let eps = x_range * 0.015;
-        let (x_a, x_b) = if dir_up {
-            ((graph_x - eps).clamp(x_lo, x_hi), (graph_x + eps).clamp(x_lo, x_hi))
-        } else {
-            ((graph_x + eps).clamp(x_lo, x_hi), (graph_x - eps).clamp(x_lo, x_hi))
-        };
-        let p_a = c2s(x_a, sample_curve(apts, x_a, abias).clamp(y_lo, y_hi));
-        let p_b = c2s(x_b, sample_curve(apts, x_b, abias).clamp(y_lo, y_hi));
-        let tang = p_b - p_a; let tl = tang.length().max(0.001);
-        let fwd = tang / tl; let perp = egui::vec2(-fwd.y, fwd.x);
-        let r = 6.0f32;
-        let (tip, l, rp) = (head + fwd*r, head - fwd*(r*0.5) + perp*(r*0.7), head - fwd*(r*0.5) - perp*(r*0.7));
-        painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
-    }
+    // Live layer: band, raw tick, and the held point on the engine's lane.
+    let geom = TwowayGeom::from_params(rect, &node_data);
+    let has_active = paint_twoway_live(ui, &painter, &geom, node_id, &node_data,
+        (&pts_up, &biases_up), (&pts_dn, &biases_dn),
+        hyst_lane.then_some((pts_hy.as_slice(), biases_hy.as_slice())), "twtrail_pin",
+        |ch| graph_channel_color(graph_ov, ch));
     if has_active { request_repaint_throttled(ui.ctx()); }
     if let Some(labels) = legend {
         paint_curve_legend(&painter, rect, labels, |ch| graph_channel_color(graph_ov, ch));
@@ -2121,33 +2004,331 @@ pub(crate) fn paint_twoway_curve_graph(
     }
 }
 
+/// Hover text for the two-way curve's hysteresis band.
+const HYST_HINT: &str = "Band the input must come back by before the lane flips (shaded on the graph).\n\
+    Input noise smaller than this never moves the output, with no lag in the\n\
+    direction of travel. Set it just above the input's peak-to-peak jitter —\n\
+    watch the tick under the graph stay inside the shaded band.";
+
+/// The Hyst row's direction picker and "Start ↑" toggle, shared by the body and
+/// the pinned row. Returns whether either changed, and their two rects (for
+/// gamepad nav, in that order).
+fn twoway_hyst_extras(ui: &mut egui::Ui, dir: &mut String, start_up: &mut bool, small: bool) -> (bool, [egui::Rect; 2]) {
+    let txt = |s: &str| if small { egui::RichText::new(s).small() } else { egui::RichText::new(s) };
+    let (mut changed, group) = twoway_dir_picker(ui, dir, HYST_DIR_HINTS, small);
+    let r = ui.checkbox(start_up, txt("Start ↑")).on_hover_text(
+        "Start on Up: at rest the input sits on the Up curve, so a pull from rest\n\
+         follows it from the first sample with no band to clear. The band still\n\
+         applies once the input has moved off rest.");
+    changed |= r.changed();
+    (changed, [group, r.rect])
+}
+
+/// Hover texts for the Hyst row's ↕ ↑ ↓.
+const HYST_DIR_HINTS: [&str; 3] = [
+    "The band guards both flips: a press and a release each have to clear it",
+    "The band guards only the press (Down → Up). A release flips to Down at once",
+    "The band guards only the release (Up → Down). A press flips to Up at once",
+];
+/// Hover texts for Peak hold's ↕ ↑ ↓.
+const PEAK_DIR_HINTS: [&str; 3] = [
+    "Hold peaks on the press and the release",
+    "Hold peaks on the press (Up curve) only — a release follows its curve at once",
+    "Hold peaks on the release (Down curve) only",
+];
+
+/// A ↕ ↑ ↓ picker for a "both" / "up" / "down" param, with a hover text per
+/// choice. Returns whether it changed, and its rect (for gamepad nav).
+fn twoway_dir_picker(ui: &mut egui::Ui, dir: &mut String, hints: [&str; 3], small: bool) -> (bool, egui::Rect) {
+    let mut changed = false;
+    let rect = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for ((val, glyph), hint) in [("both", "↕"), ("up", "↑"), ("down", "↓")].into_iter().zip(hints) {
+            let t = if small { egui::RichText::new(glyph).small() } else { egui::RichText::new(glyph) };
+            if ui.selectable_label(dir == val, t).on_hover_text(hint).clicked() && dir != val {
+                *dir = val.to_string();
+                changed = true;
+            }
+        }
+    }).response.rect;
+    (changed, rect)
+}
+
+/// Hover text for Peak hold.
+const PEAK_HOLD_HINT: &str = "Keep a curve peak up for at least this long (0 = off).\n\
+    A pad reports every few ms, so a fast pull can step right over a narrow\n\
+    peak, and one report on it is too short for a game to catch. With this on,\n\
+    the highest the curve got across each step is put out and held. A flip\n\
+    between curves drops it at once. ↕ ↑ ↓ picks the curve(s) it holds on.";
+
+/// Hover text for the Hyst tab.
+const HYST_GRAPH_TAB_HINT: &str = "Edit how wide the hysteresis band is along the input.\n\
+    One dot is a flat band set by the Hyst value; add dots to vary it, e.g. no\n\
+    band near rest and a wide one across a noisy resistance shelf.";
+/// Hover text for the Hyst value while the Hyst graph has several dots.
+const HYST_GRAPH_HINT: &str = "Set by the Hyst graph. Remove its dots down to one to edit it here.";
+
+/// The Hyst graph's dots as the editor shows them: the stored graph at two
+/// dots or more, else one dot at the Hyst value's height (Y 0..1 = 0..
+/// `TWOWAY_HYST_MAX_PCT` %), at the X it was last left at.
+pub(crate) fn twoway_hyst_points(n: &NodeData) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let pts: Vec<[f32; 2]> = n.params.get("hyst_points").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+        }).collect())
+        .unwrap_or_default();
+    if pts.len() >= 2 {
+        let biases = n.params.get("hyst_biases").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        return (pts, biases);
+    }
+    let pct = n.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+    let x = pts.first().map_or(0.0, |p| p[0]);
+    (vec![[x, (pct / TWOWAY_HYST_MAX_PCT).clamp(0.0, 1.0)]], Vec::new())
+}
+
+/// Store an edited Hyst graph. A single dot is written as the Hyst value (its
+/// height), so the value box and the dot stay one setting.
+pub(crate) fn twoway_write_hyst_points(n: &mut NodeData, pts: &[[f32; 2]], biases: &[f32]) {
+    let num = |f: f32| Number::from_f64(f as f64).map_or(Value::Null, Value::Number);
+    if let [[x, y]] = pts {
+        n.params.insert("hysteresis_pct".into(), num(y.clamp(0.0, 1.0) * TWOWAY_HYST_MAX_PCT));
+        n.params.insert("hyst_points".into(), serde_json::json!([[x, y]]));
+        n.params.insert("hyst_biases".into(), serde_json::json!([]));
+    } else {
+        let mut b = biases.to_vec();
+        b.resize(pts.len().saturating_sub(1), 0.0);
+        n.params.insert("hyst_points".into(), Value::Array(pts.iter().map(|p| serde_json::json!([p[0], p[1]])).collect()));
+        n.params.insert("hyst_biases".into(), Value::Array(b.into_iter().map(num).collect()));
+    }
+}
+
+/// The curves drawn dimmed behind the one being edited: the other lane, or
+/// both behind the Hyst graph (to place the band against their features —
+/// only in Abs / Vec, where they share its 0..1 Y).
+fn twoway_dim_curves<'a>(
+    lane_up: bool, hyst_lane: bool, absolute_eff: bool,
+    up: (&'a [[f32; 2]], &'a [f32]), dn: (&'a [[f32; 2]], &'a [f32]),
+) -> Vec<(&'a [[f32; 2]], &'a [f32])> {
+    if hyst_lane { if absolute_eff { vec![up, dn] } else { Vec::new() } }
+    else if lane_up { vec![dn] } else { vec![up] }
+}
+
+/// Where a two-way curve graph sits, for the live overlay.
+pub(crate) struct TwowayGeom {
+    pub rect: egui::Rect,
+    pub x_lo: f32, pub x_hi: f32, pub y_lo: f32, pub y_hi: f32,
+    pub absolute_eff: bool,
+    pub in_min: f32, pub in_max: f32,
+    pub scale_t: f32,
+    /// Hysteresis as the engine applies it, in input units.
+    pub hyst: TwowayHyst,
+}
+
+impl TwowayGeom {
+    fn from_params(rect: egui::Rect, n: &NodeData) -> Self {
+        let f = |k: &str, d: f64| n.params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        let absolute_eff = n.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true) || twoway_vec_mode(n);
+        let (in_min, in_max) = (f("in_min", -1.0), f("in_max", 1.0));
+        let lo = if absolute_eff { 0.0 } else { -1.0 };
+        // The Hyst graph's Y is a band width: 0..1 in any mode.
+        let y_lo = if n.params.get("active_lane").and_then(|v| v.as_str()) == Some("hy") { 0.0 } else { lo };
+        TwowayGeom {
+            rect, x_lo: lo, x_hi: 1.0, y_lo, y_hi: 1.0, absolute_eff, in_min, in_max,
+            scale_t: f("scale_t", 0.0),
+            hyst: TwowayHyst::from_params(&n.params, absolute_eff),
+        }
+    }
+    /// Top of the tracked input range (a magnitude's top in Abs / Vec mode).
+    fn in_hi(&self) -> f32 {
+        if self.absolute_eff { self.in_max.abs().max(self.in_min.abs()) } else { self.in_max }
+    }
+    fn c2s(&self, x: f32, y: f32) -> egui::Pos2 {
+        egui::pos2(
+            self.rect.left() + (x - self.x_lo) / (self.x_hi - self.x_lo) * self.rect.width(),
+            self.rect.bottom() - (y - self.y_lo) / (self.y_hi - self.y_lo) * self.rect.height(),
+        )
+    }
+    /// An input value's graph X, through the range and the Log/Exp scale.
+    fn gx(&self, v: f32) -> f32 {
+        if self.absolute_eff {
+            let abs_max = self.in_max.abs().max(self.in_min.abs()).max(f32::EPSILON);
+            curve_scale((v.abs() / abs_max).clamp(0.0, 1.0), self.scale_t)
+        } else {
+            let inr = (self.in_max - self.in_min).abs().max(f32::EPSILON);
+            let norm = ((v - self.in_min) / inr * 2.0 - 1.0).clamp(-1.0, 1.0);
+            norm.signum() * curve_scale(norm.abs(), self.scale_t)
+        }
+    }
+    /// The hysteresis band as a full-height strip from input `a` to `b`, with
+    /// the edge at `edge` drawn as the line crossing it flips the lane.
+    fn paint_band(&self, painter: &egui::Painter, a: f32, b: f32, edge: f32, col: Color32, glyph: &str) {
+        let (xa, xb) = (self.c2s(self.gx(a), self.y_lo).x, self.c2s(self.gx(b), self.y_lo).x);
+        let (l, r) = (xa.min(xb), xa.max(xb));
+        // At least a sliver, so a small band still reads at small graph sizes.
+        let (l, r) = if r - l < 2.0 { let c = (l + r) * 0.5; (c - 1.0, c + 1.0) } else { (l, r) };
+        let [cr, cg, cb, _] = col.to_array();
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(l..=r, self.rect.top()..=self.rect.bottom()),
+            0.0, Color32::from_rgba_unmultiplied(cr, cg, cb, 34));
+        let ex = self.c2s(self.gx(edge), self.y_lo).x;
+        painter.line_segment([egui::pos2(ex, self.rect.top()), egui::pos2(ex, self.rect.bottom())],
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(cr, cg, cb, 140)));
+        painter.text(egui::pos2(ex, self.rect.top() + 1.0), egui::Align2::CENTER_TOP, glyph,
+            egui::FontId::proportional(9.0), Color32::from_rgba_unmultiplied(cr, cg, cb, 200));
+    }
+}
+
+/// The live layer of a two-way curve graph. Per channel: the hysteresis band
+/// behind the engine's held point (input wandering inside it changes nothing;
+/// crossing its edge flips the lane), the raw input as a tick on the floor, and
+/// the trail and arrow at the held point on the lane the engine is on. With no
+/// live input, the band a pull from rest must clear before the Up lane engages
+/// (none with "Start on Up").
+/// Returns whether any channel was live.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_twoway_live(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    g: &TwowayGeom,
+    node_id: NodeId,
+    node: &NodeData,
+    up: (&[[f32; 2]], &[f32]),
+    dn: (&[[f32; 2]], &[f32]),
+    // Set while the Hyst graph is being edited: the live dot rides it instead.
+    hyst_curve: Option<(&[[f32; 2]], &[f32])>,
+    salt: &str,
+    color: impl Fn(usize) -> Color32,
+) -> bool {
+    let n_channels = curve_channels(node);
+    let trail_ms = node.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+    let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
+    let now = std::time::Instant::now();
+    let x_range = g.x_hi - g.x_lo;
+    let mut has_active = false;
+    for ch in 0..n_channels {
+        let Some(raw) = node.extra.last_signals.get(ch).and_then(|s| s.as_ref()).map(sig_f32) else { continue };
+        has_active = true;
+        // The engine's tracker rides after the inputs as Vec2(held, lane).
+        let (held, lane_up) = match node.extra.last_signals.get(n_channels + ch) {
+            Some(Some(Signal::Vec2(v))) => (v.x, v.y >= 0.0),
+            _ => (if g.absolute_eff { raw.abs() } else { raw }, true),
+        };
+        let (apts, abias) = if lane_up { up } else { dn };
+        let ch_col = color(ch);
+
+        // Band: behind the held point, against the lane's direction.
+        // Clamped to the input range: at rest on the Up lane there is no band
+        // below to draw.
+        let band = g.hyst.band_for(lane_up, held);
+        let edge = (if lane_up { held - band } else { held + band }).clamp(g.hyst.rest, g.in_hi());
+        if (edge - held).abs() > f32::EPSILON {
+            g.paint_band(painter, held, edge, edge, ch_col, if lane_up { "↓" } else { "↑" });
+        }
+        // Raw input tick on the floor — inside the band it moves, the dot doesn't.
+        let rx = g.c2s(g.gx(raw), g.y_lo).x;
+        painter.line_segment([egui::pos2(rx, g.rect.bottom()), egui::pos2(rx, g.rect.bottom() - 7.0)],
+            egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220)));
+
+        let graph_x = g.gx(held);
+        if let Some((hp, hb)) = hyst_curve {
+            // On the Hyst graph: the band in force, at the held point.
+            let p = g.c2s(graph_x, sample_curve(hp, graph_x, hb).clamp(0.0, 1.0));
+            painter.circle_filled(p, 4.0, Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230));
+            continue;
+        }
+        let graph_y = sample_curve(apts, graph_x, abias).clamp(g.y_lo, g.y_hi);
+
+        let lane_id: u8 = if lane_up { 0 } else { 1 };
+        type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
+        let tid  = ui.id().with((salt, node_id, ch as u32));
+        let tlid = ui.id().with((salt, "lane", node_id, ch as u32));
+        let prev_lane_id = ui.data(|d| d.get_temp::<u8>(tlid)).unwrap_or(lane_id);
+        let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).unwrap_or_default());
+        if prev_lane_id != lane_id { tbuf.clear(); }
+        if trail_ms > 0 {
+            tbuf.push_back((graph_x, now));
+            while tbuf.front().is_some_and(|&(_, t)| now.duration_since(t) > trail_dur) { tbuf.pop_front(); }
+        } else { tbuf.clear(); }
+        let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
+        ui.data_mut(|d| { d.insert_temp(tid, tbuf); d.insert_temp(tlid, lane_id); });
+
+        // Trail resamples the curve between x positions to follow its shape.
+        for w in tlist.windows(2) {
+            let (x0, _) = w[0]; let (x1, t1) = w[1];
+            let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
+            let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 220.0) as u8;
+            let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
+            let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
+            let mut pp = g.c2s(x0, sample_curve(apts, x0, abias).clamp(g.y_lo, g.y_hi));
+            for s in 1..=steps {
+                let ix = x0 + (x1 - x0) * s as f32 / steps as f32;
+                let np = g.c2s(ix, sample_curve(apts, ix, abias).clamp(g.y_lo, g.y_hi));
+                painter.line_segment([pp, np], egui::Stroke::new(1.5, tc));
+                pp = np;
+            }
+        }
+
+        // Arrow along the curve, pointing the lane's way.
+        let head = g.c2s(graph_x, graph_y);
+        let eps = x_range * 0.015;
+        let (x_a, x_b) = if lane_up {
+            ((graph_x - eps).clamp(g.x_lo, g.x_hi), (graph_x + eps).clamp(g.x_lo, g.x_hi))
+        } else {
+            ((graph_x + eps).clamp(g.x_lo, g.x_hi), (graph_x - eps).clamp(g.x_lo, g.x_hi))
+        };
+        let p_a = g.c2s(x_a, sample_curve(apts, x_a, abias).clamp(g.y_lo, g.y_hi));
+        let p_b = g.c2s(x_b, sample_curve(apts, x_b, abias).clamp(g.y_lo, g.y_hi));
+        let tang = p_b - p_a;
+        let fwd = tang / tang.length().max(0.001);
+        let perp = egui::vec2(-fwd.y, fwd.x);
+        let r = 6.0f32;
+        let (tip, l, rp) = (head + fwd * r, head - fwd * (r * 0.5) + perp * (r * 0.7), head - fwd * (r * 0.5) - perp * (r * 0.7));
+        painter.add(egui::Shape::convex_polygon(vec![tip, l, rp],
+            Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
+    }
+    let rest_band = g.hyst.band_for(false, g.hyst.rest);
+    if !has_active && !g.hyst.start_up && rest_band > 0.0 {
+        // At rest: the band a pull has to clear before the Up lane engages.
+        let (a, b) = (g.hyst.rest, (g.hyst.rest + rest_band).min(g.in_hi()));
+        g.paint_band(painter, a, b, b, Color32::from_gray(170), "↑");
+    }
+    has_active
+}
+
 pub(crate) fn render_twoway_hyst_row(
     inner_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let (mut h_pct, mut h_ms) = snarl.get_node(inner_id).map(|n| {
-        let p = n.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-        let m = n.params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
-        (p, m)
-    }).unwrap_or((0.5, 20.0));
+    let (mut h_pct, mut h_dir, mut h_start) = snarl.get_node(inner_id).map(|n| (
+        n.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32,
+        n.params.get("hyst_dir").and_then(|v| v.as_str()).unwrap_or("both").to_string(),
+        n.params.get("hyst_start_up").and_then(|v| v.as_bool()).unwrap_or(false),
+    )).unwrap_or((0.5, "both".to_string(), false));
+    let hyst_single = snarl.get_node(inner_id).is_none_or(|n| twoway_hyst_points(n).0.len() < 2);
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(300.0, 22.0));
     let mut changed = false;
-    let mut fr = [egui::Rect::NOTHING; 2];
+    let mut fr = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Hyst").weak());
-        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
+        let r = ui.add_enabled(hyst_single, egui::DragValue::new(&mut h_pct).speed(0.01).range(0.0f32..=TWOWAY_HYST_MAX_PCT).suffix("%"))
+            .on_hover_text(HYST_HINT).on_disabled_hover_text(HYST_GRAPH_HINT);
         fr[0] = r.rect; changed |= r.changed();
-        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
-        fr[1] = r.rect; changed |= r.changed();
+        let (c, rects) = twoway_hyst_extras(ui, &mut h_dir, &mut h_start, false);
+        changed |= c;
+        fr[1] = rects[0]; fr[2] = rects[1];
     });
     publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(h_pct as f64) { node.params.insert("hysteresis_pct".into(), Value::Number(n)); }
-            if let Some(n) = Number::from_f64(h_ms  as f64) { node.params.insert("hysteresis_ms".into(),  Value::Number(n)); }
+            node.params.insert("hyst_dir".into(), Value::String(h_dir));
+            node.params.insert("hyst_start_up".into(), Value::Bool(h_start));
         }
     }
 }
@@ -2158,17 +2339,31 @@ pub(crate) fn render_twoway_interp_row(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let mut i_ms = snarl.get_node(inner_id)
-        .and_then(|n| n.params.get("interp_ms").and_then(|v| v.as_f64()))
-        .unwrap_or(50.0) as f32;
+    let (mut i_ms, mut ph_ms, mut ph_dir) = snarl.get_node(inner_id).map(|n| (
+        n.params.get("interp_ms").and_then(|v| v.as_f64()).unwrap_or(50.0) as f32,
+        n.params.get("peak_hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        n.params.get("peak_hold_dir").and_then(|v| v.as_str()).unwrap_or("up").to_string(),
+    )).unwrap_or((50.0, 0.0, "up".to_string()));
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
+    let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Interp").weak());
-        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")).changed() {
-            if let Some(node) = snarl.get_node_mut(inner_id) {
-                if let Some(n) = Number::from_f64(i_ms as f64) { node.params.insert("interp_ms".into(), Value::Number(n)); }
-            }
-        }
+        let r = ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms"));
+        fr[0] = r.rect; changed |= r.changed();
+        ui.label(egui::RichText::new("Peak hold").weak()).on_hover_text(PEAK_HOLD_HINT);
+        let r = ui.add(egui::DragValue::new(&mut ph_ms).speed(0.5).range(0.0f32..=200.0f32).suffix("ms")).on_hover_text(PEAK_HOLD_HINT);
+        fr[1] = r.rect; changed |= r.changed();
+        let (c, r) = twoway_dir_picker(ui, &mut ph_dir, PEAK_DIR_HINTS, false);
+        fr[2] = r; changed |= c;
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            if let Some(n) = Number::from_f64(i_ms as f64) { node.params.insert("interp_ms".into(), Value::Number(n)); }
+            if let Some(n) = Number::from_f64(ph_ms as f64) { node.params.insert("peak_hold_ms".into(), Value::Number(n)); }
+            node.params.insert("peak_hold_dir".into(), Value::String(ph_dir));
+        }
+    }
 }

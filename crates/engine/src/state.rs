@@ -70,14 +70,20 @@ pub struct NodeState {
     // ── Two-way Response Curve ────────────────────────────────────────────────
     /// Per-channel current lane: +1 = rising, -1 = falling.
     pub twoway_lane: Vec<i8>,
-    /// Per-channel ring buffer of recent per-tick input deltas for hysteresis.
-    pub twoway_dir_buf: Vec<VecDeque<f32>>,
+    /// Per-channel held input the curves are read at: the furthest point
+    /// reached in the lane's direction, kept while the input wanders back by
+    /// less than the hysteresis band. NaN until the first sample.
+    pub twoway_held: Vec<f32>,
     /// Per-channel interpolation blend factor [0, 1] (0 = fully on old lane output).
     pub twoway_blend: Vec<f32>,
-    /// Per-channel previous tick input value for delta computation.
-    pub twoway_prev_input: Vec<f32>,
+    /// Per-channel output emitted last tick — where a lane switch blends from.
+    pub twoway_last_out: Vec<f32>,
     /// Per-channel blended output frozen at the moment a lane switch begins.
     pub twoway_old_output: Vec<f32>,
+    /// Per-channel Peak hold: the curve height being held (NaN = none), and
+    /// how long it has been held, in seconds (bounded by the hold time).
+    pub twoway_peak_y: Vec<f32>,
+    pub twoway_peak_age: Vec<f32>,
     // ── Macro-namespace carry-over (stored on a single reserved sentinel uid) ──
     /// Previous tick's macro-namespace values (`macro:` / `menu:` control pins).
     /// `collector_sigs` is rebuilt from empty every tick, so a macro READER that

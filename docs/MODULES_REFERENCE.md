@@ -393,9 +393,23 @@ pub struct ModuleDescriptor {
   - `biases: Array<f64>` - Up-lane biases
   - `points_dn: Array<[f64, f64]>` - Down-lane curve (falls back to up-lane)
   - `biases_dn: Array<f64>` - Down-lane biases
-  - `hysteresis_pct: f64` - Hysteresis threshold as percentage of range
-  - `hysteresis_ms: f64` - Hysteresis detection window in milliseconds
-  - `interp_ms: f64` - Transition interpolation time in milliseconds
+  - `hysteresis_pct: f64` - Hysteresis band as percentage of range. The curves are read at a
+    held point that follows the input in the lane's direction with no lag and stays put while
+    the input comes back by less than the band (noise suppression); coming back further flips
+    the lane. Set just above the input's peak-to-peak jitter. (`hysteresis_ms` is no longer read.)
+  - `hyst_points: Array<[f64, f64]>` / `hyst_biases: Array<f64>` - The Hyst tab's graph: band
+    over the input (same X as the curves; Y 0..1 = 0..10 %), read at the held point. With two
+    dots or more it replaces `hysteresis_pct`; a single dot is `hysteresis_pct` itself
+  - `hyst_dir: String` - Which flip the band guards: `both` (default), `up` (only Down → Up,
+    a release flips at once) or `down` (only Up → Down, a press flips at once)
+  - `hyst_start_up: bool` - Start on Up: at the bottom of the input range (within 0.2 %) the
+    tracker sits on the Up lane, unheld, so a pull from rest needs no band to clear
+  - `interp_ms: f64` - Blend time from the last emitted output into the new lane after a flip
+  - `peak_hold_ms: f64` - Peak hold (0 = off): put out the highest the curve got across each step
+    of the held point — a fast pull steps over narrow peaks between device reports — and keep it
+    up at least this long; a lane flip drops it at once. On a Down → Up flip the sweep starts
+    from the low the press came up from
+  - `peak_hold_dir: String` - Lane(s) Peak hold works on: `up` (default, the press), `down`, `both`
   - `vec_mode: bool` - Apply to Vec2 magnitude
 
 #### Gyro 3DOF
