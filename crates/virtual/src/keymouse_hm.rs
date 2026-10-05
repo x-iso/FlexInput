@@ -245,6 +245,32 @@ const REF: f32 = 60.0;
 /// Analog scroll rate unit: notches per second at |rate| = 1.0. A full-deflection
 /// stick / touch-zone maps to a firm-but-controllable continuous scroll.
 const SCROLL_REF: f32 = 18.0;
+/// The mouse profile's Resolution Multiplier maximum (its Physical Maximum in
+/// profiles/mouse.json): what one notch is worth in wheel counts once Windows
+/// applies it. Must match the descriptor.
+///
+/// Whether Windows applies it isn't ours to assume: ×8 it did, ×120 it silently
+/// didn't (every 1/120-notch count scrolled a whole notch). So the counts per
+/// notch actually in force are READ, from mouhid's own SET_FEATURE of the
+/// multiplier, which the driver forwards to the output ring — see
+/// `read_wheel_multiplier`. Until one arrives, a count is a whole notch.
+const WHEEL_MULTIPLIER_MAX: f32 = 8.0;
+/// Output-ring frame source for a SET_FEATURE (HIDMAESTRO_OUTPUT_SOURCE_HID_FEATURE).
+const OUTPUT_SOURCE_HID_FEATURE: u8 = 1;
+
+/// Counts per notch for one wheel, from mouhid's Resolution Multiplier
+/// SET_FEATURE byte: two 2-bit logical fields, vertical first (bits 0-1), then
+/// horizontal (bits 2-3), each 0 → ×1 or 1 → ×WHEEL_MULTIPLIER_MAX.
+fn multiplier_from_feature(byte: u8, horizontal: bool) -> f32 {
+    let logical = if horizontal { (byte >> 2) & 0b11 } else { byte & 0b11 };
+    if logical >= 1 { WHEEL_MULTIPLIER_MAX } else { 1.0 }
+}
+
+/// The largest wheel field one report carries: the int8 limit rounded down to
+/// whole notches, so whole-notch scrolling never splits across reports.
+fn wheel_counts_max(counts_per_notch: f32) -> f32 {
+    (127.0 / counts_per_notch).floor().max(1.0) * counts_per_notch
+}
 
 pub struct VirtualKeyMouseHm {
     pub muted: bool,
@@ -262,6 +288,10 @@ pub struct VirtualKeyMouseHm {
     hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
     scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
     scroll_vel_h: f32,   // analog horizontal scroll rate (scroll_x), +right
+    smooth_vel_v: f32,   // smooth scroll rate (trackpad_scroll_y), +up
+    smooth_vel_h: f32,   // smooth scroll rate (trackpad_scroll_x), +right
+    scroll_move_v: f32,  // scroll displacement in notches (scroll_move_y), +up
+    scroll_move_h: f32,  // scroll displacement in notches (scroll_move_x), +right
     buttons: MouseButtons,
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
@@ -276,8 +306,15 @@ pub struct VirtualKeyMouseHm {
     // Mouse emission state (port of the enigo thread's logic, at flush rate).
     carry_x: f32,
     carry_y: f32,
-    scroll_carry_v: f32, // sub-click remainder for analog vertical scroll
-    scroll_carry_h: f32, // sub-click remainder for analog horizontal scroll
+    scroll_carry_v: f32, // sub-notch remainder for analog vertical scroll
+    scroll_carry_h: f32, // sub-notch remainder for analog horizontal scroll
+    wheel_carry_v: f32,  // vertical wheel counts not yet reported
+    wheel_carry_h: f32,  // horizontal wheel counts not yet reported
+    // Wheel counts per notch Windows actually applies (see WHEEL_MULTIPLIER_MAX).
+    wheel_counts_v: f32,
+    wheel_counts_h: f32,
+    // When to log that no multiplier arrived (once; None after).
+    multiplier_deadline: Option<Instant>,
     last_emit: Instant,
     last_mouse_report: [u8; 7],
     mouse_report_dirty: bool,
@@ -313,6 +350,10 @@ impl VirtualKeyMouseHm {
             // Dropping tears down whichever node DID come up.
             return None;
         }
+        // mouhid set the wheel multiplier while the node started, before we
+        // opened its ring: replay what the ring holds so flush() sees it.
+        let mut mouse = mouse;
+        mouse.rewind_output();
         Some(Self {
             muted: false,
             mouse_vel_x: 0.0,
@@ -323,6 +364,10 @@ impl VirtualKeyMouseHm {
             hscroll_delta: 0,
             scroll_vel_v: 0.0,
             scroll_vel_h: 0.0,
+            smooth_vel_v: 0.0,
+            smooth_vel_h: 0.0,
+            scroll_move_v: 0.0,
+            scroll_move_h: 0.0,
             buttons: MouseButtons::default(),
             keys: KeysHeld::default(),
             learned_keys: HashMap::new(),
@@ -332,6 +377,11 @@ impl VirtualKeyMouseHm {
             carry_y: 0.0,
             scroll_carry_v: 0.0,
             scroll_carry_h: 0.0,
+            wheel_carry_v: 0.0,
+            wheel_carry_h: 0.0,
+            wheel_counts_v: 1.0,
+            wheel_counts_h: 1.0,
+            multiplier_deadline: Some(Instant::now() + Duration::from_secs(5)),
             last_emit: Instant::now(),
             last_mouse_report: [0; 7],
             // One neutral frame after the node comes up, then the flag latches
@@ -345,6 +395,31 @@ impl VirtualKeyMouseHm {
             self_move_until: None,
             last_kbd_report: [0; 8],
         })
+    }
+
+    /// Pick up mouhid's Resolution Multiplier SET_FEATURE from the mouse's
+    /// output ring (the node's only output), and scale the wheel by what it set.
+    fn read_wheel_multiplier(&mut self) {
+        while let Some(frame) = self.mouse.read_output_frame() {
+            if frame.source != OUTPUT_SOURCE_HID_FEATURE || frame.report_id != 0 { continue; }
+            let Some(&byte) = frame.data.first() else { continue; };
+            let v = multiplier_from_feature(byte, false);
+            let h = multiplier_from_feature(byte, true);
+            self.multiplier_deadline = None;
+            if (v, h) != (self.wheel_counts_v, self.wheel_counts_h) {
+                self.wheel_counts_v = v;
+                self.wheel_counts_h = h;
+                self.wheel_carry_v = 0.0;
+                self.wheel_carry_h = 0.0;
+                log_line(&format!(
+                    "[keymouse] Windows set the wheel Resolution Multiplier: feature byte {byte:#04x} \
+                     -> vertical x{v}, horizontal x{h} (descriptor max x{WHEEL_MULTIPLIER_MAX})"));
+            }
+        }
+        if self.multiplier_deadline.is_some_and(|t| Instant::now() > t) {
+            self.multiplier_deadline = None;
+            log_line("[keymouse] no wheel Resolution Multiplier SET_FEATURE seen: scrolling in                       whole notches (a reclaimed node, or Windows didn't apply the multiplier)");
+        }
     }
 
     /// Build the 8-byte keyboard report from held modifiers + learned keys.
@@ -392,12 +467,16 @@ impl VirtualDevice for VirtualKeyMouseHm {
             "mouse_move"    => { if let Signal::Vec2(v) = value { self.mouse_disp_x += v.x; self.mouse_disp_y += -v.y; } }
             "mouse_move_x"  => { if let Signal::Float(f) = value { self.mouse_disp_x += f; } }
             "mouse_move_y"  => { if let Signal::Float(f) = value { self.mouse_disp_y += -f; } }
-            "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
-            "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
-            "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
-            "scroll_left"   => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta -= 1; } }
+            "scroll_up"     => { self.scroll_delta  += crate::scroll_notches(value); }
+            "scroll_down"   => { self.scroll_delta  -= crate::scroll_notches(value); }
+            "scroll_right"  => { self.hscroll_delta += crate::scroll_notches(value); }
+            "scroll_left"   => { self.hscroll_delta -= crate::scroll_notches(value); }
             "scroll_y"      => { if let Signal::Float(f) = value { self.scroll_vel_v += f; } }
             "scroll_x"      => { if let Signal::Float(f) = value { self.scroll_vel_h += f; } }
+            "trackpad_scroll_y" => { if let Signal::Float(f) = value { self.smooth_vel_v += f; } }
+            "trackpad_scroll_x" => { if let Signal::Float(f) = value { self.smooth_vel_h += f; } }
+            "scroll_move_y" => { if let Signal::Float(f) = value { self.scroll_move_v += f; } }
+            "scroll_move_x" => { if let Signal::Float(f) = value { self.scroll_move_h += f; } }
             "mouse_left"    => { if let Signal::Bool(b) = value { self.buttons.lmb = b; } }
             "mouse_right"   => { if let Signal::Bool(b) = value { self.buttons.rmb = b; } }
             "mouse_middle"  => { if let Signal::Bool(b) = value { self.buttons.mmb = b; } }
@@ -417,6 +496,7 @@ impl VirtualDevice for VirtualKeyMouseHm {
 
     fn flush(&mut self) {
         let now = Instant::now();
+        self.read_wheel_multiplier();
 
         // ── Keyboard ─────────────────────────────────────────────────────────
         // Level-triggered: write only when the report actually changes; the
@@ -459,6 +539,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
         let hscroll = std::mem::take(&mut self.hscroll_delta);
         let scroll_vel_v = std::mem::take(&mut self.scroll_vel_v);
         let scroll_vel_h = std::mem::take(&mut self.scroll_vel_h);
+        let smooth_vel_v = std::mem::take(&mut self.smooth_vel_v);
+        let smooth_vel_h = std::mem::take(&mut self.smooth_vel_h);
+        let scroll_move_v = std::mem::take(&mut self.scroll_move_v);
+        let scroll_move_h = std::mem::take(&mut self.scroll_move_h);
 
         // Mixed-output braiding: keep the shared turn token alternating (see
         // module docs — the gamepad flush is gated on the other side of this
@@ -482,20 +566,36 @@ impl VirtualDevice for VirtualKeyMouseHm {
                 self.carry_x -= dx as f32;
                 self.carry_y -= dy as f32;
             }
-            // Analog scroll: dt-scaled rate → sub-click carry → int8 clicks, then
-            // fold in the digital clicks. Scroll isn't braid-gated (like the
-            // wheel already wasn't), so it emits every flush.
+            // Scroll. Analog rate → whole notches through its own carry, as
+            // before; digital clicks are whole notches. Only the smooth rate
+            // (trackpad_scroll_*) and scroll_move_* scroll by fractions of a
+            // notch (wheel counts per notch: see WHEEL_MULTIPLIER_MAX)
+            // — some apps still treat every wheel message as a full notch, so
+            // nothing else changes granularity. Everything lands in a
+            // wheel-count carry, so a burst past one report's range goes out on
+            // the next. Scroll isn't braid-gated (like the wheel already
+            // wasn't), so it emits every flush.
             self.scroll_carry_v += scroll_vel_v * SCROLL_REF * dt;
             self.scroll_carry_h += scroll_vel_h * SCROLL_REF * dt;
-            let vclicks = self.scroll_carry_v.trunc() as i32;
-            let hclicks = self.scroll_carry_h.trunc() as i32;
-            self.scroll_carry_v -= vclicks as f32;
-            self.scroll_carry_h -= hclicks as f32;
+            let vclicks = self.scroll_carry_v.trunc();
+            let hclicks = self.scroll_carry_h.trunc();
+            self.scroll_carry_v -= vclicks;
+            self.scroll_carry_h -= hclicks;
+            let smooth_v = smooth_vel_v * SCROLL_REF * dt + scroll_move_v;
+            let smooth_h = smooth_vel_h * SCROLL_REF * dt + scroll_move_h;
+            self.wheel_carry_v += (scroll as f32 + vclicks + smooth_v) * self.wheel_counts_v;
+            self.wheel_carry_h += (hscroll as f32 + hclicks + smooth_h) * self.wheel_counts_h;
+            let vmax = wheel_counts_max(self.wheel_counts_v);
+            let hmax = wheel_counts_max(self.wheel_counts_h);
+            let vcounts = self.wheel_carry_v.trunc().clamp(-vmax, vmax);
+            let hcounts = self.wheel_carry_h.trunc().clamp(-hmax, hmax);
+            self.wheel_carry_v -= vcounts;
+            self.wheel_carry_h -= hcounts;
             rep[0] = self.buttons.bits();
             rep[1..3].copy_from_slice(&(dx as i16).to_le_bytes());
             rep[3..5].copy_from_slice(&(dy as i16).to_le_bytes());
-            rep[5] = (scroll + vclicks).clamp(-127, 127) as i8 as u8;   // vertical wheel
-            rep[6] = (hscroll + hclicks).clamp(-127, 127) as i8 as u8;  // horizontal (AC Pan)
+            rep[5] = vcounts as i8 as u8;  // vertical wheel
+            rep[6] = hcounts as i8 as u8;  // horizontal (AC Pan)
             if dx != 0 || dy != 0 {
                 self.self_move_until = Some(now + SELF_MOVE_WINDOW);
                 if let Some(ref mut last) = self.last_cursor {
@@ -511,6 +611,8 @@ impl VirtualDevice for VirtualKeyMouseHm {
             self.carry_y = 0.0;
             self.scroll_carry_v = 0.0;
             self.scroll_carry_h = 0.0;
+            self.wheel_carry_v = 0.0;
+            self.wheel_carry_h = 0.0;
         }
 
         // Relative device: identical all-zero frames carry no information, so
@@ -534,6 +636,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
         self.hscroll_delta = 0;
         self.scroll_vel_v = 0.0;
         self.scroll_vel_h = 0.0;
+        self.smooth_vel_v = 0.0;
+        self.smooth_vel_h = 0.0;
+        self.scroll_move_v = 0.0;
+        self.scroll_move_h = 0.0;
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }
@@ -541,6 +647,8 @@ impl VirtualDevice for VirtualKeyMouseHm {
         self.carry_y = 0.0;
         self.scroll_carry_v = 0.0;
         self.scroll_carry_h = 0.0;
+        self.wheel_carry_v = 0.0;
+        self.wheel_carry_h = 0.0;
         // Do NOT force a report here. The I/O thread calls reset_outputs() on
         // this device EVERY TICK whenever it's bypassed or not referenced by the
         // active tab, so arming `mouse_report_dirty` on each call made an idle
@@ -560,9 +668,43 @@ impl VirtualDevice for VirtualKeyMouseHm {
     }
 }
 
+/// One diagnostic line: stderr, and appended to `flexinput-keymouse.log` under
+/// `%APPDATA%\FlexInput\logs` (best-effort). Rare events only — a GUI build
+/// has no console, so without the file they'd be unobservable.
+fn log_line(line: &str) {
+    eprintln!("{line}");
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let dir = std::path::PathBuf::from(appdata).join("FlexInput").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = dir.join("flexinput-keymouse.log");
+    // Bounded: start over rather than grow without end.
+    if path.metadata().map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(f, "[{secs}] {line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mouhid's multiplier byte: vertical in bits 0-1, horizontal in bits 2-3.
+    #[test]
+    fn wheel_multiplier_from_the_feature_byte() {
+        assert_eq!(multiplier_from_feature(0b0101, false), WHEEL_MULTIPLIER_MAX);
+        assert_eq!(multiplier_from_feature(0b0101, true), WHEEL_MULTIPLIER_MAX);
+        assert_eq!(multiplier_from_feature(0b0100, false), 1.0);
+        assert_eq!(multiplier_from_feature(0b0001, true), 1.0);
+        assert_eq!(multiplier_from_feature(0, false), 1.0, "unset = whole notches");
+        // A report never splits a whole notch: ×8 carries 15 notches, ×1 carries 127.
+        assert_eq!(wheel_counts_max(8.0), 120.0);
+        assert_eq!(wheel_counts_max(1.0), 127.0);
+    }
 
     /// Every modifier pin reaches the modifier byte, and none of them is a
     /// learned key. One that fell through would be looked up for a HID usage it

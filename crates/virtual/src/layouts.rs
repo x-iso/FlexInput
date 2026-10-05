@@ -69,7 +69,7 @@ pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     sp!("mouse_middle",  "MMB",              SignalType::Bool),
     sp!("mouse_back",    "Mouse 4 (Back)",   SignalType::Bool),
     sp!("mouse_forward", "Mouse 5 (Forward)", SignalType::Bool),
-    // Scroll (discrete Bool pulses — one true frame per tick)
+    // Scroll (discrete Bool gates — one notch per off→on edge, however long held)
     sp!("scroll_up",    "Scroll Up",    SignalType::Bool),
     sp!("scroll_down",  "Scroll Down",  SignalType::Bool),
     sp!("scroll_left",  "Scroll Left",  SignalType::Bool),
@@ -89,6 +89,14 @@ pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     sp!("mouse_move",   "Mouse XY (move)", SignalType::Vec2),
     sp!("mouse_move_x", "Mouse X (move)",  SignalType::Float),
     sp!("mouse_move_y", "Mouse Y (move)",  SignalType::Float),
+    // Smooth scroll RATE: like scroll_y/x (1.0 = the same notches per second)
+    // but sent as hi-res wheel, not whole notches. +Y up, +X right.
+    sp!("trackpad_scroll_y", "Smooth Scroll Y (rate)", SignalType::Float),
+    sp!("trackpad_scroll_x", "Smooth Scroll X (rate)", SignalType::Float),
+    // Scroll DISPLACEMENT in notches (fractions allowed), applied once like
+    // mouse_move — the trackpad routing's two-finger scroll. +Y up, +X right.
+    sp!("scroll_move_y", "Scroll Y (move)", SignalType::Float),
+    sp!("scroll_move_x", "Scroll X (move)", SignalType::Float),
 ];
 
 pub static XINPUT_SINK_PINS: &[SinkPin] = &[

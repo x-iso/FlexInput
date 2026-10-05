@@ -16,6 +16,9 @@ pub struct NodeState {
     /// Gyro to Stick Rotation: the offset, the stabiliser and the gravity
     /// estimate. Created on first use.
     pub stick_rotation: Option<Box<crate::eval::StickRotationState>>,
+    /// Virtual KB/M sink with "Route gamepad touchpad" on: the trackpad's
+    /// gesture state. Created on first use, dropped when the toggle goes off.
+    pub trackpad: Option<Box<crate::eval::TrackpadState>>,
     /// RWS Aim: the flick stick being circled during a 360° calibration sweep.
     /// Created when a sweep starts, dropped when it ends.
     pub rws_cal_flick: Option<Box<crate::eval::CalFlick>>,

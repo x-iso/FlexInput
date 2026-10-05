@@ -418,6 +418,14 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "mouse_move",    display_name: "Mouse: XY (move)",     signal_type: SignalType::Vec2 },
     AutoMapPin { id: "mouse_move_x",  display_name: "Mouse: X (move)",      signal_type: SignalType::Float },
     AutoMapPin { id: "mouse_move_y",  display_name: "Mouse: Y (move)",      signal_type: SignalType::Float },
+    // Smooth scroll RATE: scroll_y/x's scale, sent as hi-res wheel instead of
+    // whole notches. +Y scrolls up, +X scrolls right.
+    AutoMapPin { id: "trackpad_scroll_y", display_name: "Mouse: Smooth Scroll Y (rate)", signal_type: SignalType::Float },
+    AutoMapPin { id: "trackpad_scroll_x", display_name: "Mouse: Smooth Scroll X (rate)", signal_type: SignalType::Float },
+    // Scroll DISPLACEMENT in notches (fractions allowed), applied once like
+    // mouse_move. +Y scrolls up, +X scrolls right.
+    AutoMapPin { id: "scroll_move_y", display_name: "Mouse: Scroll Y (move)", signal_type: SignalType::Float },
+    AutoMapPin { id: "scroll_move_x", display_name: "Mouse: Scroll X (move)", signal_type: SignalType::Float },
 ];
 
 /// Family-specific button glyph for a cross-family pin, or `None` if the pin

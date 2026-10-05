@@ -91,7 +91,30 @@ All notable changes to FlexInput are documented here. This project adheres to
   how far (0 turns it off). It reads the accelerometer in world axes using the
   wired orientation, so it stays off when no orientation is wired.
 
+- **Virtual Keyboard & Mouse: smooth scrolling.** **Smooth Scroll X/Y
+  (rate)** scroll like Scroll X/Y (1.0 = the same notches per second) but in
+  eighths of a notch instead of whole ones, and **Scroll X/Y (move)** take a
+  scroll distance in notches, like Mouse XY (move) does for the pointer. The
+  virtual mouse now reports a high-resolution wheel; FlexInput reads the
+  multiplier Windows applies and scales to it, and falls back to whole notches
+  if there is none. The virtual mouse is recreated once on first launch.
+
+- **Virtual Keyboard & Mouse: Gamepad touchpad → trackpad.** Off by default,
+  on the node and the Easy-mode Keyboard and Mouse card. The touchpad of the
+  pad feeding the output works as a laptop trackpad: one finger moves the
+  pointer, two fingers scroll smoothly, a tap is a left click and a
+  two-finger tap a right click, and pressing the pad clicks (right with two
+  fingers down). On the node, **Pointer ×** and **Scroll ×** set the speeds
+  and **Reverse scroll direction** makes fingers up scroll up. It adds to
+  whatever else drives the mouse.
+
 ### Changed
+
+- **Scroll Up/Down/Left/Right scroll one notch per press.** Held, they
+  scrolled one notch every output tick (hundreds a second), and a press
+  shorter than a tick could be lost. Each off→on is now exactly one notch,
+  however long it's held — a JSM `SCROLLUP` included, which scrolled about
+  twenty.
 
 - **Two-way Response Curve hysteresis reworked.** The curves are now read at a
   held point that follows the input with no lag in the direction it's moving
@@ -152,6 +175,10 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 - **RWS Aim's flick rows work from the pad.** The focused field gets its
   highlight, and Stick aim and its multiplier can be reached.
+
+- **Scroll Up scrolled down on the SendInput keyboard & mouse.** The fallback
+  output (used when the HIDMaestro keyboard & mouse can't be created) had the
+  vertical wheel reversed; up is up again.
 
 ## [0.15.4] - 2026-10-03
 

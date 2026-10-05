@@ -745,6 +745,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         n.params.insert("mouse_sensitivity".into(), Value::from(ms_edit as f64));
                     }
                 }
+                if let Some(n) = snarl.get_node_mut(node) {
+                    touchpad_route_header_controls(ui, &mut n.params, LABEL_CELL_W);
+                }
             }
 
             // Rumble-feedback shaping for virtual gamepad sinks (everything but

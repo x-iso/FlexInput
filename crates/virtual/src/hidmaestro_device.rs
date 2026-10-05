@@ -279,6 +279,20 @@ impl HidMaestroDevice {
         }
     }
 
+    /// Replay the output ring from its oldest retained frame (see
+    /// `OutputSection::rewind`). For raw-report devices (`keymouse_hm`).
+    pub fn rewind_output(&mut self) {
+        if let Some(output) = self.output.as_mut() {
+            output.rewind();
+        }
+    }
+
+    /// Next frame the driver published to the output ring, undecoded — for
+    /// raw-report devices that read their own outputs (`keymouse_hm`).
+    pub fn read_output_frame(&mut self) -> Option<flexinput_hidmaestro::OutputFrame> {
+        self.output.as_mut()?.try_read()
+    }
+
     /// Which static sink-pin layout to advertise for `profile`. Xbox360/XInput
     /// uses the XInput pin set (no gyro/touchpad/lightbar); DualSense uses its
     /// full Sony set; everything else falls back to DS4 pins.

@@ -319,8 +319,9 @@ pub mod presets {
     /// hardened Win11) — a kernel-level HID device is immune.
     pub const KEYBOARD_JSON: &str = include_str!("../profiles/keyboard.json");
 
-    /// Virtual relative mouse — plain-HID 6-byte report (5 buttons, int16 X/Y
-    /// mickeys, int8 wheel). Same raw-report path + rationale as KEYBOARD_JSON.
+    /// Virtual relative mouse — plain-HID 7-byte report (5 buttons, int16 X/Y
+    /// mickeys, int8 hi-res wheel + AC Pan at 8 counts per notch). Same
+    /// raw-report path + rationale as KEYBOARD_JSON.
     pub const MOUSE_JSON: &str = include_str!("../profiles/mouse.json");
 }
 
@@ -419,6 +420,14 @@ mod tests {
         let hw = p.report.field(0x0c, 0x0238).expect("hwheel (AC Pan)");
         assert_eq!((hw.bit_offset, hw.bit_size), (48, 8));
         assert!(hw.logical_min < 0, "hwheel is signed/relative");
+        // Hi-res wheel: each wheel sits in a Logical collection with a
+        // Resolution Multiplier (Generic Desktop 0x48) whose physical max is the
+        // multiplier keymouse_hm's WHEEL_MULTIPLIER_MAX assumes (8). The
+        // multiplier is a Feature item, so the input layout above is unchanged.
+        let d = &p.descriptor;
+        let res_mult = [0x09, 0x48, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x08];
+        let n = d.windows(res_mult.len()).filter(|w| *w == res_mult).count();
+        assert_eq!(n, 2, "one ×8 Resolution Multiplier per wheel");
     }
 
     /// Golden: our parser must reproduce the exact field layout HIDMaestro's C#

@@ -26,6 +26,7 @@ mod feedback;
 mod midi_bus;
 mod modules;
 mod registry;
+mod trackpad;
 #[cfg(test)]
 mod tests;
 mod publish;
@@ -36,6 +37,7 @@ pub use config::*;
 pub use curves::*;
 pub use device_cal::*;
 pub use modules::*;
+pub use trackpad::TrackpadState;
 pub(crate) use registry::*;
 // Every publisher is crate-internal — nothing outside the engine publishes
 // into the bus — so this one glob is narrowed rather than `pub`.
@@ -807,6 +809,13 @@ pub fn eval_graph_tick(
                 }
             }
 
+            // "Route gamepad touchpad" (Virtual KB/M, off by default): the
+            // Auto-Map source's touch fingers drive this sink as a trackpad.
+            // Read off the bus below, stepped after it — see `trackpad`.
+            let route_touchpad = st.device_id.starts_with("virtual.keymouse")
+                && snap.params.get("route_touchpad").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut touch_frame: Option<trackpad::TouchFrame> = None;
+
             // AutoMap: semantic-map source device pins → sink device pins.
             // Uses resolve_mapping() for cross-family translation (e.g. btn_cross → btn_south).
             if let Some((ref src_dev, ref src_pins)) = st.automap_source {
@@ -905,6 +914,53 @@ pub fn eval_graph_tick(
                         sink_outputs.entry((st.device_id.clone(), pin)).or_insert(sig);
                     }
                 }
+                if route_touchpad {
+                    let finger = |active: &str, x: &str, y: &str| -> Option<Vec2> {
+                        if !resolve_sig(active)?.as_bool() { return None; }
+                        Some(Vec2::new(resolve_sig(x)?.as_float(), resolve_sig(y)?.as_float()))
+                    };
+                    touch_frame = Some(trackpad::TouchFrame {
+                        fingers: [
+                            finger("touch1_active", "touch1_x", "touch1_y"),
+                            finger("touch2_active", "touch2_x", "touch2_y"),
+                        ],
+                        click: resolve_sig("btn_touchpad").is_some_and(|s| s.as_bool()),
+                    });
+                }
+            }
+
+            // Step the trackpad — or, with routing off, let go of whatever it
+            // held — and ADD its output to what the sink already gets: a wire
+            // or mapping onto the same pin keeps working alongside it.
+            let tp_out = match touch_frame {
+                Some(frame) => {
+                    let natural = !snap.params.get("touchpad_reverse_scroll")
+                        .and_then(|v| v.as_bool()).unwrap_or(false);
+                    Some(state.entry(snap.node_uid).or_default()
+                        .trackpad.get_or_insert_with(Default::default)
+                        .step(&frame, dt, natural))
+                }
+                None => state.get_mut(&snap.node_uid).and_then(|ns| {
+                    let out = ns.trackpad.as_mut()?.release(dt);
+                    if out.is_none() { ns.trackpad = None; }
+                    out
+                }),
+            };
+            if let Some(mut o) = tp_out {
+                let param = |key: &str| snap.params.get(key)
+                    .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                o.pointer *= param("touchpad_speed");
+                o.scroll *= param("touchpad_scroll_speed");
+                let mut put = |pin: &str, sig: Signal| {
+                    sink_outputs.entry((st.device_id.clone(), pin.to_string()))
+                        .and_modify(|cur| *cur = combine_signals(*cur, sig))
+                        .or_insert(sig);
+                };
+                if o.pointer != Vec2::ZERO { put("mouse_move", Signal::Vec2(o.pointer)); }
+                if o.scroll.y != 0.0 { put("scroll_move_y", Signal::Float(o.scroll.y)); }
+                if o.scroll.x != 0.0 { put("scroll_move_x", Signal::Float(o.scroll.x)); }
+                put("mouse_left", Signal::Bool(o.left));
+                put("mouse_right", Signal::Bool(o.right));
             }
 
             // Resolve Vec2 vs individual axis conflicts (they write the same hardware registers).

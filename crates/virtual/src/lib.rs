@@ -129,6 +129,18 @@ pub fn braid_try_mouse() -> bool {
     braid_try(1)
 }
 
+/// Notches a `scroll_up/down/left/right` value asks for. The engine delivers
+/// these pins as a count of off→on edges since the last read (a `Float`, see
+/// `flexinput_engine::is_click_pin`), so a held gate is one notch, not one per
+/// I/O tick. A bare `Bool(true)` still counts as one.
+pub(crate) fn scroll_notches(value: Signal) -> i32 {
+    match value {
+        Signal::Float(n) => n.round() as i32,
+        Signal::Bool(true) => 1,
+        _ => 0,
+    }
+}
+
 pub struct SinkPin {
     pub id: &'static str,
     pub display_name: &'static str,

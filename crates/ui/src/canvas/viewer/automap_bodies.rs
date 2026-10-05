@@ -139,6 +139,66 @@ pub(crate) fn touch_misc_header_toggle(
     resp.on_hover_text(CAPACITIVE_HOVER);
 }
 
+/// Label and hover text for the Virtual KB/M "Route gamepad touchpad" toggle
+/// (`route_touchpad`), shared by the Advanced node header and the Easy-mode
+/// Keyboard and Mouse card.
+pub(crate) const TOUCHPAD_ROUTE_LABEL: &str = "Gamepad touchpad → trackpad";
+pub(crate) const TOUCHPAD_ROUTE_HOVER: &str =
+    "Use the touchpad of the pad feeding this output as a laptop trackpad:\n\
+     • one finger moves the pointer\n\
+     • two fingers scroll smoothly\n\
+     • tap = left click, two-finger tap = right click\n\
+     • pressing the pad = left click (right click with two fingers down)\n\
+     Adds to whatever else drives the mouse. Windows' own trackpad gestures \
+     (three-finger swipes, pinch zoom) aren't available.";
+
+/// Advanced-mode Virtual KB/M header controls for the touchpad routing: the
+/// toggle, and while it's on, the trackpad's speed and scroll direction.
+pub(crate) fn touchpad_route_header_controls(
+    ui: &mut egui::Ui,
+    params: &mut std::collections::HashMap<String, Value>,
+    label_cell_w: f32,
+) {
+    let flag = |params: &std::collections::HashMap<String, Value>, key: &str| {
+        params.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    };
+    let mut on = flag(params, "route_touchpad");
+    let resp = ui.checkbox(&mut on, egui::RichText::new(TOUCHPAD_ROUTE_LABEL).small());
+    if resp.changed() {
+        params.insert("route_touchpad".into(), Value::Bool(on));
+    }
+    resp.on_hover_text(TOUCHPAD_ROUTE_HOVER);
+    if !on { return; }
+
+    // Pointer and two-finger scroll each get their own multiplier (1.0 =
+    // the trackpad's built-in rate; double-click the track to reset).
+    for (label, key) in [("Pointer ×", "touchpad_speed"), ("Scroll ×", "touchpad_scroll_speed")] {
+        let mut speed = params.get(key).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let initial = speed;
+        ui.horizontal(|ui| {
+            slider_label(ui, label, label_cell_w);
+            let resp = ui.add(egui::Slider::new(&mut speed, 0.1_f32..=10.0)
+                .logarithmic(true)
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always));
+            if slider_track_double_clicked(ui, &resp) { speed = 1.0; }
+            ui.add(egui::DragValue::new(&mut speed).speed(0.01).range(0.1_f32..=10.0).fixed_decimals(2));
+        });
+        if (speed - initial).abs() > f32::EPSILON {
+            params.insert(key.into(), Value::from(speed as f64));
+        }
+    }
+
+    let mut reverse = flag(params, "touchpad_reverse_scroll");
+    let resp = ui.checkbox(&mut reverse, egui::RichText::new("Reverse scroll direction").small());
+    if resp.changed() {
+        params.insert("touchpad_reverse_scroll".into(), Value::Bool(reverse));
+    }
+    resp.on_hover_text(
+        "Off: the page follows your fingers (Windows' trackpad default).\n\
+         On: fingers up scroll up, like turning a mouse wheel.");
+}
+
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
     if !is_device_source { return (false, false, false); }
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {

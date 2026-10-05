@@ -201,7 +201,23 @@ pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 /// 2 kHz / 500 Hz defaults — and a JSM config aimed 4x slower than in JSM. They
 /// are therefore banked across ticks here and drained by the reader instead.
 pub fn is_displacement_pin(pin: &str) -> bool {
-    matches!(pin, "mouse_move" | "mouse_move_x" | "mouse_move_y")
+    matches!(pin, "mouse_move" | "mouse_move_x" | "mouse_move_y"
+        | "scroll_move_x" | "scroll_move_y")
+}
+
+/// Bool sink pins delivered as a COUNT of off→on edges instead of a level: one
+/// scroll notch per gate cycle. Sampled as a level, a held gate scrolled once per
+/// I/O read (~500 notches/s at the defaults) and a pulse shorter than a read
+/// could vanish. Counted on every engine tick and banked like a displacement, a
+/// press is exactly one notch however long it is held. On the bus these pins
+/// carry `Signal::Float(edges)`.
+pub fn is_click_pin(pin: &str) -> bool {
+    matches!(pin, "scroll_up" | "scroll_down" | "scroll_left" | "scroll_right")
+}
+
+/// Pins banked across ticks and drained by the reader rather than sampled.
+fn is_banked_pin(pin: &str) -> bool {
+    is_displacement_pin(pin) || is_click_pin(pin)
 }
 
 fn add_displacement(into: &mut HashMap<(String, String), Signal>, key: &(String, String), v: Signal) {
@@ -213,17 +229,33 @@ fn add_displacement(into: &mut HashMap<(String, String), Signal>, key: &(String,
     }
 }
 
-/// Add one tick's displacement pins into `bank`.
-fn bank_displacement(bank: &mut HashMap<(String, String), Signal>, sinks: &HashMap<(String, String), Signal>) {
+/// Add one tick's displacement pins and click-pin rising edges into `bank`.
+/// `levels` is each click pin's level on the previous tick.
+fn bank_displacement(
+    bank: &mut HashMap<(String, String), Signal>,
+    levels: &mut HashMap<(String, String), bool>,
+    sinks: &HashMap<(String, String), Signal>,
+) {
     for (k, &v) in sinks {
         if is_displacement_pin(&k.1) {
             add_displacement(bank, k, v);
+        } else if is_click_pin(&k.1) {
+            let on = matches!(v, Signal::Bool(true));
+            let was = match levels.get_mut(k) {
+                Some(l) => std::mem::replace(l, on),
+                None => { levels.insert(k.clone(), on); false }
+            };
+            if on && !was {
+                add_displacement(bank, k, Signal::Float(1.0));
+            }
         }
     }
+    // A pin that dropped out of the outputs (unwired) reads as released.
+    levels.retain(|k, _| sinks.contains_key(k));
 }
 
-/// Replace the bus with the latest tick's `sinks`, except that each displacement
-/// pin becomes everything banked since the last publish plus whatever the reader
+/// Replace the bus with the latest tick's `sinks`, except that each banked pin
+/// becomes everything banked since the last publish plus whatever the reader
 /// has not drained yet. Empties `bank`.
 fn publish_sink_bus(
     bus: &mut HashMap<(String, String), Signal>,
@@ -232,11 +264,11 @@ fn publish_sink_bus(
 ) {
     let undrained: Vec<((String, String), Signal)> = bus
         .iter()
-        .filter(|(k, _)| is_displacement_pin(&k.1))
+        .filter(|(k, _)| is_banked_pin(&k.1))
         .map(|(k, &v)| (k.clone(), v))
         .collect();
     bus.clone_from(sinks);
-    bus.retain(|k, _| !is_displacement_pin(&k.1));
+    bus.retain(|k, _| !is_banked_pin(&k.1));
     for (k, v) in bank.drain() {
         add_displacement(bus, &k, v);
     }
@@ -245,14 +277,14 @@ fn publish_sink_bus(
     }
 }
 
-/// Read the bus for the sinks: a copy of it, with the displacement pins zeroed
-/// in the bus afterwards so the same movement is never delivered twice. The I/O
-/// thread calls this once per iteration.
+/// Read the bus for the sinks: a copy of it, with the banked pins zeroed in the
+/// bus afterwards so the same movement or notch is never delivered twice. The
+/// I/O thread calls this once per iteration.
 pub fn drain_sink_bus(bus: &SinkBus) -> HashMap<(String, String), Signal> {
     let mut bus = bus.write().unwrap();
     let out = bus.clone();
     for (k, v) in bus.iter_mut() {
-        if is_displacement_pin(&k.1) {
+        if is_banked_pin(&k.1) {
             *v = match *v {
                 Signal::Vec2(_) => Signal::Vec2(Default::default()),
                 Signal::Float(_) => Signal::Float(0.0),
@@ -345,6 +377,8 @@ pub fn spawn_processing_thread(
         // Displacement pins summed over the catch-up loop (see
         // `is_displacement_pin`); emptied into the sink bus once per wakeup.
         let mut disp_bank: HashMap<(String, String), Signal> = HashMap::new();
+        // Previous-tick level of each click pin (see `is_click_pin`).
+        let mut click_levels: HashMap<(String, String), bool> = HashMap::new();
 
         // High-resolution waiter for the sub-tick sleep below — precise without
         // raising the global timer resolution (see hr_timer). The device-I/O
@@ -461,7 +495,7 @@ pub fn spawn_processing_thread(
                         // clears tick_out on entry, so we must move (not
                         // clone) the samples here before the next call.
                         scope_acc.append(&mut tick_out.scope_samples);
-                        bank_displacement(&mut disp_bank, &tick_out.sink_outputs);
+                        bank_displacement(&mut disp_bank, &mut click_levels, &tick_out.sink_outputs);
                     }
                 }
 
@@ -544,10 +578,11 @@ mod tests {
     fn deliver(engine_ticks: usize, ticks_per_wakeup: usize, ticks_per_read: usize, per_tick: Vec2) -> (Vec2, f32) {
         let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
         let mut bank = HashMap::new();
+        let mut levels = HashMap::new();
         let (mut got, mut got_x) = (Vec2::ZERO, 0.0);
         for t in 1..=engine_ticks {
             let last = tick(per_tick, true);
-            bank_displacement(&mut bank, &last);
+            bank_displacement(&mut bank, &mut levels, &last);
             if t % ticks_per_wakeup == 0 {
                 publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
             }
@@ -583,7 +618,7 @@ mod tests {
         let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
         let mut bank = HashMap::new();
         let last = tick(Vec2::new(3.0, 0.0), false);
-        bank_displacement(&mut bank, &last);
+        bank_displacement(&mut bank, &mut HashMap::new(), &last);
         publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
         let first = drain_sink_bus(&bus);
         let second = drain_sink_bus(&bus);
@@ -592,12 +627,58 @@ mod tests {
     }
 
     #[test]
-    fn only_the_mouse_move_pins_are_displacements() {
-        for pin in ["mouse_move", "mouse_move_x", "mouse_move_y"] {
+    fn only_the_move_pins_are_displacements() {
+        for pin in ["mouse_move", "mouse_move_x", "mouse_move_y", "scroll_move_x", "scroll_move_y"] {
             assert!(is_displacement_pin(pin), "{pin}");
         }
-        for pin in ["mouse", "mouse_x", "right_stick", "scroll_up", "mouse_left"] {
+        for pin in ["mouse", "mouse_x", "right_stick", "scroll_up", "mouse_left", "trackpad_scroll_y"] {
             assert!(!is_displacement_pin(pin), "{pin}");
         }
+    }
+
+    /// Drive `scroll_up` with `levels` (one per engine tick), publishing every
+    /// `ticks_per_wakeup` and draining every `ticks_per_read`; return the notches
+    /// the reader was handed.
+    fn notches(levels: &[bool], ticks_per_wakeup: usize, ticks_per_read: usize) -> f32 {
+        let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
+        let (mut bank, mut prev) = (HashMap::new(), HashMap::new());
+        let mut got = 0.0;
+        for (i, &on) in levels.iter().enumerate() {
+            let t = i + 1;
+            let last = HashMap::from([(key("scroll_up"), Signal::Bool(on))]);
+            bank_displacement(&mut bank, &mut prev, &last);
+            if t % ticks_per_wakeup == 0 {
+                publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
+            }
+            if t % ticks_per_read == 0 {
+                got += drain_sink_bus(&bus).get(&key("scroll_up")).map(|s| s.as_float()).unwrap_or(0.0);
+            }
+        }
+        got
+    }
+
+    /// A held gate is one notch, not one per read.
+    #[test]
+    fn held_scroll_gate_is_one_notch() {
+        assert_eq!(notches(&[true; 400], 1, 4), 1.0);
+    }
+
+    /// Each off→on cycle is one notch, even when the reader is slower than the
+    /// cycles and a pulse lasts a single engine tick.
+    #[test]
+    fn every_scroll_gate_cycle_is_one_notch() {
+        let levels: Vec<bool> = (0..400).map(|t| t % 2 == 0).collect();
+        assert_eq!(notches(&levels, 4, 8), 200.0);
+    }
+
+    /// A gate that leaves the outputs (unwired) and comes back held is a new press.
+    #[test]
+    fn unwired_scroll_gate_reads_as_released() {
+        let (mut bank, mut prev) = (HashMap::new(), HashMap::new());
+        let held = HashMap::from([(key("scroll_up"), Signal::Bool(true))]);
+        bank_displacement(&mut bank, &mut prev, &held);
+        bank_displacement(&mut bank, &mut prev, &HashMap::new());
+        bank_displacement(&mut bank, &mut prev, &held);
+        assert_eq!(bank.get(&key("scroll_up")), Some(&Signal::Float(2.0)));
     }
 }

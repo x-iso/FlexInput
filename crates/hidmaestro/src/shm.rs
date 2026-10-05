@@ -600,6 +600,14 @@ impl OutputSection {
         Ok(OutputSection { section, last_seq: 0 })
     }
 
+    /// Replay from the start: the next reads return whatever the ring still
+    /// holds (its last 64 frames), not only frames written after `open`. For a
+    /// device whose driver wrote something we need during its own start-up —
+    /// the virtual mouse's Resolution Multiplier, set by mouhid before we open.
+    pub fn rewind(&mut self) {
+        self.last_seq = 0;
+    }
+
     /// Current ring `Head` (monotonic count of total writes by the driver) and
     /// the reader's `last_seq`. Diagnostic only: lets a probe distinguish "ring
     /// alive but driver never wrote" (Head==0, frozen) from "driver wrote N

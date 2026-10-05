@@ -2192,6 +2192,66 @@ mod trigger_tests {
             "a re-injected block must zero the pin again, got {}", sink_x(&out));
     }
 
+    /// A pad auto-mapped straight onto the keymouse sink, with "Route gamepad
+    /// touchpad" on or off: a one-finger slide moves the pointer only when on,
+    /// and a two-finger slide scrolls through the scroll_move pins.
+    #[test]
+    fn route_touchpad_drives_the_keymouse_sink() {
+        let key = |pin: &str| ("virtual.keymouse:0".to_string(), pin.to_string());
+        let graph_with = |route: bool| {
+            let mut sink = empty_node(3, "device.sink");
+            sink.params.insert("route_touchpad".into(), Value::Bool(route));
+            sink.sink_target = Some(SinkTarget {
+                device_id: "virtual.keymouse:0".to_string(),
+                pin_ids: canonical_pins(),
+                multi_sources: vec![Vec::new(); canonical_pins().len()],
+                automap_source: Some(("pad".to_string(), canonical_pins())),
+                automap_fallback_dev: None,
+                feedback_sources: Vec::new(),
+                is_self_sink: false,
+                digital_trigger_bridge: false,
+            });
+            ProcessingGraph { nodes: vec![sink] }
+        };
+        let touch = |fingers: &[(f32, f32)]| {
+            let mut s = HashMap::new();
+            for (i, n) in ["1", "2"].iter().enumerate() {
+                let f = fingers.get(i);
+                s.insert(("pad".to_string(), format!("touch{n}_active")), Signal::Bool(f.is_some()));
+                if let Some(&(x, y)) = f {
+                    s.insert(("pad".to_string(), format!("touch{n}_x")), Signal::Float(x));
+                    s.insert(("pad".to_string(), format!("touch{n}_y")), Signal::Float(y));
+                }
+            }
+            s
+        };
+        // Slide over two ticks; the second tick carries the motion.
+        let slide = |route: bool, fingers: [&[(f32, f32)]; 2]| {
+            let graph = graph_with(route);
+            let mut state = HashMap::new();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut state, &touch(fingers[0]), 0.001, &mut out);
+            eval_graph_tick(&graph, &mut state, &touch(fingers[1]), 0.001, &mut out);
+            out
+        };
+
+        let out = slide(true, [&[(0.0, 0.0)], &[(0.1, 0.0)]]);
+        let moved = match out.sink_outputs.get(&key("mouse_move")) {
+            Some(Signal::Vec2(v)) => v.x,
+            _ => 0.0,
+        };
+        assert!(moved > 0.0, "a one-finger slide right moves the pointer right");
+        assert_eq!(out.sink_outputs.get(&key("mouse_left")), Some(&Signal::Bool(false)));
+
+        let out = slide(false, [&[(0.0, 0.0)], &[(0.1, 0.0)]]);
+        assert!(!out.sink_outputs.contains_key(&key("mouse_move")), "off by default: the touchpad does nothing");
+
+        let out = slide(true, [&[(0.0, 0.0), (0.4, 0.0)], &[(0.0, 0.1), (0.4, 0.1)]]);
+        let scrolled = out.sink_outputs.get(&key("scroll_move_y")).map(|s| s.as_float()).unwrap_or(0.0);
+        assert!(scrolled < 0.0, "two fingers up scroll down (content follows the fingers), got {scrolled}");
+        assert!(!out.sink_outputs.contains_key(&key("mouse_move")));
+    }
+
     /// device.source → Remapper (analog stick-cardinal → key) → keymouse sink.
     /// Reproduces the user-reported case: WASD via analog-mode stick mapping.
     fn keymouse_sink_from_remap(uid: usize, remap_uid: usize) -> NodeSnap {

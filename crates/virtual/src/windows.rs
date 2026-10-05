@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use std::os::windows::io::AsRawHandle;
 use vigem_client::{Client, XButtons, XGamepad, Xbox360Wired};
 
@@ -926,6 +926,39 @@ pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
 }
 
+// Wheel input via SendInput directly: enigo only scrolls whole notches
+// (`length * WHEEL_DELTA`), and the smooth-scroll pins need fractions of one.
+#[repr(C)]
+struct MouseInputRaw { dx: i32, dy: i32, mouse_data: u32, flags: u32, time: u32, extra_info: usize }
+/// `INPUT` with `type = INPUT_MOUSE`. MOUSEINPUT is the largest member of the
+/// union, so this has the real struct's size and layout.
+#[repr(C)]
+struct InputRaw { kind: u32, mi: MouseInputRaw }
+#[link(name = "user32")]
+extern "system" { fn SendInput(count: u32, inputs: *const InputRaw, size: i32) -> u32; }
+const INPUT_MOUSE: u32 = 0;
+const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+/// Wheel units per notch (WHEEL_DELTA).
+const WHEEL_DELTA: f32 = 120.0;
+
+/// Send `delta` wheel units (120 = one notch): vertical +up, horizontal +right,
+/// which are the signs Windows itself uses for both.
+fn send_wheel(delta: i32, horizontal: bool) {
+    let input = InputRaw {
+        kind: INPUT_MOUSE,
+        mi: MouseInputRaw {
+            dx: 0,
+            dy: 0,
+            mouse_data: delta as u32,
+            flags: if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL },
+            time: 0,
+            extra_info: 0,
+        },
+    };
+    unsafe { SendInput(1, &input, std::mem::size_of::<InputRaw>() as i32); }
+}
+
 #[derive(Default, Clone, Copy)]
 struct MouseButtons { lmb: bool, rmb: bool, mmb: bool, mb4: bool, mb5: bool }
 
@@ -951,6 +984,14 @@ struct MouseShared {
     /// Analog scroll rate (notches/sec-ish); persists across ticks like vel_x/y.
     scroll_vel_v: f32,     // vertical (+up)
     scroll_vel_h: f32,     // horizontal (+right)
+    /// Smooth scroll rate (trackpad_scroll_*); persists across ticks like
+    /// scroll_vel_v/h but isn't quantized to whole notches.
+    smooth_vel_v: f32,     // vertical (+up)
+    smooth_vel_h: f32,     // horizontal (+right)
+    /// Accumulated scroll displacement in notches (scroll_move_*, fractions
+    /// allowed) — consumed (zeroed) by the mouse thread like scroll_pending.
+    scroll_move_v: f32,    // vertical (+up)
+    scroll_move_h: f32,    // horizontal (+right)
     buttons: MouseButtons,
     muted: bool,
     /// Set to true when VirtualKeyMouse is dropped — signals the thread to exit.
@@ -984,6 +1025,9 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     // Sub-notch remainder for analog (variable-speed) scroll on each axis.
     let mut scroll_carry_v = 0.0f32;
     let mut scroll_carry_h = 0.0f32;
+    // Wheel units (WHEEL_DELTA = one notch) not yet sent, on each axis.
+    let mut wheel_carry_v = 0.0f32;
+    let mut wheel_carry_h = 0.0f32;
     // Analog scroll rate unit: notches/sec at |rate| = 1.0 (matches keymouse_hm).
     const SCROLL_REF: f32 = 18.0;
     let mut os_buttons = MouseButtons::default();
@@ -1025,6 +1069,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             let snap = s.clone();
             s.scroll_pending = 0;
             s.hscroll_pending = 0;
+            s.scroll_move_v = 0.0;
+            s.scroll_move_h = 0.0;
             s.disp_x = 0.0;
             s.disp_y = 0.0;
             snap
@@ -1107,18 +1153,28 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                     }
                 }
                 // Scroll: digital clicks plus dt-scaled analog rate (sub-notch
-                // carry). Vertical +up, horizontal +right. enigo's vertical sign
-                // convention is preserved from before; horizontal follows suit.
+                // carry), both whole notches, plus the smooth rate and
+                // scroll_move displacement in fractions of one. Only those send
+                // partial notches: some apps still treat every wheel message as
+                // a full notch. Vertical +up, horizontal +right. (This went
+                // through enigo before, whose vertical is `-length`, so
+                // scroll_up scrolled DOWN here.)
                 scroll_carry_v += state.scroll_vel_v * SCROLL_REF * dt;
                 scroll_carry_h += state.scroll_vel_h * SCROLL_REF * dt;
-                let vclicks = scroll_carry_v.trunc() as i32;
-                let hclicks = scroll_carry_h.trunc() as i32;
-                scroll_carry_v -= vclicks as f32;
-                scroll_carry_h -= hclicks as f32;
-                let v_total = state.scroll_pending + vclicks;
-                let h_total = state.hscroll_pending + hclicks;
-                if v_total != 0 { let _ = e.scroll(v_total, Axis::Vertical); }
-                if h_total != 0 { let _ = e.scroll(h_total, Axis::Horizontal); }
+                let vclicks = scroll_carry_v.trunc();
+                let hclicks = scroll_carry_h.trunc();
+                scroll_carry_v -= vclicks;
+                scroll_carry_h -= hclicks;
+                let smooth_v = state.smooth_vel_v * SCROLL_REF * dt + state.scroll_move_v;
+                let smooth_h = state.smooth_vel_h * SCROLL_REF * dt + state.scroll_move_h;
+                wheel_carry_v += (state.scroll_pending as f32 + vclicks + smooth_v) * WHEEL_DELTA;
+                wheel_carry_h += (state.hscroll_pending as f32 + hclicks + smooth_h) * WHEEL_DELTA;
+                let v_units = wheel_carry_v.trunc();
+                let h_units = wheel_carry_h.trunc();
+                wheel_carry_v -= v_units;
+                wheel_carry_h -= h_units;
+                if v_units != 0.0 { send_wheel(v_units as i32, false); }
+                if h_units != 0.0 { send_wheel(h_units as i32, true); }
                 btn_sync!(os_buttons.lmb, state.buttons.lmb, Button::Left);
                 btn_sync!(os_buttons.rmb, state.buttons.rmb, Button::Right);
                 btn_sync!(os_buttons.mmb, state.buttons.mmb, Button::Middle);
@@ -1129,6 +1185,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                 carry_y = 0.0;
                 scroll_carry_v = 0.0;
                 scroll_carry_h = 0.0;
+                wheel_carry_v = 0.0;
+                wheel_carry_h = 0.0;
                 btn_release!(os_buttons.lmb, Button::Left);
                 btn_release!(os_buttons.rmb, Button::Right);
                 btn_release!(os_buttons.mmb, Button::Middle);
@@ -1159,6 +1217,10 @@ pub struct VirtualKeyMouse {
     hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
     scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
     scroll_vel_h: f32,   // analog horizontal scroll rate (scroll_x), +right
+    smooth_vel_v: f32,   // smooth scroll rate (trackpad_scroll_y), +up
+    smooth_vel_h: f32,   // smooth scroll rate (trackpad_scroll_x), +right
+    scroll_move_v: f32,  // scroll displacement in notches (scroll_move_y), +up
+    scroll_move_h: f32,  // scroll displacement in notches (scroll_move_x), +right
     buttons: MouseButtons,
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
@@ -1202,6 +1264,10 @@ impl VirtualKeyMouse {
             hscroll_delta: 0,
             scroll_vel_v: 0.0,
             scroll_vel_h: 0.0,
+            smooth_vel_v: 0.0,
+            smooth_vel_h: 0.0,
+            scroll_move_v: 0.0,
+            scroll_move_h: 0.0,
             buttons: MouseButtons::default(),
             keys: KeysHeld::default(),
             learned_keys: HashMap::new(),
@@ -1242,12 +1308,16 @@ impl VirtualDevice for VirtualKeyMouse {
             "mouse_move"    => { if let Signal::Vec2(v) = value { self.mouse_disp_x += v.x; self.mouse_disp_y += -v.y; } }
             "mouse_move_x"  => { if let Signal::Float(f) = value { self.mouse_disp_x += f; } }
             "mouse_move_y"  => { if let Signal::Float(f) = value { self.mouse_disp_y += -f; } }
-            "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
-            "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
-            "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
-            "scroll_left"   => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta -= 1; } }
+            "scroll_up"     => { self.scroll_delta  += crate::scroll_notches(value); }
+            "scroll_down"   => { self.scroll_delta  -= crate::scroll_notches(value); }
+            "scroll_right"  => { self.hscroll_delta += crate::scroll_notches(value); }
+            "scroll_left"   => { self.hscroll_delta -= crate::scroll_notches(value); }
             "scroll_y"      => { if let Signal::Float(f) = value { self.scroll_vel_v += f; } }
             "scroll_x"      => { if let Signal::Float(f) = value { self.scroll_vel_h += f; } }
+            "trackpad_scroll_y" => { if let Signal::Float(f) = value { self.smooth_vel_v += f; } }
+            "trackpad_scroll_x" => { if let Signal::Float(f) = value { self.smooth_vel_h += f; } }
+            "scroll_move_y" => { if let Signal::Float(f) = value { self.scroll_move_v += f; } }
+            "scroll_move_x" => { if let Signal::Float(f) = value { self.scroll_move_h += f; } }
             "mouse_left"    => { if let Signal::Bool(b) = value { self.buttons.lmb = b; } }
             "mouse_right"   => { if let Signal::Bool(b) = value { self.buttons.rmb = b; } }
             "mouse_middle"  => { if let Signal::Bool(b) = value { self.buttons.mmb = b; } }
@@ -1273,6 +1343,10 @@ impl VirtualDevice for VirtualKeyMouse {
             s.hscroll_pending    += std::mem::take(&mut self.hscroll_delta);
             s.scroll_vel_v        = std::mem::take(&mut self.scroll_vel_v);
             s.scroll_vel_h        = std::mem::take(&mut self.scroll_vel_h);
+            s.smooth_vel_v        = std::mem::take(&mut self.smooth_vel_v);
+            s.smooth_vel_h        = std::mem::take(&mut self.smooth_vel_h);
+            s.scroll_move_v      += std::mem::take(&mut self.scroll_move_v);
+            s.scroll_move_h      += std::mem::take(&mut self.scroll_move_h);
             s.buttons             = self.buttons;
             s.muted               = self.muted;
         }
@@ -1358,6 +1432,10 @@ impl VirtualDevice for VirtualKeyMouse {
         self.hscroll_delta = 0;
         self.scroll_vel_v = 0.0;
         self.scroll_vel_h = 0.0;
+        self.smooth_vel_v = 0.0;
+        self.smooth_vel_h = 0.0;
+        self.scroll_move_v = 0.0;
+        self.scroll_move_h = 0.0;
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }

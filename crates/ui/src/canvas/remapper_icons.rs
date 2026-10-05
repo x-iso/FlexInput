@@ -578,8 +578,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "scroll_down"   => return Some(M_SCROLL_D),
         "scroll_left"   => return Some(M_SCROLL_L),
         "scroll_right"  => return Some(M_SCROLL_R),
-        "scroll_x"      => return Some(M_HSCROLL),
-        "scroll_y"      => return Some(M_VSCROLL),
+        "scroll_x" | "trackpad_scroll_x" | "scroll_move_x" => return Some(M_HSCROLL),
+        "scroll_y" | "trackpad_scroll_y" | "scroll_move_y" => return Some(M_VSCROLL),
         // Mouse-movement delta (Touch Zones relative-mouse outputs).
         "mouse"         => return Some(M_MOVE),
         "mouse_x"       => return Some(M_MOVE_H),
