@@ -596,6 +596,11 @@ pub struct ModuleDescriptor {
   - Input 0: Model identifier or path
   - Input 1: Orientation quaternion (Vec4)
 - **Outputs:** None (display-only)
+- **Parameters:**
+  - `motion_cue: f64` - Motion cue (0..2, default 0.5, 0 = off): the model slides
+    briefly the way the pad is moved, from the device's accelerometer turned into
+    world axes with the drawn orientation (high-passed to drop gravity, then a
+    leaky double integral). Off without a wired orientation
 
 ---
 

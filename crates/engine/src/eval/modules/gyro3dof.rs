@@ -47,6 +47,17 @@ pub(crate) fn gyro_hold_rotation(params: &HashMap<String, Value>) -> Option<glam
     )
 }
 
+/// A canonical accel reading in the orientation's model frame (X = right,
+/// Y = up, Z = back), the frame the gyro rates are integrated in.
+///
+/// The accel tuple is (forward, left, up), so right is `-y`, up is `z` and back
+/// is `-x`. The gyro's own map, `(y, -z, -x)`, is NOT this: its tuple is
+/// (forward, right, down), and reusing it here mirrors the reading about the
+/// roll axis — tilt corrections then pull pitch the wrong way.
+pub(crate) fn accel_to_model(ax: f32, ay: f32, az: f32) -> glam::Vec3 {
+    glam::Vec3::new(-ay, az, -ax)
+}
+
 pub(crate) fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -116,12 +127,19 @@ pub(crate) fn compute_gyro_3dof(
     //   x = forward  (+ nose/USB up)
     //   y = side     (+ right grip down)
     //   z = vertical (+ flat, face up)
-    // — identical for every pad, and the SAME frame the gyro vector uses (roll
-    // about x, pitch about y, yaw about z). Player/World projects gyro onto this
-    // gravity direction, so accel and gyro MUST share a frame; the module works
-    // in canonical throughout to guarantee that. (It used to assume a legacy
-    // layout with x = side, which only matched the gyro frame on the Switch Pro
-    // — hence the slanted Player/World response on Sony pads.)
+    // — identical for every pad, and the same axis ROLES the gyro uses (roll
+    // about x, pitch about y, yaw about z). (It used to assume a legacy layout
+    // with x = side, which only matched the gyro on the Switch Pro — hence the
+    // slanted Player/World response on Sony pads.)
+    //
+    // ⛔ Same roles, NOT the same basis. Written against the pad's own axes,
+    // accel is (forward, LEFT, UP) and gyro is (forward, RIGHT, DOWN): the
+    // parsers pick each sensor's signs for its own consumer (+1 g lying flat;
+    // + = turn right / nose up), and those choices mirror y and z between the
+    // two. Anything that combines them — Player/World's projection, the hold
+    // offsets, the drift correction — must convert one into the other's basis.
+    // Treating the tuples as one vector looks right lying flat and comes apart
+    // as the pad tilts.
     let ax = pin_or(5, ax_am) * inv("inv_accel_x");
     let ay = pin_or(6, ay_am) * inv("inv_accel_y");
     let az = pin_or(7, az_am) * inv("inv_accel_z");
@@ -244,9 +262,16 @@ pub(crate) fn compute_gyro_3dof(
     let (raw_x, raw_y, _raw_lean_unused) = match axis {
         "pitch_roll" => (hgx, hgy, hgz),
         "player" | "world" => {
+            // Down, in the gyro's (forward, right, down) basis: `g_hat` is the
+            // accel's UP in (forward, left, up), so negate it and mirror y and
+            // z — `(-x, y, z)`. A turn right about gravity then reads positive,
+            // as gyro_z does lying flat. Dotting `g_hat` straight in, as this
+            // once did, read a real turn as `cos 2θ` of itself with the pad
+            // tilted θ — nothing at all at 45°.
+            let down = glam::Vec3::new(-g_hat.x, g_hat.y, g_hat.z);
             let gyro  = glam::Vec3::new(hgx, hgy, hgz);
-            let world_yaw   = gyro.dot(g_hat);
-            let gyro_no_yaw = gyro - world_yaw * g_hat;
+            let world_yaw   = gyro.dot(down);
+            let gyro_no_yaw = gyro - world_yaw * down;
             (world_yaw, gyro_no_yaw.y, 0.0)
         }
         // pitch_yaw: gz=yaw→X (plus the roll share), gy=pitch→Y
@@ -501,17 +526,18 @@ pub(crate) fn compute_gyro_3dof(
     // to it is corrected. Yaw (rotation about gravity) is unobservable from
     // accel; the cross-product correction leaves it untouched.
     //
-    // Post-inv_* pins are in the canonical device convention, so the accel
-    // vector maps into the model body frame with the same fixed axis map
-    // the gyro rates use above: dev (x=roll/fwd, y=pitch/side, z=yaw/vert)
-    // → model (y, −z, −x).
+    // The accel goes into the model body frame through `accel_to_model`, NOT
+    // the gyro's axis map: the two sensors' tuples are mirrored in y and z
+    // (see where they are read). Mapping accel like the gyro made a still pad
+    // held 30° nose-up drift to 30° nose-DOWN within seconds — the correction
+    // pulled the pose to the mirror image of the truth.
     // OFF by default: gravity can't distinguish tilt from linear acceleration,
     // so translation (side-to-side / up-down swings) reads as false rotation
     // even behind the steadiness gates. Auto re-center covers rest drift
     // without that failure mode; this stays as an explicit opt-in.
     let drift_corr = pf("orient_drift", 0.0).clamp(0.0, 1.0);
     if drift_corr > 0.0 && dt > 0.0 {
-        let a_model = glam::Vec3::new(ay, -az, -ax);
+        let a_model = accel_to_model(ax, ay, az);
         let acc_len = a_model.length();
         // Accel pins are normalized ±1 == ±8 G; trust the reading only when
         // its magnitude is near 1 g (anything else isn't just gravity).
@@ -595,7 +621,7 @@ pub(crate) fn compute_gyro_3dof(
             // easing pose, exactly like a manual reset does — otherwise the
             // tilt correction would fight the pull toward identity whenever
             // the controller rests in a non-flat pose.
-            let a_model = glam::Vec3::new(ay, -az, -ax);
+            let a_model = accel_to_model(ax, ay, az);
             let len = a_model.length();
             if len > 1e-4 {
                 let w = new_q * (a_model / len);
@@ -764,12 +790,93 @@ mod hold_offset_tests {
     }
 
     #[test]
+    fn player_reads_a_whole_turn_about_gravity_on_a_tilted_pad() {
+        // ⛔ The regression: Player dotted the gyro with the accel tuple as if
+        // they shared a basis, so a real turn read as `cos 2θ` of itself —
+        // nothing at 45°, reversed past it. Flat it was right, which hid it.
+        let w = 0.1;
+        let player = [("family", json!("pointer")), ("axis", json!("player"))];
+        for deg in [0.0, 30.0, 45.0, 60.0] {
+            let (g, a) = nose_up_turn(deg, w);
+            let (x, y, _, _) = run(&player, g, a);
+            assert!((x - w).abs() < 1e-4, "{deg}° nose-up: a turn about gravity read {x}");
+            assert!(y.abs() < 1e-4, "{deg}° nose-up: and leaked {y} into pitch");
+        }
+    }
+
+    #[test]
     fn hold_offsets_leave_the_orientation_output_physical() {
         let (g, a) = nose_up_turn(30.0, 0.1);
         let (_, _, _, q0) = run(&[], g, a);
         let (_, _, _, q) =
             run(&[("hold_pitch", json!(30.0)), ("hold_yaw", json!(20.0)), ("hold_roll", json!(-15.0))], g, a);
         assert!((q - q0).length() < 1e-6, "{q:?} vs {q0:?}");
+    }
+}
+
+#[cfg(test)]
+mod drift_correction_tests {
+    use super::compute_gyro_3dof;
+    use crate::NodeState;
+    use flexinput_core::Signal;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    const ONE_G: f32 = 0.125; // accel pins: ±1 == ±8 g
+
+    /// Feed `secs` of a constant reading with drift correction on; return the
+    /// published (canonical) orientation.
+    fn step(state: &mut NodeState, gyro: [f32; 3], accel: [f32; 3], secs: f32) -> glam::Quat {
+        let mut p: HashMap<String, Value> = HashMap::new();
+        p.insert("orient_drift".into(), json!(0.5));
+        let (dev, coll) = (HashMap::new(), HashMap::new());
+        let inputs: Vec<Option<Signal>> = [None, None]
+            .into_iter()
+            .chain(gyro.iter().chain(accel.iter()).map(|v| Some(Signal::Float(*v))))
+            .collect();
+        let dt = 1.0 / 250.0;
+        let mut out = Vec::new();
+        for _ in 0..(secs / dt) as usize {
+            out = compute_gyro_3dof(&inputs, state, &p, &dev, &coll, dt);
+        }
+        match out[5] {
+            Some(Signal::Vec4(v)) => glam::Quat::from_xyzw(v.x, v.y, v.z, v.w),
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    /// Nose-up angle of a canonical orientation, in degrees: how far the pad's
+    /// forward axis points above the horizon.
+    fn nose_up_deg(q: glam::Quat) -> f32 {
+        (q * glam::Vec3::X).z.asin().to_degrees()
+    }
+
+    #[test]
+    fn a_still_tilted_pad_stays_where_it_is() {
+        // ⛔ The regression: accel went into the model frame through the gyro's
+        // axis map, mirrored about roll, so a pad held still 30° nose-up was
+        // pulled to 30° nose-DOWN in about three seconds.
+        let mut st = NodeState::default();
+        step(&mut st, [0.0; 3], [0.0, 0.0, ONE_G], 2.0); // flat: reference
+        let q = step(&mut st, [0.0, 0.03, 0.0], [0.0, 0.0, ONE_G], 0.5); // 60 °/s × 0.5 s
+        assert!((nose_up_deg(q) - 30.0).abs() < 0.5, "gyro alone: {}", nose_up_deg(q));
+        let (s, c) = 30f32.to_radians().sin_cos();
+        let q = step(&mut st, [0.0; 3], [s * ONE_G, 0.0, c * ONE_G], 10.0);
+        assert!((nose_up_deg(q) - 30.0).abs() < 0.5, "held still: {}", nose_up_deg(q));
+    }
+
+    #[test]
+    fn tilt_drift_is_pulled_back_out() {
+        // The gyro says the pad pitched 30° and rolled 20°; the accel says it
+        // never left flat. Held still, the correction must take the pose back
+        // to flat on both axes.
+        let mut st = NodeState::default();
+        step(&mut st, [0.0; 3], [0.0, 0.0, ONE_G], 2.0);
+        step(&mut st, [0.0, 0.03, 0.0], [0.0, 0.0, ONE_G], 0.5);
+        step(&mut st, [0.02, 0.0, 0.0], [0.0, 0.0, ONE_G], 0.5);
+        let q = step(&mut st, [0.0; 3], [0.0, 0.0, ONE_G], 10.0);
+        let up = q * glam::Vec3::Z;
+        assert!(up.z > 0.9995, "back to flat, got the face pointing {up:?}");
     }
 }
 

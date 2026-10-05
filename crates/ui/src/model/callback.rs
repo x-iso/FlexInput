@@ -83,6 +83,10 @@ pub struct ControllerLive {
     /// Highlight colour (0..1 RGB) for active inputs — from the pinned item's
     /// style `accent` (or the default accent on the node body).
     pub highlight: [f32; 3],
+    /// Momentary slide of the whole model from the pad's linear motion, in
+    /// model radii along the renderer's world axes (see `c3d_motion_offset`).
+    /// Zero = in place.
+    pub offset: glam::Vec3,
 }
 
 impl ControllerLive {
@@ -973,8 +977,11 @@ impl CallbackTrait for MeshRenderState {
         // ONLY — the per-part model matrix carries the object transform.
         let view_proj = crop * proj * view;
 
-        // Orientation rotates the whole assembly about its centre.
-        let orient = Mat4::from_translation(center)
+        // Orientation rotates the whole assembly about its centre; the motion
+        // cue then slides it (world axes, so a push right goes right on screen
+        // however the pad is turned).
+        let slide = self.live.offset * radius;
+        let orient = Mat4::from_translation(center + slide)
             * Mat4::from_quat(self.orientation)
             * Mat4::from_translation(-center);
 
@@ -1109,7 +1116,7 @@ impl CallbackTrait for MeshRenderState {
             }
             let dist = part
                 .map(|p| {
-                    let c = self.orientation * (p.centroid - center) + center;
+                    let c = self.orientation * (p.centroid - center) + center + slide;
                     (cam - c).length()
                 })
                 .unwrap_or(0.0);

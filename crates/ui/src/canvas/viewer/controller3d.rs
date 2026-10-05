@@ -432,6 +432,141 @@ pub(crate) fn controller3d_live(
     live
 }
 
+/// The node's Motion cue amount (`motion_cue`, 0 = off).
+pub(crate) fn c3d_motion_amount(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {
+    snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("motion_cue").and_then(|v| v.as_f64()))
+        .unwrap_or(0.5) as f32
+}
+
+/// Motion-cue filter state for one viewer instance.
+///
+/// Works in the RENDERER's world axes. The accelerometer reads the pad's motion
+/// plus gravity in the pad's own axes; turned into world axes with the drawn
+/// orientation, gravity becomes a constant, so a slow average of the result is
+/// gravity (plus whatever the orientation gets slowly wrong) and the remainder
+/// is the pad being moved. That remainder drives a leaky double integrator:
+/// a push right builds velocity, the stop takes it away again, and the leaks
+/// draw the model home — a short slide the way the pad went, then back.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct C3dMotion {
+    base: glam::Vec3,
+    vel: glam::Vec3,
+    pos: glam::Vec3,
+    primed: bool,
+}
+
+impl C3dMotion {
+    /// How long the gravity estimate takes to follow, s. Short enough to absorb
+    /// a slowly wrong orientation, long enough to leave a hand's push intact.
+    const BASE_TAU: f32 = 0.4;
+    /// Leaks on the integrated velocity and position, s.
+    const VEL_TAU: f32 = 0.3;
+    const POS_TAU: f32 = 0.25;
+    /// Accelerometer noise floor, g — a pad at rest must not shiver.
+    const DEADZONE_G: f32 = 0.03;
+    /// Metres of slide that move the model one bounding radius at amount 1.
+    const METRES_PER_RADIUS: f32 = 0.15;
+    /// Furthest the model may slide, in radii, so it never leaves the frame.
+    const MAX_RADII: f32 = 0.35;
+
+    /// Advance by one frame. `a_world` is the accelerometer in g, already in
+    /// world axes. Returns the slide in model radii.
+    pub(crate) fn step(&mut self, a_world: glam::Vec3, dt: f32, amount: f32) -> glam::Vec3 {
+        if !self.primed {
+            *self = C3dMotion { base: a_world, primed: true, ..Default::default() };
+        }
+        self.base += (a_world - self.base) * (1.0 - (-dt / Self::BASE_TAU).exp());
+        let lin = a_world - self.base;
+        let m = lin.length();
+        let lin = if m > Self::DEADZONE_G { lin * ((m - Self::DEADZONE_G) / m) } else { glam::Vec3::ZERO };
+        self.vel = (self.vel + lin * 9.81 * dt) * (-dt / Self::VEL_TAU).exp();
+        self.pos = (self.pos + self.vel * dt) * (-dt / Self::POS_TAU).exp();
+        let off = self.pos / Self::METRES_PER_RADIUS * amount;
+        let len = off.length();
+        if len > Self::MAX_RADII { off * (Self::MAX_RADII / len) } else { off }
+    }
+}
+
+/// The 3D viewer's motion cue for this frame: the slide `C3dMotion` gives the
+/// device's live accelerometer, or zero when it's off, there's no accelerometer,
+/// or no orientation is wired (`orientation` is `None`) — without one, turning
+/// the pad would move gravity across the reading and read as a slide.
+///
+/// `orientation` is the drawn one, in the renderer's basis. The accelerometer is
+/// canonical, (forward, left, up), the same basis as a canonical orientation, so
+/// it goes through the same canonical → renderer change as the orientation did.
+pub(crate) fn c3d_motion_offset(
+    ctx: &egui::Context,
+    instance: u64,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: Option<&str>,
+    orientation: Option<glam::Quat>,
+    amount: f32,
+) -> glam::Vec3 {
+    let key = egui::Id::new(("c3d_motion", instance));
+    let accel = dev.and_then(|dev| {
+        let get = |pin: &str| live_signals.get(&(dev.to_string(), pin.to_string())).map(|s| s.as_float());
+        Some(glam::Vec3::new(get("accel_x")?, get("accel_y")?, get("accel_z")?))
+    });
+    let (Some(q), Some(accel)) = (orientation, accel) else {
+        ctx.data_mut(|d| d.remove::<C3dMotion>(key));
+        return glam::Vec3::ZERO;
+    };
+    if amount <= 0.0 {
+        ctx.data_mut(|d| d.remove::<C3dMotion>(key));
+        return glam::Vec3::ZERO;
+    }
+    // Accel pins are normalised ±1 == ±8 g.
+    let a_world = q * (flexinput_core::frames::canonical_to_viewer() * (accel * 8.0));
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+    ctx.data_mut(|d| {
+        let s = d.get_temp_mut_or_default::<C3dMotion>(key);
+        s.step(a_world, dt, amount)
+    })
+}
+
+#[cfg(test)]
+mod motion_cue_tests {
+    use super::C3dMotion;
+    use glam::Vec3;
+
+    const DT: f32 = 1.0 / 60.0;
+
+    #[test]
+    fn a_pad_at_rest_stays_put() {
+        let mut m = C3dMotion::default();
+        for _ in 0..600 {
+            let off = m.step(Vec3::new(0.0, 1.0, 0.0), DT, 1.0);
+            assert!(off.length() < 1e-6, "{off:?}");
+        }
+    }
+
+    #[test]
+    fn a_push_right_slides_right_then_comes_home() {
+        let mut m = C3dMotion::default();
+        let g = Vec3::new(0.0, 1.0, 0.0);
+        for _ in 0..60 {
+            m.step(g, DT, 1.0);
+        }
+        // 0.15 s speeding up rightwards at 0.8 g, 0.15 s stopping.
+        let mut peak = 0.0f32;
+        for i in 0..18 {
+            let a = if i < 9 { 0.8 } else { -0.8 };
+            let off = m.step(g + Vec3::X * a, DT, 1.0);
+            peak = peak.max(off.x);
+            assert!(off.y.abs() < 1e-6 && off.z.abs() < 1e-6, "{off:?}");
+        }
+        assert!(peak > 0.05, "slid right: {peak}");
+        let mut off = Vec3::ZERO;
+        for _ in 0..120 {
+            off = m.step(g, DT, 1.0);
+        }
+        assert!(off.length() < 0.01, "home again: {off:?}");
+    }
+}
+
 /// Material colour swatch (RGBA — alpha renders the group as translucent
 /// plastic) with a right-click Copy/Paste menu (app-wide colour clipboard in
 /// egui temp memory; Copy also puts a hex string on the system clipboard).
@@ -565,8 +700,9 @@ pub(crate) fn show_controller3d_body(
             _ => None,
         })
         .filter(|q| q.length_squared() > 1e-6)
-        .map(|q| to_view_basis(q.normalize()))
-        .unwrap_or(glam::Quat::IDENTITY);
+        .map(|q| to_view_basis(q.normalize()));
+    let wired_orientation = orientation;
+    let orientation = orientation.unwrap_or(glam::Quat::IDENTITY);
 
     ui.vertical(|ui| {
         // Model picker: Auto (device) + every available model folder.
@@ -770,6 +906,27 @@ pub(crate) fn show_controller3d_body(
             }
         });
 
+        // Motion cue: how far the model slides when the pad is moved.
+        let mut motion = c3d_motion_amount(snarl, node_id);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Motion cue").small())
+                .on_hover_text(
+                    "Slide the model briefly the way the pad is moved (from\n\
+                     the accelerometer), then let it drift back. 0 = off.\n\
+                     Needs the Orientation input wired: the reading is turned\n\
+                     into world axes with it, so turning the pad doesn't\n\
+                     read as moving it.",
+                );
+            if ui
+                .add(egui::Slider::new(&mut motion, 0.0..=2.0))
+                .changed()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("motion_cue".into(), serde_json::json!(motion));
+                }
+            }
+        });
+
         // Resizable rectangular viewport (persisted like the scopes).
         let size_id = egui::Id::new(("c3d_size", node_id));
         let mut size = ui
@@ -790,8 +947,12 @@ pub(crate) fn show_controller3d_body(
             .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
             .unwrap_or(0.25) as f32;
         let ctx = ui.ctx().clone();
-        let live = controller3d_live(
+        let mut live = controller3d_live(
             live_signals, dev_id.as_deref(), &ctx, node_id.0, tailoff, accent, deadzone,
+        );
+        live.offset = c3d_motion_offset(
+            &ctx, node_id.0 as u64, live_signals, dev_id.as_deref(), wired_orientation,
+            c3d_motion_amount(snarl, node_id),
         );
         render_controller3d_core(
             ui, node_id.0 as u64, rect, &resolved, orientation, bg, outline, outline_w, scheme,

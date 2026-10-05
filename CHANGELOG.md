@@ -86,6 +86,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   3D Orientation output stays physical. Both rows can be pinned and driven
   from a pad.
 
+- **Controller 3D: a motion cue.** Moving the pad — not turning it — slides
+  the model briefly the way it went, and it drifts back. **Motion cue** sets
+  how far (0 turns it off). It reads the accelerometer in world axes using the
+  wired orientation, so it stays off when no orientation is wired.
+
 ### Changed
 
 - **Two-way Response Curve hysteresis reworked.** The curves are now read at a
@@ -109,6 +114,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   wire it, so Stick aim keeps the stick's whole range as before.
 
 ### Fixed
+
+- **3DOF to 2D: drift fix pulled a tilted pad to its mirror image.** Held
+  still 30° nose-up, the 3D model swung to 30° nose-down within a few seconds:
+  the correction read the accelerometer as if it shared the gyro's signs,
+  which it doesn't. It now holds the pose and takes only real drift out.
+
+- **3DOF to 2D: Player and World lost the turn on a tilted pad.** Turning
+  about gravity read as `cos 2×tilt` of the real turn — half at 30°, nothing
+  at 45°, backwards beyond — for the same mix-up. A turn now reads whole
+  however the pad is held; lying flat nothing changes.
 
 - **Two-way Response Curve fired its short pulse on release, and missed it on
   the pull.** The old direction detector switched curves late and read the

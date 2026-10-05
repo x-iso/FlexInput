@@ -215,8 +215,9 @@ pub(crate) fn render_pinned_element_impl(
                 // was normalising and drawing the canonical quaternion
                 // unchanged, so a pinned 3D view and the node it was pinned
                 // from disagreed about which way the controller was pointing.
-                .map(|q| to_view_basis(q.normalize()))
-                .unwrap_or(glam::Quat::IDENTITY);
+                .map(|q| to_view_basis(q.normalize()));
+            let wired_orientation = orientation;
+            let orientation = orientation.unwrap_or(glam::Quat::IDENTITY);
             // Colours/model are the PIN's own style override (edited directly
             // by the inspector strip — no snarl writes, no temp channels; a
             // pinned instance can never hijack the module's own state, and the
@@ -261,14 +262,19 @@ pub(crate) fn render_pinned_element_impl(
                 }
             }
             let ctx = ui.ctx().clone();
-            let live = controller3d_live(
+            let mut live = controller3d_live(
                 live_signals, dev_id.as_deref(), &ctx, inner_id.0, tailoff, accent, deadzone,
             );
+            // Pinned copies live in a different host from the canvas node, so
+            // the inner id alone can collide with it; the high bit keeps the two
+            // namespaces apart.
+            let instance = inner_id.0 as u64 | 1 << 63;
+            live.offset = c3d_motion_offset(
+                &ctx, instance, live_signals, dev_id.as_deref(), wired_orientation,
+                c3d_motion_amount(inner_snarl, inner_id),
+            );
             render_controller3d_core(
-                // Pinned copies live in a different host from the canvas node,
-                // so the inner id alone can collide with it; the high bit keeps
-                // the two namespaces apart.
-                ui, inner_id.0 as u64 | 1 << 63, rect, &resolved, orientation, bg, outline,
+                ui, instance, rect, &resolved, orientation, bg, outline,
                 outline_w, scheme, alpha, cam_pitch, live, composite,
             );
             return;
