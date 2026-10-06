@@ -643,11 +643,12 @@ impl FlexInputApp {
                 if ui.checkbox(&mut self.settings.mouse_suppression_enabled,
                     "Pause virtual mouse when you move a physical mouse")
                     .on_hover_text(
-                        "When on, the virtual mouse briefly yields if it detects the real \
-                         cursor moving on its own, so a stick-driven cursor doesn't fight a \
-                         physical mouse on the desktop. Automatically disabled while a virtual \
-                         gamepad is also active (mixed mode), since games that warp the cursor \
-                         would otherwise make virtual mouse aim stutter.")
+                        "When on, the virtual mouse's pointer briefly yields whenever another \
+                         mouse is used — a physical mouse, a touchpad, or another program's \
+                         mouse input — so a stick-driven cursor doesn't fight it on the \
+                         desktop. Only motion pauses: virtual clicks and scrolling go through. \
+                         The cursor being moved by a game doesn't count. Automatically \
+                         disabled while a virtual gamepad is also active (mixed mode).")
                     .changed()
                 {
                     flexinput_virtual::set_mouse_suppression_enabled(self.settings.mouse_suppression_enabled);

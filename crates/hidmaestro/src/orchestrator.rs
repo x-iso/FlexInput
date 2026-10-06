@@ -66,6 +66,8 @@ pub enum OrchestratorError {
     SwdTimeout,
     /// An XInput slot reorder could not be carried out (free-form detail).
     Reorder(String),
+    /// A devnode restart's query-remove failed (CONFIGRET + PNP_VETO_TYPE).
+    Restart(u32, i32),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -78,6 +80,9 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::SwdCreate(hr) => write!(f, "SwDeviceCreate failed (hr 0x{hr:08X})"),
             OrchestratorError::SwdTimeout => write!(f, "SwDeviceCreate timed out"),
             OrchestratorError::Reorder(s) => write!(f, "xinput reorder: {s}"),
+            OrchestratorError::Restart(r, veto) => {
+                write!(f, "CM_Query_And_Remove_SubTree failed (err {r}, veto type {veto})")
+            }
         }
     }
 }
@@ -195,6 +200,14 @@ extern "system" {
     fn CM_Disable_DevNode(dev_inst: u32, flags: u32) -> u32;
     /// Re-enable a previously-disabled devnode.
     fn CM_Enable_DevNode(dev_inst: u32, flags: u32) -> u32;
+    fn CM_Query_And_Remove_SubTreeW(
+        dev_inst: u32,
+        veto_type: *mut i32,
+        veto_name: *mut u16,
+        name_length: u32,
+        flags: u32,
+    ) -> u32;
+    fn CM_Setup_DevNode(dev_inst: u32, flags: u32) -> u32;
 }
 
 /// Set a devnode (by PnP instance id) enabled or disabled. This is the
@@ -922,7 +935,7 @@ pub fn create_xusb_companion_node(
     let suffix = next_swd_suffix(controller_index);
 
     let (instance_id, handle) =
-        swd_create("HIDMAESTRO", &suffix, &container, &hw_ids, &compat_ids, &desc)?;
+        swd_create("HIDMAESTRO", &suffix, &container, &hw_ids, &compat_ids, &desc, true)?;
 
     // The driver reads ControllerIndex from Device Parameters at startup to attach
     // to the right shared section (Global\HIDMaestroInput<N>).
@@ -943,6 +956,160 @@ pub fn create_xusb_companion_node(
     }
 
     Ok((instance_id, handle))
+}
+
+/// SWD enumerator for HIDMaestro nodes created in their own device container
+/// (see [`create_own_container_node`]). Distinct from the companions'
+/// `HIDMAESTRO` so [`list_hidmaestro_devices`] can tell the two apart.
+const OWN_CONTAINER_ENUMERATOR: &str = "HIDMAESTRO_KBM";
+
+/// Create a plain-HID node for `profile` in its OWN device container, the way a
+/// plugged-in USB device would be, instead of the PC's. Used for the virtual
+/// keyboard and mouse. Requires elevation.
+///
+/// Why: a ROOT-enumerated node sits in the PC's container
+/// (`{00000000-0000-0000-FFFF-FFFFFFFFFFFF}`, `InLocalMachineContainer`), so
+/// Windows treats our keyboard as the machine's BUILT-IN keyboard. On a PC with a
+/// Precision Touchpad that arms touchpad typing protection: while any key is
+/// held, and for about a second after, Windows drops left clicks — the
+/// touchpad's and our virtual mouse's. A detachable keyboard (e.g. the ROG Flow
+/// Z13's cover) is in its own container, so before our keyboard appeared the
+/// protection never ran. `SwDeviceCreate` is the only user-mode API that sets a
+/// ContainerID.
+///
+/// The driver reads `ControllerIndex` from Device Parameters once, when the
+/// device is added, falling back to 0 (another device's config and shared
+/// section). So the node is created without `DriverRequired`, and a watcher
+/// writes the index the moment the node exists, before Windows gets the driver
+/// installed. If the driver was installed first anyway, the node is restarted so
+/// it re-reads the index (upstream HIDMaestro restarts unconditionally). The
+/// restart is a query-remove, not a disable: Windows refuses to disable a
+/// keyboard (`CR_NOT_DISABLEABLE`).
+///
+/// Returns whether that restart was needed, for the helper log.
+///
+/// **Lifetime:** like the XUSB companion, the returned [`SwdHandle`] owns the
+/// node; dropping it removes the node.
+pub fn create_own_container_node(
+    profile: &Profile,
+    controller_index: u32,
+    device_id: &str,
+) -> Result<(CreatedDevice, SwdHandle, bool), OrchestratorError> {
+    write_instance_config(profile, controller_index, device_id, profile.function_mode);
+
+    let hw_id = format!("root\\VID_{:04X}&PID_{:04X}", profile.vid, profile.pid);
+    let hw_ids: [&str; 2] = [&hw_id, "root\\HIDMaestro"];
+    let display_name = profile
+        .device_description
+        .as_deref()
+        .or(profile.product_string.as_deref())
+        .unwrap_or(&profile.name);
+    let container = container_id_for(controller_index);
+    let suffix = next_swd_suffix(controller_index);
+    let expected_id = format!(r"SWD\{OWN_CONTAINER_ENUMERATOR}\{suffix}");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (created, early) = std::thread::scope(|s| {
+        let watcher = s.spawn(|| write_index_when_located(&expected_id, controller_index, &stop));
+        let created = swd_create(
+            OWN_CONTAINER_ENUMERATOR,
+            &suffix,
+            &container,
+            &hw_ids,
+            &[],
+            display_name,
+            false,
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        (created, watcher.join().ok().flatten())
+    });
+    let (instance_id, handle) = created?;
+
+    let driver_first = match early {
+        Some(driver_first) if instance_id.eq_ignore_ascii_case(&expected_id) => driver_first,
+        _ => write_index(&instance_id, controller_index)?,
+    };
+    if driver_first {
+        restart_devnode(&instance_id)?;
+    }
+
+    // Same finishing steps as the ROOT path. The driver installs asynchronously
+    // here, so the child gets longer to show up.
+    wait_for_hid_child(&instance_id, 10_000);
+    set_bus_type_usb(&instance_id);
+    set_all_naming_properties(&instance_id, display_name);
+    wait_for_hid_child_started(&instance_id, 10_000);
+
+    Ok((CreatedDevice { instance_id, controller_index }, handle, driver_first))
+}
+
+/// Write `ControllerIndex` into the node's Device Parameters. Returns whether
+/// the driver was already installed at that point, i.e. whether it may have
+/// read the key before the index was in it. Checked after the write: no driver
+/// yet means the device hasn't been added yet, so the driver will see the index.
+fn write_index(instance_id: &str, controller_index: u32) -> Result<bool, OrchestratorError> {
+    use registry::*;
+    let node = format!(r"SYSTEM\CurrentControlSet\Enum\{instance_id}");
+    write_dword(HKLM, &format!(r"{node}\Device Parameters"), "ControllerIndex", controller_index)
+        .map_err(|e| OrchestratorError::Win32("write ControllerIndex", e))?;
+    Ok(read_string(HKLM, &node, "Driver").is_some())
+}
+
+/// Spin until the devnode `instance_id` exists, then [`write_index`] — run
+/// alongside `SwDeviceCreate`, whose callback can come after Windows has
+/// already installed the driver. `None` if `stop` was set first or the write
+/// failed (the caller then writes it itself).
+fn write_index_when_located(
+    instance_id: &str,
+    controller_index: u32,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<bool> {
+    let w = to_wide(instance_id);
+    loop {
+        // Checked before locating, so the node created just before `stop` was
+        // set still gets one attempt.
+        let stopping = stop.load(std::sync::atomic::Ordering::Relaxed);
+        let located = unsafe {
+            CM_Locate_DevNodeW(&mut 0u32, w.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS
+        };
+        if located {
+            return write_index(instance_id, controller_index).ok();
+        }
+        if stopping {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Restart a devnode the way Device Manager's "Restart device" does: query-remove
+/// the subtree, then set it up again. Unlike `CM_Disable_DevNode` this works on a
+/// keyboard, which Windows marks not disableable.
+fn restart_devnode(instance_id: &str) -> Result<(), OrchestratorError> {
+    const CM_REMOVE_NO_RESTART: u32 = 0x0000_0002;
+    const CM_SETUP_DEVNODE_READY: u32 = 0x0000_0000;
+    unsafe {
+        let mut dev_inst = 0u32;
+        let r = CM_Locate_DevNodeW(&mut dev_inst, to_wide(instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL);
+        if r != CR_SUCCESS {
+            return Err(OrchestratorError::Win32("CM_Locate_DevNode (restart)", r));
+        }
+        let mut veto = 0i32;
+        let r = CM_Query_And_Remove_SubTreeW(
+            dev_inst,
+            &mut veto,
+            std::ptr::null_mut(),
+            0,
+            CM_REMOVE_NO_RESTART,
+        );
+        if r != CR_SUCCESS {
+            return Err(OrchestratorError::Restart(r, veto));
+        }
+        let r = CM_Setup_DevNode(dev_inst, CM_SETUP_DEVNODE_READY);
+        if r != CR_SUCCESS {
+            return Err(OrchestratorError::Win32("CM_Setup_DevNode (restart)", r));
+        }
+    }
+    Ok(())
 }
 
 // ── In-process SwDeviceCreate (cfgmgr32!SwDevice*, link SwDevice.lib) ─────────
@@ -1040,6 +1207,10 @@ extern "system" fn swd_create_callback(
 /// instance id + the owning handle. Waits for the create callback (or the
 /// DN_STARTED fast-path) up to ~30s. The node persists only while the returned
 /// handle is held.
+///
+/// `driver_required`: the callback waits for the driver to be installed and
+/// started. Without it the callback fires once the node is enumerated, and the
+/// driver installs afterwards.
 fn swd_create(
     enumerator: &str,
     suffix: &str,
@@ -1047,6 +1218,7 @@ fn swd_create(
     hw_ids: &[&str],
     compat_ids: &[&str],
     description: &str,
+    driver_required: bool,
 ) -> Result<(String, SwdHandle), OrchestratorError> {
     let w_enum = to_wide(enumerator);
     let w_parent = to_wide("HTREE\\ROOT\\0");
@@ -1056,15 +1228,18 @@ fn swd_create(
     let w_desc = to_wide(description);
     let container = parse_guid_str(container_guid).ok_or(OrchestratorError::SwdBadGuid)?;
 
+    let mut capability_flags =
+        SW_DEVICE_CAPABILITIES_SILENT_INSTALL | SW_DEVICE_CAPABILITIES_NO_DISPLAY_IN_UI;
+    if driver_required {
+        capability_flags |= SW_DEVICE_CAPABILITIES_DRIVER_REQUIRED;
+    }
     let info = SwDeviceCreateInfo {
         cb_size: std::mem::size_of::<SwDeviceCreateInfo>() as u32,
         pszz_instance_id: w_suffix.as_ptr(),
         pszz_hardware_ids: w_hw.as_ptr(),
-        pszz_compatible_ids: w_compat.as_ptr(),
+        pszz_compatible_ids: if compat_ids.is_empty() { std::ptr::null() } else { w_compat.as_ptr() },
         p_container_id: &container,
-        capability_flags: SW_DEVICE_CAPABILITIES_SILENT_INSTALL
-            | SW_DEVICE_CAPABILITIES_NO_DISPLAY_IN_UI
-            | SW_DEVICE_CAPABILITIES_DRIVER_REQUIRED,
+        capability_flags,
         psz_device_description: w_desc.as_ptr(),
         psz_device_location: std::ptr::null(),
         p_security_descriptor: std::ptr::null(),
@@ -1508,7 +1683,9 @@ pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
     // orphaned companion shells from prior runs (live ones are torn down by dropping
     // their owning SwdHandle; orphans with no live handle are removed via the
     // pnputil path that remove_device_node routes SWD ids to).
-    out.extend(scan_swd_companions());
+    out.extend(scan_swd("HIDMAESTRO", true));
+    // Keyboard/mouse nodes in their own container (`create_own_container_node`).
+    out.extend(scan_swd(OWN_CONTAINER_ENUMERATOR, false));
     out
 }
 
@@ -1524,14 +1701,15 @@ fn scan_all_root_enumerators() -> Vec<ExistingDevice> {
     out
 }
 
-/// Scan `SWD\HIDMAESTRO` for present, HIDMaestro-owned companion nodes (the XUSB
-/// companions). Mirrors [`scan_enumerator`] but for the SWD enumerator path.
-fn scan_swd_companions() -> Vec<ExistingDevice> {
+/// Scan `SWD\<enumerator>` for present, HIDMaestro-owned nodes: the XUSB
+/// companions (`HIDMAESTRO`, `is_companion`) or the own-container keyboard/mouse
+/// nodes. Mirrors [`scan_enumerator`] but for the SWD enumerator path.
+fn scan_swd(enumerator: &str, is_companion: bool) -> Vec<ExistingDevice> {
     use registry::*;
-    let base = r"SYSTEM\CurrentControlSet\Enum\SWD\HIDMAESTRO";
+    let base = format!(r"SYSTEM\CurrentControlSet\Enum\SWD\{enumerator}");
     let mut out = Vec::new();
-    for inst in enum_subkeys(HKLM, base).unwrap_or_default() {
-        let instance_id = format!(r"SWD\HIDMAESTRO\{inst}");
+    for inst in enum_subkeys(HKLM, &base).unwrap_or_default() {
+        let instance_id = format!(r"SWD\{enumerator}\{inst}");
         // Include phantom/failed nodes too (CM_LOCATE either normal or phantom):
         // orphaned FAILEDINSTALL shells may not locate "normal" but still need
         // tearing down via the pnputil remove path.
@@ -1562,7 +1740,7 @@ fn scan_swd_companions() -> Vec<ExistingDevice> {
             vid,
             pid,
             device_id,
-            is_companion: true,
+            is_companion,
         });
     }
     out

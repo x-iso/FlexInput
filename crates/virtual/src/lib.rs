@@ -8,15 +8,14 @@ use std::time::Instant;
 
 // ── Virtual-mouse physical-suppression config ───────────────────────────────
 //
-// The Virtual Keyboard & Mouse device blocks its synthetic mouse motion for a
-// short window whenever it sees the OS cursor move "on its own" (i.e. a real
-// mouse the user is also holding), so a stick-driven cursor doesn't fight the
-// physical one on the desktop. In games this heuristic is a liability — many
-// titles warp/recenter the cursor every frame, which the heuristic misreads as
-// physical input and uses to repeatedly stall the virtual mouse, producing the
-// "jerky in-game" feel. These process-global atomics let the UI tune it (the
-// mouse thread reads them every tick) — a global rather than a parameter
-// because the device-build path is deep and signature-stable.
+// The Virtual Keyboard & Mouse device pauses its pointer motion for a short
+// window whenever another mouse is used — a physical one, a touchpad, another
+// program's input — so a stick-driven cursor doesn't fight it on the desktop.
+// `physical_mouse` tells them apart by the device Raw Input reports each event
+// from. (It used to guess from the cursor moving "on its own", which games that
+// warp the cursor tripped constantly.) These process-global atomics let the UI
+// tune it (the mouse thread reads them every tick) — a global rather than a
+// parameter because the device-build path is deep and signature-stable.
 
 /// User setting: master enable for physical-mouse suppression. Default on
 /// (desktop-friendly). When off, the virtual mouse always wins.
@@ -213,6 +212,9 @@ pub mod hidmaestro_device;
 
 #[cfg(windows)]
 pub mod keymouse_hm;
+
+#[cfg(windows)]
+mod physical_mouse;
 
 /// List available virtual device *types* — no connections are made.
 pub fn available_device_kinds() -> &'static [DeviceKind] {

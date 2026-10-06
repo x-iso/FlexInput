@@ -41,6 +41,9 @@ pub(crate) fn eval_remapper_node(
             // bus carries. Cheap: only a MIDI device or a bus downstream of one
             // has any.
             fill_upstream_midi(collector_id, dev_id, &*collector_sigs, dev_sigs, &mut upstream);
+            // Pins an upstream module added to the bus that aren't canonical
+            // either — an Area Mapper's keys, another Remapper's — likewise.
+            let extra_pins = fill_upstream_extra(collector_id, &*collector_sigs, &mut upstream);
             // A processed Vec2 on the collector is authoritative over raw axes.
             vec2_authoritative_axis_fill(&mut upstream, collector_id, &*collector_sigs);
             // Derive synthetic cardinal-direction Bool pins from each stick's
@@ -332,6 +335,11 @@ pub(crate) fn eval_remapper_node(
             // markers — shared with the sub-patch arm so they never diverge.
             remapper_pass_through_and_suppress(
                 &key, &upstream,
+                &claimed_inputs_digital, &claimed_inputs_analog,
+                collector_sigs,
+            );
+            forward_extra_pins(
+                &key, &extra_pins, &upstream,
                 &claimed_inputs_digital, &claimed_inputs_analog,
                 collector_sigs,
             );
@@ -1082,6 +1090,64 @@ pub(crate) fn remapper_pass_through_and_suppress(
     }
 
     publish_consumed_markers(key, claimed_digital, claimed_analog, collector_sigs);
+}
+
+/// Add to `upstream` the pins the upstream bus carries that are neither
+/// canonical (`ALL_PINS`) nor MIDI — what an upstream mapping module drives
+/// that no device has, like an Area Mapper's or another Remapper's `key_w` —
+/// and return their names. Bus bookkeeping (`__`-prefixed markers) stays out.
+/// Without this a Remapper dropped them, so an Area Mapper in front of one
+/// lost its keys.
+pub(crate) fn fill_upstream_extra(
+    collector_id: &str,
+    collector_sigs: &HashMap<(String, String), Signal>,
+    upstream: &mut HashMap<String, Signal>,
+) -> Vec<String> {
+    if collector_id.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for ((k, pin), &sig) in collector_sigs.iter() {
+        if k != collector_id
+            || pin.starts_with("__")
+            || flexinput_core::midi::is_midi_pin(pin)
+            || automap::ALL_PINS.iter().any(|p| p.id == pin.as_str())
+        {
+            continue;
+        }
+        upstream.insert(pin.clone(), sig);
+        names.push(pin.clone());
+    }
+    names
+}
+
+/// Carry the [`fill_upstream_extra`] pins on, as the canonical pass-through
+/// does: an input a card claims publishes its off value, a pin held back from
+/// `upstream` (a deciding card's hold-back) isn't published, and the rest pass
+/// unchanged. The Remapper's own outputs are written after this and win.
+pub(crate) fn forward_extra_pins(
+    key: &str,
+    extra_pins: &[String],
+    upstream: &HashMap<String, Signal>,
+    claimed_digital: &HashSet<String>,
+    claimed_analog: &HashSet<String>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    for pin in extra_pins {
+        let Some(&raw) = upstream.get(pin.as_str()) else { continue };
+        let sig = if claimed_digital.contains(pin) || claimed_analog.contains(pin) {
+            match raw {
+                Signal::Bool(_) => Signal::Bool(false),
+                Signal::Float(_) => Signal::Float(0.0),
+                Signal::Int(_) => Signal::Int(0),
+                Signal::Vec2(_) => Signal::Vec2(Vec2::ZERO),
+                _ => continue,
+            }
+        } else {
+            raw
+        };
+        collector_sigs.insert((key.to_string(), pin.clone()), sig);
+    }
 }
 
 /// Apply per-side `CardinalSuppression` to one pin's raw pass-through value:

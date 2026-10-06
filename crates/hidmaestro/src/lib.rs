@@ -44,7 +44,8 @@ pub use install::{
     installed_xusb_inf_path, DriverState,
 };
 pub use orchestrator::{
-    create_device_node, create_xusb_companion_node, list_hidmaestro_devices, node_diag,
+    create_device_node, create_own_container_node, create_xusb_companion_node,
+    list_hidmaestro_devices, node_diag,
     remove_all_hidmaestro_devices, remove_device_node, remove_orphan_hid_children,
     write_instance_config, CreatedDevice, ExistingDevice, NodeDiag, OrchestratorError,
     RemovalBatch, SwdHandle,

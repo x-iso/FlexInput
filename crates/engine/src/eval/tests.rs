@@ -2389,6 +2389,85 @@ mod trigger_tests {
         assert!(w, "stick past deadzone must fire key_w, but it didn't");
     }
 
+    /// A key binding firing must not take LMB away: stick → W and RT → LMB in
+    /// one Remapper, both reaching the keymouse sink at once.
+    #[test]
+    fn key_binding_does_not_block_lmb() {
+        let dev = "gilrs:xinput:0";
+        let remap_uid = 2usize;
+        let src = source_node(1, dev, 0.1);
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog" },
+            { "in": ["btn_rt_dig"], "out": ["mouse_left"] }
+        ]));
+        let sink = keymouse_sink_from_remap(3, remap_uid);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let get = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.keymouse:0".to_string(), pin.to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "btn_rt_dig".to_string()), Signal::Bool(true));
+        for _ in 0..3 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        assert!(get(&out, "mouse_left"), "RT alone presses LMB");
+
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.8));
+        for _ in 0..3 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        assert!(get(&out, "key_w"), "the stick holds W");
+        assert!(get(&out, "mouse_left"), "and LMB stays pressed while W is held");
+    }
+
+    /// A key an upstream module drives (here a first Remapper; in the report an
+    /// Area Mapper) must pass through a second Remapper that doesn't map it.
+    /// `key_w` isn't a canonical pin, and the Remapper only carried canonical
+    /// and MIDI pins on, so an Area Mapper in front of a Remapper lost its WASD.
+    #[test]
+    fn remapper_passes_upstream_keys_through() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.1);
+        let mut first = empty_node(2, "module.remapper");
+        first.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        first.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["key_w"] },
+            { "in": ["btn_east"], "out": ["key_e"] }
+        ]));
+        let mut second = empty_node(3, "module.remapper");
+        second.params.insert("_automap_collector_id".into(), Value::String("remap:2".into()));
+        second.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        second.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_rt_dig"], "out": ["mouse_left"] },
+            { "in": ["key_e"], "out": ["key_q"] }
+        ]));
+        let sink = keymouse_sink_from_remap(4, 3);
+        let graph = ProcessingGraph { nodes: vec![src, first, second, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let get = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.keymouse:0".to_string(), pin.to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "btn_rt_dig".to_string()), Signal::Bool(true));
+        for _ in 0..3 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        assert!(get(&out, "key_w"), "the first Remapper's W reaches the sink");
+        assert!(get(&out, "mouse_left"), "alongside the second's own mapping");
+
+        sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(false));
+        for _ in 0..3 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        assert!(!get(&out, "key_w"), "and lets go of it");
+
+        // An upstream key the second Remapper maps is consumed like any input.
+        sigs.insert((dev.to_string(), "btn_east".to_string()), Signal::Bool(true));
+        for _ in 0..3 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        assert!(get(&out, "key_q"), "E is remapped to Q");
+        assert!(!get(&out, "key_e"), "and E itself is consumed");
+    }
+
     /// Even when no device.source node carries the deadzone (the device feeds
     /// AutoMap consumers like the Remapper without its source node present in
     /// the graph), stick pins must still get the default deadzone rather than

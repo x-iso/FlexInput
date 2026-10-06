@@ -32,12 +32,11 @@
 //!   eternal neutral pad) while keyboard/mouse kept working.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use flexinput_core::Signal;
 
 use crate::hidmaestro_device::HidMaestroDevice;
-use crate::windows::cursor_pos;
 use crate::{layouts, SinkPin, VirtualDevice};
 
 /// Modifier bits of report byte 0 (left-hand variants).
@@ -231,10 +230,6 @@ impl KeysHeld {
     }
 }
 
-/// Ticks (well, wall time) after our own emitted move during which a cursor
-/// mismatch is attributed to us rather than a physical mouse — GetCursorPos can
-/// lag the actual injection. Same 16 ms the enigo thread used.
-const SELF_MOVE_WINDOW: Duration = Duration::from_millis(16);
 /// Clamp on the dt applied per flush, so a scheduler gap moves at most this
 /// much worth of distance in one report instead of lurching (see the enigo
 /// thread's MAX_DT rationale). 4× the default 500 Hz tick — note this equals
@@ -245,32 +240,9 @@ const REF: f32 = 60.0;
 /// Analog scroll rate unit: notches per second at |rate| = 1.0. A full-deflection
 /// stick / touch-zone maps to a firm-but-controllable continuous scroll.
 const SCROLL_REF: f32 = 18.0;
-/// The mouse profile's Resolution Multiplier maximum (its Physical Maximum in
-/// profiles/mouse.json): what one notch is worth in wheel counts once Windows
-/// applies it. Must match the descriptor.
-///
-/// Whether Windows applies it isn't ours to assume: ×8 it did, ×120 it silently
-/// didn't (every 1/120-notch count scrolled a whole notch). So the counts per
-/// notch actually in force are READ, from mouhid's own SET_FEATURE of the
-/// multiplier, which the driver forwards to the output ring — see
-/// `read_wheel_multiplier`. Until one arrives, a count is a whole notch.
-const WHEEL_MULTIPLIER_MAX: f32 = 8.0;
-/// Output-ring frame source for a SET_FEATURE (HIDMAESTRO_OUTPUT_SOURCE_HID_FEATURE).
-const OUTPUT_SOURCE_HID_FEATURE: u8 = 1;
-
-/// Counts per notch for one wheel, from mouhid's Resolution Multiplier
-/// SET_FEATURE byte: two 2-bit logical fields, vertical first (bits 0-1), then
-/// horizontal (bits 2-3), each 0 → ×1 or 1 → ×WHEEL_MULTIPLIER_MAX.
-fn multiplier_from_feature(byte: u8, horizontal: bool) -> f32 {
-    let logical = if horizontal { (byte >> 2) & 0b11 } else { byte & 0b11 };
-    if logical >= 1 { WHEEL_MULTIPLIER_MAX } else { 1.0 }
-}
-
-/// The largest wheel field one report carries: the int8 limit rounded down to
-/// whole notches, so whole-notch scrolling never splits across reports.
-fn wheel_counts_max(counts_per_notch: f32) -> f32 {
-    (127.0 / counts_per_notch).floor().max(1.0) * counts_per_notch
-}
+/// Most wheel notches one report carries (the field is int8); more waits in
+/// the carry for the next report.
+const WHEEL_NOTCHES_MAX: f32 = 127.0;
 
 pub struct VirtualKeyMouseHm {
     pub muted: bool,
@@ -308,21 +280,11 @@ pub struct VirtualKeyMouseHm {
     carry_y: f32,
     scroll_carry_v: f32, // sub-notch remainder for analog vertical scroll
     scroll_carry_h: f32, // sub-notch remainder for analog horizontal scroll
-    wheel_carry_v: f32,  // vertical wheel counts not yet reported
-    wheel_carry_h: f32,  // horizontal wheel counts not yet reported
-    // Wheel counts per notch Windows actually applies (see WHEEL_MULTIPLIER_MAX).
-    wheel_counts_v: f32,
-    wheel_counts_h: f32,
-    // When to log that no multiplier arrived (once; None after).
-    multiplier_deadline: Option<Instant>,
+    wheel_carry_v: f32,  // vertical wheel notches not yet reported
+    wheel_carry_h: f32,  // horizontal wheel notches not yet reported
     last_emit: Instant,
     last_mouse_report: [u8; 7],
     mouse_report_dirty: bool,
-
-    // Physical-mouse suppression (same semantics as the enigo backend).
-    last_cursor: Option<(i32, i32)>,
-    blocked_until: Option<Instant>,
-    self_move_until: Option<Instant>,
 
     // Keyboard emission state.
     last_kbd_report: [u8; 8],
@@ -350,10 +312,6 @@ impl VirtualKeyMouseHm {
             // Dropping tears down whichever node DID come up.
             return None;
         }
-        // mouhid set the wheel multiplier while the node started, before we
-        // opened its ring: replay what the ring holds so flush() sees it.
-        let mut mouse = mouse;
-        mouse.rewind_output();
         Some(Self {
             muted: false,
             mouse_vel_x: 0.0,
@@ -379,9 +337,6 @@ impl VirtualKeyMouseHm {
             scroll_carry_h: 0.0,
             wheel_carry_v: 0.0,
             wheel_carry_h: 0.0,
-            wheel_counts_v: 1.0,
-            wheel_counts_h: 1.0,
-            multiplier_deadline: Some(Instant::now() + Duration::from_secs(5)),
             last_emit: Instant::now(),
             last_mouse_report: [0; 7],
             // One neutral frame after the node comes up, then the flag latches
@@ -390,36 +345,8 @@ impl VirtualKeyMouseHm {
             // isn't necessarily neutral) without arming a repeat — see
             // `reset_outputs`, which deliberately does NOT re-arm it.
             mouse_report_dirty: true,
-            last_cursor: None,
-            blocked_until: None,
-            self_move_until: None,
             last_kbd_report: [0; 8],
         })
-    }
-
-    /// Pick up mouhid's Resolution Multiplier SET_FEATURE from the mouse's
-    /// output ring (the node's only output), and scale the wheel by what it set.
-    fn read_wheel_multiplier(&mut self) {
-        while let Some(frame) = self.mouse.read_output_frame() {
-            if frame.source != OUTPUT_SOURCE_HID_FEATURE || frame.report_id != 0 { continue; }
-            let Some(&byte) = frame.data.first() else { continue; };
-            let v = multiplier_from_feature(byte, false);
-            let h = multiplier_from_feature(byte, true);
-            self.multiplier_deadline = None;
-            if (v, h) != (self.wheel_counts_v, self.wheel_counts_h) {
-                self.wheel_counts_v = v;
-                self.wheel_counts_h = h;
-                self.wheel_carry_v = 0.0;
-                self.wheel_carry_h = 0.0;
-                log_line(&format!(
-                    "[keymouse] Windows set the wheel Resolution Multiplier: feature byte {byte:#04x} \
-                     -> vertical x{v}, horizontal x{h} (descriptor max x{WHEEL_MULTIPLIER_MAX})"));
-            }
-        }
-        if self.multiplier_deadline.is_some_and(|t| Instant::now() > t) {
-            self.multiplier_deadline = None;
-            log_line("[keymouse] no wheel Resolution Multiplier SET_FEATURE seen: scrolling in                       whole notches (a reclaimed node, or Windows didn't apply the multiplier)");
-        }
     }
 
     /// Build the 8-byte keyboard report from held modifiers + learned keys.
@@ -496,7 +423,6 @@ impl VirtualDevice for VirtualKeyMouseHm {
 
     fn flush(&mut self) {
         let now = Instant::now();
-        self.read_wheel_multiplier();
 
         // ── Keyboard ─────────────────────────────────────────────────────────
         // Level-triggered: write only when the report actually changes; the
@@ -513,23 +439,9 @@ impl VirtualDevice for VirtualKeyMouseHm {
         let dt = (now - self.last_emit).as_secs_f32().min(MAX_DT);
         self.last_emit = now;
 
-        // Physical-mouse suppression: a cursor move we didn't cause blocks
-        // virtual motion for the configured window.
-        let (suppression_on, release_ms) = crate::mouse_suppression_effective();
-        let cur = cursor_pos();
-        let suppressed = if suppression_on {
-            if let (Some(pos), Some(last)) = (cur, self.last_cursor) {
-                if pos != last && self.self_move_until.map_or(true, |t| now > t) {
-                    self.blocked_until = Some(now + Duration::from_millis(release_ms as u64));
-                }
-            }
-            self.last_cursor = cur;
-            self.blocked_until.map_or(false, |t| now < t)
-        } else {
-            self.last_cursor = cur;
-            self.blocked_until = None;
-            false
-        };
+        // Physical-mouse suppression: pointer motion yields for the configured
+        // window after another mouse is used (see `physical_mouse`).
+        let suppressed = crate::physical_mouse::suppressing();
 
         let vel_x = std::mem::take(&mut self.mouse_vel_x);
         let vel_y = std::mem::take(&mut self.mouse_vel_y);
@@ -555,10 +467,19 @@ impl VirtualDevice for VirtualKeyMouseHm {
         };
 
         let mut rep = [0u8; 7];
-        if !self.muted && !suppressed {
+        if !self.muted {
             // Velocity → integrated over dt; displacement → applied once as-is.
-            self.carry_x += vel_x * REF * dt + disp_x;
-            self.carry_y += vel_y * REF * dt + disp_y;
+            // A physical mouse in use pauses only the MOTION, dropped rather
+            // than banked so it can't discharge as a jump: buttons and the
+            // wheel don't fight its cursor, and holding them back delayed every
+            // click made during a pause.
+            if suppressed {
+                self.carry_x = 0.0;
+                self.carry_y = 0.0;
+            } else {
+                self.carry_x += vel_x * REF * dt + disp_x;
+                self.carry_y += vel_y * REF * dt + disp_y;
+            }
             let (mut dx, mut dy) = (0i32, 0i32);
             if emit_move {
                 dx = (self.carry_x.trunc() as i32).clamp(-32767, 32767);
@@ -566,15 +487,12 @@ impl VirtualDevice for VirtualKeyMouseHm {
                 self.carry_x -= dx as f32;
                 self.carry_y -= dy as f32;
             }
-            // Scroll. Analog rate → whole notches through its own carry, as
-            // before; digital clicks are whole notches. Only the smooth rate
-            // (trackpad_scroll_*) and scroll_move_* scroll by fractions of a
-            // notch (wheel counts per notch: see WHEEL_MULTIPLIER_MAX)
-            // — some apps still treat every wheel message as a full notch, so
-            // nothing else changes granularity. Everything lands in a
-            // wheel-count carry, so a burst past one report's range goes out on
-            // the next. Scroll isn't braid-gated (like the wheel already
-            // wasn't), so it emits every flush.
+            // Scroll, in whole notches (the wheel has no finer resolution):
+            // digital clicks, the analog rate through its own sub-notch carry,
+            // and the smooth rate / scroll_move pins through the wheel carry,
+            // which also holds a burst past one report's range for the next.
+            // Scroll isn't braid-gated (like the wheel already wasn't), so it
+            // emits every flush.
             self.scroll_carry_v += scroll_vel_v * SCROLL_REF * dt;
             self.scroll_carry_h += scroll_vel_h * SCROLL_REF * dt;
             let vclicks = self.scroll_carry_v.trunc();
@@ -583,12 +501,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
             self.scroll_carry_h -= hclicks;
             let smooth_v = smooth_vel_v * SCROLL_REF * dt + scroll_move_v;
             let smooth_h = smooth_vel_h * SCROLL_REF * dt + scroll_move_h;
-            self.wheel_carry_v += (scroll as f32 + vclicks + smooth_v) * self.wheel_counts_v;
-            self.wheel_carry_h += (hscroll as f32 + hclicks + smooth_h) * self.wheel_counts_h;
-            let vmax = wheel_counts_max(self.wheel_counts_v);
-            let hmax = wheel_counts_max(self.wheel_counts_h);
-            let vcounts = self.wheel_carry_v.trunc().clamp(-vmax, vmax);
-            let hcounts = self.wheel_carry_h.trunc().clamp(-hmax, hmax);
+            self.wheel_carry_v += scroll as f32 + vclicks + smooth_v;
+            self.wheel_carry_h += hscroll as f32 + hclicks + smooth_h;
+            let vcounts = self.wheel_carry_v.trunc().clamp(-WHEEL_NOTCHES_MAX, WHEEL_NOTCHES_MAX);
+            let hcounts = self.wheel_carry_h.trunc().clamp(-WHEEL_NOTCHES_MAX, WHEEL_NOTCHES_MAX);
             self.wheel_carry_v -= vcounts;
             self.wheel_carry_h -= hcounts;
             rep[0] = self.buttons.bits();
@@ -596,17 +512,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
             rep[3..5].copy_from_slice(&(dy as i16).to_le_bytes());
             rep[5] = vcounts as i8 as u8;  // vertical wheel
             rep[6] = hcounts as i8 as u8;  // horizontal (AC Pan)
-            if dx != 0 || dy != 0 {
-                self.self_move_until = Some(now + SELF_MOVE_WINDOW);
-                if let Some(ref mut last) = self.last_cursor {
-                    last.0 += dx;
-                    last.1 += dy;
-                }
-            }
         } else {
-            // Muted/suppressed: zero deltas, all buttons released, and the
-            // banked carry (motion + scroll) is discarded so it can't discharge
-            // as a jump later.
+            // Muted: zero deltas, all buttons released, and the banked carry
+            // (motion + scroll) is discarded so it can't discharge as a jump
+            // later.
             self.carry_x = 0.0;
             self.carry_y = 0.0;
             self.scroll_carry_v = 0.0;
@@ -668,43 +577,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
     }
 }
 
-/// One diagnostic line: stderr, and appended to `flexinput-keymouse.log` under
-/// `%APPDATA%\FlexInput\logs` (best-effort). Rare events only — a GUI build
-/// has no console, so without the file they'd be unobservable.
-fn log_line(line: &str) {
-    eprintln!("{line}");
-    let Some(appdata) = std::env::var_os("APPDATA") else { return };
-    let dir = std::path::PathBuf::from(appdata).join("FlexInput").join("logs");
-    if std::fs::create_dir_all(&dir).is_err() { return; }
-    let path = dir.join("flexinput-keymouse.log");
-    // Bounded: start over rather than grow without end.
-    if path.metadata().map(|m| m.len() > 256 * 1024).unwrap_or(false) {
-        let _ = std::fs::remove_file(&path);
-    }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let _ = writeln!(f, "[{secs}] {line}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// mouhid's multiplier byte: vertical in bits 0-1, horizontal in bits 2-3.
-    #[test]
-    fn wheel_multiplier_from_the_feature_byte() {
-        assert_eq!(multiplier_from_feature(0b0101, false), WHEEL_MULTIPLIER_MAX);
-        assert_eq!(multiplier_from_feature(0b0101, true), WHEEL_MULTIPLIER_MAX);
-        assert_eq!(multiplier_from_feature(0b0100, false), 1.0);
-        assert_eq!(multiplier_from_feature(0b0001, true), 1.0);
-        assert_eq!(multiplier_from_feature(0, false), 1.0, "unset = whole notches");
-        // A report never splits a whole notch: ×8 carries 15 notches, ×1 carries 127.
-        assert_eq!(wheel_counts_max(8.0), 120.0);
-        assert_eq!(wheel_counts_max(1.0), 127.0);
-    }
 
     /// Every modifier pin reaches the modifier byte, and none of them is a
     /// learned key. One that fell through would be looked up for a HID usage it

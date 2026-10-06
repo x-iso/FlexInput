@@ -905,10 +905,6 @@ impl VirtualDevice for VirtualDS4 {
 
 // ── Keyboard & Mouse ──────────────────────────────────────────────────────────
 
-#[repr(C)]
-struct CursorPoint { x: i32, y: i32 }
-extern "system" { fn GetCursorPos(lp: *mut CursorPoint) -> i32; }
-
 // Thread-priority FFI (no windows-sys dep in this crate; matches the raw
 // `extern "system"` style already used here). HANDLE is pointer-sized.
 extern "system" {
@@ -921,10 +917,6 @@ extern "system" {
 /// must preempt the game's render/worker threads or it gets periodically
 /// descheduled and motion tears.
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
-pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
-    let mut p = CursorPoint { x: 0, y: 0 };
-    (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
-}
 
 // Wheel input via SendInput directly: enigo only scrolls whole notches
 // (`length * WHEEL_DELTA`), and the smooth-scroll pins need fractions of one.
@@ -953,7 +945,9 @@ fn send_wheel(delta: i32, horizontal: bool) {
             mouse_data: delta as u32,
             flags: if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL },
             time: 0,
-            extra_info: 0,
+            // enigo's marker, as on every other event we inject: it's how
+            // `physical_mouse` tells our input from someone else's.
+            extra_info: enigo::EVENT_MARKER as usize,
         },
     };
     unsafe { SendInput(1, &input, std::mem::size_of::<InputRaw>() as i32); }
@@ -1006,10 +1000,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     // often, so slow stick-aim reads noticeably smoother than at 500 Hz.
     const HZ: f32  = 1000.0;
     const REF: f32 = 60.0; // velocity unit = pixels per 60 Hz reference frame
-    // Ticks after our OWN move during which a cursor mismatch is attributed to
-    // us (GetCursorPos can lag the SendInput) rather than to a physical mouse.
-    // ~16 ms regardless of HZ.
-    const SELF_MOVE_COOLDOWN: u16 = (HZ * 0.016) as u16;
 
     // Raise this thread above the game's render/worker threads. Without it the
     // 1 kHz loop runs at default priority and a busy game periodically
@@ -1031,9 +1021,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     // Analog scroll rate unit: notches/sec at |rate| = 1.0 (matches keymouse_hm).
     const SCROLL_REF: f32 = 18.0;
     let mut os_buttons = MouseButtons::default();
-    let mut last_cursor  = cursor_pos();
-    let mut blocked_until: Option<Instant> = None;
-    let mut suppress_cooldown = 0u16;
 
     let tick = Duration::from_micros((1_000_000.0 / HZ) as u64);
     // Wall-clock time of the previous emission, used to scale velocity by the
@@ -1076,10 +1063,10 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             snap
         };
 
-        // Effective suppression: user setting AND not "mixed mode" (a virtual
-        // gamepad active alongside us). Read every tick so settings/mode apply
-        // live. The block window (ms) is user-configurable.
-        let (suppression_on, release_ms) = crate::mouse_suppression_effective();
+        // Physical-mouse suppression: pointer motion yields for the configured
+        // window after another mouse is used (see `physical_mouse`). Read every
+        // tick so the setting and mixed mode apply live.
+        let suppressed = crate::physical_mouse::suppressing();
 
         // Mixed-output braiding: when active, emit the accumulated mouse motion
         // only when the shared turn token says it's the mouse's turn (so a mouse
@@ -1095,28 +1082,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
         };
 
         if let Some(ref mut e) = enigo {
-            let now = Instant::now();
-
-            // Physical mouse suppression
-            let cur = cursor_pos();
-            let suppressed = if suppression_on {
-                if let (Some(pos), Some(last)) = (cur, last_cursor) {
-                    if pos != last {
-                        if suppress_cooldown > 0 {
-                            suppress_cooldown -= 1;
-                        } else {
-                            blocked_until = Some(now + Duration::from_millis(release_ms as u64));
-                        }
-                    }
-                }
-                last_cursor = cur;
-                blocked_until.map_or(false, |t| now < t)
-            } else {
-                last_cursor = cur;
-                blocked_until = None;
-                false
-            };
-
             macro_rules! btn_sync {
                 ($os:expr, $want:expr, $btn:expr) => {
                     if $want != $os {
@@ -1131,13 +1096,21 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                 };
             }
 
-            if !state.muted && !suppressed {
+            if !state.muted {
                 // Scale by REAL elapsed time, not a fixed per-tick constant, so
                 // cursor speed stays wall-clock-correct under scheduler jitter.
                 // Always accumulate the true desired distance so braiding never
                 // loses motion — only the SendInput timing is gated by emit_move.
-                carry_x += state.vel_x * REF * dt + state.disp_x;
-                carry_y += state.vel_y * REF * dt + state.disp_y;
+                // A physical mouse in use pauses only the MOTION, dropped rather
+                // than banked so it can't discharge as a jump: buttons and the
+                // wheel don't fight its cursor.
+                if suppressed {
+                    carry_x = 0.0;
+                    carry_y = 0.0;
+                } else {
+                    carry_x += state.vel_x * REF * dt + state.disp_x;
+                    carry_y += state.vel_y * REF * dt + state.disp_y;
+                }
                 if emit_move {
                     let dx = carry_x.trunc() as i32;
                     let dy = carry_y.trunc() as i32;
@@ -1145,11 +1118,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                     carry_y -= dy as f32;
                     if dx != 0 || dy != 0 {
                         let _ = e.move_mouse(dx, dy, Coordinate::Rel);
-                        if let Some(ref mut last) = last_cursor {
-                            last.0 += dx;
-                            last.1 += dy;
-                        }
-                        suppress_cooldown = SELF_MOVE_COOLDOWN; // re-arm window after our own move
                     }
                 }
                 // Scroll: digital clicks plus dt-scaled analog rate (sub-notch

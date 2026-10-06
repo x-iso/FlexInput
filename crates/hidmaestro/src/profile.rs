@@ -58,6 +58,10 @@ struct RawProfile {
     /// (lets us test the mode independently of companion creation).
     #[serde(rename = "functionMode")]
     function_mode: Option<u32>,
+    /// Create the node in its own device container, like a plugged-in USB device,
+    /// rather than the PC's (keyboard, mouse). See `create_own_container_node`.
+    #[serde(rename = "ownContainer")]
+    own_container: Option<bool>,
 }
 
 /// Raw `extendedReport` shape (subset). Byte offsets are 1-based in the JSON
@@ -216,6 +220,9 @@ pub struct Profile {
     pub requires_xusb_companion: bool,
     /// HIDMaestro driver `FunctionMode` (0 = plain HID, 1 = XUSB).
     pub function_mode: u32,
+    /// True if the node goes in its own device container instead of the PC's
+    /// (`orchestrator::create_own_container_node`): the virtual keyboard and mouse.
+    pub own_container: bool,
 }
 
 #[derive(Debug)]
@@ -287,6 +294,7 @@ impl Profile {
             extended,
             requires_xusb_companion,
             function_mode,
+            own_container: raw.own_container.unwrap_or(false),
         })
     }
 
@@ -320,7 +328,7 @@ pub mod presets {
     pub const KEYBOARD_JSON: &str = include_str!("../profiles/keyboard.json");
 
     /// Virtual relative mouse — plain-HID 7-byte report (5 buttons, int16 X/Y
-    /// mickeys, int8 hi-res wheel + AC Pan at 8 counts per notch). Same
+    /// mickeys, int8 wheel + AC Pan in whole notches). Same
     /// raw-report path + rationale as KEYBOARD_JSON.
     pub const MOUSE_JSON: &str = include_str!("../profiles/mouse.json");
 }
@@ -340,6 +348,8 @@ mod tests {
         // Plain-HID Sony pad: no XUSB companion, FunctionMode 0.
         assert!(!p.requires_xusb_companion);
         assert_eq!(p.function_mode, 0);
+        // Gamepads stay ROOT-enumerated (persisted across runs, own reclaim path).
+        assert!(!p.own_container);
     }
 
     #[test]
@@ -382,6 +392,9 @@ mod tests {
         // Plain HID: no companion, FunctionMode 0.
         assert!(!p.requires_xusb_companion);
         assert_eq!(p.function_mode, 0);
+        // In the PC's own container Windows takes it for the built-in keyboard,
+        // which arms touchpad typing protection (left clicks dropped while typing).
+        assert!(p.own_container);
         // Standard boot-style keyboard report: 8 bytes, no Report ID, keyboard
         // usage page fields only (modifiers bitfield + 6KRO array).
         assert_eq!(p.input_report_size, 8);
@@ -396,6 +409,7 @@ mod tests {
         assert_eq!(p.id, "hm-mouse");
         assert!(!p.requires_xusb_companion);
         assert_eq!(p.function_mode, 0);
+        assert!(p.own_container, "an internal-looking mouse has its left clicks dropped while typing");
         // [buttons, X lo/hi, Y lo/hi, wheel, hwheel] = 7 bytes, no Report ID.
         assert_eq!(p.input_report_size, 7);
         assert_eq!(p.report.byte_size(), 7);
@@ -420,14 +434,9 @@ mod tests {
         let hw = p.report.field(0x0c, 0x0238).expect("hwheel (AC Pan)");
         assert_eq!((hw.bit_offset, hw.bit_size), (48, 8));
         assert!(hw.logical_min < 0, "hwheel is signed/relative");
-        // Hi-res wheel: each wheel sits in a Logical collection with a
-        // Resolution Multiplier (Generic Desktop 0x48) whose physical max is the
-        // multiplier keymouse_hm's WHEEL_MULTIPLIER_MAX assumes (8). The
-        // multiplier is a Feature item, so the input layout above is unchanged.
-        let d = &p.descriptor;
-        let res_mult = [0x09, 0x48, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x08];
-        let n = d.windows(res_mult.len()).filter(|w| *w == res_mult).count();
-        assert_eq!(n, 2, "one ×8 Resolution Multiplier per wheel");
+        // No feature reports: the Resolution Multiplier Windows never applied
+        // is gone (see the profile notes).
+        assert!(!p.descriptor.windows(2).any(|w| w == [0x09, 0x48]), "no Resolution Multiplier");
     }
 
     /// Golden: our parser must reproduce the exact field layout HIDMaestro's C#

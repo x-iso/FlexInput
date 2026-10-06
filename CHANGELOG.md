@@ -3,6 +3,42 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **"Pause virtual mouse when you move a physical mouse" listens to the other
+  mice.** It used to guess from where the cursor was, so a game moving the
+  cursor, or any lag in reading it, counted as a physical mouse and froze the
+  virtual one at random. It now reacts only to input from another mouse or
+  touchpad (a resting sensor's jitter doesn't count), and pauses only pointer
+  movement: virtual clicks, scrolling and keys go through.
+
+- **Smooth Scroll X/Y scroll in whole notches.** Windows never switched on the
+  virtual mouse's high-resolution wheel, so it's gone and the virtual mouse is
+  back to a plain wheel; Smooth Scroll and Scroll X/Y (move) round to whole
+  notches. The virtual mouse is recreated once on first launch.
+
+- **The virtual keyboard and mouse no longer outlive FlexInput.** They're now
+  removed when it closes, even with "Keep HIDMaestro virtual controllers alive
+  after FlexInput closes" on (see Fixed).
+
+### Fixed
+
+- **Left clicks dropped while a key binding was held.** On a PC with a
+  Precision Touchpad, Windows took FlexInput's virtual keyboard for the
+  machine's built-in one and turned on touchpad typing protection: while any
+  key was held, and for about a second after, it dropped left clicks — the
+  virtual mouse's and the touchpad's own. The virtual keyboard and mouse now
+  show up as their own external devices, like a plugged-in USB keyboard and
+  mouse, so they're treated no differently from one. They're recreated once on
+  first launch.
+
+- **A Remapper drops the keys of the module in front of it.** Keys like W from
+  an Area Mapper (or another Remapper) wired into a Remapper never reached the
+  output; only pad buttons, sticks and MIDI passed through. They pass through
+  now, and a Remapper card can take them as input like any other pin.
+
 ## [0.15.5] - 2026-10-04
 
 ### Added

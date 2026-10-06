@@ -29,8 +29,9 @@ use crate::deploy::ensure_driver_installed;
 use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
 use crate::orchestrator::{
-    clear_hidmaestro_devices_and_wait, create_device_node, create_xusb_companion_node,
-    list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node, RemovalBatch,
+    clear_hidmaestro_devices_and_wait, create_device_node, create_own_container_node,
+    create_xusb_companion_node, list_hidmaestro_devices, remove_all_hidmaestro_devices,
+    remove_device_node, RemovalBatch,
     wait_for_hid_child_started,
 };
 use crate::shm::{InputSection, OutputSection};
@@ -113,6 +114,10 @@ struct LiveDevice {
     /// (the reconnect-and-downgrade path is a cosmetic no-op there). A helper crash
     /// drops it too, so nodes never leak as un-removable ParentPresent orphans.
     _companion_handle: Option<crate::orchestrator::SwdHandle>,
+    /// Owning handle for a node created in its own container under SWD
+    /// (`create_own_container_node`: keyboard, mouse). Dropping it removes the
+    /// node, so these never outlive the helper. `None` for ROOT nodes.
+    node_handle: Option<crate::orchestrator::SwdHandle>,
 }
 
 /// The HidHide masking the helper applied for the app, retained so teardown can
@@ -183,7 +188,11 @@ impl HelperState {
                 if let Some(cid) = &dev.companion_instance_id {
                     let _ = batch.remove(cid);
                 }
-                let _ = batch.remove(&id);
+                // A held SWD handle removes its node on drop; only ROOT nodes
+                // need the explicit remove.
+                if dev.node_handle.is_none() {
+                    let _ = batch.remove(&id);
+                }
             }
         }
     }
@@ -713,6 +722,12 @@ fn handle_create(
     // device_id. Re-attach by mapping its sections at the recorded index — don't
     // create a second node.
     let existing = list_hidmaestro_devices();
+    // A node that must sit in its own container (keyboard, mouse) is never
+    // reclaimed across runs: its SWD node dies with the helper that held its
+    // handle, so what's left is a phantom, or a ROOT node from an older build
+    // sitting in the PC's container — the very thing that profile avoids. Both
+    // are stale. (A live one from this session was returned above.)
+    let wrong_kind = |_: &crate::orchestrator::ExistingDevice| profile.own_container;
     // Stale-descriptor guard: reclaim re-attaches a persisted node WITHOUT
     // re-applying its report descriptor, so a node created by an older build keeps
     // its old descriptor forever. We bump the profile's PID whenever the report
@@ -724,7 +739,7 @@ fn handle_create(
     // we fall through to a fresh create that enumerates the new descriptor.
     for d in existing.iter().filter(|d|
         d.device_id == device_id && !device_id.is_empty() && !d.is_companion
-            && (d.vid != profile.vid || d.pid != profile.pid))
+            && (d.vid != profile.vid || d.pid != profile.pid || wrong_kind(d)))
     {
         diag_log(&format!(
             "[helper] stale node device_id={device_id} pid {:#06x}->{:#06x}: destroying to recreate",
@@ -744,7 +759,7 @@ fn handle_create(
     if let Some(found) = existing
         .iter()
         .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion
-            && d.vid == profile.vid && d.pid == profile.pid)
+            && d.vid == profile.vid && d.pid == profile.pid && !wrong_kind(d))
     {
         let mut input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
             Ok(s) => s,
@@ -783,6 +798,7 @@ fn handle_create(
                     device_id: device_id.to_string(),
                     companion_instance_id,
                     _companion_handle: None,
+                    node_handle: None,
                 },
             );
         }
@@ -824,8 +840,24 @@ fn handle_create(
     }
     let output = OutputSection::create(index).ok();
 
-    match create_device_node(&profile, &inf.display().to_string(), index, device_id) {
-        Ok(dev) => {
+    let created = if profile.own_container {
+        create_own_container_node(&profile, index, device_id).map(|(dev, h, restarted)| {
+            diag_log(&format!(
+                "[helper] own-container node {} {}",
+                dev.instance_id,
+                if restarted {
+                    "restarted: driver installed before ControllerIndex was written"
+                } else {
+                    "got ControllerIndex before its driver"
+                }
+            ));
+            (dev, Some(h))
+        })
+    } else {
+        create_device_node(&profile, &inf.display().to_string(), index, device_id).map(|dev| (dev, None))
+    };
+    match created {
+        Ok((dev, node_handle)) => {
             // For XInput/Xbox360 profiles, also create the XUSB companion node at
             // the SAME index. The companion is the ONE XInput identity; its sibling
             // HID node carries a non-Xbox HardwareID so it doesn't publish a second
@@ -860,6 +892,7 @@ fn handle_create(
                         device_id: device_id.to_string(),
                         companion_instance_id,
                         _companion_handle: companion_handle,
+                        node_handle,
                     },
                 );
             }
@@ -1022,6 +1055,10 @@ fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
         dev._companion_handle.take();
         if let Some(cid) = &dev.companion_instance_id {
             let _ = remove_device_node(cid);
+        }
+        // An own-container node goes the same way: its handle is the node.
+        if dev.node_handle.take().is_some() {
+            return Response::Ok { detail: Some("removed=true".into()) };
         }
     }
     let removed = match remove_device_node(instance_id) {
