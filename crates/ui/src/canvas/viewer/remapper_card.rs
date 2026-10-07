@@ -42,6 +42,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     in_pins: &[String],
     out_pins: Option<&[String]>,    // None → Map Action variant (single row)
     skin: crate::canvas::remapper_icons::Skin,
+    out_skin: crate::canvas::remapper_icons::Skin, // the out row's glyphs: the device it sends to
     allow_analog_mode: bool,        // offer the Analog press mode: Lean / Touch Zones always;
                                     // Remapper / Map Action only with an analog input
     allow_order: bool,              // Remapper only: Sequence press mode + the "in order" toggle
@@ -556,7 +557,8 @@ pub(crate) fn remapper_mapping_card_pixel(
             first = false;
             let chip_top_left = card_origin + egui::vec2(cur_x, row_y);
             let painted_w = paint_chord_chip_to_rect(
-                &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id, skin,
+                &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id,
+                if is_in { skin } else { out_skin },
             );
             if flexinput_core::midi::is_midi_pin(p) {
                 let rect = egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size));

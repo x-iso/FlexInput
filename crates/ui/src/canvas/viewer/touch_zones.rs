@@ -1127,7 +1127,9 @@ pub(crate) fn mapping_card_curve_section(
         if focus || entered { open = true; }
     }
 
-    let has_custom = working.contains_key("curve") || working.contains_key("threshold");
+    let has_custom = working.contains_key("curve") || working.contains_key("threshold")
+        || working.contains_key(flexinput_core::imu::IMU_LOG_KEY)
+        || flexinput_core::imu::ImuKind::ALL.iter().any(|k| working.contains_key(k.range_key()));
     let (row, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 15.0), egui::Sense::click());
     {
@@ -1188,6 +1190,9 @@ pub(crate) fn mapping_card_curve_section(
             None => { working.remove("threshold"); }
         }
     }
+    if imu_scale_rows(ui, working, nav_field, accent) {
+        changed = true;
+    }
     // Rel. center (adaptive) — the LAST row of the card body, under the curve +
     // threshold. Driven (non-top Synced) cards show it GRAYED with a note; the
     // driver/per-card/swipe cards edit it. Gamepad field 7 rings + edits it.
@@ -1229,6 +1234,87 @@ pub(crate) fn mapping_card_curve_section(
     out.inner
 }
 
+/// Gamepad field of a card's IMU range for `kind` (10–12), and of its Log/Exp.
+pub(crate) fn imu_range_field(kind: flexinput_core::imu::ImuKind) -> u64 {
+    10 + kind as u64
+}
+pub(crate) const IMU_LOG_FIELD: u64 = 13;
+
+/// A card reading IMU inputs: what 100% on its curve is, for each family it
+/// reads, and the Log/Exp bend applied before the curve. Value boxes, under the
+/// curve. A default value is stored as nothing. Returns true when one changed.
+fn imu_scale_rows(
+    ui: &mut egui::Ui,
+    working: &mut serde_json::Map<String, Value>,
+    nav_field: Option<u64>,
+    accent: egui::Color32,
+) -> bool {
+    use flexinput_core::imu::{self, ImuKind};
+    let kinds = imu::kinds_read(
+        working.get("in").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()),
+    );
+    if kinds.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let put = |working: &mut serde_json::Map<String, Value>, key: &str, v: f32, default: f32| {
+        if (v - default).abs() < 1e-6 {
+            working.remove(key);
+        } else {
+            working.insert(key.into(), serde_json::json!(v));
+        }
+    };
+    let ring = |ui: &egui::Ui, r: &egui::Response, field: u64| {
+        if nav_field == Some(field) {
+            ui.painter().rect_stroke(r.rect.expand(2.0), 3.0,
+                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+            r.scroll_to_me(None);
+        }
+    };
+    ui.add_space(3.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(6.0);
+        for k in kinds {
+            let (lo, hi) = k.range_limits();
+            let mut v = working.get(k.range_key()).and_then(|v| v.as_f64())
+                .map(|v| v as f32).unwrap_or(k.default_range());
+            ui.label(egui::RichText::new(format!("{} 100% =", k.label())).size(10.5).weak());
+            let decimals = if k == ImuKind::Accel { 2 } else { 0 };
+            let dv = ui.add(egui::DragValue::new(&mut v)
+                    .range(lo..=hi)
+                    .speed(((hi - lo) / 400.0) as f64)
+                    .fixed_decimals(decimals)
+                    .suffix(format!(" {}", k.unit())))
+                .on_hover_text(format!(
+                    "How much {} counts as 100% on this card's curve. Default {} {}.\n\
+                     Gamepad: enter the card, cycle to this field, change with up/down.",
+                    match k {
+                        ImuKind::Gyro => "rotation speed",
+                        ImuKind::Accel => "acceleration (gravity taken out)",
+                        ImuKind::Tilt => "tilt",
+                    },
+                    k.default_range(), k.unit()));
+            ring(ui, &dv, imu_range_field(k));
+            if dv.changed() {
+                put(working, k.range_key(), v.clamp(lo, hi), k.default_range());
+                changed = true;
+            }
+        }
+        let mut t = working.get(imu::IMU_LOG_KEY).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(0.0);
+        ui.label(egui::RichText::new("Log/Exp").size(10.5).weak());
+        let dv = ui.add(egui::DragValue::new(&mut t).range(-1.0..=1.0).speed(0.01).fixed_decimals(2))
+            .on_hover_text("Bends the motion before the curve, as the Response Curve module's Log/Exp: \
+                            below 0 raises small movements (log), above 0 holds them down (exp).\n\
+                            Gamepad: enter the card, cycle to this field, change with up/down.");
+        ring(ui, &dv, IMU_LOG_FIELD);
+        if dv.changed() {
+            put(working, imu::IMU_LOG_KEY, t.clamp(-1.0, 1.0), 0.0);
+            changed = true;
+        }
+    });
+    changed
+}
+
 /// Largest live analog-input magnitude across a mapping's in pins, read from
 /// every device behind the input (a Combiner can merge a MIDI port with a pad)
 /// — drives the editor's preview dot.
@@ -1240,6 +1326,55 @@ pub(crate) fn live_analog_in_mag(
     devs.iter()
         .filter_map(|d| live_analog_in_mag_one(live_signals, d, in_pins))
         .reduce(f32::max)
+}
+
+/// Largest live magnitude of a card's IMU inputs as the card reads them — over
+/// its range, through its Log/Exp — for the preview dot. `None` when the card
+/// reads none or no device behind the input has a gyro.
+pub(crate) fn live_imu_in_mag(
+    ctx: &egui::Context,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    devs: &[String],
+    card: &serde_json::Map<String, Value>,
+) -> Option<f32> {
+    use flexinput_core::imu;
+    let pins: Vec<&'static imu::ImuPin> = card.get("in").and_then(|v| v.as_array()).into_iter()
+        .flatten().filter_map(|v| v.as_str()).filter_map(imu::imu_pin).collect();
+    if pins.is_empty() {
+        return None;
+    }
+    let reading = devs.iter().find_map(|d| live_imu_reading(ctx, live_signals, d))?;
+    let scale = imu::ImuScale::from_card(&Value::Object(card.clone()));
+    pins.iter().map(|p| scale.normalize(p, p.bus_value(&reading)).abs()).reduce(f32::max)
+}
+
+/// A device's IMU readings, derived as the engine derives them. Its gravity
+/// estimate lives in ctx memory per device and advances once per frame,
+/// however many cards ask.
+fn live_imu_reading(
+    ctx: &egui::Context,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: &str,
+) -> Option<flexinput_core::imu::ImuReading> {
+    use flexinput_core::imu::{ImuEstimator, ImuReading};
+    let read = |p: &str| live_signals.get(&(dev.to_string(), p.to_string())).map(|s| s.as_float());
+    let gyro = glam::Vec3::new(read("gyro_x")?, read("gyro_y")?, read("gyro_z")?);
+    let accel = match (read("accel_x"), read("accel_y"), read("accel_z")) {
+        (Some(x), Some(y), Some(z)) => Some(glam::Vec3::new(x, y, z)),
+        _ => None,
+    };
+    let key = egui::Id::new(("live_imu", dev));
+    let pass = ctx.cumulative_pass_nr();
+    let now = ctx.input(|i| i.time);
+    let (at_pass, at_time, mut est, reading): (u64, f64, ImuEstimator, ImuReading) =
+        ctx.data(|d| d.get_temp(key)).unwrap_or((u64::MAX, now, ImuEstimator::default(), ImuReading::default()));
+    if at_pass == pass {
+        return Some(reading);
+    }
+    let dt = ((now - at_time) as f32).clamp(0.0, 0.1);
+    let reading = est.tick(gyro, accel, dt);
+    ctx.data_mut(|d| d.insert_temp(key, (pass, now, est, reading)));
+    Some(reading)
 }
 
 /// What a sounding MIDI note on a card is doing right now, for the curve
@@ -1301,6 +1436,17 @@ fn live_analog_in_mag_one(
                     }
                 })
                 .map(|r| (r * sign).clamp(0.0, 1.0))
+        } else if let Some((xa, ya)) = match p.as_str() {
+            "left_stick" => Some(("left_stick_x", "left_stick_y")),
+            "right_stick" => Some(("right_stick_x", "right_stick_y")),
+            _ => None,
+        } {
+            // A whole stick: how far it's pushed, any way.
+            let axis = |a: &str| live_signals.get(&(dev.to_string(), a.to_string())).map(|s| s.as_float());
+            match (axis(xa), axis(ya)) {
+                (Some(x), Some(y)) => Some(egui::vec2(x, y).length().min(1.0)),
+                _ => None,
+            }
         } else if matches!(p.as_str(), "left_trigger" | "right_trigger") {
             live_signals.get(&(dev.to_string(), p.to_string()))
                 .map(|s| s.as_float().clamp(0.0, 1.0))
@@ -1500,6 +1646,8 @@ pub(crate) fn tz_draw_field(
     // at opacity `a`, active zones stay full. `None` = normal full render.
     inactive_alpha: Option<f32>,
     id_salt: &'static str,
+    // The zones' output chips' dialect: the device they send to.
+    skin: crate::canvas::remapper_icons::Skin,
 ) {
     use flexinput_core::touchzones as tz;
     let to_x = |u: f32| rect.left() + u * rect.width();
@@ -1547,7 +1695,6 @@ pub(crate) fn tz_draw_field(
     let zone_meta = snarl.get_node(node_id)
         .map(crate::canvas::menu_body::menu_zone_meta)
         .unwrap_or_default();
-    let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
     let ctx = ui.ctx().clone();
 
     // Zone rects come from the BSP tree in BOTH modes (partial per-zone dividers).
@@ -1763,6 +1910,7 @@ pub(crate) fn render_touch_zones_pinned(
 ) {
     use crate::canvas::node::ZoneVisibility;
     let visuals = ui.visuals().clone();
+    let out_skin = remapper_out_skin(inner_snarl, inner_id, automap_parent);
     // Colour resolution: per-pin override falls back FIELD-BY-FIELD to the
     // module's own colour params; both absent = the plain themed look.
     let node_main = inner_snarl.get_node(inner_id)
@@ -1959,7 +2107,7 @@ pub(crate) fn render_touch_zones_pinned(
                 }
             }
         }
-        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &zone_live, &visuals, accent, main_c32, inactive_alpha, "pin");
+        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &zone_live, &visuals, accent, main_c32, inactive_alpha, "pin", out_skin);
         if mapping { tz_pick_banner(inner_id, ui, snarl, &painter, r, accent); }
         // Selected-zone outline on top of the pad fill.
         if let Some(tree) = &mtree {
@@ -2151,6 +2299,8 @@ pub(crate) fn show_touch_zones_body(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
+    // The zones' output chips are drawn as the device they send to.
+    let out_skin = remapper_out_skin(snarl, node_id, automap_parent);
     // Lazy default init: single-field 2×2 grid, ports mode.
     if let Some(node) = snarl.get_node_mut(node_id) {
         if !node.params.contains_key("col_edges") {
@@ -2296,16 +2446,16 @@ pub(crate) fn show_touch_zones_body(
             // resize grip; it writes the shared size so both resize symmetrically.
             ui.horizontal_top(|ui| {
                 let a = ui.vertical(|ui| {
-                    render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h)
+                    render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
                 }).inner;
                 ui.add_space(16.0);
                 let b = ui.vertical(|ui| {
-                    render_touch_field(node_id, 1, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h)
+                    render_touch_field(node_id, 1, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
                 }).inner;
                 a.union(b)
             }).inner
         } else {
-            render_touch_field(node_id, 0, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h)
+            render_touch_field(node_id, 0, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
         };
 
         // Pinnable to a sub-patch/Easy-mode layout (ports mode = move-only field).
@@ -2479,7 +2629,7 @@ pub(crate) fn render_touch_zone_cards(
     const TZ_CARD_W: f32 = 358.0;
     // Virtual Menu variant: the zone IS the trigger (token "menu_sel" — fires
     // on menu selection), so there is no touch-gesture Learn phase. "Learn"
-    // arms the gamepad DESTINATION capture directly and "Assign…" opens the
+    // arms the gamepad DESTINATION capture directly and "Choose…" opens the
     // picker with this menu's own target pins disabled (no self-targeting).
     let menu_mode = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
     // Area Mapper variant: like the menu, the cell is the trigger — picked
@@ -2498,7 +2648,10 @@ pub(crate) fn render_touch_zone_cards(
     let (sel_f, sel_z) = tz_read_selection(snarl, node_id);
     let single = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) != Some("split");
-    let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
+    // A card's chips are its outputs (and implicit triggers): drawn as the
+    // device they go to.
+    let skin = remapper_out_skin(snarl, node_id, automap_parent);
+    publish_picker_skins(ui.ctx(), automap_parent, node_id, (skin, skin));
     let dev = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
     // Every device behind the input (all of a Combiner's ports), for the
     // gamepad-learn of an output; the touch gesture itself reads `dev`, the pad.
@@ -2510,7 +2663,7 @@ pub(crate) fn render_touch_zone_cards(
     let phase = getp(snarl, "_tz_phase").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "idle".into());
 
     // ── Learn state machine ───────────────────────────────────────────────
-    // idle → Learn → (demonstrate on pad) → captured → Assign / gamepad → commit.
+    // idle → Learn → (demonstrate on pad) → captured → Choose / gamepad → commit.
     // (Menu nodes never enter "learning" — their trigger is fixed.)
     if !implicit_trig && phase == "learning" {
         if let Some((trig, field)) =
@@ -2550,6 +2703,14 @@ pub(crate) fn render_touch_zone_cards(
             for p in remapper_midi_pressed_now(ui, live_signals, &port) {
                 if !pressed_now.contains(&p) { pressed_now.push(p); }
             }
+        }
+        // And the physical keyboard, as a Remapper's Learn hears it — a key is
+        // as good an output as a pad button.
+        let panic: crate::app::PanicShortcut = ui.ctx()
+            .data(|d| d.get_temp(egui::Id::new(crate::app::PANIC_SHORTCUT_KEY)))
+            .unwrap_or_default();
+        for p in remapper_kbm_pressed_now(ui, &panic) {
+            if !pressed_now.contains(&p) { pressed_now.push(p); }
         }
         // Baseline: the pins already held at the instant we armed (typically the
         // button the user pressed to arm — South/🎮). We latch it once, then only
@@ -2715,7 +2876,7 @@ pub(crate) fn render_touch_zone_cards(
                     let hint = if implicit_trig
                         && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
                     {
-                        "press a gamepad button…"
+                        "press a gamepad button or key…"
                     } else {
                         "(pick output)"
                     };
@@ -2748,7 +2909,7 @@ pub(crate) fn render_touch_zone_cards(
                 // Menu: the trigger is this zone's selection — go straight to
                 // picking the DESTINATION (gamepad learn or the picker).
                 let b = ui.button("Learn")
-                    .on_hover_text("Learn a gamepad button as this zone's output — press one on the pad.");
+                    .on_hover_text("Learn a gamepad button or keyboard key as this zone's output — press one.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -2758,8 +2919,8 @@ pub(crate) fn render_touch_zone_cards(
                         for k in ["_tz_draft_out", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
-                let b = ui.button("Assign…")
-                    .on_hover_text("Pick keyboard / mouse / stick / macro outputs for this zone. Pick several for a chord, then Add.");
+                let b = ui.button("Choose…")
+                    .on_hover_text("Choose keyboard / mouse / gamepad / stick / macro outputs for this zone. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -2774,6 +2935,7 @@ pub(crate) fn render_touch_zone_cards(
                         phase_key: None,
                         touch_zones: true,
                         exclude_pin_prefix: menu_excl.clone(),
+                        ..Default::default()
                     });
                 }
                 let b = ui.button("MIDI…")
@@ -2811,8 +2973,8 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             _ => { // captured
-                let b = ui.button("Assign…")
-                    .on_hover_text("Pick keyboard / mouse / mouse-delta / stick outputs. Pick several for a chord, then Add.");
+                let b = ui.button("Choose…")
+                    .on_hover_text("Choose keyboard / mouse / mouse-delta / gamepad / stick outputs. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
@@ -2822,6 +2984,7 @@ pub(crate) fn render_touch_zone_cards(
                         phase_key: None,
                         touch_zones: true,
                         exclude_pin_prefix: menu_excl.clone(),
+                        ..Default::default()
                     });
                 }
                 let b = ui.button("MIDI…")
@@ -2832,7 +2995,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
                 let b = ui.add(egui::Button::new(if armed { "🎮…" } else { "🎮" }))
-                    .on_hover_text("Learn a gamepad button as the output — press one now.");
+                    .on_hover_text("Learn a gamepad button or keyboard key as the output — press one now.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -2976,9 +3139,9 @@ pub(crate) fn render_touch_zone_cards(
     let mut remove: Option<usize> = None; // full-array index
     if display.is_empty() && phase == "idle" {
         let hint = if area_mode {
-            "No mappings — Learn a gamepad output or Assign… one for this cell."
+            "No mappings — Learn a gamepad or key output, or Choose… one for this cell."
         } else if menu_mode {
-            "No mappings — Learn a gamepad output or Assign… one for this zone."
+            "No mappings — Learn a gamepad or key output, or Choose… one for this zone."
         } else {
             "No mappings — press Learn, then demonstrate on a zone."
         };
@@ -3059,7 +3222,7 @@ pub(crate) fn render_touch_zone_cards(
             |ui| {
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
-                    &in_pins, Some(&out_pins), skin,
+                    &in_pins, Some(&out_pins), skin, skin,
                     true, false, reorder_enabled, drag_off, "zone_maps", card_analog,
                     card_conf.as_ref(),
                 );
@@ -3252,6 +3415,8 @@ pub(crate) fn render_touch_field(
     accent: egui::Color32,
     field_w: f32,
     field_h: f32,
+    // The zones' output chips' dialect: the device they send to.
+    skin: crate::canvas::remapper_icons::Skin,
 ) -> egui::Rect {
     use flexinput_core::touchzones as tz;
 
@@ -3290,7 +3455,7 @@ pub(crate) fn render_touch_field(
     }
 
     // Pad visuals + dividers (tree-driven in both modes).
-    tz_draw_field(node_id, field, ui, snarl, &painter, rect, zone_live, visuals, accent, None, None, "canvas");
+    tz_draw_field(node_id, field, ui, snarl, &painter, rect, zone_live, visuals, accent, None, None, "canvas", skin);
     if mapping { tz_pick_banner(node_id, ui, snarl, &painter, rect, accent); }
 
     // Selected-zone outline (mapping mode) — drawn on top of the pad fill.

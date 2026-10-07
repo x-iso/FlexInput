@@ -123,7 +123,7 @@ pub(crate) fn kbm_cell_texture(ctx: &egui::Context, skin: crate::canvas::remappe
 pub(crate) fn kbm_svg_texture(ctx: &egui::Context, bytes: &'static [u8])
     -> Option<egui::TextureHandle>
 {
-    let size_px = (26.0 * ctx.pixels_per_point()).round() as u32;
+    let size_px = (32.0 * ctx.pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("kbm_picker_icon", bytes.as_ptr() as usize, size_px));
     if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
         return Some(tex);
@@ -429,7 +429,7 @@ pub(crate) fn show_subpatch_editors(
         let mut midi_out: Option<super::nav::MidiModalOutcome> = None;
         // Picker interaction collected inside the viewport closure (which only
         // holds `&app`); applied after it returns.
-        let mut picker_result: (Option<String>, bool) = (None, false);
+        let mut picker_result = crate::app::nav::PickerInteraction::default();
 
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
         // Build breadcrumb: "Parent Name > This Name" for nested editors.
@@ -724,7 +724,7 @@ pub(crate) fn show_subpatch_editors(
         // THIS editor's canvas — which until this point was mem::replace'd
         // out, so an earlier apply would write into the empty placeholder
         // and the draft would vanish when the real canvas returned.
-        app.apply_kbm_picker_result(picker_result.0, picker_result.1);
+        app.apply_kbm_picker_result(picker_result);
 
         // Port sync: always against parent snarl.
         match parent_editor_idx {

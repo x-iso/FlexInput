@@ -155,7 +155,7 @@ pub(crate) fn show_remapper_body(
         // Click without a detected touch point (e.g. dielectric press, or
         // click registered before the finger contacts the surface) → fall
         // back to the bare btn_touchpad pin so the click still captures.
-        // touchpad_any is NOT auto-captured here — it's the Special-dropdown
+        // touchpad_any is NOT auto-captured here — it's the Choose picker's
         // pin used when the user wants a "click anywhere" mapping that
         // additively fires alongside a specific-zone click mapping.
         if touch_click && click_mask == 0 { push(&mut pressed_now, "btn_touchpad"); }
@@ -340,6 +340,9 @@ pub(crate) fn show_remapper_body(
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "auto".to_string());
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
+    // Inputs read as the pad they come from; outputs as the device they go to.
+    let out_skin = remapper_out_skin(snarl, node_id, automap_parent);
+    publish_picker_skins(ui.ctx(), automap_parent, node_id, (skin, out_skin));
 
     // Allocate a fixed-width sub-UI so the body's measured min_rect is
     // bounded — egui-snarl reports body width as body_ui.min_rect, and a
@@ -371,15 +374,15 @@ pub(crate) fn show_remapper_body(
                 // button combo.
                 "capturing" if new_draft_input.is_empty() => {
                     if nav_active_for_device && !capture_ok {
-                        ("Press Learn to start input capture".into(), blue)
+                        ("Press Learn to capture an input, or Choose… one".into(), blue)
                     } else {
-                        ("Press a button or combination".into(), blue)
+                        ("Press a button or combination, or Choose… one".into(), blue)
                     }
                 }
                 "ready_to_learn" =>
-                    ("Captured — click Learn (press again to re-capture)".into(), green),
+                    ("Input set — Learn or Choose… the output (press again to re-capture)".into(), green),
                 "learning" if new_draft_output.is_empty() =>
-                    ("Press target key or button".into(), blue),
+                    ("Press target key or button, or Choose… one".into(), blue),
                 "learning" =>
                     ("Captured output — click Add".into(), green),
                 _ => (String::new(), Color32::TRANSPARENT),
@@ -407,7 +410,7 @@ pub(crate) fn show_remapper_body(
                 } else {
                     for (i, pin) in new_draft_output.iter().enumerate() {
                         if i > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
-                        remapper_render_chip(ui, pin, skin);
+                        remapper_render_chip(ui, pin, out_skin);
                     }
                 }
             });
@@ -420,7 +423,7 @@ pub(crate) fn show_remapper_body(
         //     where auto-capture is suppressed; harmless otherwise).
         //   • ready_to_learn → start OUTPUT learning.
         //   • learning → Stop.
-        // The three controls (Learn / Special / Add) are also gamepad-activatable
+        // The controls (Learn / Choose / Add …) are also gamepad-activatable
         // via `_nav_act_learn|special|add` flags the nav driver sets on South,
         // and their rects are published so the driver can glow the focused one.
         let in_learning = new_phase == "learning";
@@ -428,8 +431,10 @@ pub(crate) fn show_remapper_body(
 
         let need_input_arm = new_phase != "ready_to_learn" && new_phase != "learning"
             && new_draft_input.is_empty();
-        let add_enabled = (in_learning && !new_draft_output.is_empty())
-            || (learn_enabled && !new_draft_output.is_empty());
+        // Both sides set. Choose… can leave the input empty after a clear,
+        // which Learn never could.
+        let add_enabled = (in_learning || learn_enabled)
+            && !new_draft_output.is_empty() && !new_draft_input.is_empty();
 
         // A draft exists if either chord has content — Clear is shown then.
         let has_draft = !new_draft_input.is_empty() || !new_draft_output.is_empty()
@@ -491,11 +496,6 @@ pub(crate) fn show_remapper_body(
                 let _ = need_input_arm;
             }
 
-            // Special button — opens the shared KB/M + touchpad picker (mouse OR
-            // gamepad South via `_nav_act_special`). Available once input is
-            // latched (ready_to_learn) AND during output learning, so the user
-            // can pick a mouse/keyboard/touchpad action BEFORE (or instead of)
-            // learning a gamepad output chord.
             // Which MIDI In to learn a MIDI output from. Only worth asking
             // when there is more than one — with a single controller the
             // answer is never in doubt.
@@ -552,20 +552,24 @@ pub(crate) fn show_remapper_body(
                     });
                 }
             }
-            if in_learning || learn_enabled {
-                let special_btn = ui.add(egui::Button::new(
-                    egui::RichText::new("Special…").size(13.0)));
-                special_rect = special_btn.rect;
-                if special_btn.clicked() || act_special {
+            // Choose… — the alternative to Learn, on either side: opens the
+            // shared picker (mouse, or gamepad South via `_nav_act_special`) on
+            // the side Learn would capture next. A pad button, stick direction
+            // or the pad's motion as the input; a key, mouse button, pad button
+            // or macro as the output. West switches sides inside it.
+            {
+                let choose_btn = ui.add(egui::Button::new(
+                    egui::RichText::new("Choose…").size(13.0)))
+                    .on_hover_text("Pick the input or output from a board instead of pressing it — \
+                                    including the pad's motion (gyro, accel, tilt) as an input.");
+                special_rect = choose_btn.rect;
+                if choose_btn.clicked() || act_special {
                     crate::canvas::viewer::request_special_picker(ui.ctx(),
-                        crate::canvas::viewer::SpecialPickerRequest {
-                            inner: node_id,
-                            path: crate::canvas::viewer::subpatch_path(automap_parent),
-                            draft_key: "draft_output".to_string(),
-                            phase_key: None,
-                            touch_zones: false,
-                            exclude_pin_prefix: None,
-                        });
+                        crate::canvas::viewer::SpecialPickerRequest::remapper(
+                            node_id,
+                            crate::canvas::viewer::subpatch_path(automap_parent),
+                            &new_phase,
+                        ));
                 }
             }
 
@@ -623,7 +627,7 @@ pub(crate) fn show_remapper_body(
         });
         // Publish action-button rects (global) so the nav driver can glow the
         // focused one. Order MUST match `nav_remap_action_items` AND the visual
-        // layout: Learn, MIDI…, Special, Clear, Add (entries NOTHING where
+        // layout: Learn, MIDI…, Choose, Clear, Add (entries NOTHING where
         // absent, which the publisher drops — so each of these must be absent
         // under exactly the condition its nav item is).
         publish_nav_action_rects(ui, node_id, &[learn_rect, midi_rect, special_rect, clear_rect, add_rect]);
@@ -722,7 +726,7 @@ pub(crate) fn show_remapper_body(
                                     .any(|p| flexinput_engine::pin_is_analog_input(p));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
-                                    &in_pins, Some(&out_pins), skin,
+                                    &in_pins, Some(&out_pins), skin, out_skin,
                                     card_analog, true, reorder_enabled, drag_off, "mappings", card_analog,
                                     card_conf.as_ref(),
                                 );
@@ -746,6 +750,12 @@ pub(crate) fn show_remapper_body(
                                     // Combiner the MIDI port isn't the first one.
                                     let live = live_analog_in_mag(
                                         live_signals, &upstream_devs, &in_pins);
+                                    let live = match (live, live_imu_in_mag(
+                                        ui.ctx(), live_signals, &upstream_devs, &working))
+                                    {
+                                        (Some(a), Some(b)) => Some(a.max(b)),
+                                        (a, b) => a.or(b),
+                                    };
                                     let live_note = live_note_readout(
                                         live_signals, &upstream_devs, &in_pins);
                                     let nav_uid = curve_nav_uid(ui.ctx(), node_id, "mappings", i);
@@ -1036,6 +1046,7 @@ pub(crate) fn show_map_action_body(
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "auto".to_string());
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
+    publish_picker_skins(ui.ctx(), automap_parent, node_id, (skin, skin));
 
     const BODY_W: f32 = 380.0;
     let body_resp = ui.allocate_ui_with_layout(
@@ -1053,9 +1064,9 @@ pub(crate) fn show_map_action_body(
             match new_phase.as_str() {
                 "capturing" if new_draft_input.is_empty() => {
                     if nav_active_for_device && !capture_ok {
-                        ("Press Learn to start input capture".into(), blue)
+                        ("Press Learn to capture an input, or Choose… one".into(), blue)
                     } else {
-                        ("Press a button or combination".into(), blue)
+                        ("Press a button or combination, or Choose… one".into(), blue)
                     }
                 }
                 "capturing" => ("Press your input chord; release to capture".into(), blue),
@@ -1090,6 +1101,7 @@ pub(crate) fn show_map_action_body(
             }
         }
         let mut learn_rect = egui::Rect::NOTHING;
+        let mut choose_rect = egui::Rect::NOTHING;
         let mut clear_rect = egui::Rect::NOTHING;
         let mut add_rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
@@ -1104,6 +1116,17 @@ pub(crate) fn show_map_action_body(
                     node.params.insert("_nav_capture_armed".to_string(), Value::from(true));
                     node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
                 }
+            }
+            // Choose… — pick the input chord from the board instead of pressing
+            // it (gamepad: the nav driver opens the same picker).
+            let choose_btn = ui.add_enabled(wired,
+                egui::Button::new(egui::RichText::new("Choose…").size(13.0)))
+                .on_hover_text("Pick the input from a board instead of pressing it.");
+            choose_rect = choose_btn.rect;
+            if choose_btn.clicked() {
+                crate::canvas::viewer::request_special_picker(ui.ctx(),
+                    crate::canvas::viewer::SpecialPickerRequest::map_action(
+                        node_id, crate::canvas::viewer::subpatch_path(automap_parent)));
             }
             if has_draft {
                 let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
@@ -1142,8 +1165,8 @@ pub(crate) fn show_map_action_body(
                     .size(12.0).color(Color32::from_rgb(106, 167, 255)));
             }
         });
-        // Map Action action order: Learn, Clear, Add (no Special).
-        publish_nav_action_rects(ui, node_id, &[learn_rect, clear_rect, add_rect]);
+        // Map Action action order: Learn, Choose, Clear, Add.
+        publish_nav_action_rects(ui, node_id, &[learn_rect, choose_rect, clear_rect, add_rect]);
         remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
             "_nav_capture_armed", "ui_phase", &["capturing"]);
 
@@ -1219,7 +1242,7 @@ pub(crate) fn show_map_action_body(
                                     .any(|p| flexinput_engine::pin_is_analog_input(p));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
-                                    &in_pins, None, skin,
+                                    &in_pins, None, skin, skin,
                                     card_analog, false, reorder_enabled, drag_off, "mappings", false,
                                     None, // Map Action rows aren't bus writers (out_pins None)
                                 );

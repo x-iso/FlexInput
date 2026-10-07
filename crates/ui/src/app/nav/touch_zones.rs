@@ -433,7 +433,7 @@ impl FlexInputApp {
 
     /// The action-row items for the Touch Zones cards widget, in the SAME visual
     /// order the body publishes their rects (`render_touch_zone_cards`, Row 2):
-    /// idle → [Learn]; learning → [Cancel]; captured → [Assign, 🎮, ＋Add, Cancel].
+    /// idle → [Learn]; learning → [Cancel]; captured → [Choose, 🎮, ＋Add, Cancel].
     /// When any card drives a relative-mouse output the node-global mouse-speed
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
@@ -453,7 +453,7 @@ impl FlexInputApp {
         }
         // A Virtual Menu zone is triggered by its own selection (no touch/swipe),
         // so it skips the touch-"learning" phase: idle offers Learn (arm a
-        // gamepad-button capture) AND Assign (pick a specific output) directly,
+        // gamepad-button capture) AND Choose (pick a specific output) directly,
         // matching the mouse menu card. Touch Zones demonstrates a gesture first.
         let mut v = match (menu, phase) {
             (true, "idle")  => vec!["learn", "assign", "midi"],
@@ -706,7 +706,7 @@ impl FlexInputApp {
 
     /// Drive the Touch Zones mapping CARDS widget (`TzCards`). Adapts the
     /// Remapper's proven two-row model (`nav_drive_remapper`): the ACTION row
-    /// (Learn / Assign / 🎮 / ＋Add / Cancel) is navigated LEFT/RIGHT; the card
+    /// (Learn / Choose / 🎮 / ＋Add / Cancel) is navigated LEFT/RIGHT; the card
     /// list below it UP/DOWN. Down from the actions lands on the first card, Up
     /// from the first card returns to the actions. South activates a focused
     /// action or ENTERS a focused card for field editing (shared `RemapCard`
@@ -858,8 +858,8 @@ impl FlexInputApp {
                         self.gamepad_nav.card_index = 0;
                     }
                     "assign" => {
-                        // Menu idle→Assign commits the captured phase with the
-                        // menu-select trigger first (the mouse menu "Assign…"
+                        // Menu idle→Choose commits the captured phase with the
+                        // menu-select trigger first (the mouse menu "Choose…"
                         // flow), so picking outputs binds them to the zone's
                         // selection. Touch Zones is already in `captured` here.
                         if menu {
@@ -885,11 +885,12 @@ impl FlexInputApp {
                             phase_key: None,
                             touch_zones: true,
                             exclude_pin_prefix,
+                            ..Default::default()
                         }, None);
                     }
                     "midi" => {
                         // A menu zone picks its output straight from idle, as with
-                        // Assign: bind to the zone's selection first.
+                        // Choose: bind to the zone's selection first.
                         if menu {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
                             self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);

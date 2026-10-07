@@ -1,11 +1,16 @@
-//! Gamepad-navigable virtual keyboard / mouse picker.
+//! Gamepad-navigable virtual keyboard / mouse / gamepad picker.
 //!
-//! Opened from a Remapper's "Special" slot (gamepad South) during the output
-//! Learn phase. Renders a keyboard-shaped grid of KBM icons in a modal window;
-//! the user navigates cells with the left stick / D-pad, presses South to append
-//! the focused pin to the output chord (`draft_output`), North to reset that
+//! Opened from a mapping card's "Choose…" button — the alternative to Learn on
+//! either side of a mapping. Renders a keyboard-shaped grid of icons in a modal
+//! window; the user navigates cells with the left stick / D-pad, presses South
+//! to append the focused pin to the chord being built, North to reset that
 //! chord, and East to close. This lets a controller-only user assign
-//! keyboard/mouse outputs without a physical keyboard or mouse.
+//! keyboard/mouse outputs without a physical keyboard or mouse — and pick an
+//! input (a button, a stick direction, the pad's motion) without pressing it.
+//!
+//! A session picks for one [`PickStage`] at a time. Choosing an INPUT greys
+//! what can only be an output (keys, mouse, macros); choosing an OUTPUT greys
+//! what can only be an input (the IMU, the touchpad's click zones).
 //!
 //! The picker is driven entirely from the top-level nav driver (`app.rs`), NOT
 //! from inside a pinned body — pinned remapper bodies render in a child
@@ -51,7 +56,7 @@ const fn ca(pin: &'static str, x: f32, y: f32) -> KbmCell {
 // right of it, the mouse cluster further right again.
 const NAV_X: f32 = 15.5; // Insert/Home/PgUp column start
 const MOUSE_X: f32 = 19.5; // mouse cluster column start
-const TOUCH_X: f32 = 23.5; // touchpad cluster column start (right of the mouse cluster)
+const TZ_OUT_X: f32 = 23.5; // Touch Zones' analog outputs (right of the mouse cluster)
 
 /// The full keyboard + mouse layout as absolutely-positioned cells. Pin ids
 /// match `remapper_icons::pin_svg` so every cell resolves to an SVG icon.
@@ -118,14 +123,6 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     // Scroll directions arranged like a d-pad: up on top, left/down/right below.
     c("scroll_up", MOUSE_X + 1.0, 3.0),
     c("scroll_left", MOUSE_X, 4.0), c("scroll_down", MOUSE_X + 1.0, 4.0), c("scroll_right", MOUSE_X + 2.0, 4.0),
-
-    // ── Touchpad cluster (DualSense/DualShock) ────────────────────────────
-    // Row 1: the three touch zones (finger touch, no click).
-    c("touch_left", TOUCH_X, 1.0), c("touch_center", TOUCH_X + 1.0, 1.0), c("touch_right", TOUCH_X + 2.0, 1.0),
-    // Row 2: touchpad click + DualSense mic (mute) button.
-    c("btn_touchpad", TOUCH_X, 2.0), c("btn_mute", TOUCH_X + 1.0, 2.0),
-    // Row 3: analog swipes — only usable when an analog input is captured.
-    ca("touch_swipe_x", TOUCH_X, 3.0), ca("touch_swipe_y", TOUCH_X + 1.0, 3.0),
 ];
 
 /// An owned picker cell — the static [`KBM_LAYOUT`] plus the current patch's
@@ -155,17 +152,53 @@ impl From<&KbmCell> for PickerCell {
     }
 }
 
-// The gamepad cluster sits below the keyboard, to the right of where the macro
-// cluster grows, so neither can ever reach the other.
-const PAD_X: f32 = 15.5;
-const PAD_Y: f32 = 6.6;
+/// Which side of a mapping a picker session fills.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PickStage {
+    /// What triggers the mapping.
+    Input,
+    /// What it sends.
+    #[default]
+    Output,
+}
+
+/// Can `pin` sit on this side of a mapping?
+///
+/// Keys, the mouse, macro ports and menu targets are only ever sent, and the
+/// touchpad's swipes only ever driven; the IMU and the touchpad's CLICK zones
+/// are only ever read. Everything else — pad buttons, stick directions, whole
+/// sticks, triggers, touch zones — works both ways.
+pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
+    let input_only = flexinput_core::imu::is_imu_pin(pin) || CLICK_ZONES.contains(&pin);
+    let output_only = pin.starts_with("key_")
+        || pin.starts_with("mouse")
+        || pin.starts_with("scroll_")
+        || matches!(pin, "touch_swipe_x" | "touch_swipe_y")
+        || flexinput_core::macros::parse_macro_pin(pin).is_some()
+        || flexinput_core::menu::parse_target_pin(pin).is_some();
+    match stage {
+        PickStage::Input => !output_only,
+        PickStage::Output => !input_only,
+    }
+}
+
+/// The touchpad clicked in a zone, or anywhere — inputs only.
+const CLICK_ZONES: [&str; 4] = ["touchpad_left", "touchpad_center", "touchpad_right", "touchpad_any"];
+
+// Everything a pad has sits in one row under the keyboard and mouse, from the
+// left: the gamepad's buttons, its sticks with the touchpad under them, then
+// its motion. Every block keeps to the gamepad's row grid — the lower blocks
+// start on its fifth row, the fourth left for their captions. The macro
+// cluster grows below that row.
+const PAD_ROW_Y: f32 = 6.6;
+const PAD_X: f32 = 0.0;
+const PAD_Y: f32 = PAD_ROW_Y;
 
 /// The gamepad, as a shape you can find a button on without reading it.
 ///
-/// Offered only where a pad button is a legal TARGET — JSM's virtual pad
-/// output. The Remapper's picker leaves it out: there a pad button is an input
-/// being remapped, and offering it as an output would be offering a mapping to
-/// itself.
+/// On every board: JSM names its buttons on either side of a line, and a
+/// mapping card can take one as its input or send one as its output — the same
+/// buttons its Learn would capture by pressing them.
 pub const PAD_LAYOUT: &[KbmCell] = &[
     // Triggers above bumpers, the way they sit under your fingers.
     c("left_trigger", PAD_X, PAD_Y), c("right_trigger", PAD_X + 6.0, PAD_Y),
@@ -179,20 +212,19 @@ pub const PAD_LAYOUT: &[KbmCell] = &[
     c("dpad_left", PAD_X, PAD_Y + 3.0), c("dpad_right", PAD_X + 2.0, PAD_Y + 3.0),
     c("btn_west", PAD_X + 4.0, PAD_Y + 3.0), c("btn_east", PAD_X + 6.0, PAD_Y + 3.0),
     c("dpad_down", PAD_X + 1.0, PAD_Y + 4.0), c("btn_south", PAD_X + 5.0, PAD_Y + 4.0),
-    // Stick clicks at the bottom, under the hands they belong to.
-    c("btn_ls", PAD_X + 1.0, PAD_Y + 5.0), c("btn_rs", PAD_X + 5.0, PAD_Y + 5.0),
+    // (The stick clicks sit in the middle of their sticks: STICK_CLICKS.)
     // The rear paddles, in the pairs a hand finds them in. JSM calls them after
     // the JoyCon rail buttons that sit in the same place (LSL / LSR / RSL / RSR).
-    c("btn_paddle_l1", PAD_X, PAD_Y + 6.0), c("btn_paddle_l2", PAD_X + 1.0, PAD_Y + 6.0),
-    c("btn_paddle_r1", PAD_X + 5.0, PAD_Y + 6.0), c("btn_paddle_r2", PAD_X + 6.0, PAD_Y + 6.0),
+    c("btn_paddle_l1", PAD_X, PAD_Y + 5.0), c("btn_paddle_l2", PAD_X + 1.0, PAD_Y + 5.0),
+    c("btn_paddle_r1", PAD_X + 5.0, PAD_Y + 5.0), c("btn_paddle_r2", PAD_X + 6.0, PAD_Y + 5.0),
     // Capture / Share, and the extra buttons a pad may carry. JSM's CAPTURE is
     // one name for "touchpad click or Capture" (its own words), so this cell and
     // the touchpad's click cell both write it — as they should, since a config
     // written on one pad has to run on the other.
-    c("btn_capture", PAD_X, PAD_Y + 7.0),
-    c("btn_misc1", PAD_X + 1.0, PAD_Y + 7.0), c("btn_misc2", PAD_X + 2.0, PAD_Y + 7.0),
-    c("btn_misc3", PAD_X + 3.0, PAD_Y + 7.0), c("btn_misc4", PAD_X + 4.0, PAD_Y + 7.0),
-    c("btn_misc5", PAD_X + 5.0, PAD_Y + 7.0), c("btn_misc6", PAD_X + 6.0, PAD_Y + 7.0),
+    c("btn_capture", PAD_X, PAD_Y + 6.0),
+    c("btn_misc1", PAD_X + 1.0, PAD_Y + 6.0), c("btn_misc2", PAD_X + 2.0, PAD_Y + 6.0),
+    c("btn_misc3", PAD_X + 3.0, PAD_Y + 6.0), c("btn_misc4", PAD_X + 4.0, PAD_Y + 6.0),
+    c("btn_misc5", PAD_X + 5.0, PAD_Y + 6.0), c("btn_misc6", PAD_X + 6.0, PAD_Y + 6.0),
 ];
 
 /// Where the gamepad cluster's caption goes, in grid units.
@@ -202,61 +234,195 @@ pub fn pad_caption_at() -> (f32, f32) {
 
 /// Is this one of the gamepad cluster's cells?
 ///
-/// Used to draw it with a pad skin rather than the keyboard one — and the Xbox
-/// skin specifically, because the names this picker writes are JSM's `X_`
-/// family, and a board that shows a ✕ while writing `X_A` reads as a mistake.
+/// Used to draw it with a pad skin rather than the keyboard one: the dialect
+/// of the side being chosen on a mapping card, and the Xbox one for JSM, whose
+/// names are the `X_` family — a board that shows a ✕ while writing `X_A`
+/// reads as a mistake.
 pub fn is_pad_cell(pin: &str) -> bool {
-    PAD_LAYOUT.iter().any(|c| c.pin == pin)
+    PAD_LAYOUT.iter().chain(STICK_CLICKS).chain(STICK_LAYOUT).chain(WHOLE_STICKS).any(|c| c.pin == pin)
 }
 
-/// Grid Y where the macro cluster starts (one gap row below the keyboard).
-pub const MACRO_Y: f32 = 6.6;
+/// A few characters under a cell whose glyph it shares with another: the
+/// touchpad's touch and click zones are drawn alike.
+pub fn cell_caption(pin: &str) -> Option<&'static str> {
+    Some(match pin {
+        "touch_left" | "touch_center" | "touch_right" => "touch",
+        "touchpad_left" | "touchpad_center" | "touchpad_right" | "btn_touchpad" => "click",
+        "touchpad_any" => "any",
+        _ => return None,
+    })
+}
+
+const STICKS_X: f32 = PAD_X + 8.0;
+const STICKS_Y: f32 = PAD_ROW_Y;
+const TOUCHPAD_X: f32 = STICKS_X;
+const TOUCHPAD_Y: f32 = PAD_ROW_Y + 4.0;
+const GYRO_X: f32 = STICKS_X + 8.0;
+const GYRO_Y: f32 = PAD_ROW_Y;
+/// The Accel block sits beside the Gyro block, Tilt under it.
+const ACCEL_X: f32 = GYRO_X + 4.0;
+const TILT_Y: f32 = PAD_ROW_Y + 4.0;
+
+/// The touchpad (DualSense / DualShock): its touch zones; its click, the
+/// DualSense mic button and the analog swipes — only usable when an analog
+/// input is captured. Hidden in Touch Zones' variant: a touchpad can't remap
+/// to itself. (Its click ZONES, inputs only, are added on a third row by
+/// [`picker_cells`] when the board offers inputs.)
+pub const TOUCHPAD_LAYOUT: &[KbmCell] = &[
+    c("touch_left", TOUCHPAD_X, TOUCHPAD_Y),
+    c("touch_center", TOUCHPAD_X + 1.0, TOUCHPAD_Y),
+    c("touch_right", TOUCHPAD_X + 2.0, TOUCHPAD_Y),
+    c("btn_touchpad", TOUCHPAD_X, TOUCHPAD_Y + 1.0),
+    c("btn_mute", TOUCHPAD_X + 1.0, TOUCHPAD_Y + 1.0),
+    ca("touch_swipe_x", TOUCHPAD_X + 2.0, TOUCHPAD_Y + 1.0),
+    ca("touch_swipe_y", TOUCHPAD_X + 3.0, TOUCHPAD_Y + 1.0),
+];
+
+/// Both sticks' directions, each as a plus — an input to remap, or a stick to
+/// push. Not on JSM's board: its stick directions are settings, not buttons.
+pub const STICK_LAYOUT: &[KbmCell] = &[
+    c("left_stick_up", STICKS_X + 1.0, STICKS_Y),
+    c("left_stick_left", STICKS_X, STICKS_Y + 1.0),
+    c("left_stick_right", STICKS_X + 2.0, STICKS_Y + 1.0),
+    c("left_stick_down", STICKS_X + 1.0, STICKS_Y + 2.0),
+    c("right_stick_up", STICKS_X + 5.0, STICKS_Y),
+    c("right_stick_left", STICKS_X + 4.0, STICKS_Y + 1.0),
+    c("right_stick_right", STICKS_X + 6.0, STICKS_Y + 1.0),
+    c("right_stick_down", STICKS_X + 5.0, STICKS_Y + 2.0),
+];
+
+/// The stick clicks, each in the middle of its stick's plus. Part of the
+/// gamepad (every board with one has them — JSM's too), drawn with the sticks.
+pub const STICK_CLICKS: &[KbmCell] = &[
+    c("btn_ls", STICKS_X + 1.0, STICKS_Y + 1.0),
+    c("btn_rs", STICKS_X + 5.0, STICKS_Y + 1.0),
+];
+
+/// Each whole stick, in its plus's outer bottom corner: a stick read or driven
+/// as one position. Analog-only — as an output it needs an analog input to
+/// take the position from.
+pub const WHOLE_STICKS: &[KbmCell] = &[
+    ca("left_stick", STICKS_X, STICKS_Y + 2.0),
+    ca("right_stick", STICKS_X + 6.0, STICKS_Y + 2.0),
+];
+
+/// What the board is showing, besides the keyboard and mouse it always does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PickerLayout {
+    /// Touch Zones / Menu / Area: the touchpad cluster gives way to analog
+    /// outputs (a touchpad can't remap to itself).
+    pub tz: bool,
+    /// The gamepad's buttons.
+    pub pad: bool,
+    /// The sticks' directions.
+    pub sticks: bool,
+    /// The whole sticks (Remapper inputs; Remapper and Touch Zones outputs).
+    pub whole_sticks: bool,
+    /// What only a Remapper's INPUT can be: the pad's motion, and the
+    /// touchpad's click zones.
+    pub inputs: bool,
+}
+
+/// A caption over a cluster, and where (grid units) it goes.
+pub fn cluster_captions(layout: PickerLayout) -> Vec<(&'static str, f32, f32)> {
+    let mut v = Vec::new();
+    if layout.pad {
+        let (x, y) = pad_caption_at();
+        v.push(("GAMEPAD", x, y));
+    }
+    if layout.sticks || layout.pad {
+        v.push(("STICKS", STICKS_X, STICKS_Y - 0.42));
+    }
+    if !layout.tz {
+        v.push(("TOUCHPAD", TOUCHPAD_X, TOUCHPAD_Y - 0.42));
+    }
+    if layout.inputs {
+        v.push(("GYRO", GYRO_X, GYRO_Y - 0.42));
+        v.push(("ACCEL (motion)", ACCEL_X, GYRO_Y - 0.42));
+        v.push(("TILT", GYRO_X, TILT_Y - 0.42));
+    }
+    v
+}
+
+/// The IMU cells: per family a block of rows, one per axis — the two-sided pin
+/// then its two directions, as [`flexinput_core::imu::IMU_PINS`] lists them.
+fn imu_cells() -> Vec<KbmCell> {
+    use flexinput_core::imu::{ImuKind, IMU_PINS};
+    let mut cells = Vec::new();
+    let mut row_in_kind = [0usize; 3];
+    for axis in IMU_PINS.chunks(3) {
+        let kind = axis[0].kind;
+        let row = row_in_kind[kind as usize] as f32;
+        row_in_kind[kind as usize] += 1;
+        let (x, y) = match kind {
+            ImuKind::Gyro => (GYRO_X, GYRO_Y),
+            ImuKind::Accel => (ACCEL_X, GYRO_Y),
+            ImuKind::Tilt => (GYRO_X, TILT_Y),
+        };
+        for (i, p) in axis.iter().enumerate() {
+            cells.push(c(p.id, x + i as f32, y + row));
+        }
+    }
+    cells
+}
+
+/// Grid Y where the macro cluster starts (a gap row below the pad's row).
+pub const MACRO_Y: f32 = PAD_ROW_Y + 7.6;
 /// Macro cells per row before wrapping.
 const MACRO_PER_ROW: usize = 14;
 
 /// The cell set actually shown (and navigated) for the current picker mode.
 ///
 /// In Touch-Zones mode a touchpad can't remap to itself, so the touchpad cluster
-/// is hidden and analog OUTPUT cells (mouse delta + sticks) fill the vacated
-/// columns. Those extras must be REAL cells in this list — otherwise gamepad nav
+/// is hidden and analog OUTPUT cells (mouse delta + sticks) go right of the
+/// mouse cluster. Those extras must be REAL cells in this list — otherwise gamepad nav
 /// (which walks this list) can't reach them, and the focus ring lands on a
 /// hidden cell, making the cursor vanish. Single source of truth shared by the
 /// renderer, the spatial nav, and activation.
 ///
 /// `macros` is the patch's defined macro ports, laid out as an extra cluster
-/// BELOW the keyboard at [`MACRO_Y`].
+/// at the bottom, at [`MACRO_Y`].
 pub fn picker_cells(
-    tz: bool,
-    pad: bool,
+    layout: PickerLayout,
     macros: &[crate::macro_icons::MacroDisplayEntry],
 ) -> Vec<PickerCell> {
-    let mut cells: Vec<PickerCell> = if !tz {
-        KBM_LAYOUT.iter().map(PickerCell::from).collect()
+    let PickerLayout { tz, pad, sticks, whole_sticks, inputs } = layout;
+    let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
+    if !tz {
+        cells.extend(TOUCHPAD_LAYOUT.iter().map(PickerCell::from));
     } else {
-        // Touchpad cluster pins hidden in Touch-Zones mode (see kbm_picker_window).
-        let hidden = |pin: &str| matches!(pin,
-            "touch_left" | "touch_center" | "touch_right"
-            | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y" | "btn_mute");
-        let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter()
-            .filter(|c| !hidden(c.pin)).map(PickerCell::from).collect();
-        // Analog outputs placed in the vacated touchpad columns: mouse-delta and the
-        // full analog sticks (touch position → deflection). The KB/M grid has no
-        // stick keys, so they live here — and stay navigable. Marked analog-only so
-        // they are greyed for targets where analog output makes no sense (a Virtual
-        // Menu zone triggers a DISCRETE selection); a touch/touchpad zone keeps them
-        // enabled (`picker_analog_input_ok` returns true for non-menu touch zones).
-        cells.push((&ca("mouse_x", TOUCH_X, 1.0)).into());
-        cells.push((&ca("mouse_y", TOUCH_X + 1.0, 1.0)).into());
-        cells.push((&ca("mouse", TOUCH_X, 2.0)).into());
-        cells.push((&ca("left_stick", TOUCH_X, 3.0)).into());
-        cells.push((&ca("right_stick", TOUCH_X + 1.0, 3.0)).into());
-        // Analog (variable-speed) scroll — the touch-zone deflection sets the rate.
-        cells.push((&ca("scroll_y", TOUCH_X, 4.0)).into());
-        cells.push((&ca("scroll_x", TOUCH_X + 1.0, 4.0)).into());
-        cells
-    };
+        // The touchpad cluster is hidden in Touch-Zones mode (a touchpad can't
+        // remap to itself); analog mouse outputs go right of the mouse instead:
+        // mouse-delta and variable-speed scroll (touch position → rate). The
+        // whole sticks it can drive are with the sticks, on the gamepad tab.
+        // Marked analog-only so they are greyed for targets where analog
+        // output makes no sense (a Virtual Menu zone triggers a DISCRETE
+        // selection); a touch/touchpad zone keeps them enabled
+        // (`picker_analog_input_ok` returns true for non-menu touch zones).
+        cells.push((&ca("mouse_x", TZ_OUT_X, 1.0)).into());
+        cells.push((&ca("mouse_y", TZ_OUT_X + 1.0, 1.0)).into());
+        cells.push((&ca("mouse", TZ_OUT_X, 2.0)).into());
+        cells.push((&ca("scroll_y", TZ_OUT_X, 3.0)).into());
+        cells.push((&ca("scroll_x", TZ_OUT_X + 1.0, 3.0)).into());
+    }
     if pad {
-        cells.extend(PAD_LAYOUT.iter().map(PickerCell::from));
+        cells.extend(PAD_LAYOUT.iter().chain(STICK_CLICKS).map(PickerCell::from));
+    }
+    if sticks {
+        cells.extend(STICK_LAYOUT.iter().map(PickerCell::from));
+    }
+    if whole_sticks {
+        cells.extend(WHOLE_STICKS.iter().map(PickerCell::from));
+    }
+    if inputs {
+        cells.extend(imu_cells().iter().map(PickerCell::from));
+        // The click zones go on the touchpad cluster's last row, which Touch
+        // Zones' variant hides — it has no input stage to need them.
+        if !tz {
+            for (i, pin) in CLICK_ZONES.into_iter().enumerate() {
+                cells.push((&c(pin, TOUCHPAD_X + i as f32, TOUCHPAD_Y + 2.0)).into());
+            }
+        }
     }
     for (i, entry) in macros.iter().enumerate() {
         cells.push(PickerCell {
@@ -269,6 +435,70 @@ pub fn picker_cells(
         });
     }
     cells
+}
+
+/// The picker's tabs. The whole board at a readable scale is bigger than a
+/// screen wants, so it's split by what the cells are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PickerTab {
+    /// The keyboard and mouse (and Touch Zones' analog outputs beside them).
+    #[default]
+    Kbm,
+    /// Everything a pad has: buttons, sticks, touchpad, motion.
+    Gamepad,
+    /// The patch's Macro Output ports, JSM `@` macros and menu targets.
+    Macros,
+}
+
+impl PickerTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            PickerTab::Kbm => "Keyboard & Mouse",
+            PickerTab::Gamepad => "Gamepad",
+            PickerTab::Macros => "Macros",
+        }
+    }
+}
+
+/// Which tab a cell of the full board belongs to — by the band it sits in.
+fn cell_tab(cell: &PickerCell) -> PickerTab {
+    if cell.macro_meta.is_some() {
+        PickerTab::Macros
+    } else if cell.y >= PAD_ROW_Y {
+        PickerTab::Gamepad
+    } else {
+        PickerTab::Kbm
+    }
+}
+
+/// How far a tab's band moves up to start the tab: to its top row, keeping
+/// room above the gamepad's blocks for their captions.
+fn tab_shift(tab: PickerTab) -> f32 {
+    match tab {
+        PickerTab::Kbm => 0.0,
+        PickerTab::Gamepad => PAD_ROW_Y - 0.5,
+        PickerTab::Macros => MACRO_Y,
+    }
+}
+
+/// The full board's cells ([`picker_cells`]) that sit on `tab`, moved up so the
+/// tab starts at its top.
+pub fn tab_cells(cells: Vec<PickerCell>, tab: PickerTab) -> Vec<PickerCell> {
+    let dy = tab_shift(tab);
+    cells.into_iter()
+        .filter(|c| cell_tab(c) == tab)
+        .map(|mut c| { c.y -= dy; c })
+        .collect()
+}
+
+/// The cluster captions on `tab`, placed as [`tab_cells`] places its cells.
+/// Only the gamepad's blocks have captions; a tab names the rest.
+pub fn tab_captions(layout: PickerLayout, tab: PickerTab) -> Vec<(&'static str, f32, f32)> {
+    if tab != PickerTab::Gamepad {
+        return Vec::new();
+    }
+    let dy = tab_shift(tab);
+    cluster_captions(layout).into_iter().map(|(t, x, y)| (t, x, y - dy)).collect()
 }
 
 /// Width/height of a cell list in grid units (for sizing the window).
@@ -509,21 +739,27 @@ mod pad_cluster_tests {
     /// then does nothing is worse than one that isn't there.
     #[test]
     fn the_gamepad_cluster_sits_clear_of_the_rest_of_the_board() {
-        let with_pad = picker_cells(false, true, &[]);
-        let without = picker_cells(false, false, &[]);
-        assert_eq!(with_pad.len(), without.len() + PAD_LAYOUT.len());
+        let pad_only = PickerLayout { pad: true, ..Default::default() };
+        let with_pad = picker_cells(pad_only, &[]);
+        let without = picker_cells(PickerLayout::default(), &[]);
+        assert_eq!(with_pad.len(), without.len() + PAD_LAYOUT.len() + STICK_CLICKS.len());
 
         let overlaps = |a: &PickerCell, b: &PickerCell| {
             a.x < b.x + b.width && b.x < a.x + a.width && (a.y - b.y).abs() < 1.0
         };
-        for (i, a) in with_pad.iter().enumerate() {
-            for b in with_pad.iter().skip(i + 1) {
-                assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
+        // Every cluster at once, under both touchpad variants.
+        for tz in [false, true] {
+            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true }, &[]);
+            for (i, a) in all.iter().enumerate() {
+                for b in all.iter().skip(i + 1) {
+                    assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
+                }
             }
         }
-        // And it stays out of the column the macro cluster grows down.
-        for cell in PAD_LAYOUT {
-            assert!(cell.x >= MACRO_PER_ROW as f32, "{} is where macros go", cell.pin);
+        // And the whole pad row sits above where the macro cluster grows.
+        let all = picker_cells(PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() }, &[]);
+        for cell in all.iter().filter(|c| c.y >= PAD_ROW_Y) {
+            assert!(cell.y + 1.0 <= MACRO_Y, "{} is where macros go", cell.pin);
         }
     }
 
@@ -536,7 +772,7 @@ mod pad_cluster_tests {
     fn every_gamepad_cell_can_start_a_line_and_only_some_can_end_one() {
         let outputs = flexinput_engine::eval::jsm_names_by_pin();
         let inputs = flexinput_engine::eval::jsm_input_names_by_pin();
-        for cell in PAD_LAYOUT {
+        for cell in PAD_LAYOUT.iter().chain(STICK_CLICKS) {
             let pin = pin_as_bound(cell.pin);
             assert!(
                 inputs.contains_key(pin),
@@ -605,6 +841,86 @@ mod pad_cluster_tests {
                 crate::canvas::remapper_icons::char_svg(*c).is_none(),
                 "{c:?} has an icon now and should be taken off the drawn list"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    /// Choosing an input greys what can only be sent; choosing an output greys
+    /// what can only be read; the pad and its sticks are both.
+    #[test]
+    fn each_side_of_a_mapping_offers_what_can_sit_there() {
+        for pin in ["key_a", "mouse_left", "scroll_up", "touch_swipe_x", "mouse_x"] {
+            assert!(!stage_allows(PickStage::Input, pin), "{pin} is only ever sent");
+            assert!(stage_allows(PickStage::Output, pin), "{pin}");
+        }
+        for pin in ["imu_gyro_yaw_right", "imu_tilt_roll", "touchpad_left", "touchpad_any"] {
+            assert!(stage_allows(PickStage::Input, pin), "{pin}");
+            assert!(!stage_allows(PickStage::Output, pin), "{pin} is only ever read");
+        }
+        for pin in ["btn_south", "left_trigger", "dpad_up", "left_stick_up", "left_stick", "touch_left", "btn_touchpad"] {
+            assert!(stage_allows(PickStage::Input, pin), "{pin}");
+            assert!(stage_allows(PickStage::Output, pin), "{pin}");
+        }
+        assert!(!stage_allows(PickStage::Input, "macro:1f3a9c2b"), "a macro port is a target");
+    }
+
+    /// Every IMU cell wears its glyph.
+    #[test]
+    fn every_imu_input_has_a_glyph() {
+        use flexinput_core::imu::IMU_PINS;
+        for p in IMU_PINS {
+            assert!(crate::canvas::remapper_icons::pin_svg(crate::canvas::remapper_icons::Skin::Kbm, p.id).is_some(), "{}", p.id);
+        }
+    }
+
+    /// Every IMU input is on the board, and only when asked for.
+    #[test]
+    fn the_imu_cluster_holds_every_imu_input() {
+        let with = picker_cells(PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() }, &[]);
+        for p in flexinput_core::imu::IMU_PINS {
+            assert!(with.iter().any(|c| c.pin == p.id), "{} missing", p.id);
+        }
+        let without = picker_cells(PickerLayout { pad: true, sticks: true, ..Default::default() }, &[]);
+        assert!(without.iter().all(|c| !flexinput_core::imu::is_imu_pin(&c.pin)));
+        assert!(without.iter().all(|c| !c.pin.starts_with("touchpad_")));
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    /// Every cell of the full board lands on exactly one tab, each tab starts
+    /// at its top, and the gamepad's captions stay on the board.
+    #[test]
+    fn the_tabs_split_the_board_between_them() {
+        let macros = vec![crate::macro_icons::MacroDisplayEntry {
+            pin: flexinput_core::macros::macro_pin_id("1f3a9c2b"),
+            name: "Reload".into(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: flexinput_core::SignalType::Bool,
+        }];
+        let layout = PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() };
+        let all = picker_cells(layout, &macros);
+        let tabs = [PickerTab::Kbm, PickerTab::Gamepad, PickerTab::Macros];
+        let split: Vec<Vec<PickerCell>> = tabs.iter().map(|t| tab_cells(all.clone(), *t)).collect();
+        assert_eq!(split.iter().map(Vec::len).sum::<usize>(), all.len());
+        assert!(split[0].iter().any(|c| c.pin == "key_a"));
+        assert!(split[1].iter().any(|c| c.pin == "btn_south"));
+        assert!(split[1].iter().any(|c| c.pin == "imu_tilt_left"));
+        assert!(split[1].iter().any(|c| c.pin == "touch_left"));
+        assert_eq!(split[2].len(), 1);
+        for (t, cells) in tabs.iter().zip(&split) {
+            let top = cells.iter().map(|c| c.y).fold(f32::INFINITY, f32::min);
+            assert!((0.0..=0.5).contains(&top), "{t:?} starts at {top}");
+        }
+        for (name, _, y) in tab_captions(layout, PickerTab::Gamepad) {
+            assert!(y >= 0.0, "{name} is above the board");
         }
     }
 }

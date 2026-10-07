@@ -410,6 +410,7 @@ pub(crate) fn show_menu_body(
             render_touch_field(
                 node_id, 0, true, true, mapping, ui, snarl,
                 &zone_live, &visuals, accent, field_w, field_h,
+                super::viewer::remapper_out_skin(snarl, node_id, automap_parent),
             )
         };
         register_exposable_element(ui, node_id, "field", field_area);

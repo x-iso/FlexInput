@@ -5,6 +5,7 @@
 //! because Remapper, Touch Zones, Map Action and Lean all reach for them.
 
 use super::*;
+use flexinput_core::imu::{imu_pin, is_imu_pin, ImuEstimator, ImuScale, IMU_PINS};
 
 /// Map an analog-mode output pin to its one-sided trigger axis, if it is one.
 /// Triggers are 0..1 (no negative side), so analog mappings drive them with the
@@ -58,14 +59,33 @@ pub(crate) fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pi
 pub(crate) struct MappingShape {
     pub(crate) curve: Vec<[f32; 2]>,
     pub(crate) threshold: Option<f32>,
+    /// How this card reads an IMU input: its range per family and Log/Exp.
+    pub(crate) imu: ImuScale,
 }
+
+/// Where an input with no held state of its own — an IMU input, a whole stick
+/// — counts as pressed on a card with no threshold: half its (shaped) range, as
+/// a trigger counts from half travel.
+pub(crate) const ANALOG_DEFAULT_ON: f32 = 0.5;
 
 impl MappingShape {
     pub(crate) fn from_card(m: &Value) -> Self {
         Self {
             curve: mapping_curve_pts(m),
             threshold: mapping_threshold(m),
+            imu: ImuScale::from_card(m),
         }
+    }
+
+    /// An input's live analog value as THIS card reads it: an IMU input over
+    /// the card's range and Log/Exp (signed for a two-sided axis), anything
+    /// else as [`analog_in_value`].
+    pub(crate) fn in_value(&self, upstream: &HashMap<String, Signal>, pin: &str) -> Option<f32> {
+        if let Some(p) = imu_pin(pin) {
+            let v = upstream.get(pin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+            return Some(self.imu.normalize(p, v));
+        }
+        analog_in_value(upstream, pin)
     }
 
     /// Reshape a magnitude through this card's curve (identity without one).
@@ -75,12 +95,19 @@ impl MappingShape {
 
     /// Threshold verdict for one analog input pin. `None` means this card has
     /// no threshold, or the pin carries no analog value — the caller then falls
-    /// back to the pin's plain held state.
+    /// back to the pin's plain held state. An IMU input or a whole stick
+    /// always has a verdict: neither has a held state to fall back to, so
+    /// without a threshold it counts from [`ANALOG_DEFAULT_ON`] — either way
+    /// along a two-sided IMU axis, any way for a stick.
     pub(crate) fn analog_gate(
         &self,
         upstream: &HashMap<String, Signal>,
         pin: &str,
     ) -> Option<bool> {
+        if is_imu_pin(pin) || whole_stick_axes(pin).is_some() {
+            let v = self.in_value(upstream, pin)?.abs();
+            return Some(self.shaped(v) >= self.threshold.unwrap_or(ANALOG_DEFAULT_ON));
+        }
         // A note's threshold is on its VELOCITY — which strikes count — and is
         // compared as struck, not through the curve, which shapes the
         // aftertouch that follows.
@@ -120,12 +147,16 @@ pub(crate) fn shape_mag(pts: &[[f32; 2]], mag: f32) -> f32 {
 }
 
 /// Live analog INPUT value of a mapping in-pin: a stick cardinal's one-sided
-/// deflection, an analog trigger's travel, or a MIDI knob / pressure value
-/// (0..1) or pitch bend (SIGNED, −1..1 — its two halves are one control).
-/// `None` for digital pins.
+/// deflection, a whole stick's length, an analog trigger's travel, or a MIDI
+/// knob / pressure value (0..1) or pitch bend (SIGNED, −1..1 — its two halves
+/// are one control). `None` for digital pins.
 pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
     if analog_axis_for_cardinal(pin_id).is_some() {
         return Some(analog_cardinal_input_value(upstream, pin_id));
+    }
+    // A whole stick: how far it's pushed, any way.
+    if let Some(v) = whole_stick_value(upstream, pin_id) {
+        return Some(v.length().min(1.0));
     }
     if matches!(pin_id, "left_trigger" | "right_trigger") {
         return Some(upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0));
@@ -184,7 +215,8 @@ fn midi_analog_in(pin_id: &str) -> Option<flexinput_core::midi::MidiPin> {
 }
 
 /// True when a pin id is an analog INPUT source — a stick cardinal, an analog
-/// trigger, or a continuous MIDI value (see [`analog_in_value`]).
+/// trigger, a continuous MIDI value (see [`analog_in_value`]) or an IMU input
+/// (see [`MappingShape::in_value`]).
 ///
 /// It decides what "analog" can mean for a mapping: the Analog press mode is
 /// only offered (and only kept on load) for a card with at least one such
@@ -196,6 +228,70 @@ pub fn pin_is_analog_input(pin_id: &str) -> bool {
         || midi_analog_in(pin_id).is_some()
         // A note is a gate AND a value (its aftertouch).
         || flexinput_core::midi::parse_pin(pin_id).is_some_and(|p| p.note_companions().is_some())
+        || is_imu_pin(pin_id)
+        || whole_stick_axes(pin_id).is_some()
+}
+
+/// A whole stick's axis pins, for `left_stick` / `right_stick`.
+pub(crate) fn whole_stick_axes(pin: &str) -> Option<(&'static str, &'static str)> {
+    match pin {
+        "left_stick" => Some(("left_stick_x", "left_stick_y")),
+        "right_stick" => Some(("right_stick_x", "right_stick_y")),
+        _ => None,
+    }
+}
+
+/// A whole stick's four directions — what taking the whole stick takes.
+pub(crate) fn whole_stick_dirs(pin: &str) -> Option<[&'static str; 4]> {
+    match pin {
+        "left_stick" => Some(["left_stick_up", "left_stick_down", "left_stick_left", "left_stick_right"]),
+        "right_stick" => Some(["right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right"]),
+        _ => None,
+    }
+}
+
+/// A whole stick's position, from its axes (what its directions derive from),
+/// else its Vec2; centred when the bus has neither. `None` for any other pin.
+pub(crate) fn whole_stick_value(upstream: &HashMap<String, Signal>, pin: &str) -> Option<Vec2> {
+    let (xa, ya) = whole_stick_axes(pin)?;
+    let axis = |p: &str| upstream.get(p).map(|s| sig_scalar(*s));
+    Some(match (axis(xa), axis(ya)) {
+        (Some(x), Some(y)) => Vec2::new(x, y),
+        _ => match upstream.get(pin) {
+            Some(Signal::Vec2(v)) => *v,
+            _ => Vec2::ZERO,
+        },
+    })
+}
+
+/// Whether any card reads an IMU input — only then is the gravity estimate run.
+pub(crate) fn mappings_read_imu(mappings: &[Value]) -> bool {
+    mappings.iter().any(|m| {
+        m.get("in").and_then(|v| v.as_array())
+            .is_some_and(|a| a.iter().any(|v| v.as_str().is_some_and(is_imu_pin)))
+    })
+}
+
+/// Derive the IMU input pins (`imu_*`) from the canonical gyro / accel pins in
+/// `upstream`, in place, advancing the node's gravity estimate by `dt`. Each
+/// carries [`ImuPin::bus_value`]: the physical value over its family's default
+/// range, which a card rescales to its own. Nothing is derived without a gyro.
+///
+/// These are evaluator-local, like the stick cardinals: never published, never
+/// claimed — the gyro they come from passes through untouched.
+pub(crate) fn derive_imu_pins(upstream: &mut HashMap<String, Signal>, est: &mut ImuEstimator, dt: f32) {
+    let read = |p: &str| upstream.get(p).map(|s| sig_scalar(*s));
+    let (Some(gx), Some(gy), Some(gz)) = (read("gyro_x"), read("gyro_y"), read("gyro_z")) else {
+        return;
+    };
+    let accel = match (read("accel_x"), read("accel_y"), read("accel_z")) {
+        (Some(x), Some(y), Some(z)) => Some(glam::Vec3::new(x, y, z)),
+        _ => None,
+    };
+    let r = est.tick(glam::Vec3::new(gx, gy, gz), accel, dt);
+    for p in IMU_PINS {
+        upstream.insert(p.id.to_string(), Signal::Float(p.bus_value(&r)));
+    }
 }
 
 /// Whether a Remapper / Map Action card may use the Analog press mode: it

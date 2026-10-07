@@ -16,6 +16,9 @@ pub struct NodeState {
     /// Gyro to Stick Rotation: the offset, the stabiliser and the gravity
     /// estimate. Created on first use.
     pub stick_rotation: Option<Box<crate::eval::StickRotationState>>,
+    /// Remapper with a card reading an IMU input (`imu_*`): the gravity
+    /// estimate those pins are derived from. Created on first use.
+    pub imu: Option<Box<flexinput_core::imu::ImuEstimator>>,
     /// Virtual KB/M sink with "Route gamepad touchpad" on: the trackpad's
     /// gesture state. Created on first use, dropped when the toggle goes off.
     pub trackpad: Option<Box<crate::eval::TrackpadState>>,

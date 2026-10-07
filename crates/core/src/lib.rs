@@ -1,5 +1,6 @@
 pub mod area;
 pub mod frames;
+pub mod imu;
 pub mod automap;
 pub mod macros;
 pub mod menu;

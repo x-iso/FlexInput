@@ -406,6 +406,32 @@ const DEV_KBM: &[u8] = a!("kbm.svg");
 const GEN_PADDLE_L: &[u8] = a!("general/generic_button_gl.svg");
 const GEN_PADDLE_R: &[u8] = a!("general/generic_button_gr.svg");
 
+// The pad's motion, as a Remapper input (`flexinput_core::imu`).
+const IMU_GYRO_PITCH:      &[u8] = a!("Motion/gyro_pitch.svg");
+const IMU_GYRO_PITCH_UP:   &[u8] = a!("Motion/gyro_pitch_up.svg");
+const IMU_GYRO_PITCH_DOWN: &[u8] = a!("Motion/gyro_pitch_down.svg");
+const IMU_GYRO_YAW:        &[u8] = a!("Motion/gyro_yaw.svg");
+const IMU_GYRO_YAW_LEFT:   &[u8] = a!("Motion/gyro_yaw_left.svg");
+const IMU_GYRO_YAW_RIGHT:  &[u8] = a!("Motion/gyro_yaw_right.svg");
+const IMU_GYRO_ROLL:       &[u8] = a!("Motion/gyro_roll.svg");
+const IMU_GYRO_ROLL_LEFT:  &[u8] = a!("Motion/gyro_roll_left.svg");
+const IMU_GYRO_ROLL_RIGHT: &[u8] = a!("Motion/gyro_roll_right.svg");
+const IMU_ACCEL_UD:        &[u8] = a!("Motion/accel_y.svg");
+const IMU_ACCEL_UP:        &[u8] = a!("Motion/accel_y_up.svg");
+const IMU_ACCEL_DOWN:      &[u8] = a!("Motion/accel_y_down.svg");
+const IMU_ACCEL_LR:        &[u8] = a!("Motion/accel_x.svg");
+const IMU_ACCEL_LEFT:      &[u8] = a!("Motion/accel_x_left.svg");
+const IMU_ACCEL_RIGHT:     &[u8] = a!("Motion/accel_x_right.svg");
+const IMU_ACCEL_FB:        &[u8] = a!("Motion/accel_z.svg");
+const IMU_ACCEL_FORWARD:   &[u8] = a!("Motion/accel_z_forward.svg");
+const IMU_ACCEL_BACKWARD:  &[u8] = a!("Motion/accel_z_back.svg");
+const IMU_TILT_PITCH:      &[u8] = a!("Motion/tilt-noseUD.svg");
+const IMU_TILT_UP:         &[u8] = a!("Motion/tilt-noseUp.svg");
+const IMU_TILT_DOWN:       &[u8] = a!("Motion/tilt-noseDown.svg");
+const IMU_TILT_ROLL:       &[u8] = a!("Motion/tilt-leftright.svg");
+const IMU_TILT_LEFT:       &[u8] = a!("Motion/tilt-left.svg");
+const IMU_TILT_RIGHT:      &[u8] = a!("Motion/tilt-right.svg");
+
 /// Generic action icons used by panel chrome (add button, close button, …).
 pub const ADD_SVG:   &[u8] = a!("add.svg");
 pub const CLOSE_SVG: &[u8] = a!("close.svg");
@@ -607,6 +633,31 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         // L1/L2 apart. Misc buttons intentionally have no glyph → text pill.
         "btn_paddle_l1" | "btn_paddle_l2" => return Some(GEN_PADDLE_L),
         "btn_paddle_r1" | "btn_paddle_r2" => return Some(GEN_PADDLE_R),
+        // The pad's motion: family-agnostic, like the touchpad.
+        "imu_gyro_pitch"      => return Some(IMU_GYRO_PITCH),
+        "imu_gyro_pitch_up"   => return Some(IMU_GYRO_PITCH_UP),
+        "imu_gyro_pitch_down" => return Some(IMU_GYRO_PITCH_DOWN),
+        "imu_gyro_yaw"        => return Some(IMU_GYRO_YAW),
+        "imu_gyro_yaw_left"   => return Some(IMU_GYRO_YAW_LEFT),
+        "imu_gyro_yaw_right"  => return Some(IMU_GYRO_YAW_RIGHT),
+        "imu_gyro_roll"       => return Some(IMU_GYRO_ROLL),
+        "imu_gyro_roll_left"  => return Some(IMU_GYRO_ROLL_LEFT),
+        "imu_gyro_roll_right" => return Some(IMU_GYRO_ROLL_RIGHT),
+        "imu_accel_ud"        => return Some(IMU_ACCEL_UD),
+        "imu_accel_up"        => return Some(IMU_ACCEL_UP),
+        "imu_accel_down"      => return Some(IMU_ACCEL_DOWN),
+        "imu_accel_lr"        => return Some(IMU_ACCEL_LR),
+        "imu_accel_left"      => return Some(IMU_ACCEL_LEFT),
+        "imu_accel_right"     => return Some(IMU_ACCEL_RIGHT),
+        "imu_accel_fb"        => return Some(IMU_ACCEL_FB),
+        "imu_accel_forward"   => return Some(IMU_ACCEL_FORWARD),
+        "imu_accel_backward"  => return Some(IMU_ACCEL_BACKWARD),
+        "imu_tilt_pitch"      => return Some(IMU_TILT_PITCH),
+        "imu_tilt_up"         => return Some(IMU_TILT_UP),
+        "imu_tilt_down"       => return Some(IMU_TILT_DOWN),
+        "imu_tilt_roll"       => return Some(IMU_TILT_ROLL),
+        "imu_tilt_left"       => return Some(IMU_TILT_LEFT),
+        "imu_tilt_right"      => return Some(IMU_TILT_RIGHT),
         _ => {}
     }
     // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents.

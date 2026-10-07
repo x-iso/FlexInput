@@ -50,6 +50,12 @@ pub(crate) fn eval_remapper_node(
             // (x, y) so they can participate in mapping triggers just like
             // buttons. See `derive_stick_cardinals` for the dominant-axis rule.
             derive_stick_cardinals(&mut upstream);
+            // Gyro / accel / tilt directions for the cards that read one. Like
+            // the cardinals they stay in this node: see `derive_imu_pins`.
+            if mappings_read_imu(&mappings) {
+                let ns = state.entry(uid).or_insert_with(NodeState::default);
+                derive_imu_pins(&mut upstream, ns.imu.get_or_insert_with(Default::default), dt);
+            }
 
             // Derive touchpad zone pins. Two parallel variants:
             //   touch_*       — fire whenever a finger is in that zone, click
@@ -113,8 +119,8 @@ pub(crate) fn eval_remapper_node(
             upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
             upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
             upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            // touchpad_any — "click anywhere on the pad". Available via the
-            // Special… dropdown only (not auto-captured) so users opt in.
+            // touchpad_any — "click anywhere on the pad". Available from the
+            // Choose picker only (not auto-captured) so users opt in.
             // Fires together with the specific-zone pin additively.
             upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
             upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
@@ -328,6 +334,17 @@ pub(crate) fn eval_remapper_node(
                 };
                 for p in in_pins {
                     if self_mapped.contains(&p) { continue; }
+                    // An IMU input is read, never consumed. It is derived in
+                    // this node, so there is no bus pin to take — the gyro it
+                    // comes from reaches a gyro-to-mouse further down this
+                    // wire either way — and a claim would only put consumed
+                    // markers on the bus for pins no device has.
+                    if flexinput_core::imu::is_imu_pin(&p) { continue; }
+                    // A whole stick takes all four of its directions, so its
+                    // axes are suppressed along with its Vec2.
+                    if let Some(dirs) = whole_stick_dirs(&p) {
+                        target.extend(dirs.iter().map(|d| d.to_string()));
+                    }
                     target.insert(p);
                 }
             }
@@ -423,7 +440,7 @@ pub(crate) fn eval_remapper_node(
                     if is_macro_style_target(out_p) {
                         // Gate buttons read 1.0: effective[] already checked
                         // they are all held.
-                        let mag = analog_in_value(&upstream, in_p).unwrap_or(1.0).abs();
+                        let mag = shape.in_value(&upstream, in_p).unwrap_or(1.0).abs();
                         let mag = shape.shaped(mag);
                         if mag > 0.0 {
                             merge_macro_scalar(collector_sigs, out_p, Signal::Float(mag.min(1.0)));
@@ -431,6 +448,18 @@ pub(crate) fn eval_remapper_node(
                         continue;
                     }
                     analog_out_pins.insert(out_p.clone());
+                    // A whole stick onto a whole stick: the position itself,
+                    // its length through the card's curve. Anything else has no
+                    // direction to give a whole stick, so leaves it alone.
+                    if let Some((xa, ya)) = whole_stick_axes(out_p) {
+                        if let Some(v) = whole_stick_value(&upstream, in_p) {
+                            let mag = v.length().min(1.0);
+                            let s = if mag > 1e-4 { shape.shaped(mag) / mag } else { 0.0 };
+                            *analog_axis_acc.entry(xa).or_insert(0.0) += v.x * s;
+                            *analog_axis_acc.entry(ya).or_insert(0.0) += v.y * s;
+                        }
+                        continue;
+                    }
                     let out_axis_opt    = analog_axis_for_cardinal(out_p);
                     let out_trigger     = analog_trigger_out(out_p);
                     // An analog input (stick direction, trigger, MIDI knob or
@@ -439,7 +468,7 @@ pub(crate) fn eval_remapper_node(
                     // guaranteed every button is held). A bend is signed: its
                     // lower half pushes the target the other way, so one card
                     // maps the whole wheel onto a stick axis.
-                    let raw = analog_in_value(&upstream, in_p).unwrap_or(1.0);
+                    let raw = shape.in_value(&upstream, in_p).unwrap_or(1.0);
                     let mag_from_input = raw.signum() * shape.shaped(raw.abs());
                     if let Some((axis_pin, sign)) = out_axis_opt {
                         let contrib = sign * mag_from_input;
@@ -487,7 +516,7 @@ pub(crate) fn eval_remapper_node(
                         // than the full-magnitude stand-in a pad target gets:
                         // a controller that jumps to 127 the moment the trigger
                         // leaves zero would make "trigger → CC" pointless.
-                        let live = analog_in_value(&upstream, in_p)
+                        let live = shape.in_value(&upstream, in_p)
                             .map(|raw| shape.shaped(raw))
                             .unwrap_or(mag_from_input);
                         // A bend is two-sided, so a cardinal input keeps its
@@ -508,10 +537,16 @@ pub(crate) fn eval_remapper_node(
                         // a freq-modulated tap train (or PWM under Hold) so the
                         // digital destination reflects HOW FAR the stick is
                         // pushed — matching the 3DOF-Lean analog→digital path.
-                        let active = if let Some(t) = shape.threshold {
-                            press.turbo_only(mag_from_input >= t, slots, dt)
+                        // A two-sided IMU axis presses its button either way.
+                        let mag = if flexinput_core::imu::is_imu_pin(in_p) {
+                            mag_from_input.abs()
                         } else {
-                            press.analog_pulse(mag_from_input, slots, dt)
+                            mag_from_input
+                        };
+                        let active = if let Some(t) = shape.threshold {
+                            press.turbo_only(mag >= t, slots, dt)
+                        } else {
+                            press.analog_pulse(mag, slots, dt)
                         };
                         if active {
                             analog_button_out.insert(out_p.clone());
@@ -564,6 +599,17 @@ pub(crate) fn eval_remapper_node(
                 // Never 0 while sounding: a note-on at velocity 0 is a note-off.
                 put(vel.to_id(), Signal::Float(if *on { vel_v.max(1.0 / 127.0) } else { 0.0 }));
                 put(pat.to_id(), Signal::Float(if *on { *v } else { 0.0 }));
+            }
+            // A stick direction a card in any other mode sends is a full push
+            // that way: sinks read a stick's axes, never its derived direction
+            // pins, so the Bool alone moved nothing.
+            for (_, out_pins, is_analog, _) in &triggered {
+                if *is_analog { continue; }
+                for p in out_pins {
+                    if let Some((axis, sign)) = analog_axis_for_cardinal(p) {
+                        *analog_axis_acc.entry(axis).or_insert(0.0) += sign;
+                    }
+                }
             }
             // Commit axis accumulator: clamp ±1 then write.
             for (axis_pin, v) in &analog_axis_acc {
@@ -919,7 +965,11 @@ pub(crate) fn chord_raw_held(
     let shape = MappingShape::from_card(m);
     let pin_on = |p: &str| upstream.get(p).map(|s| s.as_bool()).unwrap_or(false);
     if let (Some(required), None) = (gesture_required_bits(in_pins), shape.threshold) {
-        let buttons_held = in_pins.iter().all(|p| gesture_pin_to_bit(p).is_some() || pin_on(p));
+        // An IMU input beside the stick gesture gates like a button, past its
+        // default line.
+        let buttons_held = in_pins.iter().all(|p| {
+            gesture_pin_to_bit(p).is_some() || shape.analog_gate(upstream, p).unwrap_or_else(|| pin_on(p))
+        });
         buttons_held && gesture_tick(required, gesture_state_get(ns, i), upstream)
     } else {
         in_pins.iter().all(|p| shape.analog_gate(upstream, p).unwrap_or_else(|| pin_on(p)))
@@ -945,7 +995,7 @@ fn analog_pin_active(
     if let Some(vel) = note_velocity(upstream, p) {
         return shape.analog_gate(upstream, p).unwrap_or(vel > 0.0);
     }
-    match analog_in_value(upstream, p) {
+    match shape.in_value(upstream, p) {
         Some(v) => v != 0.0,
         None => read_upstream(p).map(|s| s.as_bool()).unwrap_or(false),
     }

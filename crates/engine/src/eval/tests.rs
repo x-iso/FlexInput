@@ -311,6 +311,29 @@ mod trigger_tests {
         assert!(v.abs() < 0.01, "neutral stick should release the port to 0, got {v}");
     }
 
+    // A zone chosen onto a stick direction pushes that stick fully while
+    // touched: sinks read the axes, never the derived direction pin.
+    #[test]
+    fn touch_zones_card_pushes_a_stick_direction() {
+        let mut tz = empty_node(1, "module.touch_zones");
+        tz.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        tz.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        tz.params.insert("col_edges".into(), serde_json::json!([]));
+        tz.params.insert("row_edges".into(), serde_json::json!([]));
+        tz.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["right_stick_left"]},
+        ]));
+        let mut m: HashMap<(String, String), Signal> = HashMap::new();
+        m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+        m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
+        m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_touch_zones_map_node(&tz, 1, &m, &mut c, &mut HashMap::new(), 0.016);
+        let get = |p: &str| c.get(&("touchmap:1".to_string(), p.to_string())).copied();
+        assert_eq!(get("right_stick_x"), Some(Signal::Float(-1.0)));
+        assert_eq!(get("right_stick"), Some(Signal::Vec2(Vec2::new(-1.0, 0.0))));
+    }
+
     // A Touch Zones card targeting a macro pin publishes BOTH aspects: the
     // shaped gate (Bool) and the zone-local deflection (Vec2). The macro node
     // then coerces per port type: Vec2 passes through, Float takes the
@@ -6879,5 +6902,211 @@ mod twoway_curve_tests {
             Some(Signal::Vec2(v)) => { assert!((v.x - 0.10).abs() < 1e-6); assert_eq!(v.y, 1.0); }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod imu_input_tests {
+    use super::*;
+
+    const PAD: &str = "sdl:dualsense:0";
+    const KEY: &str = "remap:2";
+
+    fn remapper(card: serde_json::Value) -> NodeSnap {
+        let mut params = HashMap::new();
+        params.insert("_automap_device_id".to_string(), Value::String(PAD.into()));
+        params.insert("mappings".to_string(), serde_json::json!([card]));
+        NodeSnap {
+            node_uid: 2,
+            module_id: "module.remapper".to_string(),
+            params,
+            n_outputs: 1,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    /// A pad lying flat, turning at `yaw_dps` (right positive).
+    fn turning(yaw_dps: f32) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        for (pin, v) in [
+            ("gyro_x", 0.0), ("gyro_y", 0.0), ("gyro_z", yaw_dps / 2000.0),
+            ("accel_x", 0.0), ("accel_y", 0.0), ("accel_z", 1.0 / 8.0),
+            ("btn_south", 0.0),
+        ] {
+            let sig = if pin == "btn_south" { Signal::Bool(false) } else { Signal::Float(v) };
+            m.insert((PAD.to_string(), pin.to_string()), sig);
+        }
+        m
+    }
+
+    fn run(snap: &NodeSnap, sigs: &HashMap<(String, String), Signal>,
+           state: &mut HashMap<usize, NodeState>) -> HashMap<(String, String), Signal> {
+        let mut c = HashMap::new();
+        eval_remapper_node(snap, 2, sigs, &mut c, state, 0.004);
+        c
+    }
+
+    fn out(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+        c.get(&(KEY.to_string(), pin.to_string())).copied()
+    }
+
+    // The point of these inputs: a card reading the gyro fires, and the gyro
+    // goes on down the wire untouched — so a gyro-to-mouse after this Remapper
+    // on the same AutoMap port keeps working.
+    #[test]
+    fn an_imu_card_fires_and_the_gyro_passes_through() {
+        let snap = remapper(serde_json::json!({ "in": ["imu_gyro_yaw_right"], "out": ["key_space"] }));
+        let mut state = HashMap::new();
+        // Under half the default 360 °/s: not yet.
+        let c = run(&snap, &turning(120.0), &mut state);
+        assert_eq!(out(&c, "key_space"), Some(Signal::Bool(false)));
+        let c = run(&snap, &turning(270.0), &mut state);
+        assert_eq!(out(&c, "key_space"), Some(Signal::Bool(true)));
+        assert_eq!(out(&c, "gyro_z"), Some(Signal::Float(270.0 / 2000.0)), "the gyro is read, not consumed");
+        assert_eq!(out(&c, "accel_z"), Some(Signal::Float(1.0 / 8.0)));
+        assert!(c.keys().all(|(_, pin)| !pin.starts_with("imu_")), "the derived pins stay in the node");
+        // The other way is the other pin.
+        let c = run(&snap, &turning(-270.0), &mut state);
+        assert_eq!(out(&c, "key_space"), Some(Signal::Bool(false)));
+    }
+
+    // Range and threshold are the card's: 100% at 90 °/s, pressed past 50%.
+    #[test]
+    fn the_card_range_and_threshold_set_the_line() {
+        let snap = remapper(serde_json::json!({
+            "in": ["imu_gyro_yaw_right"], "out": ["key_space"],
+            "imu_range_gyro": 90.0, "threshold": 0.5,
+        }));
+        let mut state = HashMap::new();
+        let c = run(&snap, &turning(30.0), &mut state);
+        assert_eq!(out(&c, "key_space"), Some(Signal::Bool(false)));
+        let c = run(&snap, &turning(60.0), &mut state);
+        assert_eq!(out(&c, "key_space"), Some(Signal::Bool(true)));
+    }
+
+    // A two-sided axis on an Analog card steers both ways.
+    #[test]
+    fn a_two_sided_axis_steers_both_ways() {
+        let snap = remapper(serde_json::json!({
+            "in": ["imu_gyro_yaw"], "out": ["right_stick_right"], "mode": "analog",
+        }));
+        let mut state = HashMap::new();
+        let x = |c: &HashMap<(String, String), Signal>| out(c, "right_stick_x").map(|s| s.as_float());
+        let c = run(&snap, &turning(180.0), &mut state);
+        assert!((x(&c).unwrap() - 0.5).abs() < 1e-3, "{:?}", x(&c));
+        let c = run(&snap, &turning(-180.0), &mut state);
+        assert!((x(&c).unwrap() + 0.5).abs() < 1e-3, "{:?}", x(&c));
+    }
+
+    #[test]
+    fn imu_inputs_count_as_analog() {
+        assert!(pin_is_analog_input("imu_tilt_left"));
+        assert!(pin_is_analog_input("imu_accel_fb"));
+        assert!(card_allows_analog_mode(&serde_json::json!({ "in": ["imu_gyro_pitch_up"] })));
+        assert!(!pin_is_analog_input("gyro_x"), "the raw bus pin isn't a card input");
+    }
+}
+
+#[cfg(test)]
+mod stick_direction_output_tests {
+    use super::*;
+
+    const PAD: &str = "sdl:dualsense:0";
+
+    fn remapper(card: serde_json::Value) -> NodeSnap {
+        let mut params = HashMap::new();
+        params.insert("_automap_device_id".to_string(), Value::String(PAD.into()));
+        params.insert("mappings".to_string(), serde_json::json!([card]));
+        NodeSnap {
+            node_uid: 2,
+            module_id: "module.remapper".to_string(),
+            params,
+            n_outputs: 1,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn south(down: bool) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        m.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(down));
+        for (pin, sig) in [("left_stick_x", Signal::Float(0.0)), ("left_stick_y", Signal::Float(0.0)),
+                           ("left_stick", Signal::Vec2(Vec2::ZERO))] {
+            m.insert((PAD.to_string(), pin.to_string()), sig);
+        }
+        m
+    }
+
+    // A button chosen onto a stick direction pushes that stick, in the
+    // default (Normal) press mode as in Analog.
+    #[test]
+    fn a_button_onto_a_stick_direction_pushes_the_stick() {
+        for mode in [None, Some("analog")] {
+            let mut card = serde_json::json!({ "in": ["btn_south"], "out": ["left_stick_up"] });
+            if let Some(m) = mode { card["mode"] = serde_json::json!(m); }
+            let snap = remapper(card);
+            let mut state = HashMap::new();
+            let mut c = HashMap::new();
+            eval_remapper_node(&snap, 2, &south(true), &mut c, &mut state, 0.004);
+            let y = c.get(&("remap:2".to_string(), "left_stick_y".to_string())).map(|s| s.as_float());
+            let v = c.get(&("remap:2".to_string(), "left_stick".to_string())).copied();
+            assert_eq!(y, Some(1.0), "{mode:?}: axis");
+            assert_eq!(v, Some(Signal::Vec2(Vec2::new(0.0, 1.0))), "{mode:?}: Vec2");
+        }
+    }
+
+    fn stick(v: Vec2) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        for (pin, sig) in [("left_stick_x", Signal::Float(v.x)), ("left_stick_y", Signal::Float(v.y)),
+                           ("left_stick", Signal::Vec2(v)),
+                           ("right_stick_x", Signal::Float(0.0)), ("right_stick_y", Signal::Float(0.0)),
+                           ("right_stick", Signal::Vec2(Vec2::ZERO))] {
+            m.insert((PAD.to_string(), pin.to_string()), sig);
+        }
+        m
+    }
+
+    fn at(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+        c.get(&("remap:2".to_string(), pin.to_string())).copied()
+    }
+
+    // A whole stick onto the other whole stick moves it as it is, and the
+    // stick it was taken from goes quiet — axes, Vec2 and directions.
+    #[test]
+    fn a_whole_stick_moves_onto_another_and_leaves_its_own_quiet() {
+        let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["right_stick"], "mode": "analog" }));
+        let mut c = HashMap::new();
+        eval_remapper_node(&snap, 2, &stick(Vec2::new(0.6, -0.3)), &mut c, &mut HashMap::new(), 0.004);
+        assert_eq!(at(&c, "right_stick"), Some(Signal::Vec2(Vec2::new(0.6, -0.3))));
+        assert_eq!(at(&c, "right_stick_x").map(|s| s.as_float()), Some(0.6));
+        assert_eq!(at(&c, "left_stick"), Some(Signal::Vec2(Vec2::ZERO)));
+        assert_eq!(at(&c, "left_stick_x").map(|s| s.as_float()), Some(0.0));
+        assert_eq!(at(&c, "left_stick_y").map(|s| s.as_float()), Some(0.0));
+        assert_eq!(at(&c, "left_stick_right"), Some(Signal::Bool(false)));
+    }
+
+    // A whole stick onto a button: pushed any way past half (no threshold),
+    // or past the card's line.
+    #[test]
+    fn a_whole_stick_presses_a_button_however_it_is_pushed() {
+        let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["btn_east"] }));
+        let mut state = HashMap::new();
+        let east = |v: Vec2, state: &mut HashMap<usize, NodeState>| {
+            let mut c = HashMap::new();
+            eval_remapper_node(&snap, 2, &stick(v), &mut c, state, 0.004);
+            at(&c, "btn_east")
+        };
+        assert_eq!(east(Vec2::new(0.2, 0.2), &mut state), Some(Signal::Bool(false)));
+        assert_eq!(east(Vec2::new(-0.5, -0.5), &mut state), Some(Signal::Bool(true)), "a diagonal counts");
+        assert!(pin_is_analog_input("left_stick"));
     }
 }

@@ -5,7 +5,42 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Choose… — pick either side of a mapping from a board.** The alternative to
+  Learn, replacing Special… and Assign…: on a Remapper card it picks the input
+  or the output (West, or a click on the side's caption, switches), on a Map
+  Action card the input, and on Lean, Touch Zones, Virtual Menu and Area
+  Mapper cards the output. What can't sit on the side being chosen greys out —
+  keys and the mouse as an input, the pad's motion as an output. The board is
+  split into **Keyboard & Mouse**, **Gamepad** and **Macros** tabs (click them,
+  or LB / RB with a pad), and its pad is drawn as the pad the input comes from,
+  or as the device the output goes to — Xbox when there's neither.
+
+- **The pad's motion as a Remapper input.** Choose's Gamepad tab offers
+  **Gyro** (how fast the pad pitches, yaws or rolls), **Accel** (the pad pushed,
+  shaken or thrust, with gravity taken out) and **Tilt** (how far the nose is
+  raised or the grip dropped, in degrees), each as a two-way axis and as one
+  direction at a time. They're analog, so a card takes them through its
+  response curve and threshold; under the curve, each family's **100% =**
+  value sets its range (360 °/s, 1 g and 45° by default) and **Log/Exp** bends
+  it the way the Response Curve module's does. Reading the pad's motion takes
+  nothing off the bus: a gyro-to-mouse further down the same Auto-Map wire
+  keeps working.
+
+- **A whole stick as a Remapper input.** Onto the other whole stick it moves
+  that stick as it is — one card swaps the sticks; onto anything else it counts
+  how far it's pushed, any way. The stick it's taken from stops passing
+  through.
+
 ### Changed
+
+- **Learn hears your physical keyboard wherever the focus is.** A key used to
+  be learned only while a FlexInput window had keyboard focus, so learning a
+  key output from the config overlay over a game didn't work. Learn now reads
+  the keyboards themselves, leaves out FlexInput's own virtual keyboard and the
+  keys it sends, and learns Shift, Ctrl, Alt and Win as the left or right one.
+  Touch Zones, Virtual Menu and Area Mapper's gamepad learn hears keys too.
 
 - **"Pause virtual mouse when you move a physical mouse" listens to the other
   mice.** It used to guess from where the cursor was, so a game moving the
@@ -24,6 +59,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   after FlexInput closes" on (see Fixed).
 
 ### Fixed
+
+- **A stick direction as an output didn't move the stick.** A Remapper card in
+  any press mode but Analog, a Touch Zones zone or a Virtual Menu card sending
+  e.g. Left Stick Up only flagged the direction, and no virtual pad reads that.
+  It now pushes the stick fully that way while the card is on.
 
 - **Left clicks dropped while a key binding was held.** On a PC with a
   Precision Touchpad, Windows took FlexInput's virtual keyboard for the

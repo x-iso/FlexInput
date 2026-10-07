@@ -378,6 +378,8 @@ pub(crate) fn eval_menu_node(
     let mapping = pstr("zone_mode", "mapping") == "mapping";
     let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let mut button_on: HashMap<String, bool> = HashMap::new();
+    // Stick directions held by cards: a full push that way, per stick.
+    let mut stick_pushes: HashMap<&'static str, Vec2> = HashMap::new();
     if mapping {
         for (i, card) in cards.iter().enumerate() {
             let zone = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
@@ -397,6 +399,16 @@ pub(crate) fn eval_menu_node(
                 if is_macro_style_target(p) {
                     if held {
                         merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
+                    }
+                    continue;
+                }
+                // A stick direction is a push of that stick: sinks read a
+                // stick's axes, never its derived direction pins.
+                if let Some((axis, sign)) = analog_axis_for_cardinal(p) {
+                    if held {
+                        let stick = if axis.starts_with("left") { "left_stick" } else { "right_stick" };
+                        let v = stick_pushes.entry(stick).or_insert(Vec2::ZERO);
+                        if axis.ends_with("_x") { v.x += sign } else { v.y += sign }
                     }
                     continue;
                 }
@@ -452,6 +464,17 @@ pub(crate) fn eval_menu_node(
             };
             collector_sigs.insert((key.clone(), pin.clone()), off);
         }
+    }
+    // Pushed sticks: the pushed axis takes the push, the other keeps the
+    // passthrough.
+    for (stick, push) in stick_pushes {
+        let (xa, ya) = (format!("{stick}_x"), format!("{stick}_y"));
+        let cur = |a: &str| collector_sigs.get(&(key.clone(), a.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let x = if push.x != 0.0 { push.x.clamp(-1.0, 1.0) } else { cur(&xa) };
+        let y = if push.y != 0.0 { push.y.clamp(-1.0, 1.0) } else { cur(&ya) };
+        collector_sigs.insert((key.clone(), xa), Signal::Float(x));
+        collector_sigs.insert((key.clone(), ya), Signal::Float(y));
+        collector_sigs.insert((key.clone(), stick.to_string()), Signal::Vec2(Vec2::new(x, y)));
     }
 
     // ── Suppress the pointing inputs steering the menu ──

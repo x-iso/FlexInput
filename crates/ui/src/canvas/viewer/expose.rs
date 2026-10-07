@@ -114,8 +114,8 @@ pub fn set_layout_mode_active(ctx: &egui::Context, active: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(LAYOUT_ACTIVE_KEY), active));
 }
 
-/// A request from a Remapper/Lean "Special…" button (mouse click) to open the
-/// shared KB/M + touchpad picker. The viewer supplies the inner node + its draft
+/// A request from a mapping card's "Choose…" button (mouse click) to open the
+/// shared KB/M + gamepad picker. The viewer supplies the inner node + its draft
 /// and phase param keys; `app.rs` resolves the containing sub-patch (or top
 /// level) at the `Canvas::show` call site and opens the picker.
 #[derive(Clone)]
@@ -137,6 +137,44 @@ pub struct SpecialPickerRequest {
     /// Pin-id prefix whose cells render disabled for this session (e.g.
     /// `menu:{id}` so a Virtual Menu's own cards can't target that menu).
     pub exclude_pin_prefix: Option<String>,
+    /// The side the session opens on.
+    pub stage: crate::kbm_picker::PickStage,
+    /// The input draft param, for a card whose input can be chosen too
+    /// (`draft_input`). `draft_key` is then the output side, empty for a card
+    /// with no output to choose (Map Action).
+    pub input_key: Option<String>,
+    /// Offer the IMU and the touchpad's click zones (Remapper inputs).
+    pub inputs: bool,
+}
+
+impl SpecialPickerRequest {
+    /// A Remapper's Choose: the side its Learn would capture next — the input
+    /// until one is latched, then the output — with both reachable.
+    pub fn remapper(inner: NodeId, path: Vec<usize>, phase: &str) -> Self {
+        use crate::kbm_picker::PickStage;
+        let latched = matches!(phase, "ready_to_learn" | "learning");
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: "draft_output".to_string(),
+            stage: if latched { PickStage::Output } else { PickStage::Input },
+            input_key: Some("draft_input".to_string()),
+            inputs: true,
+            ..Default::default()
+        }
+    }
+
+    /// A Map Action's Choose: its input chord, the only side it has.
+    pub fn map_action(inner: NodeId, path: Vec<usize>) -> Self {
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: String::new(),
+            stage: crate::kbm_picker::PickStage::Input,
+            input_key: Some("draft_input".to_string()),
+            ..Default::default()
+        }
+    }
 }
 
 /// Outermost (tab-canvas-level) sub-patch node id for an AutoMap parent chain,
@@ -164,7 +202,17 @@ pub fn subpatch_path(parent: Option<&AutomapGlowParent<'_>>) -> Vec<usize> {
 
 impl Default for SpecialPickerRequest {
     fn default() -> Self {
-        Self { inner: NodeId(0), path: Vec::new(), draft_key: String::new(), phase_key: None, touch_zones: false, exclude_pin_prefix: None }
+        Self {
+            inner: NodeId(0),
+            path: Vec::new(),
+            draft_key: String::new(),
+            phase_key: None,
+            touch_zones: false,
+            exclude_pin_prefix: None,
+            stage: crate::kbm_picker::PickStage::Output,
+            input_key: None,
+            inputs: false,
+        }
     }
 }
 

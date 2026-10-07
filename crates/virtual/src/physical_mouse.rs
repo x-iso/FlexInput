@@ -24,6 +24,8 @@
 //! `DeviceEvent::MouseMotion` (nothing in FlexInput reads it) and registers just
 //! once, at startup. winit keeps the keyboard registration.
 
+pub(crate) mod keyboard;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;

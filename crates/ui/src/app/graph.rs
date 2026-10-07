@@ -1233,6 +1233,53 @@ pub(crate) fn find_automap_dest_sink_rec(
     None
 }
 
+/// The viewer's [`find_automap_dest_sink_rec`]: the `device.sink` the AutoMap
+/// output of `node` ends at, walked with the viewer's `AutomapGlowParent`
+/// chain. Mapping bodies use it to draw their OUTPUT glyphs in the dialect of
+/// the device they send to.
+pub fn find_automap_dest_sink_for_viewer(
+    snarl: &Snarl<NodeData>,
+    node: NodeId,
+    parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+) -> Option<String> {
+    use crate::canvas::viewer::AutomapGlowParent;
+    fn rec(
+        snarl: &Snarl<NodeData>,
+        dst: InPinId,
+        parents: Option<&AutomapGlowParent<'_>>,
+        depth: u32,
+    ) -> Option<String> {
+        if depth > 64 { return None; }
+        let node = snarl.get_node(dst.node)?;
+        if node.module_id == "device.sink" {
+            return node.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+        if node.module_id == "subpatch.outlet" {
+            let pin_idx = node.params.get("pin_index").and_then(|v| v.as_u64())? as usize;
+            let parent = parents?;
+            let out_pin = parent.snarl.out_pin(OutPinId { node: parent.subpatch_node_id, output: pin_idx });
+            return out_pin.remotes.iter()
+                .find_map(|&d| rec(parent.snarl, d, parent.prev, depth + 1));
+        }
+        if node.module_id == "subpatch" {
+            let sp = node.subpatch.as_ref()?;
+            let inlet_id: NodeId = sp.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch.inlet"
+                    && n.value.params.get("pin_index").and_then(|v| v.as_u64())
+                        == Some(dst.input as u64))
+                .map(|(id, _)| id)?;
+            let frame = AutomapGlowParent { snarl, subpatch_node_id: dst.node, prev: parents };
+            let inlet_out = sp.snarl.out_pin(OutPinId { node: inlet_id, output: 0 });
+            return inlet_out.remotes.iter()
+                .find_map(|&d| rec(&sp.snarl, d, Some(&frame), depth + 1));
+        }
+        snarl.out_pin(OutPinId { node: dst.node, output: 0 }).remotes.iter()
+            .find_map(|&d| rec(snarl, d, parents, depth + 1))
+    }
+    snarl.out_pin(OutPinId { node, output: 0 }).remotes.iter()
+        .find_map(|&d| rec(snarl, d, parent, 0))
+}
+
 /// Builds a topologically-sorted [`ProcessingGraph`] from the current Snarl state.
 /// Also returns the UIDs of any counter nodes whose reset was just requested
 /// (caller must clear the `aux_f32_dirty` flag on those nodes after writing the snapshot).

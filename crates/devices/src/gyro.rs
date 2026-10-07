@@ -2176,6 +2176,14 @@ fn preferred_interface(kind: &KindTag) -> i32 {
 mod tests {
     use super::*;
 
+    /// The IMU card inputs read the bus in these units; a scale change here
+    /// has to be made there too.
+    #[test]
+    fn the_imu_card_inputs_read_the_bus_scale() {
+        assert_eq!(GYRO_REF_DPS, flexinput_core::imu::BUS_GYRO_DPS);
+        assert_eq!(ACCEL_REF_G, flexinput_core::imu::BUS_ACCEL_G);
+    }
+
     /// Build a Sony HID buffer carrying raw accel `(r0 side, r1 vertical,
     /// r2 fwd-tilt)` and return the canonical accel `build` produces.
     fn sony_canonical_accel(r_side: i16, r_vert: i16, r_fwd: i16) -> (f32, f32, f32) {

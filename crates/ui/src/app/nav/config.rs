@@ -32,7 +32,7 @@ impl FlexInputApp {
     ) {
         use crate::gamepad_nav::{self as gn, EditLevel, NavDir};
 
-        // The Special KB/M picker (opened from a pinned Remapper/TZ body) is modal
+        // The Choose picker (opened from a pinned Remapper/TZ body) is modal
         // and renders in its own over-the-game viewport — drive IT, not the pin
         // nav, while it's open. run_gamepad_nav early-returns into here when the
         // overlay is visible, so this is the only place it can be driven.

@@ -112,6 +112,8 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut button_on: HashMap<String, bool> = HashMap::new();
     // Relative analog (adaptive-center): stick target → (x, y). Last card wins.
     let mut sticks: HashMap<&'static str, (f32, f32)> = HashMap::new();
+    // Stick directions held by zones: a full push that way, added to `sticks`.
+    let mut stick_pushes: HashMap<&'static str, (f32, f32)> = HashMap::new();
     // Relative mouse delta accumulator. The `mouse`/`mouse_x`/`mouse_y` pins use
     // the +Y-UP convention (the keymouse sink negates y to screen space itself),
     // so we accumulate the deflection directly WITHOUT flipping y.
@@ -422,6 +424,16 @@ pub(crate) fn eval_touch_zones_map_node(
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
+                // A stick direction: pushed fully that way while the card holds.
+                // Sinks read a stick's axes, never its derived direction pins.
+                p if analog_axis_for_cardinal(p).is_some() => {
+                    if held {
+                        let (axis, sign) = analog_axis_for_cardinal(p).unwrap_or(("", 0.0));
+                        let stick = if axis.starts_with("left") { "left_stick" } else { "right_stick" };
+                        let e = stick_pushes.entry(stick).or_insert((0.0, 0.0));
+                        if axis.ends_with("_x") { e.0 += sign } else { e.1 += sign }
+                    }
+                }
                 // Relative mouse. Two derivations, BOTH emitted as a VELOCITY on the
                 // "mouse" pins (the sink integrates it over its own dt):
                 //  • touchpad mode → the leaky-integrator trackball value (a bounded
@@ -522,6 +534,10 @@ pub(crate) fn eval_touch_zones_map_node(
     // Publish analog sticks (Vec2 authoritative + component floats). Only when a
     // finger is in the zone this frame; absent, the pin falls back to upstream so
     // the physical stick still passes through.
+    for (stick, (dx, dy)) in stick_pushes {
+        let e = sticks.entry(stick).or_insert((0.0, 0.0));
+        *e = ((e.0 + dx).clamp(-1.0, 1.0), (e.1 + dy).clamp(-1.0, 1.0));
+    }
     for (target, (x, y)) in &sticks {
         let (xp, yp) = match *target {
             "left_stick" => ("left_stick_x", "left_stick_y"),

@@ -580,7 +580,9 @@ pub(crate) fn remapper_hold_back_pass(
             is_sequence || matches!(press.mode(), PressMode::Short),
         ) {
             let shape = MappingShape::from_card(m);
-            let value = analog_in_value(&upstream, pin).unwrap_or(0.0);
+            // Two-sided IMU axis: a move either way is the move.
+            let value = shape.in_value(&upstream, pin).unwrap_or(0.0);
+            let value = if flexinput_core::imu::is_imu_pin(pin) { value.abs() } else { value };
             let engaged = value > 0.0 && shape.shaped(value) > 0.0;
             let past = shape.analog_gate(&upstream, pin)
                 .unwrap_or_else(|| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false));

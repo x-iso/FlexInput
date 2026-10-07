@@ -167,7 +167,7 @@ impl FlexInputApp {
 
     /// Add the message the editor builds to another module's output draft (a
     /// Lean section, a Touch Zones / Virtual Menu zone), through the same path
-    /// the Special picker adds by.
+    /// the Choose picker adds by.
     fn midi_modal_add_to(&mut self, ctx: &egui::Context) {
         let Some(m) = self.gamepad_nav.midi_modal.clone() else { return };
         let MidiModalPurpose::AddTo { ref draft_key, ref phase_key } = m.purpose else { return };
@@ -398,7 +398,7 @@ impl FlexInputApp {
             }
         });
         ui.label(egui::RichText::new(
-            "Added to the draft, like a Special pick — close this and press Add on the card to keep it.")
+            "Added to the draft, like a Choose… pick — close this and press Add on the card to keep it.")
             .small().weak());
     }
 

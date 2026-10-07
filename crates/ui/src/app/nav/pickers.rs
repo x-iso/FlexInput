@@ -11,7 +11,7 @@ impl FlexInputApp {
         nav: &crate::gamepad_nav::NavInput,
     ) {
         use crate::gamepad_nav::NavDir;
-        use crate::kbm_picker::{clamp_index, nearest_in_dir, picker_cells};
+        use crate::kbm_picker::{clamp_index, nearest_in_dir};
 
         // East closes the picker. While typing that means cancel: what was
         // typed is dropped, which is why Enter and West exist to keep it.
@@ -19,56 +19,64 @@ impl FlexInputApp {
             self.close_kbm_picker();
             return;
         }
-        // Spatial navigation over the cells actually shown for this mode (the
-        // Touch-Zones variant hides the touchpad cluster and adds analog outputs),
-        // so focus never lands on a hidden cell and the analog cells are reachable.
-        let pad = self.gamepad_nav.kbm_picker_use != crate::gamepad_nav::PickerUse::Chord;
-        let cells = picker_cells(
-            self.gamepad_nav.kbm_picker_touch_zones, pad, &self.macro_display_entries());
-        // A cell is usable (focusable + mappable) unless it's an analog output on
-        // a discrete target (analog not OK) or one of the target's own pins. Same
-        // predicate the renderer uses to grey cells — so grey == unreachable.
-        let analog_ok = self.picker_analog_input_ok();
-        let excl = self.gamepad_nav.kbm_picker_exclude.clone();
-        let usable = |cell: &crate::kbm_picker::PickerCell| {
-            let self_target = excl.as_deref().is_some_and(|p| cell.pin.starts_with(p));
-            !((cell.analog_only && !analog_ok) || self_target)
-        };
-        // What a cell is worth depends on what the picker is for: a key with no
-        // character types nothing, and a key JSM has no name for can't be a
-        // binding. Both grey the same way the chord purpose greys its own.
+        // LB / RB step through the tabs.
+        let tab_step = if nav.is_rising("btn_rb") { 1 } else if nav.is_rising("btn_lb") { -1 } else { 0 };
+        if tab_step != 0 {
+            let tabs = self.picker_tabs();
+            let at = tabs.iter().position(|t| *t == self.picker_tab()).unwrap_or(0) as i32;
+            self.picker_select_tab(tabs[(at + tab_step).rem_euclid(tabs.len() as i32) as usize]);
+            return;
+        }
+        // Spatial navigation over the cells actually shown on this tab for this
+        // mode (the Touch-Zones variant hides the touchpad cluster and adds
+        // analog outputs), so focus never lands on a hidden cell and the analog
+        // cells are reachable.
+        let cells = self.picker_tab_cells(self.picker_tab(), &self.macro_display_entries());
+        let usable = self.picker_usable();
         let purpose = self.gamepad_nav.kbm_picker_use;
         let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
-        let usable = |cell: &crate::kbm_picker::PickerCell| {
-            usable(cell) && cell_does_something(purpose, &cell.pin, &vocab)
-        };
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
-        idx = match step_dir {
-            Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
-            Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0, &usable),
-            Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0, &usable),
-            Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0, &usable),
-            None => idx,
-        };
+        if !cells.is_empty() {
+            idx = match step_dir {
+                Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
+                Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0, &usable),
+                Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0, &usable),
+                Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0, &usable),
+                None => idx,
+            };
+        }
         self.gamepad_nav.kbm_picker_idx = idx;
+        // The focused cell — none on an empty tab (Macros, before there are any).
+        let focused = cells.get(idx).cloned();
 
         // Typing is the picker's other purpose: same grid, same navigation,
         // but an activated cell gives a character or a name rather than a pin.
         if purpose != crate::gamepad_nav::PickerUse::Chord {
-            self.drive_kbm_typing(nav, &cells[idx], &vocab);
+            self.drive_kbm_typing(nav, focused.as_ref(), &vocab);
+            return;
+        }
+        let stage = self.gamepad_nav.kbm_picker_stage;
+
+        // An empty path is valid (top-level node); only `inner` is required.
+        if self.gamepad_nav.kbm_picker_node.is_none() {
+            self.gamepad_nav.kbm_picker_open = false;
+            self.gamepad_nav.kbm_picker_viewport = None;
             return;
         }
 
-        // An empty path is valid (top-level node); only `inner` is required.
-        let path = self.gamepad_nav.kbm_picker_path.clone();
-        let Some(inner) = self.gamepad_nav.kbm_picker_node else {
-            self.gamepad_nav.kbm_picker_open = false;
-            self.gamepad_nav.kbm_picker_viewport = None; return; };
-        let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
-
-        // North resets the output chord.
+        // West switches between the input and the output, on a card that has
+        // both. Focus stays put: the board is the same, only what greys changes.
+        if nav.is_rising("btn_west") && self.picker_has_both_stages() {
+            use crate::kbm_picker::PickStage;
+            self.picker_switch_stage(match stage {
+                PickStage::Input => PickStage::Output,
+                PickStage::Output => PickStage::Input,
+            });
+            return;
+        }
+        // North resets the chord being chosen.
         if nav.is_rising("btn_north") {
-            self.picker_set_draft(&path, inner, &draft_key, &[]);
+            self.picker_clear_draft();
             return;
         }
         // South appends the focused pin (de-duped) + flips the widget into the
@@ -76,10 +84,52 @@ impl FlexInputApp {
         // capture machine (so the South used to pick isn't swept into the chord).
         // Analog-only cells (swipe) are ignored when the input isn't analog;
         // excluded cells (a menu's own targets) are never appendable.
-        if nav.is_rising("btn_south") && usable(&cells[idx]) {
-            let pin = cells[idx].pin.clone();
-            self.picker_append_pin(&pin);
+        if let Some(cell) = focused.filter(|c| nav.is_rising("btn_south") && usable(c)) {
+            self.picker_append_pin(&cell.pin);
         }
+    }
+
+    /// Is a cell usable (focusable + mappable) for the open session? Not when
+    /// it's an analog output on a discrete target (analog not OK), one of the
+    /// target's own pins, something that can't sit on the side being chosen,
+    /// or — by the picker's purpose — a key with no character to type or no
+    /// JSM name. The renderer greys exactly these, so grey == unreachable.
+    pub(crate) fn picker_usable(&self) -> impl Fn(&crate::kbm_picker::PickerCell) -> bool {
+        let analog_ok = self.picker_analog_input_ok();
+        let excl = self.gamepad_nav.kbm_picker_exclude.clone();
+        let stage = self.gamepad_nav.kbm_picker_stage;
+        let purpose = self.gamepad_nav.kbm_picker_use;
+        let chord = purpose == crate::gamepad_nav::PickerUse::Chord;
+        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
+        // An analog-only cell needs an analog INPUT to drive it as an output;
+        // as an input (a whole stick) it is itself the analog input.
+        let choosing_input = chord && stage == crate::kbm_picker::PickStage::Input;
+        move |cell| {
+            let self_target = excl.as_deref().is_some_and(|p| cell.pin.starts_with(p));
+            let wrong_side = chord && !crate::kbm_picker::stage_allows(stage, &cell.pin);
+            !((cell.analog_only && !analog_ok && !choosing_input) || self_target || wrong_side)
+                && cell_does_something(purpose, &cell.pin, &vocab)
+        }
+    }
+
+    /// Show a tab, focus on its first usable cell.
+    pub(crate) fn picker_select_tab(&mut self, tab: crate::kbm_picker::PickerTab) {
+        let usable = self.picker_usable();
+        let cells = self.picker_tab_cells(tab, &self.macro_display_entries());
+        self.gamepad_nav.kbm_picker_idx = cells.iter().position(|c| usable(c)).unwrap_or(0);
+        self.gamepad_nav.kbm_picker_tab = tab;
+    }
+
+    /// Choose for the other side of the mapping. An input can't be a key, so
+    /// switching to it from the keyboard tab goes to the gamepad.
+    pub(crate) fn picker_switch_stage(&mut self, stage: crate::kbm_picker::PickStage) {
+        use crate::kbm_picker::{PickStage, PickerTab};
+        self.gamepad_nav.kbm_picker_stage = stage;
+        let tab = match (stage, self.picker_tab()) {
+            (PickStage::Input, PickerTab::Kbm) => PickerTab::Gamepad,
+            (_, t) => t,
+        };
+        self.picker_select_tab(tab);
     }
 
     /// Close the picker and forget whatever session it was running.
@@ -112,7 +162,7 @@ impl FlexInputApp {
     fn drive_kbm_typing(
         &mut self,
         nav: &crate::gamepad_nav::NavInput,
-        cell: &crate::kbm_picker::PickerCell,
+        cell: Option<&crate::kbm_picker::PickerCell>,
         vocab: &JsmVocab,
     ) {
         use crate::gamepad_nav::PickerUse;
@@ -133,7 +183,7 @@ impl FlexInputApp {
             // be spelled out letter by letter would be a worse list than the
             // list is.
             if nav.is_rising("btn_south") {
-                if let Some(name) = vocab.insert_for(&cell.pin) {
+                if let Some(name) = cell.and_then(|c| vocab.insert_for(&c.pin)) {
                     self.finish_kbm_typing(name);
                 }
             }
@@ -152,9 +202,9 @@ impl FlexInputApp {
             self.finish_kbm_typing(typed);
             return;
         }
-        if !nav.is_rising("btn_south") {
+        let Some(cell) = cell.filter(|_| nav.is_rising("btn_south")) else {
             return;
-        }
+        };
         let caps = self.gamepad_nav.kbm_text_caps;
         match cell_typed(&cell.pin, caps) {
             Some(Typed::Char(c)) => self.gamepad_nav.kbm_text.push(c),
@@ -252,8 +302,8 @@ impl FlexInputApp {
     }
 
     pub(crate) fn draw_kbm_picker(&mut self, ctx: &egui::Context) {
-        let (clicked_pin, done) = self.kbm_picker_window(ctx);
-        self.apply_kbm_picker_result(clicked_pin, done);
+        let interaction = self.kbm_picker_window(ctx);
+        self.apply_kbm_picker_result(interaction);
     }
 
     /// Render the KB/M picker in its OWN always-on-top viewport, floating over the
@@ -278,7 +328,7 @@ impl FlexInputApp {
             .with_active(false)
             .with_position(egui::pos2(0.0, 0.0))
             .with_inner_size(monitor);
-        let mut result: (Option<String>, bool) = (None, false);
+        let mut result = PickerInteraction::default();
         ctx.show_viewport_immediate(
             crate::config_overlay::picker_viewport_id(),
             builder,
@@ -286,50 +336,70 @@ impl FlexInputApp {
                 result = self.kbm_picker_window(vctx);
             },
         );
-        self.apply_kbm_picker_result(result.0, result.1);
+        self.apply_kbm_picker_result(result);
     }
 
     /// Apply a picker interaction collected by `kbm_picker_window` — split out
     /// so a sub-patch editor viewport (which holds `&self` during its closure)
     /// can render the window inline and apply the result once `&mut` is back.
-    pub(crate) fn apply_kbm_picker_result(&mut self, clicked_pin: Option<String>, done: bool) {
-        if let Some(pin) = clicked_pin {
+    pub(crate) fn apply_kbm_picker_result(&mut self, interaction: PickerInteraction) {
+        if let Some(stage) = interaction.stage {
+            self.picker_switch_stage(stage);
+        }
+        if let Some(tab) = interaction.tab {
+            self.picker_select_tab(tab);
+        }
+        if let Some(pin) = interaction.pin {
             self.picker_append_pin(&pin);
         }
-        if done {
+        if interaction.done {
             self.gamepad_nav.kbm_picker_open = false;
             self.gamepad_nav.kbm_picker_viewport = None;
         }
     }
 
     /// Render the picker window into `ctx` (read-only on `self`) and report
-    /// what the user did: `(clicked pin, Done pressed)`.
-    pub(crate) fn kbm_picker_window(&self, ctx: &egui::Context) -> (Option<String>, bool) {
-        if !self.gamepad_nav.kbm_picker_open { return (None, false); }
-        use crate::kbm_picker::{clamp_index, layout_extent, picker_cells, MACRO_Y};
+    /// what the user did.
+    pub(crate) fn kbm_picker_window(&self, ctx: &egui::Context) -> PickerInteraction {
+        if !self.gamepad_nav.kbm_picker_open { return PickerInteraction::default(); }
+        use crate::kbm_picker::{clamp_index, layout_extent, PickStage, PickerTab};
         let macros = self.macro_display_entries();
-        let pad = self.gamepad_nav.kbm_picker_use != crate::gamepad_nav::PickerUse::Chord;
-        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, pad, &macros);
+        let layout = self.picker_layout();
+        let tabs = self.picker_tabs();
+        let tab = self.picker_tab();
+        let cells = self.picker_tab_cells(tab, &macros);
         let sel = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
+        let stage = self.gamepad_nav.kbm_picker_stage;
+        let both_stages = self.picker_has_both_stages();
 
-        // Current output chord for the header preview (read from whichever draft
-        // param this picker session targets — any sub-patch depth).
-        let dk = self.gamepad_nav.kbm_picker_draft_key.clone();
-        let chord: Vec<String> = match self.gamepad_nav.kbm_picker_node {
-            Some(i) => self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path, i, &dk),
-            None => Vec::new(),
+        // The chords for the header preview (read from whichever draft params
+        // this picker session targets — any sub-patch depth): the input, when
+        // the card has one to choose, and the output, when it has that.
+        let draft = |key: &str| -> Vec<String> {
+            match self.gamepad_nav.kbm_picker_node {
+                Some(i) if !key.is_empty() => self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path, i, key),
+                _ => Vec::new(),
+            }
         };
-        // Whether analog-only (swipe) cells are usable for this target.
-        let analog_ok = self.picker_analog_input_ok();
+        let in_chord: Option<Vec<String>> = self.gamepad_nav.kbm_picker_in_key.as_deref().map(draft);
+        let has_out = !self.gamepad_nav.kbm_picker_draft_key.is_empty();
+        let chord: Vec<String> = draft(&self.gamepad_nav.kbm_picker_draft_key);
         // What this session is for, and — when it is naming a key for a config —
         // the names JSM binds our pins by, so a key it can't name greys out.
         let purpose = self.gamepad_nav.kbm_picker_use;
         let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
+        let usable = self.picker_usable();
 
-        const UNIT: f32 = 30.0; // px per grid unit
-        const GAP: f32 = 3.0;   // gap between adjacent keys
-        let (ext_x, ext_y) = layout_extent(&cells);
+        // The whole board — cells, gaps, captions, labels and the header's
+        // text — is drawn at this scale.
+        const SCALE: f32 = 1.2;
+        const UNIT: f32 = 30.0 * SCALE; // px per grid unit
+        const GAP: f32 = 3.0 * SCALE;   // gap between adjacent keys
+        // Sized for the largest tab, so switching tabs doesn't resize the window.
+        let (ext_x, ext_y) = tabs.iter()
+            .map(|t| layout_extent(&self.picker_tab_cells(*t, &macros)))
+            .fold((0.0f32, 0.0f32), |(w, h), (x, y)| (w.max(x), h.max(y)));
         let board_w = ext_x * (UNIT + GAP);
         let board_h = ext_y * (UNIT + GAP);
         let skin = crate::canvas::remapper_icons::Skin::Kbm;
@@ -337,43 +407,76 @@ impl FlexInputApp {
         // Collected from the closure (no &mut self inside the egui window body).
         let mut clicked_pin: Option<String> = None;
         let mut done = false;
+        let mut switch_to: Option<PickStage> = None;
+        let mut tab_to: Option<PickerTab> = None;
+        // A pad driving nav: its LB / RB switch tabs (drawn in its own glyphs),
+        // and the focused cell says what it is, as a hover would.
+        let nav_skin = self.gamepad_nav.active_dev.as_deref()
+            .map(crate::canvas::remapper_icons::skin_from_device_id);
+        let mut focus_tip: Option<(egui::Rect, String)> = None;
+        let mut focus_rect: Option<egui::Rect> = None;
 
         // Touch Zones variant: a touchpad can't remap to itself, so the touchpad
         // cluster is hidden and analog-output cells replace it (both handled by
         // `picker_cells`, which also keeps them navigable).
         let tz = self.gamepad_nav.kbm_picker_touch_zones;
+        // The pad drawn in the dialect of the side being chosen: an input as
+        // the pad it comes from, an output as the device it goes to (both as
+        // the target's body publishes them), Xbox while there's neither. JSM
+        // writes the Xbox names (`X_A`), so its board stays Xbox.
+        let pad_skin = match (purpose, self.gamepad_nav.kbm_picker_node) {
+            (crate::gamepad_nav::PickerUse::Chord, Some(n)) => {
+                crate::canvas::viewer::picker_skins(ctx, &self.gamepad_nav.kbm_picker_path, n)
+                    .map(|(i, o)| if stage == PickStage::Input { i } else { o })
+                    .unwrap_or(crate::canvas::remapper_icons::Skin::Xbox)
+            }
+            _ => crate::canvas::remapper_icons::Skin::Xbox,
+        };
 
-        egui::Window::new(if tz { "⌨ KB/M + mouse picker" } else { "⌨ KB/M + touchpad picker" })
+        let title = match purpose {
+            crate::gamepad_nav::PickerUse::Chord if stage == PickStage::Input => "Choose input",
+            crate::gamepad_nav::PickerUse::Chord => "Choose output",
+            _ if tz => "⌨ KB/M + mouse picker",
+            _ => "⌨ KB/M + touchpad picker",
+        };
+        egui::Window::new(title)
             .id(egui::Id::new("gp_kbm_picker"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                for font in ui.style_mut().text_styles.values_mut() {
+                    font.size *= SCALE;
+                }
                 ui.horizontal(|ui| {
                     // The hints are the session's, not the window's: the same
                     // board means three different things to the buttons.
+                    // LB / RB only where a pad can press them.
+                    let tab_hint = if nav_skin.is_some() && tabs.len() > 1 { "   LB/RB: tab" } else { "" };
                     let hints = match purpose {
-                        crate::gamepad_nav::PickerUse::Chord =>
-                            "Click or LS/D-pad: move   South: add   North: clear   East/Done: close",
+                        crate::gamepad_nav::PickerUse::Chord if both_stages => format!(
+                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   West: input ⇄ output   East/Done: close"),
+                        crate::gamepad_nav::PickerUse::Chord => format!(
+                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   East/Done: close"),
                         crate::gamepad_nav::PickerUse::JsmName => match self.gamepad_nav.kbm_slot {
                             // What the keys stand for depends on which side of
                             // the line the pick lands on, so say which.
-                            crate::gamepad_nav::JsmSlot::Name =>
-                                "A line starts with a BUTTON. South: insert its name   West: type instead   East: cancel",
-                            crate::gamepad_nav::JsmSlot::Value =>
-                                "Click or LS/D-pad: move   South: insert this key's name   West: type instead   East: cancel",
+                            crate::gamepad_nav::JsmSlot::Name => format!(
+                                "A line starts with a BUTTON.{tab_hint}   South: insert its name   West: type instead   East: cancel"),
+                            crate::gamepad_nav::JsmSlot::Value => format!(
+                                "Click or LS/D-pad: move{tab_hint}   South: insert this key's name   West: type instead   East: cancel"),
                             // Everything greys out here, and a board full of grey
                             // has to say why rather than look broken.
                             crate::gamepad_nav::JsmSlot::Neither =>
-                                "A NUMBER goes here: hold South and push the stick. West: type a word instead   East: cancel",
+                                "A NUMBER goes here: hold South and push the stick. West: type a word instead   East: cancel".to_string(),
                         },
                         crate::gamepad_nav::PickerUse::Text =>
-                            "South: type   West or Shift: caps   Backspace   North or Enter: done   East or Esc: cancel",
+                            "South: type   West or Shift: caps   Backspace   North or Enter: done   East or Esc: cancel".to_string(),
                     };
                     ui.label(egui::RichText::new(hints)
                         .small().color(egui::Color32::from_gray(150)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("Done").size(13.0)).clicked() { done = true; }
+                        if ui.button(egui::RichText::new("Done").size(13.0 * SCALE)).clicked() { done = true; }
                     });
                 });
                 ui.add_space(4.0);
@@ -413,47 +516,95 @@ impl FlexInputApp {
                         }
                     });
                 }
-                // Output chord preview.
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Output:").small().weak());
-                    if purpose != crate::gamepad_nav::PickerUse::Chord {
-                        ui.label(egui::RichText::new("—").small().weak());
-                    } else if chord.is_empty() {
-                        ui.label(egui::RichText::new("(none)").small().italics().weak());
-                    } else {
-                        for (i, pin) in chord.iter().enumerate() {
-                            if i > 0 { ui.label(egui::RichText::new("+").strong()); }
-                            // Macro pins show the port's display name.
-                            let label = macros.iter().find(|e| e.pin == *pin)
-                                .map(|e| e.name.clone())
-                                .unwrap_or_else(|| kbm_pin_label(pin));
-                            ui.label(egui::RichText::new(label).strong());
+                // Chord previews: the input (when this card's can be chosen)
+                // and the output, the side being chosen marked.
+                // With both sides to fill, a caption is also the mouse's way
+                // to switch to its side (West on the pad).
+                let mut preview = |ui: &mut egui::Ui, caption: &str, pins: &[String], side: Option<PickStage>| {
+                    let active = side == Some(stage);
+                    ui.horizontal(|ui| {
+                        let cap = egui::RichText::new(caption).small();
+                        let cap = if active { cap.strong().color(accent) } else { cap.weak() };
+                        match side {
+                            Some(s) if both_stages && !active => {
+                                if ui.add(egui::Button::new(cap).small())
+                                    .on_hover_text("Choose this side instead (West)").clicked()
+                                {
+                                    switch_to = Some(s);
+                                }
+                            }
+                            _ => { ui.label(cap); }
                         }
-                    }
-                });
+                        if purpose != crate::gamepad_nav::PickerUse::Chord {
+                            ui.label(egui::RichText::new("—").small().weak());
+                        } else if pins.is_empty() {
+                            ui.label(egui::RichText::new("(none)").small().italics().weak());
+                        } else {
+                            for (i, pin) in pins.iter().enumerate() {
+                                if i > 0 { ui.label(egui::RichText::new("+").strong()); }
+                                // Macro pins show the port's display name.
+                                let label = macros.iter().find(|e| e.pin == *pin)
+                                    .map(|e| e.name.clone())
+                                    .unwrap_or_else(|| kbm_pin_label(pin));
+                                ui.label(egui::RichText::new(label).strong());
+                            }
+                        }
+                    });
+                };
+                let chord_purpose = purpose == crate::gamepad_nav::PickerUse::Chord;
+                if let (Some(ins), true) = (in_chord.as_ref(), chord_purpose) {
+                    preview(ui, "Input:", ins, Some(PickStage::Input));
+                }
+                if has_out || !chord_purpose {
+                    preview(ui, "Output:", &chord, chord_purpose.then_some(PickStage::Output));
+                }
                 ui.add_space(6.0);
                 ui.separator();
-                ui.add_space(6.0);
+                ui.add_space(4.0);
+                // The tabs (LB / RB, or a click).
+                if tabs.len() > 1 {
+                    // The pad's own bumper glyph and an arrow, either side of
+                    // the tabs — only while a pad is driving.
+                    let bumper = |ui: &mut egui::Ui, pin: &str, arrow: &str, before: bool| {
+                        let Some(skin) = nav_skin else { return };
+                        let arrow = egui::RichText::new(arrow).color(egui::Color32::from_gray(150));
+                        if !before { ui.label(arrow.clone()); }
+                        if let Some(tex) = kbm_cell_texture(ctx, skin, pin) {
+                            ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(22.0, 22.0) * SCALE));
+                        }
+                        if before { ui.label(arrow); }
+                    };
+                    ui.horizontal(|ui| {
+                        bumper(ui, "btn_lb", "◀", true);
+                        for t in &tabs {
+                            if ui.selectable_label(*t == tab, t.label()).clicked() && *t != tab {
+                                tab_to = Some(*t);
+                            }
+                        }
+                        bumper(ui, "btn_rb", "▶", false);
+                    });
+                    ui.add_space(6.0);
+                }
 
                 // Absolute-positioned board: allocate one area sized to the layout
                 // extent, then place each cell at its (x,y)*unit origin. Cells are
                 // individually clickable (mouse) AND highlight the gamepad focus.
                 let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
-                // "GAMEPAD" caption above its cluster (only when offered).
-                if cells.iter().any(|c| crate::kbm_picker::is_pad_cell(&c.pin)) {
-                    let (px, py) = crate::kbm_picker::pad_caption_at();
+                // Cluster captions (GAMEPAD, STICKS, GYRO, …), for those shown.
+                for (caption, px, py) in crate::kbm_picker::tab_captions(layout, tab) {
                     ui.painter_at(board).text(
                         board.min + egui::vec2(px * (UNIT + GAP), py * (UNIT + GAP)),
-                        egui::Align2::LEFT_TOP, "GAMEPAD",
-                        egui::FontId::proportional(9.0), egui::Color32::from_gray(130));
+                        egui::Align2::LEFT_TOP, caption,
+                        egui::FontId::proportional(9.0 * SCALE), egui::Color32::from_gray(130));
                 }
-                // "MACROS" caption above the dynamic cluster (only when present).
-                if cells.iter().any(|c| c.macro_meta.is_some()) {
+                // An empty Macros tab stays, and says where macros come from.
+                if tab == PickerTab::Macros && cells.is_empty() {
                     ui.painter_at(board).text(
-                        board.min + egui::vec2(2.0, (MACRO_Y - 0.42) * (UNIT + GAP)),
-                        egui::Align2::LEFT_TOP, "MACROS",
-                        egui::FontId::proportional(9.0), egui::Color32::from_gray(130));
+                        board.left_top() + egui::vec2(4.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        "No macros yet — create macros via the Macro Output module or a JSM @ binding.",
+                        egui::FontId::proportional(11.0 * SCALE), egui::Color32::from_gray(140));
                 }
                 for (i, cell) in cells.iter().enumerate() {
                     let min = board.min + egui::vec2(
@@ -466,9 +617,9 @@ impl FlexInputApp {
                     // cards) are always disabled.
                     let self_target = self.gamepad_nav.kbm_picker_exclude.as_deref()
                         .is_some_and(|p| cell.pin.starts_with(p));
-                    let disabled = (cell.analog_only && !analog_ok)
-                        || self_target
-                        || !cell_does_something(purpose, &cell.pin, &vocab);
+                    let wrong_side = purpose == crate::gamepad_nav::PickerUse::Chord
+                        && !crate::kbm_picker::stage_allows(stage, &cell.pin);
+                    let disabled = !usable(cell);
                     let resp = if disabled {
                         ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
                     } else {
@@ -481,18 +632,17 @@ impl FlexInputApp {
                     let painter = ui.painter_at(rect);
                     let bg = if disabled {
                         egui::Color32::from_gray(28)
-                    } else if focused {
-                        let [rr, gg, bb, _] = accent.to_array();
-                        egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 60)
                     } else if hovered {
                         egui::Color32::from_gray(60)
                     } else {
                         egui::Color32::from_gray(40)
                     };
                     painter.rect_filled(rect, 4.0, bg);
+                    // The focus is the gamepad-nav glow round the cell, not a
+                    // fill: a tinted tile showed its square corners round every
+                    // rounded glyph.
                     if focused {
-                        painter.rect_stroke(rect, 4.0,
-                            egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                        focus_rect = Some(rect);
                     }
                     let tint = if disabled { egui::Color32::from_gray(110) } else { egui::Color32::WHITE };
                     // Macro cells: the port's icon (custom patch-embedded SVG
@@ -511,21 +661,22 @@ impl FlexInputApp {
                         } else {
                             let short: String = entry.name.chars().take(4).collect();
                             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                                short, egui::FontId::proportional(10.0), ui.visuals().text_color());
+                                short, egui::FontId::proportional(10.0 * SCALE), ui.visuals().text_color());
                         }
-                        if self_target {
-                            resp.on_hover_text(format!("{} — a menu can't target itself", entry.name));
+                        let tip = if self_target {
+                            format!("{} — a menu can't target itself", entry.name)
                         } else {
-                            resp.on_hover_text(&entry.name);
+                            entry.name.clone()
+                        };
+                        if focused && nav_skin.is_some() {
+                            focus_tip = Some((rect, tip.clone()));
                         }
+                        resp.on_hover_text(tip);
                         continue;
                     }
-                    // The gamepad cluster in the Xbox dialect, which is the
-                    // one whose names this picker writes (`X_A`, `X_LB`): a
-                    // board showing a circle while inserting `X_B` reads as a
-                    // mistake, whichever pad you actually hold.
+                    // The gamepad cells in the side's dialect (`pad_skin`).
                     let skin = if crate::kbm_picker::is_pad_cell(&cell.pin) {
-                        crate::canvas::remapper_icons::Skin::Xbox
+                        pad_skin
                     } else {
                         skin
                     };
@@ -612,23 +763,66 @@ impl FlexInputApp {
                         painter.image(tex.id(), img_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             tint);
+                        // A glyph shared with another cell (the touchpad's
+                        // touch and click zones) gets its word under it.
+                        if let Some(word) = crate::kbm_picker::cell_caption(&cell.pin) {
+                            let at = rect.center_bottom() - egui::vec2(0.0, 1.0);
+                            let font = egui::FontId::proportional(UNIT * 0.26);
+                            for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                                painter.text(at + egui::vec2(dx, dy), egui::Align2::CENTER_BOTTOM,
+                                    word, font.clone(), egui::Color32::from_black_alpha(220));
+                            }
+                            painter.text(at, egui::Align2::CENTER_BOTTOM, word, font, tint);
+                        }
                     } else {
                         // Compact labels — "L-Stick" won't fit a 30px cell.
                         let lbl = match cell.pin.as_str() {
                             "left_stick" => "LS".to_string(),
                             "right_stick" => "RS".to_string(),
-                            _ => kbm_pin_label(&cell.pin),
+                            p => match flexinput_core::imu::imu_pin(p) {
+                                Some(imu) => imu.short.to_string(),
+                                None => kbm_pin_label(p),
+                            },
                         };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                             lbl,
-                            egui::FontId::proportional(11.0),
+                            egui::FontId::proportional(11.0 * SCALE),
                             if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
+                    }
+                    // What a cell is when its face doesn't say, and why one is
+                    // grey for this side. Hovered by the mouse; shown beside the
+                    // focus while a pad drives.
+                    if let Some(tip) = picker_cell_tip(&cell.pin, wrong_side, stage) {
+                        if focused && nav_skin.is_some() {
+                            focus_tip = Some((rect, tip.clone()));
+                        }
+                        resp.on_hover_text(tip);
                     }
                 }
             });
 
+        // The focused cell's glow, above the board so neighbours can't cover it.
+        if let Some(rect) = focus_rect {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground, egui::Id::new("gp_kbm_picker_focus_glow")));
+            crate::widgets::paint_nav_bloom(&painter, rect, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
+        }
+        // The focused cell's name, under it, above everything — the pad's
+        // hover.
+        if let Some((rect, tip)) = focus_tip {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip, egui::Id::new("gp_kbm_picker_focus_tip")));
+            let galley = painter.layout_no_wrap(
+                tip, egui::FontId::proportional(11.0 * SCALE), egui::Color32::WHITE);
+            let pos = rect.center_bottom() + egui::vec2(-galley.size().x * 0.5, 6.0);
+            let bg = egui::Rect::from_min_size(pos, galley.size()).expand(4.0);
+            painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(230));
+            painter.rect_stroke(bg, 3.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+            painter.galley(pos, galley, egui::Color32::WHITE);
+        }
+
         ctx.request_repaint();
-        (clicked_pin, done)
+        PickerInteraction { pin: clicked_pin, done, stage: switch_to, tab: tab_to }
     }
 
     /// Modal press-mode picker: a vertical list of the press modes (glyph +
@@ -687,6 +881,38 @@ impl FlexInputApp {
             });
         ctx.request_repaint();
     }
+}
+
+/// What a picker cell is called where its face doesn't say it — and, when it
+/// can't sit on the side being chosen, why it's grey. Keys say what they are.
+fn picker_cell_tip(pin: &str, wrong_side: bool, stage: crate::kbm_picker::PickStage) -> Option<String> {
+    let name = match flexinput_core::imu::imu_pin(pin) {
+        Some(p) => p.name.to_string(),
+        None if pin.starts_with("key_") => kbm_pin_label(pin),
+        None => crate::canvas::viewer::remapper_pin_display(pin),
+    };
+    if wrong_side {
+        let why = match stage {
+            crate::kbm_picker::PickStage::Input => "an output only",
+            crate::kbm_picker::PickStage::Output => "an input only",
+        };
+        return Some(format!("{name} — {why}"));
+    }
+    (!pin.starts_with("key_")).then_some(name)
+}
+
+/// What the user did in the picker window this frame, applied once `&mut` is
+/// back ([`FlexInputApp::apply_kbm_picker_result`]).
+#[derive(Default)]
+pub(crate) struct PickerInteraction {
+    /// A cell clicked.
+    pub(crate) pin: Option<String>,
+    /// Done pressed.
+    pub(crate) done: bool,
+    /// A side's caption clicked, to choose for it.
+    pub(crate) stage: Option<crate::kbm_picker::PickStage>,
+    /// A tab clicked.
+    pub(crate) tab: Option<crate::kbm_picker::PickerTab>,
 }
 
 /// The names a JSM config could use for our pins, on whichever side of a line

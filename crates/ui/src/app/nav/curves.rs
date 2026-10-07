@@ -83,6 +83,40 @@ impl FlexInputApp {
         })
     }
 
+    /// Nudge an IMU card's value box: a family's range (`kind` Some) by the
+    /// FACTOR `by` — a range is felt in ratios, 90 °/s to 100 like 900 to
+    /// 1000 — or its Log/Exp (`kind` None) by the amount `by`. A value landing
+    /// on its default is stored as nothing, as the body stores it.
+    pub(crate) fn nav_nudge_card_imu(
+        &mut self,
+        outer_id: egui_snarl::NodeId,
+        idx: usize,
+        kind: Option<flexinput_core::imu::ImuKind>,
+        by: f32,
+    ) -> bool {
+        use flexinput_core::imu::IMU_LOG_KEY;
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            let (key, default, next) = match kind {
+                Some(k) => {
+                    let (lo, hi) = k.range_limits();
+                    let cur = m.get(k.range_key()).and_then(|v| v.as_f64())
+                        .map(|v| v as f32).unwrap_or(k.default_range());
+                    (k.range_key(), k.default_range(), (cur * by).clamp(lo, hi))
+                }
+                None => {
+                    let cur = m.get(IMU_LOG_KEY).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(0.0);
+                    (IMU_LOG_KEY, 0.0, (cur + by).clamp(-1.0, 1.0))
+                }
+            };
+            if (next - default).abs() < 1e-4 {
+                m.remove(key);
+            } else {
+                m.insert(key.to_string(), serde_json::json!(next as f64));
+            }
+            true
+        })
+    }
+
     /// Read the entered card's response `curve` (≥2 pts) for the gamepad dot
     /// editor — the Remapper/Lean analogue of the Touch Zones per-zone curve.
     pub(crate) fn nav_card_curve_points(&self, outer_id: egui_snarl::NodeId)

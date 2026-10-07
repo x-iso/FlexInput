@@ -1850,6 +1850,16 @@ impl crate::app::FlexInputApp {
         // chord purpose, and a stale one would answer for this session.
         self.gamepad_nav.kbm_picker_phase_key = None;
         self.gamepad_nav.kbm_picker_draft_key = String::new();
+        self.gamepad_nav.kbm_picker_in_key = None;
+        self.gamepad_nav.kbm_picker_inputs = false;
+        self.gamepad_nav.kbm_picker_stage = crate::kbm_picker::PickStage::Output;
+        // A line starts with a button; everything after it is most often a key.
+        self.gamepad_nav.kbm_picker_tab =
+            if naming && self.gamepad_nav.kbm_slot == crate::gamepad_nav::JsmSlot::Name {
+                crate::kbm_picker::PickerTab::Gamepad
+            } else {
+                crate::kbm_picker::PickerTab::Kbm
+            };
         self.gamepad_nav.kbm_picker_idx = 0;
         self.gamepad_nav.kbm_picker_open = true;
         // Where it renders is decided centrally (over the game while the config

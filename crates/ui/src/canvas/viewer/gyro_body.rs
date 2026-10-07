@@ -546,10 +546,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
     }
 
     // ── Render ──────────────────────────────────────────────────────────
-    let skin_param = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| "auto".to_string());
-    let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
+    // Every chip here is an output: drawn as the device the lean sends to.
+    let skin = remapper_out_skin(snarl, node_id, automap_parent);
+    publish_picker_skins(ui.ctx(), automap_parent, node_id, (skin, skin));
 
     // Force a top-down layout in a fixed-width sub-UI so we lay out the
     // same way regardless of parent layout (some pinned-widget contexts
@@ -569,7 +568,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     let ck = if side == "left" { "_nav_act_clear_left" }   else { "_nav_act_clear_right" };
     // Consume side-scoped one-shot gamepad activation flags. Mirrors the
     // Remapper/Map Action `_nav_act_*` pattern so a controller can drive
-    // Learn / Special / Clear / Add in the Lean sections too. (MIDI… is opened
+    // Learn / Choose / Clear / Add in the Lean sections too. (MIDI… is opened
     // by the nav driver directly, like the Remapper's.)
     let (act_learn, act_add, act_special, act_clear) = {
         let n = snarl.get_node(node_id);
@@ -586,12 +585,12 @@ pub(crate) fn show_gyro_lean_mapping_section(
     }
     let mut midi_rect = egui::Rect::NOTHING;
 
-    // Status line. Before Learn: prompt to Learn or pick Special. During
+    // Status line. Before Learn: prompt to Learn or Choose. During
     // learning: prompt for the chord (or show the draft).
     {
         let blue = Color32::from_rgb(106, 167, 255);
         let green = Color32::from_rgb(127, 201, 127);
-        // idle (no draft) → prompt for Learn/Special; "ready" (Special-picked
+        // idle (no draft) → prompt for Learn/Choose; "ready" (Choose-picked
         // draft) → prompt to Add; "learning" handled by the draft preview below.
         if new_phase != "learning" {
             if new_phase == "ready" && !draft.is_empty() {
@@ -599,9 +598,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
                     .size(13.0).color(green));
             } else {
                 let txt = if !wired {
-                    "Connect the gyro Device input, then Learn (or select Special)"
+                    "Connect the gyro Device input, then Learn (or Choose… an output)"
                 } else {
-                    "Press Learn to start capture or select Special"
+                    "Press Learn to capture an output, or Choose… one"
                 };
                 ui.label(egui::RichText::new(txt).size(13.0).color(blue));
             }
@@ -631,8 +630,8 @@ pub(crate) fn show_gyro_lean_mapping_section(
         });
         learn_rect = learn_resp.rect;
         if (learn_resp.clicked() || act_learn) && (wired || in_learning) {
-            // Coming from "ready" (Special pins already picked) keeps the draft
-            // so a gamepad chord SUMS onto the Special pins; from idle, start
+            // Coming from "ready" (Choose pins already picked) keeps the draft
+            // so a gamepad chord SUMS onto the chosen pins; from idle, start
             // fresh.
             let from_ready = new_phase == "ready";
             if let Some(node) = snarl.get_node_mut(node_id) {
@@ -654,13 +653,14 @@ pub(crate) fn show_gyro_lean_mapping_section(
             }
         }
 
-        // Special button — opens the shared KB/M + touchpad picker (mouse OR
-        // gamepad South via `_nav_act_special_<side>`). The picker writes into
+        // Choose… — opens the shared picker (mouse OR gamepad South via
+        // `_nav_act_special_<side>`) for the output. The picker writes into
         // this section's `_lean_<side>_draft`. Lean inputs are always analog (the
         // lean gesture), so the swipe bindings are always available here.
         {
             let special_btn = ui.add(egui::Button::new(
-                egui::RichText::new("Special…").size(13.0)));
+                egui::RichText::new("Choose…").size(13.0)))
+                .on_hover_text("Pick the output from a board instead of pressing it.");
             special_rect = special_btn.rect;
             if special_btn.clicked() || act_special {
                 crate::canvas::viewer::request_special_picker(ui.ctx(),
@@ -671,6 +671,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                         phase_key: Some(phase_key.to_string()),
                         touch_zones: false,
                         exclude_pin_prefix: None,
+                        ..Default::default()
                     });
             }
         }
@@ -733,7 +734,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 // Disarm so a held nav press after Add doesn't re-capture.
                 node.params.insert(armed_key.to_string(), Value::from(false));
                 node.params.insert(arm_idle_key.to_string(), Value::from(false));
-                // If we Added a Special-only pick ("ready"), return to idle (no
+                // If we Added a Choose-only pick ("ready"), return to idle (no
                 // active capture). From "learning" (gamepad), stay learning so
                 // the user can chain more captures with the same Learn session.
                 if new_phase == "ready" {
@@ -744,7 +745,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     });
     // Publish action-button rects (global) so the nav driver can glow the
     // focused one. Order MUST match `nav_remap_action_items` for Lean: Learn,
-    // Special, MIDI…, Clear(has_draft), Add((learning||ready) && draft). Use the
+    // Choose, MIDI…, Clear(has_draft), Add((learning||ready) && draft). Use the
     // cards' scope.
     publish_nav_action_rects_scoped(ui, node_id, key,
         &[learn_rect, special_rect, midi_rect, clear_rect, add_rect]);
@@ -825,7 +826,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 |ui| {
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
-                        &out_pins, None, skin, true, false,
+                        &out_pins, None, skin, skin, true, false,
                         reorder_enabled, drag_off, key, true,
                         card_conf.as_ref(),
                     );

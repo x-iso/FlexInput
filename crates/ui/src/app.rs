@@ -619,6 +619,9 @@ pub struct FlexInputApp {
     gpu_stalled: bool,
 }
 
+/// egui temp-data key the current [`PanicShortcut`] is published under each frame.
+pub(crate) const PANIC_SHORTCUT_KEY: &str = "fxi_panic_shortcut";
+
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
 /// Stored as serializable strings so it can be persisted to disk.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1359,6 +1362,11 @@ impl eframe::App for FlexInputApp {
         // bg_repaint_hz dictates the rate and inner repaint requests
         // are short-circuited at the source.
         REPAINT_SUPPRESSED.store(bg_throttle, Ordering::Relaxed);
+
+        // The panic shortcut, for the mapping bodies that learn a key output
+        // without having it passed down (Touch Zones and its siblings).
+        ctx.data_mut(|d| d.insert_temp(
+            egui::Id::new(PANIC_SHORTCUT_KEY), self.panic_shortcut.clone()));
 
         // Cache our own HWND on the first frame we have one. We need it
         // for direct Win32 work that can't go through eframe: dropping
@@ -2161,7 +2169,7 @@ impl eframe::App for FlexInputApp {
         let picker_vp = crate::config_overlay::picker_viewport_id();
         // Universal routing: while the config overlay is up the main window is
         // behind the game and unreachable, so ANY picker opened without an
-        // explicit viewport (gamepad "Assign", a body "Special…" click, …) must
+        // explicit viewport (gamepad "Choose", a body "Choose…" click, …) must
         // render OVER THE GAME. Promote it here, in the one central spot, so no
         // individual picker entry point has to special-case the overlay.
         if self.gamepad_nav.kbm_picker_open

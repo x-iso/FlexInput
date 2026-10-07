@@ -455,6 +455,17 @@ pub struct GamepadNav {
     /// → "learning"; Lean: `_lean_<side>_phase` → "learning").
     pub kbm_picker_draft_key: String,
     pub kbm_picker_phase_key: Option<String>,
+    /// Which side of the mapping the session is filling — the input chord
+    /// (`kbm_picker_in_key`) or the output chord (`kbm_picker_draft_key`).
+    pub kbm_picker_stage: crate::kbm_picker::PickStage,
+    /// The input draft param, for a card with an input to choose (Remapper,
+    /// Map Action: `draft_input`). With both keys set, West switches stage.
+    pub kbm_picker_in_key: Option<String>,
+    /// Offer the inputs only a Remapper can take: the pad's motion and the
+    /// touchpad's click zones.
+    pub kbm_picker_inputs: bool,
+    /// The picker tab showing (LB/RB, or a click on its header).
+    pub kbm_picker_tab: crate::kbm_picker::PickerTab,
     /// Touch Zones variant: hide the touchpad cluster + offer mouse-movement delta.
     pub kbm_picker_touch_zones: bool,
     /// Pin-id prefix whose cells render disabled for this picker session
@@ -572,6 +583,10 @@ impl Default for GamepadNav {
             kbm_picker_path: Vec::new(),
             kbm_picker_draft_key: String::from("draft_output"),
             kbm_picker_phase_key: None,
+            kbm_picker_stage: crate::kbm_picker::PickStage::Output,
+            kbm_picker_in_key: None,
+            kbm_picker_inputs: false,
+            kbm_picker_tab: crate::kbm_picker::PickerTab::Kbm,
             kbm_picker_touch_zones: false,
             kbm_picker_exclude: None,
             kbm_picker_viewport: None,

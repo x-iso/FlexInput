@@ -294,13 +294,65 @@ pub(crate) fn remapper_midi_pressed_now(
     out
 }
 
-/// Read live OS keyboard + mouse state as canonical AutoMap pin IDs. Used in
-/// the Remapper's `learning` phase so the user can map to keys/mouse buttons
-/// that are otherwise only present on the bus when a virtual KB/M sink is wired.
+/// Read live OS keyboard state as canonical AutoMap pin IDs. Used on a mapping
+/// card's output stage (Remapper `learning`, Lean, Touch Zones' gamepad learn)
+/// so the user can map to keys that are otherwise only present on the bus when
+/// a virtual KB/M sink is wired.
+///
+/// The PHYSICAL keyboard, read through Raw Input, whatever has focus — egui
+/// only hears keys while a FlexInput window is focused, which the config
+/// overlay over a game never is. It also leaves out the keys our own virtual
+/// keyboard is sending. egui's view is the fallback when Raw Input is
+/// unavailable.
 pub(crate) fn remapper_kbm_pressed_now(
     ui: &egui::Ui,
     panic_shortcut: &crate::app::PanicShortcut,
 ) -> Vec<String> {
+    let mut out: Vec<String> = match flexinput_virtual::physical_keys_held() {
+        Some(keys) => keys.into_iter().map(String::from).collect(),
+        None => egui_keys_pressed_now(ui),
+    };
+
+    // Mouse buttons and scroll are intentionally NOT captured here.
+    // They cannot be live-learned because the user must click Add (LMB) to
+    // confirm a mapping — that very click would otherwise latch as part of
+    // the captured combo. They are added via the Choose picker instead.
+
+    // Block the panic-mode chord from being captured. If the currently
+    // held set matches the configured Panic shortcut, drop it so the user
+    // cannot accidentally rebind the emergency-stop onto a Remapper output.
+    // We check exact equality (same modifiers + same key) so adjacent
+    // chords still work — only the exact panic combo is filtered. Modifiers
+    // match whichever side was pressed (the physical read names them sided).
+    if let Some(ref panic_key_name) = panic_shortcut.key {
+        let panic_id = if matches!(panic_key_name.as_str(), "Escape") {
+            "key_escape".to_string()
+        } else {
+            format!("key_{}", panic_key_name.to_ascii_lowercase())
+        };
+        let held = |m: &str| {
+            let sides = [format!("key_{m}"), format!("key_l{m}"), format!("key_r{m}")];
+            out.iter().any(|p| sides.contains(p))
+        };
+        let modifiers_match = held("shift") == panic_shortcut.shift
+            && held("ctrl") == panic_shortcut.ctrl
+            && held("alt") == panic_shortcut.alt
+            && held("win") == panic_shortcut.win;
+        if modifiers_match && out.iter().any(|p| p == &panic_id) {
+            out.retain(|p| {
+                p != &panic_id
+                    && !["shift", "ctrl", "alt", "win"].iter().any(|m| {
+                        *p == format!("key_{m}") || *p == format!("key_l{m}") || *p == format!("key_r{m}")
+                    })
+            });
+        }
+    }
+    out
+}
+
+/// egui's view of the held keys — only while a FlexInput window has focus, and
+/// modifiers unsided. The fallback for [`remapper_kbm_pressed_now`].
+fn egui_keys_pressed_now(ui: &egui::Ui) -> Vec<String> {
     let mut out = Vec::new();
     ui.input(|i| {
         let m = i.modifiers;
@@ -319,34 +371,6 @@ pub(crate) fn remapper_kbm_pressed_now(
                 if !out.iter().any(|p| p == &id) {
                     out.push(id);
                 }
-            }
-        }
-
-        // Mouse buttons and scroll are intentionally NOT captured here.
-        // They cannot be live-learned because the user must click Add (LMB) to
-        // confirm a mapping — that very click would otherwise latch as part of
-        // the captured combo. They are added via the Special dropdown instead.
-
-        // Block the panic-mode chord from being captured. If the currently
-        // held set matches the configured Panic shortcut, drop it so the user
-        // cannot accidentally rebind the emergency-stop onto a Remapper output.
-        // We check exact equality (same modifiers + same key) so adjacent
-        // chords still work — only the exact panic combo is filtered.
-        if let Some(ref panic_key_name) = panic_shortcut.key {
-            let panic_id = if matches!(panic_key_name.as_str(), "Escape") {
-                "key_escape".to_string()
-            } else {
-                format!("key_{}", panic_key_name.to_ascii_lowercase())
-            };
-            let modifiers_match =
-                m.shift   == panic_shortcut.shift
-                && m.ctrl == panic_shortcut.ctrl
-                && m.alt  == panic_shortcut.alt
-                && (m.command && !m.ctrl) == panic_shortcut.win;
-            if modifiers_match && out.iter().any(|p| p == &panic_id) {
-                out.retain(|p| p != &panic_id
-                    && p != "key_shift" && p != "key_ctrl"
-                    && p != "key_alt"   && p != "key_win");
             }
         }
     });
@@ -395,6 +419,12 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
             .on_hover_text(p.display_name());
         return;
     }
+    let imu = flexinput_core::imu::imu_pin(pin_id);
+    if let (Some(p), None) = (imu, remapper_icons::pin_svg(skin, pin_id)) {
+        ui.label(egui::RichText::new(imu_chip_label(p)).size(13.0).strong())
+            .on_hover_text(p.name);
+        return;
+    }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
         let tint = egui::Color32::TRANSPARENT;
@@ -412,9 +442,13 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
                 Some(handle)
             });
         if let Some(tex) = tex {
-            let resp = ui.add(egui::Image::new(&tex)
+            let mut resp = ui.add(egui::Image::new(&tex)
                 .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                 .tint(Color32::WHITE));
+            // A motion glyph is clearer with its name to hand.
+            if let Some(p) = imu {
+                resp = resp.on_hover_text(p.name);
+            }
             // Overlay the extra-button label (e.g. "PL1") so one generic paddle
             // glyph can stand for both paddle rows on a side.
             if let Some(label) = remapper_icons::extra_button_label(pin_id) {
@@ -507,6 +541,12 @@ pub(crate) fn paint_chord_chip_tinted(
     // the dimmed "icon missing" pill).
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return paint_text_pill(painter, top_left, chip_h, p.short_label(), false);
+    }
+    // The pad's motion without a glyph: the label is the rendering.
+    if let Some(p) = flexinput_core::imu::imu_pin(pin_id) {
+        if remapper_icons::pin_svg(skin, pin_id).is_none() {
+            return paint_text_pill(painter, top_left, chip_h, imu_chip_label(p), false);
+        }
     }
 
     // Probe current skin first; fall back to any other skin that has the
@@ -646,6 +686,45 @@ pub(crate) fn remapper_resolve_skin(
     }
 }
 
+/// The glyph dialect for a mapping node's OUTPUTS: that of the device its
+/// AutoMap output ends at (a virtual DualSense sends ✕, not A), Xbox when it
+/// ends nowhere yet.
+pub(crate) fn remapper_out_skin(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> crate::canvas::remapper_icons::Skin {
+    crate::app::find_automap_dest_sink_for_viewer(snarl, node_id, automap_parent)
+        .map(|d| crate::canvas::remapper_icons::skin_from_device_id(&d))
+        .unwrap_or(crate::canvas::remapper_icons::Skin::Xbox)
+}
+
+fn picker_skins_id(path: &[usize], node_id: NodeId) -> egui::Id {
+    egui::Id::new(("fxi_picker_skins", path.to_vec(), node_id.0))
+}
+
+/// Publish a mapping node's input and output glyph dialects for the Choose
+/// picker, which draws the pad in the dialect of the side it's choosing. Every
+/// frame the body draws, keyed like a picker session (sub-patch path + node).
+pub(crate) fn publish_picker_skins(
+    ctx: &egui::Context,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    node_id: NodeId,
+    skins: (crate::canvas::remapper_icons::Skin, crate::canvas::remapper_icons::Skin),
+) {
+    let id = picker_skins_id(&subpatch_path(automap_parent), node_id);
+    ctx.data_mut(|d| d.insert_temp(id, skins));
+}
+
+/// A picker target's `(input, output)` glyph dialects, as its body published.
+pub(crate) fn picker_skins(
+    ctx: &egui::Context,
+    path: &[usize],
+    node_id: NodeId,
+) -> Option<(crate::canvas::remapper_icons::Skin, crate::canvas::remapper_icons::Skin)> {
+    ctx.data(|d| d.get_temp(picker_skins_id(path, node_id)))
+}
+
 /// True for the synthetic touchpad-swipe output pins (continuous → analog mode).
 pub(crate) fn remapper_out_is_swipe(pin_id: &str) -> bool {
     matches!(pin_id, "touch_swipe_x" | "touch_swipe_y")
@@ -675,9 +754,18 @@ pub(crate) fn remapper_key_to_pin_id(key: egui::Key) -> String {
     }
 }
 
+/// A chip's text for an IMU input: its family, then its axis and direction
+/// ("Gyro Y→", "Tilt N↑").
+pub(crate) fn imu_chip_label(p: &flexinput_core::imu::ImuPin) -> String {
+    format!("{} {}", p.kind.label(), p.short)
+}
+
 pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
         return p.display_name.to_string();
+    }
+    if let Some(p) = flexinput_core::imu::imu_pin(pin_id) {
+        return p.name.to_string();
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return p.display_name();

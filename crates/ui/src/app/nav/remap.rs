@@ -644,29 +644,27 @@ impl FlexInputApp {
                         purpose: crate::canvas::viewer::MidiModalPurpose::Add,
                     }, None);
                 } else if action == "_nav_act_special" || lean_draft.is_some() {
-                    self.gamepad_nav.kbm_picker_open = true;
-                    self.gamepad_nav.kbm_picker_idx = 0;
-                    self.gamepad_nav.kbm_picker_node = Some(inner);
-                    self.gamepad_nav.kbm_picker_path = nav_path(outer_id);
-                    self.gamepad_nav.kbm_picker_touch_zones = false;
-                    self.gamepad_nav.kbm_picker_exclude = None;
+                    use crate::canvas::viewer::SpecialPickerRequest;
+                    let path = nav_path(outer_id);
+                    let req = if let Some(draft) = lean_draft {
+                        SpecialPickerRequest {
+                            inner,
+                            path,
+                            draft_key: draft.to_string(),
+                            phase_key: Some(draft.replace("_draft", "_phase")),
+                            ..Default::default()
+                        }
+                    } else if self.nav_selected_module_id(outer_id).as_deref() == Some("module.map_action") {
+                        SpecialPickerRequest::map_action(inner, path)
+                    } else {
+                        SpecialPickerRequest::remapper(inner, path, &self.nav_remap_phase(outer_id, inner))
+                    };
                     // When the config overlay owns nav (config_nav_sel set), draw
                     // the picker in its own always-on-top viewport over the game,
                     // not the main window (which is behind the game).
-                    self.gamepad_nav.kbm_picker_viewport =
-                        if self.gamepad_nav.config_nav_sel.is_some() {
-                            Some(crate::config_overlay::picker_viewport_id())
-                        } else {
-                            None
-                        };
-                    self.gamepad_nav.kbm_picker_draft_key =
-                        lean_draft.unwrap_or("draft_output").to_string();
-                    self.gamepad_nav.kbm_picker_phase_key =
-                        match action {
-                            "_nav_act_special_left" => Some("_lean_left_phase"),
-                            "_nav_act_special_right" => Some("_lean_right_phase"),
-                            _ => None,
-                        }.map(|s| s.to_string());
+                    let viewport = self.gamepad_nav.config_nav_sel.is_some()
+                        .then(crate::config_overlay::picker_viewport_id);
+                    self.open_special_picker(req, viewport);
                 } else {
                     self.set_subpatch_param_bool(outer_id, inner, action, true);
                 }
@@ -903,13 +901,21 @@ impl FlexInputApp {
         });
     }
 
-    /// Open the shared KB/M + touchpad picker for a mouse-driven Special click.
-    /// `viewport` is the egui viewport the click came from (`None` = the main
-    /// window) — the modal is drawn inside THAT viewport so it appears on the
-    /// window the user is actually working in.
+    /// Open the shared Choose picker. `viewport` is the egui viewport the
+    /// click came from (`None` = the main window) — the modal is drawn inside
+    /// THAT viewport so it appears on the window the user is actually working in.
+    ///
+    /// A one-shot Learn the card had armed is dropped: choosing replaces it, and
+    /// an armed capture holds gamepad nav, which the picker needs.
     pub(crate) fn open_special_picker(&mut self, req: crate::canvas::viewer::SpecialPickerRequest,
         viewport: Option<egui::ViewportId>)
     {
+        if req.input_key.is_some() {
+            self.picker_write(&req.path, req.inner, &|node| {
+                node.params.insert("_nav_capture_armed".into(), serde_json::Value::Bool(false));
+                node.params.insert("_nav_arm_idle".into(), serde_json::Value::Bool(false));
+            });
+        }
         self.gamepad_nav.kbm_picker_open = true;
         self.gamepad_nav.kbm_picker_idx = 0;
         self.gamepad_nav.kbm_picker_node = Some(req.inner);
@@ -918,7 +924,99 @@ impl FlexInputApp {
         self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
         self.gamepad_nav.kbm_picker_touch_zones = req.touch_zones;
         self.gamepad_nav.kbm_picker_exclude = req.exclude_pin_prefix;
+        // Open where the side being chosen is: an input is on the pad, an
+        // output most often a key.
+        self.gamepad_nav.kbm_picker_tab = match req.stage {
+            crate::kbm_picker::PickStage::Input => crate::kbm_picker::PickerTab::Gamepad,
+            crate::kbm_picker::PickStage::Output => crate::kbm_picker::PickerTab::Kbm,
+        };
+        self.gamepad_nav.kbm_picker_stage = req.stage;
+        self.gamepad_nav.kbm_picker_in_key = req.input_key;
+        self.gamepad_nav.kbm_picker_inputs = req.inputs;
         self.gamepad_nav.kbm_picker_viewport = viewport;
+        self.picker_select_tab(self.gamepad_nav.kbm_picker_tab);
+    }
+
+    /// The open session's tabs, in order. Typing text only ever wants keys;
+    /// everything else has the Macros tab — empty or not, so it can be found.
+    pub(crate) fn picker_tabs(&self) -> Vec<crate::kbm_picker::PickerTab> {
+        use crate::kbm_picker::PickerTab;
+        if self.gamepad_nav.kbm_picker_use == crate::gamepad_nav::PickerUse::Text {
+            return vec![PickerTab::Kbm];
+        }
+        let mut tabs = vec![PickerTab::Kbm];
+        if self.picker_layout().pad {
+            tabs.push(PickerTab::Gamepad);
+        }
+        tabs.push(PickerTab::Macros);
+        tabs
+    }
+
+    /// The tab showing: the session's, or its first when it hasn't that one.
+    pub(crate) fn picker_tab(&self) -> crate::kbm_picker::PickerTab {
+        let tabs = self.picker_tabs();
+        if tabs.contains(&self.gamepad_nav.kbm_picker_tab) {
+            self.gamepad_nav.kbm_picker_tab
+        } else {
+            tabs[0]
+        }
+    }
+
+    /// The cells on a tab of the open session's board. Shared by the renderer
+    /// and the gamepad driver so what's drawn is what's navigable.
+    pub(crate) fn picker_tab_cells(
+        &self,
+        tab: crate::kbm_picker::PickerTab,
+        macros: &[crate::macro_icons::MacroDisplayEntry],
+    ) -> Vec<crate::kbm_picker::PickerCell> {
+        crate::kbm_picker::tab_cells(crate::kbm_picker::picker_cells(self.picker_layout(), macros), tab)
+    }
+
+    /// The draft param the picker is filling right now.
+    pub(crate) fn picker_active_key(&self) -> String {
+        match (self.gamepad_nav.kbm_picker_stage, &self.gamepad_nav.kbm_picker_in_key) {
+            (crate::kbm_picker::PickStage::Input, Some(k)) => k.clone(),
+            _ => self.gamepad_nav.kbm_picker_draft_key.clone(),
+        }
+    }
+
+    /// Whether the session can switch sides: it has both an input and an
+    /// output to fill.
+    pub(crate) fn picker_has_both_stages(&self) -> bool {
+        self.gamepad_nav.kbm_picker_in_key.is_some() && !self.gamepad_nav.kbm_picker_draft_key.is_empty()
+    }
+
+    /// Which clusters the board shows for the open session. Shared by the
+    /// renderer and the gamepad driver so what's drawn is what's navigable.
+    pub(crate) fn picker_layout(&self) -> crate::kbm_picker::PickerLayout {
+        let chord = self.gamepad_nav.kbm_picker_use == crate::gamepad_nav::PickerUse::Chord;
+        let tz = self.gamepad_nav.kbm_picker_touch_zones;
+        crate::kbm_picker::PickerLayout {
+            tz,
+            // Every session has the pad: JSM names its buttons, and a mapping
+            // card can send one as surely as Learn can capture one.
+            pad: true,
+            // A mapping card reads a stick's directions, and sends them as a
+            // push (Remapper, Lean, Touch Zones alike).
+            sticks: chord,
+            // A whole stick: a Remapper's input or output, a Touch Zones zone's
+            // output.
+            whole_sticks: chord && (tz || self.gamepad_nav.kbm_picker_inputs),
+            inputs: chord && self.gamepad_nav.kbm_picker_inputs,
+        }
+    }
+
+    /// Clear the chord the picker is filling. Clearing a Remapper or Map
+    /// Action's INPUT puts it back to capturing, so a card can't be added with
+    /// no input.
+    pub(crate) fn picker_clear_draft(&mut self) {
+        let path = self.gamepad_nav.kbm_picker_path.clone();
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
+        let key = self.picker_active_key();
+        self.picker_set_draft(&path, inner, &key, &[]);
+        if self.gamepad_nav.kbm_picker_stage == crate::kbm_picker::PickStage::Input {
+            self.picker_set_param_str(&path, inner, "ui_phase", "capturing");
+        }
     }
 
     /// Whether the picker's current target accepts analog-only outputs (swipe).
@@ -946,15 +1044,48 @@ impl FlexInputApp {
     /// target into the draft-visible phase. Shared by gamepad South and mouse
     /// click. Analog-only pins (swipe) are ignored unless the input is analog.
     pub(crate) fn picker_append_pin(&mut self, pin: &str) {
-        // Gate analog-only outputs.
-        let analog_only = matches!(pin,
-            "touch_swipe_x" | "touch_swipe_y" | "scroll_x" | "scroll_y");
-        if analog_only && !self.picker_analog_input_ok() { return; }
+        let stage = self.gamepad_nav.kbm_picker_stage;
+        if !crate::kbm_picker::stage_allows(stage, pin) { return; }
         let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
+        if stage == crate::kbm_picker::PickStage::Input {
+            if let Some(key) = self.gamepad_nav.kbm_picker_in_key.clone() {
+                self.append_input_pin(&path, inner, &key, pin);
+            }
+            return;
+        }
+        // Gate analog-only outputs.
+        let analog_only = matches!(pin,
+            "touch_swipe_x" | "touch_swipe_y" | "scroll_x" | "scroll_y" | "left_stick" | "right_stick");
+        if analog_only && !self.picker_analog_input_ok() { return; }
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
         let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
         self.append_output_pin(&path, inner, &draft_key, phase_key.as_deref(), pin);
+    }
+
+    /// Add one input pin to a Remapper / Map Action's input draft and latch it,
+    /// as a finished Learn capture would: the Remapper moves on to its output
+    /// (unless it is already learning one), the Map Action to Add.
+    pub(crate) fn append_input_pin(
+        &mut self,
+        path: &[usize],
+        inner: egui_snarl::NodeId,
+        draft_key: &str,
+        pin: &str,
+    ) {
+        let mut ins = self.picker_draft_vec(path, inner, draft_key);
+        if !ins.iter().any(|p| p == pin) { ins.push(pin.to_string()); }
+        self.picker_set_draft(path, inner, draft_key, &ins);
+        let Some(node) = self.picker_node(path, inner) else { return; };
+        let phase = node.params.get("ui_phase").and_then(|v| v.as_str()).unwrap_or("idle");
+        let next = match node.module_id.as_str() {
+            "module.remapper" if phase != "learning" => Some("ready_to_learn"),
+            "module.map_action" => Some("ready_to_add"),
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.picker_set_param_str(path, inner, "ui_phase", next);
+        }
     }
 
     /// Add one output pin to a mapping module's output draft and move its phase
@@ -1025,13 +1156,19 @@ impl FlexInputApp {
         match mid.as_deref() {
             Some("module.remapper") => {
                 // Visual order (must match the body + published rects): Learn,
-                // MIDI…, Special(latched), Clear(has_draft), Add(out_draft&&latched).
+                // MIDI…, Choose, Clear(has_draft), Add(in+out drafts && latched).
                 // MIDI… opens the MIDI editor window, which has its own rows —
                 // they are never threaded through this row.
-                let mut v = vec!["_nav_act_learn", crate::canvas::viewer::NAV_ACT_MIDI];
-                if latched { v.push("_nav_act_special"); }
+                let mut v = vec!["_nav_act_learn", crate::canvas::viewer::NAV_ACT_MIDI, "_nav_act_special"];
                 if has_draft { v.push("_nav_act_clear"); }
-                if out_draft && latched { v.push("_nav_act_add"); }
+                if in_draft && out_draft && latched { v.push("_nav_act_add"); }
+                v
+            }
+            // Map Action: Learn, Choose, Clear(has_draft), Add(in_draft).
+            Some("module.map_action") => {
+                let mut v = vec!["_nav_act_learn", "_nav_act_special"];
+                if has_draft { v.push("_nav_act_clear"); }
+                if in_draft { v.push("_nav_act_add"); }
                 v
             }
             // Map Action / Combiner: Learn, Clear(has_draft), Add(in_draft).
@@ -1232,6 +1369,18 @@ impl FlexInputApp {
                 if show_threshold { nav_fields.push(6); }
             }
         }
+        // Fields 10–12 + 13: an IMU card's range per family it reads, then its
+        // Log/Exp — the value boxes under the curve, so reached once it's open.
+        if curve_open {
+            let kinds = self.nav_remap_card_json(outer_id, idx)
+                .map(|m| flexinput_core::imu::kinds_read(
+                    m.get("in").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str())))
+                .unwrap_or_default();
+            if !kinds.is_empty() {
+                nav_fields.extend(kinds.iter().map(|&k| crate::canvas::viewer::imu_range_field(k) as usize));
+                nav_fields.push(crate::canvas::viewer::IMU_LOG_FIELD as usize);
+            }
+        }
         // Field 7 (Touch Zones only): the per-card "Rel. center" (adaptive) slider,
         // shown for the same cards the body reveals it on — so it's finally gamepad-
         // reachable, changed with up/down like any other field.
@@ -1373,6 +1522,27 @@ impl FlexInputApp {
                     if delta != 0.0 {
                         self.nav_nudge_card_threshold(outer_id, idx, delta);
                     }
+                }
+            }
+            10..=13 => {
+                // An IMU card's range (10–12, by ratio) or Log/Exp (13, by
+                // amount): up/down step, the stick sweeps.
+                let kind = flexinput_core::imu::ImuKind::ALL.get(field - 10).copied();
+                let c = if mag > 0.5 {
+                    let accel = self.settings.cursor_accel.max(1.0);
+                    nav.lstick.y.signum() * nav.lstick.y.abs().powf(accel) * dt
+                } else {
+                    0.0
+                };
+                let by = match kind {
+                    Some(_) if edit_press != 0 => 1.1f32.powi(edit_press),
+                    Some(_) => (c * 1.5).exp(),
+                    None if edit_press != 0 => edit_press as f32 * 0.05,
+                    None => c * 0.6,
+                };
+                let idle = if kind.is_some() { by == 1.0 } else { by == 0.0 };
+                if !idle {
+                    self.nav_nudge_card_imu(outer_id, idx, kind, by);
                 }
             }
             8 => {

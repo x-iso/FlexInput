@@ -24,6 +24,7 @@ pub(crate) use midi_modal::{show_over_game, MidiModalOutcome};
 // Viewport-agnostic free fns the config overlay reuses (drawn on the overlay
 // viewport, not just the main window).
 pub(crate) use remap::draw_remap_card_glow;
+pub(crate) use pickers::PickerInteraction;
 pub(crate) use config::draw_config_field_glow;
 
 /// The nav `outer` that stands for the TAB CANVAS itself, not a sub-patch on it.

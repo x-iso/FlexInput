@@ -216,6 +216,13 @@ pub mod keymouse_hm;
 #[cfg(windows)]
 mod physical_mouse;
 
+/// Physical keys held right now (Raw Input, whatever has focus; our own virtual
+/// keyboard and injected keys left out), or `None` when that can't be known.
+#[cfg(windows)]
+pub use physical_mouse::keyboard::physical_keys_held;
+#[cfg(not(windows))]
+pub fn physical_keys_held() -> Option<Vec<&'static str>> { None }
+
 /// List available virtual device *types* — no connections are made.
 pub fn available_device_kinds() -> &'static [DeviceKind] {
     #[cfg(windows)]
