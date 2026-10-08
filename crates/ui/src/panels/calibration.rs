@@ -203,6 +203,14 @@ fn read_vec2(live: &LiveSignals, dev: &str, x_pin: &str, y_pin: &str) -> (f32, f
     (read_float(live, dev, x_pin), read_float(live, dev, y_pin))
 }
 
+/// Whether gyro calibration (manual and auto) leaves the accelerometer alone
+/// (`skip_accel_cal`). ON unless the user turned it off: an accel offset is
+/// only right when measured on a perfectly level surface — anywhere else it
+/// bakes the tilt in and makes things worse — and most uses never need one.
+fn skip_accel_cal(params: &HashMap<String, Value>) -> bool {
+    params.get("skip_accel_cal").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
 fn read_param_f32(canvas: &Canvas, node: NodeId, key: &str, fallback: f32) -> f32 {
     canvas.snarl.get_node(node)
         .and_then(|n| n.params.get(key).and_then(|v| v.as_f64()))
@@ -628,8 +636,7 @@ pub fn auto_cal_tick(ctx: &egui::Context, canvas: &mut Canvas, live: &LiveSignal
             && n.params.get("gyro_auto_cal").and_then(|v| v.as_bool()).unwrap_or(false))
         .filter_map(|(id, n)| {
             let dev = n.params.get("device_id").and_then(|v| v.as_str())?.to_string();
-            let skip_accel = n.params.get("skip_accel_cal")
-                .and_then(|v| v.as_bool()).unwrap_or(false);
+            let skip_accel = skip_accel_cal(&n.params);
             Some((id, dev, skip_accel, node_pin_ids(n)))
         })
         .collect();
@@ -1356,8 +1363,7 @@ fn gyro_section(
                 if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                     n.params.insert("gyro_offset".into(), serde_json::json!(writeback));
                     // Skip accelerometer writes if the user toggled that off.
-                    let skip_accel = n.params.get("skip_accel_cal")
-                        .and_then(|v| v.as_bool()).unwrap_or(false);
+                    let skip_accel = skip_accel_cal(&n.params);
                     if !skip_accel {
                         n.params.insert("accel_offset".into(), serde_json::json!(a_write));
                     }
@@ -1393,8 +1399,7 @@ fn gyro_section(
 
     // Hoist the skip-accel flag so both the inner UI and gyro_scope can see it.
     let skip_accel_initial = canvas.snarl.get_node(node_id)
-        .and_then(|n| n.params.get("skip_accel_cal").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+        .is_none_or(|n| skip_accel_cal(&n.params));
 
     // Read axis-alignment state once — used by both the Axis alignment
     // button row in the left column and the sample-collection block at
