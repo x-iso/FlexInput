@@ -229,32 +229,12 @@ pub fn settle_trigger_effect(text: &str, line: usize, was: Option<&str>) -> Stri
     }
     let words: Vec<&str> = rhs.split_whitespace().collect();
     let Some(&mode) = words.first() else { return text.to_string() };
-    let Some(params) = super::feedback::effect_params(mode) else { return text.to_string() };
-    // What the line says now, by name — the numbers read against the mode they
-    // were written for. A number with no name there has nothing to carry into.
-    let old = was.and_then(super::feedback::effect_params).unwrap_or(params);
-    let had: Vec<(&str, u32)> = old
-        .iter()
-        .zip(words.iter().skip(1).map_while(|w| w.parse::<u32>().ok()))
-        .map(|(p, n)| (p.name, n))
-        .collect();
-    let mut v: Vec<u8> = params
-        .iter()
-        .map(|prm| {
-            had.iter()
-                .find(|(n, _)| *n == prm.name)
-                .map(|(_, x)| (*x).clamp(prm.lo as u32, prm.hi as u32) as u8)
-                .unwrap_or(prm.default)
-        })
-        .collect();
-    for &(early, late) in super::feedback::effect_orderings(mode) {
-        if v[late] <= v[early] {
-            v[late] = (v[early] + 1).min(params[late].hi);
-            if v[late] <= v[early] {
-                v[early] = v[late].saturating_sub(1).max(params[early].lo);
-            }
-        }
-    }
+    // What the line says now — the numbers read against the mode they were
+    // written for.
+    let old: Vec<u32> = words.iter().skip(1).map_while(|w| w.parse::<u32>().ok()).collect();
+    let Some(v) = super::feedback::settle_effect_values(mode, was, &old) else {
+        return text.to_string();
+    };
     let mut value = mode.to_string();
     for n in &v {
         value.push(' ');

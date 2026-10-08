@@ -36,6 +36,8 @@ pub use jsm::{jsm_at_names, jsm_at_name_spans, jsm_bindings, jsm_catalogue, jsm_
     jsm_line_count, jsm_line_span, jsm_scrub_number,
     jsm_selection, jsm_tokens_at, JsmCursor, JsmToken, JsmTokenKind,
     jsm_note_missing_inputs, jsm_midi_tag,
+    jsm_effect_orderings, jsm_effect_params, jsm_effect_pins, jsm_settle_effect_values,
+    JsmEffectParam, JSM_TRIGGER_PINS,
     jsm_sens_curve, jsm_sens_curve_warped, jsm_set_knob, jsm_set_setting, jsm_setting_line,
     jsm_cal_deg_out, jsm_cal_peak_out, jsm_curve_dps_out, jsm_rotation_out, JSM_MACROS_PARAM, JSM_MACRO_OUTS_PARAM,
     jsm_set_knob_part, jsm_toggle_pair, jsm_knob_key_setting, jsm_pairable, jsm_replace_word,

@@ -313,3 +313,55 @@ pub(crate) fn apply_pad_feedback(
         }
     }
 }
+
+/// Device-node params holding a pad's default adaptive-trigger effect, left then
+/// right: a JSM effect word and its numbers (Calibration window). Absent = no
+/// default; the trigger is left exactly as before.
+pub const TRIGGER_DEFAULT_MODE_PARAMS: [&str; 2] = ["ltrig_effect_mode", "rtrig_effect_mode"];
+pub const TRIGGER_DEFAULT_VALUES_PARAMS: [&str; 2] = ["ltrig_effect_values", "rtrig_effect_values"];
+
+/// Last pass for one physical pad: its default trigger effect, the lowest layer
+/// of all — what a trigger does while NOTHING gives it instructions. Any value
+/// on the trigger's group, Off included, is an instruction: the game's (a
+/// virtual DualSense publishes its trigger pins only once the game has set that
+/// trigger's effect — a game without adaptive-trigger support, or any other
+/// virtual pad, publishes none), a network peer's, a module's override or
+/// injection, or a direct wire.
+///
+/// A default of `OFF` is meaningful: it is how a cleared default lets go of the
+/// effect the pad would otherwise hold (the pad keeps its last report).
+pub(crate) fn apply_default_trigger_effects(
+    st: &SinkTarget,
+    params: &HashMap<String, serde_json::Value>,
+    collector_sigs: &HashMap<(String, String), Signal>,
+    sink_outputs: &mut HashMap<(String, String), Signal>,
+) {
+    for side in 0..2 {
+        let Some(mode) = params.get(TRIGGER_DEFAULT_MODE_PARAMS[side]).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let pins = super::JSM_TRIGGER_PINS[side];
+        let dev = st.device_id.as_str();
+        // Only a pad with adaptive triggers, and only where no wire owns them.
+        if !st.pin_ids.iter().any(|p| p == pins[0]) { continue; }
+        let wired = st.pin_ids.iter().enumerate().any(|(i, pid)| {
+            pins.contains(&pid.as_str()) && st.multi_sources.get(i).is_some_and(|s| !s.is_empty())
+        });
+        if wired { continue; }
+        let override_key = format!("{FEEDBACK_OVERRIDE}{dev}");
+        if pins.iter().any(|p| collector_sigs.contains_key(&(override_key.clone(), p.to_string()))) {
+            continue;
+        }
+        if pins.iter().any(|p| sink_outputs.contains_key(&(dev.to_string(), p.to_string()))) {
+            continue;
+        }
+        let values: Vec<u8> = params.get(TRIGGER_DEFAULT_VALUES_PARAMS[side])
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0).min(255) as u8).collect())
+            .unwrap_or_default();
+        let Some(effect) = super::jsm_effect_pins(mode, &values) else { continue };
+        for (pin, v) in pins.iter().zip(effect) {
+            sink_outputs.insert((dev.to_string(), pin.to_string()), Signal::Float(v));
+        }
+    }
+}

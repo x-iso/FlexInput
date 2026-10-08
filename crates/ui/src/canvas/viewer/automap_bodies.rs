@@ -199,6 +199,24 @@ pub(crate) fn touchpad_route_header_controls(
          On: fingers up scroll up, like turning a mouse wheel.");
 }
 
+/// A device.source's sticks have different deadzones: the right stick's own
+/// `deadzone_r` (Calibration window) differs from `deadzone`. A gamepad card's
+/// single Deadzone value then shows in orange, and editing it sets both sticks
+/// again (see [`set_both_stick_deadzones`]).
+pub(crate) fn stick_deadzones_differ(params: &std::collections::HashMap<String, Value>) -> bool {
+    let left = params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1);
+    params.get("deadzone_r").and_then(|v| v.as_f64()).is_some_and(|r| (r - left).abs() > 1e-6)
+}
+
+/// The gamepad card's Deadzone: one value for both sticks.
+pub(crate) fn set_both_stick_deadzones(params: &mut std::collections::HashMap<String, Value>, dz: f32) {
+    params.insert("deadzone".into(), Value::from(dz as f64));
+    params.remove("deadzone_r");
+}
+
+/// Orange, for a card value that stands for two that differ.
+pub(crate) const MIXED_VALUE_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 160, 40);
+
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
     if !is_device_source { return (false, false, false); }
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {

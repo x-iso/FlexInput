@@ -672,6 +672,12 @@ impl FlexInputApp {
     pub(crate) fn set_node_param_f32(&mut self, node: egui_snarl::NodeId, key: &str, val: f32) {
         let canvas = &mut self.tabs[self.active_tab].canvas;
         if let Some(n) = canvas.snarl.get_node_mut(node) {
+            // A gamepad card's Deadzone is both sticks' (the Calibration
+            // window can set the right stick apart).
+            if n.module_id == "device.source" && key == "deadzone" {
+                crate::canvas::viewer::set_both_stick_deadzones(&mut n.params, val);
+                return;
+            }
             n.params.insert(key.to_string(), serde_json::Value::from(val as f64));
         }
     }

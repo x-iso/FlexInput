@@ -25,12 +25,16 @@ use crate::canvas::Canvas;
 
 // ── Layout / typography constants ────────────────────────────────────────────
 
-/// Fraction of the window width allocated to the left text column. The rest
-/// (minus a gap) becomes the right widget column.
-const LEFT_FRAC: f32 = 0.40;
-/// Minimum left-column width — clamps so instruction text never goes too
-/// narrow on small windows.
-const LEFT_MIN_W: f32 = 320.0;
+/// Fraction of the window width the right widget column (scopes, sticks,
+/// triggers) takes. It hugs the window's right edge; the left text column fills
+/// whatever is left, wrapping as the window narrows.
+const RIGHT_FRAC: f32 = 0.60;
+/// Narrowest the right widget column gets.
+const RIGHT_MIN_W: f32 = 360.0;
+/// Narrowest the left text column gets — the visuals give way below this.
+const LEFT_MIN_W: f32 = 240.0;
+/// Room kept clear of the window's right edge (the resize grip).
+const RIGHT_PAD: f32 = 4.0;
 
 /// Gap between the two side-by-side vectorscopes / triggers.
 const SCOPE_GAP_FRAC: f32 = 0.03;
@@ -148,12 +152,18 @@ struct Layout {
 }
 
 impl Layout {
+    /// Widths from the window's ACTUAL width — never more. Content laid out
+    /// wider than the window makes egui grow the window back to fit it, which
+    /// is what made it bounce back when dragged narrower.
     fn compute(ui: &egui::Ui) -> Self {
-        let avail = ui.available_width().max(700.0);
-        let left_w = (avail * LEFT_FRAC).max(LEFT_MIN_W);
-        // Subtract a small horizontal padding so the right column doesn't
-        // collide with the window's right edge.
-        let right_w = (avail - left_w - 12.0).max(360.0);
+        let avail = ui.available_width();
+        // Between the columns: the row's own item spacing.
+        let col_gap = ui.spacing().item_spacing.x;
+        let usable = (avail - col_gap - RIGHT_PAD).max(0.0);
+        let right_w = (usable * RIGHT_FRAC)
+            .min(usable - LEFT_MIN_W)
+            .max(RIGHT_MIN_W.min(usable));
+        let left_w = (usable - right_w).max(0.0);
         let scope_gap = (right_w * SCOPE_GAP_FRAC).clamp(8.0, 24.0);
         let cell_w = ((right_w - scope_gap) * 0.5).max(120.0);
         let cell_h = cell_w; // vectorscope is square
@@ -492,8 +502,10 @@ pub fn show_windows(
             .min_width(min_w)
             .min_height(min_h)
             .show(ctx, |ui| {
-                draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps,
-                spike_settings, gyro_drift);
+                scaled_below_ref_width(ui, |ui| {
+                    draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps,
+                        spike_settings, gyro_drift);
+                });
             });
         if !is_open {
             to_close.push(node_id);
@@ -501,6 +513,44 @@ pub fn show_windows(
         }
     }
     for nid in to_close { open.remove(&nid); }
+}
+
+/// Content width (points) below which the window body stops reflowing and is
+/// drawn at this width, scaled down to fit — smaller text, scopes and controls
+/// alike. Narrower than this the two-column layout has no good arrangement left
+/// (instruction text a word a line, control rows breaking apart), so shrinking
+/// it whole reads better than squeezing it.
+const CAL_REF_W: f32 = 780.0;
+/// Smallest the body is scaled to, however narrow the window.
+const CAL_MIN_SCALE: f32 = 0.35;
+
+/// Run `add_contents` at the window's width when it is at least [`CAL_REF_W`],
+/// else at `CAL_REF_W` on a child layer scaled down to the window's width. The
+/// layer transform scales input along with painting, so every control keeps
+/// working; the parent reserves only the scaled height, so the window never
+/// sees the body as wider than itself.
+fn scaled_below_ref_width(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let avail = ui.available_width();
+    if avail >= CAL_REF_W {
+        add_contents(ui);
+        return;
+    }
+    let k = (avail / CAL_REF_W).max(CAL_MIN_SCALE);
+    let origin = ui.cursor().min;
+    let layer = egui::LayerId::new(ui.layer_id().order, ui.id().with("cal_scaled_body"));
+    ui.ctx().set_sublayer(ui.layer_id(), layer);
+    let to_global = egui::emath::TSTransform::from_translation(origin.to_vec2())
+        * egui::emath::TSTransform::from_scaling(k);
+    ui.ctx().set_transform_layer(layer, to_global);
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .layer_id(layer)
+            .max_rect(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(CAL_REF_W, f32::INFINITY))),
+    );
+    inner.set_clip_rect(to_global.inverse() * ui.clip_rect());
+    add_contents(&mut inner);
+    let h = inner.min_rect().height() * k;
+    ui.allocate_space(egui::vec2(avail, h));
 }
 
 // ── Auto-calibration: flat + still watcher ───────────────────────────────────
@@ -1367,11 +1417,11 @@ fn gyro_section(
             instruct_line(ui, &[(true, "put your gamepad flat on level surface.")]);
             ui.add_space(6.0);
 
-            // start / reset / ✓ skip accelerometer — all on one line.
-            // The start button gains an orange progress overlay during
-            // sampling so there's no separate "Sampling… N/M" label
-            // shifting the layout below.
-            ui.horizontal(|ui| {
+            // start / reset / ✓ skip accelerometer — one line, wrapping when
+            // the column is narrow. The start button gains an orange progress
+            // overlay during sampling so there's no separate "Sampling… N/M"
+            // label shifting the layout below.
+            ui.horizontal_wrapped(|ui| {
                 let gyro_progress = if sampling_now {
                     (n_now as f32 / GYRO_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
                 } else { 0.0 };
@@ -1446,7 +1496,7 @@ fn gyro_section(
             ui.add_space(8.0);
 
             // "Axis alignment" header + inline solve / reset buttons.
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Axis alignment").size(INSTRUCT_SIZE).strong());
                 let all = or_captured.iter().all(|c| *c);
                 if ui.add_enabled(all && or_sampling_axis.is_none(),
@@ -1493,7 +1543,8 @@ fn gyro_section(
             // The active button gets an orange progress overlay; the
             // "N/M" sampling text is dropped because the fill IS the
             // progress indicator (and avoids button-label width jitter).
-            ui.horizontal(|ui| {
+            // Wraps onto more lines when the column is narrow.
+            ui.horizontal_wrapped(|ui| {
                 for ai in 0..3 {
                     let active = or_sampling_axis == Some(ai);
                     let core = if or_captured[ai] {
@@ -1558,7 +1609,7 @@ fn gyro_section(
                 .and_then(|n| n.params.get("spike_window").and_then(|v| v.as_u64()))
                 .unwrap_or(3) as u8;
             let mut filter_changed = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Outlier spike filter")
                     .size(INSTRUCT_SIZE).strong());
@@ -1587,7 +1638,7 @@ fn gyro_section(
             // Window width. Sets how long a burst the filter can repair, and
             // costs latency in direct proportion — which is exactly why it is
             // a control and not a constant.
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.add_space(4.0);
                 ui.add_enabled_ui(enabled, |ui| {
@@ -1643,7 +1694,7 @@ fn gyro_section(
                     ))
                     .unwrap_or((false, 2.0, 0.0, false));
                 let mut dz_changed = false;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(egui::RichText::new("Noise-floor deadzone")
                         .size(INSTRUCT_SIZE).strong());
@@ -1693,7 +1744,7 @@ fn gyro_section(
             let a_inv = read_invert3(canvas, node_id, "accel_invert");
             let mut g_new = g_inv;
             let mut a_new = a_inv;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Invert axis").size(INSTRUCT_SIZE).strong());
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Gyro:").size(INSTRUCT_SIZE).weak());
@@ -2236,10 +2287,14 @@ fn sticks_section(
     let (rx, ry) = apply_stick_view(raw_rx, raw_ry, rc, rs);
     // Deadzone applied to the displayed dot only (same math the engine uses
     // on the live signal). Lets the user see exactly where their selected
-    // deadzone collapses the dot to center.
-    let deadzone = canvas.snarl.get_node(node_id)
+    // deadzone collapses the dot to center. Each stick has its own: the right
+    // stick's `deadzone_r` when set, else the device's `deadzone`.
+    let dz_l = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("deadzone").and_then(|v| v.as_f64()))
         .map(|v| v as f32).unwrap_or(0.1).clamp(0.0, 0.5);
+    let dz_r = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("deadzone_r").and_then(|v| v.as_f64()))
+        .map(|v| (v as f32).clamp(0.0, 0.5)).unwrap_or(dz_l);
     let apply_dz = |x: f32, y: f32, dz: f32| -> (f32, f32) {
         if dz <= 0.0 { return (x, y); }
         let len = (x * x + y * y).sqrt();
@@ -2249,8 +2304,8 @@ fn sticks_section(
             (x * s, y * s)
         }
     };
-    let (lx, ly) = apply_dz(lx, ly, deadzone);
-    let (rx, ry) = apply_dz(rx, ry, deadzone);
+    let (lx, ly) = apply_dz(lx, ly, dz_l);
+    let (rx, ry) = apply_dz(rx, ry, dz_r);
 
     // Step session.
     let (sampling, l_filled, r_filled, l_cn, r_cn, commit) = ui.ctx().data_mut(|d| {
@@ -2338,7 +2393,7 @@ fn sticks_section(
                  position is observed. The inner ring magnifies the centermost 10% of \
                  deflection so drift is easy to spot.")]);
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if cal_button(ui, if sampling { "Stop" } else { "Start" }).clicked() {
                     ui.ctx().data_mut(|d| {
                         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
@@ -2362,69 +2417,17 @@ fn sticks_section(
                     }
                 }
             });
-            if sampling {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(format!(
-                    "Edge L {}/{} R {}/{}\nRest L {}/{}  R {}/{}",
-                    l_filled, STICK_MIN_BUCKETS, r_filled, STICK_MIN_BUCKETS,
-                    l_cn, STICK_CENTER_TARGET_N, r_cn, STICK_CENTER_TARGET_N,
-                )).size(INSTRUCT_SIZE).color(ORANGE));
-            }
-        });
-        ui.vertical(|ui| {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = lo.scope_gap;
-                let l_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                    .map(|s| s.stick.l_edge).unwrap_or([0.0; STICK_BUCKETS]));
-                let r_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                    .map(|s| s.stick.r_edge).unwrap_or([0.0; STICK_BUCKETS]));
-                let l_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                    .map(|s| s.l_trail.clone()).unwrap_or_default());
-                let r_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                    .map(|s| s.r_trail.clone()).unwrap_or_default());
-                // Only draw scopes for sticks the device actually has. A
-                // Joy-Con half has one, and the missing scope sat permanently
-                // centred — indistinguishable from a dead stick, and the
-                // "rotate the stick fully" step could never complete for it.
-                if caps.left_stick {
-                    stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
-                }
-                if caps.right_stick {
-                    stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
-                }
-            });
-            // Deadzone slider — directly linked to the device.source's
-            // `deadzone` param (same one the header slider edits). Lets
-            // the user tune deadzone down until the displayed dot stops
-            // drifting at rest.
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Deadzone")
-                    .size(INSTRUCT_SIZE).color(ORANGE));
-                let mut dz = deadzone;
-                let resp = ui.add(egui::Slider::new(&mut dz, 0.0_f32..=0.5)
-                    .show_value(false)
-                    .clamping(egui::SliderClamping::Always));
-                ui.add(egui::DragValue::new(&mut dz)
-                    .speed(0.005)
-                    .range(0.0_f32..=0.5)
-                    .fixed_decimals(3));
-                if (dz - deadzone).abs() > f32::EPSILON || resp.changed() {
-                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                        n.params.insert("deadzone".into(),
-                            Value::from(dz.clamp(0.0, 0.5) as f64));
-                    }
-                }
-            });
-            // Rebound filter — the device-level `stick_rebound_*` params the
-            // engine's `filter_stick_rebound` reads: a stick let go that springs
-            // past the centre reads as the centre for this long.
+            // Rebound filter, under the buttons — the device-level
+            // `stick_rebound_*` params the engine's `filter_stick_rebound`
+            // reads: a stick let go that springs past the centre reads as the
+            // centre for this long.
             let (rb_on, rb_ms) = canvas.snarl.get_node(node_id).map(|n| (
                 n.params.get("stick_rebound_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                 n.params.get("stick_rebound_ms").and_then(|v| v.as_f64()).map(|v| v as f32)
                     .unwrap_or(flexinput_engine::eval::STICK_REBOUND_MS_DEFAULT),
             )).unwrap_or((false, flexinput_engine::eval::STICK_REBOUND_MS_DEFAULT));
-            ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
                 let mut on = rb_on;
                 let toggled = ui.checkbox(&mut on, egui::RichText::new("Rebound filter")
                     .size(INSTRUCT_SIZE).color(ORANGE))
@@ -2453,8 +2456,102 @@ fn sticks_section(
                     }
                 }
             });
+            if sampling {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!(
+                    "Edge L {}/{} R {}/{}\nRest L {}/{}  R {}/{}",
+                    l_filled, STICK_MIN_BUCKETS, r_filled, STICK_MIN_BUCKETS,
+                    l_cn, STICK_CENTER_TARGET_N, r_cn, STICK_CENTER_TARGET_N,
+                )).size(INSTRUCT_SIZE).color(ORANGE));
+            }
+        });
+        // The scopes hug the window's right edge, each with its stick's own
+        // deadzone under it.
+        ui.vertical(|ui| {
+            ui.set_width(lo.right_w);
+            let l_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                .map(|s| s.stick.l_edge).unwrap_or([0.0; STICK_BUCKETS]));
+            let r_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                .map(|s| s.stick.r_edge).unwrap_or([0.0; STICK_BUCKETS]));
+            let l_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                .map(|s| s.l_trail.clone()).unwrap_or_default());
+            let r_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                .map(|s| s.r_trail.clone()).unwrap_or_default());
+            // A one-stick pad's single slider is the device's deadzone; with
+            // two, the right stick's is its own (`deadzone_r`).
+            let both = caps.left_stick && caps.right_stick;
+            let mut new_l: Option<f32> = None;
+            let mut new_r: Option<f32> = None;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = lo.scope_gap;
+                // Only draw scopes for sticks the device actually has. A
+                // Joy-Con half has one, and the missing scope sat permanently
+                // centred — indistinguishable from a dead stick, and the
+                // "rotate the stick fully" step could never complete for it.
+                if caps.left_stick {
+                    ui.vertical(|ui| {
+                        ui.set_width(lo.cell_w);
+                        stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
+                        ui.add_space(4.0);
+                        new_l = deadzone_row(ui, lo.cell_w, dz_l, "left");
+                    });
+                }
+                if caps.right_stick {
+                    ui.vertical(|ui| {
+                        ui.set_width(lo.cell_w);
+                        stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
+                        ui.add_space(4.0);
+                        new_r = deadzone_row(ui, lo.cell_w, dz_r, "right");
+                    });
+                }
+            });
+            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                if !both {
+                    if let Some(v) = new_l.or(new_r) {
+                        crate::canvas::viewer::set_both_stick_deadzones(&mut n.params, v);
+                    }
+                } else {
+                    if let Some(v) = new_l {
+                        // The right stick keeps the value it had.
+                        n.params.insert("deadzone_r".into(), Value::from(dz_r as f64));
+                        n.params.insert("deadzone".into(), Value::from(v as f64));
+                    }
+                    if let Some(v) = new_r {
+                        n.params.insert("deadzone_r".into(), Value::from(v as f64));
+                    }
+                }
+            }
         });
     });
+}
+
+/// One stick's deadzone under its scope: the device.source's `deadzone` /
+/// `deadzone_r`, which the gamepad card's single slider sets both of. Tune it
+/// down until the displayed dot stops drifting at rest. Returns the new value
+/// when it changed.
+fn deadzone_row(ui: &mut egui::Ui, width: f32, dz: f32, side: &str) -> Option<f32> {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let label = ui.label(egui::RichText::new("Deadzone").size(INSTRUCT_SIZE).color(ORANGE));
+        // The value box keeps its width; the slider takes what is left.
+        let dv_w = 52.0;
+        ui.spacing_mut().slider_width =
+            (width - label.rect.width() - dv_w - 2.0 * 6.0).max(24.0);
+        let mut v = dz;
+        ui.add(egui::Slider::new(&mut v, 0.0_f32..=0.5)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always))
+            .on_hover_text(format!("The {side} stick's deadzone."));
+        ui.add_sized([dv_w, ui.spacing().interact_size.y], egui::DragValue::new(&mut v)
+            .speed(0.005)
+            .range(0.0_f32..=0.5)
+            .fixed_decimals(3));
+        if (v - dz).abs() > f32::EPSILON {
+            out = Some(v.clamp(0.0, 0.5));
+        }
+    });
+    out
 }
 
 /// Number of buckets in the per-stick radial correction profile, mirrored
@@ -2902,6 +2999,13 @@ fn triggers_section(
     let l_norm  = normalise_trig(raw_l, lt_min, lt_max);
     let r_norm  = normalise_trig(raw_r, rt_min, rt_max);
 
+    // A pad with adaptive triggers (a DualSense, natively) also gets each
+    // trigger's default effect, beside its arc.
+    let has_inlet = |pin: &str| canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("input_pin_ids").and_then(|v| v.as_array()).cloned())
+        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(pin)));
+    let adaptive = [has_inlet("trigger_l_mode"), has_inlet("trigger_r_mode")];
+
     // Step session: track min/max + tally top/bottom 1% for jitter-aware bounds.
     let sampling = ui.ctx().data_mut(|d| {
         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
@@ -2945,8 +3049,17 @@ fn triggers_section(
             ui.add_space(8.0);
             instruct_line(ui, &[(false,
                 "Drag the yellow pin to set the Digital output threshold for each trigger.")]);
+            if adaptive.iter().any(|&a| a) {
+                ui.add_space(8.0);
+                instruct_line(ui, &[
+                    (false, "Pick each trigger's "),
+                    (true,  "default effect"),
+                    (false, ": it holds only while nothing else drives that trigger — \
+                             no game effects, no module."),
+                ]);
+            }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if cal_button(ui, if sampling { "Stop & save" } else { "Start" }).clicked() {
                     if sampling {
                         let snap = ui.ctx().data_mut(|d| {
@@ -3003,16 +3116,22 @@ fn triggers_section(
         });
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            // Each trigger widget is half the width of a vectorscope and
-            // sits centered on the matching vectorscope's vertical axis.
-            // Layout per side: [pad-left] [widget] [pad-right] so the cells
-            // remain `lo.cell_w` wide and the two widgets line up under the
-            // vectorscopes above.
-            let pad = ((lo.cell_w - lo.trig_w) * 0.5).max(0.0);
+            let mut fx_l = adaptive[0].then(|| read_trigger_effect(canvas, node_id, "l"));
+            let mut fx_r = adaptive[1].then(|| read_trigger_effect(canvas, node_id, "r"));
+            // Each trigger widget sits under the matching vectorscope. With
+            // effect controls it spans the whole cell, the arc on its right and
+            // the controls in the room the half-circle leaves on its left;
+            // without, it is a square centered on the vectorscope's axis:
+            // [pad-left] [widget] [pad-right], so the cells remain `lo.cell_w`
+            // wide and line up with the vectorscopes above.
+            let wide = fx_l.is_some() || fx_r.is_some();
+            let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
             ui.add_space(pad);
-            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, lt_min, lt_max, lo);
+            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, lt_min, lt_max, lo, wide, fx_l.as_mut());
             ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, rt_min, rt_max, lo);
+            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, rt_min, rt_max, lo, wide, fx_r.as_mut());
+            if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
+            if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                 if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
@@ -3060,16 +3179,209 @@ struct TriggerWidgetEdit {
     threshold: Option<f32>,
     range_min: Option<f32>,
     range_max: Option<f32>,
+    /// The default effect's mode or a number changed (written back by the caller).
+    effect_changed: bool,
+}
+
+// ── Default adaptive-trigger effect ──────────────────────────────────────────
+
+/// A trigger's default adaptive effect, as the device node stores it
+/// (`{l,r}trig_effect_mode` / `{l,r}trig_effect_values`): a JSM effect word and
+/// its numbers, read through JSM's own table so the two cannot disagree. The
+/// engine applies it only while nothing else — game, peer, module or wire —
+/// gives the trigger any instruction (`eval/feedback.rs`). `OFF` is "None".
+#[derive(Clone, PartialEq)]
+struct TriggerEffect {
+    mode: String,
+    values: Vec<u8>,
+}
+
+/// The picker's entries: JSM's effect word and what the dropdown calls it.
+const TRIG_EFFECT_MODES: [(&str, &str); 7] = [
+    ("OFF",            "None"),
+    ("RESISTANCE",     "Resistance"),
+    ("BOW",            "Bow"),
+    ("GALLOPING",      "Galloping"),
+    ("SEMI_AUTOMATIC", "Semi-automatic"),
+    ("AUTOMATIC",      "Automatic"),
+    ("MACHINE",        "Machine"),
+];
+
+/// Height of one effect fader, and the gap under it.
+const FX_ROW_H: f32 = 18.0;
+const FX_ROW_GAP: f32 = 4.0;
+/// Narrowest the effect controls get beside the arc; a narrower cell shrinks the arc.
+const FX_MIN_W: f32 = 120.0;
+/// Most numbers an effect takes (`MACHINE`): the controls reserve room for all
+/// of them, so the box keeps its size as the mode changes.
+const FX_MAX_ROWS: usize = 6;
+
+fn read_trigger_effect(canvas: &Canvas, node: NodeId, side: &str) -> TriggerEffect {
+    let params = canvas.snarl.get_node(node).map(|n| &n.params);
+    let mode = params
+        .and_then(|p| p.get(&format!("{side}trig_effect_mode")).and_then(|v| v.as_str()))
+        .unwrap_or("OFF")
+        .to_ascii_uppercase();
+    let values = params
+        .and_then(|p| p.get(&format!("{side}trig_effect_values")).and_then(|v| v.as_array()))
+        .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0).min(255) as u8).collect())
+        .unwrap_or_default();
+    TriggerEffect { mode, values }
+}
+
+fn write_trigger_effect(canvas: &mut Canvas, node: NodeId, side: &str, fx: &TriggerEffect) {
+    if let Some(n) = canvas.snarl.get_node_mut(node) {
+        n.params.insert(format!("{side}trig_effect_mode"), Value::String(fx.mode.clone()));
+        n.params.insert(format!("{side}trig_effect_values"), serde_json::json!(fx.values));
+    }
+}
+
+fn fx_controls_h(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Small) + FX_ROW_GAP
+        + ui.spacing().interact_size.y + FX_ROW_GAP
+        + FX_MAX_ROWS as f32 * (FX_ROW_H + FX_ROW_GAP)
+}
+
+/// After number `moved` changed, put the mode's ordered pairs (an end past its
+/// start, a second foot after the first) back in order by moving the OTHER
+/// number of the pair — the one the user is dragging goes where they put it.
+fn keep_effect_order(mode: &str, params: &[flexinput_engine::eval::JsmEffectParam], v: &mut [u8], moved: usize) {
+    for &(early, late) in flexinput_engine::eval::jsm_effect_orderings(mode) {
+        if v[late] > v[early] { continue; }
+        if moved == late {
+            v[early] = v[late].saturating_sub(1).max(params[early].lo);
+            if v[late] <= v[early] { v[late] = (v[early] + 1).min(params[late].hi); }
+        } else {
+            v[late] = (v[early] + 1).min(params[late].hi);
+            if v[late] <= v[early] { v[early] = v[late].saturating_sub(1).max(params[early].lo); }
+        }
+    }
+}
+
+/// The mode dropdown and one fader per number the mode takes, inside `rect`.
+/// True when anything changed.
+fn trigger_effect_controls(ui: &mut egui::Ui, rect: egui::Rect, label: &str, fx: &mut TriggerEffect) -> bool {
+    let mut changed = false;
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.y = FX_ROW_GAP;
+
+    ui.add(egui::Label::new(egui::RichText::new("Default adaptive mode")
+        .small().color(Color32::from_gray(170))).truncate());
+    let shown = TRIG_EFFECT_MODES.iter()
+        .find(|(word, _)| fx.mode.eq_ignore_ascii_case(word))
+        .map(|(_, name)| *name)
+        .unwrap_or("None");
+    let mut pick: Option<&str> = None;
+    egui::ComboBox::from_id_salt((ui.id(), "trig_effect_mode", label))
+        .width(rect.width())
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            for (word, name) in TRIG_EFFECT_MODES {
+                if ui.selectable_label(fx.mode.eq_ignore_ascii_case(word), name).clicked() {
+                    pick = Some(word);
+                }
+            }
+        })
+        .response
+        .on_hover_text("Default adaptive-trigger effect. It holds only while nothing else \
+            drives this trigger: the game doesn't use adaptive triggers (or the virtual pad \
+            isn't a DualSense), no module sets the trigger, and no wire feeds it. Anything \
+            that does — even asking for no effect — wins.");
+    if let Some(word) = pick.filter(|w| !fx.mode.eq_ignore_ascii_case(w)) {
+        // Numbers the two modes share by name carry over; the new mode's others
+        // get JSM's defaults — what JSM's editor does when a mode is switched.
+        let old: Vec<u32> = fx.values.iter().map(|&v| v as u32).collect();
+        fx.values = flexinput_engine::eval::jsm_settle_effect_values(word, Some(&fx.mode), &old)
+            .unwrap_or_default();
+        fx.mode = word.to_string();
+        changed = true;
+    }
+
+    let Some(params) = flexinput_engine::eval::jsm_effect_params(&fx.mode) else { return changed };
+    if params.is_empty() {
+        ui.label(egui::RichText::new("Left to the game").small().color(Color32::from_gray(120)));
+        return changed;
+    }
+    if fx.values.len() != params.len() {
+        let old: Vec<u32> = fx.values.iter().map(|&v| v as u32).collect();
+        fx.values = flexinput_engine::eval::jsm_settle_effect_values(&fx.mode, None, &old)
+            .unwrap_or_default();
+        changed = true;
+    }
+    for (i, prm) in params.iter().enumerate() {
+        if let Some(v) = effect_fader(ui, rect.width(), prm, fx.values[i]) {
+            if v != fx.values[i] {
+                fx.values[i] = v;
+                keep_effect_order(&fx.mode, params, &mut fx.values, i);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// One effect number as a slim fader with its name and value inside the bar —
+/// the box beside the arc has no room for a caption row per number. Drag (or
+/// click) anywhere on it: the value follows the pointer. Returns the value while
+/// it is being set.
+fn effect_fader(
+    ui: &mut egui::Ui,
+    width: f32,
+    prm: &flexinput_engine::eval::JsmEffectParam,
+    value: u8,
+) -> Option<u8> {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, FX_ROW_H), Sense::click_and_drag());
+    let span = (prm.hi.saturating_sub(prm.lo)).max(1) as f32;
+    let mut out = None;
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let t = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            out = Some((prm.lo as f32 + t * span).round() as u8);
+        }
+    }
+    let shown = out.unwrap_or(value).clamp(prm.lo, prm.hi);
+    let t = (shown - prm.lo) as f32 / span;
+    let active = resp.hovered() || resp.dragged();
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_gray(if active { 34 } else { 26 }));
+    if t > 0.0 {
+        let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * t, rect.bottom()));
+        painter.rect_filled(fill, 3.0, Color32::from_rgb(52, 92, 128));
+    }
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(if active { 80 } else { 50 })),
+        egui::epaint::StrokeKind::Inside);
+    let font = egui::FontId::proportional(11.5);
+    let mut name = prm.name.to_string();
+    if let Some(first) = name.get_mut(0..1) { first.make_ascii_uppercase(); }
+    painter.text(egui::pos2(rect.left() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER,
+        name, font.clone(), Color32::from_gray(200));
+    painter.text(egui::pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER,
+        shown.to_string(), font, Color32::WHITE);
+    resp.on_hover_text(format!("{} — {} to {}", prm.name, prm.lo, prm.hi));
+    out
 }
 
 /// Trigger arc with live fill + draggable threshold pin (inner ring) +
-/// draggable range min/max pins (outer ring) + Atrig SVG silhouette.
+/// draggable range min/max pins (outer ring) + Atrig SVG silhouette, and — given
+/// `effect` — the trigger's default adaptive effect beside it.
 ///
 /// Geometry: two concentric half-circles on the right side, cup opening
 /// leftward.
 ///   * Inner radius `r_in`   — threshold pin (yellow).
 ///   * Outer radius `r_out`  — range pins (green min, red max).
 /// Clicks within ±r_hit pixels of each ring are dispatched to that ring.
+///
+/// `wide` puts the arc on the right of a box spanning the whole vectorscope
+/// cell, the effect controls on its left (set for both triggers when either has
+/// effect controls, so the two boxes match). A cell too narrow for the controls
+/// beside the arc shrinks the arc rather than moving them or widening the box.
+#[allow(clippy::too_many_arguments)]
 fn trigger_widget(
     ui: &mut egui::Ui,
     label: &str,
@@ -3078,19 +3390,54 @@ fn trigger_widget(
     range_min: f32,
     range_max: f32,
     lo: Layout,
+    wide: bool,
+    effect: Option<&mut TriggerEffect>,
 ) -> TriggerWidgetEdit {
-    let size = egui::vec2(lo.trig_w, lo.trig_h);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    // Width the arc takes for an arc box `h` tall: the arc, the room right of
+    // it as the square box leaves it (centre 6% left), and the silhouette that
+    // pokes out left of its centre.
+    let arc_block = |h: f32| {
+        let r_out = h * 0.5 - 10.0;
+        h * 0.06 + 10.0 + r_out * (1.0 + 0.74 * 0.55) + 8.0
+    };
+    // The box is always one cell wide. Beside the effect controls the ARC gives
+    // way when the cell is narrow — never the box, which would push the window
+    // wider than the user dragged it.
+    let arc_h = if wide {
+        let (b, a) = (arc_block(0.0), arc_block(1.0) - arc_block(0.0));
+        lo.trig_h.min((lo.cell_w - 8.0 - FX_MIN_W - b) / a).max(48.0)
+    } else {
+        lo.trig_h
+    };
+    // Two concentric arcs: outer for range-clamp pins, inner for threshold.
+    let r_out = arc_h * 0.5 - 10.0;
+    let r_in  = r_out * 0.74;
+    let right_margin = arc_h * 0.06 + 10.0;
+    let fx_h = fx_controls_h(ui);
+
+    // Width of the effect controls on the arc's left; `None` = square box.
+    let side_w = wide.then(|| (lo.cell_w - arc_block(arc_h) - 8.0).max(0.0));
+    let size = match side_w {
+        None    => egui::vec2(lo.trig_w, arc_h),
+        Some(_) => egui::vec2(lo.cell_w, arc_h.max(fx_h + 12.0)),
+    };
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (cx, cy, arc_rect, fx_rect) = match side_w {
+        None => (rect.center().x - rect.width() * 0.06, rect.center().y, rect, None),
+        Some(w) => {
+            let fx = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 6.0), egui::vec2(w, rect.height() - 12.0));
+            let arc = egui::Rect::from_min_max(egui::pos2(fx.right() + 4.0, rect.top()), rect.max);
+            (rect.right() - right_margin - r_out, rect.center().y, arc, Some(fx))
+        }
+    };
+    // Only the arc's part of the box drags the pins, so clicks among the effect
+    // controls never move them.
+    let resp = ui.interact(arc_rect, ui.id().with(("trig_arc", label)), Sense::click_and_drag());
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, Color32::from_gray(15));
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
-    let cx = rect.center().x - rect.width() * 0.06;
-    let cy = rect.center().y;
-    // Two concentric arcs: outer for range-clamp pins, inner for threshold.
-    let r_out = (rect.width().min(rect.height()) * 0.5) - 10.0;
-    let r_in  = r_out * 0.74;
     let start = -std::f32::consts::FRAC_PI_2;
     let end   =  std::f32::consts::FRAC_PI_2;
 
@@ -3209,6 +3556,9 @@ fn trigger_widget(
                 _ => {}
             }
         }
+    }
+    if let (Some(fx_rect), Some(fx)) = (fx_rect, effect) {
+        out.effect_changed = trigger_effect_controls(ui, fx_rect, label, fx);
     }
     out
 }

@@ -159,12 +159,77 @@ pub(crate) fn effect_of(mode: &str, v: &[u8]) -> Option<Effect> {
 /// Where a mode's numbers have to be in order — an end zone past its start, a
 /// second foot after the first — as `(earlier, later)` indices into its
 /// `effect_params`.
-pub(crate) fn effect_orderings(mode: &str) -> &'static [(usize, usize)] {
+pub fn effect_orderings(mode: &str) -> &'static [(usize, usize)] {
     match mode.to_ascii_uppercase().as_str() {
         "BOW" | "SEMI_AUTOMATIC" | "MACHINE" => &[(0, 1)],
         "GALLOPING" => &[(0, 1), (2, 3)],
         _ => &[],
     }
+}
+
+/// The numbers `mode` takes, carried over from `old` — numbers written for the
+/// mode `was` (or for `mode` itself without it). A number the two modes share
+/// by name (the start zone, the force, the frequency…) carries over, held to the
+/// new mode's range; one the new mode adds gets its default; one it doesn't take
+/// goes. Where the mode needs its numbers in order the later one is moved on, or
+/// the earlier back, until it is.
+///
+/// What JSM's editor does to a line when its mode word is switched, and what the
+/// Calibration window's default-effect picker does when its mode is. `None` for
+/// a word that isn't an effect.
+pub fn settle_effect_values(mode: &str, was: Option<&str>, old: &[u32]) -> Option<Vec<u8>> {
+    let params = effect_params(mode)?;
+    let old_params = was.and_then(effect_params).unwrap_or(params);
+    let had: Vec<(&str, u32)> = old_params.iter().zip(old).map(|(p, &n)| (p.name, n)).collect();
+    let mut v: Vec<u8> = params
+        .iter()
+        .map(|prm| {
+            had.iter()
+                .find(|(n, _)| *n == prm.name)
+                .map(|(_, x)| (*x).clamp(prm.lo as u32, prm.hi as u32) as u8)
+                .unwrap_or(prm.default)
+        })
+        .collect();
+    for &(early, late) in effect_orderings(mode) {
+        if v[late] <= v[early] {
+            v[late] = (v[early] + 1).min(params[late].hi);
+            if v[late] <= v[early] {
+                v[early] = v[late].saturating_sub(1).max(params[early].lo);
+            }
+        }
+    }
+    Some(v)
+}
+
+/// The seven pins of each trigger's group, left then right, in the order
+/// [`effect_pins`] gives their values: (mode, start, end, strength, freq,
+/// strength2, period).
+pub const TRIGGER_PINS: [[&str; 7]; 2] = [
+    [
+        "trigger_l_mode",
+        "trigger_l_start",
+        "trigger_l_end",
+        "trigger_l_strength",
+        "trigger_l_freq",
+        "trigger_l_strength2",
+        "trigger_l_period",
+    ],
+    [
+        "trigger_r_mode",
+        "trigger_r_start",
+        "trigger_r_end",
+        "trigger_r_strength",
+        "trigger_r_freq",
+        "trigger_r_strength2",
+        "trigger_r_period",
+    ],
+];
+
+/// A mode word and its numbers as one trigger's [`TRIGGER_PINS`] values, each a
+/// fraction of its range. `None` for a word that isn't an effect, and for `ON`,
+/// which leaves the trigger to the game.
+pub fn effect_pins(mode: &str, v: &[u8]) -> Option<[f32; 7]> {
+    trigger_pins(effect_of(mode, v)?)
 }
 
 /// What the feedback side of a config is configured with.
@@ -224,28 +289,8 @@ pub fn pins(s: &Settings, rumble: Option<(f32, f32)>) -> Vec<Pin> {
         out.push(("rumble_weak", weak));
     }
 
-    // The seven pins of each trigger's group, left then right.
-    const LEFT: [&str; 7] = [
-        "trigger_l_mode",
-        "trigger_l_start",
-        "trigger_l_end",
-        "trigger_l_strength",
-        "trigger_l_freq",
-        "trigger_l_strength2",
-        "trigger_l_period",
-    ];
-    const RIGHT: [&str; 7] = [
-        "trigger_r_mode",
-        "trigger_r_start",
-        "trigger_r_end",
-        "trigger_r_strength",
-        "trigger_r_freq",
-        "trigger_r_strength2",
-        "trigger_r_period",
-    ];
-
     for (side, effect) in s.trigger.iter().enumerate() {
-        let pins = if side == 0 { LEFT } else { RIGHT };
+        let pins = TRIGGER_PINS[side];
         // `ADAPTIVE_TRIGGER = OFF` wins over whatever effect is set, which is how
         // JSM uses it: one switch to stop the triggers fighting you.
         let effect = if s.adaptive { *effect } else { Effect::Off };

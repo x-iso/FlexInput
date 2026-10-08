@@ -2153,6 +2153,22 @@ mod trigger_tests {
         assert!(v > 0.01, "stick past deadzone must reach sink, got {v}");
     }
 
+    // `deadzone_r` gives the right stick its own deadzone; the left keeps
+    // `deadzone`.
+    #[test]
+    fn the_right_stick_can_have_its_own_deadzone() {
+        let mut src = source_node(1, "gilrs:xinput:0", 0.05);
+        src.params.insert("deadzone_r".into(), Value::from(0.3));
+        let graph = ProcessingGraph { nodes: vec![src] };
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:xinput:0".to_string(), "left_stick_x".to_string()), Signal::Float(0.2));
+        dev.insert(("gilrs:xinput:0".to_string(), "right_stick_x".to_string()), Signal::Float(0.2));
+        let out = preprocess_dev_sigs(&graph, &dev);
+        let read = |pin: &str| out[&("gilrs:xinput:0".to_string(), pin.to_string())].as_float();
+        assert!(read("left_stick_x") > 0.1, "0.2 is past the left stick's 0.05");
+        assert_eq!(read("right_stick_x"), 0.0, "0.2 is inside the right stick's 0.3");
+    }
+
     // The UI→engine source-block (config overlay, M3.3): a `(device, pin)` the
     // UI injects into `state[MACRO_CARRY_UID].source_block` before a tick is
     // zeroed in that tick's `dev_sigs` view, so a sink reading the device pin
@@ -3251,6 +3267,70 @@ mod trigger_tests {
         assert!((pad_value(&out, FB_DS, "lightbar_r") - 1.0).abs() < 0.01);
         assert_eq!(pad_value(&out, FB_DS, "lightbar_g"), 0.0, "the game's light bar colour is replaced");
         assert!((pad_value(&out, FB_DS, "rumble_strong") - 0.5).abs() < 0.01, "game rumble untouched");
+    }
+
+    /// A DualSense with adaptive triggers whose RIGHT trigger defaults to
+    /// `RESISTANCE 2 5` (Calibration window).
+    fn ds_with_default_trigger() -> NodeSnap {
+        let mut pins: Vec<&str> = FB_DS_PINS.to_vec();
+        pins.extend(crate::eval::JSM_TRIGGER_PINS.iter().flatten());
+        let mut pad = fb_pad(1, FB_DS, &pins, Some(FB_VIRT));
+        pad.params.insert("rtrig_effect_mode".into(), Value::from("RESISTANCE"));
+        pad.params.insert("rtrig_effect_values".into(), serde_json::json!([2, 5]));
+        pad
+    }
+
+    // With nothing asking for an effect the default holds the trigger; the left
+    // trigger, with no default, is left alone.
+    #[test]
+    fn a_pads_default_trigger_effect_fills_in_when_nothing_asks() {
+        let out = fb_tick(vec![ds_with_default_trigger()], &HashMap::new());
+        let want = crate::eval::jsm_effect_pins("RESISTANCE", &[2, 5]).unwrap();
+        for (pin, v) in crate::eval::JSM_TRIGGER_PINS[1].iter().zip(want) {
+            assert!((pad_value(&out, FB_DS, pin) - v).abs() < 1e-6, "{pin}");
+        }
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trigger_l_mode".to_string())));
+    }
+
+    // Any instruction from the game wins over the default — Off included: a game
+    // that drives the triggers and asks for none means none.
+    #[test]
+    fn the_games_trigger_effect_beats_the_default() {
+        use flexinput_core::automap::TriggerMode;
+        let mut sigs = HashMap::new();
+        sigs.insert((FB_VIRT.to_string(), "trigger_r_mode".to_string()), Signal::Float(TriggerMode::Off.pin()));
+        let out = fb_tick(vec![ds_with_default_trigger()], &sigs);
+        assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), TriggerMode::Off.pin());
+        assert_eq!(pad_value(&out, FB_DS, "trigger_r_strength"), 0.0);
+
+        sigs.insert((FB_VIRT.to_string(), "trigger_r_mode".to_string()), Signal::Float(TriggerMode::Weapon.pin()));
+        sigs.insert((FB_VIRT.to_string(), "trigger_r_start".to_string()), Signal::Float(0.4));
+        let out = fb_tick(vec![ds_with_default_trigger()], &sigs);
+        assert!((pad_value(&out, FB_DS, "trigger_r_mode") - TriggerMode::Weapon.pin()).abs() < 1e-6);
+        assert!((pad_value(&out, FB_DS, "trigger_r_start") - 0.4).abs() < 1e-6);
+    }
+
+    // A module that takes the trigger over (JSM, Feedback Control in Override)
+    // wins too — even when what it asks for is Off.
+    #[test]
+    fn a_trigger_override_beats_the_default() {
+        let mut pad = ds_with_default_trigger();
+        let mut konst = empty_node(2, "module.constant");
+        konst.n_outputs = 1;
+        konst.params.insert("value".into(), Value::from(0.0));
+        let mut fc = empty_node(3, "module.feedback_control");
+        let inlets: Vec<&str> = flexinput_core::automap::FEEDBACK_INLET_PINS.iter().map(|p| p.id).collect();
+        fc.params.insert("_fb_source_dev".into(), Value::String(FB_DS.into()));
+        fc.params.insert("_fb_inlet_ids".into(), serde_json::json!(inlets));
+        fc.params.insert("fb_override".into(), Value::Bool(true));
+        fc.input_sources = std::iter::once(Some((0, 0)))
+            .chain(inlets.iter().map(|p| (*p == "trigger_r_mode").then_some((1, 0))))
+            .collect();
+        fc.n_outputs = 1;
+        pad.sink_target.as_mut().unwrap().feedback_sources.clear();
+        let out = fb_tick(vec![pad, konst, fc], &HashMap::new());
+        assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), 0.0);
+        assert_eq!(pad_value(&out, FB_DS, "trigger_r_strength"), 0.0);
     }
 
     fn peer_rumble(send_uid: usize, level: f32) {

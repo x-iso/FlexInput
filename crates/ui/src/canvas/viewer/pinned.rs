@@ -186,7 +186,7 @@ pub(crate) fn render_pinned_element_impl(
                 .and_then(|src| controller3d_physical_device(inner_snarl, src, bridged_parent));
             let (dev_id, deadzone) = match traced {
                 Some((d, z)) => (Some(d), z),
-                None => (None, 0.1),
+                None => (None, [0.1; 2]),
             };
             // Model: the pin's own choice wins (`Some("")` = force auto-detect),
             // else follow the module's param, else auto-detect.

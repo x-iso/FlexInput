@@ -867,9 +867,11 @@ fn input_slider_rows(
     // value frame inset, slider handle clearance) that make
     // cursor-based layout overshoot. With explicit rects the value
     // box's right edge is guaranteed to land at row_right.
+    // `mixed`: the value stands for two that differ (the sticks' deadzones) —
+    // shown in orange until it is changed.
     let row = |ui: &mut egui::Ui, label: &str, val: &mut f32,
                range: std::ops::RangeInclusive<f32>, log: bool,
-               default_val: f32, step: f32, decimals: usize|
+               default_val: f32, step: f32, decimals: usize, mixed: bool|
                -> bool
     {
         let initial = *val;
@@ -918,13 +920,20 @@ fn input_slider_rows(
                 .max_rect(dv_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        dv_ui.add_sized(
+        if mixed {
+            dv_ui.visuals_mut().override_text_color =
+                Some(crate::canvas::viewer::MIXED_VALUE_COLOR);
+        }
+        let dv = dv_ui.add_sized(
             [dv_w, row_h],
             egui::DragValue::new(val)
                 .speed(step)
                 .range(range.clone())
                 .fixed_decimals(decimals),
         );
+        if mixed {
+            dv.on_hover_text("The sticks have different deadzones (Calibration window).                 Changing this sets both.");
+        }
 
         (*val - initial).abs() > f32::EPSILON
     };
@@ -932,16 +941,17 @@ fn input_slider_rows(
     ui.add_enabled_ui(enabled, |ui| {
         if has_dz {
             let mut dz = params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+            let mixed = crate::canvas::viewer::stick_deadzones_differ(params);
             if row(ui, "Deadzone", &mut dz, 0.0..=0.5, false,
-                   defaults.stick_deadzone, 0.005, 2)
+                   defaults.stick_deadzone, 0.005, 2, mixed)
             {
-                params.insert("deadzone".into(), Value::from(dz as f64));
+                crate::canvas::viewer::set_both_stick_deadzones(params, dz);
             }
         }
         if has_gy {
             let mut gm = params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             if row(ui, "Gyro ×", &mut gm, 0.1..=50.0, true,
-                   defaults.gyro_mult, 0.05, 2)
+                   defaults.gyro_mult, 0.05, 2, false)
             {
                 params.insert("gyro_multiplier".into(), Value::from(gm as f64));
             }

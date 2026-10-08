@@ -65,6 +65,11 @@ pub use knobs::{feel_of as jsm_feel_of, rotation_of as jsm_rotation_of, knobs as
     sens_curve_warped as jsm_sens_curve_warped,
     set_knob as jsm_set_knob, CurvePoint as JsmCurvePoint, Feel as JsmFeel, Hand as JsmHand,
     Knob as JsmKnob};
+// A pad's default trigger effect (the Calibration window) speaks JSM's effects:
+// its picker reads the same table, and the engine encodes it the same way.
+pub use feedback::{effect_orderings as jsm_effect_orderings, effect_params as jsm_effect_params,
+    effect_pins as jsm_effect_pins, settle_effect_values as jsm_settle_effect_values,
+    EffectParam as JsmEffectParam, TRIGGER_PINS as JSM_TRIGGER_PINS};
 // The editor's "MIDI…" row writes what a MIDI picker built as a config name.
 pub use midi::tag_for_pin as jsm_midi_tag;
 pub use parse::{at_names as jsm_at_names, at_name_spans as jsm_at_name_spans, compile_full as jsm_compile_full, compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,

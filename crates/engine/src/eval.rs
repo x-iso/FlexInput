@@ -1255,6 +1255,14 @@ pub fn eval_graph_tick(
         }
     }
 
+    // Post-pass: each pad's default trigger effect (Calibration window), under
+    // every other layer — it fills in only where nothing asks for an effect.
+    for snap in graph.nodes.iter() {
+        let Some(ref st) = snap.sink_target else { continue; };
+        if st.device_id.starts_with("virtual.") { continue; }
+        apply_default_trigger_effects(st, &snap.params, &collector_sigs, sink_outputs);
+    }
+
     // Post-pass: network Receive feedback aggregation. Runs AFTER the
     // feedback_inject post-pass so ASTH / Feedback Control nodes on the RECEIVER
     // (which target a recv node's synthetic `collector:{uid}` id) have already

@@ -52,18 +52,22 @@ pub(crate) fn controller3d_physical_device(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
     parents: Option<&AutomapGlowParent<'_>>,
-) -> Option<(String, f32)> {
+) -> Option<(String, [f32; 2])> {
     let node = snarl.get_node(src.node)?;
     match node.module_id.as_str() {
-        // Returns the device id + the source's stick deadzone, so the viewer
+        // Returns the device id + the source's stick deadzones (left, right —
+        // the right stick's own `deadzone_r` when it has one), so the viewer
         // shows the same post-deadzone stick deflection the engine feeds the
         // graph. 0.1 mirrors the engine default for an omitted param.
         "device.source" => {
-            let dz = node
+            let left = node
                 .params
                 .get("deadzone")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.1) as f32;
+            let right = node.params.get("deadzone_r").and_then(|v| v.as_f64())
+                .map(|v| v as f32).unwrap_or(left);
+            let dz = [left, right];
             node.params
                 .get("device_id")
                 .and_then(|v| v.as_str())
@@ -311,7 +315,7 @@ pub(crate) fn controller3d_live(
     node_uid: usize,
     tailoff: f32,
     highlight: [f32; 3],
-    deadzone: f32,
+    deadzone: [f32; 2],
 ) -> crate::model::ControllerLive {
     let mut live = crate::model::ControllerLive::default();
     live.highlight = highlight;
@@ -347,7 +351,7 @@ pub(crate) fn controller3d_live(
     // Sticks (Vec2 pin or split x/y), triggers (analog + digital fallback).
     // The same radial deadzone the engine applies (`apply_deadzone`) is
     // reproduced here so the model's tilt matches what the graph receives.
-    let stick = |vec_pin: &str, xp: &str, yp: &str| -> glam::Vec2 {
+    let stick = |vec_pin: &str, xp: &str, yp: &str, deadzone: f32| -> glam::Vec2 {
         let raw = if let Some(Signal::Vec2(v)) =
             live_signals.get(&(dev.to_string(), vec_pin.to_string()))
         {
@@ -364,8 +368,8 @@ pub(crate) fn controller3d_live(
             raw / len * ((len - deadzone) / (1.0 - deadzone).max(f32::EPSILON))
         }
     };
-    live.left_stick = stick("left_stick", "left_stick_x", "left_stick_y");
-    live.right_stick = stick("right_stick", "right_stick_x", "right_stick_y");
+    live.left_stick = stick("left_stick", "left_stick_x", "left_stick_y", deadzone[0]);
+    live.right_stick = stick("right_stick", "right_stick_x", "right_stick_y", deadzone[1]);
     live.left_stick_press = if b("btn_ls") { 1.0 } else { 0.0 };
     live.right_stick_press = if b("btn_rs") { 1.0 } else { 0.0 };
     live.left_trigger = if has("left_trigger") { f("left_trigger") } else if b("btn_lt_dig") { 1.0 } else { 0.0 };
@@ -678,7 +682,7 @@ pub(crate) fn show_controller3d_body(
         .and_then(|src| controller3d_physical_device(snarl, src, parents));
     let (dev_id, deadzone) = match traced {
         Some((d, z)) => (Some(d), z),
-        None => (None, 0.1),
+        None => (None, [0.1; 2]),
     };
     let resolved = if !override_name.is_empty() && override_name != "auto" {
         override_name.clone()

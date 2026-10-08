@@ -124,8 +124,12 @@ struct DsFeedback {
     lightbar: (f32, f32, f32),
     player_led: f32,
     mic_led: f32,
-    trig_r: Trig,
-    trig_l: Trig,
+    /// A trigger's effect is `None` until the game first sets it (its valid-flag
+    /// bit): a game that never drives the adaptive triggers publishes no trigger
+    /// pins at all, so a pad's default trigger effect can tell "the game says
+    /// nothing" from "the game says Off".
+    trig_r: Option<Trig>,
+    trig_l: Option<Trig>,
 }
 
 /// One trigger's effect as the `trigger_*` pins carry it, each 0–1 (see
@@ -154,15 +158,16 @@ impl DsFeedback {
             ("mic_led", Signal::Float(self.mic_led)),
         ];
         for (t, pins) in [
-            (&self.trig_r, [
+            (self.trig_r, [
                 "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength",
                 "trigger_r_freq", "trigger_r_strength2", "trigger_r_period",
             ]),
-            (&self.trig_l, [
+            (self.trig_l, [
                 "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength",
                 "trigger_l_freq", "trigger_l_strength2", "trigger_l_period",
             ]),
         ] {
+            let Some(t) = t else { continue };
             let v = [t.mode, t.start, t.end, t.strength, t.freq, t.strength2, t.period];
             out.extend(pins.into_iter().zip(v).map(|(p, v)| (p, Signal::Float(v))));
         }
@@ -466,9 +471,13 @@ impl crate::VirtualDevice for HidMaestroDevice {
                     peak = Some((s.max(ps), w.max(pw)));
                     self.rumble_latest = (s, w);
                 }
-                // Keep the latest full frame for non-rumble feedback decode
-                // (lightbar/LEDs/triggers are level-held, so the most recent
-                // report is authoritative — no peak-holding needed).
+                // Trigger effects are decoded from EVERY frame: each one says
+                // whether it updates them, and a later frame that doesn't must
+                // not hide an earlier one that did.
+                self.fb.update_triggers(&self.profile.extended, &frame.data);
+                // Keep the latest full frame for the other non-rumble feedback
+                // (lightbar/LEDs are level-held, so the most recent report is
+                // authoritative — no peak-holding needed).
                 self.last_out_frame = Some(frame.data.clone());
             }
         }
@@ -533,14 +542,40 @@ impl HidMaestroDevice {
             // DualSense mute-LED byte: 0=off, 1=on(solid), 2=pulse → 0 / 0.5 / 1.
             self.fb.mic_led = (data[i] as f32 / 2.0).clamp(0.0, 1.0);
         }
-        if let Some(i) = at(ext.out_trigger_r) {
-            self.fb.trig_r = decode_trigger_effect(&data[i..]);
+    }
+}
+
+impl DsFeedback {
+    /// Update the adaptive-trigger effects from one output frame — only the
+    /// sides whose `valid_flag0` bit the frame sets, as a real DualSense does:
+    /// a rumble- or lightbar-only report leaves the triggers' effects alone
+    /// (its trigger bytes are zeros that mean nothing).
+    fn update_triggers(&mut self, ext: &flexinput_hidmaestro::profile::ExtendedLayout, data: &[u8]) {
+        // `valid_flag0` sits 10 bytes before the right trigger block in both the
+        // USB (0x02) and Bluetooth (0x31) output reports. Offsets are
+        // RID-inclusive; the ring strips the report id.
+        let Some(flags) = ext.out_trigger_r
+            .and_then(|r| r.checked_sub(11))
+            .and_then(|i| data.get(i).copied())
+        else { return };
+        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
+        if flags & DS_FLAG0_RIGHT_TRIGGER != 0 {
+            if let Some(i) = at(ext.out_trigger_r) {
+                self.trig_r = Some(decode_trigger_effect(&data[i..]));
+            }
         }
-        if let Some(i) = at(ext.out_trigger_l) {
-            self.fb.trig_l = decode_trigger_effect(&data[i..]);
+        if flags & DS_FLAG0_LEFT_TRIGGER != 0 {
+            if let Some(i) = at(ext.out_trigger_l) {
+                self.trig_l = Some(decode_trigger_effect(&data[i..]));
+            }
         }
     }
 }
+
+/// DualSense output-report `valid_flag0` bits saying the report carries a new
+/// right / left adaptive-trigger effect.
+const DS_FLAG0_RIGHT_TRIGGER: u8 = 0x04;
+const DS_FLAG0_LEFT_TRIGGER: u8 = 0x08;
 
 /// Map a DualSense player-indicator bitmask byte back to the 0–1 `player_led`
 /// convention (0=off, 0.25=P1 … 1=P4). The pad lights 1–4 of its 5 front LEDs in
@@ -700,6 +735,32 @@ mod tests {
         let ds4_ids: Vec<&str> = ds4_device().source_pins().iter().map(|p| p.id).collect();
         assert!(!ds4_ids.contains(&"player_led"), "DS4 must not expose player_led");
         assert!(!ds4_ids.contains(&"trigger_r_mode"), "DS4 must not expose triggers");
+    }
+
+    // A game that never sets a trigger's valid-flag bit publishes no trigger
+    // pins; one that does publishes them, and a later report without the bit
+    // (rumble only) leaves the effect as it was.
+    #[test]
+    fn trigger_effects_follow_the_valid_flags() {
+        let has = |ds: &HidMaestroDevice, pin: &str| ds.fb.as_pins().iter().any(|(p, _)| *p == pin);
+        let mut ds = dualsense_device();
+        // USB report 0x02 without its id: flag0 @0, right trigger block @10.
+        let mut frame = vec![0u8; 47];
+        ds.fb.update_triggers(&ds.profile.extended, &frame);
+        assert!(!has(&ds, "trigger_r_mode") && !has(&ds, "trigger_l_mode"));
+
+        frame[0] = DS_FLAG0_RIGHT_TRIGGER;
+        frame[10] = 0x21; // feedback (resistance)
+        frame[11] = 0x01;
+        frame[13] = 0x07;
+        ds.fb.update_triggers(&ds.profile.extended, &frame);
+        let r = ds.fb.trig_r.expect("right trigger set");
+        assert_ne!(r.mode, 0.0);
+        assert!(!has(&ds, "trigger_l_mode"), "left trigger never set");
+
+        let rumble_only = vec![0u8; 47];
+        ds.fb.update_triggers(&ds.profile.extended, &rumble_only);
+        assert_eq!(ds.fb.trig_r, Some(r), "a report without the flag keeps the effect");
     }
 
     #[test]

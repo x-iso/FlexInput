@@ -243,6 +243,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         } else { None };
         let deadzone_initial = data.params.get("deadzone")
             .and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+        let deadzones_differ = stick_deadzones_differ(&data.params);
         let gyro_mult_initial = data.params.get("gyro_multiplier")
             .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         let mouse_sens_initial = data.params.get("mouse_sensitivity")
@@ -857,10 +858,19 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                 .show_value(false)
                                 .clamping(egui::SliderClamping::Always));
                             if slider_track_double_clicked(ui, &resp) { dz_edit = param_defaults.stick_deadzone; }
-                            ui.add(egui::DragValue::new(&mut dz_edit)
+                            // Orange while the sticks' deadzones differ (the
+                            // Calibration window sets them apart); editing it
+                            // sets both again.
+                            if deadzones_differ {
+                                ui.visuals_mut().override_text_color = Some(MIXED_VALUE_COLOR);
+                            }
+                            let dv = ui.add(egui::DragValue::new(&mut dz_edit)
                                 .speed(0.005)
                                 .range(0.0_f32..=0.5)
                                 .fixed_decimals(2));
+                            if deadzones_differ {
+                                dv.on_hover_text("The sticks have different deadzones (Calibration                                     window). Changing this sets both.");
+                            }
                         });
                     }
                     let mut gm_edit = gyro_mult_initial;
@@ -885,7 +895,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     {
                         if let Some(n) = snarl.get_node_mut(node) {
                             if (dz_edit - dz_initial).abs() > f32::EPSILON {
-                                n.params.insert("deadzone".into(), Value::from(dz_edit as f64));
+                                set_both_stick_deadzones(&mut n.params, dz_edit);
                             }
                             if (gm_edit - gm_initial).abs() > f32::EPSILON {
                                 n.params.insert("gyro_multiplier".into(), Value::from(gm_edit as f64));

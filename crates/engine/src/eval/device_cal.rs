@@ -104,6 +104,9 @@ pub(crate) struct DeviceCal {
     /// `automap::capacitive_misc_mask`) so they can't hijack a capture. The UI
     /// masks the SAME pins out of `last_signals`, so Learn and routing agree.
     suppress_touch_misc: bool,
+    /// The right stick's own deadzone (`deadzone_r`, Calibration window), when
+    /// it has one; `None` = the device's `deadzone` covers both sticks.
+    rstick_dz: Option<f32>,
 }
 
 /// Default digital-trigger threshold. Mirrors the Calibration UI's
@@ -161,6 +164,7 @@ impl Default for DeviceCal {
             ltrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
             rtrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
             suppress_touch_misc: false,
+            rstick_dz: None,
         }
     }
 }
@@ -287,6 +291,7 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
         suppress_touch_misc: params.get("suppress_touch_misc")
             .and_then(|v| v.as_bool()).unwrap_or(false),
+        rstick_dz: params.get("deadzone_r").and_then(|v| v.as_f64()).map(|v| v as f32),
     }
 }
 
@@ -373,8 +378,10 @@ pub(crate) fn post_process_device_pin(
         (_, s) => s,
     };
 
-    // 2 + 3. Gyro × multiplier, then stick deadzone.
+    // 2 + 3. Gyro × multiplier, then stick deadzone — the right stick's own
+    // when it has one.
     if is_stick_pin(pin_id) {
+        let dz = if pin_id.starts_with("right_") { cal.rstick_dz.unwrap_or(dz) } else { dz };
         apply_deadzone(sig, dz)
     } else if is_gyro_pin(pin_id) && (gm - 1.0).abs() > f32::EPSILON {
         match sig {
