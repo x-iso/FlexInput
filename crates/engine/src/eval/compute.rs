@@ -1366,7 +1366,8 @@ impl TwowayHyst {
     pub fn from_params(params: &HashMap<String, Value>, magnitude: bool) -> Self {
         let f = |k: &str, d: f64| params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
         let (in_min, in_max) = (f("in_min", -1.0), f("in_max", 1.0));
-        let abs_max = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+        // A magnitude's range is its ↑ end alone, as `apply_curve` reads it.
+        let abs_max = in_max.abs().max(f32::EPSILON);
         let dir = params.get("hyst_dir").and_then(|v| v.as_str()).unwrap_or("both");
         let (rest, span) = if magnitude { (0.0, abs_max) } else { (in_min, (in_max - in_min).abs()) };
         let points: Vec<[f32; 2]> = params.get("hyst_points").and_then(|v| v.as_array())

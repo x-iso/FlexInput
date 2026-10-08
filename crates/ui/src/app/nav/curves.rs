@@ -671,10 +671,24 @@ impl FlexInputApp {
         let step = if fine { 0.0015 } else { 0.015 };
         let mut dx = 0.0f32;
         let mut dy = 0.0f32;
-        if nav.is_rising("dpad_left") { dx -= step; }
-        if nav.is_rising("dpad_right") { dx += step; }
-        if nav.is_rising("dpad_up") { dy += step; }
-        if nav.is_rising("dpad_down") { dy -= step; }
+        // With the graph's Snap on, a d-pad press steps the dot to the next
+        // grid line — or the 1:1 line — that way, as dragging snaps it. Fine
+        // mode (West) keeps the small free step for in-between values.
+        let snap = (!fine)
+            .then(|| ctx.data(|d| d.get_temp::<crate::canvas::viewer::NavCurveSnap>(
+                crate::canvas::viewer::nav_curve_snap_id(inner.0))))
+            .flatten();
+        let [px, py] = pts[i];
+        let press = |along_x: bool, dir: f32| -> f32 {
+            let (cur, other) = if along_x { (px, py) } else { (py, px) };
+            snap.as_ref()
+                .and_then(|s| s.next(along_x, cur, other, dir))
+                .map_or(step * dir, |target| target - cur)
+        };
+        if nav.is_rising("dpad_left") { dx += press(true, -1.0); }
+        if nav.is_rising("dpad_right") { dx += press(true, 1.0); }
+        if nav.is_rising("dpad_up") { dy += press(false, 1.0); }
+        if nav.is_rising("dpad_down") { dy += press(false, -1.0); }
         if mag > 0.08 {
             // Accelerated stick response (gentle first half, fast toward full
             // deflection) — speed scales with |axis|^accel per axis, matching the

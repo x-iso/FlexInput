@@ -69,9 +69,9 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 .unwrap_or_else(|| match n.params.get("in_scale").and_then(|v| v.as_i64()).unwrap_or(0) {
                     1 => -0.5, 2 => 0.5, _ => 0.0,
                 });
-            let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+            let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
             let ssg  = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(n).is_some());
             (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
@@ -84,8 +84,10 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
             .map(sig_f32))
         .collect();
 
-    let (x_lo, x_hi): (f32, f32) = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
-    let (y_lo, y_hi): (f32, f32) = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // A motion pick runs on the whole sensor and shows only its view of it.
+    let view = CurveView::resolve(snarl.get_node(node_id), absolute, scale_t, [in_min, in_max, out_min, out_max]);
+    let (x_lo, x_hi) = (view.x_lo, view.x_hi);
+    let (y_lo, y_hi) = (view.y_lo, view.y_hi);
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
 
@@ -208,8 +210,10 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     let snap_v = snap_nodes_y.iter().copied()
                         .min_by(|a, b| (a - v).abs().partial_cmp(&(b - v).abs()).unwrap())
                         .unwrap_or(v);
-                    (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
+                    snap_point(x, y, (x_lo + snap_u * x_range, y_lo + snap_v * y_range),
+                        &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true)
                 };
+                publish_nav_curve_snap(ui.ctx(), node_id, snap, &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true);
 
                 painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
@@ -228,69 +232,17 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
-                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-                    egui::Stroke::new(0.5, grid_axis));
+                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); }
 
                 // Labels: show the real input/output value at each grid line.
                 // Graph x is the SCALED domain (curve_scale maps real→graph), so
                 // the real value at graph position x is curve_scale_inv(x) * abs_max
                 // for abs mode, or sign*curve_scale_inv(|x|)*abs_max for bipolar.
+                let mut label_inset = egui::Vec2::ZERO;
                 if show_grid_labels {
-                    const MIN_LABEL_PX: f32 = 20.0;
-                    let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-                    let font = egui::FontId::proportional(9.0);
-                    let abs_max_in  = in_max.abs().max(in_min.abs());
-                    let abs_max_out = out_max.abs().max(out_min.abs());
-                    // Convert a normalized graph position u∈[0,1] to the real input value.
-                    let graph_to_real_in = |u: f32| -> f32 {
-                        if absolute {
-                            curve_scale_inv(u, scale_t) * abs_max_in
-                        } else {
-                            // u=0.5 is value 0; each half scaled independently
-                            let centered = u * 2.0 - 1.0; // [-1,1]
-                            let sign = if centered < 0.0 { -1.0f32 } else { 1.0 };
-                            sign * curve_scale_inv(centered.abs(), scale_t) * abs_max_in
-                        }
-                    };
-                    let graph_to_real_out = |v: f32| -> f32 {
-                        if absolute {
-                            curve_scale_inv(v, scale_t) * abs_max_out
-                        } else {
-                            let centered = v * 2.0 - 1.0;
-                            let sign = if centered < 0.0 { -1.0f32 } else { 1.0 };
-                            sign * curve_scale_inv(centered.abs(), scale_t) * abs_max_out
-                        }
-                    };
-                    let mut last_sx = f32::NEG_INFINITY;
-                    for &x in &grid_x_positions {
-                        let sx = c2s(x, y_hi).x;
-                        if sx - last_sx < MIN_LABEL_PX { continue; }
-                        last_sx = sx;
-                        let u = (x - x_lo) / x_range;
-                        let val = graph_to_real_in(u);
-                        let label = if abs_max_in <= 1.01 {
-                            format!("{:.0}%", val * 100.0)
-                        } else {
-                            format!("{:.2}", val)
-                        };
-                        painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
-                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-                    }
-                    let mut last_sy = f32::INFINITY;
-                    for &y in &grid_y_positions {
-                        let sy = c2s(x_lo, y).y;
-                        if last_sy - sy < MIN_LABEL_PX { continue; }
-                        last_sy = sy;
-                        let v = (y - y_lo) / y_range;
-                        let val = graph_to_real_out(v);
-                        let label = if abs_max_out <= 1.01 {
-                            format!("{:.0}%", val * 100.0)
-                        } else {
-                            format!("{:.2}", val)
-                        };
-                        painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
-                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-                    }
+                    let xs = grid_x_positions.iter().map(|&x| c2s(x, y_hi).x).zip(view.labels_in(&grid_x_positions));
+                    let ys = grid_y_positions.iter().map(|&y| c2s(x_lo, y).y).zip(view.labels_out(&grid_y_positions));
+                    label_inset = paint_axis_labels(&painter, rect, xs.collect(), ys.collect());
                 }
 
                 if new_points.len() >= 2 {
@@ -320,6 +272,9 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
                         let mid_y = sample_curve(&new_points, mid_x, &new_biases).clamp(y_lo, y_hi);
                         let hpos  = c2s(mid_x, mid_y);
+                        // A zoomed graph (a motion pick's view) leaves points outside it: no
+                        // hidden handle may catch clicks meant for whatever is drawn there.
+                        if !rect.expand(8.0).contains(hpos) { continue; }
                         let hid   = ui.id().with(("bias_h", node_id, seg));
                         let hresp = ui.interact(
                             egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
@@ -347,6 +302,9 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 for i in 0..new_points.len() {
                     let [px, py] = new_points[i];
                     let screen   = c2s(px, py);
+                    // A zoomed graph (a motion pick's view) leaves points outside it: no
+                    // hidden handle may catch clicks meant for whatever is drawn there.
+                    if !rect.expand(8.0).contains(screen) { continue; }
                     let pt_id    = ui.id().with(("cpt", node_id, i));
                     let pt_resp  = ui.interact(
                         egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
@@ -374,6 +332,12 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     if pt_resp.drag_stopped() {
                         ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(origin_id));
                     }
+                    // Double-click: onto the 1:1 line — output equal to its input.
+                    if pt_resp.double_clicked() {
+                        let lo = if absolute { 0.0 } else { -1.0 };
+                        new_points[i][1] = new_points[i][0].clamp(lo, 1.0);
+                        pts_changed = true;
+                    }
                     if pt_resp.secondary_clicked() && new_points.len() > 2 {
                         remove_idx = Some(i);
                         pts_changed = true;
@@ -395,6 +359,10 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    // The dot's output value: always with the grid labels, else while handled.
+                    if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
+                        paint_point_value(&painter, rect, screen, view.value_out(py));
+                    }
                 }
 
                 if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
@@ -412,7 +380,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
 
                 // Live-position trails — trail_ms history, y always recomputed
                 // from the live curve so dragging control points leaves no streaks.
-                let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+                let abs_max   = view.in_max.abs().max(f32::EPSILON);
                 let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
                 let now       = std::time::Instant::now();
                 let mut has_active = false;
@@ -422,8 +390,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     let graph_x = if absolute {
                         curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t)
                     } else {
-                        let in_range = (in_max - in_min).abs().max(f32::EPSILON);
-                        let norm     = ((raw - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
+                        let in_range = (view.in_max - view.in_min).abs().max(f32::EPSILON);
+                        let norm     = ((raw - view.in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
                         let sign     = if norm < 0.0 { -1.0f32 } else { 1.0 };
                         sign * curve_scale(norm.abs(), scale_t)
                     };
@@ -432,7 +400,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     let trail_id = ui.id().with(("trail", node_id, ch as u32));
                     let mut trail: Trail = ui.data(|d| d.get_temp::<Trail>(trail_id).clone().unwrap_or_default());
                     if trail_ms > 0 {
-                        trail.push_back((graph_x, now));
+                        push_trail_sample(&mut trail, graph_x, now, trail_dur);
                         while trail.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) {
                             trail.pop_front();
                         }
@@ -468,7 +436,15 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     request_repaint_throttled(ui.ctx());
                 }
                 if let Some(labels) = legend {
-                    paint_curve_legend(&painter, rect, labels, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                    paint_curve_legend(&painter, rect, labels, label_inset, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                }
+                // Live reading at the mouse or gamepad cursor, with the labels.
+                if show_grid_labels && !ui.input(|i| i.pointer.any_down()) {
+                    if let Some(at) = graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+                        paint_cursor_reading(&painter, rect, at, (x_lo, x_hi, y_lo, y_hi),
+                            |x| sample_curve(&new_points, x, &new_biases),
+                            |gx, gy| format!("{}  →  {}", view.value_in(gx), view.value_out(gy)));
+                    }
                 }
 
                 // Right-click on empty graph space → save/load/copy/paste/reset
@@ -535,28 +511,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
         // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Absolute + Snap
         let scale_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Log").small().weak());
-            let (slider_rect, slider_resp) = ui.allocate_exact_size(
-                egui::vec2(80.0, 14.0), egui::Sense::click_and_drag(),
-            );
-            if slider_resp.double_clicked() {
-                sc_t = 0.0;
-                changed = true;
-            } else if slider_resp.dragged() {
-                sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
-                changed = true;
-            }
-            let painter = ui.painter_at(slider_rect);
-            painter.rect_filled(slider_rect, 3.0, Color32::from_gray(35));
-            let cx = slider_rect.center().x;
-            painter.line_segment(
-                [egui::pos2(cx, slider_rect.top() + 2.0), egui::pos2(cx, slider_rect.bottom() - 2.0)],
-                egui::Stroke::new(1.0, Color32::from_gray(70)),
-            );
-            let knob_x = slider_rect.left() + (sc_t + 1.0) * 0.5 * slider_rect.width();
-            painter.circle_filled(
-                egui::pos2(knob_x, slider_rect.center().y), 5.0,
-                if slider_resp.hovered() || slider_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
-            );
+            let slider_id = ui.make_persistent_id(("log_exp", node_id));
+            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
             ui.label(egui::RichText::new("Exp").small().weak());
             ui.separator();
             let abs_before = abs;
@@ -568,36 +524,49 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
         });
         register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
 
-        // Row 2: In/Out range
+        // Row 2: In/Out range — for a motion pick, how much of the sensor the
+        // graph shows, in its units.
         let range_resp = ui.scope(|ui| {
+            if let Some(unit) = view.unit {
+                motion_view_range_fields(ui, node_id, snarl, unit, abs);
+                return;
+            }
+            let linked = snarl.get_node(node_id).map_or(true, range_linked);
+            let before = [i0, i1, o0, o1];
+            let mut link_clicked = false;
             egui::Grid::new(("crv_rng", node_id)).num_columns(5).spacing([4.0, 2.0]).show(ui, |ui| {
                 ui.label(egui::RichText::new("In").small().weak());
-                changed |= ui.add(egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2)).changed();
+                changed |= ui.add_enabled(!abs, egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2))
+                    .on_disabled_hover_text(ABS_MIN_HOVER).changed();
                 changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).prefix("↑").max_decimals(2)).changed();
                 ui.label(egui::RichText::new("Out").small().weak());
-                changed |= ui.add(egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2)).changed();
+                changed |= ui.add_enabled(!abs, egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2))
+                    .on_disabled_hover_text(ABS_MIN_HOVER).changed();
                 ui.end_row();
                 ui.label(egui::RichText::new("").small());
                 ui.label(egui::RichText::new("").small());
                 ui.label(egui::RichText::new("").small());
-                ui.label(egui::RichText::new("").small());
+                link_clicked = range_link_button(ui, linked);
                 changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).prefix("↑").max_decimals(2)).changed();
                 ui.end_row();
             });
+            if link_clicked { toggle_range_link(snarl, node_id); }
+            if linked {
+                let mut v = [i0, i1, o0, o1];
+                follow_range_link(before, &mut v);
+                [i0, i1, o0, o1] = v;
+            }
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
 
         // Row 3: Grid + Trail
         let grid_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut gx_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("H ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut gy_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("V ")).changed();
+            changed |= grid_count_fields(ui, node_id, snarl, &mut gx_f, &mut gy_f, 20.0).1;
             ui.separator();
             ui.label(egui::RichText::new("Trail").small().weak());
             changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-                .range(0i64..=1000).suffix("ms")).changed();
+                .range(0i64..=TRAIL_MS_MAX).suffix("ms")).changed();
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
@@ -694,9 +663,9 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
             let gy  = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let sn  = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
             let sc  = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
-            let tm  = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+            let tm  = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
             let ssg = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(n).is_some());
             (pts, bss, i1, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], 1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
@@ -709,9 +678,11 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
             .map(sig_f32))
         .collect();
 
-    // Vec curve always operates in [0,1] × [0,1] (magnitude space)
-    let (x_lo, x_hi) = (0.0f32, 1.0f32);
-    let (y_lo, y_hi) = (0.0f32, 1.0f32);
+    // Vec curve always operates in magnitude space; a gyro-fed one shows only
+    // its view of the sensor (see `CurveView`).
+    let view = CurveView::resolve(snarl.get_node(node_id), true, scale_t, [0.0, in_max, 0.0, out_max]);
+    let (x_lo, x_hi) = (view.x_lo, view.x_hi);
+    let (y_lo, y_hi) = (view.y_lo, view.y_hi);
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
 
@@ -787,8 +758,10 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     let snap_v = snap_nodes_y.iter().copied()
                         .min_by(|a, b| (a - v).abs().partial_cmp(&(b - v).abs()).unwrap())
                         .unwrap_or(v);
-                    (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
+                    snap_point(x, y, (x_lo + snap_u * x_range, y_lo + snap_v * y_range),
+                        &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true)
                 };
+                publish_nav_curve_snap(ui.ctx(), node_id, snap, &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true);
 
                 painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
@@ -803,41 +776,12 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
-                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-                    egui::Stroke::new(0.5, grid_axis));
+                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); }
 
                 if show_grid_labels {
-                    const MIN_LABEL_PX: f32 = 20.0;
-                    let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-                    let font = egui::FontId::proportional(9.0);
-                    let mut last_sx = f32::NEG_INFINITY;
-                    for &x in &grid_x_positions {
-                        let sx = c2s(x, y_hi).x;
-                        if sx - last_sx < MIN_LABEL_PX { continue; }
-                        last_sx = sx;
-                        let val = curve_scale_inv(x, scale_t) * in_max;
-                        let label = if in_max <= 1.01 {
-                            format!("{:.0}%", val * 100.0)
-                        } else {
-                            format!("{:.2}", val)
-                        };
-                        painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
-                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-                    }
-                    let mut last_sy = f32::INFINITY;
-                    for &y in &grid_y_positions {
-                        let sy = c2s(x_lo, y).y;
-                        if last_sy - sy < MIN_LABEL_PX { continue; }
-                        last_sy = sy;
-                        let val = curve_scale_inv(y, scale_t) * out_max;
-                        let label = if out_max <= 1.01 {
-                            format!("{:.0}%", val * 100.0)
-                        } else {
-                            format!("{:.2}", val)
-                        };
-                        painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
-                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-                    }
+                    let xs = grid_x_positions.iter().map(|&x| c2s(x, y_hi).x).zip(view.labels_in(&grid_x_positions));
+                    let ys = grid_y_positions.iter().map(|&y| c2s(x_lo, y).y).zip(view.labels_out(&grid_y_positions));
+                    paint_axis_labels(&painter, rect, xs.collect(), ys.collect());
                 }
 
                 if new_points.len() >= 2 {
@@ -862,6 +806,9 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
                         let mid_y = sample_curve(&new_points, mid_x, &new_biases).clamp(y_lo, y_hi);
                         let hpos  = c2s(mid_x, mid_y);
+                        // A zoomed graph (a motion pick's view) leaves points outside it: no
+                        // hidden handle may catch clicks meant for whatever is drawn there.
+                        if !rect.expand(8.0).contains(hpos) { continue; }
                         let hid   = ui.id().with(("vbias_h", node_id, seg));
                         let hresp = ui.interact(
                             egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
@@ -887,6 +834,9 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 for i in 0..new_points.len() {
                     let [px, py] = new_points[i];
                     let screen   = c2s(px, py);
+                    // A zoomed graph (a motion pick's view) leaves points outside it: no
+                    // hidden handle may catch clicks meant for whatever is drawn there.
+                    if !rect.expand(8.0).contains(screen) { continue; }
                     let pt_id    = ui.id().with(("vcpt", node_id, i));
                     let pt_resp  = ui.interact(
                         egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
@@ -914,6 +864,11 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     if pt_resp.drag_stopped() {
                         ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(origin_id));
                     }
+                    // Double-click: onto the 1:1 line — output equal to its input.
+                    if pt_resp.double_clicked() {
+                        new_points[i][1] = new_points[i][0].clamp(0.0, 1.0);
+                        pts_changed = true;
+                    }
                     if pt_resp.secondary_clicked() && new_points.len() > 2 {
                         remove_idx = Some(i);
                         pts_changed = true;
@@ -921,6 +876,10 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    // The dot's output value: always with the grid labels, else while handled.
+                    if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
+                        paint_point_value(&painter, rect, screen, view.value_out(py));
+                    }
                 }
 
                 if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
@@ -937,7 +896,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 }
 
                 // Live-position trails (magnitude of Vec2 input → position on curve)
-                let abs_max   = in_max.abs().max(f32::EPSILON);
+                let abs_max   = view.in_max.abs().max(f32::EPSILON);
                 let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
                 let now       = std::time::Instant::now();
                 let mut has_active = false;
@@ -949,7 +908,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     let trail_id = ui.id().with(("vtrail", node_id, ch as u32));
                     let mut trail: Trail = ui.data(|d| d.get_temp::<Trail>(trail_id).clone().unwrap_or_default());
                     if trail_ms > 0 {
-                        trail.push_back((graph_x, now));
+                        push_trail_sample(&mut trail, graph_x, now, trail_dur);
                         while trail.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) {
                             trail.pop_front();
                         }
@@ -980,6 +939,14 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
                 }
                 if has_active { request_repaint_throttled(ui.ctx()); }
+                // Live reading at the mouse or gamepad cursor, with the labels.
+                if show_grid_labels && !ui.input(|i| i.pointer.any_down()) {
+                    if let Some(at) = graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+                        paint_cursor_reading(&painter, rect, at, (x_lo, x_hi, y_lo, y_hi),
+                            |x| sample_curve(&new_points, x, &new_biases),
+                            |gx, gy| format!("{}  →  {}", view.value_in(gx), view.value_out(gy)));
+                    }
+                }
 
                 // Right-click on empty graph → save/load/copy/paste/reset
                 // (shared with the header buttons; uses .fxc format).
@@ -1037,28 +1004,8 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
         // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Snap
         let scale_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Log").small().weak());
-            let (slider_rect, slider_resp) = ui.allocate_exact_size(
-                egui::vec2(80.0, 14.0), egui::Sense::click_and_drag(),
-            );
-            if slider_resp.double_clicked() {
-                sc_t = 0.0;
-                changed = true;
-            } else if slider_resp.dragged() {
-                sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
-                changed = true;
-            }
-            let painter = ui.painter_at(slider_rect);
-            painter.rect_filled(slider_rect, 3.0, Color32::from_gray(35));
-            let cx = slider_rect.center().x;
-            painter.line_segment(
-                [egui::pos2(cx, slider_rect.top() + 2.0), egui::pos2(cx, slider_rect.bottom() - 2.0)],
-                egui::Stroke::new(1.0, Color32::from_gray(70)),
-            );
-            let knob_x = slider_rect.left() + (sc_t + 1.0) * 0.5 * slider_rect.width();
-            painter.circle_filled(
-                egui::pos2(knob_x, slider_rect.center().y), 5.0,
-                if slider_resp.hovered() || slider_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
-            );
+            let slider_id = ui.make_persistent_id(("log_exp", node_id));
+            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
             ui.label(egui::RichText::new("Exp").small().weak());
             ui.separator();
             let snap_before = snap_on;
@@ -1067,27 +1014,36 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
         });
         register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
 
-        // Row 2: In/Out max
+        // Row 2: In/Out max — for a gyro-fed curve, how much of the sensor the
+        // graph shows, in its units.
         let range_resp = ui.horizontal(|ui| {
+            if let Some(unit) = view.unit {
+                motion_view_range_fields(ui, node_id, snarl, unit, true);
+                return;
+            }
+            let linked = snarl.get_node(node_id).map_or(true, range_linked);
+            let before = [0.0, i1, 0.0, o1];
             ui.label(egui::RichText::new("In max").small().weak());
             changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).max_decimals(2)).changed();
-            ui.separator();
+            if range_link_button(ui, linked) { toggle_range_link(snarl, node_id); }
             ui.label(egui::RichText::new("Out max").small().weak());
             changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).max_decimals(2)).changed();
+            if linked {
+                let mut v = [0.0, i1, 0.0, o1];
+                follow_range_link(before, &mut v);
+                (i1, o1) = (v[1], v[3]);
+            }
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
 
         // Row 3: Grid + Trail
         let grid_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut gx_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("H ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut gy_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("V ")).changed();
+            changed |= grid_count_fields(ui, node_id, snarl, &mut gx_f, &mut gy_f, 20.0).1;
             ui.separator();
             ui.label(egui::RichText::new("Trail").small().weak());
             changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-                .range(0i64..=1000).suffix("ms")).changed();
+                .range(0i64..=TRAIL_MS_MAX).suffix("ms")).changed();
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
@@ -1199,22 +1155,24 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let grid_y    = node_data.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
     let snap      = node_data.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
     let scale_t   = node_data.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
-    let trail_ms  = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+    let trail_ms  = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
     let vec_mode  = twoway_vec_mode(&node_data);
     let hyst_pct  = node_data.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
     let interp_ms = node_data.params.get("interp_ms")     .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
     let show_scaled_grid = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-    let show_grid_labels = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+    let show_grid_labels = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(&node_data).is_some());
 
     let n_channels = curve_channels(&node_data);
     let legend = curve_channel_labels(&node_data);
 
     let absolute_eff = absolute || vec_mode;
-    let (x_lo, x_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // A motion pick runs on the whole sensor and shows only its view of it.
+    let view = CurveView::resolve(Some(&node_data), absolute_eff, scale_t, [in_min, in_max, out_min, out_max]);
+    let (x_lo, x_hi) = (view.x_lo, view.x_hi);
     // The Hyst graph's Y is a band width, 0..TWOWAY_HYST_MAX_PCT, in any mode.
     let hyst_lane = active_lane == "hy";
-    let (y_lo, y_hi): (f32, f32) = if absolute_eff || hyst_lane { (0.0, 1.0) } else { (-1.0, 1.0) };
+    let (y_lo, y_hi) = if hyst_lane { (0.0, 1.0) } else { (view.y_lo, view.y_hi) };
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
     let lane_up  = active_lane == "up";
@@ -1305,9 +1263,6 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
-                let abs_max_in  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-                let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
-
                 // Grid positions (same redistribute algorithm as float body)
                 let redistribute = |mut nodes: Vec<f32>, n: usize| -> Vec<f32> {
                     let min_gap = 1.0f32 / n as f32 * 0.5;
@@ -1351,26 +1306,30 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     let v = ((y-y_lo)/y_range).clamp(0.0, 1.0);
                     let su = sx.iter().copied().min_by(|a, b| (a-u).abs().partial_cmp(&(b-u).abs()).unwrap()).unwrap_or(u);
                     let sv = sy.iter().copied().min_by(|a, b| (a-v).abs().partial_cmp(&(b-v).abs()).unwrap()).unwrap_or(v);
-                    (x_lo + su * x_range, y_lo + sv * y_range)
+                    snap_point(x, y, (x_lo + su * x_range, y_lo + sv * y_range),
+                        &sx, &sy, (x_lo, x_range, y_lo, y_range), !hyst_lane)
                 };
+                publish_nav_curve_snap(ui.ctx(), node_id, snap_on, &sx, &sy, (x_lo, x_range, y_lo, y_range), !hyst_lane);
                 let gxp: Vec<f32> = (1..gx_f).map(|i| x_lo + sx[i] * x_range).collect();
                 let gyp: Vec<f32> = (1..gy_f).map(|i| y_lo + sy[i] * y_range).collect();
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
                 let gs = egui::Stroke::new(0.5, grid_faint);
                 for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
                 for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-                if !hyst_lane { painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis)); }
+                if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); } }
 
+                let mut label_inset = egui::Vec2::ZERO;
                 if sgl {
-                    const MPX: f32 = 20.0;
-                    let lc = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-                    let fnt = egui::FontId::proportional(9.0);
-                    let gri = |u: f32| -> f32 { if absolute_eff { curve_scale_inv(u, sc_t) * abs_max_in } else { let c = u*2.0-1.0; (if c<0.0{-1.0f32}else{1.0}) * curve_scale_inv(c.abs(), sc_t) * abs_max_in } };
-                    let gro = |v: f32| -> f32 { if absolute_eff { curve_scale_inv(v, sc_t) * abs_max_out } else { let c = v*2.0-1.0; (if c<0.0{-1.0f32}else{1.0}) * curve_scale_inv(c.abs(), sc_t) * abs_max_out } };
-                    let mut lsx = f32::NEG_INFINITY;
-                    for &x in &gxp { let sx2 = c2s(x, y_hi).x; if sx2-lsx < MPX { continue; } lsx = sx2; let val = gri((x-x_lo)/x_range); let lbl = if abs_max_in<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(sx2+1.0, rect.top()+1.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
-                    let mut lsy = f32::INFINITY;
-                    for &y in &gyp { let sy2 = c2s(x_lo, y).y; if lsy-sy2 < MPX { continue; } lsy = sy2; let val = gro((y-y_lo)/y_range); let lbl = if hyst_lane{format!("{:.1}%",(y-y_lo)/y_range*TWOWAY_HYST_MAX_PCT)}else if abs_max_out<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(rect.left()+1.0, sy2-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
+                    let xl = view.labels_in(&gxp);
+                    // The Hyst graph's Y is a band width, as a percentage.
+                    let yl = if hyst_lane {
+                        axis_labels(&gyp.iter().map(|&y| (y - y_lo) / y_range * TWOWAY_HYST_MAX_PCT).collect::<Vec<_>>(), "%")
+                    } else {
+                        view.labels_out(&gyp)
+                    };
+                    label_inset = paint_axis_labels(&painter, rect,
+                        gxp.iter().map(|&x| c2s(x, y_hi).x).zip(xl).collect(),
+                        gyp.iter().map(|&y| c2s(x_lo, y).y).zip(yl).collect());
                 }
 
                 // Inactive lane (dimmed)
@@ -1408,6 +1367,9 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         let mid_x = (new_edit_pts[seg][0] + new_edit_pts[seg+1][0]) * 0.5;
                         let mid_y = sample_curve(new_edit_pts, mid_x, new_edit_biases).clamp(y_lo, y_hi);
                         let hpos  = c2s(mid_x, mid_y);
+                        // A zoomed graph (a motion pick's view) leaves points outside it: no
+                        // hidden handle may catch clicks meant for whatever is drawn there.
+                        if !rect.expand(8.0).contains(hpos) { continue; }
                         let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
                         if hresp.double_clicked() { new_edit_biases[seg] = 0.0; *bias_changed_ref = true; }
                         else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
@@ -1422,6 +1384,9 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 for i in 0..edit_pts_r.len() {
                     let [px, py] = edit_pts_r[i];
                     let screen   = c2s(px, py);
+                    // A zoomed graph (a motion pick's view) leaves points outside it: no
+                    // hidden handle may catch clicks meant for whatever is drawn there.
+                    if !rect.expand(8.0).contains(screen) { continue; }
                     let pt_id    = ui.id().with(("twpt", node_id, lane_ix, i as u32));
                     let pt_resp  = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
                     let oid      = ui.id().with(("twpt_orig", node_id, lane_ix, i as u32));
@@ -1440,6 +1405,12 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         *pts_changed_ref = true;
                     }
                     if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
+                    // Double-click: onto the 1:1 line — output equal to its input.
+                    if pt_resp.double_clicked() && !hyst_lane {
+                        let lo = if absolute_eff { 0.0 } else { -1.0 };
+                        new_edit_pts[i][1] = new_edit_pts[i][0].clamp(lo, 1.0);
+                        *pts_changed_ref = true;
+                    }
                     if pt_resp.secondary_clicked() && edit_pts_r.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); *pts_changed_ref = true; }
                     // Gamepad-nav selected-dot highlight (active lane only).
                     if nav_sel_dot == Some(i) {
@@ -1461,6 +1432,10 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    // The dot's output value: always with the grid labels, else while handled.
+                    if sgl || pt_resp.hovered() || pt_resp.dragged() {
+                        paint_point_value(&painter, rect, screen, if hyst_lane { value_label((py - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%") } else { view.value_out(py) });
+                    }
                 }
 
                 if let Some(idx) = remove_idx { curve_remove_point(new_edit_pts, new_edit_biases, idx); }
@@ -1483,7 +1458,21 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
                 if has_active { request_repaint_throttled(ui.ctx()); }
                 if let Some(labels) = legend {
-                    paint_curve_legend(&painter, rect, labels, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                    paint_curve_legend(&painter, rect, labels, label_inset, |ch| MULTI_COLORS[ch % MULTI_COLORS.len()]);
+                }
+                // Live reading at the mouse or gamepad cursor, with the labels:
+                // on the lane being edited (the Hyst graph reads a band width).
+                if sgl && !ui.input(|i| i.pointer.any_down()) {
+                    if let Some(at) = graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+                        let (rp, rb): (&[[f32; 2]], &[f32]) = (&new_edit_pts[..], &new_edit_biases[..]);
+                        paint_cursor_reading(&painter, rect, at, (x_lo, x_hi, y_lo, y_hi),
+                            |x| sample_curve(rp, x, rb),
+                            |gx, gy| if hyst_lane {
+                                format!("{}  →  band {}", view.value_in(gx), value_label((gy - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%"))
+                            } else {
+                                format!("{}  →  {}", view.value_in(gx), view.value_out(gy))
+                            });
+                    }
                 }
 
                 // Right-click on empty graph → save/load/copy/paste/reset for
@@ -1560,14 +1549,8 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
         // Scale slider with center notch (double-click resets)
         let scale_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Log").small().weak());
-            let (sr, sresp) = ui.allocate_exact_size(egui::vec2(80.0, 14.0), egui::Sense::click_and_drag());
-            if sresp.double_clicked() { sc_t = 0.0; changed = true; }
-            else if sresp.dragged() { sc_t = (sc_t + sresp.drag_delta().x / sr.width() * 2.0).clamp(-1.0, 1.0); changed = true; }
-            let slp = ui.painter_at(sr);
-            slp.rect_filled(sr, 3.0, Color32::from_gray(35));
-            slp.line_segment([egui::pos2(sr.center().x, sr.top()+2.0), egui::pos2(sr.center().x, sr.bottom()-2.0)], egui::Stroke::new(1.0, Color32::from_gray(70)));
-            let kx = sr.left() + (sc_t+1.0)*0.5*sr.width();
-            slp.circle_filled(egui::pos2(kx, sr.center().y), 5.0, if sresp.hovered() || sresp.dragged() { Color32::WHITE } else { Color32::from_gray(190) });
+            let slider_id = ui.make_persistent_id(("log_exp", node_id));
+            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
             ui.label(egui::RichText::new("Exp").small().weak());
             ui.separator();
             let ab = abs_on;
@@ -1598,16 +1581,33 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
         register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
 
         let range_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
-            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
+            // A motion pick: how much of the sensor the graph shows, in its units.
+            if let Some(unit) = view.unit {
+                motion_view_range_fields(ui, node_id, snarl, unit, absolute_eff);
+            } else {
+                let linked = snarl.get_node(node_id).map_or(true, range_linked);
+                ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
+                if range_link_button(ui, linked) { toggle_range_link(snarl, node_id); }
+                ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
+                if linked {
+                    let mut v = [0.0, i1, 0.0, o1];
+                    follow_range_link([0.0, i1b, 0.0, o1b], &mut v);
+                    (i1, o1) = (v[1].max(0.001), v[3].max(0.001));
+                }
+            }
             ui.label(egui::RichText::new("Grid").small().weak());
-            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
+            let (mut gxd, mut gyd) = (gx_f as f64, gy_f as f64);
+            if grid_count_fields(ui, node_id, snarl, &mut gxd, &mut gyd, 32.0).1 {
+                gx_f = gxd.round() as usize;
+                gy_f = gyd.round() as usize;
+                changed = true;
+            }
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
 
         let grid_resp = ui.horizontal(|ui| {
             let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
-            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
+            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).range(0i64..=TRAIL_MS_MAX).suffix("ms")); if tm!=tmb{changed=true;}
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
@@ -1782,13 +1782,15 @@ pub(crate) fn paint_twoway_curve_graph(
     // this up/dn-lane renderer yet — the toggle exists and other curve
     // renderers honor it; read kept underscored until the overlay is ported.
     let _ssg       = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-    let sgl        = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sgl        = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(&node_data).is_some());
 
     let absolute_eff = absolute || vec_mode;
-    let (x_lo, x_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // A motion pick runs on the whole sensor and shows only its view of it.
+    let view = CurveView::resolve(Some(&node_data), absolute_eff, scale_t, [in_min, in_max, out_min, out_max]);
+    let (x_lo, x_hi) = (view.x_lo, view.x_hi);
     // The Hyst graph's Y is a band width, 0..TWOWAY_HYST_MAX_PCT, in any mode.
     let hyst_lane = active_lane == "hy";
-    let (y_lo, y_hi): (f32, f32) = if absolute_eff || hyst_lane { (0.0, 1.0) } else { (-1.0, 1.0) };
+    let (y_lo, y_hi) = if hyst_lane { (0.0, 1.0) } else { (view.y_lo, view.y_hi) };
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
     let lane_up = active_lane == "up";
@@ -1825,8 +1827,6 @@ pub(crate) fn paint_twoway_curve_graph(
     painter.rect_filled(rect, 2.0, graph_bg);
 
     // Grid
-    let abs_max_in  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-    let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
     let snap_nodes: Vec<f32> = (0..=grid_x).map(|i| i as f32 / grid_x as f32).collect();
     let snap_nodes_y: Vec<f32> = (0..=grid_y).map(|i| i as f32 / grid_y as f32).collect();
     let do_snap = |x: f32, y: f32| -> (f32, f32) {
@@ -1835,37 +1835,30 @@ pub(crate) fn paint_twoway_curve_graph(
         let v = ((y - y_lo) / y_range).clamp(0.0, 1.0);
         let su = snap_nodes.iter().copied().min_by(|a, b| (a-u).abs().partial_cmp(&(b-u).abs()).unwrap()).unwrap_or(u);
         let sv = snap_nodes_y.iter().copied().min_by(|a, b| (a-v).abs().partial_cmp(&(b-v).abs()).unwrap()).unwrap_or(v);
-        (x_lo + su * x_range, y_lo + sv * y_range)
+        snap_point(x, y, (x_lo + su * x_range, y_lo + sv * y_range),
+            &snap_nodes, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), !hyst_lane)
     };
+    publish_nav_curve_snap(ui.ctx(), node_id, snap, &snap_nodes, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), !hyst_lane);
     let gxp: Vec<f32> = (1..grid_x).map(|i| x_lo + i as f32 / grid_x as f32 * x_range).collect();
     let gyp: Vec<f32> = (1..grid_y).map(|i| y_lo + i as f32 / grid_y as f32 * y_range).collect();
     let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
     let gs = egui::Stroke::new(0.5, grid_faint);
     for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-    if !hyst_lane { painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis)); }
+    if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); } }
 
+    let mut label_inset = egui::Vec2::ZERO;
     if sgl {
-        let lc = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-        let fnt = egui::FontId::proportional(9.0);
-        let mut lsx = f32::NEG_INFINITY;
-        for &x in &gxp {
-            let sx = c2s(x, y_hi).x;
-            if sx - lsx < 20.0 { continue; } lsx = sx;
-            let u = (x - x_lo) / x_range;
-            let val = if absolute_eff { curve_scale_inv(u, scale_t) * abs_max_in } else { let c = u*2.0-1.0; (if c<0.0{-1.0f32}else{1.0})*curve_scale_inv(c.abs(),scale_t)*abs_max_in };
-            let lbl = if abs_max_in <= 1.01 { format!("{:.0}%", val*100.0) } else { format!("{:.2}", val) };
-            painter.text(egui::pos2(sx+1.0, rect.top()+1.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc);
-        }
-        let mut lsy = f32::INFINITY;
-        for &y in &gyp {
-            let sy = c2s(x_lo, y).y;
-            if lsy - sy < 20.0 { continue; } lsy = sy;
-            let v = (y - y_lo) / y_range;
-            let val = if absolute_eff { curve_scale_inv(v, scale_t) * abs_max_out } else { let c = v*2.0-1.0; (if c<0.0{-1.0f32}else{1.0})*curve_scale_inv(c.abs(),scale_t)*abs_max_out };
-            let lbl = if hyst_lane { format!("{:.1}%", v * TWOWAY_HYST_MAX_PCT) } else if abs_max_out <= 1.01 { format!("{:.0}%", val*100.0) } else { format!("{:.2}", val) };
-            painter.text(egui::pos2(rect.left()+1.0, sy-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc);
-        }
+        let xl = view.labels_in(&gxp);
+        // The Hyst graph's Y is a band width, as a percentage.
+        let yl = if hyst_lane {
+            axis_labels(&gyp.iter().map(|&y| (y - y_lo) / y_range * TWOWAY_HYST_MAX_PCT).collect::<Vec<_>>(), "%")
+        } else {
+            view.labels_out(&gyp)
+        };
+        label_inset = paint_axis_labels(&painter, rect,
+            gxp.iter().map(|&x| c2s(x, y_hi).x).zip(xl).collect(),
+            gyp.iter().map(|&y| c2s(x_lo, y).y).zip(yl).collect());
     }
 
     // Inactive lane (dimmed)
@@ -1900,6 +1893,9 @@ pub(crate) fn paint_twoway_curve_graph(
             let mid_x = (new_edit_pts[seg][0]+new_edit_pts[seg+1][0])*0.5;
             let mid_y = sample_curve(&new_edit_pts, mid_x, &new_edit_biases).clamp(y_lo, y_hi);
             let hpos = c2s(mid_x, mid_y);
+            // A zoomed graph (a motion pick's view) leaves points outside it: no
+            // hidden handle may catch clicks meant for whatever is drawn there.
+            if !rect.expand(8.0).contains(hpos) { continue; }
             let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh_pin", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
             if hresp.double_clicked() { new_edit_biases[seg] = 0.0; bias_changed = true; }
             else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); bias_changed = true; }
@@ -1914,6 +1910,9 @@ pub(crate) fn paint_twoway_curve_graph(
     for i in 0..edit_pts.len() {
         let [px, py] = edit_pts[i];
         let screen = c2s(px, py);
+        // A zoomed graph (a motion pick's view) leaves points outside it: no
+        // hidden handle may catch clicks meant for whatever is drawn there.
+        if !rect.expand(8.0).contains(screen) { continue; }
         let pt_id  = ui.id().with(("twpt_pin", node_id, lane_ix, i as u32));
         let pt_resp = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
         let oid = ui.id().with(("twpt_orig_pin", node_id, lane_ix, i as u32));
@@ -1932,6 +1931,12 @@ pub(crate) fn paint_twoway_curve_graph(
             pts_changed = true;
         }
         if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
+        // Double-click: onto the 1:1 line — output equal to its input.
+        if pt_resp.double_clicked() && !hyst_lane {
+            let lo = if absolute_eff { 0.0 } else { -1.0 };
+            new_edit_pts[i][1] = new_edit_pts[i][0].clamp(lo, 1.0);
+            pts_changed = true;
+        }
         if pt_resp.secondary_clicked() && edit_pts.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); pts_changed = true; }
         // Gamepad-nav selected-dot highlight (active lane).
         if nav_sel_dot == Some(i) {
@@ -1953,6 +1958,10 @@ pub(crate) fn paint_twoway_curve_graph(
         let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+        // The dot's output value: always with the grid labels, else while handled.
+        if sgl || pt_resp.hovered() || pt_resp.dragged() {
+            paint_point_value(&painter, rect, screen, if hyst_lane { value_label((py - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%") } else { view.value_out(py) });
+        }
     }
 
     // Remove (right-click) / add (double-click) — biases stay on their segments.
@@ -1995,7 +2004,20 @@ pub(crate) fn paint_twoway_curve_graph(
         |ch| graph_channel_color(graph_ov, ch));
     if has_active { request_repaint_throttled(ui.ctx()); }
     if let Some(labels) = legend {
-        paint_curve_legend(&painter, rect, labels, |ch| graph_channel_color(graph_ov, ch));
+        paint_curve_legend(&painter, rect, labels, label_inset, |ch| graph_channel_color(graph_ov, ch));
+    }
+    // Live reading at the mouse or gamepad cursor, with the labels: on the
+    // lane being edited (the Hyst graph reads a band width).
+    if sgl && !ui.input(|i| i.pointer.any_down()) {
+        if let Some(at) = graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+            paint_cursor_reading(&painter, rect, at, (x_lo, x_hi, y_lo, y_hi),
+                |x| sample_curve(&new_edit_pts, x, &new_edit_biases),
+                |gx, gy| if hyst_lane {
+                    format!("{}  →  band {}", view.value_in(gx), value_label((gy - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%"))
+                } else {
+                    format!("{}  →  {}", view.value_in(gx), view.value_out(gy))
+                });
+        }
     }
 
     // Optional override frame, drawn last so it sits above the graph content.
@@ -2131,19 +2153,24 @@ impl TwowayGeom {
     fn from_params(rect: egui::Rect, n: &NodeData) -> Self {
         let f = |k: &str, d: f64| n.params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
         let absolute_eff = n.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true) || twoway_vec_mode(n);
-        let (in_min, in_max) = (f("in_min", -1.0), f("in_max", 1.0));
-        let lo = if absolute_eff { 0.0 } else { -1.0 };
+        let scale_t = f("scale_t", 0.0);
+        let view = CurveView::of(n, absolute_eff, scale_t);
         // The Hyst graph's Y is a band width: 0..1 in any mode.
-        let y_lo = if n.params.get("active_lane").and_then(|v| v.as_str()) == Some("hy") { 0.0 } else { lo };
+        let (y_lo, y_hi) = if n.params.get("active_lane").and_then(|v| v.as_str()) == Some("hy") {
+            (0.0, 1.0)
+        } else {
+            (view.y_lo, view.y_hi)
+        };
         TwowayGeom {
-            rect, x_lo: lo, x_hi: 1.0, y_lo, y_hi: 1.0, absolute_eff, in_min, in_max,
-            scale_t: f("scale_t", 0.0),
-            hyst: TwowayHyst::from_params(&n.params, absolute_eff),
+            rect, x_lo: view.x_lo, x_hi: view.x_hi, y_lo, y_hi, absolute_eff,
+            in_min: view.in_min, in_max: view.in_max,
+            scale_t,
+            hyst: TwowayHyst::from_params(&curve_run_params(n), absolute_eff),
         }
     }
     /// Top of the tracked input range (a magnitude's top in Abs / Vec mode).
     fn in_hi(&self) -> f32 {
-        if self.absolute_eff { self.in_max.abs().max(self.in_min.abs()) } else { self.in_max }
+        if self.absolute_eff { self.in_max.abs() } else { self.in_max }
     }
     fn c2s(&self, x: f32, y: f32) -> egui::Pos2 {
         egui::pos2(
@@ -2154,7 +2181,7 @@ impl TwowayGeom {
     /// An input value's graph X, through the range and the Log/Exp scale.
     fn gx(&self, v: f32) -> f32 {
         if self.absolute_eff {
-            let abs_max = self.in_max.abs().max(self.in_min.abs()).max(f32::EPSILON);
+            let abs_max = self.in_max.abs().max(f32::EPSILON);
             curve_scale((v.abs() / abs_max).clamp(0.0, 1.0), self.scale_t)
         } else {
             let inr = (self.in_max - self.in_min).abs().max(f32::EPSILON);
@@ -2203,7 +2230,7 @@ pub(crate) fn paint_twoway_live(
     color: impl Fn(usize) -> Color32,
 ) -> bool {
     let n_channels = curve_channels(node);
-    let trail_ms = node.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+    let trail_ms = node.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
     let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
     let now = std::time::Instant::now();
     let x_range = g.x_hi - g.x_lo;
@@ -2249,7 +2276,7 @@ pub(crate) fn paint_twoway_live(
         let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).unwrap_or_default());
         if prev_lane_id != lane_id { tbuf.clear(); }
         if trail_ms > 0 {
-            tbuf.push_back((graph_x, now));
+            push_trail_sample(&mut tbuf, graph_x, now, trail_dur);
             while tbuf.front().is_some_and(|&(_, t)| now.duration_since(t) > trail_dur) { tbuf.pop_front(); }
         } else { tbuf.clear(); }
         let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();

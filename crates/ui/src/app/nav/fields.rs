@@ -180,8 +180,10 @@ impl FlexInputApp {
                     0.0
                 };
                 if press != 0.0 || cont != 0.0 {
+                    let before = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(*default);
                     self.nav_adjust_field_value(outer_id, inner, *key, *lo, *hi, *default, *step,
                         press, cont, fine, dt);
+                    self.nav_follow_grid_link(outer_id, inner, key, before, *hi);
                 }
             }
             NavField::Enum { key, opts } => {
@@ -256,6 +258,41 @@ impl FlexInputApp {
     /// Value-field nudge: decade or linear stepping (shared with the standalone
     /// numeric widgets), per-field bounds.
     #[allow(clippy::too_many_arguments)]
+    /// A curve's grid H / V counts — and its In / Out ranges — are linked unless set apart
+    /// (`GRID_UNLINKED`): nudging one from the pad moves the other by as much,
+    /// as dragging it does in the body.
+    fn nav_follow_grid_link(&mut self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        key: &str, before: f32, hi: f32)
+    {
+        let is_curve = matches!(self.nav_selected_module_id(outer_id).as_deref(),
+            Some("module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"));
+        if !is_curve { return; }
+        // In and Out ranges (and a motion view's): linked unless set apart
+        // (`RANGE_UNLINKED`), an end scales its counterpart by the same ratio.
+        if let Some(other) = range_counterpart(key) {
+            if self.get_subpatch_param_bool(outer_id, inner, crate::canvas::viewer::RANGE_UNLINKED).unwrap_or(false) {
+                return;
+            }
+            let after = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(before);
+            if after == before { return; }
+            let Some(o) = self.get_subpatch_param_f32(outer_id, inner, other) else { return };
+            // Slot 0 is the nudged end, slot 2 its counterpart.
+            let mut now = [after, 0.0, o, 0.0];
+            crate::canvas::viewer::follow_range_link([before, 0.0, o, 0.0], &mut now);
+            self.set_subpatch_param_f32(outer_id, inner, other, now[2]);
+            return;
+        }
+        let other = match key { "grid_x" => "grid_y", "grid_y" => "grid_x", _ => return };
+        if self.get_subpatch_param_bool(outer_id, inner, crate::canvas::viewer::GRID_UNLINKED).unwrap_or(false) {
+            return;
+        }
+        let after = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(before);
+        let d = (after - before).round();
+        if d == 0.0 { return; }
+        let o = self.get_subpatch_param_f32(outer_id, inner, other).unwrap_or(4.0);
+        self.set_subpatch_param_i64(outer_id, inner, other, (o + d).clamp(1.0, hi) as i64);
+    }
+
     pub(crate) fn nav_adjust_field_value(&mut self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId,
         key: &str, lo: f32, hi: f32, default: f32, step: NavStep,
         press: f32, cont: f32, fine: bool, dt: f32)
@@ -815,6 +852,26 @@ impl FlexInputApp {
                 .as_deref() == Some("360");
             if per_360 { FixedScaled { coarse: 100.0, factor: 360.0 } } else { Fixed(1.0) }
         };
+        // An AutoMap curve on a motion sensor: its range row is the graph's
+        // view of the sensor, in °/s or G (see `MotionUnit`).
+        if elem == "range_row" {
+            let unit = self.nav_selected_inner_node(outer_id).and_then(|inner| {
+                let canvas = &self.tabs[self.active_tab].canvas;
+                nav_scope(&canvas.snarl, outer_id)
+                    .and_then(|sp| sp.get_node(inner))
+                    .and_then(crate::canvas::viewer::MotionUnit::of)
+            });
+            if let Some(unit) = unit {
+                let (fs, d, sfx) = (unit.full_scale(), unit.default_extent(), unit.suffix());
+                let k = unit.view_keys();
+                return vec![
+                    f!(format!("In↓{sfx}"), v(k[0], -fs, fs, -d, Fixed(unit.step()))),
+                    f!(format!("In↑{sfx}"), v(k[1], -fs, fs, d, Fixed(unit.step()))),
+                    f!(format!("Out↓{sfx}"), v(k[2], -fs, fs, -d, Fixed(unit.step()))),
+                    f!(format!("Out↑{sfx}"), v(k[3], -fs, fs, d, Fixed(unit.step()))),
+                ];
+            }
+        }
         // JSM Config's editor pin: one field per numeric setting the config sets,
         // discovered from the TEXT each frame rather than from a table — which is
         // the whole point of the module, and means a setting added while the
@@ -1012,7 +1069,7 @@ impl FlexInputApp {
             | ("module.twoway_response_curve", "grid_row") => vec![
                 f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
                 f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
-                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
+                f!("Trail ms", v("trail_ms",0.0,3000.0,300.0,Decade)),
             ],
             ("module.response_curve", "grid_options_row") | ("module.vec_response_curve", "grid_options_row")
             | ("module.twoway_response_curve", "grid_options_row") => vec![
@@ -2559,4 +2616,15 @@ mod jsm_tab_cycle_tests {
         assert_eq!(next_config_tab(9, 0, 1), 0);
         assert_eq!(next_config_tab(9, 1, 3), 1, "wrapped into range");
     }
+}
+
+/// The Out end a curve's In range end is linked to, or the other way round:
+/// the plain ranges and both motion views' (see `MotionUnit::view_keys`).
+fn range_counterpart(key: &str) -> Option<&'static str> {
+    const PAIRS: &[(&str, &str)] = &[
+        ("in_min", "out_min"), ("in_max", "out_max"),
+        ("gyro_view_in_min", "gyro_view_out_min"), ("gyro_view_in_max", "gyro_view_out_max"),
+        ("accel_view_in_min", "accel_view_out_min"), ("accel_view_in_max", "accel_view_out_max"),
+    ];
+    PAIRS.iter().find_map(|&(a, b)| if key == a { Some(b) } else if key == b { Some(a) } else { None })
 }

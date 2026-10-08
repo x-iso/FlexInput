@@ -1926,6 +1926,9 @@ impl eframe::App for FlexInputApp {
         // Push a fresh graph snapshot to the processing thread each frame.
         {
             puffin::profile_scope!("build_and_publish_graph");
+            // Which curves a motion sensor feeds — read by the graph builder
+            // (they run on the whole sensor) and by the curve bodies (units).
+            crate::canvas::viewer::refresh_curve_motion_units(&mut self.tabs[self.active_tab].canvas.snarl);
             let (graph_snap, dirty_uids) = {
                 puffin::profile_scope!("build_processing_graph");
                 let defaults = self.nav_device_defaults();
@@ -3136,6 +3139,23 @@ impl eframe::App for FlexInputApp {
 
         // ── Gamepad-nav overlays: cursor ─────────────────────────────────
         self.draw_nav_cursor(ctx);
+        // Where the cursor is, for graphs that read their value under it —
+        // in the config overlay's viewport while that is up (it draws the
+        // same cursor there), else the main window's.
+        {
+            let key = egui::Id::new(crate::canvas::viewer::NAV_CURSOR_KEY);
+            if self.gamepad_nav.cursor_visible {
+                let vp = if crate::config_overlay::config_overlay_visible(ctx) {
+                    egui::ViewportId::from_hash_of("fxi_config_overlay")
+                } else {
+                    egui::ViewportId::ROOT
+                };
+                let pos = self.gamepad_nav.cursor_pos;
+                ctx.data_mut(|d| d.insert_temp(key, (vp, pos)));
+            } else {
+                ctx.data_mut(|d| d.remove_temp::<(egui::ViewportId, egui::Pos2)>(key));
+            }
+        }
 
         // ── Inner edge shadow ────────────────────────────────────────────
         // A pronounced gradient darkening at all four window edges,

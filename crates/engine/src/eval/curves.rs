@@ -76,7 +76,8 @@ pub fn apply_curve(
 ) -> f32 {
     if absolute {
         let sign     = if x < 0.0 { -1.0f32 } else { 1.0 };
-        let abs_max  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+        // Abs reads a magnitude: only the ↑ ends of the ranges apply.
+        let abs_max  = in_max.abs().max(f32::EPSILON);
         let abs_norm = (x.abs() / abs_max).clamp(0.0, 1.0);
         let scaled   = curve_scale(abs_norm, scale_t);
         curve_y_to_output(sample_curve(pts, scaled, biases), sign, true, out_min, out_max, scale_t)
@@ -94,7 +95,7 @@ pub fn apply_curve(
 pub fn curve_y_to_output(curve_y: f32, sign: f32, absolute: bool, out_min: f32, out_max: f32, scale_t: f32) -> f32 {
     if absolute {
         let out_y = curve_scale_inv(curve_y.clamp(0.0, 1.0), scale_t);
-        sign * out_y * out_max.abs().max(out_min.abs())
+        sign * out_y * out_max.abs()
     } else {
         let sign_out = if curve_y < 0.0 { -1.0f32 } else { 1.0 };
         let out_y    = sign_out * curve_scale_inv(curve_y.abs(), scale_t);

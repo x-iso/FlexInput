@@ -357,10 +357,28 @@ pub struct ModuleDescriptor {
   - `points: Array<[f64, f64]>` - Curve control points [(x, y), ...]
   - `biases: Array<f64>` - Per-segment bias values
   - `absolute: bool` - Apply curve to absolute value
-  - `in_min: f64` - Input range minimum (-1.0)
+  - `in_min: f64` - Input range minimum (-1.0) — unused under `absolute`
   - `in_max: f64` - Input range maximum (1.0)
-  - `out_min: f64` - Output range minimum (-1.0)
+  - `out_min: f64` - Output range minimum (-1.0) — unused under `absolute`
   - `out_max: f64` - Output range maximum (1.0)
+  - `grid_x` / `grid_y: i64` - Grid line counts; linked (change together) unless
+    `grid_unlinked: bool`
+  - In/Out ranges are linked too (changing an In end scales the matching Out end by
+    the same ratio) unless `range_unlinked: bool`
+  - `snap: bool` - Snap dragged dots to grid intersections and to where grid lines
+    cross the 1:1 line
+  - `trail_ms: i64` - Live trail length, 0..3000 (long trails are sample-capped)
+  - `show_grid_labels: bool` - Axis labels, plus each dot's output value
+- **Abs:** reads a magnitude, so only the ↑ ends (`in_max`, `out_max`) set the
+  ranges; the ↓ fields are greyed out.
+- **Motion sources:** a curve whose wires trace back to gyro or accel pins (a pad, a
+  Splitter, or a 3DOF to 2D's Out / X / Y in Pointer mode — Steering integrates the
+  rates into something else) runs on the sensor's whole range and labels its graph in
+  °/s or G; its In/Out fields then only choose what part of the sensor the graph shows
+  (`gyro_view_*` / `accel_view_*`). Same for the Vec and Two-way curves, and for the
+  AutoMap curves' gyro / accel picks. To shape gyro aiming, curve the 3DOF to 2D's
+  output rather than the raw gyro going into it: the module integrates and
+  gravity-fuses the rates, which a curve in front of it would distort.
 
 #### Vec Response Curve
 - **ID:** `module.vec_response_curve`

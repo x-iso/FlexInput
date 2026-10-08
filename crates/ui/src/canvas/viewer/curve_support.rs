@@ -56,27 +56,10 @@ pub(crate) fn render_response_curve_scale_row(
         // frame lengthens the slider.
         let slider_w = pin_flex_width(ui, container, 60.0);
         let slider_h = (16.0 * s).max(10.0);
-        let (slider_rect, slider_resp) =
-            ui.allocate_exact_size(egui::vec2(slider_w, slider_h), egui::Sense::click_and_drag());
+        let slider_id = ui.make_persistent_id(("log_exp_pin", inner_id));
+        let (slider_rect, c) = log_exp_slider(ui, slider_id, egui::vec2(slider_w, slider_h), &mut sc_t);
         fr.push(slider_rect);
-        if slider_resp.double_clicked() { sc_t = 0.0; changed = true; }
-        else if slider_resp.dragged() {
-            sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
-            changed = true;
-        }
-        let painter = ui.painter_at(slider_rect);
-        painter.rect_filled(slider_rect, 3.0, Color32::from_gray(35));
-        let cx = slider_rect.center().x;
-        painter.line_segment(
-            [egui::pos2(cx, slider_rect.top() + 2.0), egui::pos2(cx, slider_rect.bottom() - 2.0)],
-            egui::Stroke::new(1.0, Color32::from_gray(70)),
-        );
-        let knob_x = slider_rect.left() + (sc_t + 1.0) * 0.5 * slider_rect.width();
-        painter.circle_filled(
-            egui::pos2(knob_x, slider_rect.center().y),
-            (slider_rect.height() * 0.35).max(3.0),
-            if slider_resp.hovered() || slider_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
-        );
+        changed |= c;
         ui.label(egui::RichText::new("Exp").weak());
         ui.separator();
         if !is_vec {
@@ -111,6 +94,14 @@ pub(crate) fn render_response_curve_range_row(
 ) {
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let absolute = is_vec || snarl.get_node(inner_id).is_some_and(|n| {
+        twoway_vec_mode(n) || n.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true)
+    });
+    if let Some(unit) = snarl.get_node(inner_id).and_then(MotionUnit::of) {
+        let (fr, _) = motion_view_range_fields(ui, inner_id, snarl, unit, absolute);
+        publish_nav_field_rects(ui, inner_id, &fr);
+        return;
+    }
     let mut changed = false;
     if is_vec {
         let (mut i_max, mut o_max) = snarl.get_node(inner_id).map(|n| {
@@ -119,16 +110,25 @@ pub(crate) fn render_response_curve_range_row(
             (i, o)
         }).unwrap_or((1.0, 1.0));
         let mut fr = [egui::Rect::NOTHING; 2];
+        let linked = snarl.get_node(inner_id).map_or(true, range_linked);
+        let before = [0.0, i_max, 0.0, o_max];
+        let mut link_clicked = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In max").weak());
             let r = ui.add(egui::DragValue::new(&mut i_max).speed(0.01).max_decimals(2));
             fr[0] = r.rect; changed |= r.changed();
-            ui.separator();
+            link_clicked = range_link_button(ui, linked);
             ui.label(egui::RichText::new("Out max").weak());
             let r = ui.add(egui::DragValue::new(&mut o_max).speed(0.01).max_decimals(2));
             fr[1] = r.rect; changed |= r.changed();
         });
         publish_nav_field_rects(ui, inner_id, &fr);
+        if link_clicked { toggle_range_link(snarl, inner_id); }
+        if changed && linked {
+            let mut v = [0.0, i_max, 0.0, o_max];
+            follow_range_link(before, &mut v);
+            (i_max, o_max) = (v[1], v[3]);
+        }
         if changed {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 if let Some(n) = Number::from_f64(i_max as f64) { node.params.insert("in_max".into(),  Value::Number(n)); }
@@ -144,20 +144,31 @@ pub(crate) fn render_response_curve_range_row(
             (i0, i1, o0, o1)
         }).unwrap_or((-1.0, 1.0, -1.0, 1.0));
         let mut fr = [egui::Rect::NOTHING; 4];
+        let linked = snarl.get_node(inner_id).map_or(true, range_linked);
+        let before = [i0, i1, o0, o1];
+        let mut link_clicked = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In").weak());
-            let r = ui.add(egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2));
+            let r = ui.add_enabled(!absolute, egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2))
+                .on_disabled_hover_text(ABS_MIN_HOVER);
             fr[0] = r.rect; changed |= r.changed();
             let r = ui.add(egui::DragValue::new(&mut i1).speed(0.01).prefix("↑").max_decimals(2));
             fr[1] = r.rect; changed |= r.changed();
-            ui.separator();
+            link_clicked = range_link_button(ui, linked);
             ui.label(egui::RichText::new("Out").weak());
-            let r = ui.add(egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2));
+            let r = ui.add_enabled(!absolute, egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2))
+                .on_disabled_hover_text(ABS_MIN_HOVER);
             fr[2] = r.rect; changed |= r.changed();
             let r = ui.add(egui::DragValue::new(&mut o1).speed(0.01).prefix("↑").max_decimals(2));
             fr[3] = r.rect; changed |= r.changed();
         });
         publish_nav_field_rects(ui, inner_id, &fr);
+        if link_clicked { toggle_range_link(snarl, inner_id); }
+        if changed && linked {
+            let mut v = [i0, i1, o0, o1];
+            follow_range_link(before, &mut v);
+            [i0, i1, o0, o1] = v;
+        }
         if changed {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 for (k, v) in [
@@ -169,6 +180,343 @@ pub(crate) fn render_response_curve_range_row(
             }
         }
     }
+}
+
+/// The Log/Exp setting as text: which way, how far, and the power it puts on
+/// the input.
+pub(crate) fn log_exp_text(t: f32) -> String {
+    if t.abs() < 0.005 {
+        return "Linear".to_string();
+    }
+    let side = if t < 0.0 { "Log" } else { "Exp" };
+    format!("{side} {:.2}  ·  x^{:.2}", t.abs(), 2f32.powf(t * 3.0))
+}
+
+/// The Log ⟷ Exp scale slider: drag to set, double-click for linear, Ctrl+click
+/// to type a value (-1..1). Shows the value while it is changed and on hover.
+/// Returns the slider's rect and whether the value changed.
+pub(crate) fn log_exp_slider(ui: &mut egui::Ui, id: egui::Id, size: egui::Vec2, sc_t: &mut f32) -> (egui::Rect, bool) {
+    // Typing: 1 = just asked for (focus the field), 2 = typing.
+    let typing_id = id.with("typing");
+    let typing = ui.data(|d| d.get_temp::<u8>(typing_id)).unwrap_or(0);
+    if typing > 0 {
+        let r = ui.add_sized(size, egui::DragValue::new(sc_t).range(-1.0..=1.0).speed(0.01).max_decimals(3));
+        if typing == 1 {
+            r.request_focus();
+            ui.data_mut(|d| d.insert_temp(typing_id, 2u8));
+        } else if !r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(typing_id, 0u8));
+        }
+        return (r.rect, r.changed());
+    }
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let mut changed = false;
+    if resp.clicked() && ui.input(|i| i.modifiers.command) {
+        ui.data_mut(|d| d.insert_temp(typing_id, 1u8));
+    } else if resp.double_clicked() {
+        *sc_t = 0.0;
+        changed = true;
+    } else if resp.dragged() {
+        *sc_t = (*sc_t + resp.drag_delta().x / rect.width() * 2.0).clamp(-1.0, 1.0);
+        changed = true;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_gray(35));
+    let cx = rect.center().x;
+    painter.line_segment(
+        [egui::pos2(cx, rect.top() + 2.0), egui::pos2(cx, rect.bottom() - 2.0)],
+        egui::Stroke::new(1.0, Color32::from_gray(70)),
+    );
+    let knob_x = rect.left() + (*sc_t + 1.0) * 0.5 * rect.width();
+    painter.circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        (rect.height() * 0.35).max(3.0),
+        if resp.hovered() || resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
+    );
+    if resp.dragged() {
+        resp.show_tooltip_text(log_exp_text(*sc_t));
+    } else {
+        resp.on_hover_text(format!(
+            "{}\nDrag: Log ⟷ Exp. Double-click: linear. Ctrl+click: type a value.",
+            log_exp_text(*sc_t),
+        ));
+    }
+    (rect, changed)
+}
+
+/// A chain-link toggle, painted rather than taken from a font (the emoji
+/// font's 🔗 renders as something else): two interlocked links while on,
+/// pulled apart while off. Returns the response; the caller acts on clicks.
+pub(crate) fn link_toggle(ui: &mut egui::Ui, linked: bool, hover: &str) -> egui::Response {
+    let h = ui.text_style_height(&egui::TextStyle::Small).max(10.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(h * 1.3, h), egui::Sense::click());
+    let painter = ui.painter_at(rect.expand(1.0));
+    let vis = ui.style().interact_selectable(&resp, linked);
+    if linked || resp.hovered() {
+        painter.rect_filled(rect.expand(1.0), 3.0, vis.bg_fill);
+    }
+    let col = if linked { vis.fg_stroke.color } else { ui.visuals().weak_text_color() };
+    let stroke = egui::Stroke::new(1.3, col);
+    let (w, lh) = (rect.width() * 0.5, rect.height() * 0.5);
+    let gap = if linked { -rect.width() * 0.14 } else { 0.0 };
+    let c = rect.center();
+    for side in [-1.0f32, 1.0] {
+        let center = egui::pos2(c.x + side * (w + gap) * 0.5, c.y);
+        let link = egui::Rect::from_center_size(center, egui::vec2(w, lh));
+        painter.rect_stroke(link, lh * 0.5, stroke, egui::StrokeKind::Middle);
+    }
+    resp.on_hover_text(hover)
+}
+
+/// Where a curve's dots may snap, published by its graph each frame for the
+/// gamepad driver: the grid lines in graph coordinates, and whether the 1:1
+/// line counts too. Absent while Snap is off.
+#[derive(Clone, Default)]
+pub(crate) struct NavCurveSnap {
+    pub xs: Vec<f32>,
+    pub ys: Vec<f32>,
+    pub line: bool,
+}
+
+pub(crate) fn nav_curve_snap_id(node_id: usize) -> egui::Id {
+    egui::Id::new(("gp_nav_curve_snap", node_id))
+}
+
+/// Publish (or, with Snap off, withdraw) a curve graph's snap targets. The grid
+/// positions are fractions across the window `win` = (x_lo, x_range, y_lo, y_range).
+pub(crate) fn publish_nav_curve_snap(
+    ctx: &egui::Context, node_id: NodeId, on: bool,
+    nodes_x: &[f32], nodes_y: &[f32], win: (f32, f32, f32, f32), line: bool,
+) {
+    let id = nav_curve_snap_id(node_id.0);
+    if !on {
+        ctx.data_mut(|d| d.remove_temp::<NavCurveSnap>(id));
+        return;
+    }
+    let snap = NavCurveSnap {
+        xs: nodes_x.iter().map(|u| win.0 + u * win.1).collect(),
+        ys: nodes_y.iter().map(|v| win.2 + v * win.3).collect(),
+        line,
+    };
+    ctx.data_mut(|d| d.insert_temp(id, snap));
+}
+
+impl NavCurveSnap {
+    /// The next snap target from `cur` in direction `dir` (±1) along one axis:
+    /// a grid line, or the 1:1 line's crossing (at `other`, the dot's other
+    /// coordinate). `None` when nothing lies that way.
+    pub(crate) fn next(&self, along_x: bool, cur: f32, other: f32, dir: f32) -> Option<f32> {
+        let lines = if along_x { &self.xs } else { &self.ys };
+        lines.iter().copied()
+            .chain(self.line.then_some(other))
+            .filter(|&c| (c - cur) * dir > 1e-4)
+            .min_by(|a, b| (a - cur).abs().total_cmp(&(b - cur).abs()))
+    }
+}
+
+/// Param that unlinks a curve's In and Out ranges. Stored inverted, like
+/// [`GRID_UNLINKED`], so curves come up linked.
+pub(crate) const RANGE_UNLINKED: &str = "range_unlinked";
+
+/// Whether a curve's In and Out ranges scale together.
+pub(crate) fn range_linked(node: &NodeData) -> bool {
+    !node.params.get(RANGE_UNLINKED).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// The 🔗 between a range row's In and Out fields. Returns whether it was
+/// clicked; [`toggle_range_link`] then flips the stored link.
+pub(crate) fn range_link_button(ui: &mut egui::Ui, linked: bool) -> bool {
+    link_toggle(ui, linked, if linked {
+        "Linked: scaling In scales Out by as much, and the other way round. Click to set them apart."
+    } else {
+        "Link In and Out: scale them together"
+    })
+    .clicked()
+}
+
+pub(crate) fn toggle_range_link(snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+    if let Some(n) = snarl.get_node_mut(node_id) {
+        let linked = range_linked(n);
+        n.params.insert(RANGE_UNLINKED.into(), Value::Bool(linked));
+    }
+}
+
+/// Linked ranges `[in ↓, in ↑, out ↓, out ↑]`: an end that changed since
+/// `before` scales its counterpart (In ↓ with Out ↓, In ↑ with Out ↑) by the
+/// same ratio — or, from zero, moves it by as much.
+pub(crate) fn follow_range_link(before: [f32; 4], now: &mut [f32; 4]) {
+    let scaled = |old: f32, new: f32, other: f32| {
+        if old.abs() > 1e-6 { other * new / old } else { other + (new - old) }
+    };
+    for (a, b) in [(0, 2), (1, 3)] {
+        if now[a] != before[a] {
+            now[b] = scaled(before[a], now[a], before[b]);
+        } else if now[b] != before[b] {
+            now[a] = scaled(before[b], now[b], before[a]);
+        }
+    }
+}
+
+/// The 1:1 line — output equal to input — within a graph window, as the
+/// graph-coordinate span it covers on both axes. On a plain curve it is the
+/// corner diagonal; on a motion view showing In and Out over different spans
+/// it runs at an angle, which is what a straight curve then looks like.
+pub(crate) fn identity_span(x_lo: f32, x_hi: f32, y_lo: f32, y_hi: f32) -> Option<(f32, f32)> {
+    let (a, b) = (x_lo.max(y_lo), x_hi.min(y_hi));
+    (b > a).then_some((a, b))
+}
+
+/// Where a dragged point snaps: the nearest grid intersection (`grid`), or —
+/// with `line` — a point where a grid line crosses the 1:1 line, whichever is
+/// closer on screen. `nodes_x` / `nodes_y` are the grid positions across the
+/// window as 0..1 fractions; `win` is (x_lo, x_range, y_lo, y_range).
+pub(crate) fn snap_point(
+    x: f32, y: f32,
+    grid: (f32, f32),
+    nodes_x: &[f32], nodes_y: &[f32],
+    win: (f32, f32, f32, f32),
+    line: bool,
+) -> (f32, f32) {
+    if !line {
+        return grid;
+    }
+    let (x_lo, xr, y_lo, yr) = win;
+    let dist = |p: (f32, f32)| ((p.0 - x) / xr).powi(2) + ((p.1 - y) / yr).powi(2);
+    let within = |v: f32, lo: f32, r: f32| v >= lo - 1e-6 && v <= lo + r + 1e-6;
+    let crossings = nodes_x.iter().map(|u| x_lo + u * xr).filter(|&g| within(g, y_lo, yr))
+        .chain(nodes_y.iter().map(|v| y_lo + v * yr).filter(|&g| within(g, x_lo, xr)))
+        .map(|g| (g, g));
+    std::iter::once(grid).chain(crossings)
+        .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
+        .unwrap_or(grid)
+}
+
+/// A curve dot's output value, next to it: up and to the right, or to the left
+/// where that would run off the graph, on a dark backing.
+pub(crate) fn paint_point_value(painter: &egui::Painter, rect: egui::Rect, at: egui::Pos2, text: String) {
+    let col = Color32::from_rgba_unmultiplied(225, 225, 225, 230);
+    let g = painter.layout_no_wrap(text, egui::FontId::proportional(9.0), col);
+    let size = g.size() + egui::vec2(4.0, 2.0);
+    let right = at.x + 7.0 + size.x <= rect.right();
+    let min = egui::pos2(if right { at.x + 7.0 } else { at.x - 7.0 - size.x }, (at.y - 7.0 - size.y).max(rect.top()));
+    let bg = egui::Rect::from_min_size(min, size);
+    painter.rect_filled(bg, 2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+    painter.galley(bg.min + egui::vec2(2.0, 1.0), g, col);
+}
+
+/// ctx-data key for where the gamepad's virtual cursor is this frame, as
+/// (viewport it is drawn in, screen position). Absent while it is hidden.
+pub(crate) const NAV_CURSOR_KEY: &str = "fxi_gp_nav_cursor_pos";
+
+/// Where a pointer reads a graph at `rect`: the mouse hovering its background
+/// (`hover`, from the graph's response), else the gamepad's cursor over it.
+pub(crate) fn graph_reading_pos(ui: &egui::Ui, rect: egui::Rect, hover: Option<egui::Pos2>) -> Option<egui::Pos2> {
+    if hover.is_some() {
+        return hover;
+    }
+    let (vp, pos): (egui::ViewportId, egui::Pos2) = ui.ctx().data(|d| d.get_temp(egui::Id::new(NAV_CURSOR_KEY)))?;
+    if vp != ui.ctx().viewport_id() {
+        return None;
+    }
+    // The cursor is in screen space; the graph may sit on a scaled layer.
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let local = to_global.inverse() * pos;
+    rect.contains(local).then_some(local)
+}
+
+/// A live reading where the cursor is over a curve graph: a faint line at its
+/// input, a ring where that meets the curve, and `text(graph x, graph y)` —
+/// the input and the output it gives — in a box beside the cursor. `win` is
+/// (x_lo, x_hi, y_lo, y_hi); `sample` reads the curve at a graph X.
+pub(crate) fn paint_cursor_reading(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    at: egui::Pos2,
+    win: (f32, f32, f32, f32),
+    sample: impl Fn(f32) -> f32,
+    text: impl Fn(f32, f32) -> String,
+) {
+    let (x_lo, x_hi, y_lo, y_hi) = win;
+    let gx = x_lo + (at.x - rect.left()) / rect.width() * (x_hi - x_lo);
+    let gy = sample(gx);
+    let on_curve = egui::pos2(at.x, rect.bottom() - (gy.clamp(y_lo, y_hi) - y_lo) / (y_hi - y_lo) * rect.height());
+    let faint = Color32::from_rgba_unmultiplied(220, 220, 220, 60);
+    painter.line_segment([egui::pos2(at.x, rect.top()), egui::pos2(at.x, rect.bottom())], egui::Stroke::new(1.0, faint));
+    painter.circle_stroke(on_curve, 4.0, egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 200)));
+
+    let col = Color32::from_rgba_unmultiplied(235, 235, 235, 240);
+    let g = painter.layout_no_wrap(text(gx, gy), egui::FontId::proportional(10.0), col);
+    let size = g.size() + egui::vec2(6.0, 3.0);
+    let x = if at.x + 12.0 + size.x <= rect.right() { at.x + 12.0 } else { at.x - 12.0 - size.x };
+    let y = (at.y + 14.0).min(rect.bottom() - size.y).max(rect.top());
+    let bg = egui::Rect::from_min_size(egui::pos2(x, y), size);
+    painter.rect_filled(bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 190));
+    painter.galley(bg.min + egui::vec2(3.0, 1.5), g, col);
+}
+
+/// The longest a curve's live trail may be, in ms.
+pub(crate) const TRAIL_MS_MAX: i64 = 3000;
+
+/// Add a live-trail sample. A long trail keeps at most `MAX` samples: while the
+/// newest is within one slot (`dur / MAX`) of the one before, it is replaced
+/// rather than joined, so a 3 s trail costs no more to draw than a short one.
+pub(crate) fn push_trail_sample(
+    trail: &mut std::collections::VecDeque<(f32, std::time::Instant)>,
+    x: f32,
+    now: std::time::Instant,
+    dur: std::time::Duration,
+) {
+    const MAX: u32 = 120;
+    let slot = dur / MAX;
+    let n = trail.len();
+    if n >= 2 && now.duration_since(trail[n - 2].1) < slot {
+        trail[n - 1] = (x, now);
+    } else {
+        trail.push_back((x, now));
+    }
+}
+
+/// Param that unlinks a curve's grid H / V counts. Stored inverted so a curve
+/// saved before the link existed comes up linked, the default.
+pub(crate) const GRID_UNLINKED: &str = "grid_unlinked";
+
+/// Hover text on a range ↓ field that Abs has set aside.
+pub(crate) const ABS_MIN_HOVER: &str = "Abs reads a magnitude, so only the ↑ end of the range applies.";
+
+/// Grid H / V count fields with a 🔗 toggle between them. Linked (the default),
+/// changing either count moves the other by as much, so the grid keeps its
+/// shape. The link is written straight to the node; returns the H and V field
+/// rects and whether a count changed.
+pub(crate) fn grid_count_fields(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    gx: &mut f64,
+    gy: &mut f64,
+    max: f64,
+) -> ([egui::Rect; 2], bool) {
+    let unlinked = snarl.get_node(node_id)
+        .and_then(|n| n.params.get(GRID_UNLINKED))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (bx, by) = (*gx, *gy);
+    let rh = ui.add(egui::DragValue::new(gx).speed(0.25).range(1.0..=max).max_decimals(0).prefix("H "));
+    let link = link_toggle(ui, !unlinked,
+        if unlinked { "Link H and V: change both together" } else { "Linked: H and V change together. Click to set them apart." });
+    let rv = ui.add(egui::DragValue::new(gy).speed(0.25).range(1.0..=max).max_decimals(0).prefix("V "));
+    if link.clicked() {
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            n.params.insert(GRID_UNLINKED.into(), Value::Bool(!unlinked));
+        }
+    }
+    if !unlinked {
+        if rh.changed() {
+            *gy = (*gy + (*gx - bx)).clamp(1.0, max);
+        } else if rv.changed() {
+            *gx = (*gx + (*gy - by)).clamp(1.0, max);
+        }
+    }
+    ([rh.rect, rv.rect], rh.changed() || rv.changed())
 }
 
 /// Bare Grid + Trail row.
@@ -190,16 +538,14 @@ pub(crate) fn render_response_curve_grid_row(
     let mut field_rects = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Grid").weak());
-        let rh = ui.add(egui::DragValue::new(&mut gx).speed(0.25)
-            .range(1.0..=20.0).max_decimals(0).prefix("H "));
-        field_rects[0] = rh.rect; changed |= rh.changed();
-        let rv = ui.add(egui::DragValue::new(&mut gy).speed(0.25)
-            .range(1.0..=20.0).max_decimals(0).prefix("V "));
-        field_rects[1] = rv.rect; changed |= rv.changed();
+        let ([rh, rv], c) = grid_count_fields(ui, inner_id, snarl, &mut gx, &mut gy, 20.0);
+        field_rects[0] = rh;
+        field_rects[1] = rv;
+        changed |= c;
         ui.separator();
         ui.label(egui::RichText::new("Trail").weak());
         let rt = ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-            .range(0i64..=1000).suffix("ms"));
+            .range(0i64..=TRAIL_MS_MAX).suffix("ms"));
         field_rects[2] = rt.rect; changed |= rt.changed();
     });
     publish_nav_field_rects(ui, inner_id, &field_rects);
@@ -305,9 +651,9 @@ pub(crate) fn paint_response_curve_graph(
             let gy   = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let sn   = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
             let sc   = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
-            let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+            let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
             let ssg  = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(n).is_some());
             (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
@@ -320,8 +666,10 @@ pub(crate) fn paint_response_curve_graph(
             .map(sig_f32))
         .collect();
 
-    let (x_lo, x_hi): (f32, f32) = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
-    let (y_lo, y_hi): (f32, f32) = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
+    // A motion pick runs on the whole sensor and shows only its view of it.
+    let view = CurveView::resolve(snarl.get_node(node_id), absolute, scale_t, [in_min, in_max, out_min, out_max]);
+    let (x_lo, x_hi) = (view.x_lo, view.x_hi);
+    let (y_lo, y_hi) = (view.y_lo, view.y_hi);
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
 
@@ -407,8 +755,10 @@ pub(crate) fn paint_response_curve_graph(
             .min_by(|a, b| (a-u).abs().partial_cmp(&(b-u).abs()).unwrap()).unwrap_or(u);
         let sv = snap_nodes_y.iter().copied()
             .min_by(|a, b| (a-v).abs().partial_cmp(&(b-v).abs()).unwrap()).unwrap_or(v);
-        (x_lo + su * x_range, y_lo + sv * y_range)
+        snap_point(x, y, (x_lo + su * x_range, y_lo + sv * y_range),
+            &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true)
     };
+    publish_nav_curve_snap(ui.ctx(), node_id, snap, &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true);
 
     let (graph_bg, graph_outline) = graph_chrome(graph_ov);
     painter.rect_filled(rect, 2.0, graph_bg);
@@ -417,66 +767,15 @@ pub(crate) fn paint_response_curve_graph(
     let gs = egui::Stroke::new(0.5, grid_faint);
     for &x in &grid_x_positions { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &grid_y_positions { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-    painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-        egui::Stroke::new(0.5, grid_axis));
+    if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) {
+        painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis));
+    }
 
+    let mut label_inset = egui::Vec2::ZERO;
     if show_grid_labels {
-        const MIN_LABEL_PX: f32 = 20.0;
-        let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-        let font = egui::FontId::proportional(9.0);
-        let abs_max_in  = in_max.abs().max(in_min.abs());
-        let abs_max_out = out_max.abs().max(out_min.abs());
-        // real_in(u): u∈[0,1] graph pos → actual input value.
-        // Graph x = curve_scale(|real|/abs_max), so real = curve_scale_inv(u)*abs_max.
-        // Bipolar: centre u=0.5 is value 0; each half scales outward.
-        let real_in = |u: f32| -> f32 {
-            if absolute || is_vec {
-                curve_scale_inv(u, scale_t) * abs_max_in
-            } else {
-                let c = u * 2.0 - 1.0; // [-1,1], 0 = centre
-                let sign = if c < 0.0 { -1.0f32 } else { 1.0 };
-                sign * curve_scale_inv(c.abs(), scale_t) * abs_max_in
-            }
-        };
-        let real_out = |v: f32| -> f32 {
-            if absolute || is_vec {
-                curve_scale_inv(v, scale_t) * abs_max_out
-            } else {
-                let c = v * 2.0 - 1.0;
-                let sign = if c < 0.0 { -1.0f32 } else { 1.0 };
-                sign * curve_scale_inv(c.abs(), scale_t) * abs_max_out
-            }
-        };
-        let mut last_sx = f32::NEG_INFINITY;
-        for &x in &grid_x_positions {
-            let sx = c2s(x, y_hi).x;
-            if sx - last_sx < MIN_LABEL_PX { continue; }
-            last_sx = sx;
-            let u = (x - x_lo) / x_range;
-            let val = real_in(u);
-            let label = if abs_max_in <= 1.01 {
-                format!("{:.0}%", val * 100.0)
-            } else {
-                format!("{:.2}", val)
-            };
-            painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
-                egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-        }
-        let mut last_sy = f32::INFINITY;
-        for &y in &grid_y_positions {
-            let sy = c2s(x_lo, y).y;
-            if last_sy - sy < MIN_LABEL_PX { continue; }
-            last_sy = sy;
-            let v = (y - y_lo) / y_range;
-            let val = real_out(v);
-            let label = if abs_max_out <= 1.01 {
-                format!("{:.0}%", val * 100.0)
-            } else {
-                format!("{:.2}", val)
-            };
-            painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
-                egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
-        }
+        let xs = grid_x_positions.iter().map(|&x| c2s(x, y_hi).x).zip(view.labels_in(&grid_x_positions));
+        let ys = grid_y_positions.iter().map(|&y| c2s(x_lo, y).y).zip(view.labels_out(&grid_y_positions));
+        label_inset = paint_axis_labels(&painter, rect, xs.collect(), ys.collect());
     }
 
     if new_points.len() >= 2 {
@@ -509,6 +808,9 @@ pub(crate) fn paint_response_curve_graph(
             let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
             let mid_y = sample_curve(&new_points, mid_x, &new_biases).clamp(y_lo, y_hi);
             let hpos  = c2s(mid_x, mid_y);
+            // A zoomed graph (a motion pick's view) leaves points outside it: no
+            // hidden handle may catch clicks meant for whatever is drawn there.
+            if !rect.expand(8.0).contains(hpos) { continue; }
             let hid   = ui.id().with((bias_id_tag, node_id, seg));
             let hresp = ui.interact(
                 egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
@@ -533,6 +835,9 @@ pub(crate) fn paint_response_curve_graph(
     for i in 0..new_points.len() {
         let [px, py] = new_points[i];
         let screen   = c2s(px, py);
+        // A zoomed graph (a motion pick's view) leaves points outside it: no
+        // hidden handle may catch clicks meant for whatever is drawn there.
+        if !rect.expand(8.0).contains(screen) { continue; }
         let pt_id    = ui.id().with((pt_id_tag, node_id, i));
         let pt_resp  = ui.interact(
             egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
@@ -564,6 +869,12 @@ pub(crate) fn paint_response_curve_graph(
         if pt_resp.drag_stopped() {
             ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(origin_id));
         }
+        // Double-click: onto the 1:1 line — output equal to its input.
+        if pt_resp.double_clicked() {
+            let lo = if absolute { 0.0 } else { -1.0 };
+            new_points[i][1] = new_points[i][0].clamp(lo, 1.0);
+            pts_changed = true;
+        }
         if pt_resp.secondary_clicked() && new_points.len() > 2 {
             remove_idx = Some(i);
             pts_changed = true;
@@ -571,6 +882,9 @@ pub(crate) fn paint_response_curve_graph(
         let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+        if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
+            paint_point_value(&painter, rect, screen, view.value_out(py));
+        }
 
         // Gamepad-nav: highlight the dot the driver selected. Driver publishes
         // (pass, selected_idx, editing_dot) under ("gp_nav_curve_sel", node).
@@ -626,9 +940,7 @@ pub(crate) fn paint_response_curve_graph(
     }
 
     // Live-position trails.
-    let abs_max   = if is_vec { in_max.abs().max(f32::EPSILON) } else {
-        in_max.abs().max(in_min.abs()).max(f32::EPSILON)
-    };
+    let abs_max   = view.in_max.abs().max(f32::EPSILON);
     let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
     let now       = std::time::Instant::now();
     let mut has_active = false;
@@ -638,8 +950,8 @@ pub(crate) fn paint_response_curve_graph(
         let graph_x = if absolute {
             curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t)
         } else {
-            let in_range = (in_max - in_min).abs().max(f32::EPSILON);
-            let norm     = ((raw - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let in_range = (view.in_max - view.in_min).abs().max(f32::EPSILON);
+            let norm     = ((raw - view.in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
             let sign     = if norm < 0.0 { -1.0f32 } else { 1.0 };
             sign * curve_scale(norm.abs(), scale_t)
         };
@@ -647,7 +959,7 @@ pub(crate) fn paint_response_curve_graph(
         let trail_id = ui.id().with((trail_id_tag, node_id, ch as u32));
         let mut trail: Trail = ui.data(|d| d.get_temp::<Trail>(trail_id).clone().unwrap_or_default());
         if trail_ms > 0 {
-            trail.push_back((graph_x, now));
+            push_trail_sample(&mut trail, graph_x, now, trail_dur);
             while trail.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) {
                 trail.pop_front();
             }
@@ -679,7 +991,15 @@ pub(crate) fn paint_response_curve_graph(
     }
     if has_active { request_repaint_throttled(ui.ctx()); }
     if let Some(labels) = legend {
-        paint_curve_legend(&painter, rect, labels, |ch| graph_channel_color(graph_ov, ch));
+        paint_curve_legend(&painter, rect, labels, label_inset, |ch| graph_channel_color(graph_ov, ch));
+    }
+    // Live reading at the mouse or gamepad cursor, with the labels.
+    if show_grid_labels && !ui.input(|i| i.pointer.any_down()) {
+        if let Some(at) = graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+            paint_cursor_reading(&painter, rect, at, (x_lo, x_hi, y_lo, y_hi),
+                |x| sample_curve(&new_points, x, &new_biases),
+                |gx, gy| format!("{}  →  {}", view.value_in(gx), view.value_out(gy)));
+        }
     }
 
     // Optional override frame, painted last so it sits above the graph content.
@@ -834,12 +1154,89 @@ pub(crate) fn curve_channel_labels(node: &NodeData) -> Option<&'static [&'static
     }
 }
 
-/// Paint a channel legend in the graph's top-left corner: each label in its
-/// channel's colour, stacked, on a dark backing so it reads over the grid.
+/// Grid labels for `values`, each followed by `suffix`: as many decimals as the
+/// spacing between neighbouring lines needs to tell them apart (the finer the
+/// scale, the more), and always a fraction on a value under 10.
+pub(crate) fn axis_labels(values: &[f32], suffix: &str) -> Vec<String> {
+    let step = values.windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .filter(|d| *d > 1e-6)
+        .fold(f32::INFINITY, f32::min);
+    // The fewest decimals that write the step itself exactly, capped one past
+    // its own magnitude — 2.5 needs 1, 125 needs 0, a third settles for 2.
+    let base = if step.is_finite() {
+        let cap = ((-step.log10()).ceil() + 1.0).clamp(0.0, 4.0) as usize;
+        (0..=cap).find(|&d| {
+            let x = step * 10f32.powi(d as i32);
+            (x - x.round()).abs() < 0.02
+        }).unwrap_or(cap)
+    } else {
+        0
+    };
+    values.iter().map(|&v| {
+        if v.abs() < 1e-6 {
+            return format!("0{suffix}");
+        }
+        let d = if v.abs() < 10.0 { base.max(1) } else { base };
+        format!("{v:.d$}{suffix}")
+    }).collect()
+}
+
+/// One value as a label, to 3 significant figures (at most 4 decimals), so a
+/// dot reads as finely at 2 °/s as at 2000.
+pub(crate) fn value_label(v: f32, suffix: &str) -> String {
+    if v.abs() < 1e-6 {
+        return format!("0{suffix}");
+    }
+    let d = (2 - v.abs().log10().floor() as i32).clamp(0, 4) as usize;
+    format!("{v:.d$}{suffix}")
+}
+
+/// Paint grid labels: input labels along the top, given as (screen x, text),
+/// staggered over two rows so neighbours never overlap (a label that fits in
+/// neither row is dropped); output labels down the left, as (screen y, text).
+/// Returns the corner the labels occupy (left column width, top rows height),
+/// so a legend can sit clear of them.
+pub(crate) fn paint_axis_labels(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    xs: Vec<(f32, String)>,
+    ys: Vec<(f32, String)>,
+) -> egui::Vec2 {
+    const ROW_H: f32 = 10.0;
+    const GAP: f32 = 3.0;
+    let col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
+    let font = egui::FontId::proportional(9.0);
+    let mut row_end = [f32::NEG_INFINITY; 2];
+    let mut rows_used = 0usize;
+    for (sx, text) in xs {
+        let g = painter.layout_no_wrap(text, font.clone(), col);
+        let left = sx + 1.0;
+        let Some(row) = (0..2).find(|&r| left >= row_end[r] + GAP) else { continue };
+        row_end[row] = left + g.size().x;
+        rows_used = rows_used.max(row + 1);
+        painter.galley(egui::pos2(left, rect.top() + 1.0 + ROW_H * row as f32), g, col);
+    }
+    let mut last_y = f32::INFINITY;
+    let mut col_w = 0.0f32;
+    for (sy, text) in ys {
+        if last_y - sy < ROW_H + 1.0 { continue; }
+        last_y = sy;
+        let g = painter.layout_no_wrap(text, font.clone(), col);
+        col_w = col_w.max(g.size().x);
+        painter.galley(egui::pos2(rect.left() + 1.0, sy - 9.0), g, col);
+    }
+    egui::vec2(if col_w > 0.0 { col_w + 6.0 } else { 0.0 }, ROW_H * rows_used as f32 + 4.0)
+}
+
+/// Paint a channel legend near the graph's top-left corner, clear of the grid
+/// labels (`inset`, from [`paint_axis_labels`]): each label in its channel's
+/// colour, stacked, on a dark backing so it reads over the grid.
 pub(crate) fn paint_curve_legend(
     painter: &egui::Painter,
     rect: egui::Rect,
     labels: &[&str],
+    inset: egui::Vec2,
     color_of: impl Fn(usize) -> Color32,
 ) {
     if labels.is_empty() {
@@ -853,12 +1250,414 @@ pub(crate) fn paint_curve_legend(
     let row_h = galleys.iter().map(|g| g.size().y).fold(0.0, f32::max);
     let w = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max) + pad * 2.0;
     let h = row_h * galleys.len() as f32 + pad * 2.0;
-    let bg = egui::Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 4.0), egui::vec2(w, h));
+    let bg = egui::Rect::from_min_size(rect.left_top() + inset.max(egui::vec2(4.0, 4.0)), egui::vec2(w, h));
     painter.rect_filled(bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
     for (i, g) in galleys.into_iter().enumerate() {
         let pos = bg.left_top() + egui::vec2(pad, pad + row_h * i as f32);
         painter.galley(pos, g, Color32::WHITE);
     }
+}
+
+// ── Motion-sensor curves (AutoMap gyro / accel picks) ─────────────────────────
+
+/// The motion sensor behind a curve: an AutoMap curve's gyro / accel pick
+/// (whole or one axis), or what a plain curve's wires carry (see
+/// [`refresh_curve_motion_units`]). Such a curve runs on the sensor's full range, and its In/Out fields
+/// only choose how much of that range the graph shows — in the sensor's own
+/// units, with nothing rescaled. The shown range is stored per sensor
+/// (`gyro_view_*` in °/s, `accel_view_*` in G), apart from the In/Out ranges a
+/// trigger or stick pick scales by, so zooming the graph on one never changes
+/// the curve on the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MotionUnit { Gyro, Accel }
+
+impl MotionUnit {
+    pub(crate) fn of(node: &NodeData) -> Option<Self> {
+        if is_automap_curve(&node.module_id) {
+            Self::of_pin(automap_curve_pin(node))
+        } else if is_plain_curve(&node.module_id) {
+            node.extra.motion_unit
+        } else {
+            None
+        }
+    }
+
+    /// The sensor a bus pin (or an AutoMap curve's group pick) belongs to.
+    pub(crate) fn of_pin(pin: &str) -> Option<Self> {
+        if pin == "gyro" || pin.starts_with("gyro_") {
+            Some(Self::Gyro)
+        } else if pin == "accel" || pin.starts_with("accel_") {
+            Some(Self::Accel)
+        } else {
+            None
+        }
+    }
+
+    /// The physical value a bus 1.0 stands for (the devices normalise to it).
+    pub(crate) fn full_scale(self) -> f32 {
+        match self {
+            Self::Gyro => flexinput_devices::gyro::GYRO_REF_DPS,
+            Self::Accel => flexinput_devices::gyro::ACCEL_REF_G,
+        }
+    }
+
+    pub(crate) fn suffix(self) -> &'static str {
+        match self { Self::Gyro => "°/s", Self::Accel => " G" }
+    }
+
+    /// A physical value as an axis label.
+    pub(crate) fn format(self, v: f32) -> String {
+        match self {
+            Self::Gyro => format!("{v:.0}°/s"),
+            Self::Accel if v.abs() < 1.0 => format!("{v:.2} G"),
+            Self::Accel => format!("{v:.1} G"),
+        }
+    }
+
+    /// The shown-range param keys: [in ↓, in ↑, out ↓, out ↑].
+    pub(crate) fn view_keys(self) -> [&'static str; 4] {
+        match self {
+            Self::Gyro => ["gyro_view_in_min", "gyro_view_in_max", "gyro_view_out_min", "gyro_view_out_max"],
+            Self::Accel => ["accel_view_in_min", "accel_view_in_max", "accel_view_out_min", "accel_view_out_max"],
+        }
+    }
+
+    /// How far the graph shows until set: what a hand-held turn or tilt
+    /// mostly spans, not the sensor's whole range.
+    pub(crate) fn default_extent(self) -> f32 {
+        match self { Self::Gyro => 500.0, Self::Accel => 2.0 }
+    }
+
+    /// Step for dragging / nudging a shown-range value.
+    pub(crate) fn step(self) -> f32 {
+        match self { Self::Gyro => 10.0, Self::Accel => 0.05 }
+    }
+
+    /// The shown range [in ↓, in ↑, out ↓, out ↑], physical units.
+    pub(crate) fn view(self, node: &NodeData) -> [f32; 4] {
+        let d = self.default_extent();
+        let defaults = [-d, d, -d, d];
+        let keys = self.view_keys();
+        std::array::from_fn(|i| {
+            node.params.get(keys[i]).and_then(|v| v.as_f64()).map_or(defaults[i], |v| v as f32)
+        })
+    }
+
+    pub(crate) fn set_view(self, node: &mut NodeData, view: [f32; 4]) {
+        let fs = self.full_scale();
+        for (k, v) in self.view_keys().into_iter().zip(view) {
+            if let Some(n) = Number::from_f64(v.clamp(-fs, fs) as f64) {
+                node.params.insert(k.into(), Value::Number(n));
+            }
+        }
+    }
+}
+
+/// A curve module that takes its signal on a wire (not off an AutoMap bus).
+pub(crate) fn is_plain_curve(module_id: &str) -> bool {
+    matches!(module_id,
+        "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
+}
+
+/// Trace every plain curve's wires back to their source and record on the node
+/// (`extra.motion_unit`) whether they carry a motion sensor, so the curve can
+/// read in °/s or G and zoom instead of rescale, like an AutoMap curve's pick.
+/// The trace follows a device's or Splitter's pin, a 3DOF to 2D's Out / X / Y
+/// in Pointer mode (still angular velocity, in the gyro's units — Steering
+/// integrates it into something else), curves in between (a motion curve hands
+/// on the same units), and sub-patch boundaries both ways. Every wired input
+/// must agree. Runs once a frame, before the graph is built.
+pub(crate) fn refresh_curve_motion_units(snarl: &mut Snarl<NodeData>) {
+    let mut found = Vec::new();
+    collect_curve_motion_units(snarl, &mut Vec::new(), &mut Vec::new(), &mut found);
+    for (path, unit) in found {
+        if let Some(n) = node_at_path_mut(snarl, &path) {
+            n.extra.motion_unit = unit;
+        }
+    }
+}
+
+type Frames<'a> = Vec<(&'a Snarl<NodeData>, NodeId)>;
+
+fn collect_curve_motion_units<'a>(
+    snarl: &'a Snarl<NodeData>,
+    path: &mut Vec<NodeId>,
+    frames: &mut Frames<'a>,
+    out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>)>,
+) {
+    for (id, n) in snarl.nodes_ids_data() {
+        let node = &n.value;
+        if is_plain_curve(&node.module_id) {
+            path.push(id);
+            out.push((path.clone(), curve_inputs_motion_unit(snarl, id, frames)));
+            path.pop();
+        }
+        if let Some(sp) = node.subpatch.as_ref() {
+            path.push(id);
+            frames.push((snarl, id));
+            collect_curve_motion_units(&sp.snarl, path, frames, out);
+            frames.pop();
+            path.pop();
+        }
+    }
+}
+
+fn node_at_path_mut<'a>(snarl: &'a mut Snarl<NodeData>, path: &[NodeId]) -> Option<&'a mut NodeData> {
+    let (&last, outer) = path.split_last()?;
+    let mut cur = snarl;
+    for &id in outer {
+        cur = &mut cur.get_node_mut(id)?.subpatch.as_mut()?.snarl;
+    }
+    cur.get_node_mut(last)
+}
+
+/// The sensor every wired input of curve `id` carries, if they all agree.
+fn curve_inputs_motion_unit(snarl: &Snarl<NodeData>, id: NodeId, frames: &[(&Snarl<NodeData>, NodeId)]) -> Option<MotionUnit> {
+    let n_inputs = snarl.get_node(id)?.inputs.len();
+    let mut unit = None;
+    for i in 0..n_inputs {
+        let Some(&src) = snarl.in_pin(InPinId { node: id, input: i }).remotes.first() else { continue };
+        let u = source_motion_unit(snarl, src, frames, 0)?;
+        if unit.is_some_and(|prev| prev != u) {
+            return None;
+        }
+        unit = Some(u);
+    }
+    unit
+}
+
+/// A 3DOF to 2D in Pointer mode hands its rates straight on; Steering
+/// integrates them. (`family`, or the legacy `mode` where "laser" was steering.)
+fn gyro_3dof_is_pointer(node: &NodeData) -> bool {
+    match node.params.get("family").and_then(|v| v.as_str()) {
+        Some(f) => f != "steering",
+        None => node.params.get("mode").and_then(|v| v.as_str()) != Some("laser"),
+    }
+}
+
+fn pin_index_of(node: &NodeData) -> Option<usize> {
+    node.params.get("pin_index").and_then(|v| v.as_u64()).map(|v| v as usize)
+}
+
+/// The sensor an output pin carries, following it upstream (see
+/// [`refresh_curve_motion_units`]).
+fn source_motion_unit(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    frames: &[(&Snarl<NodeData>, NodeId)],
+    depth: u32,
+) -> Option<MotionUnit> {
+    if depth > 16 {
+        return None;
+    }
+    let node = snarl.get_node(src.node)?;
+    match node.module_id.as_str() {
+        "device.source" | "module.automap_split" => {
+            let pin = node.params.get("output_pin_ids")?.as_array()?.get(src.output)?.as_str()?;
+            MotionUnit::of_pin(pin)
+        }
+        // Out (Vec2), X, Y — not Lean, Lean!, Orientation or the bus.
+        "processing.gyro_3dof" => (src.output <= 2 && gyro_3dof_is_pointer(node)).then_some(MotionUnit::Gyro),
+        m if is_plain_curve(m) => {
+            let up = *snarl.in_pin(InPinId { node: src.node, input: src.output }).remotes.first()?;
+            source_motion_unit(snarl, up, frames, depth + 1)
+        }
+        "subpatch.inlet" => {
+            let (outer, sp_id) = *frames.last()?;
+            let up = *outer.in_pin(InPinId { node: sp_id, input: pin_index_of(node)? }).remotes.first()?;
+            source_motion_unit(outer, up, &frames[..frames.len() - 1], depth + 1)
+        }
+        "subpatch" => {
+            let sp = node.subpatch.as_ref()?;
+            let outlet = sp.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch.outlet" && pin_index_of(&n.value) == Some(src.output))
+                .map(|(id, _)| id)?;
+            let up = *sp.snarl.in_pin(InPinId { node: outlet, input: 0 }).remotes.first()?;
+            let mut inner = frames.to_vec();
+            inner.push((snarl, src.node));
+            source_motion_unit(&sp.snarl, up, &inner, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// For a motion pick, the In/Out ranges the curve runs on are the sensor's
+/// whole range; the engine is handed these instead of the stored ones (which
+/// stay for when a trigger or stick is picked). Applied by the graph builder.
+pub(crate) fn apply_motion_run_ranges(node: &NodeData, params: &mut std::collections::HashMap<String, Value>) {
+    if MotionUnit::of(node).is_none() {
+        return;
+    }
+    for (k, v) in [("in_min", -1.0), ("in_max", 1.0), ("out_min", -1.0), ("out_max", 1.0)] {
+        params.insert(k.into(), serde_json::json!(v));
+    }
+}
+
+/// A curve node's params as the engine runs them (see [`apply_motion_run_ranges`]),
+/// for UI readers that model the engine — the two-way hysteresis band.
+pub(crate) fn curve_run_params(node: &NodeData) -> std::borrow::Cow<'_, std::collections::HashMap<String, Value>> {
+    if MotionUnit::of(node).is_none() {
+        return std::borrow::Cow::Borrowed(&node.params);
+    }
+    let mut p = node.params.clone();
+    apply_motion_run_ranges(node, &mut p);
+    std::borrow::Cow::Owned(p)
+}
+
+/// What a curve graph shows and how its axes read: the window in graph
+/// coordinates, and the value ranges the curve runs on behind it. A plain
+/// curve shows its whole 0..1 (or -1..1) graph over its stored In/Out ranges; a
+/// motion pick runs on the whole sensor and shows only its view of it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurveView {
+    pub x_lo: f32, pub x_hi: f32, pub y_lo: f32, pub y_hi: f32,
+    /// The ranges values are normalised by (bus units) — for the live dots.
+    pub in_min: f32, pub in_max: f32, pub out_min: f32, pub out_max: f32,
+    pub unit: Option<MotionUnit>,
+    absolute: bool,
+    scale_t: f32,
+}
+
+impl CurveView {
+    /// `absolute` is the curve's effective Abs (forced on by a two-way Vec mode).
+    pub(crate) fn of(node: &NodeData, absolute: bool, scale_t: f32) -> Self {
+        let f = |k: &str, d: f64| node.params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        let plain = Self::plain(absolute, scale_t, f("in_min", -1.0), f("in_max", 1.0), f("out_min", -1.0), f("out_max", 1.0));
+        let Some(unit) = MotionUnit::of(node) else { return plain };
+        let fs = unit.full_scale();
+        let [il, ih, ol, oh] = unit.view(node).map(|v| (v / fs).clamp(-1.0, 1.0));
+        // A value's graph coordinate: the Log/Exp scale, mirrored for a sign.
+        let warp = |v: f32| v.signum() * curve_scale(v.abs(), scale_t);
+        let full = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
+        let axis = |lo: f32, hi: f32| -> (f32, f32) {
+            let (a, b) = if absolute { (0.0, warp(hi.abs())) } else { (warp(lo), warp(hi)) };
+            if b - a > 1e-4 { (a, b) } else { full }
+        };
+        let (x_lo, x_hi) = axis(il, ih);
+        let (y_lo, y_hi) = axis(ol, oh);
+        Self {
+            x_lo, x_hi, y_lo, y_hi,
+            in_min: -1.0, in_max: 1.0, out_min: -1.0, out_max: 1.0,
+            unit: Some(unit), absolute, scale_t,
+        }
+    }
+
+    /// The view for `node` when it has a motion pick, else a plain view over
+    /// the ranges the caller already read (`[in ↓, in ↑, out ↓, out ↑]`).
+    pub(crate) fn resolve(node: Option<&NodeData>, absolute: bool, scale_t: f32, ranges: [f32; 4]) -> Self {
+        match node {
+            Some(n) if MotionUnit::of(n).is_some() => Self::of(n, absolute, scale_t),
+            _ => Self::plain(absolute, scale_t, ranges[0], ranges[1], ranges[2], ranges[3]),
+        }
+    }
+
+    pub(crate) fn plain(absolute: bool, scale_t: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> Self {
+        let (lo, hi) = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
+        Self {
+            x_lo: lo, x_hi: hi, y_lo: lo, y_hi: hi,
+            in_min, in_max, out_min, out_max,
+            unit: None, absolute, scale_t,
+        }
+    }
+
+    /// The value at graph coordinate `g`, as a fraction of `range_max`.
+    fn real(&self, g: f32, range_max: f32) -> f32 {
+        let g = if self.absolute { g.max(0.0) } else { g };
+        g.signum() * curve_scale_inv(g.abs(), self.scale_t) * range_max
+    }
+
+    /// Labels for grid lines at graph coordinates `gs` on an axis ranging
+    /// `lo..hi`: the sensor's units for a motion pick, else a percentage of a
+    /// unit range, or plain values for a wider one. Abs reads only `hi`.
+    fn labels(&self, gs: &[f32], lo: f32, hi: f32) -> Vec<String> {
+        let (scale, suffix) = self.scale_suffix(lo, hi);
+        let values: Vec<f32> = gs.iter().map(|&g| self.real(g, scale)).collect();
+        axis_labels(&values, suffix)
+    }
+
+    /// What a graph unit is worth on an axis ranging `lo..hi`, and its suffix.
+    fn scale_suffix(&self, lo: f32, hi: f32) -> (f32, &'static str) {
+        match self.unit {
+            Some(u) => (u.full_scale(), u.suffix()),
+            None => {
+                let m = if self.absolute { hi.abs() } else { lo.abs().max(hi.abs()) };
+                if m <= 1.01 { (m * 100.0, "%") } else { (m, "") }
+            }
+        }
+    }
+
+    /// The input value at graph X `g`, for the cursor reading.
+    pub(crate) fn value_in(&self, g: f32) -> String {
+        let (scale, suffix) = self.scale_suffix(self.in_min, self.in_max);
+        value_label(self.real(g, scale), suffix)
+    }
+
+    /// The output value at graph Y `g`, for a dot's label.
+    pub(crate) fn value_out(&self, g: f32) -> String {
+        let (scale, suffix) = self.scale_suffix(self.out_min, self.out_max);
+        value_label(self.real(g, scale), suffix)
+    }
+
+    /// Labels for input grid lines at graph X positions `gs`.
+    pub(crate) fn labels_in(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.in_min, self.in_max) }
+
+    /// Labels for output grid lines at graph Y positions `gs`.
+    pub(crate) fn labels_out(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.out_min, self.out_max) }
+}
+
+/// The In/Out fields of a motion pick: how much of the sensor the graph shows,
+/// in its units. Draws the four values in a row and writes them back to the
+/// view keys; returns the field rects (for gamepad nav) and whether one changed.
+/// Under Abs (`absolute`) the ↓ ends don't apply and are greyed out.
+pub(crate) fn motion_view_range_fields(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    unit: MotionUnit,
+    absolute: bool,
+) -> ([egui::Rect; 4], bool) {
+    let mut view = snarl.get_node(node_id).map(|n| unit.view(n)).unwrap_or([0.0; 4]);
+    let before = view;
+    let linked = snarl.get_node(node_id).map_or(true, range_linked);
+    let mut link_clicked = false;
+    let fs = unit.full_scale();
+    let decimals = if unit == MotionUnit::Gyro { 0 } else { 2 };
+    let mut rects = [egui::Rect::NOTHING; 4];
+    let mut changed = false;
+    let hover = format!(
+        "How much of the sensor the graph shows ({} full scale). Only the view: \
+         the curve always runs over the whole range, and nothing is rescaled.",
+        unit.format(fs),
+    );
+    ui.horizontal(|ui| {
+        for (i, (label, arrow)) in [("In", "↓"), ("", "↑"), ("Out", "↓"), ("", "↑")].into_iter().enumerate() {
+            if i == 2 { link_clicked = range_link_button(ui, linked); }
+            if !label.is_empty() { ui.label(egui::RichText::new(label).small().weak()); }
+            let is_min = i % 2 == 0;
+            let r = ui.add_enabled(!(absolute && is_min), egui::DragValue::new(&mut view[i])
+                .speed(unit.step())
+                .range(-fs..=fs)
+                .prefix(arrow)
+                .suffix(unit.suffix())
+                .max_decimals(decimals))
+                .on_hover_text(hover.as_str())
+                .on_disabled_hover_text(ABS_MIN_HOVER);
+            rects[i] = r.rect;
+            changed |= r.changed();
+        }
+    });
+    if link_clicked {
+        toggle_range_link(snarl, node_id);
+    }
+    if changed {
+        if linked {
+            follow_range_link(before, &mut view);
+        }
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            unit.set_view(n, view);
+        }
+    }
+    (rects, changed)
 }
 
 /// The module an AutoMap curve node renders, pins and navigates as: its body IS
@@ -1177,5 +1976,93 @@ pub(crate) fn sig_f32(s: &Signal) -> f32 {
         Signal::Int(i)   => *i as f32,
         Signal::Vec2(v)  => v.length(),
         Signal::Vec4(v)  => v.length(),
+    }
+}
+
+#[cfg(test)]
+mod refinement_tests {
+    use super::*;
+
+    // Linked In/Out: the changed end scales its counterpart by the same ratio,
+    // from either side, and from zero it moves by as much.
+    #[test]
+    fn linked_ranges_scale_together() {
+        let mut v = [-1.0, 2.0, -1.0, 1.0];
+        follow_range_link([-1.0, 1.0, -1.0, 1.0], &mut v);
+        assert_eq!(v, [-1.0, 2.0, -1.0, 2.0]);
+        let mut v = [0.0, 500.0, 0.0, 1500.0];
+        follow_range_link([0.0, 500.0, 0.0, 1000.0], &mut v);
+        assert_eq!(v, [0.0, 750.0, 0.0, 1500.0]);
+        let mut v = [0.5, 1.0, 0.25, 1.0];
+        follow_range_link([0.0, 1.0, 0.25, 1.0], &mut v);
+        assert_eq!(v[2], 0.75, "from zero: moved by as much");
+    }
+
+    // The 1:1 line: the corner diagonal on a square window, at an angle when
+    // a motion view shows In and Out over different spans.
+    #[test]
+    fn identity_line_follows_the_view() {
+        assert_eq!(identity_span(0.0, 1.0, 0.0, 1.0), Some((0.0, 1.0)));
+        assert_eq!(identity_span(-1.0, 1.0, -1.0, 1.0), Some((-1.0, 1.0)));
+        // In shows 500 °/s, Out 1000 °/s, of a 2000 °/s sensor.
+        assert_eq!(identity_span(0.0, 0.25, 0.0, 0.5), Some((0.0, 0.25)));
+    }
+
+    // Snap takes the 1:1 line's crossings with the grid when they are nearer
+    // than any intersection — and only the grid where there is no line.
+    #[test]
+    fn snap_reaches_the_identity_line() {
+        let nodes = [0.0, 0.5, 1.0];
+        // Window x 0..0.5, y 0..1: the vertical line x=0.25 crosses 1:1 at (0.25, 0.25).
+        let win = (0.0, 0.5, 0.0, 1.0);
+        let grid = (0.25, 0.5);
+        assert_eq!(snap_point(0.25, 0.27, grid, &nodes, &nodes, win, true), (0.25, 0.25));
+        assert_eq!(snap_point(0.25, 0.27, grid, &nodes, &nodes, win, false), grid);
+        assert_eq!(snap_point(0.24, 0.48, grid, &nodes, &nodes, win, true), grid, "the intersection is nearer");
+    }
+
+    // A dot's value keeps 3 significant figures, however small.
+    #[test]
+    fn dot_values_keep_three_significant_figures() {
+        assert_eq!(value_label(500.0, "°/s"), "500°/s");
+        assert_eq!(value_label(12.34, "°/s"), "12.3°/s");
+        assert_eq!(value_label(2.468, " G"), "2.47 G");
+        assert_eq!(value_label(0.02468, " G"), "0.0247 G");
+        assert_eq!(value_label(-0.5, "%"), "-0.500%");
+        assert_eq!(value_label(0.0, "%"), "0%");
+    }
+
+    // The pad's d-pad steps a dot to the next grid line or 1:1 crossing.
+    #[test]
+    fn gamepad_snap_steps_to_the_next_target() {
+        let snap = NavCurveSnap { xs: vec![0.0, 0.25, 0.5, 0.75, 1.0], ys: vec![0.0, 0.5, 1.0], line: true };
+        assert_eq!(snap.next(true, 0.3, 0.9, 1.0), Some(0.5));
+        assert_eq!(snap.next(true, 0.3, 0.4, 1.0), Some(0.4), "the 1:1 crossing at y = 0.4 comes first");
+        assert_eq!(snap.next(false, 0.6, 0.3, -1.0), Some(0.5), "the nearer grid line first");
+        assert_eq!(snap.next(false, 0.45, 0.3, -1.0), Some(0.3), "then down onto the 1:1 line at x = 0.3");
+        assert_eq!(snap.next(true, 1.0, 0.0, 1.0), None);
+        let grid_only = NavCurveSnap { line: false, ..snap };
+        assert_eq!(grid_only.next(true, 0.3, 0.4, 1.0), Some(0.5));
+    }
+
+    #[test]
+    fn log_exp_text_names_the_power() {
+        assert_eq!(log_exp_text(0.0), "Linear");
+        assert_eq!(log_exp_text(1.0 / 3.0), "Exp 0.33  ·  x^2.00");
+        assert_eq!(log_exp_text(-1.0 / 3.0), "Log 0.33  ·  x^0.50");
+    }
+
+    // A 3 s trail at 120 fps keeps no more samples than the cap, newest last.
+    #[test]
+    fn long_trails_are_sample_capped() {
+        let dur = std::time::Duration::from_millis(3000);
+        let t0 = std::time::Instant::now();
+        let mut trail = std::collections::VecDeque::new();
+        for i in 0..360u32 {
+            let now = t0 + std::time::Duration::from_micros(i as u64 * 8_333);
+            push_trail_sample(&mut trail, i as f32, now, dur);
+        }
+        assert!(trail.len() <= 122, "{}", trail.len());
+        assert_eq!(trail.back().unwrap().0, 359.0, "the head is always the newest sample");
     }
 }

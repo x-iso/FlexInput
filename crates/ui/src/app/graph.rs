@@ -1525,6 +1525,9 @@ pub(crate) fn build_processing_graph_rec(
 
         // For modules that read device signals by name, inject the originating device_id.
         let mut params = node.params.clone();
+        // An AutoMap curve on a motion sensor runs on the sensor's whole range;
+        // its stored In/Out only choose what the graph shows.
+        crate::canvas::viewer::apply_motion_run_ranges(node, &mut params);
         // RWS Aim: trace the Flick input (pin 1) to the physical stick feeding it
         // so the engine can source-block that stick downstream while still reading
         // it internally (from the pre-block snapshot).
@@ -2402,6 +2405,140 @@ mod subpatch_bus_tests {
         assert!(twoway_preset_section(&plain).is_none());
         let old: CurveFile = serde_json::from_str(r#"{"points":[[0,0],[1,1]]}"#).unwrap();
         assert!(old.twoway.is_none(), "an older file still loads");
+    }
+
+    /// A gyro / accel pick reads in its sensor's units, and its In/Out only
+    /// zoom the graph: the engine is handed the whole sensor as the range, so
+    /// nothing is rescaled — while a trigger pick keeps scaling by its own
+    /// stored ranges, untouched by the gyro's view.
+    #[test]
+    fn a_motion_pick_shows_units_and_only_zooms() {
+        use crate::canvas::viewer::{CurveView, MotionUnit};
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let curve = s.insert_node(p, {
+            let mut n = node("module.automap_response_curve", &[SignalType::AutoMap], &[SignalType::AutoMap]);
+            n.params.insert("am_curve_pin".into(), json!("gyro"));
+            n.params.insert("in_min".into(), json!(-0.3));
+            n.params.insert("in_max".into(), json!(0.3));
+            n.params.insert("out_max".into(), json!(0.6));
+            n
+        });
+
+        let n = s.get_node(curve).unwrap();
+        assert_eq!(MotionUnit::of(n), Some(MotionUnit::Gyro));
+        // Default view: ±500 °/s of a ±2000 °/s sensor, so a quarter of the graph.
+        let v = CurveView::of(n, true, 0.0);
+        assert!((v.x_hi - 0.25).abs() < 1e-6 && (v.y_hi - 0.25).abs() < 1e-6, "{v:?}");
+        assert_eq!(v.labels_in(&[0.25])[0], "500°/s");
+        assert_eq!((v.in_max, v.out_max), (1.0, 1.0), "values read against the whole sensor");
+
+        // Zooming out to the whole sensor is a view change only.
+        s.get_node_mut(curve).unwrap().params.insert("gyro_view_in_max".into(), json!(2000.0));
+        let v = CurveView::of(s.get_node(curve).unwrap(), true, 0.0);
+        assert!((v.x_hi - 1.0).abs() < 1e-6, "{v:?}");
+        assert_eq!(v.labels_in(&[0.5])[0], "1000°/s");
+
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.node_uid == curve.0).unwrap();
+        for k in ["in_max", "out_max"] {
+            assert_eq!(snap.params.get(k).and_then(|v| v.as_f64()), Some(1.0), "{k} runs on the whole sensor");
+        }
+
+        // Accel reads in G.
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("accel_z"));
+        let v = CurveView::of(s.get_node(curve).unwrap(), true, 0.0);
+        assert_eq!(MotionUnit::of(s.get_node(curve).unwrap()), Some(MotionUnit::Accel));
+        assert_eq!(v.labels_in(&[v.x_hi])[0], "2.0 G");
+
+        // A trigger keeps its own stored ranges, and its labels stay percent.
+        s.get_node_mut(curve).unwrap().params.insert("am_curve_pin".into(), json!("left_trigger"));
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.node_uid == curve.0).unwrap();
+        assert_eq!(snap.params.get("in_max").and_then(|v| v.as_f64()), Some(0.3));
+        let v = CurveView::of(s.get_node(curve).unwrap(), true, 0.0);
+        assert!(v.unit.is_none() && (v.x_hi - 1.0).abs() < 1e-6, "{v:?}");
+        assert_eq!(v.labels_in(&[1.0])[0], "30%");
+    }
+
+    /// Grid labels carry as many decimals as their spacing needs, and a value
+    /// under 10 always shows a fraction.
+    #[test]
+    fn axis_labels_show_the_precision_the_scale_needs() {
+        use crate::canvas::viewer::axis_labels;
+        assert_eq!(axis_labels(&[0.0, 125.0, 250.0, 500.0], "°/s"), ["0°/s", "125°/s", "250°/s", "500°/s"]);
+        assert_eq!(axis_labels(&[0.0, 2.5, 5.0, 12.5], ""), ["0", "2.5", "5.0", "12.5"]);
+        assert_eq!(axis_labels(&[0.0, 0.05, 0.1], " G"), ["0 G", "0.05 G", "0.10 G"]);
+        assert_eq!(axis_labels(&[0.0, 2.0, 4.0, 20.0], "%"), ["0%", "2.0%", "4.0%", "20%"]);
+    }
+
+    /// A plain curve fed from a motion sensor knows it: from a pad's gyro pin,
+    /// from a 3DOF to 2D in Pointer mode (not Steering), across a sub-patch
+    /// inlet — and not when its inputs disagree.
+    #[test]
+    fn plain_curves_trace_a_motion_source_through_their_wires() {
+        use crate::canvas::viewer::{refresh_curve_motion_units, MotionUnit};
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::Float, SignalType::Float, SignalType::Float]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["gyro_x", "accel_z", "left_trigger"]));
+            n
+        });
+        let gyro_curve = s.insert_node(p, node("module.response_curve", &[SignalType::Float], &[SignalType::Float]));
+        wire(&mut s, pad, 0, gyro_curve, 0);
+        let mixed = s.insert_node(p, node("module.response_curve", &[SignalType::Float, SignalType::Float], &[SignalType::Float, SignalType::Float]));
+        wire(&mut s, pad, 0, mixed, 0);
+        wire(&mut s, pad, 1, mixed, 1);
+        let trigger = s.insert_node(p, node("module.response_curve", &[SignalType::Float], &[SignalType::Float]));
+        wire(&mut s, pad, 2, trigger, 0);
+        // A curve after a motion curve still carries the gyro.
+        let chained = s.insert_node(p, node("module.twoway_response_curve", &[SignalType::Float], &[SignalType::Float]));
+        wire(&mut s, gyro_curve, 0, chained, 0);
+        let dof = s.insert_node(p, {
+            let mut n = node("processing.gyro_3dof", &[SignalType::AutoMap], &[SignalType::Vec2, SignalType::Float, SignalType::Float]);
+            n.params.insert("family".into(), json!("pointer"));
+            n
+        });
+        let vec_curve = s.insert_node(p, node("module.vec_response_curve", &[SignalType::Vec2], &[SignalType::Vec2]));
+        wire(&mut s, dof, 0, vec_curve, 0);
+        // Inside a sub-patch, fed through its inlet.
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let inlet = inner.insert_node(p, {
+            let mut n = node("subpatch.inlet", &[], &[SignalType::Float]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        let inner_curve = inner.insert_node(p, node("module.response_curve", &[SignalType::Float], &[SignalType::Float]));
+        wire(&mut inner, inlet, 0, inner_curve, 0);
+        let sp = s.insert_node(p, {
+            let mut n = node("subpatch", &[SignalType::Float], &[]);
+            n.subpatch = Some(Box::new(crate::canvas::node::UiSubPatch { snarl: Box::new(inner), ..Default::default() }));
+            n
+        });
+        wire(&mut s, pad, 1, sp, 0);
+
+        refresh_curve_motion_units(&mut s);
+        let unit = |s: &Snarl<NodeData>, id| MotionUnit::of(s.get_node(id).unwrap());
+        assert_eq!(unit(&s, gyro_curve), Some(MotionUnit::Gyro));
+        assert_eq!(unit(&s, chained), Some(MotionUnit::Gyro));
+        assert_eq!(unit(&s, vec_curve), Some(MotionUnit::Gyro), "3DOF Pointer hands on gyro rates");
+        assert_eq!(unit(&s, mixed), None, "gyro and accel disagree");
+        assert_eq!(unit(&s, trigger), None);
+        let inner_unit = s.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl.get_node(inner_curve).unwrap().extra.motion_unit;
+        assert_eq!(inner_unit, Some(MotionUnit::Accel), "traced out through the inlet");
+
+        // The engine runs it on the whole sensor.
+        s.get_node_mut(gyro_curve).unwrap().params.insert("in_max".into(), json!(0.2));
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.node_uid == gyro_curve.0).unwrap();
+        assert_eq!(snap.params.get("in_max").and_then(|v| v.as_f64()), Some(1.0));
+
+        // Steering integrates the rates: not gyro units any more.
+        s.get_node_mut(dof).unwrap().params.insert("family".into(), json!("steering"));
+        refresh_curve_motion_units(&mut s);
+        assert_eq!(unit(&s, vec_curve), None);
     }
 
     /// Moving an AutoMap curve between a trigger and a stick changes which curve

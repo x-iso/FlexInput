@@ -7110,3 +7110,19 @@ mod stick_direction_output_tests {
         assert!(pin_is_analog_input("left_stick"));
     }
 }
+
+#[cfg(test)]
+mod abs_range_tests {
+    use super::*;
+
+    // Abs reads a magnitude: the ↑ ends set the ranges and the ↓ ends — greyed
+    // out in the UI under Abs — change nothing.
+    #[test]
+    fn abs_curves_ignore_the_lower_ends() {
+        let id = [[0.0, 0.0], [1.0, 1.0]];
+        let a = apply_curve(0.5, &id, &[0.0], true, -1.0, 1.0, -1.0, 1.0, 0.0);
+        let b = apply_curve(0.5, &id, &[0.0], true, -4.0, 1.0, -9.0, 1.0, 0.0);
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        assert!((apply_curve(-0.25, &id, &[0.0], true, -4.0, 0.5, 0.0, 2.0, 0.0) + 1.0).abs() < 1e-6);
+    }
+}

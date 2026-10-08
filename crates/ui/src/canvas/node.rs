@@ -18,6 +18,10 @@ pub struct NodeExtra {
     /// Most recent evaluated output per channel for nodes that capture outputs
     /// (e.g. twoway_response_curve blended output). Populated from last_outputs map.
     pub last_out: Vec<Option<Signal>>,
+    /// For a plain curve wired from a motion sensor (gyro / accel pins, or the
+    /// rates a 3DOF to 2D in Pointer mode hands on): which one. Traced from the
+    /// wiring each frame by `refresh_curve_motion_units`.
+    pub(crate) motion_unit: Option<crate::canvas::viewer::MotionUnit>,
     /// UI-side aux scratch used by the counter reset button.
     /// Set by the viewer; read once during graph snapshot building then cleared.
     pub aux_f32: Vec<f32>,
