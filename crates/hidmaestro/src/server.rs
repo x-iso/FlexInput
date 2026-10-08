@@ -124,11 +124,13 @@ struct LiveDevice {
 /// undo exactly what we changed: remove only the device ids WE added to the
 /// blacklist (leaving any a user set via other tools) and, if our apply switched
 /// HidHide on, switch it back off. Cleared on parent-death / shutdown so a closed
-/// app never leaves a user's controllers hidden.
+/// app never leaves a user's controllers hidden — apart from `keep`, the ids the
+/// app asked to stay hidden after exit.
 #[derive(Default, Clone)]
 struct HidHideApplied {
     our_blacklist: Vec<String>,
     we_activated: bool,
+    keep: Vec<String>,
 }
 
 /// Process-wide helper state shared between the client loop and the
@@ -200,18 +202,27 @@ impl HelperState {
     /// Undo any HidHide masking we applied: drop the device ids WE added from the
     /// blacklist (keeping any a user set elsewhere) and, if our apply switched
     /// HidHide on, switch it back off. Best-effort; runs on parent-death and clean
-    /// exit (always — masking physical pads must never outlive the app, regardless
-    /// of the device-persist setting).
+    /// exit, regardless of the device-persist setting. The only masking that
+    /// outlives the app is `keep` — what the user's "keep hidden after exit"
+    /// setting asked for; while any is kept HidHide stays on so it still applies.
     fn clear_hidhide(&self) {
         let applied = self.hidhide_applied.lock().ok().and_then(|mut g| g.take());
         let Some(applied) = applied else { return };
-        if applied.our_blacklist.is_empty() && !applied.we_activated {
+        let keep: std::collections::HashSet<String> =
+            applied.keep.iter().map(|s| s.to_uppercase()).collect();
+        let to_drop: Vec<&String> = applied
+            .our_blacklist
+            .iter()
+            .filter(|s| !keep.contains(&s.to_uppercase()))
+            .collect();
+        let deactivate = applied.we_activated && keep.is_empty();
+        if to_drop.is_empty() && !deactivate {
             return;
         }
         let Some(hh) = crate::hidhide::HidHide::open() else { return };
-        if !applied.our_blacklist.is_empty() {
+        if !to_drop.is_empty() {
             let ours: std::collections::HashSet<String> =
-                applied.our_blacklist.iter().map(|s| s.to_uppercase()).collect();
+                to_drop.iter().map(|s| s.to_uppercase()).collect();
             let kept: Vec<String> = hh
                 .blacklist()
                 .into_iter()
@@ -219,10 +230,13 @@ impl HelperState {
                 .collect();
             hh.set_blacklist(&kept);
         }
-        if applied.we_activated {
+        if deactivate {
             hh.set_active(false);
         }
-        diag_log("[helper] cleared HidHide masking on teardown");
+        diag_log(&format!(
+            "[helper] cleared HidHide masking on teardown (kept {})",
+            keep.len()
+        ));
     }
 }
 
@@ -329,7 +343,8 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
         state.teardown_tracked();
         diag_log("[helper] exit cleanup (persist off): removed tracked device(s)");
     }
-    // Always undo HidHide masking on exit (independent of device persistence).
+    // Always undo HidHide masking on exit (independent of device persistence),
+    // bar what the app asked to keep hidden.
     state.clear_hidhide();
     diag_log("[helper] stopped");
 }
@@ -420,7 +435,8 @@ fn handle_parent_death(parent_pid: u32, state: &Arc<HelperState>) {
         diag_log("[helper] removed tracked device(s) after parent death");
     }
     // Always undo HidHide masking — physical pads must never stay hidden once the
-    // app is gone, independent of the device-persist policy.
+    // app is gone (unless the user's keep-hidden-after-exit setting asked for
+    // it), independent of the device-persist policy.
     state.clear_hidhide();
     wake_accept_loop();
 }
@@ -614,8 +630,8 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 .collect();
             (Response::Devices { devices }, false)
         }
-        Request::HidHideApply { blacklist, whitelist, active } => {
-            (handle_hidhide_apply(blacklist, whitelist, active, state), false)
+        Request::HidHideApply { blacklist, whitelist, active, keep_on_exit, release } => {
+            (handle_hidhide_apply(blacklist, whitelist, active, keep_on_exit, release, state), false)
         }
         Request::RearriveXInput { device_id } => (handle_rearrive_xinput(&device_id, state), false),
         Request::AssignXInputSlot { device_id, vid, pid, slot } => {
@@ -632,6 +648,8 @@ fn handle_hidhide_apply(
     blacklist: Vec<String>,
     whitelist: Vec<String>,
     active: bool,
+    keep_on_exit: Vec<String>,
+    release: Vec<String>,
     state: &Arc<HelperState>,
 ) -> Response {
     let Some(hh) = crate::hidhide::HidHide::open() else {
@@ -653,8 +671,9 @@ fn handle_hidhide_apply(
         .ok()
         .and_then(|g| g.as_ref().map(|a| a.our_blacklist.clone()))
         .unwrap_or_default();
+    // Ids an earlier session kept hidden at exit count as ours too.
     let prev_set: std::collections::HashSet<String> =
-        prev_ours.iter().map(|s| s.to_uppercase()).collect();
+        prev_ours.iter().chain(&release).map(|s| s.to_uppercase()).collect();
     let new_set: std::collections::HashSet<String> =
         blacklist.iter().map(|s| s.to_uppercase()).collect();
     let mut merged: Vec<String> = hh
@@ -677,6 +696,7 @@ fn handle_hidhide_apply(
         *g = Some(HidHideApplied {
             our_blacklist: blacklist.clone(),
             we_activated: prev_activated || (active && !was_active),
+            keep: keep_on_exit,
         });
     }
     let hidden = hh.blacklist();

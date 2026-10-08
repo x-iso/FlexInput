@@ -340,19 +340,33 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                 request_midi_flush(ui.ctx(), dev_id_str);
                             }
                         }
-                        if has_cal_here {
+                        let has_eye = crate::hidhide_toggle::state_of(dev_id_str).is_some();
+                        if has_cal_here || has_eye {
                             ui.horizontal(|ui| {
-                                let cal_resp = ui.small_button("Calibrate")
-                                    .on_hover_text("Open the Device Calibration window");
-                                crate::panels::calibration::calibrate_button_activity(
-                                    ui, node, cal_resp.rect);
-                                if cal_resp.clicked() {
-                                    self.calibrate_request = Some(node);
+                                if has_cal_here {
+                                    let cal_resp = ui.small_button("Calibrate")
+                                        .on_hover_text("Open the Device Calibration window");
+                                    crate::panels::calibration::calibrate_button_activity(
+                                        ui, node, cal_resp.rect);
+                                    if cal_resp.clicked() {
+                                        self.calibrate_request = Some(node);
+                                    }
+                                    let hz = self.device_rates.get(&dev_id_owned).copied().unwrap_or(0);
+                                    // Fixed-width cell, so the eye after it doesn't
+                                    // shift as the measured rate changes.
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(52.0, ui.spacing().interact_size.y),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_min_width(52.0);
+                                            ui.label(egui::RichText::new(format!("{} Hz", hz))
+                                                .color(Color32::from_rgb(220, 160, 40)).small())
+                                                .on_hover_text("Measured per-device polling rate (raw events/sec)");
+                                        },
+                                    );
                                 }
-                                let hz = self.device_rates.get(&dev_id_owned).copied().unwrap_or(0);
-                                ui.label(egui::RichText::new(format!("{} Hz", hz))
-                                    .color(Color32::from_rgb(220, 160, 40)).small())
-                                    .on_hover_text("Measured per-device polling rate (raw events/sec)");
+                                // Manual HidHide toggle (see `hidhide_toggle`).
+                                crate::hidhide_toggle::eye_button(ui, dev_id_str);
                             });
                         }
                     });
@@ -800,130 +814,149 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 ui.ctx().data_mut(|d| d.insert_temp(automap_label_abs_y_key(node), center_y));
             }
 
-            // Deadzone / Gyro × slider rows.
-            //
-            // Each row is rendered as a fixed-width label cell + a Slider with
-            // its value box suppressed + a separate DragValue. This split lets
-            // us recognise double-click on the slider track alone (reset to
-            // global default), while a double-click on the DragValue keeps
-            // egui's built-in inline edit behaviour.
-            // Pad the header for device.source nodes that have fewer than
-            // two slider rows so every device.source ends up the same
-            // height. Without this, a collapsed short-header node (e.g.
-            // XInput, which has no gyro) is so short that pin rows
-            // protrude past the header bottom and remain visible
-            // through the translucent body when collapsed. Each slider
-            // row is ~22 px tall.
-            // (A MIDI In header is already that tall with its controls.)
-            if is_device_source && !is_midi_in {
-                const SLIDER_ROW_H: f32 = 22.0;
-                let present_rows = (has_deadzone as u8) + (has_gyro as u8);
-                let missing_rows = 2 - present_rows.min(2);
-                if missing_rows > 0 {
-                    ui.add_space(SLIDER_ROW_H * missing_rows as f32);
-                }
-            }
-
-            if is_device_source && (has_deadzone || has_gyro) {
-                const LABEL_CELL_W: f32 = 60.0;
-                let mut dz_edit = deadzone_initial;
-                let dz_initial  = dz_edit;
-                if has_deadzone {
-                    ui.horizontal(|ui| {
-                        slider_label(ui, "Deadzone", LABEL_CELL_W);
-                        let resp = ui.add(egui::Slider::new(&mut dz_edit, 0.0_f32..=0.5)
-                            .show_value(false)
-                            .clamping(egui::SliderClamping::Always));
-                        if slider_track_double_clicked(ui, &resp) { dz_edit = self.param_defaults.stick_deadzone; }
-                        ui.add(egui::DragValue::new(&mut dz_edit)
-                            .speed(0.005)
-                            .range(0.0_f32..=0.5)
-                            .fixed_decimals(2));
-                    });
-                }
-                let mut gm_edit = gyro_mult_initial;
-                let gm_initial  = gm_edit;
-                if has_gyro {
-                    ui.horizontal(|ui| {
-                        slider_label(ui, "Gyro ×", LABEL_CELL_W);
-                        let resp = ui.add(egui::Slider::new(&mut gm_edit, 0.1_f32..=50.0)
-                            .logarithmic(true)
-                            .show_value(false)
-                            .clamping(egui::SliderClamping::Always));
-                        if slider_track_double_clicked(ui, &resp) { gm_edit = self.param_defaults.gyro_mult; }
-                        ui.add(egui::DragValue::new(&mut gm_edit)
-                            .speed(0.05)
-                            .range(0.1_f32..=50.0)
-                            .fixed_decimals(2));
-                    });
+            // A physical pad's per-device rows: Deadzone / Gyro ×, digital
+            // triggers, capacitive mute. Laid out beside the UI-navigation toggle
+            // (below), so it's a closure the two layouts share.
+            let param_defaults = self.param_defaults;
+            let has_touch_misc = is_device_source
+                && self.physical_devices.iter()
+                    .any(|d| d.id == dev_id_str && has_capacitive_suppression(d));
+            let source_rows = |ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>| {
+                // Deadzone / Gyro × slider rows.
+                //
+                // Each row is rendered as a fixed-width label cell + a Slider with
+                // its value box suppressed + a separate DragValue. This split lets
+                // us recognise double-click on the slider track alone (reset to
+                // global default), while a double-click on the DragValue keeps
+                // egui's built-in inline edit behaviour.
+                // Pad the header for device.source nodes that have fewer than
+                // two slider rows so every device.source ends up the same
+                // height. Without this, a collapsed short-header node (e.g.
+                // XInput, which has no gyro) is so short that pin rows
+                // protrude past the header bottom and remain visible
+                // through the translucent body when collapsed. Each slider
+                // row is ~22 px tall.
+                // (A MIDI In header is already that tall with its controls.)
+                if is_device_source && !is_midi_in {
+                    const SLIDER_ROW_H: f32 = 22.0;
+                    let present_rows = (has_deadzone as u8) + (has_gyro as u8);
+                    let missing_rows = 2 - present_rows.min(2);
+                    if missing_rows > 0 {
+                        ui.add_space(SLIDER_ROW_H * missing_rows as f32);
+                    }
                 }
 
-                if (dz_edit - dz_initial).abs() > f32::EPSILON
-                   || (gm_edit - gm_initial).abs() > f32::EPSILON
-                {
-                    if let Some(n) = snarl.get_node_mut(node) {
-                        if (dz_edit - dz_initial).abs() > f32::EPSILON {
-                            n.params.insert("deadzone".into(), Value::from(dz_edit as f64));
-                        }
-                        if (gm_edit - gm_initial).abs() > f32::EPSILON {
-                            n.params.insert("gyro_multiplier".into(), Value::from(gm_edit as f64));
+                if is_device_source && (has_deadzone || has_gyro) {
+                    const LABEL_CELL_W: f32 = 60.0;
+                    let mut dz_edit = deadzone_initial;
+                    let dz_initial  = dz_edit;
+                    if has_deadzone {
+                        ui.horizontal(|ui| {
+                            slider_label(ui, "Deadzone", LABEL_CELL_W);
+                            let resp = ui.add(egui::Slider::new(&mut dz_edit, 0.0_f32..=0.5)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always));
+                            if slider_track_double_clicked(ui, &resp) { dz_edit = param_defaults.stick_deadzone; }
+                            ui.add(egui::DragValue::new(&mut dz_edit)
+                                .speed(0.005)
+                                .range(0.0_f32..=0.5)
+                                .fixed_decimals(2));
+                        });
+                    }
+                    let mut gm_edit = gyro_mult_initial;
+                    let gm_initial  = gm_edit;
+                    if has_gyro {
+                        ui.horizontal(|ui| {
+                            slider_label(ui, "Gyro ×", LABEL_CELL_W);
+                            let resp = ui.add(egui::Slider::new(&mut gm_edit, 0.1_f32..=50.0)
+                                .logarithmic(true)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always));
+                            if slider_track_double_clicked(ui, &resp) { gm_edit = param_defaults.gyro_mult; }
+                            ui.add(egui::DragValue::new(&mut gm_edit)
+                                .speed(0.05)
+                                .range(0.1_f32..=50.0)
+                                .fixed_decimals(2));
+                        });
+                    }
+
+                    if (dz_edit - dz_initial).abs() > f32::EPSILON
+                       || (gm_edit - gm_initial).abs() > f32::EPSILON
+                    {
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            if (dz_edit - dz_initial).abs() > f32::EPSILON {
+                                n.params.insert("deadzone".into(), Value::from(dz_edit as f64));
+                            }
+                            if (gm_edit - gm_initial).abs() > f32::EPSILON {
+                                n.params.insert("gyro_multiplier".into(), Value::from(gm_edit as f64));
+                            }
                         }
                     }
                 }
-            }
 
-            // Digital-trigger override toggle for physical gamepad sources.
-            // See `digital_trigger_toggle` in easy::io_panel for the semantics —
-            // forced ON + disabled for digital-only pads (Switch Pro), opt-in
-            // elsewhere. Stored on the node's `digital_triggers` param.
-            // Both gilrs AND sdl physical pads (phys_pad_slug handles both
-            // prefixes) — an SDL-surfaced pad needs the same digital-trigger
-            // option as its gilrs twin (was gilrs-only: the toggle vanished when
-            // dedup kept the SDL node of a DInput pad).
-            if is_device_source
-                && crate::canvas::remapper_icons::phys_pad_slug(dev_id_str).is_some()
-            {
-                digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
-            }
+                // Digital-trigger override toggle for physical gamepad sources.
+                // See `digital_trigger_toggle` in easy::io_panel for the semantics —
+                // forced ON + disabled for digital-only pads (Switch Pro), opt-in
+                // elsewhere. Stored on the node's `digital_triggers` param.
+                // Both gilrs AND sdl physical pads (phys_pad_slug handles both
+                // prefixes) — an SDL-surfaced pad needs the same digital-trigger
+                // option as its gilrs twin (was gilrs-only: the toggle vanished when
+                // dedup kept the SDL node of a DInput pad).
+                if is_device_source
+                    && crate::canvas::remapper_icons::phys_pad_slug(dev_id_str).is_some()
+                {
+                    digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
+                }
+
+                // Capacitive stick-cap / grip mute — pads that have them (see
+                // `has_capacitive_suppression`). Sits next to the digital-trigger
+                // toggle because both are per-device input-conditioning opt-ins.
+                if has_touch_misc {
+                    touch_misc_header_toggle(ui, snarl, node);
+                }
+            };
 
             // UI navigation: lets this pad drive FlexInput's own UI, including the
             // config overlay — which can be summoned in Advanced mode too, where
             // there is no Easy-mode device card to reach the switch from. Same
-            // button, same state (`gamepad_nav::nav_state_of`).
-            if is_device_source {
-                if let Some((nav_on, nav_disabled)) =
-                    crate::gamepad_nav::nav_state_of(dev_id_str)
-                {
-                    ui.horizontal(|ui| {
-                        if let Some(v) = crate::easy::io_panel::nav_toggle_button(
-                            ui, nav_on, nav_disabled,
-                        ) {
-                            crate::gamepad_nav::request_nav_toggle(dev_id_str, v);
-                        }
-                        // Say which of the three states this is in words. A
-                        // greyed icon button in a node header is easy to click at
-                        // and conclude nothing happened, when the answer is that
-                        // this pad is barred from nav entirely.
-                        let (text, color) = if nav_disabled {
-                            ("UI navigation — unavailable", Color32::from_rgb(214, 168, 74))
-                        } else if nav_on {
-                            ("UI navigation — on", ui.visuals().strong_text_color())
-                        } else {
-                            ("UI navigation — off", ui.visuals().weak_text_color())
-                        };
-                        ui.label(egui::RichText::new(text).small().color(color));
-                    });
+            // icon, same state (`gamepad_nav::nav_state_of`), and the same place
+            // as on the Easy card: under the device icon, the rows to its right.
+            let nav_state = if is_device_source {
+                crate::gamepad_nav::nav_state_of(dev_id_str)
+            } else {
+                None
+            };
+            if let Some((nav_on, nav_disabled)) = nav_state {
+                // The device icon (40 px square) draws its pad in the middle of
+                // the square; tuck the chevron up into the empty bottom margin.
+                // Not under the XInput slot circles, which sit in between.
+                if !crate::easy::io_panel::device_id_is_xinput(dev_id_str) {
+                    ui.add_space(-8.0);
                 }
-            }
-
-            // Capacitive stick-cap / grip mute — pads that have them (see
-            // `has_capacitive_suppression`). Sits next to the digital-trigger
-            // toggle because both are per-device input-conditioning opt-ins.
-            if is_device_source
-                && self.physical_devices.iter()
-                    .any(|d| d.id == dev_id_str && has_capacitive_suppression(d))
-            {
-                touch_misc_header_toggle(ui, snarl, node);
+                const ICON_COL_W: f32 = 40.0;
+                const NAV_W: f32 = 34.0;
+                let block = ui.horizontal_top(|ui| {
+                    let (col, _) = ui.allocate_exact_size(
+                        egui::vec2(ICON_COL_W, crate::easy::io_panel::nav_toggle_height(NAV_W)),
+                        egui::Sense::hover(),
+                    );
+                    let nav_rect = egui::Rect::from_min_size(
+                        egui::pos2(col.center().x - NAV_W * 0.5, col.top()),
+                        egui::vec2(NAV_W, col.height()),
+                    );
+                    if let Some(v) = crate::easy::io_panel::nav_toggle_icon(
+                        ui, nav_rect, dev_id_str, nav_on, nav_disabled,
+                    ) {
+                        crate::gamepad_nav::request_nav_toggle(dev_id_str, v);
+                    }
+                    ui.vertical(|ui| source_rows(ui, snarl));
+                });
+                // Read next frame by the Auto-Map label's right alignment: these
+                // rows can now be wider than the pin columns below.
+                let w = block.response.rect.width();
+                ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
+            } else {
+                source_rows(ui, snarl);
             }
 
             // Feedback Control: add to the game's feedback, or override it.

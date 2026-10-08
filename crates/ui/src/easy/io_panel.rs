@@ -92,8 +92,13 @@ const CARD_ROUND:    f32 = 12.0;
 
 // Input card geometry
 const INPUT_CARD_ICON_H: f32 = 48.0;
-// The header's Port row, shown on presets that take several inputs.
+// The header's Port row (always shown, even on a single-input preset).
 const PORT_ROW_H: f32 = 22.0;
+// Room for a two-line device name, so a long name doesn't shove the
+// Calibrate / Port rows around (longer names are elided).
+const INPUT_NAME_H: f32 = 36.0;
+// The Calibrate + Hz + HidHide-eye row.
+const CALIBRATE_ROW_H: f32 = 22.0;
 
 // Output card geometry
 const OUTPUT_CARD_ICON_H:    f32 = 36.0;
@@ -374,13 +379,17 @@ fn active_accent_fill(ui: &egui::Ui) -> egui::Color32 {
 /// Card structure (split fill):
 ///
 ///   ┌─────────────────────────────────────┐
-///   │ ICON   Name             Calibrate  │  ← active accent fill (top half)
-///   │                          261 Hz     │
-///   │        Port [Player 2         ▾]   │  ← only when the preset takes >1 input
+///   │ ICON   Name (up to two lines)       │  ← active accent fill (top half)
+///   │  ▾                                  │
+///   │ NAV    Calibrate 261 Hz        [👁] │  ← eye = manual HidHide toggle
+///   │ ICON   Port [Player 2           ▾]  │
 ///   ├─────────────────────────────────────┤
 ///   │  Deadzone ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 0.06     │  ← inactive fill (sliders)
 ///   │  Gyro ×   ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 3.50     │
 ///   └─────────────────────────────────────┘
+///
+/// NAV ICON (with the chevron from the pad above it) is the UI-navigation
+/// toggle: full strength while on, faded while off.
 fn input_card(
     ui: &mut egui::Ui,
     d: &PhysicalDevice,
@@ -399,14 +408,18 @@ fn input_card(
 ) -> bool {
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
-    // Right column beside the icon: name + Calibrate/Hz (~36 px), plus the
-    // Port row on presets that take several inputs.
-    let right_col_h = 36.0 + if ports.shown() { PORT_ROW_H } else { 0.0 };
-    // Top: icon (48 px) or the right column, whichever is taller, + tight
-    // inset. Bottom: two slider rows ~22 px each + small gap + insets, plus a
-    // digital-trigger toggle row, plus the capacitive-touch mute row on pads
-    // that have capacitive sensors.
-    let top_h = INPUT_CARD_ICON_H.max(right_col_h) + 8.0;
+    // Left column: pad icon, then the nav toggle tucked into the icon's empty
+    // bottom margin (the glyph sits in the middle ~half of its square).
+    let nav_w = INPUT_CARD_ICON_H * 0.84;
+    let nav_top = 4.0 + INPUT_CARD_ICON_H * 0.80;
+    let left_col_h = nav_top + nav_toggle_height(nav_w);
+    // Right column beside the icons: two-line name, Calibrate row, Port row.
+    const RIGHT_COL_TOP: f32 = 10.0;
+    let right_col_h = INPUT_NAME_H + 4.0 + CALIBRATE_ROW_H + 4.0 + PORT_ROW_H;
+    // Top: the taller column + tight inset. Bottom: two slider rows ~22 px
+    // each + small gap + insets, plus a digital-trigger toggle row, plus the
+    // capacitive-touch mute row on pads that have capacitive sensors.
+    let top_h = left_col_h.max(RIGHT_COL_TOP + right_col_h) + 8.0;
     let trigger_row_h = 22.0;
     let has_touch_misc = crate::canvas::viewer::has_capacitive_suppression(d);
     let touch_row_h = if has_touch_misc { 22.0 } else { 0.0 };
@@ -478,14 +491,11 @@ fn input_card(
     // identical gutters.
     const CARD_HPAD: f32 = 10.0;
 
-    // Top section: icon on the left, with a vertically-centered right
-    // column carrying (name, Calibrate+Hz).
-    let icon_x = top_rect.left() + CARD_HPAD;
-    let icon_y = top_rect.top() + 4.0 + ((right_col_h - INPUT_CARD_ICON_H) * 0.5).max(0.0);
-    let icon_w = INPUT_CARD_ICON_H;
+    // Top section, left column: the pad icon, and under it the UI-navigation
+    // toggle (chevron + nav glyph).
     let icon_rect = egui::Rect::from_min_size(
-        egui::pos2(icon_x, icon_y),
-        egui::vec2(icon_w, INPUT_CARD_ICON_H),
+        egui::pos2(top_rect.left() + CARD_HPAD, top_rect.top() + 4.0),
+        egui::vec2(INPUT_CARD_ICON_H, INPUT_CARD_ICON_H),
     );
     let mut icon_ui = ui.new_child(
         egui::UiBuilder::new()
@@ -506,51 +516,74 @@ fn input_card(
             q.push(d.id.clone());
         }
     }
-
-    // Right column: name (row 1) + Calibrate+Hz (row 2) [+ Port (row 3)],
-    // y-centered against the icon (or the icon against it, when taller).
-    let right_col_top = top_rect.top() + 4.0
-        + ((INPUT_CARD_ICON_H - right_col_h) * 0.5).max(0.0);
-    let right_col_left = icon_rect.right() + 8.0;
-    let right_col_rect = egui::Rect::from_min_max(
-        egui::pos2(right_col_left, right_col_top),
-        egui::pos2(card_rect.right() - CARD_HPAD, right_col_top + right_col_h),
+    // Lives on every card: any pad can drive the UI, not just the active source.
+    let nav_rect = egui::Rect::from_min_size(
+        egui::pos2(icon_rect.center().x - nav_w * 0.5, top_rect.top() + nav_top),
+        egui::vec2(nav_w, nav_toggle_height(nav_w)),
     );
-    let mut top_right = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(right_col_rect)
-            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-    );
-    top_right.set_clip_rect(card_visible_clip);
-    top_right.label(egui::RichText::new(&d.display_name)
-        .size(14.0).strong());
-    top_right.add_space(1.0);
-    top_right.horizontal(|ui| {
-        if is_active {
-            // This card's own node — see `source_node_for`.
-            if let Some(node_id) = source_node_for(canvas, &d.id) {
-                header_controls::render_calibrate_row(
-                    ui, node_id, &d.id,
-                    device_rates_hz, calibrate_request,
-                );
-            }
-        } else {
-            ui.add_enabled(false, egui::Button::new(
-                egui::RichText::new("Calibrate").small()));
-            ui.label(egui::RichText::new(format!("{} Hz",
-                device_rates_hz.get(&d.id).copied().unwrap_or(0)))
-                .color(egui::Color32::from_rgb(140, 110, 60)).small());
-        }
-        // UI-navigation toggle — accent-colored when on, matching the
-        // active-card selection hue used for the nav glow. Lives at the
-        // right edge of the header row on every card (any pad can drive
-        // the UI, not just the active source).
-        if let Some(v) = nav_toggle_button(ui, nav_on, nav_disabled) {
+    {
+        let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect));
+        nav_ui.set_clip_rect(card_visible_clip);
+        if let Some(v) = nav_toggle_icon(&mut nav_ui, nav_rect, &d.id, nav_on, nav_disabled) {
             *nav_toggle = Some(v);
         }
-    });
-    let port_rect = ports.shown()
-        .then(|| port_row(&mut top_right, &d.id, is_active, ports, port_pick));
+    }
+
+    // Right column, every row at a fixed offset so neither a long name nor a
+    // changing Hz readout moves anything: name (two lines) / Calibrate + Hz +
+    // eye / Port.
+    let right_col_left = icon_rect.right() + 10.0;
+    let right_col_right = card_rect.right() - CARD_HPAD;
+    let mut y = top_rect.top() + RIGHT_COL_TOP;
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(right_col_left, y), egui::pos2(right_col_right, y + INPUT_NAME_H));
+    y += INPUT_NAME_H + 4.0;
+    let calib_rect = egui::Rect::from_min_max(
+        egui::pos2(right_col_left, y), egui::pos2(right_col_right, y + CALIBRATE_ROW_H));
+    y += CALIBRATE_ROW_H + 4.0;
+    let port_row_rect = egui::Rect::from_min_max(
+        egui::pos2(right_col_left, y), egui::pos2(right_col_right, y + PORT_ROW_H));
+
+    paint_card_name(ui, name_rect, &d.display_name, card_visible_clip);
+
+    // HidHide eye, pinned to the right edge — the Port dropdown's right edge.
+    let eye_size = crate::hidhide_toggle::EYE_BUTTON_SIZE;
+    let eye_rect = egui::Rect::from_min_max(
+        egui::pos2(right_col_right - eye_size, calib_rect.top()),
+        egui::pos2(right_col_right, calib_rect.bottom()),
+    );
+    {
+        let mut eye_ui = ui.new_child(egui::UiBuilder::new()
+            .max_rect(eye_rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
+        eye_ui.set_clip_rect(card_visible_clip);
+        crate::hidhide_toggle::eye_button(&mut eye_ui, &d.id);
+    }
+    let mut calib_ui = ui.new_child(egui::UiBuilder::new()
+        .max_rect(calib_rect.with_max_x(eye_rect.left() - 4.0))
+        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+    calib_ui.set_clip_rect(card_visible_clip);
+    if is_active {
+        // This card's own node — see `source_node_for`.
+        if let Some(node_id) = source_node_for(canvas, &d.id) {
+            header_controls::render_calibrate_row(
+                &mut calib_ui, node_id, &d.id,
+                device_rates_hz, calibrate_request,
+            );
+        }
+    } else {
+        calib_ui.add_enabled(false, egui::Button::new(
+            egui::RichText::new("Calibrate").small()));
+        calib_ui.label(egui::RichText::new(format!("{} Hz",
+            device_rates_hz.get(&d.id).copied().unwrap_or(0)))
+            .color(egui::Color32::from_rgb(140, 110, 60)).small());
+    }
+
+    let mut port_ui = ui.new_child(egui::UiBuilder::new()
+        .max_rect(port_row_rect)
+        .layout(egui::Layout::top_down(egui::Align::LEFT)));
+    port_ui.set_clip_rect(card_visible_clip);
+    let port_rect = port_row(&mut port_ui, &d.id, is_active, ports, port_pick);
 
     // Bottom section: two stacked slider rows with bigger, more
     // readable labels. Layout per row: [LABEL  | slider fills | value].
@@ -602,14 +635,14 @@ fn input_card(
         // Select target: the header band only (avoid covering the sliders),
         // stopping above the Port row so the two never overlap.
         let mut select_rect = top_rect;
-        if let Some(r) = port_rect { select_rect.max.y = r.top(); }
+        select_rect.max.y = port_rect.top();
         nav_targets.push(LeftNavTarget {
             rect: select_rect,
             action: LeftNavAction::SelectInput { device_id: d.id.clone() },
         });
-        if let (true, Some(r)) = (is_active, port_rect) {
+        if is_active && ports.names.len() > 1 {
             nav_targets.push(LeftNavTarget {
-                rect: egui::Rect::from_x_y_ranges(top_rect.x_range(), r.y_range()),
+                rect: egui::Rect::from_x_y_ranges(top_rect.x_range(), port_rect.y_range()),
                 action: LeftNavAction::CycleInputPort { device_id: d.id.clone() },
             });
         }
@@ -692,9 +725,9 @@ fn midi_input_card(
     // estimate left the Port row hanging off the card's bottom edge.
     let text_h_id = ui.id().with(("easy_midi_card_text_h", d.id.as_str()));
     let text_h = ui.data(|m| m.get_temp::<f32>(text_h_id))
-        .unwrap_or(36.0 + if ports.shown() { PORT_ROW_H } else { 0.0 });
-    // Taller inset under a Port row, so the dropdown doesn't sit on the border.
-    let inset = if ports.shown() { 12.0 } else { 8.0 };
+        .unwrap_or(36.0 + PORT_ROW_H);
+    // Taller inset under the Port row, so the dropdown doesn't sit on the border.
+    let inset = 12.0;
     let card_h = INPUT_CARD_ICON_H.max(text_h) + inset;
     let (full_row, _) = ui.allocate_exact_size(egui::vec2(panel_avail, card_h), egui::Sense::hover());
     let card_rect = egui::Rect::from_min_size(
@@ -738,8 +771,7 @@ fn midi_input_card(
     } else {
         "MIDI input"
     }).small().weak());
-    let port_rect = ports.shown()
-        .then(|| port_row(&mut text_ui, &d.id, is_active, ports, port_pick));
+    let port_rect = port_row(&mut text_ui, &d.id, is_active, ports, port_pick);
     let measured = text_ui.min_rect().height();
     if (measured - text_h).abs() > 0.5 {
         ui.data_mut(|m| m.insert_temp(text_h_id, measured));
@@ -747,14 +779,14 @@ fn midi_input_card(
     }
 
     let mut select_rect = card_rect;
-    if let Some(r) = port_rect { select_rect.max.y = r.top(); }
+    select_rect.max.y = port_rect.top();
     nav_targets.push(crate::gamepad_nav::LeftNavTarget {
         rect: select_rect,
         action: crate::gamepad_nav::LeftNavAction::SelectInput { device_id: d.id.clone() },
     });
-    if let (true, Some(r)) = (is_active, port_rect) {
+    if is_active && ports.names.len() > 1 {
         nav_targets.push(crate::gamepad_nav::LeftNavTarget {
-            rect: egui::Rect::from_x_y_ranges(card_rect.x_range(), r.y_range()),
+            rect: egui::Rect::from_x_y_ranges(card_rect.x_range(), port_rect.y_range()),
             action: crate::gamepad_nav::LeftNavAction::CycleInputPort { device_id: d.id.clone() },
         });
     }
@@ -765,7 +797,9 @@ fn midi_input_card(
 /// The card header's "Port" row: which of the preset's AutoMap inlets this
 /// device feeds, under the sub-patch's own name for it. Picking another port
 /// lands in `port_pick` (applied by the caller, which swaps with the holder).
-/// Inactive cards show it disabled, so every card keeps the same height.
+/// Inactive cards show it disabled, so every card keeps the same height. Shown
+/// even when the preset takes a single input (or none is loaded), so the card
+/// layout never changes with the preset.
 /// Returns the row's rect for the gamepad-nav target.
 fn port_row(
     ui: &mut egui::Ui,
@@ -777,13 +811,13 @@ fn port_row(
     let mine = if is_active { ports.slot_of(device_id) } else { None };
     let current = match mine {
         Some(p) => ports.names[p].clone(),
-        None if is_active => "none — every port is taken".into(),
+        None if is_active && !ports.names.is_empty() => "none — every port is taken".into(),
         None => "—".into(),
     };
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Port").size(11.0).weak());
-        ui.add_enabled_ui(is_active, |ui| {
+        ui.add_enabled_ui(is_active && !ports.names.is_empty(), |ui| {
             egui::ComboBox::from_id_salt(("easy_input_port", device_id))
                 .selected_text(egui::RichText::new(current).small())
                 .width(ui.available_width())
@@ -1101,12 +1135,6 @@ impl PortTable {
         Self { names, holders }
     }
 
-    /// Only presets taking several inputs get a Port row; with one inlet there
-    /// is nothing to choose.
-    fn shown(&self) -> bool {
-        self.names.len() > 1
-    }
-
     fn slot_of(&self, device_id: &str) -> Option<usize> {
         self.holders.iter().position(|h| h.as_ref().is_some_and(|(d, _)| d == device_id))
     }
@@ -1381,70 +1409,137 @@ pub fn canvas_node_xinput_slots(ui: &mut egui::Ui, device_id: &str) {
     }
 }
 
-/// The UI-navigation toggle: accent-filled when on, matching the active-card
-/// selection hue used for the nav glow. Returns the state it was clicked to.
+/// The UI-navigation toggle: a chevron pointing down from the pad icon above it
+/// onto a "gamepad drives the UI" glyph. Full strength while nav is on, faded
+/// while off (brighter on hover), barely there when unavailable. Drawn into
+/// `rect`, which should be `nav_toggle_height(rect.width())` tall. Returns the
+/// state it was clicked to.
 ///
 /// Shared by the Easy-mode input card and the Advanced-mode device node header —
 /// the config overlay can be summoned in either mode, so the switch that lets a
 /// pad drive it has to be reachable from either. One function so the two can't
 /// drift into disagreeing about what the icon means.
 #[must_use]
-pub(crate) fn nav_toggle_button(
+pub(crate) fn nav_toggle_icon(
     ui: &mut egui::Ui,
+    rect: egui::Rect,
+    device_id: &str,
     nav_on: bool,
     nav_disabled: bool,
 ) -> Option<bool> {
-    // Rasterize the controller-nav SVG once and cache the texture in ctx memory.
-    // Render it with its NATIVE colors (outlines/fills preserved) — a
-    // fully-transparent tint makes rasterize_svg_recolored skip its recolor pass
-    // entirely. On/off state is conveyed by the button's fill + stroke below, not
-    // by tinting the glyph.
-    let tex: Option<egui::TextureHandle> = {
-        let key = egui::Id::new("controller_nav_icon_native");
-        let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
-        cached.or_else(|| {
-            const NAV_SVG: &str = include_str!("../../../../app/assets/controller_nav.svg");
-            crate::canvas::viewer::rasterize_svg_recolored(
-                NAV_SVG, 32, 32, "override", egui::Color32::TRANSPARENT)
-                .map(|img| {
-                    let t = ui.ctx().load_texture("controller_nav_icon", img,
-                        egui::TextureOptions::LINEAR);
-                    ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
-                    t
-                })
-        })
+    let sense = if nav_disabled { egui::Sense::hover() } else { egui::Sense::click() };
+    let resp = ui.interact(rect, ui.id().with(("nav_toggle_icon", device_id)), sense);
+    let alpha: u8 = if nav_disabled {
+        35
+    } else if nav_on {
+        255
+    } else if resp.hovered() {
+        150
+    } else {
+        80
     };
-    let btn = match &tex {
-        Some(t) => egui::Button::image(
-            egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))
-                // Dim the glyph when disabled so the grayed state reads.
-                .tint(if nav_disabled {
-                    egui::Color32::from_gray(110)
-                } else {
-                    egui::Color32::WHITE
-                })),
-        None => egui::Button::new(egui::RichText::new("🎮").size(13.0)),
-    };
-    let nav_resp = ui.add_enabled(
-        !nav_disabled,
-        btn.fill(if nav_on {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            })
-            .stroke(if nav_on {
-                egui::Stroke::new(1.0, ui.visuals().selection.stroke.color)
-            } else {
-                egui::Stroke::NONE
-            }),
-    ).on_hover_text(if nav_disabled {
+    if ui.is_rect_visible(rect) {
+        let tint = egui::Color32::from_white_alpha(alpha);
+        let (chevron, glyph) = nav_toggle_parts(rect);
+        let painter = ui.painter();
+        if let Some(t) = nav_svg_texture(ui, "down_chevron", NAV_CHEVRON_SVG, chevron.width() / NAV_CHEVRON_UV.width()) {
+            painter.image(t.id(), chevron, NAV_CHEVRON_UV, tint);
+        }
+        if let Some(t) = nav_svg_texture(ui, "gamepad_nav_ui", NAV_GLYPH_SVG, glyph.width() / NAV_GLYPH_UV.width()) {
+            painter.image(t.id(), glyph, NAV_GLYPH_UV, tint);
+        }
+    }
+    let resp = resp.on_hover_text(if nav_disabled {
         "UI navigation unavailable — this is FlexInput's own virtual output (shown as physical). Driving the UI from it would feed back into your own mappings."
     } else if nav_on {
         "UI navigation ON — this gamepad drives FlexInput's UI while focused (mapped output suppressed). Click to disable."
     } else {
         "UI navigation OFF — click to let this gamepad drive FlexInput's UI while focused."
     });
-    (nav_resp.clicked() && !nav_disabled).then_some(!nav_on)
+    if nav_disabled {
+        return None;
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+        .then_some(!nav_on)
+}
+
+const NAV_CHEVRON_SVG: &str = include_str!("../../../../app/assets/down_chevron.svg");
+const NAV_GLYPH_SVG: &str = include_str!("../../../../app/assets/gamepad_nav_ui.svg");
+/// The drawn part of each SVG's square viewBox (both have wide margins), so the
+/// laid-out rects hug the artwork. Measured from the rasterized output with a
+/// pixel of slack on every side — cropping inside the artwork clips it.
+const NAV_CHEVRON_UV: egui::Rect = egui::Rect {
+    min: egui::pos2(0.10, 0.30),
+    max: egui::pos2(0.90, 0.70),
+};
+const NAV_GLYPH_UV: egui::Rect = egui::Rect {
+    min: egui::pos2(0.06, 0.10),
+    max: egui::pos2(0.95, 0.90),
+};
+const NAV_CHEVRON_W_FRAC: f32 = 0.36;
+const NAV_CHEVRON_GAP: f32 = 3.0;
+
+fn uv_aspect(uv: egui::Rect) -> f32 {
+    uv.width() / uv.height()
+}
+
+/// Height of the nav toggle drawn `w` wide: chevron, gap, glyph.
+pub(crate) fn nav_toggle_height(w: f32) -> f32 {
+    w * NAV_CHEVRON_W_FRAC / uv_aspect(NAV_CHEVRON_UV) + NAV_CHEVRON_GAP + w / uv_aspect(NAV_GLYPH_UV)
+}
+
+/// The chevron's and the glyph's rects within the toggle's `rect`.
+fn nav_toggle_parts(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let w = rect.width();
+    let cw = w * NAV_CHEVRON_W_FRAC;
+    let ch = cw / uv_aspect(NAV_CHEVRON_UV);
+    let chevron = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - cw * 0.5, rect.top()), egui::vec2(cw, ch));
+    let glyph = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), chevron.bottom() + NAV_CHEVRON_GAP),
+        egui::vec2(w, w / uv_aspect(NAV_GLYPH_UV)));
+    (chevron, glyph)
+}
+
+/// Rasterize a square SVG at `side` points (native colours) and cache the texture.
+fn nav_svg_texture(ui: &egui::Ui, name: &str, svg: &str, side: f32) -> Option<egui::TextureHandle> {
+    let px = (side * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32;
+    let key = egui::Id::new(("nav_toggle_svg", name, px));
+    if let Some(t) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return Some(t);
+    }
+    // A fully-transparent tint makes rasterize_svg_recolored skip its recolor
+    // pass, keeping the artwork's own colours (and the glyph's gradient).
+    let img = crate::canvas::viewer::rasterize_svg_recolored(
+        svg, px, px, "override", egui::Color32::TRANSPARENT)?;
+    let t = ui.ctx().load_texture(format!("nav_toggle_{name}"), img, egui::TextureOptions::LINEAR);
+    ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+    Some(t)
+}
+
+/// A device card's name, wrapped onto at most two lines inside `rect` and
+/// elided past that (the full name in a tooltip), so a long name never pushes
+/// the rows below it around.
+fn paint_card_name(ui: &egui::Ui, rect: egui::Rect, name: &str, clip: egui::Rect) {
+    let color = ui.visuals().strong_text_color();
+    let mut job = egui::text::LayoutJob::single_section(
+        name.to_owned(),
+        egui::TextFormat { font_id: egui::FontId::proportional(14.0), color, ..Default::default() },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: rect.width(),
+        max_rows: 2,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    ui.painter().with_clip_rect(clip).galley(rect.min, galley, color);
+    if elided {
+        ui.interact(rect, ui.id().with(("card_name", name)), egui::Sense::hover())
+            .on_hover_text(name);
+    }
 }
 
 /// A `label` row with the four slot circles right-aligned to the dropdown width

@@ -6,6 +6,8 @@
 //! files, no external config crate. New fields default-in via
 //! `#[serde(default)]` so older saved configs keep loading.
 
+use std::collections::HashMap;
+
 use egui_snarl::Snarl;
 
 use crate::canvas::NodeData;
@@ -323,6 +325,22 @@ pub struct AppSettings {
     /// clears everything at teardown), so nothing stays hidden after a close.
     #[serde(default)]
     pub hidhide_sticky: bool,
+    /// Which hidden controllers stay hidden after FlexInput exits. The helper
+    /// otherwise clears its masking at teardown.
+    #[serde(default)]
+    pub hidhide_keep_on_exit: HidHideKeepOnExit,
+    /// Per-device manual HidHide choice from the eye button on a device card,
+    /// keyed by device id: `true` = hidden, `false` = visible. A device with no
+    /// entry follows `hide_originals` (hidden while remapped to a virtual
+    /// output). Right-clicking the eye removes the entry.
+    #[serde(default)]
+    pub hidhide_overrides: HashMap<String, bool>,
+    /// HID instance ids the helper was told to leave hidden when FlexInput
+    /// exits. Sent back as `release` on the next session's first apply, so an
+    /// entry that is no longer wanted gets unhidden instead of being mistaken
+    /// for a third-party one.
+    #[serde(default)]
+    pub hidhide_kept_ids: Vec<String>,
     /// Render backend selection, applied at startup in `app/src/main.rs`
     /// (changing it requires an app restart). Auto = DirectX 12 on Windows
     /// (falling back to Vulkan, then OpenGL, if it fails to start) — Vulkan's
@@ -604,6 +622,41 @@ pub fn startup_renderer_choice() -> RendererChoice {
     load_settings().renderer
 }
 
+/// Which HidHide-masked controllers stay hidden once FlexInput exits
+/// (see `AppSettings::hidhide_keep_on_exit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HidHideKeepOnExit {
+    /// Unhide everything FlexInput hid.
+    Never,
+    /// Keep only controllers hidden with the eye button; unhide the rest.
+    #[default]
+    ManualOnly,
+    /// Keep every controller FlexInput hid.
+    Always,
+}
+
+impl HidHideKeepOnExit {
+    pub const ALL: [Self; 3] = [Self::Never, Self::ManualOnly, Self::Always];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::ManualOnly => "Only manually hidden",
+            Self::Always => "Always",
+        }
+    }
+
+    /// Whether a controller hidden right now stays hidden after exit.
+    pub fn keeps(self, manual: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::ManualOnly => manual,
+            Self::Always => true,
+        }
+    }
+}
+
 /// Camera behavior immediately after a patch is loaded into a tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum OnPatchLoad {
@@ -686,6 +739,9 @@ impl Default for AppSettings {
             persist_virtual_devices: false,
             hide_originals: None,
             hidhide_sticky: false,
+            hidhide_keep_on_exit: HidHideKeepOnExit::default(),
+            hidhide_overrides: HashMap::new(),
+            hidhide_kept_ids: Vec::new(),
             renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,

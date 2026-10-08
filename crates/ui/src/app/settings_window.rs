@@ -308,14 +308,29 @@ impl FlexInputApp {
         }
 
         let installed = self.hidhide_installed;
-        let active = self.settings.hide_originals.unwrap_or(installed);
-        let mut targets: Vec<(u16, u16)> = if active && installed {
-            self.remapped_physical_hid_targets()
+        let auto_on = self.settings.hide_originals.unwrap_or(installed);
+        self.hidhide_auto_ids = if auto_on && installed {
+            self.remapped_physical_ids()
+        } else {
+            HashSet::new()
+        };
+        let targets: Vec<(u16, u16, bool)> = if installed {
+            self.hidhide_targets()
         } else {
             Vec::new()
         };
-        targets.sort_unstable();
-        targets.dedup();
+        // A manual hide needs HidHide on even with "Hide original controllers" off.
+        let active = auto_on || !targets.is_empty();
+        // Pads a previous session left hidden at exit, to unhide unless still wanted.
+        let release = self.settings.hidhide_kept_ids.clone();
+        // Right after launch the device list may still be empty; releasing then
+        // would unhide a kept pad for the moment until it enumerates.
+        if targets.is_empty()
+            && !release.is_empty()
+            && self.hidhide_started.elapsed() < std::time::Duration::from_secs(4)
+        {
+            return;
+        }
 
         let prev_targets = std::mem::take(&mut self.hidhide_last_targets);
         if self.hidhide_last_active == Some(active) && prev_targets == targets {
@@ -325,7 +340,7 @@ impl FlexInputApp {
         self.hidhide_last_active = Some(active);
         self.hidhide_last_targets = targets.clone();
         // Don't spawn the helper (UAC) just to apply or clear an empty set.
-        if targets.is_empty() && prev_targets.is_empty() {
+        if targets.is_empty() && prev_targets.is_empty() && release.is_empty() {
             return;
         }
 
@@ -333,11 +348,13 @@ impl FlexInputApp {
         let whitelist: Vec<String> = HidHideClient::current_exe_path().into_iter().collect();
         let sticky = self.settings.hidhide_sticky;
         let inst_cache = std::sync::Arc::clone(&self.hidhide_instance_cache);
+        let kept_report = std::sync::Arc::clone(&self.hidhide_kept_report);
         std::thread::spawn(move || {
             // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
-            let blacklist: Vec<String> = targets
+            let resolved: Vec<(String, bool)> = targets
                 .iter()
-                .filter_map(|(vid, pid)| {
+                .filter_map(|&(vid, pid, keep)| {
+                    let (vid, pid) = (&vid, &pid);
                     let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
                     // Remember every id we resolve; when sticky is on and the pad
                     // is currently absent, fall back to the remembered one so the
@@ -356,32 +373,191 @@ impl FlexInputApp {
                         None => None,
                     };
                     eprintln!(
-                        "[hidhide] target {:04X}:{:04X} -> instance {:?}",
+                        "[hidhide] target {:04X}:{:04X} -> instance {:?} (keep on exit: {keep})",
                         vid, pid, id
                     );
-                    id
+                    id.map(|id| (id, keep))
                 })
                 .collect();
-            match flexinput_hidmaestro::helper::hidhide_apply(&blacklist, &whitelist, active) {
+            let blacklist: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();
+            let keep: Vec<String> = resolved.iter()
+                .filter(|(_, k)| *k)
+                .map(|(id, _)| id.clone())
+                .collect();
+            match flexinput_hidmaestro::helper::hidhide_apply(
+                &blacklist, &whitelist, active, &keep, &release,
+            ) {
                 Ok(st) if !st.present => eprintln!("[hidhide] driver not present at apply time"),
-                Ok(st) => eprintln!(
-                    "[hidhide] applied: active={} hidden={} (requested {})",
-                    st.active, st.hidden.len(), blacklist.len()
-                ),
+                Ok(st) => {
+                    eprintln!(
+                        "[hidhide] applied: active={} hidden={} (requested {}, kept on exit {})",
+                        st.active, st.hidden.len(), blacklist.len(), keep.len()
+                    );
+                    if let Ok(mut r) = kept_report.lock() {
+                        *r = Some(keep);
+                    }
+                }
                 Err(e) => eprintln!("[hidhide] apply failed: {e}"),
             }
         });
     }
 
+    /// Fold eye-button clicks into the overrides (forcing a reconcile), and pick
+    /// up the keep list the last apply reported. Every frame, before the reconcile.
+    #[cfg(windows)]
+    pub(crate) fn drain_hidhide_requests(&mut self) {
+        use crate::hidhide_toggle::HideRequest;
+        for (id, req) in crate::hidhide_toggle::drain_requests() {
+            match req {
+                HideRequest::Set(v) => { self.settings.hidhide_overrides.insert(id, v); }
+                HideRequest::Auto => { self.settings.hidhide_overrides.remove(&id); }
+            }
+            self.settings_dirty = true;
+            self.hidhide_dirty = true;
+        }
+        let reported = self.hidhide_kept_report.lock().ok().and_then(|mut r| r.take());
+        if let Some(kept) = reported {
+            if kept != self.settings.hidhide_kept_ids {
+                self.settings.hidhide_kept_ids = kept;
+                self.settings_dirty = true;
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn drain_hidhide_requests(&mut self) {}
+
+    /// Publish every device's eye-button state. Every frame, after the reconcile:
+    /// it only reads the cached auto set, never walks the patch.
+    #[cfg(windows)]
+    pub(crate) fn publish_hidhide_ui(&mut self) {
+        use crate::hidhide_toggle::HideUiState;
+        let own_virtual = self.own_virtual_device_ids();
+        let states: HashMap<String, HideUiState> = self.devices.iter()
+            .filter(|d| !matches!(d.kind,
+                flexinput_devices::ControllerKind::MidiIn
+                | flexinput_devices::ControllerKind::MidiOut))
+            .map(|d| {
+                let blocked = self.hidhide_block_reason(d, &own_virtual);
+                let (hidden, manual) = self.hidhide_effective(&d.id);
+                (d.id.clone(), HideUiState { hidden: hidden && blocked.is_none(), manual, blocked })
+            })
+            .collect();
+        crate::hidhide_toggle::publish(states);
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn publish_hidhide_ui(&mut self) {}
+
+    /// `(hidden, manual)` for a device: its eye-button override when it has one,
+    /// else whether the auto rule ("Hide original controllers" + remapped) hides it.
+    #[cfg(windows)]
+    fn hidhide_effective(&self, device_id: &str) -> (bool, bool) {
+        match self.settings.hidhide_overrides.get(device_id) {
+            Some(&v) => (v, true),
+            None => (self.hidhide_auto_ids.contains(device_id), false),
+        }
+    }
+
+    /// Why a device can't be hidden at all, or `None` when it can.
+    #[cfg(windows)]
+    fn hidhide_block_reason(
+        &self,
+        dev: &PhysicalDevice,
+        own_virtual: &HashSet<String>,
+    ) -> Option<&'static str> {
+        use flexinput_devices::ControllerKind as K;
+        if !self.hidhide_installed {
+            return Some("The HidHide driver isn't installed (nefarius/HidHide).");
+        }
+        if own_virtual.contains(&dev.id) {
+            return Some("This is FlexInput's own virtual controller.");
+        }
+        match dev.kind {
+            K::XInput => Some("Xbox controllers can't be hidden: HidHide can't mask their XInput face."),
+            // Joy-Con 2 is excluded BY KIND, not by device-id prefix: over USB
+            // (charging grip) it DOES get a HID node, Windows binds it as a plain
+            // gamepad, and it reaches us as `sdl:`/`gilrs:` — past the prefix gate
+            // in `remapped_physical_ids`. Masking it is actively harmful, because
+            // our own hidapi transport (`joycon2::usb`) is what reads it, and
+            // HidHide's per-app whitelist is unreliable here: the pad enumerates,
+            // opens, then streams nothing at all. Nothing is gained either — the
+            // vendor protocol lives on interface 1, which no game reads, so there
+            // is no phantom gamepad to suppress.
+            K::JoyCon2L | K::JoyCon2R => {
+                Some("FlexInput reads Joy-Con 2 directly; hiding it would cut FlexInput off too.")
+            }
+            _ if dev.vid.is_none() || dev.pid.is_none() => {
+                Some("This controller reports no USB vendor/product id to hide it by.")
+            }
+            _ => None,
+        }
+    }
+
+    /// (vid, pid, keep-after-exit) of every controller to hide right now: each
+    /// live device that can be hidden and is (by override or the auto rule),
+    /// plus — with sticky masking on — remembered devices that are briefly
+    /// absent but still wanted hidden. Sorted and deduped by (vid, pid).
+    #[cfg(windows)]
+    fn hidhide_targets(&self) -> Vec<(u16, u16, bool)> {
+        let own_virtual = self.own_virtual_device_ids();
+        let keep_mode = self.settings.hidhide_keep_on_exit;
+        let mut out: Vec<(u16, u16, bool)> = Vec::new();
+        let mut live: HashSet<&str> = HashSet::new();
+        for dev in &self.devices {
+            live.insert(dev.id.as_str());
+            if matches!(dev.kind,
+                flexinput_devices::ControllerKind::MidiIn
+                | flexinput_devices::ControllerKind::MidiOut)
+            {
+                continue;
+            }
+            if self.hidhide_block_reason(dev, &own_virtual).is_some() {
+                continue;
+            }
+            let (hidden, manual) = self.hidhide_effective(&dev.id);
+            if let (true, Some(vid), Some(pid)) = (hidden, dev.vid, dev.pid) {
+                out.push((vid, pid, keep_mode.keeps(manual)));
+            }
+        }
+        // Sticky masking: a pad that isn't in the live list right now (Bluetooth
+        // dropout, or a reconnect that arrives already blacklisted and so never
+        // reaches our enumeration) keeps its mask, resolved from the session
+        // vid/pid cache. Without this the mask is dropped the instant the pad
+        // blips out — which UNHIDES it system-wide, handing a running game the
+        // physical pad alongside the virtual one until the pad returns and we
+        // re-hide it. The patch wiring / override is still the source of truth:
+        // a device unmapped (or shown) drops out here and is unmasked normally.
+        // The cache only ever holds maskable pads (see `reconcile_hidhide`).
+        if self.settings.hidhide_sticky {
+            for (id, &(vid, pid)) in &self.hidhide_vidpid_cache {
+                if live.contains(id.as_str()) {
+                    continue;
+                }
+                let (hidden, manual) = self.hidhide_effective(id);
+                if hidden {
+                    out.push((vid, pid, keep_mode.keeps(manual)));
+                }
+            }
+        }
+        // One entry per (vid, pid); kept if any device behind it is.
+        out.sort_unstable();
+        out.dedup_by(|b, a| {
+            let same = (a.0, a.1) == (b.0, b.1);
+            if same { a.2 |= b.2; }
+            same
+        });
+        out
+    }
+
     #[cfg(not(windows))]
     pub(crate) fn reconcile_hidhide(&mut self) {}
 
-    /// (vid,pid) of physical HID controllers in the active patch that feed a
-    /// `virtual.*` output. XInput (Xbox) pads are excluded — HidHide can't hide
-    /// their XUSB face — as are MIDI devices.
+    /// Ids of the physical controllers in the active patch that feed a
+    /// `virtual.*` output — what "Hide original controllers" hides. Whether each
+    /// can actually be hidden is `hidhide_block_reason`'s call.
     #[cfg(windows)]
-    pub(crate) fn remapped_physical_hid_targets(&self) -> Vec<(u16, u16)> {
-        use std::collections::HashSet;
+    pub(crate) fn remapped_physical_ids(&self) -> HashSet<String> {
         let snarl = &self.tabs[self.active_tab].canvas.snarl;
         // Physical device ids that feed a virtual.* sink (via an AutoMap wire).
         let mut phys_ids: HashSet<String> = HashSet::new();
@@ -425,65 +601,7 @@ impl FlexInputApp {
                 }
             }
         }
-        // Map device ids → (vid,pid), keeping HID-class pads only.
-        let mut out = Vec::new();
-        let mut resolved: HashSet<&str> = HashSet::new();
-        for dev in &self.devices {
-            if !phys_ids.contains(&dev.id) {
-                continue;
-            }
-            if matches!(
-                dev.kind,
-                flexinput_devices::ControllerKind::XInput
-                    | flexinput_devices::ControllerKind::MidiIn
-                    | flexinput_devices::ControllerKind::MidiOut
-            ) {
-                continue; // Xbox/XInput can't be hidden; MIDI has no vid/pid
-            }
-            // Joy-Con 2 is excluded BY KIND, not by device-id prefix.
-            //
-            // The `jc2:` prefix check above is not enough and the comment there
-            // is now only half true: over USB (charging grip) a Joy-Con 2 DOES
-            // get a HID node, Windows binds it as a plain gamepad, and it
-            // reaches us as `sdl:`/`gilrs:` — so it sailed straight past the
-            // prefix gate and got masked. Masking it is actively harmful,
-            // because our own hidapi transport (`joycon2::usb`) is what reads
-            // it, and HidHide's per-app whitelist is unreliable here: the pad
-            // enumerates, opens, then streams nothing at all. Nothing is gained
-            // either — the vendor protocol lives on interface 1, which no game
-            // reads, so there is no phantom gamepad to suppress.
-            if matches!(
-                dev.kind,
-                flexinput_devices::ControllerKind::JoyCon2L
-                    | flexinput_devices::ControllerKind::JoyCon2R
-            ) {
-                continue;
-            }
-            if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
-                out.push((vid, pid));
-                resolved.insert(dev.id.as_str());
-            }
-        }
-        // Sticky masking: a pad the patch still wires up but that isn't in the
-        // live list right now (Bluetooth dropout, or a reconnect that arrives
-        // already blacklisted and so never reaches our enumeration) keeps its
-        // mask, resolved from the session vid/pid cache. Without this the mask
-        // is dropped the instant the pad blips out — which UNHIDES it system-
-        // wide, handing a running game the physical pad alongside the virtual
-        // one until the pad returns and we re-hide it. The wiring is still the
-        // source of truth: a device removed from the patch drops out of
-        // `phys_ids` above and is unmasked normally.
-        if self.settings.hidhide_sticky {
-            for id in &phys_ids {
-                if resolved.contains(id.as_str()) {
-                    continue;
-                }
-                if let Some(&vp) = self.hidhide_vidpid_cache.get(id) {
-                    out.push(vp);
-                }
-            }
-        }
-        out
+        phys_ids
     }
 
     /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
@@ -1304,9 +1422,10 @@ impl FlexInputApp {
                         "Defaults ON because HidHide is installed. When on, any physical controller \
                          you remap to a virtual output is hidden from games, so the game sees only \
                          the virtual pad. FlexInput stays whitelisted so it still reads the original. \
-                         Masking is cleared automatically when FlexInput closes. \u{2014} Note: only \
-                         HID controllers (DualShock 4 / DualSense / Switch) can be hidden; the \
-                         XInput/XUSB face of Xbox controllers cannot.",
+                         The eye button on a device card overrides this per controller (right-click \
+                         it to go back to automatic). \u{2014} Note: only HID controllers \
+                         (DualShock 4 / DualSense / Switch) can be hidden; the XInput/XUSB face of \
+                         Xbox controllers cannot.",
                     ).small().color(egui::Color32::from_gray(140)));
                 } else {
                     ui.label(egui::RichText::new(
@@ -1338,6 +1457,36 @@ impl FlexInputApp {
                      On: a controller still mapped in your patch stays hidden across the gap, and is \
                      masked the instant it reconnects. Unmapping it, turning the option above off, or \
                      closing FlexInput still unhides it.",
+                ).small().color(egui::Color32::from_gray(140)));
+
+                // ── What stays hidden after FlexInput exits ──────────────────
+                ui.add_space(4.0);
+                ui.add_enabled_ui(hidhide_installed, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Keep controllers hidden after FlexInput exits:");
+                        let cur = self.settings.hidhide_keep_on_exit;
+                        egui::ComboBox::from_id_salt("hidhide_keep_on_exit")
+                            .selected_text(cur.label())
+                            .show_ui(ui, |ui| {
+                                for opt in crate::settings::HidHideKeepOnExit::ALL {
+                                    if ui.selectable_label(cur == opt, opt.label()).clicked()
+                                        && cur != opt
+                                    {
+                                        self.settings.hidhide_keep_on_exit = opt;
+                                        dirty = true;
+                                        self.hidhide_dirty = true; // re-apply with the new policy
+                                    }
+                                }
+                            });
+                    });
+                });
+                ui.label(egui::RichText::new(
+                    "Never: everything FlexInput hid is unhidden when it closes.\n\
+                     Only manually hidden (default): controllers you hid with the eye button on \
+                     their device card stay hidden; the automatically hidden ones are unhidden.\n\
+                     Always: every controller FlexInput hid stays hidden.\n\
+                     A kept controller is unhidden on FlexInput's next launch if it's no longer \
+                     wanted hidden then.",
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);

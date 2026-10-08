@@ -309,19 +309,25 @@ pub struct HidHideStatus {
 /// Apply a HidHide masking config via the elevated helper: ensure the `whitelist`
 /// apps stay able to see hidden pads, REPLACE the device blacklist with
 /// `blacklist`, and set the master `active` flag. The helper records what it
-/// changed and undoes it on app exit / parent death, so a closed app never leaves
-/// controllers hidden. Blocking — run off the UI thread; reuses the already-spawned
-/// helper (no extra UAC when a virtual device is already deployed).
+/// changed and undoes it on app exit / parent death — except the `keep_on_exit`
+/// subset, which stays hidden after the app closes. `release` names ids an
+/// earlier session kept, to unhide unless `blacklist` wants them again.
+/// Blocking — run off the UI thread; reuses the already-spawned helper (no extra
+/// UAC when a virtual device is already deployed).
 pub fn hidhide_apply(
     blacklist: &[String],
     whitelist: &[String],
     active: bool,
+    keep_on_exit: &[String],
+    release: &[String],
 ) -> Result<HidHideStatus, HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
     let req = Request::HidHideApply {
         blacklist: blacklist.to_vec(),
         whitelist: whitelist.to_vec(),
         active,
+        keep_on_exit: keep_on_exit.to_vec(),
+        release: release.to_vec(),
     };
     match call(&mut m, &req)? {
         Response::HidHideState { present, active, hidden } => {

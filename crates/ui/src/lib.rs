@@ -4,6 +4,7 @@ mod capture;
 mod device_ops;
 mod easy;
 mod gamepad_nav;
+mod hidhide_toggle;
 mod kbm_picker;
 mod licenses;
 mod guide_watcher;

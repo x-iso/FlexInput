@@ -78,6 +78,17 @@ pub enum Request {
         whitelist: Vec<String>,
         /// Master on/off.
         active: bool,
+        /// The subset of `blacklist` to leave hidden when the helper tears down
+        /// (the app's "keep hidden after exit" setting). While any are kept,
+        /// teardown also leaves HidHide switched on, or they'd stop being hidden.
+        #[serde(default)]
+        keep_on_exit: Vec<String>,
+        /// Ids a PREVIOUS session kept hidden at exit. This helper never applied
+        /// them, so it would otherwise treat them as a third-party user's
+        /// entries and never remove them; listing them here drops them from the
+        /// blacklist unless `blacklist` asks for them again.
+        #[serde(default)]
+        release: Vec<String>,
     },
     /// Re-arrive (disable then re-enable) the XUSB companion devnode of our own
     /// virtual XInput device `device_id`, so it drops and re-acquires an XInput

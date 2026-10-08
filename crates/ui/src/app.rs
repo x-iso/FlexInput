@@ -294,10 +294,21 @@ pub struct FlexInputApp {
     /// Whether the HidHide driver is installed (detected once at startup without
     /// holding the handle). Gates the "Hide originals" toggle.
     hidhide_installed: bool,
-    /// Debounce for HidHide reconcile: the (active, sorted vid/pid targets) last
-    /// sent to the helper, so we don't re-apply identical state.
+    /// Debounce for HidHide reconcile: the (active, sorted vid/pid targets, each
+    /// with its keep-after-exit flag) last sent to the helper, so we don't
+    /// re-apply identical state.
     hidhide_last_active: Option<bool>,
-    hidhide_last_targets: Vec<(u16, u16)>,
+    hidhide_last_targets: Vec<(u16, u16, bool)>,
+    /// Physical device ids the patch remaps to a virtual output, as of the last
+    /// reconcile walk — the devices "Hide original controllers" hides when
+    /// nothing manual overrides them. Empty while that setting is off.
+    hidhide_auto_ids: HashSet<String>,
+    /// The keep-after-exit instance ids of the last SUCCESSFUL apply, handed back
+    /// by its worker thread; the UI thread copies them into settings.
+    hidhide_kept_report: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    /// App start, for the startup grace before releasing pads a previous
+    /// session kept hidden (devices may not be enumerated yet).
+    hidhide_started: std::time::Instant,
     /// Force a HidHide reconcile next frame (set by the toggle and at startup).
     hidhide_dirty: bool,
     /// Order-independent hash of the connected device-id set; the reconcile's
@@ -1105,6 +1116,9 @@ impl FlexInputApp {
             hidhide_installed,
             hidhide_last_active: None,
             hidhide_last_targets: Vec::new(),
+            hidhide_auto_ids: HashSet::new(),
+            hidhide_kept_report: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hidhide_started: std::time::Instant::now(),
             hidhide_dirty: true, // reconcile once at startup (apply default-on masking)
             hidhide_last_device_sig: 0,
             hidhide_last_reconcile: std::time::Instant::now(),
@@ -1529,7 +1543,11 @@ impl eframe::App for FlexInputApp {
 
         // Keep HidHide masking in sync with the live patch + device set. Cheap and
         // debounced (only acts when the remapped-physical set actually changes).
+        // Eye-button clicks are folded in first, so a click applies this frame;
+        // the published state is read by the device cards drawn below.
+        self.drain_hidhide_requests();
         self.reconcile_hidhide();
+        self.publish_hidhide_ui();
 
         // Dispatch XInput player-slot requests from the slot circles. Each request
         // is routed to the helper's ordered-reorder engine, which places the named
