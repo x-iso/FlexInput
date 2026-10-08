@@ -132,6 +132,11 @@ pub struct ExtendedLayout {
     pub out_trigger_r: Option<usize>,
     /// OUTPUT-report byte where the LEFT adaptive-trigger effect block begins.
     pub out_trigger_l: Option<usize>,
+    /// OUTPUT-report `validFlag0` / `validFlag1` bytes (RID-inclusive): which
+    /// fields a report actually sets. The lightbar's bit lives in flag 0 on a
+    /// DS4 and flag 1 on a DualSense.
+    pub out_valid_flag0: Option<usize>,
+    pub out_valid_flag1: Option<usize>,
 }
 
 impl ExtendedLayout {
@@ -170,6 +175,8 @@ impl ExtendedLayout {
                     "muteLed" => out.out_mic_led = Some(byte),
                     "rightTriggerEffect" => out.out_trigger_r = Some(byte),
                     "leftTriggerEffect" => out.out_trigger_l = Some(byte),
+                    "validFlag0" => out.out_valid_flag0 = Some(byte),
+                    "validFlag1" => out.out_valid_flag1 = Some(byte),
                     _ => {}
                 }
             }

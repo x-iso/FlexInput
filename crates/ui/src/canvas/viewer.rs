@@ -366,8 +366,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                         },
                                     );
                                 }
-                                // Manual HidHide toggle (see `hidhide_toggle`).
+                                // Manual HidHide toggle (see `hidhide_toggle`), and
+                                // the default light-bar colour on pads that have one.
                                 crate::hidhide_toggle::eye_button(ui, dev_id_str);
+                                crate::device_led::swatch_button(ui, dev_id_str);
                             });
                         }
                     });

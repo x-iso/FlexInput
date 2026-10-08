@@ -40,6 +40,9 @@ pub(crate) fn spawn_io_thread(
     // restart. See `DeviceBackend::set_joycon2_pairing` for why it's opt-in.
     joycon2_pairing: Arc<AtomicBool>,
     ping_requests: Arc<Mutex<Vec<String>>>,
+    // Per-device default lightbar colour (device-card swatch), sent while no
+    // game or module drives that pad's lightbar.
+    led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -118,6 +121,9 @@ pub(crate) fn spawn_io_thread(
             // sampled physical-only signals and read a virtual pad's rumble as 0,
             // so a game's rumble never routed back to the physical pad.
             let mut last_virt_sigs: HashMap<(String, String), Signal> = HashMap::new();
+            // Default lightbar colour last sent per pad, and when — see the
+            // default-LED pass after the zero-on-drop pass below.
+            let mut led_default_sent: HashMap<String, ([u8; 3], Instant)> = HashMap::new();
             // Measured I/O rate EMA. Updated each iteration; published via
             // `flexinput_engine::set_io_rate` so the UI can show the actual
             // poll rate (separate from the engine's sample rate).
@@ -539,6 +545,34 @@ pub(crate) fn spawn_io_thread(
                     for backend in &mut backends {
                         backend.send(&key.0, &key.1, Signal::Float(0.0));
                     }
+                }
+                // Default lightbar colour (the device-card swatch). Applies while
+                // nothing drives the pad's lightbar this tick — no game colour
+                // routed back through AutoMap, no module wired to it. Runs after
+                // zero-on-drop, so a producer that just vanished hands the bar
+                // back to the default instead of leaving it dark. Sent only on a
+                // change and refreshed every 2 s (catches a reconnect): the SDL
+                // backend writes the pad on every set_led call.
+                if let Ok(defaults) = led_defaults.read() {
+                    const REFRESH: Duration = Duration::from_secs(2);
+                    for (dev, &rgb) in defaults.iter() {
+                        let driven = ["lightbar_r", "lightbar_g", "lightbar_b"].iter()
+                            .any(|p| sink_outputs.contains_key(&(dev.clone(), p.to_string())));
+                        if driven {
+                            led_default_sent.remove(dev);
+                            continue;
+                        }
+                        let due = led_default_sent.get(dev)
+                            .is_none_or(|(sent, at)| *sent != rgb || at.elapsed() >= REFRESH);
+                        if !due { continue; }
+                        for (pin, v) in [("lightbar_r", rgb[0]), ("lightbar_g", rgb[1]), ("lightbar_b", rgb[2])] {
+                            for backend in &mut backends {
+                                backend.send(dev, pin, Signal::Float(v as f32 / 255.0));
+                            }
+                        }
+                        led_default_sent.insert(dev.clone(), (rgb, Instant::now()));
+                    }
+                    led_default_sent.retain(|d, _| defaults.contains_key(d));
                 }
                 // Snapshot this tick's physical-pad outputs for next-tick drop
                 // detection (gilrs:, sdl: and jc2: feedback pins).

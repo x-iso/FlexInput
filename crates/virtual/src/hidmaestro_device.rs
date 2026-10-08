@@ -121,7 +121,10 @@ pub struct HidMaestroDevice {
 /// physical pad's matching haptic input pins. All-zero = nothing driven.
 #[derive(Clone, Copy, Default)]
 struct DsFeedback {
-    lightbar: (f32, f32, f32),
+    /// `None` until the game sends a report that sets the lightbar (its valid
+    /// flag), so a game that never touches it leaves the physical pad on its
+    /// own default colour instead of forcing it black.
+    lightbar: Option<(f32, f32, f32)>,
     player_led: f32,
     mic_led: f32,
     /// A trigger's effect is `None` until the game first sets it (its valid-flag
@@ -151,12 +154,18 @@ impl DsFeedback {
     /// lacks the pin drops it, and 0 = "off" otherwise).
     fn as_pins(&self) -> Vec<(&'static str, Signal)> {
         let mut out = vec![
-            ("lightbar_r", Signal::Float(self.lightbar.0)),
-            ("lightbar_g", Signal::Float(self.lightbar.1)),
-            ("lightbar_b", Signal::Float(self.lightbar.2)),
             ("player_led", Signal::Float(self.player_led)),
             ("mic_led", Signal::Float(self.mic_led)),
         ];
+        // Absent (not 0) until the game sets it: no pin = nothing drives the
+        // physical lightbar, so its device-card default colour applies.
+        if let Some((r, g, b)) = self.lightbar {
+            out.extend([
+                ("lightbar_r", Signal::Float(r)),
+                ("lightbar_g", Signal::Float(g)),
+                ("lightbar_b", Signal::Float(b)),
+            ]);
+        }
         for (t, pins) in [
             (self.trig_r, [
                 "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength",
@@ -475,8 +484,11 @@ impl crate::VirtualDevice for HidMaestroDevice {
                 // whether it updates them, and a later frame that doesn't must
                 // not hide an earlier one that did.
                 self.fb.update_triggers(&self.profile.extended, &frame.data);
+                // The lightbar likewise: only frames that flag it set it, so a
+                // rumble-only report doesn't turn it black.
+                self.fb.update_lightbar(&self.profile, &frame.data);
                 // Keep the latest full frame for the other non-rumble feedback
-                // (lightbar/LEDs are level-held, so the most recent report is
+                // (LEDs are level-held, so the most recent report is
                 // authoritative — no peak-holding needed).
                 self.last_out_frame = Some(frame.data.clone());
             }
@@ -520,21 +532,17 @@ impl crate::VirtualDevice for HidMaestroDevice {
 }
 
 impl HidMaestroDevice {
-    /// Decode the game's latest output report into `self.fb` (lightbar / LEDs /
-    /// adaptive triggers), using the profile's RID-inclusive output offsets. The
-    /// ring strips the report id, so an offset `o` sits at `data[o-1]`. Fields the
-    /// profile doesn't declare stay at their default (0 = off). Called from
-    /// `poll_outputs` after the rumble drain so `last_out_frame` is fresh.
+    /// Decode the game's latest output report into `self.fb` (player / mic
+    /// LEDs), using the profile's RID-inclusive output offsets. The ring strips
+    /// the report id, so an offset `o` sits at `data[o-1]`. Fields the profile
+    /// doesn't declare stay at their default (0 = off). Called from
+    /// `poll_outputs` after the rumble drain so `last_out_frame` is fresh. (The
+    /// lightbar and triggers are decoded per frame, by their valid flags.)
     fn decode_nonrumble_feedback(&mut self) {
         let Some(data) = self.last_out_frame.as_deref() else { return };
         let ext = &self.profile.extended;
         let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
 
-        if let Some(i) = at(ext.out_lightbar_r) {
-            // rgb24: R@i, G@i+1, B@i+2.
-            let g = |k: usize| data.get(k).copied().unwrap_or(0) as f32 / 255.0;
-            self.fb.lightbar = (g(i), g(i + 1), g(i + 2));
-        }
         if let Some(i) = at(ext.out_player_led) {
             self.fb.player_led = decode_player_led(data[i]);
         }
@@ -572,10 +580,38 @@ impl DsFeedback {
     }
 }
 
+impl DsFeedback {
+    /// Take the lightbar colour from one output frame, if that frame says it
+    /// sets the lightbar (DualSense `valid_flag1` bit 2, DS4 flag byte bit 1).
+    /// A profile that declares no flag byte takes every frame's colour.
+    fn update_lightbar(&mut self, profile: &Profile, data: &[u8]) {
+        let ext = &profile.extended;
+        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
+        let Some(i) = at(ext.out_lightbar_r) else { return };
+        if i + 2 >= data.len() {
+            return;
+        }
+        let (flag, bit) = if profile.id.contains("dualsense") {
+            (ext.out_valid_flag1, DS_FLAG1_LIGHTBAR)
+        } else {
+            (ext.out_valid_flag0, DS4_FLAG_LIGHTBAR)
+        };
+        if at(flag).is_some_and(|f| data[f] & bit == 0) {
+            return;
+        }
+        let c = |k: usize| data[k] as f32 / 255.0;
+        self.lightbar = Some((c(i), c(i + 1), c(i + 2)));
+    }
+}
+
 /// DualSense output-report `valid_flag0` bits saying the report carries a new
 /// right / left adaptive-trigger effect.
 const DS_FLAG0_RIGHT_TRIGGER: u8 = 0x04;
 const DS_FLAG0_LEFT_TRIGGER: u8 = 0x08;
+/// DualSense `valid_flag1` bit: LIGHTBAR_CONTROL_ENABLE.
+const DS_FLAG1_LIGHTBAR: u8 = 0x04;
+/// DS4 output report (0x05) flag-byte bit: the report sets the lightbar.
+const DS4_FLAG_LIGHTBAR: u8 = 0x02;
 
 /// Map a DualSense player-indicator bitmask byte back to the 0–1 `player_led`
 /// convention (0=off, 0.25=P1 … 1=P4). The pad lights 1–4 of its 5 front LEDs in
@@ -719,6 +755,46 @@ mod tests {
             "virtual.dualsense", "Virtual DualSense",
             flexinput_hidmaestro::profile::presets::DUALSENSE_JSON, 251,
         ).expect("valid DualSense profile")
+    }
+
+    /// An output frame as the ring hands it over (report id stripped), with the
+    /// flag byte at RID-inclusive `flag_at` and an rgb lightbar at `rgb_at`.
+    fn out_frame(len: usize, flag_at: usize, flag: u8, rgb_at: usize, rgb: [u8; 3]) -> Vec<u8> {
+        let mut d = vec![0u8; len];
+        d[flag_at - 1] = flag;
+        d[rgb_at - 1..rgb_at + 2].copy_from_slice(&rgb);
+        d
+    }
+
+    fn lightbar_pins(fb: &DsFeedback) -> Vec<&'static str> {
+        fb.as_pins().into_iter().map(|(p, _)| p).filter(|p| p.starts_with("lightbar")).collect()
+    }
+
+    // A game that never sets the lightbar must leave it unset — no pins — so the
+    // physical pad keeps its default colour; a rumble-only report must not
+    // blank a colour already set.
+    #[test]
+    fn ds4_lightbar_follows_its_valid_flag() {
+        let dev = ds4_device();
+        let mut fb = DsFeedback::default();
+        let rumble_only = out_frame(31, 1, 0x01, 6, [0, 0, 0]);
+        fb.update_lightbar(&dev.profile, &rumble_only);
+        assert!(lightbar_pins(&fb).is_empty(), "no lightbar until the game sets one");
+        fb.update_lightbar(&dev.profile, &out_frame(31, 1, 0x02, 6, [255, 0, 128]));
+        assert_eq!(fb.lightbar, Some((1.0, 0.0, 128.0 / 255.0)));
+        fb.update_lightbar(&dev.profile, &rumble_only);
+        assert_eq!(fb.lightbar, Some((1.0, 0.0, 128.0 / 255.0)), "rumble-only frame keeps it");
+        assert_eq!(lightbar_pins(&fb), ["lightbar_r", "lightbar_g", "lightbar_b"]);
+    }
+
+    #[test]
+    fn dualsense_lightbar_follows_valid_flag1() {
+        let dev = dualsense_device();
+        let mut fb = DsFeedback::default();
+        fb.update_lightbar(&dev.profile, &out_frame(47, 2, 0x00, 45, [9, 9, 9]));
+        assert_eq!(fb.lightbar, None);
+        fb.update_lightbar(&dev.profile, &out_frame(47, 2, 0x04, 45, [0, 255, 0]));
+        assert_eq!(fb.lightbar, Some((0.0, 1.0, 0.0)));
     }
 
     // The DualSense virtual exposes LED + adaptive-trigger feedback source pins

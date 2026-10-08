@@ -529,6 +529,9 @@ pub struct FlexInputApp {
     /// Per-device measured resting gyro drift, deg/s on the device's rate
     /// axes — see `DeviceBackend::set_gyro_drift`.
     pub gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
+    /// Per-device default lightbar colour (`settings.led_defaults`), mirrored
+    /// for the I/O thread, which sends it while nothing else drives the lightbar.
+    led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
     /// Pending rumble-ping requests, pushed by the UI when the user clicks a
     /// device-card icon. The I/O thread drains this each tick, starts a 200 ms
     /// rumble pulse on the named physical device, and stops it when it expires.
@@ -975,6 +978,8 @@ impl FlexInputApp {
             Arc::new(RwLock::new(seed))
         };
         let ping_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>> =
+            Arc::new(RwLock::new(app_settings.led_defaults.clone()));
         spawn_io_thread(
             backends,
             Arc::clone(&midi_backend),
@@ -994,6 +999,7 @@ impl FlexInputApp {
             Arc::clone(&sdl_all_pads),
             Arc::clone(&joycon2_pairing),
             Arc::clone(&ping_requests),
+            Arc::clone(&led_defaults),
         );
 
         spawn_midi_watch_thread(
@@ -1195,6 +1201,7 @@ impl FlexInputApp {
             scope_taps,
             spike_filter_settings,
             gyro_drift_settings,
+            led_defaults,
             ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,
@@ -1548,6 +1555,8 @@ impl eframe::App for FlexInputApp {
         self.drain_hidhide_requests();
         self.reconcile_hidhide();
         self.publish_hidhide_ui();
+        // The light-bar swatch beside the eye: same publish/queue shape.
+        self.sync_led_defaults();
 
         // Dispatch XInput player-slot requests from the slot circles. Each request
         // is routed to the helper's ordered-reorder engine, which places the named

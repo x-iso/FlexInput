@@ -1,6 +1,7 @@
 mod app;
 mod canvas;
 mod capture;
+mod device_led;
 mod device_ops;
 mod easy;
 mod gamepad_nav;

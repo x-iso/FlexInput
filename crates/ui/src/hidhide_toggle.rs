@@ -60,8 +60,10 @@ pub fn drain_requests() -> Vec<(String, HideRequest)> {
     REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
-/// Square side of the eye button.
+/// Width of the eye button (and of the LED swatch beside it).
 pub const EYE_BUTTON_SIZE: f32 = 26.0;
+/// The eye button's size — shared with the LED swatch so the two match.
+pub const CARD_BUTTON_SIZE: egui::Vec2 = egui::vec2(EYE_BUTTON_SIZE, EYE_BUTTON_SIZE * 0.82);
 
 /// The eye button for `device_id`. Accent-filled while the device is hidden; a
 /// small dot in its corner marks a manual choice. Left click toggles (and makes
@@ -69,7 +71,7 @@ pub const EYE_BUTTON_SIZE: f32 = 26.0;
 /// returns `None` when the device has no button. Returns the button's rect.
 pub fn eye_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
     let st = state_of(device_id)?;
-    let size = egui::vec2(EYE_BUTTON_SIZE, EYE_BUTTON_SIZE * 0.82);
+    let size = CARD_BUTTON_SIZE;
     let sense = if st.blocked.is_some() { egui::Sense::hover() } else { egui::Sense::click() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {

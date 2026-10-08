@@ -341,6 +341,11 @@ pub struct AppSettings {
     /// for a third-party one.
     #[serde(default)]
     pub hidhide_kept_ids: Vec<String>,
+    /// Per-device default lightbar colour (RGB), set with the swatch on a
+    /// device card and keyed by device id. Sent to the pad whenever no game or
+    /// module drives its lightbar; a device with no entry keeps its own colour.
+    #[serde(default)]
+    pub led_defaults: HashMap<String, [u8; 3]>,
     /// Render backend selection, applied at startup in `app/src/main.rs`
     /// (changing it requires an app restart). Auto = DirectX 12 on Windows
     /// (falling back to Vulkan, then OpenGL, if it fails to start) — Vulkan's
@@ -742,6 +747,7 @@ impl Default for AppSettings {
             hidhide_keep_on_exit: HidHideKeepOnExit::default(),
             hidhide_overrides: HashMap::new(),
             hidhide_kept_ids: Vec::new(),
+            led_defaults: HashMap::new(),
             renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,

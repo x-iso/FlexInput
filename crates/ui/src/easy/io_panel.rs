@@ -559,8 +559,23 @@ fn input_card(
         eye_ui.set_clip_rect(card_visible_clip);
         crate::hidhide_toggle::eye_button(&mut eye_ui, &d.id);
     }
+    // Default light-bar colour swatch, just left of the eye — pads with a
+    // lightbar only (DualShock 4 / DualSense).
+    let mut buttons_left = eye_rect.left();
+    if crate::device_led::state_of(&d.id).is_some() {
+        let swatch_rect = egui::Rect::from_min_max(
+            egui::pos2(eye_rect.left() - 6.0 - eye_size, calib_rect.top()),
+            egui::pos2(eye_rect.left() - 6.0, calib_rect.bottom()),
+        );
+        let mut swatch_ui = ui.new_child(egui::UiBuilder::new()
+            .max_rect(swatch_rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)));
+        swatch_ui.set_clip_rect(card_visible_clip);
+        crate::device_led::swatch_button(&mut swatch_ui, &d.id);
+        buttons_left = swatch_rect.left();
+    }
     let mut calib_ui = ui.new_child(egui::UiBuilder::new()
-        .max_rect(calib_rect.with_max_x(eye_rect.left() - 4.0))
+        .max_rect(calib_rect.with_max_x(buttons_left - 4.0))
         .layout(egui::Layout::left_to_right(egui::Align::Center)));
     calib_ui.set_clip_rect(card_visible_clip);
     if is_active {

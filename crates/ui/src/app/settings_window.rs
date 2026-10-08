@@ -449,6 +449,34 @@ impl FlexInputApp {
     #[cfg(not(windows))]
     pub(crate) fn publish_hidhide_ui(&mut self) {}
 
+    /// Fold light-bar swatch edits into `settings.led_defaults` (mirrored for
+    /// the I/O thread), and publish each lightbar pad's default for the swatches.
+    pub(crate) fn sync_led_defaults(&mut self) {
+        use crate::device_led::LedRequest;
+        let reqs = crate::device_led::drain_requests();
+        if !reqs.is_empty() {
+            for (id, req) in reqs {
+                match req {
+                    LedRequest::Set(rgb) => { self.settings.led_defaults.insert(id, rgb); }
+                    LedRequest::Clear => { self.settings.led_defaults.remove(&id); }
+                }
+            }
+            self.settings_dirty = true;
+            if let Ok(mut m) = self.led_defaults.write() {
+                m.clone_from(&self.settings.led_defaults);
+            }
+        }
+        let own_virtual = self.own_virtual_device_ids();
+        let states: HashMap<String, Option<[u8; 3]>> = self.devices.iter()
+            .filter(|d| matches!(d.kind,
+                flexinput_devices::ControllerKind::DualShock4
+                | flexinput_devices::ControllerKind::DualSense))
+            .filter(|d| crate::app::graph::is_physical_pad_id(&d.id) && !own_virtual.contains(&d.id))
+            .map(|d| (d.id.clone(), self.settings.led_defaults.get(&d.id).copied()))
+            .collect();
+        crate::device_led::publish(states);
+    }
+
     /// `(hidden, manual)` for a device: its eye-button override when it has one,
     /// else whether the auto rule ("Hide original controllers" + remapped) hides it.
     #[cfg(windows)]
