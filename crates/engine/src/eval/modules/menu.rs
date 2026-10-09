@@ -391,9 +391,13 @@ pub(crate) fn eval_menu_node(
             };
             let press = PressParams::from_card(card);
             let held = press.gate(raw_held, press_state_get(ns, i), dt);
-            for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
-                .filter_map(|v| v.as_str())
-            {
+            // All outputs while held, or those the card's timeline has on.
+            let outs: Vec<String> = card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+                .filter_map(|v| v.as_str().map(String::from)).collect();
+            let on_now: Vec<String> = card_outs_on(card, &outs, held, ns, 0, i, dt)
+                .into_iter().cloned().collect();
+            for p in outs.iter().map(String::as_str) {
+                let held = on_now.iter().any(|o| o == p);
                 // Macro-style targets (macro ports, OTHER menus) route into
                 // the macro namespace; self-targeting is blocked in the UI.
                 if is_macro_style_target(p) {

@@ -19,6 +19,9 @@ pub struct NodeState {
     /// Remapper with a card reading an IMU input (`imu_*`): the gravity
     /// estimate those pins are derived from. Created on first use.
     pub imu: Option<Box<flexinput_core::imu::ImuEstimator>>,
+    /// Mapping cards with timed outputs (`out_gap` / `out_dur`): each card's
+    /// sequence in flight, keyed by (card list, card index).
+    pub out_seq: HashMap<(u8, usize), crate::eval::OutSeqRun>,
     /// Virtual KB/M sink with "Route gamepad touchpad" on: the trackpad's
     /// gesture state. Created on first use, dropped when the toggle goes off.
     pub trackpad: Option<Box<crate::eval::TrackpadState>>,

@@ -1089,6 +1089,7 @@ pub(crate) fn show_automap_combiner_body(
                 | "accel_x" | "accel_y" | "accel_z" => "Motion",
                 id if id.starts_with("btn_") => "Buttons",
                 id if id.starts_with("key_")
+                    || id.starts_with("media_")
                     || id.starts_with("mouse")
                     || id.starts_with("scroll_") => "KB/M",
                 _ => "Other",

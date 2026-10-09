@@ -414,9 +414,14 @@ pub(crate) fn eval_touch_zones_map_node(
                 (ax, ay)
             }
         });
-        for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
-            .filter_map(|v| v.as_str())
-        {
+        // Which of the card's button-like outputs are on: all of them while
+        // it's held, or those its timeline has on.
+        let outs: Vec<String> = card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+            .filter_map(|v| v.as_str().map(String::from)).collect();
+        let on_now: Vec<String> = card_outs_on(card, &outs, held, ns, 0, i, dt)
+            .into_iter().cloned().collect();
+        for p in outs.iter().map(String::as_str) {
+            let held = on_now.iter().any(|o| o == p);
             match p {
                 "left_stick" | "right_stick" => {
                     // Touchpad mode → finger-velocity trackball; else position deflection.

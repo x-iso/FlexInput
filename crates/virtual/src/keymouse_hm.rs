@@ -274,6 +274,12 @@ pub struct VirtualKeyMouseHm {
     // persist_on_drop() forwards for keep-alive.
     kbd: HidMaestroDevice,
     mouse: HidMaestroDevice,
+    /// The media keys' Consumer Control node (`hm-consumer`). Optional: if it
+    /// doesn't come up, keys and mouse still work and media keys go nowhere.
+    media: Option<HidMaestroDevice>,
+    /// Media pins held, by pin.
+    media_held: HashMap<String, bool>,
+    last_media_report: [u8; 4],
 
     // Mouse emission state (port of the enigo thread's logic, at flush rate).
     carry_x: f32,
@@ -312,6 +318,18 @@ impl VirtualKeyMouseHm {
             // Dropping tears down whichever node DID come up.
             return None;
         }
+        // Same index as the keyboard and mouse, so the three share a container
+        // and read as one device, like a keyboard with media keys.
+        let media = HidMaestroDevice::create(
+            "virtual.keymouse.media",
+            "FlexInput Virtual Media Keys",
+            flexinput_hidmaestro::profile::presets::CONSUMER_JSON,
+            0,
+        )
+        .filter(|m| m.is_connected());
+        if media.is_none() {
+            eprintln!("[keymouse_hm] media-key node didn't come up; media keys won't be sent");
+        }
         Some(Self {
             muted: false,
             mouse_vel_x: 0.0,
@@ -331,6 +349,9 @@ impl VirtualKeyMouseHm {
             learned_keys: HashMap::new(),
             kbd,
             mouse,
+            media,
+            media_held: HashMap::new(),
+            last_media_report: [0; 4],
             carry_x: 0.0,
             carry_y: 0.0,
             scroll_carry_v: 0.0,
@@ -376,6 +397,31 @@ impl VirtualKeyMouseHm {
         }
         rep
     }
+
+    /// The media node's report: up to two held media keys' Consumer usages,
+    /// 16-bit little-endian, 0 for an empty slot.
+    fn build_media_report(&self) -> [u8; 4] {
+        if self.muted {
+            return [0; 4];
+        }
+        media_report(
+            self.media_held.iter().filter(|(_, held)| **held).map(|(pin, _)| pin.as_str()),
+        )
+    }
+}
+
+/// Two 16-bit Consumer-page usage slots from the held media pins, in table
+/// order so the same set always makes the same report.
+fn media_report<'a>(held: impl Iterator<Item = &'a str>) -> [u8; 4] {
+    let held: Vec<&str> = held.collect();
+    let mut rep = [0u8; 4];
+    let usages = flexinput_core::media::MEDIA_KEYS.iter()
+        .filter(|k| held.contains(&k.pin))
+        .map(|k| k.usage);
+    for (slot, u) in usages.take(2).enumerate() {
+        rep[slot * 2..slot * 2 + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    rep
 }
 
 impl VirtualDevice for VirtualKeyMouseHm {
@@ -410,6 +456,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
             "mouse_back"    => { if let Signal::Bool(b) = value { self.buttons.mb4 = b; } }
             "mouse_forward" => { if let Signal::Bool(b) = value { self.buttons.mb5 = b; } }
             "key_escape"    => { if let Signal::Bool(b) = value { self.keys.escape = b; } }
+            // Media keys go to their own Consumer Control node.
+            p if flexinput_core::media::is_media_pin(p) => {
+                self.media_held.insert(p.to_string(), value.as_bool());
+            }
             // The modifiers go to the report's first byte rather than into the
             // key array — see `modifier_slot`.
             p if modifier_slot(p).is_some() => {
@@ -431,6 +481,15 @@ impl VirtualDevice for VirtualKeyMouseHm {
         if kbd_rep != self.last_kbd_report {
             self.kbd.write_raw_input(&kbd_rep);
             self.last_kbd_report = kbd_rep;
+        }
+        // Media keys, the same way: on change only; the host repeats a held
+        // volume key itself.
+        let media_rep = self.build_media_report();
+        if media_rep != self.last_media_report {
+            if let Some(m) = self.media.as_mut() {
+                m.write_raw_input(&media_rep);
+            }
+            self.last_media_report = media_rep;
         }
 
         // ── Mouse ────────────────────────────────────────────────────────────
@@ -552,6 +611,7 @@ impl VirtualDevice for VirtualKeyMouseHm {
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }
+        for v in self.media_held.values_mut() { *v = false; }
         self.carry_x = 0.0;
         self.carry_y = 0.0;
         self.scroll_carry_v = 0.0;
@@ -574,12 +634,28 @@ impl VirtualDevice for VirtualKeyMouseHm {
     fn persist_on_drop(&mut self) {
         self.kbd.persist_on_drop();
         self.mouse.persist_on_drop();
+        if let Some(m) = self.media.as_mut() {
+            m.persist_on_drop();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The media report carries the held keys' Consumer usages, two at most,
+    /// little-endian, the same set always in the same order.
+    #[test]
+    fn media_keys_land_as_consumer_usages() {
+        assert_eq!(media_report(std::iter::empty()), [0, 0, 0, 0]);
+        assert_eq!(media_report(["media_volume_up"].into_iter()), [0xE9, 0x00, 0, 0]);
+        let both = media_report(["media_volume_up", "media_mute"].into_iter());
+        assert_eq!(both, media_report(["media_mute", "media_volume_up"].into_iter()));
+        assert_eq!(both, [0xE2, 0x00, 0xE9, 0x00], "mute is before volume up on the row");
+        let three = media_report(["media_stop", "media_mute", "media_play_pause"].into_iter());
+        assert_eq!(three, [0xCD, 0x00, 0xB7, 0x00], "a third is dropped");
+    }
 
 
     /// Every modifier pin reaches the modifier byte, and none of them is a

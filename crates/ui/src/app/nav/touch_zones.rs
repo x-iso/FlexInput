@@ -843,6 +843,8 @@ impl FlexInputApp {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", true);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
                             self.remove_subpatch_param(outer_id, inner, "_tz_gp_base");
                             self.remove_subpatch_param(outer_id, inner, "_tz_gp_seen");
                         } else {
@@ -854,6 +856,8 @@ impl FlexInputApp {
                     "cancel" => {
                         self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "idle");
                         self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                        self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
+                        self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
                         self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", false);
                         self.gamepad_nav.card_index = 0;
                     }
@@ -866,6 +870,8 @@ impl FlexInputApp {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
                             self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
                         }
                         // Exclude the menu's OWN output pins so a zone can't map to
                         // itself (mirrors the mouse menu path's `menu_excl`).
@@ -895,6 +901,8 @@ impl FlexInputApp {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
                             self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
                         }
                         self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
                             inner,

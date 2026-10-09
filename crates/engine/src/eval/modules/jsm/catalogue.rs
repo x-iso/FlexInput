@@ -1097,9 +1097,9 @@ mod catalogue_tests {
         let state = |n: &str| {
             all.iter().find(|i| i.name == n).unwrap_or_else(|| panic!("{n} is offered")).state
         };
-        // Media keys, the numpad and the lock keys have no scancode in our
-        // keyboard sink. JSM takes them; we cannot send them.
-        for name in ["PLAY_PAUSE", "MUTE", "VOLUME_UP", "NUM_LOCK", "PAUSE", "ADD", "DECIMAL"] {
+        // The numpad and the lock keys have no scancode in our keyboard sink.
+        // JSM takes them; we cannot send them.
+        for name in ["NUM_LOCK", "PAUSE", "ADD", "DECIMAL"] {
             assert!(
                 matches!(state(name), State::Ignored(_)),
                 "`{name}` cannot be sent, so it must not be offered as if it could"
@@ -1108,7 +1108,9 @@ mod catalogue_tests {
         // And everything that does work is offered plainly, or the greying
         // would mean nothing.
         for name in ["A", "7", "SPACE", "LMOUSE", "SCROLLUP", "X_A", "PS_CROSS",
-                     "GYRO_ON", "CALIBRATE", "SMALL_RUMBLE", "NONE", "F12"] {
+                     "GYRO_ON", "CALIBRATE", "SMALL_RUMBLE", "NONE", "F12",
+                     "PLAY_PAUSE", "MUTE", "VOLUME_UP", "VOLUME_DOWN",
+                     "NEXT_TRACK", "PREV_TRACK", "STOP_TRACK"] {
             assert_eq!(state(name), State::Live, "`{name}` works and should read that way");
         }
     }

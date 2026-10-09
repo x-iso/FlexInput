@@ -108,7 +108,16 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
             };
 
             let is_analog_mode = press.is_analog();
+            // Which outputs are on: all of them while the gate is, or those
+            // the card's timeline has on (analog mode ignores timing).
+            let on_now: Vec<String> = if is_analog_mode {
+                if held_now { out_pins.clone() } else { Vec::new() }
+            } else {
+                card_outs_on(m, &out_pins, held_now, node_state, side_idx as u8 + 1, i, dt)
+                    .into_iter().cloned().collect()
+            };
             for p in &out_pins {
+                let held_now = on_now.contains(p);
                 // Touchpad zone/swipe outputs are synthesized into touch points
                 // after this loop, not emitted as axis/button pins.
                 if touchpad_out_kind(p).is_some() { continue; }

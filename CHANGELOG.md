@@ -3,6 +3,57 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Media and volume keys as outputs.** Play / Pause, Previous and Next Track,
+  Stop, Mute and Volume Down / Up sit on Choose's Keyboard & Mouse tab, top
+  right where a keyboard has them, and JSM's `PLAY_PAUSE`, `PREV_TRACK`,
+  `NEXT_TRACK`, `STOP_TRACK`, `MUTE`, `VOLUME_DOWN` and `VOLUME_UP` now send
+  them instead of being greyed out. Learn picks them up from a keyboard's own
+  media keys too. The virtual keyboard sends them from a third small device
+  beside it, the way a real keyboard's media keys are their own part of it,
+  and it comes and goes with the keyboard and mouse.
+
+- **Timed outputs: gaps between picks, and a duration per pick.** In Choose,
+  **+ Gap** (RT on a pad) puts a wait before the next pick, and the output list
+  above the board can now be edited: click an element, or push Up past the
+  board's top row with a pad, to delete it (North), retime a gap or give a pick
+  its own duration (Up / Down, or the value box), or give it back the input's
+  (West). "Ctrl, 50 ms, C" presses Ctrl, then C 50 ms later with Ctrl still
+  down. A pick without its own duration lasts as long as the card's input does —
+  held, the time gap's pulse, or the press replayed, by press mode — starting
+  from its own place in the sequence. A pick can come again after a gap —
+  "East, 50 ms, East" is two presses, the first let go just before the
+  second. Once a draft has timing, Learn adds what you press to the end of it
+  instead of starting a new chord. A gap is at least 1 ms — only Delete takes
+  one out — and typing its value doesn't feed the keys to Learn. A sequence
+  plays out once started; on a
+  Normal card, **Hold** makes it one you have to hold through, cancelling the
+  rest if you let go before its last pick. Works on Remapper, Lean, Touch
+  Zones, Virtual Menu and Area Mapper cards. A gap shows as a stopwatch with
+  its time under it, and an own duration as a badge on its pick — on the
+  cards, in the draft before Add, and in the picker, whose chord previews now
+  draw picks as their icons rather than names. Analog outputs ignore timing.
+
+### Changed
+
+- **Mapping cards say what time gap, Hold and Turbo do.** Each one's tooltip
+  now explains it for the card as it's set — the press mode, "in order", a
+  threshold, timed outputs, and the other two options — and, when it's greyed
+  out, why it does nothing there. With a pad, the focused option shows its tip
+  too. An analog card with a manual threshold now greys out Hold and the time
+  gap (unless Turbo is on), since its output is simply held past the line.
+
+### Fixed
+
+- **A card that sends the same output twice keeps both after a reload.**
+  Loading folded old MIDI velocity / aftertouch picks into their note and, on
+  the way, dropped every repeated pin on a card, so a timed "East, 1 ms, East"
+  came back as a single East. Only a repeat that fold itself makes is dropped
+  now, and its timing goes with it.
+
 ## [0.15.6] - 2026-10-08
 
 ### Added

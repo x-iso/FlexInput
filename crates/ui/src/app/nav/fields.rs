@@ -1915,6 +1915,7 @@ impl crate::app::FlexInputApp {
         self.gamepad_nav.kbm_picker_draft_key = String::new();
         self.gamepad_nav.kbm_picker_in_key = None;
         self.gamepad_nav.kbm_picker_inputs = false;
+        self.gamepad_nav.kbm_picker_list = None;
         self.gamepad_nav.kbm_picker_stage = crate::kbm_picker::PickStage::Output;
         // A line starts with a button; everything after it is most often a key.
         self.gamepad_nav.kbm_picker_tab =

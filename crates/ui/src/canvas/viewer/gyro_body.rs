@@ -508,6 +508,8 @@ pub(crate) fn show_gyro_lean_mapping_section(
 
     let mut new_phase = phase.clone();
     let mut new_draft = draft.clone();
+    // The draft replaced by a new capture: its timing goes with it.
+    let mut drop_out_timing = false;
 
     if new_phase == "learning" {
         let rising: Vec<&String> = pressed_now.iter()
@@ -518,8 +520,12 @@ pub(crate) fn show_gyro_lean_mapping_section(
         // doesn't get captured; once the chord lands and releases, the arm
         // clears so subsequent nav presses don't overwrite it.
         if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft.is_empty() {
-            // Re-capture: new burst after a previous chord.
-            new_draft = rising.iter().map(|s| (*s).clone()).collect();
+            // Re-capture: new burst after a previous chord — or, once the
+            // draft has timing, the next step of the sequence being built.
+            let chord = draft_timed_chord(snarl.get_node(node_id), draft_key, &new_draft);
+            let rising: Vec<String> = rising.iter().map(|s| (*s).clone()).collect();
+            new_draft = chord.learn_press(&rising);
+            drop_out_timing = !chord.is_timed();
         } else if capture_ok && !pressed_now.is_empty() {
             for p in &pressed_now {
                 if !new_draft.iter().any(|q| q == p) { new_draft.push(p.clone()); }
@@ -537,6 +543,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
     if let Some(node) = snarl.get_node_mut(node_id) {
         node.params.insert(phase_key.to_string(), Value::String(new_phase.clone()));
         remapper_write_str_array(node, draft_key, &new_draft);
+        if drop_out_timing {
+            clear_draft_timing(node, draft_key);
+        }
         remapper_write_str_array(node, prev_key, &pressed_now);
         if let Some(v) = set_arm_idle { node.params.insert(arm_idle_key.to_string(), Value::from(v)); }
         if clear_capture_arm {
@@ -643,6 +652,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                     node.params.insert(phase_key.to_string(), Value::String("learning".to_string()));
                     if !from_ready {
                         remapper_write_str_array(node, draft_key, &[]);
+                        clear_draft_timing(node, draft_key);
                     }
                     remapper_write_str_array(node, prev_key, &[]);
                     // Arm a one-shot nav capture: arm_idle=false so capture waits
@@ -703,6 +713,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert(phase_key.to_string(), Value::String("idle".to_string()));
                     remapper_write_str_array(node, draft_key, &[]);
+                    clear_draft_timing(node, draft_key);
                     remapper_write_str_array(node, prev_key, &[]);
                     node.params.insert(armed_key.to_string(), Value::from(false));
                     node.params.insert(arm_idle_key.to_string(), Value::from(false));
@@ -726,10 +737,13 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 if new_draft.iter().any(|p| remapper_out_is_swipe(p)) {
                     entry.insert("mode".to_string(), Value::String("analog".to_string()));
                 }
+                // The output's timing, picked with Choose, goes onto the card.
+                take_draft_timing(node, draft_key, &new_draft, &mut entry);
                 let mut all = mappings.clone();
                 all.push(Value::Object(entry));
                 node.params.insert(key.to_string(), Value::Array(all));
                 remapper_write_str_array(node, draft_key, &[]);
+                clear_draft_timing(node, draft_key);
                 remapper_write_str_array(node, prev_key, &[]);
                 // Disarm so a held nav press after Add doesn't re-capture.
                 node.params.insert(armed_key.to_string(), Value::from(false));
@@ -760,8 +774,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
             .size(13.0).color(Color32::from_rgb(106, 167, 255)));
         request_repaint_throttled(ui.ctx());
     } else if (new_phase == "learning" || new_phase == "ready") && !new_draft.is_empty() {
+        let chord = draft_timed_chord(snarl.get_node(node_id), draft_key, &new_draft);
         ui.horizontal_wrapped(|ui| {
-            remapper_render_chord(ui, &new_draft, skin);
+            remapper_render_timed_chord(ui, &chord, skin);
         });
         if new_phase == "learning" { request_repaint_throttled(ui.ctx()); }
     }

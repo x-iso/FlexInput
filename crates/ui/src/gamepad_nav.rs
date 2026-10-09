@@ -466,6 +466,11 @@ pub struct GamepadNav {
     pub kbm_picker_inputs: bool,
     /// The picker tab showing (LB/RB, or a click on its header).
     pub kbm_picker_tab: crate::kbm_picker::PickerTab,
+    /// Focus in the picker's chord list (an index into `TimedChord::elems`)
+    /// instead of on the board: Up past the board's top row, or a click.
+    pub kbm_picker_list: Option<usize>,
+    /// RT held last frame, for its press edge (it inserts a gap).
+    pub kbm_picker_prev_rt: bool,
     /// Touch Zones variant: hide the touchpad cluster + offer mouse-movement delta.
     pub kbm_picker_touch_zones: bool,
     /// Pin-id prefix whose cells render disabled for this picker session
@@ -587,6 +592,8 @@ impl Default for GamepadNav {
             kbm_picker_in_key: None,
             kbm_picker_inputs: false,
             kbm_picker_tab: crate::kbm_picker::PickerTab::Kbm,
+            kbm_picker_list: None,
+            kbm_picker_prev_rt: false,
             kbm_picker_touch_zones: false,
             kbm_picker_exclude: None,
             kbm_picker_viewport: None,

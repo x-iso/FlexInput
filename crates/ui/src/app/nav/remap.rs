@@ -62,6 +62,27 @@ pub(crate) fn draw_remap_card_glow(
             if entered {
                 if let Some(fr) = field { ring_c(fr, 4.0, 160.0, 6.0); }
             }
+            // What the focused option does, as its hover tooltip says it.
+            let tip = ctx.data(|d| d.get_temp::<(u64, String)>(
+                    egui::Id::new(("gp_nav_remap_card_tip", inner.0, scope))))
+                .filter(|(p, t)| cur_pass.saturating_sub(*p) <= 2 && !t.is_empty())
+                .map(|(_, t)| t);
+            if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
+                let tp = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0))));
+                let galley = tp.layout(tip, egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE, 320.0);
+                let screen = ctx.content_rect();
+                let mut pos = fr.left_bottom() + egui::vec2(0.0, 8.0);
+                pos.x = pos.x.min(screen.right() - galley.size().x - 8.0).max(screen.left() + 8.0);
+                if pos.y + galley.size().y > screen.bottom() - 8.0 {
+                    pos.y = fr.top() - 8.0 - galley.size().y;
+                }
+                let bg = egui::Rect::from_min_size(pos, galley.size()).expand(5.0);
+                tp.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(235));
+                tp.rect_stroke(bg, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+                tp.galley(pos, galley, egui::Color32::WHITE);
+            }
         }
     }
 
@@ -918,6 +939,7 @@ impl FlexInputApp {
         }
         self.gamepad_nav.kbm_picker_open = true;
         self.gamepad_nav.kbm_picker_idx = 0;
+        self.gamepad_nav.kbm_picker_list = None;
         self.gamepad_nav.kbm_picker_node = Some(req.inner);
         self.gamepad_nav.kbm_picker_path = req.path;
         self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
@@ -1010,13 +1032,77 @@ impl FlexInputApp {
     /// Action's INPUT puts it back to capturing, so a card can't be added with
     /// no input.
     pub(crate) fn picker_clear_draft(&mut self) {
+        self.picker_set_chord(&crate::kbm_picker::TimedChord::default());
+        self.gamepad_nav.kbm_picker_list = None;
+    }
+
+    /// Whether the side being chosen carries time (gaps, durations): an
+    /// output does, an input doesn't.
+    pub(crate) fn picker_side_timed(&self) -> bool {
+        self.gamepad_nav.kbm_picker_stage == crate::kbm_picker::PickStage::Output
+            && !self.gamepad_nav.kbm_picker_draft_key.is_empty()
+    }
+
+    /// The chord the picker is filling, with its timing.
+    pub(crate) fn picker_chord(&self) -> crate::kbm_picker::TimedChord {
+        let key = self.picker_active_key();
+        let path = &self.gamepad_nav.kbm_picker_path;
+        let Some(node) = self.gamepad_nav.kbm_picker_node.and_then(|i| self.picker_node(path, i)) else {
+            return Default::default();
+        };
+        let pins = node.params.get(&key).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let (gk, dk) = crate::kbm_picker::timing_keys(&key);
+        crate::kbm_picker::TimedChord::from_params(pins, node.params.get(&gk), node.params.get(&dk))
+    }
+
+    /// Write the chord the picker is filling back, timing and all (on every
+    /// live copy of the node). An input emptied puts a Remapper or Map Action
+    /// back to capturing, so a card can't be added with no input.
+    pub(crate) fn picker_set_chord(&mut self, chord: &crate::kbm_picker::TimedChord) {
         let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
         let key = self.picker_active_key();
-        self.picker_set_draft(&path, inner, &key, &[]);
-        if self.gamepad_nav.kbm_picker_stage == crate::kbm_picker::PickStage::Input {
+        self.picker_set_draft(&path, inner, &key, &chord.pins);
+        let (gk, dk) = crate::kbm_picker::timing_keys(&key);
+        let (gaps, durs) = (chord.gaps_json(), chord.durs_json());
+        self.picker_write(&path, inner, &move |node| {
+            node.params.insert(gk.clone(), gaps.clone());
+            node.params.insert(dk.clone(), durs.clone());
+        });
+        if self.gamepad_nav.kbm_picker_stage == crate::kbm_picker::PickStage::Input && chord.pins.is_empty() {
             self.picker_set_param_str(&path, inner, "ui_phase", "capturing");
         }
+    }
+
+    /// Apply an edit to the chord list, keeping the list's focus on something
+    /// that still exists.
+    pub(crate) fn picker_edit_chord(&mut self, edit: crate::kbm_picker::ChordEdit) {
+        let timed = self.picker_side_timed();
+        if !timed && !matches!(edit, crate::kbm_picker::ChordEdit::Delete(_)) {
+            return;
+        }
+        let mut chord = self.picker_chord();
+        chord.apply(edit);
+        self.picker_set_chord(&chord);
+        let n = chord.elems(timed).len();
+        self.gamepad_nav.kbm_picker_list = match (self.gamepad_nav.kbm_picker_list, edit) {
+            // A new gap takes the focus.
+            (_, crate::kbm_picker::ChordEdit::InsertGap(after)) => {
+                let chord = self.picker_chord();
+                let gap = match after {
+                    Some(crate::kbm_picker::ChordElem::Item(i)) => crate::kbm_picker::ChordElem::Gap(i + 1),
+                    Some(g) => g,
+                    None => crate::kbm_picker::ChordElem::Gap(chord.pins.len()),
+                };
+                chord.elems(timed).iter().position(|e| *e == gap)
+                    .or(self.gamepad_nav.kbm_picker_list)
+            }
+            (Some(_), _) if n == 0 => None,
+            (Some(f), _) => Some(f.min(n - 1)),
+            (None, _) => None,
+        };
     }
 
     /// Whether the picker's current target accepts analog-only outputs (swipe).
@@ -1099,8 +1185,16 @@ impl FlexInputApp {
         phase_key: Option<&str>,
         pin: &str,
     ) {
-        let mut out = self.picker_draft_vec(path, inner, draft_key);
-        if !out.iter().any(|p| p == pin) { out.push(pin.to_string()); }
+        // A pin already picked is picked again only once a gap has passed
+        // since it: "East, 50 ms, East" presses it twice.
+        let (gk, dk) = crate::kbm_picker::timing_keys(draft_key);
+        let chord = crate::kbm_picker::TimedChord::from_params(
+            self.picker_draft_vec(path, inner, draft_key),
+            self.picker_node(path, inner).and_then(|n| n.params.get(&gk)),
+            self.picker_node(path, inner).and_then(|n| n.params.get(&dk)),
+        );
+        let mut out = chord.pins.clone();
+        if chord.takes(pin) { out.push(pin.to_string()); }
         self.picker_set_draft(path, inner, draft_key, &out);
         // Swipe outputs require analog mode; the viewer's Add detects a swipe pin
         // in the draft and stamps `mode = "analog"` on the committed mapping.
@@ -1302,25 +1396,20 @@ impl FlexInputApp {
             self.nav_remap_reset_card(outer_id, idx);
         }
         // Header fields, in display order: 0=press-mode, 1=time-gap, 2=hold,
-        // 3=turbo. Compute which apply for the current mode (mirror the card
-        // renderer's gray-out rules) so we can skip the inert ones.
-        let Some(mode) = self.nav_remap_card_mode(outer_id, idx) else {
+        // 3=turbo. Which apply comes from the card's own rule
+        // (`CardOptions`), so the inert ones are skipped.
+        if self.nav_remap_card_mode(outer_id, idx).is_none() {
             self.gamepad_nav.edit_level = ret;
             return;
         };
-        let turbo_on = self.nav_remap_card_bool(outer_id, idx, "turbo");
         let order_applies = self.nav_selected_is_remapper(outer_id)
             && self.nav_remap_card_json(outer_id, idx)
                 .is_some_and(|m| flexinput_engine::in_order_applies(&m));
-        let in_order_on = order_applies && self.nav_remap_card_bool(outer_id, idx, "in_order");
-        let gap_applies = matches!(mode.as_str(),
-            "short"|"long"|"double"|"analog"|"on_press"|"on_release"|"sequence")
-            || turbo_on;
-        let hold_applies = mode == "long" || mode == "analog"
-            || (in_order_on && matches!(mode.as_str(), "down"|"short"|"double"));
-        // On an "in order" Short / Double chord, Turbo means "the whole chord in time".
-        let turbo_applies = (in_order_on && matches!(mode.as_str(), "short"|"double"))
-            || !matches!(mode.as_str(), "short"|"double"|"on_press"|"on_release");
+        // The card's own rule for which options do anything (greyed there).
+        let opts = self.nav_remap_card_json(outer_id, idx)
+            .map(|m| crate::canvas::viewer::CardOptions::of(&m, self.nav_selected_is_remapper(outer_id)));
+        let (gap_applies, hold_applies, turbo_applies) = opts
+            .map_or((false, false, false), |o| (o.gap_applies, o.hold_applies, o.turbo_applies));
         // Field 0 (press-mode) always applies.
         let applies = [true, gap_applies, hold_applies, turbo_applies];
 

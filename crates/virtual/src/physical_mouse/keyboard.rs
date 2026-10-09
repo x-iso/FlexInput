@@ -100,8 +100,8 @@ const FKEYS: [&str; 20] = [
 
 /// The pin a raw key event names, and the virtual-key code its held state can
 /// be checked by. `None` for a key the virtual keyboard can't send back (the
-/// numpad, media keys) and for the fake Shifts Windows wraps round some
-/// navigation keys. Modifiers come out SIDED, as the picker offers them.
+/// numpad, browser and app keys) and for the fake Shifts Windows wraps round
+/// some navigation keys. Modifiers come out SIDED, as the picker offers them.
 fn key_pin(vkey: u16, make: u16, flags: u16) -> Option<(&'static str, u16)> {
     let e0 = flags & RI_KEY_E0 != 0;
     Some(match vkey {
@@ -147,7 +147,11 @@ fn key_pin(vkey: u16, make: u16, flags: u16) -> Option<(&'static str, u16)> {
         0xDC => ("key_backslash", vkey),
         0xDD => ("key_closebracket", vkey),
         0xDE => ("key_quote", vkey),
-        _ => return None,
+        // Media and volume keys, as their own `media_` pins.
+        _ => match flexinput_core::media::media_key_by_vk(vkey) {
+            Some(k) => (k.pin, vkey),
+            None => return None,
+        },
     })
 }
 
@@ -288,6 +292,9 @@ mod tests {
         assert_eq!(key_pin(0x10, 0x2A, RI_KEY_E0), None);
         // Nor is anything the virtual keyboard couldn't send back.
         assert_eq!(key_pin(0x60, 0x52, 0), None, "numpad 0");
+        // Media keys learn as the media pins the picker offers.
+        assert_eq!(key_pin(0xAF, 0x30, RI_KEY_E0), Some(("media_volume_up", 0xAF)));
+        assert_eq!(key_pin(0xB3, 0x22, RI_KEY_E0).map(|k| k.0), Some("media_play_pause"));
     }
 
     #[test]

@@ -452,3 +452,248 @@ pub(crate) fn apply_axis_clamp(v: f32, suppress: (bool, bool)) -> f32 {
     out
 }
 
+
+// ── Timed outputs ────────────────────────────────────────────────────────────
+//
+// A card's `out` is a chord: every pin on while the card's gate is. Two
+// optional arrays beside it turn it into a timeline, item i of `out` at:
+//   out_gap: [ms, …] — the wait before item i starts, after the item before
+//            it started (0 = together). One entry past the last item is a gap
+//            waiting for the next pick and changes nothing here.
+//   out_dur: [ms | null, …] — how long item i stays on; null (or absent) =
+//            as long as the card's gate is — the input held in Normal mode,
+//            the time-gap pulse of On press, the replayed press of Short —
+//            shifted by the item's start.
+// "Ctrl, 50 ms, C" presses Ctrl, then C 50 ms later with Ctrl still down.
+// A sequence started plays out after the input lets go, unless the card is in
+// Normal mode with Hold on: then letting go before the last item has started
+// cancels it. Analog outputs ignore timing.
+
+/// Card param: the gap before each `out` item, in ms.
+pub const OUT_GAP_KEY: &str = "out_gap";
+/// Card param: each `out` item's own duration in ms, or null for the gate's.
+pub const OUT_DUR_KEY: &str = "out_dur";
+
+/// A card's output timeline: each item's start, and its own duration if set,
+/// in seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OutTiming {
+    starts: Vec<f64>,
+    durs: Vec<Option<f64>>,
+    /// When each item must be off by, whatever its duration: a pin picked
+    /// again lets go before its next press (infinite otherwise).
+    ends: Vec<f64>,
+}
+
+/// The most a repeated pin is let go for before its next press, seconds.
+/// Less when the presses are closer: it gets half the gap.
+const REPRESS_RELEASE: f64 = 0.03;
+
+impl OutTiming {
+    /// The timeline for a card with `n` outputs, or `None` when it has no
+    /// timing — every item together, for the gate's length: a plain chord.
+    pub(crate) fn from_card(m: &Value, n: usize) -> Option<Self> {
+        let ms = |key: &str, i: usize| -> Option<f64> {
+            m.get(key)?.as_array()?.get(i)?.as_f64().map(|v| v.max(0.0) / 1000.0)
+        };
+        let mut starts = Vec::with_capacity(n);
+        let mut durs = Vec::with_capacity(n);
+        let mut at = 0.0;
+        for i in 0..n {
+            at += ms(OUT_GAP_KEY, i).unwrap_or(0.0);
+            starts.push(at);
+            durs.push(ms(OUT_DUR_KEY, i));
+        }
+        let timed = starts.iter().any(|&s| s > 0.0) || durs.iter().any(Option::is_some);
+        let ends = vec![f64::INFINITY; n];
+        timed.then_some(OutTiming { starts, durs, ends })
+    }
+
+    /// Let each pin picked again go before its next press ("East, 50 ms,
+    /// East" is two presses, not one long one).
+    fn with_repeats(mut self, pins: &[String]) -> Self {
+        for i in 0..pins.len().min(self.starts.len()) {
+            let Some(j) = (i + 1..pins.len()).find(|&j| pins[j] == pins[i]) else { continue };
+            let gap = self.starts[j] - self.starts[i];
+            self.ends[i] = self.starts[j] - (gap * 0.5).min(REPRESS_RELEASE);
+        }
+        self
+    }
+
+    fn last_start(&self) -> f64 {
+        self.starts.iter().copied().fold(0.0, f64::max)
+    }
+}
+
+/// One card's sequence in flight.
+#[derive(Clone, Debug, Default)]
+pub struct OutSeqRun {
+    active: bool,
+    /// Seconds since the gate rose. f64: a held sequence can run for hours
+    /// (see the no-f32-clocks rule).
+    elapsed: f64,
+    /// When the gate fell, in `elapsed` time.
+    fell: Option<f64>,
+    prev_gate: bool,
+}
+
+/// Advance a card's timeline by `dt` with this tick's `gate`, and say which
+/// of its items are on. `cancel_early`: letting go before the last item has
+/// started drops the rest.
+pub(crate) fn out_seq_tick(
+    run: &mut OutSeqRun,
+    timing: &OutTiming,
+    gate: bool,
+    cancel_early: bool,
+    dt: f32,
+) -> Vec<bool> {
+    if gate && !run.prev_gate {
+        *run = OutSeqRun { active: true, elapsed: 0.0, fell: None, prev_gate: true };
+    } else if !gate && run.prev_gate && run.active {
+        run.fell = Some(run.elapsed);
+        if cancel_early && run.elapsed < timing.last_start() {
+            run.active = false;
+        }
+    }
+    run.prev_gate = gate;
+    // A microsecond's slack on every edge: `dt` arrives as f32, and five
+    // 10 ms ticks don't quite add up to 50 ms.
+    const EPS: f64 = 1e-6;
+    let t = run.elapsed + EPS;
+    let on: Vec<bool> = timing.starts.iter().zip(&timing.durs).zip(&timing.ends).map(|((&s, d), &e)| {
+        run.active && t >= s && t < e && match d {
+            Some(d) => t < s + d,
+            None => run.fell.map_or(true, |f| t < f + s),
+        }
+    }).collect();
+    // Over once every item has had its time — after the gate fell, for any
+    // item that lasts as long as the gate.
+    if run.active {
+        let done = timing.starts.iter().zip(&timing.durs).zip(&timing.ends).all(|((&s, d), &e)| t >= e || match d {
+            Some(d) => t >= s + d,
+            None => run.fell.is_some_and(|f| t >= f + s),
+        });
+        if done {
+            run.active = false;
+        }
+        run.elapsed += dt as f64;
+    }
+    on
+}
+
+/// The `out` pins a card has on this tick: all of them while its gate is,
+/// or — for a card with timed outputs — the ones its timeline has on.
+/// `list` and `idx` key the card's sequence in `ns.out_seq`.
+pub(crate) fn card_outs_on<'a>(
+    m: &Value,
+    out_pins: &'a [String],
+    gate: bool,
+    ns: &mut NodeState,
+    list: u8,
+    idx: usize,
+    dt: f32,
+) -> Vec<&'a String> {
+    let Some(timing) = OutTiming::from_card(m, out_pins.len()).map(|t| t.with_repeats(out_pins)) else {
+        // No timeline: a plain chord. Any sequence left from an edit goes.
+        ns.out_seq.remove(&(list, idx));
+        return if gate { out_pins.iter().collect() } else { Vec::new() };
+    };
+    let press = PressParams::from_card(m);
+    let cancel_early = matches!(press.mode(), PressMode::Down) && !press.is_analog() && press.sustain;
+    let run = ns.out_seq.entry((list, idx)).or_default();
+    let on = out_seq_tick(run, &timing, gate, cancel_early, dt);
+    out_pins.iter().zip(on).filter(|(_, on)| *on).map(|(p, _)| p).collect()
+}
+
+#[cfg(test)]
+mod out_timing_tests {
+    use super::*;
+
+    const DT: f32 = 0.01;
+
+    fn run_for(timing: &OutTiming, gate: impl Fn(usize) -> bool, ticks: usize, cancel: bool) -> Vec<Vec<bool>> {
+        let mut run = OutSeqRun::default();
+        (0..ticks).map(|i| out_seq_tick(&mut run, timing, gate(i), cancel, DT)).collect()
+    }
+
+    #[test]
+    fn a_card_without_timing_is_a_plain_chord() {
+        let m = serde_json::json!({ "out": ["key_a", "key_b"] });
+        assert_eq!(OutTiming::from_card(&m, 2), None);
+        let m = serde_json::json!({ "out": ["key_a", "key_b"], "out_gap": [0, 0], "out_dur": [null, null] });
+        assert_eq!(OutTiming::from_card(&m, 2), None, "all-default timing is still a chord");
+    }
+
+    // "Ctrl, 50 ms, C": C comes in 50 ms after Ctrl, with Ctrl still down,
+    // and both follow the input's hold, each shifted by its start.
+    #[test]
+    fn a_gap_delays_what_follows_and_both_follow_the_hold() {
+        let m = serde_json::json!({ "out_gap": [0, 50] });
+        let t = OutTiming::from_card(&m, 2).unwrap();
+        // Held for 20 ticks (200 ms).
+        let on = run_for(&t, |i| i < 20, 40, false);
+        assert_eq!(on[0], [true, false]);
+        assert_eq!(on[4], [true, false], "40 ms: not yet");
+        assert_eq!(on[5], [true, true], "50 ms: C joins Ctrl");
+        assert_eq!(on[19], [true, true]);
+        assert_eq!(on[20], [false, true], "Ctrl lets go with the input; C 50 ms later");
+        assert_eq!(on[24], [false, true]);
+        assert_eq!(on[25], [false, false]);
+    }
+
+    // An item with its own duration taps for that long, however long the
+    // input is held; the sequence plays out after a quick tap.
+    #[test]
+    fn an_own_duration_taps_and_a_quick_tap_still_plays_it_all() {
+        let m = serde_json::json!({ "out_gap": [0, 100], "out_dur": [30, 30] });
+        let t = OutTiming::from_card(&m, 2).unwrap();
+        let on = run_for(&t, |i| i < 2, 20, false);
+        assert_eq!(on[0], [true, false]);
+        assert_eq!(on[3], [false, false], "the first tap is 30 ms");
+        assert_eq!(on[10], [false, true], "the second comes 100 ms in, input long gone");
+        assert_eq!(on[13], [false, false]);
+        // Held the whole time: each tap still lasts its 30 ms, once per press.
+        let on = run_for(&t, |_| true, 20, false);
+        assert_eq!(on[15], [false, false]);
+    }
+
+    // Normal mode with Hold: letting go before the last item has started
+    // cancels the rest; holding through plays it.
+    #[test]
+    fn hold_cancels_a_sequence_let_go_early() {
+        let m = serde_json::json!({ "out_gap": [0, 100] });
+        let t = OutTiming::from_card(&m, 2).unwrap();
+        let on = run_for(&t, |i| i < 5, 20, true);
+        assert!(on[5..].iter().all(|o| o == &[false, false]), "cancelled at 50 ms");
+        let on = run_for(&t, |i| i < 12, 30, true);
+        assert_eq!(on[10], [true, true], "held past 100 ms: it plays");
+        assert_eq!(on[21], [false, true], "and lets go as it would without Hold");
+    }
+
+    // "East, 50 ms, East" held: East goes on, lets go 25 ms in (half the
+    // gap), and presses again at 50 ms — two presses, not one long one.
+    #[test]
+    fn a_repeated_pin_lets_go_before_its_next_press() {
+        let outs = vec!["btn_east".to_string(), "btn_east".to_string()];
+        let m = serde_json::json!({ "out": outs, "out_gap": [0, 50] });
+        let mut ns = NodeState::default();
+        let on: Vec<usize> = (0..10).map(|_| card_outs_on(&m, &outs, true, &mut ns, 0, 0, DT).len()).collect();
+        assert_eq!(on, [1, 1, 1, 0, 0, 1, 1, 1, 1, 1]);
+    }
+
+    // The card-level helper: which pins, and Hold read from the card.
+    #[test]
+    fn card_outs_on_follows_the_timeline() {
+        let outs = vec!["key_ctrl".to_string(), "key_c".to_string()];
+        let m = serde_json::json!({ "out": outs, "out_gap": [0, 20] });
+        let mut ns = NodeState::default();
+        let a = card_outs_on(&m, &outs, true, &mut ns, 0, 0, DT);
+        assert_eq!(a, vec![&outs[0]]);
+        card_outs_on(&m, &outs, true, &mut ns, 0, 0, DT);
+        let c = card_outs_on(&m, &outs, true, &mut ns, 0, 0, DT);
+        assert_eq!(c, vec![&outs[0], &outs[1]]);
+        let plain = serde_json::json!({ "out": outs });
+        assert_eq!(card_outs_on(&plain, &outs, true, &mut ns, 0, 1, DT).len(), 2);
+        assert!(card_outs_on(&plain, &outs, false, &mut ns, 0, 1, DT).is_empty());
+    }
+}

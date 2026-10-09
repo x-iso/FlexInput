@@ -167,6 +167,10 @@ pub(crate) fn show_remapper_body(
     let mut new_phase = phase.clone();
     let mut new_draft_input = draft_input.clone();
     let mut new_draft_output = draft_output.clone();
+    // The output draft with its timing: Learn adds to a timed one.
+    let out_chord = draft_timed_chord(snarl.get_node(node_id), "draft_output", &draft_output);
+    // The output draft emptied or replaced below: its timing goes with it.
+    let mut drop_out_timing = false;
 
     // Click latches the capture into "click mode" for the rest of the session.
     //
@@ -213,6 +217,7 @@ pub(crate) fn show_remapper_body(
         new_phase = "idle".to_string();
         new_draft_input.clear();
         new_draft_output.clear();
+        drop_out_timing = true;
         if let Some(n) = snarl.get_node_mut(node_id) {
             n.params.insert("_tp_click_mode".to_string(), Value::from(false));
         }
@@ -299,7 +304,11 @@ pub(crate) fn show_remapper_body(
             // Learn-button press isn't captured — capture only opens after the
             // arm-idle handshake (Learn press released, device idle once).
             if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft_output.is_empty() {
-                new_draft_output = rising.iter().map(|s| (*s).clone()).collect();
+                // A new press: a fresh chord, or — once the draft has timing —
+                // the next step of the sequence being built.
+                let rising: Vec<String> = rising.iter().map(|s| (*s).clone()).collect();
+                new_draft_output = out_chord.learn_press(&rising);
+                drop_out_timing = !out_chord.is_timed();
             } else if capture_ok && !pressed_now.is_empty() {
                 for p in &pressed_now {
                     if !new_draft_output.iter().any(|q| q == p) {
@@ -322,6 +331,9 @@ pub(crate) fn show_remapper_body(
         node.params.insert("ui_phase".to_string(), Value::String(new_phase.clone()));
         remapper_write_str_array(node, "draft_input", &new_draft_input);
         remapper_write_str_array(node, "draft_output", &new_draft_output);
+        if drop_out_timing {
+            clear_draft_timing(node, "draft_output");
+        }
         remapper_write_str_array(node, "_pressed_prev", &pressed_now);
         if reset_click_mode {
             node.params.insert("_tp_click_mode".to_string(), Value::from(false));
@@ -403,15 +415,13 @@ pub(crate) fn show_remapper_body(
 
         // Draft output row (during learn).
         if new_phase == "learning" {
+            let chord = draft_timed_chord(snarl.get_node(node_id), "draft_output", &new_draft_output);
             ui.horizontal_wrapped(|ui| {
                 remapper_render_arrow(ui);
-                if new_draft_output.is_empty() {
+                if new_draft_output.is_empty() && !chord.is_timed() {
                     ui.label(egui::RichText::new("…").size(13.0).weak().italics());
                 } else {
-                    for (i, pin) in new_draft_output.iter().enumerate() {
-                        if i > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
-                        remapper_render_chip(ui, pin, out_skin);
-                    }
+                    remapper_render_timed_chord(ui, &chord, out_skin);
                 }
             });
         }
@@ -474,6 +484,7 @@ pub(crate) fn show_remapper_body(
                         // (a Stop mid-capture would otherwise leave nav held).
                         node.params.insert("ui_phase".to_string(), Value::String("ready_to_learn".to_string()));
                         remapper_write_str_array(node, "draft_output", &[]);
+                        clear_draft_timing(node, "draft_output");
                         node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
                         node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
                     } else if learn_enabled {
@@ -482,6 +493,7 @@ pub(crate) fn show_remapper_body(
                         // release before it begins.
                         node.params.insert("ui_phase".to_string(), Value::String("learning".to_string()));
                         remapper_write_str_array(node, "draft_output", &[]);
+                        clear_draft_timing(node, "draft_output");
                         node.params.insert("_nav_capture_armed".to_string(), Value::from(true));
                         node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
                     } else {
@@ -584,6 +596,7 @@ pub(crate) fn show_remapper_body(
                         node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
                         remapper_write_str_array(node, "draft_input", &[]);
                         remapper_write_str_array(node, "draft_output", &[]);
+                        clear_draft_timing(node, "draft_output");
                         remapper_write_str_array(node, "_pressed_prev", &[]);
                         node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
                         node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
@@ -616,12 +629,15 @@ pub(crate) fn show_remapper_body(
                     if continuous_midi_in || new_draft_output.iter().any(|p| remapper_out_is_swipe(p)) {
                         entry.insert("mode".to_string(), Value::String("analog".to_string()));
                     }
+                    // The output's timing, picked with Choose, goes onto the card.
+                    take_draft_timing(node, "draft_output", &new_draft_output, &mut entry);
                     let mut all = mappings.clone();
                     all.push(Value::Object(entry));
                     node.params.insert("mappings".to_string(), Value::Array(all));
                     node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
                     remapper_write_str_array(node, "draft_input", &[]);
                     remapper_write_str_array(node, "draft_output", &[]);
+                    clear_draft_timing(node, "draft_output");
                 }
             }
         });

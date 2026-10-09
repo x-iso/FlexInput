@@ -338,7 +338,6 @@ pub enum GyroAction { On, Off, Invert, InvertX, InvertY, Trackball, TrackballX, 
 
 /// Why a name JSM accepts isn't live here.
 const WHY_NUMPAD: &str = "numpad keys need HID usages our keyboard sink doesn't send yet";
-const WHY_MEDIA: &str = "media and volume keys are consumer-page usages our keyboard sink doesn't send yet";
 const WHY_LOCKS: &str = "Scroll Lock / Num Lock / Pause / Context aren't in our keyboard sink's key table yet";
 
 /// A note attached to a line whose name we accepted but with a caveat.
@@ -426,8 +425,12 @@ pub fn out_from_name(name: &str) -> Option<OutNote> {
         "RWINDOWS" => return plain("key_rwin"),
         "SCROLL_LOCK" | "NUM_LOCK" | "PAUSE" | "CONTEXT" => return unsupported(WHY_LOCKS),
         "ADD" | "SUBTRACT" | "SUBSTRACT" | "DIVIDE" | "MULTIPLY" | "DECIMAL" => return unsupported(WHY_NUMPAD),
+        // Media and volume keys: the keyboard sink's media node (Consumer page).
         "VOLUME_UP" | "VOLUME_DOWN" | "MUTE" | "NEXT_TRACK" | "PREV_TRACK"
-            | "STOP_TRACK" | "PLAY_PAUSE" => return unsupported(WHY_MEDIA),
+            | "STOP_TRACK" | "PLAY_PAUSE" => {
+            let k = flexinput_core::media::MEDIA_KEYS.iter().find(|k| k.jsm == upper)?;
+            return plain(k.pin);
+        }
         // ── Mouse ─────────────────────────────────────────────────────────────
         "LMOUSE" => return plain("mouse_left"),
         "RMOUSE" => return plain("mouse_right"),

@@ -13,6 +13,19 @@ impl FlexInputApp {
         use crate::gamepad_nav::NavDir;
         use crate::kbm_picker::{clamp_index, nearest_in_dir};
 
+        // RT's press edge: it inserts a gap.
+        let rt_down = nav.rt > 0.5;
+        let rt_rising = rt_down && !self.gamepad_nav.kbm_picker_prev_rt;
+        self.gamepad_nav.kbm_picker_prev_rt = rt_down;
+        // The chord list has the focus: the D-pad and the face buttons edit
+        // the list, not the board.
+        if self.gamepad_nav.kbm_picker_use == crate::gamepad_nav::PickerUse::Chord {
+            if let Some(f) = self.gamepad_nav.kbm_picker_list {
+                self.drive_picker_list(f, step_dir, nav, rt_rising);
+                return;
+            }
+        }
+
         // East closes the picker. While typing that means cancel: what was
         // typed is dropped, which is why Enter and West exist to keep it.
         if nav.is_rising("btn_east") {
@@ -36,6 +49,23 @@ impl FlexInputApp {
         let purpose = self.gamepad_nav.kbm_picker_use;
         let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
+        let chord_purpose = purpose == crate::gamepad_nav::PickerUse::Chord;
+        // Up past the board's top row goes into the chord list, on its last
+        // element, when there's one to go to.
+        if chord_purpose && matches!(step_dir, Some(NavDir::Up))
+            && (cells.is_empty() || nearest_in_dir(&cells, idx, 0.0, -1.0, &usable) == idx)
+        {
+            let n = self.picker_chord().elems(self.picker_side_timed()).len();
+            if n > 0 {
+                self.gamepad_nav.kbm_picker_list = Some(n - 1);
+                return;
+            }
+        }
+        // RT on the board: a gap at the end, for the next pick to wait on.
+        if chord_purpose && rt_rising && self.picker_side_timed() {
+            self.picker_edit_chord(crate::kbm_picker::ChordEdit::InsertGap(None));
+            return;
+        }
         if !cells.is_empty() {
             idx = match step_dir {
                 Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
@@ -89,6 +119,55 @@ impl FlexInputApp {
         }
     }
 
+    /// Drive the chord list while it has the focus. Left / Right move along
+    /// it; Up / Down retime a gap or a pick's duration; North deletes; West
+    /// gives a pick back the input's duration; RT puts a gap after the focus;
+    /// East or South go back to the board. An input's list has no time, so
+    /// there Down goes back to the board too.
+    fn drive_picker_list(
+        &mut self,
+        focus: usize,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        nav: &crate::gamepad_nav::NavInput,
+        rt_rising: bool,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        use crate::kbm_picker::{ChordEdit, ChordElem};
+        let timed = self.picker_side_timed();
+        let chord = self.picker_chord();
+        let elems = chord.elems(timed);
+        if elems.is_empty() || nav.is_rising("btn_east") || nav.is_rising("btn_south") {
+            self.gamepad_nav.kbm_picker_list = None;
+            return;
+        }
+        let f = focus.min(elems.len() - 1);
+        let elem = elems[f];
+        match step_dir {
+            Some(NavDir::Left) => self.gamepad_nav.kbm_picker_list = Some(f.saturating_sub(1)),
+            Some(NavDir::Right) => self.gamepad_nav.kbm_picker_list = Some((f + 1).min(elems.len() - 1)),
+            Some(d @ (NavDir::Up | NavDir::Down)) if timed => {
+                let mut c = chord;
+                c.nudge(elem, if d == NavDir::Up { 1 } else { -1 });
+                self.picker_set_chord(&c);
+                // A gap stepped down to nothing leaves the list; stay on what
+                // took its place.
+                let n = c.elems(timed).len();
+                self.gamepad_nav.kbm_picker_list = (n > 0).then(|| f.min(n - 1));
+            }
+            Some(NavDir::Down) => self.gamepad_nav.kbm_picker_list = None,
+            _ => {}
+        }
+        if nav.is_rising("btn_north") {
+            self.picker_edit_chord(ChordEdit::Delete(elem));
+        } else if nav.is_rising("btn_west") && timed {
+            if let ChordElem::Item(i) = elem {
+                self.picker_edit_chord(ChordEdit::SetDur(i, None));
+            }
+        } else if rt_rising && timed {
+            self.picker_edit_chord(ChordEdit::InsertGap(Some(elem)));
+        }
+    }
+
     /// Is a cell usable (focusable + mappable) for the open session? Not when
     /// it's an analog output on a discrete target (analog not OK), one of the
     /// target's own pins, something that can't sit on the side being chosen,
@@ -125,6 +204,7 @@ impl FlexInputApp {
     pub(crate) fn picker_switch_stage(&mut self, stage: crate::kbm_picker::PickStage) {
         use crate::kbm_picker::{PickStage, PickerTab};
         self.gamepad_nav.kbm_picker_stage = stage;
+        self.gamepad_nav.kbm_picker_list = None;
         let tab = match (stage, self.picker_tab()) {
             (PickStage::Input, PickerTab::Kbm) => PickerTab::Gamepad,
             (_, t) => t,
@@ -349,6 +429,12 @@ impl FlexInputApp {
         if let Some(tab) = interaction.tab {
             self.picker_select_tab(tab);
         }
+        if let Some(sel) = interaction.select {
+            self.gamepad_nav.kbm_picker_list = sel;
+        }
+        if let Some(edit) = interaction.edit {
+            self.picker_edit_chord(edit);
+        }
         if let Some(pin) = interaction.pin {
             self.picker_append_pin(&pin);
         }
@@ -396,6 +482,8 @@ impl FlexInputApp {
         const SCALE: f32 = 1.2;
         const UNIT: f32 = 30.0 * SCALE; // px per grid unit
         const GAP: f32 = 3.0 * SCALE;   // gap between adjacent keys
+        // A pick's chip in the chord previews above the board.
+        const PREVIEW_CHIP: f32 = 24.0 * SCALE;
         // Sized for the largest tab, so switching tabs doesn't resize the window.
         let (ext_x, ext_y) = tabs.iter()
             .map(|t| layout_extent(&self.picker_tab_cells(*t, &macros)))
@@ -415,6 +503,15 @@ impl FlexInputApp {
             .map(crate::canvas::remapper_icons::skin_from_device_id);
         let mut focus_tip: Option<(egui::Rect, String)> = None;
         let mut focus_rect: Option<egui::Rect> = None;
+        // The chord list of the side being chosen, with its timing, and where
+        // its focus is (it has the focus instead of the board when set).
+        let list_chord = self.picker_chord();
+        let list_timed = self.picker_side_timed();
+        let list_elems = list_chord.elems(list_timed);
+        let list_focus = self.gamepad_nav.kbm_picker_list.filter(|&k| k < list_elems.len());
+        let mut list_select: Option<Option<usize>> = None;
+        let mut list_edit: Option<crate::kbm_picker::ChordEdit> = None;
+        let mut list_focus_rect: Option<egui::Rect> = None;
 
         // Touch Zones variant: a touchpad can't remap to itself, so the touchpad
         // cluster is hidden and analog-output cells replace it (both handled by
@@ -424,14 +521,13 @@ impl FlexInputApp {
         // the pad it comes from, an output as the device it goes to (both as
         // the target's body publishes them), Xbox while there's neither. JSM
         // writes the Xbox names (`X_A`), so its board stays Xbox.
-        let pad_skin = match (purpose, self.gamepad_nav.kbm_picker_node) {
+        let side_skins = match (purpose, self.gamepad_nav.kbm_picker_node) {
             (crate::gamepad_nav::PickerUse::Chord, Some(n)) => {
                 crate::canvas::viewer::picker_skins(ctx, &self.gamepad_nav.kbm_picker_path, n)
-                    .map(|(i, o)| if stage == PickStage::Input { i } else { o })
-                    .unwrap_or(crate::canvas::remapper_icons::Skin::Xbox)
             }
-            _ => crate::canvas::remapper_icons::Skin::Xbox,
-        };
+            _ => None,
+        }.unwrap_or((crate::canvas::remapper_icons::Skin::Xbox, crate::canvas::remapper_icons::Skin::Xbox));
+        let pad_skin = if stage == PickStage::Input { side_skins.0 } else { side_skins.1 };
 
         let title = match purpose {
             crate::gamepad_nav::PickerUse::Chord if stage == PickStage::Input => "Choose input",
@@ -454,8 +550,14 @@ impl FlexInputApp {
                     // LB / RB only where a pad can press them.
                     let tab_hint = if nav_skin.is_some() && tabs.len() > 1 { "   LB/RB: tab" } else { "" };
                     let hints = match purpose {
+                        crate::gamepad_nav::PickerUse::Chord if list_focus.is_some() && list_timed =>
+                            "←→: move   ↑↓: time   North: delete   West: input's duration   RT: + gap   East/South: back to the board".to_string(),
+                        crate::gamepad_nav::PickerUse::Chord if list_focus.is_some() =>
+                            "←→: move   North: delete   East/South: back to the board".to_string(),
                         crate::gamepad_nav::PickerUse::Chord if both_stages => format!(
                             "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   West: input ⇄ output   East/Done: close"),
+                        crate::gamepad_nav::PickerUse::Chord if list_timed => format!(
+                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   RT: + gap   Up past the top: edit the list   East/Done: close"),
                         crate::gamepad_nav::PickerUse::Chord => format!(
                             "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   East/Done: close"),
                         crate::gamepad_nav::PickerUse::JsmName => match self.gamepad_nav.kbm_slot {
@@ -535,18 +637,95 @@ impl FlexInputApp {
                             }
                             _ => { ui.label(cap); }
                         }
+                        let label_of = |pin: &str| macros.iter().find(|e| e.pin == pin)
+                            .map(|e| e.name.clone())
+                            .unwrap_or_else(|| kbm_pin_label(pin));
+                        // Picks as the cards draw them: the key's or button's
+                        // glyph, the pad's in this side's dialect.
+                        let side_pad = if side == Some(PickStage::Input) { side_skins.0 } else { side_skins.1 };
+                        let pin_skin = |pin: &str| if crate::kbm_picker::is_pad_cell(pin) {
+                            side_pad
+                        } else {
+                            crate::canvas::remapper_icons::Skin::Kbm
+                        };
+                        let chip = |ui: &mut egui::Ui, pin: &str, dur: Option<f32>, sense: egui::Sense| {
+                            let ctx = ui.ctx().clone();
+                            // Measured by painting it nowhere: a pick with no
+                            // glyph is a text pill as wide as its name.
+                            let w = crate::canvas::viewer::paint_chord_chip_to_rect(
+                                &ui.painter().with_clip_rect(egui::Rect::NOTHING),
+                                &ctx, egui::Pos2::ZERO, PREVIEW_CHIP, pin, pin_skin(pin));
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PREVIEW_CHIP), sense);
+                            if resp.hovered() && sense.senses_click() {
+                                ui.painter().rect_filled(rect.expand(2.0), 4.0, egui::Color32::from_white_alpha(18));
+                            }
+                            crate::canvas::viewer::paint_chord_chip_to_rect(
+                                ui.painter(), &ctx, rect.min, PREVIEW_CHIP, pin, pin_skin(pin));
+                            if let Some(ms) = dur {
+                                crate::canvas::viewer::paint_dur_badge(ui.painter(), rect, ms);
+                            }
+                            let tip = match dur {
+                                Some(ms) => format!("{} · on for {ms:.0} ms", label_of(pin)),
+                                None => label_of(pin),
+                            };
+                            resp.on_hover_text(tip)
+                        };
+                        let plus = |ui: &mut egui::Ui| {
+                            ui.label(egui::RichText::new("+").strong());
+                        };
                         if purpose != crate::gamepad_nav::PickerUse::Chord {
                             ui.label(egui::RichText::new("—").small().weak());
+                        } else if active {
+                            // The list being built: every pick and gap can be
+                            // focused (a click, or Up from the board) and edited.
+                            if list_elems.is_empty() {
+                                ui.label(egui::RichText::new("(none)").small().italics().weak());
+                            }
+                            for (k, e) in list_elems.iter().enumerate() {
+                                use crate::kbm_picker::ChordElem;
+                                let together = k > 0 && matches!((list_elems[k - 1], e),
+                                    (ChordElem::Item(_), ChordElem::Item(_)));
+                                if together { plus(ui); }
+                                let r = match *e {
+                                    ChordElem::Item(i) => chip(ui, &list_chord.pins[i],
+                                        if list_timed { list_chord.durs.get(i).copied().flatten() } else { None },
+                                        egui::Sense::click()),
+                                    ChordElem::Gap(i) => {
+                                        let ms = list_chord.gaps.get(i).copied().unwrap_or(0.0);
+                                        let w = crate::canvas::viewer::gap_marker_width(ctx, PREVIEW_CHIP, ms);
+                                        let (rect, r) = ui.allocate_exact_size(
+                                            egui::vec2(w, PREVIEW_CHIP), egui::Sense::click());
+                                        if r.hovered() {
+                                            ui.painter().rect_filled(rect.expand(2.0), 4.0,
+                                                egui::Color32::from_white_alpha(18));
+                                        }
+                                        crate::canvas::viewer::paint_gap_marker(
+                                            ui.painter(), ctx, rect.min, PREVIEW_CHIP, ms);
+                                        r.on_hover_text(format!("Waits {ms:.0} ms after the pick before it"))
+                                    }
+                                };
+                                let focused = list_focus == Some(k);
+                                if r.clicked() {
+                                    list_select = Some(if focused { None } else { Some(k) });
+                                }
+                                if focused { list_focus_rect = Some(r.rect); }
+                            }
+                            if list_timed {
+                                let after = list_focus.and_then(|k| list_elems.get(k).copied());
+                                if ui.small_button("+ Gap")
+                                    .on_hover_text("A wait before the next pick (RT on the pad). \
+                                                    After the focused element, or at the end.")
+                                    .clicked()
+                                {
+                                    list_edit = Some(crate::kbm_picker::ChordEdit::InsertGap(after));
+                                }
+                            }
                         } else if pins.is_empty() {
                             ui.label(egui::RichText::new("(none)").small().italics().weak());
                         } else {
                             for (i, pin) in pins.iter().enumerate() {
-                                if i > 0 { ui.label(egui::RichText::new("+").strong()); }
-                                // Macro pins show the port's display name.
-                                let label = macros.iter().find(|e| e.pin == *pin)
-                                    .map(|e| e.name.clone())
-                                    .unwrap_or_else(|| kbm_pin_label(pin));
-                                ui.label(egui::RichText::new(label).strong());
+                                if i > 0 { plus(ui); }
+                                chip(ui, pin, None, egui::Sense::hover());
                             }
                         }
                     });
@@ -557,6 +736,49 @@ impl FlexInputApp {
                 }
                 if has_out || !chord_purpose {
                     preview(ui, "Output:", &chord, chord_purpose.then_some(PickStage::Output));
+                }
+                // The focused element of the list: its time, and Delete.
+                if let (Some(e), true) = (list_focus.and_then(|k| list_elems.get(k).copied()), chord_purpose) {
+                    use crate::kbm_picker::{ChordEdit, ChordElem, DEFAULT_DUR_MS};
+                    ui.horizontal(|ui| {
+                        match e {
+                            ChordElem::Gap(i) => {
+                                let mut ms = list_chord.gaps.get(i).copied().unwrap_or(0.0);
+                                ui.label(egui::RichText::new("Gap").small());
+                                if ui.add(egui::DragValue::new(&mut ms)
+                                    .range(crate::kbm_picker::MIN_GAP_MS..=5000.0).speed(1.0).suffix(" ms"))
+                                    .on_hover_text("How long after the pick before it this one starts.")
+                                    .changed()
+                                {
+                                    list_edit = Some(ChordEdit::SetGap(i, ms));
+                                }
+                            }
+                            ChordElem::Item(i) if list_timed => {
+                                let dur = list_chord.durs.get(i).copied().flatten();
+                                let mut own = dur.is_some();
+                                if ui.checkbox(&mut own, egui::RichText::new("Own duration").small())
+                                    .on_hover_text("Off: the pick stays on as long as the card's input does \
+                                                    (the time gap's pulse, or the press replayed, by mode).")
+                                    .changed()
+                                {
+                                    list_edit = Some(ChordEdit::SetDur(i, own.then_some(DEFAULT_DUR_MS)));
+                                }
+                                if let Some(mut ms) = dur {
+                                    if ui.add(egui::DragValue::new(&mut ms).range(1.0..=10000.0).speed(1.0).suffix(" ms"))
+                                        .changed()
+                                    {
+                                        list_edit = Some(ChordEdit::SetDur(i, Some(ms)));
+                                    }
+                                } else {
+                                    ui.label(egui::RichText::new("as long as the input").small().weak());
+                                }
+                            }
+                            ChordElem::Item(_) => {}
+                        }
+                        if ui.small_button("Delete").on_hover_text("Take it out of the list (North).").clicked() {
+                            list_edit = Some(ChordEdit::Delete(e));
+                        }
+                    });
                 }
                 ui.add_space(6.0);
                 ui.separator();
@@ -641,6 +863,7 @@ impl FlexInputApp {
                     // The focus is the gamepad-nav glow round the cell, not a
                     // fill: a tinted tile showed its square corners round every
                     // rounded glyph.
+                    let focused = focused && list_focus.is_none();
                     if focused {
                         focus_rect = Some(rect);
                     }
@@ -801,8 +1024,9 @@ impl FlexInputApp {
                 }
             });
 
-        // The focused cell's glow, above the board so neighbours can't cover it.
-        if let Some(rect) = focus_rect {
+        // The focused cell's glow — or the focused list element's — above the
+        // board so neighbours can't cover it.
+        if let Some(rect) = list_focus_rect.or(focus_rect) {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground, egui::Id::new("gp_kbm_picker_focus_glow")));
             crate::widgets::paint_nav_bloom(&painter, rect, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
@@ -822,7 +1046,14 @@ impl FlexInputApp {
         }
 
         ctx.request_repaint();
-        PickerInteraction { pin: clicked_pin, done, stage: switch_to, tab: tab_to }
+        PickerInteraction {
+            pin: clicked_pin,
+            done,
+            stage: switch_to,
+            tab: tab_to,
+            select: list_select,
+            edit: list_edit,
+        }
     }
 
     /// Modal press-mode picker: a vertical list of the press modes (glyph +
@@ -913,6 +1144,11 @@ pub(crate) struct PickerInteraction {
     pub(crate) stage: Option<crate::kbm_picker::PickStage>,
     /// A tab clicked.
     pub(crate) tab: Option<crate::kbm_picker::PickerTab>,
+    /// An element of the chord list clicked (focus it), or `Some(None)` to
+    /// give the focus back to the board.
+    pub(crate) select: Option<Option<usize>>,
+    /// An edit to the chord list.
+    pub(crate) edit: Option<crate::kbm_picker::ChordEdit>,
 }
 
 /// The names a JSM config could use for our pins, on whichever side of a line
@@ -1034,6 +1270,11 @@ mod vocab_tests {
         assert_eq!(name.insert_for("key_space"), None);
         assert_eq!(value.insert_for("mouse_left").as_deref(), Some("LMOUSE"));
         assert_eq!(name.insert_for("mouse_left"), None);
+
+        // A media key goes in under JSM's own name for it, as a value only.
+        assert_eq!(value.insert_for("media_volume_up").as_deref(), Some("VOLUME_UP"));
+        assert_eq!(value.insert_for("media_play_pause").as_deref(), Some("PLAY_PAUSE"));
+        assert_eq!(name.insert_for("media_mute"), None);
 
         // A setting's value takes a number, so the board has nothing for it.
         let neither = JsmVocab::of(JsmSlot::Neither);

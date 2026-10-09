@@ -334,10 +334,15 @@ fn clear_stuck_nav_arms(node: &mut NodeData) {
 /// its live value — rather than messages of their own, so a mapping card no
 /// longer holds them separately. A card saved when they could be picked on their
 /// own has each rewritten as the note it belongs to (same channel, same note),
-/// with duplicates dropped; an Analog card stays Analog, where the note now
-/// carries the value the old pin did. Every mapping card list is covered: a
-/// Remapper's and a Map Action's (legacy bare pin lists too), a Lean section's,
-/// a Touch Zones / Virtual Menu zone's. Idempotent.
+/// dropped when that note is already there; an Analog card stays Analog, where
+/// the note now carries the value the old pin did. Every mapping card list is
+/// covered: a Remapper's and a Map Action's (legacy bare pin lists too), a Lean
+/// section's, a Touch Zones / Virtual Menu zone's. Idempotent.
+///
+/// Only a pin this rewrite turns into a repeat goes: a list may repeat a pin
+/// on purpose — a timed output's "East, 50 ms, East" — and that must load as
+/// saved. An output dropped takes its timing entries with it, its gap carried
+/// on to the next, so the rest of the sequence keeps its place.
 fn fold_note_companions_into_notes(node: &mut NodeData) {
     use flexinput_core::midi::MidiPin;
     let keys: &[&str] = match node.module_id.as_str() {
@@ -346,34 +351,69 @@ fn fold_note_companions_into_notes(node: &mut NodeData) {
         "module.touch_zones" | "module.menu" | "module.area_mapper" => &["zone_maps"],
         _ => return,
     };
-    fn fold(pins: &mut Vec<Value>) {
-        let mut out: Vec<Value> = Vec::with_capacity(pins.len());
-        for v in pins.drain(..) {
-            let v = match v.as_str().and_then(flexinput_core::midi::parse_pin) {
+    /// Fold the list in place; returns the indices dropped.
+    fn fold(pins: &mut Vec<Value>) -> Vec<usize> {
+        // Each kept pin, and whether the fold made it.
+        let mut out: Vec<(Value, bool)> = Vec::with_capacity(pins.len());
+        let mut dropped = Vec::new();
+        for (i, v) in pins.drain(..).enumerate() {
+            let (v, folded) = match v.as_str().and_then(flexinput_core::midi::parse_pin) {
                 Some(MidiPin::Velocity { ch, note }) | Some(MidiPin::PolyAftertouch { ch, note }) => {
-                    Value::String(MidiPin::Note { ch, note }.to_id())
+                    (Value::String(MidiPin::Note { ch, note }.to_id()), true)
                 }
-                _ => v,
+                _ => (v, false),
             };
-            if !out.contains(&v) {
-                out.push(v);
+            // A repeat the fold made — this pin folded into one already
+            // there, or one already there was folded into this — goes.
+            if out.iter().any(|(o, f)| *o == v && (folded || *f)) {
+                dropped.push(i);
+            } else {
+                out.push((v, folded));
             }
         }
-        *pins = out;
+        *pins = out.into_iter().map(|(v, _)| v).collect();
+        dropped
     }
     for key in keys {
         let Some(Value::Array(cards)) = node.params.get_mut(*key) else { continue };
         for card in cards.iter_mut() {
             match card {
-                Value::Array(pins) => fold(pins),
+                Value::Array(pins) => {
+                    fold(pins);
+                }
                 Value::Object(m) => {
-                    for side in ["in", "out"] {
-                        if let Some(Value::Array(pins)) = m.get_mut(side) {
-                            fold(pins);
-                        }
+                    if let Some(Value::Array(pins)) = m.get_mut("in") {
+                        fold(pins);
                     }
+                    let dropped = match m.get_mut("out") {
+                        Some(Value::Array(pins)) => fold(pins),
+                        _ => Vec::new(),
+                    };
+                    drop_out_timing_entries(m, &dropped);
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+/// Take the timing entries (`out_gap` / `out_dur`) of the outputs at
+/// `dropped` (ascending) out of a card. A dropped output's gap is added to the
+/// next one's, so what follows starts when it did.
+fn drop_out_timing_entries(m: &mut serde_json::Map<String, Value>, dropped: &[usize]) {
+    use flexinput_engine::eval::{OUT_DUR_KEY, OUT_GAP_KEY};
+    for &i in dropped.iter().rev() {
+        if let Some(Value::Array(gaps)) = m.get_mut(OUT_GAP_KEY) {
+            if i < gaps.len() {
+                let g = gaps.remove(i).as_f64().unwrap_or(0.0);
+                if let Some(next) = gaps.get_mut(i) {
+                    *next = serde_json::json!(next.as_f64().unwrap_or(0.0) + g);
+                }
+            }
+        }
+        if let Some(Value::Array(durs)) = m.get_mut(OUT_DUR_KEY) {
+            if i < durs.len() {
+                durs.remove(i);
             }
         }
     }
@@ -707,6 +747,37 @@ mod migration_tests {
         assert_eq!(cards[1]["in"], serde_json::json!(["midi:note:2:60"]), "no duplicate note");
         assert_eq!(cards[1]["mode"], "analog");
         assert_eq!(cards[2]["out"], serde_json::json!(["midi:note:1:64"]));
+    }
+
+    /// Only a repeat the fold makes is dropped: a timed output that presses
+    /// the same button twice loads as saved, and an output folded away takes
+    /// its timing with it, its gap carried on.
+    #[test]
+    fn loading_keeps_a_repeated_output_and_its_timing() {
+        let mut params = HashMap::new();
+        params.insert("mappings".to_string(), serde_json::json!([
+            { "in": ["btn_east"], "out": ["btn_east", "btn_east"], "out_gap": [0.0, 1.0], "out_dur": [10.0, 10.0] },
+            { "in": ["btn_south"], "out": ["midi:pat:1:64", "midi:note:1:64", "key_a"],
+              "out_gap": [0.0, 20.0, 30.0], "out_dur": [null, 5.0, 7.0] },
+        ]));
+        let mut node = NodeData {
+            module_id: "module.remapper".to_string(),
+            display_name: "Remapper".to_string(),
+            category: "Module".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        fold_note_companions_into_notes(&mut node);
+        let cards = node.params["mappings"].as_array().unwrap().clone();
+        assert_eq!(cards[0]["out"], serde_json::json!(["btn_east", "btn_east"]));
+        assert_eq!(cards[0]["out_gap"], serde_json::json!([0.0, 1.0]));
+        assert_eq!(cards[0]["out_dur"], serde_json::json!([10.0, 10.0]));
+        assert_eq!(cards[1]["out"], serde_json::json!(["midi:note:1:64", "key_a"]));
+        assert_eq!(cards[1]["out_gap"], serde_json::json!([0.0, 50.0]), "key_a still starts at 50 ms");
+        assert_eq!(cards[1]["out_dur"], serde_json::json!([null, 7.0]));
     }
 
     /// A card of buttons alone can't be Analog: loading switches it to Normal

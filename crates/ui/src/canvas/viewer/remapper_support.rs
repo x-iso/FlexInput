@@ -312,6 +312,17 @@ pub(crate) fn remapper_kbm_pressed_now(
         Some(keys) => keys.into_iter().map(String::from).collect(),
         None => egui_keys_pressed_now(ui),
     };
+    // Typing into a value box (a gap's ms in the picker, say) isn't a key to
+    // learn — nor is the Enter that ends it, still down the frame after: the
+    // keyboard stays muted until every key typed while it had focus is up.
+    let mute_id = egui::Id::new("remapper_kbm_learn_muted");
+    let typing = ui.ctx().wants_keyboard_input();
+    let muted = typing || ui.ctx().data(|d| d.get_temp::<bool>(mute_id)).unwrap_or(false);
+    let still_muted = typing || (muted && !out.is_empty());
+    ui.ctx().data_mut(|d| d.insert_temp(mute_id, still_muted));
+    if muted {
+        return Vec::new();
+    }
 
     // Mouse buttons and scroll are intentionally NOT captured here.
     // They cannot be live-learned because the user must click Add (LMB) to
@@ -380,10 +391,12 @@ fn egui_keys_pressed_now(ui: &egui::Ui) -> Vec<String> {
 /// Render a chip for one canonical pin: SVG icon if mapped under `skin`,
 /// otherwise the textual display name. Chip height is fixed at 22 logical px
 /// to align with surrounding text. The SVG is rasterized + cached in egui
-/// memory keyed on (pin_id, skin, size, tint).
-pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate::canvas::remapper_icons::Skin) {
+/// memory keyed on (pin_id, skin, size, tint). Returns where it landed.
+pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate::canvas::remapper_icons::Skin)
+    -> egui::Rect
+{
     use crate::canvas::remapper_icons;
-    const CHIP_H: f32 = 28.0;
+    const CHIP_H: f32 = REMAPPER_CHIP_H;
     // Macro-port pins (and macro-style Virtual-Menu targets): resolve name +
     // icon through the per-frame registry (published by app.rs). Icon chip with
     // the name as tooltip, or a plain name label when the port has no icon. A
@@ -398,32 +411,33 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
                 if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
                     ui.ctx(), &entry.icon, &entry.icon_svg, CHIP_H)
                 {
-                    ui.add(egui::Image::new(&tex)
+                    return ui.add(egui::Image::new(&tex)
                         .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                         .tint(Color32::WHITE))
-                        .on_hover_text(hover);
+                        .on_hover_text(hover).rect;
                 } else {
-                    ui.label(egui::RichText::new(&entry.name).size(13.0).strong())
-                        .on_hover_text(hover);
+                    return ui.label(egui::RichText::new(&entry.name).size(13.0).strong())
+                        .on_hover_text(hover).rect;
                 }
             }
             None => {
-                ui.label(egui::RichText::new("target?").size(13.0).weak().strikethrough())
-                    .on_hover_text("This macro port / menu no longer exists");
+                return ui.label(egui::RichText::new("target?").size(13.0).weak().strikethrough())
+                    .on_hover_text("This macro port / menu no longer exists").rect;
             }
         }
-        return;
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
-        ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
-            .on_hover_text(p.display_name());
-        return;
+        return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
+            .on_hover_text(p.display_name()).rect;
+    }
+    if let Some(k) = flexinput_core::media::media_key(pin_id) {
+        return ui.label(egui::RichText::new(media_chip_label(k)).size(13.0).strong())
+            .on_hover_text(k.name).rect;
     }
     let imu = flexinput_core::imu::imu_pin(pin_id);
     if let (Some(p), None) = (imu, remapper_icons::pin_svg(skin, pin_id)) {
-        ui.label(egui::RichText::new(imu_chip_label(p)).size(13.0).strong())
-            .on_hover_text(p.name);
-        return;
+        return ui.label(egui::RichText::new(imu_chip_label(p)).size(13.0).strong())
+            .on_hover_text(p.name).rect;
     }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
@@ -454,10 +468,115 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
             if let Some(label) = remapper_icons::extra_button_label(pin_id) {
                 paint_icon_label(ui, resp.rect, label);
             }
-            return;
+            return resp.rect;
         }
     }
-    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
+    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong()).rect
+}
+
+/// The height of a chip in a body's chord row.
+pub(crate) const REMAPPER_CHIP_H: f32 = 28.0;
+
+/// The colour time is drawn in, wherever a chord shows its timing.
+pub(crate) const GAP_TINT: Color32 = Color32::from_rgb(0xE8, 0xB4, 0x41);
+
+/// A gap's ms, as written under its stopwatch.
+fn gap_text(ms: f32) -> String {
+    format!("{ms:.0}ms")
+}
+
+/// How wide a gap marker for `ms` is in a `chip_h` row.
+pub(crate) fn gap_marker_width(ctx: &egui::Context, chip_h: f32, ms: f32) -> f32 {
+    let text_w = ctx.fonts_mut(|f| f.layout_no_wrap(
+        gap_text(ms), egui::FontId::proportional(chip_h * 0.32), GAP_TINT).size().x);
+    text_w.max(chip_h * 0.66)
+}
+
+/// Paint a gap in a chord: a stopwatch, with its time under it, in a
+/// `chip_h`-tall slot at `top_left`. Returns its width.
+pub(crate) fn paint_gap_marker(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    top_left: egui::Pos2,
+    chip_h: f32,
+    ms: f32,
+) -> f32 {
+    let w = gap_marker_width(ctx, chip_h, ms);
+    let icon = chip_h * 0.62;
+    if let Some(tex) = crate::macro_icons::macro_icon_texture(ctx, "stopwatch", icon) {
+        let rect = egui::Rect::from_min_size(top_left + egui::vec2((w - icon) * 0.5, 0.0), egui::vec2(icon, icon));
+        painter.image(tex.id(), rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), GAP_TINT);
+    }
+    painter.text(
+        top_left + egui::vec2(w * 0.5, chip_h),
+        egui::Align2::CENTER_BOTTOM,
+        gap_text(ms),
+        egui::FontId::proportional(chip_h * 0.32),
+        GAP_TINT,
+    );
+    w
+}
+
+/// Paint a pick's own duration as a badge in its chip's bottom-right corner.
+pub(crate) fn paint_dur_badge(painter: &egui::Painter, chip: egui::Rect, ms: f32) {
+    let galley = painter.layout_no_wrap(
+        format!("{ms:.0}"), egui::FontId::proportional(chip.height() * 0.3), Color32::WHITE);
+    let at = chip.max - galley.size();
+    painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(1.0), 2.0,
+        Color32::from_black_alpha(200));
+    painter.galley(at, galley, Color32::WHITE);
+}
+
+/// A gap in a body's chord row.
+pub(crate) fn remapper_render_gap(ui: &mut egui::Ui, ms: f32) -> egui::Response {
+    let w = gap_marker_width(ui.ctx(), REMAPPER_CHIP_H, ms);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, REMAPPER_CHIP_H), egui::Sense::hover());
+    paint_gap_marker(ui.painter(), ui.ctx(), rect.min, REMAPPER_CHIP_H, ms);
+    resp.on_hover_text(format!("Waits {ms:.0} ms after the pick before it starts"))
+}
+
+/// A body's draft output row with its timing: picks, gaps as stopwatches,
+/// own durations as badges. Without timing, just the chord.
+pub(crate) fn remapper_render_timed_chord(
+    ui: &mut egui::Ui,
+    chord: &crate::kbm_picker::TimedChord,
+    skin: crate::canvas::remapper_icons::Skin,
+) {
+    use crate::kbm_picker::ChordElem;
+    if !chord.is_timed() {
+        crate::canvas::viewer::remapper_render_chord(ui, &chord.pins, skin);
+        return;
+    }
+    let elems = chord.elems(true);
+    for (k, e) in elems.iter().enumerate() {
+        match *e {
+            ChordElem::Gap(i) => {
+                remapper_render_gap(ui, chord.gaps.get(i).copied().unwrap_or(0.0));
+            }
+            ChordElem::Item(i) => {
+                if k > 0 && matches!(elems[k - 1], ChordElem::Item(_)) {
+                    ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
+                }
+                let rect = remapper_render_chip(ui, &chord.pins[i], skin);
+                if let Some(ms) = chord.durs.get(i).copied().flatten() {
+                    paint_dur_badge(ui.painter(), rect, ms);
+                }
+            }
+        }
+    }
+}
+
+/// A draft's chord with the timing kept beside it on `node`.
+pub(crate) fn draft_timed_chord(node: Option<&NodeData>, draft_key: &str, pins: &[String])
+    -> crate::kbm_picker::TimedChord
+{
+    let (gk, dk) = crate::kbm_picker::timing_keys(draft_key);
+    crate::kbm_picker::TimedChord::from_params(
+        pins.to_vec(),
+        node.and_then(|n| n.params.get(&gk)),
+        node.and_then(|n| n.params.get(&dk)),
+    )
 }
 
 /// Paint a short label centered over an icon rect (used for extra-button
@@ -541,6 +660,10 @@ pub(crate) fn paint_chord_chip_tinted(
     // the dimmed "icon missing" pill).
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return paint_text_pill(painter, top_left, chip_h, p.short_label(), false);
+    }
+    // Media keys have no glyphs yet: the label is the rendering.
+    if let Some(k) = flexinput_core::media::media_key(pin_id) {
+        return paint_text_pill(painter, top_left, chip_h, media_chip_label(k), false);
     }
     // The pad's motion without a glyph: the label is the rendering.
     if let Some(p) = flexinput_core::imu::imu_pin(pin_id) {
@@ -725,6 +848,37 @@ pub(crate) fn picker_skins(
     ctx.data(|d| d.get_temp(picker_skins_id(path, node_id)))
 }
 
+/// Move an output draft's timing (gaps, own durations — see
+/// `kbm_picker::TimedChord`) onto the card being added from it, as the card's
+/// `out_gap` / `out_dur`, and clear it from the draft. A gap left waiting after
+/// the last pick has nothing to wait for, and goes.
+pub(crate) fn take_draft_timing(
+    node: &mut NodeData,
+    draft_key: &str,
+    pins: &[String],
+    card: &mut serde_json::Map<String, Value>,
+) {
+    let (gk, dk) = crate::kbm_picker::timing_keys(draft_key);
+    let mut chord = crate::kbm_picker::TimedChord::from_params(
+        pins.to_vec(), node.params.get(&gk), node.params.get(&dk));
+    if let Some(waiting) = chord.gaps.last_mut() {
+        *waiting = 0.0;
+    }
+    if chord.is_timed() {
+        card.insert(flexinput_engine::eval::OUT_GAP_KEY.into(), chord.gaps_json());
+        card.insert(flexinput_engine::eval::OUT_DUR_KEY.into(), chord.durs_json());
+    }
+    clear_draft_timing(node, draft_key);
+}
+
+/// Drop an output draft's timing — whenever the draft itself is emptied or
+/// replaced, so a gap can't outlive the picks it sat between.
+pub(crate) fn clear_draft_timing(node: &mut NodeData, draft_key: &str) {
+    let (gk, dk) = crate::kbm_picker::timing_keys(draft_key);
+    node.params.remove(&gk);
+    node.params.remove(&dk);
+}
+
 /// True for the synthetic touchpad-swipe output pins (continuous → analog mode).
 pub(crate) fn remapper_out_is_swipe(pin_id: &str) -> bool {
     matches!(pin_id, "touch_swipe_x" | "touch_swipe_y")
@@ -754,6 +908,12 @@ pub(crate) fn remapper_key_to_pin_id(key: egui::Key) -> String {
     }
 }
 
+/// A chip's text for a media key: "Media" and its short name, so "Play" and
+/// "Stop" can't be taken for a key's.
+pub(crate) fn media_chip_label(k: &flexinput_core::media::MediaKey) -> String {
+    format!("Media {}", k.short)
+}
+
 /// A chip's text for an IMU input: its family, then its axis and direction
 /// ("Gyro Y→", "Tilt N↑").
 pub(crate) fn imu_chip_label(p: &flexinput_core::imu::ImuPin) -> String {
@@ -766,6 +926,9 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     }
     if let Some(p) = flexinput_core::imu::imu_pin(pin_id) {
         return p.name.to_string();
+    }
+    if let Some(k) = flexinput_core::media::media_key(pin_id) {
+        return k.name.to_string();
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return p.display_name();

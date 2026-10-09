@@ -2571,11 +2571,13 @@ pub(crate) fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
         m.insert("in".into(), Value::Array(vec![Value::from(trigger)]));
         m.insert("out".into(), Value::Array(draft_out.iter().map(|s| Value::from(s.as_str())).collect()));
         m.insert("mode".into(), Value::from(mode));
+        // The output's timing, picked with Choose, goes onto the card.
+        take_draft_timing(node, "_tz_draft_out", draft_out, &mut m);
         let mut cards = node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         cards.push(Value::Object(m));
         node.params.insert("zone_maps".into(), Value::Array(cards));
         node.params.insert("_tz_phase".into(), Value::from("idle"));
-        for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
+        for k in ["_tz_trig", "_tz_draft_out", "_tz_draft_out_gap", "_tz_draft_out_dur", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
     }
 }
 
@@ -2752,18 +2754,24 @@ pub(crate) fn render_touch_zone_cards(
         let seen = getp(snarl, "_tz_gp_seen").and_then(|v| v.as_bool()).unwrap_or(false);
         let fresh: Vec<String> = pressed_now.iter().filter(|p| !base.contains(*p)).cloned().collect();
         if !fresh.is_empty() {
-            // The first fresh press of the session replaces any prior draft;
+            // The first fresh press of the session replaces any prior draft —
+            // or adds to it, once it has timing (a sequence being built);
             // further simultaneous presses extend the chord.
-            let mut draft: Vec<String> = if seen {
-                getp(snarl, "_tz_draft_out").and_then(|v| v.as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
-                    .unwrap_or_default()
-            } else { Vec::new() };
+            let prior: Vec<String> = getp(snarl, "_tz_draft_out").and_then(|v| v.as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+                .unwrap_or_default();
+            let prior = draft_timed_chord(snarl.get_node(node_id), "_tz_draft_out", &prior);
+            let timed = prior.is_timed();
+            let mut draft: Vec<String> = if seen { prior.pins.clone() } else { prior.learn_press(&fresh) };
             for p in &fresh { if !draft.contains(p) { draft.push(p.clone()); } }
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_tz_draft_out".into(),
                     Value::Array(draft.iter().map(|p| Value::from(p.as_str())).collect()));
                 node.params.insert("_tz_gp_seen".into(), Value::from(true));
+                // A fresh capture replaced the draft, and its timing with it.
+                if !seen && !timed {
+                    clear_draft_timing(node, "_tz_draft_out");
+                }
             }
         } else if seen {
             // Whole combo released → finalise the chord and disarm.
@@ -2781,6 +2789,7 @@ pub(crate) fn render_touch_zone_cards(
     let draft_out: Vec<String> = getp(snarl, "_tz_draft_out")
         .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
         .unwrap_or_default();
+    let draft_chord = draft_timed_chord(snarl.get_node(node_id), "_tz_draft_out", &draft_out);
     let trigger = getp(snarl, "_tz_trig").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
     let idle_trig: String = if area_mode && trigger.starts_with("area_") {
         trigger.clone()
@@ -2882,7 +2891,7 @@ pub(crate) fn render_touch_zone_cards(
                     };
                     ui.label(egui::RichText::new(hint).italics().weak());
                 } else {
-                    remapper_render_chord(ui, &draft_out, skin);
+                    remapper_render_timed_chord(ui, &draft_chord, skin);
                 }
             }
             _ => {}
@@ -2916,7 +2925,7 @@ pub(crate) fn render_touch_zone_cards(
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
                         node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.insert("_tz_gp_arm".into(), Value::from(true));
-                        for k in ["_tz_draft_out", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
+                        for k in ["_tz_draft_out", "_tz_draft_out_gap", "_tz_draft_out_dur", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
                 let b = ui.button("Choose…")
@@ -2927,6 +2936,7 @@ pub(crate) fn render_touch_zone_cards(
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
                         node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.remove("_tz_draft_out");
+                        clear_draft_timing(node, "_tz_draft_out");
                     }
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
                         inner: node_id,
@@ -2946,6 +2956,7 @@ pub(crate) fn render_touch_zone_cards(
                         node.params.insert("_tz_phase".into(), Value::from("captured"));
                         node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
                         node.params.remove("_tz_draft_out");
+                        clear_draft_timing(node, "_tz_draft_out");
                     }
                     tz_request_midi(ui.ctx(), node_id, automap_parent);
                 }
@@ -3015,7 +3026,7 @@ pub(crate) fn render_touch_zone_cards(
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("idle"));
-                        for k in ["_tz_draft_out", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
+                        for k in ["_tz_draft_out", "_tz_draft_out_gap", "_tz_draft_out_dur", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
             }

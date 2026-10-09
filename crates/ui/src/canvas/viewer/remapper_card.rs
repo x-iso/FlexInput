@@ -94,13 +94,32 @@ pub(crate) fn remapper_mapping_card_pixel(
     let chord_avail_w = (card_w - 5.0 * s) - chord_x_start;
     let row_pitch_y = (chip_size + 6.0 * s).max(32.0 * s);
 
-    let measure_rows = |pins: &[String]| -> usize {
+    // The output list's timing (`out_gap` / `out_dur`): a gap shows as a wider
+    // separator carrying its ms in place of the "+", an own duration as a
+    // badge on its chip. A Lean card draws its outputs in the first row.
+    let timed_row_in = out_pins.is_none() && mapping.contains_key("out");
+    let timing = crate::kbm_picker::TimedChord::from_params(
+        if timed_row_in { in_pins.to_vec() } else { out_pins.unwrap_or(&[]).to_vec() },
+        mapping.get(flexinput_engine::eval::OUT_GAP_KEY),
+        mapping.get(flexinput_engine::eval::OUT_DUR_KEY),
+    );
+    // A gap is a stopwatch with its time under it.
+    let gap_ctx = ui.ctx().clone();
+    let gap_w = |ms: f32| super::gap_marker_width(&gap_ctx, chip_size, ms).max(plus_w);
+    // The gap before item `i` of a row, if that row is the timed one.
+    let gap_at = |is_in: bool, i: usize| -> f32 {
+        if is_in == timed_row_in { timing.gaps.get(i).copied().unwrap_or(0.0) } else { 0.0 }
+    };
+
+    let measure_rows = |pins: &[String], is_in: bool| -> usize {
         let mut rows = 1usize;
         let mut x = 0.0f32;
         let mut first = true;
-        for p in pins {
+        for (i, p) in pins.iter().enumerate() {
             if matches!(p.as_str(), "touchpad_any") { continue; }
-            let next_w = chip_size + if first { 0.0 } else { plus_w + chord_gap };
+            let gap = gap_at(is_in, i);
+            let sep = if gap > 0.0 { gap_w(gap) } else { plus_w };
+            let next_w = chip_size + if first && gap <= 0.0 { 0.0 } else { sep + chord_gap };
             if !first && x + next_w > chord_avail_w {
                 rows += 1;
                 x = chip_size + chord_gap; // next row starts with this chip
@@ -114,8 +133,8 @@ pub(crate) fn remapper_mapping_card_pixel(
         rows.max(1)
     };
 
-    let in_rows  = measure_rows(in_pins);
-    let out_rows = out_pins.map(measure_rows).unwrap_or(0);
+    let in_rows  = measure_rows(in_pins, true);
+    let out_rows = out_pins.map(|p| measure_rows(p, false)).unwrap_or(0);
 
     // Header strip is 31px; each chord row reserves `row_pitch_y` of body
     // space; bottom padding ~8px. Map Action has no out row.
@@ -312,21 +331,11 @@ pub(crate) fn remapper_mapping_card_pixel(
 
     // ── time gap pill: outer (61,5,137×20), valuebox (135,5,63×20) ────────
     let turbo_on = mapping.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Modes that read the time-gap value:
-    //   short/long/double — window timing; analog — per-tap duration;
-    //   on_press/on_release — emitted trigger duration (see apply_press_mode);
-    //   sequence — max gap between steps;
-    //   any mode with turbo on — turbo period.
-    let gap_applies = matches!(mode_now.as_str(),
-        "short" | "long" | "double" | "analog" | "on_press" | "on_release" | "sequence")
-        || turbo_on;
-    // Turbo is only meaningful for sustained/continuous gates. It's grayed for
-    // short, double, and the edge-trigger modes (on_press/on_release) — turbo
-    // on a one-shot edge pulse has no sensible meaning. Exception: on an "in
-    // order" chord in short / double mode it means "the whole chord in time".
-    let order_tap = in_order_on && matches!(mode_now.as_str(), "short" | "double");
-    let turbo_applies = order_tap || !matches!(mode_now.as_str(),
-        "short" | "double" | "on_press" | "on_release");
+    // Which of time gap / Hold / Turbo do anything as the card is set, and
+    // what — greyed when not, and said in each one's tooltip either way.
+    let opts = CardOptions::of(&Value::Object(mapping.clone()), allow_order);
+    let gap_applies = opts.gap_applies;
+    let turbo_applies = opts.turbo_applies;
     {
         let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
         let value_box = egui::Rect::from_min_size(at(61.0 + 74.0, 5.0), sz(63.0, 20.0));
@@ -342,6 +351,9 @@ pub(crate) fn remapper_mapping_card_pixel(
             egui::FontId::proportional(TEXT_SIZE_HEADER * s),
             mul(C_TEXT),
         );
+        let label = egui::Rect::from_min_max(outer.min, egui::pos2(value_box.min.x, outer.max.y));
+        ui.interact(label, ui.id().with(("gap_label", mapping_idx)), egui::Sense::hover())
+            .on_hover_text(&opts.gap_tip);
         // Editable value: a tiny DragValue sized to the value_box.
         let mut gap_ms = mapping.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
         let mut child = ui.new_child(
@@ -355,7 +367,7 @@ pub(crate) fn remapper_mapping_card_pixel(
                 egui::DragValue::new(&mut gap_ms)
                     .speed(5.0).range(1.0f32..=5000.0)
                     .custom_formatter(|n, _| format!("{n:.0} ms")),
-            );
+            ).on_hover_text(&opts.gap_tip).on_disabled_hover_text(&opts.gap_tip);
             if resp.changed() {
                 if let Some(n) = serde_json::Number::from_f64(gap_ms as f64) {
                     mapping.insert("window_ms".to_string(), Value::Number(n));
@@ -370,26 +382,9 @@ pub(crate) fn remapper_mapping_card_pixel(
     // "in order" chord: normal / long — the output stays on while the last input
     // is held, after the earlier ones are let go; short / double — the earlier
     // inputs stay held in the game throughout (only the last one is taken).
-    let hold_applies = mode_now == "long" || mode_now == "analog"
-        || (in_order_on && matches!(mode_now.as_str(), "down" | "short" | "double"));
-    let hold_tip = if in_order_on {
-        match mode_now.as_str() {
-            "down" => Some(
-                "Hold: once the chord fires, its output stays on while the last input \
-                 is held, even after you let go of the earlier ones. An output that's \
-                 one of those earlier inputs lets go with it."),
-            "long" => Some(
-                "Hold: the output stays on while held instead of a short pulse, and \
-                 keeps going while the last input is held, even after you let go of \
-                 the earlier ones."),
-            "short" | "double" => Some(
-                "Hold: the earlier inputs stay held in the game the whole time; only \
-                 the last one is taken."),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    // A Normal card with timed outputs: Hold makes the sequence one you have
+    // to hold through.
+    let hold_applies = opts.hold_applies;
     {
         let outer = egui::Rect::from_min_size(at(206.0, 5.0), sz(62.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(206.0 + 45.0, 5.0 + 3.0), sz(14.0, 14.0));
@@ -411,9 +406,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         }
         let mut resp = ui.interact(outer, ui.id().with(("hold", mapping_idx)),
             if hold_applies { egui::Sense::click() } else { egui::Sense::hover() });
-        if let Some(tip) = hold_tip {
-            resp = resp.on_hover_text(tip);
-        }
+        resp = resp.on_hover_text(&opts.hold_tip);
         if hold_applies && resp.clicked() {
             hold = !hold;
             mapping.insert("sustain".to_string(), Value::Bool(hold));
@@ -449,17 +442,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         }
         let mut resp = ui.interact(outer, ui.id().with(("turbo", mapping_idx)),
             if turbo_applies { egui::Sense::click() } else { egui::Sense::hover() });
-        if order_tap {
-            resp = resp.on_hover_text(if mode_now == "short" {
-                "Turbo (whole chord): the entire chord, from its first input, has to be \
-                 completed and let go within the time gap.\nOff: the time gap only times \
-                 the last input, so the earlier ones can be held as long as you like."
-            } else {
-                "Turbo (whole chord): the entire chord, from its first input, has to be \
-                 completed twice within the time gap.\nOff: the time gap only times the \
-                 last input's double tap, so the earlier ones can be held as long as you like."
-            });
-        }
+        resp = resp.on_hover_text(&opts.turbo_tip);
         if turbo_applies && resp.clicked() {
             turbo = !turbo;
             mapping.insert("turbo".to_string(), Value::Bool(turbo));
@@ -534,8 +517,12 @@ pub(crate) fn remapper_mapping_card_pixel(
                 "touchpad_any"    => continue, // shown as the click overlay
                 other => other,
             };
+            // A gap before this chip replaces its "+" with the wait, and
+            // shows even at the start of a row: it's timing, not a joiner.
+            let gap = gap_at(is_in, pin_idx);
+            let sep_w = if gap > 0.0 { gap_w(gap) } else { plus_w };
             // Width this chip will consume (incl. its leading "+", if any).
-            let prefix = if first { 0.0 } else { plus_w + chord_gap };
+            let prefix = if first && gap <= 0.0 { 0.0 } else { sep_w + chord_gap };
             // Wrap to the next row if this chip doesn't fit. The first chip
             // on a wrapped row drops its "+", since the prior row ended
             // with the trailing chip already.
@@ -544,7 +531,12 @@ pub(crate) fn remapper_mapping_card_pixel(
                 cur_x = chord_x_start;
                 first = true;
             }
-            if !first {
+            if gap > 0.0 {
+                let w = super::gap_marker_width(ui.ctx(), chip_size, gap);
+                super::paint_gap_marker(&chord_painter, ui.ctx(),
+                    card_origin + egui::vec2(cur_x + (sep_w - w) * 0.5, row_y), chip_size, gap);
+                cur_x += sep_w + chord_gap;
+            } else if !first {
                 chord_painter.text(
                     card_origin + egui::vec2(cur_x + plus_w * 0.5, row_y + chip_size * 0.5),
                     egui::Align2::CENTER_CENTER,
@@ -560,6 +552,13 @@ pub(crate) fn remapper_mapping_card_pixel(
                 &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id,
                 if is_in { skin } else { out_skin },
             );
+            // Its own duration, as a badge in the chip's corner.
+            if is_in == timed_row_in {
+                if let Some(ms) = timing.durs.get(pin_idx).copied().flatten() {
+                    super::paint_dur_badge(&chord_painter,
+                        egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size)), ms);
+                }
+            }
             if flexinput_core::midi::is_midi_pin(p) {
                 let rect = egui::Rect::from_min_size(chip_top_left, egui::vec2(painted_w, chip_size));
                 // The in row offers a channel (including "any"); the out row
@@ -714,7 +713,18 @@ pub(crate) fn remapper_mapping_card_pixel(
         // gets its ring cropped at the visible edge instead of spilling past it.
         let clip_g = to_global * ui.clip_rect();
         let pass = ui.ctx().cumulative_pass_nr();
+        // The focused option's tooltip, as a hover would show it (drawn by
+        // the nav driver beside the field's glow).
+        let field_tip = match nav_card_field {
+            Some(1) => opts.gap_tip.clone(),
+            Some(2) => opts.hold_tip.clone(),
+            Some(3) => opts.turbo_tip.clone(),
+            _ => String::new(),
+        };
         ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("gp_nav_remap_card_tip", node_id.0, nav_scope)),
+                (pass, field_tip));
             d.insert_temp(
                 egui::Id::new(("gp_nav_remap_card_rects", node_id.0, nav_scope)),
                 (pass, card_g, field_g, nav_card_entered));

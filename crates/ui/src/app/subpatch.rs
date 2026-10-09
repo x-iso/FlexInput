@@ -18,6 +18,9 @@ pub(crate) struct SubPatchFile {
 /// Short human label for a KB/M pin (fallback when no icon, or for the chord
 /// preview). Strips the `key_`/`mouse_`/`scroll_` prefix and prettifies a few.
 pub(crate) fn kbm_pin_label(pin: &str) -> String {
+    if let Some(k) = flexinput_core::media::media_key(pin) {
+        return k.short.into();
+    }
     match pin {
         "mouse_left" => "LMB".into(),
         "mouse_right" => "RMB".into(),

@@ -7159,6 +7159,29 @@ mod stick_direction_output_tests {
         c.get(&("remap:2".to_string(), pin.to_string())).copied()
     }
 
+    // "Ctrl, 50 ms, C" off one button: C joins Ctrl 50 ms in, and each lets
+    // go its start after the button does.
+    #[test]
+    fn a_timed_output_plays_its_timeline() {
+        let snap = remapper(serde_json::json!({
+            "in": ["btn_south"], "out": ["key_lctrl", "key_c"], "out_gap": [0, 50],
+        }));
+        let mut state = HashMap::new();
+        let mut step = |down: bool| {
+            let mut c = HashMap::new();
+            eval_remapper_node(&snap, 2, &south(down), &mut c, &mut state, 0.01);
+            let on = |p: &str| c.get(&("remap:2".to_string(), p.to_string())) == Some(&Signal::Bool(true));
+            (on("key_lctrl"), on("key_c"))
+        };
+        assert_eq!(step(true), (true, false));
+        for _ in 1..5 { step(true); }
+        assert_eq!(step(true), (true, true), "50 ms in");
+        for _ in 6..10 { step(true); }
+        assert_eq!(step(false), (false, true), "Ctrl lets go with the button, C 50 ms later");
+        for _ in 11..15 { step(false); }
+        assert_eq!(step(false), (false, false));
+    }
+
     // A whole stick onto the other whole stick moves it as it is, and the
     // stick it was taken from goes quiet — axes, Vec2 and directions.
     #[test]

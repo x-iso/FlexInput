@@ -412,7 +412,7 @@ pub const ANALOG_DIGITAL_MAX_FREQ_HZ: f32 = 20.0;
 /// Three behaviours, selected by `sustain` (Hold) and `turbo`:
 ///
 ///   - **Plain** (Hold off): a tap train. `window_ms` is the *minimum* tap
-///     period (lowest frequency); the period shortens as `mag → 1` up to
+///     period (the fastest it taps); the period shortens as `mag → 1` up to
 ///     `MAX_FREQ_HZ` (×2 with Turbo). Each tap is a clean 50%-duty square
 ///     wave so it always reads as a distinct tap rather than a held key.
 ///   - **Hold** (sustain on): PWM. `window_ms` is the fixed pulse PERIOD and
@@ -459,7 +459,7 @@ pub(crate) fn analog_digital_pulse(
         slots[0] < on_s || on_s >= period
     } else {
         // ── Plain / Turbo = tap train: frequency tracks amplitude ────────
-        // `window_ms` sets ONLY the minimum period (lowest tap frequency);
+        // `window_ms` sets ONLY the minimum period (the fastest tap rate);
         // a harder push shortens the period up to `max_freq`. Each tap is a
         // clean 50%-duty square wave so it always reads as a distinct tap —
         // NOT a near-held key (the old `tap_on = window_ms` made the duty

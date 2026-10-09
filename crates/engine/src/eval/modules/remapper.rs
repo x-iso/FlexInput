@@ -600,11 +600,30 @@ pub(crate) fn eval_remapper_node(
                 put(vel.to_id(), Signal::Float(if *on { vel_v.max(1.0 / 127.0) } else { 0.0 }));
                 put(pat.to_id(), Signal::Float(if *on { *v } else { 0.0 }));
             }
+            // Each digital card's outputs on this tick: a triggered card's
+            // (after any lifted modifiers), or — for a card with timed outputs
+            // — what its timeline has on, triggered or not: a sequence plays
+            // out after the input lets go.
+            let mut digital_on: Vec<(usize, Vec<String>)> = Vec::new();
+            for (i, m) in mappings.iter().enumerate() {
+                if m.get("mode").and_then(|v| v.as_str()) == Some("analog") { continue; }
+                let trig = triggered.iter().find(|t| t.3 == i && !t.2);
+                let outs: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if OutTiming::from_card(m, outs.len()).is_none() {
+                    ns.out_seq.remove(&(0, i));
+                    if let Some(t) = trig { digital_on.push((i, t.1.clone())); }
+                    continue;
+                }
+                let on: Vec<String> = card_outs_on(m, &outs, trig.is_some(), ns, 0, i, dt)
+                    .into_iter().cloned().collect();
+                if !on.is_empty() { digital_on.push((i, on)); }
+            }
             // A stick direction a card in any other mode sends is a full push
             // that way: sinks read a stick's axes, never its derived direction
             // pins, so the Bool alone moved nothing.
-            for (_, out_pins, is_analog, _) in &triggered {
-                if *is_analog { continue; }
+            for (_, out_pins) in &digital_on {
                 for p in out_pins {
                     if let Some((axis, sign)) = analog_axis_for_cardinal(p) {
                         *analog_axis_acc.entry(axis).or_insert(0.0) += sign;
@@ -660,8 +679,7 @@ pub(crate) fn eval_remapper_node(
                 }
             }
             let mut digital_asserted: HashSet<String> = HashSet::new();
-            for (_, out_pins, is_analog, _) in &triggered {
-                if *is_analog { continue; }
+            for (_, out_pins) in &digital_on {
                 for p in out_pins {
                     if touchpad_out_kind(p).is_some() { continue; } // synthesized below
                     digital_asserted.insert(p.clone());
@@ -685,8 +703,7 @@ pub(crate) fn eval_remapper_node(
             // feeding itself.
             {
                 let mut midi_on_now: HashMap<String, Signal> = HashMap::new();
-                for (_, out_pins, is_analog, idx) in &triggered {
-                    if *is_analog { continue; }
+                for (idx, out_pins) in &digital_on {
                     let (vel, on, _) = midi_card_levels(&mappings[*idx]);
                     for p in out_pins {
                         let Some(pin) = flexinput_core::midi::parse_pin(p) else { continue };

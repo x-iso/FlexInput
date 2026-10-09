@@ -54,6 +54,8 @@ mod remapper_card;
 mod remapper_filter;
 mod remapper_reorder;
 mod remapper_support;
+mod card_options;
+pub(crate) use card_options::CardOptions;
 mod reshape;
 mod rws;
 mod scale;

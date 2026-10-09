@@ -123,6 +123,13 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     // Scroll directions arranged like a d-pad: up on top, left/down/right below.
     c("scroll_up", MOUSE_X + 1.0, 3.0),
     c("scroll_left", MOUSE_X, 4.0), c("scroll_down", MOUSE_X + 1.0, 4.0), c("scroll_right", MOUSE_X + 2.0, 4.0),
+
+    // ── Media row (top right, where a keyboard has them) ──────────────────
+    // `flexinput_core::media::MEDIA_KEYS` order: transport, then volume.
+    c("media_prev_track", MOUSE_X, 0.0), c("media_play_pause", MOUSE_X + 1.0, 0.0),
+    c("media_next_track", MOUSE_X + 2.0, 0.0), c("media_stop", MOUSE_X + 3.0, 0.0),
+    c("media_mute", MOUSE_X + 4.0, 0.0), c("media_volume_down", MOUSE_X + 5.0, 0.0),
+    c("media_volume_up", MOUSE_X + 6.0, 0.0),
 ];
 
 /// An owned picker cell — the static [`KBM_LAYOUT`] plus the current patch's
@@ -171,6 +178,7 @@ pub enum PickStage {
 pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
     let input_only = flexinput_core::imu::is_imu_pin(pin) || CLICK_ZONES.contains(&pin);
     let output_only = pin.starts_with("key_")
+        || flexinput_core::media::is_media_pin(pin)
         || pin.starts_with("mouse")
         || pin.starts_with("scroll_")
         || matches!(pin, "touch_swipe_x" | "touch_swipe_y")
@@ -853,7 +861,7 @@ mod stage_tests {
     /// what can only be read; the pad and its sticks are both.
     #[test]
     fn each_side_of_a_mapping_offers_what_can_sit_there() {
-        for pin in ["key_a", "mouse_left", "scroll_up", "touch_swipe_x", "mouse_x"] {
+        for pin in ["key_a", "mouse_left", "scroll_up", "touch_swipe_x", "mouse_x", "media_volume_up"] {
             assert!(!stage_allows(PickStage::Input, pin), "{pin} is only ever sent");
             assert!(stage_allows(PickStage::Output, pin), "{pin}");
         }
@@ -874,6 +882,17 @@ mod stage_tests {
         use flexinput_core::imu::IMU_PINS;
         for p in IMU_PINS {
             assert!(crate::canvas::remapper_icons::pin_svg(crate::canvas::remapper_icons::Skin::Kbm, p.id).is_some(), "{}", p.id);
+        }
+    }
+
+    /// Every media key is on the keyboard tab, as an output only.
+    #[test]
+    fn the_media_keys_are_on_the_keyboard_tab() {
+        let cells = tab_cells(picker_cells(PickerLayout::default(), &[]), PickerTab::Kbm);
+        for k in flexinput_core::media::MEDIA_KEYS {
+            assert!(cells.iter().any(|c| c.pin == k.pin), "{} missing", k.pin);
+            assert!(!stage_allows(PickStage::Input, k.pin) && stage_allows(PickStage::Output, k.pin));
+            assert_eq!(cell_typed(k.pin, false), None, "{} types nothing", k.pin);
         }
     }
 
@@ -922,5 +941,314 @@ mod tab_tests {
         for (name, _, y) in tab_captions(layout, PickerTab::Gamepad) {
             assert!(y >= 0.0, "{name} is above the board");
         }
+    }
+}
+
+// ── timed outputs, as the picker edits them ──────────────────────────────────
+//
+// An output list can carry time: a gap before a pick (it starts that long
+// after the pick before it) and a pick's own duration (how long it stays on,
+// instead of as long as the card's input does). They're kept beside the pins
+// in two arrays — the engine's `out_gap` / `out_dur` on a card, `<draft>_gap`
+// / `<draft>_dur` on a draft — so everything that reads a list of pins still
+// reads one.
+
+/// The params a draft's timing is kept in, beside the draft `key` itself.
+pub fn timing_keys(key: &str) -> (String, String) {
+    (format!("{key}_gap"), format!("{key}_dur"))
+}
+
+/// Gap a fresh "+ Gap" starts at, ms.
+pub const DEFAULT_GAP_MS: f32 = 50.0;
+/// Duration a pick's first own-duration step starts at, ms.
+pub const DEFAULT_DUR_MS: f32 = 50.0;
+/// One Up / Down of a gap or a duration, ms.
+pub const TIME_STEP_MS: f32 = 10.0;
+/// The shortest a gap can be set to, ms: stepping or typing it smaller
+/// doesn't remove it (that's Delete).
+pub const MIN_GAP_MS: f32 = 1.0;
+
+/// One thing in a chord list the picker can focus: a pick, or the gap before
+/// pick `i` (`i == len` is a gap waiting for the next pick).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordElem {
+    Item(usize),
+    Gap(usize),
+}
+
+/// An edit to the chord list, from a click in the picker window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChordEdit {
+    Delete(ChordElem),
+    /// A gap after this element, or at the end.
+    InsertGap(Option<ChordElem>),
+    SetGap(usize, f32),
+    SetDur(usize, Option<f32>),
+}
+
+/// A chord list with its timing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TimedChord {
+    pub pins: Vec<String>,
+    /// The gap before each pick, ms; one longer than `pins`.
+    pub gaps: Vec<f32>,
+    /// Each pick's own duration, ms; `None` = the card's input's.
+    pub durs: Vec<Option<f32>>,
+}
+
+impl TimedChord {
+    /// From stored params: missing or short timing arrays read as no timing.
+    pub fn from_params(
+        pins: Vec<String>,
+        gaps: Option<&serde_json::Value>,
+        durs: Option<&serde_json::Value>,
+    ) -> Self {
+        let n = pins.len();
+        let arr = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let gaps_v = arr(gaps);
+        let durs_v = arr(durs);
+        TimedChord {
+            gaps: (0..=n).map(|i| gaps_v.get(i).and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0) as f32).collect(),
+            durs: (0..n).map(|i| durs_v.get(i).and_then(|v| v.as_f64()).map(|v| v.max(0.0) as f32)).collect(),
+            pins,
+        }
+    }
+
+    /// Whether picking `pin` next adds it: a new pin always does; one already
+    /// in the list only once a gap has passed since its latest pick, so it's
+    /// a second press rather than the same key twice in one chord.
+    pub fn takes(&self, pin: &str) -> bool {
+        match self.pins.iter().rposition(|p| p == pin) {
+            None => true,
+            Some(k) => self.gaps.get(k + 1..).is_some_and(|g| g.iter().any(|&g| g > 0.0)),
+        }
+    }
+
+    /// Add a pick at the end, after the gap waiting for it.
+    pub fn push(&mut self, pin: String) {
+        self.pins.push(pin);
+        self.durs.push(None);
+        self.gaps.push(0.0);
+    }
+
+    /// A Learn press into this list: a timed list is a sequence being built,
+    /// so the press adds to it (each pin `takes` allows); a plain one is
+    /// replaced by it, as a fresh chord. Returns the new picks.
+    pub fn learn_press(&self, pressed: &[String]) -> Vec<String> {
+        if !self.is_timed() {
+            return pressed.to_vec();
+        }
+        let mut c = self.clone();
+        for p in pressed {
+            if c.takes(p) {
+                c.push(p.clone());
+            }
+        }
+        c.pins
+    }
+
+    pub fn is_timed(&self) -> bool {
+        self.gaps.iter().any(|&g| g > 0.0) || self.durs.iter().any(Option::is_some)
+    }
+
+    /// The gaps as stored: trailing zeros dropped, empty when there are none.
+    pub fn gaps_json(&self) -> serde_json::Value {
+        let last = self.gaps.iter().rposition(|&g| g > 0.0).map_or(0, |i| i + 1);
+        serde_json::Value::Array(self.gaps[..last].iter().map(|&g| serde_json::json!(g)).collect())
+    }
+
+    /// The durations as stored: trailing defaults dropped.
+    pub fn durs_json(&self) -> serde_json::Value {
+        let last = self.durs.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        serde_json::Value::Array(self.durs[..last].iter().map(|d| match d {
+            Some(ms) => serde_json::json!(ms),
+            None => serde_json::Value::Null,
+        }).collect())
+    }
+
+    /// The list as shown: each pick, with its gap before it when it has one
+    /// (and a waiting gap at the end). `timed = false` (an input) shows picks
+    /// only.
+    pub fn elems(&self, timed: bool) -> Vec<ChordElem> {
+        let mut v = Vec::new();
+        for i in 0..=self.pins.len() {
+            if timed && self.gaps.get(i).is_some_and(|&g| g > 0.0) {
+                v.push(ChordElem::Gap(i));
+            }
+            if i < self.pins.len() {
+                v.push(ChordElem::Item(i));
+            }
+        }
+        v
+    }
+
+    /// Take an element out. A pick goes with the gap before it; a gap goes to
+    /// nothing, joining what's either side of it.
+    pub fn delete(&mut self, e: ChordElem) {
+        match e {
+            ChordElem::Item(i) if i < self.pins.len() => {
+                self.pins.remove(i);
+                self.durs.remove(i);
+                self.gaps.remove(i);
+            }
+            ChordElem::Gap(i) if i < self.gaps.len() => self.gaps[i] = 0.0,
+            _ => {}
+        }
+    }
+
+    /// A gap after `e` (after the last pick when `None`), unless one is there.
+    /// Returns where it is.
+    pub fn insert_gap_after(&mut self, e: Option<ChordElem>) -> ChordElem {
+        let i = match e {
+            Some(ChordElem::Item(i)) => i + 1,
+            Some(ChordElem::Gap(i)) => return ChordElem::Gap(i),
+            None => self.pins.len(),
+        };
+        if self.gaps[i] <= 0.0 {
+            self.gaps[i] = DEFAULT_GAP_MS;
+        }
+        ChordElem::Gap(i)
+    }
+
+    /// One step up (`dir > 0`) or down: a gap by [`TIME_STEP_MS`], down to
+    /// [`MIN_GAP_MS`] (Delete takes it out, not a step); a pick's duration from the input's up to [`DEFAULT_DUR_MS`]
+    /// and on, and back down past the smallest step to the input's again.
+    pub fn nudge(&mut self, e: ChordElem, dir: i32) {
+        let step = TIME_STEP_MS * dir.signum() as f32;
+        match e {
+            ChordElem::Gap(i) if i < self.gaps.len() => {
+                let g = self.gaps[i];
+                // Up from the floor lands on the step, not one past it.
+                self.gaps[i] = if dir > 0 && g < TIME_STEP_MS { TIME_STEP_MS } else { (g + step).max(MIN_GAP_MS) };
+            }
+            ChordElem::Item(i) if i < self.durs.len() => {
+                self.durs[i] = match self.durs[i] {
+                    None if dir > 0 => Some(DEFAULT_DUR_MS),
+                    None => None,
+                    Some(d) if d + step < TIME_STEP_MS => None,
+                    Some(d) => Some(d + step),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    pub fn apply(&mut self, edit: ChordEdit) {
+        match edit {
+            ChordEdit::Delete(e) => self.delete(e),
+            ChordEdit::InsertGap(after) => {
+                self.insert_gap_after(after);
+            }
+            ChordEdit::SetGap(i, ms) => {
+                if let Some(g) = self.gaps.get_mut(i) { *g = ms.max(MIN_GAP_MS); }
+            }
+            ChordEdit::SetDur(i, ms) => {
+                if let Some(d) = self.durs.get_mut(i) { *d = ms.map(|m| m.max(1.0)); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timed_chord_tests {
+    use super::*;
+
+    fn chord(pins: &[&str]) -> TimedChord {
+        TimedChord::from_params(pins.iter().map(|p| p.to_string()).collect(), None, None)
+    }
+
+    #[test]
+    fn a_plain_list_has_no_timing_and_stores_none() {
+        let c = chord(&["key_a", "key_b"]);
+        assert!(!c.is_timed());
+        assert_eq!(c.elems(true), [ChordElem::Item(0), ChordElem::Item(1)]);
+        assert_eq!(c.gaps_json(), serde_json::json!([]));
+        assert_eq!(c.durs_json(), serde_json::json!([]));
+    }
+
+    // Pick, + Gap, pick: the gap sits before the second pick, and is what
+    // gets stored.
+    #[test]
+    fn a_gap_inserted_at_the_end_is_the_next_picks() {
+        let mut c = chord(&["key_lctrl"]);
+        assert_eq!(c.insert_gap_after(None), ChordElem::Gap(1));
+        assert_eq!(c.elems(true), [ChordElem::Item(0), ChordElem::Gap(1)], "waiting for the pick");
+        c.pins.push("key_c".into());
+        let c = TimedChord::from_params(c.pins.clone(), Some(&c.gaps_json()), Some(&c.durs_json()));
+        assert_eq!(c.elems(true), [ChordElem::Item(0), ChordElem::Gap(1), ChordElem::Item(1)]);
+        assert_eq!(c.gaps_json(), serde_json::json!([0.0, 50.0]));
+        assert_eq!(c.elems(false), [ChordElem::Item(0), ChordElem::Item(1)], "an input shows no time");
+    }
+
+    // East, + Gap, East: a second press. Without a gap since it, it's the
+    // same key twice in one chord, and isn't taken.
+    #[test]
+    fn a_pin_repeats_only_after_a_gap() {
+        let mut c = chord(&["btn_east"]);
+        assert!(!c.takes("btn_east"));
+        assert!(c.takes("btn_south"));
+        c.insert_gap_after(None);
+        assert!(c.takes("btn_east"));
+        let mut c = chord(&["btn_east", "btn_south"]);
+        c.gaps[1] = 50.0;
+        assert!(c.takes("btn_east"), "a gap anywhere after it will do");
+        assert!(!c.takes("btn_south"));
+    }
+
+    // Learn into a timed list adds to it; into a plain one, a fresh press is a
+    // new chord.
+    #[test]
+    fn learn_adds_to_a_timed_list_and_replaces_a_plain_one() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let plain = chord(&["key_a"]);
+        assert_eq!(plain.learn_press(&s(&["key_b"])), s(&["key_b"]));
+        let mut timed = chord(&["btn_east"]);
+        timed.insert_gap_after(None);
+        assert_eq!(timed.learn_press(&s(&["btn_east", "key_c"])), s(&["btn_east", "btn_east", "key_c"]));
+        let mut dur = chord(&["btn_east"]);
+        dur.durs[0] = Some(30.0);
+        assert_eq!(dur.learn_press(&s(&["btn_east", "key_c"])), s(&["btn_east", "key_c"]),
+            "no gap since East: it's already down");
+    }
+
+    #[test]
+    fn deleting_a_pick_takes_its_gap_and_a_gap_just_goes() {
+        let mut c = chord(&["key_a", "key_b", "key_c"]);
+        c.gaps[1] = 50.0;
+        c.gaps[2] = 80.0;
+        c.durs[1] = Some(30.0);
+        c.delete(ChordElem::Item(1));
+        assert_eq!(c.pins, ["key_a", "key_c"]);
+        assert_eq!(c.gaps, [0.0, 80.0, 0.0]);
+        assert_eq!(c.durs, [None, None]);
+        c.delete(ChordElem::Gap(1));
+        assert!(!c.is_timed());
+    }
+
+    // Up from the input's duration starts at 50 ms and steps by 10; Down past
+    // the smallest step goes back to the input's. A gap steps down to 1 ms and
+    // stays: only Delete takes it out.
+    #[test]
+    fn nudging_steps_durations_and_gaps() {
+        let mut c = chord(&["key_a", "key_b"]);
+        c.nudge(ChordElem::Item(0), 1);
+        assert_eq!(c.durs[0], Some(50.0));
+        c.nudge(ChordElem::Item(0), 1);
+        assert_eq!(c.durs[0], Some(60.0));
+        c.durs[0] = Some(10.0);
+        c.nudge(ChordElem::Item(0), -1);
+        assert_eq!(c.durs[0], None);
+        c.durs[0] = None;
+        c.gaps[1] = 10.0;
+        c.nudge(ChordElem::Gap(1), -1);
+        assert_eq!(c.gaps[1], 1.0);
+        c.nudge(ChordElem::Gap(1), -1);
+        assert_eq!(c.gaps[1], 1.0, "a step never removes it");
+        c.nudge(ChordElem::Gap(1), 1);
+        assert_eq!(c.gaps[1], 10.0);
+        c.apply(ChordEdit::SetGap(1, 0.0));
+        assert_eq!(c.gaps[1], 1.0, "nor does typing 0");
+        c.delete(ChordElem::Gap(1));
+        assert!(!c.is_timed());
     }
 }

@@ -1468,6 +1468,20 @@ fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
     // Accept both the legacy AutoMap Collector form ("A", "Space", "Num0",
     // raw `{egui::Key:?}`) and the Remapper form ("key_a", "key_space",
     // "key_num0", lowercased with a "key_" prefix).
+    // Media keys (`media_*`): enigo's named ones, which carry the extended-key
+    // flag Windows wants for them.
+    if let Some(k) = flexinput_core::media::media_key(name) {
+        return Some(match k.pin {
+            "media_prev_track" => Key::MediaPrevTrack,
+            "media_play_pause" => Key::MediaPlayPause,
+            "media_next_track" => Key::MediaNextTrack,
+            "media_stop" => Key::MediaStop,
+            "media_mute" => Key::VolumeMute,
+            "media_volume_down" => Key::VolumeDown,
+            "media_volume_up" => Key::VolumeUp,
+            _ => return None,
+        });
+    }
     let rest = name.strip_prefix("key_").unwrap_or(name);
     let raw_lower = rest.eq_ignore_ascii_case(rest);
     let _ = raw_lower;
@@ -1630,5 +1644,20 @@ mod instance_id_tests {
         assert_ne!(id0, id1);
         assert_eq!(id0, "virtual.hm.xinput");
         assert_eq!(id1, "virtual.hm.xinput.1");
+    }
+}
+
+#[cfg(test)]
+mod media_key_tests {
+    use super::*;
+
+    /// Every media pin reaches the SendInput backend as enigo's own key for it.
+    #[test]
+    fn every_media_pin_has_an_enigo_key() {
+        for k in flexinput_core::media::MEDIA_KEYS {
+            assert!(egui_key_name_to_enigo(k.pin).is_some(), "{}", k.pin);
+        }
+        assert!(matches!(egui_key_name_to_enigo("media_volume_up"), Some(Key::VolumeUp)));
+        assert!(matches!(egui_key_name_to_enigo("media_play_pause"), Some(Key::MediaPlayPause)));
     }
 }

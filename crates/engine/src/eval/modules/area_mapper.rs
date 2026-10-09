@@ -571,7 +571,14 @@ pub(crate) fn eval_area_mapper_node(
                 (press.gate(raw, slots, dt), share)
             }
         };
-        for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()) {
+        // The buttons and macros on: all while the cell holds, or those the
+        // card's timeline has on. (Its analog outputs follow the cell's share.)
+        let outs: Vec<String> = card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+            .filter_map(|v| v.as_str().map(String::from)).collect();
+        let on_now: Vec<String> = card_outs_on(card, &outs, held, ns, 0, i, dt)
+            .into_iter().cloned().collect();
+        for p in outs.iter().map(String::as_str) {
+            let held = on_now.iter().any(|o| o == p);
             if is_macro_style_target(p) {
                 if held { merge_macro_scalar(collector_sigs, p, Signal::Bool(true)); }
                 continue;

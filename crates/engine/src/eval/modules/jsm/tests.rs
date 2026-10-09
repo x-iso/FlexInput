@@ -642,12 +642,20 @@ fn keys_we_cannot_send_are_reported() {
     );
     assert!(c.bindings.is_empty());
 
-    let c = compile("E = PLAY_PAUSE");
-    assert!(
-        c.lines[0].notes[0].contains("media"),
-        "{:?}",
-        c.lines[0].notes
-    );
+}
+
+// Media and volume keys reach the keyboard sink's media node, as their own
+// `media_` pins.
+#[test]
+fn media_keys_are_sent() {
+    assert_eq!(steps("E = PLAY_PAUSE")[0].out, pin("media_play_pause"));
+    assert_eq!(steps("E = VOLUME_UP")[0].out, pin("media_volume_up"));
+    assert_eq!(steps("E = MUTE")[0].out, pin("media_mute"));
+    assert_eq!(steps("E = STOP_TRACK")[0].out, pin("media_stop"));
+    for k in flexinput_core::media::MEDIA_KEYS {
+        let c = compile(&format!("E = {}", k.jsm));
+        assert!(!matches!(c.lines[0].status, LineStatus::Ignored(_)), "{}: {:?}", k.jsm, c.lines[0]);
+    }
 }
 
 // Pad output names are aliases of each other in JSM and land on our pad pins.

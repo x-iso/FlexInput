@@ -338,6 +338,11 @@ pub mod presets {
     /// mickeys, int8 wheel + AC Pan in whole notches). Same
     /// raw-report path + rationale as KEYBOARD_JSON.
     pub const MOUSE_JSON: &str = include_str!("../profiles/mouse.json");
+
+    /// Virtual media keys — a plain-HID Consumer Control collection, 4-byte
+    /// report of two 16-bit Consumer-page usages. Beside the keyboard rather
+    /// than in it, so the keyboard's boot report stays as it was.
+    pub const CONSUMER_JSON: &str = include_str!("../profiles/consumer.json");
 }
 
 #[cfg(test)]
@@ -408,6 +413,23 @@ mod tests {
         assert_eq!(p.report.byte_size(), 8);
         assert_eq!(p.report.report_id, 0);
         assert!(p.report.fields.iter().all(|f| f.usage_page == 0x07));
+    }
+
+    #[test]
+    fn loads_consumer_preset() {
+        let p = Profile::from_json(presets::CONSUMER_JSON).expect("load consumer");
+        assert_eq!(p.id, "hm-consumer");
+        assert!(!p.requires_xusb_companion);
+        assert_eq!(p.function_mode, 0);
+        assert!(p.own_container);
+        // Two 16-bit Consumer-page usage slots = 4 bytes, no Report ID: the
+        // layout keymouse_hm's media report builder writes.
+        assert_eq!(p.input_report_size, 4);
+        assert_eq!(p.report.byte_size(), 4);
+        assert_eq!(p.report.report_id, 0);
+        assert!(p.report.fields.iter().all(|f| f.usage_page == 0x0C));
+        // Its own PID, in the family the physical-input listeners skip.
+        assert_eq!((p.vid, p.pid), (0x1209, 0xF1E7));
     }
 
     #[test]

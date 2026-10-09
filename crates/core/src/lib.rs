@@ -3,6 +3,7 @@ pub mod frames;
 pub mod imu;
 pub mod automap;
 pub mod macros;
+pub mod media;
 pub mod menu;
 pub mod midi;
 pub mod module;
