@@ -2291,6 +2291,43 @@ mod trigger_tests {
         assert!(!out.sink_outputs.contains_key(&key("mouse_move")));
     }
 
+    /// A Joy-Con 2's optical sensor through a Remapper (so it has to survive
+    /// the bus — the pins were once missing from `ALL_PINS`) onto the keymouse
+    /// sink: with "Joy-Con 2 mouse sensor" on it drives `mouse` (already +Y up),
+    /// scaled by Mouse speed as a wire would be and by Sensor ×; off, nothing.
+    /// The contact button reaches the bus too.
+    #[test]
+    fn route_optical_mouse_drives_the_keymouse_sink() {
+        let dev = "jc2:right:aabbccddeeff";
+        let run = |route: bool| {
+            let mut remap = empty_node(2, "module.remapper");
+            remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+            remap.params.insert("mappings".into(), serde_json::json!([]));
+            let mut sink = keymouse_sink_from_remap(3, 2);
+            sink.params.insert("route_optical_mouse".into(), Value::Bool(route));
+            sink.params.insert("optical_mouse_speed".into(), Value::from(2.0));
+            sink.params.insert("mouse_sensitivity".into(), Value::from(100.0));
+            let graph = ProcessingGraph { nodes: vec![remap, sink] };
+            let mut sigs = HashMap::new();
+            sigs.insert((dev.to_string(), "optical_x".to_string()), Signal::Float(0.03));
+            sigs.insert((dev.to_string(), "optical_y".to_string()), Signal::Float(-0.01));
+            sigs.insert((dev.to_string(), "optical_contact".to_string()), Signal::Bool(true));
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.001, &mut out);
+            out
+        };
+        let pin = |out: &TickOutput, p: &str| {
+            out.sink_outputs.get(&("virtual.keymouse:0".to_string(), p.to_string())).copied()
+        };
+        let on = run(true);
+        match pin(&on, "mouse") {
+            Some(Signal::Vec2(v)) => assert!((v - Vec2::new(6.0, -2.0)).length() < 1e-4, "{v}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(pin(&on, "optical_contact"), Some(Signal::Bool(true)), "contact survives the bus");
+        assert_eq!(pin(&run(false), "mouse"), None, "off by default: the sensor does nothing");
+    }
+
     /// device.source → Remapper (analog stick-cardinal → key) → keymouse sink.
     /// Reproduces the user-reported case: WASD via analog-mode stick mapping.
     fn keymouse_sink_from_remap(uid: usize, remap_uid: usize) -> NodeSnap {

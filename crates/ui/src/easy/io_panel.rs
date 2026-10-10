@@ -114,6 +114,14 @@ const OUTPUT_KBM_CARD_H:     f32 = 100.0;
 /// inner top (title + Mouse speed rows) and its height.
 const KBM_TOUCHPAD_ROW_Y: f32 = 60.0;
 const KBM_TOUCHPAD_ROW_H: f32 = 20.0;
+/// The Joy-Con 2 mouse-sensor checkbox row, under the touchpad one. Shown only
+/// while it can matter (see [`kbm_card_h`]), so the card grows by one row then.
+const KBM_OPTICAL_ROW_Y: f32 = KBM_TOUCHPAD_ROW_Y + KBM_TOUCHPAD_ROW_H;
+
+/// The keymouse card's height, with or without the mouse-sensor row.
+fn kbm_card_h(optical_row: bool) -> f32 {
+    OUTPUT_KBM_CARD_H + if optical_row { KBM_TOUCHPAD_ROW_H } else { 0.0 }
+}
 
 // Easy-mode gamepad outputs are HIDMaestro-backed (ViGEm removed). Old patches
 // that used the ViGEm kinds are migrated to these on load.
@@ -160,7 +168,15 @@ pub fn show(
     // section height is the sum of the two card heights + spacing +
     // section header.
     let total = ui.available_rect_before_wrap();
-    let output_h = OUTPUT_GAMEPAD_CARD_H + CARD_GAP + OUTPUT_KBM_CARD_H
+    // The Joy-Con 2 mouse-sensor toggle: while a pad with the sensor is
+    // connected, or while it's on (so it can always be turned off again).
+    let optical_row = devices.iter().any(|d| d.outputs.iter().any(|p| p.id == "optical_x"))
+        || sink_node_of_kind(canvas, KIND_KEYMOUSE)
+            .and_then(|n| canvas.snarl.get_node(n))
+            .and_then(|n| n.params.get("route_optical_mouse"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let output_h = OUTPUT_GAMEPAD_CARD_H + CARD_GAP + kbm_card_h(optical_row)
         + 28.0 /* header */ + SECTION_GAP + PANEL_PADDING;
     let top_h = (total.height() - output_h).max(120.0);
     let top_rect = egui::Rect::from_min_size(
@@ -188,7 +204,7 @@ pub fn show(
     ui.scope_builder(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
         ui.set_clip_rect(bot_rect);
         show_output_section(ui, canvas, shared_pool, default_collapsed, defaults,
-            &mut nav_targets);
+            optical_row, &mut nav_targets);
     });
 
     // Publish the collected nav targets (stamped with the current pass).
@@ -1228,6 +1244,7 @@ fn show_output_section(
     shared_pool: &SharedDevicePool,
     default_collapsed: bool,
     defaults: DeviceParamDefaults,
+    optical_row: bool,
     nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) {
     use crate::gamepad_nav::{LeftNavAction, LeftNavTarget};
@@ -1273,8 +1290,8 @@ fn show_output_section(
     // Keyboard and Mouse card with Mouse speed slider inline.
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
-        let (km_click, km_rect, ms_target, tp_rect) =
-            keymouse_card(ui, keymouse_on, canvas, defaults, inner_w);
+        let (km_click, km_rect, ms_target, tp_rect, optical_rect) =
+            keymouse_card(ui, keymouse_on, canvas, defaults, inner_w, optical_row);
         if km_click {
             if keymouse_on {
                 remove_sinks_of_kind(canvas, KIND_KEYMOUSE);
@@ -1300,6 +1317,11 @@ fn show_output_section(
                 nav_targets.push(LeftNavTarget { rect,
                     action: LeftNavAction::ToggleParam {
                         node: km_node, key: "route_touchpad".into() } });
+            }
+            if let Some(rect) = optical_rect {
+                nav_targets.push(LeftNavTarget { rect,
+                    action: LeftNavAction::ToggleParam {
+                        node: km_node, key: "route_optical_mouse".into() } });
             }
         }
         ui.add_space(PANEL_PADDING);
@@ -1770,7 +1792,8 @@ fn keymouse_card(
     canvas: &mut Canvas,
     defaults: DeviceParamDefaults,
     width: f32,
-) -> (bool, egui::Rect, Option<(NodeId, egui::Rect)>, Option<egui::Rect>) {
+    optical_row: bool,
+) -> (bool, egui::Rect, Option<(NodeId, egui::Rect)>, Option<egui::Rect>, Option<egui::Rect>) {
     // Card geometry — derived from content rather than a constant so
     // the four stacked rows on the right always fit without spill.
     //
@@ -1779,12 +1802,13 @@ fn keymouse_card(
     //   │ ICON   Mouse speed:   [   300  ]        │
     //   │ ICON   [══════════slider══════════]     │
     //   │ ICON   ☐ Gamepad touchpad → trackpad    │
+    //   │ ICON   ☐ Joy-Con 2 mouse sensor → …     │  (only with `optical_row`)
     //   └─────────────────────────────────────────┘
     //
     // ICON column is the LEFT-half accent surface; content stacks in
     // the right column.
     let icon_col_w = OUTPUT_CARD_ICON_H + 16.0;
-    let card_h = OUTPUT_KBM_CARD_H;
+    let card_h = kbm_card_h(optical_row);
 
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, card_h),
@@ -1858,11 +1882,15 @@ fn keymouse_card(
     let right_content_w = right_inset.width().max(40.0);
     let mut mouse_target: Option<(NodeId, egui::Rect)> = None;
     let mut touchpad_target: Option<egui::Rect> = None;
+    let mut optical_target: Option<egui::Rect> = None;
     if is_active {
         if let Some(km_node) = sink_node_of_kind(canvas, KIND_KEYMOUSE) {
             if let Some(params) = canvas.snarl.get_node_mut(km_node).map(|n| &mut n.params) {
                 mouse_speed_stack(&mut right_ui, params, defaults, right_content_w);
                 touchpad_route_toggle(&mut right_ui, params, true);
+                if optical_row {
+                    optical_route_toggle(&mut right_ui, params, true);
+                }
             }
             // Mouse-speed nav target: the value-row + slider span (~36 px below
             // the title), mirroring `mouse_speed_stack`'s two rows; the touchpad
@@ -1876,6 +1904,12 @@ fn keymouse_card(
                 egui::pos2(right_inset.left(), right_inset.top() + KBM_TOUCHPAD_ROW_Y),
                 egui::vec2(right_inset.width(), KBM_TOUCHPAD_ROW_H),
             ));
+            if optical_row {
+                optical_target = Some(egui::Rect::from_min_size(
+                    egui::pos2(right_inset.left(), right_inset.top() + KBM_OPTICAL_ROW_Y),
+                    egui::vec2(right_inset.width(), KBM_TOUCHPAD_ROW_H),
+                ));
+            }
         }
     } else {
         right_ui.add_enabled_ui(false, |ui| {
@@ -1884,9 +1918,12 @@ fn keymouse_card(
                 Value::from(defaults.mouse_sensitivity as f64));
             mouse_speed_stack(ui, &mut preview, defaults, right_content_w);
             touchpad_route_toggle(ui, &mut preview, false);
+            if optical_row {
+                optical_route_toggle(ui, &mut preview, false);
+            }
         });
     }
-    (resp.clicked(), rect, mouse_target, touchpad_target)
+    (resp.clicked(), rect, mouse_target, touchpad_target, optical_target)
 }
 
 /// The keymouse card's "Gamepad touchpad → trackpad" checkbox (`route_touchpad`).
@@ -1896,14 +1933,38 @@ fn touchpad_route_toggle(
     enabled: bool,
 ) {
     use crate::canvas::viewer::{TOUCHPAD_ROUTE_HOVER, TOUCHPAD_ROUTE_LABEL};
-    let mut checked = params.get("route_touchpad").and_then(|v| v.as_bool()).unwrap_or(false);
+    route_toggle(ui, params, enabled, "route_touchpad", TOUCHPAD_ROUTE_LABEL, TOUCHPAD_ROUTE_HOVER);
+}
+
+/// The keymouse card's "Joy-Con 2 mouse sensor → pointer" checkbox
+/// (`route_optical_mouse`).
+fn optical_route_toggle(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    enabled: bool,
+) {
+    use crate::canvas::viewer::{OPTICAL_MOUSE_ROUTE_HOVER, OPTICAL_MOUSE_ROUTE_LABEL};
+    route_toggle(ui, params, enabled, "route_optical_mouse",
+        OPTICAL_MOUSE_ROUTE_LABEL, OPTICAL_MOUSE_ROUTE_HOVER);
+}
+
+/// One boolean sink param as a keymouse-card checkbox row.
+fn route_toggle(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    enabled: bool,
+    key: &str,
+    label: &str,
+    hover: &str,
+) {
+    let mut checked = params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     ui.add_space(2.0);
     ui.add_enabled_ui(enabled, |ui| {
-        let resp = ui.checkbox(&mut checked, egui::RichText::new(TOUCHPAD_ROUTE_LABEL).size(11.0));
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(11.0));
         if resp.changed() {
-            params.insert("route_touchpad".into(), Value::Bool(checked));
+            params.insert(key.into(), Value::Bool(checked));
         }
-        resp.on_hover_text(TOUCHPAD_ROUTE_HOVER);
+        resp.on_hover_text(hover);
     });
 }
 

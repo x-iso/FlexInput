@@ -815,6 +815,11 @@ pub fn eval_graph_tick(
             let route_touchpad = st.device_id.starts_with("virtual.keymouse")
                 && snap.params.get("route_touchpad").and_then(|v| v.as_bool()).unwrap_or(false);
             let mut touch_frame: Option<trackpad::TouchFrame> = None;
+            // "Joy-Con 2 mouse sensor" (Virtual KB/M, off by default): the
+            // Auto-Map source's optical sensor drives the pointer.
+            let route_optical = st.device_id.starts_with("virtual.keymouse")
+                && snap.params.get("route_optical_mouse").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut optical: Option<Vec2> = None;
 
             // AutoMap: semantic-map source device pins → sink device pins.
             // Uses resolve_mapping() for cross-family translation (e.g. btn_cross → btn_south).
@@ -927,6 +932,12 @@ pub fn eval_graph_tick(
                         click: resolve_sig("btn_touchpad").is_some_and(|s| s.as_bool()),
                     });
                 }
+                if route_optical {
+                    // The device already publishes it in `mouse` units (+Y up,
+                    // Mouse speed 100 = a pixel per count), so it passes as-is.
+                    let axis = |p: &str| resolve_sig(p).map(|s| s.as_float()).unwrap_or(0.0);
+                    optical = Some(Vec2::new(axis("optical_x"), axis("optical_y")));
+                }
             }
 
             // Step the trackpad — or, with routing off, let go of whatever it
@@ -961,6 +972,16 @@ pub fn eval_graph_tick(
                 if o.scroll.x != 0.0 { put("scroll_move_x", Signal::Float(o.scroll.x)); }
                 put("mouse_left", Signal::Bool(o.left));
                 put("mouse_right", Signal::Bool(o.right));
+            }
+            // Like the trackpad: ADDED to whatever else drives the pointer.
+            // Mouse speed applies as it would to a wire; Sensor × on top.
+            if let Some(v) = optical.filter(|v| *v != Vec2::ZERO) {
+                let speed = snap.params.get("optical_mouse_speed")
+                    .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let sig = scale_for_sink("mouse", Signal::Vec2(v * speed));
+                sink_outputs.entry((st.device_id.clone(), "mouse".to_string()))
+                    .and_modify(|cur| *cur = combine_signals(*cur, sig))
+                    .or_insert(sig);
             }
 
             // Resolve Vec2 vs individual axis conflicts (they write the same hardware registers).

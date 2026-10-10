@@ -193,16 +193,20 @@ fn joycon2_shared_outputs() -> Vec<DevicePin> {
         // rate-only pad cannot: the firmware fuses gyro, accel and
         // magnetometer, so yaw is drift-free rather than integrated.
         f2("orientation", "Orientation (absolute)", SignalType::Vec4),
-        // Relative optical-mouse deltas, in report units per frame. Unlike
-        // every other Float pin here these are NOT normalised to −1..1: mouse
-        // travel has no natural full-scale, and clamping it would cap pointer
-        // speed. Scale them with a curve or the RWS module.
-        fl("mouse_dx", "Mouse ΔX (relative)"),
-        fl("mouse_dy", "Mouse ΔY (relative)"),
-        // 0 when the sensor is flat on a surface, rising as it lifts. The
-        // research notes mark the exact units unknown, so it is passed through
-        // raw for now and is mainly useful as a "is it on a desk" gate.
-        fl("mouse_liftoff", "Mouse Lift-off"),
+        // Optical sensor motion in the Virtual KB/M's own mouse units (+Y up,
+        // the default Mouse speed of 100 = one pixel per sensor count), so a
+        // plain wire onto its `mouse` / `mouse_x` / `mouse_y` works. Unlike
+        // every other Float pin here these are NOT clamped to −1..1: mouse
+        // travel has no natural full-scale, and clamping would cap pointer
+        // speed.
+        f2("optical_motion", "Mouse Sensor XY", SignalType::Vec2),
+        fl("optical_x", "Mouse Sensor X"),
+        fl("optical_y", "Mouse Sensor Y"),
+        // On while the sensor sits on a surface or a finger covers it, so it
+        // doubles as a touch button — e.g. a gyro on/off gate.
+        bo("optical_contact", "Mouse Sensor Contact"),
+        // Raw distance byte: 0 on a surface, ≈12 lifted. Diagnostic.
+        fl("optical_distance", "Mouse Sensor Distance (raw)"),
         fl("battery", "Battery (0–1)"),
         bo("charging", "Charging"),
     ]);

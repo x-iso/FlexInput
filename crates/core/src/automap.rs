@@ -338,6 +338,19 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     // It has to live in ALL_PINS or the bus cannot carry it and it could never
     // be picked in a Remapper or Splitter, however the device declares it.
     AutoMapPin { id: "orientation",    display_name: "Orientation (absolute)", signal_type: SignalType::Vec4 },
+    // Joy-Con 2 optical mouse sensor: motion in the Virtual KB/M's mouse units
+    // (+Y up; Mouse speed 100 = a pixel per count), a contact button (on a
+    // surface or covered by a finger) and the raw distance byte. Declared and
+    // published by the backend all along, but — like `btn_c` below — dropped
+    // before the bus until listed here. Deliberately NOT `mouse*`: a direct
+    // match onto the KB/M pins would steer every Joy-Con into the pointer,
+    // and code all over reads a `mouse` prefix as a KB/M OUTPUT (the picker's
+    // output-only stage, the AutoMap "KB/M" group, JSM's editor guard).
+    AutoMapPin { id: "optical_motion",   display_name: "Mouse Sensor XY",       signal_type: SignalType::Vec2 },
+    AutoMapPin { id: "optical_x",        display_name: "Mouse Sensor X",        signal_type: SignalType::Float },
+    AutoMapPin { id: "optical_y",        display_name: "Mouse Sensor Y",        signal_type: SignalType::Float },
+    AutoMapPin { id: "optical_contact",  display_name: "Mouse Sensor Contact",  signal_type: SignalType::Bool },
+    AutoMapPin { id: "optical_distance", display_name: "Mouse Sensor Distance", signal_type: SignalType::Float },
     AutoMapPin { id: "btn_south",     display_name: "South",                signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_east",      display_name: "East",                 signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_west",      display_name: "West",                 signal_type: SignalType::Bool },

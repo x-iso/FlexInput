@@ -243,6 +243,7 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                 field_rate: [0.0; 3],
             yaw_rate: 0.0,
             pin_rate: [0.0; 3],
+                mouse: Default::default(),
                 events: 0,
             },
         );
@@ -309,10 +310,15 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                         payload,
                     );
                 }
-                let Some(snap) = reports::parse_input(side, payload) else {
+                let Some(mut snap) = reports::parse_input(side, payload) else {
                     unparsed += 1;
                     continue;
                 };
+                // USB carries report 0x05, whose mouse block is ABSOLUTE and at
+                // 0x10 — the per-side delta offset `parse_input` reads lands in
+                // the sticks there. Never feed that to a pointer; `pad.mouse`
+                // stays at rest on this transport.
+                snap.mouse = Default::default();
                 let stick = calib.normalize(snap.stick_raw);
                 // Pick up a calibration measured on THIS controller, if the user has
                 // captured one. Pushed every report rather than at connect: a capture

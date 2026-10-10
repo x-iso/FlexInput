@@ -84,6 +84,7 @@ pub(crate) fn kbm_pin_label(pin: &str) -> String {
         "mouse_y" => "Mouse↕".into(),
         "left_stick" => "L-Stick".into(),
         "right_stick" => "R-Stick".into(),
+        "optical_contact" => "Sensor".into(),
         _ => {
             let s = pin.strip_prefix("key_").or_else(|| pin.strip_prefix("mouse_"))
                 .unwrap_or(pin);

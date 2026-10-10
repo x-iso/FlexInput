@@ -199,6 +199,50 @@ pub(crate) fn touchpad_route_header_controls(
          On: fingers up scroll up, like turning a mouse wheel.");
 }
 
+/// Label and hover text for the Virtual KB/M "Joy-Con 2 mouse sensor" toggle
+/// (`route_optical_mouse`), shared like the touchpad's above.
+pub(crate) const OPTICAL_MOUSE_ROUTE_LABEL: &str = "Joy-Con 2 mouse sensor → pointer";
+pub(crate) const OPTICAL_MOUSE_ROUTE_HOVER: &str =
+    "Use the optical sensor of a Joy-Con 2 feeding this output as a mouse:\n\
+     stand it on its rail side on a desk and slide it.\n\
+     Adds to whatever else drives the mouse. Mouse speed applies (100 = one \
+     pixel per sensor count); Advanced mode adds a Sensor × on top.\n\
+     The pad's Mouse Sensor pins can also be wired or mapped directly, and \
+     Mouse Sensor Contact works as a button (on a surface / finger over it).";
+
+/// Advanced-mode Virtual KB/M header controls for the Joy-Con 2 optical
+/// sensor: the toggle and, while it's on, its own speed.
+pub(crate) fn optical_mouse_route_header_controls(
+    ui: &mut egui::Ui,
+    params: &mut std::collections::HashMap<String, Value>,
+    label_cell_w: f32,
+) {
+    let mut on = params.get("route_optical_mouse").and_then(|v| v.as_bool()).unwrap_or(false);
+    let resp = ui.checkbox(&mut on, egui::RichText::new(OPTICAL_MOUSE_ROUTE_LABEL).small());
+    if resp.changed() {
+        params.insert("route_optical_mouse".into(), Value::Bool(on));
+    }
+    resp.on_hover_text(OPTICAL_MOUSE_ROUTE_HOVER);
+    if !on { return; }
+
+    // A multiplier on top of Mouse speed; double-click the track to reset.
+    let key = "optical_mouse_speed";
+    let mut speed = params.get(key).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let initial = speed;
+    ui.horizontal(|ui| {
+        slider_label(ui, "Sensor ×", label_cell_w);
+        let resp = ui.add(egui::Slider::new(&mut speed, 0.05_f32..=20.0)
+            .logarithmic(true)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always));
+        if slider_track_double_clicked(ui, &resp) { speed = 1.0; }
+        ui.add(egui::DragValue::new(&mut speed).speed(0.01).range(0.05_f32..=20.0).fixed_decimals(2));
+    });
+    if (speed - initial).abs() > f32::EPSILON {
+        params.insert(key.into(), Value::from(speed as f64));
+    }
+}
+
 /// A device.source's sticks have different deadzones: the right stick's own
 /// `deadzone_r` (Calibration window) differs from `deadzone`. A gamepad card's
 /// single Deadzone value then shows in orange, and editing it sets both sticks

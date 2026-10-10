@@ -43,4 +43,4 @@ pub use hub::{Joycon2Hub, PadKey, PadState};
 pub use dongle::Joycon2DongleHub;
 pub use usb::Joycon2UsbHub;
 pub use protocol::{Side, NINTENDO_VID, PID_JOYCON2_L, PID_JOYCON2_R};
-pub use reports::{Buttons, Motion, Mouse, PadSnapshot, Power, StickCalib};
+pub use reports::{Buttons, Motion, Mouse, MouseEncoding, MouseTracker, PadSnapshot, Power, StickCalib};

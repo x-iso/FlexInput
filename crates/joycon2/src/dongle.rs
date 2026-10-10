@@ -848,6 +848,7 @@ fn register(shared: &Arc<Shared>, link: &Link) {
             field_rate: [0.0; 3],
             yaw_rate: 0.0,
             pin_rate: [0.0; 3],
+            mouse: Default::default(),
             events: 0,
         },
     );
@@ -922,6 +923,9 @@ fn pump(
         link.last_input = Instant::now();
         if let Some(pad) = shared.pads.lock().unwrap().get_mut(&link.key) {
             pad.streaming = true;
+            if let Some(note) = pad.mouse.update(snap.mouse, link.last_input) {
+                eprintln!("[jc2-dongle] {} {note}", link.key.side.display_name());
+            }
             pad.snapshot = snap;
             pad.stick = stick;
             pad.gyro = o.rate_dps;

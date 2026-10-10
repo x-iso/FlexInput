@@ -449,6 +449,15 @@ pub struct Motion {
     /// diagnostics, not because their meaning is known.
     ///
     /// Roll and pitch now come from gravity instead — see [`tilt_from_accel`].
+    ///
+    /// ⭐ **SUPERSEDED (2026-10-10): the block is decoded — see [`Motion::quat`].**
+    /// The three fields plus their tag bytes are the firmware's own orientation
+    /// quaternion in "divide by the largest component" form. Every test above
+    /// failed for the same two reasons: the tags carry the fields' HIGH bits and
+    /// which component was divided out, and the fields are offset binary of
+    /// different widths (26/25/24 bits), so no reading of the bare 24-bit values
+    /// could ever compose into a rotation. The "glitches" `MAX_STEP` rejects are
+    /// the moments the firmware switches which component it divides by.
     pub angle: [i32; 3],
     /// **The same 12 bytes as [`Motion::angle`], read instead as six i16.**
     ///
@@ -495,6 +504,29 @@ pub struct Motion {
     ///
     /// Scale is [`GYRO_LSB_PER_DPS`].
     pub gyro: Option<[i16; 3]>,
+    /// ⭐ **The firmware's orientation, decoded from the 12 bytes after the
+    /// timestamp** — `[x, y, z, w]`, raw sensor axes (the same axes as
+    /// [`Motion::accel`] before [`to_canonical_accel`]), body to the
+    /// controller's own reference frame. See [`decode_motion_quat`].
+    ///
+    /// Integrated from the gyro with NO gravity correction, so its reference
+    /// frame drifts at the gyro's bias (about 0.5 °/s on an M12-S) — which is
+    /// the "drift" every earlier reading of this block saw. Differences between
+    /// consecutive samples are the true body rotation, which is how
+    /// [`OrientationTracker`] uses it. `None` when the tag bytes do not have the
+    /// expected shape, so a controller sending something else falls back to the
+    /// old path instead of being decoded as nonsense.
+    pub quat: Option<[f32; 4]>,
+    /// The device tick of a console-report block: bits 0-11 of
+    /// [`Motion::timestamp`], 1.25 ms units, wrapping every 4096 without a carry.
+    ///
+    /// ❗ The rest of that word is NOT clock. Bits 15-16 count how many IMU
+    /// samples the report covers, so differencing the whole word turned every
+    /// report that bundled two samples — and every 12-bit wrap — into an
+    /// out-of-range gap. `dt` then fell back to host arrival time, and a two-
+    /// sample rotation divided by one report's worth of time is a spike. Links
+    /// that bundle more often (one half further from the radio) looked noisy.
+    pub tick: Option<u16>,
     /// Accelerometer from the standard block, in counts, `None` when absent.
     ///
     /// Same units as [`Motion::accel`] ([`ACCEL_LSB_PER_G`]) but read from the
@@ -502,6 +534,50 @@ pub struct Motion {
     /// so the two can be compared on hardware instead of one silently replacing
     /// the other.
     pub std_accel: Option<[i16; 3]>,
+}
+
+/// ⭐ Decode the 12 bytes after the motion timestamp into the firmware's
+/// orientation quaternion, `[x, y, z, w]` in raw sensor axes.
+///
+/// Layout, `b` = those 12 bytes: `[tag1][f1 24-bit LE][tag2][f2][tag3][f3]`.
+///
+/// * `tag1` bits 0-1 = which component has the largest magnitude
+///   (0 = w, 1 = x, 2 = y, 3 = z). The firmware divides the other three by it,
+///   so they all stay within ±1 and nothing ever blows up near 180°.
+/// * The three fields are the NEXT three components in cyclic order
+///   (w→x→y→z→w), divided by the largest, as offset binary scaled to ±1:
+///   field 1 is 26 bits (`tag2` bits 0-1 on top), field 2 is 25 bits (`tag3`
+///   bit 0 on top), field 3 is 24 bits.
+///
+/// Verified on five guided captures of an M12-S (2026-10-10): rotating gravity
+/// into the world frame through this quaternion holds it still to 0.7–1.0°
+/// against 22–32° for no rotation, full turns integrate to 361–366°, flips to
+/// 357°, with no step over 4° anywhere — the regime switches are seamless.
+/// The joycon-probe repo has the captures and the scripts.
+pub fn decode_motion_quat(b: &[u8]) -> Option<[f32; 4]> {
+    if b.len() < 12 {
+        return None;
+    }
+    // Anything outside the observed tag shape is not this encoding. `tag3`
+    // bit 7 toggles freely and carries nothing, so it is the one bit allowed.
+    if b[0] & 0xFC != 0 || b[4] & 0xFC != 0 || b[8] & 0x7E != 0 {
+        return None;
+    }
+    let f = |o: usize| b[o] as u32 | (b[o + 1] as u32) << 8 | (b[o + 2] as u32) << 16;
+    let n = [
+        ((f(1) | ((b[4] & 3) as u32) << 24) as f64 - (1u64 << 25) as f64) / (1u64 << 25) as f64,
+        ((f(5) | ((b[8] & 1) as u32) << 24) as f64 - (1u64 << 24) as f64) / (1u64 << 24) as f64,
+        (f(9) as f64 - (1u64 << 23) as f64) / (1u64 << 23) as f64,
+    ];
+    let largest = (b[0] & 3) as usize;
+    let parts = [1.0, n[0], n[1], n[2]];
+    let mut wxyz = [0.0f64; 4];
+    for (j, v) in parts.iter().enumerate() {
+        wxyz[(largest + j) % 4] = *v;
+    }
+    let m = wxyz.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let s = if wxyz[0] < 0.0 { -1.0 / m } else { 1.0 / m };
+    Some([(wxyz[1] * s) as f32, (wxyz[2] * s) as f32, (wxyz[3] * s) as f32, (wxyz[0] * s) as f32])
 }
 
 /// Modulus of the [`Motion::angle`] field — its WIDTH, 24 bits.
@@ -1340,6 +1416,26 @@ mod quat {
         }
     }
 
+    pub fn conj(q: [f32; 4]) -> [f32; 4] {
+        [-q[0], -q[1], -q[2], q[3]]
+    }
+
+    /// Rotate `v` by unit quaternion `q`.
+    pub fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+        let p = mul(mul(q, [v[0], v[1], v[2], 0.0]), conj(q));
+        [p[0], p[1], p[2]]
+    }
+
+    /// Rotation by `|v|` radians about `v`.
+    pub fn from_rotvec(v: [f32; 3]) -> [f32; 4] {
+        let a = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if a < 1e-9 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let s = (a * 0.5).sin() / a;
+        [v[0] * s, v[1] * s, v[2] * s, (a * 0.5).cos()]
+    }
+
     /// `(roll, pitch, yaw)` for consumers that still want Euler angles.
     ///
     /// ZYX, matching the convention the rest of this crate documents. Pitch is
@@ -1512,7 +1608,113 @@ pub struct OrientationTracker {
     /// levelled from the accelerometer instead of starting at identity and
     /// spending seconds converging.
     q: Option<[f32; 4]>,
+    /// Previous decoded firmware quaternion — see [`Motion::quat`].
+    dev_prev: Option<[f32; 4]>,
+    /// Resting bias of the rates recovered from it — see [`QuatBias`].
+    quat_bias: QuatBias,
+    /// Last output, repeated for reports that carry no motion block.
+    last_out: Orientation,
 }
+
+/// Resting gyro bias for the decoded-quaternion path.
+///
+/// ⭐ **Why not [`GyroBias`].** That learner decides "still" from gravity, and
+/// gravity cannot see a rotation about the vertical: a slow steady turn held
+/// for a second passes as rest, and with a 10 °/s plausibility limit the turn
+/// itself is learned as bias. The pad then drifts the other way until the next
+/// genuine rest — reported on hardware as an occasional slow drift, always in
+/// the same couple of directions, that a second of stillness cured.
+///
+/// Measured on two M12-S sessions (every quiet 2 s stretch, 4 minutes each):
+/// the real bias is roll ≈ −0.1, pitch ≈ +0.03, yaw ≈ +0.07 °/s, moving by
+/// under 0.05 °/s across the session, with 0.06–0.08 °/s of noise at rest. So
+/// this learner trusts only what looks like that:
+///
+/// * stillness from the RATES: a [`QUAT_BIAS_WINDOW_SECS`] window in which no
+///   sample strays [`QUAT_BIAS_STRAY_DPS`] from the current estimate and the
+///   spread stays under [`QUAT_BIAS_MAX_SPREAD_DPS`] — hand tremor fails this,
+///   a pad on a table passes it
+/// * a believable size: no axis beyond [`QUAT_BIAS_MAX_DPS`]
+/// * slow adoption ([`QUAT_BIAS_TAU_SECS`]), so a moment that fools both
+///   tests can only nudge the estimate
+#[derive(Debug, Clone, Copy, Default)]
+struct QuatBias {
+    bias: [f32; 3],
+    sum: [f64; 3],
+    sum_sq: [f64; 3],
+    n: u32,
+    secs: f32,
+    seeded: bool,
+}
+
+const QUAT_BIAS_WINDOW_SECS: f32 = 0.5;
+const QUAT_BIAS_STRAY_DPS: f32 = 1.0;
+const QUAT_BIAS_MAX_SPREAD_DPS: f32 = 0.25;
+const QUAT_BIAS_MAX_DPS: f32 = 0.6;
+const QUAT_BIAS_TAU_SECS: f32 = 2.0;
+
+impl QuatBias {
+    fn correct(&mut self, raw: [f32; 3], dt: f32, gravity_ok: bool) -> [f32; 3] {
+        let stray = (0..3).any(|i| (raw[i] - self.bias[i]).abs() > QUAT_BIAS_STRAY_DPS);
+        if stray || !gravity_ok {
+            self.restart();
+        } else {
+            for i in 0..3 {
+                self.sum[i] += raw[i] as f64;
+                self.sum_sq[i] += (raw[i] as f64).powi(2);
+            }
+            self.n += 1;
+            self.secs += dt;
+            if self.secs >= QUAT_BIAS_WINDOW_SECS && self.n >= 8 {
+                self.learn();
+                self.restart();
+            }
+        }
+        [raw[0] - self.bias[0], raw[1] - self.bias[1], raw[2] - self.bias[2]]
+    }
+
+    fn learn(&mut self) {
+        let n = self.n as f64;
+        let mut mean = [0.0f32; 3];
+        for i in 0..3 {
+            let m = self.sum[i] / n;
+            let spread = (self.sum_sq[i] / n - m * m).max(0.0).sqrt() as f32;
+            if spread > QUAT_BIAS_MAX_SPREAD_DPS || (m as f32).abs() > QUAT_BIAS_MAX_DPS {
+                return;
+            }
+            mean[i] = m as f32;
+        }
+        // The first quiet window is adopted outright, so a pad set down after
+        // connecting is clean within half a second.
+        let k = if self.seeded { (self.secs / QUAT_BIAS_TAU_SECS).min(1.0) } else { 1.0 };
+        for i in 0..3 {
+            self.bias[i] += (mean[i] - self.bias[i]) * k;
+        }
+        self.seeded = true;
+    }
+
+    fn restart(&mut self) {
+        self.sum = [0.0; 3];
+        self.sum_sq = [0.0; 3];
+        self.n = 0;
+        self.secs = 0.0;
+    }
+}
+
+/// Time constant for levelling the integrated orientation with gravity.
+///
+/// The firmware's quaternion is pure gyro integration, so tilt error grows at
+/// its bias (~0.5 °/s). One second pulls that back long before it is visible
+/// while staying slow enough that a shove — which the magnitude gate does not
+/// always catch — only nudges the attitude.
+const LEVEL_TAU_SECS: f32 = 1.0;
+
+/// Largest believable rotation between two decoded quaternions, radians.
+///
+/// 1 rad in one report is over 6000 °/s at the slowest link rate, three times
+/// the sensor's full scale. Anything bigger is a lost stretch of reports or a
+/// bad frame, and is held rather than integrated.
+const MAX_QUAT_STEP_RAD: f32 = 1.0;
 
 /// How far gravity may move between reports and still count as "not rotating",
 /// as a fraction of a unit vector.
@@ -1803,12 +2005,25 @@ impl TickClock {
 
     /// [`TickClock::dt`] with the host clock supplied, so that bursty arrival —
     /// the thing this used to get wrong — can be reproduced exactly in a test.
+    /// Same as [`TickClock::dt`] for a counter that wraps at `modulus` — see
+    /// [`Motion::tick`].
+    fn dt_mod(&mut self, stamp: u32, modulus: u32, fallback_hz: f32) -> Option<f32> {
+        self.dt_at_mod(stamp, Some(modulus), fallback_hz, std::time::Instant::now())
+    }
+
     fn dt_at(&mut self, stamp: u32, fallback_hz: f32, now: std::time::Instant) -> Option<f32> {
+        self.dt_at_mod(stamp, None, fallback_hz, now)
+    }
+
+    fn dt_at_mod(&mut self, stamp: u32, modulus: Option<u32>, fallback_hz: f32, now: std::time::Instant) -> Option<f32> {
         let host = self
             .prev_at
             .replace(now)
             .map(|t| now.duration_since(t).as_secs_f64());
-        let ticks = self.prev.replace(stamp).map(|p| stamp.wrapping_sub(p));
+        let ticks = self.prev.replace(stamp).map(|p| match modulus {
+            Some(m) => (stamp % m + m - p % m) % m,
+            None => stamp.wrapping_sub(p),
+        });
 
         let (ticks, host) = match (ticks, host) {
             (Some(t), Some(h)) => (t, h),
@@ -1857,6 +2072,110 @@ impl TickClock {
 }
 
 impl OrientationTracker {
+    /// One report through the decoded firmware quaternion — see [`Motion::quat`].
+    ///
+    /// The quaternion is used for what it is good at, the ROTATION between
+    /// reports, and not for its absolute value, whose reference frame drifts:
+    ///
+    /// 1. body rotation = `conj(prev) * cur`, mapped to canonical axes
+    /// 2. resting bias removed by [`GyroBias`] while the pad is still
+    /// 3. integrated into the orientation, levelled towards gravity with
+    ///    [`LEVEL_TAU_SECS`]
+    ///
+    /// Roll and pitch therefore stay absolute (gravity), and yaw drifts only by
+    /// whatever bias is left after step 2 — there is no compass in this report.
+    ///
+    /// Returns `None` on the first quaternion, which only primes the difference.
+    #[allow(clippy::too_many_arguments)]
+    fn update_from_quat(
+        &mut self,
+        cur: [f32; 4],
+        gdir: Option<[f32; 3]>,
+        gmag: f32,
+        dt: f32,
+        hz: f32,
+        device_still: bool,
+        mount: [(usize, f32); 3],
+    ) -> Option<Orientation> {
+        let prev = self.dev_prev.replace(cur)?;
+        let mut d = quat::mul(quat::conj(prev), cur);
+        if d[3] < 0.0 {
+            d = [-d[0], -d[1], -d[2], -d[3]];
+        }
+        let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let angle = 2.0 * s.atan2(d[3]);
+        let step_raw = if s > 1e-9 && angle < MAX_QUAT_STEP_RAD {
+            [d[0] / s * angle, d[1] / s * angle, d[2] / s * angle]
+        } else {
+            [0.0; 3]
+        };
+        // Same permutation as the accelerometer: the quaternion is in raw
+        // sensor axes, verified against the accel itself.
+        let step = apply_mount([step_raw[1], -step_raw[0], step_raw[2]], mount);
+        let dt = if dt > 1e-6 { dt } else { 1.0 / hz };
+        // Right-handed body rates, canonical axes (x forward, y left, z up).
+        let raw_dps = [step[0].to_degrees() / dt, step[1].to_degrees() / dt, step[2].to_degrees() / dt];
+        let _ = device_still; // the gravity-only stillness test cannot see yaw — see `QuatBias`
+        let gravity_ok = gdir.is_some() && (gmag - 1.0).abs() < STILL_GRAVITY_TOLERANCE;
+        let body_dps = self.quat_bias.correct(raw_dps, dt, gravity_ok);
+
+        let mut q = self.q.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        q = quat::normalise(quat::mul(
+            q,
+            quat::from_rotvec([
+                body_dps[0].to_radians() * dt,
+                body_dps[1].to_radians() * dt,
+                body_dps[2].to_radians() * dt,
+            ]),
+        ));
+        if let Some(g) = gdir {
+            if (gmag - 1.0).abs() < STILL_GRAVITY_TOLERANCE {
+                // Measured up, carried into the world: it should be +z.
+                let w = quat::rotate(q, g);
+                let axis = [w[1], -w[0], 0.0]; // w x +z
+                let sn = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+                if sn > 1e-6 {
+                    let err = sn.atan2(w[2]);
+                    let k = (dt / LEVEL_TAU_SECS).min(1.0) * err / sn;
+                    q = quat::normalise(quat::mul(quat::from_rotvec([axis[0] * k, axis[1] * k, 0.0]), q));
+                }
+            }
+        }
+        self.q = Some(q);
+
+        let euler_rad = quat::to_euler(q);
+        // Keep the old path's yaw in step, so a report that falls back to it
+        // does not snap the heading.
+        self.yaw_rad = euler_rad[2];
+        let prev_euler = self.prev.replace(euler_rad).unwrap_or(euler_rad);
+        let mut rate_dps = [0.0f32; 3];
+        for i in 0..3 {
+            let mut e = euler_rad[i] - prev_euler[i];
+            if e > std::f32::consts::PI {
+                e -= std::f32::consts::TAU;
+            } else if e < -std::f32::consts::PI {
+                e += std::f32::consts::TAU;
+            }
+            rate_dps[i] = e.to_degrees() * hz;
+        }
+
+        // Pin conventions (see `flexinput_devices::gyro::HidReading`): roll
+        // + clockwise from behind = right-handed about forward; pitch
+        // + nose-up = left-handed about the left axis; yaw + clockwise from
+        // above, taken about GRAVITY as before so a tilted grip still yaws
+        // about the world vertical.
+        let up = quat::rotate(quat::conj(q), [0.0, 0.0, 1.0]);
+        let yaw_pin = -canonical_yaw_rate(body_dps, up);
+        Some(Orientation {
+            euler_rad,
+            rate_dps,
+            field_rate_dps: raw_dps,
+            pin_rate_dps: [body_dps[0], -body_dps[1], yaw_pin],
+            yaw_rate_dps: yaw_pin,
+            quat_xyzw: q,
+        })
+    }
+
     /// Replace the compiled-in resting drift with one measured on this
     /// controller; `None` restores the default.
     ///
@@ -1874,6 +2193,22 @@ impl OrientationTracker {
     /// explicitly rather than stored, so a caller cannot forget to set it and
     /// silently get the other half's frame.
     pub fn update(&mut self, motion: &Motion, side: crate::protocol::Side) -> Orientation {
+        // ⭐ A report with no motion block is not a sample. Retail halves
+        // interleave frames whose block is not parsed (see `parse_input`), and
+        // those arrive here as an all-zero `Motion`. Feeding them through gave
+        // the tracker a zero accelerometer, a zero angle and a zero timestamp
+        // — which also became the clock's "previous" stamp for the next real
+        // frame. Hold the last output instead; real frames carry on as if the
+        // empty one never happened.
+        if motion.accel == [0; 3] && motion.quat.is_none() && motion.gyro.is_none() {
+            return self.last_out;
+        }
+        let out = self.update_sample(motion, side);
+        self.last_out = out;
+        out
+    }
+
+    fn update_sample(&mut self, motion: &Motion, side: crate::protocol::Side) -> Orientation {
         let (accel, angle) = (motion.accel, motion.angle);
         // Canonical permutation, then the per-half mounting correction. Both
         // are frame changes; keeping them separate keeps the first anchored to
@@ -1947,6 +2282,7 @@ impl OrientationTracker {
             )));
             self.prev = Some([roll, pitch, 0.0]);
             self.prev_at = Some(std::time::Instant::now());
+            self.dev_prev = motion.quat;
             return Orientation {
                 euler_rad: [roll, pitch, 0.0],
                 rate_dps: [0.0; 3],
@@ -1984,7 +2320,11 @@ impl OrientationTracker {
         // ⛔ Smoothed over a TIME window before anything uses it — see
         // `RATE_WINDOW_SECS`. Report-to-report differencing of a quantised
         // angle put ±3 °/s of spikes on a stationary controller.
-        let dt = self.clock.dt(motion.timestamp, hz).unwrap_or(1.0 / hz);
+        let dt = match motion.tick {
+            Some(t) => self.clock.dt_mod(t as u32, 4096, hz),
+            None => self.clock.dt(motion.timestamp, hz),
+        }
+        .unwrap_or(1.0 / hz);
         let counts = self.rate_window.push(self.field_gyro.rate(angle), dt);
         let per_sec = if dt > 1e-6 { 1.0 / dt } else { hz };
         // Is the controller actually stationary? Gravity is fixed in the world,
@@ -2051,6 +2391,17 @@ impl OrientationTracker {
         self.drift_probe.update(raw_dps, dt, device_still, side);
         self.imu_diag.update(raw_dps, counts, angle, dt, device_still, side,
                              self.resting_override, ca, gmag, motion.gyro);
+
+        // ⭐ The decoded firmware quaternion, when there is no real gyro block.
+        // Everything below this point is the older recovery from the bare fields
+        // and only runs for a controller that does not send the quaternion.
+        if motion.gyro.is_none() {
+            if let Some(cur) = motion.quat {
+                if let Some(o) = self.update_from_quat(cur, gdir, gmag, dt, hz, device_still, mount) {
+                    return o;
+                }
+            }
+        }
 
         // Subtract the reproducible resting drift FIRST, so the estimator only
         // has the session-specific remainder to find — see `RESTING_DRIFT_*`.
@@ -2217,13 +2568,178 @@ impl OrientationTracker {
     }
 }
 
-/// Relative motion from the Joy-Con 2's optical mouse sensor (feature bit 4).
+/// The Joy-Con 2's optical mouse block (feature bit 4), raw.
+///
+/// ⚠️ Whether `x`/`y` are per-report DELTAS or running POSITIONS is disputed:
+/// `ndeadly/switch2_controller_research` documents deltas for this per-side
+/// report, while german77's driver just calls them x/y, and every working PC
+/// tool (joyglide, jc2mouse, JoyCon2Mac) reads the common report 0x05, where
+/// they are absolute u16 positions differenced with wrap. [`MouseTracker`]
+/// works out which from the stream rather than betting on either.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Mouse {
-    pub delta_x: i16,
-    pub delta_y: i16,
-    /// The research doc labels this "Lift-off distance?" — surfaced raw.
-    pub liftoff: u8,
+    pub x: i16,
+    pub y: i16,
+    /// Distance to the surface. ⭐ **0 = touching a surface, > 0 = in the air**
+    /// (≈12 typical) — the reading JoyCon2Mac picks the on-desk Joy-Con by.
+    /// A finger over the sensor is expected to read as a surface too.
+    pub distance: u8,
+}
+
+/// How the controller turned out to encode [`Mouse::x`]/[`Mouse::y`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    /// Not settled yet. No motion is output: guessing wrong either way either
+    /// flings the pointer (a position read as a delta) or garbles it.
+    #[default]
+    Unknown,
+    Absolute,
+    Delta,
+}
+
+/// The optical sensor turned into what pins can carry: a held VELOCITY in
+/// counts per 60 Hz frame (+Y as the sensor reports it), and a debounced
+/// surface-contact flag.
+///
+/// ❗ A raw delta cannot go on a pin: the pin holds its value until the next
+/// report, and the engine runs many ticks (and several per wakeup) on one
+/// device sample, so a delta would be applied once per tick rather than once.
+/// A velocity is a level, which is what a held pin can carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MouseTracker {
+    encoding: MouseEncoding,
+    prev: Option<(i16, i16)>,
+    prev_contact: bool,
+    /// Consecutive identical non-zero samples — a resting position.
+    repeats: u8,
+    /// Times an on-surface `(0, 0)` followed non-zero motion — a delta stream
+    /// coming to rest.
+    rests: u8,
+    last: Option<std::time::Instant>,
+    vel: [f32; 2],
+    /// A non-zero distance has been seen, so the field is live. Until then a
+    /// zero means nothing (an M12-S has no sensor and reads 0 forever), so
+    /// contact stays false rather than reading as permanently covered.
+    alive: bool,
+    zero_frames: u8,
+    contact: bool,
+}
+
+impl MouseTracker {
+    /// Report spacing assumed for the first report after a pause.
+    const NOMINAL_DT: f32 = 0.015;
+    /// Bounds on the measured spacing: notifications that arrive bunched
+    /// would otherwise turn one delta into a spike.
+    const MIN_DT: f32 = 0.004;
+    const MAX_DT: f32 = 0.1;
+    /// No report for this long ⇒ the sensor has stopped; read zero rather
+    /// than the last speed forever. Past a 16 Hz Windows link's interval.
+    const STALE_S: f32 = 0.1;
+    /// A per-report step bigger than this is a re-baseline, not motion; for a
+    /// delta stream it can only be a position.
+    const MAX_STEP: i32 = 1000;
+    /// Identical non-zero samples that mean "a position at rest". A delta
+    /// stream holding one exact non-zero step this long is implausible.
+    const ABS_REPEATS: u8 = 30;
+    const DELTA_RESTS: u8 = 2;
+    /// Zero-distance reports before contact is believed (≈30 ms).
+    const CONTACT_FRAMES: u8 = 2;
+
+    /// Feed one report. Returns a line worth logging when the encoding is
+    /// settled, so a tester's log says which way it went.
+    pub fn update(&mut self, m: Mouse, now: std::time::Instant) -> Option<String> {
+        let dt = self
+            .last
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .filter(|&dt| dt <= Self::MAX_DT)
+            .unwrap_or(Self::NOMINAL_DT)
+            .max(Self::MIN_DT);
+        self.last = Some(now);
+
+        // Contact: debounced onto a surface, off it at once.
+        if m.distance != 0 {
+            self.alive = true;
+            self.zero_frames = 0;
+            self.contact = false;
+        } else if self.alive {
+            self.zero_frames = self.zero_frames.saturating_add(1);
+            self.contact = self.zero_frames >= Self::CONTACT_FRAMES;
+        }
+        let on_surface = m.distance == 0 && self.alive;
+
+        let cur = (m.x, m.y);
+        let note = self.classify(cur, on_surface);
+        let step = match (self.encoding, self.prev) {
+            (MouseEncoding::Delta, _) => (cur.0 as i32, cur.1 as i32),
+            // A lifted sensor zeroes its position (joyglide, jc2mouse), so
+            // a jump to or from the origin is a re-baseline, not motion.
+            (MouseEncoding::Absolute, Some(p)) if p != (0, 0) && cur != (0, 0) => (
+                cur.0.wrapping_sub(p.0) as i32,
+                cur.1.wrapping_sub(p.1) as i32,
+            ),
+            _ => (0, 0),
+        };
+        let step = if step.0.abs() > Self::MAX_STEP || step.1.abs() > Self::MAX_STEP {
+            (0, 0)
+        } else {
+            step
+        };
+        self.prev = Some(cur);
+        self.prev_contact = on_surface;
+        let k = 1.0 / (dt * 60.0);
+        self.vel = [step.0 as f32 * k, step.1 as f32 * k];
+        note
+    }
+
+    fn classify(&mut self, cur: (i16, i16), on_surface: bool) -> Option<String> {
+        if self.encoding != MouseEncoding::Unknown {
+            return None;
+        }
+        let big = (cur.0 as i32).abs() > Self::MAX_STEP || (cur.1 as i32).abs() > Self::MAX_STEP;
+        if cur != (0, 0) && self.prev == Some(cur) {
+            self.repeats = self.repeats.saturating_add(1);
+        } else {
+            self.repeats = 0;
+        }
+        if cur == (0, 0)
+            && on_surface
+            && self.prev_contact
+            && self.prev.is_some_and(|p| p != (0, 0))
+        {
+            self.rests += 1;
+        }
+        let (enc, why) = if big {
+            (MouseEncoding::Absolute, format!("a value of {cur:?} is too large for one report's step"))
+        } else if self.repeats >= Self::ABS_REPEATS {
+            (MouseEncoding::Absolute, format!("it held {cur:?} unchanged at rest"))
+        } else if self.rests >= Self::DELTA_RESTS {
+            (MouseEncoding::Delta, "it returned to (0, 0) on a surface after moving".to_string())
+        } else {
+            return None;
+        };
+        self.encoding = enc;
+        Some(format!("optical mouse x/y are {enc:?}: {why}"))
+    }
+
+    /// `(x, y)` counts per 60 Hz frame in the sensor's sign convention, zero
+    /// once stale.
+    pub fn velocity(&self, now: std::time::Instant) -> [f32; 2] {
+        match self.last {
+            Some(t) if now.duration_since(t).as_secs_f32() <= Self::STALE_S => self.vel,
+            _ => [0.0; 2],
+        }
+    }
+
+    /// On a surface — or covered by a finger. False until the sensor has
+    /// shown it is live, and once the reports stop.
+    pub fn contact(&self, now: std::time::Instant) -> bool {
+        self.contact
+            && self.last.is_some_and(|t| now.duration_since(t).as_secs_f32() <= Self::STALE_S)
+    }
+
+    pub fn encoding(&self) -> MouseEncoding {
+        self.encoding
+    }
 }
 
 /// Battery / charge state from the power-info bitfield.
@@ -2442,9 +2958,9 @@ pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
 
     if payload.len() >= OFF_MOUSE + 5 {
         snap.mouse = Mouse {
-            delta_x: i16le(payload, OFF_MOUSE),
-            delta_y: i16le(payload, OFF_MOUSE + 2),
-            liftoff: payload[OFF_MOUSE + 4],
+            x: i16le(payload, OFF_MOUSE),
+            y: i16le(payload, OFF_MOUSE + 2),
+            distance: payload[OFF_MOUSE + 4],
         };
     }
 
@@ -2487,6 +3003,7 @@ pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
                 timestamp: u32::from_le_bytes([
                     payload[t], payload[t + 1], payload[t + 2], payload[t + 3],
                 ]),
+                tick: Some(u16::from_le_bytes([payload[t], payload[t + 1]]) & 0x0FFF),
                 // i16 on a 4-byte stride, widened for the caller. The two
                 // bytes after each axis are padding, not part of the value.
                 accel: [
@@ -2500,6 +3017,7 @@ pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
                     i24le(payload, g + 8),
                 ],
                 probe,
+                quat: decode_motion_quat(&payload[p..p + 12]),
                 ..Default::default()
             };
 
@@ -2864,9 +3382,74 @@ mod tests {
         let mut buf = vec![0u8; INPUT_REPORT_LEN];
         buf[OFF_MOUSE..OFF_MOUSE + 5].copy_from_slice(&[0xFF, 0xFF, 0x0A, 0x00, 0x42]);
         let s = parse_input(Side::Right, &buf).unwrap();
-        assert_eq!(s.mouse.delta_x, -1);
-        assert_eq!(s.mouse.delta_y, 10);
-        assert_eq!(s.mouse.liftoff, 0x42);
+        assert_eq!(s.mouse.x, -1);
+        assert_eq!(s.mouse.y, 10);
+        assert_eq!(s.mouse.distance, 0x42);
+    }
+
+    /// Feed `samples` 60 Hz apart; return the tracker and the time of the last.
+    fn track(samples: &[(i16, i16, u8)]) -> (MouseTracker, std::time::Instant) {
+        let mut t = std::time::Instant::now();
+        let mut m = MouseTracker::default();
+        for &(x, y, distance) in samples {
+            t += std::time::Duration::from_micros(16_667);
+            m.update(Mouse { x, y, distance }, t);
+        }
+        (m, t)
+    }
+
+    /// Lifted (distance 12), set down, moved twice and stopped twice: a delta
+    /// stream. Afterwards a 3-count step is 3 counts per 60 Hz frame.
+    #[test]
+    fn a_stream_that_rests_at_zero_is_deltas() {
+        let mut s = vec![(0, 0, 12), (0, 0, 0), (0, 0, 0)];
+        s.extend([(5, 0, 0), (0, 0, 0), (0, -4, 0), (0, 0, 0)]);
+        let (m, _) = track(&s);
+        assert_eq!(m.encoding(), MouseEncoding::Delta);
+        s.push((3, -6, 0));
+        let (m, t) = track(&s);
+        let [x, y] = m.velocity(t);
+        assert!((x - 3.0).abs() < 1e-3 && (y + 6.0).abs() < 1e-3, "{x} {y}");
+        assert!(m.contact(t));
+        assert_eq!(m.velocity(t + std::time::Duration::from_millis(150)), [0.0, 0.0]);
+        assert!(!m.contact(t + std::time::Duration::from_millis(150)), "no reports, no contact");
+    }
+
+    /// A position at rest is absolute; motion is then the wrapped difference,
+    /// and a jump to or from the lifted (0, 0) is a re-baseline, not a fling.
+    #[test]
+    fn a_position_held_at_rest_is_absolute_and_differenced_with_wrap() {
+        let mut s = vec![(0, 0, 12)];
+        s.extend(std::iter::repeat((100, 200, 0)).take(31));
+        let (m, _) = track(&s);
+        assert_eq!(m.encoding(), MouseEncoding::Absolute);
+        s.push((103, 194, 0));
+        let (m, t) = track(&s);
+        let [x, y] = m.velocity(t);
+        assert!((x - 3.0).abs() < 1e-3 && (y + 6.0).abs() < 1e-3, "{x} {y}");
+        // Wrap: i16::MAX → i16::MIN is one count forward.
+        let (m, t) = track(&[(0, 0, 12), (i16::MAX, 5, 0), (i16::MIN, 5, 0)]);
+        assert_eq!(m.encoding(), MouseEncoding::Absolute, "a value that large is a position");
+        assert!((m.velocity(t)[0] - 1.0).abs() < 1e-3, "{:?}", m.velocity(t));
+        s.extend([(0, 0, 12), (900, 900, 0)]);
+        let (m, t) = track(&s);
+        assert_eq!(m.velocity(t), [0.0, 0.0], "setting it down again is not motion");
+    }
+
+    /// Contact is distance 0, debounced on and dropped at once — but only after
+    /// the field has shown it is live: an M12-S (no sensor) reads 0 forever.
+    #[test]
+    fn contact_needs_a_live_distance_field() {
+        let (m, t) = track(&[(0, 0, 0); 10]);
+        assert!(!m.contact(t), "never seen non-zero: no sensor, not a covered one");
+        assert_eq!(m.encoding(), MouseEncoding::Unknown);
+        assert_eq!(m.velocity(t), [0.0, 0.0]);
+        let (m, t) = track(&[(0, 0, 12), (0, 0, 0)]);
+        assert!(!m.contact(t), "one frame is not enough");
+        let (m, t) = track(&[(0, 0, 12), (0, 0, 0), (0, 0, 0)]);
+        assert!(m.contact(t));
+        let (m, t) = track(&[(0, 0, 12), (0, 0, 0), (0, 0, 0), (0, 0, 9)]);
+        assert!(!m.contact(t), "lifting drops contact at once");
     }
 
     #[test]
@@ -3166,6 +3749,79 @@ mod tests {
             "expected ~5 ms per report, got {dt} s — the clock is out by x{:.2}",
             dt / 0.005,
         );
+    }
+
+    /// The console tick is 12 bits with sample-count bits above it: a wrap and
+    /// a two-sample report must both be ordinary steps, the second one twice
+    /// as long.
+    #[test]
+    fn the_console_tick_wraps_at_4096_and_counts_bundled_samples() {
+        let mut c = TickClock::default();
+        assert_eq!(c.dt_mod(4090, 4096, 100.0), None);
+        let one = c.dt_mod(6, 4096, 100.0).expect("4090 -> 6 is a 12-tick step");
+        assert!((one - 0.01).abs() < 1e-6, "fallback until calibrated, got {one}");
+        // A raw word with the sample-count bits flipping is what used to break.
+        let w1 = 0x0C00_8000u32 | 18;
+        let w2 = 0x0C01_0000u32 | 42; // two samples, 24 ticks later
+        let (t1, t2) = ((w1 & 0xFFF) as u32, (w2 & 0xFFF) as u32);
+        let mut c = TickClock::default();
+        c.dt_mod(t1, 4096, 100.0);
+        assert!(c.dt_mod(t2, 4096, 100.0).is_some(), "bundled report must still have a dt");
+        assert_eq!(TickClock::default().dt_mod(t1, 4096, 100.0), None);
+    }
+
+    /// A frame with no motion block repeats the last output and does not
+    /// disturb the clock or the orientation.
+    #[test]
+    fn an_empty_motion_frame_holds_the_last_output() {
+        let mut t = OrientationTracker::default();
+        let m = Motion { accel: [0, 0, ACCEL_LSB_PER_G as i32], quat: Some([0.0, 0.0, 0.0, 1.0]), tick: Some(100), ..Default::default() };
+        t.update(&m, Side::Right);
+        let held = t.update(&Motion { tick: Some(112), ..m }, Side::Right);
+        let empty = t.update(&Motion::default(), Side::Right);
+        assert_eq!(empty, held);
+    }
+
+    /// A pad on a table with a typical bias and noise: learned, and removed.
+    #[test]
+    fn the_quaternion_bias_learns_a_real_resting_bias() {
+        let mut b = QuatBias::default();
+        let truth = [-0.1f32, 0.03, 0.07];
+        let mut out = [0.0; 3];
+        for i in 0..800 {
+            // Deterministic +-0.08 deg/s wobble, the measured resting noise.
+            let w = ((i * 37 % 17) as f32 / 8.0 - 1.0) * 0.08;
+            out = b.correct([truth[0] + w, truth[1] - w, truth[2] + w], 0.0075, true);
+        }
+        for i in 0..3 {
+            assert!((b.bias[i] - truth[i]).abs() < 0.03, "axis {i}: learned {:?}", b.bias);
+            assert!(out[i].abs() < 0.15, "axis {i} residual {:?}", out);
+        }
+    }
+
+    /// The drift bug: a slow, steady turn about vertical is invisible to
+    /// gravity and used to be learned as bias. It must not be — not at a
+    /// speed a hand makes on purpose, nor at a crawl.
+    #[test]
+    fn a_slow_steady_turn_is_not_learned_as_bias() {
+        for yaw in [0.8f32, 2.0, 5.0] {
+            let mut b = QuatBias::default();
+            for _ in 0..2000 {
+                b.correct([0.0, 0.0, yaw], 0.0075, true);
+            }
+            assert!(b.bias[2].abs() < 1e-6, "{yaw} deg/s turn learned as bias {:?}", b.bias);
+        }
+    }
+
+    /// Hand tremor is not stillness, even when it averages to nothing.
+    #[test]
+    fn tremor_is_not_learned_as_bias() {
+        let mut b = QuatBias::default();
+        for i in 0..2000 {
+            let w = if i % 6 < 3 { 0.6 } else { -0.4 };
+            b.correct([w, -w, 0.3 + w], 0.0075, true);
+        }
+        assert_eq!(b.bias, [0.0; 3], "tremor learned as {:?}", b.bias);
     }
 
     /// Calibration must survive the timestamp counter wrapping at 2^32.
@@ -3531,6 +4187,81 @@ mod orientation_tests {
     use super::*;
 
     const G: i32 = ACCEL_LSB_PER_G as i32;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// Two 30-byte motion blocks captured from an M12-S-R: lying flat just
+    /// after power-on (identity, largest component w) and stood on its end
+    /// (largest component x). Through the decoded quaternion the measured
+    /// gravity must land on world +z in both.
+    #[test]
+    fn the_motion_quaternion_decodes_captured_blocks() {
+        let cases = [
+            ("F8C7000C0068D4FF011E41FF00B438800000230000000D000000F40F0000", [35.0f32, 13.0, 4084.0]),
+            ("F68A010C016844C20162EF0E01649FFE0000C801000040100000C3FF0000", [456.0, 4160.0, -61.0]),
+        ];
+        for (block, acc) in cases {
+            let b = hex(block);
+            let q = decode_motion_quat(&b[4..16]).expect("tag shape");
+            let n = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
+            let up = quat::rotate(q, [acc[0] / n, acc[1] / n, acc[2] / n]);
+            assert!(up[2] > 0.995, "gravity not up: {up:?}");
+        }
+        // The power-on block is the identity to within a fraction of a degree.
+        let q = decode_motion_quat(&hex(cases[0].0)[4..16]).unwrap();
+        assert!(q[3] > 0.9999, "{q:?}");
+    }
+
+    #[test]
+    fn a_foreign_tag_shape_is_not_decoded() {
+        let mut b = hex("F8C7000C0068D4FF011E41FF00B438800000230000000D000000F40F0000");
+        b[8] = 0x40;
+        assert_eq!(decode_motion_quat(&b[4..16]), None);
+    }
+
+    /// A pad lying flat and turning LEFT about vertical through the quaternion
+    /// path: the yaw pin is clockwise-positive, so it must read negative, at
+    /// the rate actually turned, and the model's yaw must go positive.
+    #[test]
+    fn a_left_turn_through_the_quaternion_reads_negative_yaw_on_the_pin() {
+        let mut t = OrientationTracker::default();
+        let per_report = 1.0f32.to_radians();
+        let mut last = Orientation::default();
+        for i in 0..40 {
+            let a = per_report * i as f32;
+            let m = Motion {
+                accel: [0, 0, G],
+                quat: Some([0.0, 0.0, (a * 0.5).sin(), (a * 0.5).cos()]),
+                ..Default::default()
+            };
+            last = t.update(&m, Side::Right);
+        }
+        let want = REPORT_HZ; // 1 degree per report at the fallback rate
+        assert!((last.pin_rate_dps[2] + want).abs() < 0.05 * want, "yaw pin {:?}", last.pin_rate_dps);
+        assert!(last.pin_rate_dps[0].abs() < 0.5 && last.pin_rate_dps[1].abs() < 0.5);
+        assert!(last.euler_rad[2] > 0.5, "model yaw {}", last.euler_rad[2]);
+    }
+
+    /// Nose up about the canonical side axis: raw +x is canonical -y, so a
+    /// right-handed raw rotation about +x is nose-UP and the pitch pin is +.
+    #[test]
+    fn nose_up_through_the_quaternion_reads_positive_pitch() {
+        let mut t = OrientationTracker::default();
+        let per_report = 0.5f32.to_radians();
+        let mut last = Orientation::default();
+        for i in 0..20 {
+            let a = per_report * i as f32;
+            let m = Motion {
+                accel: [0, 0, G],
+                quat: Some([(a * 0.5).sin(), 0.0, 0.0, (a * 0.5).cos()]),
+                ..Default::default()
+            };
+            last = t.update(&m, Side::Right);
+        }
+        assert!(last.pin_rate_dps[1] > 0.4 * REPORT_HZ, "pitch pin {:?}", last.pin_rate_dps);
+    }
 
     /// A motion block carrying just the two fields these tests exercise.
     ///

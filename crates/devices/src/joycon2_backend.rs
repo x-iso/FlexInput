@@ -22,6 +22,11 @@ use crate::{layouts, ControllerKind, DeviceBackend, PhysicalDevice};
 /// to evidence instead of a coincidence.
 const JC2_ACCEL_G_PER_LSB: f32 = 1.0 / flexinput_joycon2::reports::ACCEL_LSB_PER_G;
 
+/// Optical-sensor pin units per sensor count per 60 Hz frame. The Virtual
+/// KB/M multiplies its `mouse` pins by Mouse speed (default 100) into pixels
+/// per 60 Hz frame, so 1/100 makes a direct wire one pixel per count by default.
+const MOUSE_PIN_PER_COUNT: f32 = 1.0 / 100.0;
+
 pub struct Joycon2Backend {
     hub: Joycon2Hub,
     usb: Joycon2UsbHub,
@@ -267,12 +272,20 @@ fn push_common(
     pad: &PadState,
     spike: &mut SpikeFilter,
 ) {
-    let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
+    // The optical sensor, in the Virtual KB/M's mouse units so a plain wire
+    // works: +Y up, and scaled so the default Mouse speed (100) moves one
+    // pixel per sensor count. The raw per-report step can't sit on a held pin
+    // (see `MouseTracker`), so this is its velocity.
+    let now = std::time::Instant::now();
+    let [mx, my] = pad.mouse.velocity(now);
+    let motion = glam::Vec2::new(mx, -my) * MOUSE_PIN_PER_COUNT;
+    out.push((dev.into(), "optical_motion".into(), Signal::Vec2(motion)));
+    out.push((dev.into(), "optical_contact".into(), Signal::Bool(pad.mouse.contact(now))));
 
-    // Mouse deltas are relative and intentionally unnormalised (see layouts.rs).
-    f("mouse_dx", pad.snapshot.mouse.delta_x as f32);
-    f("mouse_dy", pad.snapshot.mouse.delta_y as f32);
-    f("mouse_liftoff", pad.snapshot.mouse.liftoff as f32);
+    let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
+    f("optical_x", motion.x);
+    f("optical_y", motion.y);
+    f("optical_distance", pad.snapshot.mouse.distance as f32);
     f("battery", pad.snapshot.power.fraction());
 
     // ⭐ The gyro pins now carry the FIELD-derived rate, not the accel-derived
@@ -601,6 +614,7 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
         pin_rate: [0.0; 3],
         orientation: [0.0; 3],
                 orientation_quat: [0.0, 0.0, 0.0, 1.0],
+        mouse: Default::default(),
         events: 0,
     };
     let mut out = Vec::new();

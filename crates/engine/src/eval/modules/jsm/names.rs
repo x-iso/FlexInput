@@ -41,6 +41,10 @@ pub enum Btn {
     RTouch,
     LMini,
     RMini,
+    /// `OPTICAL` — FlexInput's own: a Joy-Con 2's optical (mouse) sensor
+    /// touching something, a surface or a finger over it. Switch2Connect's
+    /// sensor-gated gyro is `GYRO_ON = OPTICAL`.
+    Optical,
     /// A MIDI message used as a button (`MIDI_C4 = SPACE`) — FlexInput's own
     /// vocabulary, see [`super::midi`]. Parametric like `T(n)`, and far too
     /// many to list in [`Btn::ALL`]; `midi.rs` round-trips its own names.
@@ -133,7 +137,7 @@ impl Btn {
         Btn::Mup, Btn::Mdown, Btn::Mleft, Btn::Mright, Btn::Mring,
         Btn::Tup, Btn::Tdown, Btn::Tleft, Btn::Tright, Btn::Tring,
         Btn::Touch, Btn::Capture,
-        Btn::LTouch, Btn::RTouch, Btn::LMini, Btn::RMini,
+        Btn::LTouch, Btn::RTouch, Btn::LMini, Btn::RMini, Btn::Optical,
         // The numbered families, listed rather than generated so the round-trip
         // test covers their bounds too.
         Btn::T(1), Btn::T(2), Btn::T(3), Btn::T(4), Btn::T(5),
@@ -180,7 +184,7 @@ impl Btn {
             "MUP" => Mup, "MDOWN" => Mdown, "MLEFT" => Mleft, "MRIGHT" => Mright, "MRING" => Mring,
             "TOUCH" => Touch, "CAPTURE" => Capture,
             "LTOUCH" => LTouch, "RTOUCH" => RTouch, "LMINI" => LMini, "RMINI" => RMini,
-            "ZLF" => Zlf, "ZRF" => Zrf,
+            "ZLF" => Zlf, "ZRF" => Zrf, "OPTICAL" => Optical,
             "TUP" => Tup, "TDOWN" => Tdown, "TLEFT" => Tleft, "TRIGHT" => Tright, "TRING" => Tring,
             _ => return None,
         })
@@ -220,7 +224,7 @@ impl Btn {
             LTouch => "LTOUCH".into(), RTouch => "RTOUCH".into(),
             LMini => "LMINI".into(), RMini => "RMINI".into(),
             Misc(n) => format!("MISC{n}"),
-            Zlf => "ZLF".into(), Zrf => "ZRF".into(),
+            Zlf => "ZLF".into(), Zrf => "ZRF".into(), Optical => "OPTICAL".into(),
             Tup => "TUP".into(), Tdown => "TDOWN".into(), Tleft => "TLEFT".into(),
             Tright => "TRIGHT".into(), Tring => "TRING".into(),
             T(n) => format!("T{n}"),
@@ -283,6 +287,7 @@ impl Btn {
                 "the bus has no pin for a mini shoulder button; try LSL / LSR / RSL / RSR for a \
                  rail button, or a MISC one for whatever your pad calls it",
             ),
+            Optical => S::Pin("optical_contact"),
             Midi(m) => S::Midi(m),
             Macro { id, at } => S::Macro { id, at },
             Tup => S::TouchZone { cell: None, dir: Some(Dir::Up) },

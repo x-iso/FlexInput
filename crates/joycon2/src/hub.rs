@@ -171,6 +171,10 @@ pub struct PadState {
     /// canonical order, with the fields' pose-dependent leak cancelled — see
     /// [`crate::reports::Orientation::pin_rate_dps`].
     pub pin_rate: [f32; 3],
+    /// The optical sensor as a velocity and a contact flag — see
+    /// [`crate::reports::MouseTracker`]. Read this, not `snapshot.mouse`, which
+    /// is one raw report.
+    pub mouse: crate::reports::MouseTracker,
     /// Reports received since the last [`Joycon2Hub::take_event_counts`].
     pub events: u32,
 }
@@ -961,6 +965,7 @@ async fn run_session(
                 field_rate: [0.0; 3],
                 yaw_rate: 0.0,
                 pin_rate: [0.0; 3],
+                mouse: Default::default(),
                 events: 0,
             },
         );
@@ -1267,6 +1272,9 @@ async fn run_session(
                 }
 
                 if let Some(pad) = shared.pads.lock().unwrap().get_mut(&key) {
+                    if let Some(note) = pad.mouse.update(snap.mouse, std::time::Instant::now()) {
+                        eprintln!("[jc2] {} {note}", side.display_name());
+                    }
                     pad.snapshot = snap;
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;

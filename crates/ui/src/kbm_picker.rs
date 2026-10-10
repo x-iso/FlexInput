@@ -176,7 +176,9 @@ pub enum PickStage {
 /// are only ever read. Everything else — pad buttons, stick directions, whole
 /// sticks, triggers, touch zones — works both ways.
 pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
-    let input_only = flexinput_core::imu::is_imu_pin(pin) || CLICK_ZONES.contains(&pin);
+    let input_only = flexinput_core::imu::is_imu_pin(pin)
+        || CLICK_ZONES.contains(&pin)
+        || pin == OPTICAL_CONTACT;
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
         || pin.starts_with("mouse")
@@ -271,6 +273,12 @@ const GYRO_Y: f32 = PAD_ROW_Y;
 const ACCEL_X: f32 = GYRO_X + 4.0;
 const TILT_Y: f32 = PAD_ROW_Y + 4.0;
 
+/// The Joy-Con 2's optical sensor touching something — a surface, or a finger
+/// over it. Input only, and only ever CHOSEN: Learn can't take it, since a pad
+/// resting on a desk holds it on forever and Learn latches when all is let go.
+/// Sits beside Tilt, under Accel.
+pub const OPTICAL_CONTACT: &str = "optical_contact";
+
 /// The touchpad (DualSense / DualShock): its touch zones; its click, the
 /// DualSense mic button and the analog swipes — only usable when an analog
 /// input is captured. Hidden in Touch Zones' variant: a touchpad can't remap
@@ -348,6 +356,7 @@ pub fn cluster_captions(layout: PickerLayout) -> Vec<(&'static str, f32, f32)> {
         v.push(("GYRO", GYRO_X, GYRO_Y - 0.42));
         v.push(("ACCEL (motion)", ACCEL_X, GYRO_Y - 0.42));
         v.push(("TILT", GYRO_X, TILT_Y - 0.42));
+        v.push(("MOUSE SENSOR", ACCEL_X, TILT_Y - 0.42));
     }
     v
 }
@@ -424,6 +433,7 @@ pub fn picker_cells(
     }
     if inputs {
         cells.extend(imu_cells().iter().map(PickerCell::from));
+        cells.push((&c(OPTICAL_CONTACT, ACCEL_X, TILT_Y)).into());
         // The click zones go on the touchpad cluster's last row, which Touch
         // Zones' variant hides — it has no input stage to need them.
         if !tz {
@@ -865,7 +875,7 @@ mod stage_tests {
             assert!(!stage_allows(PickStage::Input, pin), "{pin} is only ever sent");
             assert!(stage_allows(PickStage::Output, pin), "{pin}");
         }
-        for pin in ["imu_gyro_yaw_right", "imu_tilt_roll", "touchpad_left", "touchpad_any"] {
+        for pin in ["imu_gyro_yaw_right", "imu_tilt_roll", "touchpad_left", "touchpad_any", OPTICAL_CONTACT] {
             assert!(stage_allows(PickStage::Input, pin), "{pin}");
             assert!(!stage_allows(PickStage::Output, pin), "{pin} is only ever read");
         }

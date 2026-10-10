@@ -243,11 +243,8 @@ pub mod feature {
     /// none beat applying no rotation at all. Meanwhile the bytes where the
     /// standard accel and gyro live stayed zero, because they were switched off.
     ///
-    /// ⚠️ [`MOUSE`] is dropped here to match the reference exactly rather than
-    /// to save the bit. If the optical sensor goes quiet, `0x3f` is the obvious
-    /// next thing to try — but the reference is the only configuration known to
-    /// produce working motion on this hardware, so it is what ships until the
-    /// gyro is confirmed.
+    /// ⚠️ [`MOUSE`] was dropped to match the reference exactly; it is set again
+    /// now (`0x3f`, see below) so the optical sensor streams.
     /// ⛔ **0x2f, and NOT changed to 0x07 without hardware saying so.**
     ///
     /// Two sources disagree and only one of them is a capture:
@@ -264,7 +261,13 @@ pub mod feature {
     /// and every one left `0x30..0x3c` zero. On that controller the block lives
     /// behind a command channel that ignores everything sent to it — see
     /// `docs/BLUETOOTH_TRANSPORTS.md`. Retail Joy-Con 2 firmware is untested.
-    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | RUMBLE; // 0x2f
+    ///
+    /// ⭐ **Now 0x3f: [`MOUSE`] is back on**, so a retail Joy-Con 2 streams its
+    /// optical sensor (the M12-S has none). Official software sets the bit too
+    /// (its 0x37), and the M12-S sweep above acknowledged 0x3f with nothing
+    /// else changing — so it costs the clone nothing. Untested on a retail
+    /// half; if one goes wrong with it, this bit is the first suspect.
+    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | MOUSE | RUMBLE; // 0x3f
 
     /// `JOYCON2_DEFAULT` plus the magnetometer (0xB7).
     ///
@@ -553,17 +556,21 @@ mod tests {
     /// change has to disagree with the reference's actual payload byte.
     #[test]
     fn joycon2_default_features_enable_the_raw_imu() {
-        assert_eq!(feature::JOYCON2_DEFAULT, 0x2f);
+        // The reference's 0x2f plus the optical mouse.
+        assert_eq!(feature::JOYCON2_DEFAULT, 0x2f | feature::MOUSE);
         assert_ne!(
             feature::JOYCON2_DEFAULT & feature::IMU_RAW,
             0,
             "without IMU_RAW the standard gyro block is never sent",
         );
-        // Exactly the payload byte the working reference writes in
-        // `0c 91 01 02 00 04 00 00 2f 00 00 00`.
+        assert_ne!(
+            feature::JOYCON2_DEFAULT & feature::MOUSE,
+            0,
+            "without MOUSE a retail Joy-Con 2's optical sensor stays silent",
+        );
         assert_eq!(
             command(CMD_FEATURE_SELECT, SUB_FEATURE_INIT, &[feature::JOYCON2_DEFAULT, 0, 0, 0]),
-            vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00],
+            vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00],
         );
     }
 

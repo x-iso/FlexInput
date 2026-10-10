@@ -131,6 +131,10 @@ pub(crate) fn remapper_pressed_now(
         // suppressed in Remapper Learn — the zone synthesis below already
         // expresses the same information as touch_left/center/right.
         if ap.id == "touch1_active" || ap.id == "touch2_active" { continue; }
+        // A Joy-Con 2 resting on a desk holds its sensor contact on for ever,
+        // and Learn only latches once everything is let go — so it would never
+        // finish, and an armed capture holds gamepad nav. Chosen, not learned.
+        if ap.id == crate::kbm_picker::OPTICAL_CONTACT { continue; }
         if ap.id == "btn_lt_dig" && lt_analog { continue; }
         if ap.id == "btn_rt_dig" && rt_analog { continue; }
         // btn_touchpad is conditionally suppressed below: when a finger is
@@ -434,6 +438,10 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
         return ui.label(egui::RichText::new(media_chip_label(k)).size(13.0).strong())
             .on_hover_text(k.name).rect;
     }
+    if pin_id == crate::kbm_picker::OPTICAL_CONTACT {
+        return ui.label(egui::RichText::new("Sensor").size(13.0).strong())
+            .on_hover_text(remapper_pin_display(pin_id)).rect;
+    }
     let imu = flexinput_core::imu::imu_pin(pin_id);
     if let (Some(p), None) = (imu, remapper_icons::pin_svg(skin, pin_id)) {
         return ui.label(egui::RichText::new(imu_chip_label(p)).size(13.0).strong())
@@ -664,6 +672,10 @@ pub(crate) fn paint_chord_chip_tinted(
     // Media keys have no glyphs yet: the label is the rendering.
     if let Some(k) = flexinput_core::media::media_key(pin_id) {
         return paint_text_pill(painter, top_left, chip_h, media_chip_label(k), false);
+    }
+    // The Joy-Con 2 sensor has no glyph: the label is the rendering.
+    if pin_id == crate::kbm_picker::OPTICAL_CONTACT {
+        return paint_text_pill(painter, top_left, chip_h, "Sensor".to_string(), false);
     }
     // The pad's motion without a glyph: the label is the rendering.
     if let Some(p) = flexinput_core::imu::imu_pin(pin_id) {

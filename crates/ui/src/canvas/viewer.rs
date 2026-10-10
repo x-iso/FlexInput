@@ -766,6 +766,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
                 if let Some(n) = snarl.get_node_mut(node) {
                     touchpad_route_header_controls(ui, &mut n.params, LABEL_CELL_W);
+                    optical_mouse_route_header_controls(ui, &mut n.params, LABEL_CELL_W);
                 }
             }
 

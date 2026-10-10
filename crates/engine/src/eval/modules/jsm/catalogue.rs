@@ -1158,6 +1158,15 @@ mod catalogue_tests {
         assert!(Btn::from_name("MISC6").is_some() && Btn::from_name("MISC7").is_none());
     }
 
+    /// `OPTICAL` — the Joy-Con 2 sensor's contact — reads its bus pin, so
+    /// `GYRO_ON = OPTICAL` gates gyro on the sensor, and our picker names it.
+    #[test]
+    fn optical_reads_the_joycon2_sensor_contact() {
+        assert_eq!(Btn::from_name("optical"), Some(Btn::Optical));
+        assert!(matches!(Btn::Optical.source(), super::super::names::BtnSource::Pin("optical_contact")));
+        assert_eq!(input_names_by_pin().get("optical_contact").map(String::as_str), Some("OPTICAL"));
+    }
+
     #[test]
     fn the_catalogue_tells_the_truth_about_what_runs() {
         let none = HashSet::new();
