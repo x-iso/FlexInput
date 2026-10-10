@@ -964,6 +964,8 @@ pub const DEFAULT_GAP_MS: f32 = 50.0;
 pub const DEFAULT_DUR_MS: f32 = 50.0;
 /// One Up / Down of a gap or a duration, ms.
 pub const TIME_STEP_MS: f32 = 10.0;
+/// One Up / Down with fine adjustment on, ms.
+pub const FINE_STEP_MS: f32 = 1.0;
 /// The shortest a gap can be set to, ms: stepping or typing it smaller
 /// doesn't remove it (that's Delete).
 pub const MIN_GAP_MS: f32 = 1.0;
@@ -1110,22 +1112,25 @@ impl TimedChord {
         ChordElem::Gap(i)
     }
 
-    /// One step up (`dir > 0`) or down: a gap by [`TIME_STEP_MS`], down to
-    /// [`MIN_GAP_MS`] (Delete takes it out, not a step); a pick's duration from the input's up to [`DEFAULT_DUR_MS`]
-    /// and on, and back down past the smallest step to the input's again.
-    pub fn nudge(&mut self, e: ChordElem, dir: i32) {
-        let step = TIME_STEP_MS * dir.signum() as f32;
+    /// One step up (`dir > 0`) or down, by [`TIME_STEP_MS`] — or by
+    /// [`FINE_STEP_MS`] when `fine`: a gap down to [`MIN_GAP_MS`] (Delete
+    /// takes it out, not a step); a pick's duration from the input's up to
+    /// [`DEFAULT_DUR_MS`] and on, and back down past the smallest step to the
+    /// input's again.
+    pub fn nudge(&mut self, e: ChordElem, dir: i32, fine: bool) {
+        let unit = if fine { FINE_STEP_MS } else { TIME_STEP_MS };
+        let step = unit * dir.signum() as f32;
         match e {
             ChordElem::Gap(i) if i < self.gaps.len() => {
                 let g = self.gaps[i];
                 // Up from the floor lands on the step, not one past it.
-                self.gaps[i] = if dir > 0 && g < TIME_STEP_MS { TIME_STEP_MS } else { (g + step).max(MIN_GAP_MS) };
+                self.gaps[i] = if dir > 0 && g < unit { unit } else { (g + step).max(MIN_GAP_MS) };
             }
             ChordElem::Item(i) if i < self.durs.len() => {
                 self.durs[i] = match self.durs[i] {
                     None if dir > 0 => Some(DEFAULT_DUR_MS),
                     None => None,
-                    Some(d) if d + step < TIME_STEP_MS => None,
+                    Some(d) if d + step < unit => None,
                     Some(d) => Some(d + step),
                 };
             }
@@ -1231,20 +1236,33 @@ mod timed_chord_tests {
     #[test]
     fn nudging_steps_durations_and_gaps() {
         let mut c = chord(&["key_a", "key_b"]);
-        c.nudge(ChordElem::Item(0), 1);
+        c.nudge(ChordElem::Item(0), 1, false);
         assert_eq!(c.durs[0], Some(50.0));
-        c.nudge(ChordElem::Item(0), 1);
+        c.nudge(ChordElem::Item(0), 1, false);
         assert_eq!(c.durs[0], Some(60.0));
+        c.nudge(ChordElem::Item(0), 1, true);
+        assert_eq!(c.durs[0], Some(61.0), "fine: 1 ms");
         c.durs[0] = Some(10.0);
-        c.nudge(ChordElem::Item(0), -1);
+        c.nudge(ChordElem::Item(0), -1, false);
         assert_eq!(c.durs[0], None);
-        c.durs[0] = None;
+        c.durs[0] = Some(2.0);
+        c.nudge(ChordElem::Item(0), -1, true);
+        assert_eq!(c.durs[0], Some(1.0));
+        c.nudge(ChordElem::Item(0), -1, true);
+        assert_eq!(c.durs[0], None, "fine steps down past 1 ms to the input's");
         c.gaps[1] = 10.0;
-        c.nudge(ChordElem::Gap(1), -1);
+        c.nudge(ChordElem::Gap(1), -1, false);
         assert_eq!(c.gaps[1], 1.0);
-        c.nudge(ChordElem::Gap(1), -1);
+        c.nudge(ChordElem::Gap(1), -1, false);
         assert_eq!(c.gaps[1], 1.0, "a step never removes it");
-        c.nudge(ChordElem::Gap(1), 1);
+        c.nudge(ChordElem::Gap(1), 1, true);
+        assert_eq!(c.gaps[1], 2.0, "fine: 1 ms");
+        c.nudge(ChordElem::Gap(1), 1, false);
+        assert_eq!(c.gaps[1], 10.0, "a coarse step from under 10 ms lands on 10");
+        c.nudge(ChordElem::Gap(1), 1, false);
+        assert_eq!(c.gaps[1], 20.0);
+        c.gaps[1] = 1.0;
+        c.nudge(ChordElem::Gap(1), 1, false);
         assert_eq!(c.gaps[1], 10.0);
         c.apply(ChordEdit::SetGap(1, 0.0));
         assert_eq!(c.gaps[1], 1.0, "nor does typing 0");

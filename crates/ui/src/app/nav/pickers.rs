@@ -51,13 +51,15 @@ impl FlexInputApp {
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let chord_purpose = purpose == crate::gamepad_nav::PickerUse::Chord;
         // Up past the board's top row goes into the chord list, on its last
-        // element, when there's one to go to.
+        // element — or on "+ Gap" when the list has nothing yet — when there's
+        // one to go to.
         if chord_purpose && matches!(step_dir, Some(NavDir::Up))
             && (cells.is_empty() || nearest_in_dir(&cells, idx, 0.0, -1.0, &usable) == idx)
         {
             let n = self.picker_chord().elems(self.picker_side_timed()).len();
-            if n > 0 {
-                self.gamepad_nav.kbm_picker_list = Some(n - 1);
+            if self.picker_list_stops() > 0 {
+                self.gamepad_nav.kbm_picker_list = Some(n.saturating_sub(1));
+                self.gamepad_nav.fine_increment = false;
                 return;
             }
         }
@@ -119,11 +121,20 @@ impl FlexInputApp {
         }
     }
 
+    /// How many stops the chord list has for the pad: its elements, then —
+    /// on a side that takes time — the "+ Gap" button after them.
+    pub(crate) fn picker_list_stops(&self) -> usize {
+        let timed = self.picker_side_timed();
+        self.picker_chord().elems(timed).len() + usize::from(timed)
+    }
+
     /// Drive the chord list while it has the focus. Left / Right move along
-    /// it; Up / Down retime a gap or a pick's duration; North deletes; West
-    /// gives a pick back the input's duration; RT puts a gap after the focus;
-    /// East or South go back to the board. An input's list has no time, so
-    /// there Down goes back to the board too.
+    /// it, out to "+ Gap" at its end; Up / Down retime a gap or a pick's
+    /// duration (a duration stepped below its smallest goes back to the
+    /// input's); West toggles fine steps; North deletes; RT puts a gap after
+    /// the focus, as South does on "+ Gap"; East — or South anywhere else —
+    /// goes back to the board. An input's list has no time, so there Down
+    /// goes back to the board too.
     fn drive_picker_list(
         &mut self,
         focus: usize,
@@ -132,37 +143,54 @@ impl FlexInputApp {
         rt_rising: bool,
     ) {
         use crate::gamepad_nav::NavDir;
-        use crate::kbm_picker::{ChordEdit, ChordElem};
+        use crate::kbm_picker::ChordEdit;
         let timed = self.picker_side_timed();
         let chord = self.picker_chord();
         let elems = chord.elems(timed);
-        if elems.is_empty() || nav.is_rising("btn_east") || nav.is_rising("btn_south") {
-            self.gamepad_nav.kbm_picker_list = None;
+        let stops = elems.len() + usize::from(timed);
+        let f = focus.min(stops.saturating_sub(1));
+        // The focus is on "+ Gap" past the last element.
+        let on_add_gap = timed && f == elems.len();
+        let back = |app: &mut Self| {
+            app.gamepad_nav.kbm_picker_list = None;
+            app.gamepad_nav.fine_increment = false;
+        };
+        if stops == 0 || nav.is_rising("btn_east") {
+            back(self);
             return;
         }
-        let f = focus.min(elems.len() - 1);
-        let elem = elems[f];
+        if nav.is_rising("btn_south") {
+            if on_add_gap {
+                self.picker_edit_chord(ChordEdit::InsertGap(elems.last().copied()));
+            } else {
+                back(self);
+            }
+            return;
+        }
+        if nav.is_rising("btn_west") && timed {
+            self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+        }
+        let fine = self.gamepad_nav.fine_increment;
         match step_dir {
             Some(NavDir::Left) => self.gamepad_nav.kbm_picker_list = Some(f.saturating_sub(1)),
-            Some(NavDir::Right) => self.gamepad_nav.kbm_picker_list = Some((f + 1).min(elems.len() - 1)),
-            Some(d @ (NavDir::Up | NavDir::Down)) if timed => {
+            Some(NavDir::Right) => self.gamepad_nav.kbm_picker_list = Some((f + 1).min(stops - 1)),
+            Some(d @ (NavDir::Up | NavDir::Down)) if timed && !on_add_gap => {
                 let mut c = chord;
-                c.nudge(elem, if d == NavDir::Up { 1 } else { -1 });
+                c.nudge(elems[f], if d == NavDir::Up { 1 } else { -1 }, fine);
                 self.picker_set_chord(&c);
-                // A gap stepped down to nothing leaves the list; stay on what
-                // took its place.
-                let n = c.elems(timed).len();
-                self.gamepad_nav.kbm_picker_list = (n > 0).then(|| f.min(n - 1));
             }
-            Some(NavDir::Down) => self.gamepad_nav.kbm_picker_list = None,
+            Some(NavDir::Down) => back(self),
             _ => {}
         }
+        if on_add_gap {
+            if rt_rising {
+                self.picker_edit_chord(ChordEdit::InsertGap(elems.last().copied()));
+            }
+            return;
+        }
+        let elem = elems[f];
         if nav.is_rising("btn_north") {
             self.picker_edit_chord(ChordEdit::Delete(elem));
-        } else if nav.is_rising("btn_west") && timed {
-            if let ChordElem::Item(i) = elem {
-                self.picker_edit_chord(ChordEdit::SetDur(i, None));
-            }
         } else if rt_rising && timed {
             self.picker_edit_chord(ChordEdit::InsertGap(Some(elem)));
         }
@@ -218,6 +246,8 @@ impl FlexInputApp {
     /// time still typing into the last thing that asked.
     pub(crate) fn close_kbm_picker(&mut self) {
         self.gamepad_nav.kbm_picker_open = false;
+        self.gamepad_nav.kbm_picker_list = None;
+        self.gamepad_nav.fine_increment = false;
         self.gamepad_nav.kbm_picker_viewport = None;
         self.gamepad_nav.kbm_picker_use = crate::gamepad_nav::PickerUse::Chord;
         self.gamepad_nav.kbm_text.clear();
@@ -508,7 +538,9 @@ impl FlexInputApp {
         let list_chord = self.picker_chord();
         let list_timed = self.picker_side_timed();
         let list_elems = list_chord.elems(list_timed);
-        let list_focus = self.gamepad_nav.kbm_picker_list.filter(|&k| k < list_elems.len());
+        // Its stops: the elements, and "+ Gap" after them on a timed side.
+        let list_focus = self.gamepad_nav.kbm_picker_list
+            .filter(|&k| k < list_elems.len() + usize::from(list_timed));
         let mut list_select: Option<Option<usize>> = None;
         let mut list_edit: Option<crate::kbm_picker::ChordEdit> = None;
         let mut list_focus_rect: Option<egui::Rect> = None;
@@ -545,38 +577,24 @@ impl FlexInputApp {
                     font.size *= SCALE;
                 }
                 ui.horizontal(|ui| {
-                    // The hints are the session's, not the window's: the same
-                    // board means three different things to the buttons.
-                    // LB / RB only where a pad can press them.
-                    let tab_hint = if nav_skin.is_some() && tabs.len() > 1 { "   LB/RB: tab" } else { "" };
-                    let hints = match purpose {
-                        crate::gamepad_nav::PickerUse::Chord if list_focus.is_some() && list_timed =>
-                            "←→: move   ↑↓: time   North: delete   West: input's duration   RT: + gap   East/South: back to the board".to_string(),
-                        crate::gamepad_nav::PickerUse::Chord if list_focus.is_some() =>
-                            "←→: move   North: delete   East/South: back to the board".to_string(),
-                        crate::gamepad_nav::PickerUse::Chord if both_stages => format!(
-                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   West: input ⇄ output   East/Done: close"),
-                        crate::gamepad_nav::PickerUse::Chord if list_timed => format!(
-                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   RT: + gap   Up past the top: edit the list   East/Done: close"),
-                        crate::gamepad_nav::PickerUse::Chord => format!(
-                            "Click or LS/D-pad: move{tab_hint}   South: add   North: clear   East/Done: close"),
-                        crate::gamepad_nav::PickerUse::JsmName => match self.gamepad_nav.kbm_slot {
-                            // What the keys stand for depends on which side of
-                            // the line the pick lands on, so say which.
-                            crate::gamepad_nav::JsmSlot::Name => format!(
-                                "A line starts with a BUTTON.{tab_hint}   South: insert its name   West: type instead   East: cancel"),
-                            crate::gamepad_nav::JsmSlot::Value => format!(
-                                "Click or LS/D-pad: move{tab_hint}   South: insert this key's name   West: type instead   East: cancel"),
-                            // Everything greys out here, and a board full of grey
-                            // has to say why rather than look broken.
-                            crate::gamepad_nav::JsmSlot::Neither =>
-                                "A NUMBER goes here: hold South and push the stick. West: type a word instead   East: cancel".to_string(),
-                        },
-                        crate::gamepad_nav::PickerUse::Text =>
-                            "South: type   West or Shift: caps   Backspace   North or Enter: done   East or Esc: cancel".to_string(),
+                    // What the pad's buttons do is the bottom legend bar's to
+                    // say (`gp_legend_hints`); the window keeps only what the
+                    // board is for, where that isn't plain from it.
+                    let note = match (purpose, self.gamepad_nav.kbm_slot) {
+                        // What the keys stand for depends on which side of
+                        // the line the pick lands on, so say which.
+                        (crate::gamepad_nav::PickerUse::JsmName, crate::gamepad_nav::JsmSlot::Name) =>
+                            Some("A line starts with a BUTTON: pick the one it binds."),
+                        // Everything greys out here, and a board full of grey
+                        // has to say why rather than look broken.
+                        (crate::gamepad_nav::PickerUse::JsmName, crate::gamepad_nav::JsmSlot::Neither) =>
+                            Some("A NUMBER goes here, not a key."),
+                        _ => None,
                     };
-                    ui.label(egui::RichText::new(hints)
-                        .small().color(egui::Color32::from_gray(150)));
+                    if let Some(note) = note {
+                        ui.label(egui::RichText::new(note)
+                            .small().color(egui::Color32::from_gray(150)));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(egui::RichText::new("Done").size(13.0 * SCALE)).clicked() { done = true; }
                     });
@@ -712,11 +730,15 @@ impl FlexInputApp {
                             }
                             if list_timed {
                                 let after = list_focus.and_then(|k| list_elems.get(k).copied());
-                                if ui.small_button("+ Gap")
+                                // The list's last stop for the pad, past its
+                                // elements: South on it adds the gap.
+                                let on_it = list_focus == Some(list_elems.len());
+                                let r = ui.add(egui::Button::new(egui::RichText::new("+ Gap").small())
+                                    .selected(on_it))
                                     .on_hover_text("A wait before the next pick (RT on the pad). \
-                                                    After the focused element, or at the end.")
-                                    .clicked()
-                                {
+                                                    After the focused element, or at the end.");
+                                if on_it { list_focus_rect = Some(r.rect); }
+                                if r.clicked() {
                                     list_edit = Some(crate::kbm_picker::ChordEdit::InsertGap(after));
                                 }
                             }

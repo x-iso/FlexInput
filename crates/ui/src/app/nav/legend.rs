@@ -25,26 +25,81 @@ impl FlexInputApp {
             // One board, three jobs: appending to an output chord, naming a key
             // for a config, or typing. The bar has to say which.
             use crate::gamepad_nav::PickerUse;
+            let tabs = self.picker_tabs().len() > 1;
+            let tab = |v: &mut Vec<(Vec<&'static str>, &'static str)>| {
+                if tabs { v.push((vec!["btn_lb", "btn_rb"], "Tab")); }
+            };
             return match self.gamepad_nav.kbm_picker_use {
-                PickerUse::Chord => vec![
-                    (hint_move(), "Move"),
-                    (vec!["btn_south"], "Add key"),
-                    (vec!["btn_north"], "Clear chord"),
-                    (vec!["btn_east"], "Done"),
-                ],
-                PickerUse::JsmName => vec![
-                    (hint_move(), "Move"),
-                    (vec!["btn_south"], "Insert name"),
-                    (vec!["btn_west"], "Type instead"),
-                    (vec!["btn_east"], "Cancel"),
-                ],
-                PickerUse::Text => vec![
-                    (hint_move(), "Move"),
-                    (vec!["btn_south"], "Type"),
-                    (vec!["btn_west"], "Caps"),
-                    (vec!["btn_north"], "Done"),
-                    (vec!["btn_east"], "Cancel"),
-                ],
+                // The chord list above the board has the focus.
+                PickerUse::Chord if self.gamepad_nav.kbm_picker_list.is_some() => {
+                    use crate::kbm_picker::ChordElem;
+                    let timed = self.picker_side_timed();
+                    let elems = self.picker_chord().elems(timed);
+                    let at = self.gamepad_nav.kbm_picker_list
+                        .map(|k| k.min(self.picker_list_stops().saturating_sub(1)))
+                        .and_then(|k| elems.get(k).copied());
+                    let fine = self.gamepad_nav.fine_increment;
+                    let mut v = vec![(hint_horiz(), "Move")];
+                    match at {
+                        // "+ Gap", past the last element.
+                        None => {
+                            v.push((vec!["btn_south"], "Add gap"));
+                        }
+                        Some(e) => {
+                            if timed {
+                                v.push((hint_vert(), match e {
+                                    ChordElem::Gap(_) => "Gap time",
+                                    ChordElem::Item(_) => "Duration (below min: input's)",
+                                }));
+                                v.push((vec!["btn_west"], if fine { "Fine: on" } else { "Fine" }));
+                            }
+                            v.push((vec!["btn_north"], "Delete"));
+                            if timed { v.push((vec!["right_trigger"], "Gap after")); }
+                        }
+                    }
+                    // South is "Add gap" on "+ Gap", and back elsewhere.
+                    v.push((if at.is_some() { vec!["btn_south", "btn_east"] } else { vec!["btn_east"] },
+                        "Back to board"));
+                    v
+                }
+                PickerUse::Chord => {
+                    let mut v = vec![(hint_move(), "Move")];
+                    tab(&mut v);
+                    v.push((vec!["btn_south"], "Add"));
+                    v.push((vec!["btn_north"], "Clear"));
+                    if self.picker_has_both_stages() {
+                        v.push((vec!["btn_west"], "Input / output"));
+                    }
+                    if self.picker_side_timed() {
+                        v.push((vec!["right_trigger"], "Gap"));
+                    }
+                    if self.picker_list_stops() > 0 {
+                        v.push((vec!["dpad_up"], "Past the top: edit list"));
+                    }
+                    v.push((vec!["btn_east"], "Done"));
+                    v
+                }
+                PickerUse::JsmName => {
+                    let mut v = vec![(hint_move(), "Move")];
+                    tab(&mut v);
+                    if self.gamepad_nav.kbm_slot == crate::gamepad_nav::JsmSlot::Neither {
+                        v.push((vec!["btn_south", "left_stick_vertical"], "Hold: number"));
+                    } else {
+                        v.push((vec!["btn_south"], "Insert name"));
+                    }
+                    v.push((vec!["btn_west"], "Type instead"));
+                    v.push((vec!["btn_east"], "Cancel"));
+                    v
+                }
+                PickerUse::Text => {
+                    let mut v = vec![(hint_move(), "Move")];
+                    tab(&mut v);
+                    v.push((vec!["btn_south"], "Type"));
+                    v.push((vec!["btn_west"], "Caps"));
+                    v.push((vec!["btn_north"], "Done"));
+                    v.push((vec!["btn_east"], "Cancel"));
+                    v
+                }
             };
         }
         if self.gamepad_nav.settings_open {

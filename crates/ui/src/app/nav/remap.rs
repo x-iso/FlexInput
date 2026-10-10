@@ -1087,6 +1087,8 @@ impl FlexInputApp {
         chord.apply(edit);
         self.picker_set_chord(&chord);
         let n = chord.elems(timed).len();
+        // The list's stops: its elements, and "+ Gap" after them when timed.
+        let stops = n + usize::from(timed);
         self.gamepad_nav.kbm_picker_list = match (self.gamepad_nav.kbm_picker_list, edit) {
             // A new gap takes the focus.
             (_, crate::kbm_picker::ChordEdit::InsertGap(after)) => {
@@ -1099,8 +1101,8 @@ impl FlexInputApp {
                 chord.elems(timed).iter().position(|e| *e == gap)
                     .or(self.gamepad_nav.kbm_picker_list)
             }
-            (Some(_), _) if n == 0 => None,
-            (Some(f), _) => Some(f.min(n - 1)),
+            (Some(_), _) if stops == 0 => None,
+            (Some(f), _) => Some(f.min(stops - 1)),
             (None, _) => None,
         };
     }

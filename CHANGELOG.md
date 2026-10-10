@@ -46,6 +46,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   too. An analog card with a manual threshold now greys out Hold and the time
   gap (unless Turbo is on), since its output is simply held past the line.
 
+### Changed
+
+- **Choose with a pad: "+ Gap" is reachable, fine steps, legend at the
+  bottom.** "+ Gap" is the output list's last stop (South adds the gap), and
+  Up past the board reaches it even before anything is picked. West toggles
+  fine 1 ms steps for gaps and durations, as on every other value the pad
+  edits; stepping a duration below its smallest gives the pick back the
+  input's. The picker's button hints moved to the bottom legend bar, worded
+  for what has the focus.
+
 ### Fixed
 
 - **A card that sends the same output twice keeps both after a reload.**
