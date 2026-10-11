@@ -689,6 +689,8 @@ pub(crate) fn automap_combiner_publish(
     key_uid: usize,
     dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &mut HashMap<(String, String), Signal>,
+    state: &mut HashMap<usize, crate::state::NodeState>,
+    dt: f32,
 ) {
     let input_devs = snap.params.get("_automap_input_devs")
         .and_then(|v| v.as_array())
@@ -747,6 +749,26 @@ pub(crate) fn automap_combiner_publish(
         }
     }
 
+    // The Motion section is resolved as ONE unit — see `combiner_motion`.
+    // Per-pin SORT let a resting top pad's zeroed gyro hand individual axes
+    // to the next port.
+    let motion: HashMap<&'static str, Signal> = {
+        use super::combiner_motion::{resolve, PortMotion};
+        let correlate = snap.params.get("combiner_motion").and_then(|v| v.as_str()) == Some("CORRELATE");
+        let ports: Vec<Option<PortMotion>> = (0..input_devs.len())
+            .map(|i| PortMotion::read(|p| read_pin_at(i, p, &input_devs, &input_collectors, collector_sigs, dev_sigs)))
+            .collect();
+        let ids: Vec<String> = (0..input_devs.len())
+            .map(|i| format!("{}|{}",
+                input_devs.get(i).map(String::as_str).unwrap_or(""),
+                input_collectors.get(i).map(String::as_str).unwrap_or("")))
+            .collect();
+        let ns = state.entry(key_uid).or_default();
+        resolve(correlate, &ports, &ids, &mut ns.combiner_motion, dt)
+            .map(|m| m.signals().into_iter().collect())
+            .unwrap_or_default()
+    };
+
     for pin in flexinput_core::automap::ALL_PINS {
         if let Some(port_v) = port_map.get(pin.id) {
             if let Some(port_u) = port_v.as_u64() {
@@ -760,6 +782,19 @@ pub(crate) fn automap_combiner_publish(
                 }
                 continue;
             }
+        }
+
+        // A motion pin follows its section, unless that one pin carries its
+        // own policy (a port pin is handled just above). Port defaults don't
+        // reach motion: they're for buttons and sticks, and two gyros ADDed
+        // or MULTed are no rotation.
+        if super::combiner_motion::is_motion_pin(pin.id)
+            && !policy_map.get(pin.id).and_then(|v| v.as_str()).is_some_and(|p| p != "SORT")
+        {
+            if let Some(&sig) = motion.get(pin.id) {
+                collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+            }
+            continue;
         }
 
         // Effective policy: per-pin override > per-port default (from the

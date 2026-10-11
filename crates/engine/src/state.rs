@@ -25,6 +25,9 @@ pub struct NodeState {
     /// Virtual KB/M sink with "Route gamepad touchpad" on: the trackpad's
     /// gesture state. Created on first use, dropped when the toggle goes off.
     pub trackpad: Option<Box<crate::eval::TrackpadState>>,
+    /// AutoMap Combiner with its Motion section on CORRELATE: each lower
+    /// port's learned mounting rotation. Created on first use, dropped on SORT.
+    pub combiner_motion: Option<Box<crate::eval::MotionCorrelator>>,
     /// RWS Aim: the flick stick being circled during a 360° calibration sweep.
     /// Created when a sweep starts, dropped when it ends.
     pub rws_cal_flick: Option<Box<crate::eval::CalFlick>>,

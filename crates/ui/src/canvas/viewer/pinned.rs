@@ -183,26 +183,20 @@ pub(crate) fn render_pinned_element_impl(
                 .unwrap_or("").to_string();
             let traced = inner_snarl.in_pin(InPinId { node: inner_id, input: 0 })
                 .remotes.first().copied()
-                .and_then(|src| controller3d_physical_device(inner_snarl, src, bridged_parent));
-            let (dev_id, deadzone) = match traced {
-                Some((d, z)) => (Some(d), z),
-                None => (None, [0.1; 2]),
-            };
+                .map(|src| controller3d_physical_devices(inner_snarl, src, bridged_parent))
+                .unwrap_or_default();
+            let (devs, deadzone) = controller3d_devices_and_deadzone(traced);
+            let dev_id = devs.first().cloned();
             // Model: the pin's own choice wins (`Some("")` = force auto-detect),
             // else follow the module's param, else auto-detect.
             let pin_model = iv_style_override.as_ref().and_then(|o| o.c3d_model.clone());
-            let auto_resolve = |dev_id: Option<&str>| {
-                if let Some(dev) = dev_id {
-                    crate::model::model_for_device(dev)
-                } else {
-                    crate::model::available_models().into_iter().next().unwrap_or_default()
-                }
-            };
+            let auto_resolve = || crate::model::model_for_devices(&devs)
+                .unwrap_or_else(|| crate::model::available_models().into_iter().next().unwrap_or_default());
             let resolved = match pin_model {
                 Some(m) if !m.is_empty() => m,
-                Some(_) => auto_resolve(dev_id.as_deref()),
+                Some(_) => auto_resolve(),
                 None if !override_name.is_empty() && override_name != "auto" => override_name,
-                None => auto_resolve(dev_id.as_deref()),
+                None => auto_resolve(),
             };
             let orientation = inner_snarl.get_node(inner_id)
                 .and_then(|n| n.extra.last_signals.get(1).copied().flatten())
@@ -263,7 +257,7 @@ pub(crate) fn render_pinned_element_impl(
             }
             let ctx = ui.ctx().clone();
             let mut live = controller3d_live(
-                live_signals, dev_id.as_deref(), &ctx, inner_id.0, tailoff, accent, deadzone,
+                live_signals, &devs, &ctx, inner_id.0, tailoff, accent, deadzone,
             );
             // Pinned copies live in a different host from the canvas node, so
             // the inner id alone can collide with it; the high bit keeps the two

@@ -503,11 +503,33 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
 /// model override is left on "auto". Falls back to any available model when the
 /// preferred one isn't present.
 pub fn model_for_device(dev_id: &str) -> String {
-    let want = match skin_from_device_id(dev_id) {
-        Skin::Playstation => "DualSense",
-        Skin::SwitchPro => "Switch Pro",
-        _ => "Xbox One",
+    // A Joy-Con half before the skin: its id names no "switch" at all
+    // (`jc2:joycon2_l:<address>`), so it fell through to the Xbox model.
+    let want = match crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
+        Some("joycon2_l") => "Left Joycon",
+        Some("joycon2_r") => "Right Joycon",
+        _ => match skin_from_device_id(dev_id) {
+            Skin::Playstation => "DualSense",
+            Skin::SwitchPro => "Switch Pro",
+            _ => "Xbox One",
+        },
     };
+    pick_available(want)
+}
+
+/// The model for everything behind a bus, top port first: both Joy-Con
+/// halves combined are the Grip; anything else is its top device's model.
+pub fn model_for_devices(dev_ids: &[String]) -> Option<String> {
+    let slugs: Vec<_> = dev_ids.iter()
+        .filter_map(|d| crate::canvas::remapper_icons::phys_pad_slug(d))
+        .collect();
+    if slugs.contains(&"joycon2_l") && slugs.contains(&"joycon2_r") {
+        return Some(pick_available("Joycon Grip"));
+    }
+    dev_ids.first().map(|d| model_for_device(d))
+}
+
+fn pick_available(want: &str) -> String {
     let avail = available_models();
     if avail.iter().any(|m| m == want) {
         want.to_string()
@@ -1971,5 +1993,23 @@ mod vis_tests {
             let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
             assert_eq!(f[0], Some(1.0), "self-occlusion at {deg}° — depth epsilon too tight");
         }
+    }
+}
+
+#[cfg(test)]
+mod model_choice_tests {
+    use super::*;
+
+    /// Joy-Con 2 ids name no "switch", so they used to fall through to Xbox.
+    /// One half is its own model; both halves behind a Combiner are the Grip.
+    #[test]
+    fn joycons_get_joycon_models_and_a_pair_is_the_grip() {
+        assert_eq!(model_for_device("jc2:joycon2_l:da2d160f0169"), "Left Joycon");
+        assert_eq!(model_for_device("sdl:joycon2_r:0"), "Right Joycon");
+        let pair = ["jc2:joycon2_r:bb".to_string(), "jc2:joycon2_l:aa".to_string()];
+        assert_eq!(model_for_devices(&pair).as_deref(), Some("Joycon Grip"));
+        let mixed = ["gilrs:dualsense:0".to_string(), "jc2:joycon2_l:aa".to_string()];
+        assert_eq!(model_for_devices(&mixed).as_deref(), Some("DualSense"), "else the top device's");
+        assert_eq!(model_for_devices(&[]), None);
     }
 }

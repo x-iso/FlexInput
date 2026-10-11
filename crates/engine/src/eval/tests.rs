@@ -2907,6 +2907,37 @@ mod trigger_tests {
         assert!(leaked, "port-default ADD must opt the raw port into mixing (btn_south should pass)");
     }
 
+    /// Two Joy-Cons into one Combiner: the Motion section comes whole from the
+    /// top port. Per-pin SORT used to hand each axis to whichever port was
+    /// non-zero, so a resting L (gyro deadzoned to exact zeros) let the R's
+    /// gyro through axis by axis. A port default doesn't reach motion either.
+    #[test]
+    fn combiner_takes_motion_whole_from_the_top_port() {
+        let (l, r) = ("jc2:joycon2_l:aa", "jc2:joycon2_r:bb");
+        let mut combiner = empty_node(3, "module.automap_combiner");
+        combiner.params.insert("_automap_input_devs".into(), serde_json::json!([l, r]));
+        combiner.params.insert("_automap_input_collectors".into(), serde_json::json!(["", ""]));
+        combiner.params.insert("combiner_port_default".into(), serde_json::json!({"0": "ADD"}));
+        let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
+        let graph = ProcessingGraph { nodes: vec![combiner, sink] };
+        let mut sigs = HashMap::new();
+        for (pin, lv, rv) in [("gyro_x", 0.0, 0.3), ("gyro_y", 0.1, 0.4), ("gyro_z", 0.0, 0.5),
+                              ("accel_z", 0.12, -0.12)] {
+            sigs.insert((l.to_string(), pin.to_string()), Signal::Float(lv));
+            sigs.insert((r.to_string(), pin.to_string()), Signal::Float(rv));
+        }
+        sigs.insert((r.to_string(), "left_stick_x".to_string()), Signal::Float(0.5));
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.001, &mut out);
+        let get = |p: &str| out.sink_outputs.get(&("virtual.xinput:0".to_string(), p.to_string()))
+            .map(|s| s.as_float());
+        assert_eq!(get("gyro_x"), Some(0.0), "the top pad's resting zero, not the other pad's 0.3");
+        assert_eq!(get("gyro_y"), Some(0.1));
+        assert_eq!(get("gyro_z"), Some(0.0));
+        assert_eq!(get("accel_z"), Some(0.12), "port 0's ADD default doesn't sum motion");
+        assert!(get("left_stick_x").is_some_and(|v| v > 0.0), "everything else still combines");
+    }
+
     // D-pad PER-SIDE suppression: mapping only `dpad_left` away must suppress
     // the left direction across ALL three representations (Bool, dpad_x
     // negative side, dpad Vec2 x-negative) — but leave `dpad_right`, the

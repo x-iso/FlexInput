@@ -18,6 +18,7 @@ use crate::state::NodeState;
 // them. Items the split promoted to `pub(crate)` simply stay crate-visible —
 // a glob re-export never widens.
 mod activation;
+mod combiner_motion;
 mod compute;
 mod config;
 mod curves;
@@ -38,6 +39,7 @@ pub use curves::*;
 pub use device_cal::*;
 pub use modules::*;
 pub use trackpad::TrackpadState;
+pub use combiner_motion::MotionCorrelator;
 pub(crate) use registry::*;
 // Every publisher is crate-internal — nothing outside the engine publishes
 // into the bus — so this one glob is narrowed rather than `pub`.
@@ -296,7 +298,7 @@ fn eval_subgraph(
             continue;
         }
         if snap.module_id == "module.automap_combiner" {
-            automap_combiner_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            automap_combiner_publish(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
             computed[idx] = vec![None];
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
@@ -704,7 +706,7 @@ pub fn eval_graph_tick(
         //   - MULT: product, clamped per pin
         // Writes into collector_sigs under "combiner:{uid}".
         if snap.module_id == "module.automap_combiner" {
-            automap_combiner_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+            automap_combiner_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             computed[idx] = vec![None];
             continue;
         }

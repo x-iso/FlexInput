@@ -48,11 +48,44 @@ pub(crate) fn to_view_basis(q: glam::Quat) -> glam::Quat {
     flexinput_core::frames::canonical_to_viewer_quat(q)
 }
 
-pub(crate) fn controller3d_physical_device(
+/// Every physical device behind a bus, top port first. Only an AutoMap
+/// Combiner has more than one: two Joy-Con halves combined are one assembly
+/// to show — the Grip model, each pin read from whichever half has it.
+pub(crate) fn controller3d_physical_devices(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
     parents: Option<&AutomapGlowParent<'_>>,
-) -> Option<(String, [f32; 2])> {
+) -> Vec<(String, [f32; 2])> {
+    if let Some(node) = snarl.get_node(src.node) {
+        if node.module_id == "module.automap_combiner" {
+            return node.inputs.iter().enumerate()
+                .filter(|(_, p)| p.signal_type == SignalType::AutoMap)
+                .filter_map(|(i, _)| snarl.in_pin(InPinId { node: src.node, input: i }).remotes.first().copied())
+                .flat_map(|up| controller3d_physical_devices(snarl, up, parents))
+                .collect();
+        }
+    }
+    controller3d_trace(snarl, src, parents).unwrap_or_default()
+}
+
+/// The traced devices' ids, and the stick deadzones to show: each stick's from
+/// the device that has that stick — the left from the first device that isn't
+/// a right Joy-Con, the right from the first that isn't a left one.
+pub(crate) fn controller3d_devices_and_deadzone(traced: Vec<(String, [f32; 2])>) -> (Vec<String>, [f32; 2]) {
+    fn slug(d: &str) -> Option<&str> {
+        crate::canvas::remapper_icons::phys_pad_slug(d)
+    }
+    let left = traced.iter().find(|(d, _)| slug(d) != Some("joycon2_r")).map(|(_, z)| z[0]);
+    let right = traced.iter().find(|(d, _)| slug(d) != Some("joycon2_l")).map(|(_, z)| z[1]);
+    let dz = [left.unwrap_or(0.1), right.unwrap_or(0.1)];
+    (traced.into_iter().map(|(d, _)| d).collect(), dz)
+}
+
+fn controller3d_trace(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parents: Option<&AutomapGlowParent<'_>>,
+) -> Option<Vec<(String, [f32; 2])>> {
     let node = snarl.get_node(src.node)?;
     match node.module_id.as_str() {
         // Returns the device id + the source's stick deadzones (left, right —
@@ -71,7 +104,7 @@ pub(crate) fn controller3d_physical_device(
             node.params
                 .get("device_id")
                 .and_then(|v| v.as_str())
-                .map(|s| (s.to_string(), dz))
+                .map(|s| vec![(s.to_string(), dz)])
         }
         "subpatch" => {
             // Descend through the outlet feeding this output pin.
@@ -88,7 +121,7 @@ pub(crate) fn controller3d_physical_device(
             let outlet_in = sp.snarl.in_pin(InPinId { node: outlet_id, input: 0 });
             let inner_upstream = *outlet_in.remotes.first()?;
             let frame = AutomapGlowParent { snarl, subpatch_node_id: src.node, prev: parents };
-            controller3d_physical_device(&sp.snarl, inner_upstream, Some(&frame))
+            Some(controller3d_physical_devices(&sp.snarl, inner_upstream, Some(&frame)))
         }
         "subpatch.inlet" => {
             // Pop back out to the enclosing snarl through the matching inlet.
@@ -96,14 +129,14 @@ pub(crate) fn controller3d_physical_device(
             let p = parents?;
             let outer_in = p.snarl.in_pin(InPinId { node: p.subpatch_node_id, input: pin_idx });
             let upstream = *outer_in.remotes.first()?;
-            controller3d_physical_device(p.snarl, upstream, p.prev)
+            Some(controller3d_physical_devices(p.snarl, upstream, p.prev))
         }
         _ => {
             // Any other module carrying the bus: follow its first AutoMap input.
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
             let upstream = *in_pin.remotes.first()?;
-            controller3d_physical_device(snarl, upstream, parents)
+            Some(controller3d_physical_devices(snarl, upstream, parents))
         }
     }
 }
@@ -308,9 +341,13 @@ pub(crate) fn c3d_glow(ctx: &egui::Context, node_uid: usize, key: &str, target: 
 /// button presses, and the fading active-input highlight) for the resolved
 /// device. Reads the same live-signal pin keys the 2D input viewer uses; touch
 /// is normalized via `pad_point_to_unit` (the codebase-standard mapping).
+///
+/// `devs` is every device behind the bus, top port first; each pin is read
+/// from the first that has it, so combined Joy-Con halves show as one grip
+/// (the L's stick and D-pad, the R's face buttons).
 pub(crate) fn controller3d_live(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
-    dev_id: Option<&str>,
+    devs: &[String],
     ctx: &egui::Context,
     node_uid: usize,
     tailoff: f32,
@@ -319,20 +356,13 @@ pub(crate) fn controller3d_live(
 ) -> crate::model::ControllerLive {
     let mut live = crate::model::ControllerLive::default();
     live.highlight = highlight;
-    let Some(dev) = dev_id else { return live };
-    let f = |pin: &str| {
-        live_signals
-            .get(&(dev.to_string(), pin.to_string()))
-            .map(|s| s.as_float())
-            .unwrap_or(0.0)
-    };
-    let b = |pin: &str| {
-        live_signals
-            .get(&(dev.to_string(), pin.to_string()))
-            .map(|s| s.as_bool())
-            .unwrap_or(false)
-    };
-    let has = |pin: &str| live_signals.contains_key(&(dev.to_string(), pin.to_string()));
+    if devs.is_empty() {
+        return live;
+    }
+    let get = |pin: &str| devs.iter().find_map(|d| live_signals.get(&(d.clone(), pin.to_string())));
+    let f = |pin: &str| get(pin).map(|s| s.as_float()).unwrap_or(0.0);
+    let b = |pin: &str| get(pin).map(|s| s.as_bool()).unwrap_or(false);
+    let has = |pin: &str| get(pin).is_some();
 
     // Touch dots (normalized, y already flipped by pad_point_to_unit).
     for (k, (px, py, pa)) in [
@@ -352,9 +382,7 @@ pub(crate) fn controller3d_live(
     // The same radial deadzone the engine applies (`apply_deadzone`) is
     // reproduced here so the model's tilt matches what the graph receives.
     let stick = |vec_pin: &str, xp: &str, yp: &str, deadzone: f32| -> glam::Vec2 {
-        let raw = if let Some(Signal::Vec2(v)) =
-            live_signals.get(&(dev.to_string(), vec_pin.to_string()))
-        {
+        let raw = if let Some(Signal::Vec2(v)) = get(vec_pin) {
             glam::Vec2::new(v.x, v.y)
         } else {
             glam::Vec2::new(f(xp), f(yp))
@@ -679,17 +707,15 @@ pub(crate) fn show_controller3d_body(
         .remotes
         .first()
         .copied()
-        .and_then(|src| controller3d_physical_device(snarl, src, parents));
-    let (dev_id, deadzone) = match traced {
-        Some((d, z)) => (Some(d), z),
-        None => (None, [0.1; 2]),
-    };
+        .map(|src| controller3d_physical_devices(snarl, src, parents))
+        .unwrap_or_default();
+    let (devs, deadzone) = controller3d_devices_and_deadzone(traced);
+    let dev_id = devs.first().cloned();
     let resolved = if !override_name.is_empty() && override_name != "auto" {
         override_name.clone()
-    } else if let Some(dev) = dev_id.as_deref() {
-        model::model_for_device(dev)
     } else {
-        model::available_models().into_iter().next().unwrap_or_default()
+        model::model_for_devices(&devs)
+            .unwrap_or_else(|| model::available_models().into_iter().next().unwrap_or_default())
     };
 
     // Orientation quaternion from the Vec4 input (index 1), else identity. The
@@ -952,7 +978,7 @@ pub(crate) fn show_controller3d_body(
             .unwrap_or(0.25) as f32;
         let ctx = ui.ctx().clone();
         let mut live = controller3d_live(
-            live_signals, dev_id.as_deref(), &ctx, node_id.0, tailoff, accent, deadzone,
+            live_signals, &devs, &ctx, node_id.0, tailoff, accent, deadzone,
         );
         live.offset = c3d_motion_offset(
             &ctx, node_id.0 as u64, live_signals, dev_id.as_deref(), wired_orientation,

@@ -243,6 +243,49 @@ pub(crate) fn optical_mouse_route_header_controls(
     }
 }
 
+/// The Combiner's Motion-section mode row: SORT takes gyro, accel and
+/// orientation whole from the top port carrying motion; CORRELATE fuses
+/// rigidly joined IMUs. A per-pin policy below still overrides its one pin.
+fn motion_section_mode(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    current: &str,
+    next: &mut Option<&'static str>,
+) {
+    const MODES: &[(&str, &str, &str)] = &[
+        ("SORT", "Sort (top port)",
+         "The whole Motion section — gyro, accel and orientation together — \
+          from the top port that carries motion, even while it reads zero. \
+          Two IMUs are never mixed axis by axis."),
+        ("CORRELATE", "Correlate",
+         "Fuse every port's motion. Only for IMUs that move as one: Joy-Cons in \
+          a grip, or an extra IMU strapped to a pad with its own.\n\
+          Each lower port's mounting rotation is learned by correlating its \
+          gyro with the top port's — turn the assembly about a few different \
+          axes for a second or two — then the aligned readings are averaged. \
+          Until the fit is good (or if it degrades), the top port alone, as \
+          Sort. Orientation always comes from the top port."),
+    ];
+    let label = MODES.iter().find(|(m, _, _)| *m == current).map(|(_, l, _)| *l).unwrap_or("Sort (top port)");
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Section").small());
+        let resp = egui::ComboBox::from_id_salt(egui::Id::new(("automap_combiner_motion", node_id)))
+            .selected_text(egui::RichText::new(label).small())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for &(mode, name, hover) in MODES {
+                    if ui.selectable_label(current == mode, egui::RichText::new(name).small())
+                        .on_hover_text(hover).clicked()
+                    {
+                        *next = Some(mode);
+                    }
+                }
+            });
+        resp.response.on_hover_text(
+            MODES.iter().find(|(m, _, _)| *m == current).map(|(_, _, h)| *h).unwrap_or(MODES[0].2));
+    });
+}
+
 /// A device.source's sticks have different deadzones: the right stick's own
 /// `deadzone_r` (Calibration window) differs from `deadzone`. A gamepad card's
 /// single Deadzone value then shows in orange, and editing it sets both sticks
@@ -1101,6 +1144,12 @@ pub(crate) fn show_automap_combiner_body(
         let current_port: serde_json::Map<String, Value> = snarl.get_node(node_id)
             .and_then(|n| n.params.get("combiner_pin_port"))
             .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        // The Motion section's own mode (`combiner_motion`): gyro, accel and
+        // orientation resolved as one unit — see the engine's combiner_motion.
+        let current_motion = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("combiner_motion"))
+            .and_then(|v| v.as_str()).unwrap_or("SORT").to_string();
+        let mut next_motion: Option<&'static str> = None;
 
         // Union of structurally-overlapping pins and explicitly-overridden pins.
         let mut tracked: std::collections::BTreeMap<&'static str, ()> = std::collections::BTreeMap::new();
@@ -1130,7 +1179,7 @@ pub(crate) fn show_automap_combiner_body(
                 "dpad" | "dpad_x" | "dpad_y"
                 | "dpad_up" | "dpad_down" | "dpad_left" | "dpad_right" => "D-Pad",
                 "gyro_x" | "gyro_y" | "gyro_z"
-                | "accel_x" | "accel_y" | "accel_z" => "Motion",
+                | "accel_x" | "accel_y" | "accel_z" | "orientation" => "Motion",
                 id if id.starts_with("btn_") => "Buttons",
                 id if id.starts_with("key_")
                     || id.starts_with("media_")
@@ -1177,6 +1226,9 @@ pub(crate) fn show_automap_combiner_body(
                         .id_salt(cat_id)
                         .default_open(false)
                         .show(ui, |ui| {
+                            if cat == "Motion" {
+                                motion_section_mode(ui, node_id, &current_motion, &mut next_motion);
+                            }
                             for &pin_id in pins {
                                 let neutral = am_canon::ALL_PINS.iter()
                                     .find(|p| p.id == pin_id)
@@ -1297,6 +1349,15 @@ pub(crate) fn show_automap_combiner_body(
                     }
                 }
             });
+        if let Some(mode) = next_motion {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if mode == "SORT" {
+                    node.params.remove("combiner_motion"); // SORT is the implicit default.
+                } else {
+                    node.params.insert("combiner_motion".to_string(), Value::String(mode.to_string()));
+                }
+            }
+        }
     });
     // Register the whole body as the pinnable element so Layout mode's "Pin
     // element ▶ Whole module" works for the combiner (matches remapper /
