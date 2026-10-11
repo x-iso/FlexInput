@@ -1230,7 +1230,7 @@ async fn run_session(
                 }
                 last_input = tokio::time::Instant::now();
                 reports += 1;
-                let Some(snap) = reports::parse_input(side, &n.value) else { continue };
+                let Some(snap) = reports::parse_streamed(side, &n.value) else { continue };
                 let stick = calib.normalize(snap.stick_raw);
                 // Pick up a calibration measured on THIS controller, if the user has
                 // captured one. Pushed every report rather than at connect: a capture

@@ -58,6 +58,31 @@ pub(crate) fn accel_to_model(ax: f32, ay: f32, az: f32) -> glam::Vec3 {
     glam::Vec3::new(-ay, az, -ax)
 }
 
+/// The device's own orientation off the bus, when the module is set to use it
+/// (`orient_source = "device"`) and the bus carries one. Canonical, normalised.
+fn device_orientation(
+    params: &HashMap<String, Value>,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &HashMap<(String, String), Signal>,
+) -> Option<glam::Quat> {
+    if params.get("orient_source").and_then(|v| v.as_str()) != Some("device") {
+        return None;
+    }
+    let dev_id = params.get("_automap_device_id").and_then(|v| v.as_str())?;
+    let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+    let key = |d: &str| (d.to_string(), "orientation".to_string());
+    let sig = (!collector_id.is_empty())
+        .then(|| collector_sigs.get(&key(collector_id)))
+        .flatten()
+        .or_else(|| dev_sigs.get(&key(dev_id)));
+    match sig {
+        Some(Signal::Vec4(v)) if v.length_squared() > 1e-6 => {
+            Some(glam::Quat::from_xyzw(v.x, v.y, v.z, v.w).normalize())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -657,6 +682,23 @@ pub(crate) fn compute_gyro_3dof(
         state.aux_f32[9],
         state.aux_f32[10],
     ));
+    // `orient_source = "device"`: pass through the orientation the DEVICE fuses
+    // itself (a Joy-Con 2 publishes one — absolute, magnetometer-held yaw, and
+    // already relative to the calibration window's baseline), instead of the
+    // integration above. Reset re-zeroes it against the pose at the press.
+    // Falls back to the computed one when the bus carries none.
+    let q_canonical = match device_orientation(params, dev_sigs, collector_sigs) {
+        Some(q) => {
+            while state.aux_f32.len() < 21 { state.aux_f32.push(0.0); }
+            if q_reset_edge {
+                state.aux_f32[17..21].copy_from_slice(&[q.x, q.y, q.z, q.w]);
+            }
+            let r = glam::Quat::from_xyzw(
+                state.aux_f32[17], state.aux_f32[18], state.aux_f32[19], state.aux_f32[20]);
+            if r.length_squared() > 0.5 { (r.normalize().inverse() * q).normalize() } else { q }
+        }
+        None => q_canonical,
+    };
     let orientation_signal = Some(Signal::Vec4(glam::Vec4::new(
         q_canonical.x,
         q_canonical.y,

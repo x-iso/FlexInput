@@ -277,15 +277,19 @@ fn push_common(
     // pixel per sensor count. The raw per-report step can't sit on a held pin
     // (see `MouseTracker`), so this is its velocity.
     let now = std::time::Instant::now();
-    let [mx, my] = pad.mouse.velocity(now);
-    let motion = glam::Vec2::new(mx, -my) * MOUSE_PIN_PER_COUNT;
-    out.push((dev.into(), "optical_motion".into(), Signal::Vec2(motion)));
-    out.push((dev.into(), "optical_contact".into(), Signal::Bool(pad.mouse.contact(now))));
+    // Only while the sensor is streamed — the same switch that declares them.
+    if crate::layouts::JC2_MOUSE_STREAMED {
+        let [mx, my] = pad.mouse.velocity(now);
+        let motion = glam::Vec2::new(mx, -my) * MOUSE_PIN_PER_COUNT;
+        out.push((dev.into(), "optical_motion".into(), Signal::Vec2(motion)));
+        out.push((dev.into(), "optical_contact".into(), Signal::Bool(pad.mouse.contact(now))));
+        for (pin, v) in [("optical_x", motion.x), ("optical_y", motion.y),
+                         ("optical_distance", pad.snapshot.mouse.distance as f32)] {
+            out.push((dev.into(), pin.into(), Signal::Float(v)));
+        }
+    }
 
     let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
-    f("optical_x", motion.x);
-    f("optical_y", motion.y);
-    f("optical_distance", pad.snapshot.mouse.distance as f32);
     f("battery", pad.snapshot.power.fraction());
 
     // ⭐ The gyro pins now carry the FIELD-derived rate, not the accel-derived

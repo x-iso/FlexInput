@@ -2938,6 +2938,18 @@ const COMMON_OFF_BUTTONS: usize = 0x04;
 const COMMON_OFF_STICK_L: usize = 0x0A;
 const COMMON_OFF_STICK_R: usize = 0x0D;
 
+/// [`parse_input`] for a live Bluetooth link: the mouse block is dropped
+/// unless the feature mask in use asked for the optical sensor — see
+/// [`crate::protocol::feature::MOUSE_STREAMED`]. Unrequested, those bytes are
+/// not promised to be mouse data, and read as such they would move a pointer.
+pub fn parse_streamed(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
+    let mut snap = parse_input(side, payload)?;
+    if !crate::protocol::feature::MOUSE_STREAMED {
+        snap.mouse = Mouse::default();
+    }
+    Some(snap)
+}
+
 pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
     if payload.len() < OFF_STICK + 3 {
         return None;

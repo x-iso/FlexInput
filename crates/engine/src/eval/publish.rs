@@ -763,8 +763,10 @@ pub(crate) fn automap_combiner_publish(
                 input_devs.get(i).map(String::as_str).unwrap_or(""),
                 input_collectors.get(i).map(String::as_str).unwrap_or("")))
             .collect();
+        // The Correlate noise gate's strength (0 = off); 1 unless set.
+        let gate = snap.params.get("combiner_motion_gate").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         let ns = state.entry(key_uid).or_default();
-        resolve(correlate, &ports, &ids, &mut ns.combiner_motion, dt)
+        resolve(correlate, gate, &ports, &ids, &mut ns.combiner_motion, dt)
             .map(|m| m.signals().into_iter().collect())
             .unwrap_or_default()
     };

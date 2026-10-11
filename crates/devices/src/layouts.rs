@@ -193,6 +193,29 @@ fn joycon2_shared_outputs() -> Vec<DevicePin> {
         // rate-only pad cannot: the firmware fuses gyro, accel and
         // magnetometer, so yaw is drift-free rather than integrated.
         f2("orientation", "Orientation (absolute)", SignalType::Vec4),
+    ]);
+    if JC2_MOUSE_STREAMED {
+        pins.extend(joycon2_optical_outputs());
+    }
+    pins.extend(vec![
+        fl("battery", "Battery (0–1)"),
+        bo("charging", "Charging"),
+    ]);
+    pins.extend(joycon2_probe_outputs());
+    pins
+}
+
+/// Whether Joy-Con 2s stream their optical sensor — see
+/// `flexinput_joycon2::protocol::feature::MOUSE_STREAMED`. While they don't,
+/// the sensor's pins aren't offered at all, rather than offered and dead.
+#[cfg(feature = "joycon2")]
+pub(crate) const JC2_MOUSE_STREAMED: bool = flexinput_joycon2::protocol::feature::MOUSE_STREAMED;
+#[cfg(not(feature = "joycon2"))]
+pub(crate) const JC2_MOUSE_STREAMED: bool = false;
+
+/// The Joy-Con 2 optical (mouse) sensor's pins.
+fn joycon2_optical_outputs() -> Vec<DevicePin> {
+    vec![
         // Optical sensor motion in the Virtual KB/M's own mouse units (+Y up,
         // the default Mouse speed of 100 = one pixel per sensor count), so a
         // plain wire onto its `mouse` / `mouse_x` / `mouse_y` works. Unlike
@@ -207,11 +230,7 @@ fn joycon2_shared_outputs() -> Vec<DevicePin> {
         bo("optical_contact", "Mouse Sensor Contact"),
         // Raw distance byte: 0 on a surface, ≈12 lifted. Diagnostic.
         fl("optical_distance", "Mouse Sensor Distance (raw)"),
-        fl("battery", "Battery (0–1)"),
-        bo("charging", "Charging"),
-    ]);
-    pins.extend(joycon2_probe_outputs());
-    pins
+    ]
 }
 
 /// Raw, undecoded IMU bytes, exposed so they can be judged by hand.

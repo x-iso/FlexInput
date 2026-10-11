@@ -243,8 +243,7 @@ pub mod feature {
     /// none beat applying no rotation at all. Meanwhile the bytes where the
     /// standard accel and gyro live stayed zero, because they were switched off.
     ///
-    /// ⚠️ [`MOUSE`] was dropped to match the reference exactly; it is set again
-    /// now (`0x3f`, see below) so the optical sensor streams.
+    /// ⚠️ [`MOUSE`] is left out — see the ⛔ note on [`JOYCON2_DEFAULT`].
     /// ⛔ **0x2f, and NOT changed to 0x07 without hardware saying so.**
     ///
     /// Two sources disagree and only one of them is a capture:
@@ -262,12 +261,18 @@ pub mod feature {
     /// behind a command channel that ignores everything sent to it — see
     /// `docs/BLUETOOTH_TRANSPORTS.md`. Retail Joy-Con 2 firmware is untested.
     ///
-    /// ⭐ **Now 0x3f: [`MOUSE`] is back on**, so a retail Joy-Con 2 streams its
-    /// optical sensor (the M12-S has none). Official software sets the bit too
-    /// (its 0x37), and the M12-S sweep above acknowledged 0x3f with nothing
-    /// else changing — so it costs the clone nothing. Untested on a retail
-    /// half; if one goes wrong with it, this bit is the first suspect.
-    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | MOUSE | RUMBLE; // 0x3f
+    /// ⛔ **[`MOUSE`] OFF again (2026-10-11).** It was briefly on (0x3f) so a
+    /// retail Joy-Con 2's optical sensor would stream, and on retail halves it
+    /// changed the reporting in a way that broke them — the M12-S, having no
+    /// sensor, shows nothing either way, which is why it looked harmless. The
+    /// optical pins stay declared; [`MOUSE_STREAMED`] keeps the transports from
+    /// reading mouse bytes the controller was never asked for.
+    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | RUMBLE; // 0x2f
+
+    /// Whether the mask in use asks for the optical sensor. Without it the
+    /// per-side report's mouse bytes are not promised to be mouse data, so they
+    /// are dropped rather than turned into pointer motion and a contact flag.
+    pub const MOUSE_STREAMED: bool = JOYCON2_DEFAULT & MOUSE != 0;
 
     /// `JOYCON2_DEFAULT` plus the magnetometer (0xB7).
     ///
@@ -556,21 +561,19 @@ mod tests {
     /// change has to disagree with the reference's actual payload byte.
     #[test]
     fn joycon2_default_features_enable_the_raw_imu() {
-        // The reference's 0x2f plus the optical mouse.
-        assert_eq!(feature::JOYCON2_DEFAULT, 0x2f | feature::MOUSE);
+        assert_eq!(feature::JOYCON2_DEFAULT, 0x2f);
         assert_ne!(
             feature::JOYCON2_DEFAULT & feature::IMU_RAW,
             0,
             "without IMU_RAW the standard gyro block is never sent",
         );
-        assert_ne!(
-            feature::JOYCON2_DEFAULT & feature::MOUSE,
-            0,
-            "without MOUSE a retail Joy-Con 2's optical sensor stays silent",
+        assert!(
+            !feature::MOUSE_STREAMED,
+            "MOUSE changed retail Joy-Con 2 reporting; off until that is understood",
         );
         assert_eq!(
             command(CMD_FEATURE_SELECT, SUB_FEATURE_INIT, &[feature::JOYCON2_DEFAULT, 0, 0, 0]),
-            vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00],
+            vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00],
         );
     }
 

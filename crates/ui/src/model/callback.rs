@@ -623,6 +623,23 @@ struct MatteTarget {
 /// Whether this frame's `paint` should composite from the matte target.
 struct MatteActive(bool);
 
+/// ⭐ Everything `prepare` hands to `paint`, and the visibility measurement,
+/// PER VIEWER INSTANCE — for the same reason as [`ModelBuffers`].
+///
+/// egui runs every callback's `prepare` before any `paint`, and these used to be
+/// single slots in the shared type-map: with two 3D viewers on screen, both
+/// painted the x-ray ghost list (and matte image) of whichever prepared last,
+/// and both fed one depth measurement — so one viewer ghosted its inputs by
+/// the OTHER's pose. Two viewers showing different models (a Joy-Con half and
+/// a grip) even rebuilt the shared measurement every frame, so it never
+/// finished. A raw-orientation viewer beside a 3DOF-fed one showed exactly that.
+#[derive(Default)]
+struct PerInstance {
+    frame: HashMap<u64, (MatteActive, XrayOrder)>,
+    matte: HashMap<u64, MatteTarget>,
+    vis: HashMap<u64, VisMeasure>,
+}
+
 /// Ghost-gate threshold on the measured `visible / total` sample ratio. The
 /// X-ray ghost gating with hysteresis (kills the strobe when a part sits at the
 /// edge of occlusion): an active part ENTERS x-ray only once its smoothed
@@ -880,6 +897,14 @@ struct VisMeasure {
     stalled_frames: std::sync::atomic::AtomicU32,
 }
 
+/// This frame's per-instance slots, created on first use.
+fn per_instance(res: &mut CallbackResources) -> &mut PerInstance {
+    if res.get::<PerInstance>().is_none() {
+        res.insert(PerInstance::default());
+    }
+    res.get_mut::<PerInstance>().expect("just inserted")
+}
+
 impl CallbackTrait for MeshRenderState {
     fn prepare(
         &self,
@@ -1018,7 +1043,8 @@ impl CallbackTrait for MeshRenderState {
         // Latched per-part "hidden" flags (smoothing + hysteresis applied at
         // readback) — an active part that's hidden shows the x-ray ghost.
         let ghost_hidden: Vec<bool> = callback_resources
-            .get::<VisMeasure>()
+            .get::<PerInstance>()
+            .and_then(|p| p.vis.get(&self.instance))
             .and_then(|v| v.ghost.lock().ok().map(|g| g.clone()))
             .unwrap_or_default();
         let center_radius4 = [center.x, center.y, center.z, radius];
@@ -1197,7 +1223,8 @@ impl CallbackTrait for MeshRenderState {
             let w = ((self.vis_rect.width() * ppp).round() as u32).max(1);
             let h = ((self.vis_rect.height() * ppp).round() as u32).max(1);
             let rebuild = callback_resources
-                .get::<MatteTarget>()
+                .get::<PerInstance>()
+                .and_then(|p| p.matte.get(&self.instance))
                 .map(|m| m.size != (w, h))
                 .unwrap_or(true);
             if rebuild {
@@ -1253,7 +1280,7 @@ impl CallbackTrait for MeshRenderState {
                         },
                     ],
                 });
-                callback_resources.insert(MatteTarget {
+                per_instance(callback_resources).matte.insert(self.instance, MatteTarget {
                     color_view,
                     depth_view,
                     size: (w, h),
@@ -1269,7 +1296,7 @@ impl CallbackTrait for MeshRenderState {
                 Some(b) => b.parts.as_slice(),
                 None => return Vec::new(),
             };
-            if let Some(mt) = callback_resources.get::<MatteTarget>() {
+            if let Some(mt) = callback_resources.get::<PerInstance>().and_then(|p| p.matte.get(&self.instance)) {
                 queue.write_buffer(
                     &mt.alpha_buf,
                     0,
@@ -1336,7 +1363,8 @@ impl CallbackTrait for MeshRenderState {
         // plenty — visibility changes with orientation, not per frame.
         let n_parts = self.model.parts.len();
         let vis_rebuild = callback_resources
-            .get::<VisMeasure>()
+            .get::<PerInstance>()
+            .and_then(|p| p.vis.get(&self.instance))
             .map(|v| v.n_parts != n_parts || v.model != self.model.name)
             .unwrap_or(true);
         if vis_rebuild && n_parts > 0 {
@@ -1362,7 +1390,7 @@ impl CallbackTrait for MeshRenderState {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            callback_resources.insert(VisMeasure {
+            per_instance(callback_resources).vis.insert(self.instance, VisMeasure {
                 depth_view: depth.create_view(&Default::default()),
                 depth_tex: depth,
                 n_parts,
@@ -1392,7 +1420,7 @@ impl CallbackTrait for MeshRenderState {
                 Some(b) => b.parts.as_slice(),
                 None => return Vec::new(),
             };
-            if let Some(vm) = callback_resources.get::<VisMeasure>() {
+            if let Some(vm) = callback_resources.get::<PerInstance>().and_then(|p| p.vis.get(&self.instance)) {
                 let st = *vm.state.lock().unwrap();
                 match st {
                     VisMapState::Ready => {
@@ -1520,12 +1548,14 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        callback_resources.insert(MatteActive(use_matte));
-        callback_resources.insert(XrayOrder {
-            ghosts: ghost_order,
-            restore,
-            translucent: trans_order,
-        });
+        per_instance(callback_resources).frame.insert(self.instance, (
+            MatteActive(use_matte),
+            XrayOrder {
+                ghosts: ghost_order,
+                restore,
+                translucent: trans_order,
+            },
+        ));
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
     }
@@ -1555,14 +1585,12 @@ impl CallbackTrait for MeshRenderState {
 
         // Widget matte path: the controller was already rendered offscreen in
         // `prepare`; composite that image at the matte alpha and stop.
-        if callback_resources
-            .get::<MatteActive>()
-            .map(|m| m.0)
-            .unwrap_or(false)
-        {
+        let per = callback_resources.get::<PerInstance>();
+        let frame = per.and_then(|p| p.frame.get(&self.instance));
+        if frame.is_some_and(|(m, _)| m.0) {
             if let (Some(blit), Some(mt)) = (
                 callback_resources.get::<Arc<BlitPipeline>>(),
-                callback_resources.get::<MatteTarget>(),
+                per.and_then(|p| p.matte.get(&self.instance)),
             ) {
                 render_pass.set_pipeline(&blit.pipeline);
                 render_pass.set_bind_group(0, &mt.bind_group, &[]);
@@ -1571,7 +1599,7 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        let xo = callback_resources.get::<XrayOrder>();
+        let xo = frame.map(|(_, xo)| xo);
         let is_trans: Vec<bool> = {
             let mut v = vec![false; gpu_parts.len()];
             if let Some(xo) = xo {

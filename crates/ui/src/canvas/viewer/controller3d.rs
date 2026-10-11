@@ -420,6 +420,14 @@ pub(crate) fn controller3d_live(
         ("misc", "btn_capture"),
         ("left_bumper", "btn_lb"),
         ("right_bumper", "btn_rb"),
+        // Joy-Con rail buttons, published as paddles (L: SL = l1, SR = l2;
+        // R: SL = r1, SR = r2). The models number them by rail position —
+        // 1/2 at the upper end (by the shoulder), 3/4 at the lower — and the
+        // upper one is SL on the left half but SR on the right, as printed.
+        ("paddle1", "btn_paddle_l1"),
+        ("paddle3", "btn_paddle_l2"),
+        ("paddle2", "btn_paddle_r2"),
+        ("paddle4", "btn_paddle_r1"),
     ];
     for (part, pin) in BUTTON_PART_PINS {
         if b(pin) {

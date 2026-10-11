@@ -251,6 +251,8 @@ fn motion_section_mode(
     node_id: NodeId,
     current: &str,
     next: &mut Option<&'static str>,
+    gate: f32,
+    next_gate: &mut Option<f32>,
 ) {
     const MODES: &[(&str, &str, &str)] = &[
         ("SORT", "Sort (top port)",
@@ -262,9 +264,11 @@ fn motion_section_mode(
           a grip, or an extra IMU strapped to a pad with its own.\n\
           Each lower port's mounting rotation is learned by correlating its \
           gyro with the top port's — turn the assembly about a few different \
-          axes for a second or two — then the aligned readings are averaged. \
-          Until the fit is good (or if it degrades), the top port alone, as \
-          Sort. Orientation always comes from the top port."),
+          axes for a second or two. Then the aligned readings are fused, each \
+          weighted by its own measured noise (a noisier half counts for less), \
+          and a noise gate removes what can't be told from noise. Until the fit \
+          is good (or if it degrades), the top port alone, as Sort. \
+          Orientation always comes from the top port."),
     ];
     let label = MODES.iter().find(|(m, _, _)| *m == current).map(|(_, l, _)| *l).unwrap_or("Sort (top port)");
     ui.horizontal(|ui| {
@@ -283,6 +287,22 @@ fn motion_section_mode(
             });
         resp.response.on_hover_text(
             MODES.iter().find(|(m, _, _)| *m == current).map(|(_, _, h)| *h).unwrap_or(MODES[0].2));
+        if current == "CORRELATE" {
+            let mut g = gate;
+            ui.label(egui::RichText::new("noise gate ×").small().weak());
+            let r = ui.add(egui::DragValue::new(&mut g).speed(0.02).range(0.0..=4.0).fixed_decimals(2))
+                .on_hover_text(
+                    "How much measured noise the fused gyro rate sheds.\n\
+                     The noise is measured live from how much the IMUs DISAGREE \
+                     — motion is the same in both, so their difference is noise \
+                     alone — and rates within that are removed smoothly.\n\
+                     1 = the default (a resting pair reads zero ~95% of the \
+                     time; real turns pass whole). 0 = off: weighting only. \
+                     Higher trims more of the slowest aim.");
+            if r.changed() {
+                *next_gate = Some(g);
+            }
+        }
     });
 }
 
@@ -893,31 +913,77 @@ pub(crate) fn bus_label(module_id: &str) -> Option<&'static str> {
     })
 }
 
+/// What one Combiner port traces back to.
+enum TracedInput {
+    /// A physical `device.source`: its id and the canonical pins it offers.
+    Device { dev_id: String, pins: std::collections::HashSet<&'static str> },
+    /// A bus-shaped node, which may offer any pin.
+    Bus(&'static str),
+}
+
+/// `parent` is the enclosing canvas when the Combiner sits inside a sub-patch.
+///
+/// ❗ Inside a sub-patch every input arrives through a `subpatch.inlet`, and the
+/// walk used to stop there: each port traced to nothing, offered no pins, and
+/// the Combiner listed no overlap at all — no Resolution rows, no Motion
+/// section, so nothing to choose CORRELATE from. It now pops out through the
+/// inlet into the enclosing canvas (and descends through a sub-patch's outlet
+/// on the way), as the 3D viewer's trace does.
 pub(crate) fn combiner_inputs_info(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
+    parent: Option<&AutomapGlowParent<'_>>,
 ) -> Vec<CombinerInputInfo> {
-    /// Walks the AutoMap chain to find the originating `device.source` (returns
-    /// its device_id), OR detects a collector-shaped node (Remapper/Collector/
-    /// Combiner/Splitter+Fork+Selector) and returns a synthetic tag.
-    fn trace(snarl: &Snarl<NodeData>, src: OutPinId, depth: u32)
-        -> Option<(Option<String>, &'static str)>
-    {
+    /// Walks the AutoMap chain to the originating `device.source`, or stops at
+    /// a bus-shaped node (Remapper/Collector/Combiner/Fork/Selector/...).
+    fn trace(
+        snarl: &Snarl<NodeData>,
+        src: OutPinId,
+        parent: Option<&AutomapGlowParent<'_>>,
+        depth: u32,
+    ) -> Option<TracedInput> {
         if depth > 16 { return None; }
         let node = snarl.get_node(src.node)?;
         match node.module_id.as_str() {
             "device.source" => {
                 let dev_id = node.params.get("device_id").and_then(|v| v.as_str())?.to_string();
-                Some((Some(dev_id), "device"))
+                // Read off the node the walk reached — it may live in another
+                // canvas than the Combiner, so searching by id would miss it.
+                let pins = node.params.get("output_pin_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter_map(|s| am_canon::ALL_PINS.iter().find(|ap| ap.id == s).map(|ap| ap.id))
+                        .collect())
+                    .unwrap_or_default();
+                Some(TracedInput::Device { dev_id, pins })
             }
             // Splitter is a transparent passthrough on its AutoMap input.
             "module.automap_split" => {
                 let in_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
                 let pin = snarl.in_pin(InPinId { node: src.node, input: in_idx });
                 let upstream = *pin.remotes.first()?;
-                trace(snarl, upstream, depth + 1)
+                trace(snarl, upstream, parent, depth + 1)
             }
-            id => bus_label(id).map(|label| (None, label)),
+            // Out of the sub-patch, through the outer wire into this inlet.
+            "subpatch.inlet" => {
+                let pin_idx = node.params.get("pin_index").and_then(|v| v.as_u64())? as usize;
+                let p = parent?;
+                let outer = p.snarl.in_pin(InPinId { node: p.subpatch_node_id, input: pin_idx });
+                trace(p.snarl, *outer.remotes.first()?, p.prev, depth + 1)
+            }
+            // Into a sub-patch, through the outlet feeding this output.
+            "subpatch" => {
+                let sp = node.subpatch.as_ref()?;
+                let outlet = sp.snarl.nodes_ids_data()
+                    .find(|(_, n)| n.value.module_id == "subpatch.outlet"
+                        && n.value.params.get("pin_index").and_then(|v| v.as_u64()) == Some(src.output as u64))
+                    .map(|(id, _)| id)?;
+                let inner = *sp.snarl.in_pin(InPinId { node: outlet, input: 0 }).remotes.first()?;
+                let frame = AutomapGlowParent { snarl, subpatch_node_id: src.node, prev: parent };
+                trace(&sp.snarl, inner, Some(&frame), depth + 1)
+            }
+            id => bus_label(id).map(TracedInput::Bus),
         }
     }
 
@@ -925,44 +991,34 @@ pub(crate) fn combiner_inputs_info(
     let mut out: Vec<CombinerInputInfo> = Vec::with_capacity(n);
     for i in 0..n {
         let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
-        let traced = in_pin.remotes.first().and_then(|&src| trace(snarl, src, 0));
+        let traced = in_pin.remotes.first().and_then(|&src| trace(snarl, src, parent, 0));
         let (offered, label) = match traced {
             // Physical device.source: pin set is whatever its output_pin_ids declares.
-            Some((Some(dev_id), "device")) => {
-                let pins: std::collections::HashSet<&'static str> = snarl
-                    .nodes_ids_data()
-                    .find_map(|(_, n)| {
-                        let nd = &n.value;
-                        if nd.module_id != "device.source" { return None; }
-                        if nd.params.get("device_id").and_then(|v| v.as_str()) != Some(dev_id.as_str()) {
-                            return None;
-                        }
-                        nd.params.get("output_pin_ids")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .filter_map(|s| am_canon::ALL_PINS.iter()
-                                    .find(|ap| ap.id == s).map(|ap| ap.id))
-                                .collect())
-                    })
-                    .unwrap_or_default();
-                let label = match family_slug_from_device_id(&dev_id) {
-                    Some("dualsense")  => "DualSense".to_string(),
-                    Some("ds4")        => "DualShock 4".to_string(),
-                    Some("xinput")     => "Xbox / XInput".to_string(),
-                    Some("switch_pro") => "Switch Pro".to_string(),
-                    _ => dev_id,
+            Some(TracedInput::Device { dev_id, pins }) => {
+                // Joy-Con halves by their pad slug: they have no glyph family,
+                // so `family_slug_from_device_id` (a glyph lookup) knows nothing
+                // of them.
+                let label = match crate::canvas::remapper_icons::phys_pad_slug(&dev_id) {
+                    Some("joycon2_l") => "Joy-Con 2 (L)".to_string(),
+                    Some("joycon2_r") => "Joy-Con 2 (R)".to_string(),
+                    _ => match family_slug_from_device_id(&dev_id) {
+                        Some("dualsense")  => "DualSense".to_string(),
+                        Some("ds4")        => "DualShock 4".to_string(),
+                        Some("xinput")     => "Xbox / XInput".to_string(),
+                        Some("switch_pro") => "Switch Pro".to_string(),
+                        _ => dev_id,
+                    },
                 };
                 (pins, label)
             }
             // Collector-shaped node: offers the full canonical pin set (any
             // pin could be overridden into the bus).
-            Some((None, tag)) => {
+            Some(TracedInput::Bus(tag)) => {
                 let pins: std::collections::HashSet<&'static str> =
                     am_canon::ALL_PINS.iter().map(|p| p.id).collect();
                 (pins, tag.to_string())
             }
-            _ => (std::collections::HashSet::new(), String::new()),
+            None => (std::collections::HashSet::new(), String::new()),
         };
         out.push(CombinerInputInfo { offered, label });
     }
@@ -1012,10 +1068,11 @@ pub(crate) fn show_automap_combiner_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
+    parent: Option<&AutomapGlowParent<'_>>,
 ) {
     let _ = live_signals; // no longer used: structural overlap is connection-based
     let n = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(0);
-    let infos = combiner_inputs_info(snarl, node_id);
+    let infos = combiner_inputs_info(snarl, node_id, parent);
 
     // overlap[pin] = list of port indices whose upstream offers this pin.
     // A pin counts as conflicting when ≥2 inputs offer it (structural overlap,
@@ -1150,6 +1207,10 @@ pub(crate) fn show_automap_combiner_body(
             .and_then(|n| n.params.get("combiner_motion"))
             .and_then(|v| v.as_str()).unwrap_or("SORT").to_string();
         let mut next_motion: Option<&'static str> = None;
+        let current_gate = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("combiner_motion_gate"))
+            .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let mut next_gate: Option<f32> = None;
 
         // Union of structurally-overlapping pins and explicitly-overridden pins.
         let mut tracked: std::collections::BTreeMap<&'static str, ()> = std::collections::BTreeMap::new();
@@ -1227,7 +1288,8 @@ pub(crate) fn show_automap_combiner_body(
                         .default_open(false)
                         .show(ui, |ui| {
                             if cat == "Motion" {
-                                motion_section_mode(ui, node_id, &current_motion, &mut next_motion);
+                                motion_section_mode(ui, node_id, &current_motion, &mut next_motion,
+                                    current_gate, &mut next_gate);
                             }
                             for &pin_id in pins {
                                 let neutral = am_canon::ALL_PINS.iter()
@@ -1349,6 +1411,11 @@ pub(crate) fn show_automap_combiner_body(
                     }
                 }
             });
+        if let Some(g) = next_gate {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("combiner_motion_gate".to_string(), Value::from(g as f64));
+            }
+        }
         if let Some(mode) = next_motion {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 if mode == "SORT" {
@@ -1363,4 +1430,68 @@ pub(crate) fn show_automap_combiner_body(
     // element ▶ Whole module" works for the combiner (matches remapper /
     // map_action, which were registered but the combiner was missed).
     register_exposable_element(ui, node_id, "whole_module", body_resp.response.rect);
+}
+
+#[cfg(test)]
+mod combiner_trace_tests {
+    use super::*;
+    use flexinput_core::PinDescriptor;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn node(module: &str, inputs: usize, outputs: usize, params: HashMap<String, Value>) -> NodeData {
+        NodeData {
+            module_id: module.to_string(),
+            display_name: module.to_string(),
+            category: String::new(),
+            inputs: (0..inputs).map(|i| PinDescriptor::new(format!("in_{i}"), SignalType::AutoMap)).collect(),
+            outputs: (0..outputs).map(|i| PinDescriptor::new(format!("out_{i}"), SignalType::AutoMap)).collect(),
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Two Joy-Con halves wired into a sub-patch, merged by a Combiner inside
+    /// it. Each port's trace has to leave through its inlet into the outer
+    /// canvas; it used to stop there, so the ports offered nothing and the
+    /// Combiner listed no overlap — and with it no Motion section.
+    #[test]
+    fn a_combiner_inside_a_sub_patch_sees_its_devices_through_the_inlets() {
+        let mut outer = Snarl::new();
+        let src = |dev: &str| {
+            let mut p = HashMap::new();
+            p.insert("device_id".to_string(), json!(dev));
+            p.insert("output_pin_ids".to_string(), json!(["gyro_x", "gyro_y", "gyro_z", "orientation", "btn_lb"]));
+            node("device.source", 0, 1, p)
+        };
+        let l = outer.insert_node(egui::pos2(0.0, 0.0), src("jc2:joycon2_l:aa"));
+        let r = outer.insert_node(egui::pos2(0.0, 0.0), src("jc2:joycon2_r:bb"));
+        let sp = outer.insert_node(egui::pos2(0.0, 0.0), node("subpatch", 2, 0, HashMap::new()));
+        outer.connect(OutPinId { node: l, output: 0 }, InPinId { node: sp, input: 0 });
+        outer.connect(OutPinId { node: r, output: 0 }, InPinId { node: sp, input: 1 });
+
+        let mut inner = Snarl::new();
+        let inlet = |i: u64| {
+            let mut p = HashMap::new();
+            p.insert("pin_index".to_string(), json!(i));
+            node("subpatch.inlet", 0, 1, p)
+        };
+        let i0 = inner.insert_node(egui::pos2(0.0, 0.0), inlet(0));
+        let i1 = inner.insert_node(egui::pos2(0.0, 0.0), inlet(1));
+        let comb = inner.insert_node(egui::pos2(0.0, 0.0), node("module.automap_combiner", 2, 1, HashMap::new()));
+        inner.connect(OutPinId { node: i0, output: 0 }, InPinId { node: comb, input: 0 });
+        inner.connect(OutPinId { node: i1, output: 0 }, InPinId { node: comb, input: 1 });
+
+        let parent = AutomapGlowParent { snarl: &outer, subpatch_node_id: sp, prev: None };
+        let infos = combiner_inputs_info(&inner, comb, Some(&parent));
+        assert_eq!(infos.len(), 2);
+        for info in &infos {
+            assert!(info.offered.contains("gyro_x") && info.offered.contains("orientation"), "{:?}", info.offered);
+        }
+        assert!(infos[0].label.contains("(L)") && infos[1].label.contains("(R)"),
+            "{} / {}", infos[0].label, infos[1].label);
+        // Without the enclosing canvas the inlets lead nowhere — the old blindness.
+        assert!(combiner_inputs_info(&inner, comb, None).iter().all(|i| i.offered.is_empty()));
+    }
 }

@@ -52,6 +52,9 @@ pub(crate) fn show_gyro_3dof_body(
     let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
     let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
+    // Where the 3D Orientation output comes from: "computed" (integrated here)
+    // or "device" (the pad's own fused orientation, e.g. a Joy-Con 2's).
+    let orient_device     = snap.and_then(|n| n.params.get("orient_source").and_then(|v| v.as_str())) == Some("device");
     let roll_mix          = snap.and_then(|n| n.params.get("roll_contribution").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let hold = snap.map(gyro_read_hold).unwrap_or([0.0; 3]);
     let out_x = snap.and_then(|n| match n.extra.last_out.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -70,6 +73,7 @@ pub(crate) fn show_gyro_3dof_body(
     let mut orient_drift = orient_drift;
     let mut yaw_recenter = yaw_recenter;
     let mut yaw_thresh   = yaw_thresh;
+    let mut orient_device = orient_device;
     let mut roll_mix     = roll_mix;
     let mut hold         = hold;
     let mut changed   = false;
@@ -187,9 +191,33 @@ pub(crate) fn show_gyro_3dof_body(
         });
         hold_rect = Some(r.response.rect);
 
+        // Source of the 3D Orientation output. The rows under it tune the
+        // integration, so they grey out while the device's own is used.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.label(egui::RichText::new("3D source:").small().weak());
+            for (dev, lbl, tip) in [
+                (false, "Computed", "Integrate this module's own orientation from the gyro
+                                    (with the drift fix / re-center options below)."),
+                (true, "Device", "Use the orientation the device fuses itself, when it
+                                  publishes one (Joy-Con 2: absolute, magnetometer-held
+                                  yaw, relative to the Calibration window's baseline).
+                                  Reset re-zeroes it to the pose at the press.
+                                  Falls back to Computed for a pad without one."),
+            ] {
+                if ui.selectable_label(orient_device == dev, egui::RichText::new(lbl).small())
+                    .on_hover_text(tip).clicked() && orient_device != dev
+                {
+                    orient_device = dev;
+                    changed = true;
+                }
+            }
+        });
+
         // 3D Orientation display scale (applied to the integration rate, so it's
         // continuous — no flipping at 180°). Affects the Orientation output that
         // feeds the Controller 3D viewer, NOT the 2D pointer/steering outputs.
+        ui.add_enabled_ui(!orient_device, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(egui::RichText::new("3D rot ×").small().weak())
@@ -249,6 +277,7 @@ pub(crate) fn show_gyro_3dof_body(
                     .min_decimals(3).max_decimals(4))
                     .changed() { changed = true; }
             });
+        });
         });
 
         let r = ui.horizontal(|ui| {
@@ -349,6 +378,11 @@ pub(crate) fn show_gyro_3dof_body(
             node.params.insert("orient_drift".into(),
                 serde_json::Number::from_f64(orient_drift as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("orient_auto_recenter".into(), Value::Bool(yaw_recenter));
+            if orient_device {
+                node.params.insert("orient_source".into(), Value::String("device".into()));
+            } else {
+                node.params.remove("orient_source");
+            }
             node.params.insert("orient_recenter_thresh".into(),
                 serde_json::Number::from_f64(yaw_thresh as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("roll_contribution".into(),

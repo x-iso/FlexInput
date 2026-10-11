@@ -1030,8 +1030,8 @@ pub(crate) fn render_combiner_whole_module(
         "combiner", REMAP_DESIGN_W, inner_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, is_layout_mode,
         "Combiner",
-        |id, ins, ui, sn, sigs, _panic, _am| {
-            show_automap_combiner_body(id, ins, ui, sn, sigs);
+        |id, ins, ui, sn, sigs, _panic, am| {
+            show_automap_combiner_body(id, ins, ui, sn, sigs, am);
         },
         combiner_hash_config,
         combiner_hash_config,

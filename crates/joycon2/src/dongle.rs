@@ -905,7 +905,7 @@ fn pump(
         let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
             continue;
         };
-        let Some(snap) = reports::parse_input(link.key.side, &n.value) else {
+        let Some(snap) = reports::parse_streamed(link.key.side, &n.value) else {
             link.unparsed = link.unparsed.saturating_add(1);
             if link.unparsed.is_power_of_two() {
                 eprintln!(

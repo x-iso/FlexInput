@@ -3555,8 +3555,7 @@ fn connect_both(dongle: &Dongle, opts: &Opts) -> Vec<Link> {
 ///
 /// Widening it is actively harmful rather than merely wasteful: the reference
 /// records that enabling everything makes the Joy-Con emit phantom ZL/ZR.
-/// ⭐ **Now 0x3f (0x2f + mouse), and the probe must never disagree with the
-/// shipped path.**
+/// ⭐ **Now 0x2f, and the probe must never disagree with the shipped path.**
 ///
 /// 0x94 was wrong, and so was the 0x37 it replaced. Neither carries bit 0x08
 /// ([`flexinput_joycon2::protocol::feature::IMU_RAW`]), and without that bit the
@@ -3572,7 +3571,7 @@ fn connect_both(dongle: &Dongle, opts: &Opts) -> Vec<Link> {
 /// Spelled as a literal because `btle` sits BELOW `joycon2` in the dependency
 /// graph and cannot import its constant. Keep the two in step by hand:
 /// `flexinput_joycon2::protocol::feature::JOYCON2_DEFAULT`.
-const FEATURE_MASK: u8 = 0x3f;
+const FEATURE_MASK: u8 = 0x2f;
 
 /// Command-line switches that change what the probe does to the controller.
 #[derive(Clone, Copy)]
