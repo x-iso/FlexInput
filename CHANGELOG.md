@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.8] - 2026-10-12
+
 ### Added
 
 - **Media and volume keys as outputs.** Play / Pause, Previous and Next Track,
@@ -45,8 +47,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   out, why it does nothing there. With a pad, the focused option shows its tip
   too. An analog card with a manual threshold now greys out Hold and the time
   gap (unless Turbo is on), since its output is simply held past the line.
-
-### Changed
 
 - **Choose with a pad: "+ Gap" is reachable, fine steps, legend at the
   bottom.** "+ Gap" is the output list's last stop (South adds the gap), and
