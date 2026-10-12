@@ -2,14 +2,18 @@
 //!
 //! # Why this is the preferred transport
 //!
-//! Windows reclaims **unpaired** BLE links on a ~30 s timer. That is measured,
-//! not inferred: an HCI capture shows `HCI_Disconnect` with reason `0x16`
-//! ("Terminated by Local Host") at exactly 31.1 s, while input notifications
-//! were still arriving every 15 ms. Nothing available to a GATT client
-//! prevents it — not `MaintainConnection`, not constant traffic, not WinRT
-//! pairing, not a hand-injected registry link key. Windows also cannot bond
-//! with these controllers at all: SMP ends in `Confirm Value Failed` because
-//! they use a non-zero legacy TK that WinRT has no API to supply.
+//! Over the Windows stack a link dies ~30 s in, with `HCI_Disconnect` reason
+//! `0x16` ("Terminated by Local Host") while input is still flowing. ⛔ It is
+//! the **SMP timeout**, not a timer on unpaired links (as this said until
+//! 2026-10): the controller sends an SMP Security Request ~30 ms after every
+//! connect, Windows answers with a Pairing Request of its own, then stalls —
+//! and kills the link when its 30-second SMP timer expires, 30.07 s after that
+//! request in the capture. Windows cannot finish the pairing either: SMP ends
+//! in `Confirm Value Failed` (the controller wants a non-zero legacy TK that
+//! WinRT has no API to supply), after which the controller hangs up itself.
+//!
+//! This stack simply never answers the Security Request (only ATT is read),
+//! and the controller tolerates that indefinitely.
 //!
 //! Owning the radio removes the problem rather than working around it. The same
 //! controller on the same machine holds **90 s at 64 Hz with zero drops** here.

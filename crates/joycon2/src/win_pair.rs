@@ -2,15 +2,21 @@
 //!
 //! # Why
 //!
-//! An HCI capture of a live session settled what six earlier theories could
-//! not. Windows sends `HCI_Disconnect` **31.1 s** after `LE Create Connection`,
-//! with `Reason = 0x16` ("Connection Terminated by Local Host"). The controller
-//! never terminates anything. At the moment of the kill the link was perfectly
-//! healthy: notifications arriving every 15 ms, the last one 11 ms earlier, and
-//! our keep-alive write going out fine. Nothing preceded the disconnect — no
-//! SMP, no security request, no failed command. It is a **timer**, and neither
-//! `GattSession.MaintainConnection = true` nor constant traffic in both
-//! directions stops it.
+//! ⛔ **Corrected 2026-10-12.** This used to say the capture showed "no SMP, no
+//! security request" — its filter simply excluded SMP. Re-read with `btsmp`:
+//! the controller sends a Security Request ~30 ms after connecting, Windows
+//! answers with its own Pairing Request, the controller responds, and Windows
+//! then stalls and disconnects (`0x16`) **30.07 s after its Pairing Request** —
+//! the SMP 30-second timeout. Pairing that proceeds (this module, accepting)
+//! ends in `Confirm Value Failed` and the controller hangs up. So bonding as
+//! below cannot work; what remains open is whether a pairing Windows DECLINES
+//! outright leaves the link up.
+//!
+//! The original reasoning, kept for the record: Windows sends `HCI_Disconnect`
+//! **31.1 s** after `LE Create Connection`, with `Reason = 0x16` ("Connection
+//! Terminated by Local Host"), while notifications were still arriving every
+//! 15 ms. Neither `GattSession.MaintainConnection = true` nor constant traffic
+//! in both directions stops it.
 //!
 //! The remaining difference between this connection and one Windows does not
 //! reclaim is that the device is **unpaired**. So: pair it.

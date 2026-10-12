@@ -512,10 +512,6 @@ pub struct FlexInputApp {
     /// so the Settings toggle re-arbitrates backends live. Mirrors
     /// `app_settings.sdl_all_pads`.
     sdl_all_pads: Arc<AtomicBool>,
-    /// Joy-Con 2 Bluetooth pairing opt-in, shared with the I/O thread so the
-    /// Settings toggle applies live. Mirrors `app_settings.joycon2_pairing`.
-    /// Off by default — the handshake writes to controller flash.
-    joycon2_pairing: Arc<AtomicBool>,
     /// Per-device measured polling rates (device_id → Hz). Written by the
     /// I/O thread, read by the canvas viewer to show live per-device Hz.
     pub device_rates: flexinput_engine::DeviceRates,
@@ -771,7 +767,6 @@ impl FlexInputApp {
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
-        let joycon2_pairing = Arc::new(AtomicBool::new(app_settings.joycon2_pairing));
         // Mirror the virtual-mouse physical-suppression settings to the
         // flexinput-virtual globals the keymouse thread reads. Pushed again on
         // every Settings change (see the Settings panel handlers).
@@ -997,7 +992,6 @@ impl FlexInputApp {
             Arc::clone(&spike_filter_settings),
             Arc::clone(&gyro_drift_settings),
             Arc::clone(&sdl_all_pads),
-            Arc::clone(&joycon2_pairing),
             Arc::clone(&ping_requests),
             Arc::clone(&led_defaults),
         );
@@ -1196,7 +1190,6 @@ impl FlexInputApp {
             sample_rate_hz,
             polling_hz,
             sdl_all_pads,
-            joycon2_pairing,
             device_rates,
             scope_taps,
             spike_filter_settings,

@@ -512,17 +512,6 @@ pub struct AppSettings {
     #[serde(default)]
     pub sdl_all_pads: bool,
 
-    /// Let Joy-Con 2 controllers complete Nintendo's Bluetooth pairing
-    /// handshake, so they reconnect on a button press instead of needing the
-    /// Sync button every session.
-    ///
-    /// Off by default because finalising the handshake WRITES to the
-    /// controller's internal flash, which stores only two host addresses —
-    /// pairing to this PC can evict the Switch 2 console's entry and force a
-    /// re-sync on the console. Input streaming works either way.
-    #[serde(default)]
-    pub joycon2_pairing: bool,
-
     /// Persisted main-window geometry (logical points at UI scale 100% — the
     /// units the window is created in at startup, before `ui_scale` takes
     /// effect), restored on the next launch so the window reopens where it
@@ -784,7 +773,6 @@ impl Default for AppSettings {
             mixed_braid_enabled: false,
             mixed_braid_rate_hz: MIXED_BRAID_RATE_HZ_DEFAULT,
             sdl_all_pads: false,
-            joycon2_pairing: false,
             window_pos: None,
             window_size: None,
             window_maximized: false,

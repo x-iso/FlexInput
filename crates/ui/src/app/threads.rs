@@ -35,10 +35,6 @@ pub(crate) fn spawn_io_thread(
     // Global "route every pad through SDL" switch — pushed to every backend
     // each iteration so a live toggle re-arbitrates without a restart.
     sdl_all_pads: Arc<AtomicBool>,
-    // Joy-Con 2 Bluetooth pairing opt-in. Pushed alongside the SDL switch so a
-    // live toggle applies to the next controller that connects, without a
-    // restart. See `DeviceBackend::set_joycon2_pairing` for why it's opt-in.
-    joycon2_pairing: Arc<AtomicBool>,
     ping_requests: Arc<Mutex<Vec<String>>>,
     // Per-device default lightbar colour (device-card swatch), sent while no
     // game or module drives that pad's lightbar.
@@ -216,10 +212,8 @@ pub(crate) fn spawn_io_thread(
                 // toggle takes effect this iteration.
                 {
                     let on = sdl_all_pads.load(Ordering::Relaxed);
-                    let pairing = joycon2_pairing.load(Ordering::Relaxed);
                     for backend in &mut backends {
                         backend.set_sdl_all_pads(on);
-                        backend.set_joycon2_pairing(pairing);
                     }
                 }
 

@@ -91,16 +91,6 @@ pub trait DeviceBackend: Send {
     /// against its canonical-correct native path. Changes device IDs
     /// (`gilrs:…` → `sdl:…`), so existing wiring does not follow the switch.
     fn set_sdl_all_pads(&mut self, _on: bool) {}
-    /// Arm Joy-Con 2's Bluetooth pairing handshake, pushed from the I/O loop
-    /// each tick like `set_sdl_all_pads`. Only the BLE backend acts on it.
-    ///
-    /// Off by default and deliberately opt-in: finalising the handshake writes
-    /// the host address and link key into the controller's flash, which holds
-    /// only two host slots, so pairing to a PC can evict a console's entry.
-    /// With it off the controller still streams input — it just won't
-    /// wake-and-reconnect on a button press, so the Sync button is needed each
-    /// session.
-    fn set_joycon2_pairing(&mut self, _on: bool) {}
     /// Hand a device its measured resting gyro drift, in **degrees per second
     /// on the device's own rate axes**, or `None` to fall back to whatever the
     /// backend compiled in.
@@ -129,12 +119,8 @@ pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
     // driver to these controllers, so gilrs and SDL never see them and no
     // dedup is needed. Starts its own thread and enumerates nothing until a
     // controller has finished connecting, so it is free to add unconditionally.
-    //
-    // Pairing defaults OFF here: the LTK handshake writes the host address into
-    // controller flash, which has only two slots and can evict a console's
-    // entry. The UI turns it on explicitly via `set_pairing_enabled`.
     #[cfg(feature = "joycon2")]
-    backends.push(Box::new(joycon2_backend::Joycon2Backend::new(false)));
+    backends.push(Box::new(joycon2_backend::Joycon2Backend::new()));
     // Bluetooth Classic gamepads on our own dongle. Enumerates nothing until a
     // controller with a STORED LINK KEY connects, so on a machine that has
     // never run the pairing tool it costs one idle thread and touches no radio

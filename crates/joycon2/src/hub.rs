@@ -192,9 +192,6 @@ enum PadCommand {
 struct Shared {
     pads: Mutex<HashMap<PadKey, PadState>>,
     senders: Mutex<HashMap<PadKey, tokio::sync::mpsc::UnboundedSender<PadCommand>>>,
-    /// Whether the LTK pairing handshake may run. Off means we still stream
-    /// input, we just never write to controller flash.
-    pairing_enabled: AtomicBool,
     /// Dongle transport state; the hub defers to it. See
     /// [`Joycon2Hub::set_stand_down`].
     stand_down: Mutex<Option<Arc<std::sync::atomic::AtomicU8>>>,
@@ -257,7 +254,7 @@ impl Joycon2Hub {
     /// point.** It used to be a separate `set_stand_down` call:
     ///
     /// ```text
-    ///     let hub = Joycon2Hub::start(pairing_enabled);   // loop starts HERE
+    ///     let hub = Joycon2Hub::start();                  // loop starts HERE
     ///     hub.set_stand_down(dongle.state_flag());        // flag lands later
     /// ```
     ///
@@ -272,12 +269,8 @@ impl Joycon2Hub {
     ///
     /// Passing it at construction closes the window by construction rather than
     /// by ordering discipline, and there is no longer a setter to forget.
-    pub fn start(
-        pairing_enabled: bool,
-        stand_down: Option<Arc<std::sync::atomic::AtomicU8>>,
-    ) -> Self {
+    pub fn start(stand_down: Option<Arc<std::sync::atomic::AtomicU8>>) -> Self {
         let shared = Arc::new(Shared::default());
-        shared.pairing_enabled.store(pairing_enabled, Ordering::Relaxed);
         *shared.stand_down.lock().unwrap() = stand_down;
 
         let worker = Arc::clone(&shared);
@@ -328,10 +321,6 @@ impl Joycon2Hub {
     /// Set the player-LED bitmask (bits 0–3).
     pub fn set_player_led(&self, key: PadKey, mask: u8) {
         self.send(key, PadCommand::PlayerLed(mask));
-    }
-
-    pub fn set_pairing_enabled(&self, on: bool) {
-        self.shared.pairing_enabled.store(on, Ordering::Relaxed);
     }
 
     /// Ask for one discovery pass even though controllers are connected — for
@@ -1042,11 +1031,14 @@ async fn run_session(
         eprintln!("[jc2] {} sent 0x03/0x02 cancel-advertising, answered={answered}", side.display_name());
     }
 
-    // 4. Pairing, only when explicitly enabled — this writes controller flash.
+    // 4. Pairing, always — exactly as the dongle transport does. It used to be
+    //    opt-in ("Pair Joy-Con 2 controllers" in Settings) because finalising
+    //    writes controller flash, but the dongle has always paired regardless,
+    //    so the switch only ever governed this fallback; removed 2026-10-12.
     //    A controller already paired during this run reuses its stored key and
     //    skips the `0x15` exchange entirely, so waking it with a button press
     //    does not rewrite flash every single time.
-    if shared.pairing_enabled.load(Ordering::Relaxed) {
+    {
         match crate::host_addr::local_bluetooth_address() {
             Some(host) => {
                 let known = shared.paired.lock().unwrap().get(&key.address).copied();

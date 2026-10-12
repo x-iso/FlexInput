@@ -58,9 +58,10 @@ impl Joycon2Backend {
 }
 
 impl Joycon2Backend {
-    /// Start the BLE hub. `pairing_enabled` gates the LTK handshake, which
-    /// writes to controller flash — see `flexinput_joycon2::pairing`.
-    pub fn new(pairing_enabled: bool) -> Self {
+    /// Start the transports. Both Bluetooth ones run Nintendo's pairing
+    /// handshake on a controller's first connect each run, so it wakes and
+    /// reconnects on a button press — see `flexinput_joycon2::pairing`.
+    pub fn new() -> Self {
         // Dongle FIRST, so its readiness flag exists before the hub can scan.
         // Constructing the hub first leaves a window in which the Windows stack
         // scans, spots a remembered controller and auto-connects it — after
@@ -70,7 +71,7 @@ impl Joycon2Backend {
         // a window in which this hub scanned with no flag set, which Windows
         // used to claim a remembered controller before the dongle was ready —
         // see `Joycon2Hub::start`.
-        let hub = Joycon2Hub::start(pairing_enabled, Some(dongle.state_flag()));
+        let hub = Joycon2Hub::start(Some(dongle.state_flag()));
         Self {
             hub,
             // Started unconditionally: it costs one idle thread polling hidapi
@@ -81,10 +82,6 @@ impl Joycon2Backend {
             dongle,
             spike: std::collections::HashMap::new(),
         }
-    }
-
-    pub fn set_pairing_enabled(&self, on: bool) {
-        self.hub.set_pairing_enabled(on);
     }
 }
 
@@ -554,13 +551,6 @@ impl DeviceBackend for Joycon2Backend {
             pre_gain_drift(d, flexinput_joycon2::reports::field_gain())
         });
         flexinput_joycon2::cal::set_field_drift(pad.key, pre_gain);
-    }
-
-    fn set_joycon2_pairing(&mut self, on: bool) {
-        // Cheap: the hub stores this in an atomic and only reads it when a
-        // controller is mid-initialisation, so pushing it every tick is free
-        // and a live toggle applies to the next controller that connects.
-        self.hub.set_pairing_enabled(on);
     }
 
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {

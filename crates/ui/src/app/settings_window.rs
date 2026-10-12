@@ -717,27 +717,6 @@ impl FlexInputApp {
 
                 ui.add_space(8.0);
 
-                if ui.checkbox(&mut self.settings.joycon2_pairing, "Pair Joy-Con 2 controllers")
-                    .on_hover_text(
-                        "Let Joy-Con 2 controllers complete Nintendo's Bluetooth pairing so they \
-                         reconnect on a button press instead of needing the Sync button every \
-                         session.\n\n\
-                         WARNING: pairing WRITES to the controller's internal memory, which stores \
-                         only two host addresses. Pairing to this PC can evict your Switch 2 \
-                         console's entry and force you to re-sync the controller on the console.\n\n\
-                         Off = the controller still works normally, it just won't wake-reconnect."
-                    )
-                    .changed()
-                {
-                    self.joycon2_pairing.store(self.settings.joycon2_pairing, Ordering::Relaxed);
-                    dirty = true;
-                }
-                ui.label(egui::RichText::new(
-                    "Joy-Con 2 works without this. Only enable it if you want wake-on-button, and \
-                     accept that the controller may need re-syncing on your Switch 2."
-                ).small().color(egui::Color32::from_gray(140)));
-
-                ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
                     ui.label("MIDI devices");
