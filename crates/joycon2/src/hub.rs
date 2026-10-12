@@ -1222,7 +1222,7 @@ async fn run_session(
                 }
                 last_input = tokio::time::Instant::now();
                 reports += 1;
-                let Some(snap) = reports::parse_streamed(side, &n.value) else { continue };
+                let Some(mut snap) = reports::parse_streamed(side, &n.value) else { continue };
                 let stick = calib.normalize(snap.stick_raw);
                 // Pick up a calibration measured on THIS controller, if the user has
                 // captured one. Pushed every report rather than at connect: a capture
@@ -1267,6 +1267,7 @@ async fn run_session(
                     if let Some(note) = pad.mouse.update(snap.mouse, std::time::Instant::now()) {
                         eprintln!("[jc2] {} {note}", side.display_name());
                     }
+                    snap.carry_motion(&pad.snapshot);
                     pad.snapshot = snap;
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;

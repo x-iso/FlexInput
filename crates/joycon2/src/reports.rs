@@ -536,6 +536,19 @@ pub struct Motion {
     pub std_accel: Option<[i16; 3]>,
 }
 
+impl Motion {
+    /// Whether this report carried no motion block this decoder reads — the
+    /// all-default `Motion` that [`parse_input`] leaves for a block it refuses.
+    ///
+    /// ⭐ Retail halves interleave such frames with real ones (`motion_len`
+    /// 0x28 between the 0x1e frames), so on a retail pad every other report is
+    /// empty. Consumers hold the last real sample through them instead of
+    /// reading zeros — see [`PadSnapshot::carry_motion`].
+    pub fn is_empty(&self) -> bool {
+        self.accel == [0; 3] && self.quat.is_none() && self.gyro.is_none()
+    }
+}
+
 /// ⭐ Decode the 12 bytes after the motion timestamp into the firmware's
 /// orientation quaternion, `[x, y, z, w]` in raw sensor axes.
 ///
@@ -2200,7 +2213,7 @@ impl OrientationTracker {
         // — which also became the clock's "previous" stamp for the next real
         // frame. Hold the last output instead; real frames carry on as if the
         // empty one never happened.
-        if motion.accel == [0; 3] && motion.quat.is_none() && motion.gyro.is_none() {
+        if motion.is_empty() {
             return self.last_out;
         }
         let out = self.update_sample(motion, side);
@@ -2805,6 +2818,21 @@ pub struct PadSnapshot {
     /// Raw value of the motion-length field. Zero means the IMU block was
     /// absent and [`PadSnapshot::motion`] is stale/default.
     pub motion_len: u8,
+}
+
+impl PadSnapshot {
+    /// Keep `prev`'s motion when this report carried none.
+    ///
+    /// ⛔ Without it a retail half's accel pins read zero on every other
+    /// report — the refused 0x28 frames — which shows as a comb of dropouts
+    /// to 0 g on every axis and feeds the spike filter a fake outlier per
+    /// frame. The orientation already held through them; the raw pins did not.
+    /// `motion_len` stays this report's own, for diagnosis.
+    pub fn carry_motion(&mut self, prev: &PadSnapshot) {
+        if self.motion.is_empty() {
+            self.motion = prev.motion;
+        }
+    }
 }
 
 fn i16le(b: &[u8], off: usize) -> i16 {
@@ -3792,6 +3820,32 @@ mod tests {
         let held = t.update(&Motion { tick: Some(112), ..m }, Side::Right);
         let empty = t.update(&Motion::default(), Side::Right);
         assert_eq!(empty, held);
+    }
+
+    /// ⛔ A retail half's refused 0x28 frame must not zero the raw accel pins:
+    /// the snapshot keeps the last real motion, but reports its own length.
+    #[test]
+    fn a_refused_motion_frame_keeps_the_previous_accel() {
+        let mut good = vec![0u8; 64];
+        good[OFF_MOTION_LEN] = 30;
+        good[OFF_MOTION_ACCEL..OFF_MOTION_ACCEL + 2].copy_from_slice(&4000i16.to_le_bytes());
+        let prev = parse_input(Side::Right, &good).expect("30-byte frame");
+        assert!(!prev.motion.is_empty());
+
+        let mut odd = good.clone();
+        odd[OFF_MOTION_LEN] = 40;
+        let mut snap = parse_input(Side::Right, &odd).expect("40-byte frame");
+        assert!(snap.motion.is_empty(), "a 40-byte block is refused");
+        snap.carry_motion(&prev);
+        assert_eq!(snap.motion.accel, prev.motion.accel, "accel dropped to zero");
+        assert_eq!(snap.motion_len, 40, "the frame's own length is kept");
+
+        // A real frame replaces the carried one.
+        let mut next = parse_input(Side::Right, &good).unwrap();
+        next.motion.accel[2] = 123;
+        let kept = next.motion;
+        next.carry_motion(&snap);
+        assert_eq!(next.motion, kept);
     }
 
     /// A pad on a table with a typical bias and noise: learned, and removed.

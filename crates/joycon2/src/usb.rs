@@ -329,6 +329,7 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                 reports += 1;
                 if let Some(pad) = shared.pads.lock().unwrap().get_mut(&key) {
                     pad.streaming = true;
+                    snap.carry_motion(&pad.snapshot);
                     pad.snapshot = snap;
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;

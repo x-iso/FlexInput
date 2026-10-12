@@ -909,7 +909,7 @@ fn pump(
         let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
             continue;
         };
-        let Some(snap) = reports::parse_streamed(link.key.side, &n.value) else {
+        let Some(mut snap) = reports::parse_streamed(link.key.side, &n.value) else {
             link.unparsed = link.unparsed.saturating_add(1);
             if link.unparsed.is_power_of_two() {
                 eprintln!(
@@ -930,6 +930,7 @@ fn pump(
             if let Some(note) = pad.mouse.update(snap.mouse, link.last_input) {
                 eprintln!("[jc2-dongle] {} {note}", link.key.side.display_name());
             }
+            snap.carry_motion(&pad.snapshot);
             pad.snapshot = snap;
             pad.stick = stick;
             pad.gyro = o.rate_dps;

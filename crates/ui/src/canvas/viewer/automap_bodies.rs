@@ -10,7 +10,7 @@ use super::*;
 /// Returns `(has_deadzone, has_gyro_mult, has_sticks_cal)`.
 /// - MIDI ports: nothing
 /// - XInput (Xbox): deadzone + sticks calibration, no gyro
-/// - DualShock4 / DualSense / Switch Pro: deadzone + gyro + sticks
+/// - DualShock4 / DualSense / Switch Pro / Joy-Con 2: deadzone + gyro + sticks
 /// - Generic HID / unknown: deadzone + sticks (conservative)
 /// Whether a `gilrs:<slug>:<inst>` device has pressure-sensitive analog
 /// triggers. Switch Pro (digital-only ZL/ZR) returns false. Unknown slugs are
@@ -334,7 +334,8 @@ pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool,
     if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
         return match slug {
             "xinput"                          => (true, false, true),
-            "ds4" | "dualsense" | "switch_pro" => (true, true,  true),
+            "ds4" | "dualsense" | "switch_pro"
+            | "joycon2_l" | "joycon2_r"       => (true, true,  true),
             _                                 => (true, false, true),
         };
     }
