@@ -3522,15 +3522,21 @@ impl FlexInputApp {
         let focused = raw_focused || self.settings.pin_active
             || self.gamepad_nav.alt_tab_active || config_visible;
 
-        // Determine the active nav device. ALL nav-enabled physical gamepads can
-        // drive the UI simultaneously by a last-active-input-takes-over rule:
-        // each frame we pick the device showing fresh activity (a button press or
-        // a stick/trigger deflection past the deadzone — gyro is EXCLUDED since
-        // it's effectively always active), and keep driving the previously-active
-        // device when nothing is moving (so edge detection stays stable). Devices
-        // excluded: MIDI, and FlexInput's own loopback virtuals (feedback loop).
+        // ALL nav-enabled physical gamepads drive the UI at once, merged into one
+        // `NavInput` (see `merge_nav_input`): a split Joy-Con pair is one
+        // controller to the user, so a held North on the right half must survive
+        // the left half's d-pad, and a face press must not be eaten as a
+        // "device switch" frame. Edge detection runs on the merged set, so it is
+        // continuous whichever pad a button lives on.
+        //
+        // `active_dev` is still ONE pad — the last to show fresh activity (a
+        // press, or a stick/trigger past the deadzone; gyro is EXCLUDED since
+        // it's effectively always active) — but only for what can't be merged:
+        // the legend's glyph skin and the gyro cursor. Devices excluded: MIDI,
+        // and FlexInput's own loopback virtuals (feedback loop).
         let mut active_dev: Option<String> = None;
         let mut active_input: Option<gn::NavInput> = None;
+        let mut nav_devs: Vec<String> = Vec::new();
         if focused && (easy_mode || config_visible) {
             // FlexInput's own loopback virtuals — excluded from nav to avoid a
             // feedback loop driving the UI from our own output.
@@ -3545,39 +3551,42 @@ impl FlexInputApp {
                 .map(|d| d.id.clone())
                 .collect();
 
-            // Find the device with fresh activity this frame (rising button OR
-            // stick/trigger past deadzone). Prefer one that ISN'T the current
-            // sticky device only when it's actually active, so the last input
-            // wins; otherwise keep the sticky one.
             const STICK_DZ: f32 = 0.35;
             const TRIG_DZ: f32 = 0.5;
             // Buttons a gamepad shortcut is using never reach nav: the D-pad
             // of a Home+D-pad chord must not also step the selection.
             let shortcut_owned = self.shortcut_owned.read()
                 .map(|s| s.clone()).unwrap_or_default();
-            let read_nav = |id: &str, prev: &std::collections::HashSet<String>| {
-                let mut nav = gn::read_nav_input(&self.last_signals, id, prev);
+            let prev_pressed = &self.gamepad_nav.prev_pressed;
+            let inputs: Vec<(String, gn::NavInput)> = eligible.iter().map(|id| {
+                let mut nav = gn::read_nav_input(&self.last_signals, id, prev_pressed);
                 gn::mask_owned(&mut nav, id, &shortcut_owned);
-                nav
-            };
-            let prev_pressed = self.gamepad_nav.prev_pressed.clone();
-            let mut newly_active: Option<String> = None;
-            for id in &eligible {
-                let nav = read_nav(id, &prev_pressed);
-                let rising = nav.pressed.iter().any(|p| !prev_pressed.contains(p));
-                let moved = nav.lstick.length() > STICK_DZ
-                    || nav.rstick.length() > STICK_DZ
-                    || nav.lt > TRIG_DZ || nav.rt > TRIG_DZ;
-                if rising || moved { newly_active = Some(id.clone()); break; }
-            }
+                (id.clone(), nav)
+            }).collect();
 
-            // Resolve the driving device: a newly-active one wins; else keep the
-            // sticky device if still eligible; else seed from the tab's source or
-            // the first eligible device.
-            let sticky_ok = self.gamepad_nav.active_dev.as_ref()
-                .map(|d| eligible.contains(d)).unwrap_or(false);
+            // The pad that shows fresh activity becomes `active_dev`. A press
+            // outranks movement, and a still-moving sticky pad keeps the role
+            // over another pad's movement, so a drifting stick can't steal it.
+            let moved = |nav: &gn::NavInput| nav.lstick.length() > STICK_DZ
+                || nav.rstick.length() > STICK_DZ
+                || nav.lt > TRIG_DZ || nav.rt > TRIG_DZ;
+            let sticky = self.gamepad_nav.active_dev.as_ref()
+                .filter(|d| eligible.contains(d));
+            let sticky_moving = sticky
+                .and_then(|d| inputs.iter().find(|(id, _)| id == d))
+                .is_some_and(|(_, nav)| moved(nav));
+            let newly_active = inputs.iter()
+                .find(|(_, nav)| !nav.rising.is_empty())
+                .or_else(|| if sticky_moving { None } else {
+                    inputs.iter().find(|(_, nav)| moved(nav))
+                })
+                .map(|(id, _)| id.clone());
+
+            // Resolve the active pad: a newly-active one wins; else keep the
+            // sticky pad if still eligible; else seed from the tab's source or
+            // the first eligible pad.
             let chosen = newly_active
-                .or_else(|| if sticky_ok { self.gamepad_nav.active_dev.clone() } else { None })
+                .or_else(|| sticky.cloned())
                 .or_else(|| {
                     // Seed: the active tab's source device if it's eligible…
                     let src = self.tabs[self.active_tab].canvas.snarl
@@ -3592,15 +3601,22 @@ impl FlexInputApp {
                 });
 
             if let Some(dev) = chosen {
-                let nav = read_nav(&dev, &self.gamepad_nav.prev_pressed);
+                // Start from the active pad (its gyro is the one kept), then
+                // fold every other nav pad in.
+                let mut nav = inputs.iter().find(|(id, _)| *id == dev)
+                    .map(|(_, n)| n.clone())
+                    .expect("active nav pad is one of the eligible pads");
+                for (id, other) in &inputs {
+                    if *id != dev { gn::merge_nav_input(&mut nav, other); }
+                }
                 active_dev = Some(dev);
                 active_input = Some(nav);
             }
+            nav_devs = eligible;
         }
 
-        // Suppression + capture-hold key on the resolved active nav device (the
-        // physical source). Suppress mapped output while focused + nav-enabled
-        // so the controller drives only the UI.
+        // Suppress mapped output while focused + nav-enabled so the controller
+        // drives only the UI.
         let any_nav_enabled = active_dev.is_some();
         // The config overlay suppresses input SELECTIVELY via its own engine
         // source-block (blocking every physical device EXCEPT the tweak-pin's
@@ -3609,10 +3625,14 @@ impl FlexInputApp {
         // overlay owns nav.
         self.ui_nav_suppress
             .store(any_nav_enabled && !config_visible, Ordering::Relaxed);
-        if let Some(dev) = &active_dev {
+        if active_dev.is_some() {
             let pass = ctx.cumulative_pass_nr();
             ctx.data_mut(|data| {
-                data.insert_temp(egui::Id::new(("gp_nav_active", dev.clone())), pass);
+                // Every nav pad, not just the active one: each is driving the
+                // UI, so a Learn on any of them must wait for its arm handshake.
+                for dev in &nav_devs {
+                    data.insert_temp(egui::Id::new(("gp_nav_active", dev.clone())), pass);
+                }
                 // Global flag: nav owns the sub-patch selection this frame, so
                 // the body renderer must NOT clear `selected_item` (it normally
                 // wipes selection every frame when not in layout-edit mode).
@@ -3639,16 +3659,17 @@ impl FlexInputApp {
                 return;
             }
         };
-        // When the driving device CHANGES (another pad took over), suppress this
-        // frame's rising edges so the new pad's already-held buttons don't fire
-        // an action on the switch frame — the user must release+repress to act.
-        // (The stick/move paths still respond immediately, which is fine.)
-        let device_changed = self.gamepad_nav.active_dev.as_deref() != Some(dev_id.as_str());
-        if device_changed {
+        // When nav STARTS (no pad drove it last frame), suppress this frame's
+        // rising edges so buttons already held — e.g. the press that focused the
+        // window — don't fire an action; the user must release+repress to act.
+        // A change of active pad is NOT such a frame: input is merged across
+        // pads, so the edge state is continuous (clearing there made every
+        // press on the other half of a Joy-Con pair cost two presses).
+        if self.gamepad_nav.active_dev.is_none() {
             nav.rising.clear();
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
         }
-        // Record the active nav device so the bottom legend bar can render with
+        // Record the active nav pad so the bottom legend bar can render with
         // the right button-glyph skin this frame.
         self.gamepad_nav.active_dev = Some(dev_id.clone());
 

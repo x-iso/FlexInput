@@ -64,6 +64,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   came back as a single East. Only a repeat that fold itself makes is dropped
   now, and its timing goes with it.
 
+- **Two pads driving the UI together act as one controller.** With gamepad
+  navigation on for more than one pad — a split Joy-Con pair, say — a press on
+  the half that wasn't used last no longer takes two presses, and a held button
+  (North to bend a curve) stays held while the other half steps the d-pad. All
+  nav pads are now read together each frame; the last one used only picks the
+  legend's button glyphs and drives the gyro cursor.
+
 ## [0.15.6] - 2026-10-08
 
 ### Added

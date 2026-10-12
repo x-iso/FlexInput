@@ -276,10 +276,11 @@ pub struct GamepadNav {
     pub stick_walk_latch: bool,
     /// Widget-level vs editing-a-widget.
     pub edit_level: EditLevel,
-    /// The physical device id driving nav this frame (set by `run_gamepad_nav`
-    /// when a nav-enabled source is active, cleared otherwise). Used by the
-    /// bottom legend bar to (a) decide whether to show and (b) pick the button
-    /// glyph skin (Xbox / PlayStation / Switch).
+    /// The nav pad that last showed fresh activity (set by `run_gamepad_nav`
+    /// while any nav-enabled pad exists, cleared otherwise). Every nav pad
+    /// drives the UI at once, merged; this one only supplies what can't merge:
+    /// the gyro cursor, and the button glyph skin (Xbox / PlayStation / Switch)
+    /// the bottom legend bar picks — which also shows only while it's set.
     pub active_dev: Option<String>,
     /// West toggles fine increments / lower stick sensitivity while editing.
     pub fine_increment: bool,
@@ -770,6 +771,21 @@ pub fn read_nav_input(
     }
 }
 
+/// Fold another nav-enabled pad's frame into `into`, so several pads drive the
+/// UI as ONE controller: buttons union (a hold on one pad survives the other's
+/// presses, and a press is one rising edge whichever pad made it), each stick
+/// takes the more deflected of the two (a split Joy-Con pair has one stick per
+/// half), triggers take the max. Gyro is left alone — the caller picks it from
+/// a single pad, since two gyros summed would just add their noise.
+pub fn merge_nav_input(into: &mut NavInput, other: &NavInput) {
+    into.pressed.extend(other.pressed.iter().cloned());
+    into.rising.extend(other.rising.iter().cloned());
+    if other.lstick.length() > into.lstick.length() { into.lstick = other.lstick; }
+    if other.rstick.length() > into.rstick.length() { into.rstick = other.rstick; }
+    into.lt = into.lt.max(other.lt);
+    into.rt = into.rt.max(other.rt);
+}
+
 /// Drop the buttons a gamepad shortcut currently owns on `dev_id` (published
 /// by `guide_watcher`), so e.g. the D-pad half of a Home+D-pad chord doesn't
 /// also step the selection. An owned button stays owned until it's released,
@@ -781,9 +797,7 @@ pub fn mask_owned(nav: &mut NavInput, dev_id: &str, owned: &HashSet<(String, Str
     nav.rising.retain(|p| !is_owned(p));
 }
 
-/// True if the device shows any nav activity this frame (used to pick the
-/// single active device among several nav-enabled pads, and to decide
-/// suppression).
+/// True if the device shows any nav activity this frame.
 #[allow(dead_code)]
 pub fn has_activity(nav: &NavInput) -> bool {
     !nav.pressed.is_empty()
@@ -1023,6 +1037,29 @@ mod nav_switch_tests {
 
     fn set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    // A split Joy-Con pair is one controller: North held on the right half stays
+    // held while the left half steps the d-pad, and each press is one edge.
+    #[test]
+    fn two_nav_pads_merge_into_one_controller() {
+        let pad = |id: &str, pins: &[(&str, bool)], stick: (&str, f32)| {
+            let mut sig: HashMap<(String, String), Signal> = pins.iter()
+                .map(|(p, b)| ((id.to_string(), p.to_string()), Signal::Bool(*b)))
+                .collect();
+            sig.insert((id.to_string(), stick.0.to_string()),
+                Signal::Vec2(glam::Vec2::new(stick.1, 0.0)));
+            sig
+        };
+        let mut signals = pad("L", &[("dpad_down", true)], ("left_stick", 0.6));
+        signals.extend(pad("R", &[("btn_north", true)], ("right_stick", 0.2)));
+        let prev = set(&["btn_north"]);
+        let mut nav = read_nav_input(&signals, "R", &prev);
+        merge_nav_input(&mut nav, &read_nav_input(&signals, "L", &prev));
+        assert_eq!(nav.pressed, set(&["btn_north", "dpad_down"]));
+        assert_eq!(nav.rising, set(&["dpad_down"]));
+        assert_eq!(nav.lstick.x, 0.6);
+        assert_eq!(nav.rstick.x, 0.2);
     }
 
     // The switch has to be able to say three different things, and a pad that is
