@@ -5,6 +5,29 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Settings is grouped into sections, with a jump list.** A list on the left
+  names every section — Display, Workspace, Gamepad navigation, Gamepad and
+  Keyboard shortcuts, Pin & overlays, Controllers, Hide controllers, Virtual
+  output, Device defaults, Performance, MIDI, Folders and About — and clicking
+  one scrolls the page to it. Scrolling the page lights up the section you're
+  in. Settings that had ended up under the wrong heading moved to where you'd
+  look for them: the keyboard hotkeys sit together, the folder pickers sit
+  together, and the HidHide options have their own section. When HidHide isn't
+  installed, that section is marked ⚠ in the list and opens with a warning, a
+  **Download HidHide** link and a **Check again** button, so a fresh install is
+  picked up without restarting FlexInput.
+
+- **New defaults for a fresh install.** Gamepad UI navigation starts on, "Keep
+  hiding through disconnects" starts on, and three gamepad shortcuts come
+  bound: **Home + D-pad Right** toggles the config overlay, **Home + D-pad
+  Up** the info overlay, and **Home + D-pad Down** pins FlexInput on top. An
+  existing settings file keeps the choices already saved in it.
+
+- **Contrast defaults to 0.50**, a little lighter than before, which reads
+  better. Double-clicking the Contrast slider now resets it to 0.50.
+
 ## [0.15.8] - 2026-10-12
 
 ### Added

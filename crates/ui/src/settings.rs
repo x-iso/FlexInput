@@ -96,7 +96,10 @@ fn default_rumble_floor() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_FL
 fn default_rumble_max() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_MAX }
 fn default_rumble_exp() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_EXP }
 fn default_theme() -> Theme { Theme::Dark }
-fn default_contrast() -> f32 { 0.0 }
+/// Factory contrast: a little lighter than egui's stock dark panels, which
+/// reads better against the text.
+pub const CONTRAST_DEFAULT: f32 = 0.5;
+fn default_contrast() -> f32 { CONTRAST_DEFAULT }
 fn default_see_through_alpha() -> f32 { 0.55 }
 fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
 fn default_cursor_max_speed() -> f32 { 4000.0 }
@@ -108,6 +111,14 @@ fn default_chord_mode() -> String { "down".to_string() }
 fn default_chord_gap_ms() -> f32 { 200.0 }
 fn default_focus_flip_flop() -> bool { true }
 fn default_ui_mode() -> UiMode { UiMode::Easy }
+/// Factory gamepad shortcuts: Home + a D-pad direction. Home is a leader, so a
+/// lone Home press still reaches the game as a tap (see `guide_watcher`).
+fn home_chord(dpad: &str) -> Option<Vec<String>> {
+    Some(vec!["btn_guide".to_string(), dpad.to_string()])
+}
+fn default_overlay_chord() -> Option<Vec<String>> { home_chord("dpad_up") }
+fn default_pin_chord() -> Option<Vec<String>> { home_chord("dpad_down") }
+fn default_config_overlay_chord() -> Option<Vec<String>> { home_chord("dpad_right") }
 
 /// Keyboard shortcut for the always-on-top pin toggle. Mirrors
 /// `PanicShortcut` in shape — kept in `settings.rs` so the full settings
@@ -212,7 +223,7 @@ pub struct AppSettings {
     pub theme: Theme,
     /// Contrast adjustment in -1..1 range. Positive lightens panel/node
     /// backgrounds (more contrast against text), negative darkens. 0 is
-    /// neutral — current default.
+    /// egui's stock dark theme; the default is [`CONTRAST_DEFAULT`] (0.5).
     #[serde(default = "default_contrast")]
     pub contrast: f32,
     /// Whole-UI scale on top of the OS display scale (egui zoom factor), one of
@@ -259,8 +270,8 @@ pub struct AppSettings {
     /// Default nav-mode state for newly-seen gamepads. Per-device runtime
     /// overrides live in `FlexInputApp::gamepad_nav.mode` (not persisted).
     /// When on, the controller drives FlexInput's own UI (with mapped output
-    /// suppressed) while FlexInput holds focus.
-    #[serde(default)]
+    /// suppressed) while FlexInput holds focus. On by default.
+    #[serde(default = "default_true")]
     pub gamepad_ui_nav_default: bool,
     /// Top speed (px/s at full right-stick deflection) of the gamepad-nav
     /// cursor. The actual speed follows an accelerated curve up to this cap.
@@ -323,7 +334,8 @@ pub struct AppSettings {
     /// the gap; the mask is still dropped when the wiring goes away, when
     /// `hide_originals` is turned off, and always on app exit (the helper
     /// clears everything at teardown), so nothing stays hidden after a close.
-    #[serde(default)]
+    /// On by default.
+    #[serde(default = "default_true")]
     pub hidhide_sticky: bool,
     /// Which hidden controllers stay hidden after FlexInput exits. The helper
     /// otherwise clears its masking at teardown.
@@ -388,19 +400,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub panic_chord: Option<Vec<String>>,
     /// Optional gamepad button combo that toggles the info OVERLAY.
-    /// None = unassigned.
-    #[serde(default)]
+    /// None = unassigned. Default Home + D-pad Up.
+    #[serde(default = "default_overlay_chord")]
     pub overlay_chord: Option<Vec<String>>,
     /// Optional gamepad button combo that toggles the PIN (always-on-top). The
     /// pin's old Guide binding moved here so the user picks their own button /
-    /// combo. Focus-gated like the other chords. None = unassigned.
-    #[serde(default)]
+    /// combo. Focus-gated like the other chords. None = unassigned. Default
+    /// Home + D-pad Down.
+    #[serde(default = "default_pin_chord")]
     pub pin_chord: Option<Vec<String>>,
     /// Optional gamepad button combo that toggles the CONFIG overlay. Detected
     /// globally by the background watcher (fires even while a game holds focus),
     /// so it's the primary controller path to summon the overlay mid-play.
-    /// None = unassigned.
-    #[serde(default)]
+    /// None = unassigned. Default Home + D-pad Right.
+    #[serde(default = "default_config_overlay_chord")]
     pub config_overlay_chord: Option<Vec<String>>,
     /// Press mode for each gamepad shortcut chord above (`"down"` = on press,
     /// `"long"` = hold for the gap, `"double"` = double-tap within the gap).
@@ -713,7 +726,7 @@ impl Default for AppSettings {
             default_rumble_max: default_rumble_max(),
             default_rumble_exp: default_rumble_exp(),
             theme: Theme::Dark,
-            contrast: 0.0,
+            contrast: CONTRAST_DEFAULT,
             ui_scale: UI_SCALE_DEFAULT,
             see_through_alpha: 0.55,
             see_through_active: false,
@@ -723,7 +736,7 @@ impl Default for AppSettings {
             config_via_guide: true,
             config_guide_double_tap: true,
             config_guide_chord: None,
-            gamepad_ui_nav_default: false,
+            gamepad_ui_nav_default: true,
             cursor_max_speed: 4000.0,
             cursor_accel: 2.0,
             pin_guide_double_tap: true,
@@ -732,7 +745,7 @@ impl Default for AppSettings {
             show_own_virtuals_as_physical: false,
             persist_virtual_devices: false,
             hide_originals: None,
-            hidhide_sticky: false,
+            hidhide_sticky: true,
             hidhide_keep_on_exit: HidHideKeepOnExit::default(),
             hidhide_overrides: HashMap::new(),
             hidhide_kept_ids: Vec::new(),
@@ -745,9 +758,9 @@ impl Default for AppSettings {
             favorite_presets: Vec::new(),
             seethrough_chord: None,
             panic_chord: None,
-            overlay_chord: None,
-            pin_chord: None,
-            config_overlay_chord: None,
+            overlay_chord: default_overlay_chord(),
+            pin_chord: default_pin_chord(),
+            config_overlay_chord: default_config_overlay_chord(),
             seethrough_chord_mode: default_chord_mode(),
             panic_chord_mode: default_chord_mode(),
             overlay_chord_mode: default_chord_mode(),
