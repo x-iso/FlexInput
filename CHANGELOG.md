@@ -3,32 +3,7 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-### Changed
-
-- **Settings is grouped into sections, with a jump list.** A list on the left
-  names every section — Display, Workspace, Gamepad navigation, Gamepad and
-  Keyboard shortcuts, Pin & overlays, Controllers, Hide controllers, Virtual
-  output, Device defaults, Performance, MIDI, Folders and About — and clicking
-  one scrolls the page to it. Scrolling the page lights up the section you're
-  in. Settings that had ended up under the wrong heading moved to where you'd
-  look for them: the keyboard hotkeys sit together, the folder pickers sit
-  together, and the HidHide options have their own section. When HidHide isn't
-  installed, that section is marked ⚠ in the list and opens with a warning, a
-  **Download HidHide** link and a **Check again** button, so a fresh install is
-  picked up without restarting FlexInput.
-
-- **New defaults for a fresh install.** Gamepad UI navigation starts on, "Keep
-  hiding through disconnects" starts on, and three gamepad shortcuts come
-  bound: **Home + D-pad Right** toggles the config overlay, **Home + D-pad
-  Up** the info overlay, and **Home + D-pad Down** pins FlexInput on top. An
-  existing settings file keeps the choices already saved in it.
-
-- **Contrast defaults to 0.50**, a little lighter than before, which reads
-  better. Double-clicking the Contrast slider now resets it to 0.50.
-
-## [0.15.8] - 2026-10-12
+## [0.15.8] - 2026-10-13
 
 ### Added
 
@@ -62,7 +37,73 @@ All notable changes to FlexInput are documented here. This project adheres to
   cards, in the draft before Add, and in the picker, whose chord previews now
   draw picks as their icons rather than names. Analog outputs ignore timing.
 
+- **The Area Mapper on the screen overlay.** A new **Overlay** setting beside
+  Presets shows the area over the game while it's in use — **While moved**
+  (stick off centre, or a finger on the touchpad), **While touched**, or
+  **Outside deadzone** (the point out of the first layer's centre cell) —
+  with its cells, layers and cursor live, then fades once use stops. Off by
+  default. **Position…** places and sizes it with the same editor as the
+  Virtual Menu's overlay.
+
+- **A hide/show eye on every controller.** Each gamepad card (and each
+  device node in Advanced mode) has a HidHide eye: click it to hide or show
+  that controller by hand, right-click to hand it back to automatic (hidden
+  while remapped, per "Hide original controllers"). It's greyed out, with
+  the reason, where HidHide can't help — Xbox / XInput pads, Joy-Con 2,
+  FlexInput's own virtual pads, or no HidHide installed. A new setting,
+  **Keep controllers hidden after FlexInput exits** (Never / Only manually
+  hidden / Always, default Only manually hidden), decides what stays hidden
+  once FlexInput closes.
+
+- **A default lightbar colour for DualShock 4 and DualSense.** A colour
+  swatch beside the eye on their cards: click to pick a colour, right-click
+  to clear. The pad shows it whenever no game or module is driving its
+  lightbar, and gets it back after a reconnect.
+
+- **A default adaptive-trigger effect for DualSense.** In the Calibration
+  window each trigger has a **Default adaptive mode** picker — JSM's seven
+  effects, with a fader per number. It holds whenever nothing else (a game,
+  a module, a wire) puts a value on that trigger.
+
+- **Combiner fuses rigidly joined motion sensors.** The Combiner's new
+  Motion section has a **CORRELATE** mode for IMUs fixed together — two
+  Joy-Cons in a grip, an IMU strapped to a pad. It learns how each one is
+  mounted from their gyros, then averages them, weighting each by its own
+  noise, with a **noise gate ×** control to silence what can't be told from
+  noise. Until the fit is good, the top port is used alone.
+
+- **Response curves on gyro and accel read in °/s and G.** A curve fed by
+  a pad's gyro or accelerometer — directly or through a Splitter, 3DOF to
+  2D, other curves or sub-patches — now shows its graph in physical units
+  and works on the sensor's whole range; In / Out only zoom the graph and
+  no longer rescale the signal.
+
+- **3DOF to 2D can use the device's own orientation.** "3D source:
+  Computed / Device" passes through the pad's fused orientation (Joy-Con 2
+  computes its own), with Reset re-zeroing it.
+
 ### Changed
+
+- **Settings is grouped into sections, with a jump list.** A list on the left
+  names every section — Display, Workspace, Gamepad navigation, Gamepad and
+  Keyboard shortcuts, Pin & overlays, Controllers, Hide controllers, Virtual
+  output, Device defaults, Performance, MIDI, Folders and About — and clicking
+  one scrolls the page to it. Scrolling the page lights up the section you're
+  in. Settings that had ended up under the wrong heading moved to where you'd
+  look for them: the keyboard hotkeys sit together, the folder pickers sit
+  together, and the HidHide options have their own section. When HidHide isn't
+  installed, that section is marked ⚠ in the list and opens with a warning, a
+  **Download HidHide** link and a **Check again** button, so a fresh install is
+  picked up without restarting FlexInput.
+
+- **New defaults for a fresh install.** Gamepad UI navigation starts on, "Keep
+  hiding through disconnects" starts on, and three gamepad shortcuts come
+  bound: **Home + D-pad Right** toggles the config overlay, **Home + D-pad
+  Up** the info overlay, and **Home + D-pad Down** pins FlexInput on top. An
+  existing settings file keeps the choices already saved in it.
+
+- **Contrast defaults to 0.50**, a little lighter than before, which reads
+  better. Double-clicking the Contrast slider now resets it to 0.50.
 
 - **Mapping cards say what time gap, Hold and Turbo do.** Each one's tooltip
   now explains it for the card as it's set — the press mode, "in order", a
@@ -79,6 +120,48 @@ All notable changes to FlexInput are documented here. This project adheres to
   input's. The picker's button hints moved to the bottom legend bar, worded
   for what has the focus.
 
+- **Redesigned gamepad cards.** The UI-navigation toggle is now a large
+  icon under the pad icon, faded while off; the device name gets a fixed
+  two-line area; and the Port selector always shows, even on single-input
+  presets. Advanced-mode device nodes get the same layout. The single
+  **Deadzone** on a card sets both sticks, and turns orange while they
+  differ.
+
+- **Calibration window.** Each stick has its own deadzone slider, and the
+  Rebound filter sits under the stick's Start / Reset buttons. The window
+  follows its real width and, dragged narrow, scales its contents down
+  instead of reflowing and bouncing back. Gyro calibration now skips the
+  accelerometer by default — an accel offset is only right when measured on
+  a perfectly level surface; untick **skip accelerometer** to include it.
+
+- **Curve editing aids.** Abs curves only take the upper end of each range
+  (the lower ones grey out). In / Out ranges and grid H / V counts each have
+  a link toggle, on by default, so both ends scale together. Grid labels
+  take the decimals their spacing needs and stagger over two rows; dots show
+  their output value with labels on or while dragged; hovering (mouse or
+  gamepad cursor) shows a live input → output reading. Snap also catches
+  where grid lines cross the 1:1 line, and with Snap on the d-pad steps a
+  dot to the next one; double-clicking a dot puts it on the 1:1 line. The
+  reference line is always the true 1:1 line. Log / Exp is one shared
+  slider: Ctrl+click types a value, and dragging shows the power it applies.
+
+- **Combiner takes motion whole from one port.** Gyro, accel and
+  orientation are now one Motion section. The default **SORT** takes all of
+  it from the top port carrying motion, so a resting pad's deadzoned gyro no
+  longer hands single axes to the next port and mixes two sensors axis by
+  axis. A per-pin policy still overrides.
+
+- **Joy-Con 2: orientation baseline instead of a 60 s capture.** Calibration
+  offers **Set Current Orientation as Baseline** (under half a second, with
+  pointing / charging-grip instructions); drift is learned on the fly, and
+  Clear also drops an old drift value. The halves show as Left / Right
+  Joy-Con in the 3D viewer, both together as a Joy-Con grip, and their SL /
+  SR buttons animate.
+
+- **The "Pair Joy-Con 2" setting is gone.** Joy-Con 2 always pairs on first
+  connect now, over the Bluetooth dongle and over Windows' own Bluetooth
+  alike, so a button press reconnects either way.
+
 ### Fixed
 
 - **A card that sends the same output twice keeps both after a reload.**
@@ -93,6 +176,26 @@ All notable changes to FlexInput are documented here. This project adheres to
   (North to bend a curve) stays held while the other half steps the d-pad. All
   nav pads are now read together each frame; the last one used only picks the
   legend's button glyphs and drives the gyro cursor.
+
+- **Joy-Con 2 accelerometer read 0 g on every other report.** Retail halves
+  interleave reports without motion; the accel now holds through them as
+  the orientation already did.
+
+- **Joy-Con 2 had no "Gyro ×" row** on its card, device node header or in
+  gamepad navigation.
+
+- **A game could black out a DualShock 4 / DualSense lightbar or drop its
+  trigger effects.** The virtual DS4 and DualSense now take the lightbar and
+  trigger effects from a game's report only when the report marks them
+  valid, as the hardware does. A game that never sets them no longer forces
+  the bar black, and a rumble-only report no longer clears a colour or a
+  trigger effect set earlier.
+
+- **A Combiner inside a sub-patch showed no Motion section**, as its inputs
+  weren't traced out through the sub-patch's inlets.
+
+- **Two 3D viewers on screen interfered** — each painted the other's x-ray
+  ghost and they shared one depth measurement.
 
 ## [0.15.6] - 2026-10-08
 
