@@ -944,27 +944,34 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             if let Some((nav_on, nav_disabled)) = nav_state {
                 // The device icon (40 px square) draws its pad in the middle of
                 // the square; tuck the chevron up into the empty bottom margin.
-                // Not under the XInput slot circles, which sit in between.
-                if !crate::easy::io_panel::device_id_is_xinput(dev_id_str) {
-                    ui.add_space(-8.0);
-                }
+                // Not under the XInput slot circles, which sit in between. Only
+                // the chevron column tucks: the rows beside it stay under the
+                // title column (Calibrate / HidHide eye / LED swatch), which
+                // reaches the icon's bottom.
+                let tuck = if crate::easy::io_panel::device_id_is_xinput(dev_id_str) { 0.0 } else { 8.0 };
                 const ICON_COL_W: f32 = 40.0;
                 const NAV_W: f32 = 34.0;
+                // Breathing room between the Calibrate row and the slider rows.
+                const ROWS_GAP: f32 = 4.0;
+                let nav_h = crate::easy::io_panel::nav_toggle_height(NAV_W);
                 let block = ui.horizontal_top(|ui| {
                     let (col, _) = ui.allocate_exact_size(
-                        egui::vec2(ICON_COL_W, crate::easy::io_panel::nav_toggle_height(NAV_W)),
+                        egui::vec2(ICON_COL_W, (nav_h - tuck).max(0.0)),
                         egui::Sense::hover(),
                     );
                     let nav_rect = egui::Rect::from_min_size(
-                        egui::pos2(col.center().x - NAV_W * 0.5, col.top()),
-                        egui::vec2(NAV_W, col.height()),
+                        egui::pos2(col.center().x - NAV_W * 0.5, col.top() - tuck),
+                        egui::vec2(NAV_W, nav_h),
                     );
                     if let Some(v) = crate::easy::io_panel::nav_toggle_icon(
                         ui, nav_rect, dev_id_str, nav_on, nav_disabled,
                     ) {
                         crate::gamepad_nav::request_nav_toggle(dev_id_str, v);
                     }
-                    ui.vertical(|ui| source_rows(ui, snarl));
+                    ui.vertical(|ui| {
+                        ui.add_space(ROWS_GAP);
+                        source_rows(ui, snarl);
+                    });
                 });
                 // Read next frame by the Auto-Map label's right alignment: these
                 // rows can now be wider than the pin columns below.
