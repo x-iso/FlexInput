@@ -146,7 +146,7 @@ fn gyro_source() -> GyroSource {
     })
 }
 
-/// Undo the pin gain, taking a drift measured on `probe_rate_*` back into the
+/// Undo the pin gain, taking a drift measured on the field rate back into the
 /// space the decoder subtracts it in.
 ///
 /// Trivial arithmetic with an untrivial failure mode: get it backwards and the
@@ -337,51 +337,10 @@ fn push_common(
         Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)),
     ));
 
-    push_probe(out, dev, &pad.snapshot.motion);
-    // Normalised by the same reference as `gyro_x/y/z`, so the two are
-    // interchangeable in a patch and a difference in feel is a difference in
-    // SENSOR, not in scaling.
-    for (i, v) in pad.field_rate.iter().enumerate() {
-        out.push((
-            dev.into(),
-            format!("probe_rate_{i}"),
-            Signal::Float(v / GYRO_REF_DPS),
-        ));
-    }
-
     let mut bo = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
     bo("charging", pad.snapshot.power.charging);
     // The rail buttons are pushed per side — see `push_left` / `push_right` —
     // because which paddle slot they occupy depends on which half they are on.
-}
-
-/// Full scale of each probe reading, used only to bring the pins into the
-/// ±1 range every other Float pin lives in.
-const PROBE_I16_FULL_SCALE: f32 = 32768.0;
-const PROBE_I24_FULL_SCALE: f32 = (1u32 << 23) as f32;
-
-/// Push the undecoded motion bytes out as pins — see `joycon2_probe_outputs`.
-///
-/// Scaled, never re-interpreted. Dividing by full scale changes no shape and
-/// loses no information; it just puts the value where FlexInput's displays,
-/// curves and AutoMap already work. Anything more (bias removal, differencing,
-/// axis permutation) would be another decode, and a decode is exactly what
-/// these pins exist to avoid — the reader is the judge here, not the code.
-fn push_probe(out: &mut Vec<(String, String, Signal)>, dev: &str, m: &flexinput_joycon2::reports::Motion) {
-    for (i, v) in m.probe.iter().enumerate() {
-        out.push((
-            dev.into(),
-            format!("probe_i16_{i}"),
-            Signal::Float(*v as f32 / PROBE_I16_FULL_SCALE),
-        ));
-    }
-    for (i, v) in m.angle.iter().enumerate() {
-        out.push((
-            dev.into(),
-            format!("probe_i24_{i}"),
-            Signal::Float(*v as f32 / PROBE_I24_FULL_SCALE),
-        ));
-    }
 }
 
 fn push_left(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
@@ -528,8 +487,8 @@ impl DeviceBackend for Joycon2Backend {
     /// ❗ Two conversions, and both matter.
     ///
     /// The value arrives in the units the calibration could actually observe:
-    /// degrees per second on the `probe_rate_*` pins, which carry the field
-    /// rate AFTER [`flexinput_joycon2::reports::field_gain`]. The decoder
+    /// degrees per second of the field rate (once published on the removed
+    /// `probe_rate_*` pins) AFTER [`flexinput_joycon2::reports::field_gain`]. The decoder
     /// subtracts its drift BEFORE that gain — the same place
     /// `RESTING_DRIFT_*` is applied — so the gain has to come back out here, or
     /// the correction lands four times too large on the yaw field and
@@ -853,75 +812,6 @@ mod tests {
         // sign from the DualSense and Switch Pro on the same motion.
         assert!(axis_of([0, lsb, 0])[0] > 0.12, "raw axis 1 must be canonical +x");
         assert!(axis_of([lsb, 0, 0])[1] < -0.12, "raw axis 0 must be canonical -y");
-    }
-
-    /// The probe pins must be a pure rescale of the report bytes.
-    ///
-    /// This is the one property that makes them worth having: the moment
-    /// anything here filters, biases or permutes, the pins stop answering "what
-    /// does the hardware send" and start answering "what does this code think
-    /// the hardware sends" — which is the question that has already been
-    /// answered wrongly several times.
-    #[test]
-    fn probe_pins_are_a_pure_rescale_of_the_raw_bytes() {
-        use flexinput_joycon2::reports::Motion;
-        let m = Motion {
-            probe: [i16::MIN, -1, 0, 1, 16384, i16::MAX],
-            angle: [-(1 << 23), 0, (1 << 23) - 1],
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        push_probe(&mut out, "dev", &m);
-
-        let get = |pin: &str| {
-            out.iter()
-                .find(|(_, p, _)| p == pin)
-                .map(|(_, _, s)| match s {
-                    Signal::Float(v) => *v,
-                    other => panic!("{pin} is {other:?}, not a Float"),
-                })
-                .unwrap_or_else(|| panic!("{pin} was never pushed"))
-        };
-
-        // Full scale lands at -1, and no value can exceed it.
-        assert_eq!(get("probe_i16_0"), -1.0);
-        assert_eq!(get("probe_i16_2"), 0.0);
-        assert_eq!(get("probe_i16_4"), 0.5);
-        assert!((get("probe_i16_5") - 1.0).abs() < 1e-4);
-        assert_eq!(get("probe_i24_0"), -1.0);
-        assert_eq!(get("probe_i24_1"), 0.0);
-        assert!((get("probe_i24_2") - 1.0).abs() < 1e-6);
-
-        // Sign and ORDER survive: #1 and #3 differ only in sign, and neither is
-        // silently zeroed the way a "clean up the noise" filter would.
-        assert!(get("probe_i16_1") < 0.0 && get("probe_i16_3") > 0.0);
-        assert_eq!(get("probe_i16_1"), -get("probe_i16_3"));
-    }
-
-    /// A resting controller must NOT read zero on the probe pins.
-    ///
-    /// Sounds backwards, but it is the point: these pins exist to show what is
-    /// actually in the bytes, and the real at-rest capture has two fields near
-    /// full scale. If a future change makes them quietly read zero at rest —
-    /// the shape someone would "fix" them into, expecting a gyro — the pins
-    /// have stopped reporting and started asserting.
-    #[test]
-    fn the_probe_pins_report_the_resting_values_hardware_actually_sends() {
-        use flexinput_joycon2::reports::Motion;
-        let m = Motion {
-            // From the pinned at-rest capture in `reports.rs`.
-            probe: [30720, -153, -767, -24, -1536, 32752],
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        push_probe(&mut out, "dev", &m);
-        let v = |pin: &str| match out.iter().find(|(_, p, _)| p == pin).unwrap().2 {
-            Signal::Float(v) => v,
-            _ => unreachable!(),
-        };
-        assert!(v("probe_i16_0") > 0.9, "resting #0 should be near full scale");
-        assert!(v("probe_i16_5") > 0.9, "resting #5 should be near full scale");
-        assert!(v("probe_i16_1").abs() < 0.01);
     }
 
     #[test]

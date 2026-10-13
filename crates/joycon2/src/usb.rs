@@ -334,8 +334,8 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;
                     // Was missing: a wired pad published zeros on every
-                    // field-derived pin, so `probe_rate_*` read flat and the
-                    // drift calibration had nothing to measure over USB.
+                    // field-derived rate, so the drift calibration had
+                    // nothing to measure over USB.
                     pad.field_rate = o.field_rate_dps;
                     pad.yaw_rate = o.yaw_rate_dps;
                     pad.pin_rate = o.pin_rate_dps;

@@ -151,7 +151,7 @@ pub const ORIENTATION_GAIN: [f32; 3] = [1.0, 1.0, 1.0];
 ///
 /// ❗ Yaw is POSITIVE. It was briefly negated here on a hardware report that the
 /// cursor moved the wrong way — but that report came from a patch still feeding
-/// the `probe_rate_*` pins, where the yaw had already been inverted once
+/// the (since removed) `probe_rate_*` pins, where the yaw had already been inverted once
 /// downstream. Two inversions in series, one of them invisible from where the
 /// symptom was observed.
 ///
@@ -2265,8 +2265,8 @@ impl OrientationTracker {
         // Unwrap BEFORE converting to radians. The field covers half a turn, so
         // untracked wraps land as 180 degree flips in the middle of otherwise
         // ordinary motion.
-        // Heading is still tracked, for the `probe_i24_2` pin and for anything
-        // that wants the controller's own absolute figure. It no longer feeds
+        // Heading is still tracked, for anything that wants the controller's
+        // own absolute figure. It no longer feeds
         // the orientation — see the yaw integration below.
         let h = angle[HEADING_AXIS];
         match self.prev_heading.replace(h) {
