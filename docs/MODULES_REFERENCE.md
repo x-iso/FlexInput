@@ -800,6 +800,13 @@ pub struct ModuleDescriptor {
   - **Presets** (options row): Circle 4-way / 8-way / inner-outer, Rectangle 3×3 for the
     edited layer; **Save… / Load…** the whole module (every layer, its cards and
     settings) as a `.fxarea` file.
+  - **Screen overlay** (beside Presets): **Overlay** shows the area over the game
+    while it is in use — **While moved** (the stick off centre, or a finger on the
+    touchpad), **While touched** (a finger on the touchpad; a stick counts while
+    moved, as no pad reports stick touch yet), **Outside deadzone** (the point out of
+    the first layer's centre cell), or **Off** (default). It draws live — cells,
+    layers, the analog view and the cursor — and fades out shortly after use stops.
+    **Position…** places and sizes it with the Virtual Menu's overlay editor.
   - **One press mode for all** (row above the cards): its mode, time, Hold and Turbo
     rule every card of every layer.
   - **Analog layers:** a layer's **Analog** switch drives its keys from the stick's
@@ -910,6 +917,8 @@ pub struct ModuleDescriptor {
     area_layer_hold_ms (Smooth minimum), area_layer_ramp_ms, area_layer_mid,
     area_layer_full }`; the edited layer also lives
     under those plain keys (`_area_layer_loaded` says which), `area_layer` asks for one
+  - `area_overlay: String` - `off` | `moved` | `touched` | `outside` (default `off`)
+  - `area_rect: Array<f32>` - Overlay placement, monitor fractions `[x, y, w, h]`
   - `area_press_lock`, `area_press_mode`, `area_press_ms`, `area_press_hold`,
     `area_press_turbo` - One press mode for all cards
   - `zone_meta: Object` - Per-cell icon / name override (as the Virtual Menu)

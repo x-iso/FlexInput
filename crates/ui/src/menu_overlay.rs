@@ -1,7 +1,10 @@
 //! Virtual Menu overlay — a second transparent always-on-top viewport that
 //! exists only while a menu is OPEN (eval-side truth, read from the node's
 //! `Open` output mirror) or being POSITIONED, fully independent of the info
-//! overlay's visibility in both directions.
+//! overlay's visibility in both directions. Area Mappers show here too, while
+//! in use by their `area_overlay` mode (see `area_body::area_overlay_wanted`),
+//! at their `area_rect`, fading out once they stop being used; they are
+//! positioned with the same editor.
 //!
 //! * **Live** — click-through; every open menu on the active tab (top level +
 //!   first-level sub-patches) draws at its `menu_rect` (monitor fractions)
@@ -26,6 +29,116 @@ use crate::canvas::NodeData;
 const MENU_OVERLAY_TITLE: &str = "FlexInput Menu Overlay";
 /// Default `menu_rect` (monitor fractions) for a menu that was never placed.
 const DEFAULT_RECT: [f32; 4] = [0.375, 0.35, 0.25, 0.30];
+/// Default `area_rect`: about square on a 16:9 screen, below the middle.
+const DEFAULT_AREA_RECT: [f32; 4] = [0.41, 0.52, 0.18, 0.32];
+/// An Area Mapper stays this long after it stops being used, then fades.
+const AREA_HOLD_S: f64 = 0.15;
+const AREA_FADE_S: f64 = 0.30;
+
+/// One Area Mapper on the active tab that may show on the overlay.
+struct AreaInst {
+    outer: Option<NodeId>,
+    inner: NodeId,
+    rect: [f32; 4],
+    /// In use by its overlay mode this frame.
+    wanted: bool,
+}
+
+/// Every Area Mapper on the tab canvas and its first-level sub-patches whose
+/// overlay mode isn't Off.
+fn collect_areas(tab_snarl: &Snarl<NodeData>) -> Vec<AreaInst> {
+    let read = |n: &NodeData, outer: Option<NodeId>, inner: NodeId| -> Option<AreaInst> {
+        let mode = n.params.get(crate::canvas::area_body::AREA_OVERLAY_PARAM).and_then(|v| v.as_str());
+        if mode.is_none_or(|m| m == "off") {
+            return None;
+        }
+        Some(AreaInst {
+            outer,
+            inner,
+            rect: read_rect(n, crate::canvas::area_body::AREA_RECT_PARAM).unwrap_or(DEFAULT_AREA_RECT),
+            wanted: crate::canvas::area_body::area_overlay_wanted(n),
+        })
+    };
+    let mut out = Vec::new();
+    for (id, node_ref) in tab_snarl.nodes_ids_data() {
+        let n = &node_ref.value;
+        if n.module_id == "module.area_mapper" {
+            out.extend(read(n, None, id));
+        }
+        if let Some(sp) = n.subpatch.as_deref() {
+            for (iid, inner_ref) in sp.snarl.nodes_ids_data() {
+                if inner_ref.value.module_id == "module.area_mapper" {
+                    out.extend(read(&inner_ref.value, Some(id), iid));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A placement param (`menu_rect` / `area_rect`) as `[x, y, w, h]`.
+fn read_rect(node: &NodeData, key: &str) -> Option<[f32; 4]> {
+    node.params.get(key).and_then(|v| v.as_array()).and_then(|a| {
+        let f = |i: usize| a.get(i)?.as_f64().map(|x| x as f32);
+        Some([f(0)?, f(1)?, f(2)?, f(3)?])
+    })
+}
+
+/// How visible an Area Mapper is this frame: 1 while in use, then held for
+/// [`AREA_HOLD_S`] and faded over [`AREA_FADE_S`] — so it doesn't flicker
+/// as the stick passes the threshold.
+fn area_alpha(ctx: &egui::Context, a: &AreaInst, now: f64) -> f32 {
+    let key = egui::Id::new(("fxi_area_overlay_seen", a.outer.map(|n| n.0), a.inner.0));
+    if a.wanted {
+        ctx.data_mut(|d| d.insert_temp(key, now));
+        return 1.0;
+    }
+    let Some(seen) = ctx.data(|d| d.get_temp::<f64>(key)) else { return 0.0 };
+    let t = now - seen - AREA_HOLD_S;
+    if t <= 0.0 {
+        1.0
+    } else {
+        (1.0 - t / AREA_FADE_S).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// The snarl holding a node addressed as `(outer sub-patch, inner)`.
+fn snarl_at(tab_snarl: &mut Snarl<NodeData>, outer: Option<NodeId>) -> Option<&mut Snarl<NodeData>> {
+    match outer {
+        None => Some(tab_snarl),
+        Some(sp) => tab_snarl.get_node_mut(sp).and_then(|n| n.subpatch.as_deref_mut()).map(|sp| &mut *sp.snarl),
+    }
+}
+
+/// Move (drag the body) and resize (drag the corner square) a placement on
+/// the screen, kept on screen with a sane minimum.
+fn drag_rect(ui: &mut egui::Ui, screen: egui::Rect, px: egui::Rect, uid: usize, r: &mut [f32; 4]) {
+    let body = ui.interact(px, egui::Id::new(("fxi_menu_move", uid)), egui::Sense::drag());
+    if body.dragged() {
+        let d = body.drag_delta();
+        r[0] += d.x / screen.width();
+        r[1] += d.y / screen.height();
+    }
+    let handle = egui::Rect::from_center_size(px.right_bottom(), egui::vec2(22.0, 22.0));
+    let hresp = ui.interact(handle, egui::Id::new(("fxi_menu_size", uid)), egui::Sense::drag());
+    if hresp.dragged() {
+        let d = hresp.drag_delta();
+        r[2] += d.x / screen.width();
+        r[3] += d.y / screen.height();
+    }
+    ui.painter().rect_filled(handle.shrink(4.0), 3.0, egui::Color32::from_rgb(255, 196, 90));
+    if hresp.hovered() || body.hovered() {
+        ui.output_mut(|o| o.cursor_icon = if hresp.hovered() {
+            egui::CursorIcon::ResizeNwSe
+        } else {
+            egui::CursorIcon::Move
+        });
+    }
+    r[2] = r[2].clamp(0.06, 1.0);
+    r[3] = r[3].clamp(0.06, 1.0);
+    r[0] = r[0].clamp(0.0, 1.0 - r[2]);
+    r[1] = r[1].clamp(0.0, 1.0 - r[3]);
+}
 
 /// Ctx temp slot holding the edit target as `(outer subpatch uid, inner uid)`
 /// (`None` outer = the node sits on the tab canvas).
@@ -84,12 +197,7 @@ fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst 
     let pstr = |k: &str| node.params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let open = node.extra.last_out.get(1).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(false);
     let hover = node.extra.last_out.get(2).and_then(|s| *s).map(|s| s.as_float()).unwrap_or(-1.0) as i32;
-    let rect = node.params.get("menu_rect").and_then(|v| v.as_array())
-        .and_then(|a| {
-            let f = |i: usize| a.get(i)?.as_f64().map(|x| x as f32);
-            Some([f(0)?, f(1)?, f(2)?, f(3)?])
-        })
-        .unwrap_or(DEFAULT_RECT);
+    let rect = read_rect(node, "menu_rect").unwrap_or(DEFAULT_RECT);
     let read_edges = |which: &str| -> Vec<f32> {
         node.params.get(which).and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
@@ -239,22 +347,12 @@ fn collect_menus(tab_snarl: &Snarl<NodeData>) -> Vec<MenuInst> {
     out
 }
 
-/// Write a menu's `menu_rect` back through its node path.
-fn write_menu_rect(tab_snarl: &mut Snarl<NodeData>, outer: Option<NodeId>, inner: NodeId, rect: [f32; 4]) {
+/// Write a placement param (`menu_rect` / `area_rect`) back through its node
+/// path.
+fn write_menu_rect(tab_snarl: &mut Snarl<NodeData>, outer: Option<NodeId>, inner: NodeId, key: &str, rect: [f32; 4]) {
     let val = serde_json::json!([rect[0], rect[1], rect[2], rect[3]]);
-    match outer {
-        None => {
-            if let Some(node) = tab_snarl.get_node_mut(inner) {
-                node.params.insert("menu_rect".to_string(), val);
-            }
-        }
-        Some(sp_id) => {
-            if let Some(sp) = tab_snarl.get_node_mut(sp_id).and_then(|n| n.subpatch.as_deref_mut()) {
-                if let Some(node) = sp.snarl.get_node_mut(inner) {
-                    node.params.insert("menu_rect".to_string(), val);
-                }
-            }
-        }
+    if let Some(node) = snarl_at(tab_snarl, outer).and_then(|s| s.get_node_mut(inner)) {
+        node.params.insert(key.to_string(), val);
     }
 }
 
@@ -265,15 +363,16 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
     // Collect the active tab's menus, then drop the borrow so the write-back at
     // the end can also reach any open sub-patch editor (see below).
-    let menus = {
+    let (menus, areas) = {
         let (tab, _live_signals, _panic) = app.overlay_parts();
-        collect_menus(&tab.canvas.snarl)
+        (collect_menus(&tab.canvas.snarl), collect_areas(&tab.canvas.snarl))
     };
     // Validate the edit target against the current node set (node deleted /
     // tab switched while editing → drop the edit).
     let mut edit = menu_edit_target(ctx);
     if let Some((outer, inner)) = edit {
-        let found = menus.iter().any(|m| m.outer.map(|n| n.0) == outer && m.inner.0 == inner);
+        let found = menus.iter().any(|m| m.outer.map(|n| n.0) == outer && m.inner.0 == inner)
+            || areas.iter().any(|a| a.outer.map(|n| n.0) == outer && a.inner.0 == inner);
         if !found {
             clear_menu_edit(ctx);
             edit = None;
@@ -294,7 +393,13 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         if let Some((z, a)) = glow { glows.push((i, z, a)); }
     }
 
-    let any_open = menus.iter().any(|m| m.open);
+    // Area Mappers in use (or fading out), with their alpha.
+    let shown_areas: Vec<(usize, f32)> = areas.iter().enumerate()
+        .map(|(i, a)| (i, area_alpha(ctx, a, now)))
+        .filter(|(_, alpha)| *alpha > 0.0)
+        .collect();
+
+    let any_open = menus.iter().any(|m| m.open) || !shown_areas.is_empty();
     if !any_open && edit.is_none() && lingers.is_empty() {
         return; // viewport not declared → eframe destroys the OS window
     }
@@ -319,7 +424,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .with_inner_size(monitor_size);
 
     let mut exit_edit = false;
-    let mut rect_write: Option<(Option<NodeId>, NodeId, [f32; 4])> = None;
+    let mut rect_write: Option<(Option<NodeId>, NodeId, &'static str, [f32; 4])> = None;
 
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs).
@@ -370,43 +475,43 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         let mut r = m.rect;
                         let px = to_px(r);
                         paint_menu(ui, px, m, true);
-
-                        // Drag the body to move.
-                        let body = ui.interact(px, egui::Id::new(("fxi_menu_move", inner_uid)), egui::Sense::drag());
-                        if body.dragged() {
-                            let d = body.drag_delta();
-                            r[0] += d.x / screen.width();
-                            r[1] += d.y / screen.height();
-                        }
-                        // Drag the bottom-right corner to resize.
-                        let handle = egui::Rect::from_center_size(px.right_bottom(), egui::vec2(22.0, 22.0));
-                        let hresp = ui.interact(handle, egui::Id::new(("fxi_menu_size", inner_uid)), egui::Sense::drag());
-                        if hresp.dragged() {
-                            let d = hresp.drag_delta();
-                            r[2] += d.x / screen.width();
-                            r[3] += d.y / screen.height();
-                        }
-                        ui.painter().rect_filled(handle.shrink(4.0), 3.0, egui::Color32::from_rgb(255, 196, 90));
-                        if hresp.hovered() || body.hovered() {
-                            ui.output_mut(|o| o.cursor_icon = if hresp.hovered() {
-                                egui::CursorIcon::ResizeNwSe
-                            } else {
-                                egui::CursorIcon::Move
-                            });
-                        }
-
-                        // Clamp: keep a sane minimum and stay on screen.
-                        r[2] = r[2].clamp(0.06, 1.0);
-                        r[3] = r[3].clamp(0.06, 1.0);
-                        r[0] = r[0].clamp(0.0, 1.0 - r[2]);
-                        r[1] = r[1].clamp(0.0, 1.0 - r[3]);
+                        drag_rect(ui, screen, px, inner_uid, &mut r);
                         if r != m.rect {
-                            rect_write = Some((m.outer, m.inner, r));
+                            rect_write = Some((m.outer, m.inner, "menu_rect", r));
                         }
-
+                        menu_edit_chrome(ui, screen, &mut exit_edit);
+                    } else if let Some(a) = areas.iter().find(|a|
+                        a.outer.map(|n| n.0) == outer_uid && a.inner.0 == inner_uid)
+                    {
+                        let mut r = a.rect;
+                        let px = to_px(r);
+                        ui.painter().rect_stroke(px, 4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60)), egui::StrokeKind::Inside);
+                        {
+                            let (tab, _, _) = app.overlay_parts();
+                            if let Some(s) = snarl_at(&mut tab.canvas.snarl, a.outer) {
+                                crate::canvas::area_body::paint_area_overlay(ui, px, s, a.inner);
+                            }
+                        }
+                        drag_rect(ui, screen, px, inner_uid, &mut r);
+                        if r != a.rect {
+                            rect_write = Some((a.outer, a.inner, crate::canvas::area_body::AREA_RECT_PARAM, r));
+                        }
                         menu_edit_chrome(ui, screen, &mut exit_edit);
                     }
                 } else {
+                    // Area Mappers in use, under any open menu.
+                    for &(i, alpha) in &shown_areas {
+                        let a = &areas[i];
+                        let px = to_px(a.rect);
+                        let (tab, _, _) = app.overlay_parts();
+                        if let Some(s) = snarl_at(&mut tab.canvas.snarl, a.outer) {
+                            ui.scope(|ui| {
+                                ui.set_opacity(alpha);
+                                crate::canvas::area_body::paint_area_overlay(ui, px, s, a.inner);
+                            });
+                        }
+                    }
                     for (i, m) in menus.iter().enumerate() {
                         if !m.open { continue; }
                         paint_menu(ui, to_px(m.rect), m, false);
@@ -429,17 +534,17 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             });
     });
 
-    if let Some((outer, inner, r)) = rect_write {
+    if let Some((outer, inner, key, r)) = rect_write {
         {
             let (tab, _live_signals, _panic) = app.overlay_parts();
-            write_menu_rect(&mut tab.canvas.snarl, outer, inner, r);
+            write_menu_rect(&mut tab.canvas.snarl, outer, inner, key, r);
         }
         // A sub-patch editor renders (and writes back) its OWN clone of the inner
         // snarl; without this, the next time the user edits the menu the editor's
         // full-snarl write-back clobbers the menu_rect we just wrote to the
         // embedded copy — the placement would silently reset. Mirror the write
         // into the editor's clone so its write-back preserves it.
-        app.write_menu_rect_to_editors(outer, inner, r);
+        app.write_menu_rect_to_editors(outer, inner, key, r);
     }
     if exit_edit {
         clear_menu_edit(ctx);

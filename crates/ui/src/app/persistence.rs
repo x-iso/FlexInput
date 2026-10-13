@@ -60,7 +60,7 @@ impl FlexInputApp {
     /// `inner` is the menu's NodeId, identical in the editor's clone (its slots
     /// were seeded aligned).
     pub(crate) fn write_menu_rect_to_editors(
-        &mut self, outer: Option<NodeId>, inner: NodeId, r: [f32; 4],
+        &mut self, outer: Option<NodeId>, inner: NodeId, key: &str, r: [f32; 4],
     ) {
         let Some(outer) = outer else { return; };
         let val = serde_json::json!([r[0], r[1], r[2], r[3]]);
@@ -71,7 +71,7 @@ impl FlexInputApp {
                 && ed.node_id == outer
             {
                 if let Some(node) = ed.canvas.snarl.get_node_mut(inner) {
-                    node.params.insert("menu_rect".to_string(), val.clone());
+                    node.params.insert(key.to_string(), val.clone());
                 }
             }
         }

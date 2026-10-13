@@ -89,6 +89,17 @@ pub(crate) const AREA_CELL_ROUND: &str = "area_cell_round";
 pub(crate) const AREA_CELL_PRESSURE: &str = "area_cell_press";
 /// Mirror of the selected cell's touch gate.
 pub(crate) const AREA_CELL_TOUCH: &str = "area_cell_touch";
+/// When the area shows on the screen overlay (see [`AREA_OVERLAY_MODES`]).
+pub(crate) const AREA_OVERLAY_PARAM: &str = "area_overlay";
+/// Where it shows there: monitor fractions `[x, y, w, h]`.
+pub(crate) const AREA_RECT_PARAM: &str = "area_rect";
+/// The overlay modes: (value, label, what it means).
+pub(crate) const AREA_OVERLAY_MODES: &[(&str, &str, &str)] = &[
+    ("off", "Off", "The area never shows on the screen."),
+    ("moved", "While moved", "Shows while the stick is off centre, or a finger is on the touchpad."),
+    ("touched", "While touched", "Shows while a finger is on the touchpad, or the stick is touched (a capacitive stick; on a pad that doesn't report stick touch, while the stick is off centre)."),
+    ("outside", "Outside deadzone", "Shows while the point is out of the centre cell (the deadzone) of the first layer."),
+];
 const G_SYNC: &str = "_area_g_sync";
 const CELL_SYNC: &str = "_area_cell_sync";
 pub(crate) const SEL_BORDER: &str = "_area_sel_border";
@@ -160,6 +171,54 @@ pub(crate) fn area_live(node: &NodeData) -> (Option<egui::Vec2>, HashMap<u32, f3
         _ => None,
     }).collect();
     (point, weights)
+}
+
+/// Does the area want to be on the screen overlay right now, by its
+/// [`AREA_OVERLAY_PARAM`] mode and the live point?
+pub(crate) fn area_overlay_wanted(node: &NodeData) -> bool {
+    let mode = node.params.get(AREA_OVERLAY_PARAM).and_then(|v| v.as_str()).unwrap_or("off");
+    if mode == "off" {
+        return false;
+    }
+    // A touchpad has a point only while a finger is down.
+    let Some(p) = area_live(node).0 else { return false };
+    let touchpad = area_input(node).starts_with("touch");
+    let moved = touchpad || p.length() > 0.05;
+    match mode {
+        // No backend reports a stick's touch yet, so a stick counts as touched
+        // while it is moved.
+        "moved" | "touched" => moved,
+        "outside" => {
+            let base = first_layer_layout(node);
+            base.locate_id(p.x, p.y) != base.locate_id(0.0, 0.0)
+        }
+        _ => false,
+    }
+}
+
+/// The first layer's layout (the loaded keys hold it when it is the one
+/// being edited).
+fn first_layer_layout(node: &NodeData) -> AreaLayout {
+    if loaded_layer(node) == 0 {
+        return area_layout(node);
+    }
+    node.params.get(AREA_LAYERS_PARAM).and_then(|v| v.as_array()).and_then(|a| a.first())
+        .and_then(|l| l.get(AREA_LAYOUT_PARAM)).and_then(AreaLayout::from_value)
+        .unwrap_or_else(|| area_layout(node))
+}
+
+/// The area as the screen overlay shows it: the largest square in `rect`,
+/// live, with nothing to edit.
+pub(crate) fn paint_area_overlay(ui: &mut egui::Ui, rect: egui::Rect, snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+    let Some(n) = snarl.get_node(node_id) else { return };
+    let colors = ZoneColors::build(
+        layer_color(|key| n.params.get(key).cloned(), loaded_layer(n)),
+        super::menu_body::MENU_HIGHLIGHT_DEFAULT,
+    );
+    let size = rect.width().min(rect.height()).max(40.0);
+    let mut child = ui.new_child(egui::UiBuilder::new()
+        .max_rect(egui::Rect::from_center_size(rect.center(), egui::vec2(size, size))));
+    area_field(node_id, &mut child, snarl, colors, size, false, true);
 }
 
 /// A border named by POSITION rather than index, so a selection survives
@@ -1576,7 +1635,10 @@ fn paint_analog_view(
 }
 
 /// Paint the area and run its mouse editing. Returns the field rect and
-/// whether an undo step's worth of editing happened.
+/// whether an undo step's worth of editing happened. `live_only` (the screen
+/// overlay) paints it live with no selection, no gamepad focus or targets,
+/// and no editing.
+#[allow(clippy::too_many_arguments)]
 fn area_field(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -1584,6 +1646,7 @@ fn area_field(
     colors: ZoneColors,
     size: f32,
     resizable: bool,
+    live_only: bool,
 ) -> (egui::Rect, bool) {
     let Some(node) = snarl.get_node(node_id) else { return (egui::Rect::NOTHING, false) };
     let layout = area_layout(node);
@@ -1597,19 +1660,20 @@ fn area_field(
     let meta = menu_zone_meta(node);
     let full = node.params.get(AREA_LAYER_FULL_PARAM).and_then(|v| v.as_f64()).map(|v| v as f32)
         .unwrap_or(AREA_ANALOG_FULL_DEFAULT);
-    let sel = selected_cell(node, &layout);
-    let sel_border = selected_border(node, &layout);
-    let picking = tz_pick_kind(snarl, node_id).is_some();
+    let sel = if live_only { u32::MAX } else { selected_cell(node, &layout) };
+    let sel_border = selected_border(node, &layout).filter(|_| !live_only);
+    let picking = !live_only && tz_pick_kind(snarl, node_id).is_some();
     let ctx = ui.ctx().clone();
 
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+    let sense = if live_only { egui::Sense::hover() } else { egui::Sense::click_and_drag() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), sense);
     let g = FieldGeom::of(rect);
     let p = ui.painter_at(rect.expand(2.0));
     // Pointer positions in this layer's space: the canvas is zoomed and
     // panned, and egui reports the press origin in screen space.
     let to_global = ctx.layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
     let from_global = to_global.inverse();
-    let hover_pos = resp.hover_pos();
+    let hover_pos = resp.hover_pos().filter(|_| !live_only);
     // Per host: the same node can be drawn in the editor and pinned at once.
     let host = egui::Id::new((ctx.viewport_id(), ui.layer_id(), node_id, "area_field"));
     let drag_id = host.with("drag");
@@ -1636,7 +1700,7 @@ fn area_field(
         && ((hp - g.center).length() - full * g.unit).abs() <= GRAB_PX;
     // Gamepad focus on the ring rides the Touch Zones seam channel (an Area
     // Mapper has no seam of its own); grabbed is the shared flag.
-    let nav_ring = analog && ctx
+    let nav_ring = analog && !live_only && ctx
         .data(|d| d.get_temp::<(u64, bool)>(egui::Id::new(("gp_nav_tz_seam", node_id.0))))
         .is_some_and(|(pass, on)| on && crate::widgets::nav_pass_matches(&ctx, pass));
     let full_lit = nav_ring || full_dragging || (dragging.is_none() && hover_pos.is_some_and(near_full));
@@ -1655,11 +1719,11 @@ fn area_field(
     let cur_pass = crate::widgets::nav_pass(&ctx);
     let nav_line: Option<(usize, bool)> = ctx
         .data(|d| d.get_temp::<(u64, u64, u64, u64, bool)>(egui::Id::new(("gp_nav_tz", node_id.0))))
-        .filter(|(pass, f, a, _, _)| cur_pass.saturating_sub(*pass) <= 2 && *f == 0 && *a == 0)
+        .filter(|(pass, f, a, _, _)| !live_only && cur_pass.saturating_sub(*pass) <= 2 && *f == 0 && *a == 0)
         .map(|(_, _, _, l, grabbed)| (l as usize, grabbed));
     let nav_cell: Option<u32> = ctx
         .data(|d| d.get_temp::<(u64, u64, u64)>(egui::Id::new(("gp_nav_tz_zone", node_id.0))))
-        .filter(|(pass, f, z)| *f == 0 && *z != u64::MAX && crate::widgets::nav_pass_matches(&ctx, *pass))
+        .filter(|(pass, f, z)| !live_only && *f == 0 && *z != u64::MAX && crate::widgets::nav_pass_matches(&ctx, *pass))
         .map(|(_, _, z)| z as u32);
     let nav_style = crate::widgets::NavHighlightStyle::of(&ctx);
 
@@ -1833,14 +1897,19 @@ fn area_field(
             egui::Stroke::new(1.0, colors.main.gamma_multiply(0.6))));
     }
 
-    let nav_pass_now = crate::widgets::nav_pass(&ctx);
-    ctx.data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_tz_targets", node_id.0, 0usize)), (nav_pass_now, nav_targets)));
+    if !live_only {
+        let nav_pass_now = crate::widgets::nav_pass(&ctx);
+        ctx.data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_tz_targets", node_id.0, 0usize)), (nav_pass_now, nav_targets)));
+    }
 
     // ── Live point ──
     if let Some(pt) = point {
         let end = g.to_screen(pt.x.clamp(-1.2, 1.2), pt.y.clamp(-1.2, 1.2));
         paint_menu_cursor(&p, g.center, end, colors.hi);
+    }
+    if live_only {
+        return (rect, false);
     }
 
     // ── Interaction ──
@@ -2133,7 +2202,10 @@ pub(crate) fn show_area_options_row(
         }
     });
     publish_nav_field_rects(ui, node_id, &rects);
-    let preset_changed = ui.horizontal(|ui| presets_menu(node_id, ui, snarl)).inner;
+    let preset_changed = ui.horizontal(|ui| {
+        let changed = presets_menu(node_id, ui, snarl);
+        changed | overlay_controls(node_id, ui, snarl, automap_parent)
+    }).inner;
 
     let Some(n) = snarl.get_node_mut(node_id) else { return false };
     let mut changed = preset_changed;
@@ -2401,6 +2473,52 @@ pub(crate) fn show_area_press_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mu
         }
     }
     changed
+}
+
+// ── Screen overlay ────────────────────────────────────────────────────────────
+
+/// When the area shows on the screen overlay, and placing it there (the
+/// Virtual Menu's overlay and position editor).
+fn overlay_controls(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> bool {
+    let Some(n) = snarl.get_node(node_id) else { return false };
+    let cur = n.params.get(AREA_OVERLAY_PARAM).and_then(|v| v.as_str()).unwrap_or("off").to_string();
+    let label = AREA_OVERLAY_MODES.iter().find(|m| m.0 == cur).map(|m| m.1).unwrap_or("Off");
+    let mut pick: Option<&str> = None;
+    ui.label(egui::RichText::new("Overlay").small().weak());
+    egui::ComboBox::from_id_salt((node_id, "area_overlay"))
+        .selected_text(egui::RichText::new(label).small())
+        .width(110.0)
+        .show_ui(ui, |ui| {
+            for (value, name, tip) in AREA_OVERLAY_MODES {
+                if ui.selectable_label(cur == *value, *name).on_hover_text(*tip).clicked() && cur != *value {
+                    pick = Some(value);
+                }
+            }
+        })
+        .response
+        .on_hover_text("Show the area on the screen, over the game, while it is in use.");
+    if cur != "off" {
+        let outer_uid = super::viewer::root_subpatch_id(automap_parent).map(|n| n.0);
+        let editing = crate::menu_overlay::menu_edit_target(ui.ctx()) == Some((outer_uid, node_id.0));
+        if ui.add(egui::Button::selectable(editing, "🖵 Position…"))
+            .on_hover_text("Place and size the area on the screen: it appears as an editable overlay widget — drag to move, corner to resize, Esc / Done saves.")
+            .clicked()
+        {
+            crate::menu_overlay::request_menu_edit(ui.ctx(), outer_uid, node_id.0);
+        }
+    }
+    match (pick, snarl.get_node_mut(node_id)) {
+        (Some(v), Some(n)) => {
+            n.params.insert(AREA_OVERLAY_PARAM.into(), json!(v));
+            true
+        }
+        _ => false,
+    }
 }
 
 // ── Presets ───────────────────────────────────────────────────────────────────
@@ -2709,7 +2827,7 @@ pub(crate) fn show_area_mapper_body(
             changed |= show_area_layer_row(node_id, ui, snarl);
         }).response.rect;
         register_exposable_element(ui, node_id, "layers", layers);
-        let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), true);
+        let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), true, false);
         changed |= structural;
         register_exposable_element(ui, node_id, "field", field);
         ui.label(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
@@ -2740,7 +2858,7 @@ pub(crate) fn render_area_field_pinned(inner_id: NodeId, ui: &mut egui::Ui, snar
     let size = container.x.min(container.y).max(40.0);
     let mut child = ui.new_child(egui::UiBuilder::new()
         .max_rect(egui::Rect::from_center_size(rect.center(), egui::vec2(size, size))));
-    area_field(inner_id, &mut child, snarl, colors, size, false);
+    area_field(inner_id, &mut child, snarl, colors, size, false, false);
 }
 
 /// The options row pinned.
@@ -2794,6 +2912,36 @@ mod tests {
         let mut n = NodeData::from(&d);
         area_sync(&mut n);
         n
+    }
+
+    /// The overlay shows by its mode and the live point: Off never, While
+    /// moved once off centre, Outside deadzone only past the centre cell, and
+    /// a touchpad only with a finger down.
+    #[test]
+    fn the_overlay_shows_while_in_use() {
+        let mut n = node();
+        let at = |n: &mut NodeData, p: Option<(f32, f32)>| {
+            n.extra.last_out = vec![None, p.map(|(x, y)| Signal::Vec2(glam::Vec2::new(x, y)))];
+        };
+        at(&mut n, Some((0.0, 0.2)));
+        assert!(!area_overlay_wanted(&n), "off by default");
+        n.params.insert(AREA_OVERLAY_PARAM.into(), json!("moved"));
+        assert!(area_overlay_wanted(&n));
+        at(&mut n, Some((0.0, 0.01)));
+        assert!(!area_overlay_wanted(&n), "at rest");
+        // The default circle's deadzone is its centre disc.
+        n.params.insert(AREA_OVERLAY_PARAM.into(), json!("outside"));
+        at(&mut n, Some((0.0, 0.2)));
+        assert!(!area_overlay_wanted(&n), "inside the deadzone");
+        at(&mut n, Some((0.0, 0.8)));
+        assert!(area_overlay_wanted(&n));
+        // A touchpad: a finger down anywhere, nothing when lifted.
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+        n.params.insert(AREA_OVERLAY_PARAM.into(), json!("touched"));
+        at(&mut n, Some((0.0, 0.0)));
+        assert!(area_overlay_wanted(&n));
+        at(&mut n, None);
+        assert!(!area_overlay_wanted(&n));
     }
 
     /// A click in an analog layer's view picks the deadzone or the nearest
