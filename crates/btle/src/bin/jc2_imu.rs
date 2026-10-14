@@ -321,6 +321,8 @@ fn main() {
             cmd_per_side: args.iter().any(|a| a == "--cmd-per-side"),
             detached: args.iter().any(|a| a == "--detached"),
             late_subscribe: args.iter().any(|a| a == "--late-subscribe"),
+            encrypt_first: false,
+            ltk_reversed: false,
             led_test: args.iter().any(|a| a == "--led"),
             force: true,
         };
@@ -363,9 +365,15 @@ fn main() {
                 || a == "--late-subscribe"
                 || a == "--read-all"
                 || a == "--encrypt"
+                || a == "--encrypt-full"
+                || a == "--encrypt-first"
         }),
         detached: std::env::args().any(|a| a == "--detached"),
-        late_subscribe: std::env::args().any(|a| a == "--late-subscribe"),
+        // The reference order — subscribe after init — is part of what a
+        // console does, so `--encrypt-first` implies it.
+        late_subscribe: std::env::args().any(|a| a == "--late-subscribe" || a == "--encrypt-first"),
+        encrypt_first: std::env::args().any(|a| a == "--encrypt-first"),
+        ltk_reversed: std::env::args().any(|a| a == "--ltk-reversed"),
         led_test: std::env::args().any(|a| a == "--led"),
         force: std::env::args().any(|a| a == "--force"),
     };
@@ -419,10 +427,28 @@ fn main() {
         std::process::exit(1);
     }
 
+    if opts.encrypt_first {
+        enc_log_open(&enc_log_path());
+    }
     let links = connect_both(&dongle, &opts);
     if links.is_empty() {
         eprintln!("[imu] no controllers connected");
         std::process::exit(1);
+    }
+    if opts.encrypt_first {
+        // Which halves came up encrypted: an Encryption Change was logged for
+        // each, and the link-level answer is the same for every stream of it.
+        let mut conns: Vec<u16> = links.iter().map(|l| l.conn).collect();
+        conns.dedup();
+        say(format!("\n[enc] === after encrypt -> init -> subscribe, {} half/halves ===", conns.len()));
+        report_streams(&dongle, &links, &conns, 6);
+        // `--mask-sweep` too: the same sweep, now on encrypted links. Its
+        // table goes to the terminal; the summary line points there.
+        if std::env::args().any(|a| a == "--mask-sweep") {
+            say("[enc] running the feature-mask sweep on the encrypted link(s) — see terminal table".into());
+            mask_sweep(&dongle, &links);
+        }
+        return;
     }
     // Count HALVES, not streams: each half now contributes several streams, so
     // `links.len()` no longer answers "did both controllers connect".
@@ -442,6 +468,11 @@ fn main() {
     // of them need the sweep to answer.
     if std::env::args().any(|a| a == "--mask-sweep") {
         mask_sweep(&dongle, &links);
+        return;
+    }
+
+    if std::env::args().any(|a| a == "--encrypt-full") {
+        try_encrypt_full(&dongle, &links, &enc_log_path(), std::env::args().any(|a| a == "--ltk-reversed"));
         return;
     }
 
@@ -3513,6 +3544,9 @@ fn connect_both(dongle: &Dongle, opts: &Opts) -> Vec<Link> {
             Ok(conn) => {
                 println!("[imu] {side} connected as handle {conn:#06x} ({} of 2)", conns.len() + 1);
                 let found = subscribe_all(dongle, conn, side, opts);
+                if opts.encrypt_first && !pair_encrypt(dongle, conn, side, opts.ltk_reversed) {
+                    say(format!("[enc] {side}: not encrypted — continuing on plaintext"));
+                }
                 init(dongle, conn, opts, &found);
                 if opts.late_subscribe {
                     subscribe_inputs(dongle, conn, &found);
@@ -3613,6 +3647,11 @@ struct Opts {
     /// characteristic would read as "exists, subscribes fine, never notifies":
     /// exactly what `0x000a` has done on every run.
     late_subscribe: bool,
+    /// `--encrypt-first`: pair and encrypt each half right after discovery,
+    /// BEFORE init, the order a console's bonded reconnect has.
+    encrypt_first: bool,
+    /// `--ltk-reversed`: the key byte order the M12-S accepted.
+    ltk_reversed: bool,
     /// Blink the player LEDs through the common command channel and stop.
     led_test: bool,
     /// Record the sweep even when the preflight says nothing new will come of it.
@@ -3725,6 +3764,239 @@ fn cmd_reply(dongle: &Dongle, conn: u16, cmd: u8, sub: u8, data: &[u8]) -> Optio
         }
     }
     None
+}
+
+/// HCI error code, by name — the whole content of a refused encryption.
+fn hci_reason(code: u8) -> &'static str {
+    match code {
+        0x00 => "success",
+        0x05 => "Authentication Failure",
+        0x06 => "PIN or Key Missing — the controller has NO key for this link",
+        0x08 => "Connection Timeout",
+        0x13 => "Remote User Terminated — the controller hung up",
+        0x16 => "Connection Terminated by Local Host",
+        0x1A => "Unsupported Remote Feature",
+        0x22 => "LL Response Timeout",
+        0x25 => "Encryption Mode Not Acceptable",
+        0x29 => "Pairing With Unit Key Not Supported",
+        0x3B => "Unacceptable Connection Parameters",
+        0x3D => "Connection Terminated due to MIC Failure — WRONG key",
+        0x3E => "Connection Failed to be Established",
+        _ => "(see the Bluetooth core spec, Vol 1 Part F)",
+    }
+}
+
+/// The encryption runs' log file — everything [`say`] prints also lands here.
+static ENC_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+fn enc_log_open(path: &str) {
+    if let Ok(mut g) = ENC_LOG.lock() {
+        *g = std::fs::File::create(path).ok();
+    }
+    say(format!("[enc] log -> {path}"));
+}
+
+/// Print, and append to the encryption log when one is open.
+fn say(s: String) {
+    use std::io::Write as _;
+    println!("{s}");
+    if let Ok(mut g) = ENC_LOG.lock() {
+        if let Some(f) = g.as_mut() {
+            let _ = writeln!(f, "{s}");
+            let _ = f.flush();
+        }
+    }
+}
+
+/// The log path from `--log`, else a timestamped one.
+fn enc_log_path() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == "--log")
+        .and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            format!("jc2_encrypt_{secs}.log")
+        })
+}
+
+/// The pairing FlexInput's own dongle transport runs on every first connect —
+/// addresses, key exchange, confirm, finalise, register, commit
+/// (`crates/joycon2/src/pairing.rs`) — then `LE_Enable_Encryption` with the
+/// derived key. Returns whether the link came up encrypted.
+///
+/// ⭐ Measured 2026-10-14 on the M12-S right half: with the key passed
+/// REVERSED (`--ltk-reversed`) the link encrypts; in natural order it drops
+/// with a connection timeout.
+///
+/// ❗ Finalise writes the bond to controller flash — exactly as the app already
+/// does on every first dongle connect of a session, so nothing new is risked.
+fn pair_encrypt(dongle: &Dongle, conn: u16, side: &str, reversed: bool) -> bool {
+    // The reference's fixed host key; the derived LTK is this XOR the reply.
+    const A1: [u8; 16] = [
+        0xea, 0xbd, 0x47, 0x13, 0x89, 0x35, 0x42, 0xc6,
+        0x79, 0xee, 0x07, 0xf2, 0x53, 0x2c, 0x6c, 0x31,
+    ];
+    // The challenge the hardware test in `pairing.rs` captured.
+    const A2: [u8; 16] = [
+        0x40, 0xb0, 0x8a, 0x5f, 0xcd, 0x1f, 0x9b, 0x41,
+        0x12, 0x5c, 0xac, 0xc6, 0x3f, 0x38, 0xa0, 0x73,
+    ];
+    say(format!("\n[enc] === {side} (conn {conn:#06x}) ==="));
+    let host = match dongle.read_bd_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            say(format!("[enc] cannot read dongle address: {e}"));
+            return false;
+        }
+    };
+    let mut host_wire = host;
+    host_wire.reverse();
+    let step = |name: &str, cmd: u8, sub: u8, data: &[u8]| match cmd_reply(dongle, conn, cmd, sub, data) {
+        Some((st, d)) => {
+            say(format!("   {cmd:#04x}/{sub:#04x} {name:12} status {st:#04x} data {d:02x?}"));
+            Some(d)
+        }
+        None => {
+            say(format!("   {cmd:#04x}/{sub:#04x} {name:12} NO REPLY"));
+            None
+        }
+    };
+    let mut addrs = vec![0x00, 0x01];
+    addrs.extend_from_slice(&host_wire);
+    step("addresses", 0x15, 0x01, &addrs);
+    let mut k = vec![0x00];
+    k.extend_from_slice(&A1);
+    let Some(reply) = step("key-xchg", 0x15, 0x04, &k) else {
+        say("   stopping: no key reply".into());
+        return false;
+    };
+    if reply.len() < 17 {
+        say(format!("   stopping: key reply is {} bytes, expected 17", reply.len()));
+        return false;
+    }
+    let mut ltk = A1;
+    for (i, b) in ltk.iter_mut().enumerate() {
+        *b ^= reply[i + 1];
+    }
+    say(format!("   LTK = A1 ^ B1 = {ltk:02x?}"));
+    let mut c = vec![0x00];
+    c.extend_from_slice(&A2);
+    step("confirm", 0x15, 0x02, &c);
+    step("finalise", 0x15, 0x03, &[0x00]);
+    let mut reg = host_wire.to_vec();
+    let mut lr = ltk;
+    lr.reverse();
+    reg.extend_from_slice(&lr);
+    step("register-key", 0x03, 0x07, &reg);
+    step("commit", 0x03, 0x09, &[]);
+
+    let key = if reversed { lr } else { ltk };
+    say(format!(
+        "   -> LE_Enable_Encryption, EDIV 0 / Rand 0, key {}{key:02x?}",
+        if reversed { "(REVERSED) " } else { "" }
+    ));
+    if let Err(e) = dongle.le_enable_encryption(conn, 0, 0, &key) {
+        say(format!("     failed to send: {e}"));
+        return false;
+    }
+    // ❗ Matched to THIS connection: the first run read any half's events as
+    // its own, and a late Encryption Change was credited to the wrong half.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        match dongle.read_event_timeout(Duration::from_millis(200)) {
+            Ok(Some(Event::EncryptionChange { status, enabled, conn_handle })) if conn_handle == conn => {
+                if status == 0 && enabled != 0 {
+                    say("     ENCRYPTION ENABLED".into());
+                    return true;
+                }
+                say(format!("     refused: status {status:#04x} ({}), enabled {enabled}", hci_reason(status)));
+                return false;
+            }
+            Ok(Some(Event::DisconnectionComplete { reason, conn_handle })) if conn_handle == conn => {
+                say(format!("     LINK DROPPED, reason {reason:#04x}: {}", hci_reason(reason)));
+                return false;
+            }
+            Ok(Some(Event::EncryptionChange { status, enabled, conn_handle })) => say(format!(
+                "     (encryption change on OTHER conn {conn_handle:#06x}: status {status:#04x}, enabled {enabled})")),
+            Ok(Some(Event::DisconnectionComplete { reason, conn_handle })) => say(format!(
+                "     (OTHER conn {conn_handle:#06x} dropped: {reason:#04x} {})", hci_reason(reason))),
+            Ok(Some(Event::CommandStatus { status, opcode })) => say(format!(
+                "     (command status {status:#04x} for opcode {:#06x})", opcode.0)),
+            // Number Of Completed Packets: routine ACL flow control.
+            Ok(Some(Event::Other { code: 0x13, .. })) => {}
+            Ok(Some(other)) => say(format!("     (event {other:?})")),
+            _ => {}
+        }
+    }
+    say("     no Encryption Change event within 12 s".into());
+    false
+}
+
+/// After encryption: read the common input once, then record every channel of
+/// every connected half and show what streamed.
+fn report_streams(dongle: &Dongle, links: &[Link], encrypted: &[u16], secs: u64) {
+    let mut conns: Vec<u16> = links.iter().map(|l| l.conn).collect();
+    conns.dedup();
+    for conn in conns {
+        match dongle.read_attribute_detail(conn, jc::HANDLE_INPUT_COMMON) {
+            Ok(Ok(Some(v))) => say(format!("   conn {conn:#06x} READ {:#06x} = {} bytes {v:02x?}", jc::HANDLE_INPUT_COMMON, v.len())),
+            Ok(Ok(None)) => say(format!("   conn {conn:#06x} READ {:#06x}: no reply", jc::HANDLE_INPUT_COMMON)),
+            Ok(Err(code)) => say(format!("   conn {conn:#06x} READ {:#06x}: refused, ATT error {code:#04x}", jc::HANDLE_INPUT_COMMON)),
+            Err(e) => say(format!("   conn {conn:#06x} READ {:#06x}: {e}", jc::HANDLE_INPUT_COMMON)),
+        }
+    }
+    say(format!("   recording EVERY channel for {secs} s — move the pad"));
+    let frames = record(dongle, links, Duration::from_secs(secs));
+    for l in links {
+        let f = frames.get(&(l.conn, l.att));
+        let n = f.map(|f| f.len()).unwrap_or(0);
+        say(format!(
+            "   {}{}: {n} frames",
+            l.label(),
+            if encrypted.contains(&l.conn) { " (encrypted)" } else { " (plaintext)" }
+        ));
+        if let Some(f) = f {
+            for fr in f.iter().take(3) {
+                say(format!("      {fr:02x?}"));
+            }
+        }
+    }
+}
+
+/// `--encrypt-full`: pair and encrypt links that were initialised on
+/// plaintext, then look. Superseded by `--encrypt-first`, which encrypts BEFORE
+/// init the way a console's bonded reconnect does; kept to compare the two.
+fn try_encrypt_full(dongle: &Dongle, links: &[Link], log: &str, reversed: bool) {
+    enc_log_open(log);
+    let only = std::env::args()
+        .skip_while(|a| a != "--side")
+        .nth(1)
+        .map(|s| s.to_ascii_uppercase());
+    let mut seen: Vec<(u16, &str)> = Vec::new();
+    for l in links {
+        if !seen.iter().any(|(c, _)| *c == l.conn)
+            && only.as_deref().is_none_or(|s| l.side.eq_ignore_ascii_case(s))
+        {
+            seen.push((l.conn, l.side));
+        }
+    }
+    let mut encrypted = Vec::new();
+    for (conn, side) in seen {
+        if pair_encrypt(dongle, conn, side, reversed) {
+            encrypted.push(conn);
+            std::thread::sleep(Duration::from_millis(300));
+            match dongle.write_attribute(conn, jc::HANDLE_INPUT_COMMON_CCCD, &acl::CCCD_NOTIFY, acl::ATT_WRITE_REQUEST) {
+                Ok(()) => say(format!("     CCCD {:#06x} <- 01 00 ok", jc::HANDLE_INPUT_COMMON_CCCD)),
+                Err(e) => say(format!("     CCCD {:#06x} <- 01 00 {e}", jc::HANDLE_INPUT_COMMON_CCCD)),
+            }
+        }
+    }
+    if !encrypted.is_empty() {
+        report_streams(dongle, links, &encrypted, 5);
+    }
 }
 
 /// Try to bring the link up ENCRYPTED, then see whether `0x000a` starts talking.
@@ -4358,7 +4630,13 @@ fn mask_sweep(dongle: &Dongle, links: &[Link]) {
     // Every mask that adds a bit to the known-good 0x37, plus 0x37 itself as
     // the control and 0xFF as the upper bound. The reference warns 0xFF makes
     // the pad emit phantom ZL/ZR, which is a reason to measure it, not skip it.
-    const MASKS: &[u8] = &[0x37, 0x3F, 0x77, 0xB7, 0xBF, 0xF7, 0x7F, 0xFF];
+    // 2026-10-14: led by today's 0x2f (the shipped mask, the control) and its
+    // supersets WITH the magnetometer bit 0x80, then 0x80 alone; the old
+    // 0x37-based set follows.
+    const MASKS: &[u8] = &[
+        0x2F, 0xAF, 0x3F, 0xBF, 0x6F, 0xEF, 0x80, 0x84, 0x8C,
+        0x37, 0x77, 0xB7, 0xF7, 0x7F, 0xFF, 0x2F,
+    ];
 
     let mut conns: Vec<u16> = links.iter().map(|l| l.conn).collect();
     conns.sort_unstable();
