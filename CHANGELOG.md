@@ -3,6 +3,43 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **3DOF to 2D: Edge turn.** In Pointer mode, turning the pad past a zone
+  around the neutral pose (where Reset last put it) keeps the camera turning
+  on its own, the way it was already going, until you come back in. Nothing
+  switches at the zone: everything eases in past it over **blend**, so the
+  gyro's feel bleeds into the edge's. **Ramp** works like a stick past its
+  deadzone — the further out, the faster, up to **max** at zone + **ramp**.
+  **Momentum** keeps the camera from slowing below the speed you turned out
+  at (× gain): keep turning and it adds nothing, ease off and it makes up the
+  difference, pull back to brake, with an optional **fade**. **Both** uses
+  the two together. **gyro** sets how much of the gyro's own aim is left past
+  the blend — 100% keeps it, 0% hands over to the edge like a stick. **X
+  only** leaves pitch out. It measures the module's orientation, whose yaw
+  can drift; Reset re-centres the zone.
+
+- **Set Neutral Forward, as a card output.** On Choose's Gamepad tab under
+  the motion inputs: while a card sends it, the pad (or pads — both Joy-Con 2
+  halves behind a Combiner) feeding that card takes the way it points as
+  forward. Only yaw is re-zeroed; roll and pitch stay on gravity. Let go and
+  the new forward holds, so it re-centres a heading that has crept and works
+  as a clutch while held. It applies to a pad's own orientation (Joy-Con 2)
+  and to the one the 3DOF to 2D module computes.
+
+- **3DOF to 2D: Auto orientation source, now the default.** Auto uses the
+  device's own orientation when it publishes one and the module's computed
+  one otherwise.
+
+### Changed
+
+- **3DOF to 2D: Device orientation no longer falls back.** A pad without its
+  own orientation now gets none (and no Edge turn) instead of quietly getting
+  the computed one — that's what Auto is for. Nodes saved on Computed before
+  this didn't store the choice, so they open on Auto.
+
 ## [0.15.8] - 2026-10-13
 
 ### Added

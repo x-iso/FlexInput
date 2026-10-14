@@ -20,6 +20,76 @@ pub(crate) const MACRO_CARRY_UID: usize = usize::MAX;
 /// tick end into `NodeState::source_block` and applied to `dev_sigs` next tick.
 pub(crate) const SRC_BLOCK_PREFIX: &str = "__src_block__:";
 
+/// `collector_sigs` key prefix a card files a Set Neutral Forward request
+/// under: `("{ORIENT_NEUTRAL_PREFIX}{device_id}", ORIENT_NEUTRAL_PIN) =
+/// Bool(true)`. Drained at tick end into `NodeState::orient_neutral_req` and
+/// applied to `dev_sigs` next tick.
+pub(crate) const ORIENT_NEUTRAL_PREFIX: &str = "__orient_neutral__:";
+
+/// Synthetic per-device pin the engine raises (next tick) on a device a card
+/// asked to Set Neutral Forward, for modules that keep an orientation of their
+/// own — the 3DOF module's computed one.
+pub(crate) const ORIENT_NEUTRAL_DEV_PIN: &str = "__orient_neutral";
+
+/// If the card node publishing under `key` is sending Set Neutral Forward this
+/// tick, file the request for every device feeding it: `_upstream_device_ids`
+/// (all of a Combiner's ports — both Joy-Con 2 halves), else the single
+/// `_automap_device_id`. Called at the end of each card module's evaluation.
+pub(crate) fn request_orient_neutral(
+    snap: &NodeSnap,
+    key: &str,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    use flexinput_core::imu::ORIENT_NEUTRAL_PIN;
+    let on = collector_sigs
+        .get(&(key.to_string(), ORIENT_NEUTRAL_PIN.to_string()))
+        .is_some_and(|s| s.as_bool());
+    if !on {
+        return;
+    }
+    let mut devs: Vec<String> = snap.params.get("_upstream_device_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+    if devs.is_empty() {
+        if let Some(d) = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            devs.push(d.to_string());
+        }
+    }
+    for d in devs {
+        collector_sigs.insert(
+            (format!("{ORIENT_NEUTRAL_PREFIX}{d}"), ORIENT_NEUTRAL_PIN.to_string()),
+            Signal::Bool(true),
+        );
+    }
+}
+
+/// Start of tick: apply Set Neutral Forward. A device requested last tick takes
+/// its current heading as forward — the correction is captured from its
+/// orientation as it arrives now, before any earlier correction — and gets
+/// [`ORIENT_NEUTRAL_DEV_PIN`] raised for this tick. Every device with a
+/// captured correction then has it applied to its `orientation` pin.
+pub(crate) fn apply_orient_neutral(
+    carry: &mut NodeState,
+    dev_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    for dev in &carry.orient_neutral_req {
+        dev_sigs.insert((dev.clone(), ORIENT_NEUTRAL_DEV_PIN.to_string()), Signal::Bool(true));
+        if let Some(Signal::Vec4(v)) = dev_sigs.get(&(dev.clone(), "orientation".to_string())) {
+            let q = glam::Quat::from_xyzw(v.x, v.y, v.z, v.w);
+            if q.length_squared() > 1e-6 {
+                carry.orient_neutral.insert(dev.clone(), flexinput_core::frames::yaw_neutralizer(q.normalize()));
+            }
+        }
+    }
+    for (dev, n) in &carry.orient_neutral {
+        if let Some(Signal::Vec4(v)) = dev_sigs.get_mut(&(dev.clone(), "orientation".to_string())) {
+            let q = (*n * glam::Quat::from_xyzw(v.x, v.y, v.z, v.w)).normalize();
+            *v = glam::Vec4::new(q.x, q.y, q.z, q.w);
+        }
+    }
+}
+
 /// Write `__consumed__:{pin}` markers into `collector_sigs` under `key` for
 /// every pin a Remapper claimed — both the claimed cardinals/buttons and the
 /// underlying stick axes of any claimed cardinal (so a Combiner suppresses the

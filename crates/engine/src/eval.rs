@@ -489,6 +489,8 @@ pub fn eval_graph_tick(
         let e = state.entry(MACRO_CARRY_UID).or_default();
         e.unblocked_src = snap;
     }
+    // Set Neutral Forward, requested by a card last tick (one tick stale).
+    apply_orient_neutral(state.entry(MACRO_CARRY_UID).or_default(), &mut dev_sigs_owned);
     let dev_sigs = &dev_sigs_owned;
 
     // Destructure with `ref mut` so the rest of the function can keep
@@ -1310,11 +1312,14 @@ pub fn eval_graph_tick(
         let carry = state.entry(MACRO_CARRY_UID).or_default();
         carry.macro_prev.clear();
         carry.source_block.clear();
+        carry.orient_neutral_req.clear();
         for ((k, pin), sig) in collector_sigs.iter() {
             if k == SIGS_NS || k == SIGS_NS_VEC2 {
                 carry.macro_prev.insert((k.clone(), pin.clone()), *sig);
             } else if let Some(dev) = k.strip_prefix(SRC_BLOCK_PREFIX) {
                 carry.source_block.insert((dev.to_string(), pin.clone()));
+            } else if let Some(dev) = k.strip_prefix(ORIENT_NEUTRAL_PREFIX) {
+                carry.orient_neutral_req.insert(dev.to_string());
             }
         }
     }

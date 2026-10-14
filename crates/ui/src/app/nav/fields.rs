@@ -615,6 +615,7 @@ impl FlexInputApp {
             | ("processing.gyro_3dof", "steering_mode")
             | ("processing.gyro_3dof", "steering_opts")
             | ("processing.gyro_3dof", "roll_mix") | ("processing.gyro_3dof", "hold_offset")
+            | ("processing.gyro_3dof", "edge_turn") | ("processing.gyro_3dof", "orient_source")
             | ("processing.gyro_3dof", "gyro_invert") | ("processing.gyro_3dof", "accel_invert")
             | ("logic.counter", "mode") | ("logic.counter", "range_mode")
             | ("logic.counter", "step") | ("logic.counter", "min_max")
@@ -1021,6 +1022,22 @@ impl FlexInputApp {
                 f!("Yaw°", v("hold_yaw",-180.0,180.0,0.0,Fixed(5.0))),
                 f!("Roll°", v("hold_roll",-180.0,180.0,0.0,Fixed(5.0))),
             ],
+            // Order matches `GyroEdge::ui_rects`' field rects.
+            ("processing.gyro_3dof", "edge_turn") => vec![
+                f!("Edge turn", Enum{key:"edge_mode",opts:&["off","ramp","momentum","both"]}),
+                f!("X only", Toggle{key:"edge_x_only"}),
+                f!("Zone°", v("edge_zone_deg",0.0,170.0,30.0,Fixed(5.0))),
+                f!("Blend°", v("edge_blend_deg",0.0,170.0,15.0,Fixed(5.0))),
+                f!("Gyro kept", v("edge_gyro_keep",0.0,1.0,1.0,Fixed(0.1))),
+                f!("Ramp°", v("edge_ramp_deg",0.0,170.0,30.0,Fixed(5.0))),
+                f!("Max °/s", v("edge_max_dps",0.0,4000.0,180.0,Fixed(20.0))),
+                f!("Momentum ×", v("edge_momentum",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Fade s", v("edge_decay_s",0.0,30.0,0.0,Fixed(0.1))),
+            ],
+            // A missing key is Auto, so Auto leads (a missing Enum reads as
+            // its first option).
+            ("processing.gyro_3dof", "orient_source") =>
+                vec![f!("3D source", Enum{key:"orient_source",opts:&["auto","computed","device"]})],
             ("processing.gyro_3dof", "gyro_invert") => vec![
                 f!("yaw", Toggle{key:"inv_yaw"}),
                 f!("pitch", Toggle{key:"inv_pitch"}),

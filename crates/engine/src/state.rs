@@ -122,6 +122,15 @@ pub struct NodeState {
     /// reason they're blocked for everyone else). Only the reserved
     /// `MACRO_CARRY_UID` entry uses this field.
     pub unblocked_src: HashMap<(String, String), Signal>,
+    /// Devices a card asked to Set Neutral Forward last tick
+    /// (`flexinput_core::imu::ORIENT_NEUTRAL_PIN`), drained from
+    /// `collector_sigs` like `source_block`. Only `MACRO_CARRY_UID` uses this.
+    pub orient_neutral_req: HashSet<String>,
+    /// Per device, the yaw correction Set Neutral Forward last captured,
+    /// applied to that device's `orientation` pin every tick. Session-only —
+    /// the Calibration window's baseline is the persisted part. Only
+    /// `MACRO_CARRY_UID` uses this.
+    pub orient_neutral: HashMap<String, glam::Quat>,
 }
 
 /// Progress of one order-aware Remapper card (see `NodeState::order_state`).

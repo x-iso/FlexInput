@@ -977,6 +977,45 @@ pub(crate) fn tab_physical_source_device(tab_snarl: &Snarl<NodeData>) -> Option<
         .next()
 }
 
+/// Every physical device behind the AutoMap output `src`: a Combiner gives all
+/// of its ports, a card or other node with an AutoMap input is followed up it,
+/// and anything else — a sub-patch boundary, a Fork — is answered by
+/// [`find_automap_device_rec`]'s single device.
+pub(crate) fn upstream_physical_devices(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parents: Option<&AutomapParent<'_>>,
+    out: &mut Vec<String>,
+) {
+    let push = |id: String, out: &mut Vec<String>| {
+        if !id.is_empty() && !out.contains(&id) { out.push(id); }
+    };
+    let Some(node) = snarl.get_node(src.node) else { return };
+    let follow = |i: usize| snarl.in_pin(InPinId { node: src.node, input: i }).remotes.first().copied();
+    let automap_inputs: Vec<usize> = node.inputs.iter().enumerate()
+        .filter(|(_, p)| p.signal_type == SignalType::AutoMap)
+        .map(|(i, _)| i)
+        .collect();
+    let walks_up = !matches!(node.module_id.as_str(),
+        "device.source" | "subpatch" | "subpatch.inlet" | "module.automap_fork" | "module.automap_selector");
+    if node.module_id == "module.automap_combiner" {
+        for i in automap_inputs {
+            if let Some(up) = follow(i) { upstream_physical_devices(snarl, up, parents, out); }
+        }
+        return;
+    }
+    if walks_up {
+        if let Some(up) = automap_inputs.first().and_then(|&i| follow(i)) {
+            upstream_physical_devices(snarl, up, parents, out);
+            return;
+        }
+    }
+    if let Some((dev, _, fallback)) = find_automap_device_rec(snarl, src, parents) {
+        let id = fallback.unwrap_or(dev);
+        if !flexinput_engine::eval::is_namespaced_source(&id) { push(id, out); }
+    }
+}
+
 /// Walk an AutoMap wire chain from `src` back to the originating device.source.
 /// Returns (source_dev_id, source_pin_ids, fallback_dev_id).
 /// - For device.source: (real_dev_id, output_pins, None).
@@ -1580,6 +1619,23 @@ pub(crate) fn build_processing_graph_rec(
                                 serde_json::Value::String(dev_id));
                         }
                     }
+                }
+            }
+            // Every physical pad feeding a card module, for requests that go
+            // BACK to the pads (Set Neutral Forward): a Combiner of both
+            // Joy-Con 2 halves has to reach both, where `_automap_device_id`
+            // names one.
+            if matches!(node.module_id.as_str(),
+                "module.remapper" | "module.map_action" | "module.touch_zones"
+                | "module.menu" | "module.area_mapper" | "processing.gyro_3dof")
+            {
+                if let Some(src) = automap_idx
+                    .and_then(|idx| snarl.in_pin(InPinId { node: *node_id, input: idx }).remotes.first().copied())
+                {
+                    let mut devs = Vec::new();
+                    upstream_physical_devices(snarl, src, parents, &mut devs);
+                    params.insert("_upstream_device_ids".to_string(),
+                        serde_json::Value::Array(devs.into_iter().map(serde_json::Value::String).collect()));
                 }
             }
             // Selector: inject parallel dev / collector strings per port so

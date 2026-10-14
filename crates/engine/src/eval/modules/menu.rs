@@ -601,6 +601,7 @@ pub(crate) fn eval_menu_node(
         (true, Some((ux, uy))) => Some(Signal::Vec2(Vec2::new(ux, uy))),
         _ => None,
     });
+    request_orient_neutral(snap, &key, collector_sigs);
     out
 }
 

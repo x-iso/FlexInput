@@ -446,6 +446,21 @@ pub struct ModuleDescriptor {
 - **Parameters:**
   - `roll_contribution: f64` - Roll mix, % (−100..100, default 0). Pitch+Yaw only:
     X = yaw − roll × share, the JSM module's `ROLL_CONTRIBUTION` (same sign)
+  - `orient_source: String` - Pose for the Orientation output and Edge turn: `auto`
+    (default; the device's own orientation when it publishes one, else computed),
+    `computed`, `device` (device only — none without one)
+  - `edge_mode: String` - Edge turn, Pointer family only: `off` (default), `ramp`,
+    `momentum`, `both`. Past `edge_zone_deg` (30) from the neutral pose (the
+    Orientation output's identity, set by Reset) the X/Y outputs gain a turn in the
+    direction of the deflection (X = yaw, or roll in Pitch+Roll; Y = pitch), same
+    signs and units as the gyro's; everything eases in (smoothstep), nothing steps.
+    Ramp: 0 → `edge_max_dps` (180) over `edge_ramp_deg` (30). Momentum: the fastest
+    outward deflection speed since leaving the zone × `edge_momentum` (1) is a floor
+    on the camera's speed that way, eased in over `edge_blend_deg` (15) — it fills
+    only what the gyro (and ramp) don't already give, ignores inward motion so
+    pulling back brakes, and fades by `edge_decay_s` (0 = held). The gyro's own
+    output eases to `edge_gyro_keep` (1 = kept, 0 = handed over) across the blend.
+    `edge_x_only` drops pitch from both the zone and the turn
   - `hold_pitch` / `hold_yaw` / `hold_roll: f64` - Neutral hold, degrees (default 0;
     + = far edge raised / nose right / right grip down). The 2D outputs and Lean
     are measured from this hold: Pitch+Yaw / Pitch+Roll rotate gyro AND gravity

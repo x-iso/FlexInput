@@ -564,5 +564,6 @@ pub(crate) fn eval_touch_zones_map_node(
         collector_sigs.insert((key.clone(), "scroll_x".to_string()), Signal::Float(scroll_vx));
         collector_sigs.insert((key.clone(), "scroll_y".to_string()), Signal::Float(scroll_vy));
     }
+    request_orient_neutral(snap, &key, collector_sigs);
 }
 

@@ -181,6 +181,16 @@ pub fn is_imu_pin(id: &str) -> bool {
     imu_pin(id).is_some()
 }
 
+/// **Set Neutral Forward** — a mapping-card OUTPUT, never an input. While a card
+/// sends it, the pad(s) feeding that card take the way they point now as
+/// forward: their orientation's yaw is re-zeroed, roll and pitch stay on
+/// gravity. Let go and the new forward holds — so it doubles as a clutch, and
+/// as the cure for a heading that has crept. The engine applies it to a pad's
+/// own orientation pin (a Joy-Con 2's) and the 3DOF module to the one it
+/// computes.
+pub const ORIENT_NEUTRAL_PIN: &str = "orient_neutral";
+pub const ORIENT_NEUTRAL_NAME: &str = "Set Neutral Forward";
+
 /// The families a card's inputs read, in [`ImuKind::ALL`] order — one range
 /// field each on the card.
 pub fn kinds_read<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<ImuKind> {

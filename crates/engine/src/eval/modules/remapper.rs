@@ -955,6 +955,7 @@ pub(crate) fn eval_remapper_node(
                 }
                 publish_touch_points(&key, &fingers, collector_sigs);
             }
+    request_orient_neutral(snap, &format!("remap:{uid}"), collector_sigs);
 }
 
 /// Whether an order-agnostic digital card's input counts as held this tick.

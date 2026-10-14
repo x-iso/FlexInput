@@ -181,6 +181,7 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
         || pin == OPTICAL_CONTACT;
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
+        || pin == flexinput_core::imu::ORIENT_NEUTRAL_PIN
         || pin.starts_with("mouse")
         || pin.starts_with("scroll_")
         || matches!(pin, "touch_swipe_x" | "touch_swipe_y")
@@ -272,6 +273,10 @@ const GYRO_Y: f32 = PAD_ROW_Y;
 /// The Accel block sits beside the Gyro block, Tilt under it.
 const ACCEL_X: f32 = GYRO_X + 4.0;
 const TILT_Y: f32 = PAD_ROW_Y + 4.0;
+/// Set Neutral Forward, under the motion cluster: an output, so it is on every
+/// mapping card's board, motion inputs or not.
+const ORIENT_X: f32 = ACCEL_X;
+const ORIENT_Y: f32 = TILT_Y + 2.0;
 
 /// The Joy-Con 2's optical sensor touching something — a surface, or a finger
 /// over it. Input only, and only ever CHOSEN: Learn can't take it, since a pad
@@ -337,6 +342,8 @@ pub struct PickerLayout {
     /// What only a Remapper's INPUT can be: the pad's motion, and the
     /// touchpad's click zones.
     pub inputs: bool,
+    /// Set Neutral Forward — a mapping card's output; nothing JSM can name.
+    pub orient: bool,
 }
 
 /// A caption over a cluster, and where (grid units) it goes.
@@ -351,6 +358,9 @@ pub fn cluster_captions(layout: PickerLayout) -> Vec<(&'static str, f32, f32)> {
     }
     if !layout.tz {
         v.push(("TOUCHPAD", TOUCHPAD_X, TOUCHPAD_Y - 0.42));
+    }
+    if layout.orient {
+        v.push(("ORIENTATION", ORIENT_X, ORIENT_Y - 0.42));
     }
     if layout.inputs {
         v.push(("GYRO", GYRO_X, GYRO_Y - 0.42));
@@ -403,7 +413,7 @@ pub fn picker_cells(
     layout: PickerLayout,
     macros: &[crate::macro_icons::MacroDisplayEntry],
 ) -> Vec<PickerCell> {
-    let PickerLayout { tz, pad, sticks, whole_sticks, inputs } = layout;
+    let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient } = layout;
     let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
     if !tz {
         cells.extend(TOUCHPAD_LAYOUT.iter().map(PickerCell::from));
@@ -424,6 +434,9 @@ pub fn picker_cells(
     }
     if pad {
         cells.extend(PAD_LAYOUT.iter().chain(STICK_CLICKS).map(PickerCell::from));
+    }
+    if orient {
+        cells.push((&c(flexinput_core::imu::ORIENT_NEUTRAL_PIN, ORIENT_X, ORIENT_Y)).into());
     }
     if sticks {
         cells.extend(STICK_LAYOUT.iter().map(PickerCell::from));
@@ -767,7 +780,7 @@ mod pad_cluster_tests {
         };
         // Every cluster at once, under both touchpad variants.
         for tz in [false, true] {
-            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true }, &[]);
+            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true, orient: true }, &[]);
             for (i, a) in all.iter().enumerate() {
                 for b in all.iter().skip(i + 1) {
                     assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
@@ -775,7 +788,7 @@ mod pad_cluster_tests {
             }
         }
         // And the whole pad row sits above where the macro cluster grows.
-        let all = picker_cells(PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() }, &[]);
+        let all = picker_cells(PickerLayout { pad: true, sticks: true, inputs: true, orient: true, ..Default::default() }, &[]);
         for cell in all.iter().filter(|c| c.y >= PAD_ROW_Y) {
             assert!(cell.y + 1.0 <= MACRO_Y, "{} is where macros go", cell.pin);
         }
@@ -924,6 +937,19 @@ mod tab_tests {
     use super::*;
 
     /// Every cell of the full board lands on exactly one tab, each tab starts
+    /// Set Neutral Forward is a card's output on the Gamepad tab, and only
+    /// there for a mapping card — JSM can't name it.
+    #[test]
+    fn set_neutral_forward_is_a_gamepad_tab_output() {
+        use flexinput_core::imu::ORIENT_NEUTRAL_PIN as PIN;
+        let card = picker_cells(PickerLayout { pad: true, orient: true, ..Default::default() }, &[]);
+        assert!(tab_cells(card, PickerTab::Gamepad).iter().any(|c| c.pin == PIN));
+        let jsm = picker_cells(PickerLayout { pad: true, ..Default::default() }, &[]);
+        assert!(jsm.iter().all(|c| c.pin != PIN));
+        assert!(stage_allows(PickStage::Output, PIN) && !stage_allows(PickStage::Input, PIN));
+        assert!(crate::canvas::remapper_icons::pin_svg(crate::canvas::remapper_icons::Skin::Auto, PIN).is_some());
+    }
+
     /// at its top, and the gamepad's captions stay on the board.
     #[test]
     fn the_tabs_split_the_board_between_them() {

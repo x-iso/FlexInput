@@ -408,6 +408,8 @@ const GEN_PADDLE_R: &[u8] = a!("general/generic_button_gr.svg");
 
 // The pad's motion, as a Remapper input (`flexinput_core::imu`).
 const IMU_GYRO_PITCH:      &[u8] = a!("Motion/gyro_pitch.svg");
+/// Set Neutral Forward: a pad turned at an angle.
+const ORIENT_NEUTRAL:      &[u8] = a!("angled_pad.svg");
 const IMU_GYRO_PITCH_UP:   &[u8] = a!("Motion/gyro_pitch_up.svg");
 const IMU_GYRO_PITCH_DOWN: &[u8] = a!("Motion/gyro_pitch_down.svg");
 const IMU_GYRO_YAW:        &[u8] = a!("Motion/gyro_yaw.svg");
@@ -634,6 +636,7 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "btn_paddle_l1" | "btn_paddle_l2" => return Some(GEN_PADDLE_L),
         "btn_paddle_r1" | "btn_paddle_r2" => return Some(GEN_PADDLE_R),
         // The pad's motion: family-agnostic, like the touchpad.
+        flexinput_core::imu::ORIENT_NEUTRAL_PIN => return Some(ORIENT_NEUTRAL),
         "imu_gyro_pitch"      => return Some(IMU_GYRO_PITCH),
         "imu_gyro_pitch_up"   => return Some(IMU_GYRO_PITCH_UP),
         "imu_gyro_pitch_down" => return Some(IMU_GYRO_PITCH_DOWN),

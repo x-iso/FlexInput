@@ -52,9 +52,11 @@ pub(crate) fn show_gyro_3dof_body(
     let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
     let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
-    // Where the 3D Orientation output comes from: "computed" (integrated here)
-    // or "device" (the pad's own fused orientation, e.g. a Joy-Con 2's).
-    let orient_device     = snap.and_then(|n| n.params.get("orient_source").and_then(|v| v.as_str())) == Some("device");
+    // Where the 3D Orientation output (and Edge turn) takes its pose from:
+    // "auto" (default), "computed" (integrated here) or "device" (the pad's own
+    // fused orientation, e.g. a Joy-Con 2's).
+    let orient_source     = snap.map(gyro_read_orient_source).unwrap_or("auto");
+    let edge = snap.map(GyroEdge::read).unwrap_or_default();
     let roll_mix          = snap.and_then(|n| n.params.get("roll_contribution").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let hold = snap.map(gyro_read_hold).unwrap_or([0.0; 3]);
     let out_x = snap.and_then(|n| match n.extra.last_out.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -73,7 +75,8 @@ pub(crate) fn show_gyro_3dof_body(
     let mut orient_drift = orient_drift;
     let mut yaw_recenter = yaw_recenter;
     let mut yaw_thresh   = yaw_thresh;
-    let mut orient_device = orient_device;
+    let mut orient_source = orient_source;
+    let mut edge         = edge;
     let mut roll_mix     = roll_mix;
     let mut hold         = hold;
     let mut changed   = false;
@@ -114,6 +117,8 @@ pub(crate) fn show_gyro_3dof_body(
     let mut stopts_rect:     Option<egui::Rect> = None;
     let mut roll_mix_rect:   Option<egui::Rect> = None;
     let mut hold_rect:       Option<egui::Rect> = None;
+    let mut edge_rect:       Option<egui::Rect> = None;
+    let mut source_rect:     Option<egui::Rect> = None;
     let mut gyr_rect:        Option<egui::Rect> = None;
     let mut acc_rect:        Option<egui::Rect> = None;
     let mut lean_rect:       Option<egui::Rect> = None;
@@ -191,33 +196,28 @@ pub(crate) fn show_gyro_3dof_body(
         });
         hold_rect = Some(r.response.rect);
 
+        // Edge turn (Pointer only): past a zone around the neutral pose, keep
+        // turning on its own.
+        let r = ui.scope(|ui| {
+            ui.add_enabled_ui(family == "pointer", |ui| {
+                if edge.ui(ui, true) { changed = true; }
+            });
+        });
+        edge_rect = Some(r.response.rect);
+
         // Source of the 3D Orientation output. The rows under it tune the
-        // integration, so they grey out while the device's own is used.
-        ui.horizontal(|ui| {
+        // integration, so they grey out while only the device's is used.
+        let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.label(egui::RichText::new("3D source:").small().weak());
-            for (dev, lbl, tip) in [
-                (false, "Computed", "Integrate this module's own orientation from the gyro
-                                    (with the drift fix / re-center options below)."),
-                (true, "Device", "Use the orientation the device fuses itself, when it
-                                  publishes one (Joy-Con 2: absolute, magnetometer-held
-                                  yaw, relative to the Calibration window's baseline).
-                                  Reset re-zeroes it to the pose at the press.
-                                  Falls back to Computed for a pad without one."),
-            ] {
-                if ui.selectable_label(orient_device == dev, egui::RichText::new(lbl).small())
-                    .on_hover_text(tip).clicked() && orient_device != dev
-                {
-                    orient_device = dev;
-                    changed = true;
-                }
-            }
+            if gyro_orient_source_buttons(ui, &mut orient_source, true) { changed = true; }
         });
+        source_rect = Some(r.response.rect);
 
         // 3D Orientation display scale (applied to the integration rate, so it's
         // continuous — no flipping at 180°). Affects the Orientation output that
         // feeds the Controller 3D viewer, NOT the 2D pointer/steering outputs.
-        ui.add_enabled_ui(!orient_device, |ui| {
+        ui.add_enabled_ui(orient_source != "device", |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(egui::RichText::new("3D rot ×").small().weak())
@@ -341,6 +341,8 @@ pub(crate) fn show_gyro_3dof_body(
     if let Some(r) = stopts_rect     { register_exposable_element(ui, node_id, "steering_opts", r); }
     if let Some(r) = roll_mix_rect   { register_exposable_element(ui, node_id, "roll_mix",      r); }
     if let Some(r) = hold_rect       { register_exposable_element(ui, node_id, "hold_offset",   r); }
+    if let Some(r) = edge_rect       { register_exposable_element(ui, node_id, "edge_turn",     r); }
+    if let Some(r) = source_rect     { register_exposable_element(ui, node_id, "orient_source", r); }
     if let Some(r) = gyr_rect        { register_exposable_element(ui, node_id, "gyro_invert",   r); }
     if let Some(r) = acc_rect        { register_exposable_element(ui, node_id, "accel_invert",  r); }
     if let Some(r) = lean_rect       { register_exposable_element(ui, node_id, "lean_threshold", r); }
@@ -378,11 +380,8 @@ pub(crate) fn show_gyro_3dof_body(
             node.params.insert("orient_drift".into(),
                 serde_json::Number::from_f64(orient_drift as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("orient_auto_recenter".into(), Value::Bool(yaw_recenter));
-            if orient_device {
-                node.params.insert("orient_source".into(), Value::String("device".into()));
-            } else {
-                node.params.remove("orient_source");
-            }
+            node.params.insert("orient_source".into(), Value::String(orient_source.into()));
+            edge.write(node);
             node.params.insert("orient_recenter_thresh".into(),
                 serde_json::Number::from_f64(yaw_thresh as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("roll_contribution".into(),
@@ -422,6 +421,213 @@ pub(crate) const GYRO_HOLD_AXIS_TIPS: [&str; 3] = [
 pub(crate) fn gyro_read_hold(n: &NodeData) -> [f32; 3] {
     let g = |k: &str| n.params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     [g("hold_pitch"), g("hold_yaw"), g("hold_roll")]
+}
+
+/// `orient_source`, absent = "auto".
+pub(crate) fn gyro_read_orient_source(n: &NodeData) -> &'static str {
+    match n.params.get("orient_source").and_then(|v| v.as_str()) {
+        Some("computed") => "computed",
+        Some("device") => "device",
+        _ => "auto",
+    }
+}
+
+/// The Auto / Computed / Device picker. Returns true on a change.
+pub(crate) fn gyro_orient_source_buttons(ui: &mut egui::Ui, source: &mut &'static str, small: bool) -> bool {
+    let mut changed = false;
+    for (id, lbl, tip) in [
+        ("auto", "Auto", "The device's own orientation when it publishes one\n\
+                          (Joy-Con 2), otherwise Computed."),
+        ("computed", "Computed", "Integrate this module's own orientation from the gyro\n\
+                                  (with the drift fix / re-center options below)."),
+        ("device", "Device", "Only the orientation the device fuses itself (Joy-Con 2:\n\
+                              gravity-held roll and pitch, relative to the\n\
+                              Calibration window's baseline; yaw is integrated,\n\
+                              with no compass, so it can still drift). A pad\n\
+                              without one gets no orientation — and no Edge turn."),
+    ] {
+        let text = if small { egui::RichText::new(lbl).small() } else { egui::RichText::new(lbl) };
+        if ui.selectable_label(*source == id, text).on_hover_text(tip).clicked() && *source != id {
+            *source = id;
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub(crate) const GYRO_EDGE_TIP: &str =
+    "Edge turn (Pointer only): within the zone around the neutral\n\
+     pose — where Reset last put it — the gyro moves the camera as\n\
+     usual. Turned past it, the camera keeps turning on its own,\n\
+     the way it was already going, until you come back in.\n\
+     \n\
+     Nothing switches at the zone: it all eases in past it.\n\
+     \n\
+     Ramp: like a stick past its deadzone — the further out, the\n\
+     faster, reaching max at zone + ramp.\n\
+     Momentum: the camera doesn't slow below the speed you turned\n\
+     out at (× gain), eased in over blend — keep turning and it\n\
+     adds nothing, ease off and it makes up the difference. Pull\n\
+     back to brake. fade lets it die away (0 = holds).\n\
+     Both: the two together.\n\
+     gyro: how much of the gyro's own aim is left once past the\n\
+     blend — 100% keeps it, 0% hands over to the edge entirely.\n\
+     \n\
+     Measured on the Orientation output's pose. Its yaw can drift\n\
+     (a computed pose more than a Joy-Con 2's) — Reset re-centres\n\
+     the zone.";
+
+/// Edge turn settings as edited (`edge_*` params).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GyroEdge {
+    pub mode: &'static str,
+    pub x_only: bool,
+    pub zone: f32,
+    pub blend: f32,
+    pub ramp: f32,
+    pub max_dps: f32,
+    pub gain: f32,
+    pub decay: f32,
+    /// The gyro's direct share past the blend, 0..1 (shown as %).
+    pub gyro_keep: f32,
+}
+
+impl Default for GyroEdge {
+    fn default() -> Self {
+        GyroEdge {
+            mode: "off", x_only: false, zone: 30.0, blend: 15.0, ramp: 30.0, max_dps: 180.0,
+            gain: 1.0, decay: 0.0, gyro_keep: 1.0,
+        }
+    }
+}
+
+pub(crate) const GYRO_EDGE_MODES: [(&str, &str); 4] =
+    [("off", "Off"), ("ramp", "Ramp"), ("momentum", "Momentum"), ("both", "Both")];
+
+impl GyroEdge {
+    pub(crate) fn read(n: &NodeData) -> Self {
+        let d = GyroEdge::default();
+        let f = |k: &str, v: f32| n.params.get(k).and_then(|x| x.as_f64()).map_or(v, |x| x as f32);
+        let mode = n.params.get("edge_mode").and_then(|v| v.as_str())
+            .and_then(|m| GYRO_EDGE_MODES.iter().find(|(id, _)| *id == m).map(|(id, _)| *id))
+            .unwrap_or("off");
+        GyroEdge {
+            mode,
+            x_only: n.params.get("edge_x_only").and_then(|v| v.as_bool()).unwrap_or(false),
+            zone: f("edge_zone_deg", d.zone),
+            blend: f("edge_blend_deg", d.blend),
+            ramp: f("edge_ramp_deg", d.ramp),
+            max_dps: f("edge_max_dps", d.max_dps),
+            gain: f("edge_momentum", d.gain),
+            decay: f("edge_decay_s", d.decay),
+            gyro_keep: f("edge_gyro_keep", d.gyro_keep),
+        }
+    }
+
+    pub(crate) fn write(&self, node: &mut NodeData) {
+        let num = |v: f32| serde_json::Number::from_f64(v as f64).map(Value::Number).unwrap_or(Value::Null);
+        node.params.insert("edge_mode".into(), Value::String(self.mode.into()));
+        node.params.insert("edge_x_only".into(), Value::Bool(self.x_only));
+        node.params.insert("edge_zone_deg".into(), num(self.zone));
+        node.params.insert("edge_blend_deg".into(), num(self.blend));
+        node.params.insert("edge_gyro_keep".into(), num(self.gyro_keep));
+        node.params.insert("edge_ramp_deg".into(), num(self.ramp));
+        node.params.insert("edge_max_dps".into(), num(self.max_dps));
+        node.params.insert("edge_momentum".into(), num(self.gain));
+        node.params.insert("edge_decay_s".into(), num(self.decay));
+    }
+
+    /// Four rows: mode + X only, zone / blend / gyro, ramp, momentum. `small` is the
+    /// node body's text size. Returns true on a change; `rects` gets each
+    /// field's rect in the nav order (mode, X only, zone, blend, gyro, ramp, max, gain, fade).
+    pub(crate) fn ui_rects(&mut self, ui: &mut egui::Ui, small: bool, rects: &mut [egui::Rect; 9]) -> bool {
+        let t = |s: &str| if small { egui::RichText::new(s).small() } else { egui::RichText::new(s) };
+        let w = |s: &str| t(s).weak();
+        let mut changed = false;
+        let off = self.mode == "off";
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.label(w("Edge turn:")).on_hover_text(GYRO_EDGE_TIP);
+            let mut row = egui::Rect::NOTHING;
+            for (id, lbl) in GYRO_EDGE_MODES {
+                let r = ui.selectable_label(self.mode == id, t(lbl)).on_hover_text(GYRO_EDGE_TIP);
+                row = row.union(r.rect);
+                if r.clicked() && self.mode != id {
+                    self.mode = id;
+                    changed = true;
+                }
+            }
+            rects[0] = row;
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!off, |ui| {
+                let r = ui.checkbox(&mut self.x_only, t("X only"))
+                    .on_hover_text("Horizontal only: pitch neither counts toward the zone\nnor turns the camera.");
+                rects[1] = r.rect;
+                changed |= r.changed();
+            });
+        });
+        let ramp_on = matches!(self.mode, "ramp" | "both");
+        let mom_on = matches!(self.mode, "momentum" | "both");
+        ui.add_enabled_ui(!off, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.label(w("zone"));
+                let r = ui.add(egui::DragValue::new(&mut self.zone).speed(0.5).range(0.0..=170.0).suffix("°"))
+                    .on_hover_text("Where the edge starts, from neutral. Pure gyro inside.");
+                rects[2] = r.rect;
+                changed |= r.changed();
+                ui.label(w("blend"));
+                let r = ui.add(egui::DragValue::new(&mut self.blend).speed(0.5).range(0.0..=170.0).suffix("°"))
+                    .on_hover_text("Degrees past the zone over which momentum and the\ngyro hand-off ease in (0 = all at once).");
+                rects[3] = r.rect;
+                changed |= r.changed();
+                ui.label(w("gyro"));
+                let mut pct = self.gyro_keep * 100.0;
+                let r = ui.add(egui::DragValue::new(&mut pct).speed(0.5).range(0.0..=100.0).suffix(" %"))
+                    .on_hover_text("The gyro's own aim left once past the blend: 100% keeps\nit (the edge only adds), 0% hands over to the edge\nentirely, like a stick.");
+                rects[4] = r.rect;
+                if r.changed() {
+                    self.gyro_keep = pct / 100.0;
+                    changed = true;
+                }
+            });
+            ui.add_enabled_ui(ramp_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.label(w("ramp"));
+                    let r = ui.add(egui::DragValue::new(&mut self.ramp).speed(0.5).range(0.0..=170.0).suffix("°"))
+                        .on_hover_text("Degrees past the zone where Ramp reaches max, eased in\n(0 = full speed as soon as you leave it).");
+                    rects[5] = r.rect;
+                    changed |= r.changed();
+                    ui.label(w("max"));
+                    let r = ui.add(egui::DragValue::new(&mut self.max_dps).speed(2.0).range(0.0..=4000.0).suffix(" °/s"))
+                        .on_hover_text("Ramp's top speed, as a gyro turn rate — downstream\nsensitivity scales it like the gyro.");
+                    rects[6] = r.rect;
+                    changed |= r.changed();
+                });
+            });
+            ui.add_enabled_ui(mom_on, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.label(w("momentum ×"));
+                    let r = ui.add(egui::DragValue::new(&mut self.gain).speed(0.02).range(0.0..=10.0))
+                        .on_hover_text("Share of the turn-out speed kept as the camera's floor\n(1 = carries on as fast as the pad was turning).");
+                    rects[7] = r.rect;
+                    changed |= r.changed();
+                    ui.label(w("fade"));
+                    let r = ui.add(egui::DragValue::new(&mut self.decay).speed(0.02).range(0.0..=30.0).suffix(" s"))
+                        .on_hover_text("Momentum fade time constant (0 = holds while you stay out).");
+                    rects[8] = r.rect;
+                    changed |= r.changed();
+                });
+            });
+        });
+        changed
+    }
+
+    pub(crate) fn ui(&mut self, ui: &mut egui::Ui, small: bool) -> bool {
+        self.ui_rects(ui, small, &mut [egui::Rect::NOTHING; 9])
+    }
 }
 
 pub(crate) fn gyro_write_hold(node: &mut NodeData, hold: [f32; 3]) {

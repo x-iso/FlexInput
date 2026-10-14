@@ -61,6 +61,21 @@ pub fn viewer_to_canonical_quat(q: Quat) -> Quat {
     r.conjugate() * q * r
 }
 
+/// The rotation about canonical up that turns `q` to face forward — heading 0 —
+/// leaving its tilt alone: `yaw_neutralizer(q) * q` points the way `q` did,
+/// rotated round to straight ahead. For "take the way the pad points now as
+/// forward" on a canonical orientation.
+///
+/// The heading is the pad's nose projected onto the horizontal. With the nose
+/// near vertical that projection is too short to trust, so the face normal
+/// stands in: a pad pointed at the ceiling shows its face to the player, so the
+/// way it faces AWAY from them — minus the normal — is forward.
+pub fn yaw_neutralizer(q: Quat) -> Quat {
+    let f = q * Vec3::X;
+    let h = if f.x * f.x + f.y * f.y >= 0.25 { f } else { -(q * Vec3::Z) };
+    Quat::from_rotation_z(-h.y.atan2(h.x))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +126,26 @@ mod tests {
         // here, and a model that starts out facing sideways reads as a broken
         // mesh rather than a broken transform.
         assert!(canonical_to_viewer_quat(Quat::IDENTITY).abs_diff_eq(Quat::IDENTITY, 1e-6));
+    }
+
+    #[test]
+    fn neutralizing_turns_the_heading_to_zero_and_keeps_the_tilt() {
+        let tilt = Quat::from_rotation_y(-0.3) * Quat::from_rotation_x(0.2);
+        let q = Quat::from_rotation_z(1.1) * tilt;
+        let n = yaw_neutralizer(q) * q;
+        let f = n * Vec3::X;
+        assert!(f.y.abs() < 1e-5 && f.x > 0.0, "nose straight ahead: {f:?}");
+        let up = |q: Quat| (q * Vec3::Z).z;
+        assert!((up(n) - up(q)).abs() < 1e-5, "same tilt from gravity");
+        assert!(n.abs_diff_eq(tilt, 1e-5) || n.abs_diff_eq(-tilt, 1e-5), "exactly the tilt alone");
+    }
+
+    #[test]
+    fn a_pad_pointed_up_takes_forward_from_its_face() {
+        // Nose up 90°, then turned to face left: the face points backward-right.
+        let q = Quat::from_rotation_z(0.7) * Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let n = yaw_neutralizer(q) * q;
+        let back = -(n * Vec3::Z);
+        assert!(back.y.abs() < 1e-4 && back.x > 0.9, "faces away straight ahead: {back:?}");
     }
 }

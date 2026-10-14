@@ -847,6 +847,55 @@ mod trigger_tests {
         c.get(&("remap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
     }
 
+    // ── Set Neutral Forward ──────────────────────────────────────────────────
+
+    fn neutral_req(c: &HashMap<(String, String), Signal>, dev: &str) -> bool {
+        c.get(&(format!("{ORIENT_NEUTRAL_PREFIX}{dev}"), flexinput_core::imu::ORIENT_NEUTRAL_PIN.to_string()))
+            .is_some_and(|s| s.as_bool())
+    }
+
+    #[test]
+    fn a_card_sending_set_neutral_files_it_for_its_pads() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": [flexinput_core::imu::ORIENT_NEUTRAL_PIN] }
+        ]));
+        assert!(!neutral_req(&rig.tick(&[]), RIG_DEV), "nothing while the button is up");
+        assert!(neutral_req(&rig.tick(&["btn_south"]), RIG_DEV), "the pad feeding the card");
+        // Behind a Combiner: every port's pad, both Joy-Con 2 halves.
+        rig.snap.params.insert("_upstream_device_ids".into(), serde_json::json!(["jc2:l", "jc2:r"]));
+        let c = rig.tick(&["btn_south"]);
+        assert!(neutral_req(&c, "jc2:l") && neutral_req(&c, "jc2:r"), "{c:?}");
+    }
+
+    #[test]
+    fn set_neutral_turns_the_pads_orientation_to_forward_and_keeps_it() {
+        let dev = "jc2:l";
+        let pose = |yaw: f32| {
+            let q = glam::Quat::from_rotation_z(yaw) * glam::Quat::from_rotation_y(-0.25);
+            Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w))
+        };
+        let heading = |s: &Signal| match s {
+            Signal::Vec4(v) => {
+                let f = glam::Quat::from_xyzw(v.x, v.y, v.z, v.w) * glam::Vec3::X;
+                f.y.atan2(f.x)
+            }
+            _ => panic!(),
+        };
+        let key = (dev.to_string(), "orientation".to_string());
+        let mut carry = NodeState::default();
+        carry.orient_neutral_req.insert(dev.to_string());
+        let mut sigs = HashMap::from([(key.clone(), pose(0.8))]);
+        apply_orient_neutral(&mut carry, &mut sigs);
+        assert!(heading(&sigs[&key]).abs() < 1e-4, "facing forward: {}", heading(&sigs[&key]));
+        assert!(sigs[&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())].as_bool(), "and modules hear it");
+        // Released: the new forward holds, and turning reads from it.
+        carry.orient_neutral_req.clear();
+        let mut sigs = HashMap::from([(key.clone(), pose(1.1))]);
+        apply_orient_neutral(&mut carry, &mut sigs);
+        assert!((heading(&sigs[&key]) - 0.3).abs() < 1e-4, "{}", heading(&sigs[&key]));
+        assert!(!sigs.contains_key(&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())));
+    }
+
     // A then B and B then A are different cards.
     #[test]
     fn in_order_chord_distinguishes_order() {

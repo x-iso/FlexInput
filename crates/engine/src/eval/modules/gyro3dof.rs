@@ -58,16 +58,33 @@ pub(crate) fn accel_to_model(ax: f32, ay: f32, az: f32) -> glam::Vec3 {
     glam::Vec3::new(-ay, az, -ax)
 }
 
-/// The device's own orientation off the bus, when the module is set to use it
-/// (`orient_source = "device"`) and the bus carries one. Canonical, normalised.
+/// Where the Orientation output (and Edge turn) takes its pose from:
+/// `orient_source`, absent = Auto.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OrientSource {
+    /// Always this module's own integration.
+    Computed,
+    /// Only the pose the device fuses itself; nothing when it publishes none.
+    Device,
+    /// The device's when it publishes one, else Computed. The default.
+    Auto,
+}
+
+pub(crate) fn gyro_orient_source(params: &HashMap<String, Value>) -> OrientSource {
+    match params.get("orient_source").and_then(|v| v.as_str()) {
+        Some("computed") => OrientSource::Computed,
+        Some("device") => OrientSource::Device,
+        _ => OrientSource::Auto,
+    }
+}
+
+/// The device's own orientation off the bus, when it carries one. Canonical,
+/// normalised.
 fn device_orientation(
     params: &HashMap<String, Value>,
     dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &HashMap<(String, String), Signal>,
 ) -> Option<glam::Quat> {
-    if params.get("orient_source").and_then(|v| v.as_str()) != Some("device") {
-        return None;
-    }
     let dev_id = params.get("_automap_device_id").and_then(|v| v.as_str())?;
     let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
     let key = |d: &str| (d.to_string(), "orientation".to_string());
@@ -81,6 +98,163 @@ fn device_orientation(
         }
         _ => None,
     }
+}
+
+/// How far a canonical orientation has turned from identity, in degrees, as
+/// `(yaw, pitch, roll)`: + = nose turned right, nose up, right grip down — the
+/// signs of `gyro_z`, `gyro_y` and `gyro_x`. Read off where the pad's forward
+/// and right axes now point; canonical is (forward, left, up).
+pub(crate) fn pose_angles(q: glam::Quat) -> glam::Vec3 {
+    let f = q * glam::Vec3::X;
+    let right = q * glam::Vec3::NEG_Y;
+    let yaw = (-f.y).atan2(f.x);
+    let pitch = f.z.atan2((f.x * f.x + f.y * f.y).sqrt());
+    let roll = (-right.z).clamp(-1.0, 1.0).asin();
+    glam::Vec3::new(yaw, pitch, roll) * (180.0 / std::f32::consts::PI)
+}
+
+/// Edge turn settings, from the `edge_*` params. `None` = off.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EdgeCfg {
+    /// The gradient: past the zone, turn faster the further out.
+    pub ramp: bool,
+    /// Momentum: past the zone, don't let the camera slow below the speed it
+    /// was turning at on the way out.
+    pub momentum: bool,
+    /// Where the edge starts, degrees from neutral. Pure gyro inside.
+    pub zone: f32,
+    /// Degrees past the zone over which momentum and the gyro hand-off fade in
+    /// (0 = all at once).
+    pub blend: f32,
+    /// Degrees past the zone where Ramp reaches `max_dps` (0 = at once).
+    pub ramp_width: f32,
+    pub max_dps: f32,
+    /// Momentum's share of the exit speed (1 = carries on as fast as it left).
+    pub gain: f32,
+    /// Momentum fade time constant, s (0 = holds for as long as you stay out).
+    pub decay: f32,
+    /// The gyro's direct share once fully past the blend: 1 = the gyro keeps
+    /// turning the camera as usual (the edge only adds), 0 = the edge takes
+    /// over completely, like a stick.
+    pub gyro_keep: f32,
+    /// Horizontal only: pitch neither counts toward the zone nor turns.
+    pub x_only: bool,
+}
+
+pub(crate) fn edge_cfg(params: &HashMap<String, Value>) -> Option<EdgeCfg> {
+    let (ramp, momentum) = match params.get("edge_mode").and_then(|v| v.as_str()) {
+        Some("ramp") => (true, false),
+        Some("momentum") => (false, true),
+        Some("both") => (true, true),
+        _ => return None,
+    };
+    let f = |k: &str, d: f32| params.get(k).and_then(|v| v.as_f64()).map_or(d, |x| x as f32);
+    Some(EdgeCfg {
+        ramp,
+        momentum,
+        zone: f("edge_zone_deg", 30.0).clamp(0.0, 170.0),
+        blend: f("edge_blend_deg", 15.0).clamp(0.0, 170.0),
+        ramp_width: f("edge_ramp_deg", 30.0).clamp(0.0, 170.0),
+        max_dps: f("edge_max_dps", 180.0).clamp(0.0, 4000.0),
+        gain: f("edge_momentum", 1.0).clamp(0.0, 10.0),
+        decay: f("edge_decay_s", 0.0).clamp(0.0, 30.0),
+        gyro_keep: f("edge_gyro_keep", 1.0).clamp(0.0, 1.0),
+        x_only: params.get("edge_x_only").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// 0 → 1 across `width` degrees past `from`, eased at both ends (smoothstep),
+/// so whatever it weights starts and finishes with no kink. `width` 0 = a step.
+fn edge_ease(r: f32, from: f32, width: f32) -> f32 {
+    if r <= from {
+        0.0
+    } else if width <= 0.0 {
+        1.0
+    } else {
+        let t = ((r - from) / width).min(1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
+/// What Edge turn does this tick: scale the gyro's own X/Y by `gyro`, then add
+/// `add_dps` (degrees per second, the outputs' sign convention).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeOut {
+    pub gyro: glam::Vec2,
+    pub add_dps: glam::Vec2,
+}
+
+/// One tick of Edge turn. `d` is the deflection from neutral in degrees (X, Y
+/// in the outputs' sign convention). `st` (9 floats) carries: [0] last radius,
+/// [1..3] last deflection, [3..5] smoothed deflection speed, [5..7] momentum,
+/// [8] primed.
+///
+/// Nothing switches at the zone's edge — everything eases in past it, so the
+/// gyro's own feel bleeds into the edge's instead of being cut over to it:
+///
+/// * **Ramp** — like a stick past its deadzone: 0 at the zone, `max_dps` at
+///   `ramp_width` beyond, eased in, pointed the way the pad is deflected.
+/// * **Momentum** — the fastest the pad was moving outward since it left the
+///   zone (× `gain`) becomes a FLOOR on the camera's speed that way, eased in
+///   over `blend`. While the pad keeps turning that fast it adds nothing — the
+///   camera just keeps going as it was — and as the pad slows the edge makes up
+///   the difference. Pulling back brakes it (the gyro then turns against it,
+///   and the floor eases out toward the zone). `decay` fades the floor itself.
+/// * **gyro_keep** — the gyro's direct share eases from 1 down to this across
+///   `blend`: 1 keeps gyro aim everywhere, 0 hands over to the edge entirely.
+pub(crate) fn edge_turn(st: &mut [f32], d: glam::Vec2, dt: f32, c: &EdgeCfg) -> EdgeOut {
+    use glam::Vec2;
+    const SPEED_TAU: f32 = 0.03;
+    let d = if c.x_only { Vec2::new(d.x, 0.0) } else { d };
+    let r = d.length();
+    let primed = st[8] > 0.5;
+    let raw_v = if primed && dt > 0.0 { (d - Vec2::new(st[1], st[2])) / dt } else { Vec2::ZERO };
+    let mut v = Vec2::new(st[3], st[4]);
+    v += (raw_v - v) * (1.0 - (-dt / SPEED_TAU).exp());
+    let mut m = Vec2::new(st[5], st[6]);
+    let dir = if r > 0.0 { d / r } else { Vec2::ZERO };
+    if r <= c.zone || !primed {
+        // Inside — or starting out already past the zone, which isn't an exit.
+        m = if r <= c.zone { Vec2::ZERO } else { m };
+    } else {
+        // The fastest outward the pad has gone since leaving.
+        let out_speed = v.dot(dir);
+        if out_speed > 0.0 && out_speed > m.length() {
+            m = v;
+        }
+        if c.decay > 0.0 {
+            m *= (-dt / c.decay).exp();
+        }
+    }
+    st[0] = r;
+    st[1] = d.x;
+    st[2] = d.y;
+    st[3] = v.x;
+    st[4] = v.y;
+    st[5] = m.x;
+    st[6] = m.y;
+    st[8] = 1.0;
+
+    let blend = edge_ease(r, c.zone, c.blend);
+    let g = 1.0 - (1.0 - c.gyro_keep) * blend;
+    let gyro = if c.x_only { Vec2::new(g, 1.0) } else { Vec2::splat(g) };
+
+    let mut add = Vec2::ZERO;
+    if c.ramp {
+        add += dir * edge_ease(r, c.zone, c.ramp_width) * c.max_dps;
+    }
+    if c.momentum {
+        let speed = m.length() * c.gain;
+        if speed > 0.0 {
+            let m_dir = m / m.length();
+            // What already moves the camera that way: the gyro's remaining
+            // share of the pad's own motion, and the ramp. Only an outward
+            // contribution counts — pulling back must not be made up for.
+            let moving = (gyro * v).dot(m_dir).max(0.0) + add.dot(m_dir).max(0.0);
+            add += m_dir * blend * (speed - moving).max(0.0);
+        }
+    }
+    EdgeOut { gyro, add_dps: add }
 }
 
 pub(crate) fn compute_gyro_3dof(
@@ -239,6 +413,8 @@ pub(crate) fn compute_gyro_3dof(
     //   [12] ease-in residual for orientation blend during reset
     //   [13..16] captured world-frame gravity reference for drift correction
     //   [16] gyro-still time accumulator for the yaw auto re-center
+    //   [17..21] device orientation captured at the last Reset
+    //   [21..30] Edge turn state (see `edge_turn`)
     while state.aux_f32.len() < 17 { state.aux_f32.push(0.0); }
 
     // ── Smoothed gravity: how is the pad being HELD? ──────────────────────
@@ -676,35 +852,101 @@ pub(crate) fn compute_gyro_3dof(
     //
     // Converting HERE rather than changing the integration keeps the drift
     // correction's captured gravity reference in the frame it was captured in.
+    // ── Set Neutral Forward (a card sent it for this module's pad) ─────────
+    //
+    // The engine has already re-zeroed the device's OWN orientation pin, so a
+    // Reset reference captured against the old one would now be off by the
+    // same turn: drop it. The computed pose is this module's own, so it turns
+    // round to forward here — yaw only, tilt kept — and the drift fix's
+    // captured gravity turns with it, or it would pull the tilt back to where
+    // the old heading had it.
+    while state.aux_f32.len() < 30 { state.aux_f32.push(0.0); }
+    let neutral_now = params
+        .get("_automap_device_id")
+        .and_then(|v| v.as_str())
+        .and_then(|d| dev_sigs.get(&(d.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())))
+        .is_some_and(|s| s.as_bool());
+    if neutral_now {
+        state.aux_f32[17..21].fill(0.0);
+        let q_model = glam::Quat::from_xyzw(
+            state.aux_f32[7], state.aux_f32[8], state.aux_f32[9], state.aux_f32[10]);
+        let q_c = flexinput_core::frames::viewer_to_canonical_quat(q_model);
+        let n_c = flexinput_core::frames::yaw_neutralizer(q_c);
+        let q_model = flexinput_core::frames::canonical_to_viewer_quat((n_c * q_c).normalize());
+        state.aux_f32[7..11].copy_from_slice(&[q_model.x, q_model.y, q_model.z, q_model.w]);
+        let n_model = flexinput_core::frames::canonical_to_viewer_quat(n_c);
+        let u_ref = glam::Vec3::new(state.aux_f32[13], state.aux_f32[14], state.aux_f32[15]);
+        if u_ref.length_squared() > 0.5 {
+            let u = n_model * u_ref;
+            state.aux_f32[13..16].copy_from_slice(&[u.x, u.y, u.z]);
+        }
+    }
     let q_canonical = flexinput_core::frames::viewer_to_canonical_quat(glam::Quat::from_xyzw(
         state.aux_f32[7],
         state.aux_f32[8],
         state.aux_f32[9],
         state.aux_f32[10],
     ));
-    // `orient_source = "device"`: pass through the orientation the DEVICE fuses
-    // itself (a Joy-Con 2 publishes one — absolute, magnetometer-held yaw, and
-    // already relative to the calibration window's baseline), instead of the
+    // Device / Auto: pass through the orientation the DEVICE fuses itself (a
+    // Joy-Con 2 publishes one — roll and pitch held by gravity, yaw integrated
+    // with no compass, relative to the calibration window's baseline), instead of the
     // integration above. Reset re-zeroes it against the pose at the press.
-    // Falls back to the computed one when the bus carries none.
-    let q_canonical = match device_orientation(params, dev_sigs, collector_sigs) {
+    // Auto falls back to the computed one when the bus carries none; Device
+    // then publishes nothing, so a pad without one shows it plainly.
+    while state.aux_f32.len() < 30 { state.aux_f32.push(0.0); }
+    let source = gyro_orient_source(params);
+    let device_q = match source {
+        OrientSource::Computed => None,
+        OrientSource::Device | OrientSource::Auto => device_orientation(params, dev_sigs, collector_sigs),
+    };
+    let pose = match device_q {
         Some(q) => {
-            while state.aux_f32.len() < 21 { state.aux_f32.push(0.0); }
             if q_reset_edge {
                 state.aux_f32[17..21].copy_from_slice(&[q.x, q.y, q.z, q.w]);
             }
             let r = glam::Quat::from_xyzw(
                 state.aux_f32[17], state.aux_f32[18], state.aux_f32[19], state.aux_f32[20]);
-            if r.length_squared() > 0.5 { (r.normalize().inverse() * q).normalize() } else { q }
+            Some(if r.length_squared() > 0.5 { (r.normalize().inverse() * q).normalize() } else { q })
         }
-        None => q_canonical,
+        None if source == OrientSource::Device => None,
+        None => Some(q_canonical),
     };
-    let orientation_signal = Some(Signal::Vec4(glam::Vec4::new(
-        q_canonical.x,
-        q_canonical.y,
-        q_canonical.z,
-        q_canonical.w,
-    )));
+    let orientation_signal =
+        pose.map(|q| Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)));
+
+    // ── Edge turn (Pointer only) ──────────────────────────────────────────
+    //
+    // Past `edge_zone_deg` from the neutral pose (the Orientation output's
+    // identity — where Reset last put it), the camera keeps turning on its
+    // own, the way a cursor scrolls a view at the screen edge. The pose is
+    // measured as a stick-like deflection: X is how far the pad is yawed (rolled
+    // in Pitch+Roll), Y how far it is pitched, in the SAME sign convention as
+    // the X/Y outputs, so the turn always continues the way the gyro was
+    // already turning the camera. See `edge_turn` for the two ways it turns.
+    let mut final_x = final_x;
+    let mut final_y = final_y;
+    let edge = edge_cfg(params);
+    match (pose, &edge) {
+        (Some(q), Some(cfg)) if family == "pointer" => {
+            let a = pose_angles(q);
+            // The computed pose already integrates with the inv_* toggles (and
+            // the 3D rot × scale); a device's is physical, so it takes them here.
+            let d = if device_q.is_some() {
+                let x = if axis == "pitch_roll" { a.z * inv("inv_roll") } else { a.x };
+                glam::Vec2::new(x * inv("inv_yaw"), a.y * inv("inv_pitch"))
+            } else {
+                let x = if axis == "pitch_roll" { a.z * inv("inv_yaw") } else { a.x };
+                glam::Vec2::new(x, a.y) / orient_disp_scale.abs().max(1e-3)
+            };
+            let e = edge_turn(&mut state.aux_f32[21..30], d, dt, cfg);
+            // Out in the X/Y outputs' units: ±1 == ±GYRO_REF_DPS, with the
+            // device's gyro multiplier on top, as the gyro itself carries it.
+            let k = dev_gyro_mult / GYRO_REF_DPS;
+            final_x = final_x * e.gyro.x + e.add_dps.x * k;
+            final_y = final_y * e.gyro.y + e.add_dps.y * k;
+        }
+        _ => state.aux_f32[21..30].fill(0.0),
+    }
 
     vec![
         Some(Signal::Vec2(glam::Vec2::new(final_x, final_y))),
@@ -853,6 +1095,280 @@ mod hold_offset_tests {
         let (_, _, _, q) =
             run(&[("hold_pitch", json!(30.0)), ("hold_yaw", json!(20.0)), ("hold_roll", json!(-15.0))], g, a);
         assert!((q - q0).length() < 1e-6, "{q:?} vs {q0:?}");
+    }
+}
+
+#[cfg(test)]
+mod edge_turn_tests {
+    use super::{compute_gyro_3dof, edge_cfg, edge_turn};
+    use crate::NodeState;
+    use flexinput_core::Signal;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    const DT: f32 = 1.0 / 250.0;
+    /// Normalised gyro for `dps` degrees per second.
+    fn rate(dps: f32) -> f32 { dps / 2000.0 }
+
+    struct Rig {
+        st: NodeState,
+        p: HashMap<String, Value>,
+        dev: HashMap<(String, String), Signal>,
+    }
+
+    impl Rig {
+        fn new(extra: &[(&str, Value)]) -> Self {
+            let mut p: HashMap<String, Value> = HashMap::new();
+            p.insert("family".into(), json!("pointer"));
+            p.insert("axis".into(), json!("pitch_yaw"));
+            for (k, v) in extra {
+                p.insert((*k).into(), v.clone());
+            }
+            Rig { st: NodeState::default(), p, dev: HashMap::new() }
+        }
+        /// Run `secs` at a constant gyro (°/s, canonical x/y/z) and return the
+        /// last (X, Y, Orientation).
+        fn spin(&mut self, dps: [f32; 3], secs: f32) -> (f32, f32, Option<glam::Vec4>) {
+            let inputs: Vec<Option<Signal>> = vec![
+                None,
+                None,
+                Some(Signal::Float(rate(dps[0]))),
+                Some(Signal::Float(rate(dps[1]))),
+                Some(Signal::Float(rate(dps[2]))),
+                Some(Signal::Float(0.0)),
+                Some(Signal::Float(0.0)),
+                Some(Signal::Float(0.125)),
+            ];
+            let coll = HashMap::new();
+            let mut out = Vec::new();
+            for _ in 0..((secs / DT).round() as usize).max(1) {
+                out = compute_gyro_3dof(&inputs, &mut self.st, &self.p, &self.dev, &coll, DT);
+            }
+            let f = |i: usize| match out[i] {
+                Some(Signal::Float(v)) => v,
+                ref o => panic!("{o:?}"),
+            };
+            let q = match out[5] {
+                Some(Signal::Vec4(v)) => Some(v),
+                None => None,
+                ref o => panic!("{o:?}"),
+            };
+            (f(1), f(2), q)
+        }
+    }
+
+    fn ramp(zone: f32, width: f32, max: f32) -> Vec<(&'static str, Value)> {
+        vec![
+            ("edge_mode", json!("ramp")),
+            ("edge_zone_deg", json!(zone)),
+            ("edge_ramp_deg", json!(width)),
+            ("edge_max_dps", json!(max)),
+        ]
+    }
+
+    #[test]
+    fn inside_the_zone_nothing_changes() {
+        let mut r = Rig::new(&ramp(30.0, 30.0, 200.0));
+        r.spin([0.0, 0.0, 100.0], 0.2); // 20° right
+        let (x, y, _) = r.spin([0.0, 0.0, 0.0], 0.5);
+        assert_eq!((x, y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn ramp_turns_on_past_the_zone_the_way_the_gyro_turned() {
+        // 45° right with a 30° zone and 30° ramp: halfway → 100 °/s, held.
+        let mut r = Rig::new(&ramp(30.0, 30.0, 200.0));
+        r.spin([0.0, 0.0, 100.0], 0.45);
+        let (x, y, _) = r.spin([0.0, 0.0, 0.0], 1.0);
+        assert!((x - rate(100.0)).abs() < rate(2.0), "yaw right keeps turning right: {x}");
+        assert!(y.abs() < 1e-6, "{y}");
+        // Pitch up the same way → Y, with the gyro's sign.
+        let mut r = Rig::new(&ramp(30.0, 30.0, 200.0));
+        r.spin([0.0, 100.0, 0.0], 0.45);
+        let (x, y, _) = r.spin([0.0, 0.0, 0.0], 1.0);
+        assert!((y - rate(100.0)).abs() < rate(2.0), "nose up keeps turning up: {y}");
+        assert!(x.abs() < 1e-6, "{x}");
+        // Pitch+Roll: X is roll.
+        let mut p = ramp(30.0, 30.0, 200.0);
+        p.push(("axis", json!("pitch_roll")));
+        let mut r = Rig::new(&p);
+        r.spin([100.0, 0.0, 0.0], 0.45);
+        let (x, _, _) = r.spin([0.0, 0.0, 0.0], 1.0);
+        assert!((x - rate(100.0)).abs() < rate(2.0), "rolled right keeps turning right: {x}");
+    }
+
+    #[test]
+    fn an_inverted_axis_turns_with_the_gyro_not_against_it() {
+        for src in ["computed", "auto"] {
+            let mut p = ramp(30.0, 30.0, 200.0);
+            p.push(("inv_yaw", json!(true)));
+            p.push(("orient_source", json!(src)));
+            let mut r = Rig::new(&p);
+            let (moving, _, _) = r.spin([0.0, 0.0, 100.0], 0.45);
+            assert!(moving < 0.0, "inverted yaw: the gyro turns X negative ({moving})");
+            let (x, _, _) = r.spin([0.0, 0.0, 0.0], 0.5);
+            assert!(x < -rate(90.0), "{src}: and so does the edge turn ({x})");
+        }
+    }
+
+    #[test]
+    fn a_device_pose_is_used_and_takes_the_inversions() {
+        // Device orientation 45° nose-right (a negative turn about canonical
+        // up), gyro still. Auto and Device take it; Computed ignores it.
+        let q = glam::Quat::from_rotation_z((-45f32).to_radians());
+        for (src, inv, want) in [("auto", false, 100.0), ("device", true, -100.0), ("computed", false, 0.0)] {
+            let mut p = ramp(30.0, 30.0, 200.0);
+            p.push(("orient_source", json!(src)));
+            p.push(("inv_yaw", json!(inv)));
+            p.push(("_automap_device_id", json!("d")));
+            let mut r = Rig::new(&p);
+            r.dev.insert(("d".into(), "orientation".into()), Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)));
+            let (x, _, _) = r.spin([0.0; 3], 0.2);
+            assert!((x - rate(want)).abs() < rate(2.0), "{src}: {x}");
+        }
+    }
+
+    #[test]
+    fn set_neutral_turns_the_computed_pose_to_forward() {
+        let mut r = Rig::new(&[("_automap_device_id", json!("pad"))]);
+        r.spin([0.0, 100.0, 0.0], 0.2); // 20° nose up
+        r.spin([0.0, 0.0, 100.0], 0.4); // then 40° right
+        r.dev.insert(("pad".into(), super::ORIENT_NEUTRAL_DEV_PIN.into()), Signal::Bool(true));
+        let (_, _, q) = r.spin([0.0; 3], DT);
+        let q = q.unwrap();
+        let q = glam::Quat::from_xyzw(q.x, q.y, q.z, q.w);
+        let a = super::pose_angles(q);
+        assert!(a.x.abs() < 0.1, "yaw back to forward: {a:?}");
+        assert!(a.y > 15.0, "tilt kept: {a:?}");
+    }
+
+    #[test]
+    fn device_is_strict_and_auto_falls_back() {
+        let mut d = Rig::new(&[("orient_source", json!("device"))]);
+        assert_eq!(d.spin([0.0, 0.0, 100.0], 0.2).2, None, "Device with no device pose: nothing");
+        let mut a = Rig::new(&[]);
+        let q = a.spin([0.0, 0.0, 100.0], 0.2).2.expect("Auto (the default) falls back to Computed");
+        assert!(q.w < 0.999, "and it's the integrated pose: {q:?}");
+    }
+
+    fn momentum(zone: f32, blend: f32) -> Vec<(&'static str, Value)> {
+        vec![
+            ("edge_mode", json!("momentum")),
+            ("edge_zone_deg", json!(zone)),
+            ("edge_blend_deg", json!(blend)),
+            ("edge_momentum", json!(1.0)),
+        ]
+    }
+
+    #[test]
+    fn momentum_carries_the_exit_speed_until_back_inside() {
+        let mut r = Rig::new(&momentum(20.0, 5.0));
+        r.spin([0.0, 0.0, 300.0], 0.1); // 30°: out at 300 °/s
+        let (x, _, _) = r.spin([0.0, 0.0, 0.0], 1.0);
+        assert!((x - rate(300.0)).abs() < rate(15.0), "holds the flick's speed: {x}");
+        // A slow exit carries a slow turn.
+        let mut r = Rig::new(&momentum(20.0, 5.0));
+        r.spin([0.0, 0.0, 40.0], 0.75);
+        let (slow, _, _) = r.spin([0.0, 0.0, 0.0], 1.0);
+        assert!((slow - rate(40.0)).abs() < rate(5.0), "{slow}");
+        // Back inside: stops.
+        r.spin([0.0, 0.0, -40.0], 0.5);
+        let (x, _, _) = r.spin([0.0, 0.0, 0.0], 0.2);
+        assert_eq!(x, 0.0);
+    }
+
+    #[test]
+    fn momentum_keeps_the_speed_continuous_instead_of_adding_to_it() {
+        // ⛔ The first version added the exit speed ON TOP of the gyro, so a
+        // pad still turning as it left the zone doubled the camera's speed at
+        // the boundary. Turning steadily straight through it, the camera must
+        // simply keep the gyro's speed — every tick, not just at the end.
+        let mut r = Rig::new(&momentum(20.0, 15.0));
+        for _ in 0..40 {
+            let (x, _, _) = r.spin([0.0, 0.0, 300.0], 0.005); // to 60°
+            assert!((x - rate(300.0)).abs() < rate(10.0), "{x}");
+        }
+        // Easing off, the edge makes up the difference.
+        let (x, _, _) = r.spin([0.0, 0.0, 100.0], 0.1);
+        assert!((x - rate(300.0)).abs() < rate(10.0), "slowing down keeps the camera's speed: {x}");
+    }
+
+    #[test]
+    fn pulling_back_brakes_momentum() {
+        let mut r = Rig::new(&momentum(20.0, 5.0));
+        r.spin([0.0, 0.0, 300.0], 0.15); // 45°
+        r.spin([0.0, 0.0, 0.0], 0.2);
+        let (x, _, _) = r.spin([0.0, 0.0, -100.0], 0.05);
+        assert!(x < rate(250.0) && x > 0.0, "the gyro turns against the carry: {x}");
+    }
+
+    #[test]
+    fn the_blend_eases_momentum_in_past_the_zone() {
+        // Stopped just past the zone, only part of the carry has eased in.
+        let mut r = Rig::new(&momentum(20.0, 20.0));
+        r.spin([0.0, 0.0, 300.0], 0.1); // 30°: halfway through the blend
+        let (x, _, _) = r.spin([0.0, 0.0, 0.0], 0.2);
+        assert!((x - rate(150.0)).abs() < rate(10.0), "smoothstep(0.5) of 300: {x}");
+    }
+
+    #[test]
+    fn gyro_keep_hands_the_camera_over_to_the_edge() {
+        let mut p = ramp(30.0, 30.0, 200.0);
+        p.push(("edge_blend_deg", json!(10.0)));
+        p.push(("edge_gyro_keep", json!(0.0)));
+        let mut r = Rig::new(&p);
+        let (x, _, _) = r.spin([0.0, 0.0, 100.0], 0.7); // still turning, at 70°
+        assert!((x - rate(200.0)).abs() < rate(3.0), "the ramp alone, not the ramp plus the gyro: {x}");
+        let (inside, _, _) = Rig::new(&p).spin([0.0, 0.0, 100.0], 0.2); // 20°
+        assert!((inside - rate(100.0)).abs() < 1e-4, "inside, the gyro as usual: {inside}");
+    }
+
+    #[test]
+    fn momentum_decay_fades_it() {
+        let cfg = edge_cfg(&HashMap::from([
+            ("edge_mode".to_string(), json!("momentum")),
+            ("edge_zone_deg".to_string(), json!(10.0)),
+            ("edge_decay_s".to_string(), json!(0.5)),
+        ]))
+        .unwrap();
+        let mut st = [0.0f32; 9];
+        let mut d = glam::Vec2::ZERO;
+        for _ in 0..50 {
+            d.x += 200.0 * DT; // 200 °/s out to 40°
+            edge_turn(&mut st, d, DT, &cfg);
+        }
+        let mut out = edge_turn(&mut st, d, DT, &cfg).add_dps;
+        for _ in 0..50 {
+            out = edge_turn(&mut st, d, DT, &cfg).add_dps; // let the speed estimate settle at 0
+        }
+        // The fade runs from the stop (0.2 s ago by now): 200·e^-0.4 ≈ 134.
+        let at_stop = out.x;
+        for _ in 0..125 {
+            out = edge_turn(&mut st, d, DT, &cfg).add_dps; // 0.5 s still
+        }
+        assert!((at_stop - 134.0).abs() < 5.0, "{at_stop}");
+        assert!((out.x / at_stop - (-1.0f32).exp()).abs() < 0.05, "one time constant: {}", out.x / at_stop);
+    }
+
+    #[test]
+    fn x_only_ignores_pitch() {
+        let mut p = ramp(30.0, 30.0, 200.0);
+        p.push(("edge_x_only", json!(true)));
+        let mut r = Rig::new(&p);
+        r.spin([0.0, 100.0, 0.0], 0.6); // 60° nose up
+        let (x, y, _) = r.spin([0.0, 0.0, 0.0], 0.5);
+        assert_eq!((x, y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn steering_ignores_it() {
+        let mut p = ramp(10.0, 0.0, 200.0);
+        p[0] = ("edge_mode", json!("both"));
+        let mut r = Rig::new(&p);
+        r.p.insert("family".into(), json!("steering"));
+        let (x0, _, _) = r.spin([0.0, 0.0, 100.0], 0.45);
+        let (x1, _, _) = r.spin([0.0, 0.0, 0.0], 0.5);
+        assert!((x1 - x0).abs() < 1e-3, "steering holds its angle: {x0} → {x1}");
     }
 }
 

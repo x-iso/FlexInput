@@ -1025,6 +1025,8 @@ impl FlexInputApp {
             // output.
             whole_sticks: chord && (tz || self.gamepad_nav.kbm_picker_inputs),
             inputs: chord && self.gamepad_nav.kbm_picker_inputs,
+            // Set Neutral Forward: any mapping card can send it.
+            orient: chord,
         }
     }
 

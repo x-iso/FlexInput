@@ -525,6 +525,14 @@ pub(crate) fn render_pinned_element_impl(
             render_gyro_hold_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("processing.gyro_3dof", "edge_turn") => {
+            render_gyro_edge_rows(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("processing.gyro_3dof", "orient_source") => {
+            render_gyro_orient_source_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("processing.gyro_3dof", "gyro_invert") => {
             render_gyro_invert_row(inner_id, ui, inner_snarl, container_size);
             return;
@@ -2058,6 +2066,46 @@ pub(crate) fn render_gyro_hold_row(
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             super::gyro_body::gyro_write_hold(node, hold);
+        }
+    }
+}
+
+pub(crate) fn render_gyro_edge_rows(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let Some(n) = snarl.get_node(inner_id) else { return };
+    let mut edge = super::gyro_body::GyroEdge::read(n);
+    let pointer = super::gyro_body::gyro_read_family_axis(n).0 == "pointer";
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(300.0, 92.0));
+    let mut fr = [egui::Rect::NOTHING; 9];
+    let changed = ui
+        .add_enabled_ui(pointer, |ui| ui.vertical(|ui| edge.ui_rects(ui, false, &mut fr)).inner)
+        .inner;
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            edge.write(node);
+        }
+    }
+}
+
+pub(crate) fn render_gyro_orient_source_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let Some(n) = snarl.get_node(inner_id) else { return };
+    let mut source = super::gyro_body::gyro_read_orient_source(n);
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let r = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.label(egui::RichText::new("3D source:").weak());
+        super::gyro_body::gyro_orient_source_buttons(ui, &mut source, false)
+    });
+    publish_nav_field_rects(ui, inner_id, &[r.response.rect]);
+    if r.inner {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("orient_source".into(), Value::String(source.into()));
         }
     }
 }
