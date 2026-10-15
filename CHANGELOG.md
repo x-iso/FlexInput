@@ -26,6 +26,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **The spike filter works on the Bluetooth dongle.** A Switch Pro connected
+  through FlexInput's own dongle had no spike filter: the Calibration window
+  showed its controls, but they did nothing for it. It now filters every
+  report, takes the window's settings, and Calibrate Gyro can tune it.
+
 - **Spike filter settings apply from launch.** A device's saved spike filter
   settings only reached it once its Calibration window had been opened; until
   then it ran on the defaults.

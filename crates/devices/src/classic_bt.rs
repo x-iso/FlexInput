@@ -41,6 +41,7 @@ use crate::gyro::{
     switch_pro_enable_vibration, switch_pro_spi_reply, switch_pro_spi_request,
     switch_rumble_report, HidReading, OutputState, SwitchProCalib, SWITCH_PRO_CALIB_READS,
 };
+use crate::spike::SpikeFilter;
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
 
 /// Whether to print the per-link report-cadence line.
@@ -79,6 +80,10 @@ struct PadState {
     /// changes would show zero for a controller sitting still. Neither is the
     /// polling rate.
     events: u32,
+    /// Outlier spike suppression on the six IMU axes, run on every report as
+    /// it arrives — one report is one true sample, as on the HID path. Its
+    /// settings come from the UI through `set_spike_filter`.
+    spike: SpikeFilter,
 }
 
 /// What a pairing run is doing, for the UI to show.
@@ -1127,7 +1132,15 @@ fn run_inner(shared: &Arc<Shared>) {
                     last: link.last,
                     name: link.name.clone(),
                     events: 0,
+                    spike: SpikeFilter::new(),
                 });
+                let mut reading = reading;
+                let imu = slot.spike.push([
+                    reading.gyro_x, reading.gyro_y, reading.gyro_z,
+                    reading.accel_x, reading.accel_y, reading.accel_z,
+                ]);
+                [reading.gyro_x, reading.gyro_y, reading.gyro_z] = [imu[0], imu[1], imu[2]];
+                [reading.accel_x, reading.accel_y, reading.accel_z] = [imu[3], imu[4], imu[5]];
                 slot.reading = reading;
                 slot.last = link.last;
                 slot.name = link.name.clone();
@@ -1521,6 +1534,18 @@ impl DeviceBackend for ClassicBtBackend {
         let byte = (f * 255.0) as u8;
         if let Ok(mut outs) = self.shared.outputs.lock() {
             outs.entry(addr).or_default().stage(pin_id, byte);
+        }
+    }
+
+    /// Applied to the pad's filter on the transport thread's side of the
+    /// pads lock. A pad that hasn't sent a report yet has no filter to set;
+    /// the settings arrive again next tick.
+    fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
+        let Some(addr) = parse_device_id(device_id) else { return };
+        let Ok(mut pads) = self.shared.pads.lock() else { return };
+        if let Some(p) = pads.get_mut(&addr) {
+            p.spike.bind_capture(device_id);
+            p.spike.set_config(enabled, sensitivity_pct, window);
         }
     }
 
