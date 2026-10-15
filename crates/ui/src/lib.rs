@@ -9,6 +9,7 @@ mod hidhide_toggle;
 mod kbm_picker;
 mod licenses;
 mod guide_watcher;
+mod gyro_cal_overlay;
 mod macro_icons;
 mod module_ui_info;
 mod menu_overlay;

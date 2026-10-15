@@ -867,6 +867,37 @@ mod trigger_tests {
         assert!(neutral_req(&c, "jc2:l") && neutral_req(&c, "jc2:r"), "{c:?}");
     }
 
+    // ── Calibrate Gyro ───────────────────────────────────────────────────────
+
+    fn gyro_cal_req(c: &SigMap, dev: &str) -> bool {
+        c.get(&(format!("{GYRO_CAL_PREFIX}{dev}"), flexinput_core::imu::GYRO_CAL_PIN.to_string()))
+            .is_some_and(|s| s.as_bool())
+    }
+
+    #[test]
+    fn a_card_sending_calibrate_gyro_files_it_for_its_pads() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": [flexinput_core::imu::GYRO_CAL_PIN] }
+        ]));
+        assert!(!gyro_cal_req(&rig.tick(&[]), RIG_DEV), "nothing while the button is up");
+        let c = rig.tick(&["btn_south"]);
+        assert!(gyro_cal_req(&c, RIG_DEV), "the pad feeding the card");
+        assert!(!neutral_req(&c, RIG_DEV), "and only the action it sends");
+        rig.snap.params.insert("_upstream_device_ids".into(), serde_json::json!(["jc2:l", "jc2:r"]));
+        let c = rig.tick(&["btn_south"]);
+        assert!(gyro_cal_req(&c, "jc2:l") && gyro_cal_req(&c, "jc2:r"), "{c:?}");
+    }
+
+    #[test]
+    fn calibrate_gyro_reaches_the_ui_once_per_press() {
+        let set = |d: &[&str]| d.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        let mut carry = NodeState::default();
+        assert_eq!(gyro_cal_edges(&mut carry, set(&["jc2:l", "jc2:r"])).len(), 2, "the press");
+        assert!(gyro_cal_edges(&mut carry, set(&["jc2:l", "jc2:r"])).is_empty(), "held");
+        assert!(gyro_cal_edges(&mut carry, set(&[])).is_empty(), "let go");
+        assert_eq!(gyro_cal_edges(&mut carry, set(&["jc2:l"])), vec!["jc2:l".to_string()], "pressed again");
+    }
+
     #[test]
     fn set_neutral_turns_the_pads_orientation_to_forward_and_keeps_it() {
         let dev = "jc2:l";

@@ -40,20 +40,29 @@ pub(crate) const ORIENT_NEUTRAL_PREFIX: &str = "__orient_neutral__:";
 /// own — the 3DOF module's computed one.
 pub(crate) const ORIENT_NEUTRAL_DEV_PIN: &str = "__orient_neutral";
 
-/// If the card node publishing under `key` is sending Set Neutral Forward this
-/// tick, file the request for every device feeding it: `_upstream_device_ids`
-/// (all of a Combiner's ports — both Joy-Con 2 halves), else the single
+/// `collector_sigs` key prefix a card files a Calibrate Gyro request under:
+/// `("{GYRO_CAL_PREFIX}{device_id}", GYRO_CAL_PIN) = Bool(true)`, every tick
+/// it is sent. Drained at tick end into [`gyro_cal_edges`], which passes the
+/// UI one request per press.
+pub(crate) const GYRO_CAL_PREFIX: &str = "__gyro_cal__:";
+
+/// For the pad-wide actions a card can send — Set Neutral Forward and
+/// Calibrate Gyro — file each one the card node publishing under `key` is
+/// sending this tick for every device feeding it: `_upstream_device_ids` (all
+/// of a Combiner's ports — both Joy-Con 2 halves), else the single
 /// `_automap_device_id`. Called at the end of each card module's evaluation.
-pub(crate) fn request_orient_neutral(
+pub(crate) fn request_pad_actions(
     snap: &NodeSnap,
     key: &str,
     collector_sigs: &mut SigMap,
 ) {
-    use flexinput_core::imu::ORIENT_NEUTRAL_PIN;
-    let on = collector_sigs
-        .get_pin(&key, &ORIENT_NEUTRAL_PIN)
-        .is_some_and(|s| s.as_bool());
-    if !on {
+    use flexinput_core::imu::{GYRO_CAL_PIN, ORIENT_NEUTRAL_PIN};
+    let sent = |pin: &str| collector_sigs.get_pin(key, pin).is_some_and(|s| s.as_bool());
+    let actions: Vec<(&str, &str)> = [(ORIENT_NEUTRAL_PREFIX, ORIENT_NEUTRAL_PIN), (GYRO_CAL_PREFIX, GYRO_CAL_PIN)]
+        .into_iter()
+        .filter(|(_, pin)| sent(pin))
+        .collect();
+    if actions.is_empty() {
         return;
     }
     let mut devs: Vec<String> = snap.params.get("_upstream_device_ids")
@@ -65,12 +74,20 @@ pub(crate) fn request_orient_neutral(
             devs.push(d.to_string());
         }
     }
-    for d in devs {
-        collector_sigs.insert(
-            (format!("{ORIENT_NEUTRAL_PREFIX}{d}"), ORIENT_NEUTRAL_PIN.to_string()),
-            Signal::Bool(true),
-        );
+    for (prefix, pin) in actions {
+        for d in &devs {
+            collector_sigs.insert((format!("{prefix}{d}"), pin.to_string()), Signal::Bool(true));
+        }
     }
+}
+
+/// Tick end: `now` is every device a card is sending Calibrate Gyro to this
+/// tick. Returns the ones it wasn't sent to last tick — one request per press,
+/// however long the card holds it — and remembers `now` for the next tick.
+pub(crate) fn gyro_cal_edges(carry: &mut NodeState, now: HashSet<String>) -> Vec<String> {
+    let fresh = now.iter().filter(|d| !carry.gyro_cal_held.contains(*d)).cloned().collect();
+    carry.gyro_cal_held = now;
+    fresh
 }
 
 /// Start of tick: apply Set Neutral Forward. A device requested last tick takes

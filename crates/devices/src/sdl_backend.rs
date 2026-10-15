@@ -690,8 +690,10 @@ impl DeviceBackend for SdlBackend {
         // every tick — `set_config` returns immediately when nothing changed.
         let Some(state) = self.state.as_mut() else { return };
         if let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) {
+            pad.spike.bind_capture(device_id);
             pad.spike.set_config(enabled, sensitivity_pct, window);
         } else if let Some(pad) = state.raw_pads.values_mut().find(|p| p.dev_id == device_id) {
+            pad.spike.bind_capture(device_id);
             pad.spike.set_config(enabled, sensitivity_pct, window);
         }
     }

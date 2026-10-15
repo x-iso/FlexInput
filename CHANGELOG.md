@@ -5,6 +5,31 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Calibrate Gyro, as a card output.** On Choose's Gamepad tab, beside Set
+  Neutral Forward. Press it in game and a prompt over the game asks you to lay
+  the controller (or controllers — both Joy-Con 2 halves behind a Combiner)
+  flat, with a live scope of its gyro. Once it holds still a ring fills while
+  its gyro is measured; the result is the pad's gyro offset, as the
+  Calibration window's would be, in every tab, and the accelerometer is left
+  alone. A spike or two doesn't stop it settling or skew the offset. Pick it
+  up early and that pad starts over; press again to cancel. It stops after 45
+  seconds if the pad never settles.
+
+- **…then it checks for spikes.** The pad stays down a few seconds more while
+  everything its spike filter is fed is recorded — before the filter, so the
+  spikes it already removes count too — and marked on the scope as they're
+  found. If there are any, the spike filter is set to the least that removes
+  them all: the narrowest window, then the lowest sensitivity. No spikes, no
+  change. Controllers whose connection has no spike filter skip this step.
+
+### Fixed
+
+- **Spike filter settings apply from launch.** A device's saved spike filter
+  settings only reached it once its Calibration window had been opened; until
+  then it ran on the defaults.
+
 ## [0.15.9] - 2026-10-15
 
 ### Added

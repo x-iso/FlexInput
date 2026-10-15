@@ -425,10 +425,9 @@ impl DeviceBackend for Joycon2Backend {
     fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
         // Create on demand: settings are pushed every I/O tick and may arrive
         // before the pad's first poll. `set_config` is a no-op when unchanged.
-        self.spike
-            .entry(device_id.to_string())
-            .or_default()
-            .set_config(enabled, sensitivity_pct, window);
+        let f = self.spike.entry(device_id.to_string()).or_default();
+        f.bind_capture(device_id);
+        f.set_config(enabled, sensitivity_pct, window);
     }
 
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {

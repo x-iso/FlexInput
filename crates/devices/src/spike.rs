@@ -44,8 +44,21 @@
 //! current value before updating, so a spike can never inflate it, and it
 //! updates on every sample (accepted or not) so it can never deadlock at a
 //! value that rejects everything.
+//!
+//! # Capture
+//!
+//! While the UI asks for it ([`capture_start`]), a filter bound to a device id
+//! ([`SpikeFilter::bind_capture`]) also records every sample it is fed, before
+//! judging it. This is the one point every backend's IMU stream passes at the
+//! rate the filter sees it — one HID report each on raw HID, one poll each on
+//! SDL and the Joy-Con 2 — so it is the input [`crate::spike_tune`] tunes the
+//! filter from. A tap further down sees fewer samples, and none of the spikes
+//! the filter already removed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// Axis count: gyro x/y/z then accel x/y/z.
 pub const AXES: usize = 6;
@@ -149,6 +162,8 @@ pub struct SpikeFilter {
     ring: VecDeque<[f32; AXES]>,
     /// Per-axis running noise floor, in normalized units.
     noise: [f32; AXES],
+    /// The device id this filter's input is captured under, once bound.
+    capture_id: Option<String>,
 }
 
 impl Default for SpikeFilter {
@@ -159,6 +174,7 @@ impl Default for SpikeFilter {
             window: 3,
             ring: VecDeque::with_capacity(MAX_WINDOW),
             noise: [NOISE_SEED; AXES],
+            capture_id: None,
         }
     }
 }
@@ -206,6 +222,15 @@ impl SpikeFilter {
         self.ring.clear();
     }
 
+    /// Name the device this filter belongs to, so [`capture_start`] for that
+    /// id records its input. Backends call it where they apply the UI's
+    /// settings, which arrive keyed by device id every I/O tick.
+    pub fn bind_capture(&mut self, device_id: &str) {
+        if self.capture_id.as_deref() != Some(device_id) {
+            self.capture_id = Some(device_id.to_string());
+        }
+    }
+
     /// Feed one raw sample; get back the sample to publish.
     ///
     /// Exactly one output per input, so the stream's rate is unchanged — but
@@ -213,6 +238,11 @@ impl SpikeFilter {
     /// window is still filling, the oldest buffered sample is repeated, which
     /// costs a brief hold at connect and nothing after.
     pub fn push(&mut self, sample: [f32; AXES]) -> [f32; AXES] {
+        if ARMED.load(Ordering::Relaxed) > 0 {
+            if let Some(id) = &self.capture_id {
+                record(id, sample);
+            }
+        }
         if !self.enabled {
             if !self.ring.is_empty() {
                 self.ring.clear();
@@ -290,9 +320,94 @@ impl SpikeFilter {
     }
 }
 
+// ── Capture ──────────────────────────────────────────────────────────────────
+
+/// Most samples a capture holds. The UI drains it every frame, so this only
+/// has to outlast a stalled frame.
+const CAPTURE_MAX: usize = 16384;
+
+struct Capture {
+    /// Samples recorded since the capture started.
+    total: u64,
+    samples: VecDeque<(Instant, [f32; AXES])>,
+}
+
+/// Captures running — `push` checks this before touching the lock, so a
+/// filter pays one relaxed load per sample while nobody is capturing.
+static ARMED: AtomicUsize = AtomicUsize::new(0);
+
+fn captures() -> &'static Mutex<HashMap<String, Capture>> {
+    static CAPTURES: OnceLock<Mutex<HashMap<String, Capture>>> = OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record(device_id: &str, sample: [f32; AXES]) {
+    let Ok(mut map) = captures().lock() else { return };
+    if let Some(c) = map.get_mut(device_id) {
+        c.total += 1;
+        c.samples.push_back((Instant::now(), sample));
+        if c.samples.len() > CAPTURE_MAX {
+            c.samples.pop_front();
+        }
+    }
+}
+
+/// Start recording what `device_id`'s filter is fed (from empty; a running
+/// capture is restarted). The filter has to be bound to the id — see
+/// [`SpikeFilter::bind_capture`] — so a device whose backend has no filter
+/// records nothing.
+pub fn capture_start(device_id: &str) {
+    let Ok(mut map) = captures().lock() else { return };
+    let fresh = Capture { total: 0, samples: VecDeque::new() };
+    if map.insert(device_id.to_string(), fresh).is_none() {
+        ARMED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stop recording for `device_id` and drop what is held.
+pub fn capture_stop(device_id: &str) {
+    let Ok(mut map) = captures().lock() else { return };
+    if map.remove(device_id).is_some() {
+        ARMED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The samples recorded for `device_id` after the first `since` of them (as
+/// many of those as are still held), and how many have been recorded in all —
+/// the `since` for the next read. Empty while not capturing.
+pub fn capture_read(device_id: &str, since: u64) -> (Vec<(Instant, [f32; AXES])>, u64) {
+    let Ok(map) = captures().lock() else { return (Vec::new(), since) };
+    let Some(c) = map.get(device_id) else { return (Vec::new(), since) };
+    let held_from = c.total - c.samples.len() as u64;
+    let skip = since.saturating_sub(held_from) as usize;
+    (c.samples.iter().skip(skip).copied().collect(), c.total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bound_filter_records_its_input_while_captured() {
+        let id = "test:capture";
+        let mut f = SpikeFilter::new();
+        f.push([1.0; AXES]); // not bound: nothing to record under
+        f.bind_capture(id);
+        f.push([2.0; AXES]); // bound, but nobody is capturing
+        capture_start(id);
+        f.set_config(false, 50.0, 3); // recorded even with the filter off
+        f.push([3.0; AXES]);
+        f.push([4.0; AXES]);
+        let (got, total) = capture_read(id, 0);
+        assert_eq!(total, 2);
+        assert_eq!(got.iter().map(|(_, s)| s[0]).collect::<Vec<_>>(), vec![3.0, 4.0]);
+        f.push([5.0; AXES]);
+        let (got, total) = capture_read(id, total);
+        assert_eq!((got.len(), got[0].1[0], total), (1, 5.0, 3), "only what's new");
+        capture_stop(id);
+        f.push([6.0; AXES]);
+        assert_eq!(capture_read(id, 0), (Vec::new(), 0));
+    }
 
     /// Drive a filter with a scalar signal on gyro_x and collect gyro_x out.
     fn run(samples: &[f32], sensitivity: f32, window: u8) -> Vec<f32> {

@@ -959,6 +959,9 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     if pin_id == flexinput_core::imu::ORIENT_NEUTRAL_PIN {
         return flexinput_core::imu::ORIENT_NEUTRAL_NAME.to_string();
     }
+    if pin_id == flexinput_core::imu::GYRO_CAL_PIN {
+        return flexinput_core::imu::GYRO_CAL_NAME.to_string();
+    }
     if let Some(k) = flexinput_core::media::media_key(pin_id) {
         return k.name.to_string();
     }

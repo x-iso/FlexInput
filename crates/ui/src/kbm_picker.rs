@@ -182,6 +182,7 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
         || pin == flexinput_core::imu::ORIENT_NEUTRAL_PIN
+        || pin == flexinput_core::imu::GYRO_CAL_PIN
         || pin.starts_with("mouse")
         || pin.starts_with("scroll_")
         || matches!(pin, "touch_swipe_x" | "touch_swipe_y")
@@ -273,8 +274,8 @@ const GYRO_Y: f32 = PAD_ROW_Y;
 /// The Accel block sits beside the Gyro block, Tilt under it.
 const ACCEL_X: f32 = GYRO_X + 4.0;
 const TILT_Y: f32 = PAD_ROW_Y + 4.0;
-/// Set Neutral Forward, under the motion cluster: an output, so it is on every
-/// mapping card's board, motion inputs or not.
+/// Set Neutral Forward and Calibrate Gyro, under the motion cluster: outputs,
+/// so they are on every mapping card's board, motion inputs or not.
 const ORIENT_X: f32 = ACCEL_X;
 const ORIENT_Y: f32 = TILT_Y + 2.0;
 
@@ -342,7 +343,8 @@ pub struct PickerLayout {
     /// What only a Remapper's INPUT can be: the pad's motion, and the
     /// touchpad's click zones.
     pub inputs: bool,
-    /// Set Neutral Forward — a mapping card's output; nothing JSM can name.
+    /// Set Neutral Forward and Calibrate Gyro — a mapping card's outputs;
+    /// nothing JSM can name.
     pub orient: bool,
 }
 
@@ -437,6 +439,7 @@ pub fn picker_cells(
     }
     if orient {
         cells.push((&c(flexinput_core::imu::ORIENT_NEUTRAL_PIN, ORIENT_X, ORIENT_Y)).into());
+        cells.push((&c(flexinput_core::imu::GYRO_CAL_PIN, ORIENT_X + 1.0, ORIENT_Y)).into());
     }
     if sticks {
         cells.extend(STICK_LAYOUT.iter().map(PickerCell::from));
@@ -936,20 +939,22 @@ mod stage_tests {
 mod tab_tests {
     use super::*;
 
-    /// Every cell of the full board lands on exactly one tab, each tab starts
-    /// Set Neutral Forward is a card's output on the Gamepad tab, and only
-    /// there for a mapping card — JSM can't name it.
+    /// Set Neutral Forward and Calibrate Gyro are a card's outputs on the
+    /// Gamepad tab, and only there for a mapping card — JSM can't name them.
     #[test]
-    fn set_neutral_forward_is_a_gamepad_tab_output() {
-        use flexinput_core::imu::ORIENT_NEUTRAL_PIN as PIN;
-        let card = picker_cells(PickerLayout { pad: true, orient: true, ..Default::default() }, &[]);
-        assert!(tab_cells(card, PickerTab::Gamepad).iter().any(|c| c.pin == PIN));
-        let jsm = picker_cells(PickerLayout { pad: true, ..Default::default() }, &[]);
-        assert!(jsm.iter().all(|c| c.pin != PIN));
-        assert!(stage_allows(PickStage::Output, PIN) && !stage_allows(PickStage::Input, PIN));
-        assert!(crate::canvas::remapper_icons::pin_svg(crate::canvas::remapper_icons::Skin::Auto, PIN).is_some());
+    fn set_neutral_forward_and_calibrate_gyro_are_gamepad_tab_outputs() {
+        use flexinput_core::imu::{GYRO_CAL_PIN, ORIENT_NEUTRAL_PIN};
+        for pin in [ORIENT_NEUTRAL_PIN, GYRO_CAL_PIN] {
+            let card = picker_cells(PickerLayout { pad: true, orient: true, ..Default::default() }, &[]);
+            assert!(tab_cells(card, PickerTab::Gamepad).iter().any(|c| c.pin == pin), "{pin}");
+            let jsm = picker_cells(PickerLayout { pad: true, ..Default::default() }, &[]);
+            assert!(jsm.iter().all(|c| c.pin != pin), "{pin}");
+            assert!(stage_allows(PickStage::Output, pin) && !stage_allows(PickStage::Input, pin), "{pin}");
+            assert!(crate::canvas::remapper_icons::pin_svg(crate::canvas::remapper_icons::Skin::Auto, pin).is_some(), "{pin}");
+        }
     }
 
+    /// Every cell of the full board lands on exactly one tab, each tab starts
     /// at its top, and the gamepad's captions stay on the board.
     #[test]
     fn the_tabs_split_the_board_between_them() {

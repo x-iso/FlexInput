@@ -11,6 +11,7 @@ pub mod raw_hid;
 pub mod sdl_backend;
 pub mod spectrum;
 pub mod spike;
+pub mod spike_tune;
 
 #[cfg(feature = "joycon2")]
 pub mod joycon2_backend;

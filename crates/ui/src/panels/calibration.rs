@@ -448,6 +448,16 @@ pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32, u8)>>>;
 /// app restarted.
 pub type GyroDriftSettings = Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>;
 
+/// A `device.source` node's spike-filter settings as the device thread takes
+/// them: (enabled, sensitivity %, window), defaulting like the filter itself.
+pub(crate) fn spike_params(params: &HashMap<String, Value>) -> (bool, f32, u8) {
+    (
+        params.get("spike_suppress").and_then(|v| v.as_bool()).unwrap_or(true),
+        params.get("spike_sensitivity").and_then(|v| v.as_f64()).unwrap_or(50.0) as f32,
+        params.get("spike_window").and_then(|v| v.as_u64()).unwrap_or(3) as u8,
+    )
+}
+
 pub fn show_windows(
     ctx: &egui::Context,
     canvas: &mut Canvas,
@@ -567,10 +577,11 @@ fn scaled_below_ref_width(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui
 const AUTOCAL_WINDOW_S: f32 = 5.0;
 /// Max peak-to-peak span per gyro axis over the window to count as "still"
 /// (normalized units: 0.006 ≈ 12 dps span at the ±2000 dps reference —
-/// hand-held tremor is well above this, a table is well below).
-const AUTOCAL_GYRO_P2P: f32 = 0.006;
+/// hand-held tremor is well above this, a table is well below). Also what
+/// Calibrate Gyro's prompt counts as "set down" (`gyro_cal_overlay`).
+pub(crate) const AUTOCAL_GYRO_P2P: f32 = 0.006;
 /// Max peak-to-peak span per accel axis (0.008 ≈ 0.064 G span at ±8 G).
-const AUTOCAL_ACCEL_P2P: f32 = 0.008;
+pub(crate) const AUTOCAL_ACCEL_P2P: f32 = 0.008;
 /// "Flat" must be UNAMBIGUOUS: mean |ax| / |ay| under this (≈ 3.7° of surface
 /// tilt at ±8 G) — a pad held in hands or propped on a stand never passes…
 const AUTOCAL_FLAT_XY: f64 = 0.008;
@@ -590,6 +601,12 @@ fn auto_cal_id(node: NodeId) -> egui::Id { egui::Id::new(("auto_cal", node)) }
 /// Completion-glow timestamp, separate from `WindowState` so the device-card
 /// Calibrate buttons can glow green even when the window is closed (auto-cal).
 fn cal_glow_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_done_glow", node)) }
+
+/// Light the completion glow on a device card's Calibrate buttons, for a
+/// calibration that finished outside the window (Calibrate Gyro's prompt).
+pub(crate) fn mark_calibrated(ctx: &egui::Context, node: NodeId) {
+    ctx.data_mut(|d| d.insert_temp(cal_glow_id(node), Instant::now()));
+}
 
 /// Border animation for a device card's Calibrate button: orange trail while
 /// any calibration session is sampling on that node, green fading glow right

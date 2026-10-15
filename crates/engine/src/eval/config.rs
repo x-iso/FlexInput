@@ -192,6 +192,9 @@ pub struct TickOutput {
     pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Latest signals destined for each (device_id, pin_id) sink slot.
     pub sink_outputs: SigMap,
+    /// Devices a card started sending Calibrate Gyro to this tick (one entry
+    /// per press — see `gyro_cal_edges`), for the UI to calibrate.
+    pub gyro_cal_requests: Vec<String>,
     /// The tick's working maps — the AutoMap bus and the preprocessed device
     /// signals — kept here between ticks, empty, so each tick reuses their
     /// tables and (through `recycle_keys`) their key Strings rather than
@@ -209,6 +212,7 @@ impl TickOutput {
         self.scope_samples.clear();
         self.last_inputs.clear();
         self.last_outputs.clear();
+        self.gyro_cal_requests.clear();
         flexinput_core::recycle_keys(&mut self.sink_outputs);
     }
 }

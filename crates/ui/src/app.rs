@@ -942,8 +942,26 @@ impl FlexInputApp {
 
         let device_rates = flexinput_engine::new_device_rates();
         let scope_taps   = flexinput_engine::new_scope_taps();
-        let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        // Seeded from the saved graph, so a pad's spike-filter settings reach
+        // it from launch — not only once its Calibration window is opened,
+        // which is what pushes them while it is open.
+        let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>> = {
+            let mut seed: HashMap<String, (bool, f32, u8)> = HashMap::new();
+            for tab in &tabs {
+                for (_, node) in tab.canvas.snarl.node_ids() {
+                    if node.module_id != "device.source"
+                        || !["spike_suppress", "spike_sensitivity", "spike_window"]
+                            .iter().any(|k| node.params.contains_key(*k))
+                    {
+                        continue;
+                    }
+                    let Some(dev) = node.params.get("device_id").and_then(|v| v.as_str())
+                    else { continue };
+                    seed.insert(dev.to_string(), crate::panels::calibration::spike_params(&node.params));
+                }
+            }
+            Arc::new(RwLock::new(seed))
+        };
         // ⭐ Seeded from the SAVED graph, not left empty for the calibration
         // window to fill.
         //
@@ -1991,12 +2009,16 @@ impl eframe::App for FlexInputApp {
                         let last     = std::mem::take(&mut out.last_inputs);
                         let last_out = std::mem::take(&mut out.last_outputs);
                         let scopes   = std::mem::take(&mut out.scope_pending);
-                        Some((last, last_out, scopes))
+                        let gyro_cal = std::mem::take(&mut out.gyro_cal_requests);
+                        Some((last, last_out, scopes, gyro_cal))
                     }
                     Err(_) => None,
                 }
             };
-            if let Some((last_inputs_snap, last_outputs_snap, scope_batch)) = drained {
+            if let Some((last_inputs_snap, last_outputs_snap, scope_batch, gyro_cal)) = drained {
+                // Calibrate Gyro presses from mapping cards: the prompt runs
+                // here, beside the other overlays.
+                crate::gyro_cal_overlay::request(ctx, &self.last_signals, gyro_cal);
                 let scope_count = scope_batch.len();
                 let li_count = last_inputs_snap.len();
                 let lo_count = last_outputs_snap.len();
@@ -3095,6 +3117,17 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("show_menu_overlay");
             crate::menu_overlay::show_menu_overlay(self, ctx);
+        }
+
+        // ── Calibrate Gyro prompt ─────────────────────────────────────────────
+        // Another transparent viewport, up only while a card's Calibrate Gyro
+        // press is running: asks for the pad to be laid down, calibrates its
+        // gyro once still, tunes its spike filter, and fades out.
+        {
+            puffin::profile_scope!("show_gyro_cal_overlay");
+            let fps = self.overlay_fps();
+            crate::gyro_cal_overlay::show(ctx, &mut self.tabs, self.active_tab, &self.last_signals,
+                &self.spike_filter_settings, fps);
         }
 
         // ── Config overlay ────────────────────────────────────────────────────

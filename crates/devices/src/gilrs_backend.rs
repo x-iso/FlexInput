@@ -1114,7 +1114,7 @@ impl DeviceBackend for GilrsBackend {
 
     fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
         if let Some((vid, pid, idx)) = self.lookup_phys(device_id) {
-            self.gyro.set_spike_filter(vid, pid, idx, enabled, sensitivity_pct, window);
+            self.gyro.set_spike_filter(vid, pid, idx, device_id, enabled, sensitivity_pct, window);
         }
     }
 }

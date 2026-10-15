@@ -957,7 +957,7 @@ pub(crate) fn eval_remapper_node(
                 }
                 publish_touch_points(&key, &fingers, collector_sigs);
             }
-    request_orient_neutral(snap, &format!("remap:{uid}"), collector_sigs);
+    request_pad_actions(snap, &format!("remap:{uid}"), collector_sigs);
     // Hand the per-tick pin snapshot's key Strings back for the next tick.
     flexinput_core::recycle_strings(&mut upstream);
 }

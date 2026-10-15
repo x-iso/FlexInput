@@ -287,6 +287,6 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
         }
         publish_touch_points(&key, &fingers, collector_sigs);
     }
-    request_orient_neutral(snap, &key, collector_sigs);
+    request_pad_actions(snap, &key, collector_sigs);
 }
 

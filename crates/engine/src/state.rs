@@ -131,6 +131,10 @@ pub struct NodeState {
     /// the Calibration window's baseline is the persisted part. Only
     /// `MACRO_CARRY_UID` uses this.
     pub orient_neutral: HashMap<String, glam::Quat>,
+    /// Devices a card was sending Calibrate Gyro to last tick
+    /// (`flexinput_core::imu::GYRO_CAL_PIN`), so only a fresh press reaches
+    /// the UI. Only `MACRO_CARRY_UID` uses this.
+    pub gyro_cal_held: HashSet<String>,
     /// A sink's AutoMap source→destination pin pairing, kept between ticks:
     /// `automap::resolve_mapping` compares every source pin with every
     /// destination pin, and its answer only changes when the pin lists do.

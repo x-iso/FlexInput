@@ -185,7 +185,14 @@ pub struct ProcessingOutput {
     pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Accumulated scope samples not yet drained by the UI thread.
     pub scope_pending: Vec<(usize, Vec<Option<f32>>)>,
+    /// Calibrate Gyro presses (device ids, one per press) not yet drained by
+    /// the UI thread, which runs the calibration.
+    pub gyro_cal_requests: Vec<String>,
 }
+
+/// How many undrained Calibrate Gyro requests to keep — presses are rare; this
+/// only bounds a UI that stopped draining.
+const MAX_GYRO_CAL_PENDING: usize = 64;
 
 /// Separate lock for sink routing outputs — read by the I/O thread at the
 /// polling rate (default 500 Hz), written by the processing thread at the
@@ -386,6 +393,8 @@ pub fn spawn_processing_thread(
         // Pre-allocated outside the hot loop so it grows once and is
         // reused thereafter.
         let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
+        // Calibrate Gyro presses over the catch-up loop, like `scope_acc`.
+        let mut gyro_cal_acc: Vec<String> = Vec::new();
         // Displacement pins summed over the catch-up loop (see
         // `is_displacement_pin`); emptied into the sink bus once per wakeup.
         let mut disp_bank: SigMap = SigMap::default();
@@ -507,6 +516,7 @@ pub fn spawn_processing_thread(
                         // clears tick_out on entry, so we must move (not
                         // clone) the samples here before the next call.
                         scope_acc.append(&mut tick_out.scope_samples);
+                        gyro_cal_acc.append(&mut tick_out.gyro_cal_requests);
                         bank_displacement(&mut disp_bank, &mut click_levels, &tick_out.sink_outputs);
                     }
                 }
@@ -523,6 +533,11 @@ pub fn spawn_processing_thread(
                     for sample in scope_acc.drain(..) {
                         if out.scope_pending.len() < MAX_SCOPE_PENDING {
                             out.scope_pending.push(sample);
+                        }
+                    }
+                    for dev in gyro_cal_acc.drain(..) {
+                        if out.gyro_cal_requests.len() < MAX_GYRO_CAL_PENDING {
+                            out.gyro_cal_requests.push(dev);
                         }
                     }
                     // Swap instead of clone: hand our just-filled maps

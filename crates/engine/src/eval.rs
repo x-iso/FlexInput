@@ -1299,6 +1299,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         carry.macro_prev.clear();
         carry.source_block.clear();
         carry.orient_neutral_req.clear();
+        let mut gyro_cal: HashSet<String> = HashSet::new();
         for ((k, pin), sig) in collector_sigs.iter() {
             if k == SIGS_NS || k == SIGS_NS_VEC2 {
                 carry.macro_prev.insert((k.clone(), pin.clone()), *sig);
@@ -1306,8 +1307,14 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 carry.source_block.insert((dev.to_string(), pin.clone()));
             } else if let Some(dev) = k.strip_prefix(ORIENT_NEUTRAL_PREFIX) {
                 carry.orient_neutral_req.insert(dev.to_string());
+            } else if let Some(dev) = k.strip_prefix(GYRO_CAL_PREFIX) {
+                gyro_cal.insert(dev.to_string());
             }
         }
+        // Calibrate Gyro runs in the UI (it owns the calibration params);
+        // hand it one request per press.
+        let fresh = gyro_cal_edges(carry, gyro_cal);
+        out.gyro_cal_requests.extend(fresh);
     }
 
     // Hand the working maps back, emptied, for the next tick to reuse.

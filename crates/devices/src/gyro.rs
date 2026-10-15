@@ -578,16 +578,20 @@ impl GyroManager {
     /// repairs longer bursts and costs `window / 2` samples of latency).
     /// Has no effect if the device hasn't been opened yet — callers
     /// should retry on subsequent frames or just call every UI frame.
+    /// `device_id` names the filter's input for `spike::capture_start`.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_spike_filter(
         &mut self,
         vid: u16,
         pid: u16,
         idx: usize,
+        device_id: &str,
         on: bool,
         sensitivity_pct: f32,
         window: u8,
     ) {
         if let Some(e) = self.devices.get_mut(&(vid, pid, idx)) {
+            e.spike.bind_capture(device_id);
             e.spike.set_config(on, sensitivity_pct, window);
         }
     }

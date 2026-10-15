@@ -191,6 +191,15 @@ pub fn is_imu_pin(id: &str) -> bool {
 pub const ORIENT_NEUTRAL_PIN: &str = "orient_neutral";
 pub const ORIENT_NEUTRAL_NAME: &str = "Set Neutral Forward";
 
+/// **Calibrate Gyro** — a mapping-card OUTPUT, never an input. Each press
+/// starts a quick gyro calibration of the pad(s) feeding that card: an
+/// on-screen prompt asks for the pad to be laid down, and once it holds still
+/// its resting gyro rate becomes the new gyro offset. The accelerometer is
+/// left alone. One calibration per press, however long it is held; pressing
+/// again while one is waiting cancels it.
+pub const GYRO_CAL_PIN: &str = "gyro_calibrate";
+pub const GYRO_CAL_NAME: &str = "Calibrate Gyro";
+
 /// The families a card's inputs read, in [`ImuKind::ALL`] order — one range
 /// field each on the card.
 pub fn kinds_read<'a>(pins: impl IntoIterator<Item = &'a str>) -> Vec<ImuKind> {

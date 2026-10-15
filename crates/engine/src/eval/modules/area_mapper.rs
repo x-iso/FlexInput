@@ -722,6 +722,6 @@ pub(crate) fn eval_area_mapper_node(
         let tag = k as u32 * AREA_LAYER_STRIDE;
         out.extend(l.weights.iter().map(|c| Some(Signal::Vec2(Vec2::new((tag + c.id) as f32, c.weight)))));
     }
-    request_orient_neutral(snap, &key, collector_sigs);
+    request_pad_actions(snap, &key, collector_sigs);
     out
 }
