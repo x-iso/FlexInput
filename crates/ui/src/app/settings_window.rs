@@ -483,9 +483,27 @@ impl FlexInputApp {
     pub(crate) fn sync_raw_pad_profiles(&mut self) {
         use flexinput_core::raw_pad::{is_raw_device_id, profile_key};
         let edits = crate::raw_learn::drain_requests();
-        if !edits.is_empty()
-            && crate::raw_learn::apply_edits(&mut self.settings.raw_pad_profiles, edits)
-        {
+        let mut changed = !edits.is_empty()
+            && crate::raw_learn::apply_edits(&mut self.settings.raw_pad_profiles, edits);
+        // A raw pad nobody has taught yet starts from the community controller
+        // database's layout for its model, where it has one (`sdl_db`) —
+        // looked up once per model and session. A profile that exists is
+        // never replaced, even an emptied one (`from_db` keeps it), so a
+        // layout the user cleared on purpose isn't offered again.
+        for d in self.devices.iter().filter(|d| is_raw_device_id(&d.id)) {
+            let key = profile_key(d.vid, d.pid, &d.display_name);
+            if self.settings.raw_pad_profiles.contains_key(&key) || !self.raw_db_tried.insert(key.clone()) {
+                continue;
+            }
+            if let Some(mut layout) = flexinput_core::sdl_db::layout_for(d.vid, d.pid, &d.display_name) {
+                eprintln!("[raw-pad] {}: starting from SDL_GameControllerDB's \"{}\" layout ({} binds)",
+                    d.id, layout.name, layout.binds.len());
+                layout.name = d.display_name.clone();
+                self.settings.raw_pad_profiles.insert(key, layout);
+                changed = true;
+            }
+        }
+        if changed {
             self.settings_dirty = true;
             if let Ok(mut m) = self.raw_pad_profiles.write() {
                 *m = Arc::new(self.settings.raw_pad_profiles.clone());

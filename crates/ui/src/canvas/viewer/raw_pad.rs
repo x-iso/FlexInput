@@ -258,6 +258,15 @@ pub(crate) fn show_raw_pad_header_controls(
     };
     let dev_name = node.display_name.clone();
     let sid = state_id(node_id, &dev_id);
+    // A layout started from the controller database arrives after the node
+    // may already exist: give the node its ports once (flagged, so Clear
+    // unused isn't undone the next frame).
+    if profile.from_db && node.params.get("raw_db_ports").and_then(|v| v.as_bool()) != Some(true) {
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            add_missing_ports(n, &profile);
+            n.params.insert("raw_db_ports".into(), Value::Bool(true));
+        }
+    }
     let verdicts = analyze(ui.ctx(), node_id, &dev_id, live);
     let in_motion_setup = motion_setup_active(ui.ctx(), node_id, &dev_id);
     if in_motion_setup && learning {
@@ -443,6 +452,9 @@ pub(crate) fn show_raw_pad_body(
     let mut forget: Option<(String, Vec<&'static str>)> = None;
     ui.vertical(|ui| {
         ui.set_min_width(180.0);
+        if profile.from_db {
+            ui.label(egui::RichText::new("Started from the community controller database —                                           Learn changes any of it.").small().weak());
+        }
         for b in &profile.binds {
             ui.horizontal(|ui| {
                 if ui.small_button("×").on_hover_text("Forget this").clicked() {

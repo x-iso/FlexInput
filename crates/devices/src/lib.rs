@@ -57,12 +57,6 @@ pub struct PhysicalDevice {
     /// HidHide masking, so a slow SetupAPI lookup never runs on the I/O loop.
     pub vid: Option<u16>,
     pub pid: Option<u16>,
-    /// The backend only GUESSED this pad's layout: gilrs's positional default
-    /// (axis 0 = left X, button 0 = West, …) for a DirectInput pad no
-    /// controller database knows. The device-io dedup lets the same pad's
-    /// `sdl:raw:` entry — whose layout the user learns — replace such an
-    /// entry, but never one with a real mapping.
-    pub layout_guessed: bool,
 }
 
 pub trait DeviceBackend: Send {

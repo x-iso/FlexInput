@@ -375,6 +375,11 @@ pub struct RawPadProfile {
     pub gyro: Option<ImuMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accel: Option<ImuMap>,
+    /// Started from the community controller database (`sdl_db`) rather
+    /// than from nothing. Kept even once every entry is forgotten, so the
+    /// database isn't offered again for a pad the user cleared on purpose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_db: bool,
 }
 
 /// All learned layouts, by [`profile_key`].

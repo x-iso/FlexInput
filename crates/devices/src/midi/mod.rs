@@ -408,7 +408,6 @@ impl DeviceBackend for MidiBackend {
             instance_path: None,
             vid: None,
             pid: None,
-            layout_guessed: false,
         };
         let mut devs: Vec<PhysicalDevice> = self.live_in.iter()
             .map(|n| dev(in_id(self.in_slots[n]), n, ControllerKind::MidiIn))

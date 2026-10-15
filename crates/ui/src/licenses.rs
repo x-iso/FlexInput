@@ -117,6 +117,14 @@ pub const LICENSES: &[License] = &[
         text: include_str!("../../../licenses/sdl3-sys.txt"),
     },
     License {
+        name: "SDL_GameControllerDB",
+        what: "Community controller mappings, bundled as data: the starting                layout for a controller SDL has no built-in mapping for.",
+        spdx: "Zlib",
+        url: "https://github.com/gabomdq/SDL_GameControllerDB",
+        note: Some("The copy gilrs 0.10.10 ships."),
+        text: include_str!("../../../vendor/SDL_GameControllerDB/LICENSE"),
+    },
+    License {
         name: "midir",
         what: "MIDI input and output.",
         spdx: "MIT",

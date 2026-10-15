@@ -460,7 +460,6 @@ impl DeviceBackend for Joycon2Backend {
                         Side::Left => flexinput_joycon2::PID_JOYCON2_L,
                         Side::Right => flexinput_joycon2::PID_JOYCON2_R,
                     }),
-                    layout_guessed: false,
                 }
             })
             .collect()

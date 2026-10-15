@@ -532,6 +532,9 @@ pub struct FlexInputApp {
     /// I/O thread, whose SDL backend applies them. Replaced wholesale on an
     /// edit, so the backend can tell a change by pointer.
     raw_pad_profiles: Arc<RwLock<Arc<flexinput_core::raw_pad::RawPadProfiles>>>,
+    /// Raw-pad models already looked up in the community controller
+    /// database this session (`sync_raw_pad_profiles`), hit or miss.
+    raw_db_tried: HashSet<String>,
     /// Pending rumble-ping requests, pushed by the UI when the user clicks a
     /// device-card icon. The I/O thread drains this each tick, starts a 200 ms
     /// rumble pulse on the named physical device, and stops it when it expires.
@@ -1221,6 +1224,7 @@ impl FlexInputApp {
             gyro_drift_settings,
             led_defaults,
             raw_pad_profiles,
+            raw_db_tried: HashSet::new(),
             ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,

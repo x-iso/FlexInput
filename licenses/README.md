@@ -15,6 +15,7 @@ straight at it instead — no copy, so it can't drift:
 | HIDMaestro | [`crates/hidmaestro/driver/LICENSE`](../crates/hidmaestro/driver/LICENSE) |
 | egui-snarl | [`vendor/egui-snarl/LICENSE-MIT`](../vendor/egui-snarl/LICENSE-MIT) |
 | btleplug | [`vendor/btleplug/LICENSE.md`](../vendor/btleplug/LICENSE.md) |
+| SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, the copy gilrs 0.10.10 ships) is embedded by `crates/core/src/sdl_db.rs` |
 
 ## Where each copy came from
 

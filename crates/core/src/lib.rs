@@ -9,6 +9,7 @@ pub mod midi;
 pub mod module;
 pub mod patch;
 pub mod raw_pad;
+pub mod sdl_db;
 pub mod pinkey;
 pub mod signal;
 pub mod touchzones;

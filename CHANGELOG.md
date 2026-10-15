@@ -35,6 +35,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   settings only reached it once its Calibration window had been opened; until
   then it ran on the defaults.
 
+- **Learn shows up for every unknown controller.** A DirectInput pad SDL has
+  no mapping for, but that FlexInput's other controller backend recognised —
+  from its controller database, or as an Xbox pad by its name — stayed on its
+  old device without Learn unless "Route all pads through SDL" was on. It now
+  gets its Learn device either way, already set up from the community
+  controller database's layout where that has one: the node lists it, and
+  Learn changes any part of it. Anything wired to its old device needs
+  re-pointing.
+
 ## [0.15.9] - 2026-10-15
 
 ### Added

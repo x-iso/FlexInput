@@ -118,7 +118,9 @@ pub fn apply_edits(profiles: &mut RawPadProfiles, edits: Vec<(String, String, Ra
             }
         }
     }
-    profiles.retain(|_, p| !p.is_empty());
+    // An emptied layout that came from the controller database stays (as an
+    // empty one), so the database isn't offered again for that model.
+    profiles.retain(|_, p| !p.is_empty() || p.from_db);
     changed
 }
 
@@ -151,5 +153,19 @@ mod tests {
             ("k".into(), String::new(), RawEdit::RemovePin("btn_east".into())),
         ]);
         assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn an_emptied_database_layout_is_kept_so_it_is_not_offered_again() {
+        let mut profiles = RawPadProfiles::new();
+        profiles.insert("k".into(), RawPadProfile {
+            from_db: true,
+            binds: vec![bind(RawSrc::Button(0), "btn_south")],
+            ..Default::default()
+        });
+        apply_edits(&mut profiles, vec![
+            ("k".into(), String::new(), RawEdit::RemovePin("btn_south".into())),
+        ]);
+        assert!(profiles.get("k").is_some_and(|p| p.is_empty() && p.from_db));
     }
 }

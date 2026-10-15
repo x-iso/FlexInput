@@ -1517,7 +1517,6 @@ impl DeviceBackend for ClassicBtBackend {
                 instance_path: None,
                 vid: None,
                 pid: None,
-                layout_guessed: false,
             })
             .collect()
     }

@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use glam::Vec2;
-use gilrs::{Axis, Button, EventType, Gilrs, GilrsBuilder, MappingSource};
+use gilrs::{Axis, Button, EventType, Gilrs, GilrsBuilder};
 use hidapi::HidApi;
 
 use flexinput_core::Signal;
@@ -525,12 +525,6 @@ impl DeviceBackend for GilrsBackend {
                 // for HidHide is deferred to an off-thread reconcile that reads these.
                 vid: pad.vendor_id(),
                 pid: pad.product_id(),
-                // No database mapping: gilrs fell back to reading the pad's
-                // raw indices as a standard layout. Only a Generic pad's is a
-                // guess — an XInput-class pad is read through WGI's own
-                // gamepad layout, which is exact.
-                layout_guessed: kind == ControllerKind::Generic
-                    && pad.mapping_source() == MappingSource::Driver,
             });
         }
 

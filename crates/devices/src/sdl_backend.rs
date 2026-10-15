@@ -533,8 +533,8 @@ impl SdlBackend {
     /// Open every joystick SDL has NO gamepad mapping for as a [`RawPad`], and
     /// drop the ones that have gone. These are what `SDL_GetGamepads` leaves
     /// out: unknown DirectInput pads, wheels, flight sticks. gilrs lists the
-    /// same pads with a guessed layout; the device-io dedup keeps this entry
-    /// instead (see `PhysicalDevice::layout_guessed`).
+    /// same pads too; the device-io dedup keeps this entry instead, as it
+    /// does every SDL entry.
     fn sync_raw_pads(&mut self) {
         let Some(state) = self.state.as_mut() else { return };
         let state = &mut **state;
@@ -747,7 +747,6 @@ impl DeviceBackend for SdlBackend {
                 instance_path: None,
                 vid: pad.gamepad.vendor_id(),
                 pid: pad.gamepad.product_id(),
-                layout_guessed: false,
             });
         }
         for pad in state.raw_pads.values() {
@@ -774,7 +773,6 @@ impl DeviceBackend for SdlBackend {
                 instance_path: None,
                 vid: pad.vid,
                 pid: pad.pid,
-                layout_guessed: false,
             });
         }
         result

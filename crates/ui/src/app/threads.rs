@@ -347,34 +347,23 @@ pub(crate) fn spawn_io_thread(
                     // Controller" via gilrs). When SDL surfaced a pad, drop gilrs's
                     // copy of the same vid/pid. This only fires on an ACTUAL match, so
                     // a generic SDL couldn't open never vanishes (gilrs keeps it).
-                    use flexinput_core::raw_pad::is_raw_device_id;
+                    //
+                    // That includes a raw joystick (`sdl:raw:`), a pad SDL has no
+                    // mapping for at all: gilrs lists it too, with a layout from its
+                    // own database or a positional guess, but only the raw entry
+                    // can Learn the pad and read everything it reports — and it
+                    // starts from the same database's layout where that has one
+                    // (`flexinput_core::sdl_db`). It used to yield to gilrs whenever
+                    // gilrs had a database mapping or took the pad for an Xbox one,
+                    // which hid Learn unless "Route all pads through SDL" silenced
+                    // gilrs.
                     let sdl_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
-                        .filter(|d| d.id.starts_with("sdl:") && !is_raw_device_id(&d.id))
+                        .filter(|d| d.id.starts_with("sdl:"))
                         .filter_map(|d| Some((d.vid?, d.pid?)))
                         .collect();
                     if !sdl_vp.is_empty() {
                         devs.retain(|d| !(d.id.starts_with("gilrs:")
                             && d.vid.zip(d.pid).is_some_and(|vp| sdl_vp.contains(&vp))));
-                    }
-                    // Raw joysticks (`sdl:raw:`) — pads SDL has NO mapping for.
-                    // gilrs lists the same pad too: with a real database mapping
-                    // (gilrs ships a bigger community database than SDL's built-in
-                    // one) it keeps the pad and the raw entry goes; with only its
-                    // positional guess, the raw entry — whose layout the user
-                    // learns — replaces it.
-                    let gilrs_mapped_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
-                        .filter(|d| d.id.starts_with("gilrs:") && !d.layout_guessed)
-                        .filter_map(|d| Some((d.vid?, d.pid?)))
-                        .collect();
-                    devs.retain(|d| !(is_raw_device_id(&d.id)
-                        && d.vid.zip(d.pid).is_some_and(|vp| gilrs_mapped_vp.contains(&vp))));
-                    let raw_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
-                        .filter(|d| is_raw_device_id(&d.id))
-                        .filter_map(|d| Some((d.vid?, d.pid?)))
-                        .collect();
-                    if !raw_vp.is_empty() {
-                        devs.retain(|d| !(d.id.starts_with("gilrs:") && d.layout_guessed
-                            && d.vid.zip(d.pid).is_some_and(|vp| raw_vp.contains(&vp))));
                     }
                     // Append MIDI device list maintained by the MIDI watch thread.
                     devs.extend(shared_midi_devices.read().unwrap().iter().cloned());
