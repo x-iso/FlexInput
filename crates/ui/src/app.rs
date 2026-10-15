@@ -528,6 +528,10 @@ pub struct FlexInputApp {
     /// Per-device default lightbar colour (`settings.led_defaults`), mirrored
     /// for the I/O thread, which sends it while nothing else drives the lightbar.
     led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
+    /// Learned raw-pad layouts (`settings.raw_pad_profiles`), mirrored for the
+    /// I/O thread, whose SDL backend applies them. Replaced wholesale on an
+    /// edit, so the backend can tell a change by pointer.
+    raw_pad_profiles: Arc<RwLock<Arc<flexinput_core::raw_pad::RawPadProfiles>>>,
     /// Pending rumble-ping requests, pushed by the UI when the user clicks a
     /// device-card icon. The I/O thread drains this each tick, starts a 200 ms
     /// rumble pulse on the named physical device, and stops it when it expires.
@@ -975,6 +979,8 @@ impl FlexInputApp {
         let ping_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>> =
             Arc::new(RwLock::new(app_settings.led_defaults.clone()));
+        let raw_pad_profiles: Arc<RwLock<Arc<flexinput_core::raw_pad::RawPadProfiles>>> =
+            Arc::new(RwLock::new(Arc::new(app_settings.raw_pad_profiles.clone())));
         spawn_io_thread(
             backends,
             Arc::clone(&midi_backend),
@@ -994,6 +1000,7 @@ impl FlexInputApp {
             Arc::clone(&sdl_all_pads),
             Arc::clone(&ping_requests),
             Arc::clone(&led_defaults),
+            Arc::clone(&raw_pad_profiles),
         );
 
         spawn_midi_watch_thread(
@@ -1195,6 +1202,7 @@ impl FlexInputApp {
             spike_filter_settings,
             gyro_drift_settings,
             led_defaults,
+            raw_pad_profiles,
             ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,
@@ -1550,6 +1558,8 @@ impl eframe::App for FlexInputApp {
         self.publish_hidhide_ui();
         // The light-bar swatch beside the eye: same publish/queue shape.
         self.sync_led_defaults();
+        // Raw-pad layouts learned on device nodes: same publish/queue shape.
+        self.sync_raw_pad_profiles();
 
         // Dispatch XInput player-slot requests from the slot circles. Each request
         // is routed to the helper's ordered-reorder engine, which places the named

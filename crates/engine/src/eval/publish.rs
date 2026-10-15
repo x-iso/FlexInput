@@ -262,7 +262,7 @@ pub(crate) fn republish_bus_as_collector(
             }
         }
     }
-    fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
+    fill_raw_dynamic(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
 }
 
 pub(crate) fn audio_stream_haptics_publish(
@@ -736,7 +736,7 @@ pub(crate) fn automap_fork_publish(
             flexinput_core::copy_bus(collector_sigs, collector_id_upstream, &key,
                 |p| !automap::is_canonical_pin(p));
         }
-        fill_raw_midi(dev_sigs, dev_id, &key, collector_sigs);
+        fill_raw_dynamic(dev_sigs, dev_id, &key, collector_sigs);
     }
 }
 
@@ -1171,7 +1171,7 @@ pub(crate) fn automap_selector_publish(
         flexinput_core::copy_bus(collector_sigs, &selected_collector, &key,
             |p| !automap::is_canonical_pin(p));
     }
-    fill_raw_midi(dev_sigs, &selected_dev, &key, collector_sigs);
+    fill_raw_dynamic(dev_sigs, &selected_dev, &key, collector_sigs);
 }
 
 // ── Sub-patch inner evaluation ────────────────────────────────────────────────

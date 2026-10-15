@@ -463,6 +463,9 @@ fn bus_pin_neutral_label(pin_id: &str) -> String {
     if flexinput_core::midi::is_midi_pin(pin_id) {
         return midi_pin_label(pin_id);
     }
+    if flexinput_core::raw_pad::is_extra_pin(pin_id) {
+        return crate::raw_learn::extra_label(pin_id);
+    }
     pin_id.to_string()
 }
 
@@ -562,6 +565,16 @@ pub(crate) fn show_automap_split_body(
         .unwrap_or_default();
 
     let family_ref = splitter_upstream_family(snarl, node_id);
+    // Own ports of the raw pads upstream (`extra:` pins): not canonical, so
+    // offered by name from the pads' learned layouts.
+    let upstream_extras: Vec<(String, String, SignalType)> = snarl.get_node(node_id)
+        .and_then(|n| n.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap))
+        .and_then(|i| snarl.in_pin(egui_snarl::InPinId { node: node_id, input: i }).remotes.first().copied())
+        .map(|src| crate::app::find_automap_device_ids_for_viewer(snarl, src, None))
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|d| crate::raw_learn::extra_pins_of(d))
+        .collect();
 
     ui.vertical(|ui| {
         ui.set_min_width(170.0);
@@ -598,6 +611,23 @@ pub(crate) fn show_automap_split_body(
                                     node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
                                         Value::String("automap_pass".to_string()),
                                         Value::String(ap.id.to_string()),
+                                    ]));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (id, name, ty) in &upstream_extras {
+                    if current_ids.iter().any(|c| c == id) { continue; }
+                    if ui.selectable_label(false, egui::RichText::new(name).small()).clicked() {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.outputs.push(PinDescriptor::new(name, *ty));
+                            match node.params.get_mut("output_pin_ids") {
+                                Some(Value::Array(ids)) => ids.push(Value::String(id.clone())),
+                                _ => {
+                                    node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
+                                        Value::String("automap_pass".to_string()),
+                                        Value::String(id.clone()),
                                     ]));
                                 }
                             }

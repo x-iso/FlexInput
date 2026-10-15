@@ -7,6 +7,7 @@ pub mod hidhide;
 pub mod identification;
 pub mod layouts;
 pub mod midi;
+pub mod raw_hid;
 pub mod sdl_backend;
 pub mod spectrum;
 pub mod spike;
@@ -23,6 +24,7 @@ pub mod loopback_haptic;
 #[cfg(windows)]
 pub mod loopback_manager;
 
+use flexinput_core::raw_pad::RawPadProfiles;
 use flexinput_core::{Signal, SignalType};
 
 pub use gilrs_backend::{
@@ -54,6 +56,12 @@ pub struct PhysicalDevice {
     /// HidHide masking, so a slow SetupAPI lookup never runs on the I/O loop.
     pub vid: Option<u16>,
     pub pid: Option<u16>,
+    /// The backend only GUESSED this pad's layout: gilrs's positional default
+    /// (axis 0 = left X, button 0 = West, …) for a DirectInput pad no
+    /// controller database knows. The device-io dedup lets the same pad's
+    /// `sdl:raw:` entry — whose layout the user learns — replace such an
+    /// entry, but never one with a real mapping.
+    pub layout_guessed: bool,
 }
 
 pub trait DeviceBackend: Send {
@@ -102,6 +110,12 @@ pub trait DeviceBackend: Send {
     /// and only the device layer can subtract it early enough to fix both.
     /// Backends without an internal integrator can ignore this.
     fn set_gyro_drift(&mut self, _device_id: &str, _drift: Option<[f32; 3]>) {}
+    /// Hand the backend every learned raw-pad layout (see
+    /// `flexinput_core::raw_pad`), pushed from the I/O loop each iteration.
+    /// Cheap to call: the snapshot is only replaced when the user changes a
+    /// layout, so a backend compares the `Arc` by pointer and returns. Only the
+    /// backend that surfaces `sdl:raw:` devices uses it.
+    fn set_raw_pad_profiles(&mut self, _profiles: &std::sync::Arc<RawPadProfiles>) {}
 }
 
 pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {

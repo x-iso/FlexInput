@@ -358,6 +358,13 @@ pub struct AppSettings {
     /// module drives its lightbar; a device with no entry keeps its own colour.
     #[serde(default)]
     pub led_defaults: HashMap<String, [u8; 3]>,
+    /// Learned layouts of controllers no mapping database knows (the
+    /// `sdl:raw:` devices), keyed by model (`raw_pad::profile_key`), not by
+    /// device id — a layout taught once follows the pad across reconnects,
+    /// tabs and presets. Mirrored for the I/O thread, whose SDL backend
+    /// applies it.
+    #[serde(default)]
+    pub raw_pad_profiles: flexinput_core::raw_pad::RawPadProfiles,
     /// Render backend selection, applied at startup in `app/src/main.rs`
     /// (changing it requires an app restart). Auto = DirectX 12 on Windows
     /// (falling back to Vulkan, then OpenGL, if it fails to start) — Vulkan's
@@ -750,6 +757,7 @@ impl Default for AppSettings {
             hidhide_overrides: HashMap::new(),
             hidhide_kept_ids: Vec::new(),
             led_defaults: HashMap::new(),
+            raw_pad_profiles: HashMap::new(),
             renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,

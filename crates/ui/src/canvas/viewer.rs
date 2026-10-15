@@ -48,6 +48,8 @@ mod net;
 mod osc_envelope;
 mod pad_hints;
 mod pins;
+mod raw_motion;
+mod raw_pad;
 mod pinned;
 mod remapper_bodies;
 mod remapper_card;
@@ -80,6 +82,7 @@ pub(crate) use midi::*;
 pub(crate) use net::*;
 pub(crate) use osc_envelope::*;
 pub(crate) use pins::*;
+pub(crate) use raw_pad::*;
 pub(crate) use pinned::*;
 pub(crate) use remapper_bodies::*;
 pub(crate) use remapper_card::*;
@@ -941,6 +944,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             } else {
                 None
             };
+            // Width of the nav block's rows, when drawn this frame.
+            let mut rows_w: Option<f32> = None;
             if let Some((nav_on, nav_disabled)) = nav_state {
                 // The device icon (40 px square) draws its pad in the middle of
                 // the square; tuck the chevron up into the empty bottom margin.
@@ -977,8 +982,19 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 // rows can now be wider than the pin columns below.
                 let w = block.response.rect.width();
                 ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
+                rows_w = Some(w);
             } else {
                 source_rows(ui, snarl);
+            }
+
+            // Raw joysticks: Learn and what it caught, in the header like a
+            // MIDI In's message controls. Its width joins the rows' for the
+            // Auto-Map label's alignment.
+            if is_device_source && is_raw_pad_node("device.source", dev_id_str) {
+                let w = ui.scope(|ui| show_raw_pad_header_controls(node, _outputs, ui, snarl, self.live_signals))
+                    .response.rect.width();
+                let w = rows_w.map_or(w, |r| r.max(w));
+                ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
             }
 
             // Feedback Control: add to the game's feedback, or override it.
@@ -1189,6 +1205,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
         if module_id == "device.source" && device_id.starts_with("midi_in:") {
             show_midi_in_body(node_id, outputs, ui, snarl);
+            return;
+        }
+        if is_raw_pad_node(&module_id, &device_id) {
+            show_raw_pad_body(node_id, outputs, ui, snarl);
             return;
         }
         if module_id == "device.sink" && device_id.starts_with("midi_out:") {

@@ -174,7 +174,7 @@ fn eval_subgraph(
                 }
             }
             // A MIDI device's pins are dynamic (not in ALL_PINS).
-            fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
+            fill_raw_dynamic(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
 
             // Phase 2: explicit collected-pin overrides.
             for (i, pin_id) in collect_ids.iter().enumerate() {
@@ -667,7 +667,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
             }
             // A MIDI device's pins are dynamic (not in ALL_PINS): copy its live
             // ones too, under whatever the upstream collector already carried.
-            fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, &mut collector_sigs);
+            fill_raw_dynamic(dev_sigs, &upstream_dev, &uid_key, &mut collector_sigs);
 
             // Phase 2: explicit collected-pin overrides (win over pass-through).
             // A MIDI pin wired in here counts as PRODUCED, so a MIDI Out sink

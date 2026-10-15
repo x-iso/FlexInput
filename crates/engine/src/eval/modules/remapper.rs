@@ -43,7 +43,9 @@ pub(crate) fn eval_remapper_node(
             fill_upstream_midi(collector_id, dev_id, &*collector_sigs, dev_sigs, &mut upstream);
             // Pins an upstream module added to the bus that aren't canonical
             // either — an Area Mapper's keys, another Remapper's — likewise.
-            let extra_pins = fill_upstream_extra(collector_id, &*collector_sigs, &mut upstream);
+            let mut extra_pins = fill_upstream_extra(collector_id, &*collector_sigs, &mut upstream);
+            // A raw pad's own ports, when the Remapper sits straight on the pad.
+            fill_upstream_raw_extra(dev_id, dev_sigs, &mut upstream, &mut extra_pins);
             // A processed Vec2 on the collector is authoritative over raw axes.
             vec2_authoritative_axis_fill(&mut upstream, collector_id, &*collector_sigs);
             // Derive synthetic cardinal-direction Bool pins from each stick's

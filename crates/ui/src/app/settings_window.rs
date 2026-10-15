@@ -477,6 +477,28 @@ impl FlexInputApp {
         crate::device_led::publish(states);
     }
 
+    /// Fold Learn edits made on raw-pad device nodes into
+    /// `settings.raw_pad_profiles` (mirrored for the I/O thread), and publish
+    /// the layouts with which connected raw device uses which.
+    pub(crate) fn sync_raw_pad_profiles(&mut self) {
+        use flexinput_core::raw_pad::{is_raw_device_id, profile_key};
+        let edits = crate::raw_learn::drain_requests();
+        if !edits.is_empty()
+            && crate::raw_learn::apply_edits(&mut self.settings.raw_pad_profiles, edits)
+        {
+            self.settings_dirty = true;
+            if let Ok(mut m) = self.raw_pad_profiles.write() {
+                *m = Arc::new(self.settings.raw_pad_profiles.clone());
+            }
+        }
+        let keys: HashMap<String, String> = self.devices.iter()
+            .filter(|d| is_raw_device_id(&d.id))
+            .map(|d| (d.id.clone(), profile_key(d.vid, d.pid, &d.display_name)))
+            .collect();
+        let profiles = self.raw_pad_profiles.read().map(|m| Arc::clone(&m)).unwrap_or_default();
+        crate::raw_learn::publish(profiles, keys);
+    }
+
     /// `(hidden, manual)` for a device: its eye-button override when it has one,
     /// else whether the auto rule ("Hide original controllers" + remapped) hides it.
     #[cfg(windows)]

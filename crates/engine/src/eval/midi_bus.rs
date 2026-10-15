@@ -4,8 +4,9 @@
 //! too many to list in `automap::ALL_PINS`, and a MIDI In port only publishes
 //! the ones away from rest. So wherever the bus falls back to a RAW device for
 //! canonical pins, a MIDI device's live pins are copied in as well
-//! ([`fill_raw_midi`]); collector-to-collector pass-through already copies
-//! every entry, MIDI included.
+//! ([`fill_raw_dynamic`]); collector-to-collector pass-through already copies
+//! every entry, MIDI included. A raw pad's own ports (`extra:` pins, see
+//! `flexinput_core::raw_pad`) ride the same way.
 //!
 //! **Provenance.** A MIDI Out sink must not echo raw MIDI straight back out —
 //! with In and Out on the same port that is an instant feedback loop. So the
@@ -16,7 +17,7 @@
 
 use super::*;
 
-use flexinput_core::midi;
+use flexinput_core::{midi, raw_pad};
 
 /// `collector_sigs` pin prefix marking a `midi:` pin as produced on that key.
 pub(crate) const MIDI_PRODUCED_PREFIX: &str = "__midi_out__:";
@@ -26,24 +27,52 @@ pub(crate) fn is_midi_device(dev_id: &str) -> bool {
     dev_id.starts_with("midi_in:")
 }
 
-/// Copy `dev_id`'s live MIDI bus pins into `key`, never overwriting an entry
-/// the key already carries (an upstream producer's value wins over raw). A
-/// no-op for anything but a MIDI input port. Legacy `cc_<n>` / `pitch_bend`
-/// aliases stay off the bus.
-pub(crate) fn fill_raw_midi(
+/// Copy `dev_id`'s live dynamic bus pins into `key`, never overwriting an
+/// entry the key already carries (an upstream producer's value wins over
+/// raw): a MIDI input port's `midi:` pins, or the `extra:` pins of a raw pad's
+/// elements kept as ports of their own (`flexinput_core::raw_pad`) — neither
+/// fits in `automap::ALL_PINS`. A no-op for any other device. Legacy
+/// `cc_<n>` / `pitch_bend` aliases and a raw pad's per-element `raw:` pins
+/// stay off the bus.
+pub(crate) fn fill_raw_dynamic(
     dev_sigs: &SigMap,
     dev_id: &str,
     key: &str,
     collector_sigs: &mut SigMap,
 ) {
-    if !is_midi_device(dev_id) {
+    let wanted: fn(&str) -> bool = if is_midi_device(dev_id) {
+        midi::is_midi_pin
+    } else if raw_pad::is_raw_device_id(dev_id) {
+        raw_pad::is_extra_pin
+    } else {
         return;
-    }
+    };
     for ((d, pin), &sig) in dev_sigs.iter() {
-        if d != dev_id || !midi::is_midi_pin(pin) {
+        if d != dev_id || !wanted(pin) {
             continue;
         }
         collector_sigs.set_pin_if_absent(key, pin, sig);
+    }
+}
+
+/// A raw pad's `extra:` pins, for a mapping module wired straight to the pad
+/// (with a collector upstream, `fill_upstream_extra` already finds them on
+/// the bus). Adds each to `upstream` and `names` unless already there.
+pub(crate) fn fill_upstream_raw_extra(
+    dev_id: &str,
+    dev_sigs: &SigMap,
+    upstream: &mut PinSigs,
+    names: &mut Vec<String>,
+) {
+    if !raw_pad::is_raw_device_id(dev_id) {
+        return;
+    }
+    for ((d, pin), &sig) in dev_sigs.iter() {
+        if d != dev_id || !raw_pad::is_extra_pin(pin) || upstream.contains_key(pin.as_str()) {
+            continue;
+        }
+        upstream.insert(flexinput_core::pooled_string(pin), sig);
+        names.push(pin.clone());
     }
 }
 
@@ -208,4 +237,38 @@ pub(crate) fn midi_out_pins(
         }
     }
     out.into_iter().collect()
+}
+
+#[cfg(test)]
+mod raw_extra_tests {
+    use super::*;
+
+    fn sigs(entries: &[(&str, &str, Signal)]) -> SigMap {
+        entries.iter().map(|(d, p, s)| ((d.to_string(), p.to_string()), *s)).collect()
+    }
+
+    #[test]
+    fn a_raw_pads_own_ports_ride_the_bus_and_its_raw_pins_do_not() {
+        let dev = sigs(&[
+            ("sdl:raw:i0", "extra:b9", Signal::Bool(true)),
+            ("sdl:raw:i0", "raw:b9", Signal::Bool(true)),
+            ("sdl:raw:i0", "btn_south", Signal::Bool(false)),
+            ("sdl:raw:i1", "extra:b2", Signal::Bool(true)),
+        ]);
+        let mut bus = SigMap::default();
+        fill_raw_dynamic(&dev, "sdl:raw:i0", "fork:1:0", &mut bus);
+        assert_eq!(bus.len(), 1, "{bus:?}");
+        assert_eq!(bus.get_pin("fork:1:0", "extra:b9"), Some(&Signal::Bool(true)));
+
+        let mut upstream = PinSigs::default();
+        let mut names = Vec::new();
+        fill_upstream_raw_extra("sdl:raw:i0", &dev, &mut upstream, &mut names);
+        assert_eq!(names, ["extra:b9"]);
+
+        // Any other device carries none.
+        let mut bus = SigMap::default();
+        fill_raw_dynamic(&sigs(&[("gilrs:generic:0", "extra:b1", Signal::Bool(true))]),
+            "gilrs:generic:0", "k", &mut bus);
+        assert!(bus.is_empty());
+    }
 }

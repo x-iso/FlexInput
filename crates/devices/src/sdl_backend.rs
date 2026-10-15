@@ -19,25 +19,27 @@
 //! never touched from anywhere else — `DeviceBackend`'s `&mut self` methods make
 //! that a compile-time guarantee.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
 
-use flexinput_core::Signal;
+use flexinput_core::raw_pad::{self, RawLayout, RawPadProfiles, RawReading};
+use flexinput_core::{Signal, SignalType};
 
 use crate::{
     gyro::{ACCEL_REF_G, GYRO_REF_DPS},
     identification::ControllerKind,
     layouts,
     spike::SpikeFilter,
-    DeviceBackend, PhysicalDevice,
+    DeviceBackend, DevicePin, PhysicalDevice,
 };
 
 use sdl3::gamepad::{Axis, Button, Gamepad};
-use sdl3::joystick::JoystickId;
+use sdl3::joystick::{HatState, Joystick, JoystickId};
 use sdl3::sensor::SensorType;
-use sdl3::{GamepadSubsystem, Sdl};
+use sdl3::{GamepadSubsystem, JoystickSubsystem, Sdl};
 
 /// Device-id prefix for SDL pads. Kept distinct from gilrs's `gilrs:` prefix so
 /// ids never collide and `send()` routing (which keys off the prefix) is
@@ -118,8 +120,70 @@ struct SdlState {
     /// so it must outlive them — declared first, dropped last.
     _sdl: Sdl,
     gamepad_subsystem: GamepadSubsystem,
+    /// For the joysticks SDL has no gamepad mapping for — `SDL_GetGamepads`
+    /// never lists those, only `SDL_GetJoysticks` does.
+    joystick_subsystem: JoystickSubsystem,
     /// Opened generic pads, keyed by SDL joystick instance id.
     pads: HashMap<JoystickId, OpenPad>,
+    /// Opened raw joysticks (see [`RawPad`]), keyed the same way.
+    raw_pads: HashMap<JoystickId, RawPad>,
+}
+
+/// A joystick SDL has no gamepad mapping for — an unknown DirectInput pad, a
+/// wheel, a flight stick — read through SDL's joystick API as numbered axes,
+/// buttons and hats. Each element is published under its raw pin
+/// (`raw:a0`, `raw:b3`, `raw:h0`) and the user's learned layout
+/// (`flexinput_core::raw_pad`) turns them into canonical pins.
+struct RawPad {
+    /// Dropping it calls `SDL_CloseJoystick`.
+    joystick: Joystick,
+    /// `sdl:raw:<inst>`.
+    dev_id: String,
+    name: String,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    /// Which learned layout applies (`raw_pad::profile_key`).
+    profile_key: String,
+    /// The layout compiled from the current profiles; empty until learned.
+    layout: RawLayout,
+    /// Pin ids per element, built once so the poll doesn't format them.
+    axis_pins: Vec<String>,
+    button_pins: Vec<String>,
+    hat_pins: Vec<String>,
+    /// This poll's readings, kept to avoid reallocating every poll.
+    axes: Vec<f32>,
+    buttons: Vec<bool>,
+    hats: Vec<Vec2>,
+    /// Last-sent rumble (strong, weak), as for `OpenPad`.
+    last_rumble: (u8, u8),
+    /// The pad's HID tier (`raw_hid`): the fields SDL doesn't read. `None`
+    /// while it opens, or when the pad has no HID path or wouldn't open.
+    hid: Option<crate::raw_hid::HidTier>,
+    /// SDL's HID path for the pad, kept to reopen a stalled tier.
+    hid_path: Option<String>,
+    /// When the tier was last (re)requested, to space reopens out.
+    hid_requested: Option<Instant>,
+    /// Outlier spike filter over a learned motion sensor, as `OpenPad`'s.
+    spike: SpikeFilter,
+}
+
+fn compile_layout(profiles: &RawPadProfiles, key: &str) -> RawLayout {
+    profiles.get(key).map(|p| p.compile()).unwrap_or_default()
+}
+
+/// SDL's hat bits → (+x right, +y up).
+fn hat_vec(h: HatState) -> Vec2 {
+    match h {
+        HatState::Centered => Vec2::ZERO,
+        HatState::Up => Vec2::new(0.0, 1.0),
+        HatState::Down => Vec2::new(0.0, -1.0),
+        HatState::Left => Vec2::new(-1.0, 0.0),
+        HatState::Right => Vec2::new(1.0, 0.0),
+        HatState::RightUp => Vec2::new(1.0, 1.0),
+        HatState::RightDown => Vec2::new(1.0, -1.0),
+        HatState::LeftUp => Vec2::new(-1.0, 1.0),
+        HatState::LeftDown => Vec2::new(-1.0, -1.0),
+    }
 }
 
 /// One opened SDL gamepad plus the per-device state we carry across polls.
@@ -243,6 +307,16 @@ pub struct SdlBackend {
     /// Ids are per-connection: a reconnect gets a fresh id and a fresh probe.
     /// Pruned alongside `pads` when a device disappears.
     rejected_ids: std::collections::HashSet<JoystickId>,
+    /// Joystick ids `sync_raw_pads` turned down (our own virtual, a kind a
+    /// native parser owns, nothing to read). Kept apart from `rejected_ids`,
+    /// which is pruned against the GAMEPAD list and would forget these every
+    /// pass.
+    raw_rejected: HashSet<JoystickId>,
+    /// Every learned raw-pad layout, as last pushed by the I/O loop.
+    raw_profiles: Arc<RawPadProfiles>,
+    /// Opens raw pads' HID tiers off this thread; started with the first
+    /// raw pad.
+    hid_opener: Option<crate::raw_hid::Opener>,
     /// Global "route every pad through SDL" switch (see
     /// `DeviceBackend::set_sdl_all_pads`). When set, `sync_open_pads` claims
     /// EVERY gamepad, not just the ones kind-detect calls `Generic`.
@@ -258,6 +332,9 @@ impl SdlBackend {
             last_sig: HashMap::new(),
             init_failed: false,
             rejected_ids: std::collections::HashSet::new(),
+            raw_rejected: HashSet::new(),
+            raw_profiles: Arc::new(RawPadProfiles::new()),
+            hid_opener: None,
             sdl_all_pads: false,
         }
     }
@@ -289,6 +366,7 @@ impl SdlBackend {
     fn try_init() -> Option<SdlState> {
         let sdl = sdl3::init().ok()?;
         let gamepad_subsystem = sdl.gamepad().ok()?;
+        let joystick_subsystem = sdl.joystick().ok()?;
         // Do NOT create an EventPump / pump the SDL event queue. This backend
         // lives on the real-time device-io loop (up to 4 kHz); pumping the whole
         // SDL event system there is expensive (it drives window messages + full
@@ -301,7 +379,9 @@ impl SdlBackend {
         Some(SdlState {
             _sdl: sdl,
             gamepad_subsystem,
+            joystick_subsystem,
             pads: HashMap::new(),
+            raw_pads: HashMap::new(),
         })
     }
 
@@ -335,25 +415,8 @@ impl SdlBackend {
             if pads.contains_key(&id) || rejected.contains(&id) {
                 continue;
             }
-            // Only SDL-classified GAMEPADS (have a mapping); raw joysticks without
-            // a gamepad mapping are skipped — FlexInput's pin model is gamepad-shaped.
-            // A device that lands here (e.g. a DInput pad SDL has no mapping for)
-            // falls through to gilrs's WGI handling, which only exposes the standard
-            // gamepad axes — its extra/raw axes are invisible. This log is the recon
-            // hook for the planned SDL joystick-API fallback (raw numbered axes): it
-            // fires ONCE per connection (the rejected set skips it thereafter), so
-            // plugging such a pad in reveals its SDL guid without spamming.
-            if !gs.is_gamepad(id) {
-                // The guid string encodes bus/vid/pid — the device signature we'd
-                // need to add a mapping or match it for the joystick-API fallback.
-                eprintln!(
-                    "[sdl] non-gamepad joystick rejected (no SDL mapping) guid={} \
-                     — falls through to gilrs; raw axes not exposed",
-                    gs.guid_for_id(id)
-                );
-                rejected.insert(id);
-                continue;
-            }
+            // `gamepads()` lists only joysticks SDL HAS a mapping for; the rest
+            // are opened as raw pads by `sync_raw_pads`.
             let gamepad = match gs.open(id) {
                 Ok(g) => g,
                 // Open failures are NOT remembered: they can be transient
@@ -466,6 +529,152 @@ impl SdlBackend {
             );
         }
     }
+
+    /// Open every joystick SDL has NO gamepad mapping for as a [`RawPad`], and
+    /// drop the ones that have gone. These are what `SDL_GetGamepads` leaves
+    /// out: unknown DirectInput pads, wheels, flight sticks. gilrs lists the
+    /// same pads with a guessed layout; the device-io dedup keeps this entry
+    /// instead (see `PhysicalDevice::layout_guessed`).
+    fn sync_raw_pads(&mut self) {
+        let Some(state) = self.state.as_mut() else { return };
+        let state = &mut **state;
+        let ids = match state.joystick_subsystem.joysticks() {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        let present: HashSet<JoystickId> = ids.iter().copied().collect();
+        state.raw_pads.retain(|id, _| present.contains(id));
+        self.raw_rejected.retain(|id| present.contains(id));
+
+        for id in ids {
+            if state.raw_pads.contains_key(&id)
+                || self.raw_rejected.contains(&id)
+                || state.gamepad_subsystem.is_gamepad(id)
+            {
+                continue;
+            }
+            // Identity BEFORE opening: these are cached by SDL's enumeration,
+            // no device I/O, so a pad turned down here costs nothing to re-ask.
+            let (name, vid, pid) = unsafe {
+                use sdl3::sys::joystick::{
+                    SDL_GetJoystickNameForID, SDL_GetJoystickProductForID, SDL_GetJoystickVendorForID,
+                };
+                let p = SDL_GetJoystickNameForID(id);
+                let name = if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                };
+                let v = SDL_GetJoystickVendorForID(id);
+                let pr = SDL_GetJoystickProductForID(id);
+                (name, (v != 0).then_some(v), (pr != 0).then_some(pr))
+            };
+            // Never our own virtual, whatever the switch says (see the same
+            // guard in `sync_open_pads`).
+            if let (Some(v), Some(p)) = (vid, pid) {
+                if crate::gilrs_backend::is_hidmaestro_virtual_xinput(v, p, &name) {
+                    self.raw_rejected.insert(id);
+                    continue;
+                }
+            }
+            // A pad one of the native parsers reads (DualShock 4, DualSense,
+            // Switch Pro, Joy-Con 2) belongs to them even unmapped. Generic is
+            // the point of this path; XInput is allowed because kind-detect
+            // calls ANY Microsoft VID that, and a real XInput pad is always an
+            // SDL gamepad — an unmapped 045E joystick is something like a
+            // SideWinder.
+            let kind = ControllerKind::detect(&name, vid, pid);
+            if !matches!(kind, ControllerKind::Generic | ControllerKind::XInput) {
+                self.raw_rejected.insert(id);
+                continue;
+            }
+            let joystick = match state.joystick_subsystem.open(id) {
+                Ok(j) => j,
+                // Not remembered: an open can fail transiently mid-arrival.
+                Err(_) => continue,
+            };
+            let (n_axes, n_buttons, n_hats) =
+                (joystick.num_axes(), joystick.num_buttons(), joystick.num_hats());
+            if n_axes + n_buttons + n_hats == 0 {
+                self.raw_rejected.insert(id);
+                continue;
+            }
+            let serial = unsafe {
+                use sdl3::sys::joystick::{SDL_GetJoystickFromID, SDL_GetJoystickSerial};
+                let js = SDL_GetJoystickFromID(id);
+                let p = if js.is_null() { std::ptr::null() } else { SDL_GetJoystickSerial(js) };
+                (!p.is_null()).then(|| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+            };
+            let inst = match serial.as_deref().map(sanitize_inst) {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    let n = self.next_inst;
+                    self.next_inst += 1;
+                    format!("i{n}")
+                }
+            };
+            let dev_id = format!("{}{inst}", raw_pad::RAW_DEVICE_PREFIX);
+            // The name the device list shows is the one the profile is keyed
+            // on — the UI derives the key from the list (`profile_key`).
+            let name = if name.is_empty() { "Unknown controller".to_string() } else { name };
+            let profile_key = raw_pad::profile_key(vid, pid, &name);
+            let layout = compile_layout(&self.raw_profiles, &profile_key);
+            // The id-based GUID query, not `Joystick::guid`: that one panics on
+            // a zero GUID, and a panic here would take the whole I/O loop down.
+            eprintln!(
+                "[sdl] opened raw joystick {dev_id} name={name:?} vid={vid:04X?} pid={pid:04X?} \
+                 axes={n_axes} buttons={n_buttons} hats={n_hats} guid={} learned={}",
+                state.gamepad_subsystem.guid_for_id(id),
+                !layout.is_empty(),
+            );
+            // SDL caps nothing at 256, but a pin index is a u8.
+            let cap = |n: u32| n.min(256) as usize;
+            let pins = |n: u32, mk: fn(u8) -> raw_pad::RawSrc| {
+                (0..cap(n)).map(|i| mk(i as u8).pin_id()).collect::<Vec<_>>()
+            };
+            // The HID tier opens the collection SDL reads, by SDL's own path
+            // (DirectInput reports the HID interface path), off this thread.
+            let path = unsafe {
+                let p = sdl3::sys::joystick::SDL_GetJoystickPathForID(id);
+                (!p.is_null()).then(|| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+            };
+            let hid_path = path.filter(|p| p.to_ascii_lowercase().contains("hid"));
+            match &hid_path {
+                Some(path) => {
+                    if self.hid_opener.is_none() {
+                        self.hid_opener = crate::raw_hid::Opener::spawn();
+                    }
+                    if let Some(o) = &self.hid_opener {
+                        o.request(&dev_id, path);
+                    }
+                }
+                None => eprintln!("[raw-hid] {dev_id}: no HID path from SDL — SDL's elements only"),
+            }
+            state.raw_pads.insert(
+                id,
+                RawPad {
+                    joystick,
+                    dev_id,
+                    name,
+                    vid,
+                    pid,
+                    profile_key,
+                    layout,
+                    axis_pins: pins(n_axes, raw_pad::RawSrc::Axis),
+                    button_pins: pins(n_buttons, raw_pad::RawSrc::Button),
+                    hat_pins: pins(n_hats, raw_pad::RawSrc::Hat),
+                    axes: Vec::with_capacity(cap(n_axes)),
+                    buttons: Vec::with_capacity(cap(n_buttons)),
+                    hats: Vec::with_capacity(cap(n_hats)),
+                    last_rumble: (0, 0),
+                    hid: None,
+                    hid_requested: hid_path.as_ref().map(|_| Instant::now()),
+                    hid_path,
+                    spike: SpikeFilter::new(),
+                },
+            );
+        }
+    }
 }
 
 impl Default for SdlBackend {
@@ -482,6 +691,20 @@ impl DeviceBackend for SdlBackend {
         let Some(state) = self.state.as_mut() else { return };
         if let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) {
             pad.spike.set_config(enabled, sensitivity_pct, window);
+        } else if let Some(pad) = state.raw_pads.values_mut().find(|p| p.dev_id == device_id) {
+            pad.spike.set_config(enabled, sensitivity_pct, window);
+        }
+    }
+
+    fn set_raw_pad_profiles(&mut self, profiles: &Arc<RawPadProfiles>) {
+        if Arc::ptr_eq(&self.raw_profiles, profiles) {
+            return;
+        }
+        self.raw_profiles = Arc::clone(profiles);
+        if let Some(state) = self.state.as_mut() {
+            for pad in state.raw_pads.values_mut() {
+                pad.layout = compile_layout(&self.raw_profiles, &pad.profile_key);
+            }
         }
     }
 
@@ -507,6 +730,7 @@ impl DeviceBackend for SdlBackend {
             return Vec::new();
         }
         self.sync_open_pads();
+        self.sync_raw_pads();
 
         let mut result = Vec::new();
         let Some(state) = self.state.as_ref() else { return result };
@@ -521,6 +745,34 @@ impl DeviceBackend for SdlBackend {
                 instance_path: None,
                 vid: pad.gamepad.vendor_id(),
                 pid: pad.gamepad.product_id(),
+                layout_guessed: false,
+            });
+        }
+        for pad in state.raw_pads.values() {
+            // Ports for what has been learned, then the bus. A pad learned
+            // nothing yet is just its Auto-Map port: the node's Learn adds the
+            // rest.
+            let mut outputs: Vec<DevicePin> = self.raw_profiles.get(&pad.profile_key)
+                .map(|p| p.ports())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, display_name, signal_type)| DevicePin { id, display_name, signal_type })
+                .collect();
+            outputs.push(DevicePin {
+                id: "automap_out".into(),
+                display_name: "Auto-Map".into(),
+                signal_type: SignalType::AutoMap,
+            });
+            result.push(PhysicalDevice {
+                id: pad.dev_id.clone(),
+                display_name: pad.name.clone(),
+                kind: ControllerKind::Generic,
+                outputs,
+                inputs: layouts::inputs_for(ControllerKind::Generic),
+                instance_path: None,
+                vid: pad.vid,
+                pid: pad.pid,
+                layout_guessed: false,
             });
         }
         result
@@ -773,6 +1025,98 @@ impl DeviceBackend for SdlBackend {
             sig_updates.push((dev.clone(), h));
         }
 
+        // ── Raw joysticks: every element under its raw pin, then whatever the
+        // learned layout makes of them. ──────────────────────────────────────
+        // HID tiers that finished opening join their pad first.
+        if let Some(opener) = &self.hid_opener {
+            for (dev_id, opened) in opener.finished() {
+                let Some(pad) = state.raw_pads.values_mut().find(|p| p.dev_id == dev_id) else {
+                    continue; // gone before its HID tier opened
+                };
+                match opened {
+                    Ok(o) => {
+                        let tier = o.into_tier(&dev_id);
+                        if let Some(info) = crate::raw_hid::hid_info(&dev_id) {
+                            eprintln!(
+                                "[raw-hid] {dev_id}: HID tier open — {} field(s) past SDL, {} vendor blob(s) {:?}",
+                                info.fields.len(), info.blobs.len(), info.blobs,
+                            );
+                        }
+                        pad.hid = Some(tier);
+                    }
+                    Err(e) => eprintln!("[raw-hid] {dev_id}: {e} — SDL's elements only"),
+                }
+            }
+        }
+        for pad in state.raw_pads.values_mut() {
+            let start_len = out.len();
+            let js = &pad.joystick;
+            pad.axes.clear();
+            pad.buttons.clear();
+            pad.hats.clear();
+            for (i, pin) in pad.axis_pins.iter().enumerate() {
+                let v = js.axis(i as u32).map_or(0.0, |v| (v as f32 / 32767.0).clamp(-1.0, 1.0));
+                pad.axes.push(v);
+                out.push((pad.dev_id.clone(), pin.clone(), Signal::Float(v)));
+            }
+            for (i, pin) in pad.button_pins.iter().enumerate() {
+                let b = js.button(i as u32).unwrap_or(false);
+                pad.buttons.push(b);
+                out.push((pad.dev_id.clone(), pin.clone(), Signal::Bool(b)));
+            }
+            for (i, pin) in pad.hat_pins.iter().enumerate() {
+                let h = js.hat(i as u32).map_or(Vec2::ZERO, hat_vec);
+                pad.hats.push(h);
+                out.push((pad.dev_id.clone(), pin.clone(), Signal::Vec2(h)));
+            }
+            if let Some(hid) = pad.hid.as_mut() {
+                hid.drain();
+                hid.publish(&mut out);
+            }
+            // A stalled tier is dropped and opened again, at most every
+            // 10 s (see `HidTier::stalled`).
+            if pad.hid.as_ref().is_some_and(|h| h.stalled())
+                && pad.hid_requested.is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+            {
+                if let (Some(o), Some(path)) = (&self.hid_opener, &pad.hid_path) {
+                    eprintln!("[raw-hid] {}: no reports for a while — reopening the HID tier", pad.dev_id);
+                    pad.hid = None;
+                    pad.hid_requested = Some(Instant::now());
+                    o.request(&pad.dev_id, path);
+                }
+            }
+            if !pad.layout.is_empty() {
+                let reports: &dyn raw_pad::ReportSource = match &pad.hid {
+                    Some(h) => &h.reports,
+                    None => &(),
+                };
+                let reading = RawReading { axes: &pad.axes, buttons: &pad.buttons, hats: &pad.hats, reports };
+                let dev = &pad.dev_id;
+                pad.layout.apply(&reading, |id, s| out.push((dev.clone(), id.to_string(), s)));
+                // A learned motion sensor: through the spike filter as one
+                // six-axis sample, like the SDL gamepad path's.
+                let (gyro, accel) = pad.layout.motion(&reading);
+                if gyro.is_some() || accel.is_some() {
+                    let mut imu = [0.0f32; 6];
+                    imu[..3].copy_from_slice(&gyro.unwrap_or_default());
+                    imu[3..].copy_from_slice(&accel.unwrap_or_default());
+                    let imu = pad.spike.push(imu);
+                    if gyro.is_some() {
+                        for (pin, v) in ["gyro_x", "gyro_y", "gyro_z"].iter().zip(&imu[..3]) {
+                            out.push((dev.clone(), pin.to_string(), Signal::Float(*v)));
+                        }
+                    }
+                    if accel.is_some() {
+                        for (pin, v) in ["accel_x", "accel_y", "accel_z"].iter().zip(&imu[3..]) {
+                            out.push((dev.clone(), pin.to_string(), Signal::Float(*v)));
+                        }
+                    }
+                }
+            }
+            let h = hash_signals(&out[start_len..]);
+            sig_updates.push((pad.dev_id.clone(), h));
+        }
+
         // Update event-count approximation (one tick counted if the pad's signal
         // set changed since last poll — SDL gives no raw event count).
         for (dev, h) in sig_updates {
@@ -798,6 +1142,25 @@ impl DeviceBackend for SdlBackend {
         };
         // Find the pad by device id.
         let Some(state) = self.state.as_mut() else { return };
+        if raw_pad::is_raw_device_id(device_id) {
+            // A raw joystick has nothing but rumble, where its driver offers
+            // force feedback at all (SDL's DirectInput driver plays it).
+            let Some(pad) = state.raw_pads.values_mut().find(|p| p.dev_id == device_id) else {
+                return;
+            };
+            match pin_id {
+                "rumble_strong" => pad.last_rumble.0 = byte,
+                "rumble_weak" => pad.last_rumble.1 = byte,
+                _ => return,
+            }
+            let (strong, weak) = pad.last_rumble;
+            let _ = pad.joystick.set_rumble(
+                (strong as u16).saturating_mul(257),
+                (weak as u16).saturating_mul(257),
+                1000,
+            );
+            return;
+        }
         let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) else {
             return;
         };

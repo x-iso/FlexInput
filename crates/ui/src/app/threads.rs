@@ -40,6 +40,8 @@ pub(crate) fn spawn_io_thread(
     // Per-device default lightbar colour (device-card swatch), sent while no
     // game or module drives that pad's lightbar.
     led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
+    // Learned raw-pad layouts, swapped wholesale on an edit.
+    raw_pad_profiles: Arc<RwLock<Arc<flexinput_core::raw_pad::RawPadProfiles>>>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -212,6 +214,16 @@ pub(crate) fn spawn_io_thread(
                 }
                 mark!("gyro_drift");
 
+                // Push the learned raw-pad layouts before polling, so the first
+                // poll after an edit already reads the pad the new way. The
+                // backend compares the Arc by pointer: no work while unchanged.
+                {
+                    let profiles = Arc::clone(&raw_pad_profiles.read().unwrap());
+                    for backend in &mut backends {
+                        backend.set_raw_pad_profiles(&profiles);
+                    }
+                }
+
                 // Push the global-SDL switch before enumerate/poll so a live
                 // toggle takes effect this iteration.
                 {
@@ -335,13 +347,34 @@ pub(crate) fn spawn_io_thread(
                     // Controller" via gilrs). When SDL surfaced a pad, drop gilrs's
                     // copy of the same vid/pid. This only fires on an ACTUAL match, so
                     // a generic SDL couldn't open never vanishes (gilrs keeps it).
+                    use flexinput_core::raw_pad::is_raw_device_id;
                     let sdl_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
-                        .filter(|d| d.id.starts_with("sdl:"))
+                        .filter(|d| d.id.starts_with("sdl:") && !is_raw_device_id(&d.id))
                         .filter_map(|d| Some((d.vid?, d.pid?)))
                         .collect();
                     if !sdl_vp.is_empty() {
                         devs.retain(|d| !(d.id.starts_with("gilrs:")
                             && d.vid.zip(d.pid).is_some_and(|vp| sdl_vp.contains(&vp))));
+                    }
+                    // Raw joysticks (`sdl:raw:`) — pads SDL has NO mapping for.
+                    // gilrs lists the same pad too: with a real database mapping
+                    // (gilrs ships a bigger community database than SDL's built-in
+                    // one) it keeps the pad and the raw entry goes; with only its
+                    // positional guess, the raw entry — whose layout the user
+                    // learns — replaces it.
+                    let gilrs_mapped_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
+                        .filter(|d| d.id.starts_with("gilrs:") && !d.layout_guessed)
+                        .filter_map(|d| Some((d.vid?, d.pid?)))
+                        .collect();
+                    devs.retain(|d| !(is_raw_device_id(&d.id)
+                        && d.vid.zip(d.pid).is_some_and(|vp| gilrs_mapped_vp.contains(&vp))));
+                    let raw_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
+                        .filter(|d| is_raw_device_id(&d.id))
+                        .filter_map(|d| Some((d.vid?, d.pid?)))
+                        .collect();
+                    if !raw_vp.is_empty() {
+                        devs.retain(|d| !(d.id.starts_with("gilrs:") && d.layout_guessed
+                            && d.vid.zip(d.pid).is_some_and(|vp| raw_vp.contains(&vp))));
                     }
                     // Append MIDI device list maintained by the MIDI watch thread.
                     devs.extend(shared_midi_devices.read().unwrap().iter().cloned());

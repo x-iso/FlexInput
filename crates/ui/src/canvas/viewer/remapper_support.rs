@@ -148,6 +148,18 @@ pub(crate) fn remapper_pressed_now(
             }
         }
     }
+    // A raw pad's own button ports (`extra:` pins) — the controls its layout
+    // kept apart because no gamepad button fits them.
+    if flexinput_core::raw_pad::is_raw_device_id(dev_id) {
+        let mut extras: Vec<String> = live_signals.iter()
+            .filter(|((d, pin), sig)| d == dev_id
+                && flexinput_core::raw_pad::is_extra_pin(pin)
+                && matches!(sig, Signal::Bool(true)))
+            .map(|((_, pin), _)| pin.clone())
+            .collect();
+        extras.sort();
+        out.extend(extras);
+    }
     // Synthetic stick-cardinal pins. Mirror of the rule in
     // `flexinput_engine::eval::derive_stick_cardinals` so what Learn captures
     // matches what the eval engine will trigger on.
@@ -433,6 +445,11 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
             .on_hover_text(p.display_name()).rect;
+    }
+    if flexinput_core::raw_pad::is_extra_pin(pin_id) {
+        let name = crate::raw_learn::extra_label(pin_id);
+        return ui.label(egui::RichText::new(&name).size(13.0).strong())
+            .on_hover_text(format!("{name} — this controller's own port")).rect;
     }
     if let Some(k) = flexinput_core::media::media_key(pin_id) {
         return ui.label(egui::RichText::new(media_chip_label(k)).size(13.0).strong())
@@ -947,6 +964,9 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
         return p.display_name();
+    }
+    if flexinput_core::raw_pad::is_extra_pin(pin_id) {
+        return crate::raw_learn::extra_label(pin_id);
     }
     // Synthetic stick-cardinal pins (derived inside Remapper, not canonical).
     match pin_id {
