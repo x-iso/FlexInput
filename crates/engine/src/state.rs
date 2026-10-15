@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use glam::Vec2;
-use flexinput_core::Signal;
+use flexinput_core::{Signal, SigMap};
 
 /// Per-node computation state owned by the processing thread.
 /// Replaces the computation fields that were previously in NodeExtra.
@@ -109,7 +109,7 @@ pub struct NodeState {
     /// cycle — would never observe the value this tick. This snapshot lets such a
     /// reader fall back to the last published value (one tick stale, imperceptible
     /// at kHz rates). Only the reserved `MACRO_CARRY_UID` entry uses this field.
-    pub macro_prev: HashMap<(String, String), Signal>,
+    pub macro_prev: SigMap,
     /// Virtual Menu SOURCE-BLOCK request, `(device_id, pin_id)` pairs an open
     /// menu asked to zero at the source so those analog inputs reach ONLY the
     /// menu's navigation (not a mouse mapping, another module, or the pad).
@@ -121,7 +121,7 @@ pub struct NodeState {
     /// is applied so the menu can still READ its navigation inputs (it's the
     /// reason they're blocked for everyone else). Only the reserved
     /// `MACRO_CARRY_UID` entry uses this field.
-    pub unblocked_src: HashMap<(String, String), Signal>,
+    pub unblocked_src: SigMap,
     /// Devices a card asked to Set Neutral Forward last tick
     /// (`flexinput_core::imu::ORIENT_NEUTRAL_PIN`), drained from
     /// `collector_sigs` like `source_block`. Only `MACRO_CARRY_UID` uses this.
@@ -131,6 +131,46 @@ pub struct NodeState {
     /// the Calibration window's baseline is the persisted part. Only
     /// `MACRO_CARRY_UID` uses this.
     pub orient_neutral: HashMap<String, glam::Quat>,
+    /// A sink's AutoMap source→destination pin pairing, kept between ticks:
+    /// `automap::resolve_mapping` compares every source pin with every
+    /// destination pin, and its answer only changes when the pin lists do.
+    pub automap_pairs: Option<AutomapPairs>,
+}
+
+/// See `NodeState::automap_pairs`: the pin lists a pairing was resolved for,
+/// and the pairs as indices into them.
+#[derive(Default, Clone)]
+pub struct AutomapPairs {
+    pub src: Vec<String>,
+    pub dst: Vec<String>,
+    pub pairs: Vec<(u16, u16)>,
+}
+
+impl AutomapPairs {
+    /// The pairing for `src` → `dst`, resolved again only when either changed.
+    pub fn resolve<'a>(cache: &'a mut Option<AutomapPairs>, src: &[&str], dst: &[&str]) -> &'a [(u16, u16)] {
+        let fresh = cache.as_ref().is_some_and(|c| {
+            c.src.len() == src.len() && c.dst.len() == dst.len()
+                && c.src.iter().zip(src).all(|(a, b)| a == b)
+                && c.dst.iter().zip(dst).all(|(a, b)| a == b)
+        });
+        if !fresh {
+            // By value: resolve_mapping hands back the digital-trigger bridge
+            // pairs as literals, not as elements of `src` / `dst`.
+            let index_of = |list: &[&str], p: &str| {
+                list.iter().position(|s| *s == p).unwrap_or(0) as u16
+            };
+            let pairs = flexinput_core::automap::resolve_mapping(src, dst).into_iter()
+                .map(|(s, d)| (index_of(src, s), index_of(dst, d)))
+                .collect();
+            *cache = Some(AutomapPairs {
+                src: src.iter().map(|s| s.to_string()).collect(),
+                dst: dst.iter().map(|s| s.to_string()).collect(),
+                pairs,
+            });
+        }
+        &cache.as_ref().unwrap().pairs
+    }
 }
 
 /// Progress of one order-aware Remapper card (see `NodeState::order_state`).

@@ -1385,7 +1385,7 @@ fn render_subpatch_body(
             || i.events.iter().any(|e| matches!(e,
                 egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)))
     });
-    let pre_snapshot = if needs_snapshot { Some(canvas.snarl.clone()) } else { None };
+    let pre_snapshot = if needs_snapshot { Some(canvas.undo_clone()) } else { None };
 
     let area_id = egui::Id::new(("easy_subpatch_body_area", outer_id.0));
     egui::Area::new(area_id)

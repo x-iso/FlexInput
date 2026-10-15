@@ -43,8 +43,8 @@ pub(crate) fn compute_node(
     snap: &NodeSnap,
     inputs: &[Option<Signal>],
     state: &mut NodeState,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     puffin::profile_function!();
@@ -60,7 +60,7 @@ pub(crate) fn compute_node(
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
-                dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &pin_id).copied()
                     .or_else(|| if is_midi { flexinput_core::midi::rest_value_for_id(pin_id) } else { None })
             }).collect()
         }
@@ -76,13 +76,13 @@ pub(crate) fn compute_node(
                 // "automap_pass" or empty = the AutoMap passthrough slot — no signal value.
                 if pin_id.is_empty() || pin_id == "automap_pass" { return None; }
                 if !collector_id.is_empty() {
-                    if let Some(&sig) = collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())) {
+                    if let Some(&sig) = collector_sigs.get_pin(&collector_id, &pin_id) {
                         return Some(sig);
                     }
                 }
                 // MIDI pins are only published away from rest; a missing one
                 // reads as its rest value.
-                dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &pin_id).copied()
                     .or_else(|| flexinput_core::midi::parse_pin(pin_id).map(|p| p.rest_value()))
             }).collect()
         }
@@ -122,11 +122,11 @@ pub(crate) fn compute_node(
             let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
             let read = |pin: &str| -> Option<Signal> {
                 if !collector_id.is_empty() {
-                    if let Some(&s) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                    if let Some(&s) = collector_sigs.get_pin(&collector_id, &pin) {
                         return Some(s);
                     }
                 }
-                dev_sigs.get(&(dev_id.to_string(), pin.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &pin).copied()
             };
             let read_edges = |field: usize, which: &str| -> Vec<f32> {
                 let key = if field == 0 { which.to_string() } else { format!("{which}{field}") };
@@ -212,8 +212,8 @@ pub(crate) fn compute_node(
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
                 let ty = port_types.get(pin_id).copied().unwrap_or(SignalType::Bool);
-                let scalar = collector_sigs.get(&(mac::SIGS_NS.to_string(), pin_id.to_string())).copied();
-                let vec2 = collector_sigs.get(&(mac::SIGS_NS_VEC2.to_string(), pin_id.to_string())).copied();
+                let scalar = collector_sigs.get_pin(&mac::SIGS_NS, &pin_id).copied();
+                let vec2 = collector_sigs.get_pin(&mac::SIGS_NS_VEC2, &pin_id).copied();
                 macro_port_value(ty, scalar, vec2)
             }).collect()
         }
@@ -368,7 +368,7 @@ pub(crate) fn compute_node(
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
-                let sig = dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()?;
+                let sig = dev_sigs.get_pin(&dev_id, &pin_id).copied()?;
                 Some(if dz > 0.0 && is_stick_pin(pin_id) { apply_deadzone(sig, dz) } else { sig })
             }).collect()
         }

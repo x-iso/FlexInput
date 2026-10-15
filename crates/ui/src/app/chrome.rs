@@ -1186,7 +1186,7 @@ pub(crate) fn mode_pill_texture(
     h_px: u32,
 ) -> Option<egui::TextureHandle> {
     let cache_key = egui::Id::new(("mode_pill_tex", bytes.as_ptr() as usize, w_px, h_px));
-    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+    if let Some(h) = crate::widgets::tex_cache::get(ui.ctx(), cache_key) {
         return Some(h);
     }
     let text = std::str::from_utf8(bytes).ok()?;
@@ -1197,7 +1197,7 @@ pub(crate) fn mode_pill_texture(
         img,
         egui::TextureOptions::LINEAR,
     );
-    ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
     Some(handle)
 }
 

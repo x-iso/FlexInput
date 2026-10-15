@@ -155,7 +155,7 @@ pub(crate) fn gesture_required_bits(in_pins: &[&str]) -> Option<[u8; 2]> {
 pub(crate) fn gesture_tick(
     required: [u8; 2],
     visited: &mut [u8; 2],
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
 ) -> bool {
     for (stick_idx, axis_pins) in [
         (0usize, ("left_stick_x",  "left_stick_y")),
@@ -481,12 +481,12 @@ pub(crate) fn analog_digital_pulse(
 /// Per-axis overrides are untouched: if the axes ARE present on the collector,
 /// they win (the user processed them individually).
 pub(crate) fn vec2_authoritative_axis_fill(
-    upstream: &mut HashMap<String, Signal>,
+    upstream: &mut PinSigs,
     collector_id: &str,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &SigMap,
 ) {
     if collector_id.is_empty() { return; }
-    let coll = |pin: &str| collector_sigs.get(&(collector_id.to_string(), pin.to_string())).copied();
+    let coll = |pin: &str| collector_sigs.get_pin(&collector_id, &pin).copied();
     for (vec2, xa, ya) in [
         ("left_stick",  "left_stick_x",  "left_stick_y"),
         ("right_stick", "right_stick_x", "right_stick_y"),
@@ -506,8 +506,8 @@ pub(crate) fn vec2_authoritative_axis_fill(
             Some(a) => (a - comp).abs() > 1e-3,
             None => true,
         };
-        if disagree(ax, v.x) { upstream.insert(xa.to_string(), Signal::Float(v.x)); }
-        if disagree(ay, v.y) { upstream.insert(ya.to_string(), Signal::Float(v.y)); }
+        if disagree(ax, v.x) { upstream.insert(flexinput_core::pooled_string(xa), Signal::Float(v.x)); }
+        if disagree(ay, v.y) { upstream.insert(flexinput_core::pooled_string(ya), Signal::Float(v.y)); }
     }
 }
 
@@ -517,7 +517,7 @@ pub(crate) fn vec2_authoritative_axis_fill(
 /// dominates the perpendicular axis by 1.5× — so pushing slightly off-axis
 /// still captures a single direction, but a genuine diagonal fires both
 /// cardinals as a chord.
-pub(crate) fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
+pub(crate) fn derive_stick_cardinals(upstream: &mut PinSigs) {
     // Tuned for round-gate sticks where 45° physically caps at ~0.707.
     //   T_CARDINAL — minimum push for a single cardinal to fire when
     //     the perpendicular axis is quiet.
@@ -551,10 +551,10 @@ pub(crate) fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
             || y >  T_CARDINAL && (ax < T_CARDINAL ||  y >  DOM * ax);
         let down_on  = diagonal && y < -T_DIAGONAL
             || y < -T_CARDINAL && (ax < T_CARDINAL || -y >  DOM * ax);
-        upstream.insert(up.to_string(),    Signal::Bool(up_on));
-        upstream.insert(down.to_string(),  Signal::Bool(down_on));
-        upstream.insert(left.to_string(),  Signal::Bool(left_on));
-        upstream.insert(right.to_string(), Signal::Bool(right_on));
+        upstream.insert(flexinput_core::pooled_string(up),    Signal::Bool(up_on));
+        upstream.insert(flexinput_core::pooled_string(down),  Signal::Bool(down_on));
+        upstream.insert(flexinput_core::pooled_string(left),  Signal::Bool(left_on));
+        upstream.insert(flexinput_core::pooled_string(right), Signal::Bool(right_on));
     }
 }
 
@@ -682,7 +682,7 @@ pub(crate) fn is_macro_style_target(pin: &str) -> bool {
 }
 
 pub(crate) fn merge_macro_ns(
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     ns: &str,
     pin: &str,
     sig: Signal,
@@ -696,7 +696,7 @@ pub(crate) fn merge_macro_ns(
 
 /// Publish the scalar/bool aspect of a macro-port write.
 pub(crate) fn merge_macro_scalar(
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     pin: &str,
     sig: Signal,
 ) {
@@ -705,7 +705,7 @@ pub(crate) fn merge_macro_scalar(
 
 /// Publish the Vec2 aspect of a macro-port write (zone-local deflection).
 pub(crate) fn merge_macro_vec2(
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     pin: &str,
     v: Vec2,
 ) {

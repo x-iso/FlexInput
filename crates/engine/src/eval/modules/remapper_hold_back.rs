@@ -405,7 +405,7 @@ pub(crate) fn hold_back_tick(
     fired_any: &HashSet<&str>,
     fired_sticky: &HashSet<&str>,
     down: &HashSet<&str>,
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     dt: f32,
 ) -> HoldBackView {
     let mut pins: HashSet<String> = states.keys().cloned().collect();
@@ -494,7 +494,7 @@ pub(crate) fn hold_back_tick(
 /// A press that can be replayed late: a plain button. A stick direction or
 /// trigger can't be — there's no deflection to play back — so it just stays
 /// hidden until the card gives up, then goes live if still pushed.
-fn replayable(upstream: &HashMap<String, Signal>, pin: &str) -> bool {
+fn replayable(upstream: &PinSigs, pin: &str) -> bool {
     analog_axis_for_cardinal(pin).is_none() && matches!(upstream.get(pin), Some(Signal::Bool(_)))
 }
 
@@ -503,7 +503,7 @@ fn replayable(upstream: &HashMap<String, Signal>, pin: &str) -> bool {
 fn order_held<'a>(
     m: &Value,
     pins: &[&'a str],
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     down: &mut HashSet<&'a str>,
 ) -> Vec<bool> {
     let shape = MappingShape::from_card(m);
@@ -526,7 +526,7 @@ pub(crate) struct HoldBackPass {
     /// Each deciding card's outcome; `None` for every other card.
     pub(crate) verdicts: Vec<Option<CardVerdict>>,
     /// The inputs everything else on the node reads.
-    pub(crate) view: HashMap<String, Signal>,
+    pub(crate) view: PinSigs,
     /// Inputs held back this tick. The caller marks them consumed, so a
     /// downstream Combiner with a raw-device port doesn't pick them up there.
     pub(crate) hidden: HashSet<String>,
@@ -536,7 +536,7 @@ pub(crate) struct HoldBackPass {
 /// reads: `upstream` itself unless a hold-back is hiding or replaying input.
 pub(crate) fn remapper_hold_back_pass(
     mappings: &[Value],
-    upstream: HashMap<String, Signal>,
+    upstream: PinSigs,
     ns: &mut NodeState,
     dt: f32,
 ) -> HoldBackPass {

@@ -11,7 +11,12 @@ use serde_json::Value;
 pub struct NodeExtra {
     /// Rolling signal history for oscilloscope / vectorscope nodes.
     /// Populated each frame by draining the processing thread's scope_pending buffer.
-    pub history: VecDeque<Vec<Option<f32>>>,
+    ///
+    /// Copy-on-write (`Arc`): up to 20k samples, and a node is cloned by the
+    /// renderers, the sub-patch editor's display sync and every undo snapshot.
+    /// Those clones now share it; an append (`Arc::make_mut`) copies only while
+    /// something else still holds it — so a pasted scope still gets its own.
+    pub history: std::sync::Arc<VecDeque<Vec<Option<f32>>>>,
     /// Most recent evaluated signal per input (for readout / body display).
     /// Populated each frame from the processing thread's last_inputs map.
     pub last_signals: Vec<Option<Signal>>,

@@ -82,8 +82,8 @@ pub(crate) fn gyro_orient_source(params: &HashMap<String, Value>) -> OrientSourc
 /// normalised.
 fn device_orientation(
     params: &HashMap<String, Value>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
 ) -> Option<glam::Quat> {
     let dev_id = params.get("_automap_device_id").and_then(|v| v.as_str())?;
     let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -261,8 +261,8 @@ pub(crate) fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
     params: &HashMap<String, Value>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     let (family, axis) = gyro_resolve_mode(params);
@@ -283,11 +283,11 @@ pub(crate) fn compute_gyro_3dof(
             let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
             let get = |pin: &str| -> f32 {
                 if !collector_id.is_empty() {
-                    if let Some(Signal::Float(f)) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                    if let Some(Signal::Float(f)) = collector_sigs.get_pin(&collector_id, &pin) {
                         return *f;
                     }
                 }
-                match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
+                match dev_sigs.get_pin(&dev_id, &pin) {
                     Some(Signal::Float(f)) => *f,
                     _ => 0.0,
                 }
@@ -295,16 +295,16 @@ pub(crate) fn compute_gyro_3dof(
             let az_raw = {
                 let pin = "accel_z";
                 if !collector_id.is_empty() {
-                    if let Some(Signal::Float(f)) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                    if let Some(Signal::Float(f)) = collector_sigs.get_pin(&collector_id, &pin) {
                         *f
                     } else {
-                        match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
+                        match dev_sigs.get_pin(&dev_id, &pin) {
                             Some(Signal::Float(f)) => *f,
                             _ => 1.0,
                         }
                     }
                 } else {
-                    match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
+                    match dev_sigs.get_pin(&dev_id, &pin) {
                         Some(Signal::Float(f)) => *f,
                         _ => 1.0,
                     }
@@ -643,7 +643,7 @@ pub(crate) fn compute_gyro_3dof(
     let dev_gyro_mult = params
         .get("_automap_device_id")
         .and_then(|v| v.as_str())
-        .and_then(|dev| dev_sigs.get(&(dev.to_string(), "__gyro_mult".to_string())))
+        .and_then(|dev| dev_sigs.get_pin(&dev, "__gyro_mult"))
         .and_then(|s| if let Signal::Float(f) = s { Some(*f) } else { None })
         .filter(|m| m.abs() > 1e-6)
         .unwrap_or(1.0);
@@ -864,7 +864,7 @@ pub(crate) fn compute_gyro_3dof(
     let neutral_now = params
         .get("_automap_device_id")
         .and_then(|v| v.as_str())
-        .and_then(|d| dev_sigs.get(&(d.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())))
+        .and_then(|d| dev_sigs.get_pin(&d, &ORIENT_NEUTRAL_DEV_PIN))
         .is_some_and(|s| s.as_bool());
     if neutral_now {
         state.aux_f32[17..21].fill(0.0);
@@ -969,7 +969,7 @@ pub(crate) fn compute_gyro_3dof(
 mod hold_offset_tests {
     use super::compute_gyro_3dof;
     use crate::NodeState;
-    use flexinput_core::Signal;
+    use flexinput_core::{Signal, SigMap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -981,7 +981,7 @@ mod hold_offset_tests {
         for (k, v) in params {
             p.insert((*k).into(), v.clone());
         }
-        let (dev, coll) = (HashMap::new(), HashMap::new());
+        let (dev, coll) = (SigMap::default(), SigMap::default());
         let inputs: Vec<Option<Signal>> = vec![
             None,
             None,
@@ -1102,7 +1102,7 @@ mod hold_offset_tests {
 mod edge_turn_tests {
     use super::{compute_gyro_3dof, edge_cfg, edge_turn};
     use crate::NodeState;
-    use flexinput_core::Signal;
+    use flexinput_core::{Signal, SigMap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -1113,7 +1113,7 @@ mod edge_turn_tests {
     struct Rig {
         st: NodeState,
         p: HashMap<String, Value>,
-        dev: HashMap<(String, String), Signal>,
+        dev: SigMap,
     }
 
     impl Rig {
@@ -1124,7 +1124,7 @@ mod edge_turn_tests {
             for (k, v) in extra {
                 p.insert((*k).into(), v.clone());
             }
-            Rig { st: NodeState::default(), p, dev: HashMap::new() }
+            Rig { st: NodeState::default(), p, dev: SigMap::default() }
         }
         /// Run `secs` at a constant gyro (°/s, canonical x/y/z) and return the
         /// last (X, Y, Orientation).
@@ -1139,7 +1139,7 @@ mod edge_turn_tests {
                 Some(Signal::Float(0.0)),
                 Some(Signal::Float(0.125)),
             ];
-            let coll = HashMap::new();
+            let coll = SigMap::default();
             let mut out = Vec::new();
             for _ in 0..((secs / DT).round() as usize).max(1) {
                 out = compute_gyro_3dof(&inputs, &mut self.st, &self.p, &self.dev, &coll, DT);
@@ -1376,7 +1376,7 @@ mod edge_turn_tests {
 mod drift_correction_tests {
     use super::compute_gyro_3dof;
     use crate::NodeState;
-    use flexinput_core::Signal;
+    use flexinput_core::{Signal, SigMap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -1387,7 +1387,7 @@ mod drift_correction_tests {
     fn step(state: &mut NodeState, gyro: [f32; 3], accel: [f32; 3], secs: f32) -> glam::Quat {
         let mut p: HashMap<String, Value> = HashMap::new();
         p.insert("orient_drift".into(), json!(0.5));
-        let (dev, coll) = (HashMap::new(), HashMap::new());
+        let (dev, coll) = (SigMap::default(), SigMap::default());
         let inputs: Vec<Option<Signal>> = [None, None]
             .into_iter()
             .chain(gyro.iter().chain(accel.iter()).map(|v| Some(Signal::Float(*v))))
@@ -1442,7 +1442,7 @@ mod drift_correction_tests {
 mod orientation_frame_tests {
     use super::compute_gyro_3dof;
     use crate::NodeState;
-    use flexinput_core::Signal;
+    use flexinput_core::{Signal, SigMap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -1454,8 +1454,8 @@ mod orientation_frame_tests {
         // Off, so the captured gravity reference cannot nudge the pose and
         // blur what this is measuring.
         params.insert("orient_drift".into(), json!(0.0));
-        let dev = HashMap::new();
-        let coll = HashMap::new();
+        let dev = SigMap::default();
+        let coll = SigMap::default();
         let dt = 1.0 / 250.0;
         let mut out = Vec::new();
         let steps = (secs / dt) as usize;

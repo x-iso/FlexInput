@@ -602,7 +602,7 @@ impl FlexInputApp {
         -> Option<egui::TextureHandle>
     {
         let key = egui::Id::new(("gp_legend_glyph", skin.as_str(), pin));
-        if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        if let Some(t) = crate::widgets::tex_cache::get(&ctx, key) {
             return Some(t);
         }
         let bytes = crate::canvas::remapper_icons::pin_svg(skin, pin)?;
@@ -612,7 +612,7 @@ impl FlexInputApp {
             svg, 36, 36, "override", egui::Color32::TRANSPARENT)?;
         let t = ctx.load_texture(format!("gp_legend_{}_{}", skin.as_str(), pin),
             img, egui::TextureOptions::LINEAR);
-        ctx.data_mut(|d| d.insert_temp(key, t.clone()));
+        crate::widgets::tex_cache::put(&ctx, key, t.clone());
         Some(t)
     }
 }

@@ -10,6 +10,15 @@ use super::*;
 
 pub(crate) const CONSUMED_PREFIX: &str = "__consumed__:";
 
+/// `{CONSUMED_PREFIX}{pin}` for every canonical pin, in `ALL_PINS` order —
+/// built once rather than formatted per pin on every tick.
+pub(crate) fn consumed_markers() -> &'static [String] {
+    static MARKERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    MARKERS.get_or_init(|| {
+        automap::ALL_PINS.iter().map(|p| format!("{CONSUMED_PREFIX}{}", p.id)).collect()
+    })
+}
+
 /// Reserved `state` key holding the cross-tick menu carry state
 /// (`NodeState::macro_prev` / `source_block` / `unblocked_src`). No real node
 /// ever has this uid.
@@ -38,11 +47,11 @@ pub(crate) const ORIENT_NEUTRAL_DEV_PIN: &str = "__orient_neutral";
 pub(crate) fn request_orient_neutral(
     snap: &NodeSnap,
     key: &str,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     use flexinput_core::imu::ORIENT_NEUTRAL_PIN;
     let on = collector_sigs
-        .get(&(key.to_string(), ORIENT_NEUTRAL_PIN.to_string()))
+        .get_pin(&key, &ORIENT_NEUTRAL_PIN)
         .is_some_and(|s| s.as_bool());
     if !on {
         return;
@@ -71,11 +80,11 @@ pub(crate) fn request_orient_neutral(
 /// captured correction then has it applied to its `orientation` pin.
 pub(crate) fn apply_orient_neutral(
     carry: &mut NodeState,
-    dev_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &mut SigMap,
 ) {
     for dev in &carry.orient_neutral_req {
         dev_sigs.insert((dev.clone(), ORIENT_NEUTRAL_DEV_PIN.to_string()), Signal::Bool(true));
-        if let Some(Signal::Vec4(v)) = dev_sigs.get(&(dev.clone(), "orientation".to_string())) {
+        if let Some(Signal::Vec4(v)) = dev_sigs.get_pin(&dev, "orientation") {
             let q = glam::Quat::from_xyzw(v.x, v.y, v.z, v.w);
             if q.length_squared() > 1e-6 {
                 carry.orient_neutral.insert(dev.clone(), flexinput_core::frames::yaw_neutralizer(q.normalize()));
@@ -83,7 +92,7 @@ pub(crate) fn apply_orient_neutral(
         }
     }
     for (dev, n) in &carry.orient_neutral {
-        if let Some(Signal::Vec4(v)) = dev_sigs.get_mut(&(dev.clone(), "orientation".to_string())) {
+        if let Some(Signal::Vec4(v)) = dev_sigs.get_pin_mut(&dev, "orientation") {
             let q = (*n * glam::Quat::from_xyzw(v.x, v.y, v.z, v.w)).normalize();
             *v = glam::Vec4::new(q.x, q.y, q.z, q.w);
         }
@@ -98,10 +107,10 @@ pub(crate) fn publish_consumed_markers(
     key: &str,
     claimed_digital: &HashSet<String>,
     claimed_analog: &HashSet<String>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
-    let mark = |pin: &str, collector_sigs: &mut HashMap<(String, String), Signal>| {
-        collector_sigs.insert((key.to_string(), format!("{CONSUMED_PREFIX}{pin}")), Signal::Int(1));
+    let mark = |pin: &str, collector_sigs: &mut SigMap| {
+        collector_sigs.set_pin(&key, &format!("{CONSUMED_PREFIX}{pin}"), Signal::Int(1));
     };
     for pin in claimed_digital.iter().chain(claimed_analog.iter()) {
         mark(pin, collector_sigs);
@@ -154,8 +163,8 @@ pub(crate) fn combine_signals(a: Signal, b: Signal) -> Signal {
 pub(crate) fn feedback_control_publish(
     snap: &NodeSnap,
     computed: &[Vec<Option<Signal>>],
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) -> Vec<Option<Signal>> {
     // Resolve wired inputs for this node (input[0] = AutoMap bus, ignored as a
     // value; inputs[1..] = inlets parallel to `_fb_inlet_ids`).
@@ -180,12 +189,7 @@ pub(crate) fn feedback_control_publish(
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
                     // Additive combine when several injectors hit the same pin
                     // on the same device (last-writer-wins would silently drop).
-                    let entry = collector_sigs.entry((key.clone(), pin_id.to_string()));
-                    use std::collections::hash_map::Entry;
-                    match entry {
-                        Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), sig); }
-                        Entry::Vacant(v)       => { v.insert(sig); }
-                    }
+                    collector_sigs.merge_pin(&key, pin_id, sig, |cur| *cur = combine_signals(*cur, sig));
                 }
             }
         }
@@ -202,7 +206,7 @@ pub(crate) fn feedback_control_publish(
             let out_idx = i + 1;
             if out_idx >= out.len() { break; }
             if dest_dev.is_empty() { continue; }
-            if let Some(&sig) = dev_sigs.get(&(dest_dev.to_string(), pin_id.to_string())) {
+            if let Some(&sig) = dev_sigs.get_pin(&dest_dev, &pin_id) {
                 out[out_idx] = Some(sig);
             }
         }
@@ -235,33 +239,26 @@ pub(crate) fn feedback_control_publish(
 pub(crate) fn republish_bus_as_collector(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) {
     let uid_key = format!("collector:{}", uid);
-    let upstream_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let upstream_collector = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let upstream_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+    let upstream_collector = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
     if !upstream_collector.is_empty() {
-        let copies: Vec<(String, Signal)> = collector_sigs.iter()
-            .filter(|((dev, _), _)| dev == &upstream_collector)
-            .map(|((_, pin), sig)| (pin.clone(), *sig))
-            .collect();
-        for (pin, sig) in copies {
-            collector_sigs.insert((uid_key.clone(), pin), sig);
-        }
+        flexinput_core::copy_bus(collector_sigs, upstream_collector, &uid_key, |_| true);
         if !upstream_dev.is_empty() {
             for pin in flexinput_core::automap::ALL_PINS {
-                let key = (uid_key.clone(), pin.id.to_string());
-                if collector_sigs.contains_key(&key) { continue; }
-                if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
-                    collector_sigs.insert(key, sig);
+                if collector_sigs.has_pin(&uid_key, pin.id) { continue; }
+                if let Some(&sig) = dev_sigs.get_pin(upstream_dev, pin.id) {
+                    collector_sigs.set_pin(&uid_key, pin.id, sig);
                 }
             }
         }
     } else if !upstream_dev.is_empty() {
         for pin in flexinput_core::automap::ALL_PINS {
-            if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
-                collector_sigs.insert((uid_key.clone(), pin.id.to_string()), sig);
+            if let Some(&sig) = dev_sigs.get_pin(&upstream_dev, &pin.id) {
+                collector_sigs.set_pin(&uid_key, &pin.id, sig);
             }
         }
     }
@@ -271,8 +268,8 @@ pub(crate) fn republish_bus_as_collector(
 pub(crate) fn audio_stream_haptics_publish(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) -> Vec<Option<Signal>> {
     // `uid` is this node's effective publishing id: `snap.node_uid` at the top level,
     // the namespaced uid inside a sub-patch. It keys the collector pass-through AND
@@ -495,11 +492,8 @@ pub(crate) fn audio_stream_haptics_publish(
     // buzzes forever) from the frequency pins (only meaningful when amp > 0).
     let mut put = |pin: &str, v: f32, force: bool| {
         if v <= 0.0 && !force { return; }
-        use std::collections::hash_map::Entry;
-        match collector_sigs.entry((key.clone(), pin.to_string())) {
-            Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), Signal::Float(v)); }
-            Entry::Vacant(e)       => { e.insert(Signal::Float(v)); }
-        }
+        collector_sigs.merge_pin(&key, pin, Signal::Float(v),
+            |cur| *cur = combine_signals(*cur, Signal::Float(v)));
     };
     // hd_* = carrier amplitude (always written so the pad zeroes on silence);
     // hd2_* = modulator depth.
@@ -531,8 +525,8 @@ pub(crate) fn audio_stream_haptics_publish(
 pub(crate) fn net_send_publish(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) -> Vec<Option<Signal>> {
     // ── 1. Forward pass-through: mirror the upstream bus into collector:{uid}
     //    so a locally-wired sink downstream still receives the pad's signals. ──
@@ -561,8 +555,8 @@ pub(crate) fn net_send_publish(
 pub(crate) fn net_recv_publish(
     snap: &NodeSnap,
     uid: usize,
-    _dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    _dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) -> Vec<Option<Signal>> {
     let uid_key = format!("collector:{}", uid);
     let stale_ms = snap.params.get("net_stale_ms").and_then(|v| v.as_u64()).unwrap_or(200) as u128;
@@ -571,10 +565,10 @@ pub(crate) fn net_recv_publish(
     let connected = match flexinput_net::latest_input(uid) {
         Some((frame, age)) if age.as_millis() < stale_ms => {
             for (pin, sig) in frame.iter_present() {
-                collector_sigs.insert((uid_key.clone(), pin.to_string()), sig);
+                collector_sigs.set_pin(&uid_key, &pin, sig);
             }
             for extra in &frame.extras {
-                collector_sigs.insert((uid_key.clone(), extra.name.clone()), extra.value);
+                collector_sigs.set_pin(&uid_key, &extra.name, extra.value);
             }
             true
         }
@@ -582,7 +576,7 @@ pub(crate) fn net_recv_publish(
         // last value, so we MUST write neutral, not just stop publishing.
         _ => {
             for (pin, sig) in flexinput_net::BusFrame::neutral().iter_present() {
-                collector_sigs.insert((uid_key.clone(), pin.to_string()), sig);
+                collector_sigs.set_pin(&uid_key, &pin, sig);
             }
             false
         }
@@ -642,8 +636,8 @@ pub(crate) fn publish_recv_feedback_frames(
     nodes: &[NodeSnap],
     outer_uid: usize,
     nested: bool,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
     sink_sources: &HashMap<String, Vec<String>>,
 ) {
     for node in nodes {
@@ -661,21 +655,21 @@ pub(crate) fn publish_recv_feedback_frames(
             for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
                 let mut best: Option<f32> = None;
                 for dev in fb_devs {
-                    if let Some(&sig) = dev_sigs.get(&(dev.clone(), pin.id.to_string())) {
+                    if let Some(&sig) = dev_sigs.get_pin(&dev, &pin.id) {
                         let v = sig.as_float();
                         best = Some(best.map_or(v, |b| b.max(v)));
                     }
                 }
-                if let Some(&sig) = collector_sigs.get(&(net_key.clone(), pin.id.to_string())) {
+                if let Some(&sig) = collector_sigs.get_pin(&net_key, &pin.id) {
                     let v = sig.as_float();
                     best = Some(best.map_or(v, |b| b.max(v)));
                 }
                 if flexinput_core::automap::feedback_group(pin.id).is_some_and(|g| groups.contains(&g)) {
-                    best = collector_sigs.get(&(override_key.clone(), pin.id.to_string()))
+                    best = collector_sigs.get_pin(&override_key, &pin.id)
                         .map(|s| s.as_float())
                         .or(best.map(|_| 0.0));
                 }
-                if let Some(&sig) = collector_sigs.get(&(inject_key.clone(), pin.id.to_string())) {
+                if let Some(&sig) = collector_sigs.get_pin(&inject_key, &pin.id) {
                     let v = sig.as_float();
                     best = Some(best.map_or(v, |b| b.max(v)));
                 }
@@ -708,8 +702,8 @@ pub(crate) fn automap_fork_publish(
     snap: &NodeSnap,
     key_uid: usize,
     computed: &[Vec<Option<Signal>>],
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) {
     let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
     let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -729,26 +723,18 @@ pub(crate) fn automap_fork_publish(
         let key = format!("forksel:{}:{}", key_uid, out_idx);
         for pin in flexinput_core::automap::ALL_PINS {
             let sig = if !collector_id_upstream.is_empty() {
-                collector_sigs.get(&(collector_id_upstream.to_string(), pin.id.to_string())).copied()
-                    .or_else(|| dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied())
+                collector_sigs.get_pin(&collector_id_upstream, &pin.id).copied()
+                    .or_else(|| dev_sigs.get_pin(&dev_id, &pin.id).copied())
             } else {
-                dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &pin.id).copied()
             };
             if let Some(sig) = sig {
-                collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                collector_sigs.set_pin(&key, &pin.id, sig);
             }
         }
         if !collector_id_upstream.is_empty() {
-            let copies: Vec<(String, Signal)> = collector_sigs.iter()
-                .filter(|((d, p), _)| {
-                    d == collector_id_upstream
-                        && !automap::ALL_PINS.iter().any(|ap| ap.id == p.as_str())
-                })
-                .map(|((_, p), s)| (p.clone(), *s))
-                .collect();
-            for (pin, sig) in copies {
-                collector_sigs.insert((key.clone(), pin), sig);
-            }
+            flexinput_core::copy_bus(collector_sigs, collector_id_upstream, &key,
+                |p| !automap::is_canonical_pin(p));
         }
         fill_raw_midi(dev_sigs, dev_id, &key, collector_sigs);
     }
@@ -757,29 +743,36 @@ pub(crate) fn automap_fork_publish(
 pub(crate) fn automap_combiner_publish(
     snap: &NodeSnap,
     key_uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, crate::state::NodeState>,
     dt: f32,
 ) {
-    let input_devs = snap.params.get("_automap_input_devs")
+    // Borrowed, not cloned: this runs every engine tick.
+    let input_devs: Vec<&str> = snap.params.get("_automap_input_devs")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).collect())
         .unwrap_or_default();
-    let input_collectors = snap.params.get("_automap_input_collectors")
+    let input_collectors: Vec<&str> = snap.params.get("_automap_input_collectors")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("")).collect())
         .unwrap_or_default();
+    let no_map = serde_json::Map::new();
     let policy_map = snap.params.get("combiner_pin_policy")
-        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        .and_then(|v| v.as_object()).unwrap_or(&no_map);
     let port_map = snap.params.get("combiner_pin_port")
-        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        .and_then(|v| v.as_object()).unwrap_or(&no_map);
     // Per-PORT default policy: `{ "0": "ADD", "1": "SORT", … }`. Applies to any
     // pin offered by that port that has no per-pin override. When several ports
     // offer a pin, the lowest-index (highest-priority) port that actually
     // carries the pin this tick wins the default. Falls back to global SORT.
     let port_default_map = snap.params.get("combiner_port_default")
-        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        .and_then(|v| v.as_object()).unwrap_or(&no_map);
+    let port_default_keys: Vec<String> = if port_default_map.is_empty() {
+        Vec::new()
+    } else {
+        (0..input_devs.len()).map(|i| i.to_string()).collect()
+    };
     let key = format!("combiner:{}", key_uid);
 
     fn clamp_for_pin(pin_id: &str, v: f32) -> f32 {
@@ -799,21 +792,21 @@ pub(crate) fn automap_combiner_publish(
 
     fn read_pin_at(
         i: usize, pin_id: &str,
-        input_devs: &[String], input_collectors: &[String],
-        collector_sigs: &HashMap<(String, String), Signal>,
-        dev_sigs: &HashMap<(String, String), Signal>,
+        input_devs: &[&str], input_collectors: &[&str],
+        collector_sigs: &SigMap,
+        dev_sigs: &SigMap,
     ) -> Option<Signal> {
-        let collector_id = input_collectors.get(i).map(|s| s.as_str()).unwrap_or("");
-        let dev_id       = input_devs.get(i).map(|s| s.as_str()).unwrap_or("");
+        let collector_id = input_collectors.get(i).copied().unwrap_or("");
+        let dev_id       = input_devs.get(i).copied().unwrap_or("");
         if !collector_id.is_empty() {
-            collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())).copied()
+            collector_sigs.get_pin(&collector_id, &pin_id).copied()
                 .or_else(|| {
                     if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                        dev_sigs.get_pin(&dev_id, &pin_id).copied()
                     } else { None }
                 })
         } else if !dev_id.is_empty() {
-            dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+            dev_sigs.get_pin(&dev_id, &pin_id).copied()
         } else {
             None
         }
@@ -830,8 +823,8 @@ pub(crate) fn automap_combiner_publish(
             .collect();
         let ids: Vec<String> = (0..input_devs.len())
             .map(|i| format!("{}|{}",
-                input_devs.get(i).map(String::as_str).unwrap_or(""),
-                input_collectors.get(i).map(String::as_str).unwrap_or("")))
+                input_devs.get(i).copied().unwrap_or(""),
+                input_collectors.get(i).copied().unwrap_or("")))
             .collect();
         // The Correlate noise gate's strength (0 = off); 1 unless set.
         let gate = snap.params.get("combiner_motion_gate").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
@@ -841,7 +834,9 @@ pub(crate) fn automap_combiner_publish(
             .unwrap_or_default()
     };
 
-    for pin in flexinput_core::automap::ALL_PINS {
+    let markers = consumed_markers();
+    let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
+    for (pin_ix, pin) in flexinput_core::automap::ALL_PINS.iter().enumerate() {
         if let Some(port_v) = port_map.get(pin.id) {
             if let Some(port_u) = port_v.as_u64() {
                 let n_inputs = input_devs.len();
@@ -850,7 +845,7 @@ pub(crate) fn automap_combiner_publish(
                 if let Some(sig) = read_pin_at(port, pin.id,
                     &input_devs, &input_collectors, &collector_sigs, dev_sigs)
                 {
-                    collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                    collector_sigs.set_pin(&key, &pin.id, sig);
                 }
                 continue;
             }
@@ -864,7 +859,7 @@ pub(crate) fn automap_combiner_publish(
             && !policy_map.get(pin.id).and_then(|v| v.as_str()).is_some_and(|p| p != "SORT")
         {
             if let Some(&sig) = motion.get(pin.id) {
-                collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                collector_sigs.set_pin(&key, &pin.id, sig);
             }
             continue;
         }
@@ -880,7 +875,7 @@ pub(crate) fn automap_combiner_publish(
                     let offers = read_pin_at(i, pin.id,
                         &input_devs, &input_collectors, &collector_sigs, dev_sigs).is_some();
                     if !offers { continue; }
-                    if let Some(p) = port_default_map.get(&i.to_string()).and_then(|v| v.as_str()) {
+                    if let Some(p) = port_default_map.get(&port_default_keys[i]).and_then(|v| v.as_str()) {
                         from_port = p;
                         break;
                     }
@@ -894,9 +889,9 @@ pub(crate) fn automap_combiner_publish(
         // every port — the pin is dropped from all inputs, including raw-device
         // ports that still carry it. EXCEPTION: ADD explicitly opts into mixing,
         // so a Combiner port set to ADD keeps its value.
-        let marker = format!("{CONSUMED_PREFIX}{}", pin.id);
+        let marker = markers[pin_ix].as_str();
         let any_consumed = input_collectors.iter().any(|cid| {
-            !cid.is_empty() && collector_sigs.contains_key(&(cid.to_string(), marker.clone()))
+            !cid.is_empty() && collector_sigs.has_pin(cid, marker)
         });
         if any_consumed && policy != "ADD" {
             // Hierarchy: a pin an upstream Remapper claimed is owned by that
@@ -910,24 +905,24 @@ pub(crate) fn automap_combiner_publish(
             // receiving, so a dropped consumed D-pad/button would stay stuck.
             let consuming = input_collectors.iter().find(|cid| {
                 !cid.is_empty()
-                    && collector_sigs.contains_key(&((*cid).clone(), marker.clone()))
-            }).cloned();
+                    && collector_sigs.has_pin(cid, marker)
+            }).copied();
             let owned = consuming
-                .and_then(|cid| collector_sigs.get(&(cid, pin.id.to_string())).copied());
+                .and_then(|cid| collector_sigs.get_pin(cid, pin.id).copied());
             let sig = owned.unwrap_or(match pin.signal_type {
                 flexinput_core::SignalType::Bool => Signal::Bool(false),
                 flexinput_core::SignalType::Vec2 => Signal::Vec2(glam::Vec2::ZERO),
                 flexinput_core::SignalType::Int  => Signal::Int(0),
                 _ => Signal::Float(0.0),
             });
-            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+            collector_sigs.set_pin(&key, &pin.id, sig);
             // Re-publish the marker so a Combiner-of-Combiners keeps honouring
             // the hierarchy.
-            collector_sigs.insert((key.clone(), marker.clone()), Signal::Int(1));
+            collector_sigs.set_pin(&key, marker, Signal::Int(1));
             continue;
         }
 
-        let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
+        raw.clear();
         for i in 0..input_devs.len() {
             if let Some(s) = read_pin_at(i, pin.id,
                 &input_devs, &input_collectors, &collector_sigs, dev_sigs)
@@ -953,7 +948,7 @@ pub(crate) fn automap_combiner_publish(
                     Signal::Vec2(v) => *v != glam::Vec2::ZERO,
                     Signal::Vec4(v) => *v != glam::Vec4::ZERO,
                 });
-                asserted.or_else(|| raw.into_iter().next())
+                asserted.or_else(|| raw.first().copied())
             }
             "OR" => match pin.signal_type {
                 flexinput_core::SignalType::Bool => {
@@ -1083,13 +1078,13 @@ pub(crate) fn automap_combiner_publish(
             _ => None,
         };
         if let Some(s) = resolved {
-            collector_sigs.insert((key.clone(), pin.id.to_string()), s);
+            collector_sigs.set_pin(&key, &pin.id, s);
         }
     }
 
     // Off-spec pass-through (Remapper's keyboard/mouse pins etc.).
     {
-        let mut extras: HashMap<String, Signal> = HashMap::new();
+        let mut extras: PinSigs = PinSigs::default();
         // Highest port first, so the lowest port's value is inserted last and
         // wins (SORT). Within a port, its collector beats its raw MIDI device.
         let n_ports = input_collectors.len().max(input_devs.len());
@@ -1104,7 +1099,7 @@ pub(crate) fn automap_combiner_publish(
             let Some(collector_id) = input_collectors.get(i).filter(|c| !c.is_empty()) else { continue };
             for ((dev, pin), &sig) in collector_sigs.iter() {
                 if dev != collector_id { continue; }
-                if automap::ALL_PINS.iter().any(|p| p.id == pin.as_str()) { continue; }
+                if automap::is_canonical_pin(pin) { continue; }
                 extras.insert(pin.clone(), sig);
             }
         }
@@ -1121,8 +1116,8 @@ pub(crate) fn automap_selector_publish(
     snap: &NodeSnap,
     key_uid: usize,
     computed: &[Vec<Option<Signal>>],
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     fb_routes: &mut HashMap<String, String>,
 ) {
     let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
@@ -1157,32 +1152,24 @@ pub(crate) fn automap_selector_publish(
     }
     for pin in flexinput_core::automap::ALL_PINS {
         let sig = if !selected_collector.is_empty() {
-            collector_sigs.get(&(selected_collector.clone(), pin.id.to_string())).copied()
+            collector_sigs.get_pin(&selected_collector, &pin.id).copied()
                 .or_else(|| {
                     if !selected_dev.is_empty() {
-                        dev_sigs.get(&(selected_dev.clone(), pin.id.to_string())).copied()
+                        dev_sigs.get_pin(&selected_dev, &pin.id).copied()
                     } else { None }
                 })
         } else if !selected_dev.is_empty() {
-            dev_sigs.get(&(selected_dev.clone(), pin.id.to_string())).copied()
+            dev_sigs.get_pin(&selected_dev, &pin.id).copied()
         } else {
             None
         };
         if let Some(sig) = sig {
-            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+            collector_sigs.set_pin(&key, &pin.id, sig);
         }
     }
     if !selected_collector.is_empty() {
-        let copies: Vec<(String, Signal)> = collector_sigs.iter()
-            .filter(|((d, p), _)| {
-                d == &selected_collector
-                    && !automap::ALL_PINS.iter().any(|ap| ap.id == p.as_str())
-            })
-            .map(|((_, p), s)| (p.clone(), *s))
-            .collect();
-        for (pin, sig) in copies {
-            collector_sigs.insert((key.clone(), pin), sig);
-        }
+        flexinput_core::copy_bus(collector_sigs, &selected_collector, &key,
+            |p| !automap::is_canonical_pin(p));
     }
     fill_raw_midi(dev_sigs, &selected_dev, &key, collector_sigs);
 }

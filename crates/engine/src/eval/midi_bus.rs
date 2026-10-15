@@ -31,10 +31,10 @@ pub(crate) fn is_midi_device(dev_id: &str) -> bool {
 /// no-op for anything but a MIDI input port. Legacy `cc_<n>` / `pitch_bend`
 /// aliases stay off the bus.
 pub(crate) fn fill_raw_midi(
-    dev_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
     dev_id: &str,
     key: &str,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     if !is_midi_device(dev_id) {
         return;
@@ -43,15 +43,15 @@ pub(crate) fn fill_raw_midi(
         if d != dev_id || !midi::is_midi_pin(pin) {
             continue;
         }
-        collector_sigs.entry((key.to_string(), pin.clone())).or_insert(sig);
+        collector_sigs.set_pin_if_absent(key, pin, sig);
     }
 }
 
 /// Mark a `midi:` pin on `key` as produced (see the module docs). No-op for
 /// other pins.
-pub(crate) fn mark_produced(key: &str, pin: &str, collector_sigs: &mut HashMap<(String, String), Signal>) {
+pub(crate) fn mark_produced(key: &str, pin: &str, collector_sigs: &mut SigMap) {
     if midi::is_midi_pin(pin) {
-        collector_sigs.insert((key.to_string(), format!("{MIDI_PRODUCED_PREFIX}{pin}")), Signal::Bool(true));
+        collector_sigs.set_pin(&key, &format!("{MIDI_PRODUCED_PREFIX}{pin}"), Signal::Bool(true));
     }
 }
 
@@ -66,21 +66,21 @@ pub(crate) fn mark_produced(key: &str, pin: &str, collector_sigs: &mut HashMap<(
 pub(crate) fn fill_upstream_midi(
     collector_id: &str,
     dev_id: &str,
-    collector_sigs: &HashMap<(String, String), Signal>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    upstream: &mut HashMap<String, Signal>,
+    collector_sigs: &SigMap,
+    dev_sigs: &SigMap,
+    upstream: &mut PinSigs,
 ) {
     if !collector_id.is_empty() {
         for ((k, pin), &sig) in collector_sigs.iter() {
             if k == collector_id && midi::is_midi_pin(pin) {
-                upstream.insert(pin.clone(), sig);
+                upstream.insert(flexinput_core::pooled_string(pin), sig);
             }
         }
     }
     if !dev_id.is_empty() {
         for ((d, pin), &sig) in dev_sigs.iter() {
             if d == dev_id && midi::is_midi_pin(pin) {
-                upstream.entry(pin.clone()).or_insert(sig);
+                upstream.entry(flexinput_core::pooled_string(pin)).or_insert(sig);
             }
         }
     }
@@ -109,12 +109,12 @@ pub(crate) fn publish_card_midi(
     pin_id: &str,
     state: CardMidi,
     levels: (f32, f32, f32),
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     let Some(pin) = midi::parse_pin(pin_id) else { return };
     let (vel, on, off) = levels;
-    let put = |id: String, sig: Signal, collector_sigs: &mut HashMap<(String, String), Signal>| {
-        collector_sigs.insert((key.to_string(), id.clone()), sig);
+    let put = |id: String, sig: Signal, collector_sigs: &mut SigMap| {
+        collector_sigs.set_pin(&key, &id, sig);
         mark_produced(key, &id, collector_sigs);
     };
     if let midi::MidiPin::Note { ch, note } = pin {
@@ -181,17 +181,17 @@ pub(crate) fn midi_out_pins(
     src_is_collector: bool,
     fallback_dev: Option<&str>,
     thru: bool,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
 ) -> Vec<(String, Signal)> {
-    let mut out: HashMap<String, Signal> = HashMap::new();
+    let mut out: PinSigs = PinSigs::default();
     if src_is_collector {
         for ((k, pin), &sig) in collector_sigs.iter() {
             if k != src_key || !midi::is_midi_pin(pin) {
                 continue;
             }
             let produced = collector_sigs
-                .contains_key(&(src_key.to_string(), format!("{MIDI_PRODUCED_PREFIX}{pin}")));
+                .has_pin(&src_key, &format!("{MIDI_PRODUCED_PREFIX}{pin}"));
             if produced || thru {
                 out.insert(pin.clone(), sig);
             }

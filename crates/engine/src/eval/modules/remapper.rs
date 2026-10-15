@@ -13,29 +13,29 @@ use super::*;
 pub(crate) fn eval_remapper_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) {
             let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
             let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
             let key = format!("remap:{}", uid);
 
             // Snapshot upstream values for every canonical pin once, so we can
             // freely mutate collector_sigs below without aliasing the read side.
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            let mut upstream: PinSigs = PinSigs::default();
             for ap in automap::ALL_PINS {
                 let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                    collector_sigs.get_pin(&collector_id, &ap.id).copied()
                 } else { None }
                 .or_else(|| {
                     if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                        dev_sigs.get_pin(&dev_id, &ap.id).copied()
                     } else { None }
                 });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+                if let Some(s) = sig { upstream.insert(flexinput_core::pooled_string(ap.id), s); }
             }
             // MIDI pins are dynamic (never in ALL_PINS), so take whatever the
             // bus carries. Cheap: only a MIDI device or a bus downstream of one
@@ -116,23 +116,23 @@ pub(crate) fn eval_remapper_node(
                 touch_only[1] = false;
                 touch_only[2] = false;
             }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_left"),   Signal::Bool(click_zone[0]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_center"), Signal::Bool(click_zone[1]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_right"),  Signal::Bool(click_zone[2]));
             // touchpad_any — "click anywhere on the pad". Available from the
             // Choose picker only (not auto-captured) so users opt in.
             // Fires together with the specific-zone pin additively.
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_any"),    Signal::Bool(touch_click && any_zone));
+            upstream.insert(flexinput_core::pooled_string("touch_left"),      Signal::Bool(touch_only[0]));
+            upstream.insert(flexinput_core::pooled_string("touch_center"),    Signal::Bool(touch_only[1]));
+            upstream.insert(flexinput_core::pooled_string("touch_right"),     Signal::Bool(touch_only[2]));
 
             // Cards that decide after the press ("in order", Sequence, Short /
             // Long / Double) run first, against the RAW inputs. Their hold-back
             // then decides what the rest of the node sees, so every read below
             // goes through that view instead.
             let ns = state.entry(uid).or_insert_with(NodeState::default);
-            let HoldBackPass { verdicts, view: upstream, hidden: held_back } =
+            let HoldBackPass { verdicts, view: mut upstream, hidden: held_back } =
                 remapper_hold_back_pass(&mappings, upstream, ns, dt);
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
@@ -307,7 +307,7 @@ pub(crate) fn eval_remapper_node(
             // (e.g. `dpad_left → dpad_left`, a deliberate pass-through) is NOT
             // suppressed, so the user can keep an input while also reacting to it.
             let mut self_mapped: HashSet<String> = HashSet::new();
-            for m in &mappings {
+            for m in mappings {
                 let ins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
                 let outs: Vec<&str> = m.get("out").and_then(|v| v.as_array())
@@ -561,7 +561,7 @@ pub(crate) fn eval_remapper_node(
             for (pin, v) in &midi_analog_acc {
                 let bipolar = midi_analog_out(pin).map(|(_, b)| b).unwrap_or(false);
                 let clamped = if bipolar { v.clamp(-1.0, 1.0) } else { v.clamp(0.0, 1.0) };
-                collector_sigs.insert((key.clone(), pin.clone()), Signal::Float(clamped));
+                collector_sigs.set_pin(&key, &pin, Signal::Float(clamped));
                 mark_produced(&key, pin, collector_sigs);
             }
             // An analog card that isn't firing writes its MIDI pin at rest, the
@@ -570,7 +570,7 @@ pub(crate) fn eval_remapper_node(
             // leaving a downstream reader to infer it. A card the pass above
             // already wrote keeps that value, and the digital pass, which runs
             // later, still wins over both.
-            for m in &mappings {
+            for m in mappings {
                 if m.get("mode").and_then(|v| v.as_str()) != Some("analog") { continue; }
                 let outs = m.get("out").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 for v in &outs {
@@ -582,7 +582,7 @@ pub(crate) fn eval_remapper_node(
                         continue;
                     }
                     if midi_analog_acc.contains_key(p) || midi_analog_out(p).is_none() { continue; }
-                    collector_sigs.insert((key.clone(), p.to_string()), Signal::Float(0.0));
+                    collector_sigs.set_pin(&key, &p, Signal::Float(0.0));
                     mark_produced(&key, p, collector_sigs);
                 }
             }
@@ -592,7 +592,7 @@ pub(crate) fn eval_remapper_node(
                 let Some(mp) = flexinput_core::midi::parse_pin(pin) else { continue };
                 let Some([pat, _, vel]) = mp.note_companions() else { continue };
                 let mut put = |id: String, sig: Signal| {
-                    collector_sigs.insert((key.clone(), id.clone()), sig);
+                    collector_sigs.set_pin(&key, &id, sig);
                     mark_produced(&key, &id, collector_sigs);
                 };
                 put(pin.clone(), Signal::Bool(*on));
@@ -633,7 +633,7 @@ pub(crate) fn eval_remapper_node(
             // Commit axis accumulator: clamp ±1 then write.
             for (axis_pin, v) in &analog_axis_acc {
                 let clamped = v.clamp(-1.0, 1.0);
-                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
+                collector_sigs.set_pin(&key, &(*axis_pin), Signal::Float(clamped));
             }
             // Update bundled Vec2 pins so downstream sinks that read the
             // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
@@ -647,12 +647,12 @@ pub(crate) fn eval_remapper_node(
                 let x_override = analog_axis_acc.get(&x_axis).copied();
                 let y_override = analog_axis_acc.get(&y_axis).copied();
                 if x_override.is_none() && y_override.is_none() { continue; }
-                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
+                let cur = collector_sigs.get_pin(&key, &vec2_pin)
                     .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
                     .unwrap_or(Vec2::ZERO);
                 let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
                 let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
-                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
+                collector_sigs.set_pin(&key, &vec2_pin, Signal::Vec2(Vec2::new(x, y)));
             }
 
             // ── Digital publish pass (existing semantics) ────────────────
@@ -702,7 +702,7 @@ pub(crate) fn eval_remapper_node(
             // toggle off — the setting that stops a shared In/Out port from
             // feeding itself.
             {
-                let mut midi_on_now: HashMap<String, Signal> = HashMap::new();
+                let mut midi_on_now: PinSigs = PinSigs::default();
                 for (idx, out_pins) in &digital_on {
                     let (vel, on, _) = midi_card_levels(&mappings[*idx]);
                     for p in out_pins {
@@ -719,8 +719,8 @@ pub(crate) fn eval_remapper_node(
                 }
                 // Released cards write their off level, so a value pin returns
                 // to rest and a note lifts instead of hanging.
-                let mut midi_off_now: HashMap<String, Signal> = HashMap::new();
-                for m in &mappings {
+                let mut midi_off_now: PinSigs = PinSigs::default();
+                for m in mappings {
                     if m.get("mode").and_then(|v| v.as_str()) == Some("analog") { continue; }
                     let (_, _, off) = midi_card_levels(m);
                     let outs = m.get("out").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -739,7 +739,7 @@ pub(crate) fn eval_remapper_node(
                     }
                 }
                 for (pin, sig) in midi_on_now.into_iter().chain(midi_off_now) {
-                    collector_sigs.insert((key.clone(), pin.clone()), sig);
+                    collector_sigs.set_pin(&key, &pin, sig);
                     mark_produced(&key, &pin, collector_sigs);
                 }
             }
@@ -757,7 +757,7 @@ pub(crate) fn eval_remapper_node(
                         SignalType::Int   => Signal::Int(1),
                         _                 => Signal::Bool(true),
                     };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                    collector_sigs.set_pin(&key, &out_pin, sig);
                 } else {
                     if upstream.contains_key(out_pin.as_str()) { continue; }
                     // If an analog mapping has already written this same out
@@ -774,7 +774,7 @@ pub(crate) fn eval_remapper_node(
                         SignalType::Int   => Signal::Int(0),
                         _                 => Signal::Bool(false),
                     };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                    collector_sigs.set_pin(&key, &out_pin, sig);
                 }
             }
 
@@ -785,7 +785,7 @@ pub(crate) fn eval_remapper_node(
             // only when upstream doesn't naturally emit it (mirrors digital
             // release rule).
             let mut analog_button_pins: HashSet<String> = HashSet::new();
-            for m in &mappings {
+            for m in mappings {
                 let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
                 if !is_analog { continue; }
                 if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
@@ -826,7 +826,7 @@ pub(crate) fn eval_remapper_node(
                             a.iter().any(|v| v.as_str() == Some(out_pin.as_str()))))
                         .map(|m| midi_card_levels(m).0)
                         .unwrap_or(MIDI_CARD_VELOCITY / 127.0);
-                    collector_sigs.insert((key.clone(), out_pin.clone()), Signal::Bool(on));
+                    collector_sigs.set_pin(&key, &out_pin, Signal::Bool(on));
                     mark_produced(&key, out_pin, collector_sigs);
                     if let Some(twin) = midi_velocity_twin(&pin) {
                         let id = twin.to_id();
@@ -849,7 +849,7 @@ pub(crate) fn eval_remapper_node(
                         SignalType::Int   => Signal::Int(1),
                         _                 => Signal::Bool(true),
                     };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                    collector_sigs.set_pin(&key, &out_pin, sig);
                 } else {
                     if upstream.contains_key(out_pin.as_str()) { continue; }
                     let sig = match sig_type {
@@ -858,7 +858,7 @@ pub(crate) fn eval_remapper_node(
                         SignalType::Int   => Signal::Int(0),
                         _                 => Signal::Bool(false),
                     };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                    collector_sigs.set_pin(&key, &out_pin, sig);
                 }
             }
 
@@ -894,7 +894,7 @@ pub(crate) fn eval_remapper_node(
                 let mut xy = [0.0f32; 2];
                 for (dir, axis, sign) in DPAD_DIRS {
                     let on = collector_sigs
-                        .get(&(key.clone(), dir.to_string()))
+                        .get_pin(&key, &dir)
                         .or_else(|| upstream.get(dir))
                         .copied()
                         .map(|s| s.as_bool())
@@ -904,9 +904,9 @@ pub(crate) fn eval_remapper_node(
                 // Opposite directions cancel — an axis can't hold both.
                 let x = xy[0].clamp(-1.0, 1.0);
                 let y = xy[1].clamp(-1.0, 1.0);
-                collector_sigs.insert((key.clone(), "dpad_x".to_string()), Signal::Float(x));
-                collector_sigs.insert((key.clone(), "dpad_y".to_string()), Signal::Float(y));
-                collector_sigs.insert((key.clone(), "dpad".to_string()), Signal::Vec2(Vec2::new(x, y)));
+                collector_sigs.set_pin(&key, "dpad_x", Signal::Float(x));
+                collector_sigs.set_pin(&key, "dpad_y", Signal::Float(y));
+                collector_sigs.set_pin(&key, "dpad", Signal::Vec2(Vec2::new(x, y)));
             }
 
             // ── Touchpad output synthesis (zones + analog swipe) ──────────
@@ -929,7 +929,7 @@ pub(crate) fn eval_remapper_node(
             let has_touch_mappings = mappings.iter().any(mapping_targets_touch);
             if has_touch_mappings {
                 let mut fingers: Vec<(f32, f32)> = Vec::new();
-                for m in &mappings {
+                for m in mappings {
                     if fingers.len() >= 2 { break; }
                     if !mapping_targets_touch(m) { continue; }
                     let out_pins: Vec<&str> = m.get("out").and_then(|v| v.as_array())
@@ -956,6 +956,8 @@ pub(crate) fn eval_remapper_node(
                 publish_touch_points(&key, &fingers, collector_sigs);
             }
     request_orient_neutral(snap, &format!("remap:{uid}"), collector_sigs);
+    // Hand the per-tick pin snapshot's key Strings back for the next tick.
+    flexinput_core::recycle_strings(&mut upstream);
 }
 
 /// Whether an order-agnostic digital card's input counts as held this tick.
@@ -977,7 +979,7 @@ pub(crate) fn chord_raw_held(
     m: &Value,
     i: usize,
     in_pins: &[&str],
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     ns: &mut NodeState,
 ) -> bool {
     let shape = MappingShape::from_card(m);
@@ -1006,7 +1008,7 @@ pub(crate) fn chord_raw_held(
 /// input while its value is off rest; a button while held.
 fn analog_pin_active(
     shape: &MappingShape,
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     p: &str,
     read_upstream: &dyn Fn(&str) -> Option<Signal>,
 ) -> bool {
@@ -1087,10 +1089,10 @@ pub(crate) fn midi_velocity_twin(pin: &flexinput_core::midi::MidiPin) -> Option<
 
 pub(crate) fn remapper_pass_through_and_suppress(
     key: &str,
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     claimed_digital: &HashSet<String>,
     claimed_analog: &HashSet<String>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     let mut all_claimed: HashSet<String> = claimed_digital.clone();
     all_claimed.extend(claimed_analog.iter().cloned());
@@ -1111,12 +1113,12 @@ pub(crate) fn remapper_pass_through_and_suppress(
                     SignalType::Int   => Signal::Int(0),
                     _ => continue,
                 };
-                collector_sigs.insert((key.to_string(), ap.id.to_string()), off);
+                collector_sigs.set_pin(&key, &ap.id, off);
             }
             continue;
         };
         let sig = suppress_signal_for_pin(ap.id, raw, &suppression);
-        collector_sigs.insert((key.to_string(), ap.id.to_string()), sig);
+        collector_sigs.set_pin(&key, &ap.id, sig);
     }
 
     // MIDI pins: dynamic, so driven by what the upstream snapshot holds rather
@@ -1135,15 +1137,15 @@ pub(crate) fn remapper_pass_through_and_suppress(
         } else {
             *raw
         };
-        collector_sigs.insert((key.to_string(), pin.clone()), sig);
+        collector_sigs.set_pin(&key, &pin, sig);
     }
 
     // Recompute synthetic stick cardinals from the (possibly clamped) axes so
     // downstream consumers see consistent cardinal bools.
     {
-        let mut local_up: HashMap<String, Signal> = HashMap::new();
+        let mut local_up: PinSigs = PinSigs::default();
         for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
-            if let Some(&sig) = collector_sigs.get(&(key.to_string(), axis.to_string())) {
+            if let Some(&sig) = collector_sigs.get_pin(&key, &axis) {
                 local_up.insert(axis.to_string(), sig);
             }
         }
@@ -1152,7 +1154,7 @@ pub(crate) fn remapper_pass_through_and_suppress(
             if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
                 || k.ends_with("_left") || k.ends_with("_right"))
             {
-                collector_sigs.insert((key.to_string(), k), v);
+                collector_sigs.set_pin(&key, &k, v);
             }
         }
     }
@@ -1168,8 +1170,8 @@ pub(crate) fn remapper_pass_through_and_suppress(
 /// lost its keys.
 pub(crate) fn fill_upstream_extra(
     collector_id: &str,
-    collector_sigs: &HashMap<(String, String), Signal>,
-    upstream: &mut HashMap<String, Signal>,
+    collector_sigs: &SigMap,
+    upstream: &mut PinSigs,
 ) -> Vec<String> {
     if collector_id.is_empty() {
         return Vec::new();
@@ -1179,11 +1181,11 @@ pub(crate) fn fill_upstream_extra(
         if k != collector_id
             || pin.starts_with("__")
             || flexinput_core::midi::is_midi_pin(pin)
-            || automap::ALL_PINS.iter().any(|p| p.id == pin.as_str())
+            || automap::is_canonical_pin(pin)
         {
             continue;
         }
-        upstream.insert(pin.clone(), sig);
+        upstream.insert(flexinput_core::pooled_string(pin), sig);
         names.push(pin.clone());
     }
     names
@@ -1196,10 +1198,10 @@ pub(crate) fn fill_upstream_extra(
 pub(crate) fn forward_extra_pins(
     key: &str,
     extra_pins: &[String],
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     claimed_digital: &HashSet<String>,
     claimed_analog: &HashSet<String>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     for pin in extra_pins {
         let Some(&raw) = upstream.get(pin.as_str()) else { continue };
@@ -1214,7 +1216,7 @@ pub(crate) fn forward_extra_pins(
         } else {
             raw
         };
-        collector_sigs.insert((key.to_string(), pin.clone()), sig);
+        collector_sigs.set_pin(&key, &pin, sig);
     }
 }
 

@@ -8,9 +8,11 @@ pub mod menu;
 pub mod midi;
 pub mod module;
 pub mod patch;
+pub mod pinkey;
 pub mod signal;
 pub mod touchzones;
 
 pub use module::{Module, ModuleDescriptor, ModuleFactory, ModuleRegistration, PinDescriptor};
 pub use patch::{NodeInstance, Patch, SubPatch, SubPatchPin, Wire, PATCH_VERSION};
+pub use pinkey::{copy_bus, pooled_string, recycle_keys, recycle_strings, FastHasher, PinMapExt, PinSigs, SigMap};
 pub use signal::{Signal, SignalType};

@@ -21,7 +21,7 @@ pub(crate) fn render_readout_value(
         Some(Signal::Int(i))   => format!("{i}"),
         None                   => "—".into(),
     };
-    let font = container.y.clamp(10.0, 64.0) * 0.55;
+    let font = super::quantize_font_size(container.y.clamp(10.0, 64.0) * 0.55);
     ui.add_sized(
         [container.x, container.y.max(18.0)],
         egui::Label::new(egui::RichText::new(text).monospace().size(font)),

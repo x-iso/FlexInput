@@ -90,7 +90,7 @@ pub(crate) fn apply_display_state(
                         }
                     }
                 } else {
-                    let h = &mut node.extra.history;
+                    let h = std::sync::Arc::make_mut(&mut node.extra.history);
                     for s in samples {
                         if h.len() >= HISTORY_LEN { h.pop_front(); }
                         h.push_back(s);
@@ -124,6 +124,42 @@ pub(crate) fn apply_display_state(
 /// the editor without reverting in-progress edits. NodeIds line up because the
 /// editor was seeded from a clone of `sp.snarl` and writes its full snarl back,
 /// keeping the slab slots aligned.
+/// Drop the live display buffers (scope history, trigger-scope capture) from a
+/// snarl that is only kept as an undo/redo snapshot, recursively. They are
+/// display-only, and every snapshot used to hold its own copy — up to 20k
+/// samples per scope, ×50 snapshots per canvas. Undo/redo hand the live
+/// buffers across with [`carry_display_buffers`] instead.
+pub(crate) fn strip_display_buffers(snarl: &mut Snarl<NodeData>) {
+    for (_, node) in snarl.nodes_ids_data_mut() {
+        let extra = &mut node.value.extra;
+        extra.history = Default::default();
+        extra.trig_acc = Vec::new();
+        extra.trig_capture = None;
+        if let Some(sp) = node.value.subpatch.as_mut() {
+            strip_display_buffers(&mut sp.snarl);
+        }
+    }
+}
+
+/// Move the live display buffers from `from` (the snarl being replaced) onto
+/// the same nodes of `to` (a restored undo/redo snapshot, stripped), recursing
+/// into matching sub-patches — so scopes keep running across an undo instead
+/// of starting over empty.
+pub(crate) fn carry_display_buffers(to: &mut Snarl<NodeData>, from: &mut Snarl<NodeData>) {
+    let ids: Vec<NodeId> = to.nodes_ids_data().map(|(id, _)| id).collect();
+    for id in ids {
+        let (Some(dst), Some(src)) = (to.get_node_mut(id), from.get_node_mut(id)) else { continue };
+        dst.extra.history = std::mem::take(&mut src.extra.history);
+        dst.extra.trig_acc = std::mem::take(&mut src.extra.trig_acc);
+        dst.extra.trig_capture = src.extra.trig_capture.take();
+        dst.extra.trig_prev = src.extra.trig_prev;
+        dst.extra.trig_armed = src.extra.trig_armed;
+        if let (Some(dsp), Some(ssp)) = (dst.subpatch.as_mut(), src.subpatch.as_mut()) {
+            carry_display_buffers(&mut dsp.snarl, &mut ssp.snarl);
+        }
+    }
+}
+
 pub(crate) fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<NodeData>) {
     let ids: Vec<NodeId> = dst.nodes_ids_data().map(|(id, _)| id).collect();
     for id in ids {
@@ -1010,10 +1046,19 @@ pub(crate) fn upstream_physical_devices(
             return;
         }
     }
-    if let Some((dev, _, fallback)) = find_automap_device_rec(snarl, src, parents) {
+    if let Some((dev, _, fallback)) = find_automap_rec_inner(snarl, src, parents, false) {
         let id = fallback.unwrap_or(dev);
         if !flexinput_engine::eval::is_namespaced_source(&id) { push(id, out); }
     }
+}
+
+/// Every canonical AutoMap pin id as an owned String, built once: the resolver
+/// below hands this list back for every bus module it passes, every UI frame.
+fn canonical_pin_ids() -> std::borrow::Cow<'static, [String]> {
+    static IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    std::borrow::Cow::Borrowed(IDS.get_or_init(|| {
+        flexinput_core::automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect()
+    }))
 }
 
 /// Walk an AutoMap wire chain from `src` back to the originating device.source.
@@ -1027,13 +1072,30 @@ pub(crate) fn find_automap_device_rec(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
     parents: Option<&AutomapParent<'_>>,
-) -> Option<(String, Vec<String>, Option<String>)> {
+) -> Option<(String, std::borrow::Cow<'static, [String]>, Option<String>)> {
+    find_automap_rec_inner(snarl, src, parents, true)
+}
+
+/// [`find_automap_device_rec`]; with `want_pins` false the pin list comes back
+/// empty, for the many callers that only want the ids — building a
+/// device.source's pin list for every recursive step cost most of a frame's
+/// graph rebuild.
+fn find_automap_rec_inner(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parents: Option<&AutomapParent<'_>>,
+    want_pins: bool,
+) -> Option<(String, std::borrow::Cow<'static, [String]>, Option<String>)> {
     let node = snarl.get_node(src.node)?;
     if node.module_id == "device.source" {
         let dev_id = node.params.get("device_id")?.as_str()?.to_string();
-        let pin_ids: Vec<String> = node.params.get("output_pin_ids")?.as_array()?
-            .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-        return Some((dev_id, pin_ids, None));
+        let pins = node.params.get("output_pin_ids")?.as_array()?;
+        let pin_ids: Vec<String> = if want_pins {
+            pins.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        return Some((dev_id, std::borrow::Cow::Owned(pin_ids), None));
     }
     // Touch Zones in MAPPING mode is an injector: it publishes per-zone behaviour
     // overrides into collector_sigs under a `touchmap:{uid}` key, exactly like the
@@ -1051,15 +1113,14 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
+            .and_then(|s| find_automap_rec_inner(snarl, s, parents, false).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         let map_uid = match parents {
             None => src.node.0,
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
         let prefix = if node.module_id == "module.menu" { "menumap" } else { "touchmap" };
         let map_id = format!("{prefix}:{map_uid}");
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         return Some((map_id, canonical_pins, upstream_dev_id));
     }
     if node.module_id == "module.automap_split"
@@ -1073,7 +1134,7 @@ pub(crate) fn find_automap_device_rec(
         let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
         let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
         let upstream = *in_pin.remotes.first()?;
-        return find_automap_device_rec(snarl, upstream, parents);
+        return find_automap_rec_inner(snarl, upstream, parents, want_pins);
     }
     // Fork and Selector act as gating collectors: they inject signals into collector_sigs
     // only on the active output/input, so non-active paths produce silence.
@@ -1087,8 +1148,7 @@ pub(crate) fn find_automap_device_rec(
         };
         // Encode which output pin the sink is downstream of so eval can gate per-output.
         let collector_id = format!("forksel:{}:{}", node_uid, src.output);
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         return Some((collector_id, canonical_pins, None));
     }
     // Modules that re-publish the AutoMap bus into their own `collector:{uid}` key
@@ -1102,7 +1162,7 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
+            .and_then(|s| find_automap_rec_inner(snarl, s, parents, false).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         // The collector ID must match the key the eval thread uses when injecting
         // signals: root-level collectors use NodeId.0, subpatch-nested collectors
         // use namespaced_uid folded through the parent chain.
@@ -1111,8 +1171,7 @@ pub(crate) fn find_automap_device_rec(
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
         let collector_id = format!("collector:{}", collector_uid);
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         return Some((collector_id, canonical_pins, upstream_dev_id));
     }
     if node.module_id == "module.automap_combiner" {
@@ -1124,8 +1183,7 @@ pub(crate) fn find_automap_device_rec(
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
         let combiner_id = format!("combiner:{}", combiner_uid);
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         // A connected input's underlying physical device as the fallback, so
         // haptic-feedback reverse-routing has something to bind (matches
         // Collector's behaviour) — the first PAD among the ports, not just port
@@ -1136,7 +1194,7 @@ pub(crate) fn find_automap_device_rec(
                 if node.inputs[i].signal_type != SignalType::AutoMap { return None; }
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: i });
                 let &s = in_pin.remotes.first()?;
-                find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| {
+                find_automap_rec_inner(snarl, s, parents, false).map(|(id, _, fallback)| {
                     fallback.unwrap_or(id)
                 })
             })
@@ -1157,14 +1215,13 @@ pub(crate) fn find_automap_device_rec(
                 let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
                 in_pin.remotes.first().copied()
             })
-            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id)));
+            .and_then(|s| find_automap_rec_inner(snarl, s, parents, false).map(|(id, _, fallback)| fallback.unwrap_or(id)));
         let remap_uid = match parents {
             None => src.node.0,
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
         let remap_id = format!("remap:{}", remap_uid);
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         return Some((remap_id, canonical_pins, upstream_dev_id));
     }
     if node.module_id == "processing.gyro_3dof" {
@@ -1182,8 +1239,7 @@ pub(crate) fn find_automap_device_rec(
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
         let lean_id = format!("lean:{}", lean_uid);
-        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
-            .iter().map(|p| p.id.to_string()).collect();
+        let canonical_pins = canonical_pin_ids();
         return Some((lean_id, canonical_pins, None));
     }
     if node.module_id == "subpatch" {
@@ -1198,7 +1254,7 @@ pub(crate) fn find_automap_device_rec(
         let outlet_in = sp.snarl.in_pin(InPinId { node: outlet_id, input: 0 });
         let inner_upstream = *outlet_in.remotes.first()?;
         let frame = AutomapParent { snarl, subpatch_id: src.node, prev: parents };
-        return find_automap_device_rec(&sp.snarl, inner_upstream, Some(&frame));
+        return find_automap_rec_inner(&sp.snarl, inner_upstream, Some(&frame), want_pins);
     }
     if node.module_id == "subpatch.inlet" {
         // Inner trace reached an inlet — pop back to the outer snarl and follow
@@ -1207,7 +1263,7 @@ pub(crate) fn find_automap_device_rec(
         let parent = parents?;
         let outer_in = parent.snarl.in_pin(InPinId { node: parent.subpatch_id, input: pin_idx });
         let upstream = *outer_in.remotes.first()?;
-        return find_automap_device_rec(parent.snarl, upstream, parent.prev);
+        return find_automap_rec_inner(parent.snarl, upstream, parent.prev, want_pins);
     }
     None
 }
@@ -1351,7 +1407,7 @@ fn trace_rws_flick_source(
                     // AutoMap splitter (or similar): resolve via its AutoMap input.
                     up.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)
                         .and_then(|i| snarl.in_pin(InPinId { node: cur.node, input: i }).remotes.first().copied())
-                        .and_then(|s| find_automap_device_rec(snarl, s, parents))
+                        .and_then(|s| find_automap_rec_inner(snarl, s, parents, false))
                         .map(|(id, _, fb)| fb.unwrap_or(id))
                 };
                 if let Some(dev) = dev {
@@ -1434,7 +1490,7 @@ pub(crate) fn build_processing_graph_rec(
             }
             let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
             let &src = pin.remotes.first()?;
-            find_automap_device_rec(snarl, src, parents).map(|(d, _, fallback)| {
+            find_automap_rec_inner(snarl, src, parents, false).map(|(d, _, fallback)| {
                 if is_real_device_id(&d) { d } else { fallback.unwrap_or(d) }
             })
         });
@@ -1537,7 +1593,7 @@ pub(crate) fn build_processing_graph_rec(
                 find_automap_device_rec(snarl, src, parents)
             });
             let (automap_source, automap_fallback_dev) = match automap_result {
-                Some((dev_id, pins, fallback)) => (Some((dev_id, pins)), fallback),
+                Some((dev_id, pins, fallback)) => (Some((dev_id, pins.into_owned())), fallback),
                 None => (None, None),
             };
 
@@ -1606,7 +1662,7 @@ pub(crate) fn build_processing_graph_rec(
             if let Some(idx) = automap_idx {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: idx });
                 if let Some(&src) = pin.remotes.first() {
-                    if let Some((dev_id, _, fallback)) = find_automap_device_rec(snarl, src, parents) {
+                    if let Some((dev_id, _, fallback)) = find_automap_rec_inner(snarl, src, parents, false) {
                         // _automap_device_id = real physical device (fallback when upstream is a collector/forksel).
                         let real_id = fallback.unwrap_or_else(|| dev_id.clone());
                         params.insert("_automap_device_id".to_string(), serde_json::Value::String(real_id));
@@ -1647,7 +1703,7 @@ pub(crate) fn build_processing_graph_rec(
                 for i in 1..node.inputs.len() {
                     let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
                     let resolved = pin.remotes.first()
-                        .and_then(|&src| find_automap_device_rec(snarl, src, parents));
+                        .and_then(|&src| find_automap_rec_inner(snarl, src, parents, false));
                     let (dev_str, coll_str) = match resolved {
                         Some((dev_id, _, fallback)) => {
                             let is_collector = dev_id.starts_with("collector:")
@@ -1685,7 +1741,7 @@ pub(crate) fn build_processing_graph_rec(
             for i in 0..node.inputs.len() {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
                 let resolved = pin.remotes.first()
-                    .and_then(|&src| find_automap_device_rec(snarl, src, parents));
+                    .and_then(|&src| find_automap_rec_inner(snarl, src, parents, false));
                 let (dev_str, coll_str) = match resolved {
                     Some((dev_id, _, fallback)) => {
                         let is_collector = dev_id.starts_with("collector:")
@@ -1723,7 +1779,7 @@ pub(crate) fn build_processing_graph_rec(
             let src_dev = {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
                 pin.remotes.first()
-                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .and_then(|&src| find_automap_rec_inner(snarl, src, parents, false))
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
@@ -1771,7 +1827,7 @@ pub(crate) fn build_processing_graph_rec(
             let dest_dev = {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
                 pin.remotes.first()
-                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .and_then(|&src| find_automap_rec_inner(snarl, src, parents, false))
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
@@ -1786,7 +1842,7 @@ pub(crate) fn build_processing_graph_rec(
             let dest_dev = {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
                 pin.remotes.first()
-                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .and_then(|&src| find_automap_rec_inner(snarl, src, parents, false))
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
@@ -1978,7 +2034,7 @@ pub(crate) fn build_processing_graph_rec(
                 }
                 let pin = snarl.in_pin(InPinId { node: outer_node_id, input: i });
                 let Some(&src) = pin.remotes.first() else { continue };
-                let Some((am_dev_id, _, _)) = find_automap_device_rec(snarl, src, parents) else { continue };
+                let Some((am_dev_id, _, _)) = find_automap_rec_inner(snarl, src, parents, false) else { continue };
                 let Some(uid) = uid_from_collector_id(&am_dev_id) else { continue };
                 let Some(am_idx) = snaps.iter().position(|s| match_inner_uid(uid, s.node_uid)) else { continue };
                 if am_idx != idx && seen.insert(am_idx) {

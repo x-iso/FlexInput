@@ -38,7 +38,7 @@ pub(crate) fn eval_rws_node(
     snap: &NodeSnap,
     uid: usize,
     inputs: &[Option<Signal>],
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -56,17 +56,17 @@ pub(crate) fn eval_rws_node(
     // Recover the flick stick from the pre-block snapshot (we're the reason it's
     // blocked, so we must still read it); falls back to the resolved input when
     // it isn't (yet) being blocked.
-    let unblocked: HashMap<(String, String), Signal> = state
+    let unblocked: SigMap = state
         .get(&MACRO_CARRY_UID)
         .map(|s| s.unblocked_src.clone())
         .unwrap_or_default();
     let sig_f32 = |s: &Signal| if let Signal::Float(f) = s { Some(*f) } else { None };
     let flick_snapshot = if can_suppress {
-        let x = unblocked.get(&(dev_id.clone(), format!("{stick}_x"))).and_then(sig_f32);
-        let y = unblocked.get(&(dev_id.clone(), format!("{stick}_y"))).and_then(sig_f32);
+        let x = unblocked.get_pin(&dev_id, &format!("{stick}_x")).and_then(sig_f32);
+        let y = unblocked.get_pin(&dev_id, &format!("{stick}_y")).and_then(sig_f32);
         match (x, y) {
             (Some(x), Some(y)) => Some(glam::Vec2::new(x, y)),
-            _ => match unblocked.get(&(dev_id.clone(), stick.clone())) {
+            _ => match unblocked.get_pin(&dev_id, &stick) {
                 Some(Signal::Vec2(v)) => Some(*v),
                 _ => None,
             },
@@ -112,7 +112,7 @@ pub(crate) fn eval_rws_node(
                 format!("{stick}_left"),
                 format!("{stick}_right"),
             ] {
-                collector_sigs.insert((bk.clone(), p), Signal::Bool(true));
+                collector_sigs.set_pin(&bk, &p, Signal::Bool(true));
             }
         }
     }

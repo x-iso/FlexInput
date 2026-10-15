@@ -12,7 +12,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
     uid: usize,
     node_outputs: &[Option<Signal>],
     node_state: &mut NodeState,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     dt: f32,
 ) {
     let lean_val = node_outputs.get(3)
@@ -50,7 +50,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
         }
     }
 
-    let mut asserted: HashMap<String, Signal> = HashMap::new();
+    let mut asserted: PinSigs = PinSigs::default();
     // MIDI outputs, typed and levelled the way every mapping card's are.
     let mut midi_asserted: HashMap<String, CardMidi> = HashMap::new();
 
@@ -243,7 +243,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                 _                 => Signal::Bool(false),
             }
         });
-        collector_sigs.insert((key.clone(), p.clone()), sig);
+        collector_sigs.set_pin(&key, &p, sig);
     }
 
     // ── Touchpad output synthesis (zones + analog swipe) ──────────────────

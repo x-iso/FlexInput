@@ -40,6 +40,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   the computed one — that's what Auto is for. Nodes saved on Computed before
   this didn't store the choice, so they open on Auto.
 
+- **Much lower CPU use.** The processing engine does the same work about three
+  times faster and the window redraws its graph about twice as fast, with the
+  same results. On a Ryzen 7 3800X a typical preset went from 16–17% CPU with
+  the window focused to about 5% (about 2% minimized). Heavy patches no longer
+  outrun the engine at the default sample rate.
+
+- **Lower memory use that no longer creeps up.** Text drawn at many sizes —
+  resizing pinned widgets and overlay elements — filled a glyph cache that could
+  reach about half a gigabyte before it was ever cleared, all of it system
+  memory on integrated graphics; it now has a much lower ceiling. Icons drawn at
+  many sizes are recycled instead of kept forever, undo history no longer keeps
+  a copy of every scope's trace, and readouts no longer record a trace nothing
+  shows.
+
 ## [0.15.8] - 2026-10-13
 
 ### Added

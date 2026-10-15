@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flexinput_core::automap::{self, FeedbackGroup};
-use flexinput_core::Signal;
+use flexinput_core::{PinMapExt, Signal, SigMap};
 
 use crate::graph::{NodeSnap, SinkTarget};
 
@@ -49,11 +49,8 @@ fn needs_game_feedback(nodes: &[NodeSnap]) -> bool {
     })
 }
 
-fn put_max(collector_sigs: &mut HashMap<(String, String), Signal>, key: &str, pin: &str, v: f32) {
-    collector_sigs
-        .entry((key.to_string(), pin.to_string()))
-        .and_modify(|s| *s = Signal::Float(s.as_float().max(v)))
-        .or_insert(Signal::Float(v));
+fn put_max(collector_sigs: &mut SigMap, key: &str, pin: &str, v: f32) {
+    collector_sigs.merge_pin(key, pin, Signal::Float(v), |s| *s = Signal::Float(s.as_float().max(v)));
 }
 
 /// Pre-pass, before any node runs:
@@ -68,8 +65,8 @@ fn put_max(collector_sigs: &mut HashMap<(String, String), Signal>, key: &str, pi
 ///     as game feedback by [`apply_pad_feedback`] / the receiver frame fold.
 pub(crate) fn gather_game_feedback(
     nodes: &[NodeSnap],
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
 ) {
     if !needs_game_feedback(nodes) { return; }
     // Main-loop auto-feedback only runs for top-level pads, so only those.
@@ -93,13 +90,13 @@ pub(crate) fn gather_game_feedback(
 }
 
 fn read_virtual_feedback(
-    dev_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
     virtual_dev: &str,
     key: &str,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     for pin in automap::FEEDBACK_INLET_PINS {
-        if let Some(sig) = dev_sigs.get(&(virtual_dev.to_string(), pin.id.to_string())) {
+        if let Some(sig) = dev_sigs.get_pin(&virtual_dev, &pin.id) {
             put_max(collector_sigs, key, pin.id, sig.as_float());
         }
     }
@@ -114,7 +111,7 @@ fn gather_net_send_feedback(
     nodes: &[NodeSnap],
     outer_uid: usize,
     nested: bool,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     for node in nodes {
         let uid = if nested { namespaced_uid(outer_uid, node.node_uid) } else { node.node_uid };
@@ -126,10 +123,8 @@ fn gather_net_send_feedback(
                         let net_key = format!("{FEEDBACK_NET}{target}");
                         let game_key = format!("{FEEDBACK_GAME}{target}");
                         for (pin, v) in fb.iter_present() {
-                            collector_sigs
-                                .entry((net_key.clone(), pin.to_string()))
-                                .and_modify(|e| *e = combine_signals(*e, Signal::Float(v)))
-                                .or_insert(Signal::Float(v));
+                            collector_sigs.merge_pin(&net_key, pin, Signal::Float(v),
+                                |e| *e = combine_signals(*e, Signal::Float(v)));
                             put_max(collector_sigs, &game_key, pin, v);
                         }
                     }
@@ -145,7 +140,7 @@ fn gather_net_send_feedback(
 /// The strongest value the game requests on any of `pins` across `targets`
 /// (pad or bus ids; empty ids are skipped). 0 when the game asks for nothing.
 pub(crate) fn game_feedback(
-    collector_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &SigMap,
     targets: &[&str],
     pins: &[&str],
 ) -> f32 {
@@ -153,7 +148,7 @@ pub(crate) fn game_feedback(
     for target in targets.iter().filter(|t| !t.is_empty()) {
         let key = format!("{FEEDBACK_GAME}{target}");
         for pin in pins {
-            if let Some(sig) = collector_sigs.get(&(key.clone(), pin.to_string())) {
+            if let Some(sig) = collector_sigs.get_pin(&key, &pin) {
                 best = best.max(sig.as_float());
             }
         }
@@ -164,14 +159,14 @@ pub(crate) fn game_feedback(
 /// An AutoMap Selector's output id reads the game feedback of the input it is
 /// gating from, so a module placed after the Selector still sees the game.
 pub(crate) fn forward_game_feedback(
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
     from: &str,
     to: &str,
 ) {
     let from_key = format!("{FEEDBACK_GAME}{from}");
     let to_key = format!("{FEEDBACK_GAME}{to}");
     for pin in automap::FEEDBACK_INLET_PINS {
-        if let Some(&sig) = collector_sigs.get(&(from_key.clone(), pin.id.to_string())) {
+        if let Some(&sig) = collector_sigs.get_pin(&from_key, &pin.id) {
             put_max(collector_sigs, &to_key, pin.id, sig.as_float());
         }
     }
@@ -179,12 +174,12 @@ pub(crate) fn forward_game_feedback(
 
 /// The feedback groups a target's overrides take over this tick.
 pub(crate) fn overridden_groups(
-    collector_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &SigMap,
     target: &str,
 ) -> HashSet<FeedbackGroup> {
     let key = format!("{FEEDBACK_OVERRIDE}{target}");
     automap::FEEDBACK_INLET_PINS.iter()
-        .filter(|p| collector_sigs.contains_key(&(key.clone(), p.id.to_string())))
+        .filter(|p| collector_sigs.has_pin(&key, &p.id))
         .filter_map(|p| automap::feedback_group(p.id))
         .collect()
 }
@@ -229,23 +224,18 @@ fn route_pin<'a>(
 }
 
 fn combine_into(
-    sink_outputs: &mut HashMap<(String, String), Signal>,
+    sink_outputs: &mut SigMap,
     dev: &str,
     dst: &str,
     sig: Signal,
 ) {
-    use std::collections::hash_map::Entry;
-    match sink_outputs.entry((dev.to_string(), dst.to_string())) {
-        Entry::Occupied(mut o) => {
-            let merged = combine_signals(*o.get(), sig);
-            *o.get_mut() = clamp_feedback_signal(dst, merged);
-        }
-        Entry::Vacant(v) => { v.insert(sig); }
-    }
+    sink_outputs.merge_pin(dev, dst, sig, |cur| {
+        *cur = clamp_feedback_signal(dst, combine_signals(*cur, sig));
+    });
 }
 
 /// True if any module or peer wrote a feedback layer this tick.
-pub(crate) fn any_feedback_layer(collector_sigs: &HashMap<(String, String), Signal>) -> bool {
+pub(crate) fn any_feedback_layer(collector_sigs: &SigMap) -> bool {
     collector_sigs.keys().any(|(k, _)| FEEDBACK_WRITE_CHANNELS.iter().any(|c| k.starts_with(c)))
 }
 
@@ -254,14 +244,14 @@ pub(crate) fn any_feedback_layer(collector_sigs: &HashMap<(String, String), Sign
 /// Direct wires are never touched.
 pub(crate) fn apply_pad_feedback(
     st: &SinkTarget,
-    collector_sigs: &HashMap<(String, String), Signal>,
-    sink_outputs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &SigMap,
+    sink_outputs: &mut SigMap,
 ) {
     let dev = st.device_id.as_str();
     let layer = |prefix: &str| -> Vec<(&'static str, Signal)> {
         let key = format!("{prefix}{dev}");
         automap::FEEDBACK_INLET_PINS.iter()
-            .filter_map(|p| collector_sigs.get(&(key.clone(), p.id.to_string())).map(|s| (p.id, *s)))
+            .filter_map(|p| collector_sigs.get_pin(&key, &p.id).map(|s| (p.id, *s)))
             .collect()
     };
     let game_net = layer(FEEDBACK_NET);
@@ -295,7 +285,7 @@ pub(crate) fn apply_pad_feedback(
         for &p in &dst_pins {
             if directly_wired.contains(p) { continue; }
             if !automap::feedback_group(p).is_some_and(|g| groups.contains(&g)) { continue; }
-            if let Some(v) = sink_outputs.get_mut(&(dev.to_string(), p.to_string())) {
+            if let Some(v) = sink_outputs.get_pin_mut(&dev, &p) {
                 *v = Signal::Float(0.0);
             }
         }
@@ -333,8 +323,8 @@ pub const TRIGGER_DEFAULT_VALUES_PARAMS: [&str; 2] = ["ltrig_effect_values", "rt
 pub(crate) fn apply_default_trigger_effects(
     st: &SinkTarget,
     params: &HashMap<String, serde_json::Value>,
-    collector_sigs: &HashMap<(String, String), Signal>,
-    sink_outputs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &SigMap,
+    sink_outputs: &mut SigMap,
 ) {
     for side in 0..2 {
         let Some(mode) = params.get(TRIGGER_DEFAULT_MODE_PARAMS[side]).and_then(|v| v.as_str()) else {
@@ -349,10 +339,10 @@ pub(crate) fn apply_default_trigger_effects(
         });
         if wired { continue; }
         let override_key = format!("{FEEDBACK_OVERRIDE}{dev}");
-        if pins.iter().any(|p| collector_sigs.contains_key(&(override_key.clone(), p.to_string()))) {
+        if pins.iter().any(|p| collector_sigs.has_pin(&override_key, &p)) {
             continue;
         }
-        if pins.iter().any(|p| sink_outputs.contains_key(&(dev.to_string(), p.to_string()))) {
+        if pins.iter().any(|p| sink_outputs.has_pin(&dev, &p)) {
             continue;
         }
         let values: Vec<u8> = params.get(TRIGGER_DEFAULT_VALUES_PARAMS[side])
@@ -361,7 +351,7 @@ pub(crate) fn apply_default_trigger_effects(
             .unwrap_or_default();
         let Some(effect) = super::jsm_effect_pins(mode, &values) else { continue };
         for (pin, v) in pins.iter().zip(effect) {
-            sink_outputs.insert((dev.to_string(), pin.to_string()), Signal::Float(v));
+            sink_outputs.set_pin(&dev, &pin, Signal::Float(v));
         }
     }
 }

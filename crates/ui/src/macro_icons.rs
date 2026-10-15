@@ -146,13 +146,13 @@ fn svg_texture_cached(
 ) -> Option<egui::TextureHandle> {
     let size_px = (size_pts * ctx.pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("macro_icon", cache_salt, size_px));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+    if let Some(tex) = crate::widgets::tex_cache::get(&ctx, cache_key) {
         return Some(tex);
     }
     let img = crate::canvas::viewer::rasterize_svg_recolored(
         svg_text, size_px, size_px, "override", egui::Color32::TRANSPARENT)?;
     let handle = ctx.load_texture(
         format!("macro_icon_{cache_salt:x}_{size_px}"), img, egui::TextureOptions::LINEAR);
-    ctx.data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    crate::widgets::tex_cache::put(&ctx, cache_key, handle.clone());
     Some(handle)
 }

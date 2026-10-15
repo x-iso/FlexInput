@@ -807,7 +807,7 @@ pub(crate) fn switch_icon_texture(
 ) -> Option<egui::TextureHandle> {
     if svg.is_empty() || px == 0 { return None; }
     let key = egui::Id::new(("switch_icon_tex", node_uid, side, rev, px));
-    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+    if let Some(h) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(h);
     }
     let img = rasterize_svg_recolored(svg, px, px, "override", egui::Color32::TRANSPARENT)?;
@@ -816,7 +816,7 @@ pub(crate) fn switch_icon_texture(
         img,
         egui::TextureOptions::LINEAR,
     );
-    ui.ctx().data_mut(|d| d.insert_temp(key, handle.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), key, handle.clone());
     Some(handle)
 }
 
@@ -1179,7 +1179,7 @@ pub(crate) fn show_svg_body_sized(
         "svg_tex_cache", node_id.0, rev, pw, ph, mode.as_str(),
         tint.r(), tint.g(), tint.b(), tint.a(),
     ));
-    let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key));
+    let cached = crate::widgets::tex_cache::get(ui.ctx(), cache_key);
     let tex = match cached {
         Some(t) => t,
         None => {
@@ -1190,7 +1190,7 @@ pub(crate) fn show_svg_body_sized(
                         image,
                         egui::TextureOptions::LINEAR,
                     );
-                    ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                    crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
                     handle
                 }
                 None => {

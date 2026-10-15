@@ -2,6 +2,8 @@
 //! enough for FlexInput's UI, so hand-rolled replacements collect here.
 //! Future home of style flavors / theming hooks.
 
+pub(crate) mod tex_cache;
+
 /// Drop-in replacement for the removed-in-spirit `egui::popup_below_widget`
 /// (deprecated in 0.33): a memory-toggled popup anchored under the widget.
 /// Mirrors egui's own `popup_above_or_below_widget` shim over `egui::Popup`.

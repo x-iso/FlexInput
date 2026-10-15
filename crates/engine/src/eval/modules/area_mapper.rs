@@ -403,17 +403,17 @@ struct LayerLive {
 pub(crate) fn eval_area_mapper_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
     let key = format!("collector:{uid}");
     let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let bus = |pin: &str, cs: &HashMap<(String, String), Signal>| -> Option<Signal> {
-        cs.get(&(key.clone(), pin.to_string())).copied()
-            .or_else(|| dev_sigs.get(&(dev_id.clone(), pin.to_string())).copied())
+    let bus = |pin: &str, cs: &SigMap| -> Option<Signal> {
+        cs.get_pin(&key, &pin).copied()
+            .or_else(|| dev_sigs.get_pin(&dev_id, &pin).copied())
     };
 
     let input = snap.params.get(AREA_INPUT_PARAM).and_then(|v| v.as_str()).unwrap_or("left_stick");
@@ -542,7 +542,7 @@ pub(crate) fn eval_area_mapper_node(
     });
 
     // ── Cards ──
-    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
     let mut button_on: HashMap<String, bool> = HashMap::new();
     let mut axis_acc: HashMap<&'static str, f32> = HashMap::new();
     let mut mouse: Option<Vec2> = None;
@@ -642,15 +642,15 @@ pub(crate) fn eval_area_mapper_node(
                 } else {
                     ("right_stick", "right_stick_x", "right_stick_y")
                 };
-                collector_sigs.insert((key.clone(), v.to_string()), Signal::Vec2(Vec2::ZERO));
-                collector_sigs.insert((key.clone(), x.to_string()), Signal::Float(0.0));
-                collector_sigs.insert((key.clone(), y.to_string()), Signal::Float(0.0));
+                collector_sigs.set_pin(&key, &v, Signal::Vec2(Vec2::ZERO));
+                collector_sigs.set_pin(&key, &x, Signal::Float(0.0));
+                collector_sigs.set_pin(&key, &y, Signal::Float(0.0));
                 sticks_touched.insert(v);
             }
             _ => {
-                collector_sigs.insert((key.clone(), format!("{input}_active")), Signal::Bool(false));
-                collector_sigs.insert((key.clone(), format!("{input}_x")), Signal::Float(0.0));
-                collector_sigs.insert((key.clone(), format!("{input}_y")), Signal::Float(0.0));
+                collector_sigs.set_pin(&key, &format!("{input}_active"), Signal::Bool(false));
+                collector_sigs.set_pin(&key, &format!("{input}_x"), Signal::Float(0.0));
+                collector_sigs.set_pin(&key, &format!("{input}_y"), Signal::Float(0.0));
             }
         }
     }
@@ -664,7 +664,7 @@ pub(crate) fn eval_area_mapper_node(
         }
         let sig_type = automap::ALL_PINS.iter().find(|ap| ap.id == pin.as_str())
             .map(|ap| ap.signal_type).unwrap_or(SignalType::Bool);
-        let carried = collector_sigs.contains_key(&(key.clone(), pin.clone()));
+        let carried = collector_sigs.has_pin(&key, &pin);
         // Released and on the bus anyway → leave the passthrough value (a real
         // press of the same button still comes through). Released and NOT on
         // the bus → write it off, or a virtual sink latches the last press.
@@ -675,11 +675,11 @@ pub(crate) fn eval_area_mapper_node(
             (SignalType::Int, on) => Signal::Int(on as i32),
             (_, on) => Signal::Bool(on),
         };
-        collector_sigs.insert((key.clone(), pin.clone()), sig);
+        collector_sigs.set_pin(&key, &pin, sig);
     }
     for (axis, v) in &axis_acc {
         let clamped = if matches!(*axis, "left_trigger" | "right_trigger") { v.clamp(0.0, 1.0) } else { v.clamp(-1.0, 1.0) };
-        collector_sigs.insert((key.clone(), axis.to_string()), Signal::Float(clamped));
+        collector_sigs.set_pin(&key, &axis, Signal::Float(clamped));
         if let Some(vec_pin) = vec2_pin_for_axis(axis) {
             sticks_touched.insert(vec_pin);
         }
@@ -687,23 +687,23 @@ pub(crate) fn eval_area_mapper_node(
     // Mouse and scroll only while a cell drives them; otherwise the bus's own
     // values pass.
     if let Some(m) = mouse {
-        collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(m));
-        collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(m.x));
-        collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(m.y));
+        collector_sigs.set_pin(&key, "mouse", Signal::Vec2(m));
+        collector_sigs.set_pin(&key, "mouse_x", Signal::Float(m.x));
+        collector_sigs.set_pin(&key, "mouse_y", Signal::Float(m.y));
     }
     if let Some(s) = scroll {
-        collector_sigs.insert((key.clone(), "scroll_x".to_string()), Signal::Float(s.x));
-        collector_sigs.insert((key.clone(), "scroll_y".to_string()), Signal::Float(s.y));
+        collector_sigs.set_pin(&key, "scroll_x", Signal::Float(s.x));
+        collector_sigs.set_pin(&key, "scroll_y", Signal::Float(s.y));
     }
     // Keep each written stick's Vec2 and cardinal pins in step with its axes.
     for stick in sticks_touched {
         let (x, y) = (format!("{stick}_x"), format!("{stick}_y"));
-        let ax = collector_sigs.get(&(key.clone(), x.clone())).map(|s| s.as_float()).unwrap_or(0.0);
-        let ay = collector_sigs.get(&(key.clone(), y.clone())).map(|s| s.as_float()).unwrap_or(0.0);
+        let ax = collector_sigs.get_pin(&key, &x).map(|s| s.as_float()).unwrap_or(0.0);
+        let ay = collector_sigs.get_pin(&key, &y).map(|s| s.as_float()).unwrap_or(0.0);
         if stick != "dpad" {
-            collector_sigs.insert((key.clone(), stick.to_string()), Signal::Vec2(Vec2::new(ax, ay)));
+            collector_sigs.set_pin(&key, &stick, Signal::Vec2(Vec2::new(ax, ay)));
         }
-        let mut local: HashMap<String, Signal> = HashMap::new();
+        let mut local: PinSigs = PinSigs::default();
         local.insert(x, Signal::Float(ax));
         local.insert(y, Signal::Float(ay));
         derive_stick_cardinals(&mut local);
@@ -711,7 +711,7 @@ pub(crate) fn eval_area_mapper_node(
             if k.starts_with(stick) && (k.ends_with("_up") || k.ends_with("_down")
                 || k.ends_with("_left") || k.ends_with("_right"))
             {
-                collector_sigs.insert((key.clone(), k), v);
+                collector_sigs.set_pin(&key, &k, v);
             }
         }
     }

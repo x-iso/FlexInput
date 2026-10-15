@@ -15,8 +15,8 @@ use super::*;
 pub(crate) fn eval_automap_curve_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> (Vec<Option<Signal>>, Vec<Option<Signal>>) {
@@ -31,7 +31,7 @@ pub(crate) fn eval_automap_curve_node(
     };
     let key = format!("collector:{uid}");
     let inputs: Vec<Option<Signal>> = pins.iter()
-        .map(|p| collector_sigs.get(&(key.clone(), p.to_string())).copied())
+        .map(|p| collector_sigs.get_pin(&key, &p).copied())
         .collect();
     // The picked signal decides the curve's mode — a stick is shaped by its
     // length, so always absolute — and never the stored params: switching the
@@ -69,11 +69,11 @@ fn write_curved_pin(
     key: &str,
     pin: &str,
     output: Signal,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
-    collector_sigs.insert((key.to_string(), pin.to_string()), output);
+    collector_sigs.set_pin(&key, &pin, output);
     let mut set_if_carried = |p: &str, sig: Signal| {
-        if let Some(slot) = collector_sigs.get_mut(&(key.to_string(), p.to_string())) {
+        if let Some(slot) = collector_sigs.get_pin_mut(&key, &p) {
             *slot = sig;
         }
     };

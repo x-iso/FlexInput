@@ -27,8 +27,8 @@ pub(crate) fn eval_menu_node(
     snap: &NodeSnap,
     uid: usize,
     inputs: &[Option<Signal>],
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -40,14 +40,14 @@ pub(crate) fn eval_menu_node(
 
     // Upstream snapshot (collector override first, else raw device), owned so
     // the publish pass below can mutate collector_sigs freely.
-    let mut upstream: HashMap<String, Signal> = HashMap::new();
+    let mut upstream: PinSigs = PinSigs::default();
     for ap in automap::ALL_PINS {
         let sig = if !collector_id.is_empty() {
-            collector_sigs.get(&(collector_id.clone(), ap.id.to_string())).copied()
+            collector_sigs.get_pin(&collector_id, &ap.id).copied()
         } else { None }
         .or_else(|| {
             if !dev_id.is_empty() {
-                dev_sigs.get(&(dev_id.clone(), ap.id.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &ap.id).copied()
             } else { None }
         });
         if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
@@ -56,10 +56,10 @@ pub(crate) fn eval_menu_node(
     // `dev_sigs` (so nothing ELSE in the patch sees them), but the menu is the
     // reason they're blocked and must still steer from them — so it reads the
     // pre-block snapshot, falling back to the (unblocked) bus for everything else.
-    let unblocked_nav: HashMap<(String, String), Signal> = state.get(&MACRO_CARRY_UID)
+    let unblocked_nav: SigMap = state.get(&MACRO_CARRY_UID)
         .map(|s| s.unblocked_src.clone()).unwrap_or_default();
     let read_nav = |pin: &str| -> Option<Signal> {
-        unblocked_nav.get(&(dev_id.clone(), pin.to_string())).copied()
+        unblocked_nav.get_pin(&dev_id, &pin).copied()
             .or_else(|| upstream.get(pin).copied())
     };
 
@@ -110,7 +110,7 @@ pub(crate) fn eval_menu_node(
     // stale is imperceptible at kHz. Captured before the mutable `state.entry`
     // below so the immutable borrow ends first (NLL).
     let macro_prev = state.get(&MACRO_CARRY_UID).map(|s| &s.macro_prev);
-    let macro_on = |cs: &HashMap<(String, String), Signal>, pin: String| -> bool {
+    let macro_on = |cs: &SigMap, pin: String| -> bool {
         let key = (flexinput_core::macros::SIGS_NS.to_string(), pin);
         cs.get(&key).map(|s| s.as_bool()).unwrap_or(false)
             || macro_prev.and_then(|m| m.get(&key)).map(|s| s.as_bool()).unwrap_or(false)
@@ -376,7 +376,7 @@ pub(crate) fn eval_menu_node(
     // "menu_sel" = the select pulse of this card's zone, "menu_hover" = held
     // while the zone is highlighted) ──
     let mapping = pstr("zone_mode", "mapping") == "mapping";
-    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
     let mut button_on: HashMap<String, bool> = HashMap::new();
     // Stick directions held by cards: a full push that way, per stick.
     let mut stick_pushes: HashMap<&'static str, Vec2> = HashMap::new();
@@ -430,7 +430,7 @@ pub(crate) fn eval_menu_node(
     // leaked). Card overrides + suppression below overwrite specific pins on top
     // of this complete bus.
     for (pin, sig) in &upstream {
-        collector_sigs.insert((key.clone(), pin.clone()), *sig);
+        collector_sigs.set_pin(&key, &pin, *sig);
     }
 
     // Card button pins. While the card is active, assert the pin. When the card
@@ -458,7 +458,7 @@ pub(crate) fn eval_menu_node(
                 SignalType::Vec2  => continue,
                 _                 => Signal::Bool(true),
             };
-            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            collector_sigs.set_pin(&key, &pin, sig);
         } else if !upstream.contains_key(pin) {
             let off = match sig_type {
                 SignalType::Float => Signal::Float(0.0),
@@ -466,19 +466,19 @@ pub(crate) fn eval_menu_node(
                 SignalType::Vec2  => continue,
                 _                 => Signal::Bool(false),
             };
-            collector_sigs.insert((key.clone(), pin.clone()), off);
+            collector_sigs.set_pin(&key, &pin, off);
         }
     }
     // Pushed sticks: the pushed axis takes the push, the other keeps the
     // passthrough.
     for (stick, push) in stick_pushes {
         let (xa, ya) = (format!("{stick}_x"), format!("{stick}_y"));
-        let cur = |a: &str| collector_sigs.get(&(key.clone(), a.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let cur = |a: &str| collector_sigs.get_pin(&key, &a).map(|s| s.as_float()).unwrap_or(0.0);
         let x = if push.x != 0.0 { push.x.clamp(-1.0, 1.0) } else { cur(&xa) };
         let y = if push.y != 0.0 { push.y.clamp(-1.0, 1.0) } else { cur(&ya) };
-        collector_sigs.insert((key.clone(), xa), Signal::Float(x));
-        collector_sigs.insert((key.clone(), ya), Signal::Float(y));
-        collector_sigs.insert((key.clone(), stick.to_string()), Signal::Vec2(Vec2::new(x, y)));
+        collector_sigs.set_pin(&key, &xa, Signal::Float(x));
+        collector_sigs.set_pin(&key, &ya, Signal::Float(y));
+        collector_sigs.set_pin(&key, &stick, Signal::Vec2(Vec2::new(x, y)));
     }
 
     // ── Suppress the pointing inputs steering the menu ──
@@ -507,19 +507,19 @@ pub(crate) fn eval_menu_node(
         // (2) Zero the blocked pins on our own passthrough bus.
         for (on, name) in [(block_ls, "left_stick"), (block_rs, "right_stick")] {
             if !on { continue; }
-            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
-            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
-            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+            collector_sigs.set_pin(&key, &name, Signal::Vec2(Vec2::ZERO));
+            collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(0.0));
+            collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(0.0));
         }
         if block_touch {
-            collector_sigs.insert((key.clone(), format!("{touch_which}_active")), Signal::Bool(false));
-            collector_sigs.insert((key.clone(), format!("{touch_which}_x")), Signal::Float(0.0));
-            collector_sigs.insert((key.clone(), format!("{touch_which}_y")), Signal::Float(0.0));
-            collector_sigs.insert((key.clone(), "btn_touchpad".to_string()), Signal::Bool(false));
+            collector_sigs.set_pin(&key, &format!("{touch_which}_active"), Signal::Bool(false));
+            collector_sigs.set_pin(&key, &format!("{touch_which}_x"), Signal::Float(0.0));
+            collector_sigs.set_pin(&key, &format!("{touch_which}_y"), Signal::Float(0.0));
+            collector_sigs.set_pin(&key, "btn_touchpad", Signal::Bool(false));
         }
         if block_gyro {
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
-                collector_sigs.insert((key.clone(), pin.to_string()), Signal::Float(0.0));
+                collector_sigs.set_pin(&key, &pin, Signal::Float(0.0));
             }
         }
 
@@ -538,16 +538,16 @@ pub(crate) fn eval_menu_node(
             }
             if block_gyro { for p in ["gyro_x", "gyro_y", "gyro_z"] { blocked.push(p.to_string()); } }
             for p in blocked {
-                collector_sigs.insert((bk.clone(), p), Signal::Bool(true));
+                collector_sigs.set_pin(&bk, &p, Signal::Bool(true));
             }
         }
 
         // Re-derive stick cardinals from the (now zeroed) axes so a suppressed
         // stick can't leak through synthetic left_stick_up/down/... pins, which
         // a pass-through Collector would otherwise copy verbatim from the bus.
-        let mut local: HashMap<String, Signal> = HashMap::new();
+        let mut local: PinSigs = PinSigs::default();
         for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
-            if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
+            if let Some(&sig) = collector_sigs.get_pin(&key, &axis) {
                 local.insert(axis.to_string(), sig);
             }
         }
@@ -556,7 +556,7 @@ pub(crate) fn eval_menu_node(
             if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
                 || k.ends_with("_left") || k.ends_with("_right"))
             {
-                collector_sigs.insert((key.clone(), k), v);
+                collector_sigs.set_pin(&key, &k, v);
             }
         }
     }

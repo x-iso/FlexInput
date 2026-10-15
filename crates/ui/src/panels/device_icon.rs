@@ -5,7 +5,7 @@ use eframe::egui::{self, Color32};
 pub(crate) fn render_device_icon(ui: &mut egui::Ui, bytes: &'static [u8], height: f32) {
     let size_px = (height * ui.ctx().pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("device_icon", bytes.as_ptr() as usize, size_px));
-    let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+    let tex = crate::widgets::tex_cache::get(ui.ctx(), cache_key)
         .or_else(|| {
             let text = std::str::from_utf8(bytes).ok()?;
             let img = crate::canvas::viewer::rasterize_svg_recolored(
@@ -16,7 +16,7 @@ pub(crate) fn render_device_icon(ui: &mut egui::Ui, bytes: &'static [u8], height
                 img,
                 egui::TextureOptions::LINEAR,
             );
-            ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+            crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
             Some(handle)
         });
     if let Some(tex) = tex {
@@ -85,7 +85,7 @@ fn load_svg_texture(
     invert: bool,
 ) -> Option<egui::TextureHandle> {
     let cache_key = egui::Id::new(("svg_icon_btn", bytes.as_ptr() as usize, size_px, invert));
-    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+    if let Some(h) = crate::widgets::tex_cache::get(ui.ctx(), cache_key) {
         return Some(h);
     }
     let text = std::str::from_utf8(bytes).ok()?;
@@ -113,6 +113,6 @@ fn load_svg_texture(
         img,
         egui::TextureOptions::LINEAR,
     );
-    ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
     Some(handle)
 }

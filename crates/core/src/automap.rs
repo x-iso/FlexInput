@@ -441,6 +441,15 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "scroll_move_x", display_name: "Mouse: Scroll X (move)", signal_type: SignalType::Float },
 ];
 
+/// Whether `id` is one of [`ALL_PINS`]. A set lookup: the engine asks this per
+/// bus entry every tick, where a scan of the list cost a hundred-odd string
+/// compares each time.
+pub fn is_canonical_pin(id: &str) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str, crate::FastHasher>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| ALL_PINS.iter().map(|p| p.id).collect()).contains(id)
+}
+
 /// Family-specific button glyph for a cross-family pin, or `None` if the pin
 /// is family-neutral. `family_slug` is the middle segment of a gilrs device ID
 /// (e.g. `"dualsense"` from `"gilrs:dualsense:0"`). Pass `None` / unknown to get

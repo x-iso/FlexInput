@@ -30,7 +30,7 @@ pub(crate) fn analog_trigger_out(pin_id: &str) -> Option<&'static str> {
 /// direction; up to ±1.0 at full deflection in the cardinal's direction.
 /// Used by analog-mode Remapper / Map Action to drive output axes from
 /// input cardinals' live magnitudes (no gesture gate).
-pub(crate) fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> f32 {
+pub(crate) fn analog_cardinal_input_value(upstream: &PinSigs, pin_id: &str) -> f32 {
     let Some((axis_pin, cardinal_sign)) = analog_axis_for_cardinal(pin_id) else { return 0.0; };
     let axis_val = upstream.get(axis_pin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
     let signed = axis_val * cardinal_sign;
@@ -80,7 +80,7 @@ impl MappingShape {
     /// An input's live analog value as THIS card reads it: an IMU input over
     /// the card's range and Log/Exp (signed for a two-sided axis), anything
     /// else as [`analog_in_value`].
-    pub(crate) fn in_value(&self, upstream: &HashMap<String, Signal>, pin: &str) -> Option<f32> {
+    pub(crate) fn in_value(&self, upstream: &PinSigs, pin: &str) -> Option<f32> {
         if let Some(p) = imu_pin(pin) {
             let v = upstream.get(pin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
             return Some(self.imu.normalize(p, v));
@@ -101,7 +101,7 @@ impl MappingShape {
     /// along a two-sided IMU axis, any way for a stick.
     pub(crate) fn analog_gate(
         &self,
-        upstream: &HashMap<String, Signal>,
+        upstream: &PinSigs,
         pin: &str,
     ) -> Option<bool> {
         if is_imu_pin(pin) || whole_stick_axes(pin).is_some() {
@@ -150,7 +150,7 @@ pub(crate) fn shape_mag(pts: &[[f32; 2]], mag: f32) -> f32 {
 /// deflection, a whole stick's length, an analog trigger's travel, or a MIDI
 /// knob / pressure value (0..1) or pitch bend (SIGNED, −1..1 — its two halves
 /// are one control). `None` for digital pins.
-pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+pub(crate) fn analog_in_value(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     if analog_axis_for_cardinal(pin_id).is_some() {
         return Some(analog_cardinal_input_value(upstream, pin_id));
     }
@@ -179,7 +179,7 @@ pub(crate) fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) 
 /// "Else" means ABSENT from the bus, not zero: a MIDI port keeps a held note's
 /// pressure on the bus at 0 once it has been sent, so easing off aftertouch
 /// reads 0 rather than jumping back to the velocity.
-pub(crate) fn note_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+pub(crate) fn note_value(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     let pin = flexinput_core::midi::parse_pin(pin_id)?;
     let companions = pin.note_companions()?;
     if !upstream.get(pin_id).is_some_and(|s| s.as_bool()) {
@@ -197,7 +197,7 @@ pub(crate) fn note_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Op
 /// A note's strike velocity while it sounds (0 once released). A card's
 /// threshold on a note input is measured against this, not the live value: it
 /// decides which strikes count, while the curve shapes the aftertouch after.
-pub(crate) fn note_velocity(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+pub(crate) fn note_velocity(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     let pin = flexinput_core::midi::parse_pin(pin_id)?;
     let [_, _, vel] = pin.note_companions()?;
     if !upstream.get(pin_id).is_some_and(|s| s.as_bool()) {
@@ -252,7 +252,7 @@ pub(crate) fn whole_stick_dirs(pin: &str) -> Option<[&'static str; 4]> {
 
 /// A whole stick's position, from its axes (what its directions derive from),
 /// else its Vec2; centred when the bus has neither. `None` for any other pin.
-pub(crate) fn whole_stick_value(upstream: &HashMap<String, Signal>, pin: &str) -> Option<Vec2> {
+pub(crate) fn whole_stick_value(upstream: &PinSigs, pin: &str) -> Option<Vec2> {
     let (xa, ya) = whole_stick_axes(pin)?;
     let axis = |p: &str| upstream.get(p).map(|s| sig_scalar(*s));
     Some(match (axis(xa), axis(ya)) {
@@ -279,7 +279,7 @@ pub(crate) fn mappings_read_imu(mappings: &[Value]) -> bool {
 ///
 /// These are evaluator-local, like the stick cardinals: never published, never
 /// claimed — the gyro they come from passes through untouched.
-pub(crate) fn derive_imu_pins(upstream: &mut HashMap<String, Signal>, est: &mut ImuEstimator, dt: f32) {
+pub(crate) fn derive_imu_pins(upstream: &mut PinSigs, est: &mut ImuEstimator, dt: f32) {
     let read = |p: &str| upstream.get(p).map(|s| sig_scalar(*s));
     let (Some(gx), Some(gy), Some(gz)) = (read("gyro_x"), read("gyro_y"), read("gyro_z")) else {
         return;
@@ -290,7 +290,7 @@ pub(crate) fn derive_imu_pins(upstream: &mut HashMap<String, Signal>, est: &mut 
     };
     let r = est.tick(glam::Vec3::new(gx, gy, gz), accel, dt);
     for p in IMU_PINS {
-        upstream.insert(p.id.to_string(), Signal::Float(p.bus_value(&r)));
+        upstream.insert(flexinput_core::pooled_string(p.id), Signal::Float(p.bus_value(&r)));
     }
 }
 
@@ -375,7 +375,7 @@ pub(crate) struct TouchComboEval {
 /// analog deflected). This must NOT require every cardinal at once — a combo
 /// mixing left+right of one axis can never be "simultaneously held", which is
 /// exactly why a generic all-held check would never suppress its gate buttons.
-pub(crate) fn eval_touch_combo(in_pins: &[&str], upstream: &HashMap<String, Signal>) -> TouchComboEval {
+pub(crate) fn eval_touch_combo(in_pins: &[&str], upstream: &PinSigs) -> TouchComboEval {
     let mut gate_buttons_held = true;
     let mut has_gate_button = false;
     let mut has_analog = false;
@@ -422,7 +422,7 @@ pub(crate) fn eval_touch_combo(in_pins: &[&str], upstream: &HashMap<String, Sign
 pub(crate) fn publish_touch_points(
     key: &str,
     fingers: &[(f32, f32)],
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    collector_sigs: &mut SigMap,
 ) {
     for (i, (xk, yk, ak)) in [
         ("touch1_x", "touch1_y", "touch1_active"),
@@ -433,9 +433,9 @@ pub(crate) fn publish_touch_points(
                 Signal::Float(x.clamp(-1.0, 1.0)));
             collector_sigs.insert((key.to_string(), yk.to_string()),
                 Signal::Float(y.clamp(-1.0, 1.0)));
-            collector_sigs.insert((key.to_string(), ak.to_string()), Signal::Bool(true));
+            collector_sigs.set_pin(&key, &ak, Signal::Bool(true));
         } else {
-            collector_sigs.insert((key.to_string(), ak.to_string()), Signal::Bool(false));
+            collector_sigs.set_pin(&key, &ak, Signal::Bool(false));
         }
     }
 }

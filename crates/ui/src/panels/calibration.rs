@@ -3356,7 +3356,7 @@ fn arc_segment(painter: &egui::Painter, center: Pos2, radius: f32, a0: f32, a1: 
 
 fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
     let key = egui::Id::new(("cal_atrig_svg", h_px));
-    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+    if let Some(h) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(h);
     }
     let text = std::str::from_utf8(ATRIG_SVG).ok()?;
@@ -3368,7 +3368,7 @@ fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
         img,
         egui::TextureOptions::LINEAR,
     );
-    ui.ctx().data_mut(|d| d.insert_temp(key, handle.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), key, handle.clone());
     Some(handle)
 }
 

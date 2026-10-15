@@ -1553,7 +1553,7 @@ fn nav_toggle_parts(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
 fn nav_svg_texture(ui: &egui::Ui, name: &str, svg: &str, side: f32) -> Option<egui::TextureHandle> {
     let px = (side * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32;
     let key = egui::Id::new(("nav_toggle_svg", name, px));
-    if let Some(t) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+    if let Some(t) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(t);
     }
     // A fully-transparent tint makes rasterize_svg_recolored skip its recolor
@@ -1561,7 +1561,7 @@ fn nav_svg_texture(ui: &egui::Ui, name: &str, svg: &str, side: f32) -> Option<eg
     let img = crate::canvas::viewer::rasterize_svg_recolored(
         svg, px, px, "override", egui::Color32::TRANSPARENT)?;
     let t = ui.ctx().load_texture(format!("nav_toggle_{name}"), img, egui::TextureOptions::LINEAR);
-    ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), key, t.clone());
     Some(t)
 }
 

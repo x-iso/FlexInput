@@ -67,6 +67,11 @@ pub fn net_config_from_params(
     params: &HashMap<String, Value>,
 ) -> Option<flexinput_net::NetNodeConfig> {
     use flexinput_net::{NetNodeConfig, Transport};
+    // The engine asks this of every node on every wakeup: bail before reading
+    // (and allocating) params for anything that isn't a network node.
+    if module_id != NET_SEND_ID && module_id != NET_RECV_ID {
+        return None;
+    }
     let transport = Transport::from_str(
         params.get("net_transport").and_then(|v| v.as_str()).unwrap_or("udp"),
     );
@@ -186,7 +191,13 @@ pub struct TickOutput {
     /// Latest outputs per twoway_response_curve node (blended engine output for UI arrow).
     pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Latest signals destined for each (device_id, pin_id) sink slot.
-    pub sink_outputs: HashMap<(String, String), Signal>,
+    pub sink_outputs: SigMap,
+    /// The tick's working maps — the AutoMap bus and the preprocessed device
+    /// signals — kept here between ticks, empty, so each tick reuses their
+    /// tables and (through `recycle_keys`) their key Strings rather than
+    /// rebuilding a few hundred entries from nothing.
+    pub(crate) bus_scratch: SigMap,
+    pub(crate) dev_scratch: SigMap,
 }
 
 impl TickOutput {
@@ -198,6 +209,6 @@ impl TickOutput {
         self.scope_samples.clear();
         self.last_inputs.clear();
         self.last_outputs.clear();
-        self.sink_outputs.clear();
+        flexinput_core::recycle_keys(&mut self.sink_outputs);
     }
 }

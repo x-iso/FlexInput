@@ -316,8 +316,8 @@ pub struct StickRotationState {
 pub(crate) fn eval_stick_rotation_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -339,7 +339,7 @@ pub(crate) fn eval_stick_rotation_node(
         return_s: relative.then(|| num(STICK_ROT_RETURN_PARAM, STICK_ROT_RETURN_DEFAULT_MS).max(0.0) / 1000.0),
     };
 
-    let bus = |pin: &str| collector_sigs.get(&(key.clone(), pin.to_string())).copied();
+    let bus = |pin: &str| collector_sigs.get_pin(&key, &pin).copied();
     let f = |pin: &str| bus(pin).map(|s| s.as_float());
     let stick = match bus(stick_pin) {
         Some(Signal::Vec2(v)) => v,
@@ -366,9 +366,9 @@ pub(crate) fn eval_stick_rotation_node(
     if r.engaged {
         // All three forms of the stick, or a reader taking the one left alone
         // gets the thumb's direction instead of the aim.
-        collector_sigs.insert((key.clone(), stick_pin.to_string()), Signal::Vec2(r.out));
-        collector_sigs.insert((key.clone(), format!("{stick_pin}_x")), Signal::Float(r.out.x));
-        collector_sigs.insert((key.clone(), format!("{stick_pin}_y")), Signal::Float(r.out.y));
+        collector_sigs.set_pin(&key, &stick_pin, Signal::Vec2(r.out));
+        collector_sigs.set_pin(&key, &format!("{stick_pin}_x"), Signal::Float(r.out.x));
+        collector_sigs.set_pin(&key, &format!("{stick_pin}_y"), Signal::Float(r.out.y));
     }
     vec![
         Some(Signal::Vec2(stick)),
@@ -695,8 +695,8 @@ mod tests {
 
     /// The pad's bus: a stick on `stick_pin` (all three forms), a yaw rate, the
     /// pad flat, and a button to see pass through.
-    fn pad(stick_pin: &str, stick: Vec2, yaw_dps: f32) -> HashMap<(String, String), Signal> {
-        let mut d = HashMap::new();
+    fn pad(stick_pin: &str, stick: Vec2, yaw_dps: f32) -> SigMap {
+        let mut d = SigMap::default();
         let mut put = |pin: &str, s: Signal| { d.insert((PAD.to_string(), pin.to_string()), s); };
         for side in ["left_stick", "right_stick"] {
             let v = if side == stick_pin { stick } else { Vec2::ZERO };
@@ -715,21 +715,21 @@ mod tests {
     }
 
     /// Run the node for `secs`, a fresh bus every tick as the engine does.
-    fn run_node(snap: &NodeSnap, dev: &HashMap<(String, String), Signal>, secs: f32)
-        -> (HashMap<(String, String), Signal>, Vec<Option<Signal>>)
+    fn run_node(snap: &NodeSnap, dev: &SigMap, secs: f32)
+        -> (SigMap, Vec<Option<Signal>>)
     {
         let mut state = HashMap::new();
-        let mut last = (HashMap::new(), Vec::new());
+        let mut last = (SigMap::default(), Vec::new());
         for _ in 0..(secs / DT).round() as usize {
-            let mut cs = HashMap::new();
+            let mut cs = SigMap::default();
             let out = eval_stick_rotation_node(snap, snap.node_uid, dev, &mut cs, &mut state, DT);
             last = (cs, out);
         }
         last
     }
 
-    fn published(cs: &HashMap<(String, String), Signal>, pin: &str) -> Signal {
-        *cs.get(&("collector:7".to_string(), pin.to_string())).unwrap_or_else(|| panic!("{pin} published"))
+    fn published(cs: &SigMap, pin: &str) -> Signal {
+        *cs.get_pin("collector:7", &pin).unwrap_or_else(|| panic!("{pin} published"))
     }
 
     #[test]

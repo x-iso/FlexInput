@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use flexinput_core::Signal;
+use flexinput_core::{Signal, SigMap};
 
 use crate::eval::{eval_graph_tick, TickOutput};
 use crate::graph::ProcessingGraph;
@@ -220,7 +220,7 @@ fn is_banked_pin(pin: &str) -> bool {
     is_displacement_pin(pin) || is_click_pin(pin)
 }
 
-fn add_displacement(into: &mut HashMap<(String, String), Signal>, key: &(String, String), v: Signal) {
+fn add_displacement<S: std::hash::BuildHasher>(into: &mut HashMap<(String, String), Signal, S>, key: &(String, String), v: Signal) {
     match (into.get_mut(key), v) {
         (Some(Signal::Vec2(a)), Signal::Vec2(b)) => *a += b,
         (Some(Signal::Float(a)), Signal::Float(b)) => *a += b,
@@ -232,9 +232,9 @@ fn add_displacement(into: &mut HashMap<(String, String), Signal>, key: &(String,
 /// Add one tick's displacement pins and click-pin rising edges into `bank`.
 /// `levels` is each click pin's level on the previous tick.
 fn bank_displacement(
-    bank: &mut HashMap<(String, String), Signal>,
+    bank: &mut SigMap,
     levels: &mut HashMap<(String, String), bool>,
-    sinks: &HashMap<(String, String), Signal>,
+    sinks: &SigMap,
 ) {
     for (k, &v) in sinks {
         if is_displacement_pin(&k.1) {
@@ -257,33 +257,46 @@ fn bank_displacement(
 /// Replace the bus with the latest tick's `sinks`, except that each banked pin
 /// becomes everything banked since the last publish plus whatever the reader
 /// has not drained yet. Empties `bank`.
+///
+/// Updated in place rather than rebuilt: this runs every engine wakeup (up to
+/// the sample rate), and a rebuild cloned two key Strings per sink pin each time.
 fn publish_sink_bus(
     bus: &mut HashMap<(String, String), Signal>,
-    sinks: &HashMap<(String, String), Signal>,
-    bank: &mut HashMap<(String, String), Signal>,
+    sinks: &SigMap,
+    bank: &mut SigMap,
 ) {
-    let undrained: Vec<((String, String), Signal)> = bus
-        .iter()
-        .filter(|(k, _)| is_banked_pin(&k.1))
-        .map(|(k, &v)| (k.clone(), v))
-        .collect();
-    bus.clone_from(sinks);
-    bus.retain(|k, _| !is_banked_pin(&k.1));
-    for (k, v) in bank.drain() {
-        add_displacement(bus, &k, v);
+    use flexinput_core::PinMapExt;
+    // Level pins that left the outputs go; banked pins keep what the reader
+    // has not drained yet.
+    bus.retain(|k, _| is_banked_pin(&k.1) || sinks.contains_key(k));
+    for (k, &v) in sinks {
+        if !is_banked_pin(&k.1) {
+            bus.set_pin(&k.0, &k.1, v);
+        }
     }
-    for (k, v) in undrained {
+    for (k, v) in bank.drain() {
         add_displacement(bus, &k, v);
     }
 }
 
 /// Read the bus for the sinks: a copy of it, with the banked pins zeroed in the
-/// bus afterwards so the same movement or notch is never delivered twice. The
-/// I/O thread calls this once per iteration.
+/// bus afterwards so the same movement or notch is never delivered twice.
 pub fn drain_sink_bus(bus: &SinkBus) -> HashMap<(String, String), Signal> {
+    let mut out = HashMap::new();
+    drain_sink_bus_into(bus, &mut out);
+    out
+}
+
+/// [`drain_sink_bus`] into `out`, which is made an exact copy of the bus in
+/// place. The I/O thread calls this once per iteration (the polling rate) with
+/// the same map, so the copy reuses last iteration's keys instead of cloning
+/// two Strings per sink pin every time.
+pub fn drain_sink_bus_into(bus: &SinkBus, out: &mut HashMap<(String, String), Signal>) {
+    use flexinput_core::PinMapExt;
     let mut bus = bus.write().unwrap();
-    let out = bus.clone();
+    out.retain(|k, _| bus.contains_key(k));
     for (k, v) in bus.iter_mut() {
+        out.set_pin(&k.0, &k.1, *v);
         if is_banked_pin(&k.1) {
             *v = match *v {
                 Signal::Vec2(_) => Signal::Vec2(Default::default()),
@@ -292,7 +305,6 @@ pub fn drain_sink_bus(bus: &SinkBus) -> HashMap<(String, String), Signal> {
             };
         }
     }
-    out
 }
 
 /// UI→engine source-block channel. The UI writes the set of physical device
@@ -376,7 +388,7 @@ pub fn spawn_processing_thread(
         let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
         // Displacement pins summed over the catch-up loop (see
         // `is_displacement_pin`); emptied into the sink bus once per wakeup.
-        let mut disp_bank: HashMap<(String, String), Signal> = HashMap::new();
+        let mut disp_bank: SigMap = SigMap::default();
         // Previous-tick level of each click pin (see `is_click_pin`).
         let mut click_levels: HashMap<(String, String), bool> = HashMap::new();
 
@@ -564,8 +576,8 @@ mod tests {
         ("virtual.keymouse:0".to_string(), pin.to_string())
     }
 
-    fn tick(disp: Vec2, lmb: bool) -> HashMap<(String, String), Signal> {
-        HashMap::from([
+    fn tick(disp: Vec2, lmb: bool) -> SigMap {
+        SigMap::from_iter([
             (key("mouse_move"), Signal::Vec2(disp)),
             (key("mouse_move_x"), Signal::Float(disp.x)),
             (key("mouse_left"), Signal::Bool(lmb)),
@@ -577,7 +589,7 @@ mod tests {
     /// reader was handed in total.
     fn deliver(engine_ticks: usize, ticks_per_wakeup: usize, ticks_per_read: usize, per_tick: Vec2) -> (Vec2, f32) {
         let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
-        let mut bank = HashMap::new();
+        let mut bank = SigMap::default();
         let mut levels = HashMap::new();
         let (mut got, mut got_x) = (Vec2::ZERO, 0.0);
         for t in 1..=engine_ticks {
@@ -616,7 +628,7 @@ mod tests {
     #[test]
     fn displacement_is_not_delivered_twice_to_a_faster_reader() {
         let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
-        let mut bank = HashMap::new();
+        let mut bank = SigMap::default();
         let last = tick(Vec2::new(3.0, 0.0), false);
         bank_displacement(&mut bank, &mut HashMap::new(), &last);
         publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
@@ -641,11 +653,11 @@ mod tests {
     /// the reader was handed.
     fn notches(levels: &[bool], ticks_per_wakeup: usize, ticks_per_read: usize) -> f32 {
         let bus: SinkBus = Arc::new(RwLock::new(HashMap::new()));
-        let (mut bank, mut prev) = (HashMap::new(), HashMap::new());
+        let (mut bank, mut prev) = (SigMap::default(), HashMap::new());
         let mut got = 0.0;
         for (i, &on) in levels.iter().enumerate() {
             let t = i + 1;
-            let last = HashMap::from([(key("scroll_up"), Signal::Bool(on))]);
+            let last = SigMap::from_iter([(key("scroll_up"), Signal::Bool(on))]);
             bank_displacement(&mut bank, &mut prev, &last);
             if t % ticks_per_wakeup == 0 {
                 publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
@@ -674,10 +686,10 @@ mod tests {
     /// A gate that leaves the outputs (unwired) and comes back held is a new press.
     #[test]
     fn unwired_scroll_gate_reads_as_released() {
-        let (mut bank, mut prev) = (HashMap::new(), HashMap::new());
-        let held = HashMap::from([(key("scroll_up"), Signal::Bool(true))]);
+        let (mut bank, mut prev) = (SigMap::default(), HashMap::new());
+        let held = SigMap::from_iter([(key("scroll_up"), Signal::Bool(true))]);
         bank_displacement(&mut bank, &mut prev, &held);
-        bank_displacement(&mut bank, &mut prev, &HashMap::new());
+        bank_displacement(&mut bank, &mut prev, &SigMap::default());
         bank_displacement(&mut bank, &mut prev, &held);
         assert_eq!(bank.get(&key("scroll_up")), Some(&Signal::Float(2.0)));
     }

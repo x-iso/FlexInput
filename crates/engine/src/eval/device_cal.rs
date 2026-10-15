@@ -397,10 +397,24 @@ pub(crate) fn post_process_device_pin(
 /// deadzone and gyro_multiplier applied to its own device's pins. Called once
 /// at the top of `eval_graph_tick` so AutoMap (which reads dev_sigs directly)
 /// sees the same processed values as direct wires.
-pub(crate) fn preprocess_dev_sigs(
+#[cfg(test)]
+pub(crate) fn preprocess_dev_sigs<S: std::hash::BuildHasher>(
     graph: &ProcessingGraph,
-    dev_sigs: &HashMap<(String, String), Signal>,
-) -> HashMap<(String, String), Signal> {
+    dev_sigs: &HashMap<(String, String), Signal, S>,
+) -> SigMap {
+    let mut out = SigMap::default();
+    preprocess_dev_sigs_into(graph, dev_sigs, &mut out);
+    out
+}
+
+/// [`preprocess_dev_sigs`] into `out`, which must be empty: the tick hands in
+/// last tick's map, emptied by `recycle_keys`, so its table and key Strings are
+/// reused instead of rebuilt every tick.
+pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
+    graph: &ProcessingGraph,
+    dev_sigs: &HashMap<(String, String), Signal, S>,
+    out: &mut SigMap,
+) {
     let mut params: HashMap<String, (f32, f32, DeviceCal)> = HashMap::new();
     for snap in &graph.nodes {
         if snap.module_id != "device.source" { continue; }
@@ -423,10 +437,10 @@ pub(crate) fn preprocess_dev_sigs(
     // pipeline can't see. We collect each device's gyro/accel triples,
     // apply offset → matrix → sign, and pre-write the corrected values
     // into a side map that pass 2 reads from instead of the raw signal.
-    let mut imu_override: HashMap<(String, String), Signal> = HashMap::new();
+    let mut imu_override: SigMap = SigMap::default();
     for (dev_id, (_, _, cal)) in &params {
         let read_f = |pin: &str| -> Option<f32> {
-            dev_sigs.get(&(dev_id.clone(), pin.to_string())).and_then(|s| {
+            dev_sigs.get_pin(&dev_id, &pin).and_then(|s| {
                 if let Signal::Float(v) = s { Some(*v) } else { None }
             })
         };
@@ -454,9 +468,9 @@ pub(crate) fn preprocess_dev_sigs(
                 let s = gyro_dz_ease(mag, cal.gyro_dz);
                 out = [out[0] * s, out[1] * s, out[2] * s];
             }
-            imu_override.insert((dev_id.clone(), "gyro_x".into()), Signal::Float(out[0]));
-            imu_override.insert((dev_id.clone(), "gyro_y".into()), Signal::Float(out[1]));
-            imu_override.insert((dev_id.clone(), "gyro_z".into()), Signal::Float(out[2]));
+            imu_override.set_pin(&dev_id, "gyro_x", Signal::Float(out[0]));
+            imu_override.set_pin(&dev_id, "gyro_y", Signal::Float(out[1]));
+            imu_override.set_pin(&dev_id, "gyro_z", Signal::Float(out[2]));
         }
         let axyz = (read_f("accel_x"), read_f("accel_y"), read_f("accel_z"));
         if let (Some(ax), Some(ay), Some(az)) = axyz {
@@ -492,16 +506,16 @@ pub(crate) fn preprocess_dev_sigs(
                 }
                 out = *base;
             }
-            imu_override.insert((dev_id.clone(), "accel_x".into()), Signal::Float(out[0]));
-            imu_override.insert((dev_id.clone(), "accel_y".into()), Signal::Float(out[1]));
-            imu_override.insert((dev_id.clone(), "accel_z".into()), Signal::Float(out[2]));
+            imu_override.set_pin(&dev_id, "accel_x", Signal::Float(out[0]));
+            imu_override.set_pin(&dev_id, "accel_y", Signal::Float(out[1]));
+            imu_override.set_pin(&dev_id, "accel_z", Signal::Float(out[2]));
         }
     }
 
     // ── Pass 2: per-pin pipeline ──────────────────────────────────────────────
-    let mut out = HashMap::with_capacity(dev_sigs.len());
+    out.reserve(dev_sigs.len());
     for (key, sig) in dev_sigs.iter() {
-        let entry = params.get(&key.0).cloned().unwrap_or_else(|| default_entry.clone());
+        let entry = params.get(&key.0).unwrap_or(&default_entry);
         // Use the matrix-transformed value when this is a gyro/accel pin
         // that we pre-processed; the per-pin function will still apply
         // gyro_multiplier (gyro only) but skip its own offset + sign.
@@ -509,8 +523,9 @@ pub(crate) fn preprocess_dev_sigs(
         let is_imu = matches!(key.1.as_str(),
             "gyro_x" | "gyro_y" | "gyro_z" |
             "accel_x" | "accel_y" | "accel_z");
-        out.insert(
-            key.clone(),
+        out.set_pin(
+            &key.0,
+            &key.1,
             post_process_device_pin(&key.1, src, entry.0, entry.1, &entry.2, is_imu),
         );
     }
@@ -541,7 +556,7 @@ pub(crate) fn preprocess_dev_sigs(
             // Guard against a threshold pinned at 0.0 firing on rest jitter.
             let over = v >= thr.max(f32::EPSILON);
             out.insert(key, Signal::Float(if over { 1.0 } else { 0.0 }));
-            out.insert((dev_id.clone(), dig_pin.to_string()), Signal::Bool(over));
+            out.set_pin(&dev_id, &dig_pin, Signal::Bool(over));
         }
     }
 
@@ -575,10 +590,8 @@ pub(crate) fn preprocess_dev_sigs(
     // output). "__gyro_mult" is not a real pin, so per-name pin lookups and the
     // canonical pin lists never surface it.
     for (dev_id, (_, gm, _)) in &params {
-        out.insert((dev_id.clone(), "__gyro_mult".to_string()), Signal::Float(*gm));
+        out.set_pin(&dev_id, "__gyro_mult", Signal::Float(*gm));
     }
-
-    out
 }
 
 pub(crate) fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
@@ -714,7 +727,7 @@ pub struct StickReboundState {
 /// (the Vec2 and its two axes) so no reader sees the bounce through another.
 pub(crate) fn filter_stick_rebound(
     graph: &ProcessingGraph,
-    sigs: &mut HashMap<(String, String), Signal>,
+    sigs: &mut SigMap,
     st: &mut StickReboundState,
     dt: f32,
 ) {
@@ -825,7 +838,7 @@ mod stick_rebound_tests {
             sink_target: None,
             inline_subgraph: None,
         };
-        let sigs_at = |x: f32| -> HashMap<(String, String), Signal> {
+        let sigs_at = |x: f32| -> SigMap {
             [
                 (("pad".into(), "right_stick".into()), Signal::Vec2(Vec2::new(x, 0.0))),
                 (("pad".into(), "right_stick_x".into()), Signal::Float(x)),

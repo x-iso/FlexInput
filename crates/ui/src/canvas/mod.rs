@@ -1112,7 +1112,17 @@ impl Canvas {
     /// Take a clone of the current snarl, for use as an undo baseline (e.g. the
     /// gamepad nav driver snapshots before a value-edit gesture begins).
     pub(crate) fn snapshot_for_undo(&self) -> Snarl<NodeData> {
-        self.snarl.clone()
+        self.undo_clone()
+    }
+
+    /// A clone of the snarl to keep as an undo/redo snapshot: without the live
+    /// display buffers (scope history, trigger captures). Every snapshot used to
+    /// carry its own copy of them; [`Self::undo`] / [`Self::redo`] hand the
+    /// live ones across instead.
+    pub(crate) fn undo_clone(&self) -> Snarl<NodeData> {
+        let mut snap = self.snarl.clone();
+        crate::app::graph::strip_display_buffers(&mut snap);
+        snap
     }
 
     /// Commit a previously-taken `baseline` as one undo entry, but only if the
@@ -1163,7 +1173,8 @@ impl Canvas {
 
     /// Snapshot the current snarl state onto the undo stack, clearing redo.
     fn push_undo(&mut self) {
-        self.undo_stack.push(self.snarl.clone());
+        let snap = self.undo_clone();
+        self.undo_stack.push(snap);
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
         }
@@ -1173,7 +1184,8 @@ impl Canvas {
     }
 
     /// Push an externally-taken pre-mutation snapshot onto the undo stack.
-    fn push_snapshot(&mut self, snapshot: Snarl<NodeData>) {
+    fn push_snapshot(&mut self, mut snapshot: Snarl<NodeData>) {
+        crate::app::graph::strip_display_buffers(&mut snapshot);
         self.undo_stack.push(snapshot);
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
@@ -1185,8 +1197,8 @@ impl Canvas {
 
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            self.redo_stack.push(self.snarl.clone());
-            self.snarl = prev;
+            let outgoing = self.swap_in_snapshot(prev);
+            self.redo_stack.push(outgoing);
             self.mutation_gen = self.mutation_gen.wrapping_add(1);
             self.sync_committed_fingerprint();
         }
@@ -1194,11 +1206,20 @@ impl Canvas {
 
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(self.snarl.clone());
-            self.snarl = next;
+            let outgoing = self.swap_in_snapshot(next);
+            self.undo_stack.push(outgoing);
             self.mutation_gen = self.mutation_gen.wrapping_add(1);
             self.sync_committed_fingerprint();
         }
+    }
+
+    /// Make `snapshot` the live snarl, moving the live display buffers onto it,
+    /// and return the outgoing snarl stripped for the other stack.
+    fn swap_in_snapshot(&mut self, snapshot: Snarl<NodeData>) -> Snarl<NodeData> {
+        let mut outgoing = std::mem::replace(&mut self.snarl, snapshot);
+        crate::app::graph::carry_display_buffers(&mut self.snarl, &mut outgoing);
+        crate::app::graph::strip_display_buffers(&mut outgoing);
+        outgoing
     }
 
     /// Commit-on-settle undo capture for in-node value/param edits — sliders,
@@ -1255,7 +1276,7 @@ impl Canvas {
                     // User-driven value edit — stash the pre-gesture snapshot as
                     // the future undo entry (reuse this frame's clone when given).
                     self.pending_value_baseline =
-                        Some(pre.cloned().unwrap_or_else(|| self.snarl.clone()));
+                        Some(pre.cloned().unwrap_or_else(|| self.undo_clone()));
                 } else {
                     // Divergence with NO input this frame came from outside a UI
                     // interaction — a patch load, device-panel add/remove, preset
@@ -1594,7 +1615,7 @@ impl Canvas {
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
         });
         let pre_snapshot = if needs_snapshot {
-            Some(self.snarl.clone())
+            Some(self.undo_clone())
         } else {
             None
         };
@@ -1787,7 +1808,7 @@ impl Canvas {
                 // step replays itself. This branch should be very rare —
                 // if it fires often, the gating heuristic above needs to
                 // be widened.
-                self.push_snapshot(self.snarl.clone());
+                self.push_snapshot(self.undo_clone());
             }
             committed_this_frame = true;
         }
@@ -3054,7 +3075,9 @@ pub fn group_into_subpatch(
 
     // ── Snapshot undo state before mutating ───────────────────────────────────
 
-    undo_stack.push(snarl.clone());
+    let mut snap = snarl.clone();
+    crate::app::graph::strip_display_buffers(&mut snap);
+    undo_stack.push(snap);
     if undo_stack.len() > MAX_UNDO {
         undo_stack.remove(0);
     }

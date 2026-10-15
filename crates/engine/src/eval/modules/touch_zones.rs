@@ -18,8 +18,8 @@ use super::*;
 pub(crate) fn eval_touch_zones_map_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) {
@@ -31,14 +31,14 @@ pub(crate) fn eval_touch_zones_map_node(
     // Snapshot every canonical upstream pin once (collector override first, else
     // raw device) into an owned map, so the publish pass can mutate collector_sigs
     // without aliasing the read side. Mirrors eval_remapper_node's `upstream`.
-    let mut upstream: HashMap<String, Signal> = HashMap::new();
+    let mut upstream: PinSigs = PinSigs::default();
     for ap in automap::ALL_PINS {
         let sig = if !collector_id.is_empty() {
-            collector_sigs.get(&(collector_id.clone(), ap.id.to_string())).copied()
+            collector_sigs.get_pin(&collector_id, &ap.id).copied()
         } else { None }
         .or_else(|| {
             if !dev_id.is_empty() {
-                dev_sigs.get(&(dev_id.clone(), ap.id.to_string())).copied()
+                dev_sigs.get_pin(&dev_id, &ap.id).copied()
             } else { None }
         });
         if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
@@ -106,7 +106,7 @@ pub(crate) fn eval_touch_zones_map_node(
     };
 
     // ── Apply mapping cards ───────────────────────────────────────────────
-    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
     // Button out pins: OR every card targeting the same pin so two zones can
     // share a button. `button_pins` tracks the full set for the release pass.
     let mut button_on: HashMap<String, bool> = HashMap::new();
@@ -521,7 +521,7 @@ pub(crate) fn eval_touch_zones_map_node(
                 SignalType::Vec2  => continue,
                 _                 => Signal::Bool(true),
             };
-            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            collector_sigs.set_pin(&key, &pin, sig);
         } else {
             // Upstream already carries this pin (e.g. a real gamepad button) →
             // leave it to passthrough instead of forcing a released value.
@@ -532,7 +532,7 @@ pub(crate) fn eval_touch_zones_map_node(
                 SignalType::Vec2  => continue,
                 _                 => Signal::Bool(false),
             };
-            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            collector_sigs.set_pin(&key, &pin, sig);
         }
     }
 
@@ -548,21 +548,21 @@ pub(crate) fn eval_touch_zones_map_node(
             "left_stick" => ("left_stick_x", "left_stick_y"),
             _            => ("right_stick_x", "right_stick_y"),
         };
-        collector_sigs.insert((key.clone(), target.to_string()), Signal::Vec2(Vec2::new(*x, *y)));
-        collector_sigs.insert((key.clone(), xp.to_string()), Signal::Float(*x));
-        collector_sigs.insert((key.clone(), yp.to_string()), Signal::Float(*y));
+        collector_sigs.set_pin(&key, &target, Signal::Vec2(Vec2::new(*x, *y)));
+        collector_sigs.set_pin(&key, &xp, Signal::Float(*x));
+        collector_sigs.set_pin(&key, &yp, Signal::Float(*y));
     }
     // Publish relative mouse delta (Vec2 authoritative + component floats) while
     // a finger drives it. Absent, the pins fall back to upstream.
     if mouse_active {
-        collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
-        collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(mouse_dx));
-        collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(mouse_dy));
+        collector_sigs.set_pin(&key, "mouse", Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
+        collector_sigs.set_pin(&key, "mouse_x", Signal::Float(mouse_dx));
+        collector_sigs.set_pin(&key, "mouse_y", Signal::Float(mouse_dy));
     }
     // Publish analog scroll rate while a finger drives it; else fall back upstream.
     if scroll_active {
-        collector_sigs.insert((key.clone(), "scroll_x".to_string()), Signal::Float(scroll_vx));
-        collector_sigs.insert((key.clone(), "scroll_y".to_string()), Signal::Float(scroll_vy));
+        collector_sigs.set_pin(&key, "scroll_x", Signal::Float(scroll_vx));
+        collector_sigs.set_pin(&key, "scroll_y", Signal::Float(scroll_vy));
     }
     request_orient_neutral(snap, &key, collector_sigs);
 }

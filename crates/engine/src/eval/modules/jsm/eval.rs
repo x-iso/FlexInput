@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use flexinput_core::{automap, Signal, SignalType};
+use flexinput_core::{automap, PinMapExt, PinSigs, Signal, SignalType, SigMap};
 use glam::Vec2;
 
 use crate::eval::remapper_pass_through_and_suppress;
@@ -99,8 +99,8 @@ pub struct JsmState {
 pub(crate) fn jsm_publish(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &mut SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -124,12 +124,12 @@ pub(crate) fn jsm_publish(
         .get("_automap_collector_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let mut upstream: HashMap<String, Signal> = HashMap::new();
+    let mut upstream: PinSigs = PinSigs::default();
     for ap in automap::ALL_PINS {
         let sig = (!collector_id.is_empty())
             .then(|| {
                 collector_sigs
-                    .get(&(collector_id.to_string(), ap.id.to_string()))
+                    .get_pin(&collector_id, &ap.id)
                     .copied()
             })
             .flatten()
@@ -137,7 +137,7 @@ pub(crate) fn jsm_publish(
                 (!dev_id.is_empty())
                     .then(|| {
                         dev_sigs
-                            .get(&(dev_id.to_string(), ap.id.to_string()))
+                            .get_pin(&dev_id, &ap.id)
                             .copied()
                     })
                     .flatten()
@@ -162,7 +162,7 @@ pub(crate) fn jsm_publish(
     // Nothing that carries `upstream` on reads these pins: the pass-through
     // walks the pad's pins and the MIDI ones by name.
     let shown_macros = shown_macro_pins(snap);
-    let mut shown_prev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut shown_prev: SigMap = SigMap::default();
     {
         use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
         let amounts = |sigs: &mut dyn Iterator<Item = (&(String, String), &Signal)>| {
@@ -367,7 +367,7 @@ pub(crate) fn jsm_publish(
     if strict {
         for ap in automap::ALL_PINS {
             if let Some(off) = off_value(ap.signal_type) {
-                collector_sigs.insert((key.clone(), ap.id.to_string()), off);
+                collector_sigs.set_pin(&key, &ap.id, off);
             }
         }
         // MIDI too. Without this a MIDI pin was simply absent from this key and a
@@ -375,7 +375,7 @@ pub(crate) fn jsm_publish(
         // past a strict config.
         for pin in upstream.keys().filter(|p| flexinput_core::midi::is_midi_pin(p)) {
             if let Some(rest) = crate::eval::midi_bus::midi_rest(pin) {
-                collector_sigs.insert((key.clone(), pin.clone()), rest);
+                collector_sigs.set_pin(&key, &pin, rest);
             }
         }
     } else {
@@ -464,7 +464,7 @@ pub(crate) fn jsm_publish(
                         Some((r, _)) => r.abs().clamp(1.0 / 127.0, 1.0),
                         None => res.midi.velocity as f32 / 127.0,
                     };
-                    collector_sigs.insert((key.clone(), vel.clone()), Signal::Float(v));
+                    collector_sigs.set_pin(&key, &vel, Signal::Float(v));
                     crate::eval::midi_bus::mark_produced(&key, &vel, collector_sigs);
                 }
             }
@@ -478,10 +478,10 @@ pub(crate) fn jsm_publish(
                     (true, Some((r, _))) => r.abs().clamp(0.0, 1.0),
                     _ => 0.0,
                 };
-                collector_sigs.insert((key.clone(), at.clone()), Signal::Float(v));
+                collector_sigs.set_pin(&key, &at, Signal::Float(v));
                 crate::eval::midi_bus::mark_produced(&key, &at, collector_sigs);
             }
-            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            collector_sigs.set_pin(&key, &pin, sig);
             crate::eval::midi_bus::mark_produced(&key, &pin, collector_sigs);
             continue;
         }
@@ -501,7 +501,7 @@ pub(crate) fn jsm_publish(
             (true, None) => on_value(&pin),
             (false, _) => pin_off_value(&pin),
         };
-        collector_sigs.insert((key.clone(), pin), sig);
+        collector_sigs.set_pin(&key, &pin, sig);
     }
 
     // ── the D-pad's other two forms ──────────────────────────────────────────
@@ -528,7 +528,7 @@ pub(crate) fn jsm_publish(
             // on the bus by now — passed through, or zeroed by strict mode — so
             // there is nothing to fall back to.
             let on = collector_sigs
-                .get(&(key.clone(), dir.to_string()))
+                .get_pin(&key, &dir)
                 .copied()
                 .map(|s| s.as_bool())
                 .unwrap_or(false);
@@ -538,9 +538,9 @@ pub(crate) fn jsm_publish(
         }
         // Opposite directions cancel — one axis can't hold both.
         let (x, y) = (xy[0].clamp(-1.0, 1.0), xy[1].clamp(-1.0, 1.0));
-        collector_sigs.insert((key.clone(), "dpad_x".to_string()), Signal::Float(x));
-        collector_sigs.insert((key.clone(), "dpad_y".to_string()), Signal::Float(y));
-        collector_sigs.insert((key.clone(), "dpad".to_string()), Signal::Vec2(Vec2::new(x, y)));
+        collector_sigs.set_pin(&key, "dpad_x", Signal::Float(x));
+        collector_sigs.set_pin(&key, "dpad_y", Signal::Float(y));
+        collector_sigs.set_pin(&key, "dpad", Signal::Vec2(Vec2::new(x, y)));
     }
 
     // ── the virtual pad's sticks and triggers ────────────────────────────────
@@ -552,14 +552,14 @@ pub(crate) fn jsm_publish(
     for side in 0..2 {
         let name = if side == 0 { "left_stick" } else { "right_stick" };
         if let Some(v) = pad_out.sticks[side] {
-            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(v));
-            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(v.x));
-            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(v.y));
+            collector_sigs.set_pin(&key, &name, Signal::Vec2(v));
+            collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(v.x));
+            collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(v.y));
         }
         // `ZL_MODE = X_LT`: the trigger's pull goes straight out to the pad.
         if let Some(v) = st.analog.pad_trigger(side) {
             let name = if side == 0 { "left_trigger" } else { "right_trigger" };
-            collector_sigs.insert((key.clone(), name.to_string()), Signal::Float(v));
+            collector_sigs.set_pin(&key, &name, Signal::Float(v));
         }
     }
 
@@ -572,7 +572,7 @@ pub(crate) fn jsm_publish(
     let mut rotation_live = (Vec2::ZERO, crate::eval::Rotated::default());
     if let Some(side) = res.pad.gyro_dest.rotation_side() {
         let name = if side == 0 { "left_stick" } else { "right_stick" };
-        let stick = match collector_sigs.get(&(key.clone(), name.to_string())) {
+        let stick = match collector_sigs.get_pin(&key, &name) {
             Some(Signal::Vec2(v)) => *v,
             _ => Vec2::ZERO,
         };
@@ -583,9 +583,9 @@ pub(crate) fn jsm_publish(
         };
         let r = st.rotation.tick(stick, aimed.turn_dps, dt, &settings);
         if r.engaged {
-            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(r.out));
-            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(r.out.x));
-            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(r.out.y));
+            collector_sigs.set_pin(&key, &name, Signal::Vec2(r.out));
+            collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(r.out.x));
+            collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(r.out.y));
         }
         rotation_live = (stick, r);
     } else {
@@ -599,7 +599,7 @@ pub(crate) fn jsm_publish(
     // otherwise keep nudging the cursor for ever.
     if aims_anything(&st.cfg, &res) || res.touch.mode == super::touch::Mode::Mouse {
         let m = if typing { Vec2::ZERO } else { mouse + touch_out.mouse };
-        collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
+        collector_sigs.set_pin(&key, "mouse_move", Signal::Vec2(m));
     }
 
     // ── continuous sources, as MIDI ──────────────────────────────────────────
@@ -649,7 +649,7 @@ pub(crate) fn jsm_publish(
             let pin = target.pin(Some(m.channel));
             let v = super::midi::value_for(&pin, target.bend_dir(), reading, src.two_sided());
             let id = pin.to_id();
-            collector_sigs.insert((key.clone(), id.clone()), Signal::Float(v));
+            collector_sigs.set_pin(&key, &id, Signal::Float(v));
             crate::eval::midi_bus::mark_produced(&key, &id, collector_sigs);
         }
     }
@@ -675,9 +675,9 @@ pub(crate) fn jsm_publish(
                 let yaw = if sw.axis.takes_flick() {
                     let sticks = [bus_stick(&upstream, "left_stick"), bus_stick(&upstream, "right_stick")];
                     for name in ["left_stick", "right_stick"] {
-                        collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
-                        collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
-                        collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+                        collector_sigs.set_pin(&key, &name, Signal::Vec2(Vec2::ZERO));
+                        collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(0.0));
+                        collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(0.0));
                     }
                     gyro.yaw + st.cal_flick.rate(sticks, dt)
                 } else {
@@ -686,7 +686,7 @@ pub(crate) fn jsm_publish(
                 let (d, rate, defl) = super::cal::drive(
                     sw, yaw, gyro.pitch, counts_per_deg, res.pad.calibration);
                 if let Some(m) = d.mouse {
-                    collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m * dt));
+                    collector_sigs.set_pin(&key, "mouse_move", Signal::Vec2(m * dt));
                 }
                 if let Some(v) = d.stick {
                     // The stick the gyro is pointed at, or the right one when it
@@ -694,17 +694,17 @@ pub(crate) fn jsm_publish(
                     // anyway (they may be about to switch `GYRO_OUTPUT` over).
                     let side = res.pad.gyro_dest.side().unwrap_or(1);
                     let name = if side == 0 { "left_stick" } else { "right_stick" };
-                    collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(v));
-                    collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(v.x));
-                    collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(v.y));
+                    collector_sigs.set_pin(&key, &name, Signal::Vec2(v));
+                    collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(v.x));
+                    collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(v.y));
                 } else if let Some(side) = res.pad.gyro_dest.side() {
                     // Calibrating the mouse while the gyro drives a stick: hold
                     // that stick still, or it turns the camera too and the
                     // measured rotation answers for both.
                     let name = if side == 0 { "left_stick" } else { "right_stick" };
-                    collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
-                    collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
-                    collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+                    collector_sigs.set_pin(&key, &name, Signal::Vec2(Vec2::ZERO));
+                    collector_sigs.set_pin(&key, &format!("{name}_x"), Signal::Float(0.0));
+                    collector_sigs.set_pin(&key, &format!("{name}_y"), Signal::Float(0.0));
                 }
                 (rate, defl)
             }
@@ -735,7 +735,7 @@ pub(crate) fn jsm_publish(
     if !dest_dev.is_empty() {
         let fb_key = format!("{}{dest_dev}", crate::eval::feedback::FEEDBACK_OVERRIDE);
         for (pin, v) in super::feedback::pins(&res.fb, outputs.rumble) {
-            collector_sigs.insert((fb_key.clone(), pin.to_string()), Signal::Float(v));
+            collector_sigs.set_pin(&fb_key, &pin, Signal::Float(v));
         }
     }
 
@@ -906,7 +906,7 @@ fn text_gen_of(tabs: &[(String, String)], selected: &str, ports: &[(String, Stri
 
 
 /// A stick off the bus: its Vec2 when there is one, else its two axis floats.
-fn bus_stick(upstream: &HashMap<String, Signal>, name: &str) -> Vec2 {
+fn bus_stick(upstream: &PinSigs, name: &str) -> Vec2 {
     if let Some(Signal::Vec2(v)) = upstream.get(name) {
         return *v;
     }
@@ -916,7 +916,7 @@ fn bus_stick(upstream: &HashMap<String, Signal>, name: &str) -> Vec2 {
 
 /// What the analog side needs off the bus this tick.
 fn read_pad(
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     motion: (f32, f32),
     touch: &super::touch::Out,
 ) -> Pad {
@@ -943,7 +943,7 @@ fn read_pad(
 }
 
 /// The touchpad's two fingers, as the touch side wants them.
-fn touch_fingers(upstream: &HashMap<String, Signal>) -> [super::touch::Finger; 2] {
+fn touch_fingers(upstream: &PinSigs) -> [super::touch::Finger; 2] {
     let f = |n: usize| {
         let g = |suffix: &str| {
             upstream
@@ -965,7 +965,7 @@ fn touch_fingers(upstream: &HashMap<String, Signal>) -> [super::touch::Finger; 2
 
 /// The accelerometer, if the pad reports one. A pad that reports nothing here has
 /// no idea which way is down, which is not the same as being held flat.
-fn read_accel(upstream: &HashMap<String, Signal>) -> Option<glam::Vec3> {
+fn read_accel(upstream: &PinSigs) -> Option<glam::Vec3> {
     let any = ["accel_x", "accel_y", "accel_z"]
         .iter()
         .any(|p| upstream.contains_key(*p));
@@ -1002,7 +1002,7 @@ fn macro_amount(sig: Signal) -> f32 {
 
 /// The amount a Macro Output port carries this tick, as `jsm_publish` put it
 /// into `upstream`.
-fn port_amount(upstream: &HashMap<String, Signal>, id: u32) -> f32 {
+fn port_amount(upstream: &PinSigs, id: u32) -> f32 {
     upstream.get(&super::names::macro_btn_pin(id)).map(|s| s.as_float()).unwrap_or(0.0)
 }
 
@@ -1012,7 +1012,7 @@ fn port_amount(upstream: &HashMap<String, Signal>, id: u32) -> f32 {
 /// gravity and touch passes.
 fn button_down(
     btn: Btn,
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     analog: &Analog,
     ext: &Extra,
 ) -> bool {
@@ -1072,7 +1072,7 @@ fn held_value(
     pin: &str,
     mp: &flexinput_core::midi::MidiPin,
     holders: &[(Btn, usize)],
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     midi: &super::midi::Settings,
 ) -> f32 {
     use flexinput_core::midi::MidiPin;
@@ -1108,7 +1108,7 @@ fn held_value(
 /// with whether it is two-sided (a bend). `None` for a plain button.
 fn analog_reading(
     btn: Btn,
-    upstream: &HashMap<String, Signal>,
+    upstream: &PinSigs,
     midi: &super::midi::Settings,
 ) -> Option<(f32, bool)> {
     let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0);

@@ -129,7 +129,7 @@ pub(crate) fn kbm_svg_texture(ctx: &egui::Context, bytes: &'static [u8])
 {
     let size_px = (32.0 * ctx.pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("kbm_picker_icon", bytes.as_ptr() as usize, size_px));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+    if let Some(tex) = crate::widgets::tex_cache::get(&ctx, cache_key) {
         return Some(tex);
     }
     let text = std::str::from_utf8(bytes).ok()?;
@@ -137,7 +137,7 @@ pub(crate) fn kbm_svg_texture(ctx: &egui::Context, bytes: &'static [u8])
         text, size_px, size_px, "override", egui::Color32::TRANSPARENT)?;
     let handle = ctx.load_texture(
         format!("kbm_picker_icon_{:p}", bytes.as_ptr()), img, egui::TextureOptions::LINEAR);
-    ctx.data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    crate::widgets::tex_cache::put(&ctx, cache_key, handle.clone());
     Some(handle)
 }
 

@@ -16,6 +16,8 @@ mod config_overlay;
 mod overlay;
 mod panels;
 mod panic_hotkey;
+#[cfg(test)]
+mod perf_bench;
 mod pin_hotkey;
 mod widgets;
 pub mod process_list;

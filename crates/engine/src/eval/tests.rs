@@ -323,11 +323,11 @@ mod trigger_tests {
         tz.params.insert("zone_maps".into(), serde_json::json!([
             {"f":0,"z":0,"in":["tz_touch"],"out":["right_stick_left"]},
         ]));
-        let mut m: HashMap<(String, String), Signal> = HashMap::new();
+        let mut m: SigMap = SigMap::default();
         m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
         m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
         m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_touch_zones_map_node(&tz, 1, &m, &mut c, &mut HashMap::new(), 0.016);
         let get = |p: &str| c.get(&("touchmap:1".to_string(), p.to_string())).copied();
         assert_eq!(get("right_stick_x"), Some(Signal::Float(-1.0)));
@@ -351,14 +351,14 @@ mod trigger_tests {
         // Finger at pad center then pushed right: unit x 0.5→0.75 within the
         // single full-pad zone → deflection x ≈ +0.5 from the zone center.
         let finger = |px: f32| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         // Land at center (adaptive center latches there), then move right.
         eval_touch_zones_map_node(&tz, 1, &finger(0.0), &mut c, &mut state, 0.016);
         c.clear();
@@ -374,7 +374,7 @@ mod trigger_tests {
 
         // Coercion: read the same namespace back through each port type.
         let mut ns = NodeState::default();
-        let dev_sigs = HashMap::new();
+        let dev_sigs = SigMap::default();
         let mac = macro_node(2, &[("abcd0123", "vec2")]);
         let out = compute_node(&mac, &[], &mut ns, &dev_sigs, &c, 0.016);
         assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x > 0.4),
@@ -414,13 +414,13 @@ mod trigger_tests {
         n.n_outputs = n.output_pin_ids.len();
 
         // Finger at pad (0.5, -0.5) → unit (0.75, 0.75) → bottom-right = leaf 2.
-        let mut dev_sigs = HashMap::new();
+        let mut dev_sigs = SigMap::default();
         dev_sigs.insert((dev.to_string(), "touch1_x".to_string()), Signal::Float(0.5));
         dev_sigs.insert((dev.to_string(), "touch1_y".to_string()), Signal::Float(-0.5));
         dev_sigs.insert((dev.to_string(), "touch1_active".to_string()), Signal::Bool(true));
 
         let mut ns = NodeState::default();
-        let c = HashMap::new();
+        let c = SigMap::default();
         let out = compute_node(&n, &[], &mut ns, &dev_sigs, &c, 0.016);
         assert_eq!(out[1], Some(Signal::Bool(true)), "leaf 2 active");
         assert!(matches!(out[2], Some(Signal::Float(f)) if (f - 0.5).abs() < 1e-4),
@@ -457,13 +457,13 @@ mod trigger_tests {
             n
         };
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
-        let get = |c: &HashMap<(String, String), Signal>|
+        let get = |c: &SigMap|
             c.get(&("macro".to_string(), "macro:11aa22bb".to_string())).copied();
 
         // Analog: leaning left at 0.8 → Float(0.8) on the macro namespace.
         let snap = mk("analog");
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
         let v = get(&c).map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((v - 0.8).abs() < 1e-4, "analog lean should pass magnitude, got {v}");
@@ -475,7 +475,7 @@ mod trigger_tests {
         // Down mode: asserts Bool while the side is active.
         let snap = mk("down");
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c), Some(Signal::Bool(true)));
     }
@@ -494,8 +494,8 @@ mod trigger_tests {
         ProcessingGraph { nodes: vec![src, remap, sink] }
     }
 
-    fn stick_y(y: f32) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn stick_y(y: f32) -> SigMap {
+        let mut m = SigMap::default();
         m.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(y));
         m
     }
@@ -592,10 +592,10 @@ mod trigger_tests {
             { "out": ["btn_south"], "mode": "down", "threshold": 0.7 }
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
-        let get = |c: &HashMap<(String, String), Signal>, pin: &str|
+        let get = |c: &SigMap, pin: &str|
             c.get(&("lean:1".to_string(), pin.to_string())).copied();
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.5), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c, "btn_south"), Some(Signal::Bool(false)),
             "below the card threshold the mapping must not fire");
@@ -610,7 +610,7 @@ mod trigger_tests {
               "curve": [[0.0, 0.0], [1.0, 0.5]] }
         ]));
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
         let v = get(&c, "right_trigger").map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((v - 0.5).abs() < 0.01, "curve must shape the analog lean magnitude, got {v}");
@@ -620,7 +620,7 @@ mod trigger_tests {
     // arrival order — an asserted mapping beats an idle/weaker one.
     #[test]
     fn macro_merge_larger_magnitude_wins() {
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.3));
         merge_macro_scalar(&mut c, "macro:x", Signal::Bool(true)); // mag 1.0
         merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.6));
@@ -821,8 +821,8 @@ mod trigger_tests {
             rig
         }
 
-        fn tick_sigs(&mut self, sigs: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
-            let mut dev = HashMap::new();
+        fn tick_sigs(&mut self, sigs: &[(&str, Signal)]) -> SigMap {
+            let mut dev = SigMap::default();
             for b in ["btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb"] {
                 dev.insert((RIG_DEV.to_string(), b.to_string()), Signal::Bool(false));
             }
@@ -832,24 +832,24 @@ mod trigger_tests {
             for (pin, sig) in sigs {
                 dev.insert((RIG_DEV.to_string(), pin.to_string()), *sig);
             }
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_remapper_node(&self.snap, 1, &dev, &mut c, &mut self.state, RIG_DT);
             c
         }
 
-        fn tick(&mut self, down: &[&str]) -> HashMap<(String, String), Signal> {
+        fn tick(&mut self, down: &[&str]) -> SigMap {
             let sigs: Vec<(&str, Signal)> = down.iter().map(|p| (*p, Signal::Bool(true))).collect();
             self.tick_sigs(&sigs)
         }
     }
 
-    fn on(c: &HashMap<(String, String), Signal>, pin: &str) -> bool {
+    fn on(c: &SigMap, pin: &str) -> bool {
         c.get(&("remap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
     }
 
     // ── Set Neutral Forward ──────────────────────────────────────────────────
 
-    fn neutral_req(c: &HashMap<(String, String), Signal>, dev: &str) -> bool {
+    fn neutral_req(c: &SigMap, dev: &str) -> bool {
         c.get(&(format!("{ORIENT_NEUTRAL_PREFIX}{dev}"), flexinput_core::imu::ORIENT_NEUTRAL_PIN.to_string()))
             .is_some_and(|s| s.as_bool())
     }
@@ -884,13 +884,13 @@ mod trigger_tests {
         let key = (dev.to_string(), "orientation".to_string());
         let mut carry = NodeState::default();
         carry.orient_neutral_req.insert(dev.to_string());
-        let mut sigs = HashMap::from([(key.clone(), pose(0.8))]);
+        let mut sigs = SigMap::from_iter([(key.clone(), pose(0.8))]);
         apply_orient_neutral(&mut carry, &mut sigs);
         assert!(heading(&sigs[&key]).abs() < 1e-4, "facing forward: {}", heading(&sigs[&key]));
         assert!(sigs[&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())].as_bool(), "and modules hear it");
         // Released: the new forward holds, and turning reads from it.
         carry.orient_neutral_req.clear();
-        let mut sigs = HashMap::from([(key.clone(), pose(1.1))]);
+        let mut sigs = SigMap::from_iter([(key.clone(), pose(1.1))]);
         apply_orient_neutral(&mut carry, &mut sigs);
         assert!((heading(&sigs[&key]) - 0.3).abs() < 1e-4, "{}", heading(&sigs[&key]));
         assert!(!sigs.contains_key(&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())));
@@ -1025,7 +1025,7 @@ mod trigger_tests {
     }
 
     /// Run `steps` of held inputs; returns each tick's published map.
-    fn rig_steps(rig: &mut RemapRig, steps: &[&[&str]]) -> Vec<HashMap<(String, String), Signal>> {
+    fn rig_steps(rig: &mut RemapRig, steps: &[&[&str]]) -> Vec<SigMap> {
         steps.iter().map(|down| rig.tick(down)).collect()
     }
 
@@ -1284,11 +1284,11 @@ mod trigger_tests {
         assert!(seen[8..].iter().all(|v| *v), "live once the gap runs out: {seen:?}");
     }
 
-    fn rig_stick_y(c: &HashMap<(String, String), Signal>) -> f32 {
+    fn rig_stick_y(c: &SigMap) -> f32 {
         c.get(&("remap:1".to_string(), "left_stick_y".to_string())).map(|s| s.as_float()).unwrap_or(f32::NAN)
     }
 
-    fn push_y(rig: &mut RemapRig, v: f32) -> HashMap<(String, String), Signal> {
+    fn push_y(rig: &mut RemapRig, v: f32) -> SigMap {
         rig.tick_sigs(&[("left_stick_y", Signal::Float(v))])
     }
 
@@ -1596,20 +1596,20 @@ mod trigger_tests {
         };
         // px in [-1,1] → unit x in [0,1]: -0.5→0.25 (zone 0), +0.5→0.75 (zone 1).
         let finger = |px: f32| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
-        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+        let getb = |c: &SigMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
 
         // WITH hold on zone 0.
         {
             let snap = mk(true);
             let mut state = HashMap::new();
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
             c.clear();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
@@ -1623,7 +1623,7 @@ mod trigger_tests {
         {
             let snap = mk(false);
             let mut state = HashMap::new();
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
             c.clear();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
@@ -1650,14 +1650,14 @@ mod trigger_tests {
         ]));
         n.params.insert("hold_zones".into(), serde_json::json!([[0,0]]));
         let finger = |px: f32| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         // Land in zone 0 (analog origin), establish the start zone.
         eval_touch_zones_map_node(&n, 1, &finger(-0.5), &mut c, &mut state, 0.016);
         c.clear();
@@ -1685,16 +1685,16 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["scroll_y","scroll_x"],"mode":"analog"},
         ]));
         let finger = |px: f32, py: f32| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(py));
             m
         };
-        let getf = |c: &HashMap<(String, String), Signal>, pin: &str|
+        let getf = |c: &SigMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
         let mut state = HashMap::new();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         // Land at centre to establish the adaptive centre, then deflect up-right
         // (raw pad +Y is up; pad_point_to_unit flips it into y-down unit space).
         eval_touch_zones_map_node(&n, 1, &finger(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -1719,18 +1719,18 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":"touchpad"},
         ]));
         let finger = |px: f32| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
-        let getv = |c: &HashMap<(String, String), Signal>, pin: &str| match
+        let getv = |c: &SigMap, pin: &str| match
             c.get(&("touchmap:1".to_string(), pin.to_string())) {
                 Some(Signal::Vec2(v)) => Some((v.x, v.y)), _ => None };
         let mut state = HashMap::new();
         // Touchdown (delta seeds 0), then slide right → positive x velocity.
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_touch_zones_map_node(&n, 1, &finger(0.0), &mut c, &mut state, 0.016);
         c.clear();
         eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
@@ -1760,17 +1760,17 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
         ]));
         let input = |click: bool| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "btn_touchpad".into()), Signal::Bool(click));
             m
         };
-        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+        let getb = |c: &SigMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
         let mut state = HashMap::new();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_touch_zones_map_node(&n, 1, &input(false), &mut c, &mut state, 0.016);
         c.clear();
         eval_touch_zones_map_node(&n, 1, &input(true), &mut c, &mut state, 0.016);
@@ -1792,7 +1792,7 @@ mod trigger_tests {
             {"f":1,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
         ]));
         let input = |left_click: bool, misc2: bool| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch2_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch2_x".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "touch2_y".into()), Signal::Float(0.3));
@@ -1800,10 +1800,10 @@ mod trigger_tests {
             m.insert(("pad".into(), "btn_misc2".into()), Signal::Bool(misc2));
             m
         };
-        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+        let getb = |c: &SigMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
         let mut state = HashMap::new();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_touch_zones_map_node(&n, 1, &input(true, false), &mut c, &mut state, 0.016);
         assert!(!getb(&c, "btn_east"), "the left pad's click is Pad A's, not Pad B's");
         c.clear();
@@ -3196,7 +3196,7 @@ mod trigger_tests {
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
-        let mut sigs = HashMap::new();
+        let mut sigs = SigMap::default();
         sigs.insert((dev.to_string(), "dpad_left".to_string()), Signal::Bool(true));
         for _ in 0..20 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
 
@@ -3263,14 +3263,14 @@ mod trigger_tests {
         asth
     }
 
-    fn game_rumble(level: f32) -> HashMap<(String, String), Signal> {
-        let mut sigs = HashMap::new();
+    fn game_rumble(level: f32) -> SigMap {
+        let mut sigs = SigMap::default();
         sigs.insert((FB_VIRT.to_string(), "rumble_strong".to_string()), Signal::Float(level));
         sigs.insert((FB_VIRT.to_string(), "rumble_weak".to_string()), Signal::Float(level));
         sigs
     }
 
-    fn fb_tick(nodes: Vec<NodeSnap>, sigs: &HashMap<(String, String), Signal>) -> TickOutput {
+    fn fb_tick(nodes: Vec<NodeSnap>, sigs: &SigMap) -> TickOutput {
         let graph = ProcessingGraph { nodes };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
@@ -3343,7 +3343,7 @@ mod trigger_tests {
         inlet: &str,
         value: f32,
         override_game: bool,
-        sigs: &HashMap<(String, String), Signal>,
+        sigs: &SigMap,
     ) -> TickOutput {
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
         let mut konst = empty_node(2, "module.constant");
@@ -3401,7 +3401,7 @@ mod trigger_tests {
     // trigger, with no default, is left alone.
     #[test]
     fn a_pads_default_trigger_effect_fills_in_when_nothing_asks() {
-        let out = fb_tick(vec![ds_with_default_trigger()], &HashMap::new());
+        let out = fb_tick(vec![ds_with_default_trigger()], &SigMap::default());
         let want = crate::eval::jsm_effect_pins("RESISTANCE", &[2, 5]).unwrap();
         for (pin, v) in crate::eval::JSM_TRIGGER_PINS[1].iter().zip(want) {
             assert!((pad_value(&out, FB_DS, pin) - v).abs() < 1e-6, "{pin}");
@@ -3414,7 +3414,7 @@ mod trigger_tests {
     #[test]
     fn the_games_trigger_effect_beats_the_default() {
         use flexinput_core::automap::TriggerMode;
-        let mut sigs = HashMap::new();
+        let mut sigs = SigMap::default();
         sigs.insert((FB_VIRT.to_string(), "trigger_r_mode".to_string()), Signal::Float(TriggerMode::Off.pin()));
         let out = fb_tick(vec![ds_with_default_trigger()], &sigs);
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), TriggerMode::Off.pin());
@@ -3445,7 +3445,7 @@ mod trigger_tests {
             .collect();
         fc.n_outputs = 1;
         pad.sink_target.as_mut().unwrap().feedback_sources.clear();
-        let out = fb_tick(vec![pad, konst, fc], &HashMap::new());
+        let out = fb_tick(vec![pad, konst, fc], &SigMap::default());
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), 0.0);
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_strength"), 0.0);
     }
@@ -3469,7 +3469,7 @@ mod trigger_tests {
     fn network_peer_rumble_reaches_pad() {
         peer_rumble(9201, 0.6);
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
-        let out = fb_tick(vec![pad, net_send_node(9201, 0, FB_DS)], &HashMap::new());
+        let out = fb_tick(vec![pad, net_send_node(9201, 0, FB_DS)], &SigMap::default());
         let v = pad_value(&out, FB_DS, "rumble_strong");
         assert!((v - 0.6).abs() < 0.01, "peer rumble 0.6 must reach the pad, got {v}");
     }
@@ -3482,7 +3482,7 @@ mod trigger_tests {
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
         let asth = asth_node(9203, FB_DS, FB_DS, 0.0, 0.5);
         let send = net_send_node(9202, 1, FB_DS);
-        let out = fb_tick(vec![pad, asth, send], &HashMap::new());
+        let out = fb_tick(vec![pad, asth, send], &SigMap::default());
         assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "peer rumble must not play alongside");
         let v = pad_value(&out, FB_DS, "hd_l_amp");
         assert!((v - 0.3).abs() < 0.01, "gate: audio 0.5 × peer 0.6, got {v}");
@@ -3557,8 +3557,8 @@ mod menu_eval_tests {
         n
     }
 
-    fn dev_stick(x: f32, y: f32) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn dev_stick(x: f32, y: f32) -> SigMap {
+        let mut m = SigMap::default();
         m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
         m
     }
@@ -3576,7 +3576,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
         ]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
 
         let out = eval_menu_node(&snap, 1, &show(false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -3619,7 +3619,7 @@ mod menu_eval_tests {
     fn passthrough_republishes_full_bus() {
         // Closed menu = pure passthrough: the stick passes straight through.
         let snap = menu_snap(8);
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         eval_menu_node(&snap, 8, &show(false), &dev_stick(0.6, -0.3), &mut c, &mut state, 0.016);
         assert_eq!(
@@ -3631,7 +3631,7 @@ mod menu_eval_tests {
         // Open with suppression OFF: still passes through (suppression is opt-in).
         let mut snap2 = menu_snap(9);
         snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
-        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c2: SigMap = SigMap::default();
         let mut st2 = HashMap::new();
         eval_menu_node(&snap2, 9, &show(true), &dev_stick(0.6, -0.3), &mut c2, &mut st2, 0.016);
         assert_eq!(
@@ -3649,7 +3649,7 @@ mod menu_eval_tests {
     #[test]
     fn suppress_publishes_source_block() {
         let snap = menu_snap(11); // default: suppress = true, left-stick pointer
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         // Open (wired Show) while the left stick is deflected (active).
         eval_menu_node(&snap, 11, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
@@ -3673,7 +3673,7 @@ mod menu_eval_tests {
 
         // Partial mode: an IDLE enabled driver (stick inside deadzone) is NOT
         // blocked, so it still reaches the game.
-        let mut c_idle: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c_idle: SigMap = SigMap::default();
         let mut st_idle = HashMap::new();
         eval_menu_node(&snap, 11, &show(true), &dev_stick(0.05, 0.0), &mut c_idle, &mut st_idle, 0.016);
         assert!(c_idle.get(&(sk.clone(), "left_stick".to_string())).is_none(),
@@ -3682,7 +3682,7 @@ mod menu_eval_tests {
         // Full mode: the enabled driver is blocked even when idle.
         let mut snap_full = menu_snap(14);
         snap_full.params.insert("suppress_mode".into(), Value::String("full".into()));
-        let mut c_full: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c_full: SigMap = SigMap::default();
         let mut st_full = HashMap::new();
         eval_menu_node(&snap_full, 14, &show(true), &dev_stick(0.0, 0.0), &mut c_full, &mut st_full, 0.016);
         assert_eq!(
@@ -3693,7 +3693,7 @@ mod menu_eval_tests {
         // Suppression OFF → no block published.
         let mut snap2 = menu_snap(12);
         snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
-        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c2: SigMap = SigMap::default();
         let mut st2 = HashMap::new();
         eval_menu_node(&snap2, 12, &show(true), &dev_stick(0.8, -0.8), &mut c2, &mut st2, 0.016);
         assert!(c2.get(&(sk, "left_stick".to_string())).is_none());
@@ -3709,8 +3709,8 @@ mod menu_eval_tests {
         let mut snap = menu_snap(15);
         snap.params.insert("ptr_ls".into(), Value::Bool(false));
         snap.params.insert("ptr_gyro".into(), Value::Bool(true));
-        let dev_gyro = |rate: f32| -> HashMap<(String, String), Signal> {
-            let mut m = HashMap::new();
+        let dev_gyro = |rate: f32| -> SigMap {
+            let mut m = SigMap::default();
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
                 m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
             }
@@ -3722,25 +3722,25 @@ mod menu_eval_tests {
         // Tick 1 opens (prev_open false → no integration yet); tick 2 rotates,
         // driving the cursor past the deadzone. Fresh collector map per tick,
         // like the real pipeline — a stale block entry can't fake a pass.
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
             "rotating gyro must be source-blocked in partial mode");
 
         // Rotation stops (holding on a target): the cursor is still deflected,
         // so the block must hold.
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
             "block must latch while the gyro cursor is out of the deadzone");
 
         // A menu opened without ever tilting keeps gyro passing in partial mode.
         let mut st2 = HashMap::new();
-        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c2: SigMap = SigMap::default();
         for _ in 0..3 {
-            c2 = HashMap::new();
+            c2 = SigMap::default();
             eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c2, &mut st2, 0.016);
         }
         assert!(c2.get(&gk).is_none(),
@@ -3757,8 +3757,8 @@ mod menu_eval_tests {
         snap.params.insert("ptr_ls".into(), Value::Bool(true));
         snap.params.insert("ptr_gyro".into(), Value::Bool(true));
         snap.params.insert("suppress_mode".into(), Value::String("latch".into()));
-        let dev = |x: f32, y: f32, rate: f32| -> HashMap<(String, String), Signal> {
-            let mut m = HashMap::new();
+        let dev = |x: f32, y: f32, rate: f32| -> SigMap {
+            let mut m = SigMap::default();
             m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
                 m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
@@ -3773,9 +3773,9 @@ mod menu_eval_tests {
         // Tick 1 opens (no engagement while prev_open is false); tick 2: LS
         // deflects AND gyro rotates at once — LS engages first and takes the
         // latch, so LS is blocked while gyro passes untouched.
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&lk).map(|s| s.as_bool()), Some(true),
             "the latched driver must be source-blocked");
@@ -3784,7 +3784,7 @@ mod menu_eval_tests {
 
         // LS returns to the deadzone while gyro keeps rotating: ownership hands
         // over — gyro is now blocked, LS passes again.
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.0, 0.0, 1.0), &mut c, &mut state, 0.016);
         assert!(c.get(&lk).is_none(),
             "a disengaged driver must be released from the block");
@@ -3803,7 +3803,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_north"] }
         ]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         // Wired Show + Select: [_, Show, Select, _].
         let sel = |sh: bool, se: bool|
@@ -3832,7 +3832,7 @@ mod menu_eval_tests {
     #[test]
     fn macro_style_show_target_opens() {
         let snap = menu_snap(2);
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         merge_macro_scalar(&mut c, "menu:abcd1234_show", Signal::Bool(true));
         let mut state = HashMap::new();
         let out = eval_menu_node(&snap, 2, &[], &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -3845,7 +3845,7 @@ mod menu_eval_tests {
     fn toggle_mode_edges() {
         let mut snap = menu_snap(3);
         snap.params.insert("activation_mode".into(), Value::String("toggle".into()));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         let dev = dev_stick(0.0, 0.0);
 
@@ -3868,7 +3868,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_west"] }
         ]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         let sel = |show_b: bool, sel_b: bool| {
             vec![None, Some(Signal::Bool(show_b)), Some(Signal::Bool(sel_b)), None]
@@ -3893,7 +3893,7 @@ mod menu_eval_tests {
         // Synthetic 1×4 strip = 4 sectors (up, right, down, left).
         snap.params.insert("col_edges".into(), serde_json::json!([0.25, 0.5, 0.75]));
         snap.params.insert("row_edges".into(), serde_json::json!([] as [f32; 0]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
 
         // Stick up (+y = up in stick coords) → sector 0.
@@ -3921,7 +3921,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
         ]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
 
         let out = eval_menu_node(&snap, 7, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
@@ -3947,7 +3947,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["macro:ff00ff00"] }
         ]));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         // Two frames: hover establishes on frame 1, the Select edge rises on
         // frame 2 (prev_sel must be low for the edge to register).
@@ -4267,8 +4267,8 @@ mod lean_axis_tests {
             &inputs,
             &mut state,
             &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            &SigMap::default(),
+            &SigMap::default(),
             1.0 / 60.0,
         );
         match out.get(LEAN_OUT) {
@@ -4298,7 +4298,7 @@ mod lean_axis_tests {
         for _ in 0..600 {
             let out = compute_gyro_3dof(
                 &inputs, &mut state, &params,
-                &HashMap::new(), &HashMap::new(), 1.0 / 60.0,
+                &SigMap::default(), &SigMap::default(), 1.0 / 60.0,
             );
             lean = match out.get(LEAN_OUT) {
                 Some(Some(Signal::Float(f))) => *f,
@@ -4372,7 +4372,7 @@ mod lean_axis_tests {
         for _ in 0..600 {
             out = compute_gyro_3dof(
                 &inputs, &mut state, &params,
-                &HashMap::new(), &HashMap::new(), 1.0 / 60.0,
+                &SigMap::default(), &SigMap::default(), 1.0 / 60.0,
             );
         }
         let x = match out.get(1) { Some(Some(Signal::Float(f))) => *f, o => panic!("x: {o:?}") };
@@ -4921,7 +4921,7 @@ mod rws_tests {
         let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
         let push = Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)));
         let run = |ctl: Option<Signal>| {
-            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut c: SigMap = SigMap::default();
             let mut state = HashMap::new();
             let out = eval_rws_node(&snap, 27, &[gyro, push, ctl], &mut c, &mut state, 0.01);
             (vec_at(&out, 0), c.is_empty())
@@ -5146,7 +5146,7 @@ mod rws_tests {
     #[test]
     fn rws_full_suppress_publishes_block() {
         let snap = rws_snap(21, "full");
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
         eval_rws_node(&snap, 21, &inputs, &mut c, &mut state, 0.016);
@@ -5164,7 +5164,7 @@ mod rws_tests {
     #[test]
     fn rws_suppress_off_publishes_nothing() {
         let snap = rws_snap(22, "off");
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
         eval_rws_node(&snap, 22, &inputs, &mut c, &mut state, 0.016);
@@ -5177,13 +5177,13 @@ mod rws_tests {
         let snap = rws_snap(23, "deadzone");
         let sk = format!("{SRC_BLOCK_PREFIX}dev");
         // Inside the deadzone (0.85) → not blocked, still reaches the game.
-        let mut c1: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c1: SigMap = SigMap::default();
         let mut s1 = HashMap::new();
         let inside = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
         eval_rws_node(&snap, 23, &inside, &mut c1, &mut s1, 0.016);
         assert!(c1.get(&(sk.clone(), "right_stick".to_string())).is_none(), "inside deadzone: not blocked");
         // Past the deadzone → blocked.
-        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c2: SigMap = SigMap::default();
         let mut s2 = HashMap::new();
         let past = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
         eval_rws_node(&snap, 23, &past, &mut c2, &mut s2, 0.016);
@@ -5200,7 +5200,7 @@ mod rws_tests {
         let mut snap = rws_snap(24, "full");
         snap.params.insert("scale".into(), serde_json::json!(1.0));
         snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
-        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut c: SigMap = SigMap::default();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         // Block is active: the resolved Flick input is zeroed, but the snapshot
         // holds the real stick (pushed full right).
@@ -5224,7 +5224,7 @@ mod rws_tests {
         let mut snap = rws_snap(25, "off");
         snap.params.insert("stick_aim_enabled".into(), Value::Bool(true));
         for v in [glam::Vec2::new(0.3, 0.0), glam::Vec2::new(1.0, 0.0)] {
-            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut c: SigMap = SigMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(v))];
             eval_rws_node(&snap, 25, &inputs, &mut c, &mut state, 0.016);
@@ -5241,7 +5241,7 @@ mod rws_tests {
             let mut snap = rws_snap(26, "off");
             snap.params.insert("flick_output".into(), Value::String("mouse".into()));
             snap.params.insert("cal_measure".into(), Value::String(axis.into()));
-            let mut c: HashMap<(String, String), Signal> = HashMap::new();
+            let mut c: SigMap = SigMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
             eval_rws_node(&snap, 26, &inputs, &mut c, &mut state, 0.016);
@@ -5391,9 +5391,9 @@ mod midi_source_tests {
     #[test]
     fn untouched_midi_pins_read_as_rest_on_a_midi_source() {
         let snap = midi_source(&["cc_7", "pitch_bend", "midi:note:1:60", "midi:cc:2:1", "btn_south"]);
-        let mut dev_sigs = HashMap::new();
+        let mut dev_sigs = SigMap::default();
         dev_sigs.insert(("midi_in:0".to_string(), "midi:cc:2:1".to_string()), Signal::Float(0.5));
-        let out = compute_node(&snap, &[], &mut NodeState::default(), &dev_sigs, &HashMap::new(), 0.016);
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &dev_sigs, &SigMap::default(), 0.016);
         assert_eq!(out, vec![
             Some(Signal::Float(0.0)),
             Some(Signal::Float(0.0)),
@@ -5427,8 +5427,8 @@ mod midi_source_tests {
         n
     }
 
-    fn played() -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn played() -> SigMap {
+        let mut m = SigMap::default();
         m.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
         m.insert(("midi_in:0".to_string(), "midi:cc:1:7".to_string()), Signal::Float(0.5));
         m.insert(("midi_in:0".to_string(), "cc_7".to_string()), Signal::Float(0.5));
@@ -5608,7 +5608,7 @@ mod midi_source_tests {
                 pad_sink(3, "remap:2"),
             ],
         };
-        let north = |sigs: &HashMap<(String, String), Signal>| {
+        let north = |sigs: &SigMap| {
             let mut out = TickOutput::default();
             eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
             out.sink_outputs
@@ -5616,11 +5616,11 @@ mod midi_source_tests {
                 .map(|s| s.as_bool())
                 .unwrap_or(false)
         };
-        let mut on_ch9 = HashMap::new();
+        let mut on_ch9 = SigMap::default();
         on_ch9.insert(("midi_in:0".to_string(), "midi:note:9:60".to_string()), Signal::Bool(true));
         on_ch9.insert(("midi_in:0".to_string(), "midi:note:*:60".to_string()), Signal::Bool(true));
         assert!(north(&on_ch9));
-        assert!(!north(&HashMap::new()));
+        assert!(!north(&SigMap::default()));
     }
 
     const PAD: &str = "gilrs:xinput:0";
@@ -5643,7 +5643,7 @@ mod midi_source_tests {
         n
     }
 
-    fn pad_sigs(pairs: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
+    fn pad_sigs(pairs: &[(&str, Signal)]) -> SigMap {
         pairs.iter().map(|(p, s)| ((PAD.to_string(), p.to_string()), *s)).collect()
     }
 
@@ -5748,7 +5748,7 @@ mod midi_source_tests {
         split.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
         split.n_outputs = 3;
         split.output_pin_ids = vec!["automap_pass".into(), "midi:note:1:61".into(), "midi:pb:1".into()];
-        let out = compute_node(&split, &[], &mut NodeState::default(), &played(), &HashMap::new(), 0.016);
+        let out = compute_node(&split, &[], &mut NodeState::default(), &played(), &SigMap::default(), 0.016);
         assert_eq!(out, vec![None, Some(Signal::Bool(false)), Some(Signal::Float(0.0))]);
     }
 
@@ -5756,12 +5756,12 @@ mod midi_source_tests {
     fn non_midi_sources_are_not_rest_filled() {
         let mut snap = midi_source(&["cc_7"]);
         snap.device_id = Some("gilrs:xinput:0".to_string());
-        let out = compute_node(&snap, &[], &mut NodeState::default(), &HashMap::new(), &HashMap::new(), 0.016);
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &SigMap::default(), &SigMap::default(), 0.016);
         assert_eq!(out, vec![None]);
     }
 
-    fn note_sigs(vel: f32, pat: Option<f32>, cp: Option<f32>) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn note_sigs(vel: f32, pat: Option<f32>, cp: Option<f32>) -> SigMap {
+        let mut m = SigMap::default();
         let d = "midi_in:0".to_string();
         m.insert((d.clone(), "midi:note:1:60".to_string()), Signal::Bool(true));
         m.insert((d.clone(), "midi:vel:1:60".to_string()), Signal::Float(vel));
@@ -5770,7 +5770,7 @@ mod midi_source_tests {
         m
     }
 
-    fn trigger_from(graph: &ProcessingGraph, sigs: &HashMap<(String, String), Signal>) -> f32 {
+    fn trigger_from(graph: &ProcessingGraph, sigs: &SigMap) -> f32 {
         let mut out = TickOutput::default();
         eval_graph_tick(graph, &mut HashMap::new(), sigs, 0.016, &mut out);
         out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
@@ -5812,7 +5812,7 @@ mod midi_source_tests {
                 pad_sink(3, "remap:2"),
             ],
         };
-        let south = |sigs: &HashMap<(String, String), Signal>| {
+        let south = |sigs: &SigMap| {
             let mut out = TickOutput::default();
             eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
             out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string()))
@@ -5862,7 +5862,7 @@ mod midi_source_tests {
                 midi_out_sink(4, "remap:2", Some("midi_in:0"), false),
             ],
         };
-        let run = |sigs: &HashMap<(String, String), Signal>| {
+        let run = |sigs: &SigMap| {
             let mut out = TickOutput::default();
             eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
             (midi_out_of(&out, "midi:note:2:72"), midi_out_of(&out, "midi:vel:2:72"), midi_out_of(&out, "midi:pat:2:72"))
@@ -5957,7 +5957,7 @@ mod midi_card_module_tests {
         }
     }
 
-    fn get(c: &HashMap<(String, String), Signal>, key: &str, pin: &str) -> Option<Signal> {
+    fn get(c: &SigMap, key: &str, pin: &str) -> Option<Signal> {
         c.get(&(key.to_string(), pin.to_string())).copied()
     }
 
@@ -5969,7 +5969,7 @@ mod midi_card_module_tests {
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c, "lean:1", "midi:note:2:60"), Some(Signal::Bool(true)), "{c:?}");
         assert_eq!(get(&c, "lean:1", "midi:vel:2:60"), Some(Signal::Float(64.0 / 127.0)));
@@ -5988,7 +5988,7 @@ mod midi_card_module_tests {
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
         let mut ns = NodeState::default();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.6), &mut ns, &mut c, 0.016);
         let f = |pin: &str| get(&c, "lean:1", pin).map(|s| s.as_float()).unwrap_or(f32::NAN);
         assert!((f("midi:cc:1:11") - 0.6).abs() < 1e-4, "{c:?}");
@@ -6006,14 +6006,14 @@ mod midi_card_module_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["midi:cc:1:20"],"midi_on": 100},
         ]));
         let finger = |on: bool| {
-            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            let mut m: SigMap = SigMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(on));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         for _ in 0..3 {
             c.clear();
             eval_touch_zones_map_node(&n, 1, &finger(true), &mut c, &mut state, 0.016);
@@ -6032,11 +6032,11 @@ mod midi_card_module_tests {
         let mut n = node(1, "module.map_action");
         n.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
         n.params.insert("mappings".into(), serde_json::json!([{ "in": ["midi:note:1:60"] }]));
-        let mut dev = HashMap::new();
+        let mut dev = SigMap::default();
         dev.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
-        let out = eval_map_action_node(&n, 1, &dev, &HashMap::new(), &mut HashMap::new(), 0.016);
+        let out = eval_map_action_node(&n, 1, &dev, &SigMap::default(), &mut HashMap::new(), 0.016);
         assert_eq!(out.first().copied().flatten(), Some(Signal::Bool(true)), "{out:?}");
-        let out = eval_map_action_node(&n, 1, &HashMap::new(), &HashMap::new(), &mut HashMap::new(), 0.016);
+        let out = eval_map_action_node(&n, 1, &SigMap::default(), &SigMap::default(), &mut HashMap::new(), 0.016);
         assert_ne!(out.first().copied().flatten(), Some(Signal::Bool(true)));
     }
 }
@@ -6096,8 +6096,8 @@ mod automap_curve_tests {
         n
     }
 
-    fn pad(lt: f32, stick: Vec2) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn pad(lt: f32, stick: Vec2) -> SigMap {
+        let mut m = SigMap::default();
         let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
         put("left_trigger", Signal::Float(lt));
         put("right_trigger", Signal::Float(0.6));
@@ -6108,7 +6108,7 @@ mod automap_curve_tests {
         m
     }
 
-    fn tick(nodes: Vec<NodeSnap>, sigs: &HashMap<(String, String), Signal>) -> TickOutput {
+    fn tick(nodes: Vec<NodeSnap>, sigs: &SigMap) -> TickOutput {
         let graph = ProcessingGraph { nodes };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
@@ -6158,20 +6158,20 @@ mod automap_curve_tests {
     #[test]
     fn a_stick_and_its_axes_stay_in_step() {
         let key = |pin: &str| ("collector:5".to_string(), pin.to_string());
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick"), 5,
             &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
         assert!(close(c.get(&key("left_stick_y")).copied(), Signal::Float(0.4)));
 
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick_x"), 5,
             &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
         assert!(close(c.get(&key("left_stick")).copied(), Signal::Vec2(Vec2::new(0.3, 0.8))));
     }
 
-    fn imu() -> HashMap<(String, String), Signal> {
+    fn imu() -> SigMap {
         let mut m = pad(0.0, Vec2::ZERO);
         for (pin, v) in [("gyro_x", 0.2), ("gyro_y", -0.4), ("gyro_z", 0.8),
                          ("accel_x", 0.1), ("accel_y", 0.3), ("accel_z", -0.5)] {
@@ -6180,7 +6180,7 @@ mod automap_curve_tests {
         m
     }
 
-    fn bus_value(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+    fn bus_value(c: &SigMap, pin: &str) -> Option<Signal> {
         c.get(&("collector:5".to_string(), pin.to_string())).copied()
     }
 
@@ -6190,7 +6190,7 @@ mod automap_curve_tests {
     #[test]
     fn a_gyro_pick_curves_all_three_axes() {
         for module in [AUTOMAP_CURVE_ID, AUTOMAP_TWOWAY_CURVE_ID] {
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             let (ins, outs) = eval_automap_curve_node(&curve(5, module, "gyro"), 5,
                 &imu(), &mut c, &mut HashMap::new(), 0.016);
             assert_eq!(ins.len(), 3, "{module}");
@@ -6206,7 +6206,7 @@ mod automap_curve_tests {
 
     #[test]
     fn an_accel_pick_leaves_the_gyro_alone() {
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "accel"), 5,
             &imu(), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(bus_value(&c, "accel_z"), Signal::Float(-0.25)));
@@ -6222,7 +6222,7 @@ mod automap_curve_tests {
             sigs.insert((PAD.to_string(), pin.to_string()), Signal::Float(v));
         }
         sigs.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         let (ins, _) = eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "touch1"), 5,
             &sigs, &mut c, &mut HashMap::new(), 0.016);
         assert_eq!(ins.len(), 2);
@@ -6291,8 +6291,8 @@ mod area_mapper_tests {
         n
     }
 
-    fn stick(v: Vec2) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn stick(v: Vec2) -> SigMap {
+        let mut m = SigMap::default();
         let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
         put("left_stick", Signal::Vec2(v));
         put("left_stick_x", Signal::Float(v.x));
@@ -6309,19 +6309,19 @@ mod area_mapper_tests {
     /// One tick; returns the published bus and the live mirror.
     fn run(
         n: &NodeSnap,
-        sigs: &HashMap<(String, String), Signal>,
+        sigs: &SigMap,
         state: &mut HashMap<usize, NodeState>,
-    ) -> (HashMap<(String, String), Signal>, Vec<Option<Signal>>) {
-        let mut c = HashMap::new();
+    ) -> (SigMap, Vec<Option<Signal>>) {
+        let mut c = SigMap::default();
         let out = eval_area_mapper_node(n, 5, sigs, &mut c, state, DT);
         (c, out)
     }
 
-    fn bus(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+    fn bus(c: &SigMap, pin: &str) -> Option<Signal> {
         c.get(&("collector:5".to_string(), pin.to_string())).copied()
     }
 
-    fn on(c: &HashMap<(String, String), Signal>, pin: &str) -> bool {
+    fn on(c: &SigMap, pin: &str) -> bool {
         bus(c, pin).is_some_and(|s| s.as_bool())
     }
 
@@ -6487,7 +6487,7 @@ mod area_mapper_tests {
         ]));
         n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
         let touch = |active: bool| {
-            let mut m = HashMap::new();
+            let mut m = SigMap::default();
             // Top middle of the pad: +Y is up on the bus.
             m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.0));
             m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(0.95));
@@ -7128,8 +7128,8 @@ mod imu_input_tests {
     }
 
     /// A pad lying flat, turning at `yaw_dps` (right positive).
-    fn turning(yaw_dps: f32) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn turning(yaw_dps: f32) -> SigMap {
+        let mut m = SigMap::default();
         for (pin, v) in [
             ("gyro_x", 0.0), ("gyro_y", 0.0), ("gyro_z", yaw_dps / 2000.0),
             ("accel_x", 0.0), ("accel_y", 0.0), ("accel_z", 1.0 / 8.0),
@@ -7141,14 +7141,14 @@ mod imu_input_tests {
         m
     }
 
-    fn run(snap: &NodeSnap, sigs: &HashMap<(String, String), Signal>,
-           state: &mut HashMap<usize, NodeState>) -> HashMap<(String, String), Signal> {
-        let mut c = HashMap::new();
+    fn run(snap: &NodeSnap, sigs: &SigMap,
+           state: &mut HashMap<usize, NodeState>) -> SigMap {
+        let mut c = SigMap::default();
         eval_remapper_node(snap, 2, sigs, &mut c, state, 0.004);
         c
     }
 
-    fn out(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+    fn out(c: &SigMap, pin: &str) -> Option<Signal> {
         c.get(&(KEY.to_string(), pin.to_string())).copied()
     }
 
@@ -7193,7 +7193,7 @@ mod imu_input_tests {
             "in": ["imu_gyro_yaw"], "out": ["right_stick_right"], "mode": "analog",
         }));
         let mut state = HashMap::new();
-        let x = |c: &HashMap<(String, String), Signal>| out(c, "right_stick_x").map(|s| s.as_float());
+        let x = |c: &SigMap| out(c, "right_stick_x").map(|s| s.as_float());
         let c = run(&snap, &turning(180.0), &mut state);
         assert!((x(&c).unwrap() - 0.5).abs() < 1e-3, "{:?}", x(&c));
         let c = run(&snap, &turning(-180.0), &mut state);
@@ -7233,8 +7233,8 @@ mod stick_direction_output_tests {
         }
     }
 
-    fn south(down: bool) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn south(down: bool) -> SigMap {
+        let mut m = SigMap::default();
         m.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(down));
         for (pin, sig) in [("left_stick_x", Signal::Float(0.0)), ("left_stick_y", Signal::Float(0.0)),
                            ("left_stick", Signal::Vec2(Vec2::ZERO))] {
@@ -7252,7 +7252,7 @@ mod stick_direction_output_tests {
             if let Some(m) = mode { card["mode"] = serde_json::json!(m); }
             let snap = remapper(card);
             let mut state = HashMap::new();
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_remapper_node(&snap, 2, &south(true), &mut c, &mut state, 0.004);
             let y = c.get(&("remap:2".to_string(), "left_stick_y".to_string())).map(|s| s.as_float());
             let v = c.get(&("remap:2".to_string(), "left_stick".to_string())).copied();
@@ -7261,8 +7261,8 @@ mod stick_direction_output_tests {
         }
     }
 
-    fn stick(v: Vec2) -> HashMap<(String, String), Signal> {
-        let mut m = HashMap::new();
+    fn stick(v: Vec2) -> SigMap {
+        let mut m = SigMap::default();
         for (pin, sig) in [("left_stick_x", Signal::Float(v.x)), ("left_stick_y", Signal::Float(v.y)),
                            ("left_stick", Signal::Vec2(v)),
                            ("right_stick_x", Signal::Float(0.0)), ("right_stick_y", Signal::Float(0.0)),
@@ -7272,7 +7272,7 @@ mod stick_direction_output_tests {
         m
     }
 
-    fn at(c: &HashMap<(String, String), Signal>, pin: &str) -> Option<Signal> {
+    fn at(c: &SigMap, pin: &str) -> Option<Signal> {
         c.get(&("remap:2".to_string(), pin.to_string())).copied()
     }
 
@@ -7285,7 +7285,7 @@ mod stick_direction_output_tests {
         }));
         let mut state = HashMap::new();
         let mut step = |down: bool| {
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_remapper_node(&snap, 2, &south(down), &mut c, &mut state, 0.01);
             let on = |p: &str| c.get(&("remap:2".to_string(), p.to_string())) == Some(&Signal::Bool(true));
             (on("key_lctrl"), on("key_c"))
@@ -7304,7 +7304,7 @@ mod stick_direction_output_tests {
     #[test]
     fn a_whole_stick_moves_onto_another_and_leaves_its_own_quiet() {
         let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["right_stick"], "mode": "analog" }));
-        let mut c = HashMap::new();
+        let mut c = SigMap::default();
         eval_remapper_node(&snap, 2, &stick(Vec2::new(0.6, -0.3)), &mut c, &mut HashMap::new(), 0.004);
         assert_eq!(at(&c, "right_stick"), Some(Signal::Vec2(Vec2::new(0.6, -0.3))));
         assert_eq!(at(&c, "right_stick_x").map(|s| s.as_float()), Some(0.6));
@@ -7321,7 +7321,7 @@ mod stick_direction_output_tests {
         let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["btn_east"] }));
         let mut state = HashMap::new();
         let east = |v: Vec2, state: &mut HashMap<usize, NodeState>| {
-            let mut c = HashMap::new();
+            let mut c = SigMap::default();
             eval_remapper_node(&snap, 2, &stick(v), &mut c, state, 0.004);
             at(&c, "btn_east")
         };

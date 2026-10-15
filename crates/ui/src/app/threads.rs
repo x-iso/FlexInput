@@ -2,6 +2,7 @@
 //! the MIDI enumeration watcher.
 
 use super::*;
+use flexinput_core::PinMapExt;
 
 // ── Device I/O thread (polling-rate setting, default 500 Hz) ──────────────────
 
@@ -155,6 +156,9 @@ pub(crate) fn spawn_io_thread(
             let io_started = Instant::now();
             let mut sect_marks: Vec<(&'static str, Duration)> = Vec::with_capacity(12);
             let mut backend_marks: Vec<Duration> = Vec::with_capacity(4);
+            // This iteration's sink outputs: refreshed in place from the bus each
+            // iteration (see `drain_sink_bus_into`) rather than rebuilt.
+            let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
 
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
@@ -351,10 +355,10 @@ pub(crate) fn spawn_io_thread(
                 // A drain, not a read: the mouse displacement pins are banked across
                 // engine ticks and must be delivered exactly once (see
                 // `flexinput_engine::is_displacement_pin`).
-                let sink_outputs: HashMap<(String, String), Signal> = {
+                {
                     puffin::profile_scope!("read_sink_bus");
-                    flexinput_engine::drain_sink_bus(&sink_bus)
-                };
+                    flexinput_engine::drain_sink_bus_into(&sink_bus, &mut sink_outputs);
+                }
                 mark!("sink_bus");
 
                 // ── Drive virtual & physical devices ──────────────────────────
@@ -516,7 +520,7 @@ pub(crate) fn spawn_io_thread(
                         if !is_phys || pin_id != amp_pin { continue; }
                         let amp = signal.as_float();
                         let has_freq = sink_outputs
-                            .get(&(device_id.clone(), freq_pin.to_string()))
+                            .get_pin(device_id, freq_pin)
                             .map(|s| s.as_float() > 0.0)
                             .unwrap_or(false);
                         if amp > 0.01 && !has_freq {
@@ -551,7 +555,7 @@ pub(crate) fn spawn_io_thread(
                     const REFRESH: Duration = Duration::from_secs(2);
                     for (dev, &rgb) in defaults.iter() {
                         let driven = ["lightbar_r", "lightbar_g", "lightbar_b"].iter()
-                            .any(|p| sink_outputs.contains_key(&(dev.clone(), p.to_string())));
+                            .any(|p| sink_outputs.has_pin(dev, p));
                         if driven {
                             led_default_sent.remove(dev);
                             continue;

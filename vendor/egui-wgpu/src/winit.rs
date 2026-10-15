@@ -291,9 +291,18 @@ impl Painter {
     /// at least once, since the underlying device and render state are initialized lazily
     /// once we have a window (that may determine the choice of adapter/device).
     pub fn max_texture_side(&self) -> Option<usize> {
+        // FLEXINPUT PATCH: report at most 4096 to egui. egui sizes its font
+        // atlas as max_texture_side wide, doubles the height as glyphs arrive,
+        // and only resets it once 80% of the full SQUARE is used — at the
+        // device's 8192 that is a 256 MB CPU image plus a 256 MB texture (on an
+        // iGPU both in system RAM) before it is ever cleared. Text drawn at
+        // many sizes (scaled pinned widgets, rect-sized labels) fills it over a
+        // session. At 4096 it peaks at 64 + 64 MB and resets. Capped here, at
+        // the one source every viewport (immediate ones included) reads, so
+        // egui never sees two values and rebuilds the atlas each frame.
         self.render_state
             .as_ref()
-            .map(|rs| rs.device.limits().max_texture_dimension_2d as usize)
+            .map(|rs| (rs.device.limits().max_texture_dimension_2d as usize).min(4096))
     }
 
     fn resize_and_generate_depth_texture_view_and_msaa_view(

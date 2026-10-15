@@ -1454,7 +1454,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 "deco_svg_tex", salt, *rev, pw, ph, tint_mode.as_str(),
                 tint[0], tint[1], tint[2], tint[3],
             ));
-            let cached = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key));
+            let cached = crate::widgets::tex_cache::get(&ctx, cache_key);
             let tex = match cached {
                 Some(t) => Some(t),
                 None => {
@@ -1465,7 +1465,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                                 img,
                                 egui::TextureOptions::LINEAR,
                             );
-                            ctx.data_mut(|d| d.insert_temp(cache_key, h.clone()));
+                            crate::widgets::tex_cache::put(&ctx, cache_key, h.clone());
                             h
                         })
                 }

@@ -294,6 +294,15 @@ pub(crate) fn pin_flex_width(ui: &egui::Ui, container: egui::Vec2, min_w: f32) -
     min_w * scale + surplus
 }
 
+/// A computed font size, rounded DOWN to a half point. egui rasterizes every
+/// distinct size into its font atlas and never evicts one until the atlas is
+/// nearly full, so continuously scaled text (a pinned row being resized, text
+/// sized from a frame) left a trail of glyph sets behind it. Down, so scaled
+/// text still never outgrows the frame it was fitted to.
+pub(crate) fn quantize_font_size(size: f32) -> f32 {
+    (size * 2.0).floor() / 2.0
+}
+
 pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
     // Text/controls scale with the container HEIGHT, capped by what the WIDTH
     // can hold, so a pinned row grows with its frame but never crops out of
@@ -325,7 +334,7 @@ pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natur
     // the current sub-Ui (the allocate_ui_at_rect closure), not the parent.
     let style = ui.style_mut();
     for (_, font_id) in style.text_styles.iter_mut() {
-        font_id.size = (font_id.size * scale).max(6.0);
+        font_id.size = quantize_font_size((font_id.size * scale).max(6.0));
     }
     let sp = &mut style.spacing;
     sp.button_padding *= scale;

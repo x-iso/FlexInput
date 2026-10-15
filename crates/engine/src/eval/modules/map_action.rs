@@ -10,26 +10,26 @@ use super::*;
 pub(crate) fn eval_map_action_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    collector_sigs: &HashMap<(String, String), Signal>,
+    dev_sigs: &SigMap,
+    collector_sigs: &SigMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
             let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
             let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
             // Snapshot upstream values for every canonical pin once.
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            let mut upstream: PinSigs = PinSigs::default();
             for ap in automap::ALL_PINS {
                 let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                    collector_sigs.get_pin(&collector_id, &ap.id).copied()
                 } else { None }
                 .or_else(|| {
                     if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                        dev_sigs.get_pin(&dev_id, &ap.id).copied()
                     } else { None }
                 });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+                if let Some(s) = sig { upstream.insert(flexinput_core::pooled_string(ap.id), s); }
             }
             // MIDI pins are dynamic (never in ALL_PINS): take whatever the bus
             // carries, so a note or a knob can trigger an action.
@@ -66,13 +66,13 @@ pub(crate) fn eval_map_action_node(
             let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
             let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
             if touch_click { touch_only = [false;3]; }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_left"),   Signal::Bool(click_zone[0]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_center"), Signal::Bool(click_zone[1]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_right"),  Signal::Bool(click_zone[2]));
+            upstream.insert(flexinput_core::pooled_string("touchpad_any"),    Signal::Bool(touch_click && any_zone));
+            upstream.insert(flexinput_core::pooled_string("touch_left"),      Signal::Bool(touch_only[0]));
+            upstream.insert(flexinput_core::pooled_string("touch_center"),    Signal::Bool(touch_only[1]));
+            upstream.insert(flexinput_core::pooled_string("touch_right"),     Signal::Bool(touch_only[2]));
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
@@ -177,6 +177,8 @@ pub(crate) fn eval_map_action_node(
             let analog_mag = if max_analog_mag > 0.0 {
                 max_analog_mag
             } else if any_trigger && !any_analog_present { 1.0 } else { max_analog_mag };
+            // Hand the per-tick pin snapshot's key Strings back for the next tick.
+            flexinput_core::recycle_strings(&mut upstream);
             return vec![
                 Some(Signal::Bool(any_trigger)),
                 Some(Signal::Float(analog_mag.clamp(0.0, 1.0))),

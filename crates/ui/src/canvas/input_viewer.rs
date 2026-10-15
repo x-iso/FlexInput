@@ -567,14 +567,14 @@ fn glyph_chip(
 fn glyph_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Option<egui::TextureHandle> {
     let px = (logical_size * ui.ctx().pixels_per_point()).round().max(4.0) as u32;
     let key = egui::Id::new(("iv_glyph", skin.as_str(), pin, px));
-    if let Some(tex) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+    if let Some(tex) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(tex);
     }
     let bytes = remapper_icons::pin_svg(skin, pin)?;
     let text = std::str::from_utf8(bytes).ok()?;
     let img = rasterize_svg_recolored(text, px, px, "override", egui::Color32::TRANSPARENT)?;
     let tex = ui.ctx().load_texture(format!("iv_glyph_{pin}"), img, egui::TextureOptions::LINEAR);
-    ui.ctx().data_mut(|d| d.insert_temp(key, tex.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), key, tex.clone());
     Some(tex)
 }
 
@@ -584,7 +584,7 @@ fn glyph_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Opt
 fn dpad_highlight_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Option<egui::TextureHandle> {
     let px = (logical_size * ui.ctx().pixels_per_point()).round().max(4.0) as u32;
     let key = egui::Id::new(("iv_dpad_hl", skin.as_str(), pin, px));
-    if let Some(tex) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+    if let Some(tex) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(tex);
     }
     let bytes = remapper_icons::pin_svg(skin, pin)?;
@@ -592,7 +592,7 @@ fn dpad_highlight_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f3
     let highlight_only = strip_white_paths(text);
     let img = rasterize_svg_recolored(&highlight_only, px, px, "override", egui::Color32::TRANSPARENT)?;
     let tex = ui.ctx().load_texture(format!("iv_dpad_hl_{pin}"), img, egui::TextureOptions::LINEAR);
-    ui.ctx().data_mut(|d| d.insert_temp(key, tex.clone()));
+    crate::widgets::tex_cache::put(ui.ctx(), key, tex.clone());
     Some(tex)
 }
 

@@ -451,7 +451,7 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
         let tint = egui::Color32::TRANSPARENT;
         let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+        let tex = crate::widgets::tex_cache::get(ui.ctx(), cache_key)
             .or_else(|| {
                 let text = std::str::from_utf8(bytes).ok()?;
                 let img = rasterize_svg_recolored(text, size_px, size_px, "override", tint)?;
@@ -460,7 +460,7 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
                     img,
                     egui::TextureOptions::LINEAR,
                 );
-                ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
                 Some(handle)
             });
         if let Some(tex) = tex {
@@ -703,7 +703,7 @@ pub(crate) fn paint_chord_chip_tinted(
     if let Some((bytes, dim)) = found {
         let size_px = (chip_h * ctx.pixels_per_point()).round() as u32;
         let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+        let tex = crate::widgets::tex_cache::get(&ctx, cache_key)
             .or_else(|| {
                 let text = std::str::from_utf8(bytes).ok()?;
                 let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
@@ -712,7 +712,7 @@ pub(crate) fn paint_chord_chip_tinted(
                     img,
                     egui::TextureOptions::LINEAR,
                 );
-                ctx.data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                crate::widgets::tex_cache::put(&ctx, cache_key, handle.clone());
                 Some(handle)
             });
         if let Some(tex) = tex {
@@ -781,7 +781,7 @@ pub(crate) fn remapper_render_arrow(ui: &mut egui::Ui) {
     const H: f32 = 22.0;
     let size_px = (H * ui.ctx().pixels_per_point()).round() as u32;
     let cache_key = egui::Id::new(("remapper_arrow_svg", size_px));
-    let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+    let tex = crate::widgets::tex_cache::get(ui.ctx(), cache_key)
         .or_else(|| {
             let text = std::str::from_utf8(remapper_icons::ARROW_LONG_SVG).ok()?;
             let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
@@ -790,7 +790,7 @@ pub(crate) fn remapper_render_arrow(ui: &mut egui::Ui) {
                 img,
                 egui::TextureOptions::LINEAR,
             );
-            ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+            crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
             Some(handle)
         });
     if let Some(tex) = tex {

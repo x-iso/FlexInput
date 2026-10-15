@@ -3,6 +3,7 @@
 use super::bind::*;
 use super::names::*;
 use super::parse::*;
+use flexinput_core::{PinSigs, SigMap};
 
 fn one(line: &str) -> LineInfo {
     let c = compile(line);
@@ -1991,8 +1992,8 @@ fn a_stick_waits_for_centre_after_its_modeshift_ends() {
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let up = Signal::Vec2(glam::Vec2::new(0.0, 1.0));
 
-    let mut run = |chord: bool, stick: bool| -> HashMap<String, Signal> {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut run = |chord: bool, stick: bool| -> PinSigs {
+        let mut dev: SigMap = SigMap::default();
         if chord {
             dev.insert((PAD.to_string(), "left_trigger".to_string()), Signal::Float(1.0));
         }
@@ -2000,7 +2001,7 @@ fn a_stick_waits_for_centre_after_its_modeshift_ends() {
             (PAD.to_string(), "left_stick".to_string()),
             if stick { up } else { Signal::Vec2(glam::Vec2::ZERO) },
         );
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
         collector.into_iter()
             .filter(|((d, _), _)| *d == key)
@@ -2122,7 +2123,7 @@ fn jsm_snap(uid: usize, text: &str, strict: bool) -> NodeSnap {
 
 /// Run the node for `ticks` with the given pad pins held, and return what it
 /// published on its own bus.
-fn run_node(text: &str, strict: bool, held: &[&str], ticks: usize) -> HashMap<String, Signal> {
+fn run_node(text: &str, strict: bool, held: &[&str], ticks: usize) -> PinSigs {
     let sigs: Vec<(&str, Signal)> = held.iter().map(|p| (*p, Signal::Bool(true))).collect();
     run_node_with(text, strict, &sigs, ticks)
 }
@@ -2148,17 +2149,17 @@ fn an_at_binding_drives_a_macro_port_through_the_macro_namespace() {
 
     // Nothing held: the port is not written at all. Absent IS released for a
     // macro target, and writing "off" every tick would fight every other writer.
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
-    super::eval::jsm_publish(&snap, uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    let mut collector: SigMap = SigMap::default();
+    super::eval::jsm_publish(&snap, uid, &SigMap::default(), &mut collector, &mut state, 0.010);
     assert!(
         !collector.contains_key(&("macro".to_string(), "macro:aa11bb22".to_string())),
         "an idle port must not be claimed: {collector:?}"
     );
 
     // Held: the port is asserted in the macro namespace.
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
     assert_eq!(
         collector
@@ -2213,7 +2214,7 @@ fn a_hold_works_behind_automap_curves() {
         jsm.params.insert("_automap_collector_id".into(), serde_json::json!(from));
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         let mut run = |held: &[&str], ticks: usize| {
-            let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+            let mut dev: SigMap = SigMap::default();
             for p in ["btn_west", "btn_south"] {
                 dev.insert((PAD.to_string(), p.to_string()), Signal::Bool(held.contains(&p)));
             }
@@ -2221,7 +2222,7 @@ fn a_hold_works_behind_automap_curves() {
             dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(0.0));
             let mut seen = std::collections::HashSet::new();
             for _ in 0..ticks {
-                let mut col: HashMap<(String, String), Signal> = HashMap::new();
+                let mut col: SigMap = SigMap::default();
                 for c in &curves {
                     eval_automap_curve_node(c, c.node_uid, &dev, &mut col, &mut state, 0.010);
                 }
@@ -2256,9 +2257,9 @@ fn the_curve_mark_follows_the_gyro_the_node_receives() {
     let speed = |text: &str| {
         let mut snap = jsm_snap(uid, text, false);
         snap.params.insert("_automap_collector_id".to_string(), serde_json::json!("collector:77"));
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(0.1));
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         collector.insert(("collector:77".to_string(), "gyro_z".to_string()), Signal::Float(0.05));
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         let mut v = 0.0;
@@ -2287,10 +2288,10 @@ fn a_macro_made_after_the_text_is_picked_up_without_another_edit() {
     let uid = 910;
     let mut snap = jsm_snap(uid, "S = @Reload", false);
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
     let pressed = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>| {
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, 0.010);
         collector.get(&("macro".to_string(), "macro:aa11bb22".to_string())).map(|s| s.as_bool())
     };
@@ -2323,7 +2324,7 @@ fn run_node_with(
     strict: bool,
     sigs: &[(&str, Signal)],
     ticks: usize,
-) -> HashMap<String, Signal> {
+) -> PinSigs {
     let _guard = alone();
     run_node_unlocked_with(text, strict, sigs, ticks)
 }
@@ -2335,7 +2336,7 @@ fn run_node_unlocked(
     strict: bool,
     held: &[&str],
     ticks: usize,
-) -> HashMap<String, Signal> {
+) -> PinSigs {
     let sigs: Vec<(&str, Signal)> = held.iter().map(|p| (*p, Signal::Bool(true))).collect();
     run_node_unlocked_with(text, strict, &sigs, ticks)
 }
@@ -2345,14 +2346,14 @@ fn run_node_unlocked_with(
     strict: bool,
     sigs: &[(&str, Signal)],
     ticks: usize,
-) -> HashMap<String, Signal> {
+) -> PinSigs {
     let uid = 4242;
     let snap = jsm_snap(uid, text, strict);
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     for (pin, sig) in sigs {
         dev.insert((PAD.to_string(), pin.to_string()), *sig);
     }
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     for _ in 0..ticks {
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
@@ -2365,7 +2366,7 @@ fn run_node_unlocked_with(
         .collect()
 }
 
-fn on(bus: &HashMap<String, Signal>, pin: &str) -> bool {
+fn on(bus: &PinSigs, pin: &str) -> bool {
     bus.get(pin).map(|s| s.as_bool()).unwrap_or(false)
 }
 
@@ -2383,11 +2384,11 @@ fn run_frames(
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let mut drove = std::collections::HashSet::new();
     for frame in frames {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         for (pin, sig) in frame {
             dev.insert((PAD.to_string(), pin.to_string()), *sig);
         }
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
         for ((d, pin), sig) in collector {
             if d == key && sig.as_bool() {
@@ -2423,7 +2424,7 @@ fn a_bound_button_is_taken_over_and_the_rest_passes_through() {
 #[test]
 fn a_stick_direction_drives_its_key_and_claims_the_stick() {
     let up = Signal::Vec2(glam::Vec2::new(0.0, 1.0));
-    let stick = |bus: &HashMap<String, Signal>| match bus.get("left_stick") {
+    let stick = |bus: &PinSigs| match bus.get("left_stick") {
         Some(Signal::Vec2(v)) => *v,
         other => panic!("the left stick should be a vector: {other:?}"),
     };
@@ -2564,11 +2565,11 @@ fn a_released_key_stays_released() {
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let mut seen = Vec::new();
     for pressed in [true, true, true, false, false, false] {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         if pressed {
             dev.insert((PAD.to_string(), "btn_lb".to_string()), Signal::Bool(true));
         }
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
         seen.push(collector.get(&(key.clone(), "key_e".to_string())).map(|s| s.as_bool()));
     }
@@ -2684,12 +2685,12 @@ fn an_analog_trigger_presses_its_button() {
     let _guard = alone();
     let uid = 4243;
     let snap = jsm_snap(uid, "ZR = LMOUSE", false);
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert(
         (PAD.to_string(), "right_trigger".to_string()),
         Signal::Float(0.6),
     );
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     for _ in 0..2 {
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
@@ -4152,8 +4153,8 @@ fn feedback_reaches_the_pad_it_came_from() {
     let mut snap = jsm_snap(uid, "LIGHT_BAR = RED\nRUMBLE = OFF", false);
     snap.params
         .insert("_jsm_dest_dev".into(), serde_json::Value::String(PAD.into()));
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     for _ in 0..2 {
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
@@ -4179,8 +4180,8 @@ fn feedback_with_no_pad_upstream_goes_nowhere() {
     let _guard = alone();
     let uid = 4243;
     let snap = jsm_snap(uid, "LIGHT_BAR = RED", false);
-    let dev: HashMap<(String, String), Signal> = HashMap::new();
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let dev: SigMap = SigMap::default();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
     assert!(
@@ -4272,9 +4273,9 @@ fn a_rumble_binding_reaches_the_pad() {
     let mut snap = jsm_snap(uid, "S = BIG_RUMBLE", false);
     snap.params
         .insert("_jsm_dest_dev".into(), serde_json::Value::String(PAD.into()));
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let key = format!("feedback_override:{PAD}");
     let mut strongest = 0.0f32;
@@ -4292,8 +4293,8 @@ fn a_rumble_binding_reaches_the_pad() {
 
     // And with nothing pressed, the rumble group is left to the game — `RUMBLE` is
     // on by default, so nothing is claimed.
-    let dev: HashMap<(String, String), Signal> = HashMap::new();
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let dev: SigMap = SigMap::default();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     for _ in 0..4 {
         collector.clear();
@@ -4329,11 +4330,11 @@ fn run_tabs(
     let _guard = alone();
     let uid = 5150;
     let snap = tabbed_snap(uid, tabs);
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let mut seen = Vec::new();
     for (held, ticks) in steps {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         for pin in *held {
             dev.insert((PAD.to_string(), pin.to_string()), Signal::Bool(true));
         }
@@ -4403,9 +4404,9 @@ fn switching_layers_does_not_leave_a_key_held() {
         uid,
         &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "N = B")],
     );
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
 
     // Hold S so A is down.
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
@@ -4556,16 +4557,16 @@ fn an_edit_puts_the_module_back_on_the_open_tab() {
         uid,
         &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "S = B")],
     );
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
     for _ in 0..3 {
         collector.clear();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
     }
     // On the driving layer now: S is B.
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
     for _ in 0..3 {
         collector.clear();
@@ -4636,9 +4637,9 @@ fn switching_layers_publishes_the_old_layers_keys_as_released() {
         uid,
         &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "N = B")],
     );
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     let key = (format!("collector:{uid}"), "key_a".to_string());
 
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
@@ -4715,14 +4716,14 @@ fn editing_a_tab_that_is_not_open_still_recompiles() {
     let _guard = alone();
     let uid = 5154;
     let run = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>| {
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
+        let mut dev: SigMap = SigMap::default();
         dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
         for _ in 0..3 {
             collector.clear();
             super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, DT);
         }
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
         for _ in 0..3 {
             collector.clear();
@@ -4764,8 +4765,8 @@ fn a_layer_can_be_switched_to_again_after_an_edit() {
     let uid = 5155;
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let press = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>, pins: &[&str]| {
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
+        let mut dev: SigMap = SigMap::default();
         for p in pins {
             dev.insert((PAD.to_string(), p.to_string()), Signal::Bool(true));
         }
@@ -6342,11 +6343,11 @@ fn run_sweep(
     gyro: &[(&str, f32)],
     ticks: usize,
     dt: f32,
-) -> (HashMap<String, Signal>, Vec<Option<Signal>>) {
+) -> (PinSigs, Vec<Option<Signal>>) {
     const GYRO_REF_DPS: f32 = 2000.0;
     let uid = snap.node_uid;
     let key = format!("collector:{uid}");
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     for (pin, dps) in gyro {
         dev.insert(
             (PAD.to_string(), (*pin).to_string()),
@@ -6354,7 +6355,7 @@ fn run_sweep(
         );
     }
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     let mut out = Vec::new();
     for _ in 0..ticks {
         collector.clear();
@@ -6496,20 +6497,20 @@ fn a_circled_stick_and_the_gyro_turn_the_360_together_without_a_flick_config() {
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         let mut out = Vec::new();
         let mut total_x = 0.0;
-        let mut last_bus: HashMap<String, Signal> = HashMap::new();
+        let mut last_bus: PinSigs = PinSigs::default();
         // 90° of clockwise sweep in 9° steps, read every fourth 1 ms tick the way a
         // stick polling slower than the engine delivers it, then held while the
         // payout drains.
         for i in 0..400 {
             let a = ((i / 4).min(10) as f32 * 9.0).to_radians();
             let v = glam::Vec2::new(a.sin(), a.cos());
-            let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+            let mut dev: SigMap = SigMap::default();
             dev.insert((PAD.to_string(), "right_stick".to_string()), Signal::Vec2(v));
             dev.insert((PAD.to_string(), "right_stick_x".to_string()), Signal::Float(v.x));
             dev.insert((PAD.to_string(), "right_stick_y".to_string()), Signal::Float(v.y));
             // And the pad turning at 90°/s the whole time: 36° over the 400 ms.
             dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(90.0 / 2000.0));
-            let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+            let mut collector: SigMap = SigMap::default();
             out = super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.001);
             last_bus = collector
                 .into_iter()
@@ -6824,14 +6825,14 @@ fn the_touchpad_in_midi_mode_is_an_xy_pad() {
     let snap = jsm_snap(uid, "TOUCHPAD_MODE = MIDI\nTOUCH_MIDI_X = MIDI_CC70\nTOUCH_MIDI_Y = MIDI_CC71", false);
     let key = format!("collector:{uid}");
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut run = |finger: Option<(f32, f32)>| -> HashMap<String, Signal> {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut run = |finger: Option<(f32, f32)>| -> PinSigs {
+        let mut dev: SigMap = SigMap::default();
         if let Some((x, y)) = finger {
             dev.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
             dev.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(x));
             dev.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(y));
         }
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
         collector.into_iter().filter(|((d, _), _)| *d == key).map(|((_, p), s)| (p, s)).collect()
     };
@@ -7005,7 +7006,7 @@ fn with_ports(mut snap: NodeSnap) -> NodeSnap {
     snap
 }
 
-fn key_space_on(collector: &HashMap<(String, String), Signal>, uid: usize) -> bool {
+fn key_space_on(collector: &SigMap, uid: usize) -> bool {
     collector
         .get(&(format!("collector:{uid}"), "key_space".to_string()))
         .is_some_and(|s| s.as_bool())
@@ -7025,11 +7026,11 @@ fn an_at_name_on_the_left_reads_a_port_another_node_drives() {
 
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let run = |state: &mut HashMap<usize, NodeState>, pins: &[&str]| {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         for p in pins {
             dev.insert((PAD.to_string(), (*p).to_string()), Signal::Bool(true));
         }
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&writer, writer.node_uid, &dev, &mut collector, state, 0.010);
         super::eval::jsm_publish(&reader, reader.node_uid, &dev, &mut collector, state, 0.010);
         collector
@@ -7054,8 +7055,8 @@ fn an_at_name_reads_last_ticks_value_when_its_driver_runs_later() {
         .or_default()
         .macro_prev
         .insert(("macro".to_string(), "macro:aa11bb22".to_string()), Signal::Bool(true));
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
-    super::eval::jsm_publish(&reader, reader.node_uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    let mut collector: SigMap = SigMap::default();
+    super::eval::jsm_publish(&reader, reader.node_uid, &SigMap::default(), &mut collector, &mut state, 0.010);
     assert!(key_space_on(&collector, 923), "{collector:?}");
 }
 
@@ -7104,11 +7105,11 @@ fn gyro_travel(text: &str, aim_held: bool) -> f32 {
     let snap = with_ports(jsm_snap(931, text, false));
     let key = format!("collector:{}", snap.node_uid);
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "gyro_z".to_string()), Signal::Float(90.0 / 2000.0));
     let mut total = 0.0;
     for _ in 0..20 {
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         if aim_held {
             collector.insert(("macro".to_string(), "macro:aa11bb22".to_string()), Signal::Bool(true));
         }
@@ -7170,12 +7171,12 @@ fn an_included_tab_resolves_its_ports() {
 }
 
 /// Run a reader node once with the `Jump` port carrying `sig` in namespace `ns`.
-fn read_port(text: &str, ns: &str, sig: Signal) -> HashMap<(String, String), Signal> {
+fn read_port(text: &str, ns: &str, sig: Signal) -> SigMap {
     let snap = with_ports(jsm_snap(941, text, false));
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     collector.insert((ns.to_string(), "macro:aa11bb22".to_string()), sig);
-    super::eval::jsm_publish(&snap, snap.node_uid, &HashMap::new(), &mut collector, &mut state, 0.010);
+    super::eval::jsm_publish(&snap, snap.node_uid, &SigMap::default(), &mut collector, &mut state, 0.010);
     collector
 }
 
@@ -7220,10 +7221,10 @@ fn a_trigger_writes_its_pull_into_a_port() {
     let _guard = alone();
     let snap = with_ports(jsm_snap(942, "ZL = @Jump\nS = @\"Menu — Show\"", false));
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut dev: SigMap = SigMap::default();
     dev.insert((PAD.to_string(), "left_trigger".to_string()), Signal::Float(0.3));
     dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
-    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: SigMap = SigMap::default();
     super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, &mut state, 0.010);
     let port = collector.get(&("macro".to_string(), "macro:aa11bb22".to_string())).copied();
     assert!(
@@ -7265,9 +7266,9 @@ fn a_shown_macro_is_an_output_pin_of_the_node() {
     snap.n_outputs = 2;
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let run = |state: &mut HashMap<usize, NodeState>, held: bool| {
-        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: SigMap = SigMap::default();
         dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(held));
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, state, 0.010)
     };
     let out = run(&mut state, true);
@@ -7309,16 +7310,16 @@ fn run_rotation(
     strict: bool,
     sigs: &[(String, Signal)],
     ticks: usize,
-) -> (HashMap<String, Signal>, Vec<Option<Signal>>) {
+) -> (PinSigs, Vec<Option<Signal>>) {
     let _guard = alone();
     let uid = 4243;
     let snap = jsm_snap(uid, text, strict);
-    let dev: HashMap<(String, String), Signal> =
+    let dev: SigMap =
         sigs.iter().map(|(p, s)| ((PAD.to_string(), p.clone()), *s)).collect();
     let mut state: HashMap<usize, NodeState> = HashMap::new();
-    let mut last = (HashMap::new(), Vec::new());
+    let mut last = (PinSigs::default(), Vec::new());
     for _ in 0..ticks {
-        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut collector: SigMap = SigMap::default();
         let out = super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
         let key = format!("collector:{uid}");
         let bus = collector.into_iter().filter(|((d, _), _)| *d == key).map(|((_, p), s)| (p, s)).collect();
@@ -7327,7 +7328,7 @@ fn run_rotation(
     last
 }
 
-fn bearing_of(bus: &HashMap<String, Signal>, stick: &str) -> (f32, glam::Vec2) {
+fn bearing_of(bus: &PinSigs, stick: &str) -> (f32, glam::Vec2) {
     let Some(Signal::Vec2(v)) = bus.get(stick) else { panic!("{stick} is published as a vector") };
     (v.x.atan2(v.y).to_degrees(), *v)
 }
