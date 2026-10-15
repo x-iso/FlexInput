@@ -5,7 +5,42 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.15.9] - 2026-10-15
+
 ### Added
+
+- **Unknown controllers: Learn their layout.** A DirectInput pad, wheel or
+  stick that no controller database knows used to show up with its buttons
+  scrambled. It now appears as its own device, and its node has a **Learn**
+  button: press a button or move a stick, trigger or D-pad, and pick what it
+  is from **Assign to…**. Learn says what it saw — a button, a centred axis,
+  an axis resting at one end like a trigger, or a hat — and offers the
+  matching Auto-Map pins, worded by the way you pushed ("Left Stick — you
+  pushed it up") so a stick never comes out inverted. Two triggers sharing one
+  axis, a D-pad reported as two axes, and triggers that click before their
+  travel all map properly. The layout is saved for that controller model, so
+  it works wherever the pad is plugged in, in every tab and preset, Easy mode
+  included. The node's list shows what's learned, with × to forget an entry.
+
+- **Controls of their own.** Anything on such a controller that isn't a
+  gamepad control can be kept as **its own port** under a name you give it.
+  It rides the Auto-Map bus too: a Remapper downstream can Learn it and shows
+  it by name, and a Splitter can add it.
+
+- **Everything the controller reports, not just what DirectInput reads.**
+  Where the pad's HID description can be read, the fields DirectInput skips —
+  vendor data, a built-in accelerometer or gyro, extra controls — show up in
+  Learn too, under their own names where they have one. Learn also watches the
+  pad's opaque vendor data, so a button or axis that only lives there can be
+  learned like any other.
+
+- **Motion setup for unknown controllers.** When the node spots a motion
+  sensor (its readings never sit quite still), **Set up motion** walks you
+  through six quick poses — flat, nose up, flat, right side down, flat, a turn
+  on the table — and works out which axes are the accelerometer and the gyro,
+  which way round they sit and how they scale, even when they're hidden in the
+  pad's vendor data. The result drives the usual gyro and accel pins, so the
+  calibration window, Gyro × and every motion module work with it.
 
 - **3DOF to 2D: Edge turn.** In Pointer mode, turning the pad past a zone
   around the neutral pose (where Reset last put it) keeps the camera turning
@@ -34,6 +69,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   one otherwise.
 
 ### Changed
+
+- **Unknown DirectInput pads move to a new device.** A pad that used to
+  appear with a guessed layout now appears as a new device with Learn;
+  anything wired to the old one needs re-pointing. Pads with a known mapping
+  are unchanged.
 
 - **3DOF to 2D: Device orientation no longer falls back.** A pad without its
   own orientation now gets none (and no Edge turn) instead of quietly getting
