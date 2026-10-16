@@ -34,6 +34,7 @@ mod bluetooth_window;
 mod chrome;
 mod config_route;
 mod devices_pool;
+mod fonts;
 pub(crate) mod graph;
 mod hidhide_ui;
 mod jsm_ports;
@@ -49,6 +50,7 @@ pub(crate) use config_route::*;
 // glob above would otherwise narrow it to pub(crate).
 pub use chrome::render_app_icon;
 pub(crate) use devices_pool::*;
+use fonts::setup_fonts;
 pub(crate) use graph::*;
 pub(crate) use nav::draw_remap_card_glow;
 pub(crate) use nav::draw_config_field_glow;

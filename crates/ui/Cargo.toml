@@ -69,7 +69,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
+    "Win32_Globalization",
 ] }
+# Fallback system fonts (fonts.rs): mapped rather than read, and checked to
+# parse before epaint gets them (it panics on a font it cannot parse). Both
+# are already in the tree under epaint/fontdb.
+memmap2    = "0.9"
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 # Screen capture for the RWS calibration reference frame (GDI BitBlt of the
 # desktop; a plain BitBlt excludes our layered overlay, capturing the game
 # behind). Same major version already used by flexinput-joycon2.

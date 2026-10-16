@@ -1,28 +1,7 @@
-//! Window chrome: fonts, the inner-window shadow, the tab bar, the custom
-//! title bar, and the mode pills / eye toggle that live on it.
+//! Window chrome: the inner-window shadow, the tab bar, the custom title
+//! bar, and the mode pills / eye toggle that live on it.
 
 use super::*;
-
-pub(crate) fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    #[cfg(windows)]
-    {
-        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-            fonts.font_data.insert("segoe_ui".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            for family in fonts.families.values_mut() {
-                family.push("segoe_ui".to_owned());
-            }
-        }
-        // Segoe UI Symbol provides arrows/symbols (↶ ↷) not covered by Segoe UI.
-        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
-            fonts.font_data.insert("segoe_sym".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            for family in fonts.families.values_mut() {
-                family.push("segoe_sym".to_owned());
-            }
-        }
-    }
-    ctx.set_fonts(fonts);
-}
 
 /// ctx-data slot holding the rect the inner-shadow gradient should hug.
 /// Written during the CentralPanel pass: the content area below the tab
