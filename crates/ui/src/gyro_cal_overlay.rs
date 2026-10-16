@@ -51,7 +51,11 @@ use crate::canvas::NodeData;
 use crate::panels::calibration::{SpikeSettings, AUTOCAL_ACCEL_P2P, AUTOCAL_GYRO_P2P};
 
 type LiveSignals = HashMap<(String, String), Signal>;
-type Sample = [f32; 6];
+/// Raw `[gx, gy, gz, ax, ay, az]`.
+pub(crate) type Sample = [f32; 6];
+/// A spike-filter tuning running on a worker thread: `Some` once it is done
+/// (`None` inside when the recording was too short to judge).
+pub(crate) type TuneSlot = Arc<Mutex<Option<Option<Tuning>>>>;
 
 const TITLE: &str = "FlexInput Calibration Overlay";
 const PAD_SVG: &[u8] = include_bytes!("../../../app/assets/gamepad_flat_front.svg");
@@ -60,7 +64,7 @@ const PAD_SVG: &[u8] = include_bytes!("../../../app/assets/gamepad_flat_front.sv
 /// starts — long enough for the knock of setting it down to pass. Still =
 /// every axis's 5th–95th percentile spread inside the auto-calibration's
 /// peak-to-peak spans, so a spike or two can't keep a pad from settling.
-const STEADY_S: f64 = 0.5;
+pub(crate) const STEADY_S: f64 = 0.5;
 /// How long a still pad's gyro is measured. Also enough stillness for a
 /// Joy-Con 2's decoder to learn its own bias (0.5 s windows, ~2 s constant).
 const CAL_S: f64 = 3.0;
@@ -134,7 +138,7 @@ enum SpikeCheck {
     /// No spike filter on this controller.
     Unavailable,
     /// Tuning on a worker thread.
-    Analysing(Arc<Mutex<Option<Option<Tuning>>>>),
+    Analysing(TuneSlot),
     Done(Option<Tuning>),
 }
 
@@ -238,27 +242,16 @@ impl PadCal {
         }
     }
 
-    /// The last [`STEADY_S`] are covered (give or take a frame) and every
-    /// axis kept within its span, outliers aside.
+    /// The last [`STEADY_S`] are covered (give or take a frame) and
+    /// [`steady`].
     fn still(&self, now: f64) -> bool {
-        let win: Vec<&Sample> = self.recent.iter()
+        let win: Vec<Sample> = self.recent.iter()
             .filter(|(t, _)| now - t <= STEADY_S)
-            .map(|(_, s)| s)
+            .map(|(_, s)| *s)
             .collect();
         let covered = self.recent.iter().find(|(t, _)| now - t <= STEADY_S)
             .is_some_and(|(t0, _)| now - t0 >= STEADY_S * 0.6);
-        if win.len() < 4 || !covered {
-            return false;
-        }
-        let mut v: Vec<f32> = Vec::with_capacity(win.len());
-        (0..6).all(|a| {
-            v.clear();
-            v.extend(win.iter().map(|s| s[a]));
-            v.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-            let n = v.len() - 1;
-            let spread = v[n * 95 / 100] - v[n * 5 / 100];
-            spread < if a < 3 { AUTOCAL_GYRO_P2P } else { AUTOCAL_ACCEL_P2P }
-        })
+        covered && steady(&win)
     }
 
     fn restart(&mut self, now: f64) {
@@ -302,6 +295,24 @@ impl PadCal {
     }
 }
 
+/// A pad lying still over `win`: every axis's 5th–95th percentile spread
+/// inside the auto-calibration's peak-to-peak spans — so a spike or two can't
+/// fail it, and hand tremor always does. Needs four samples at the least.
+pub(crate) fn steady(win: &[Sample]) -> bool {
+    if win.len() < 4 {
+        return false;
+    }
+    let mut v: Vec<f32> = Vec::with_capacity(win.len());
+    (0..6).all(|a| {
+        v.clear();
+        v.extend(win.iter().map(|s| s[a]));
+        v.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len() - 1;
+        let spread = v[n * 95 / 100] - v[n * 5 / 100];
+        spread < if a < 3 { AUTOCAL_GYRO_P2P } else { AUTOCAL_ACCEL_P2P }
+    })
+}
+
 /// The share of the ring the gyro takes.
 fn gyro_share(source: Source) -> f32 {
     if source == Source::Signals { 1.0 } else { (CAL_S / SPIKE_S) as f32 }
@@ -340,22 +351,26 @@ fn gyro_cal(stretch: &[Sample]) -> Option<GyroCal> {
     Some(GyroCal { offset, floor: var.sqrt() as f32 })
 }
 
-/// Tune the spike filter from `stretch` on a worker thread.
-fn analyse(stretch: Vec<Sample>) -> SpikeCheck {
-    let slot = Arc::new(Mutex::new(None));
+/// Tune the spike filter from `samples` (a pad lying still) on a worker
+/// thread — a full search replays the filter dozens of times. `None` if the
+/// thread couldn't start.
+pub(crate) fn spawn_tune(samples: Vec<Sample>) -> Option<TuneSlot> {
+    let slot: TuneSlot = Arc::new(Mutex::new(None));
     let out = Arc::clone(&slot);
-    let spawned = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("spike-tune".into())
         .spawn(move || {
-            let result = spike_tune::tune(&stretch);
+            let result = spike_tune::tune(&samples);
             if let Ok(mut o) = out.lock() {
                 *o = Some(result);
             }
-        });
-    match spawned {
-        Ok(_) => SpikeCheck::Analysing(slot),
-        Err(_) => SpikeCheck::Done(None),
-    }
+        })
+        .ok()?;
+    Some(slot)
+}
+
+fn analyse(stretch: Vec<Sample>) -> SpikeCheck {
+    spawn_tune(stretch).map_or(SpikeCheck::Done(None), SpikeCheck::Analysing)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -660,16 +675,21 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// What a pad's spike check found, once it has.
-fn spike_summary(p: &PadCal) -> Option<(String, Color32)> {
-    let SpikeCheck::Done(Some(t)) = &p.spikes else { return None };
+/// What a spike check found and did, in a line, with its colour.
+pub(crate) fn tuning_summary(t: &Tuning) -> (String, Color32) {
     let found = plural(t.report.bursts, "spike", "spikes");
-    Some(match t.setting {
+    match t.setting {
         None if t.report.spikes == 0 => ("No spikes found".into(), Color32::from_gray(170)),
         None => (format!("{found} — the spike filter can't remove them"), ORANGE),
         Some((w, sens)) if t.left == 0 => (format!("{found} · spike filter set to window {w}, {sens:.0}%"), CYAN),
         Some((w, sens)) => (format!("{found} · window {w}, {sens:.0}% removes most"), ORANGE),
-    })
+    }
+}
+
+/// What a pad's spike check found, once it has.
+fn spike_summary(p: &PadCal) -> Option<(String, Color32)> {
+    let SpikeCheck::Done(Some(t)) = &p.spikes else { return None };
+    Some(tuning_summary(t))
 }
 
 /// One pad's status in a multi-pad prompt.

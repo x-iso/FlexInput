@@ -169,22 +169,29 @@ impl FlexInputApp {
         // shortcut the widget has taken is worse than no legend.
         let jsm = self.nav_jsm_editor_selected();
         match self.gamepad_nav.edit_level {
-            EditLevel::Widget => vec![
-                (hint_move(), "Navigate"),
-                (vec!["right_stick"], "Cursor"),
-                (vec!["btn_south", "right_trigger"], "Select / Edit"),
-                (vec!["btn_north"], "Show/Hide devices"),
-                if jsm {
-                    (vec!["btn_lb", "btn_rb"], "Edit / Tune")
-                } else {
-                    (vec!["btn_lb", "btn_rb"], "Tab")
-                },
-                (vec!["btn_start"], "Presets"),
-                (vec!["btn_start"], "Hold: Settings"),
-                (vec!["btn_back"], "Alt-Tab"),
-                (vec!["btn_ls"], "Undo"),
-                (vec!["btn_rs"], "Redo"),
-            ],
+            EditLevel::Widget => {
+                let mut v = vec![
+                    (hint_move(), "Navigate"),
+                    (vec!["right_stick"], "Cursor"),
+                    (vec!["btn_south", "right_trigger"], "Select / Edit"),
+                    (vec!["btn_north"], "Show/Hide devices"),
+                    if jsm {
+                        (vec!["btn_lb", "btn_rb"], "Edit / Tune")
+                    } else {
+                        (vec!["btn_lb", "btn_rb"], "Tab")
+                    },
+                    (vec!["btn_start"], "Presets"),
+                    (vec!["btn_start"], "Hold: Settings"),
+                    (vec!["btn_back"], "Alt-Tab"),
+                    (vec!["btn_ls"], "Undo"),
+                    (vec!["btn_rs"], "Redo"),
+                ];
+                // On a device card whose pad has a gyro.
+                if self.gamepad_nav.left_gyro_card.is_some() {
+                    v.insert(3, (vec!["btn_west"], "Calibrate gyro"));
+                }
+                v
+            }
             EditLevel::Editing => {
                 // Row-type (multi-field) widgets split the axes: horizontal =
                 // select field, vertical = adjust value. Single-value widgets

@@ -356,6 +356,10 @@ pub struct GamepadNav {
     /// the left panel and LS/D-pad move between its targets; `None` means focus
     /// is on the sub-patch (or nothing). Independent of the RS/gyro cursor.
     pub left_selected: Option<usize>,
+    /// The device card the left panel's cursor or selection is on, when West
+    /// would Calibrate Gyro on it (the pad streams a gyro and has a device
+    /// node). Set each frame by the left-panel driver, read by the legend.
+    pub left_gyro_card: Option<String>,
     /// Gamepad-native settings panel (Hold-Start). Modal: captures dpad/South/
     /// East. `settings_index` is the highlighted row; `settings_editing` is true
     /// while a numeric row is being nudged.
@@ -559,6 +563,7 @@ impl Default for GamepadNav {
             prev_rt: false,
             left_edit: None,
             left_selected: None,
+            left_gyro_card: None,
             config_index: None,
             config_nav_sel: None,
             settings_open: false,

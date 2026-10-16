@@ -24,6 +24,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   them all: the narrowest window, then the lowest sensitivity. No spikes, no
   change. Controllers whose connection has no spike filter skip this step.
 
+- **The Calibration window checks for spikes too.** Starting a gyro
+  calibration there now also records the pad for six seconds while it lies
+  still and sets its spike filter the same way, with the result (and what the
+  filter was before) under the filter's controls. Moving the pad restarts the
+  check; it gives up after 30 seconds.
+
+- **Calibrate Gyro from the Devices panel with a controller.** With a device
+  card highlighted (cursor or selection, on any of its rows), West runs the
+  same quick calibration on that pad; the button bar shows it when the pad has
+  a gyro and is in the patch.
+
 ### Fixed
 
 - **The spike filter works on the Bluetooth dongle.** A Switch Pro connected

@@ -13,6 +13,8 @@ impl FlexInputApp {
     ///   digital-triggers checkbox, or (for sliders) ENTER a left-edit.
     /// - Editing a slider: stick/dpad nudges the value, West toggles fine,
     ///   North resets to default, East/LT exits (committing one undo entry).
+    /// - Not editing, on a device card (any of its targets): West runs
+    ///   Calibrate Gyro on that pad — see `nav_gyro_card`.
     pub(crate) fn nav_drive_left_panel(
         &mut self,
         ctx: &egui::Context,
@@ -22,6 +24,8 @@ impl FlexInputApp {
         lt_rising: bool,
     ) -> bool {
         use crate::gamepad_nav::{self as gn, LeftNavAction, NavDir};
+
+        self.gamepad_nav.left_gyro_card = None;
 
         // Published targets (this frame, from io_panel). Used for hover-glow and
         // to recover the editing target's rect.
@@ -181,6 +185,18 @@ impl FlexInputApp {
             }
         }
 
+        // The device card under the cursor (else the selection), if West can
+        // calibrate it. Consumes the frame on West so a card selected in the
+        // sub-patch can't also take it (West deletes there).
+        let focus = cursor_hit.or(self.gamepad_nav.left_selected).and_then(|i| targets.get(i));
+        self.gamepad_nav.left_gyro_card = focus.and_then(|t| self.nav_gyro_card(&t.action));
+        if nav.is_rising("btn_west") {
+            if let Some(dev) = self.gamepad_nav.left_gyro_card.clone() {
+                crate::gyro_cal_overlay::request(ctx, &self.last_signals, vec![dev]);
+                return true;
+            }
+        }
+
         // Activation (South / RT): the cursor target wins when the cursor is over
         // one; otherwise the LS/D-pad selection.
         if nav.is_rising("btn_south") || rt_rising {
@@ -230,6 +246,33 @@ impl FlexInputApp {
                 self.gamepad_nav.left_edit = Some(action);
             }
         }
+    }
+
+    /// The pad a left-panel target belongs to, when Calibrate Gyro can run on
+    /// it: the card's own targets name it, its slider and checkbox rows name
+    /// its `device.source` node. Only a pad streaming a gyro, and with a node
+    /// in this tab — the calibration is written to its nodes, so a card that
+    /// isn't in the patch would have nowhere to keep it.
+    pub(crate) fn nav_gyro_card(&self, action: &crate::gamepad_nav::LeftNavAction) -> Option<String> {
+        use crate::gamepad_nav::LeftNavAction;
+        let snarl = &self.tabs[self.active_tab].canvas.snarl;
+        let source_dev = |node: egui_snarl::NodeId| {
+            snarl.get_node(node)
+                .filter(|n| n.module_id == "device.source")
+                .and_then(|n| n.params.get("device_id").and_then(|v| v.as_str()))
+                .map(String::from)
+        };
+        let dev = match action {
+            LeftNavAction::SelectInput { device_id } | LeftNavAction::CycleInputPort { device_id } => {
+                device_id.clone()
+            }
+            LeftNavAction::AdjustParam { node, .. } | LeftNavAction::ToggleParam { node, .. } => source_dev(*node)?,
+            LeftNavAction::ToggleOutput { .. } | LeftNavAction::CycleGamepadOutput => return None,
+        };
+        let has_gyro = self.last_signals.contains_key(&(dev.clone(), "gyro_x".to_string()));
+        let in_patch = snarl.node_ids().any(|(_, n)| n.module_id == "device.source"
+            && n.params.get("device_id").and_then(|v| v.as_str()) == Some(dev.as_str()));
+        (has_gyro && in_patch).then_some(dev)
     }
 
     /// Select (or, on a multi-inlet preset, deselect) `device_id` as an input —

@@ -282,6 +282,164 @@ struct GyroSession {
     done_at: Option<Instant>,
 }
 
+/// How long the spike check records the pad lying still, from "start" — the
+/// gyro's own session is far too short to catch occasional spikes.
+const SPIKE_CHECK_S: f32 = 6.0;
+/// How long the spike filter gets to deliver its first captured sample
+/// before the connection is taken to have none.
+const SPIKE_CAPTURE_GRACE_S: f32 = 0.8;
+/// Gives up when the pad hasn't lain still long enough by then — and stops
+/// capturing, which every bound filter pays for while it runs.
+const SPIKE_GIVE_UP_S: f32 = 30.0;
+
+/// The spike check that runs beside a gyro calibration: records everything
+/// the device's spike filter is fed (`spike::capture_*`) while the pad lies
+/// still, then sets the filter to the least that removes what it found —
+/// the same check Calibrate Gyro's prompt runs (`gyro_cal_overlay`).
+#[derive(Clone, Default)]
+enum SpikeRun {
+    #[default]
+    Idle,
+    Recording {
+        /// When the check began.
+        begun: Instant,
+        /// Start of the current still stretch; moving restarts it.
+        started: Instant,
+        cursor: u64,
+        samples: Vec<crate::gyro_cal_overlay::Sample>,
+        /// The last `STEADY_S`, for the stillness test.
+        recent: VecDeque<(Instant, crate::gyro_cal_overlay::Sample)>,
+        moved_at: Option<Instant>,
+    },
+    Analysing(crate::gyro_cal_overlay::TuneSlot),
+    /// `prev` = the filter settings before, when the check changed them.
+    Done {
+        tuning: Option<flexinput_devices::spike_tune::Tuning>,
+        prev: Option<(bool, f32, u8)>,
+    },
+    /// The connection has no spike filter.
+    Unavailable,
+    /// The pad never lay still for long enough.
+    GaveUp,
+}
+
+impl SpikeRun {
+    fn start(dev_id: &str) -> Self {
+        flexinput_devices::spike::capture_start(dev_id);
+        SpikeRun::Recording {
+            begun: Instant::now(),
+            started: Instant::now(),
+            cursor: 0,
+            samples: Vec::new(),
+            recent: VecDeque::new(),
+            moved_at: None,
+        }
+    }
+
+    /// Drop a recording in progress (its capture with it).
+    fn cancel(&mut self, dev_id: &str) {
+        if matches!(self, SpikeRun::Recording { .. }) {
+            flexinput_devices::spike::capture_stop(dev_id);
+        }
+        *self = SpikeRun::Idle;
+    }
+
+    /// Advance one frame. Returns the setting to apply when a check has just
+    /// found one.
+    fn tick(&mut self, dev_id: &str) -> Option<(u8, f32)> {
+        use crate::gyro_cal_overlay::{steady, STEADY_S};
+        match self {
+            SpikeRun::Recording { begun, started, cursor, samples, recent, moved_at } => {
+                let now = Instant::now();
+                if now.duration_since(*begun).as_secs_f32() > SPIKE_GIVE_UP_S {
+                    flexinput_devices::spike::capture_stop(dev_id);
+                    *self = SpikeRun::GaveUp;
+                    return None;
+                }
+                let (got, total) = flexinput_devices::spike::capture_read(dev_id, *cursor);
+                *cursor = total;
+                if total == 0 {
+                    if now.duration_since(*started).as_secs_f32() > SPIKE_CAPTURE_GRACE_S && moved_at.is_none() {
+                        flexinput_devices::spike::capture_stop(dev_id);
+                        *self = SpikeRun::Unavailable;
+                    }
+                    return None;
+                }
+                for (t, x) in got {
+                    samples.push(x);
+                    recent.push_back((t, x));
+                }
+                let keep = std::time::Duration::from_secs_f64(STEADY_S);
+                while recent.front().is_some_and(|(t, _)| now.duration_since(*t) > keep) {
+                    recent.pop_front();
+                }
+                let covered = recent.front()
+                    .is_some_and(|(t, _)| now.duration_since(*t).as_secs_f64() >= STEADY_S * 0.6);
+                if covered {
+                    let win: Vec<_> = recent.iter().map(|(_, x)| *x).collect();
+                    if !steady(&win) {
+                        samples.clear();
+                        recent.clear();
+                        *started = now;
+                        *moved_at = Some(now);
+                        return None;
+                    }
+                }
+                if now.duration_since(*started).as_secs_f32() >= SPIKE_CHECK_S {
+                    flexinput_devices::spike::capture_stop(dev_id);
+                    *self = match crate::gyro_cal_overlay::spawn_tune(std::mem::take(samples)) {
+                        Some(slot) => SpikeRun::Analysing(slot),
+                        None => SpikeRun::Done { tuning: None, prev: None },
+                    };
+                }
+                None
+            }
+            SpikeRun::Analysing(slot) => {
+                let result = slot.lock().ok().and_then(|mut r| r.take())?;
+                *self = SpikeRun::Done { tuning: result, prev: None };
+                result.and_then(|t| t.setting)
+            }
+            _ => None,
+        }
+    }
+
+    fn busy(&self) -> bool {
+        matches!(self, SpikeRun::Recording { .. } | SpikeRun::Analysing(_))
+    }
+
+    /// The status line under the spike filter rows.
+    fn line(&self) -> Option<(String, Color32)> {
+        const CYAN: Color32 = Color32::from_rgb(90, 190, 235);
+        let weak = Color32::from_gray(140);
+        Some(match self {
+            SpikeRun::Idle => return None,
+            SpikeRun::Recording { started, moved_at, .. } => {
+                if moved_at.is_some_and(|m| m.elapsed().as_secs_f32() < 1.5) {
+                    ("Spike check: moved — keep the pad still".into(), ORANGE)
+                } else {
+                    let pct = (started.elapsed().as_secs_f32() / SPIKE_CHECK_S * 100.0).min(100.0);
+                    (format!("Checking for spikes… {pct:.0}% — keep the pad still"), CYAN)
+                }
+            }
+            SpikeRun::Analysing(_) => ("Analysing spikes…".into(), CYAN),
+            SpikeRun::Done { tuning: None, .. } => ("Spike check: too little data to judge".into(), weak),
+            SpikeRun::Done { tuning: Some(t), prev } => {
+                let (mut text, col) = crate::gyro_cal_overlay::tuning_summary(t);
+                if let Some((on, sens, w)) = prev {
+                    if *on {
+                        text.push_str(&format!(" (was window {w}, {sens:.0}%)"));
+                    } else {
+                        text.push_str(" (was off)");
+                    }
+                }
+                (text, col)
+            }
+            SpikeRun::Unavailable => ("Spike check: this connection has no spike filter".into(), weak),
+            SpikeRun::GaveUp => ("Spike check stopped: the pad didn't stay still".into(), ORANGE),
+        })
+    }
+}
+
 /// Per-axis orientation-calibration sample buffer. Each Vec collects raw
 /// gyro vectors observed during a single-axis rotation. Mean accel during
 /// each pass is averaged across captures and used as a gravity reference
@@ -371,6 +529,8 @@ struct WindowState {
     stick: StickSession,
     trig: TriggerSession,
     orient: OrientSession,
+    /// The spike check started with the gyro calibration.
+    spikes: SpikeRun,
     /// User-selected gyro-scope time window in ms (500 / 1000 / 5000).
     scope_win_ms: f32,
 }
@@ -384,6 +544,7 @@ impl Default for WindowState {
             stick: StickSession::default(),
             trig: TriggerSession::default(),
             orient: OrientSession::default(),
+            spikes: SpikeRun::Idle,
             scope_win_ms: 1000.0,
         }
     }
@@ -516,7 +677,12 @@ pub fn show_windows(
             });
         if !is_open {
             to_close.push(node_id);
-            ctx.data_mut(|d| d.remove::<WindowState>(state_id(node_id)));
+            ctx.data_mut(|d| {
+                if let Some(mut st) = d.get_temp::<WindowState>(state_id(node_id)) {
+                    st.spikes.cancel(&dev_id);
+                }
+                d.remove::<WindowState>(state_id(node_id));
+            });
         }
     }
     for nid in to_close { open.remove(&nid); }
@@ -1232,8 +1398,13 @@ fn gyro_section(
                         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
                         if sampling_now {
                             st.gyro.sampling = false;
+                            st.spikes.cancel(dev_id);
                         } else {
                             st.gyro = GyroSession { sampling: true, ..Default::default() };
+                            // The pad lies still for this anyway: check it for
+                            // spikes while it does.
+                            st.spikes.cancel(dev_id);
+                            st.spikes = SpikeRun::start(dev_id);
                             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                                 n.params.insert("gyro_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
                                 n.params.insert("accel_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
@@ -1388,6 +1559,32 @@ fn gyro_section(
             // Oscilloscope.
             gyro_scope(ui, node_id, dev_id, lo, skip_accel_initial, canvas, scope_taps);
 
+            // The spike check running beside a calibration: advance it, and
+            // apply what it recommends before the row below reads the node.
+            let (spike_found, spike_line, spike_busy) = ui.ctx().data_mut(|d| {
+                let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                let found = st.spikes.tick(dev_id);
+                (found, st.spikes.line(), st.spikes.busy())
+            });
+            if let Some((w, sens)) = spike_found {
+                let prev = canvas.snarl.get_node_mut(node_id).map(|n| {
+                    let prev = spike_params(&n.params);
+                    n.params.insert("spike_suppress".into(), Value::Bool(true));
+                    n.params.insert("spike_sensitivity".into(), serde_json::json!(sens));
+                    n.params.insert("spike_window".into(), Value::Number(w.into()));
+                    prev
+                });
+                ui.ctx().data_mut(|d| {
+                    let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                    if let SpikeRun::Done { prev: p, .. } = &mut st.spikes {
+                        *p = prev;
+                    }
+                });
+            }
+            if spike_busy {
+                ui.ctx().request_repaint();
+            }
+
             // Outlier spike-filter row — directly beneath the scope so
             // dragging sensitivity gives instant visual feedback on the
             // trace above.
@@ -1469,6 +1666,9 @@ fn gyro_section(
             }
             if let Ok(mut map) = spike_settings.write() {
                 map.insert(dev_id.to_string(), (enabled, sens, window));
+            }
+            if let Some((text, col)) = spike_line {
+                ui.label(egui::RichText::new(text).size(INSTRUCT_SIZE - 2.0).color(col));
             }
 
             // Noise-floor deadzone row: zero out readings inside the measured
