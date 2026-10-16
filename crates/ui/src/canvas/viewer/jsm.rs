@@ -893,7 +893,12 @@ fn jsm_rows(
                 .filter(|(_, _, name)| !macro_known(name))
                 .map(|(s, e, _)| (at + s, at + e))
                 .collect();
-            let token = nav_token.filter(|&(ts, te)| ts >= at && te <= end && te > ts);
+            // The pad's token was found in the stored text, not this one, so
+            // after a keystroke it can fall inside a character here; slicing
+            // there would panic. Skip the highlight for that one frame.
+            let token = nav_token.filter(|&(ts, te)| {
+                ts >= at && te <= end && te > ts && raw.is_char_boundary(ts) && raw.is_char_boundary(te)
+            });
             let mut cuts: Vec<usize> = vec![at, end];
             cuts.extend(waiting.iter().flat_map(|&(s, e)| [s, e]));
             cuts.extend(token.iter().flat_map(|&(s, e)| [s, e]));

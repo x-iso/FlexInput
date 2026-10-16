@@ -223,6 +223,108 @@ fn every_half_typed_line_compiles_instead_of_crashing() {
         "{info:?}");
 }
 
+// The editor takes any text: a comment in Japanese, a tab or `@` name with an
+// accent, an emoji, a full-width `＝` or space an IME left behind. Each of those
+// is several bytes per character, and everything that cuts the text at an offset
+// has to land between characters or one keystroke takes the app down. So every
+// odd character goes in at every position of real lines, and every edit the
+// editor and the pad can make is made on the result, at every token.
+#[test]
+fn non_ascii_anywhere_survives_every_edit() {
+    use super::catalogue::{self, Kind};
+    use super::cursor::{self, Cursor};
+    use super::knobs;
+    const LINES: &[&str] = &[
+        "S = SPACE # コメント", "ZL,GYRO_SENS = 3", "GYRO_SENS = 1 2", "W = @Reload R",
+        "N = @\"Weapon wheel — Show\"", "HOME = \"運転.txt\"", "ZL = ^RMOUSE\\ RMOUSE_",
+        "RIGHT_STICK_MODE = FLICK", "TRIGGER_THRESHOLD = 0.5", "LIGHT_BAR = 255 0 0",
+        "L+R = Q", "# naïve — em dash",
+    ];
+    // Two, three and four bytes; a pair; full-width look-alikes of the grammar's
+    // own `=` and `#`; spaces that aren't ASCII; a combining mark; and two whose
+    // case mapping changes their length.
+    const ODD: &[&str] = &[
+        "é", "日", "😀", "❤\u{FE0F}", "＝", "＃", "\u{3000}", "\u{00A0}", "e\u{0301}", "ß", "İ",
+    ];
+    let tabs = vec![
+        ("運転".to_string(), "S = SPACE # ジャンプ".to_string()),
+        ("Ünïcode".to_string(), String::new()),
+    ];
+    let mut ports = ports();
+    ports.push(("リロード".to_string(), "macro:ff00ff00".to_string()));
+    let mut texts: Vec<String> = Vec::new();
+    for line in LINES {
+        let cuts = line.char_indices().map(|(b, _)| b).chain([line.len()]);
+        for at in cuts {
+            for odd in ODD {
+                texts.push(format!("{}{odd}{}\nGYRO_SENS = 2", &line[..at], &line[at..]));
+            }
+        }
+    }
+    texts.extend(["W = @リロード", "W = @\"リロード\"", "HOME = 運転", "HOME = \"Ünïcode\""].map(String::from));
+
+    for text in &texts {
+        let text = text.as_str();
+        let cfg = compile_full(text, &tabs, &ports);
+        let _ = knobs::sens_curve(&cfg, 8);
+        let _ = at_names(text);
+        for line in text.lines() {
+            for (s, e, _) in at_name_spans(line) {
+                let _ = &line[s..e];
+            }
+        }
+        for line in 0..cursor::line_count(text) {
+            let _ = knobs::set_knob(text, line, 1.5, false);
+            let _ = knobs::set_knob_part(text, line, Some(1), 2.0, true);
+            let _ = knobs::split_pair(text, line);
+            let _ = knobs::join_pair(text, line);
+            let _ = knobs::settle_trigger_effect(text, line, Some("RESISTANCE"));
+            for token in 0..cursor::tokens_at(text, line).len().max(1) {
+                let cur = Cursor { line, token };
+                if let Some((t, s, e)) = cursor::selection(text, cur) {
+                    let (ls, _) = cursor::line_span(text, line);
+                    let _ = (&text[s..e], t.text(&text[ls..]));
+                }
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let _ = cursor::moved(text, cur, dx, dy);
+                }
+                let _ = cursor::clamped(text, cur);
+                let _ = cursor::replace(text, cur, "日本");
+                let _ = cursor::insert_slot(text, cur, true);
+                let _ = cursor::insert_slot(text, cur, false);
+                let _ = cursor::insert_line(text, cur, true);
+                let _ = cursor::delete(text, cur);
+                let _ = catalogue::kinds_at(text, cur);
+                let _ = catalogue::value_options(text, cur);
+                for kind in [Kind::Setting, Kind::Command, Kind::Trigger, Kind::Binding] {
+                    let _ = catalogue::insert_pick(text, cur, "SPACE", kind);
+                }
+                for dir in [1, -1] {
+                    let _ = catalogue::cycle_value(text, cur, dir);
+                    let _ = knobs::scrub(text, cur, dir);
+                }
+                let _ = knobs::replace_word(text, cur, "é");
+            }
+        }
+        for k in knobs::knobs(text) {
+            let _ = knobs::toggle_pair(text, &k);
+            let _ = knobs::set_setting(text, &k.name, 1.0, false);
+            let _ = knobs::line_of(text, &k.name);
+        }
+    }
+
+    // And the names resolve: a tab and a port are found by what they are called,
+    // in any script.
+    for line in ["W = @リロード", "W = @\"リロード\"", "HOME = \"運転.txt\""] {
+        let c = compile_full(line, &tabs, &ports);
+        assert_eq!(c.lines[0].status, LineStatus::Ok, "{line}: {:?}", c.lines[0]);
+    }
+    // An IME's full-width `＝` is not JSM's `=`: the line is an error, rather
+    // than binding something by accident.
+    let info = one("S ＝ SPACE");
+    assert!(matches!(info.status, LineStatus::Error(_)), "{info:?}");
+}
+
 // Every output name JoyShockMapper accepts, taken from its own `nameToKey`
 // (`src/win32/PlatformDefinitions.cpp`) plus its pattern-matched and pad names.
 // A config carrying any of them must get a truthful answer on the line: either it
