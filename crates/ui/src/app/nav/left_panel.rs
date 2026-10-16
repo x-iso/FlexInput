@@ -286,7 +286,7 @@ impl FlexInputApp {
         let defaults = self.nav_device_defaults();
         let collapsed = self.settings.device_nodes_default_collapsed;
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        crate::easy::io_panel::toggle_source(canvas, &dev, collapsed, defaults);
+        crate::easy::io_panel::toggle_source(canvas, &dev, &self.devices, collapsed, defaults);
         crate::easy::wiring::rewire(canvas);
     }
 

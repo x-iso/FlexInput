@@ -342,7 +342,7 @@ fn show_input_section(
                     ping_requests, nav_on, nav_disabled, &mut nav_toggle, &ports,
                     &mut port_pick, nav_targets,
                 ) && (capacity > 1 || !is_active) {
-                    toggle_source(canvas, d, default_collapsed, defaults);
+                    toggle_source(canvas, d, devices, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
                 }
                 if let Some(v) = nav_toggle {
@@ -366,7 +366,7 @@ fn show_input_section(
                 if midi_input_card(ui, d, is_active, &ports, &mut port_pick, nav_targets)
                     && (capacity > 1 || !is_active)
                 {
-                    toggle_source(canvas, d, default_collapsed, defaults);
+                    toggle_source(canvas, d, devices, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
                 }
                 if let Some(p) = port_pick {
@@ -1102,11 +1102,15 @@ fn active_sources(canvas: &Canvas) -> Vec<(NodeId, String, usize)> {
 ///   input device and no obvious way back)
 /// * already active, capacity > 1 → deselect it
 /// * not active, room left → add on the lowest free port
-/// * not active, full → replace the highest port, which for capacity 1 is the
-///   old "clicking another device swaps to it" behaviour
+/// * not active, full → replace a source whose device is not connected, else
+///   the highest port, which for capacity 1 is the old "clicking another
+///   device swaps to it" behaviour
+///
+/// `connected` is the live device list — the cards the picker is showing.
 pub(crate) fn toggle_source(
     canvas: &mut Canvas,
     device: &PhysicalDevice,
+    connected: &[PhysicalDevice],
     default_collapsed: bool,
     defaults: DeviceParamDefaults,
 ) {
@@ -1121,15 +1125,11 @@ pub(crate) fn toggle_source(
         return;
     }
 
-    let port = if active.len() < capacity {
-        // Lowest free port, so removing a middle device and adding another
-        // reuses the gap instead of pushing past the inlet count.
-        (0..capacity).find(|p| !active.iter().any(|(_, _, q)| q == p)).unwrap_or(0)
-    } else {
-        let (id, _, port) = active.last().map(|(a, _, c)| (*a, (), *c)).unwrap();
-        canvas.snarl.remove_node(id);
-        port
-    };
+    let held: Vec<(&str, usize)> = active.iter().map(|(_, d, p)| (d.as_str(), *p)).collect();
+    let (evict, port) = place_new_source(&held, capacity, |d| connected.iter().any(|c| c.id == d));
+    if let Some(i) = evict {
+        canvas.snarl.remove_node(active[i].0);
+    }
 
     canvas.add_device_source(device, default_collapsed, defaults);
     if let Some(node_id) = find_source_node_for(canvas, &device.id) {
@@ -1138,6 +1138,33 @@ pub(crate) fn toggle_source(
         }
     }
     super::layout::reposition_io_nodes(canvas);
+}
+
+/// The port a newly picked device takes, and which of the `held` sources
+/// (device id, port; lowest port first) it displaces to get it, if any.
+///
+/// ⛔ A source whose device is not connected has no card, so the picker can't
+/// deselect it — yet it still holds its port. Replacing the highest port
+/// regardless meant a saved-but-absent Joy-Con on port 0 kept that port while
+/// the Pro Controller on port 1, the one selected device on screen, got
+/// swapped out by every new pick: a second device could never be added. An
+/// absent device's port is given up first (lowest such port first); it only
+/// keeps its place while there is still a free one, so it comes back on its
+/// own port when it reconnects.
+fn place_new_source(
+    held: &[(&str, usize)],
+    capacity: usize,
+    is_connected: impl Fn(&str) -> bool,
+) -> (Option<usize>, usize) {
+    if held.len() < capacity {
+        // Lowest free port, so removing a middle device and adding another
+        // reuses the gap instead of pushing past the inlet count.
+        let port = (0..capacity).find(|p| !held.iter().any(|(_, q)| q == p)).unwrap_or(0);
+        return (None, port);
+    }
+    let i = held.iter().position(|(d, _)| !is_connected(d))
+        .unwrap_or(held.len().saturating_sub(1));
+    (Some(i), held.get(i).map_or(0, |(_, p)| *p))
 }
 
 /// The preset's AutoMap inlets as the cards' Port rows show them.
@@ -1168,9 +1195,11 @@ impl PortTable {
         for (id, dev, _) in active_sources(canvas) {
             let Some(slot) = super::wiring::source_slot(canvas, id) else { continue; };
             let Some(h) = holders.get_mut(slot) else { continue; };
+            // An absent device has no card of its own, so this dropdown is the
+            // only place that says why its port is taken.
             let label = devices.iter().find(|d| d.id == dev)
                 .map(|d| d.display_name.clone())
-                .unwrap_or_else(|| dev.clone());
+                .unwrap_or_else(|| format!("{dev} (not connected)"));
             *h = Some((dev, label));
         }
         Self { names, holders }
@@ -2124,4 +2153,43 @@ pub fn nav_ensure_sink(
     defaults: DeviceParamDefaults,
 ) {
     ensure_sink_of_kind(canvas, kind_id, pool, default_collapsed, defaults);
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::place_new_source;
+
+    /// The report: a 2-port preset holding a saved Joy-Con (absent) on port 0
+    /// and the Pro Controller on port 1. Picking another pad must take the
+    /// Joy-Con's port, not swap out the Pro Controller.
+    #[test]
+    fn a_full_preset_gives_up_an_absent_devices_port_first() {
+        let held = [("jc2:l", 0), ("pro", 1)];
+        assert_eq!(place_new_source(&held, 2, |d| d == "pro"), (Some(0), 0));
+    }
+
+    /// Several absent: the lowest port goes first, so fresh picks fill from
+    /// port 1 up.
+    #[test]
+    fn absent_devices_are_replaced_lowest_port_first() {
+        let held = [("a", 0), ("b", 1)];
+        assert_eq!(place_new_source(&held, 2, |_| false), (Some(0), 0));
+    }
+
+    /// While there is a free port an absent device keeps its own, so it comes
+    /// back on it when it reconnects.
+    #[test]
+    fn an_absent_device_keeps_its_port_while_one_is_free() {
+        let held = [("jc2:l", 0)];
+        assert_eq!(place_new_source(&held, 2, |_| false), (None, 1));
+    }
+
+    /// Everything connected: unchanged — the highest port is replaced, which
+    /// for a single-inlet preset is the old "click another device to swap".
+    #[test]
+    fn all_connected_still_replaces_the_highest_port() {
+        assert_eq!(place_new_source(&[("a", 0), ("b", 1)], 2, |_| true), (Some(1), 1));
+        assert_eq!(place_new_source(&[("a", 0)], 1, |_| true), (Some(0), 0));
+        assert_eq!(place_new_source(&[], 1, |_| true), (None, 0));
+    }
 }
