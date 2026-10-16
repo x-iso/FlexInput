@@ -811,6 +811,7 @@ impl FlexInputApp {
         let ui_source_block     = flexinput_engine::new_ui_source_block();
         let shortcut_owned      = flexinput_engine::new_ui_source_block();
         let shortcut_replay     = flexinput_engine::new_ui_source_block();
+        let engine_sync         = flexinput_engine::EngineSync::new();
         spawn_processing_thread(
             Arc::clone(&proc_graph),
             Arc::clone(&proc_device_signals),
@@ -820,6 +821,7 @@ impl FlexInputApp {
             Arc::clone(&ui_source_block),
             Arc::clone(&shortcut_owned),
             Arc::clone(&shortcut_replay),
+            Arc::clone(&engine_sync),
         );
 
         // Restore workspace if the user opted in; otherwise start with one empty tab.
@@ -1022,6 +1024,7 @@ impl FlexInputApp {
             Arc::clone(&ping_requests),
             Arc::clone(&led_defaults),
             Arc::clone(&raw_pad_profiles),
+            Arc::clone(&engine_sync),
         );
 
         spawn_midi_watch_thread(

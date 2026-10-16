@@ -69,6 +69,37 @@ impl HrWaiter {
             WaitForSingleObject(self.handle, INFINITE);
         }
     }
+
+    /// Block until `event` is signaled or about `dur` has passed, whichever is
+    /// first — with this timer's precision, where a plain timed wait would
+    /// round up to the system tick (~15.6 ms). True if the event fired.
+    ///
+    /// The timer may still go off later with nobody waiting and stay signaled,
+    /// so a later wait on it can return early: callers loop on their own
+    /// condition and deadline rather than trusting a timeout.
+    pub fn wait_event(&self, event: windows_sys::Win32::Foundation::HANDLE, dur: Duration) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            SetWaitableTimer, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+        };
+        // SAFETY: FFI on valid handles owned by the caller / us.
+        unsafe {
+            if dur.is_zero() {
+                return WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+            }
+            let hundred_ns = (dur.as_nanos() / 100).max(1).min(i64::MAX as u128) as i64;
+            let due: i64 = -hundred_ns;
+            if self.handle.is_null()
+                || SetWaitableTimer(self.handle, &due, 0, None, std::ptr::null(), 0) == 0
+            {
+                // No high-resolution timer: a millisecond timeout, rounded up.
+                let ms = dur.as_millis().max(1).min(u32::MAX as u128 - 1) as u32;
+                return WaitForSingleObject(event, ms) == WAIT_OBJECT_0;
+            }
+            let handles = [event, self.handle];
+            WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) == WAIT_OBJECT_0
+        }
+    }
 }
 
 #[cfg(windows)]

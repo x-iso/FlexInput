@@ -331,6 +331,162 @@ pub fn new_ui_source_block() -> UiSourceBlock {
     Arc::new(RwLock::new(HashSet::new()))
 }
 
+// ── Engine ↔ device-I/O hand-off ────────────────────────────────────────────
+//
+// The engine used to tick on its own timer at the sample rate (2 kHz by
+// default) while inputs only change when the I/O thread polls (500 Hz by
+// default): three of every four wakeups ran against an input that hadn't
+// moved, and each one was a context switch that, on a machine a game keeps
+// busy, preempts a game thread. And the I/O thread read the sink bus as the
+// engine had left it after the PREVIOUS poll's input, so outputs lagged one
+// polling period behind.
+//
+// Now the I/O thread publishes a frame and kicks the engine; the engine runs
+// every tick due by then (same sample-rate math, same dt) against that frame
+// and marks it consumed; the I/O thread waits for that — bounded — before it
+// reads the bus, so the outputs it sends come from the input it just polled.
+// If the engine can't finish in time (a slow machine), the I/O thread goes on
+// with the previous outputs, which is exactly the old behavior. If the kicks
+// stop (I/O thread stalled), the engine falls back to ticking on a timer.
+
+/// Synchronizes the engine with the device-I/O thread; see the comment above.
+/// One per process, shared by [`spawn_processing_thread`] and the I/O loop.
+pub struct EngineSync {
+    /// Input frames the I/O thread has published.
+    published: std::sync::atomic::AtomicU64,
+    /// The newest published frame the engine has run its due ticks against.
+    consumed: std::sync::atomic::AtomicU64,
+    #[cfg(windows)]
+    kick: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    done: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(not(windows))]
+    kicked: (Mutex<bool>, std::sync::Condvar),
+    #[cfg(not(windows))]
+    done: (Mutex<()>, std::sync::Condvar),
+}
+
+// SAFETY: the two HANDLEs are kernel event objects, safe to signal and wait on
+// from any thread; they are only closed in Drop.
+#[cfg(windows)]
+unsafe impl Send for EngineSync {}
+#[cfg(windows)]
+unsafe impl Sync for EngineSync {}
+
+impl EngineSync {
+    pub fn new() -> Arc<Self> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::CreateEventW;
+            // SAFETY: FFI. Auto-reset, initially unsignaled, unnamed.
+            let (kick, done) = unsafe {
+                (
+                    CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+                    CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+                )
+            };
+            Arc::new(Self { published: 0.into(), consumed: 0.into(), kick, done })
+        }
+        #[cfg(not(windows))]
+        {
+            Arc::new(Self {
+                published: 0.into(),
+                consumed: 0.into(),
+                kicked: (Mutex::new(false), std::sync::Condvar::new()),
+                done: (Mutex::new(()), std::sync::Condvar::new()),
+            })
+        }
+    }
+
+    /// I/O thread: a fresh input frame is published — wake the engine. Call it
+    /// AFTER storing the signals. Returns the frame's number for
+    /// [`Self::wait_consumed`].
+    pub fn input_published(&self) -> u64 {
+        let n = self.published.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(windows)]
+        // SAFETY: FFI on our own event.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetEvent(self.kick);
+        }
+        #[cfg(not(windows))]
+        {
+            *self.kicked.0.lock().unwrap() = true;
+            self.kicked.1.notify_one();
+        }
+        n
+    }
+
+    /// I/O thread: wait until the engine has run its due ticks against frame
+    /// `n`, for at most `budget`. True if it has.
+    pub fn wait_consumed(&self, n: u64, budget: Duration, waiter: &crate::hr_timer::HrWaiter) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.consumed.load(Ordering::Acquire) >= n {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            #[cfg(windows)]
+            waiter.wait_event(self.done, deadline - now);
+            #[cfg(not(windows))]
+            {
+                let _ = waiter;
+                let guard = self.done.0.lock().unwrap();
+                let _ = self.done.1.wait_timeout(guard, deadline - now);
+            }
+        }
+    }
+
+    /// Engine: the newest frame published so far. Read BEFORE loading the
+    /// signals, so the signals loaded are at least that new.
+    fn frame(&self) -> u64 {
+        self.published.load(Ordering::Acquire)
+    }
+
+    /// Engine: the ticks due so far have run against frame `n`.
+    fn mark_consumed(&self, n: u64) {
+        self.consumed.fetch_max(n, Ordering::AcqRel);
+        #[cfg(windows)]
+        // SAFETY: FFI on our own event.
+        unsafe {
+            windows_sys::Win32::System::Threading::SetEvent(self.done);
+        }
+        #[cfg(not(windows))]
+        {
+            let _g = self.done.0.lock().unwrap();
+            self.done.1.notify_all();
+        }
+    }
+
+    /// Engine: sleep until the next kick, or `fallback` if none comes.
+    fn wait_kick(&self, fallback: Duration, waiter: &crate::hr_timer::HrWaiter) {
+        #[cfg(windows)]
+        waiter.wait_event(self.kick, fallback);
+        #[cfg(not(windows))]
+        {
+            let _ = waiter;
+            let mut kicked = self.kicked.0.lock().unwrap();
+            if !*kicked {
+                kicked = self.kicked.1.wait_timeout(kicked, fallback).unwrap().0;
+            }
+            *kicked = false;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EngineSync {
+    fn drop(&mut self) {
+        // SAFETY: FFI; created in `new`, not used after drop.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.kick);
+            windows_sys::Win32::Foundation::CloseHandle(self.done);
+        }
+    }
+}
+
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
 /// Spawns the processing thread and returns the shared state handles.
@@ -353,6 +509,9 @@ pub fn spawn_processing_thread(
     // Home tap no shortcut used. Shown pressed, and let through the shortcut
     // block (not the UI's — an open config overlay still withholds them).
     shortcut_replay: UiSourceBlock,
+    // Hand-off with the device-I/O thread: the engine runs when it publishes
+    // an input frame (see `EngineSync`).
+    sync: Arc<EngineSync>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Raise this thread above the UI/render threads. The engine ticks at
@@ -401,15 +560,18 @@ pub fn spawn_processing_thread(
         // Previous-tick level of each click pin (see `is_click_pin`).
         let mut click_levels: HashMap<(String, String), bool> = HashMap::new();
 
-        // High-resolution waiter for the sub-tick sleep below — precise without
-        // raising the global timer resolution (see hr_timer). The device-I/O
-        // thread no longer calls timeBeginPeriod, so a plain thread::sleep here
-        // would round up to ~15.6 ms and collapse the tick rate.
+        // High-resolution waiter for the wait for the next input frame below —
+        // precise without raising the global timer resolution (see hr_timer).
+        // The device-I/O thread no longer calls timeBeginPeriod, so a plain
+        // timed wait would round up to ~15.6 ms when the kicks stop.
         let waiter = crate::hr_timer::HrWaiter::new();
 
         loop {
             puffin::GlobalProfiler::lock().new_frame();
             puffin::profile_scope!("proc_thread_iter");
+            // The input frame these ticks run against — read before the
+            // signals are loaded below, so they're at least this new.
+            let frame = sync.frame();
             let now = Instant::now();
 
             // Re-read sample rate each wakeup so live retunes apply immediately.
@@ -425,8 +587,11 @@ pub fn spawn_processing_thread(
                 next_tick += interval;
                 ticks += 1;
             }
-            // Cap catchup to ~8 ms to avoid spiral-of-death on heavy load.
-            let ticks = ticks.min(16);
+            // Cap catchup to avoid spiral-of-death on heavy load: 10 ms worth,
+            // at least 16. A wakeup normally runs one polling period's ticks
+            // (4 at the defaults); the slowest polling step (125 Hz, 8 ms)
+            // must still fit at any sample rate.
+            let ticks = ticks.min((sr / 100).max(16));
 
             if ticks > 0 {
                 // Refcount-bump reads — no cloning of graph or signal map.
@@ -562,22 +727,21 @@ pub fn spawn_processing_thread(
                 }
             }
 
-            // Sleep until the next tick deadline, capped at 1 ms so we still
-            // respond to a sample-rate change within ~1 ms. The old fixed
-            // 200 µs spin was a major CPU sink: at the default 2 kHz target (500 µs
-            // interval), waking every 200 µs to find 0 or 1 ticks pending
-            // burned ~5k wake-ups/sec for almost no real work.
-            //
-            // Now: if we're already behind (next_tick <= now), don't
-            // sleep at all — head straight back into the catchup loop.
-            // If we're ahead, sleep the remaining gap so the wakeup
-            // lands right when the next tick is due.
-            let now2 = Instant::now();
-            if next_tick > now2 {
-                let gap = next_tick - now2;
-                let sleep_for = gap.min(Duration::from_millis(1));
-                waiter.wait(sleep_for);
-            }
+            // The due ticks have run against `frame`: let the I/O thread send
+            // their outputs (see `EngineSync`).
+            sync.mark_consumed(frame);
+
+            // Sleep until the I/O thread publishes the next input frame. If it
+            // goes quiet (stalled, or not started yet), fall back to waking on
+            // our own every ~2.5 polling periods (2 ms before the first poll
+            // rate is known) and catching up the ticks due by then.
+            let io_hz = current_io_rate();
+            let fallback = if io_hz > 0 {
+                Duration::from_secs_f64((2.5 / io_hz as f64).clamp(0.002, 0.025))
+            } else {
+                Duration::from_millis(2)
+            };
+            sync.wait_kick(fallback, &waiter);
         }
     })
 }
@@ -707,5 +871,85 @@ mod tests {
         bank_displacement(&mut bank, &mut prev, &SigMap::default());
         bank_displacement(&mut bank, &mut prev, &held);
         assert_eq!(bank.get(&key("scroll_up")), Some(&Signal::Float(2.0)));
+    }
+
+    // ── Engine ↔ I/O hand-off ────────────────────────────────────────────────
+
+    /// The I/O side's wait returns as soon as the engine has run the frame,
+    /// not at the end of its budget.
+    #[test]
+    fn hand_off_returns_when_the_engine_consumes_the_frame() {
+        let sync = EngineSync::new();
+        let engine = {
+            let sync = Arc::clone(&sync);
+            std::thread::spawn(move || {
+                let waiter = crate::hr_timer::HrWaiter::new();
+                sync.wait_kick(Duration::from_secs(5), &waiter);
+                std::thread::sleep(Duration::from_millis(2));
+                sync.mark_consumed(sync.frame());
+            })
+        };
+        let waiter = crate::hr_timer::HrWaiter::new();
+        let t = Instant::now();
+        let n = sync.input_published();
+        assert!(sync.wait_consumed(n, Duration::from_secs(2), &waiter));
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        engine.join().unwrap();
+    }
+
+    /// With no engine, the wait gives up at its budget — precisely, not at the
+    /// next ~15.6 ms system tick.
+    #[test]
+    fn hand_off_times_out_at_its_budget() {
+        let sync = EngineSync::new();
+        let waiter = crate::hr_timer::HrWaiter::new();
+        let n = sync.input_published();
+        let t = Instant::now();
+        assert!(!sync.wait_consumed(n, Duration::from_millis(3), &waiter));
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(3), "{took:?}");
+        assert!(took < Duration::from_millis(12), "{took:?}");
+    }
+
+    /// An engine pass over an OLDER frame (its done-signal still pending)
+    /// doesn't satisfy a wait for a newer one.
+    #[test]
+    fn hand_off_ignores_an_older_frames_signal() {
+        let sync = EngineSync::new();
+        let waiter = crate::hr_timer::HrWaiter::new();
+        let old = sync.input_published();
+        sync.mark_consumed(old);
+        let new = sync.input_published();
+        assert!(!sync.wait_consumed(new, Duration::from_millis(3), &waiter));
+        sync.mark_consumed(new);
+        assert!(sync.wait_consumed(new, Duration::from_millis(3), &waiter));
+    }
+
+    /// The real processing thread consumes every published frame, including
+    /// one published after a quiet spell (it was waiting on its fallback).
+    #[test]
+    fn processing_thread_consumes_each_published_frame() {
+        let sync = EngineSync::new();
+        let output = Arc::new(Mutex::new(ProcessingOutput::default()));
+        spawn_processing_thread(
+            new_arc_graph(),
+            new_arc_signals(),
+            Arc::clone(&output),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(AtomicU32::new(2000)),
+            new_ui_source_block(),
+            new_ui_source_block(),
+            new_ui_source_block(),
+            Arc::clone(&sync),
+        );
+        let waiter = crate::hr_timer::HrWaiter::new();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(2));
+            let n = sync.input_published();
+            assert!(sync.wait_consumed(n, Duration::from_millis(500), &waiter), "frame {n}");
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let n = sync.input_published();
+        assert!(sync.wait_consumed(n, Duration::from_millis(500), &waiter), "after a quiet spell");
     }
 }

@@ -35,6 +35,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   same quick calibration on that pad; the button bar shows it when the pad has
   a gyro and is in the patch.
 
+### Changed
+
+- **Outputs follow input a polling period sooner, with fewer wakeups.** The
+  engine used to run on its own timer at the sample rate, and each output sent
+  to a virtual device came from the input polled the time before. Now it runs
+  as each input poll arrives — every tick due by then, at the same sample rate,
+  so the results are the same — and the outputs sent right after come from that
+  poll: about 1 ms from poll to output instead of about 2 ms on a desktop at
+  the default rates. It also wakes a quarter as often (500 times a second
+  instead of 2000), so it interrupts a busy game less. A machine too slow to
+  finish in time keeps the old behavior.
+
 ### Fixed
 
 - **The spike filter works on the Bluetooth dongle.** A Switch Pro connected

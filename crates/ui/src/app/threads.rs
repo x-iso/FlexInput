@@ -42,6 +42,9 @@ pub(crate) fn spawn_io_thread(
     led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
     // Learned raw-pad layouts, swapped wholesale on an edit.
     raw_pad_profiles: Arc<RwLock<Arc<flexinput_core::raw_pad::RawPadProfiles>>>,
+    // Hand-off with the engine: kick it after publishing each input frame,
+    // then wait (bounded) for its ticks before reading the sink bus.
+    engine_sync: Arc<flexinput_engine::EngineSync>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -161,6 +164,11 @@ pub(crate) fn spawn_io_thread(
             // This iteration's sink outputs: refreshed in place from the bus each
             // iteration (see `drain_sink_bus_into`) rather than rebuilt.
             let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
+            // Its own high-resolution waiter for the engine hand-off (the loop's
+            // pacing waiter must not see this one's leftover timer signal).
+            let engine_waiter = flexinput_engine::HrWaiter::new();
+            let mut skip_engine_wait_until = Instant::now();
+            let mut engine_wait_misses = 0u32;
 
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
@@ -321,6 +329,9 @@ pub(crate) fn spawn_io_thread(
                     // map clone under a RwLock.
                     proc_device_signals.store(std::sync::Arc::new(signals));
                 }
+                // Wake the engine to run the ticks due by now against this
+                // frame; its outputs are waited for below, before the drain.
+                let frame = engine_sync.input_published();
                 mark!("publish");
 
                 // ── Enumerate gilrs devices periodically ──────────────────────
@@ -377,6 +388,30 @@ pub(crate) fn spawn_io_thread(
                 // A drain, not a read: the mouse displacement pins are banked across
                 // engine ticks and must be delivered exactly once (see
                 // `flexinput_engine::is_displacement_pin`).
+                //
+                // First wait — bounded, at most 85% of the polling period, which
+                // leaves the routing below room in the rest — for the engine to
+                // run this frame's ticks, so the outputs sent this iteration come
+                // from the input polled this iteration rather than the previous
+                // one. (Measured on a fast desktop: the engine's pass takes 0.6–
+                // 1.1 ms at the default rates, so input→output drops from ~2 ms
+                // to ~1 ms.) When it can't make it in time, go on with what the
+                // bus holds — the previous frame's outputs, as before. Three
+                // misses in a row means the machine can't keep up: stop waiting
+                // for a second rather than hold this loop up for nothing.
+                if Instant::now() >= skip_engine_wait_until {
+                    puffin::profile_scope!("wait_engine");
+                    if engine_sync.wait_consumed(frame, interval.mul_f32(0.85), &engine_waiter) {
+                        engine_wait_misses = 0;
+                    } else {
+                        engine_wait_misses += 1;
+                        if engine_wait_misses >= 3 {
+                            engine_wait_misses = 0;
+                            skip_engine_wait_until = Instant::now() + Duration::from_secs(1);
+                        }
+                    }
+                }
+                mark!("engine_wait");
                 {
                     puffin::profile_scope!("read_sink_bus");
                     flexinput_engine::drain_sink_bus_into(&sink_bus, &mut sink_outputs);

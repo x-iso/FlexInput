@@ -56,6 +56,109 @@ fn heap_bytes_of<T>(f: impl FnOnce() -> T) -> (T, i64) {
     (v, LIVE_BYTES.load(Ordering::Relaxed) - before)
 }
 
+/// CPU seconds this process has used (user + kernel).
+fn process_cpu() -> f64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let z = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut e, mut k, mut u) = (z(), z(), z(), z());
+    // SAFETY: FFI with valid out-pointers.
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+    let secs = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 * 1e-7;
+    secs(k) + secs(u)
+}
+
+/// End-to-end check of the engine ↔ I/O hand-off on a real tab: a 500 Hz
+/// emulated I/O loop toggles `btn_south` every iteration, publishes, kicks the
+/// engine, waits like the I/O thread does, and drains the sink bus. Reports how
+/// often the virtual pad's `btn_south` matches the button polled in the SAME
+/// iteration (fresh) vs the previous one (one polling period late).
+/// `FXI_BENCH_WORKSPACE`, `FXI_BENCH_TAB` (default 1).
+#[test]
+#[ignore]
+fn perf_handoff() {
+    use flexinput_engine::{EngineSync, HrWaiter};
+    use std::sync::{Arc, Mutex, RwLock};
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let tab_ix: usize = std::env::var("FXI_BENCH_TAB").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    let mut tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
+    crate::canvas::viewer::refresh_curve_motion_units(&mut tab.snarl);
+    let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
+    let devs = source_devices(&graph);
+
+    let arc_graph = flexinput_engine::new_arc_graph();
+    arc_graph.store(Arc::new(graph));
+    let signals = flexinput_engine::new_arc_signals();
+    let bus: flexinput_engine::SinkBus = Arc::new(RwLock::new(HashMap::new()));
+    let sync = EngineSync::new();
+    flexinput_engine::spawn_processing_thread(
+        arc_graph, Arc::clone(&signals),
+        Arc::new(Mutex::new(flexinput_engine::ProcessingOutput::default())),
+        Arc::clone(&bus), Arc::new(std::sync::atomic::AtomicU32::new(2000)),
+        flexinput_engine::new_ui_source_block(), flexinput_engine::new_ui_source_block(),
+        flexinput_engine::new_ui_source_block(), Arc::clone(&sync),
+    );
+
+    let waiter = HrWaiter::new();
+    let pace = HrWaiter::new();
+    // FXI_KICK_HZ=2000 wakes the engine once per tick, as the old timer did,
+    // to compare CPU against the default 500 (one wakeup per poll).
+    let kick_hz: u32 = std::env::var("FXI_KICK_HZ").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+    let interval = std::time::Duration::from_secs_f64(1.0 / kick_hz as f64);
+    let polls_per_input = (kick_hz / 500).max(1);
+    let budget_pct: f32 = std::env::var("FXI_BUDGET_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(85.0);
+    let cpu0 = process_cpu();
+    let wall0 = Instant::now();
+    let mut waits_us: Vec<u128> = Vec::new();
+    let (mut fresh, mut late, mut other, mut timeouts) = (0, 0, 0, 0);
+    let mut out: HashMap<(String, String), flexinput_core::Signal> = HashMap::new();
+    for i in 0..1500 * polls_per_input {
+        let t0 = Instant::now();
+        let held = (i / polls_per_input) % 2 == 1;
+        // The input itself changes at 500 Hz whatever the kick rate.
+        if i % polls_per_input == 0 {
+            let mut s = signals_at(&devs, i as f32 * 0.002);
+            for (k, v) in s.iter_mut() {
+                if matches!(v, flexinput_core::Signal::Bool(_)) {
+                    *v = flexinput_core::Signal::Bool(k.1 == "btn_south" && held);
+                }
+            }
+            signals.store(Arc::new(s));
+        }
+        let frame = sync.input_published();
+        let tw = Instant::now();
+        if !sync.wait_consumed(frame, interval.mul_f32(budget_pct / 100.0), &waiter) {
+            timeouts += 1;
+        } else if i > 50 {
+            waits_us.push(tw.elapsed().as_micros());
+        }
+        flexinput_engine::drain_sink_bus_into(&bus, &mut out);
+        if i > 50 {
+            let v = out.iter()
+                .find(|(k, _)| k.0.starts_with("virtual.") && k.1 == "btn_south")
+                .map(|(_, v)| v.as_bool());
+            match v {
+                Some(b) if b == held => fresh += 1,
+                Some(_) => late += 1,
+                None => other += 1,
+            }
+        }
+        let el = t0.elapsed();
+        if el < interval { pace.wait(interval - el); }
+    }
+    let cpu_ms_per_s = (process_cpu() - cpu0) * 1e3 / wall0.elapsed().as_secs_f64();
+    eprintln!("kicks at {kick_hz} Hz: process CPU {cpu_ms_per_s:.0} ms per second");
+    waits_us.sort();
+    let pct = |p: usize| waits_us.get(waits_us.len() * p / 100).copied().unwrap_or(0);
+    eprintln!("virtual btn_south: fresh (same poll) {fresh}, one poll late {late}, absent {other}; engine waits timed out {timeouts}");
+    eprintln!("kick→consumed µs (successful waits): p50 {} p90 {} p99 {} max {}",
+        pct(50), pct(90), pct(99), waits_us.last().copied().unwrap_or(0));
+}
+
 /// How egui's font atlas grows when text is drawn at many distinct sizes (as a
 /// continuously scaled pinned widget or a rect-sized label does), at the
 /// atlas width the app runs with (`FXI_ATLAS_SIDE`, default 8192).
