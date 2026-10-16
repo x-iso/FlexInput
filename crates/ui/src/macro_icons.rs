@@ -137,6 +137,58 @@ pub fn macro_port_icon_texture(
     macro_icon_texture(ctx, icon_key, size_pts)
 }
 
+/// Corner badge telling a Virtual Menu's targets apart — Show, Select, Next
+/// and Previous all wear the menu's own icon. A dark disc in `icon`'s
+/// top-right corner (the bottom-right one is a timed output's duration)
+/// carrying an eye, a check, or a right / left arrowhead, drawn in `tint`.
+/// No-op for any pin that isn't a menu target.
+pub fn paint_menu_target_badge(
+    painter: &egui::Painter,
+    icon: egui::Rect,
+    pin: &str,
+    tint: egui::Color32,
+) {
+    use flexinput_core::menu::{parse_target_pin, TargetPin};
+    use egui::{pos2, Pos2, Stroke};
+    let Some((_, target)) = parse_target_pin(pin) else { return };
+    let r = (icon.width().min(icon.height()) * 0.22).clamp(4.5, 9.0);
+    let c = pos2(icon.right() - r, icon.top() + r);
+    painter.circle(c, r, egui::Color32::from_black_alpha(225),
+        Stroke::new(1.0, egui::Color32::from_gray(150)));
+    let g = r * 0.62;
+    let at = |x: f32, y: f32| -> Pos2 { pos2(c.x + x * g, c.y + y * g) };
+    match target {
+        TargetPin::Show => {
+            // A lens with a dark pupil.
+            const N: usize = 8;
+            let mut pts: Vec<Pos2> = Vec::with_capacity(2 * N + 2);
+            for i in 0..=N {
+                let th = std::f32::consts::PI * i as f32 / N as f32;
+                pts.push(at(-th.cos(), -0.62 * th.sin()));
+            }
+            for i in 1..N {
+                let th = std::f32::consts::PI * i as f32 / N as f32;
+                pts.push(at(th.cos(), 0.62 * th.sin()));
+            }
+            painter.add(egui::Shape::convex_polygon(pts, tint, Stroke::NONE));
+            painter.circle_filled(c, g * 0.34, egui::Color32::from_black_alpha(235));
+        }
+        TargetPin::Select => {
+            let s = Stroke::new((r * 0.3).max(1.2), tint);
+            painter.line_segment([at(-0.7, 0.0), at(-0.2, 0.5)], s);
+            painter.line_segment([at(-0.2, 0.5), at(0.7, -0.5)], s);
+        }
+        TargetPin::Next | TargetPin::Prev => {
+            let d = if target == TargetPin::Next { 1.0 } else { -1.0 };
+            painter.add(egui::Shape::convex_polygon(
+                vec![at(-0.5 * d, -0.7), at(0.7 * d, 0.0), at(-0.5 * d, 0.7)],
+                tint,
+                Stroke::NONE,
+            ));
+        }
+    }
+}
+
 /// Rasterize + cache one SVG at `size_pts`, keyed by (`cache_salt`, size).
 fn svg_texture_cached(
     ctx: &egui::Context,

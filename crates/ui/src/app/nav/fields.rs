@@ -1211,7 +1211,7 @@ impl FlexInputApp {
                     fs.push(f!("Gyro ax", Enum{key:"ptr_gyro_axes",opts:&["pitch_yaw","pitch_roll"]}));
                     fs.push(f!("Gyro ×", v("ptr_gyro_sens",0.5,8.0,4.0,Linear)));
                 }
-                fs.push(f!("Show", Enum{key:"activation_mode",opts:&["hold","toggle","touch"]}));
+                fs.push(f!("Show", Enum{key:"activation_mode",opts:&["hold","toggle","touch","never"]}));
                 fs.push(f!("Select", Enum{key:"select_on",opts:&["release","press","click"]}));
                 fs.push(f!("Deadzone", v("pointer_deadzone",0.0,0.9,0.25,Linear)));
                 fs.push(f!("Linger", v("select_linger",0.0,10.0,0.5,Fixed(0.05))));

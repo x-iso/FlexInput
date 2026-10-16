@@ -996,8 +996,17 @@ pub struct ModuleDescriptor {
   - Pointer sources (additive): `ptr_ls`, `ptr_rs`, `ptr_touch` (+ `ptr_touch_which`),
     `ptr_gyro` (+ `ptr_gyro_axes`, `ptr_gyro_sens`). Absent flags fall back to the legacy
     single-choice `pointer_source`.
-  - Session behaviour: `activation_mode` (hold/toggle/touch), `select_on`
+  - Session behaviour: `activation_mode` (hold/toggle/touch/never), `select_on`
     (release/press/click), `pointer_deadzone`, `select_linger`, `hover_sticky`.
+    `never` keeps the menu (and its select linger) off screen for good, so only
+    Next / Previous select (Select commits an open menu's highlight, so it's inert).
+- **Targets (macro-style, `menu:{menu_id}_{show|sel|next|prev}`):** assignable from
+  Remapper / Touch Zones / Lean / JSM `@`, badged by role on their chips. Next /
+  Previous step one cell per press in reading order (`menu::cycle_order`: by top
+  edge, then left edge — rows, or rings clockwise when radial), wrapping: while open
+  they move the highlight (held against a resting pointer even with sticky off; the
+  pointer takes over once past its deadzone), while closed they select outright
+  (starting from the last selection) and the overlay lingers the cell.
   - Header: `menu_name`, `menu_icon`/`menu_icon_svg`.
 - **MIDI:** selecting a zone can play MIDI, exactly as a Touch Zones card does.
 

@@ -12,6 +12,12 @@ use super::*;
 /// Control resolution — macro-style targets first, wired pins as alternates:
 ///   Show    = ("macro", menu:{menu_id}_show) OR wired Show (slot 1)
 ///   Select  = ("macro", menu:{menu_id}_sel)  OR wired Select (slot 2)
+///   Next / Previous = ("macro", menu:{menu_id}_next / _prev) — targets only.
+///             Each press steps one cell in `menu::cycle_order`: while open it
+///             moves the highlight (the pointer takes over again once it
+///             leaves its deadzone); while closed it selects the next cell
+///             outright. `activation_mode = "never"` keeps the menu closed
+///             for good, so only they select (Select needs an open menu).
 ///   Pointer = wired Pointer Vec2 (slot 3) when connected, else the SUM of
 ///             every enabled source checkbox (`ptr_ls`/`ptr_rs`/`ptr_touch`/
 ///             `ptr_gyro`): stick deflection past the deadzone maps onto the
@@ -121,6 +127,10 @@ pub(crate) fn eval_menu_node(
     let sel_raw = inputs.get(2).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(false)
         || (!menu_id.is_empty()
             && macro_on(collector_sigs, fm::target_pin(&menu_id, fm::TargetPin::Select)));
+    let next_raw = !menu_id.is_empty()
+        && macro_on(collector_sigs, fm::target_pin(&menu_id, fm::TargetPin::Next));
+    let prev_raw = !menu_id.is_empty()
+        && macro_on(collector_sigs, fm::target_pin(&menu_id, fm::TargetPin::Prev));
     let wired_ptr: Option<Vec2> = inputs.get(3).and_then(|s| *s)
         .and_then(|s| if let Signal::Vec2(v) = s { Some(v) } else { None });
 
@@ -134,8 +144,11 @@ pub(crate) fn eval_menu_node(
     //     short pulse at low overlay FPS),
     // [10]/[11] gyro pointer accumulator X/Y (integrated rad, reset while
     //     closed so the pointer always starts centered),
-    // [12] latch-mode owner (0 = none, 1 = LS, 2 = RS, 3 = touch, 4 = gyro) ──
-    const SLOTS: usize = 13;
+    // [12] latch-mode owner (0 = none, 1 = LS, 2 = RS, 3 = touch, 4 = gyro),
+    // [13]/[14] prev Next / prev Previous,
+    // [15] the highlight came from Next/Previous (held against a resting
+    //      pointer even with sticky hover off) ──
+    const SLOTS: usize = 16;
     const SELECT_PULSE_MS: f32 = 120.0;
     let ns = state.entry(uid).or_insert_with(NodeState::default);
     while ns.aux_f32.len() < SLOTS { ns.aux_f32.push(0.0); }
@@ -143,7 +156,11 @@ pub(crate) fn eval_menu_node(
     let prev_show = ns.aux_f32[1] > 0.5;
     let prev_sel = ns.aux_f32[2] > 0.5;
     let prev_hover: i32 = ns.aux_f32[3] as i32 - 1;
+    let last_sel: i32 = ns.aux_f32[5] as i32 - 1;
     let prev_click = ns.aux_f32[6] > 0.5;
+    let prev_next = ns.aux_f32[13] > 0.5;
+    let prev_prev = ns.aux_f32[14] > 0.5;
+    let mut cycle_held = prev_open && ns.aux_f32[15] > 0.5;
     // The touchpad click doubles as the Select gesture, and it may itself be a
     // blocked pin — read it unblocked.
     let click_now = read_nav("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
@@ -303,16 +320,26 @@ pub(crate) fn eval_menu_node(
     // toward a zone's on-screen direction has to select THAT zone.
     let radial_origin = snap.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
+    // "never": the menu doesn't open at all — it's driven by Next/Previous
+    // alone, selecting without ever showing.
     let open = match act.as_str() {
+        "never" => false,
         "toggle" => prev_open ^ (show_raw && !prev_show),
         "touch" => touching,
         _ => show_raw, // hold
     };
 
+    // Cycling: one step per rising edge, +1 Next / −1 Previous (both on the
+    // same tick cancel).
+    let next_edge = next_raw && !prev_next;
+    let prev_edge = prev_raw && !prev_prev;
+    let step = next_edge as i32 - prev_edge as i32;
+
     // Hover: sticky while open (default) — the frame the menu closes still
     // sees the last hover (release-select reads it), then it resets to none.
     // With `hover_sticky` off, a pointer back inside the deadzone clears the
-    // highlight instead, so releasing there selects nothing.
+    // highlight instead, so releasing there selects nothing — unless the
+    // highlight came from Next/Previous, which no pointer was holding.
     let mut hover: i32 = if prev_open { prev_hover } else { -1 };
     let mut hover_local = (ns.aux_f32[7], ns.aux_f32[8]);
     if open {
@@ -334,17 +361,31 @@ pub(crate) fn eval_menu_node(
                         let (zid, lx, ly) = tree.locate(ax, rv);
                         hover = zid as i32;
                         hover_local = (lx, ly);
-                    } else if !sticky {
+                        cycle_held = false;
+                    } else if !sticky && !cycle_held {
                         hover = -1;
                     }
                 } else {
                     let (zid, lx, ly) = tree.locate(ux, uy);
                     hover = zid as i32;
                     hover_local = (lx, ly);
+                    cycle_held = false;
                 }
             }
             None => {
-                if !sticky { hover = -1; }
+                if !sticky && !cycle_held { hover = -1; }
+            }
+        }
+        // Next/Previous move the highlight on from the hovered cell, else
+        // from the last selection — so reopening carries on where the cycle
+        // left off.
+        if step != 0 {
+            let from = if hover >= 0 { hover } else { last_sel };
+            let from = (from >= 0).then_some(from as u32);
+            if let Some(z) = fm::cycle_step(&fm::cycle_order(&tree), from, step) {
+                hover = z as i32;
+                hover_local = (0.5, 0.5);
+                cycle_held = true;
             }
         }
     }
@@ -354,15 +395,28 @@ pub(crate) fn eval_menu_node(
         "click" => open && click_now && !prev_click,
         _ => prev_open && !open, // release: the closing edge selects
     };
-    if select_now {
+    // Closed (or never shown): a step selects the next cell outright. Not on
+    // the closing tick itself — that one belongs to the release select.
+    let commit: Option<i32> = if select_now {
+        Some(hover)
+    } else if !open && !prev_open && step != 0 {
+        fm::cycle_step(&fm::cycle_order(&tree), (last_sel >= 0).then_some(last_sel as u32), step)
+            .map(|z| z as i32)
+    } else {
+        None
+    };
+    if let Some(z) = commit {
         ns.aux_f32[4] = SELECT_PULSE_MS;
-        ns.aux_f32[5] = (hover + 1) as f32;
+        ns.aux_f32[5] = (z + 1) as f32;
         ns.aux_f32[9] += 1.0;
     }
     let pulse_on = ns.aux_f32[4] > 0.0;
     let selected: i32 = ns.aux_f32[5] as i32 - 1;
     ns.aux_f32[4] = (ns.aux_f32[4] - dt * 1000.0).max(0.0);
-    if !open { hover = -1; }
+    if !open {
+        hover = -1;
+        cycle_held = false;
+    }
 
     ns.aux_f32[0] = if open { 1.0 } else { 0.0 };
     ns.aux_f32[1] = if show_raw { 1.0 } else { 0.0 };
@@ -371,6 +425,9 @@ pub(crate) fn eval_menu_node(
     ns.aux_f32[6] = if click_now { 1.0 } else { 0.0 };
     ns.aux_f32[7] = hover_local.0;
     ns.aux_f32[8] = hover_local.1;
+    ns.aux_f32[13] = if next_raw { 1.0 } else { 0.0 };
+    ns.aux_f32[14] = if prev_raw { 1.0 } else { 0.0 };
+    ns.aux_f32[15] = if cycle_held { 1.0 } else { 0.0 };
 
     // ── Mapping-mode cards (shared Remapper card schema; trigger tokens
     // "menu_sel" = the select pulse of this card's zone, "menu_hover" = held

@@ -427,10 +427,12 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
                 if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
                     ui.ctx(), &entry.icon, &entry.icon_svg, CHIP_H)
                 {
-                    return ui.add(egui::Image::new(&tex)
+                    let rect = ui.add(egui::Image::new(&tex)
                         .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                         .tint(Color32::WHITE))
                         .on_hover_text(hover).rect;
+                    crate::macro_icons::paint_menu_target_badge(ui.painter(), rect, pin_id, Color32::WHITE);
+                    return rect;
                 } else {
                     return ui.label(egui::RichText::new(&entry.name).size(13.0).strong())
                         .on_hover_text(hover).rect;
@@ -673,6 +675,7 @@ pub(crate) fn paint_chord_chip_tinted(
                     painter.image(tex.id(), rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         tint);
+                    crate::macro_icons::paint_menu_target_badge(painter, rect, pin_id, tint);
                     return chip_h;
                 }
                 return paint_text_pill(painter, top_left, chip_h, entry.name, false);

@@ -847,6 +847,31 @@ mod trigger_tests {
         c.get(&("remap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
     }
 
+    // A menu's Next on a button and Previous on a chord with it — one button
+    // cycling both ways: the chord shadows the plain card, so it steps back
+    // only (both at once would cancel in the menu), chord in order or not.
+    #[test]
+    fn menu_next_on_a_button_previous_on_its_chord() {
+        let mac = |c: &SigMap, pin: &str| c.get(&(flexinput_core::macros::SIGS_NS.to_string(), pin.to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        for in_order in [true, false] {
+            let mut rig = RemapRig::new(serde_json::json!([
+                { "in": ["btn_rb"], "out": ["menu:m_next"] },
+                { "in": ["btn_lb", "btn_rb"], "out": ["menu:m_prev"], "in_order": in_order },
+            ]));
+            rig.tick(&["btn_lb"]);
+            let c = rig.tick(&["btn_lb", "btn_rb"]);
+            assert!(mac(&c, "menu:m_prev") && !mac(&c, "menu:m_next"),
+                "LB + RB is Previous alone (in_order {in_order})");
+            let c = rig.tick(&["btn_lb"]);
+            assert!(!mac(&c, "menu:m_prev") && !mac(&c, "menu:m_next"));
+            rig.tick(&[]);
+            let c = rig.tick(&["btn_rb"]);
+            assert!(mac(&c, "menu:m_next") && !mac(&c, "menu:m_prev"),
+                "RB alone is Next (in_order {in_order})");
+        }
+    }
+
     // ── Set Neutral Forward ──────────────────────────────────────────────────
 
     fn neutral_req(c: &SigMap, dev: &str) -> bool {
@@ -3888,6 +3913,168 @@ mod menu_eval_tests {
         assert_eq!(out[1], Some(Signal::Bool(true)), "released: stays open");
         let out = eval_menu_node(&snap, 3, &show(true), &dev, &mut c, &mut state, 0.016);
         assert_eq!(out[1], Some(Signal::Bool(false)), "second rising edge closes");
+    }
+
+    /// The last selection `(zone, seq)` from the trailing mirror slot.
+    fn menu_sel(out: &[Option<Signal>]) -> Option<(u32, u32)> {
+        match out.get(out.len().checked_sub(2)?) {
+            Some(Some(Signal::Vec2(v))) => Some((v.x as u32, v.y as u32)),
+            _ => None,
+        }
+    }
+
+    /// Tap a macro-style target — pressed one tick, released the next — with
+    /// wired Show held as given. Returns the press tick's outputs.
+    fn tap_target(
+        snap: &NodeSnap,
+        pin: &str,
+        show_b: bool,
+        dev: &SigMap,
+        c: &mut SigMap,
+        state: &mut HashMap<usize, NodeState>,
+    ) -> Vec<Option<Signal>> {
+        let uid = snap.node_uid;
+        merge_macro_scalar(c, pin, Signal::Bool(true));
+        let out = eval_menu_node(snap, uid, &show(show_b), dev, c, state, 0.016);
+        c.remove(&(flexinput_core::macros::SIGS_NS.to_string(), pin.to_string()));
+        eval_menu_node(snap, uid, &show(show_b), dev, c, state, 0.016);
+        out
+    }
+
+    const NEXT: &str = "menu:abcd1234_next";
+    const PREV: &str = "menu:abcd1234_prev";
+
+    // Closed: Next / Previous select outright, in reading order, wrapping
+    // both ways, and never open the menu. A HELD press steps only once.
+    #[test]
+    fn next_prev_select_while_closed() {
+        let snap = menu_snap(20);
+        let mut c: SigMap = SigMap::default();
+        let mut state = HashMap::new();
+        let dev = dev_stick(0.0, 0.0);
+        let mut tap = |pin: &str| {
+            let out = tap_target(&snap, pin, false, &dev, &mut c, &mut state);
+            assert_eq!(out[1], Some(Signal::Bool(false)), "stepping while closed never opens");
+            menu_sel(&out)
+        };
+        assert_eq!(tap(NEXT), Some((0, 1)), "from no selection, Next starts at the first cell");
+        assert_eq!(tap(NEXT), Some((1, 2)));
+        assert_eq!(tap(PREV), Some((0, 3)));
+        assert_eq!(tap(PREV), Some((3, 4)), "Previous wraps to the last cell");
+        assert_eq!(tap(NEXT), Some((0, 5)), "Next wraps to the first cell");
+
+        merge_macro_scalar(&mut c, NEXT, Signal::Bool(true));
+        for _ in 0..5 {
+            eval_menu_node(&snap, 20, &show(false), &dev, &mut c, &mut state, 0.016);
+        }
+        let out = eval_menu_node(&snap, 20, &show(false), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(menu_sel(&out), Some((1, 6)), "holding Next steps once, not every tick");
+    }
+
+    // Closed steps fire the cell's card like any selection.
+    #[test]
+    fn next_while_closed_fires_the_cells_card() {
+        let mut snap = menu_snap(21);
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_east"] }
+        ]));
+        let mut c: SigMap = SigMap::default();
+        let mut state = HashMap::new();
+        tap_target(&snap, NEXT, false, &dev_stick(0.0, 0.0), &mut c, &mut state);
+        assert_eq!(c.get(&("menumap:21".to_string(), "btn_east".to_string())).copied(),
+            Some(Signal::Bool(true)), "the stepped-to cell's card must fire");
+    }
+
+    // Open: Next / Previous move the highlight (carrying on from the last
+    // selection), it holds against a resting stick even with sticky hover
+    // off, and letting go of Show selects the stepped-to cell.
+    #[test]
+    fn next_moves_highlight_while_open_and_release_selects_it() {
+        let mut snap = menu_snap(22);
+        snap.params.insert("hover_sticky".into(), Value::Bool(false));
+        let mut c: SigMap = SigMap::default();
+        let mut state = HashMap::new();
+        let rest = dev_stick(0.0, 0.0);
+
+        // A closed step first, so the open cycle has somewhere to carry on from.
+        tap_target(&snap, NEXT, false, &rest, &mut c, &mut state);
+        let out = eval_menu_node(&snap, 22, &show(true), &rest, &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(-1.0)), "opens with nothing highlighted");
+
+        let out = tap_target(&snap, NEXT, true, &rest, &mut c, &mut state);
+        assert_eq!(out[1], Some(Signal::Bool(true)));
+        assert_eq!(out[2], Some(Signal::Float(1.0)), "Next carries on after the last selection (0)");
+        assert_eq!(menu_sel(&out), Some((0, 1)), "moving the highlight selects nothing");
+        let out = eval_menu_node(&snap, 22, &show(true), &rest, &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(1.0)), "a stepped highlight survives a resting stick");
+        let out = tap_target(&snap, PREV, true, &rest, &mut c, &mut state);
+        assert_eq!(out[2], Some(Signal::Float(0.0)));
+        let out = tap_target(&snap, PREV, true, &rest, &mut c, &mut state);
+        assert_eq!(out[2], Some(Signal::Float(3.0)), "Previous wraps while open too");
+
+        // The stick takes over once it leaves the deadzone (top-right = 1).
+        let out = eval_menu_node(&snap, 22, &show(true), &dev_stick(0.8, 0.8), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(1.0)), "the pointer takes the highlight back");
+        let out = eval_menu_node(&snap, 22, &show(true), &rest, &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(-1.0)), "pointer-made highlight still clears (sticky off)");
+
+        let out = tap_target(&snap, NEXT, true, &rest, &mut c, &mut state);
+        assert_eq!(out[2], Some(Signal::Float(1.0)),
+            "with nothing highlighted, Next carries on after the last selection (0) again");
+
+        let out = eval_menu_node(&snap, 22, &show(false), &rest, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)));
+        assert_eq!(menu_sel(&out), Some((1, 2)), "letting go of Show selects the stepped-to cell");
+    }
+
+    fn show_sel(show_b: bool, sel_b: bool) -> Vec<Option<Signal>> {
+        vec![None, Some(Signal::Bool(show_b)), Some(Signal::Bool(sel_b)), None]
+    }
+
+    // Never: Show doesn't open the menu and Select, with no open highlight
+    // to commit, does nothing — only Next / Previous select.
+    #[test]
+    fn never_mode_stays_shut_and_only_next_prev_select() {
+        let mut snap = menu_snap(23);
+        snap.params.insert("activation_mode".into(), Value::String("never".into()));
+        snap.params.insert("select_on".into(), Value::String("press".into()));
+        let mut c: SigMap = SigMap::default();
+        let mut state = HashMap::new();
+        let dev = dev_stick(0.8, 0.8);
+
+        let out = eval_menu_node(&snap, 23, &show_sel(true, false), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)), "Show can't open a never-shown menu");
+        assert_eq!(out[2], Some(Signal::Float(-1.0)), "nothing is ever highlighted");
+        assert_eq!(*out.last().unwrap(), None, "no live pointer while shut");
+        let out = eval_menu_node(&snap, 23, &show_sel(true, true), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(menu_sel(&out), None, "Select has nothing to commit");
+
+        let out = tap_target(&snap, NEXT, true, &dev, &mut c, &mut state);
+        assert_eq!(menu_sel(&out), Some((0, 1)));
+        let out = tap_target(&snap, PREV, true, &dev, &mut c, &mut state);
+        assert_eq!(menu_sel(&out), Some((3, 2)), "Previous steps back, wrapping");
+    }
+
+    // No pointer driving the menu at all: Next / Previous are its only way
+    // round, and Select commits what they highlighted.
+    #[test]
+    fn without_a_pointer_next_highlights_and_select_commits() {
+        let mut snap = menu_snap(24);
+        snap.params.insert("ptr_ls".into(), Value::Bool(false));
+        snap.params.insert("select_on".into(), Value::String("press".into()));
+        let mut c: SigMap = SigMap::default();
+        let mut state = HashMap::new();
+        let dev = dev_stick(0.8, 0.8); // deflected, but no source reads it
+
+        let out = eval_menu_node(&snap, 24, &show_sel(true, false), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(-1.0)), "a disabled stick highlights nothing");
+        tap_target(&snap, NEXT, true, &dev, &mut c, &mut state);
+        let out = tap_target(&snap, NEXT, true, &dev, &mut c, &mut state);
+        assert_eq!(out[2], Some(Signal::Float(1.0)));
+        assert_eq!(menu_sel(&out), None, "highlighting selects nothing");
+        let out = eval_menu_node(&snap, 24, &show_sel(true, true), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)), "a press select keeps the menu open");
+        assert_eq!(menu_sel(&out), Some((1, 1)), "Select commits the stepped-to cell");
     }
 
     // select_on = "press": the wired Select input commits the hovered zone

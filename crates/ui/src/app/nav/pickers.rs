@@ -894,7 +894,9 @@ impl FlexInputApp {
                     // or embedded set) or the port name + full-name tooltip.
                     // KBM cells: skin icon or text fallback.
                     if let Some(entry) = cell.macro_meta.as_ref() {
-                        if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                        // A menu's four targets share its icon (or its name's
+                        // first letters): the corner badge tells them apart.
+                        let badge_on = if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
                             ctx, &entry.icon, &entry.icon_svg, UNIT - 6.0)
                         {
                             let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
@@ -903,11 +905,14 @@ impl FlexInputApp {
                             painter.image(tex.id(), img_rect,
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                 tint);
+                            img_rect
                         } else {
                             let short: String = entry.name.chars().take(4).collect();
                             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                                 short, egui::FontId::proportional(10.0 * SCALE), ui.visuals().text_color());
-                        }
+                            rect.shrink(2.0)
+                        };
+                        crate::macro_icons::paint_menu_target_badge(&painter, badge_on, &cell.pin, tint);
                         let tip = if self_target {
                             format!("{} — a menu can't target itself", entry.name)
                         } else {

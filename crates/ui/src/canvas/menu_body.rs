@@ -12,17 +12,18 @@
 //! The difference is the DRIVER: instead of the upstream device's touchpad,
 //! the menu's pointer comes from a chosen analog input of the upstream device
 //! (`pointer_source`: LS / RS / touch 1 / touch 2) or the wired Pointer Vec2
-//! inlet, and its Show/Select controls are macro-style named targets
-//! (menu:{menu_id}_show / _sel — assignable from Remapper / Touch Zones /
-//! Lean via the Special picker, where the menu wears its name + icon) plus
-//! the wired Show/Select pins as alternates. It renders on its own screen
+//! inlet, and its Show/Select/Next/Previous controls are macro-style named
+//! targets (menu:{menu_id}_show / _sel / _next / _prev — assignable from
+//! Remapper / Touch Zones / Lean via the Special picker, where the menu wears
+//! its name + icon, badged by role) plus the wired Show/Select pins as
+//! alternates. It renders on its own screen
 //! overlay while open. The zone-live highlight here comes from the node's own
 //! eval mirror (Open/Hover outputs), not from touch pins.
 //!
 //! Menu-specific params (on top of the TZ set):
 //!   menu_id — stable identity behind the target pin ids (save-format)
 //!   menu_name, menu_icon, menu_icon_svg — identity (Macro pattern)
-//!   activation_mode: "hold" | "toggle" | "touch"
+//!   activation_mode: "hold" | "toggle" | "touch" | "never"
 //!   pointer_source: "left_stick" | "right_stick" | "touch1" | "touch2"
 //!   select_on: "release" | "press" | "click"
 //!   pointer_deadzone: f32
@@ -1963,12 +1964,14 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     };
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Show").small().weak())
-            .on_hover_text("How the Show input opens the menu.\nHold: open while held. Toggle: press opens, press closes.\nTouch: open while a finger rests on the touchpad.");
+            .on_hover_text("How the Show input opens the menu.\nHold: open while held. Toggle: press opens, press closes.\nTouch: open while a finger rests on the touchpad.\nNever: the menu never appears — Next / Previous pick the cells\nwithout showing them.");
         let r = egui::ComboBox::from_id_salt((node_id, "menu_act"))
-            .selected_text(match act.as_str() { "toggle" => "Toggle", "touch" => "Touch", _ => "Hold" })
+            .selected_text(match act.as_str() {
+                "toggle" => "Toggle", "touch" => "Touch", "never" => "Never", _ => "Hold",
+            })
             .width(70.0)
             .show_ui(ui, |ui| {
-                for (val, label) in [("hold", "Hold"), ("toggle", "Toggle"), ("touch", "Touch")] {
+                for (val, label) in [("hold", "Hold"), ("toggle", "Toggle"), ("touch", "Touch"), ("never", "Never")] {
                     if ui.selectable_label(act == val, label).clicked() {
                         set.push(("activation_mode", serde_json::json!(val)));
                     }

@@ -745,18 +745,19 @@ impl FlexInputApp {
                         });
                     }
                 }
-                // Virtual Menus are macro-style targets too: one Show + one
-                // Select entry per menu, wearing the menu's name + icon.
+                // Virtual Menus are macro-style targets too: Show, Select,
+                // Next and Previous entries per menu, wearing the menu's name +
+                // icon (the chip painters badge each icon with its role).
                 if n.module_id == "module.menu" {
                     if let Some(mid) = n.params.get("menu_id").and_then(|v| v.as_str()) {
                         let name = n.params.get("menu_name").and_then(|v| v.as_str()).unwrap_or("");
                         let name = if name.is_empty() { "Menu" } else { name };
                         let icon = n.params.get("menu_icon").and_then(|v| v.as_str()).unwrap_or("");
                         let icon_svg = n.params.get("menu_icon_svg").and_then(|v| v.as_str()).unwrap_or("");
-                        for (t, verb) in [(fm::TargetPin::Show, "Show"), (fm::TargetPin::Select, "Select")] {
+                        for t in fm::TargetPin::ALL {
                             out.push(crate::macro_icons::MacroDisplayEntry {
                                 pin: fm::target_pin(mid, t),
-                                name: format!("{name} — {verb}"),
+                                name: format!("{name} — {}", t.verb()),
                                 icon: icon.to_string(),
                                 icon_svg: icon_svg.to_string(),
                                 signal_type: flexinput_core::SignalType::Bool,

@@ -191,6 +191,9 @@ struct MenuInst {
     /// How long the selected cell stays on screen after the menu hides
     /// before fading out (`select_linger` param, seconds; 0 = off).
     linger_s: f32,
+    /// `activation_mode = "never"`: nothing of this menu ever shows live —
+    /// not the menu, not a selected cell (it can still be positioned).
+    never: bool,
 }
 
 fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst {
@@ -224,6 +227,7 @@ fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst 
         zone_meta: crate::canvas::menu_body::menu_zone_meta(node),
         sel: crate::canvas::menu_body::menu_sel_info(node),
         linger_s: node.params.get("select_linger").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32,
+        never: pstr("activation_mode") == "never",
     }
 }
 
@@ -241,9 +245,10 @@ const GLOW_S: f64 = 0.35;
 /// Advance one menu's linger/glow state machine. Returns
 /// `(linger cell, glow)` — each as `(zone, alpha)`:
 /// * linger — the cell of a now-hidden menu to keep painting while it fades.
-///   A selection only replays when it happened during the open session that
-///   just ended; reopening cancels the fade, and a stale seq from before the
-///   overlay started tracking never animates.
+///   A selection replays when it happened during the open session that just
+///   ended, or while the menu stayed shut (Next / Previous select outright);
+///   reopening cancels the fade, and a stale seq from before the overlay
+///   started tracking never animates.
 /// * glow — the quick border flash marking the moment a zone was accepted.
 fn linger_tick(
     ctx: &egui::Context,
@@ -257,11 +262,13 @@ fn linger_tick(
     ));
     // Selection observed (order matters: before the close check, so a
     // release-select — close + seq bump on the same tick — lingers).
+    let mut fresh = false;
     if let Some((zone, seq)) = m.sel {
         if seq != st.0 {
             st.0 = seq;
             st.1 = zone;
             st.5 = now; // glow flash on every accepted selection
+            fresh = true;
         }
     }
     if m.open && !st.3 {
@@ -271,6 +278,11 @@ fn linger_tick(
     }
     if !m.open && st.3 && st.0 != st.4 {
         // Closed after at least one accepted selection → start the linger.
+        st.2 = now;
+    }
+    if fresh && !m.open && !st.3 {
+        // Selected while shut (Next / Previous): the chosen cell flashes up
+        // on its own, restarting the fade on every step.
         st.2 = now;
     }
     st.3 = m.open;
@@ -388,7 +400,10 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let mut lingers: Vec<(usize, u32, f32)> = Vec::new();
     let mut glows: Vec<(usize, u32, f32)> = Vec::new();
     for (i, m) in menus.iter().enumerate() {
+        // A never-shown menu still ticks, so its seq stays current and
+        // switching it to another mode can't replay an old selection.
         let (linger, glow) = linger_tick(ctx, m, now);
+        if m.never { continue; }
         if let Some((z, a)) = linger { lingers.push((i, z, a)); }
         if let Some((z, a)) = glow { glows.push((i, z, a)); }
     }

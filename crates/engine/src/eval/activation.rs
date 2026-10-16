@@ -674,7 +674,7 @@ pub(crate) fn sig_magnitude(s: Signal) -> f32 {
 
 /// True for any out-pin that routes into the macro collector namespaces
 /// instead of the AutoMap bus: Macro ports (`macro:{id}`) and Virtual-Menu
-/// targets (`menu:{id}_show` / `_sel`). Every publish/skip gate in the mapping
+/// targets (`menu:{id}_show` / `_sel` / `_next` / `_prev`). Every publish/skip gate in the mapping
 /// evaluators goes through this so the two pin families behave identically.
 pub(crate) fn is_macro_style_target(pin: &str) -> bool {
     flexinput_core::macros::parse_macro_pin(pin).is_some()

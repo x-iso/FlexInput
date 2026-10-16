@@ -35,6 +35,22 @@ All notable changes to FlexInput are documented here. This project adheres to
   same quick calibration on that pad; the button bar shows it when the pad has
   a gyro and is in the patch.
 
+- **Step through a Virtual Menu with buttons.** Every menu now offers Next
+  and Previous beside Show and Select wherever its targets are picked (and to
+  JSM configs by `@` name). While the menu is open, each press moves the
+  highlight one cell — row by row, or ring by ring clockwise on a radial menu,
+  wrapping at the ends — and Select or letting go of Show picks it as before.
+  While it's closed, each press picks the next cell straight away and flashes
+  it up for the Linger time. Bind Previous to a chord to go both ways on one
+  button.
+
+- **Show: Never.** A menu set to Never doesn't appear at all, not even its
+  selected cell: Next and Previous pick its cells unseen.
+
+- **Badges on a menu's targets.** Show, Select, Next and Previous all wear the
+  menu's icon; a small badge in its corner — an eye, a check, or an arrow —
+  now says which is which, on mapping cards and in Choose.
+
 ### Changed
 
 - **Outputs follow input a polling period sooner, with fewer wakeups.** The

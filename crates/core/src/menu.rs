@@ -72,6 +72,26 @@ pub enum TargetPin {
     Show,
     /// Bool — the menu's Select control (commit per `select_on`).
     Select,
+    /// Bool — each press moves to the next cell in [`cycle_order`]: the
+    /// highlight while the menu is open, else straight to a selection.
+    Next,
+    /// Bool — [`TargetPin::Next`] the other way round.
+    Prev,
+}
+
+impl TargetPin {
+    /// Every target, in the order the pickers list them.
+    pub const ALL: [TargetPin; 4] = [TargetPin::Show, TargetPin::Select, TargetPin::Next, TargetPin::Prev];
+
+    /// The verb the pickers show after the menu's name ("Menu — Next").
+    pub fn verb(self) -> &'static str {
+        match self {
+            TargetPin::Show => "Show",
+            TargetPin::Select => "Select",
+            TargetPin::Next => "Next",
+            TargetPin::Prev => "Previous",
+        }
+    }
 }
 
 /// Target pin id, e.g. `target_pin("1f3a9c2b", TargetPin::Show) ==
@@ -80,6 +100,8 @@ pub fn target_pin(menu_id: &str, t: TargetPin) -> String {
     match t {
         TargetPin::Show => format!("menu:{menu_id}_show"),
         TargetPin::Select => format!("menu:{menu_id}_sel"),
+        TargetPin::Next => format!("menu:{menu_id}_next"),
+        TargetPin::Prev => format!("menu:{menu_id}_prev"),
     }
 }
 
@@ -93,8 +115,47 @@ pub fn parse_target_pin(pin: &str) -> Option<(&str, TargetPin)> {
     match comp {
         "show" => Some((id, TargetPin::Show)),
         "sel" => Some((id, TargetPin::Select)),
+        "next" => Some((id, TargetPin::Next)),
+        "prev" => Some((id, TargetPin::Prev)),
         _ => None,
     }
+}
+
+// ── Cycling ──────────────────────────────────────────────────────────────────
+//
+// Next / Previous step through the cells in READING order of the zone tree's
+// unit space: by each cell's top edge, then its left edge. A grid reads row by
+// row, left to right; radial mode (x = angle, y = radius) reads ring by ring,
+// clockwise from the origin — so the order follows what's on screen, not the
+// tree's traversal (a column-first tree would otherwise run down columns).
+
+/// Zone ids in cycling order.
+pub fn cycle_order(tree: &crate::touchzones::ZoneNode) -> Vec<u32> {
+    let mut zones = tree.zones();
+    // Quantized so cells on one row compare by x even when their dividers
+    // sit a hair apart.
+    let q = |f: f32| (f * 1000.0).round() as i32;
+    zones.sort_by_key(|&(id, [x0, y0, _, _])| (q(y0), q(x0), id));
+    zones.into_iter().map(|(id, _)| id).collect()
+}
+
+/// One step through `order` from `from` (`dir` > 0 forward, < 0 back),
+/// wrapping at both ends. From nowhere (or a zone no longer in the tree),
+/// forward starts at the first cell and back at the last. `None` only for an
+/// empty order or `dir == 0`.
+pub fn cycle_step(order: &[u32], from: Option<u32>, dir: i32) -> Option<u32> {
+    if order.is_empty() || dir == 0 {
+        return None;
+    }
+    let n = order.len();
+    let at = from.and_then(|z| order.iter().position(|&o| o == z));
+    let i = match at {
+        Some(i) if dir > 0 => (i + 1) % n,
+        Some(i) => (i + n - 1) % n,
+        None if dir > 0 => 0,
+        None => n - 1,
+    };
+    Some(order[i])
 }
 
 // ── Radial geometry ──────────────────────────────────────────────────────────
@@ -181,9 +242,45 @@ mod tests {
             parse_target_pin(&target_pin("1f3a9c2b", TargetPin::Select)),
             Some(("1f3a9c2b", TargetPin::Select))
         );
+        for t in TargetPin::ALL {
+            assert_eq!(parse_target_pin(&target_pin("1f3a9c2b", t)), Some(("1f3a9c2b", t)));
+        }
         assert_eq!(parse_target_pin("menu:_show"), None);
         assert_eq!(parse_target_pin("menu:abc_bogus"), None);
         assert_eq!(parse_target_pin("macro:abc"), None);
         assert_eq!(parse_target_pin("menu_open"), None);
+    }
+
+    #[test]
+    fn cycle_order_reads_rows_then_columns() {
+        use crate::touchzones::{Axis, ZoneNode};
+        // 2×2 grid: ids are row-major already.
+        assert_eq!(cycle_order(&ZoneNode::from_grid(&[0.5], &[0.5])), vec![0, 1, 2, 3]);
+        // Column-first tree: left column split top (5) / bottom (7), right
+        // column one tall cell (9). Traversal is 5, 7, 9; reading order puts
+        // the tall right cell on the top row, beside 5.
+        let tree = ZoneNode::Split {
+            axis: Axis::V, t: 0.5,
+            a: Box::new(ZoneNode::Split {
+                axis: Axis::H, t: 0.5,
+                a: Box::new(ZoneNode::Leaf(5)),
+                b: Box::new(ZoneNode::Leaf(7)),
+            }),
+            b: Box::new(ZoneNode::Leaf(9)),
+        };
+        assert_eq!(cycle_order(&tree), vec![5, 9, 7]);
+    }
+
+    #[test]
+    fn cycle_step_wraps_both_ways() {
+        let order = [5, 9, 7];
+        assert_eq!(cycle_step(&order, Some(5), 1), Some(9));
+        assert_eq!(cycle_step(&order, Some(7), 1), Some(5), "forward wraps to the first");
+        assert_eq!(cycle_step(&order, Some(5), -1), Some(7), "back wraps to the last");
+        assert_eq!(cycle_step(&order, None, 1), Some(5));
+        assert_eq!(cycle_step(&order, None, -1), Some(7));
+        assert_eq!(cycle_step(&order, Some(42), 1), Some(5), "a vanished zone starts over");
+        assert_eq!(cycle_step(&order, Some(5), 0), None);
+        assert_eq!(cycle_step(&[], None, 1), None);
     }
 }
