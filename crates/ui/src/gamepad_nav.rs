@@ -236,6 +236,12 @@ pub fn left_targets_id() -> egui::Id {
     egui::Id::new("gp_nav_left_targets")
 }
 
+/// ctx-temp id under which `io_panel` publishes the `egui::LayerId` its targets
+/// render in: the left-panel glow's host, so a window over the panel covers it.
+pub fn left_host_id() -> egui::Id {
+    egui::Id::new("gp_nav_left_host")
+}
+
 /// ctx-temp id under which the nav driver asks the input list to bring a
 /// target into view: `(pass_nr, index into the published targets)`.
 pub fn left_scroll_request_id() -> egui::Id {

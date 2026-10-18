@@ -701,6 +701,8 @@ impl FlexInputApp {
         // Install egui_extras image loaders so SVG images render inside nodes
         // and pinned sub-patch widgets. The svg feature pulls in resvg/usvg.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Gamepad-nav glows yield to whatever window or popup covers their target.
+        crate::widgets::install_nav_glow_cut(&cc.egui_ctx);
         let descriptors = all_modules().into_iter().map(|r| r.descriptor).collect();
         let backends    = init_backends();
         let midi_backend = Arc::new(Mutex::new(Some(MidiBackend::new())));

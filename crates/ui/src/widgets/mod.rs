@@ -259,9 +259,140 @@ impl NavHighlightStyle {
 /// cropped at the visible edge instead of spilling over the hidden part. Inline
 /// callers pass `ui.clip_rect()`; post-hoc callers pass their published
 /// container rect (or the full rect when there is no scroll container).
-pub(crate) fn nav_highlight_painter(ctx: &egui::Context, id: egui::Id, clip: egui::Rect) -> egui::Painter {
-    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, id))
+///
+/// `host` is the layer the highlighted widget lives on: whatever is stacked
+/// over it is cut out of the glow (see [`nav_glow_layer`]).
+pub(crate) fn nav_highlight_painter(
+    ctx: &egui::Context,
+    id: egui::Id,
+    host: egui::LayerId,
+    clip: egui::Rect,
+) -> egui::Painter {
+    ctx.layer_painter(nav_glow_layer(ctx, egui::Order::Foreground, id, host))
         .with_clip_rect(clip)
+}
+
+/// The layer a post-hoc nav highlight (a glow, a focus HUD, a tip) paints on,
+/// for a widget that lives on `host`. It stays a free `order` layer, so it is
+/// always above the widget and its own sublayers, but at the end of the pass
+/// [`cut_nav_glows`] removes every part that falls under something stacked over
+/// `host`: a Settings or Calibration window, a popup, a tooltip. A plain
+/// `Foreground` glow painted over all of those.
+///
+/// Why not an egui sublayer of `host`: the Easy body nests three deep (body
+/// area → scaled body → module pin → card-list scroll), and egui resolves
+/// nested sublayers in hash-map order, which changes every pass. The glow would
+/// flicker under the cards it rings.
+///
+/// Inert unless [`install_nav_glow_cut`] ran on the context.
+pub(crate) fn nav_glow_layer(
+    ctx: &egui::Context,
+    order: egui::Order,
+    id: egui::Id,
+    host: egui::LayerId,
+) -> egui::LayerId {
+    let layer = egui::LayerId::new(order, id.with(host));
+    // Both before taking the data lock: nesting ctx locks deadlocks.
+    let key = nav_glow_cut_key(ctx.viewport_id());
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        let cuts = d.get_temp_mut_or_default::<(u64, Vec<(egui::LayerId, egui::LayerId)>)>(key);
+        if cuts.0 != pass {
+            *cuts = (pass, Vec::new());
+        }
+        if !cuts.1.contains(&(layer, host)) {
+            cuts.1.push((layer, host));
+        }
+    });
+    layer
+}
+
+/// Register the end-of-pass cut behind [`nav_glow_layer`]. Once, at startup:
+/// it runs at the end of every pass of every viewport (the config overlay and
+/// the over-game picker included), after all the windows have drawn, so it sees
+/// this frame's window rects.
+pub(crate) fn install_nav_glow_cut(ctx: &egui::Context) {
+    ctx.on_end_pass("nav_glow_cut", std::sync::Arc::new(cut_nav_glows));
+}
+
+/// Ctx-data slot of this pass's `(glow layer, host)` pairs. Per viewport: ctx
+/// data is shared by all of them.
+fn nav_glow_cut_key(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::new(("gp_nav_glow_cut", viewport))
+}
+
+/// Cut every glow registered this pass out from under what covers its host.
+/// Each shape is re-added once per uncovered piece of its clip rect; the pieces
+/// are disjoint, so translucent rings never double up.
+fn cut_nav_glows(ctx: &egui::Context) {
+    let key = nav_glow_cut_key(ctx.viewport_id());
+    let pass = ctx.cumulative_pass_nr();
+    let Some((stamp, glows)) =
+        ctx.data_mut(|d| d.remove_temp::<(u64, Vec<(egui::LayerId, egui::LayerId)>)>(key))
+    else {
+        return;
+    };
+    if stamp != pass {
+        return;
+    }
+    for (layer, host) in glows {
+        let covers = nav_covers(ctx, host);
+        if covers.is_empty() {
+            continue;
+        }
+        ctx.graphics_mut(|g| {
+            let painted = std::mem::take(g.entry(layer));
+            let list = g.entry(layer);
+            for shape in painted.all_entries() {
+                let mut pieces = vec![shape.clip_rect];
+                for cover in &covers {
+                    pieces = pieces.into_iter().flat_map(|p| rect_minus(p, *cover)).collect();
+                }
+                for piece in pieces {
+                    list.add(piece, shape.shape.clone());
+                }
+            }
+        });
+    }
+}
+
+/// Screen rects of the visible areas stacked over `host`: later in egui's layer
+/// order (last pass's, plus areas first shown this pass, which go on top), or in
+/// a higher `Order`. Only areas have rects, so `host`'s own sublayers never
+/// count. A host egui doesn't order (the background) sits under everything.
+fn nav_covers(ctx: &egui::Context, host: egui::LayerId) -> Vec<egui::Rect> {
+    let above: Vec<(egui::LayerId, egui::Rect)> = ctx.memory(|m| {
+        let order: Vec<egui::LayerId> = m.layer_ids().collect();
+        let host_at = order.iter().position(|l| *l == host).map_or(-1, |i| i as i64);
+        order
+            .iter()
+            .enumerate()
+            .filter(|&(i, l)| (l.order, i as i64) > (host.order, host_at) && *l != host)
+            .filter(|(_, l)| m.areas().is_visible(l))
+            .filter_map(|(_, l)| Some((*l, m.area_rect(l.id)?)))
+            .collect()
+    });
+    above
+        .into_iter()
+        .map(|(l, r)| ctx.layer_transform_to_global(l).map_or(r, |t| t * r))
+        .filter(|r| r.is_positive())
+        .collect()
+}
+
+/// `r` minus `hole`, as up to four disjoint rects: full-width bands above and
+/// below the hole, then the parts beside it.
+fn rect_minus(r: egui::Rect, hole: egui::Rect) -> Vec<egui::Rect> {
+    let h = r.intersect(hole);
+    if !h.is_positive() {
+        return vec![r];
+    }
+    let bands = [
+        egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, h.min.y)),
+        egui::Rect::from_min_max(egui::pos2(r.min.x, h.max.y), r.max),
+        egui::Rect::from_min_max(egui::pos2(r.min.x, h.min.y), egui::pos2(h.min.x, h.max.y)),
+        egui::Rect::from_min_max(egui::pos2(h.max.x, h.min.y), egui::pos2(r.max.x, h.max.y)),
+    ];
+    bands.into_iter().filter(|b| b.is_positive()).collect()
 }
 
 /// Outward-bloom highlight on `rect`: `rings` expanding strokes fading from
@@ -307,4 +438,81 @@ pub(crate) fn paint_nav_bloom(
         egui::Stroke::new(inner_stroke, color),
         egui::StrokeKind::Outside,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MARK: egui::Color32 = egui::Color32::from_rgb(1, 2, 3);
+
+    #[test]
+    fn rect_minus_leaves_disjoint_pieces_covering_the_rest() {
+        let r = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 80.0));
+        let far = egui::Rect::from_min_max(egui::pos2(200.0, 0.0), egui::pos2(300.0, 80.0));
+        assert_eq!(rect_minus(r, far), vec![r]);
+        assert!(rect_minus(r, r.expand(5.0)).is_empty());
+
+        let hole = egui::Rect::from_min_max(egui::pos2(30.0, 20.0), egui::pos2(60.0, 50.0));
+        let pieces = rect_minus(r, hole);
+        assert_eq!(pieces.len(), 4);
+        let area: f32 = pieces.iter().map(|p| p.area()).sum();
+        assert_eq!(area, r.area() - hole.area());
+        for (i, a) in pieces.iter().enumerate() {
+            assert!(!a.intersect(hole).is_positive(), "piece {i} overlaps the hole");
+            for b in &pieces[i + 1..] {
+                assert!(!a.intersect(*b).is_positive(), "pieces overlap: {a:?} {b:?}");
+            }
+        }
+    }
+
+    /// Run one pass: a fixed window, and a glow ring crossing its edge painted
+    /// BEFORE it (as nav does) for a widget on `host`. Returns the window rect and
+    /// the glow's painted shapes.
+    fn glow_under_window(ctx: &egui::Context, host: impl Fn() -> egui::LayerId) -> (egui::Rect, Vec<egui::epaint::ClippedShape>) {
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let p = nav_highlight_painter(ctx, egui::Id::new("test_glow"), host(), ctx.content_rect());
+            p.rect_stroke(
+                egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(400.0, 300.0)),
+                0.0, egui::Stroke::new(2.0, MARK), egui::StrokeKind::Outside);
+            egui::Window::new("cover")
+                .fixed_pos(egui::pos2(100.0, 100.0))
+                .fixed_size(egui::vec2(200.0, 150.0))
+                .show(ctx, |ui| ui.label("covering"));
+        });
+        let win = ctx.memory(|m| m.area_rect(egui::Id::new("cover"))).expect("window rect");
+        let glow = out.shapes.into_iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.stroke.color == MARK))
+            .collect();
+        (win, glow)
+    }
+
+    /// The reported bug: the Easy glow showed on top of the Calibration and
+    /// Settings windows. Whatever is stacked over the glow's host is cut out of
+    /// it, and only that.
+    #[test]
+    fn a_window_over_the_host_covers_the_glow() {
+        let ctx = egui::Context::default();
+        install_nav_glow_cut(&ctx);
+        for _ in 0..2 {
+            let (win, glow) = glow_under_window(&ctx, egui::LayerId::background);
+            assert!(!glow.is_empty(), "the uncovered part still paints");
+            for s in &glow {
+                assert!(!s.clip_rect.intersect(win).is_positive(),
+                    "glow piece {:?} paints over the window {win:?}", s.clip_rect);
+            }
+        }
+    }
+
+    #[test]
+    fn a_glow_on_the_window_itself_is_left_whole() {
+        let ctx = egui::Context::default();
+        install_nav_glow_cut(&ctx);
+        for _ in 0..2 {
+            let (_, glow) = glow_under_window(&ctx,
+                || egui::LayerId::new(egui::Order::Middle, egui::Id::new("cover")));
+            assert_eq!(glow.len(), 1);
+            assert_eq!(glow[0].clip_rect, ctx.content_rect());
+        }
+    }
 }

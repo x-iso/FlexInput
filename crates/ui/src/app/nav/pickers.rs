@@ -567,8 +567,9 @@ impl FlexInputApp {
             _ if tz => "⌨ KB/M + mouse picker",
             _ => "⌨ KB/M + touchpad picker",
         };
+        let picker_id = egui::Id::new("gp_kbm_picker");
         egui::Window::new(title)
-            .id(egui::Id::new("gp_kbm_picker"))
+            .id(picker_id)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -1052,17 +1053,18 @@ impl FlexInputApp {
             });
 
         // The focused cell's glow — or the focused list element's — above the
-        // board so neighbours can't cover it.
+        // board so neighbours can't cover it, but under a window over the picker.
+        let host = egui::LayerId::new(egui::Order::Middle, picker_id);
         if let Some(rect) = list_focus_rect.or(focus_rect) {
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground, egui::Id::new("gp_kbm_picker_focus_glow")));
+            let painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+                egui::Order::Foreground, egui::Id::new("gp_kbm_picker_focus_glow"), host));
             crate::widgets::paint_nav_bloom(&painter, rect, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
         }
         // The focused cell's name, under it, above everything — the pad's
         // hover.
         if let Some((rect, tip)) = focus_tip {
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Tooltip, egui::Id::new("gp_kbm_picker_focus_tip")));
+            let painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+                egui::Order::Tooltip, egui::Id::new("gp_kbm_picker_focus_tip"), host));
             let galley = painter.layout_no_wrap(
                 tip, egui::FontId::proportional(11.0 * SCALE), egui::Color32::WHITE);
             let pos = rect.center_bottom() + egui::vec2(-galley.size().x * 0.5, 6.0);

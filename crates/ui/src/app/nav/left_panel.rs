@@ -33,6 +33,9 @@ impl FlexInputApp {
             .data(|d| d.get_temp::<(u64, Vec<gn::LeftNavTarget>)>(gn::left_targets_id()))
             .map(|(_, t)| t)
             .unwrap_or_default();
+        let host = ctx
+            .data(|d| d.get_temp::<egui::LayerId>(gn::left_host_id()))
+            .unwrap_or_else(egui::LayerId::background);
 
         // Glow helper: edge ring + OUTWARD bloom only — never fills the widget
         // interior, so the slider/checkbox underneath stays fully visible while
@@ -41,8 +44,8 @@ impl FlexInputApp {
         let glow = |t: &gn::LeftNavTarget, editing: bool| {
             if !t.is_visible() { return; }
             let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-            let mut painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground, egui::Id::new("gp_nav_left_glow")));
+            let mut painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+                egui::Order::Foreground, egui::Id::new("gp_nav_left_glow"), host));
             // Partly scrolled out: crop at the list's edge rather than draw the
             // missing part over the header or the output cards.
             if !t.clip.contains_rect(t.rect) {

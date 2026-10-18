@@ -1270,6 +1270,16 @@ fn find_subpatch(canvas: &Canvas) -> Option<NodeId> {
 
 // ── Sub-patch body render ───────────────────────────────────────────
 
+/// The `Area` layer the Easy sub-patch body of `outer_id` renders in. Every nav
+/// glow on the body names it as its host, so a window stacked over the body
+/// covers the glow too (`widgets::nav_glow_layer`).
+pub(crate) fn body_area_layer(outer_id: NodeId) -> egui::LayerId {
+    egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("easy_subpatch_body_area", outer_id.0)),
+    )
+}
+
 fn render_subpatch_body(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -1387,9 +1397,9 @@ fn render_subpatch_body(
     });
     let pre_snapshot = if needs_snapshot { Some(canvas.undo_clone()) } else { None };
 
-    let area_id = egui::Id::new(("easy_subpatch_body_area", outer_id.0));
-    egui::Area::new(area_id)
-        .order(egui::Order::Middle)
+    let area_layer = body_area_layer(outer_id);
+    egui::Area::new(area_layer.id)
+        .order(area_layer.order)
         .movable(false)
         .interactable(true)
         .fixed_pos(panel_rect.min)
@@ -1530,10 +1540,12 @@ fn render_subpatch_body(
                     // interior, so the control underneath stays fully visible
                     // while editing. Bloom = concentric outside-strokes with
                     // falling alpha (a true outward gradient).
-                    let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                        egui::Order::Foreground,
+                    let painter = crate::widgets::nav_highlight_painter(
+                        ui.ctx(),
                         egui::Id::new(("gp_nav_glow_top", outer_id.0)),
-                    )).with_clip_rect(panel_rect);
+                        area_layer,
+                        panel_rect,
+                    );
                     let rings = 7;
                     let max_grow = if editing { 9.0 } else { 6.0 };
                     let peak = if editing { 150.0 } else { 90.0 };

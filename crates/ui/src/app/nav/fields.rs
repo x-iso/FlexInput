@@ -373,11 +373,14 @@ impl FlexInputApp {
     /// context's Foreground layer. Shared by `nav_publish_field_hud` (main window)
     /// and the config overlay (`config_draw_field_glow`) so the value-field glow
     /// shows in BOTH viewports — the overlay is a separate window, so nav's own
-    /// root-viewport draw never reaches it. No-op on a degenerate rect.
-    pub(crate) fn paint_field_glow_ring(ctx: &egui::Context, fr: egui::Rect, accent: egui::Color32) {
+    /// root-viewport draw never reaches it. No-op on a degenerate rect. `host` is
+    /// the layer the field's body renders in.
+    pub(crate) fn paint_field_glow_ring(ctx: &egui::Context, fr: egui::Rect, accent: egui::Color32,
+        host: egui::LayerId)
+    {
         if !fr.is_finite() || fr.width() <= 0.5 { return; }
-        let p = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground, egui::Id::new("gp_nav_field_glow")));
+        let p = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+            egui::Order::Foreground, egui::Id::new("gp_nav_field_glow"), host));
         crate::widgets::paint_nav_bloom(&p, fr, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
     }
 
@@ -433,6 +436,8 @@ impl FlexInputApp {
         let rect = rects.and_then(|(_, rs)| sel.and_then(|s| rs.iter().find(|(i,_)| *i == s).map(|(_,r)| *r)));
         let Some(rect) = rect else { return; };
         let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
+        // Both ride the Easy body: a window over it covers them too.
+        let host = crate::easy::center_panel::body_area_layer(outer_id);
 
         // Per-field inner glow: if the row renderer published per-control rects
         // this frame, draw an outward bloom ring on the focused field's rect so
@@ -445,11 +450,11 @@ impl FlexInputApp {
             ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, element))));
         if let Some((_, frs)) = field_rects {
             if let Some(fr) = frs.get(idx).filter(|r| Self::nav_ring_is_worth_drawing(r)) {
-                Self::paint_field_glow_ring(ctx, *fr, accent);
+                Self::paint_field_glow_ring(ctx, *fr, accent, host);
             }
         }
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground, egui::Id::new(("gp_nav_field_hud", outer_id.0))));
+        let painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+            egui::Order::Foreground, egui::Id::new(("gp_nav_field_hud", outer_id.0)), host));
         let n = fields.len();
         let label = if n > 1 {
             format!("[{}/{}] {} = {}{}", idx + 1, n, def.label, val_str,

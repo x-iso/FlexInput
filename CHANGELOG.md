@@ -257,6 +257,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   before reaching the outputs, and the cursor and highlight only land on
   cards you can see.
 
+- **Easy mode: the controller highlight stays under windows.** The glow
+  around what the controller has selected drew on top of everything, so it
+  showed through the Calibration window, Settings and any other window or
+  menu opened over it. A window, popup or tooltip now covers it like the rest
+  of what's underneath. The same goes for the field highlight and its label,
+  the left panel's highlight, and the focus glow in the input/output picker.
+
 ## [0.15.8] - 2026-10-13
 
 ### Added

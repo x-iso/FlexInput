@@ -9,12 +9,14 @@ use super::*;
 /// temps and paints on whichever `ctx`'s foreground layer you hand it — the main
 /// window (via [`FlexInputApp::nav_draw_remap_card_glow`]) or the config-overlay
 /// viewport. `inner` is the mapping node; `scope` its mappings key
-/// (`"mappings"` / `"zone_maps"` / `"lean_*"`).
+/// (`"mappings"` / `"zone_maps"` / `"lean_*"`); `host` the layer the body renders
+/// in, so what covers the body covers the glow too.
 pub(crate) fn draw_remap_card_glow(
     ctx: &egui::Context,
     outer_id: egui_snarl::NodeId,
     inner: egui_snarl::NodeId,
     scope: &str,
+    host: egui::LayerId,
 ) {
     let cur_pass = ctx.cumulative_pass_nr();
     let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
@@ -22,7 +24,7 @@ pub(crate) fn draw_remap_card_glow(
     // the top of the body and never scrolls); the card glow below re-clips to the
     // card-list viewport so a card scrolled partly out is cropped at its edge.
     let painter = crate::widgets::nav_highlight_painter(
-        ctx, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0)), ctx.content_rect());
+        ctx, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0)), host, ctx.content_rect());
     let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
         crate::widgets::paint_nav_bloom(&painter, rect, accent, round, peak, max_grow, 6, 2.0, 1.0, 2.0);
     };
@@ -68,8 +70,8 @@ pub(crate) fn draw_remap_card_glow(
                 .filter(|(p, t)| cur_pass.saturating_sub(*p) <= 2 && !t.is_empty())
                 .map(|(_, t)| t);
             if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
-                let tp = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0))));
+                let tp = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+                    egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0)), host));
                 let galley = tp.layout(tip, egui::FontId::proportional(12.0),
                     egui::Color32::WHITE, 320.0);
                 let screen = ctx.content_rect();
@@ -114,7 +116,8 @@ impl FlexInputApp {
     pub(crate) fn nav_draw_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let scope = self.nav_remap_mappings_key(outer_id);
-        draw_remap_card_glow(ctx, outer_id, inner, scope);
+        let host = crate::easy::center_panel::body_area_layer(outer_id);
+        draw_remap_card_glow(ctx, outer_id, inner, scope, host);
     }
 
     /// Mappings array key for the selected remapper-family node. Remapper /

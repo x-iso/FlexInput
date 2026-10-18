@@ -209,10 +209,13 @@ pub fn show(
             optical_row, &mut nav_targets);
     });
 
-    // Publish the collected nav targets (stamped with the current pass).
+    // Publish the collected nav targets (stamped with the current pass), and the
+    // layer they render in for their glow.
     let pass = ui.ctx().cumulative_pass_nr();
+    let layer = ui.layer_id();
     ui.ctx().data_mut(|d| {
-        d.insert_temp(crate::gamepad_nav::left_targets_id(), (pass, nav_targets))
+        d.insert_temp(crate::gamepad_nav::left_targets_id(), (pass, nav_targets));
+        d.insert_temp(crate::gamepad_nav::left_host_id(), layer);
     });
 }
 

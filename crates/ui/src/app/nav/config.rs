@@ -476,7 +476,12 @@ impl FlexInputApp {
 /// publishes the per-field rects in this viewport's pass, so reading them here
 /// and painting on the overlay ctx lands the glow in the right spot. Free fn (not
 /// a method) so it can run inside the viewport closure, like `draw_remap_card_glow`.
-pub(crate) fn draw_config_field_glow(ctx: &egui::Context, target: Option<(usize, String, usize)>) {
+/// `host` is the layer the overlay body renders in.
+pub(crate) fn draw_config_field_glow(
+    ctx: &egui::Context,
+    target: Option<(usize, String, usize)>,
+    host: egui::LayerId,
+) {
     let Some((inner_uid, elem, field_idx)) = target else { return };
     let field_rects: Option<(u64, Vec<egui::Rect>)> =
         ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner_uid, elem))));
@@ -489,7 +494,7 @@ pub(crate) fn draw_config_field_glow(ctx: &egui::Context, target: Option<(usize,
         .filter(|r| FlexInputApp::nav_ring_is_worth_drawing(r))
     {
         let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent);
+        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent, host);
     }
 }
 

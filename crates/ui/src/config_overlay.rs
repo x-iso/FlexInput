@@ -660,12 +660,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 // shared drawer is viewport-agnostic; run here so the ring appears
                 // over the overlay, not behind it in the main window).
                 if let Some((outer, inner, scope)) = &remap_glow {
-                    crate::app::draw_remap_card_glow(ui.ctx(), *outer, *inner, scope);
+                    crate::app::draw_remap_card_glow(ui.ctx(), *outer, *inner, scope, ui.layer_id());
                 }
 
                 // Value-field bloom ring (knob / min-max / range rows). nav draws
                 // this on the main window; redraw it here so it shows over the game.
-                crate::app::draw_config_field_glow(ui.ctx(), field_glow_target.clone());
+                crate::app::draw_config_field_glow(ui.ctx(), field_glow_target.clone(), ui.layer_id());
 
                 // Focus ring on the active pin (its input is passing through);
                 // brighter + larger while it's being edited, like Easy mode.
