@@ -376,6 +376,21 @@ fn show_input_section(
                 }
                 ui.add_space(CARD_GAP);
             }
+
+            // The gamepad selection moved: bring its target into view. The
+            // request indexes the targets as published, and this list draws
+            // first and in the same order, so an index past the targets pushed
+            // so far is an output card, which never scrolls.
+            let req = ui.ctx().data_mut(|d| {
+                d.remove_temp::<(u64, usize)>(crate::gamepad_nav::left_scroll_request_id())
+            });
+            if let Some((pass, i)) = req {
+                if ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 2 {
+                    if let Some(t) = nav_targets.get(i) {
+                        ui.scroll_to_rect(t.rect, None);
+                    }
+                }
+            }
         });
 
     // Paint scroll-edge fade shadows over the visible viewport when
@@ -670,11 +685,13 @@ fn input_card(
         let mut select_rect = top_rect;
         select_rect.max.y = port_rect.top();
         nav_targets.push(LeftNavTarget {
+            clip: viewport_clip,
             rect: select_rect,
             action: LeftNavAction::SelectInput { device_id: d.id.clone() },
         });
         if is_active && ports.names.len() > 1 {
             nav_targets.push(LeftNavTarget {
+                clip: viewport_clip,
                 rect: egui::Rect::from_x_y_ranges(top_rect.x_range(), port_rect.y_range()),
                 action: LeftNavAction::CycleInputPort { device_id: d.id.clone() },
             });
@@ -689,6 +706,7 @@ fn input_card(
                 let mut y = inner.top();
                 if has_dz {
                     nav_targets.push(LeftNavTarget {
+                        clip: viewport_clip,
                         rect: egui::Rect::from_min_size(
                             egui::pos2(inner.left(), y), egui::vec2(inner.width(), row_h)),
                         action: LeftNavAction::AdjustParam {
@@ -701,6 +719,7 @@ fn input_card(
                 }
                 if has_gy {
                     nav_targets.push(LeftNavTarget {
+                        clip: viewport_clip,
                         rect: egui::Rect::from_min_size(
                             egui::pos2(inner.left(), y), egui::vec2(inner.width(), row_h)),
                         action: LeftNavAction::AdjustParam {
@@ -715,6 +734,7 @@ fn input_card(
                 // triggers — otherwise it's forced-on & disabled).
                 if d.kind.has_analog_triggers() {
                     nav_targets.push(LeftNavTarget {
+                        clip: viewport_clip,
                         rect: egui::Rect::from_min_size(
                             egui::pos2(inner.left(), y + 2.0),
                             egui::vec2(inner.width(), row_h)),
@@ -726,6 +746,7 @@ fn input_card(
                 // which renders (forced/disabled or not) on every pad.
                 if has_touch_misc {
                     nav_targets.push(LeftNavTarget {
+                        clip: viewport_clip,
                         rect: egui::Rect::from_min_size(
                             egui::pos2(inner.left(), y + 2.0 + trigger_row_h),
                             egui::vec2(inner.width(), row_h)),
@@ -815,11 +836,13 @@ fn midi_input_card(
     select_rect.max.y = port_rect.top();
     nav_targets.push(crate::gamepad_nav::LeftNavTarget {
         rect: select_rect,
+        clip,
         action: crate::gamepad_nav::LeftNavAction::SelectInput { device_id: d.id.clone() },
     });
     if is_active && ports.names.len() > 1 {
         nav_targets.push(crate::gamepad_nav::LeftNavTarget {
             rect: egui::Rect::from_x_y_ranges(card_rect.x_range(), port_rect.y_range()),
+            clip,
             action: crate::gamepad_nav::LeftNavAction::CycleInputPort { device_id: d.id.clone() },
         });
     }
@@ -1301,7 +1324,7 @@ fn show_output_section(
             ui, canvas, shared_pool, default_collapsed, defaults, false, inner_w);
         // Nav target cycles the selector to the NEXT model (wrapping through
         // None) — a single actionable rect for the RS/gyro cursor.
-        nav_targets.push(LeftNavTarget { rect: sel_rect,
+        nav_targets.push(LeftNavTarget { rect: sel_rect, clip: ui.clip_rect(),
             action: LeftNavAction::CycleGamepadOutput });
         ui.add_space(PANEL_PADDING);
     });
@@ -1335,22 +1358,23 @@ fn show_output_section(
         let icon_col_w = OUTPUT_CARD_ICON_H + 16.0;
         let toggle_rect = egui::Rect::from_min_size(
             km_rect.min, egui::vec2(icon_col_w, km_rect.height()));
-        nav_targets.push(LeftNavTarget { rect: toggle_rect,
+        let clip = ui.clip_rect();
+        nav_targets.push(LeftNavTarget { rect: toggle_rect, clip,
             action: LeftNavAction::ToggleOutput { kind: KIND_KEYMOUSE.into() } });
         if let Some((km_node, ms_rect)) = ms_target {
-            nav_targets.push(LeftNavTarget { rect: ms_rect,
+            nav_targets.push(LeftNavTarget { rect: ms_rect, clip,
                 action: LeftNavAction::AdjustParam {
                     node: km_node, key: "mouse_sensitivity".into(),
                     lo: 0.0, hi: 3000.0, step: 0.5,
                     default: defaults.mouse_sensitivity, log: false,
                 } });
             if let Some(rect) = tp_rect {
-                nav_targets.push(LeftNavTarget { rect,
+                nav_targets.push(LeftNavTarget { rect, clip,
                     action: LeftNavAction::ToggleParam {
                         node: km_node, key: "route_touchpad".into() } });
             }
             if let Some(rect) = optical_rect {
-                nav_targets.push(LeftNavTarget { rect,
+                nav_targets.push(LeftNavTarget { rect, clip,
                     action: LeftNavAction::ToggleParam {
                         node: km_node, key: "route_optical_mouse".into() } });
             }

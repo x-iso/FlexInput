@@ -211,13 +211,35 @@ pub enum LeftNavAction {
 /// One navigable left-panel element: its screen rect + what activating it does.
 #[derive(Clone, Debug)]
 pub struct LeftNavTarget {
+    /// Where the layout put it. For a card scrolled out of the input list that
+    /// is outside the list — over the output section, or above the panel.
     pub rect: egui::Rect,
+    /// What it is seen through: the input list's viewport for the cards in it.
+    /// Targets sharing a clip share a scroll container.
+    pub clip: egui::Rect,
     pub action: LeftNavAction,
+}
+
+impl LeftNavTarget {
+    /// The part on screen, for the cursor to hit and the glow to cover.
+    pub fn visible_rect(&self) -> egui::Rect {
+        self.rect.intersect(self.clip)
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible_rect().is_positive()
+    }
 }
 
 /// ctx-temp id under which `io_panel` publishes `(pass_nr, Vec<LeftNavTarget>)`.
 pub fn left_targets_id() -> egui::Id {
     egui::Id::new("gp_nav_left_targets")
+}
+
+/// ctx-temp id under which the nav driver asks the input list to bring a
+/// target into view: `(pass_nr, index into the published targets)`.
+pub fn left_scroll_request_id() -> egui::Id {
+    egui::Id::new("gp_nav_left_scroll_to")
 }
 
 /// What the Touch Zones / Virtual Menu FIELD nav currently has focused. The
@@ -356,6 +378,10 @@ pub struct GamepadNav {
     /// the left panel and LS/D-pad move between its targets; `None` means focus
     /// is on the sub-patch (or nothing). Independent of the RS/gyro cursor.
     pub left_selected: Option<usize>,
+    /// The `left_selected` the input list was last asked to scroll to. The ask
+    /// goes out once per selection change, so a selection left where it is
+    /// doesn't pin the list against the mouse wheel.
+    pub left_scrolled_to: Option<usize>,
     /// The device card the left panel's cursor or selection is on, when West
     /// would Calibrate Gyro on it (the pad streams a gyro and has a device
     /// node). Set each frame by the left-panel driver, read by the legend.
@@ -563,6 +589,7 @@ impl Default for GamepadNav {
             prev_rt: false,
             left_edit: None,
             left_selected: None,
+            left_scrolled_to: None,
             left_gyro_card: None,
             config_index: None,
             config_nav_sel: None,
@@ -889,8 +916,10 @@ pub fn nearest_in_dir(
 /// Spatial neighbour-finding for the left I/O panel: from `cur` (an index into
 /// `targets`), pick the nearest target in screen direction `dir` using each
 /// target's rect centre. Mirrors `nearest_in_dir`'s primary-axis + penalised-
-/// cross scoring, but over screen rects. With `cur = None`, seeds at the
-/// top-left-most target. `None` when nothing lies in the pressed direction.
+/// cross scoring, but over screen rects, and stays inside `cur`'s scroll
+/// container while it has anything in that direction. With `cur = None`, seeds
+/// at the top-left-most visible target. `None` when nothing lies in the pressed
+/// direction.
 pub fn nearest_target_rect_in_dir(
     targets: &[LeftNavTarget],
     cur: Option<usize>,
@@ -902,10 +931,12 @@ pub fn nearest_target_rect_in_dir(
     let cur = match cur.filter(|&i| i < targets.len()) {
         Some(i) => i,
         None => {
-            // No selection → top-left-most target.
+            // No selection → top-left-most target on screen (not the top of a
+            // list that has been scrolled past it).
             return targets
                 .iter()
                 .enumerate()
+                .filter(|(_, t)| t.is_visible())
                 .min_by(|(_, a), (_, b)| {
                     let ca = a.rect.center();
                     let cb = b.rect.center();
@@ -918,29 +949,42 @@ pub fn nearest_target_rect_in_dir(
     };
 
     let c = targets[cur].rect.center();
-    let mut best: Option<(usize, f32)> = None;
-    for (i, t) in targets.iter().enumerate() {
-        if i == cur {
-            continue;
+    let home = targets[cur].clip;
+    // Best (index, score) in `dir` among the targets `admit` lets through.
+    let best_where = |admit: &dyn Fn(&LeftNavTarget) -> bool| {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, t) in targets.iter().enumerate() {
+            if i == cur || !admit(t) {
+                continue;
+            }
+            let o = t.rect.center();
+            let dx = o.x - c.x;
+            let dy = o.y - c.y;
+            let (primary, cross) = match dir {
+                NavDir::Right => (dx, dy),
+                NavDir::Left => (-dx, dy),
+                NavDir::Down => (dy, dx),
+                NavDir::Up => (-dy, dx),
+            };
+            if primary <= 0.0 {
+                continue;
+            }
+            let score = primary + 2.0 * cross.abs();
+            if best.map(|(_, s)| score < s).unwrap_or(true) {
+                best = Some((i, score));
+            }
         }
-        let o = t.rect.center();
-        let dx = o.x - c.x;
-        let dy = o.y - c.y;
-        let (primary, cross) = match dir {
-            NavDir::Right => (dx, dy),
-            NavDir::Left => (-dx, dy),
-            NavDir::Down => (dy, dx),
-            NavDir::Up => (-dy, dx),
-        };
-        if primary <= 0.0 {
-            continue;
-        }
-        let score = primary + 2.0 * cross.abs();
-        if best.map(|(_, s)| score < s).unwrap_or(true) {
-            best = Some((i, score));
-        }
-    }
-    best.map(|(i, _)| i)
+        best.map(|(i, _)| i)
+    };
+    // Its own scroll container first, scrolled-out targets included: stepping
+    // onto one scrolls it in. Centres alone would leave the input list early —
+    // the next card's centre sits deep inside it, often further down than the
+    // output card under the list — so the whole list is walked before leaving.
+    // Elsewhere only what is on screen: a card scrolled out of the list is
+    // still laid out over the output cards, and from there it would pass for
+    // the nearest thing above.
+    best_where(&|t| t.clip == home)
+        .or_else(|| best_where(&|t| t.clip != home && t.is_visible()))
 }
 
 /// Map a left-stick vector to a dominant direction once it clears the
@@ -1098,6 +1142,83 @@ mod nav_switch_tests {
             vec![("gilrs:pad:0".to_string(), true), ("gilrs:pad:1".to_string(), false)]
         );
         assert!(drain_nav_toggles().is_empty(), "drained once, not twice");
+    }
+}
+
+#[cfg(test)]
+mod left_nav_tests {
+    use super::*;
+
+    /// The Easy panel's shape: an input list scrolling in y 40..500, the
+    /// output cards fixed below it.
+    fn list() -> egui::Rect { egui::Rect::from_x_y_ranges(0.0..=300.0, 40.0..=500.0) }
+    fn outputs() -> egui::Rect { egui::Rect::from_x_y_ranges(0.0..=300.0, 500.0..=800.0) }
+
+    fn target(y0: f32, y1: f32, clip: egui::Rect) -> LeftNavTarget {
+        LeftNavTarget {
+            rect: egui::Rect::from_x_y_ranges(10.0..=290.0, y0..=y1),
+            clip,
+            action: LeftNavAction::CycleGamepadOutput,
+        }
+    }
+
+    /// Cards 0-1 on screen, 2 cut by the list's bottom edge, 3 scrolled out —
+    /// laid out over the output cards, as the real layout does.
+    fn panel() -> Vec<LeftNavTarget> {
+        vec![
+            target(50.0, 130.0, list()),
+            target(240.0, 320.0, list()),
+            target(430.0, 510.0, list()),
+            target(620.0, 700.0, list()),
+            target(520.0, 640.0, outputs()), // gamepad output
+            target(650.0, 770.0, outputs()), // keyboard & mouse
+        ]
+    }
+
+    /// The report: Down has to carry on down the list, onto the card scrolled
+    /// out of it, not jump to the output card whose centre happens to be nearer.
+    #[test]
+    fn down_walks_the_list_before_leaving_it() {
+        assert_eq!(nearest_target_rect_in_dir(&panel(), Some(2), NavDir::Down), Some(3));
+    }
+
+    /// Once the last card has been scrolled in, Down leaves for the outputs.
+    #[test]
+    fn down_from_the_last_card_reaches_the_outputs() {
+        let mut p = panel();
+        for t in &mut p[..4] {
+            t.rect = t.rect.translate(egui::vec2(0.0, -220.0));
+        }
+        assert_eq!(nearest_target_rect_in_dir(&p, Some(3), NavDir::Down), Some(4));
+    }
+
+    /// A card scrolled out of the list lies over the output cards; from there
+    /// it must not pass for the nearest thing above.
+    #[test]
+    fn a_scrolled_out_card_is_not_reachable_from_the_outputs() {
+        let p = panel();
+        assert_eq!(nearest_target_rect_in_dir(&p, Some(5), NavDir::Up), Some(4));
+        assert_eq!(nearest_target_rect_in_dir(&p, Some(4), NavDir::Up), Some(2));
+    }
+
+    /// Entering the panel seeds on what is on screen, not on the top of a list
+    /// that has been scrolled past it.
+    #[test]
+    fn entering_seeds_on_the_top_visible_target() {
+        let mut p = panel();
+        for t in &mut p[..4] {
+            t.rect = t.rect.translate(egui::vec2(0.0, -380.0));
+        }
+        assert_eq!(nearest_target_rect_in_dir(&p, None, NavDir::Left), Some(2));
+    }
+
+    /// The cursor and the glow only get the part on screen.
+    #[test]
+    fn only_the_part_on_screen_is_visible() {
+        let p = panel();
+        assert_eq!(p[2].visible_rect().max.y, 500.0);
+        assert!(!p[3].is_visible());
+        assert!(!p[3].visible_rect().contains(egui::pos2(150.0, 660.0)));
     }
 }
 

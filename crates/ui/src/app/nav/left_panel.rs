@@ -38,16 +38,22 @@ impl FlexInputApp {
         // interior, so the slider/checkbox underneath stays fully visible while
         // editing. The bloom is concentric outside-strokes with falling alpha (a
         // true outward gradient). `editing` brightens + widens it.
-        let glow = |rect: egui::Rect, editing: bool| {
+        let glow = |t: &gn::LeftNavTarget, editing: bool| {
+            if !t.is_visible() { return; }
             let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-            let painter = ctx.layer_painter(egui::LayerId::new(
+            let mut painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground, egui::Id::new("gp_nav_left_glow")));
+            // Partly scrolled out: crop at the list's edge rather than draw the
+            // missing part over the header or the output cards.
+            if !t.clip.contains_rect(t.rect) {
+                painter = painter.with_clip_rect(t.clip);
+            }
             // Outward bloom: a handful of expanding rings fading to transparent,
             // plus a crisp edge ring. Thicker + brighter while editing.
             let max_grow = if editing { 9.0 } else { 6.0 };
             let peak = if editing { 150.0 } else { 90.0 };
             crate::widgets::paint_nav_bloom(
-                &painter, rect, accent, 10.0, peak, max_grow, 7, 2.0, 1.0,
+                &painter, t.rect, accent, 10.0, peak, max_grow, 7, 2.0, 1.0,
                 if editing { 2.0 } else { 1.25 });
         };
 
@@ -109,7 +115,7 @@ impl FlexInputApp {
             if let Some(t) = targets.iter().find(|t| matches!(&t.action,
                 LeftNavAction::AdjustParam { node: n, key: k, .. } if *n == node && *k == key))
             {
-                glow(t.rect, true);
+                glow(t, true);
             }
             let _ = (rt_rising, step);
             return true;
@@ -120,21 +126,24 @@ impl FlexInputApp {
         // and let sub-patch navigation run.
         if self.easy_left_panel_collapsed || targets.is_empty() {
             self.gamepad_nav.left_selected = None;
+            self.gamepad_nav.left_scrolled_to = None;
             return false;
         }
 
         // RS/gyro cursor: top-most target under the cursor (glow it so the user
         // sees what South/RT will act on). `enumerate().rev()` so a later
-        // (top-most) target wins overlaps; we keep the index.
+        // (top-most) target wins overlaps; we keep the index. Only the part on
+        // screen counts: a card scrolled out of the list still has its rect
+        // laid out over the output cards.
         let cursor_hit: Option<usize> = if self.gamepad_nav.cursor_visible {
             let cursor = self.gamepad_nav.cursor_pos;
             targets.iter().enumerate().rev()
-                .find(|(_, t)| t.rect.contains(cursor)).map(|(i, _)| i)
+                .find(|(_, t)| t.visible_rect().contains(cursor)).map(|(i, _)| i)
         } else {
             None
         };
         if let Some(ci) = cursor_hit {
-            glow(targets[ci].rect, false);
+            glow(&targets[ci], false);
         }
 
         // LS/D-pad selection movement — only while focus lives in the panel.
@@ -181,8 +190,18 @@ impl FlexInputApp {
                 }
             }
             if let Some(s) = self.gamepad_nav.left_selected {
-                if let Some(t) = targets.get(s) { glow(t.rect, false); }
+                // Stepping onto a card the input list has scrolled past has to
+                // scroll it in, or the selection walks off the bottom with
+                // nothing on screen to show where it went.
+                if self.gamepad_nav.left_scrolled_to != Some(s) {
+                    self.gamepad_nav.left_scrolled_to = Some(s);
+                    let pass = ctx.cumulative_pass_nr();
+                    ctx.data_mut(|d| d.insert_temp(gn::left_scroll_request_id(), (pass, s)));
+                }
+                if let Some(t) = targets.get(s) { glow(t, false); }
             }
+        } else {
+            self.gamepad_nav.left_scrolled_to = None;
         }
 
         // The device card under the cursor (else the selection), if West can
