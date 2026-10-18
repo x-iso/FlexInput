@@ -59,6 +59,10 @@ pub struct JsmState {
     gen: u64,
     cfg: Compiled,
     rt: Runtime,
+    /// Layers switched away from while a press of theirs was under way, each
+    /// finishing those presses on its own bindings — JSM keeps a press's
+    /// mapping until the button lets go. Dropped once done (`Runtime::finished`).
+    retired: Vec<Retired>,
     /// Triggers and sticks turned into JSM's buttons.
     analog: Analog,
     /// The gyro and the aiming sticks, turned into mouse movement.
@@ -97,6 +101,15 @@ pub struct JsmState {
     ever_claimed: HashSet<String>,
     /// The touchpad's last MIDI position, kept while no finger is down.
     midi_touch: (f32, f32),
+}
+
+/// A layer switched away from, finishing the presses it had under way.
+struct Retired {
+    cfg: Compiled,
+    rt: Runtime,
+    /// The buttons whose press it is finishing. One leaves when it lets go:
+    /// pressed again, it is the running layer's.
+    owned: HashSet<Btn>,
 }
 
 /// Evaluate one JSM Config node.
@@ -234,6 +247,7 @@ pub(crate) fn jsm_publish(
             midi_touch: (0.0, 0.0),
             cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
+            retired: Vec::new(),
             analog: Analog::default(),
             aim: Aim::default(),
             pad: PadOut::default(),
@@ -249,6 +263,7 @@ pub(crate) fn jsm_publish(
         st.layer = selected.clone();
         st.cfg = super::parse::compile_full(&text, &tabs, &ports);
         st.rt = Runtime::default();
+        st.retired.clear();
         st.sticky.clear();
         st.analog = Analog::default();
         st.aim = Aim::default();
@@ -319,8 +334,27 @@ pub(crate) fn jsm_publish(
         _ => false,
     };
     // Cloned so the runtime can be asked, below, which button holds which pin.
-    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only).clone();
+    let mut outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only).clone();
     let held_by = st.rt.held_by();
+    // The layers switched away from finish their presses alongside: each sees
+    // only the buttons it is finishing, until each lets go. What they fire is
+    // this tick's as much as the running layer's — a tap on release, a hold, a
+    // switch back on release (`L3 = PS_L3' "Base.txt"/`).
+    for r in &mut st.retired {
+        let timings = super::parse::resolve_with(&r.cfg, &[], r.rt.chords()).timings;
+        let owned = &r.owned;
+        let down = |b: Btn| owned.contains(&b) && held(b);
+        let done = r.rt.tick(&r.cfg, &timings, dt, &down, &chord_only);
+        outputs.pins.extend(done.pins.iter().cloned());
+        outputs.gyro.extend(done.gyro.iter().copied());
+        outputs.commands.extend(done.commands.iter().cloned());
+        outputs.settings.extend(done.settings.iter().cloned());
+        outputs.rumble = outputs.rumble.or(done.rumble);
+        outputs.layer = outputs.layer.take().or_else(|| done.layer.clone());
+        outputs.reset |= done.reset;
+        r.owned.retain(|&b| held(b));
+    }
+    st.retired.retain(|r| !r.owned.is_empty() || !r.rt.finished());
     let driven: Vec<String> = outputs.pins.iter().cloned().collect();
     let gyro_actions = outputs.gyro.clone();
     let recentre = outputs
@@ -762,9 +796,11 @@ pub(crate) fn jsm_publish(
     // first would leave whatever it was holding latched on the bus, which is the
     // stuck-key bug in a different coat.
     //
-    // A switch recompiles from the new tab and starts it clean: JSM loading a config
-    // replaces the mappings outright, so a press held across the switch does not
-    // carry over. `RESET_MAPPINGS` goes back to the tab the editor has open.
+    // A switch recompiles from the new tab and starts it clean — except for the
+    // presses under way: JSM keeps a press's mapping until its button lets go,
+    // so the old layer is kept to finish them (its tap on release, say), and the
+    // new one takes those buttons as already down rather than as fresh presses
+    // of its own. `RESET_MAPPINGS` goes back to the tab the editor has open.
     let want = if reset {
         Some(selected.clone())
     } else {
@@ -773,8 +809,20 @@ pub(crate) fn jsm_publish(
     if let Some(layer) = want {
         if reset || tabs.iter().any(|(n, _)| *n == layer) {
             st.layer = layer.clone();
-            st.cfg = super::parse::compile_full(&text_for(&layer), &tabs, &ports);
-            st.rt = Runtime::default();
+            let cfg = super::parse::compile_full(&text_for(&layer), &tabs, &ports);
+            let held_now = st.rt.held_buttons();
+            let rt = Runtime::continuing(&cfg, &held_now, st.rt.chords());
+            let mut old = Retired {
+                cfg: std::mem::replace(&mut st.cfg, cfg),
+                rt: std::mem::replace(&mut st.rt, rt),
+                owned: held_now.into_iter().collect(),
+            };
+            old.rt.retire();
+            // A chain of quick switches keeps a few; past that the oldest goes.
+            if st.retired.len() >= 4 {
+                st.retired.remove(0);
+            }
+            st.retired.push(old);
             st.sticky.clear();
             st.analog = Analog::default();
             st.aim = Aim::default();

@@ -158,6 +158,56 @@ impl Runtime {
         out
     }
 
+    /// The runtime for a layer switched to while `held` were down (`chords`
+    /// being the old runtime's stack, oldest first).
+    ///
+    /// JSM keeps a press's mapping until the button lets go, so a press that
+    /// switched layers — `L3 = PS_L3' "L3.txt"\` — still taps PS_L3 on release:
+    /// the old layer's runtime finishes it (`retire`). This one must not see
+    /// those buttons go down as fresh presses of its own, so they start here as
+    /// already down; letting go of one is nothing, and the next press is this
+    /// layer's. The ones this layer holds as chords stack as chords, so a held
+    /// layer button can still shift the layer it switched to.
+    pub fn continuing(cfg: &Compiled, held: &[Btn], chords: &[Btn]) -> Runtime {
+        let mut rt = Runtime::default();
+        for &b in held {
+            rt.buttons.entry(b).or_default().down = true;
+        }
+        let order = chords.iter().chain(held.iter()).copied();
+        for b in order {
+            if held.contains(&b) && is_chord_button(cfg, b) && !rt.chords.contains(&b) {
+                rt.chords.push(b);
+            }
+        }
+        rt
+    }
+
+    /// The buttons down right now.
+    pub fn held_buttons(&self) -> Vec<Btn> {
+        let mut v: Vec<Btn> = self.buttons.iter().filter(|(_, r)| r.down).map(|(b, _)| *b).collect();
+        v.sort_by_key(|b| b.name());
+        v
+    }
+
+    /// This layer has been switched away from: it only finishes the presses
+    /// already under way (their releases, taps and holds) and lets its timed
+    /// pins run out. A toggle it left on goes off now, as it did when a switch
+    /// threw the whole runtime away.
+    pub fn retire(&mut self) {
+        self.toggles.clear();
+    }
+
+    /// Nothing left for a retired layer to do: no press under way, no tap
+    /// waiting on a double press or running out its time, no pair waiting.
+    pub fn finished(&self) -> bool {
+        self.presses.iter().all(|p| p.ended)
+            && self.timed.is_empty()
+            && self.toggles.is_empty()
+            && self.buttons.values().all(|r| {
+                r.pending_tap.is_none() && !matches!(r.role, Role::WaitSim { .. })
+            })
+    }
+
     /// Start the clock this far in, for a test of a long session without
     /// ticking through it.
     #[cfg(test)]

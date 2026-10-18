@@ -105,6 +105,17 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **JSM: a press that switches tabs still taps.** `L3 = PS_L3' "L3.txt"\`
+  switches on the press, and switching threw the press away, so its tap never
+  came — and the new tab took the still-held L3 for a press of its own, firing
+  that tab's binding on release instead (`L3 = PS_L3' "Base.txt"/` there sent
+  you straight back). A tap that switched on release (`"Base.txt"/`) lasted a
+  single tick, too short for a game to see. Now, as in JSM, a press keeps the
+  binding it started with until its button lets go: the tab it started on
+  finishes it — tap, hold, release — and the next press is the new tab's. A
+  key held across a switch stays down until its button is released, then goes
+  up.
+
 - **JSM: `GYRO_OFF` and the other gyro actions work as binding outputs.** Bound
   to a button (`S = GYRO_OFF`), they lasted a single tick — the gyro blinked off
   and straight back on. They now last as a key would: while the button is held,

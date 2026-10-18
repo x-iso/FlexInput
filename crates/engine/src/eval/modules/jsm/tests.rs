@@ -4455,6 +4455,64 @@ fn run_tabs(
     seen
 }
 
+/// A press that switches layers is finished by the layer it started in, as JSM
+/// keeps a press's mapping until the button lets go: `L3 = Q' "L3.txt"\`
+/// switches on the press and still taps Q on release. The layer switched to
+/// takes the held button as already down, not as a press of its own; its own
+/// binding is the next press's — which taps W and switches back on release.
+#[test]
+fn a_press_that_switches_layers_finishes_on_the_layer_it_started_in() {
+    let _guard = alone();
+    let uid = 5151;
+    let snap = tabbed_snap(uid, &[
+        ("Base", "L3 = Q' \"L3.txt\"\\\nS = R"),
+        ("L3", "L3 = W' \"Base.txt\"/\nS = E"),
+    ]);
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    // Every key seen down over `ticks` with `held` held.
+    let mut run = |held: &[&str], ticks: usize| {
+        let mut dev: SigMap = SigMap::default();
+        for pin in held {
+            dev.insert((PAD.to_string(), pin.to_string()), Signal::Bool(true));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..ticks {
+            let mut collector: SigMap = SigMap::default();
+            super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+            seen.extend(
+                collector
+                    .iter()
+                    .filter(|((_, p), v)| p.starts_with("key_") && v.as_bool())
+                    .map(|((_, p), _)| p.clone()),
+            );
+        }
+        seen
+    };
+    assert!(run(&["btn_south"], 3).contains("key_r"), "starts on Base");
+    run(&[], 3);
+
+    // Tap L3 on Base: the press switches to L3, the release still taps Q.
+    run(&["btn_ls"], 5);
+    let after = run(&[], 10);
+    assert!(after.contains("key_q"), "Base's tap fires on release: {after:?}");
+    assert!(!after.contains("key_w"), "the held L3 wasn't a press on the L3 layer: {after:?}");
+    assert!(run(&["btn_south"], 3).contains("key_e"), "and the L3 layer is running");
+    run(&[], 3);
+
+    // Tap L3 on the L3 layer: W on release, and back to Base.
+    run(&["btn_ls"], 5);
+    let after = run(&[], 10);
+    assert!(after.contains("key_w"), "the L3 layer's tap fires as it switches back: {after:?}");
+    assert!(run(&["btn_south"], 3).contains("key_r"), "back on Base");
+    run(&[], 3);
+
+    // Held past the hold time, it is no tap: no Q, but still on the L3 layer.
+    run(&["btn_ls"], 30);
+    let after = run(&[], 10);
+    assert!(!after.contains("key_q"), "a held press doesn't tap: {after:?}");
+    assert!(run(&["btn_south"], 3).contains("key_e"), "switched on the press all the same");
+}
+
 /// A tab is named by its file name alone, whatever path a JSM config used.
 #[test]
 fn a_tab_is_named_by_its_file_name_alone() {
@@ -4497,7 +4555,9 @@ fn a_binding_can_switch_to_another_tab() {
 
 /// Switching layers must release whatever the old one was driving. This is the
 /// stuck-key bug in a different coat: a key held when the layer changes has no
-/// binding left to release it.
+/// binding left to release it. The old layer finishes the press — JSM keeps a
+/// press's mapping until its button lets go — so the key stays down while S
+/// does, and goes up with it.
 #[test]
 fn switching_layers_does_not_leave_a_key_held() {
     let _guard = alone();
@@ -4528,13 +4588,16 @@ fn switching_layers_does_not_leave_a_key_held() {
         collector.clear();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
     }
-    let a = collector
-        .get(&(format!("collector:{uid}"), "key_a".to_string()))
-        .map(|s| s.as_bool());
-    assert!(
-        a != Some(true),
-        "the key the old layer was holding is not left down: {a:?}"
-    );
+    let a = |c: &SigMap| c.get(&(format!("collector:{uid}"), "key_a".to_string())).map(|s| s.as_bool());
+    assert_eq!(a(&collector), Some(true), "S's press still holds A, on the layer it started in");
+
+    // Let go of S: A goes up, although the running layer has no binding for S.
+    dev.remove(&(PAD.to_string(), "btn_south".to_string()));
+    for _ in 0..5 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert!(a(&collector) != Some(true), "the key the old layer was holding is not left down: {:?}", a(&collector));
 }
 
 /// `RESET_MAPPINGS` bound to a button puts the module back on the tab the editor
@@ -4751,8 +4814,14 @@ fn switching_layers_publishes_the_old_layers_keys_as_released() {
     }
     assert_eq!(collector.get(&key).map(|s| s.as_bool()), Some(true), "A starts held");
 
-    // Switch with S still held, then run on for a while.
+    // Switch with S still held — its press finishes on the old layer, A held
+    // while S is — then let go of S and run on for a while.
     dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    dev.remove(&(PAD.to_string(), "btn_south".to_string()));
     for _ in 0..6 {
         collector.clear();
         super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
