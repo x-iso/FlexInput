@@ -96,6 +96,9 @@ pub struct Outputs {
     pub gyro: HashSet<GyroAction>,
     /// Console commands fired this tick (phase 8 runs them).
     pub commands: Vec<String>,
+    /// Quoted settings fired this tick (`S = "GYRO_SENS = 2"`), as (name, value),
+    /// in the order they fired. `eval.rs` keeps them in force from then on.
+    pub settings: Vec<(String, String)>,
     /// Rumble asked for by a binding, as (strong, weak) — phase 7 sends it.
     pub rumble: Option<(f32, f32)>,
     /// A binding asked to switch to this tab (JSM: load that config file).
@@ -455,55 +458,65 @@ impl Runtime {
             // `Out::Midi` never gets here: compiling settles each one into the
             // `Out::Pin` it plays (`parse::settle_midi`).
             Out::None | Out::Unsupported { .. } | Out::Midi(_) => {}
-            Out::Gyro(g) => { self.out.gyro.insert(*g); }
+            // Held, tapped and toggled exactly as a key is, under its reserved
+            // pin — see `GyroAction::pin`. Asserted only on the tick it fired, a
+            // `GYRO_OFF` binding switched the gyro off for one tick.
+            Out::Gyro(g) => self.hold_pin(action, &g.pin(), event, press, true),
             Out::Calibrate => {}
             Out::Command(c) => self.out.commands.push(c.clone()),
+            Out::Set { name, value } => self.out.settings.push((name.clone(), value.clone())),
             // Both are acted on by `eval.rs`, which owns the tab the module runs
             // and the state a reset throws away.
             Out::Layer(tab) => self.out.layer = Some(tab.clone()),
             Out::Reset => self.out.reset = true,
             Out::Rumble { strong, weak } => self.out.rumble = Some((*strong, *weak)),
             Out::Pulse(pin) => self.timed.push(Timed { pin: pin.clone(), until: self.t + TAP_HOLD }),
-            Out::Pin(pin) | Out::Bend { pin, .. } => match action {
-                ActionMod::Toggle => {
-                    if !self.toggles.remove(pin) { self.toggles.insert(pin.clone()); }
-                }
-                ActionMod::Instant => {
-                    self.timed.push(Timed { pin: pin.clone(), until: self.t + INSTANT_HOLD });
-                }
-                ActionMod::Release => {
-                    self.toggles.remove(pin);
-                    self.held.remove(pin);
-                    self.timed.retain(|t| &t.pin != pin);
-                }
-                ActionMod::None => match event {
-                    // Held until the button lets go.
-                    EventMod::Start | EventMod::Hold => {
-                        *self.held.entry(pin.clone()).or_insert(0) += 1;
-                        if let Some(i) = press {
-                            if let Some(p) = self.presses.get_mut(i) { p.held.push(pin.clone()); }
-                        }
+            Out::Pin(pin) | Out::Bend { pin, .. } => self.hold_pin(action, pin, event, press, false),
+        }
+    }
+
+    /// Drive `pin` the way `action` and `event` say. `long_tap` is JSM's rule for
+    /// gyro actions and calibration: a tap of one lasts much longer than a key's.
+    fn hold_pin(&mut self, action: ActionMod, pin: &String, event: EventMod, press: Option<usize>, long_tap: bool) {
+        match action {
+            ActionMod::Toggle => {
+                if !self.toggles.remove(pin) { self.toggles.insert(pin.clone()); }
+            }
+            ActionMod::Instant => {
+                self.timed.push(Timed { pin: pin.clone(), until: self.t + INSTANT_HOLD });
+            }
+            ActionMod::Release => {
+                self.toggles.remove(pin);
+                self.held.remove(pin);
+                self.timed.retain(|t| &t.pin != pin);
+            }
+            ActionMod::None => match event {
+                // Held until the button lets go.
+                EventMod::Start | EventMod::Hold => {
+                    *self.held.entry(pin.clone()).or_insert(0) += 1;
+                    if let Some(i) = press {
+                        if let Some(p) = self.presses.get_mut(i) { p.held.push(pin.clone()); }
                     }
-                    // A tap is a short press of its own; gyro actions and
-                    // calibration hold much longer, which is JSM's own rule.
-                    EventMod::Tap | EventMod::Turbo => {
-                        let hold = if matches!(out, Out::Gyro(_) | Out::Calibrate) {
-                            EXTENDED_TAP_HOLD
-                        } else {
-                            TAP_HOLD
-                        };
-                        self.timed.push(Timed { pin: pin.clone(), until: self.t + hold });
-                    }
-                    EventMod::Release => {}
-                },
+                }
+                // A tap is a short press of its own (see `long_tap`).
+                EventMod::Tap | EventMod::Turbo => {
+                    let hold = if long_tap { EXTENDED_TAP_HOLD } else { TAP_HOLD };
+                    self.timed.push(Timed { pin: pin.clone(), until: self.t + hold });
+                }
+                EventMod::Release => {}
             },
         }
     }
 
     fn compose(&mut self) {
-        for pin in self.held.keys() { self.out.pins.insert(pin.clone()); }
-        for t in &self.timed { self.out.pins.insert(t.pin.clone()); }
-        for pin in &self.toggles { self.out.pins.insert(pin.clone()); }
+        let held = self.held.keys().chain(self.timed.iter().map(|t| &t.pin)).chain(self.toggles.iter());
+        for pin in held {
+            // A gyro action's reserved pin comes out as the action, never as a pin.
+            match GyroAction::from_pin(pin) {
+                Some(g) => { self.out.gyro.insert(g); }
+                None => { self.out.pins.insert(pin.clone()); }
+            }
+        }
     }
 }
 

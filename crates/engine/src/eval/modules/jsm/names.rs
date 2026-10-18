@@ -316,6 +316,10 @@ pub enum Out {
     Rumble { strong: f32, weak: f32 },
     /// A console command in quotes, run when the event fires.
     Command(String),
+    /// A quoted setting (`S = "GYRO_SENS = 2"`): a console command that changes
+    /// that setting from then on, as typing it into JSM's console would — until
+    /// `RESET_MAPPINGS`, a layer switch or an edit puts the config back.
+    Set { name: String, value: String },
     /// Switch to another config — JSM loads a file, we switch to the tab of that
     /// name. This is how a JSM config does action layers.
     Layer(String),
@@ -340,6 +344,31 @@ pub enum Out {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum GyroAction { On, Off, Invert, InvertX, InvertY, Trackball, TrackballX, TrackballY }
+
+/// What a gyro action is held under inside the press machinery. A gyro action
+/// lasts exactly as a key would — while its button is held, for a tap's length,
+/// until a toggle is pressed again — so it rides the same held/tap/toggle
+/// bookkeeping as a pin, under a name no bus pin has, and comes out as a gyro
+/// action rather than a pin (`bind.rs`, `compose`).
+const GYRO_PIN_PREFIX: &str = "__jsm_gyro:";
+
+impl GyroAction {
+    const ALL: [GyroAction; 8] = [
+        GyroAction::On, GyroAction::Off, GyroAction::Invert, GyroAction::InvertX,
+        GyroAction::InvertY, GyroAction::Trackball, GyroAction::TrackballX, GyroAction::TrackballY,
+    ];
+
+    /// The reserved pin this action is held under.
+    pub fn pin(self) -> String {
+        format!("{GYRO_PIN_PREFIX}{self:?}")
+    }
+
+    /// The action a reserved pin holds, or `None` for an ordinary pin.
+    pub fn from_pin(pin: &str) -> Option<GyroAction> {
+        let name = pin.strip_prefix(GYRO_PIN_PREFIX)?;
+        Self::ALL.into_iter().find(|g| format!("{g:?}") == name)
+    }
+}
 
 /// Why a name JSM accepts isn't live here.
 const WHY_NUMPAD: &str = "numpad keys need HID usages our keyboard sink doesn't send yet";

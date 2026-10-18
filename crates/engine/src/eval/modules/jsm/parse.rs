@@ -141,7 +141,16 @@ pub struct Resolved {
 /// press machinery stacks them. JSM resolves each setting against the stack from
 /// the newest chord down, taking the first that has something to say, so applying
 /// them oldest-first and letting later ones overwrite comes to the same thing.
+#[cfg(test)]
 pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
+    resolve_with(cfg, &[], chords)
+}
+
+/// [`resolve`], with the settings buttons have changed by command (`S = "GYRO_SENS
+/// = 2"`) applied first, in the order they were fired. A console command changes
+/// the base setting, so a chord held on top still has the last word — the order
+/// JSM's own console and modeshifts come in.
+pub fn resolve_with(cfg: &Compiled, sticky: &[(String, String)], chords: &[Btn]) -> Resolved {
     let mut r = Resolved {
         timings: cfg.timings,
         settings: cfg.settings,
@@ -154,6 +163,25 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         midi: cfg.midi,
         stick_mode_chorded: [false; 2],
     };
+    for (name, value) in sticky {
+        let Some(support) = setting_support(name) else { continue };
+        apply_setting(
+            name,
+            value,
+            support,
+            Knobs {
+                timings: &mut r.timings,
+                settings: &mut r.settings,
+                aim: &mut r.aim,
+                pad: &mut r.pad,
+                motion: &mut r.motion,
+                touch: &mut r.touch,
+                fb: &mut r.fb,
+                cc: &mut r.cc,
+                midi: &mut r.midi,
+            },
+        );
+    }
     if cfg.modeshifts.is_empty() {
         return r;
     }
@@ -739,10 +767,46 @@ pub(crate) fn command_does_nothing(name: &str) -> Option<&'static str> {
             "it is a JSM console command with nothing to do here"
         }
         // Anything else is a name JSM would print or refuse; say so plainly.
+        // A setting this module knows but doesn't run (a later phase's, or one
+        // that is deliberately someone else's job) is still a setting.
+        cmd if cmd.split_once('=').is_some_and(|(n, _)| setting_support(n.trim()).is_some()) => {
+            "that setting isn't live here, so setting it from a button does nothing either"
+        }
         _ => "it is not a command this module runs",
     })
 }
 
+
+/// A quoted command that sets a setting (`"GYRO_SENS = 2"`, `"RIGHT_STICK_MODE =
+/// AIM"`): JSM runs any console command from a button, and a setting line is one.
+/// `Some(Ok((name, value)))` when it is a live setting with a good value — checked
+/// now, by compiling it as a line of its own, so a bad value is an error on the
+/// binding rather than a button that silently does nothing. `Some(Err)` when the
+/// value is wrong, and `None` when it isn't a setting this module runs (it then
+/// stays a command, and the line says it does nothing and why).
+fn bound_setting(cmd: &str) -> Option<Result<(String, String), String>> {
+    let (name, value) = cmd.split_once('=')?;
+    let name = name.trim().to_ascii_uppercase();
+    let value = value.trim().to_string();
+    let support = setting_support(&name)?;
+    // A channel decides which pin a MIDI name IS; changing it with notes held
+    // would start one on one channel and stop it on another — the rule a
+    // modeshift follows, for the same reason.
+    if let Support::Midi(which) = support {
+        if !which.chordable() {
+            return Some(Err(format!(
+                "`{name}` can't be changed by a button — a note started on one channel has to \
+                 stop on it"
+            )));
+        }
+    }
+    let line = format!("{name} = {value}");
+    match compile_with(&line, &[]).lines.into_iter().next().map(|l| l.status) {
+        Some(LineStatus::Ok) => Some(Ok((name, value))),
+        Some(LineStatus::Error(why)) => Some(Err(format!("in `\"{line}\"`: {why}"))),
+        _ => None,
+    }
+}
 
 /// Does this name refer to another config? `Some(Ok(tab))` when it does and the tab
 /// exists, `Some(Err(why))` when it plainly means a config we haven't got, and
@@ -1209,6 +1273,17 @@ fn binding_line(
                 }
                 None => {}
             }
+        }
+    }
+    // A quoted setting is a console command that changes the setting for good —
+    // which is easy to mistake for a modeshift, so say how long "for good" is.
+    for step in &steps {
+        if let Out::Set { name, .. } = &step.out {
+            notes.push(format!(
+                "changes `{name}` from then on, as typing it into JSM's console would — until \
+                 RESET_MAPPINGS, a layer switch or an edit. To change it only while a button \
+                 is held, use a modeshift (`ZL,{name} = …`)"
+            ));
         }
     }
     // A pad output goes nowhere unless a virtual pad is wired downstream of this
@@ -1716,7 +1791,11 @@ pub(crate) fn parse_mapping(
                 Some(Ok(tab)) => Out::Layer(tab),
                 Some(Err(missing)) => return Err(missing),
                 None if key.eq_ignore_ascii_case("RESET_MAPPINGS") => Out::Reset,
-                None => Out::Command(key.clone()),
+                None => match bound_setting(&key) {
+                    Some(Ok((name, value))) => Out::Set { name, value },
+                    Some(Err(why)) => return Err(why),
+                    None => Out::Command(key.clone()),
+                },
             }
         } else if let Some(parsed) = super::midi::parse(&key) {
             // A MIDI message to play. Its channel is filled in once the whole
@@ -2295,6 +2374,12 @@ pub(crate) enum PadId {
     RotationMode,
     /// `GYRO_STICK_ROTATION_RETURN_TIME` — likewise.
     RotationReturnTime,
+    /// `GYRO_STICK_ROTATION_TAKEOVER` (`ON` / `OFF`) — likewise.
+    RotationTakeover,
+    /// `GYRO_STICK_ROTATION_TAKEOVER_SPEED` — likewise.
+    RotationTakeoverSpeed,
+    /// `GYRO_STICK_ROTATION_OUTER` — likewise.
+    RotationOuter,
 }
 
 /// Apply one virtual-pad setting.
@@ -2449,7 +2534,10 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
         PadId::RotationDeadzone
         | PadId::RotationSmoothTime
         | PadId::RotationMode
-        | PadId::RotationReturnTime => {
+        | PadId::RotationReturnTime
+        | PadId::RotationTakeover
+        | PadId::RotationTakeoverSpeed
+        | PadId::RotationOuter => {
             let mut info = LineInfo::of(LineStatus::Ok);
             match which {
                 PadId::RotationDeadzone => match in_range(0.0, 1.0) {
@@ -2469,6 +2557,35 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
                     Some(v) => p.rotation_smooth = v,
                     None => return wants("a time in seconds, zero or more (zero means no stabilising)"),
                 },
+                PadId::RotationTakeover => {
+                    match rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str() {
+                        "ON" => p.rotation_takeover = true,
+                        "OFF" => p.rotation_takeover = false,
+                        _ => return wants("ON or OFF"),
+                    }
+                }
+                PadId::RotationTakeoverSpeed | PadId::RotationOuter => {
+                    let speed = which == PadId::RotationTakeoverSpeed;
+                    let v = if speed { num().filter(|v| *v >= 0.0) } else { in_range(0.0, 1.0) };
+                    let Some(v) = v else {
+                        return wants(if speed {
+                            "a speed in degrees per second, zero or more"
+                        } else {
+                            "a fraction of stick travel, 0 to 1"
+                        });
+                    };
+                    if speed {
+                        p.rotation_takeover_speed = v;
+                    } else {
+                        p.rotation_outer = v;
+                    }
+                    // Against the switch as parsed so far, like the notes below.
+                    if !p.rotation_takeover {
+                        info.notes.push(
+                            "only does anything with `GYRO_STICK_ROTATION_TAKEOVER = ON`".to_string(),
+                        );
+                    }
+                }
                 PadId::RotationMode => {
                     match rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str() {
                         "ABSOLUTE" => p.rotation_relative = false,
@@ -3232,6 +3349,9 @@ pub(crate) fn setting_support(name: &str) -> Option<Support> {
         "GYRO_STICK_ROTATION_SMOOTH_TIME" => Pad(PadId::RotationSmoothTime),
         "GYRO_STICK_ROTATION_MODE" => Pad(PadId::RotationMode),
         "GYRO_STICK_ROTATION_RETURN_TIME" => Pad(PadId::RotationReturnTime),
+        "GYRO_STICK_ROTATION_TAKEOVER" => Pad(PadId::RotationTakeover),
+        "GYRO_STICK_ROTATION_TAKEOVER_SPEED" => Pad(PadId::RotationTakeoverSpeed),
+        "GYRO_STICK_ROTATION_OUTER" => Pad(PadId::RotationOuter),
 
         // Touchpad and motion stick.
         "TOUCHPAD_MODE" => Motion(MotionId::TouchpadMode),

@@ -67,6 +67,10 @@ pub struct JsmState {
     pad: PadOut,
     /// `GYRO_OUTPUT = *_ROTATION`: the turn the gyro has put on that stick.
     rotation: crate::eval::StickRotation,
+    /// Settings a button has changed by command (`S = "GYRO_SENS = 2"`), as
+    /// (name, value), oldest first, one per name. In force until
+    /// `RESET_MAPPINGS`, a layer switch or an edit — JSM's console-command rule.
+    sticky: Vec<(String, String)>,
     /// Which way is down, and the motion stick built from it.
     motion: super::motion::Motion,
     /// The touchpad: its grid, its two relative sticks, its mouse mode.
@@ -226,6 +230,7 @@ pub(crate) fn jsm_publish(
             cal: super::cal::Measure::default(),
             cal_flick: super::cal::Flick::default(),
             ever_claimed: HashSet::new(),
+            sticky: Vec::new(),
             midi_touch: (0.0, 0.0),
             cfg: super::parse::compile_full(&text, &tabs, &ports),
             rt: Runtime::default(),
@@ -244,6 +249,7 @@ pub(crate) fn jsm_publish(
         st.layer = selected.clone();
         st.cfg = super::parse::compile_full(&text, &tabs, &ports);
         st.rt = Runtime::default();
+        st.sticky.clear();
         st.analog = Analog::default();
         st.aim = Aim::default();
         st.pad = PadOut::default();
@@ -257,7 +263,7 @@ pub(crate) fn jsm_publish(
     // tick, so a modeshift takes hold a tick after its button — imperceptible at
     // any tick rate we run, and it keeps the order here simple: settings, then
     // buttons, then aiming.
-    let mut res = super::parse::resolve(&st.cfg, st.rt.chords());
+    let mut res = super::parse::resolve_with(&st.cfg, &st.sticky, st.rt.chords());
     for side in 0..2 {
         let stick = if side == 0 { &mut res.settings.left } else { &mut res.settings.right };
         if res.stick_mode_chorded[side] {
@@ -322,6 +328,12 @@ pub(crate) fn jsm_publish(
         .iter()
         .any(|c| c.trim().eq_ignore_ascii_case("SET_MOTION_STICK_NEUTRAL"));
     let switch_to = outputs.layer.clone();
+    // A setting a button set by command holds from the next tick on (the same
+    // one-tick step a modeshift takes), replacing any earlier one of that name.
+    for (name, value) in &outputs.settings {
+        st.sticky.retain(|(n, _)| n != name);
+        st.sticky.push((name.clone(), value.clone()));
+    }
     let reset = outputs.reset;
     if recentre {
         st.motion.set_neutral(gravity);
@@ -580,6 +592,10 @@ pub(crate) fn jsm_publish(
             deadzone: res.pad.rotation_deadzone,
             smooth_s: res.pad.rotation_smooth,
             return_s: res.pad.rotation_relative.then_some(res.pad.rotation_return),
+            takeover: res.pad.rotation_takeover.then_some(crate::eval::Takeover {
+                speed_dps: res.pad.rotation_takeover_speed,
+                outer: res.pad.rotation_outer,
+            }),
         };
         let r = st.rotation.tick(stick, aimed.turn_dps, dt, &settings);
         if r.engaged {
@@ -759,6 +775,7 @@ pub(crate) fn jsm_publish(
             st.layer = layer.clone();
             st.cfg = super::parse::compile_full(&text_for(&layer), &tabs, &ports);
             st.rt = Runtime::default();
+            st.sticky.clear();
             st.analog = Analog::default();
             st.aim = Aim::default();
             st.pad = PadOut::default();
@@ -802,6 +819,7 @@ pub(crate) fn jsm_publish(
     out.push(Some(Signal::Vec2(r.out)));
     out.push(Some(Signal::Float(r.offset_deg)));
     out.push(Some(Signal::Bool(r.engaged)));
+    out.push(Some(Signal::Bool(r.taken)));
     out
 }
 
@@ -819,10 +837,10 @@ pub fn cal_peak_out(n_outputs: usize) -> usize {
 pub fn curve_dps_out(n_outputs: usize) -> usize {
     n_outputs.max(1) + 2
 }
-/// Index of the first of the four trailing outputs carrying the gyro-turned
-/// stick (`GYRO_OUTPUT = *_ROTATION`), after the curve speed: the stick as it
-/// came, as it goes out, the offset in degrees, and whether it is engaged — in
-/// the order of the module's `STICK_ROT_OUT_*`.
+/// Index of the first of the trailing outputs carrying the gyro-turned stick
+/// (`GYRO_OUTPUT = *_ROTATION`), after the curve speed: the stick as it came, as
+/// it goes out, the offset in degrees, whether it is engaged and whether the gyro
+/// has taken over — in the order of the module's `STICK_ROT_OUT_*`.
 pub fn rotation_out(n_outputs: usize) -> usize {
     n_outputs.max(1) + 3
 }

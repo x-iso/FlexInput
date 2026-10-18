@@ -10,6 +10,8 @@ use super::*;
 use flexinput_engine::eval::{
     STICK_ROT_DEADZONE_DEFAULT, STICK_ROT_DEADZONE_PARAM, STICK_ROT_INVERT_PARAM, STICK_ROT_MODE_PARAM,
     STICK_ROT_OUT_ENGAGED, STICK_ROT_OUT_OFFSET, STICK_ROT_OUT_RAW, STICK_ROT_OUT_ROTATED,
+    STICK_ROT_OUT_TAKEN, STICK_ROT_OUTER_DEFAULT, STICK_ROT_OUTER_PARAM, STICK_ROT_TAKEOVER_PARAM,
+    STICK_ROT_TAKEOVER_SPEED_DEFAULT, STICK_ROT_TAKEOVER_SPEED_PARAM,
     STICK_ROT_RELATIVE_PARAM, STICK_ROT_RETURN_DEFAULT_MS, STICK_ROT_RETURN_PARAM,
     STICK_ROT_SENS_DEFAULT, STICK_ROT_SENS_PARAM, STICK_ROT_SMOOTH_PARAM, STICK_ROT_STICK_PARAM,
 };
@@ -46,6 +48,18 @@ const HOLD_TIP: &str = "How the turn behaves once the pad stops turning.\n\
 const RETURN_TIP: &str = "Relative: how quickly the stick folds back to your thumb once the pad\n\
     stops turning. After this long about a third of the turn is left, after\n\
     three times as long almost none. Longer feels more like Absolute.";
+const TAKEOVER_TIP: &str = "Let the gyro take the aim over once the pad turns.\n\
+    The thumb aims as usual until the pad turns faster than the speed set here;\n\
+    from then the stick's direction is held where your thumb had it and only\n\
+    the gyro turns it, so a thumb drifting while your wrist does the fine work\n\
+    moves nothing. The stick's length still follows your thumb.\n\
+    Push the stick out past the Outer zone and your thumb has the direction\n\
+    back; centring the stick or the deadzone ends it too. The next turn takes\n\
+    over again.";
+const TAKEOVER_SPEED_TIP: &str = "How fast the aim has to turn (°/s, after Sens) for the gyro to take over.\n\
+    High enough that a pad held still doesn't trip it.";
+const OUTER_TIP: &str = "The outer zone, as a fraction of stick travel: pushed out past it, the\n\
+    stick's direction is your thumb's again. Drawn as the outer ring.";
 const SMOOTH_TIP: &str = "Stabilise the stick's direction against a shaky thumb (0 = off).\n\
     Small back-and-forth wobble is smoothed over about this long; a deliberate\n\
     sweep is let through with little delay. Only the thumb's direction is\n\
@@ -63,6 +77,8 @@ pub(crate) fn show_stick_rotation_body(node_id: NodeId, ui: &mut egui::Ui, snarl
         });
         let r = ui.horizontal(|ui| changed |= hold_row(node_id, ui, snarl));
         register_exposable_element(ui, node_id, "hold", r.response.rect);
+        let r = ui.horizontal(|ui| changed |= takeover_row(node_id, ui, snarl));
+        register_exposable_element(ui, node_id, "takeover", r.response.rect);
         ui.horizontal(|ui| {
             let r = ui.horizontal(|ui| changed |= number_row(node_id, ui, snarl, NumRow::Deadzone));
             register_exposable_element(ui, node_id, "deadzone", r.response.rect);
@@ -150,6 +166,37 @@ fn hold_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> 
     true
 }
 
+/// Takeover, and when it is on, its speed and outer zone.
+fn takeover_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let Some(node) = snarl.get_node(node_id) else { return false };
+    let mut on = node.params.get(STICK_ROT_TAKEOVER_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut speed = num(node, STICK_ROT_TAKEOVER_SPEED_PARAM, STICK_ROT_TAKEOVER_SPEED_DEFAULT);
+    let mut outer = num(node, STICK_ROT_OUTER_PARAM, STICK_ROT_OUTER_DEFAULT);
+    let mut set: Option<(&str, Value)> = None;
+    if ui.checkbox(&mut on, egui::RichText::new("Takeover").small()).on_hover_text(TAKEOVER_TIP).changed() {
+        set = Some((STICK_ROT_TAKEOVER_PARAM, Value::Bool(on)));
+    }
+    if on {
+        ui.label(egui::RichText::new("above").small().weak()).on_hover_text(TAKEOVER_SPEED_TIP);
+        if ui.add(egui::DragValue::new(&mut speed).speed(0.5).range(0.0..=120.0).max_decimals(0).suffix(" °/s"))
+            .on_hover_text(TAKEOVER_SPEED_TIP).changed()
+        {
+            set = serde_json::Number::from_f64(speed as f64).map(|n| (STICK_ROT_TAKEOVER_SPEED_PARAM, Value::Number(n)));
+        }
+        ui.label(egui::RichText::new("Outer").small()).on_hover_text(OUTER_TIP);
+        if ui.add(egui::DragValue::new(&mut outer).speed(0.005).range(0.05..=1.0).max_decimals(2))
+            .on_hover_text(OUTER_TIP).changed()
+        {
+            set = serde_json::Number::from_f64(outer as f64).map(|n| (STICK_ROT_OUTER_PARAM, Value::Number(n)));
+        }
+    }
+    let Some((k, v)) = set else { return false };
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert(k.to_string(), v);
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 enum NumRow {
     Deadzone,
@@ -194,17 +241,26 @@ pub(crate) fn render_stick_rotation_field(
     snarl: &Snarl<NodeData>,
     container: egui::Vec2,
 ) -> egui::Rect {
-    let (out, deadzone) = snarl
+    let (out, deadzone, outer) = snarl
         .get_node(node_id)
-        .map(|n| (n.extra.last_out.clone(), num(n, STICK_ROT_DEADZONE_PARAM, STICK_ROT_DEADZONE_DEFAULT)))
+        .map(|n| {
+            let takeover = n.params.get(STICK_ROT_TAKEOVER_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
+            (
+                n.extra.last_out.clone(),
+                num(n, STICK_ROT_DEADZONE_PARAM, STICK_ROT_DEADZONE_DEFAULT),
+                takeover.then(|| num(n, STICK_ROT_OUTER_PARAM, STICK_ROT_OUTER_DEFAULT)),
+            )
+        })
         .unwrap_or_default();
-    paint_stick_rotation(ui, container, &out, 0, deadzone)
+    paint_stick_rotation(ui, container, &out, 0, deadzone, outer)
 }
 
 /// The live circle: the stick's range, the deadzone, the stick where the thumb
 /// has it (hollow), where the gyro turned it to (filled, with the aim line), and
-/// the arc between the two, with the offset written under it. Reads the four
-/// live values (`STICK_ROT_OUT_*`) from `out` starting at `base` — 0 for the
+/// the arc between the two, with the offset written under it. With takeover on,
+/// `outer` is its outer zone, drawn as a ring, and while the gyro has taken over
+/// the arc starts from the direction it is holding and the label says so. Reads
+/// the live values (`STICK_ROT_OUT_*`) from `out` starting at `base` — 0 for the
 /// module, the trailing outputs for a JSM node (`jsm_rotation_out`).
 pub(crate) fn paint_stick_rotation(
     ui: &mut egui::Ui,
@@ -212,6 +268,7 @@ pub(crate) fn paint_stick_rotation(
     out: &[Option<Signal>],
     base: usize,
     deadzone: f32,
+    outer: Option<f32>,
 ) -> egui::Rect {
     let side = container.x.min(container.y).max(48.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
@@ -229,6 +286,9 @@ pub(crate) fn paint_stick_rotation(
     painter.circle_stroke(c, radius, egui::Stroke::new(1.0, line));
     painter.circle_filled(c, radius * deadzone, weak.gamma_multiply(0.15));
     painter.circle_stroke(c, radius * deadzone, egui::Stroke::new(1.0, weak.gamma_multiply(0.5)));
+    if let Some(o) = outer {
+        painter.circle_stroke(c, radius * o.clamp(0.0, 1.0), egui::Stroke::new(1.0, accent.gamma_multiply(0.35)));
+    }
     // Up, as the compass the offset is measured from.
     painter.line_segment([c - egui::vec2(0.0, radius), c - egui::vec2(0.0, radius - 5.0)],
         egui::Stroke::new(1.0, line));
@@ -245,6 +305,7 @@ pub(crate) fn paint_stick_rotation(
         _ => 0.0,
     };
     let engaged = matches!(get(STICK_ROT_OUT_ENGAGED), Some(Signal::Bool(true)));
+    let taken = matches!(get(STICK_ROT_OUT_TAKEN), Some(Signal::Bool(true)));
     // The bus counts y up; the screen counts it down.
     let at = |v: glam::Vec2| c + egui::vec2(v.x, -v.y) * radius;
 
@@ -268,9 +329,17 @@ pub(crate) fn paint_stick_rotation(
     painter.circle_stroke(at(raw), 4.0, egui::Stroke::new(1.5, weak));
     if engaged {
         painter.circle_filled(at(rotated), 4.5, accent);
+        if taken {
+            // The gyro has the aim: ring the dot it is turning.
+            painter.circle_stroke(at(rotated), 7.0, egui::Stroke::new(1.0, accent));
+        }
     }
 
-    let text = if engaged { format!("{offset:+.1}°") } else { "—".to_string() };
+    let text = match (engaged, taken) {
+        (true, true) => format!("{offset:+.1}° · gyro"),
+        (true, false) => format!("{offset:+.1}°"),
+        _ => "—".to_string(),
+    };
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 2.0),
         egui::Align2::CENTER_BOTTOM,
@@ -291,9 +360,9 @@ pub(crate) fn render_jsm_rotation(
     container: egui::Vec2,
 ) -> Option<egui::Rect> {
     let node = snarl.get_node(node_id)?;
-    let (_, deadzone) = flexinput_engine::eval::jsm_rotation_of(cfg)?;
+    let (_, deadzone, outer) = flexinput_engine::eval::jsm_rotation_of(cfg)?;
     let base = flexinput_engine::eval::jsm_rotation_out(node.outputs.len());
-    Some(paint_stick_rotation(ui, container, &node.extra.last_out, base, deadzone))
+    Some(paint_stick_rotation(ui, container, &node.extra.last_out, base, deadzone, outer))
 }
 
 // ── pinned copies ───────────────────────────────────────────────────────────
@@ -304,6 +373,16 @@ pub(crate) fn render_stick_rotation_options_pinned(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(170.0, 22.0));
     if ui.horizontal(|ui| options_row(node_id, ui, snarl)).inner {
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
+pub(crate) fn render_stick_rotation_takeover_pinned(
+    node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(230.0, 22.0));
+    if ui.horizontal(|ui| takeover_row(node_id, ui, snarl)).inner {
         mark_overlay_param_write(ui.ctx());
     }
 }

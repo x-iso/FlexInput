@@ -51,12 +51,24 @@ pub const STICK_ROT_SMOOTH_PARAM: &str = "rot_smooth_ms";
 pub const STICK_ROT_RELATIVE_PARAM: &str = "rot_relative";
 /// Relative mode's return time constant, in milliseconds.
 pub const STICK_ROT_RETURN_PARAM: &str = "rot_return_ms";
+/// Takeover: once the pad turns, the gyro alone aims — the thumb's direction is
+/// set aside until the stick is pushed into the outer zone.
+pub const STICK_ROT_TAKEOVER_PARAM: &str = "rot_takeover";
+/// How fast the aim has to turn, °/s, for the gyro to take over.
+pub const STICK_ROT_TAKEOVER_SPEED_PARAM: &str = "rot_takeover_dps";
+/// The outer zone, a fraction of stick travel: out past it the thumb aims.
+pub const STICK_ROT_OUTER_PARAM: &str = "rot_outer";
 
 pub const STICK_ROT_DEADZONE_DEFAULT: f32 = 0.2;
 pub const STICK_ROT_SENS_DEFAULT: f32 = 1.0;
 /// Relative mode's default return time, ms: a flick of the wrist registers
 /// nearly whole, and the stick is back on the thumb well inside a second.
 pub const STICK_ROT_RETURN_DEFAULT_MS: f32 = 250.0;
+/// Takeover's default speed: well above what a pad held still reads (noise and
+/// a steady hand stay under a few °/s), well below a deliberate fine turn.
+pub const STICK_ROT_TAKEOVER_SPEED_DEFAULT: f32 = 10.0;
+/// The outer zone's default: the rim, where a thumb re-aiming ends up anyway.
+pub const STICK_ROT_OUTER_DEFAULT: f32 = 0.9;
 
 /// Where the node's live values sit in its `last_out`, for the body's circle:
 /// the stick as it came in, the stick as it goes out, the offset in degrees
@@ -65,6 +77,10 @@ pub const STICK_ROT_OUT_RAW: usize = 0;
 pub const STICK_ROT_OUT_ROTATED: usize = 1;
 pub const STICK_ROT_OUT_OFFSET: usize = 2;
 pub const STICK_ROT_OUT_ENGAGED: usize = 3;
+/// …and whether the gyro has taken over (the thumb's direction is set aside).
+pub const STICK_ROT_OUT_TAKEN: usize = 4;
+/// How many live values there are.
+pub const STICK_ROT_OUT_COUNT: usize = 5;
 
 /// How fast the stabiliser lets go of a deliberate sweep: its cutoff in Hz rises
 /// by this much per radian per second the direction is turning. At heavy
@@ -76,6 +92,12 @@ const STABILISE_D_CUTOFF: f32 = 1.0;
 /// Gravity settles over this long — the JSM module's figure, for the same reason:
 /// follow a change of grip, not a flick.
 const GRAVITY_TAU: f32 = 0.5;
+/// The turn rate takeover watches is smoothed over this long against sample
+/// noise — short, so it falls away soon after a turn stops…
+const TAKEOVER_SPEED_TAU: f32 = 0.01;
+/// …and it has to stay over the takeover speed for this long in a row, so a
+/// single spiky sample (or the tail of a turn that has stopped) can't trip it.
+const TAKEOVER_SUSTAIN: f32 = 0.02;
 
 /// How one stick is turned — the knobs both modules expose.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,11 +111,32 @@ pub struct RotationSettings {
     /// Relative mode: the offset folds back to the thumb's own direction with
     /// this time constant, seconds. `None` is absolute — the offset holds.
     pub return_s: Option<f32>,
+    /// Takeover, when it is on — see [`Takeover`].
+    pub takeover: Option<Takeover>,
+}
+
+/// Takeover: the thumb aims until the pad turns; from then the thumb's
+/// DIRECTION is set aside — held where it was — and only the gyro turns the aim,
+/// so a thumb that drifts while the wrist does the fine work moves nothing. The
+/// stick's length still follows the thumb. Pushing the stick out into the outer
+/// zone gives the direction back to the thumb; so does centring it, and the
+/// deadzone drops everything as it always does. The next turn takes over again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Takeover {
+    /// The aim has to turn faster than this, °/s, for the gyro to take over.
+    pub speed_dps: f32,
+    /// The outer zone, a fraction of stick travel: out past it the thumb aims.
+    pub outer: f32,
 }
 
 impl Default for RotationSettings {
     fn default() -> Self {
-        RotationSettings { deadzone: STICK_ROT_DEADZONE_DEFAULT, smooth_s: 0.0, return_s: None }
+        RotationSettings {
+            deadzone: STICK_ROT_DEADZONE_DEFAULT,
+            smooth_s: 0.0,
+            return_s: None,
+            takeover: None,
+        }
     }
 }
 
@@ -109,6 +152,8 @@ pub struct Rotated {
     /// Whether the offset applies: the stick is out past the deadzone, or there
     /// is no deadzone.
     pub engaged: bool,
+    /// Whether the gyro has taken over (see [`Takeover`]).
+    pub taken: bool,
 }
 
 /// Below this length a stick's direction is noise — a deadzone-less stick
@@ -131,6 +176,14 @@ pub struct StickRotation {
     unwrapped: f32,
     last_raw: f32,
     filter: AngleFilter,
+    /// Takeover: the thumb's direction as it was when the gyro took over, in the
+    /// same unwrapped terms as `unwrapped`; `None` while the thumb aims.
+    frozen: Option<f32>,
+    /// The turn rate takeover watches, smoothed (°/s, unsigned).
+    speed: f32,
+    /// How long, seconds, `speed` has been over the takeover speed in a row
+    /// since the thumb last had the direction.
+    above: f32,
 }
 
 impl StickRotation {
@@ -142,7 +195,7 @@ impl StickRotation {
         // Inside the deadzone: drop everything, pass the stick through untouched.
         if s.deadzone > 0.0 && len <= s.deadzone {
             *self = StickRotation::default();
-            return Rotated { out: stick, offset_deg: 0.0, engaged: false };
+            return Rotated { out: stick, offset_deg: 0.0, engaged: false, taken: false };
         }
 
         // The offset. Absolute: the turn, added up — where the pad points now
@@ -161,19 +214,25 @@ impl StickRotation {
             // Folding back instantly: nothing is ever held.
             Some(_) => 0.0,
         };
+        let k = 1.0 - (-dt / TAKEOVER_SPEED_TAU).exp();
+        self.speed += k * (turn_dps.abs() - self.speed);
 
         if len < DIRECTION_FLOOR {
             // Only without a deadzone: too little stick to have a direction worth
             // stabilising, but the offset still turns what there is. The
-            // stabiliser starts again from the next real direction.
+            // stabiliser starts again from the next real direction, and a
+            // takeover lets go — a centred stick has no direction to hold, and the
+            // next push is the thumb's.
             self.filter = AngleFilter::default();
+            self.frozen = None;
+            self.above = 0.0;
             let out = if len > 0.0 {
                 let bearing = stick.x.atan2(stick.y) + self.offset;
                 Vec2::new(bearing.sin(), bearing.cos()) * len
             } else {
                 stick
             };
-            return Rotated { out, offset_deg: self.offset.to_degrees(), engaged: true };
+            return Rotated { out, offset_deg: self.offset.to_degrees(), engaged: true, taken: false };
         }
 
         // The stick's direction as a compass bearing: 0 up, clockwise positive.
@@ -192,6 +251,9 @@ impl StickRotation {
             let turns = (self.unwrapped / TAU).trunc() * TAU;
             self.unwrapped -= turns;
             self.filter.shift(-turns);
+            if let Some(f) = &mut self.frozen {
+                *f -= turns;
+            }
         }
 
         let direction = if s.smooth_s > 0.0 {
@@ -202,11 +264,36 @@ impl StickRotation {
             self.unwrapped
         };
 
+        // Takeover. Out in the outer zone the thumb has the direction; inside
+        // it, a turn fast enough holds the direction where the thumb has it now
+        // and leaves it to the gyro until the thumb reaches the outer zone again.
+        let direction = match s.takeover {
+            Some(t) => {
+                if len >= t.outer {
+                    // The thumb's again — and a turn has to start afresh to take
+                    // it back, so a stale one can't the moment the stick comes in.
+                    self.frozen = None;
+                    self.above = 0.0;
+                } else if self.frozen.is_none() {
+                    self.above = if self.speed > t.speed_dps { self.above + dt } else { 0.0 };
+                    if self.above >= TAKEOVER_SUSTAIN {
+                        self.frozen = Some(direction);
+                    }
+                }
+                self.frozen.unwrap_or(direction)
+            }
+            None => {
+                self.frozen = None;
+                direction
+            }
+        };
+
         let bearing = direction + self.offset;
         Rotated {
             out: Vec2::new(bearing.sin(), bearing.cos()) * len,
             offset_deg: self.offset.to_degrees(),
             engaged: true,
+            taken: self.frozen.is_some(),
         }
     }
 }
@@ -337,6 +424,10 @@ pub(crate) fn eval_stick_rotation_node(
         deadzone: num(STICK_ROT_DEADZONE_PARAM, STICK_ROT_DEADZONE_DEFAULT).clamp(0.0, 1.0),
         smooth_s: num(STICK_ROT_SMOOTH_PARAM, 0.0).max(0.0) / 1000.0,
         return_s: relative.then(|| num(STICK_ROT_RETURN_PARAM, STICK_ROT_RETURN_DEFAULT_MS).max(0.0) / 1000.0),
+        takeover: p.get(STICK_ROT_TAKEOVER_PARAM).and_then(|v| v.as_bool()).unwrap_or(false).then(|| Takeover {
+            speed_dps: num(STICK_ROT_TAKEOVER_SPEED_PARAM, STICK_ROT_TAKEOVER_SPEED_DEFAULT).max(0.0),
+            outer: num(STICK_ROT_OUTER_PARAM, STICK_ROT_OUTER_DEFAULT).clamp(0.0, 1.0),
+        }),
     };
 
     let bus = |pin: &str| collector_sigs.get_pin(&key, &pin).copied();
@@ -375,6 +466,7 @@ pub(crate) fn eval_stick_rotation_node(
         Some(Signal::Vec2(r.out)),
         Some(Signal::Float(r.offset_deg)),
         Some(Signal::Bool(r.engaged)),
+        Some(Signal::Bool(r.taken)),
     ]
 }
 
@@ -386,7 +478,7 @@ mod tests {
 
     /// Absolute mode with this deadzone and stabilising time.
     fn abs(deadzone: f32, smooth_s: f32) -> RotationSettings {
-        RotationSettings { deadzone, smooth_s, return_s: None }
+        RotationSettings { deadzone, smooth_s, return_s: None, takeover: None }
     }
 
     fn bearing(v: Vec2) -> f32 {
@@ -489,7 +581,7 @@ mod tests {
     }
 
     fn rel(return_s: f32) -> RotationSettings {
-        RotationSettings { deadzone: 0.2, smooth_s: 0.0, return_s: Some(return_s) }
+        RotationSettings { deadzone: 0.2, smooth_s: 0.0, return_s: Some(return_s), takeover: None }
     }
 
     fn run_rel(rot: &mut StickRotation, turn: f32, secs: f32, return_s: f32) -> Rotated {
@@ -550,6 +642,124 @@ mod tests {
         let r = run_rel(&mut rot, 500.0, 0.2, 0.0);
         assert_eq!(r.offset_deg, 0.0);
         assert!(bearing(r.out).abs() < 1e-4);
+    }
+
+    // ── takeover ─────────────────────────────────────────────────────────────
+
+    fn takeover(deadzone: f32) -> RotationSettings {
+        RotationSettings {
+            deadzone,
+            smooth_s: 0.0,
+            return_s: None,
+            takeover: Some(Takeover { speed_dps: 10.0, outer: 0.9 }),
+        }
+    }
+
+    fn at(deg: f32, len: f32) -> Vec2 {
+        let a = deg.to_radians();
+        Vec2::new(a.sin(), a.cos()) * len
+    }
+
+    fn run_with(rot: &mut StickRotation, stick: Vec2, turn: f32, secs: f32, s: &RotationSettings) -> Rotated {
+        let mut r = Rotated::default();
+        for _ in 0..(secs / DT).round() as usize {
+            r = rot.tick(stick, turn, DT, s);
+        }
+        r
+    }
+
+    #[test]
+    fn takeover_holds_the_thumbs_direction_once_the_pad_turns() {
+        let s = takeover(0.2);
+        let mut rot = StickRotation::default();
+        // The pad still: the thumb aims.
+        let r = run_with(&mut rot, at(30.0, 0.6), 0.0, 0.1, &s);
+        assert!(!r.taken && (bearing(r.out) - 30.0).abs() < 0.01, "{r:?}");
+        // A turn takes over, and the gyro turns the aim from the thumb's 30°.
+        let r = run_with(&mut rot, at(30.0, 0.6), 100.0, 0.1, &s);
+        assert!(r.taken, "{r:?}");
+        assert!((bearing(r.out) - 40.0).abs() < 0.05, "{r:?}");
+        // The thumb drifts to 50° and eases off: the direction holds, the
+        // length follows the thumb.
+        let r = run_with(&mut rot, at(50.0, 0.7), 0.0, 0.1, &s);
+        assert!(r.taken && (bearing(r.out) - 40.0).abs() < 0.05, "{r:?}");
+        assert!((r.out.length() - 0.7).abs() < 1e-4);
+    }
+
+    #[test]
+    fn takeover_gives_the_thumb_back_in_the_outer_zone_and_takes_over_on_the_next_turn() {
+        let s = takeover(0.2);
+        let mut rot = StickRotation::default();
+        run_with(&mut rot, at(30.0, 0.6), 100.0, 0.1, &s);
+        // Out to the rim at 50°: the thumb's direction again, with the turn on top.
+        let r = run_with(&mut rot, at(50.0, 0.95), 0.0, 0.05, &s);
+        assert!(!r.taken && (bearing(r.out) - 60.0).abs() < 0.05, "{r:?}");
+        // Back in from the rim, the pad still: the thumb keeps aiming — even
+        // straight after a turn, whose tail mustn't count as a new one.
+        let mut quick = StickRotation::default();
+        run_with(&mut quick, at(30.0, 0.6), 100.0, 0.1, &s);
+        run_with(&mut quick, at(50.0, 0.95), 0.0, 0.01, &s);
+        let q = run_with(&mut quick, at(50.0, 0.6), 0.0, 0.1, &s);
+        assert!(!q.taken, "{q:?}");
+        let r = run_with(&mut rot, at(70.0, 0.6), 0.0, 0.05, &s);
+        assert!(!r.taken && (bearing(r.out) - 80.0).abs() < 0.05, "{r:?}");
+        // The next turn takes over from there.
+        run_with(&mut rot, at(70.0, 0.6), 100.0, 0.05, &s);
+        let r = run_with(&mut rot, at(10.0, 0.6), 0.0, 0.05, &s);
+        assert!(r.taken && (bearing(r.out) - 85.0).abs() < 0.1, "{r:?}");
+    }
+
+    #[test]
+    fn takeover_waits_for_a_turn_faster_than_its_speed() {
+        let s = takeover(0.2);
+        let mut rot = StickRotation::default();
+        // 5°/s, under the 10: the thumb still aims.
+        run_with(&mut rot, at(0.0, 0.6), 5.0, 1.0, &s);
+        let r = run_with(&mut rot, at(40.0, 0.6), 5.0, 0.01, &s);
+        assert!(!r.taken, "{r:?}");
+        assert!((bearing(r.out) - (40.0 + 5.05)).abs() < 0.1, "the thumb's 40 plus 5° of turn: {r:?}");
+        // One sample of a spike doesn't trip it either — the speed is smoothed.
+        let r = rot.tick(at(40.0, 0.6), 500.0, DT, &s);
+        assert!(!r.taken, "{r:?}");
+    }
+
+    #[test]
+    fn takeover_never_happens_with_the_stick_already_in_the_outer_zone() {
+        let s = takeover(0.2);
+        let mut rot = StickRotation::default();
+        run_with(&mut rot, at(0.0, 1.0), 100.0, 0.1, &s);
+        let r = run_with(&mut rot, at(20.0, 1.0), 0.0, 0.01, &s);
+        assert!(!r.taken && (bearing(r.out) - 30.0).abs() < 0.05, "{r:?}");
+    }
+
+    #[test]
+    fn takeover_lets_go_at_the_deadzone_and_at_a_centred_stick() {
+        let s = takeover(0.2);
+        let mut rot = StickRotation::default();
+        run_with(&mut rot, at(30.0, 0.6), 100.0, 0.1, &s);
+        run_with(&mut rot, at(30.0, 0.1), 0.0, 0.01, &s);
+        let r = run_with(&mut rot, at(70.0, 0.6), 0.0, 0.01, &s);
+        assert!(!r.taken && (bearing(r.out) - 70.0).abs() < 0.01, "the deadzone dropped it all: {r:?}");
+        // With no deadzone, centring the stick hands the next push back to the
+        // thumb — and keeps the turn, as no deadzone always does.
+        let s = takeover(0.0);
+        let mut rot = StickRotation::default();
+        run_with(&mut rot, at(30.0, 0.6), 100.0, 0.1, &s);
+        run_with(&mut rot, Vec2::ZERO, 0.0, 0.01, &s);
+        let r = run_with(&mut rot, at(70.0, 0.6), 0.0, 0.01, &s);
+        assert!(!r.taken && (bearing(r.out) - 80.0).abs() < 0.05, "{r:?}");
+    }
+
+    #[test]
+    fn takeover_in_relative_mode_folds_back_to_the_held_direction() {
+        let mut s = takeover(0.2);
+        s.return_s = Some(0.25);
+        let mut rot = StickRotation::default();
+        run_with(&mut rot, at(30.0, 0.6), 100.0, 0.1, &s);
+        // The pad stops; the thumb has drifted. The turn folds away and leaves
+        // the aim on the direction the gyro took over from, not on the thumb.
+        let r = run_with(&mut rot, at(60.0, 0.6), 0.0, 3.0, &s);
+        assert!(r.taken && (bearing(r.out) - 30.0).abs() < 0.05, "{r:?}");
     }
 
     #[test]
@@ -783,6 +993,32 @@ mod tests {
         let (cs, _) = run_node(&snap, &pad("right_stick", Vec2::new(0.0, 1.0), 50.0), 1.0);
         let Signal::Vec2(v) = published(&cs, "right_stick") else { panic!() };
         assert!((bearing(v) - 5.0).abs() < 0.05, "{v:?}");
+    }
+
+    #[test]
+    fn the_node_with_takeover_holds_the_direction_and_says_so() {
+        let snap = node(&[(STICK_ROT_TAKEOVER_PARAM, Value::Bool(true))]);
+        let (_, out) = run_node(&snap, &pad("right_stick", Vec2::new(0.0, 0.6), 100.0), 0.1);
+        assert_eq!(out[STICK_ROT_OUT_TAKEN], Some(Signal::Bool(true)));
+        assert_eq!(out.len(), STICK_ROT_OUT_COUNT);
+        // Its speed and outer zone come from the params: a slow turn under a
+        // raised speed doesn't take over, and an outer zone below the push
+        // keeps the thumb aiming.
+        let slow = node(&[
+            (STICK_ROT_TAKEOVER_PARAM, Value::Bool(true)),
+            (STICK_ROT_TAKEOVER_SPEED_PARAM, serde_json::json!(150.0)),
+        ]);
+        let (_, out) = run_node(&slow, &pad("right_stick", Vec2::new(0.0, 0.6), 100.0), 0.1);
+        assert_eq!(out[STICK_ROT_OUT_TAKEN], Some(Signal::Bool(false)));
+        let low = node(&[
+            (STICK_ROT_TAKEOVER_PARAM, Value::Bool(true)),
+            (STICK_ROT_OUTER_PARAM, serde_json::json!(0.5)),
+        ]);
+        let (_, out) = run_node(&low, &pad("right_stick", Vec2::new(0.0, 0.6), 100.0), 0.1);
+        assert_eq!(out[STICK_ROT_OUT_TAKEN], Some(Signal::Bool(false)));
+        // Off (the default): never.
+        let (_, out) = run_node(&node(&[]), &pad("right_stick", Vec2::new(0.0, 0.6), 100.0), 0.1);
+        assert_eq!(out[STICK_ROT_OUT_TAKEN], Some(Signal::Bool(false)));
     }
 
     #[test]

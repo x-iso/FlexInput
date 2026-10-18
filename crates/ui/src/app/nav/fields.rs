@@ -656,7 +656,7 @@ impl FlexInputApp {
             | ("processing.rws", "flick_opts") | ("processing.rws", "flick_speed")
             | ("module.stick_rotation", "options") | ("module.stick_rotation", "sens")
             | ("module.stick_rotation", "deadzone") | ("module.stick_rotation", "stabilise")
-            | ("module.stick_rotation", "hold")
+            | ("module.stick_rotation", "hold") | ("module.stick_rotation", "takeover")
             | ("module.stick_rotation", "field")
             | ("math.negate", "unipolar")
             | ("math.quantize", "factor") | ("math.quantize", "mode")
@@ -980,6 +980,11 @@ impl FlexInputApp {
                 f!("Relative", Toggle{key:"rot_relative"}),
                 f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
             ],
+            ("module.stick_rotation", "takeover") => vec![
+                f!("Takeover", Toggle{key:"rot_takeover"}),
+                f!("Above °/s", v("rot_takeover_dps",0.0,120.0,10.0,Fixed(1.0))),
+                f!("Outer", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
+            ],
             ("module.stick_rotation", "deadzone") => vec![f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05)))],
             ("module.stick_rotation", "stabilise") => vec![f!("Stabilise ms", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0)))],
             ("module.stick_rotation", "field") => vec![
@@ -989,6 +994,8 @@ impl FlexInputApp {
                 f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
                 f!("Relative", Toggle{key:"rot_relative"}),
                 f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
+                f!("Takeover", Toggle{key:"rot_takeover"}),
+                f!("Outer", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
             ],
             // ── multi-field rows ──
             ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],

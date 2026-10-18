@@ -80,6 +80,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   bus as the paddle buttons, over USB or Bluetooth. The device is now named
   DualSense Edge too.
 
+- **Gyro to Stick Rotation: Takeover.** Turn it on and the thumb aims as usual
+  until the pad turns; from then the stick's direction is held where your thumb
+  had it and only the gyro turns the aim, so a thumb that drifts while your
+  wrist does the fine work moves nothing (the stick's length still follows the
+  thumb). Push the stick out past the **Outer** zone, drawn as a ring on the
+  circle, and your thumb has the direction back; centring the stick or the
+  deadzone ends it too, and the next turn takes over again. How fast the pad has
+  to turn is set beside it. The circle marks the aim while the gyro holds it.
+  The JSM Config module has the same as `GYRO_STICK_ROTATION_TAKEOVER`,
+  `GYRO_STICK_ROTATION_TAKEOVER_SPEED` and `GYRO_STICK_ROTATION_OUTER`.
+
 ### Changed
 
 - **Outputs follow input a polling period sooner, with fewer wakeups.** The
@@ -93,6 +104,19 @@ All notable changes to FlexInput are documented here. This project adheres to
   finish in time keeps the old behavior.
 
 ### Fixed
+
+- **JSM: `GYRO_OFF` and the other gyro actions work as binding outputs.** Bound
+  to a button (`S = GYRO_OFF`), they lasted a single tick — the gyro blinked off
+  and straight back on. They now last as a key would: while the button is held,
+  until a toggle (`^GYRO_OFF`) is pressed again, from the hold of a tap/hold
+  pair (`S = SPACE GYRO_OFF`), and for JSM's half second on a tap. The same goes
+  for `GYRO_ON`, `GYRO_INVERT`, `GYRO_INV_X`/`_Y` and the trackball actions.
+
+- **JSM: a setting in quotes works as a binding output.** `S = "GYRO_SENS = 2"`
+  said it was "not a command this module runs". It is a console command, and now
+  runs as one: from that press on the setting is changed, until `RESET_MAPPINGS`,
+  a layer switch or an edit, with any modeshift held on top still having the last
+  word. A bad value is an error on the line.
 
 - **A Virtual DualSense added from the Devices panel has all its feedback
   outputs.** Its node came up with a DualShock 4's — rumble and light bar

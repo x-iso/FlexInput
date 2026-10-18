@@ -301,6 +301,10 @@ pub(crate) fn render_pinned_element_impl(
             render_stick_rotation_options_pinned(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("module.stick_rotation", "takeover") => {
+            render_stick_rotation_takeover_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("module.stick_rotation", "hold") => {
             render_stick_rotation_hold_pinned(inner_id, ui, inner_snarl, container_size);
             return;

@@ -585,11 +585,15 @@ pub fn feel_of(cfg: &Compiled, name: &str) -> Feel {
     }
 }
 
-/// `GYRO_OUTPUT = *_ROTATION`: which stick the gyro turns (0 left, 1 right) and
-/// its `GYRO_STICK_ROTATION_DEADZONE`, for the Tune panel's circle. `None` when the
-/// gyro turns no stick.
-pub fn rotation_of(cfg: &Compiled) -> Option<(usize, f32)> {
-    cfg.pad.gyro_dest.rotation_side().map(|side| (side, cfg.pad.rotation_deadzone))
+/// `GYRO_OUTPUT = *_ROTATION`: which stick the gyro turns (0 left, 1 right), its
+/// `GYRO_STICK_ROTATION_DEADZONE`, and its `GYRO_STICK_ROTATION_OUTER` when
+/// takeover is on — what the Tune panel's circle draws. `None` when the gyro
+/// turns no stick.
+pub fn rotation_of(cfg: &Compiled) -> Option<(usize, f32, Option<f32>)> {
+    let p = &cfg.pad;
+    p.gyro_dest
+        .rotation_side()
+        .map(|side| (side, p.rotation_deadzone, p.rotation_takeover.then_some(p.rotation_outer)))
 }
 
 fn feel_by_name(cfg: &Compiled, name: &str) -> Feel {
@@ -617,6 +621,8 @@ fn feel_by_name(cfg: &Compiled, name: &str) -> Feel {
         // FlexInput's own: the gyro turning a pushed stick (see `feel_of`).
         | "GYRO_STICK_ROTATION_DEADZONE" | "GYRO_STICK_ROTATION_SMOOTH_TIME"
         | "GYRO_STICK_ROTATION_MODE" | "GYRO_STICK_ROTATION_RETURN_TIME"
+        | "GYRO_STICK_ROTATION_TAKEOVER" | "GYRO_STICK_ROTATION_TAKEOVER_SPEED"
+        | "GYRO_STICK_ROTATION_OUTER"
         | "LEAN_THRESHOLD" | "MOTION_DEADZONE_INNER" | "MOTION_DEADZONE_OUTER" => Feel::Gyro,
 
         // The winding settings shape whatever was routed to a virtual stick,
@@ -895,6 +901,10 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         // How fast a relative turn folds back; past a couple of seconds it is
         // all but absolute.
         "GYRO_STICK_ROTATION_RETURN_TIME" => (0.0, 2.0, false),
+        // How fast the aim turns before the gyro takes over, and where the
+        // thumb gets the direction back.
+        "GYRO_STICK_ROTATION_TAKEOVER_SPEED" => (0.0, 60.0, false),
+        "GYRO_STICK_ROTATION_OUTER" => (0.0, 1.0, false),
         _ => return None,
     };
     Some(r)

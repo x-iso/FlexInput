@@ -769,6 +769,14 @@ pub struct ModuleDescriptor {
   **Return** time constant: a quick turn registers nearly whole, a steady turn holds
   an offset of its rate times the return time, and when the pad stops the stick folds
   back to the thumb (about a third left after one return time).
+- **Takeover** (off by default) — the thumb aims until the pad turns faster than
+  **above** °/s (default 10, after Sens, held for 20 ms so a spike can't trip it);
+  from then the thumb's DIRECTION is held where it was and only the gyro turns the
+  aim, while the stick's length still follows the thumb. Pushed out past the
+  **Outer** zone (default 0.9, the outer ring on the circle) the direction is the
+  thumb's again; centring the stick or the deadzone ends it too, and the next turn
+  takes over again. In Relative mode the aim folds back to the held direction, not
+  the thumb. The circle rings the aim dot and the label reads "gyro" while it holds.
   Every other signal passes through. The body's circle shows the deadzone, the stick
   where the thumb has it (hollow), where the gyro has taken it (filled, with the arc
   between) and the offset in degrees. Every row and the circle pin on their own, and a
@@ -792,6 +800,9 @@ pub struct ModuleDescriptor {
   - `rot_smooth_ms: f32` - stabilising time, ms (default 0 = off)
   - `rot_relative: bool` - relative mode (default off = absolute)
   - `rot_return_ms: f32` - relative mode's return time constant, ms (default 250)
+  - `rot_takeover: bool` - takeover (default off)
+  - `rot_takeover_dps: f32` - takeover speed, °/s (default 10)
+  - `rot_outer: f32` - takeover's outer zone, 0..1 of stick travel (default 0.9)
 - **The same rotation in the JSM Config module:** `GYRO_OUTPUT = RIGHT_STICK_ROTATION`
   (or `LEFT_`), with `GYRO_STICK_ROTATION_DEADZONE` and `GYRO_STICK_ROTATION_SMOOTH_TIME` — see
   JSM Config below. Both run `eval/modules/stick_rotation.rs`.
@@ -1257,10 +1268,21 @@ pub struct ModuleDescriptor {
   and `GYRO_OFF` all apply. `GYRO_STICK_ROTATION_SMOOTH_TIME` (seconds) stabilises the
   thumb's direction; `GYRO_STICK_ROTATION_MODE = ABSOLUTE | RELATIVE` and
   `GYRO_STICK_ROTATION_RETURN_TIME` (seconds, default 0.25) are the module's
-  Absolute/Relative and Return. A deadzone of 0 never drops the turn. It turns whatever that stick is about to send — passed through,
+  Absolute/Relative and Return; `GYRO_STICK_ROTATION_TAKEOVER = ON`,
+  `GYRO_STICK_ROTATION_TAKEOVER_SPEED` (°/s, default 10) and
+  `GYRO_STICK_ROTATION_OUTER` (default 0.9) its Takeover. A deadzone of 0 never drops
+  the turn. It turns whatever that stick is about to send — passed through,
   or routed by a stick mode — and, like any non-mouse `GYRO_OUTPUT`, silences the
   gyro mouse. The Tune panel shows the same live circle as the module (pinnable as
   `rotation`); tuning one of these settings lets the gyro and that stick through.
+- **Gyro actions and commands as outputs:** `GYRO_OFF`, `GYRO_ON`, `GYRO_INVERT`,
+  `GYRO_INV_X/Y`, `GYRO_TRACKBALL` and `GYRO_TRACK_X/Y` bound to a button last as a
+  key would — while it is held, through a toggle (`^`), from the hold of a tap/hold
+  pair (`S = SPACE GYRO_OFF`) — and a tap of one lasts JSM's half second (they are
+  held under reserved `__jsm_gyro:` pins in the press machinery and come out as gyro
+  actions). A quoted setting (`S = "GYRO_SENS = 2"`) is a console command, as in JSM:
+  checked when the config compiles, it changes that setting from the next tick until
+  `RESET_MAPPINGS`, a layer switch or an edit, under any modeshift held on top.
 - **What it takes over:** only what it actually runs. A stick left in a mode a
   later phase owns, and a full pull the trigger mode never fires, keep passing
   through rather than going quiet for a binding that can't run; the line says why.

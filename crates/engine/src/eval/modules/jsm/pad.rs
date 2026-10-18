@@ -109,6 +109,13 @@ pub struct Settings {
     pub rotation_relative: bool,
     /// `GYRO_STICK_ROTATION_RETURN_TIME`: how fast it folds back, seconds.
     pub rotation_return: f32,
+    /// `GYRO_STICK_ROTATION_TAKEOVER`: once the pad turns, the gyro alone aims
+    /// until the stick reaches the outer zone (see `stick_rotation::Takeover`).
+    pub rotation_takeover: bool,
+    /// `GYRO_STICK_ROTATION_TAKEOVER_SPEED`: how fast the aim has to turn, °/s.
+    pub rotation_takeover_speed: f32,
+    /// `GYRO_STICK_ROTATION_OUTER`: the outer zone, a fraction of stick travel.
+    pub rotation_outer: f32,
 }
 
 impl Default for Settings {
@@ -127,6 +134,9 @@ impl Default for Settings {
             rotation_smooth: 0.0,
             rotation_relative: false,
             rotation_return: crate::eval::STICK_ROT_RETURN_DEFAULT_MS / 1000.0,
+            rotation_takeover: false,
+            rotation_takeover_speed: crate::eval::STICK_ROT_TAKEOVER_SPEED_DEFAULT,
+            rotation_outer: crate::eval::STICK_ROT_OUTER_DEFAULT,
         }
     }
 }

@@ -7374,7 +7374,7 @@ fn a_shown_macro_is_an_output_pin_of_the_node() {
         super::eval::jsm_publish(&snap, snap.node_uid, &dev, &mut collector, state, 0.010)
     };
     let out = run(&mut state, true);
-    assert_eq!(out.len(), 9, "bus, one pin, the three readouts, then the stick rotation's four");
+    assert_eq!(out.len(), 10, "bus, one pin, the three readouts, then the stick rotation's five");
     assert_eq!(out[1].map(|s| s.as_bool()), Some(true), "held: the pin is on");
     assert!(matches!(out[super::eval::cal_deg_out(2)], Some(Signal::Float(_))));
     assert!(matches!(out[super::eval::curve_dps_out(2)], Some(Signal::Float(_))));
@@ -7614,4 +7614,202 @@ fn rotation_mode_and_return_time_parse_and_say_when_they_do_nothing() {
     for name in ["GYRO_STICK_ROTATION_MODE", "GYRO_STICK_ROTATION_RETURN_TIME"] {
         assert!(super::help::help_for(name).is_some(), "{name} has help");
     }
+}
+
+// ── gyro actions and setting commands as binding outputs ─────────────────────
+
+/// Run the node through `frames`, each a set of pad pins held for that many
+/// 10 ms ticks, a fresh bus every tick; the last tick's bus and outputs.
+fn run_seq(
+    text: &str,
+    frames: &[(Vec<(String, Signal)>, usize)],
+) -> (PinSigs, Vec<Option<Signal>>) {
+    let _guard = alone();
+    let uid = 4244;
+    let snap = jsm_snap(uid, text, false);
+    let key = format!("collector:{uid}");
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut last = (PinSigs::default(), Vec::new());
+    for (sigs, ticks) in frames {
+        let dev: SigMap = sigs.iter().map(|(p, s)| ((PAD.to_string(), p.clone()), *s)).collect();
+        for _ in 0..*ticks {
+            let mut collector: SigMap = SigMap::default();
+            let out = super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
+            let bus = collector.into_iter().filter(|((d, _), _)| *d == key).map(|((_, p), s)| (p, s)).collect();
+            last = (bus, out);
+        }
+    }
+    last
+}
+
+/// The right stick pushed up while the pad turns at `yaw`, with `buttons` held.
+fn turning(yaw: f32, buttons: &[&str]) -> Vec<(String, Signal)> {
+    let mut sigs = rot_pad("right_stick", glam::Vec2::new(0.0, 1.0), yaw);
+    sigs.extend(buttons.iter().map(|b| (b.to_string(), Signal::Bool(true))));
+    sigs
+}
+
+#[test]
+fn a_gyro_off_binding_holds_the_gyro_off_while_its_button_is_held() {
+    // Before the fix this switched the gyro off for the press's first tick only,
+    // and the turn came through as 9° of the 10.
+    let cfg = format!("{ROT_CFG}\nS = GYRO_OFF");
+    let (bus, _) = run_seq(&cfg, &[(turning(100.0, &["btn_south"]), 10)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!(deg.abs() < 0.01, "off for the whole hold: {deg}");
+    // Let go and it turns again.
+    let (bus, _) = run_seq(&cfg, &[(turning(100.0, &["btn_south"]), 10), (turning(100.0, &[]), 10)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 10.0).abs() < 0.2, "on again once released: {deg}");
+}
+
+#[test]
+fn a_toggled_gyro_off_stays_off_until_toggled_back() {
+    let cfg = format!("{ROT_CFG}\nS = ^GYRO_OFF");
+    let tap = (turning(0.0, &["btn_south"]), 2);
+    let (bus, _) = run_seq(&cfg, &[tap.clone(), (turning(100.0, &[]), 10)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!(deg.abs() < 0.01, "toggled off, released, still off: {deg}");
+    let (bus, _) = run_seq(&cfg, &[tap.clone(), (turning(0.0, &[]), 2), tap, (turning(100.0, &[]), 10)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 10.0).abs() < 0.2, "toggled back on: {deg}");
+}
+
+#[test]
+fn a_tapped_gyro_action_lasts_jsms_long_tap() {
+    // A gyro action on a tap is held half a second, not a key tap's 40 ms.
+    let cfg = format!("{ROT_CFG}\nS = GYRO_OFF'");
+    let tap = (turning(0.0, &["btn_south"]), 2);
+    let (bus, _) = run_seq(&cfg, &[tap.clone(), (turning(100.0, &[]), 30)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!(deg.abs() < 0.01, "still off 0.3 s after the tap: {deg}");
+    let (bus, _) = run_seq(&cfg, &[tap, (turning(100.0, &[]), 80)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!(deg > 25.0 && deg < 35.0, "back on after half a second: {deg}");
+}
+
+#[test]
+fn a_gyro_off_on_hold_takes_over_once_the_hold_time_passes() {
+    // `S = SPACE GYRO_OFF`: tap for space, hold for the gyro off. The hold fires
+    // at HOLD_PRESS_TIME (150 ms), so 15° get through and no more.
+    let cfg = format!("{ROT_CFG}\nS = SPACE GYRO_OFF");
+    let (bus, _) = run_seq(&cfg, &[(turning(100.0, &["btn_south"]), 50)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((14.0..=16.5).contains(&deg), "the hold switched it off and kept it off: {deg}");
+}
+
+#[test]
+fn a_bound_setting_changes_it_from_then_on() {
+    // A tap sets the sensitivity to a half; from then the same turn goes half as far.
+    let cfg = format!("{ROT_CFG}\nS = \"GYRO_SENS = 0.5\"");
+    let tap = (turning(0.0, &["btn_south"]), 2);
+    let (bus, _) = run_seq(&cfg, &[tap.clone(), (turning(0.0, &[]), 2), (turning(100.0, &[]), 10)]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 5.0).abs() < 0.2, "half the turn: {deg}");
+    // RESET_MAPPINGS puts the config back.
+    let cfg = format!("{cfg}\nN = \"RESET_MAPPINGS\"");
+    let (bus, _) = run_seq(&cfg, &[
+        tap,
+        (turning(0.0, &[]), 2),
+        (turning(0.0, &["btn_north"]), 2),
+        (turning(0.0, &[]), 2),
+        (turning(100.0, &[]), 10),
+    ]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 10.0).abs() < 0.2, "back to the config as written: {deg}");
+}
+
+#[test]
+fn a_bound_setting_yields_to_a_held_chord_as_the_console_does() {
+    // The command changes the base; a modeshift held on top still wins.
+    let cfg = format!("{ROT_CFG}\nS = \"GYRO_SENS = 0.5\"\nW,GYRO_SENS = 2");
+    let (bus, _) = run_seq(&cfg, &[
+        (turning(0.0, &["btn_south"]), 2),
+        (turning(0.0, &["btn_west"]), 2),
+        (turning(100.0, &["btn_west"]), 10),
+    ]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 20.0).abs() < 0.3, "the chord's 2, not the command's 0.5: {deg}");
+}
+
+/// The right stick at `deg` (0 up, clockwise) and `len`, the pad turning at `yaw`.
+fn stick_at(deg: f32, len: f32, yaw: f32) -> Vec<(String, Signal)> {
+    let a = deg.to_radians();
+    rot_pad("right_stick", glam::Vec2::new(a.sin(), a.cos()) * len, yaw)
+}
+
+#[test]
+fn rotation_takeover_holds_the_thumbs_direction_until_the_outer_zone() {
+    let cfg = format!("{ROT_CFG}\nGYRO_STICK_ROTATION_TAKEOVER = ON");
+    let at = super::eval::rotation_out(1);
+    // Aim at 30°, turn 10° with the pad, let the thumb drift to 50°: still 40°.
+    let (bus, out) = run_seq(&cfg, &[
+        (stick_at(30.0, 0.6, 0.0), 5),
+        (stick_at(30.0, 0.6, 100.0), 10),
+        (stick_at(50.0, 0.6, 0.0), 5),
+    ]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 40.0).abs() < 0.2, "{deg}");
+    assert_eq!(out[at + 4], Some(Signal::Bool(true)), "the gyro has taken over");
+    // Out to the rim: the thumb's 50° again, with the 10° on top.
+    let (bus, out) = run_seq(&cfg, &[
+        (stick_at(30.0, 0.6, 0.0), 5),
+        (stick_at(30.0, 0.6, 100.0), 10),
+        (stick_at(50.0, 0.95, 0.0), 5),
+    ]);
+    let (deg, _) = bearing_of(&bus, "right_stick");
+    assert!((deg - 60.0).abs() < 0.2, "{deg}");
+    assert_eq!(out[at + 4], Some(Signal::Bool(false)));
+    // A lower outer zone gives it back sooner; without TAKEOVER nothing holds.
+    let low = format!("{cfg}\nGYRO_STICK_ROTATION_OUTER = 0.5");
+    let (bus, _) = run_seq(&low, &[(stick_at(30.0, 0.6, 100.0), 10), (stick_at(50.0, 0.6, 0.0), 5)]);
+    assert!((bearing_of(&bus, "right_stick").0 - 60.0).abs() < 0.2);
+    let (bus, _) = run_seq(ROT_CFG, &[(stick_at(30.0, 0.6, 100.0), 10), (stick_at(50.0, 0.6, 0.0), 5)]);
+    assert!((bearing_of(&bus, "right_stick").0 - 60.0).abs() < 0.2);
+    // A takeover speed above the turn: the thumb keeps aiming.
+    let fast = format!("{cfg}\nGYRO_STICK_ROTATION_TAKEOVER_SPEED = 150");
+    let (bus, _) = run_seq(&fast, &[(stick_at(30.0, 0.6, 100.0), 10), (stick_at(50.0, 0.6, 0.0), 5)]);
+    assert!((bearing_of(&bus, "right_stick").0 - 60.0).abs() < 0.2);
+}
+
+#[test]
+fn rotation_takeover_settings_parse_and_say_when_they_do_nothing() {
+    for (line, ok) in [
+        ("GYRO_STICK_ROTATION_TAKEOVER = ON", true),
+        ("GYRO_STICK_ROTATION_TAKEOVER = off", true),
+        ("GYRO_STICK_ROTATION_TAKEOVER = MAYBE", false),
+        ("GYRO_STICK_ROTATION_TAKEOVER_SPEED = 15", true),
+        ("GYRO_STICK_ROTATION_TAKEOVER_SPEED = -1", false),
+        ("GYRO_STICK_ROTATION_OUTER = 0.8", true),
+        ("GYRO_STICK_ROTATION_OUTER = 1.5", false),
+    ] {
+        let c = compile(line);
+        assert_eq!(c.lines[0].status == LineStatus::Ok, ok, "{line}: {:?}", c.lines[0].status);
+    }
+    for line in ["GYRO_STICK_ROTATION_TAKEOVER_SPEED = 15", "GYRO_STICK_ROTATION_OUTER = 0.8"] {
+        let c = compile(line);
+        assert!(c.lines[0].notes.iter().any(|n| n.contains("TAKEOVER = ON")), "{line}: {:?}", c.lines[0].notes);
+        let c = compile(&format!("GYRO_STICK_ROTATION_TAKEOVER = ON\n{line}"));
+        assert!(c.lines[1].notes.iter().all(|n| !n.contains("TAKEOVER = ON")), "{line}");
+    }
+    for name in ["GYRO_STICK_ROTATION_TAKEOVER", "GYRO_STICK_ROTATION_TAKEOVER_SPEED", "GYRO_STICK_ROTATION_OUTER"] {
+        assert!(super::help::help_for(name).is_some(), "{name} has help");
+    }
+}
+
+#[test]
+fn bound_settings_are_checked_and_say_how_long_they_last() {
+    let c = compile("S = \"GYRO_SENS = 2\"");
+    assert_eq!(c.lines[0].status, LineStatus::Ok, "{:?}", c.lines[0].status);
+    assert!(c.lines[0].notes.iter().any(|n| n.contains("from then on")), "{:?}", c.lines[0].notes);
+    assert!(c.lines[0].notes.iter().all(|n| !n.contains("does nothing")), "{:?}", c.lines[0].notes);
+    // A bad value is an error on the binding, not a button that does nothing.
+    let c = compile("S = \"STICK_DEADZONE_INNER = 2\"");
+    assert!(matches!(&c.lines[0].status, LineStatus::Error(e) if e.contains("STICK_DEADZONE_INNER")), "{:?}", c.lines[0].status);
+    // A channel can't change under held notes, from a button any more than a chord.
+    let c = compile("S = \"MIDI_CHANNEL = 3\"");
+    assert!(matches!(c.lines[0].status, LineStatus::Error(_)), "{:?}", c.lines[0].status);
+    // A setting that isn't live here says so, rather than "not a command".
+    let c = compile("S = \"SCREEN_RESOLUTION_X = 1920\"");
+    assert!(c.lines[0].notes.iter().any(|n| n.contains("isn't live here")), "{:?}", c.lines[0].notes);
 }
