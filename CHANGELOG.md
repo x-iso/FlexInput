@@ -3,9 +3,68 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.15.9] - 2026-10-15
 
 ### Added
+
+- **Unknown controllers: Learn their layout.** A DirectInput pad, wheel or
+  stick that no controller database knows used to show up with its buttons
+  scrambled. It now appears as its own device, and its node has a **Learn**
+  button: press a button or move a stick, trigger or D-pad, and pick what it
+  is from **Assign to…**. Learn says what it saw — a button, a centred axis,
+  an axis resting at one end like a trigger, or a hat — and offers the
+  matching Auto-Map pins, worded by the way you pushed ("Left Stick — you
+  pushed it up") so a stick never comes out inverted. Two triggers sharing one
+  axis, a D-pad reported as two axes, and triggers that click before their
+  travel all map properly. The layout is saved for that controller model, so
+  it works wherever the pad is plugged in, in every tab and preset, Easy mode
+  included. The node's list shows what's learned, with × to forget an entry.
+
+- **Controls of their own.** Anything on such a controller that isn't a
+  gamepad control can be kept as **its own port** under a name you give it.
+  It rides the Auto-Map bus too: a Remapper downstream can Learn it and shows
+  it by name, and a Splitter can add it.
+
+- **Everything the controller reports, not just what DirectInput reads.**
+  Where the pad's HID description can be read, the fields DirectInput skips —
+  vendor data, a built-in accelerometer or gyro, extra controls — show up in
+  Learn too, under their own names where they have one. Learn also watches the
+  pad's opaque vendor data, so a button or axis that only lives there can be
+  learned like any other.
+
+- **Motion setup for unknown controllers.** When the node spots a motion
+  sensor (its readings never sit quite still), **Set up motion** walks you
+  through six quick poses — flat, nose up, flat, right side down, flat, a turn
+  on the table — and works out which axes are the accelerometer and the gyro,
+  which way round they sit and how they scale, even when they're hidden in the
+  pad's vendor data. The result drives the usual gyro and accel pins, so the
+  calibration window, Gyro × and every motion module work with it.
+
+- **3DOF to 2D: Edge turn.** In Pointer mode, turning the pad past a zone
+  around the neutral pose (where Reset last put it) keeps the camera turning
+  on its own, the way it was already going, until you come back in. Nothing
+  switches at the zone: everything eases in past it over **blend**, so the
+  gyro's feel bleeds into the edge's. **Ramp** works like a stick past its
+  deadzone — the further out, the faster, up to **max** at zone + **ramp**.
+  **Momentum** keeps the camera from slowing below the speed you turned out
+  at (× gain): keep turning and it adds nothing, ease off and it makes up the
+  difference, pull back to brake, with an optional **fade**. **Both** uses
+  the two together. **gyro** sets how much of the gyro's own aim is left past
+  the blend — 100% keeps it, 0% hands over to the edge like a stick. **X
+  only** leaves pitch out. It measures the module's orientation, whose yaw
+  can drift; Reset re-centres the zone.
+
+- **Set Neutral Forward, as a card output.** On Choose's Gamepad tab under
+  the motion inputs: while a card sends it, the pad (or pads — both Joy-Con 2
+  halves behind a Combiner) feeding that card takes the way it points as
+  forward. Only yaw is re-zeroed; roll and pitch stay on gravity. Let go and
+  the new forward holds, so it re-centres a heading that has crept and works
+  as a clutch while held. It applies to a pad's own orientation (Joy-Con 2)
+  and to the one the 3DOF to 2D module computes.
+
+- **3DOF to 2D: Auto orientation source, now the default.** Auto uses the
+  device's own orientation when it publishes one and the module's computed
+  one otherwise.
 
 - **Calibrate Gyro, as a card output.** On Choose's Gamepad tab, beside Set
   Neutral Forward. Press it in game and a prompt over the game asks you to lay
@@ -93,6 +152,30 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Unknown DirectInput pads move to a new device.** A pad that used to
+  appear with a guessed layout now appears as a new device with Learn;
+  anything wired to the old one needs re-pointing. Pads with a known mapping
+  are unchanged.
+
+- **3DOF to 2D: Device orientation no longer falls back.** A pad without its
+  own orientation now gets none (and no Edge turn) instead of quietly getting
+  the computed one — that's what Auto is for. Nodes saved on Computed before
+  this didn't store the choice, so they open on Auto.
+
+- **Much lower CPU use.** The processing engine does the same work about three
+  times faster and the window redraws its graph about twice as fast, with the
+  same results. On a Ryzen 7 3800X a typical preset went from 16–17% CPU with
+  the window focused to about 5% (about 2% minimized). Heavy patches no longer
+  outrun the engine at the default sample rate.
+
+- **Lower memory use that no longer creeps up.** Text drawn at many sizes —
+  resizing pinned widgets and overlay elements — filled a glyph cache that could
+  reach about half a gigabyte before it was ever cleared, all of it system
+  memory on integrated graphics; it now has a much lower ceiling. Icons drawn at
+  many sizes are recycled instead of kept forever, undo history no longer keeps
+  a copy of every scope's trace, and readouts no longer record a trace nothing
+  shows.
+
 - **Outputs follow input a polling period sooner, with fewer wakeups.** The
   engine used to run on its own timer at the sample rate, and each output sent
   to a virtual device came from the input polled the time before. Now it runs
@@ -159,94 +242,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   Learn changes any part of it. Anything wired to its old device needs
   re-pointing.
 
-## [0.15.9] - 2026-10-15
+- **Easy mode: picking a second controller keeps the first.** On a preset
+  that takes more than one input device, a controller that wasn't connected
+  still held its port, and with no card of its own it couldn't be
+  deselected — so picking another controller replaced the one you could see
+  instead. A controller that isn't connected now gives up its port first. It
+  keeps it while another port is free, so it's back on its own port when it
+  reconnects, and the Port list marks a port it holds "(not connected)".
 
-### Added
-
-- **Unknown controllers: Learn their layout.** A DirectInput pad, wheel or
-  stick that no controller database knows used to show up with its buttons
-  scrambled. It now appears as its own device, and its node has a **Learn**
-  button: press a button or move a stick, trigger or D-pad, and pick what it
-  is from **Assign to…**. Learn says what it saw — a button, a centred axis,
-  an axis resting at one end like a trigger, or a hat — and offers the
-  matching Auto-Map pins, worded by the way you pushed ("Left Stick — you
-  pushed it up") so a stick never comes out inverted. Two triggers sharing one
-  axis, a D-pad reported as two axes, and triggers that click before their
-  travel all map properly. The layout is saved for that controller model, so
-  it works wherever the pad is plugged in, in every tab and preset, Easy mode
-  included. The node's list shows what's learned, with × to forget an entry.
-
-- **Controls of their own.** Anything on such a controller that isn't a
-  gamepad control can be kept as **its own port** under a name you give it.
-  It rides the Auto-Map bus too: a Remapper downstream can Learn it and shows
-  it by name, and a Splitter can add it.
-
-- **Everything the controller reports, not just what DirectInput reads.**
-  Where the pad's HID description can be read, the fields DirectInput skips —
-  vendor data, a built-in accelerometer or gyro, extra controls — show up in
-  Learn too, under their own names where they have one. Learn also watches the
-  pad's opaque vendor data, so a button or axis that only lives there can be
-  learned like any other.
-
-- **Motion setup for unknown controllers.** When the node spots a motion
-  sensor (its readings never sit quite still), **Set up motion** walks you
-  through six quick poses — flat, nose up, flat, right side down, flat, a turn
-  on the table — and works out which axes are the accelerometer and the gyro,
-  which way round they sit and how they scale, even when they're hidden in the
-  pad's vendor data. The result drives the usual gyro and accel pins, so the
-  calibration window, Gyro × and every motion module work with it.
-
-- **3DOF to 2D: Edge turn.** In Pointer mode, turning the pad past a zone
-  around the neutral pose (where Reset last put it) keeps the camera turning
-  on its own, the way it was already going, until you come back in. Nothing
-  switches at the zone: everything eases in past it over **blend**, so the
-  gyro's feel bleeds into the edge's. **Ramp** works like a stick past its
-  deadzone — the further out, the faster, up to **max** at zone + **ramp**.
-  **Momentum** keeps the camera from slowing below the speed you turned out
-  at (× gain): keep turning and it adds nothing, ease off and it makes up the
-  difference, pull back to brake, with an optional **fade**. **Both** uses
-  the two together. **gyro** sets how much of the gyro's own aim is left past
-  the blend — 100% keeps it, 0% hands over to the edge like a stick. **X
-  only** leaves pitch out. It measures the module's orientation, whose yaw
-  can drift; Reset re-centres the zone.
-
-- **Set Neutral Forward, as a card output.** On Choose's Gamepad tab under
-  the motion inputs: while a card sends it, the pad (or pads — both Joy-Con 2
-  halves behind a Combiner) feeding that card takes the way it points as
-  forward. Only yaw is re-zeroed; roll and pitch stay on gravity. Let go and
-  the new forward holds, so it re-centres a heading that has crept and works
-  as a clutch while held. It applies to a pad's own orientation (Joy-Con 2)
-  and to the one the 3DOF to 2D module computes.
-
-- **3DOF to 2D: Auto orientation source, now the default.** Auto uses the
-  device's own orientation when it publishes one and the module's computed
-  one otherwise.
-
-### Changed
-
-- **Unknown DirectInput pads move to a new device.** A pad that used to
-  appear with a guessed layout now appears as a new device with Learn;
-  anything wired to the old one needs re-pointing. Pads with a known mapping
-  are unchanged.
-
-- **3DOF to 2D: Device orientation no longer falls back.** A pad without its
-  own orientation now gets none (and no Edge turn) instead of quietly getting
-  the computed one — that's what Auto is for. Nodes saved on Computed before
-  this didn't store the choice, so they open on Auto.
-
-- **Much lower CPU use.** The processing engine does the same work about three
-  times faster and the window redraws its graph about twice as fast, with the
-  same results. On a Ryzen 7 3800X a typical preset went from 16–17% CPU with
-  the window focused to about 5% (about 2% minimized). Heavy patches no longer
-  outrun the engine at the default sample rate.
-
-- **Lower memory use that no longer creeps up.** Text drawn at many sizes —
-  resizing pinned widgets and overlay elements — filled a glyph cache that could
-  reach about half a gigabyte before it was ever cleared, all of it system
-  memory on integrated graphics; it now has a much lower ceiling. Icons drawn at
-  many sizes are recycled instead of kept forever, undo history no longer keeps
-  a copy of every scope's trace, and readouts no longer record a trace nothing
-  shows.
+- **Easy mode: the input list scrolls with the controller.** Stepping down
+  the input devices with the d-pad or left stick moved the highlight past the
+  bottom of the list without scrolling it, onto the output cards. The list
+  now scrolls to the highlighted card, Down goes through every input device
+  before reaching the outputs, and the cursor and highlight only land on
+  cards you can see.
 
 ## [0.15.8] - 2026-10-13
 
