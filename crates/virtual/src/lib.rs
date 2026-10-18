@@ -211,6 +211,12 @@ pub mod windows;
 pub mod hidmaestro_device;
 
 #[cfg(windows)]
+mod sony_feedback;
+
+#[cfg(windows)]
+pub mod composite_device;
+
+#[cfg(windows)]
 pub mod keymouse_hm;
 
 #[cfg(windows)]
@@ -229,6 +235,44 @@ pub fn available_device_kinds() -> &'static [DeviceKind] {
     { return windows::DEVICE_KINDS; }
     #[allow(unreachable_code)]
     &[]
+}
+
+/// Each pad that can carry USB audio, and the composite kind that does: the
+/// same controller with its speaker / haptics and microphone interfaces, the
+/// path a game's authored haptic waveforms take. Not offered as kinds of their
+/// own — a pad's "Audio & Haptics" option switches between the two.
+pub const USB_AUDIO_VARIANTS: &[(&str, &str)] = &[
+    ("virtual.hm.dualsense", "virtual.usb.dualsense"),
+    ("virtual.hm.dualsense_edge", "virtual.usb.dualsense_edge"),
+];
+
+/// Whether `kind_id` names a device this crate can build: a listed kind, or a
+/// pad's USB audio variant.
+pub fn is_known_kind(kind_id: &str) -> bool {
+    available_device_kinds().iter().any(|k| k.kind_id == kind_id)
+        || USB_AUDIO_VARIANTS.iter().any(|(_, usb)| *usb == kind_id)
+}
+
+/// Whether the device `dev_id` is a pad's USB audio variant.
+pub fn has_usb_audio(dev_id: &str) -> bool {
+    let kind = kind_prefix(dev_id);
+    USB_AUDIO_VARIANTS.iter().any(|(_, usb)| *usb == kind)
+}
+
+/// The id of the same pad with USB audio switched the other way, keeping its
+/// instance suffix — or `None` for a device that has no USB audio variant.
+pub fn usb_audio_toggled_id(dev_id: &str) -> Option<String> {
+    let kind = kind_prefix(dev_id);
+    let suffix = &dev_id[kind.len()..];
+    USB_AUDIO_VARIANTS.iter().find_map(|&(plain, usb)| {
+        if kind == plain {
+            Some(format!("{usb}{suffix}"))
+        } else if kind == usb {
+            Some(format!("{plain}{suffix}"))
+        } else {
+            None
+        }
+    })
 }
 
 /// Instantiate a virtual device by kind ID and instance index.
@@ -254,11 +298,41 @@ pub fn kind_pin_metadata(
 
 /// Best-effort: extract the kind prefix (e.g. "virtual.xinput",
 /// "virtual.hm.ds4") from a full device id like "virtual.xinput.2" or
-/// "virtual.hm.ds4.1". HIDMaestro kinds live in a 3-segment namespace
-/// (`virtual.hm.<model>`); all other kinds are 2-segment. Used by the UI to
-/// identify which kind a device id belongs to (output-card toggles, physical-list
-/// filtering, etc.).
+/// "virtual.hm.ds4.1". HIDMaestro kinds and the USB composite ones live in
+/// 3-segment namespaces (`virtual.hm.<model>`, `virtual.usb.<model>`); all
+/// other kinds are 2-segment. Used by the UI to identify which kind a device id
+/// belongs to (output-card toggles, physical-list filtering, etc.).
 pub fn kind_prefix(dev_id: &str) -> String {
-    let segs = if dev_id.starts_with("virtual.hm.") { 3 } else { 2 };
+    let segs = if dev_id.starts_with("virtual.hm.") || dev_id.starts_with("virtual.usb.") { 3 } else { 2 };
     dev_id.split('.').take(segs).collect::<Vec<_>>().join(".")
+}
+
+#[cfg(test)]
+mod usb_audio_tests {
+    use super::*;
+
+    #[test]
+    fn toggling_usb_audio_swaps_the_kind_and_keeps_the_instance() {
+        assert_eq!(usb_audio_toggled_id("virtual.hm.dualsense").as_deref(), Some("virtual.usb.dualsense"));
+        assert_eq!(usb_audio_toggled_id("virtual.usb.dualsense.2").as_deref(), Some("virtual.hm.dualsense.2"));
+        assert_eq!(
+            usb_audio_toggled_id("virtual.hm.dualsense_edge.1").as_deref(),
+            Some("virtual.usb.dualsense_edge.1")
+        );
+        assert_eq!(usb_audio_toggled_id("virtual.hm.ds4"), None);
+        assert_eq!(usb_audio_toggled_id("virtual.keymouse"), None);
+        assert!(has_usb_audio("virtual.usb.dualsense_edge.3"));
+        assert!(!has_usb_audio("virtual.hm.dualsense"));
+    }
+
+    #[test]
+    fn composite_kinds_are_known_but_not_listed() {
+        assert_eq!(kind_prefix("virtual.usb.dualsense.4"), "virtual.usb.dualsense");
+        for (_, usb) in USB_AUDIO_VARIANTS {
+            assert!(is_known_kind(usb));
+            assert!(!available_device_kinds().iter().any(|k| k.kind_id == *usb));
+        }
+        assert!(is_known_kind("virtual.hm.dualsense"));
+        assert!(!is_known_kind("virtual.usb.ds4"));
+    }
 }

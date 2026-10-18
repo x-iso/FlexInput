@@ -29,6 +29,10 @@ pub enum Request {
     Ping,
     /// Ensure the HIDMaestro driver is installed (idempotent).
     EnsureDriver,
+    /// Ensure usbip-win2's virtual host controller is installed and running
+    /// (idempotent), from the installer bundled in the exe. The composite USB
+    /// personas need it. Replies `Ok`.
+    EnsureUsbip,
     /// Force a clean driver reinstall: remove every installed HIDMaestro package
     /// then install fresh. Tears down all live HIDMaestro device nodes first (a
     /// bound driver can refuse removal). Unlike `EnsureDriver` this runs even

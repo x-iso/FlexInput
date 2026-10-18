@@ -234,6 +234,19 @@ pub fn ensure_driver() -> Result<(), HelperError> {
     }
 }
 
+/// Install usbip-win2's virtual host controller via the helper, if it isn't
+/// already running (the transport behind the composite USB personas). Blocking,
+/// up to a few minutes on a first install — run off the UI thread. One UAC if
+/// the helper isn't already up.
+pub fn ensure_usbip() -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::EnsureUsbip)? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to EnsureUsbip".into())),
+    }
+}
+
 /// Force a clean driver reinstall via the helper (delete every HIDMaestro
 /// package, then install fresh). The helper tears down all live device nodes
 /// first; the caller must re-create its devices afterward. Blocking — run off

@@ -111,6 +111,14 @@ pub enum DeployError {
     PartialInstall { has_main: bool, has_xusb: bool },
     /// pnputil could not be launched.
     Pnputil(std::io::Error),
+    /// usbip-win2 is in the DriverStore but its host controller isn't running.
+    UsbipNotRunning,
+    /// The bundled usbip-win2 installer isn't the pinned release.
+    UsbipUnverified,
+    /// The usbip-win2 installer failed (its exit code; -1 for a timeout).
+    UsbipInstaller(i32),
+    /// The installer finished but the host controller never appeared.
+    UsbipDidNotAppear,
 }
 
 impl std::fmt::Display for DeployError {
@@ -134,6 +142,19 @@ impl std::fmt::Display for DeployError {
                 )
             }
             DeployError::Pnputil(e) => write!(f, "could not run pnputil: {e}"),
+            DeployError::UsbipNotRunning => write!(
+                f,
+                "usbip-win2 is installed but its virtual host controller isn't running.                  Reinstalling it would first uninstall it, which detaches a filter from                  every USB root hub and can take minutes, so that isn't done                  automatically: repair or reinstall usbip-win2, or reboot, and try again."
+            ),
+            DeployError::UsbipUnverified => {
+                write!(f, "the bundled usbip-win2 installer failed its SHA-256 check; not running it")
+            }
+            DeployError::UsbipInstaller(-1) => write!(f, "the usbip-win2 installer didn't finish in time"),
+            DeployError::UsbipInstaller(code) => write!(f, "the usbip-win2 installer failed (exit code {code})"),
+            DeployError::UsbipDidNotAppear => write!(
+                f,
+                "the usbip-win2 installer finished but its virtual host controller didn't                  appear; check Device Manager for 'USBip 3.X Emulated Host Controller' and                  for a pending reboot"
+            ),
         }
     }
 }
@@ -486,14 +507,14 @@ fn install_inf(inf: &Path) -> Result<(), DeployError> {
 /// open; the random name means no one can create it first; and creation fails
 /// rather than reusing a directory that already exists. It also keeps the path
 /// plain ASCII, which the catalog builder needs — a user profile path may not be.
-struct StagingDir(PathBuf);
+pub(crate) struct StagingDir(PathBuf);
 
 impl StagingDir {
     /// Protected DACL: full control for SYSTEM and Administrators, inherited by
     /// everything created inside; no other principal gets any access.
     const SDDL: &'static str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
-    fn create() -> Result<StagingDir, DeployError> {
+    pub(crate) fn create() -> Result<StagingDir, DeployError> {
         let parent = windows_dir().join("Temp");
         let sddl: Vec<u16> = Self::SDDL.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor: *mut c_void = std::ptr::null_mut();
@@ -529,7 +550,7 @@ impl StagingDir {
         result
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -569,7 +590,7 @@ fn windows_dir() -> PathBuf {
     PathBuf::from(String::from_utf16_lossy(&buf[..n]))
 }
 
-fn system32() -> PathBuf {
+pub(crate) fn system32() -> PathBuf {
     windows_dir().join("System32")
 }
 

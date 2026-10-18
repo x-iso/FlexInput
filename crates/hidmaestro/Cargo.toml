@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 flexinput-core = { workspace = true }
+# The helper deploys usbip-win2 for the composite personas (usbip_install.rs)
+# and checks for its host controller through flexinput-usbip's vhci client.
+flexinput-usbip = { workspace = true }
+# Pins the bundled usbip-win2 installer (usbip_bundled.rs). Already in the graph
+# via crates/net.
+sha2       = "0.10"
 serde      = { workspace = true }
 serde_json = { workspace = true }
 # Per-machine driver package signing (signing.rs): self-signed cert on a CNG

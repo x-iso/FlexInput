@@ -147,6 +147,97 @@ pub fn render_rumble_feedback_controls(
     changed
 }
 
+/// The "Audio & Haptics" option on a virtual pad that has a composite USB
+/// variant (the DualSense and the Edge). Returns the device id to switch the
+/// node to when it's toggled; the two variants share every pin, so the node
+/// keeps its wires. Lays out in the caller's current layout.
+///
+/// Turning it on where usbip-win2 isn't installed yet first asks, in a modal:
+/// the install re-enumerates the USB root hubs, so every USB device drops and
+/// reconnects. The box shows ticked while the question is open.
+pub fn render_usb_audio_toggle(ui: &mut egui::Ui, dev_id: &str) -> Option<String> {
+    let switched = flexinput_virtual::usb_audio_toggled_id(dev_id)?;
+    let has = flexinput_virtual::has_usb_audio(dev_id);
+    let confirm_id = egui::Id::new(("usb_audio_install_confirm", dev_id));
+    let asking = ui.ctx().data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
+    let mut on = has || asking;
+    let resp = ui
+        .checkbox(&mut on, egui::RichText::new("Audio & Haptics").small())
+        .on_hover_text(
+            "Present this pad as a wired DualSense with its USB audio: a speaker and \
+             haptics output, and a microphone. Games that author HD haptics stream \
+             them to it.\n\nNeeds usbip-win2. The first time, FlexInput installs it: \
+             one Windows elevation prompt, and USB devices reconnect for a moment.",
+        );
+    if resp.changed() {
+        if asking {
+            // Unticked while the question is open: the answer is no.
+            ui.ctx().data_mut(|d| d.remove::<bool>(confirm_id));
+        } else if has || usbip_installed() {
+            return Some(switched);
+        } else {
+            ui.ctx().data_mut(|d| d.insert_temp(confirm_id, true));
+        }
+        return None;
+    }
+    if asking {
+        match usbip_install_confirm(ui.ctx(), confirm_id) {
+            Some(true) => {
+                ui.ctx().data_mut(|d| d.remove::<bool>(confirm_id));
+                return Some(switched);
+            }
+            Some(false) => ui.ctx().data_mut(|d| d.remove::<bool>(confirm_id)),
+            None => {}
+        }
+    }
+    None
+}
+
+fn usbip_installed() -> bool {
+    #[cfg(windows)]
+    return flexinput_usbip::vhci::is_available();
+    #[cfg(not(windows))]
+    true
+}
+
+/// The question before the first install of usbip-win2. `Some(true)` to go
+/// ahead, `Some(false)` to back out (Cancel, Escape, a click outside), `None`
+/// while it's still open.
+fn usbip_install_confirm(ctx: &egui::Context, id: egui::Id) -> Option<bool> {
+    let mut answer = None;
+    let modal = egui::Modal::new(id.with("modal")).show(ctx, |ui| {
+        ui.set_max_width(360.0);
+        ui.heading("Install USB audio support?");
+        ui.add_space(6.0);
+        ui.label(
+            "Audio & Haptics needs usbip-win2, a virtual USB host controller. \
+             FlexInput installs it now; Windows asks for permission once.",
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "While it installs, every USB device disconnects and reconnects for a \
+                 moment: controllers, keyboard, mouse, audio. A running game may lose \
+                 input briefly.",
+            )
+            .color(ui.visuals().warn_fg_color),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button("Install").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(false);
+    }
+    answer
+}
+
 /// A horizontal slider with two rectangular "clamp" handles defining a
 /// `[lo, hi]` band within `0.0..=1.0`. Styled to match the regular egui
 /// sliders (same rail, same widget visuals); the two handles read like a clamp

@@ -84,13 +84,14 @@ pub(crate) fn is_own_virtual_gilrs_id(gilrs_id: &str) -> bool {
 }
 
 /// Map an own-virtual loopback id (`gilrs:<kind>:v<N>`) to the matching virtual
-/// pool device: its `kind_prefix` (e.g. `virtual.hm.xinput`) and the `N`th
-/// own-virtual of that kind. Returns `None` for a real physical id. Used by the
+/// pool device: the `kind_prefix`es that read back as that kind (e.g.
+/// `virtual.hm.xinput`; a DualSense Edge reads back as a DualSense) and the
+/// `N`th own-virtual among them. Returns `None` for a real physical id. Used by the
 /// rumble "ping" to inject into the virtual's feedback rather than a backend
 /// (which has no motor for our own virtual). The `v<N>` index matches pool order
 /// because the read-side tags own-virtuals (`gilrs_device_id`) in the same
 /// enumeration order the pool lists them.
-pub(crate) fn own_virtual_pool_target(gilrs_id: &str) -> Option<(&'static str, usize)> {
+pub(crate) fn own_virtual_pool_target(gilrs_id: &str) -> Option<(&'static [&'static str], usize)> {
     let mut parts = gilrs_id.split(':');
     if parts.next()? != "gilrs" {
         return None;
@@ -98,13 +99,18 @@ pub(crate) fn own_virtual_pool_target(gilrs_id: &str) -> Option<(&'static str, u
     let slug = parts.next()?;
     let inst = parts.next()?;
     let n: usize = inst.strip_prefix('v')?.parse().ok()?; // own-virtuals only
-    let kind_prefix = match slug {
-        "xinput" => "virtual.hm.xinput",
-        "ds4" => "virtual.hm.ds4",
-        "dualsense" => "virtual.hm.dualsense",
+    let kinds: &'static [&'static str] = match slug {
+        "xinput" => &["virtual.hm.xinput"],
+        "ds4" => &["virtual.hm.ds4"],
+        "dualsense" => &[
+            "virtual.hm.dualsense",
+            "virtual.hm.dualsense_edge",
+            "virtual.usb.dualsense",
+            "virtual.usb.dualsense_edge",
+        ],
         _ => return None,
     };
-    Some((kind_prefix, n))
+    Some((kinds, n))
 }
 
 
@@ -152,9 +158,7 @@ pub(crate) fn try_create_virtual_device_known(id: &str) -> bool {
         },
         None => id,
     };
-    flexinput_virtual::available_device_kinds()
-        .iter()
-        .any(|k| k.kind_id == kind_id)
+    flexinput_virtual::is_known_kind(kind_id)
 }
 
 /// Remove devices from the shared pool whose id is not referenced by any open

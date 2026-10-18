@@ -1,0 +1,30 @@
+[package]
+name    = "flexinput-usbip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A USB/IP device server for composite USB personas: a virtual DualSense (or
+# Edge) with its real USB audio interfaces beside the HID one, so a game can
+# stream its haptic waveforms to it. Windows reaches the server through
+# usbip-win2's signed virtual host controller and binds its own in-box
+# usbaudio.sys / hidusb to the device. Ported from HIDMaestro's usbip backend
+# (MIT); see src/lib.rs.
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The 1 ms isochronous pacing needs a high-resolution waitable timer (a plain
+# timed wait rounds up to the ~15.6 ms system tick); vhci.rs drives usbip-win2's
+# host controller through CfgMgr32 and DeviceIoControl. 0.61 to match the other
+# crates.
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

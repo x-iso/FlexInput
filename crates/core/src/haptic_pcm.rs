@@ -13,8 +13,9 @@
 //! game's HD-haptic waveform can drive the parametric sinks (Switch Pro HD Rumble,
 //! or a physical DualSense's LRAs).
 //!
-//! Pure DSP, no I/O — the audio bytes arrive from the virtual-DualSense driver's
-//! audio-OUT ring (see the UDE driver path). Unit-tested in isolation.
+//! Pure DSP, no I/O — the audio bytes arrive from a virtual DualSense's USB
+//! audio output (`flexinput-virtual`'s composite device). Unit-tested in
+//! isolation.
 
 /// Source PCM format constants for the DualSense audio endpoint.
 pub const CHANNELS: usize = 4;

@@ -33,6 +33,14 @@ const SEMANTIC_GROUPS: &[&[&str]] = &[
 pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
     ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),
+    // HD-rumble first carrier, as a virtual DualSense with USB audio measures it
+    // from the haptic waveform a game streams to it. Direct id match: pads with
+    // HD actuators (Switch Pro, a USB DualSense) take it; the engine combines it
+    // with any classic rumble on the same pin by magnitude.
+    ("hd_l_amp",  &["hd_l_amp"]),
+    ("hd_l_freq", &["hd_l_freq"]),
+    ("hd_r_amp",  &["hd_r_amp"]),
+    ("hd_r_freq", &["hd_r_freq"]),
     // HD-rumble second carrier (HF). Direct id match — only pads that expose the
     // hd2_* inputs (Switch Pro, DualSense) receive it; others drop it silently and
     // play carrier 1 alone.

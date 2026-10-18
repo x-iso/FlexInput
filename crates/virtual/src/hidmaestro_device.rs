@@ -20,6 +20,7 @@ use flexinput_core::Signal;
 use flexinput_hidmaestro::encode::{encode_report_into, gip_from_state, PinState};
 use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
+use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 
 /// Classification of one XUSB-companion output-ring frame for rumble purposes.
@@ -102,86 +103,9 @@ pub struct HidMaestroDevice {
     /// Helper-managed device instance id (`ROOT\HIDClass\NNNN`). `Some` when
     /// this device was created via the helper and must be destroyed on drop.
     helper_instance_id: Option<String>,
-    /// True when last tick published a peak that exceeded the real value; the
-    /// next tick settles `rumble` to the latest actual frame value so a held
-    /// peak doesn't buzz forever after a one-shot ping.
-    rumble_settle_pending: bool,
-    /// Latest actual (non-peak) rumble frame value, used to settle after a peak.
-    rumble_latest: (f32, f32),
-    /// Most recent FULL output frame from the game (kept so non-rumble feedback —
-    /// lightbar/LEDs/triggers — can be decoded from a level-held report rather
-    /// than peak-held like rumble). `None` until the game sends one.
-    last_out_frame: Option<Vec<u8>>,
-    /// Latest decoded non-rumble feedback (lightbar/LEDs/adaptive triggers).
-    fb: DsFeedback,
-}
-
-/// Decoded non-rumble DualSense/DS4 feedback the game wrote to the virtual pad,
-/// normalized to the 0–1 source-pin convention so it routes straight to a
-/// physical pad's matching haptic input pins. All-zero = nothing driven.
-#[derive(Clone, Copy, Default)]
-struct DsFeedback {
-    /// `None` until the game sends a report that sets the lightbar (its valid
-    /// flag), so a game that never touches it leaves the physical pad on its
-    /// own default colour instead of forcing it black.
-    lightbar: Option<(f32, f32, f32)>,
-    player_led: f32,
-    mic_led: f32,
-    /// A trigger's effect is `None` until the game first sets it (its valid-flag
-    /// bit): a game that never drives the adaptive triggers publishes no trigger
-    /// pins at all, so a pad's default trigger effect can tell "the game says
-    /// nothing" from "the game says Off".
-    trig_r: Option<Trig>,
-    trig_l: Option<Trig>,
-}
-
-/// One trigger's effect as the `trigger_*` pins carry it, each 0–1 (see
-/// `flexinput_core::automap::TriggerMode` for the mode's values).
-#[derive(Clone, Copy, Default, Debug, PartialEq)]
-struct Trig {
-    mode: f32,
-    start: f32,
-    end: f32,
-    strength: f32,
-    freq: f32,
-    strength2: f32,
-    period: f32,
-}
-
-impl DsFeedback {
-    /// Flatten to source-pin (id, Signal) pairs. Pins whose underlying field the
-    /// profile doesn't declare still report 0.0 — harmless (a physical pad that
-    /// lacks the pin drops it, and 0 = "off" otherwise).
-    fn as_pins(&self) -> Vec<(&'static str, Signal)> {
-        let mut out = vec![
-            ("player_led", Signal::Float(self.player_led)),
-            ("mic_led", Signal::Float(self.mic_led)),
-        ];
-        // Absent (not 0) until the game sets it: no pin = nothing drives the
-        // physical lightbar, so its device-card default colour applies.
-        if let Some((r, g, b)) = self.lightbar {
-            out.extend([
-                ("lightbar_r", Signal::Float(r)),
-                ("lightbar_g", Signal::Float(g)),
-                ("lightbar_b", Signal::Float(b)),
-            ]);
-        }
-        for (t, pins) in [
-            (self.trig_r, [
-                "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength",
-                "trigger_r_freq", "trigger_r_strength2", "trigger_r_period",
-            ]),
-            (self.trig_l, [
-                "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength",
-                "trigger_l_freq", "trigger_l_strength2", "trigger_l_period",
-            ]),
-        ] {
-            let Some(t) = t else { continue };
-            let v = [t.mode, t.start, t.end, t.strength, t.freq, t.strength2, t.period];
-            out.extend(pins.into_iter().zip(v).map(|(p, v)| (p, Signal::Float(v))));
-        }
-        out
-    }
+    /// The plain-HID (Sony) path's output-report decode: rumble peak/settle,
+    /// lightbar, LEDs, adaptive triggers.
+    sony: SonyFeedback,
 }
 
 impl HidMaestroDevice {
@@ -212,11 +136,8 @@ impl HidMaestroDevice {
             output,
             rumble: (0.0, 0.0),
             helper_instance_id: None,
-            rumble_settle_pending: false,
-            rumble_latest: (0.0, 0.0),
             last_rumble_cmd: None,
-            last_out_frame: None,
-            fb: DsFeedback::default(),
+            sony: SonyFeedback::default(),
         })
     }
 
@@ -295,15 +216,41 @@ impl HidMaestroDevice {
 
     /// Which static sink-pin layout to advertise for `profile`. Xbox360/XInput
     /// uses the XInput pin set (no gyro/touchpad/lightbar); DualSense uses its
-    /// full Sony set; everything else falls back to DS4 pins.
+    /// full Sony set, and the Edge that plus its back/Fn buttons; everything
+    /// else falls back to DS4 pins.
     fn sink_pins_for(&self) -> &'static [SinkPin] {
         if self.profile.requires_xusb_companion {
             layouts::XINPUT_SINK_PINS
+        } else if self.profile.id.contains("dualsense-edge") {
+            layouts::DUALSENSE_EDGE_SINK_PINS
         } else if self.profile.id.contains("dualsense") {
             layouts::DUALSENSE_SINK_PINS
         } else {
             layouts::DS4_SINK_PINS
         }
+    }
+}
+
+/// One sink-pin write into the encoder's accumulator. Vec2 pins decompose into
+/// the x/y entries; scalar pins pass both views and PinState picks the one it
+/// needs. Shared with the composite backend.
+pub(crate) fn apply_pin(pins: &mut PinState, pin: &str, value: Signal) {
+    match (pin, value) {
+        ("left_stick", Signal::Vec2(v)) => {
+            pins.set("left_stick_x", v.x, true);
+            pins.set("left_stick_y", v.y, true);
+        }
+        ("right_stick", Signal::Vec2(v)) => {
+            pins.set("right_stick_x", v.x, true);
+            pins.set("right_stick_y", v.y, true);
+        }
+        ("dpad", Signal::Vec2(v)) => {
+            pins.set("dpad_left", 0.0, v.x < -0.5);
+            pins.set("dpad_right", 0.0, v.x > 0.5);
+            pins.set("dpad_up", 0.0, v.y > 0.5);
+            pins.set("dpad_down", 0.0, v.y < -0.5);
+        }
+        _ => pins.set(pin, value.as_float(), value.as_bool()),
     }
 }
 
@@ -321,27 +268,7 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 
     fn send(&mut self, pin: &str, value: Signal) {
-        // Vec2 pins decompose into the x/y accumulator entries; scalar pins use
-        // the float/bool views and PinState picks the right one.
-        match (pin, value) {
-            ("left_stick", Signal::Vec2(v)) => {
-                self.pins.set("left_stick_x", v.x, true);
-                self.pins.set("left_stick_y", v.y, true);
-            }
-            ("right_stick", Signal::Vec2(v)) => {
-                self.pins.set("right_stick_x", v.x, true);
-                self.pins.set("right_stick_y", v.y, true);
-            }
-            ("dpad", Signal::Vec2(v)) => {
-                self.pins.set("dpad_left", 0.0, v.x < -0.5);
-                self.pins.set("dpad_right", 0.0, v.x > 0.5);
-                self.pins.set("dpad_up", 0.0, v.y > 0.5);
-                self.pins.set("dpad_down", 0.0, v.y < -0.5);
-            }
-            _ => {
-                self.pins.set(pin, value.as_float(), value.as_bool());
-            }
-        }
+        apply_pin(&mut self.pins, pin, value);
     }
 
     fn flush(&mut self) {
@@ -452,69 +379,15 @@ impl crate::VirtualDevice for HidMaestroDevice {
                 ("rumble_weak", Signal::Float(self.rumble.1)),
             ];
         }
-        // Drain the output ring; keep the latest rumble report we recognize.
-        // Motor byte offsets differ between DS4 (right@4/left@5) and DualSense
-        // (right@3/left@4), so we read them from the profile's
-        // `extendedOutputReport` rather than hardcoding. Those offsets are
-        // RID-inclusive; the ring strips the report id, so within `data` a motor
-        // at byte `o` sits at index `o-1`.
-        let (left_idx, right_idx) = (
-            self.profile.extended.out_left_motor.map(|o| o.saturating_sub(1)),
-            self.profile.extended.out_right_motor.map(|o| o.saturating_sub(1)),
-        );
-        // Drain all frames queued since the last tick, keeping the PEAK rumble
-        // seen this tick — not just the last frame. A short ping enqueues an ON
-        // frame immediately followed by an OFF frame; if we kept only the last,
-        // one poll drains both and publishes (0,0), so the consumer (a physical
-        // pad via AutoMap feedback) never sees the pulse. This is the divergence
-        // from the XInput backend, whose async notification lets the ON value
-        // linger. We publish the peak for one tick, then settle to the latest
-        // actual value so a held peak doesn't buzz forever once frames stop.
-        let mut peak: Option<(f32, f32)> = None;
+        // Drain the output ring (frames arrive with the report id stripped) and
+        // fold this tick's reports into the feedback pins.
+        let mut frames = Vec::new();
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
-                let strong = left_idx.and_then(|i| frame.data.get(i)).map(|b| *b as f32 / 255.0);
-                let weak = right_idx.and_then(|i| frame.data.get(i)).map(|b| *b as f32 / 255.0);
-                if let (Some(s), Some(w)) = (strong, weak) {
-                    let (ps, pw) = peak.unwrap_or((0.0, 0.0));
-                    peak = Some((s.max(ps), w.max(pw)));
-                    self.rumble_latest = (s, w);
-                }
-                // Trigger effects are decoded from EVERY frame: each one says
-                // whether it updates them, and a later frame that doesn't must
-                // not hide an earlier one that did.
-                self.fb.update_triggers(&self.profile.extended, &frame.data);
-                // The lightbar likewise: only frames that flag it set it, so a
-                // rumble-only report doesn't turn it black.
-                self.fb.update_lightbar(&self.profile, &frame.data);
-                // Keep the latest full frame for the other non-rumble feedback
-                // (LEDs are level-held, so the most recent report is
-                // authoritative — no peak-holding needed).
-                self.last_out_frame = Some(frame.data.clone());
+                frames.push(frame.data);
             }
         }
-        if let Some((pk_s, pk_w)) = peak {
-            let (lt_s, lt_w) = self.rumble_latest;
-            // Hold the peak one tick when it exceeds the settled value.
-            self.rumble_settle_pending = pk_s > lt_s + 0.01 || pk_w > lt_w + 0.01;
-            self.rumble = (pk_s, pk_w);
-        } else if self.rumble_settle_pending {
-            // No new frames, but we owe a settle from a prior peak.
-            self.rumble_settle_pending = false;
-            self.rumble = self.rumble_latest;
-        }
-        let mut out = vec![
-            ("rumble_strong", Signal::Float(self.rumble.0)),
-            ("rumble_weak", Signal::Float(self.rumble.1)),
-        ];
-        // Non-rumble feedback (lightbar / LEDs / adaptive triggers). The game's
-        // last output report is the authoritative state for these LEVEL-held
-        // fields (unlike rumble, which needs peak-holding because a ping's
-        // on→off pair can drain in one tick). We keep the most recent decoded
-        // values in `self.fb` and refresh them from `last_out_frame` here.
-        self.decode_nonrumble_feedback();
-        out.extend(self.fb.as_pins());
-        out
+        self.sony.poll(&self.profile, &mut self.rumble, frames.iter().map(Vec::as_slice))
     }
 
     fn inject_rumble_ping(&mut self, strong: f32, weak: f32) {
@@ -528,180 +401,6 @@ impl crate::VirtualDevice for HidMaestroDevice {
         // frame, which is fine for a momentary ping.
         self.rumble = (strong, weak);
         self.last_rumble_cmd = None;
-    }
-}
-
-impl HidMaestroDevice {
-    /// Decode the game's latest output report into `self.fb` (player / mic
-    /// LEDs), using the profile's RID-inclusive output offsets. The ring strips
-    /// the report id, so an offset `o` sits at `data[o-1]`. Fields the profile
-    /// doesn't declare stay at their default (0 = off). Called from
-    /// `poll_outputs` after the rumble drain so `last_out_frame` is fresh. (The
-    /// lightbar and triggers are decoded per frame, by their valid flags.)
-    fn decode_nonrumble_feedback(&mut self) {
-        let Some(data) = self.last_out_frame.as_deref() else { return };
-        let ext = &self.profile.extended;
-        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
-
-        if let Some(i) = at(ext.out_player_led) {
-            self.fb.player_led = decode_player_led(data[i]);
-        }
-        if let Some(i) = at(ext.out_mic_led) {
-            // DualSense mute-LED byte: 0=off, 1=on(solid), 2=pulse → 0 / 0.5 / 1.
-            self.fb.mic_led = (data[i] as f32 / 2.0).clamp(0.0, 1.0);
-        }
-    }
-}
-
-impl DsFeedback {
-    /// Update the adaptive-trigger effects from one output frame — only the
-    /// sides whose `valid_flag0` bit the frame sets, as a real DualSense does:
-    /// a rumble- or lightbar-only report leaves the triggers' effects alone
-    /// (its trigger bytes are zeros that mean nothing).
-    fn update_triggers(&mut self, ext: &flexinput_hidmaestro::profile::ExtendedLayout, data: &[u8]) {
-        // `valid_flag0` sits 10 bytes before the right trigger block in both the
-        // USB (0x02) and Bluetooth (0x31) output reports. Offsets are
-        // RID-inclusive; the ring strips the report id.
-        let Some(flags) = ext.out_trigger_r
-            .and_then(|r| r.checked_sub(11))
-            .and_then(|i| data.get(i).copied())
-        else { return };
-        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
-        if flags & DS_FLAG0_RIGHT_TRIGGER != 0 {
-            if let Some(i) = at(ext.out_trigger_r) {
-                self.trig_r = Some(decode_trigger_effect(&data[i..]));
-            }
-        }
-        if flags & DS_FLAG0_LEFT_TRIGGER != 0 {
-            if let Some(i) = at(ext.out_trigger_l) {
-                self.trig_l = Some(decode_trigger_effect(&data[i..]));
-            }
-        }
-    }
-}
-
-impl DsFeedback {
-    /// Take the lightbar colour from one output frame, if that frame says it
-    /// sets the lightbar (DualSense `valid_flag1` bit 2, DS4 flag byte bit 1).
-    /// A profile that declares no flag byte takes every frame's colour.
-    fn update_lightbar(&mut self, profile: &Profile, data: &[u8]) {
-        let ext = &profile.extended;
-        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
-        let Some(i) = at(ext.out_lightbar_r) else { return };
-        if i + 2 >= data.len() {
-            return;
-        }
-        let (flag, bit) = if profile.id.contains("dualsense") {
-            (ext.out_valid_flag1, DS_FLAG1_LIGHTBAR)
-        } else {
-            (ext.out_valid_flag0, DS4_FLAG_LIGHTBAR)
-        };
-        if at(flag).is_some_and(|f| data[f] & bit == 0) {
-            return;
-        }
-        let c = |k: usize| data[k] as f32 / 255.0;
-        self.lightbar = Some((c(i), c(i + 1), c(i + 2)));
-    }
-}
-
-/// DualSense output-report `valid_flag0` bits saying the report carries a new
-/// right / left adaptive-trigger effect.
-const DS_FLAG0_RIGHT_TRIGGER: u8 = 0x04;
-const DS_FLAG0_LEFT_TRIGGER: u8 = 0x08;
-/// DualSense `valid_flag1` bit: LIGHTBAR_CONTROL_ENABLE.
-const DS_FLAG1_LIGHTBAR: u8 = 0x04;
-/// DS4 output report (0x05) flag-byte bit: the report sets the lightbar.
-const DS4_FLAG_LIGHTBAR: u8 = 0x02;
-
-/// Map a DualSense player-indicator bitmask byte back to the 0–1 `player_led`
-/// convention (0=off, 0.25=P1 … 1=P4). The pad lights 1–4 of its 5 front LEDs in
-/// fixed symmetric patterns per player number; we recognise those, and fall back
-/// to "scale by lit-count" for anything non-standard. Low 5 bits are the LEDs.
-fn decode_player_led(b: u8) -> f32 {
-    match b & 0x1F {
-        0x00 => 0.0,        // off
-        0x04 => 0.25,       // P1: centre
-        0x0A => 0.5,        // P2: inner pair
-        0x15 => 0.75,       // P3: centre + outer pair
-        0x1B => 1.0,        // P4: two pairs
-        other => {
-            // Non-standard: approximate by how many LEDs are lit (1..5 → ~0.25..1).
-            let n = other.count_ones() as f32;
-            (n / 4.0).clamp(0.0, 1.0)
-        }
-    }
-}
-
-/// Decode one 11-byte DualSense adaptive-trigger effect block back into the
-/// `trigger_*` pins, each normalized 0–1 — the inverse of
-/// `flexinput_devices::gyro::encode_trigger_effect`, for all seven effect types
-/// that encoder writes (Off 0x05, Feedback 0x21, Bow 0x22, Galloping 0x23,
-/// Weapon 0x25, Vibration 0x26, Machine 0x27; byte layouts per Nielk1's
-/// `TriggerEffectGenerator`). Zones are 0–9 (→ /9), forces 0–7 (→ /7), freq and
-/// period raw bytes (→ /255). A short/empty block, and the "simple" effect types
-/// whose positions are raw bytes rather than zones, decode as Off. Enough to
-/// forward a game's effect to a physical DualSense, which re-encodes it.
-fn decode_trigger_effect(block: &[u8]) -> Trig {
-    use flexinput_core::automap::TriggerMode;
-    if block.len() < 10 {
-        return Trig::default();
-    }
-    let zone = |z: u32| (z as f32 / 9.0).clamp(0.0, 1.0);
-    let force = |f: u8| (f.min(7) as f32 / 7.0).clamp(0.0, 1.0);
-    let byte = |b: u8| b as f32 / 255.0;
-    // The 10-bit zone field (params bytes 1..3): every active zone for the
-    // positional effects, just the start and end bits for the two-zone ones.
-    let zones = (block[1] as u16) | ((block[2] as u16) << 8);
-    let lo = if zones == 0 { 0 } else { zones.trailing_zeros() };
-    let hi = if zones == 0 { 0 } else { 15 - zones.leading_zeros() };
-    // Positional effects repeat a 3-bit force per active zone (bytes 3..7); read
-    // the one at the start zone.
-    let forces = u32::from_le_bytes([block[3], block[4], block[5], block[6]]);
-    let force_at = |z: u32| ((forces >> (z * 3)) & 0x7) as u8;
-    // Two-zone effects pack a pair of 3-bit values into byte 3.
-    let (low3, high3) = (block[3] & 0x7, (block[3] >> 3) & 0x7);
-
-    let t = |mode: TriggerMode| Trig { mode: mode.pin(), ..Trig::default() };
-    match block[0] {
-        0x21 => Trig { start: zone(lo), strength: force(force_at(lo)), ..t(TriggerMode::Feedback) },
-        0x22 => Trig {
-            start: zone(lo),
-            end: zone(hi),
-            strength: force(low3),
-            strength2: force(high3),
-            ..t(TriggerMode::Bow)
-        },
-        // Galloping packs the SECOND foot low and the first above it.
-        0x23 => Trig {
-            start: zone(lo),
-            end: zone(hi),
-            strength: force(high3),
-            strength2: force(low3),
-            freq: byte(block[4]),
-            ..t(TriggerMode::Galloping)
-        },
-        0x25 => Trig {
-            start: zone(lo),
-            end: zone(hi),
-            strength: force(block[3]),
-            ..t(TriggerMode::Weapon)
-        },
-        0x26 => Trig {
-            start: zone(lo),
-            strength: force(force_at(lo)),
-            freq: byte(block[9]),
-            ..t(TriggerMode::Vibration)
-        },
-        0x27 => Trig {
-            start: zone(lo),
-            end: zone(hi),
-            strength: force(low3),
-            strength2: force(high3),
-            freq: byte(block[4]),
-            period: byte(block[5]),
-            ..t(TriggerMode::Machine)
-        },
-        _ => Trig::default(), // 0x00 / 0x05 (off) and anything unrecognized.
     }
 }
 
@@ -723,6 +422,9 @@ impl Drop for HidMaestroDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sony_feedback::{
+        decode_player_led, decode_trigger_effect, DsFeedback, Trig, DS_FLAG0_RIGHT_TRIGGER,
+    };
     use crate::VirtualDevice;
     use flexinput_core::Signal;
     use flexinput_hidmaestro::profile::presets::DUALSHOCK_4_V2_JSON;
@@ -813,30 +515,56 @@ mod tests {
         assert!(!ds4_ids.contains(&"trigger_r_mode"), "DS4 must not expose triggers");
     }
 
+    // The Edge sinks everything the DualSense does plus its back/Fn buttons,
+    // and feeds back the same set, read from its longer (63-byte) report 0x02.
+    #[test]
+    fn edge_adds_back_and_fn_sinks_and_keeps_dualsense_feedback() {
+        let edge = HidMaestroDevice::open(
+            "virtual.hm.dualsense_edge", "Virtual DualSense Edge",
+            flexinput_hidmaestro::profile::presets::DUALSENSE_EDGE_JSON, 251,
+        ).expect("valid Edge profile");
+        let ds = dualsense_device();
+        let sinks: Vec<&str> = edge.sink_pins().iter().map(|p| p.id).collect();
+        let ds_sinks: Vec<&str> = ds.sink_pins().iter().map(|p| p.id).collect();
+        let paddles = ["btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2"];
+        for p in paddles {
+            assert!(sinks.contains(&p), "Edge sink pins missing {p}");
+            assert!(!ds_sinks.contains(&p), "plain DualSense must not offer {p}");
+        }
+        assert!(ds_sinks.iter().all(|p| sinks.contains(p)), "Edge keeps every DualSense sink");
+        assert_eq!(sinks.last(), Some(&"automap_in"), "Auto-Map port stays last");
+        let ids = |d: &HidMaestroDevice| d.source_pins().iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(&edge), ids(&ds));
+
+        let mut fb = DsFeedback::default();
+        fb.update_lightbar(&edge.profile, &out_frame(63, 2, 0x04, 45, [0, 0, 255]));
+        assert_eq!(fb.lightbar, Some((0.0, 0.0, 1.0)));
+    }
+
     // A game that never sets a trigger's valid-flag bit publishes no trigger
     // pins; one that does publishes them, and a later report without the bit
     // (rumble only) leaves the effect as it was.
     #[test]
     fn trigger_effects_follow_the_valid_flags() {
-        let has = |ds: &HidMaestroDevice, pin: &str| ds.fb.as_pins().iter().any(|(p, _)| *p == pin);
+        let has = |ds: &HidMaestroDevice, pin: &str| ds.sony.fb.as_pins().iter().any(|(p, _)| *p == pin);
         let mut ds = dualsense_device();
         // USB report 0x02 without its id: flag0 @0, right trigger block @10.
         let mut frame = vec![0u8; 47];
-        ds.fb.update_triggers(&ds.profile.extended, &frame);
+        ds.sony.fb.update_triggers(&ds.profile.extended, &frame);
         assert!(!has(&ds, "trigger_r_mode") && !has(&ds, "trigger_l_mode"));
 
         frame[0] = DS_FLAG0_RIGHT_TRIGGER;
         frame[10] = 0x21; // feedback (resistance)
         frame[11] = 0x01;
         frame[13] = 0x07;
-        ds.fb.update_triggers(&ds.profile.extended, &frame);
-        let r = ds.fb.trig_r.expect("right trigger set");
+        ds.sony.fb.update_triggers(&ds.profile.extended, &frame);
+        let r = ds.sony.fb.trig_r.expect("right trigger set");
         assert_ne!(r.mode, 0.0);
         assert!(!has(&ds, "trigger_l_mode"), "left trigger never set");
 
         let rumble_only = vec![0u8; 47];
-        ds.fb.update_triggers(&ds.profile.extended, &rumble_only);
-        assert_eq!(ds.fb.trig_r, Some(r), "a report without the flag keeps the effect");
+        ds.sony.fb.update_triggers(&ds.profile.extended, &rumble_only);
+        assert_eq!(ds.sony.fb.trig_r, Some(r), "a report without the flag keeps the effect");
     }
 
     #[test]

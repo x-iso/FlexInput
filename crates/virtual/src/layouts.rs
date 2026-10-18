@@ -56,6 +56,38 @@ pub static DUALSENSE_SOURCE_PINS: &[SourcePin] = &[
     op!("trigger_l_period",   "L.Trigger Period",         SignalType::Float),
 ];
 
+/// A DualSense with USB audio adds the HD-rumble carrier it measures from the
+/// haptic waveform a game streams to it: per side, the actuator signal's level
+/// and its frequency (0 = 80 Hz, 1 = 500 Hz, as the physical pads' `hd_*`
+/// inputs take it).
+pub static DUALSENSE_USB_SOURCE_PINS: &[SourcePin] = &[
+    op!("rumble_strong",      "Rumble Strong",            SignalType::Float),
+    op!("rumble_weak",        "Rumble Weak",              SignalType::Float),
+    op!("lightbar_r",         "Lightbar R",               SignalType::Float),
+    op!("lightbar_g",         "Lightbar G",               SignalType::Float),
+    op!("lightbar_b",         "Lightbar B",               SignalType::Float),
+    op!("player_led",         "Player LED",               SignalType::Float),
+    op!("mic_led",            "Mic LED",                  SignalType::Float),
+    op!("trigger_r_mode",     "R.Trigger Mode",           SignalType::Float),
+    op!("trigger_r_start",    "R.Trigger Start",          SignalType::Float),
+    op!("trigger_r_end",      "R.Trigger End",            SignalType::Float),
+    op!("trigger_r_strength", "R.Trigger Strength",       SignalType::Float),
+    op!("trigger_r_freq",     "R.Trigger Freq",           SignalType::Float),
+    op!("trigger_r_strength2", "R.Trigger Strength 2",    SignalType::Float),
+    op!("trigger_r_period",   "R.Trigger Period",         SignalType::Float),
+    op!("trigger_l_mode",     "L.Trigger Mode",           SignalType::Float),
+    op!("trigger_l_start",    "L.Trigger Start",          SignalType::Float),
+    op!("trigger_l_end",      "L.Trigger End",            SignalType::Float),
+    op!("trigger_l_strength", "L.Trigger Strength",       SignalType::Float),
+    op!("trigger_l_freq",     "L.Trigger Freq",           SignalType::Float),
+    op!("trigger_l_strength2", "L.Trigger Strength 2",    SignalType::Float),
+    op!("trigger_l_period",   "L.Trigger Period",         SignalType::Float),
+    op!("hd_l_amp",           "HD Haptic L: Amplitude",   SignalType::Float),
+    op!("hd_l_freq",          "HD Haptic L: Frequency",   SignalType::Float),
+    op!("hd_r_amp",           "HD Haptic R: Amplitude",   SignalType::Float),
+    op!("hd_r_freq",          "HD Haptic R: Frequency",   SignalType::Float),
+];
+
 pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     // Modifier / special keys — always present, non-removable
     sp!("key_escape",  "Escape",  SignalType::Bool),
@@ -128,7 +160,10 @@ pub static XINPUT_SINK_PINS: &[SinkPin] = &[
     sp!("automap_in",    "Auto-Map",          SignalType::AutoMap),
 ];
 
-pub static DUALSENSE_SINK_PINS: &[SinkPin] = &[
+/// The DualSense sink pin set, with `$extra` pins (the Edge's) placed just
+/// before the Auto-Map port so it stays last.
+macro_rules! dualsense_sink_pins {
+    ($($extra:expr),* $(,)?) => { &[
     sp!("left_stick",    "Left Stick",           SignalType::Vec2),
     sp!("right_stick",   "Right Stick",          SignalType::Vec2),
     sp!("dpad",          "D-Pad",                SignalType::Vec2),
@@ -176,8 +211,21 @@ pub static DUALSENSE_SINK_PINS: &[SinkPin] = &[
     // No battery sink: the virtual pad always reports full charge (a low
     // reported battery makes some hosts disable haptics). Battery remains a
     // SOURCE pin on physical devices.
+    $($extra,)*
     sp!("automap_in",    "Auto-Map",             SignalType::AutoMap),
-];
+    ] };
+}
+
+pub static DUALSENSE_SINK_PINS: &[SinkPin] = dualsense_sink_pins!();
+
+/// The DualSense Edge adds its two back buttons and two Fn buttons, on the
+/// paddle pins in the order SDL reports them (back = first pair, Fn = second).
+pub static DUALSENSE_EDGE_SINK_PINS: &[SinkPin] = dualsense_sink_pins!(
+    sp!("btn_paddle_l1", "Left Back Button",     SignalType::Bool),
+    sp!("btn_paddle_r1", "Right Back Button",    SignalType::Bool),
+    sp!("btn_paddle_l2", "Left Fn",              SignalType::Bool),
+    sp!("btn_paddle_r2", "Right Fn",             SignalType::Bool),
+);
 
 pub static DS4_SINK_PINS: &[SinkPin] = &[
     sp!("left_stick",    "Left Stick",           SignalType::Vec2),

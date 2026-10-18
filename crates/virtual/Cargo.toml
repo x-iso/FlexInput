@@ -14,6 +14,8 @@ vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_
 # wgpu comment in the workspace Cargo.toml).
 enigo = "0.6"
 flexinput-hidmaestro = { workspace = true }
+# The composite USB personas (a virtual DualSense with its audio interfaces).
+flexinput-usbip = { workspace = true }
 
 [dev-dependencies]
 glam = { workspace = true }

@@ -59,11 +59,18 @@ rustfft        = "6"
 # install COM apartment hooks, and the result is that accesskit's
 # `SetPropW` calls in subclass.rs panic on startup with ERROR_NOT_ENOUGH_MEMORY.
 wasapi = "=0.18"
+# Recognises FlexInput's own composite USB personas by the USB serial
+# flexinput-usbip gives them (devnode.rs), so they're never read back as pads.
+flexinput-usbip = { workspace = true }
 # Process enumeration for the Audio Stream Haptics module: list running
 # processes (Toolhelp32 snapshot), resolve a chosen exe name → live PID, and
-# read the foreground window's PID. Bindings-only (no COM runtime), windows-sys
-# 0.61 to match engine/ui — does NOT conflict with wasapi's `windows` major.
+# read the foreground window's PID. Also CfgMgr32, so DualSense HD haptics
+# open the audio endpoint in the pad's own device container. Bindings-only (no
+# COM runtime), windows-sys 0.61 to match engine/ui — does NOT conflict with
+# wasapi's `windows` major.
 windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",

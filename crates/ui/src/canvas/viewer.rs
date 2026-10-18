@@ -783,6 +783,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 if let Some(n) = snarl.get_node_mut(node) {
                     crate::canvas::header_controls::render_rumble_feedback_controls(ui, &mut n.params, self.param_defaults);
                 }
+                // Switching USB audio swaps the node to the pad's other variant;
+                // the per-frame reconcile builds it and retires the old one.
+                if let Some(id) = crate::canvas::header_controls::render_usb_audio_toggle(ui, dev_id_str) {
+                    crate::canvas::switch_virtual_sink_device(snarl, node, &id);
+                }
             }
 
             // device.sink: "Auto-Map" label anchored to the bottom of the

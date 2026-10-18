@@ -506,19 +506,28 @@ impl DeviceBackend for GilrsBackend {
                 _ => continue, // Drop (ViGEm virtual beyond real count) or missing
             };
 
+            let is_edge = crate::identification::is_dualsense_edge(pad.vendor_id(), pad.product_id());
+            let kind_name = if is_edge { "DualSense Edge" } else { kind.display_name() };
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()
             } else if is_virt {
-                format!("{} (virtual)", kind.display_name())
+                format!("{kind_name} (virtual)")
             } else {
-                kind.display_name().to_string()
+                kind_name.to_string()
+            };
+            // The Edge's back/Fn buttons come from the raw-HID read, which only
+            // real pads get, so an own virtual Edge doesn't list them.
+            let outputs = if is_virt {
+                layouts::outputs_for(kind)
+            } else {
+                layouts::outputs_for_pad(kind, pad.vendor_id(), pad.product_id())
             };
 
             result.push(PhysicalDevice {
                 id: dev_id,
                 display_name,
                 kind,
-                outputs: layouts::outputs_for(kind),
+                outputs,
                 inputs: layouts::inputs_for(kind),
                 instance_path: None,
                 // Cheap (already read for `kind`); the slow HID-instance-id lookup
@@ -843,6 +852,14 @@ impl DeviceBackend for GilrsBackend {
                         out.push((dev.clone(), "dpad_x".into(),  Signal::Float(ndx)));
                         out.push((dev.clone(), "dpad_y".into(),  Signal::Float(ndy)));
                         out.push((dev.clone(), "dpad".into(),    Signal::Vec2(Vec2::new(ndx, ndy))));
+                        // DualSense Edge: back buttons and Fn buttons, which gilrs
+                        // doesn't report at all (see layouts::outputs_for_pad).
+                        if crate::identification::is_dualsense_edge(Some(vid), Some(pid)) {
+                            out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(ds.btn_back_l)));
+                            out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(ds.btn_back_r)));
+                            out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(ds.btn_fn_l)));
+                            out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(ds.btn_fn_r)));
+                        }
                     }
                     // Switch Pro: override gilrs button output with raw-HID button data.
                     // This bypasses gilrs's WGI backend which loses D-Pad diagonals (8-position

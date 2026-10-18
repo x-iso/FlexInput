@@ -5,6 +5,7 @@ members = [
     "crates/devices",
     "crates/virtual",
     "crates/hidmaestro",
+    "crates/usbip",
     "crates/joycon2",
     "crates/btle",
     "crates/net",
@@ -35,6 +36,7 @@ flexinput-engine  = { path = "crates/engine" }
 flexinput-devices = { path = "crates/devices", default-features = false }
 flexinput-virtual = { path = "crates/virtual" }
 flexinput-hidmaestro = { path = "crates/hidmaestro" }
+flexinput-usbip   = { path = "crates/usbip" }
 flexinput-joycon2 = { path = "crates/joycon2" }
 flexinput-net     = { path = "crates/net" }
 # default-features off so the optional `asth` module feature is controlled by

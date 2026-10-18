@@ -51,6 +51,35 @@ All notable changes to FlexInput are documented here. This project adheres to
   menu's icon; a small badge in its corner — an eye, a check, or an arrow —
   now says which is which, on mapping cards and in Choose.
 
+- **Virtual DualSense Edge.** A new virtual controller, in the Devices panel
+  and Easy mode's gamepad output: everything the Virtual DualSense does, plus
+  the Edge's two back buttons and two Fn buttons. It presents as an Edge (its
+  own product id, name and report), so games and Steam that support the Edge
+  can read the extra buttons. Like a real Edge's, those four aren't standard
+  buttons, so
+  DirectInput and Windows' own gamepad API don't see them. A controller's rear
+  paddles reach them through Auto-Map: Paddle L1 and R1 press the back
+  buttons, L2 and R2 the Fn buttons.
+
+- **USB audio & HD haptics on a virtual DualSense or Edge.** A new Audio &
+  Haptics option on the pad (on its node, and beside the label of Easy mode's
+  gamepad card) presents it as a wired pad
+  with its USB audio — a speaker and haptics output, and a microphone — so
+  games that author DualSense HD haptics stream them to it. The haptic
+  waveform comes back out as the pad's HD Haptic amplitude and frequency, and
+  through Auto-Map reaches a physical pad's HD rumble: a Switch Pro's, or a
+  USB DualSense's. Turning it on the first time installs usbip-win2, the
+  virtual USB host controller the pad sits behind, after asking: there's one
+  Windows elevation prompt, and every USB device reconnects for a moment
+  while it installs. Speaker audio and the
+  microphone aren't routed anywhere yet. The pad can't outlive FlexInput, so
+  "keep virtual controllers alive" doesn't apply to it.
+
+- **A real DualSense Edge's back and Fn buttons.** They show up on its device
+  node as Left/Right Back Button and Left/Right Fn, and travel on the Auto-Map
+  bus as the paddle buttons, over USB or Bluetooth. The device is now named
+  DualSense Edge too.
+
 ### Changed
 
 - **Outputs follow input a polling period sooner, with fewer wakeups.** The
@@ -64,6 +93,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   finish in time keeps the old behavior.
 
 ### Fixed
+
+- **A Virtual DualSense added from the Devices panel has all its feedback
+  outputs.** Its node came up with a DualShock 4's — rumble and light bar
+  only — so a game's player LEDs, mic LED and adaptive-trigger effects
+  couldn't be wired from it by hand. Auto-Map carried them all along. Nodes
+  added before this keep their old outputs; add the controller again to get
+  the full set.
+
+- **HD haptics play on the DualSense they're for.** The haptic stream opened
+  the first DualSense-named audio output it found, so with two USB DualSenses
+  connected, one pad's haptics could play on the other. Each pad now opens the
+  audio output that belongs to the same device.
 
 - **The spike filter works on the Bluetooth dongle.** A Switch Pro connected
   through FlexInput's own dongle had no spike filter: the Calibration window

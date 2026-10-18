@@ -470,6 +470,8 @@ pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
         "virtual.hm.xinput"    => DEV_XBOX,
         "virtual.hm.ds4"       => DEV_PS4,
         "virtual.hm.dualsense" => DEV_PS5,
+        "virtual.hm.dualsense_edge" => DEV_PS5,
+        "virtual.usb.dualsense" | "virtual.usb.dualsense_edge" => DEV_PS5,
         _ if kind_prefix.starts_with("virtual.hm") => DEV_PS4,
         _                      => DEV_XBOX,
     }
@@ -513,6 +515,7 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
             "keymouse"        => Some(NodeIconSpec::Single(DEV_KBM)),
             _ if kind.starts_with("hm.xinput")    => Some(NodeIconSpec::Single(DEV_XBOX)),
             _ if kind.starts_with("hm.dualsense") => Some(NodeIconSpec::Single(DEV_PS5)),
+            _ if kind.starts_with("usb.dualsense") => Some(NodeIconSpec::Single(DEV_PS5)),
             _ if kind.starts_with("hm.ds4")       => Some(NodeIconSpec::Single(DEV_PS4)),
             _                 => None,
         };

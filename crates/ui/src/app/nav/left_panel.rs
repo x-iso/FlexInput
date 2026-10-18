@@ -341,7 +341,7 @@ impl FlexInputApp {
     }
 
     /// Cycle the single gamepad output to the next model (Xbox 360 → DS4 →
-    /// DualSense → None → …). Mirrors the Easy output card's selector so the
+    /// DualSense → DualSense Edge → None → …). Mirrors the Easy output card's selector so the
     /// gamepad-nav cursor and the mouse agree. Deploying a model removes any
     /// other gamepad sink first (Easy mode drives one pad).
     pub(crate) fn nav_cycle_gamepad_output(&mut self) {

@@ -123,3 +123,10 @@ impl ControllerKind {
         matches!(self, Self::XInput | Self::DualShock4 | Self::DualSense | Self::Generic)
     }
 }
+
+/// Whether `vid`/`pid` is a DualSense Edge. It classifies as
+/// [`ControllerKind::DualSense`] (the same report), and differs by its two
+/// back buttons and two Fn buttons, which only the Edge reports.
+pub fn is_dualsense_edge(vid: Option<u16>, pid: Option<u16>) -> bool {
+    vid == Some(0x054C) && pid == Some(0x0DF2)
+}

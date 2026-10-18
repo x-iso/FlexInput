@@ -129,6 +129,19 @@ fn worker_loop(
 
         match op {
             DeviceOp::Create { device_id } => {
+                // A pad's USB audio variant sits behind usbip-win2. Install it
+                // here, under its own overlay, the first time one is created.
+                #[cfg(windows)]
+                if flexinput_virtual::has_usb_audio(&device_id) && !flexinput_usbip::vhci::is_available() {
+                    set(Some(DeviceOpProgress {
+                        kind: ProgressKind::Installing,
+                        label: "Installing USB audio support (usbip-win2)…".into(),
+                        detail: Some("One-time setup. USB devices reconnect for a moment.".into()),
+                    }));
+                    if let Err(e) = flexinput_hidmaestro::helper::ensure_usbip() {
+                        eprintln!("[device-ops] usbip-win2 install failed: {e}");
+                    }
+                }
                 set(Some(DeviceOpProgress::new(
                     ProgressKind::Deploying,
                     format!("Deploying {}…", friendly(&device_id)),
@@ -229,10 +242,7 @@ fn build_device(id: &str) -> Option<Box<dyn VirtualDevice>> {
         },
         None => (id, 0),
     };
-    let known = flexinput_virtual::available_device_kinds()
-        .iter()
-        .any(|k| k.kind_id == kind_id);
-    if !known {
+    if !flexinput_virtual::is_known_kind(kind_id) {
         return None;
     }
     Some(flexinput_virtual::create_device(kind_id, instance))
@@ -241,7 +251,10 @@ fn build_device(id: &str) -> Option<Box<dyn VirtualDevice>> {
 /// Short human label for a device id, for overlay wording.
 fn friendly(id: &str) -> &str {
     match id {
+        _ if id.starts_with("virtual.hm.dualsense_edge") => "DualSense Edge",
         _ if id.starts_with("virtual.hm.dualsense") => "DualSense",
+        _ if id.starts_with("virtual.usb.dualsense_edge") => "DualSense Edge (USB audio)",
+        _ if id.starts_with("virtual.usb.dualsense") => "DualSense (USB audio)",
         _ if id.starts_with("virtual.hm.ds4") => "DualShock 4",
         _ if id.starts_with("virtual.hm.xinput") => "Xbox 360 controller",
         _ if id.starts_with("virtual.ds4") => "DualShock 4",

@@ -19,6 +19,7 @@ pub static DEVICE_KINDS: &[DeviceKind] = &[
     DeviceKind { kind_id: "virtual.hm.xinput",    display_name: "Virtual Xbox 360",          allows_multiple: true },
     DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4",       allows_multiple: true },
     DeviceKind { kind_id: "virtual.hm.dualsense", display_name: "Virtual DualSense",         allows_multiple: true },
+    DeviceKind { kind_id: "virtual.hm.dualsense_edge", display_name: "Virtual DualSense Edge", allows_multiple: true },
     DeviceKind { kind_id: "virtual.keymouse",     display_name: "Virtual Keyboard & Mouse",  allows_multiple: false },
 ];
 
@@ -28,16 +29,30 @@ fn hm_profile_json(kind_id: &str) -> Option<&'static str> {
     match kind_id {
         "virtual.hm.ds4"       => Some(presets::DUALSHOCK_4_V2_JSON),
         "virtual.hm.dualsense" => Some(presets::DUALSENSE_JSON),
+        "virtual.hm.dualsense_edge" => Some(presets::DUALSENSE_EDGE_JSON),
         "virtual.hm.xinput"    => Some(presets::XBOX360_JSON),
         _ => None,
     }
 }
 
-/// Friendly display name for a HIDMaestro kind id.
+/// Profile JSON for each composite USB kind (vendored in flexinput-usbip).
+fn usb_profile_json(kind_id: &str) -> Option<&'static str> {
+    use flexinput_usbip::profiles;
+    match kind_id {
+        "virtual.usb.dualsense" => Some(profiles::DUALSENSE_COMPOSITE_JSON),
+        "virtual.usb.dualsense_edge" => Some(profiles::DUALSENSE_EDGE_COMPOSITE_JSON),
+        _ => None,
+    }
+}
+
+/// Friendly display name for a HIDMaestro kind id, or a composite USB one: the
+/// same pad, so the same name.
 fn hm_display_name(kind_id: &str) -> &'static str {
     match kind_id {
         "virtual.hm.ds4" => "Virtual DualShock 4",
         "virtual.hm.dualsense" => "Virtual DualSense",
+        "virtual.hm.dualsense_edge" | "virtual.usb.dualsense_edge" => "Virtual DualSense Edge",
+        "virtual.usb.dualsense" => "Virtual DualSense",
         "virtual.hm.xinput" => "Virtual Xbox 360",
         _ => "Virtual Controller",
     }
@@ -58,7 +73,10 @@ pub fn kind_pin_metadata(
         "virtual.ds4"      => (layouts::DS4_SINK_PINS,       layouts::DS4_SOURCE_PINS,    "Virtual DualShock 4"),
         "virtual.keymouse" => (layouts::KEYMOUSE_DEFAULT_PINS, &[],                       "Virtual Keyboard & Mouse"),
         "virtual.hm.ds4"       => (layouts::DS4_SINK_PINS,       layouts::DS4_SOURCE_PINS, "Virtual DualShock 4"),
-        "virtual.hm.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DS4_SOURCE_PINS, "Virtual DualSense"),
+        "virtual.hm.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DUALSENSE_SOURCE_PINS, "Virtual DualSense"),
+        "virtual.hm.dualsense_edge" => (layouts::DUALSENSE_EDGE_SINK_PINS, layouts::DUALSENSE_SOURCE_PINS, "Virtual DualSense Edge"),
+        "virtual.usb.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DUALSENSE_USB_SOURCE_PINS, "Virtual DualSense"),
+        "virtual.usb.dualsense_edge" => (layouts::DUALSENSE_EDGE_SINK_PINS, layouts::DUALSENSE_USB_SOURCE_PINS, "Virtual DualSense Edge"),
         "virtual.hm.xinput"    => (layouts::XINPUT_SINK_PINS,    layouts::XINPUT_SOURCE_PINS, "Virtual Xbox 360"),
         _ => return None,
     };
@@ -71,6 +89,18 @@ pub fn kind_pin_metadata(
 }
 
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
+    if let Some(profile_json) = usb_profile_json(kind_id) {
+        // Composite USB persona: served from this process and attached through
+        // usbip-win2 (installed via the helper on first use). The
+        // instance-qualified id fixes the device's USB serial, so each pad
+        // keeps its own identity across lives.
+        let (device_id, display_name) = instance_label(kind_id, hm_display_name(kind_id), instance);
+        if let Some(d) = crate::composite_device::CompositeDevice::create(
+            device_id, display_name, profile_json, instance as u8,
+        ) {
+            return Box::new(d);
+        }
+    }
     if let Some(profile_json) = hm_profile_json(kind_id) {
         // HIDMaestro device: the helper creates the node + sections (one UAC on
         // first use). `instance` is BOTH the index hint and the per-instance
@@ -1627,12 +1657,31 @@ mod instance_id_tests {
     #[test]
     fn instance_label_id_round_trips_through_split() {
         // 3-segment kind (HIDMaestro) is the regression case.
-        for kind in ["virtual.hm.xinput", "virtual.hm.ds4", "virtual.hm.dualsense"] {
+        for kind in ["virtual.hm.xinput", "virtual.hm.ds4", "virtual.hm.dualsense",
+                     "virtual.hm.dualsense_edge"] {
             for inst in 0..4usize {
                 let (id, _name) = instance_label(kind, "X", inst);
                 let (k, n) = split(&id);
                 assert_eq!((k, n), (kind, inst), "id {id:?} must split back to ({kind}, {inst})");
             }
+        }
+    }
+
+    // A node added from static metadata must carry the pins the built device
+    // advertises, or its feedback outputs (the DualSense's LEDs and adaptive
+    // triggers) are missing until the node is rebuilt.
+    #[test]
+    fn static_pin_metadata_matches_the_built_device() {
+        for kind in DEVICE_KINDS.iter().map(|k| k.kind_id) {
+            let Some(json) = hm_profile_json(kind) else { continue };
+            // Index 251, as the device tests use: no live pad's sections there.
+            let dev = crate::hidmaestro_device::HidMaestroDevice::open(kind, "X", json, 251)
+                .expect("bundled profile parses");
+            let (sink, source, _) = kind_pin_metadata(kind, 0).expect("kind has metadata");
+            let ids = |p: &[SinkPin]| p.iter().map(|p| p.id).collect::<Vec<_>>();
+            let src_ids = |p: &[SourcePin]| p.iter().map(|p| p.id).collect::<Vec<_>>();
+            assert_eq!(ids(sink), ids(dev.sink_pins()), "{kind} sink pins");
+            assert_eq!(src_ids(source), src_ids(dev.source_pins()), "{kind} source pins");
         }
     }
 

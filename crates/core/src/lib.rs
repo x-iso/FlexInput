@@ -1,5 +1,6 @@
 pub mod area;
 pub mod frames;
+pub mod haptic_pcm;
 pub mod imu;
 pub mod automap;
 pub mod macros;

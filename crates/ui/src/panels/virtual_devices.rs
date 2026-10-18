@@ -349,10 +349,11 @@ fn circular_ghost_button(ui: &mut egui::Ui, glyph: &str, size: f32) -> egui::Res
 
 fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {
     let dev = &active[i];
-    let kind_prefix = kind_prefix(dev.id());
-    let total = active.iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
-    let rank  = active[..i].iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
-    let base = kind_base_name(&kind_prefix);
+    let kind = kind_prefix(dev.id());
+    // Whole-kind compare: `virtual.hm.dualsense` is a string prefix of the Edge's kind.
+    let total = active.iter().filter(|d| kind_prefix(d.id()) == kind).count();
+    let rank  = active[..i].iter().filter(|d| kind_prefix(d.id()) == kind).count();
+    let base = kind_base_name(&kind);
     if total <= 1 { base.to_string() } else { format!("{} #{}", base, rank + 1) }
 }
 
@@ -363,6 +364,9 @@ fn kind_base_name(kind_prefix: &str) -> &'static str {
         "virtual.keymouse"      => "Virtual Keyboard & Mouse",
         "virtual.hm.ds4"        => "Virtual DualShock 4",
         "virtual.hm.dualsense"  => "Virtual DualSense",
+        "virtual.hm.dualsense_edge" => "Virtual DualSense Edge",
+        "virtual.usb.dualsense"  => "Virtual DualSense",
+        "virtual.usb.dualsense_edge" => "Virtual DualSense Edge",
         "virtual.hm.xinput"     => "Virtual Xbox 360",
         _                       => "Virtual Device",
     }

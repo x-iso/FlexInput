@@ -62,6 +62,16 @@ struct RawProfile {
     /// rather than the PC's (keyboard, mouse). See `create_own_container_node`.
     #[serde(rename = "ownContainer")]
     own_container: Option<bool>,
+    /// Fixed on-wire bytes laid over every built input report (byte 0 is the
+    /// report ID). The DualSense Edge's active-profile byte lives here.
+    #[serde(rename = "inputDefaults")]
+    input_defaults: Option<Vec<RawInputDefault>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInputDefault {
+    byte: usize,
+    value: u8,
 }
 
 /// Raw `extendedReport` shape (subset). Byte offsets are 1-based in the JSON
@@ -79,6 +89,11 @@ struct RawExtField {
     #[serde(rename = "type")]
     ty: Option<String>,
     semantic: Option<String>,
+    /// Bit range within `byte`, e.g. "4-7". A `button-mask` lists its buttons
+    /// from the range's first bit (bit 0 when absent).
+    bits: Option<String>,
+    /// A `button-mask`'s button names in bit order; "_" marks an unused bit.
+    buttons: Option<Vec<String>>,
 }
 
 impl RawExtField {
@@ -92,6 +107,30 @@ impl RawExtField {
         let lo = r.split('-').next()?.trim();
         lo.parse().ok()
     }
+
+    /// The first bit of the field's `bits` range, or 0.
+    fn start_bit(&self) -> u8 {
+        self.bits
+            .as_deref()
+            .and_then(|r| r.split('-').next())
+            .and_then(|lo| lo.trim().parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// Button bit ([`crate::encode::button`]) for a `button-mask` name that only
+/// the byte-addressed layout can place: the DualSense Edge's back and Fn
+/// buttons, which sit in the descriptor's vendor-defined bits rather than its
+/// Button page. Names the descriptor's buttons already carry return `None`.
+fn extended_only_button(name: &str) -> Option<u32> {
+    use crate::encode::button;
+    Some(match name {
+        "LeftPaddle" => button::PADDLE_L1,
+        "RightPaddle" => button::PADDLE_R1,
+        "LeftPaddle2" => button::PADDLE_L2,
+        "RightPaddle2" => button::PADDLE_R2,
+        _ => return None,
+    })
 }
 
 /// Byte offsets (into the on-wire report, RID included at byte 0) for the IMU
@@ -137,6 +176,10 @@ pub struct ExtendedLayout {
     /// DS4 and flag 1 on a DualSense.
     pub out_valid_flag0: Option<usize>,
     pub out_valid_flag1: Option<usize>,
+    /// Buttons the input report carries outside the descriptor's Button page:
+    /// `(button bit, byte, bit)`, the byte RID-inclusive. The DualSense Edge's
+    /// back and Fn buttons. Empty for every other profile.
+    pub extra_buttons: Vec<(u32, usize, u8)>,
 }
 
 impl ExtendedLayout {
@@ -159,6 +202,23 @@ impl ExtendedLayout {
                 }
                 if f.ty.as_deref() == Some("touchpad-finger") {
                     out.touch_fingers.push(byte);
+                }
+            }
+            for f in &raw.fields {
+                let (Some(byte), Some(names)) = (f.byte, f.buttons.as_ref()) else {
+                    continue;
+                };
+                if f.ty.as_deref() != Some("button-mask") {
+                    continue;
+                }
+                for (i, name) in names.iter().enumerate() {
+                    let bit = f.start_bit() as usize + i;
+                    if bit >= 8 {
+                        break;
+                    }
+                    if let Some(mask) = extended_only_button(name) {
+                        out.extra_buttons.push((mask, byte, bit as u8));
+                    }
                 }
             }
         }
@@ -230,6 +290,9 @@ pub struct Profile {
     /// True if the node goes in its own device container instead of the PC's
     /// (`orchestrator::create_own_container_node`): the virtual keyboard and mouse.
     pub own_container: bool,
+    /// `(byte, value)` laid over every encoded input report, the byte
+    /// RID-inclusive (`inputDefaults`). Empty for most profiles.
+    pub input_defaults: Vec<(usize, u8)>,
 }
 
 #[derive(Debug)]
@@ -302,6 +365,12 @@ impl Profile {
             requires_xusb_companion,
             function_mode,
             own_container: raw.own_container.unwrap_or(false),
+            input_defaults: raw
+                .input_defaults
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| (d.byte, d.value))
+                .collect(),
         })
     }
 
@@ -321,6 +390,12 @@ pub mod presets {
     /// DualSense (CFI-ZCT1), USB — plain-HID Sony pad, `VID_054C&PID_0CE6`. The
     /// HIDMaestro capability ViGEm can't provide.
     pub const DUALSENSE_JSON: &str = include_str!("../profiles/dualsense.json");
+
+    /// DualSense Edge (CFI-ZCP1), USB — `VID_054C&PID_0DF2`. The DualSense's
+    /// report plus the two back buttons and two Fn buttons, which ride in the
+    /// descriptor's vendor-defined bits. The driver answers the Edge's own
+    /// firmware-info reply by PID.
+    pub const DUALSENSE_EDGE_JSON: &str = include_str!("../profiles/dualsense-edge.json");
 
     /// Xbox 360 / XInput (`VID_045E&PID_028E`). Needs the XUSB companion node;
     /// input flows through the SHM `GipData[]` (XINPUT_GAMEPAD) region, not the
@@ -362,6 +437,32 @@ mod tests {
         assert_eq!(p.function_mode, 0);
         // Gamepads stay ROOT-enumerated (persisted across runs, own reclaim path).
         assert!(!p.own_container);
+    }
+
+    // The Edge shares the DualSense's input and output layouts; what it adds is
+    // its PID, its product string and the four buttons outside the Button page.
+    #[test]
+    fn loads_dualsense_edge_preset() {
+        let p = Profile::from_json(presets::DUALSENSE_EDGE_JSON).expect("load Edge");
+        let ds = Profile::from_json(presets::DUALSENSE_JSON).expect("load DualSense");
+        assert_eq!((p.vid, p.pid), (0x054C, 0x0DF2));
+        assert_eq!(p.product_string.as_deref(), Some("DualSense Edge Wireless Controller"));
+        assert_eq!(p.descriptor.len(), 389);
+        assert_eq!(p.button_map, ds.button_map, "same FlexInput button bits");
+        let mut extra = p.extended.extra_buttons.clone();
+        extra.sort();
+        assert_eq!(extra, vec![
+            (crate::encode::button::PADDLE_R1, 10, 7),
+            (crate::encode::button::PADDLE_L1, 10, 6),
+            (crate::encode::button::PADDLE_R2, 10, 5),
+            (crate::encode::button::PADDLE_L2, 10, 4),
+        ]);
+        assert!(ds.extended.extra_buttons.is_empty());
+        // Feedback decode reads the same output bytes on both pads.
+        let out = |l: &ExtendedLayout| (l.out_left_motor, l.out_right_motor, l.out_lightbar_r,
+            l.out_player_led, l.out_mic_led, l.out_trigger_l, l.out_trigger_r,
+            l.out_valid_flag0, l.out_valid_flag1);
+        assert_eq!(out(&p.extended), out(&ds.extended));
     }
 
     #[test]

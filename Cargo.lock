@@ -1954,6 +1954,7 @@ dependencies = [
  "flexinput-btle",
  "flexinput-core",
  "flexinput-joycon2",
+ "flexinput-usbip",
  "gilrs",
  "glam",
  "hidapi",
@@ -1986,8 +1987,10 @@ name = "flexinput-hidmaestro"
 version = "0.15.9"
 dependencies = [
  "flexinput-core",
+ "flexinput-usbip",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "windows-sys 0.61.2",
 ]
 
@@ -2049,6 +2052,7 @@ dependencies = [
  "flexinput-hidmaestro",
  "flexinput-modules",
  "flexinput-net",
+ "flexinput-usbip",
  "flexinput-virtual",
  "glam",
  "include_dir",
@@ -2072,12 +2076,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flexinput-usbip"
+version = "0.15.9"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flexinput-virtual"
 version = "0.15.9"
 dependencies = [
  "enigo",
  "flexinput-core",
  "flexinput-hidmaestro",
+ "flexinput-usbip",
  "glam",
  "vigem-client",
 ]

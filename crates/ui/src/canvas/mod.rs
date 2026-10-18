@@ -2595,6 +2595,45 @@ fn migrate_ds4_pin_ids(canvas: &mut Canvas) {
     }
 }
 
+/// Point a virtual-sink node at another device of the same pad — a DualSense
+/// switched to or from its USB audio variant. The sink pins are the same, so
+/// inputs stay as they are; the source pins become the new kind's, and each
+/// wire from an output follows its pin id (one from a pin the new kind lacks is
+/// dropped). The per-frame pool reconcile then builds the new device and
+/// retires the old one.
+pub fn switch_virtual_sink_device(snarl: &mut Snarl<NodeData>, node_id: NodeId, new_device_id: &str) {
+    let Some((_, source, _)) =
+        flexinput_virtual::kind_pin_metadata(&flexinput_virtual::kind_prefix(new_device_id), 0)
+    else {
+        return;
+    };
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let old_ids: Vec<String> = node.params
+        .get("output_pin_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+        .unwrap_or_default();
+    let out_conns: Vec<(usize, InPinId)> = snarl.wires()
+        .filter_map(|(o, i)| (o.node == node_id).then_some((o.output, i)))
+        .collect();
+    for &(out_idx, inp) in &out_conns {
+        snarl.disconnect(OutPinId { node: node_id, output: out_idx }, inp);
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert("device_id".into(), Value::String(new_device_id.to_string()));
+        node.outputs = source.iter().map(|p| PinDescriptor::new(p.display_name, p.signal_type)).collect();
+        node.params.insert("output_pin_ids".into(), Value::Array(
+            source.iter().map(|p| Value::String(p.id.to_string())).collect(),
+        ));
+    }
+    for (out_idx, inp) in out_conns {
+        let Some(id) = old_ids.get(out_idx) else { continue };
+        if let Some(new_idx) = source.iter().position(|p| p.id == id) {
+            snarl.connect(OutPinId { node: node_id, output: new_idx }, inp);
+        }
+    }
+}
+
 /// Strip a trailing " #N" suffix from a device display name, returning the base name.
 fn device_base_name(name: &str) -> &str {
     if let Some(pos) = name.rfind(" #") {
@@ -3317,6 +3356,52 @@ impl Canvas {
 }
 
 // ── Regression tests for canvas clipboard semantics ──────────────────────────
+
+#[cfg(test)]
+mod usb_audio_switch_tests {
+    use super::*;
+
+    // Switching a DualSense to its USB audio variant keeps its wires (they
+    // follow pin ids) and adds the HD carrier outputs; switching back drops
+    // only those.
+    #[test]
+    fn switching_usb_audio_keeps_wires_by_pin_id() {
+        let mut canvas = Canvas::new();
+        let (sink, source, name) = flexinput_virtual::kind_pin_metadata("virtual.hm.dualsense", 0).unwrap();
+        canvas.add_virtual_sink_static("virtual.hm.dualsense", &name, sink, source, false, DeviceParamDefaults::default());
+        let node = canvas.snarl.nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "device.sink")
+            .map(|(id, _)| id)
+            .unwrap();
+        let target = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData {
+            module_id: "test.node".into(),
+            display_name: "T".into(),
+            category: "Test".into(),
+            outputs: vec![],
+            inputs: vec![PinDescriptor::new("in", SignalType::Float)],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        });
+        let mic_led = source.iter().position(|p| p.id == "mic_led").unwrap();
+        canvas.snarl.connect(OutPinId { node, output: mic_led }, InPinId { node: target, input: 0 });
+
+        switch_virtual_sink_device(&mut canvas.snarl, node, "virtual.usb.dualsense");
+        let n = canvas.snarl.get_node(node).unwrap();
+        assert_eq!(n.params["device_id"], "virtual.usb.dualsense");
+        let ids: Vec<&str> = n.params["output_pin_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(ids.contains(&"hd_l_freq"));
+        assert_eq!(n.outputs.len(), ids.len());
+        let wire: Vec<_> = canvas.snarl.wires().collect();
+        assert_eq!(wire.len(), 1);
+        assert_eq!(ids[wire[0].0.output], "mic_led", "the wire stays on its pin");
+
+        switch_virtual_sink_device(&mut canvas.snarl, node, "virtual.hm.dualsense");
+        let n = canvas.snarl.get_node(node).unwrap();
+        assert_eq!(n.outputs.len(), source.len());
+        assert_eq!(canvas.snarl.wires().count(), 1);
+    }
+}
 
 #[cfg(test)]
 mod clipboard_tests {

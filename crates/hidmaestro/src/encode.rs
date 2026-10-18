@@ -131,6 +131,16 @@ pub mod button {
     pub const LT_DIGITAL: u32 = 1 << 12; // L2 digital click
     pub const RT_DIGITAL: u32 = 1 << 13; // R2 digital click
     pub const MUTE: u32 = 1 << 14; // DualSense mic-mute button
+    // The DualSense Edge's back buttons (L1/R1) and Fn buttons (L2/R2), named
+    // after the paddle pins they carry. They sit outside the descriptor's
+    // Button page, so `buttonMap` never addresses them: the profile's
+    // `extendedReport` places them (`ExtendedLayout::extra_buttons`).
+    pub const PADDLE_R1: u32 = 1 << 15;
+    pub const PADDLE_L1: u32 = 1 << 16;
+    pub const PADDLE_R2: u32 = 1 << 17;
+    pub const PADDLE_L2: u32 = 1 << 18;
+    /// The bits only `extendedReport` places.
+    pub const EXTENDED_ONLY: u32 = PADDLE_R1 | PADDLE_L1 | PADDLE_R2 | PADDLE_L2;
 }
 
 /// HID usage (page 0x01 Generic Desktop) for the standard axes.
@@ -259,13 +269,15 @@ pub fn encode_report_into(profile: &Profile, state: &GamepadState, report: &mut 
     }
 
     // Buttons: HMButton bit → descriptor button index via buttonMap (identity
-    // when absent), then set the descBtn-th button field.
+    // when absent), then set the descBtn-th button field. The extended-only bits
+    // stay out: by identity they'd land on whatever descriptor button shares
+    // their index.
     let buttons: Vec<&InputField> = r
         .fields
         .iter()
         .filter(|f| f.usage_page == 0x09)
         .collect();
-    let mut mask = state.buttons;
+    let mut mask = state.buttons & !button::EXTENDED_ONLY;
     while mask != 0 {
         let b = mask.trailing_zeros() as usize;
         mask &= mask - 1;
@@ -282,6 +294,14 @@ pub fn encode_report_into(profile: &Profile, state: &GamepadState, report: &mut 
     // IMU + touchpad: byte-addressed regions the HID descriptor exposes only as
     // opaque vendor blobs, driven from the profile's `extendedReport` layout.
     encode_extended(profile, state, report);
+
+    // Fixed bytes the profile pins on every report, last so nothing above can
+    // clobber them (the DualSense Edge's active-profile byte).
+    for &(byte, value) in &profile.input_defaults {
+        if let Some(b) = report.get_mut(byte) {
+            *b = value;
+        }
+    }
 }
 
 /// The HIDMaestro companion's GIP button-word bit flags — **NOT** `XINPUT_GAMEPAD`
@@ -421,6 +441,16 @@ fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
     }
     if let Some(o) = ext.accel_z {
         write_i16_le(report, o, to_i16(state.accel_z));
+    }
+
+    // Buttons outside the descriptor's Button page (the DualSense Edge's back
+    // and Fn buttons).
+    for &(mask, byte, bit) in &ext.extra_buttons {
+        if state.buttons & mask != 0 {
+            if let Some(b) = report.get_mut(byte) {
+                *b |= 1 << bit;
+            }
+        }
     }
 
     // Battery: ALWAYS report 100% / full, regardless of any physical source. A
@@ -669,6 +699,12 @@ pub fn ds_button_bit(pin: &str) -> Option<u32> {
         "btn_guide" => button::GUIDE,
         "btn_touchpad" => button::TOUCHPAD,
         "btn_mute" => button::MUTE,
+        // DualSense Edge: back buttons on the first paddle pair, Fn on the
+        // second, the order SDL gives them. A profile without them ignores these.
+        "btn_paddle_l1" => button::PADDLE_L1,
+        "btn_paddle_r1" => button::PADDLE_R1,
+        "btn_paddle_l2" => button::PADDLE_L2,
+        "btn_paddle_r2" => button::PADDLE_R2,
         _ => return None,
     })
 }
@@ -916,6 +952,71 @@ mod tests {
         let rep = encode_report(&p, &ps.state());
         assert_eq!(bit(touch_f, &rep), 1, "touchpad sets Button 14");
         assert_eq!(bit(mute_f, &rep), 0, "touchpad does not set mute");
+    }
+
+    fn edge() -> Profile {
+        Profile::from_json(crate::profile::presets::DUALSENSE_EDGE_JSON).unwrap()
+    }
+
+    // The Edge's back and Fn buttons are byte 10 bits 4-7 (left Fn 0x10, right
+    // Fn 0x20, left back 0x40, right back 0x80), the vendor-defined bits after
+    // the descriptor's 15 buttons. Each pin lands on its own bit and nowhere else.
+    #[test]
+    fn edge_back_and_fn_buttons_set_byte_10_high_bits() {
+        let p = edge();
+        let neutral = encode_report(&p, &GamepadState::neutral());
+        assert_eq!(neutral[10] & 0xF0, 0, "nothing pressed → high bits clear");
+        for (pin, want) in [
+            ("btn_paddle_l2", 0x10u8), // left Fn
+            ("btn_paddle_r2", 0x20),   // right Fn
+            ("btn_paddle_l1", 0x40),   // left back
+            ("btn_paddle_r1", 0x80),   // right back
+        ] {
+            let mut ps = PinState::new();
+            ps.set(pin, 0.0, true);
+            let rep = encode_report(&p, &ps.state());
+            assert_eq!(rep[10] & 0xF8, want, "{pin} sets only its bit in byte 10");
+            let diff: Vec<usize> = (0..rep.len()).filter(|&i| i != 10 && rep[i] != neutral[i]).collect();
+            assert!(diff.is_empty(), "{pin} changed other bytes: {diff:?}");
+        }
+    }
+
+    // Mute keeps riding descriptor Button 15 (byte 10 bit 2) on the Edge, so it
+    // and the new bits never overlap.
+    #[test]
+    fn edge_mute_and_paddles_coexist() {
+        let p = edge();
+        let mut ps = PinState::new();
+        for pin in ["btn_mute", "btn_guide", "btn_touchpad",
+                    "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2"] {
+            ps.set(pin, 0.0, true);
+        }
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[10], 0xF7, "PS, touchpad, mute and all four Edge buttons; bit 3 unused");
+    }
+
+    // A plain DualSense has no back/Fn buttons: the pins change nothing.
+    #[test]
+    fn dualsense_ignores_paddle_pins() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let neutral = encode_report(&p, &GamepadState::neutral());
+        let mut ps = PinState::new();
+        for pin in ["btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2"] {
+            ps.set(pin, 0.0, true);
+        }
+        assert_eq!(encode_report(&p, &ps.state()), neutral);
+    }
+
+    // The Edge's inputDefaults pin the active-profile byte (49) to 0x80 on every
+    // report, whatever else is pressed.
+    #[test]
+    fn edge_stamps_input_defaults() {
+        let p = edge();
+        assert_eq!(p.report.byte_size(), 64, "Edge USB report 0x01 is 64 bytes");
+        let mut ps = PinState::new();
+        ps.set("btn_paddle_r1", 0.0, true);
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(&rep[49..53], &[0x80, 0, 0, 0]);
     }
 
     #[test]

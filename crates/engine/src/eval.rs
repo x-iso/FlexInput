@@ -1024,8 +1024,12 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         // Shape ONLY the feedback path to the HD amp pins (direct
                         // knob wiring and ERM `rumble_strong`/lightbar are
                         // untouched), using the source virtual device's per-device
-                        // floor/max/exp.
-                        let routed = if matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
+                        // floor/max/exp. Only classic rumble: an amplitude a
+                        // virtual pad measured from a game's haptic waveform is
+                        // already the authored level, and a lifted floor would
+                        // turn its decaying tail into a steady buzz.
+                        let classic = matches!(*virt_out_pin, "rumble_strong" | "rumble_weak");
+                        let routed = if classic && matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
                             shape_hd_feedback(sig, fb.rumble_floor, fb.rumble_max, fb.rumble_exp)
                         } else {
                             sig

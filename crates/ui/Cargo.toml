@@ -61,6 +61,9 @@ puffin_http        = { workspace = true }
 # Direct access to the HIDMaestro helper for the persistence setting + the
 # reclaim-on-startup path (already a transitive dep via flexinput-virtual).
 flexinput-hidmaestro = { workspace = true }
+# Whether usbip-win2's host controller is present, for the first-use install of
+# a pad's USB audio variant (already a transitive dep via flexinput-virtual).
+flexinput-usbip = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

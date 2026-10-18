@@ -263,6 +263,37 @@ Similar to XInput but with DS-specific report structures:
 - HD rumble (DualSense)
 - Adaptive trigger resistance (DualSense)
 
+The **DualSense Edge** (`virtual.hm.dualsense_edge`, PID 0x0DF2) is the
+DualSense plus its two back buttons and two Fn buttons. They sit in the
+descriptor's vendor-defined bits of report byte 10 (0x10 left Fn, 0x20 right
+Fn, 0x40 left back, 0x80 right back), so the profile's `extendedReport`
+places them (`ExtendedLayout::extra_buttons`), not `buttonMap`. Pins:
+`btn_paddle_l1`/`r1` = back buttons, `btn_paddle_l2`/`r2` = Fn — SDL's paddle
+order, so an Elite pad's paddles carry over. A physical Edge publishes the same
+pins.
+
+#### USB audio composites (`composite_device.rs`, `crates/usbip`)
+
+A real USB DualSense is four interfaces: USB Audio Class speaker/haptics out
+(4 ch, 48 kHz; channels 3/4 drive the actuators), microphone in, and HID. The
+UMDF driver can present only the HID one, so a pad's **Audio & Haptics**
+option swaps its node to the composite kind (`virtual.usb.dualsense[_edge]`,
+see `USB_AUDIO_VARIANTS`): the whole device, served by an in-process USB/IP
+server (a port of HIDMaestro's usbip backend) and attached through usbip-win2's
+signed virtual host controller, which the helper installs from the copy bundled
+in the exe on first use. Windows binds its own usbaudio.sys and hidusb, so a
+game streams its authored haptic waveform to it like to a wired pad.
+
+- The HID side is the plain profile's encoder and output decode
+  (`sony_feedback.rs`); only the transport differs.
+- The game's haptic channels are measured (`flexinput_core::haptic_pcm`) into
+  `hd_l/r_amp` + `hd_l/r_freq` source pins, which Auto-Map routes to a physical
+  pad's HD rumble (Switch Pro, USB DualSense).
+- FlexInput tells its own composites from real pads by the USB serial it gives
+  them ("FX" + 12 hex, `flexinput_usbip::serial_for`): `devnode.rs` walks a HID
+  interface up to its USB device; SDL reads the serial directly.
+- The device lives in this process, so it can't persist past it.
+
 #### Virtual Keyboard/Mouse (`keymouse_hm.rs`)
 
 Emulates KB/M via HIDMaestro:
@@ -358,6 +389,10 @@ fn shape_rumble(signal: Signal, floor: f32, max: f32, exp: f32) -> Signal {
     }
 }
 ```
+
+Only classic rumble (`rumble_strong`/`rumble_weak`) landing on HD amplitude
+pins is shaped; an `hd_*` amplitude a USB audio composite measured from the
+game's haptic waveform passes through as authored.
 
 **Why shape?**
 - Classic rumble signals are often weak (0.1-0.3)

@@ -2,7 +2,9 @@ pub mod gamepad;
 pub mod gilrs_backend;
 pub mod classic_bt;
 pub mod gyro;
-pub mod haptic_pcm;
+// Moved to core (pure DSP, shared with the virtual composite pads); kept at
+// its old path here.
+pub use flexinput_core::haptic_pcm;
 pub mod hidhide;
 pub mod identification;
 pub mod layouts;
@@ -18,6 +20,8 @@ pub mod joycon2_backend;
 
 #[cfg(windows)]
 mod dualsense_haptic;
+#[cfg(windows)]
+mod devnode;
 
 #[cfg(windows)]
 pub mod loopback_haptic;

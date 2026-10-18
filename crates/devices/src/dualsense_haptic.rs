@@ -27,6 +27,9 @@ use wasapi::{
     StreamMode, WaveFormat,
 };
 
+use crate::devnode::container_of_endpoint;
+pub use crate::devnode::{container_of_interface, ContainerId};
+
 /// Frequency range exposed by the `ds_l_freq` / `ds_r_freq` pins.
 /// The DualSense LRAs resonate around ~160 Hz; useful band is ~80–500 Hz.
 const FREQ_MIN_HZ: f32 = 80.0;
@@ -54,10 +57,13 @@ pub struct HapticStream {
 }
 
 impl HapticStream {
-    /// Locate the DualSense audio endpoint and start the render thread.
-    /// Returns `None` if no matching device exists (controller not plugged in
-    /// over USB, or audio driver hasn't enumerated it yet).
-    pub fn open() -> Option<Self> {
+    /// Start the render thread on the audio endpoint of the pad in `container`
+    /// (see [`container_of_interface`]). With `None` — the pad's container
+    /// couldn't be read — it takes the first DualSense-named endpoint, which
+    /// can be the wrong pad's or a virtual one's. The thread exits if no
+    /// endpoint matches (controller not on USB, or its audio driver hasn't
+    /// enumerated yet).
+    pub fn open(container: Option<ContainerId>) -> Option<Self> {
         let shared = Arc::new(Shared {
             targets: AtomicU32::new(0),
             targets2: AtomicU32::new(0),
@@ -68,7 +74,7 @@ impl HapticStream {
         let thread = thread::Builder::new()
             .name("dualsense-haptic".into())
             .spawn(move || {
-                if let Err(e) = render_loop(shared_for_thread) {
+                if let Err(e) = render_loop(shared_for_thread, container) {
                     #[cfg(debug_assertions)]
                     eprintln!("[ds-haptic] render loop exited: {e}");
                     let _ = e;
@@ -110,12 +116,12 @@ impl Drop for HapticStream {
 
 // ── render thread ─────────────────────────────────────────────────────────────
 
-fn render_loop(shared: Arc<Shared>) -> Result<(), String> {
+fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<(), String> {
     // COM init for this thread (MTA — matches what the wasapi crate documents).
     // Ignored if already initialized.
     let _ = initialize_mta();
 
-    let (client, render, fmt, event) = open_dualsense_stream()
+    let (client, render, fmt, event) = open_dualsense_stream(container)
         .ok_or_else(|| "no DualSense audio endpoint found".to_string())?;
 
     let sample_rate = fmt.get_samplespersec() as f32;
@@ -245,21 +251,30 @@ fn write_frame(frame: &mut [u8], channels: usize, sample_type: &SampleType, hl: 
 
 // ── device matching ───────────────────────────────────────────────────────────
 
-/// Walk active render endpoints and return the first DualSense-looking one as
-/// a fully-initialized event-driven shared-mode stream.
+/// Walk active render endpoints and return the pad's as a fully-initialized
+/// event-driven shared-mode stream: the 4-channel endpoint in `container`.
 ///
-/// Heuristic: friendly name contains "Wireless Controller" (Sony's USB Audio
-/// product name, shared by DS4 and DualSense — both expose 4 channels when
-/// they have HD haptic actuators) or "DualSense" (some Windows drivers).
+/// Without a container, the first 4-channel endpoint whose friendly name
+/// contains "Wireless Controller" (Sony's USB Audio product name, shared by
+/// DS4 and DualSense) or "DualSense" (some Windows drivers).
 fn open_dualsense_stream(
+    container: Option<ContainerId>,
 ) -> Option<(AudioClient, AudioRenderClient, WaveFormat, wasapi::Handle)> {
     let collection = DeviceCollection::new(&Direction::Render).ok()?;
     let count = collection.get_nbr_devices().ok()?;
 
     for i in 0..count {
         let Ok(device) = collection.get_device_at_index(i) else { continue; };
-        let name = device.get_friendlyname().unwrap_or_default();
-        if !(name.contains("Wireless Controller") || name.contains("DualSense")) {
+        let ours = match container {
+            Some(want) => device.get_id().ok()
+                .and_then(|id| container_of_endpoint(&id))
+                .is_some_and(|c| c == want),
+            None => {
+                let name = device.get_friendlyname().unwrap_or_default();
+                name.contains("Wireless Controller") || name.contains("DualSense")
+            }
+        };
+        if !ours {
             continue;
         }
 

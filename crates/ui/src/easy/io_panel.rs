@@ -128,6 +128,7 @@ fn kbm_card_h(optical_row: bool) -> f32 {
 const KIND_XINPUT:    &str = "virtual.hm.xinput";
 const KIND_DS4:       &str = "virtual.hm.ds4";
 const KIND_DUALSENSE: &str = "virtual.hm.dualsense";
+const KIND_DUALSENSE_EDGE: &str = "virtual.hm.dualsense_edge";
 const KIND_KEYMOUSE:  &str = "virtual.keymouse";
 
 /// The selectable gamepad output models, in dropdown order: `(kind id, label)`.
@@ -137,6 +138,7 @@ const GAMEPAD_KINDS: &[(&str, &str)] = &[
     (KIND_XINPUT,    "Xbox 360"),
     (KIND_DS4,       "DualShock 4"),
     (KIND_DUALSENSE, "DualSense"),
+    (KIND_DUALSENSE_EDGE, "DualSense Edge"),
 ];
 
 /// Display label for a gamepad kind id (falls back to a generic name).
@@ -1649,6 +1651,31 @@ fn xinput_slot_row(
     )
 }
 
+/// The gamepad card's label row for a pad with a USB audio variant: the label
+/// on the left and the Audio & Haptics checkbox right-aligned to the dropdown's
+/// edge, where an XInput pad shows its player slots. Returns the device id to
+/// switch to when it's toggled.
+fn usb_audio_row(ui: &mut egui::Ui, label: &str, dropdown_w: f32, dev_id: &str) -> Option<String> {
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(row_rect.left(), row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        ui.visuals().strong_text_color(),
+    );
+    let right = egui::Rect::from_min_max(
+        row_rect.left_top(),
+        egui::pos2(row_rect.left() + dropdown_w, row_rect.bottom()),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    header_controls::render_usb_audio_toggle(&mut child, dev_id)
+}
+
 fn gamepad_selector_card(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -1700,7 +1727,13 @@ fn gamepad_selector_card(
         if driver_missing { ui.disable(); }
         ui.add_space(2.0);
         // XInput player-slot circles apply only to an XInput (Virtual Xbox) output;
-        // DualShock/DualSense virtuals have no XInput slot, so show a plain label.
+        // DualShock/DualSense virtuals have no XInput slot. A DualSense / Edge
+        // has the Audio & Haptics option in that spot instead; a DS4 a plain label.
+        let sink = active.and_then(|k| sink_node_of_kind(canvas, k));
+        let sink_dev = sink
+            .and_then(|n| canvas.snarl.get_node(n))
+            .and_then(|n| n.params.get("device_id").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_default();
         if active == Some(KIND_XINPUT) {
             let dropdown_w = (ui.available_width() - 4.0).clamp(120.0, 240.0);
             // "This device's slot" glow: keyed by the active Virtual Xbox sink's
@@ -1714,6 +1747,11 @@ fn gamepad_selector_card(
             let this_slot = this_device_slot(dev_id.as_deref().unwrap_or(""));
             if let Some(slot) = xinput_slot_row(ui, "Gamepad output", dropdown_w, "xi_slot_out", this_slot) {
                 request_xinput_slot(XINPUT_CARD_OUTPUT, slot);
+            }
+        } else if let (Some(node), true) = (sink, flexinput_virtual::usb_audio_toggled_id(&sink_dev).is_some()) {
+            let dropdown_w = (ui.available_width() - 4.0).clamp(120.0, 240.0);
+            if let Some(id) = usb_audio_row(ui, "Gamepad output", dropdown_w, &sink_dev) {
+                crate::canvas::switch_virtual_sink_device(&mut canvas.snarl, node, &id);
             }
         } else {
             ui.label(egui::RichText::new("Gamepad output").size(13.0).strong());
@@ -1780,7 +1818,8 @@ pub fn remove_all_gamepad_sinks(canvas: &mut Canvas) {
     }
 }
 
-/// Next model for the gamepad-nav cycle: Xbox 360 → DS4 → DualSense → None → …
+/// Next model for the gamepad-nav cycle: Xbox 360 → DS4 → DualSense →
+/// DualSense Edge → None → …
 /// `None` means "deploy nothing" (the off state). Wraps from the last model
 /// through None back to the first.
 pub fn next_gamepad_kind(canvas: &Canvas) -> Option<&'static str> {
@@ -2079,12 +2118,22 @@ fn mouse_speed_stack(
 
 // ── Sink helpers ────────────────────────────────────────────────────
 
+/// The kind a device id counts as here: a pad's USB audio variant is the same
+/// model as the plain pad.
+fn model_kind(device_id: &str) -> String {
+    let kind = kind_prefix(device_id);
+    flexinput_virtual::USB_AUDIO_VARIANTS
+        .iter()
+        .find(|(_, usb)| *usb == kind)
+        .map_or(kind, |(plain, _)| plain.to_string())
+}
+
 fn has_sink_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> bool {
     canvas.snarl.nodes_ids_data().any(|(_, n)| {
         n.value.module_id == "device.sink"
             && n.value.params.get("device_id")
                 .and_then(|v| v.as_str())
-                .map(|did| kind_prefix(did) == kind_prefix_str)
+                .map(|did| model_kind(did) == kind_prefix_str)
                 .unwrap_or(false)
     })
 }
@@ -2095,7 +2144,7 @@ fn sink_node_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> Option<NodeId> {
             n.value.module_id == "device.sink"
                 && n.value.params.get("device_id")
                     .and_then(|v| v.as_str())
-                    .map(|did| kind_prefix(did) == kind_prefix_str)
+                    .map(|did| model_kind(did) == kind_prefix_str)
                     .unwrap_or(false)
         })
         .map(|(id, _)| id)
@@ -2107,7 +2156,7 @@ fn remove_sinks_of_kind(canvas: &mut Canvas, kind_prefix_str: &str) {
             n.value.module_id == "device.sink"
                 && n.value.params.get("device_id")
                     .and_then(|v| v.as_str())
-                    .map(|did| kind_prefix(did) == kind_prefix_str)
+                    .map(|did| model_kind(did) == kind_prefix_str)
                     .unwrap_or(false)
         })
         .map(|(id, _)| id)
@@ -2126,12 +2175,12 @@ fn ensure_sink_of_kind(
     let existing: Option<String> = {
         let devs = pool.lock().unwrap();
         devs.iter()
-            .find(|d| d.id().starts_with(kind_id))
+            .find(|d| kind_prefix(d.id()) == kind_id)
             .map(|d| d.id().to_string())
     };
     if existing.is_some() {
         let devs = pool.lock().unwrap();
-        if let Some(d) = devs.iter().find(|d| d.id().starts_with(kind_id)) {
+        if let Some(d) = devs.iter().find(|d| kind_prefix(d.id()) == kind_id) {
             canvas.add_virtual_sink(d.as_ref(), default_collapsed, defaults);
         }
     } else {

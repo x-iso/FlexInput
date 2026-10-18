@@ -84,6 +84,10 @@ pub struct DualSenseState {
     pub btn_options: bool, pub btn_create: bool, pub btn_ps: bool,
     // DPad
     pub dpad_up: bool, pub dpad_down: bool, pub dpad_left: bool, pub dpad_right: bool,
+    // DualSense Edge only: back buttons and Fn buttons (buttons[2] bits 4-7).
+    // Read on every DualSense; only an Edge's publish (gilrs backend) uses them.
+    pub btn_back_l: bool, pub btn_back_r: bool,
+    pub btn_fn_l: bool, pub btn_fn_r: bool,
 }
 
 /// Switch Pro button state read directly from input report 0x30 bytes 3/4/5.
@@ -188,6 +192,10 @@ enum DeviceKind {
         /// the audio endpoint hasn't been resolved yet or on non-Windows builds.
         #[cfg(windows)]
         haptic: Option<dualsense_haptic::HapticStream>,
+        /// The pad's device container, read at open: the haptic stream opens
+        /// the audio endpoint that shares it. `None` if Windows couldn't say.
+        #[cfg(windows)]
+        container: Option<dualsense_haptic::ContainerId>,
     },
     SwitchPro {
         initialized: bool,
@@ -387,6 +395,9 @@ struct OpenedDevice {
     /// handshake (run to completion on the worker).
     calib: Option<SwitchProCalib>,
     packet_counter: u8,
+    /// DualSense only: the pad's device container (see `DeviceKind::DualSense`).
+    #[cfg(windows)]
+    container: Option<dualsense_haptic::ContainerId>,
 }
 
 /// Background worker loop: performs `open_and_init` (device-list read + open
@@ -450,6 +461,8 @@ impl GyroManager {
                             bt_seq: 0,
                             #[cfg(windows)]
                             haptic: None,
+                            #[cfg(windows)]
+                            container: o.container,
                         },
                         KindTag::SwitchPro => DeviceKind::SwitchPro {
                             initialized: true, // handshake ran on the worker
@@ -653,7 +666,7 @@ impl GyroManager {
                 DeviceKind::Ds4 => {
                     hid_write(device, &build_ds4_usb_out(out));
                 }
-                DeviceKind::DualSense { connection, bt_seq, #[cfg(windows)] haptic } => {
+                DeviceKind::DualSense { connection, bt_seq, #[cfg(windows)] haptic, #[cfg(windows)] container } => {
                     match connection {
                         Some(Connection::Bt) => {
                             let pkt = build_dualsense_bt_out(out, *bt_seq);
@@ -673,7 +686,7 @@ impl GyroManager {
                                 let want_haptic = out.hd_l_amp != 0 || out.hd_r_amp != 0
                                     || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
                                 if want_haptic && haptic.is_none() {
-                                    *haptic = dualsense_haptic::HapticStream::open();
+                                    *haptic = dualsense_haptic::HapticStream::open(*container);
                                 }
                                 if let Some(h) = haptic.as_mut() {
                                     h.set_targets_dual(
@@ -777,7 +790,7 @@ pub(crate) fn gamepad_device_list_of(api: &HidApi, vid: u16, pid: u16) -> Vec<hi
 /// failed handshake — callers treat both as a rate-limited retry.
 fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Option<OpenedDevice> {
     let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
-    let device = {
+    let (device, path) = {
         let guard = api.lock().ok()?;
         // Real devices only: our own virtual (ROOT-enumerated `HIDCLASS`/
         // `HIDMAESTRO` path) must never be a gyro/HID target. Excluding it here
@@ -788,7 +801,7 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
         // (`classify_own_virtual`) still reads the full list.
         let paths: Vec<hidapi::DeviceInfo> = gamepad_device_list_of(&guard, vid, pid)
             .into_iter()
-            .filter(|d| !instance_path_is_virtual(&d.path().to_string_lossy()))
+            .filter(|d| !path_is_own_virtual(&d.path().to_string_lossy()))
             .collect();
 
         #[cfg(debug_assertions)]
@@ -799,7 +812,7 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
 
         let info = paths.get(idx)?;
         match guard.open_path(info.path()) {
-            Ok(d) => d,
+            Ok(d) => (d, info.path().to_string_lossy().into_owned()),
             Err(e) => {
                 #[cfg(debug_assertions)]
                 eprintln!("[gyro] open_path failed: {e}");
@@ -807,6 +820,13 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
             }
         }
     };
+    // Outside the api lock: a CfgMgr32 lookup, nothing hidapi needs.
+    #[cfg(windows)]
+    let container = matches!(kind_tag, KindTag::DualSense)
+        .then(|| dualsense_haptic::container_of_interface(&path))
+        .flatten();
+    #[cfg(not(windows))]
+    let _ = path;
     device.set_blocking_mode(false).ok()?;
 
     // On Windows, DualSense/DS4 LED output (report 0x02) is only processed by
@@ -827,7 +847,11 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
             return None;
         }
     }
-    Some(OpenedDevice { device, kind_tag, calib, packet_counter })
+    Some(OpenedDevice {
+        device, kind_tag, calib, packet_counter,
+        #[cfg(windows)]
+        container,
+    })
 }
 
 /// True if the Nth physical device with this VID/PID is one of FlexInput's
@@ -847,9 +871,24 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
 /// shared api first, then calls this against the same locked instance.
 pub(crate) fn classify_own_virtual(api: &HidApi, vid: u16, pid: u16, idx: usize) -> bool {
     match gamepad_device_list_of(api, vid, pid).get(idx) {
-        Some(info) => instance_path_is_virtual(&info.path().to_string_lossy()),
+        Some(info) => path_is_own_virtual(&info.path().to_string_lossy()),
         None => false,
     }
+}
+
+/// Whether a HID path is one of our own virtual pads: a HIDMaestro UMDF one
+/// (told by its instance path), or a composite USB persona, whose path is a
+/// real wired pad's and is told by its USB device's serial instead.
+fn path_is_own_virtual(path: &str) -> bool {
+    if instance_path_is_virtual(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        crate::devnode::is_own_composite_interface(path)
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn instance_path_is_virtual(path: &str) -> bool {
@@ -1270,6 +1309,8 @@ fn parse_ds4(buf: &[u8]) -> Option<HidReading> {
         dpad_right: matches!(dpad, 1 | 2 | 3),
         dpad_down:  matches!(dpad, 3 | 4 | 5),
         dpad_left:  matches!(dpad, 5 | 6 | 7),
+        // No back/Fn buttons on a DS4 (its buttons[2] high bits are a counter).
+        ..Default::default()
     };
 
     let mut r = build(buf, go, ao, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
@@ -1303,7 +1344,8 @@ fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<Hi
     //   lx(0) ly(1) rx(2) ry(3) l2(4) r2(5) seq(6)
     //   buttons[0](7): dpad(3:0) square(4) cross(5) circle(6) triangle(7)
     //   buttons[1](8): l1(0) r1(1) l2_dig(2) r2_dig(3) create(4) options(5) l3(6) r3(7)
-    //   buttons[2](9): ps(0) touchpad(1) mute(2)
+    //   buttons[2](9): ps(0) touchpad(1) mute(2); Edge only: fn_l(4) fn_r(5)
+    //                  back_l(6) back_r(7)
     //   reserved[4](11-14) gyro[3](15-20) accel[3](21-26)
     //   timestamp(27-30) reserved2(31) touch[2](32-39)
     // USB: report 0x01, payload base po=1. BT: report 0x31, payload base po=2.
@@ -1345,6 +1387,10 @@ fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<Hi
         dpad_right: matches!(dpad, 1 | 2 | 3),
         dpad_down:  matches!(dpad, 3 | 4 | 5),
         dpad_left:  matches!(dpad, 5 | 6 | 7),
+        btn_fn_l:    btn2 & 0x10 != 0,
+        btn_fn_r:    btn2 & 0x20 != 0,
+        btn_back_l:  btn2 & 0x40 != 0,
+        btn_back_r:  btn2 & 0x80 != 0,
     };
 
     let mut r = build(buf, go, ao, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
@@ -2372,6 +2418,30 @@ mod tests {
         buf[5] = 0x08; // dpad neutral
         let r = parse_ds4(&buf).expect("valid short DS4 report");
         assert!(!r.has_touchpad, "short report → no touchpad claimed");
+    }
+
+    /// The Edge's back/Fn buttons are buttons[2] bits 4-7, over USB (byte 10)
+    /// and Bluetooth (byte 11), and leave PS/touchpad/mute as they were.
+    #[test]
+    fn parse_dualsense_reads_edge_back_and_fn_buttons() {
+        for (rid, len, at) in [(0x01u8, 64usize, 10usize), (0x31, 79, 11)] {
+            for (bits, want) in [
+                (0x10u8, [false, false, true, false]),
+                (0x20, [false, false, false, true]),
+                (0x40, [true, false, false, false]),
+                (0x80, [false, true, false, false]),
+            ] {
+                let mut buf = vec![0u8; len];
+                buf[0] = rid;
+                buf[at] = bits | 0x04; // + mute
+                let mut conn = None;
+                let r = parse_dualsense(&buf, &mut conn).expect("valid DualSense report");
+                let ds = r.dualsense.expect("full state");
+                assert_eq!([ds.btn_back_l, ds.btn_back_r, ds.btn_fn_l, ds.btn_fn_r], want,
+                    "report {rid:#04x}, bits {bits:#04x}");
+                assert!(r.mic_button && !ds.btn_ps && !r.touchpad_click);
+            }
+        }
     }
 
     /// Reflected IEEE CRC32 of the empty input is 0 (the canonical identity).

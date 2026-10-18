@@ -450,6 +450,13 @@ impl SdlBackend {
                     continue;
                 }
             }
+            // Nor one of our own composite USB personas, which SDL sees as a
+            // wired Sony pad; the USB serial we gave it is the tell.
+            #[cfg(windows)]
+            if gamepad.serial_number().is_some_and(|s| flexinput_usbip::is_own_serial(&s)) {
+                rejected.insert(id);
+                continue;
+            }
             if !sdl_all && kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
@@ -742,7 +749,8 @@ impl DeviceBackend for SdlBackend {
                 id: pad.dev_id.clone(),
                 display_name: name,
                 kind: pad.kind,
-                outputs: layouts::outputs_for(pad.kind),
+                outputs: layouts::outputs_for_pad(
+                    pad.kind, pad.gamepad.vendor_id(), pad.gamepad.product_id()),
                 inputs: layouts::inputs_for(pad.kind),
                 instance_path: None,
                 vid: pad.gamepad.vendor_id(),
@@ -881,6 +889,14 @@ impl DeviceBackend for SdlBackend {
             match pad.kind {
                 ControllerKind::DualSense => {
                     out.push((dev.clone(), "btn_mute".into(), Signal::Bool(b(Button::Misc1))));
+                    // SDL gives the Edge's back buttons as the first paddle pair
+                    // and its Fn buttons as the second, as our pins name them.
+                    if crate::identification::is_dualsense_edge(g.vendor_id(), g.product_id()) {
+                        out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(b(Button::LeftPaddle1))));
+                        out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(b(Button::RightPaddle1))));
+                        out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(b(Button::LeftPaddle2))));
+                        out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(b(Button::RightPaddle2))));
+                    }
                 }
                 ControllerKind::SwitchPro => {
                     out.push((dev.clone(), "btn_capture".into(), Signal::Bool(b(Button::Misc1))));

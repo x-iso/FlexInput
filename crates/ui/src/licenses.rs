@@ -13,7 +13,8 @@
 //! Scope is what FlexInput actually **redistributes**: code linked into
 //! `flexinput.exe` (including SDL3, which we build from source and link
 //! statically), the driver binaries vendored under `crates/hidmaestro/driver`,
-//! and the bundled art assets. Tools the user installs separately — HidHide,
+//! the usbip-win2 installer under `crates/hidmaestro/usbip-win2`, and the
+//! bundled art assets. Tools the user installs separately — HidHide,
 //! ViGEmBus — are not redistributed and so are not listed here.
 
 /// One entry in the licence viewer.
@@ -50,11 +51,23 @@ pub const LICENSES: &[License] = &[
         name: "HIDMaestro",
         what: "Virtual HID/XInput driver. The signed driver package under \
                crates/hidmaestro/driver is redistributed as-is; the Rust client \
-               in crates/hidmaestro is a port of its shared-memory protocol.",
+               in crates/hidmaestro is a port of its shared-memory protocol, and \
+               crates/usbip a port of its USB/IP backend for the composite \
+               DualSense personas, whose profiles it carries.",
         spdx: "MIT",
         url: "https://github.com/hifihedgehog/HIDMaestro",
-        note: Some("Driver binaries from release v1.7.3."),
+        note: Some("Driver binaries from release v1.7.3; USB/IP backend and composite \
+                    profiles from commit b4d29d9."),
         text: include_str!("../../../crates/hidmaestro/driver/LICENSE"),
+    },
+    License {
+        name: "usbip-win2",
+        what: "Virtual USB host controller behind a virtual DualSense's USB audio. \
+               Its signed installer is bundled unmodified and run on first use.",
+        spdx: "BSD-2-Clause",
+        url: "https://github.com/vadimgrn/usbip-win2",
+        note: Some("Installer USBip-0.9.8.1-x64.exe from release v.0.9.8.1."),
+        text: include_str!("../../../crates/hidmaestro/usbip-win2/LICENSE.txt"),
     },
     License {
         name: "egui / eframe",

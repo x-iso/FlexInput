@@ -591,6 +591,15 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             ),
             Err(e) => (Response::err(format!("driver install failed: {e}")), false),
         },
+        Request::EnsureUsbip => match crate::usbip_install::ensure_usbip_installed() {
+            Ok(fresh) => (
+                Response::Ok {
+                    detail: Some(if fresh { "usbip-win2 installed".into() } else { "usbip-win2 already present".into() }),
+                },
+                false,
+            ),
+            Err(e) => (Response::err(format!("usbip-win2 install failed: {e}")), false),
+        },
         Request::ReinstallDriver => {
             // Live nodes can pin the driver and make /delete-driver fail, so tear
             // them all down first (the app re-creates them after this returns).

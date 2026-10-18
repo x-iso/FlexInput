@@ -19,6 +19,29 @@ pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
     pins
 }
 
+/// [`outputs_for`] for one pad, whose VID/PID can add pins its kind doesn't
+/// carry: a DualSense Edge's back and Fn buttons.
+pub fn outputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>) -> Vec<DevicePin> {
+    let mut pins = outputs_for(kind);
+    if kind == ControllerKind::DualSense && crate::identification::is_dualsense_edge(vid, pid) {
+        // Ahead of the Auto-Map port, which stays last.
+        let at = pins.len().saturating_sub(1);
+        pins.splice(at..at, dualsense_edge_extra_outputs());
+    }
+    pins
+}
+
+/// The DualSense Edge's back buttons on the first paddle pair and its Fn
+/// buttons on the second, the order SDL reports them in.
+fn dualsense_edge_extra_outputs() -> Vec<DevicePin> {
+    vec![
+        bo("btn_paddle_l1", "Left Back Button"),
+        bo("btn_paddle_r1", "Right Back Button"),
+        bo("btn_paddle_l2", "Left Fn"),
+        bo("btn_paddle_r2", "Right Fn"),
+    ]
+}
+
 pub fn inputs_for(kind: ControllerKind) -> Vec<DevicePin> {
     match kind {
         ControllerKind::DualShock4 => ds4_inputs(),
@@ -531,5 +554,23 @@ mod automap_vocabulary_tests {
             "these buttons can never be mapped — they are published but absent \
              from ALL_PINS: {orphans:?}",
         );
+    }
+
+    // Only an Edge gains the back/Fn pins, ahead of the Auto-Map port.
+    #[test]
+    fn dualsense_edge_adds_back_and_fn_pins() {
+        let ids = |vid, pid| -> Vec<String> {
+            outputs_for_pad(ControllerKind::DualSense, Some(vid), Some(pid))
+                .into_iter().map(|p| p.id).collect()
+        };
+        let edge = ids(0x054C, 0x0DF2);
+        let plain = ids(0x054C, 0x0CE6);
+        let extra = ["btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2"];
+        for pin in extra {
+            assert!(edge.iter().any(|p| p == pin), "Edge lacks {pin}");
+            assert!(!plain.iter().any(|p| p == pin), "plain DualSense has {pin}");
+        }
+        assert_eq!(edge.len(), plain.len() + extra.len());
+        assert_eq!(edge.last().map(String::as_str), Some("automap_out"));
     }
 }

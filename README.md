@@ -15,7 +15,8 @@ A node-based HID/MIDI input routing and mapping application for Windows. Connect
 
 #### Virtual Outputs
 - **HIDMaestro XInput** — Virtual Xbox 360/XInput controller (pure-Rust UMDF2 client)
-- **HIDMaestro DS4/DualSense** — Virtual DualShock 4/DualSense via HIDMaestro
+- **HIDMaestro DS4/DualSense/DualSense Edge** — Virtual DualShock 4, DualSense and DualSense Edge (back + Fn buttons) via HIDMaestro
+- **USB audio & HD haptics** — A virtual DualSense / Edge can present the real pad's USB audio, so games stream their HD haptics to it (via [usbip-win2](https://github.com/vadimgrn/usbip-win2), installed on first use)
 - **Virtual Keyboard & Mouse** — HIDMaestro-based with enigo fallback
 
 #### Advanced Features

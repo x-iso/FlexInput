@@ -685,12 +685,12 @@ pub(crate) fn spawn_io_thread(
                             // exactly as a game's rumble would. (Restores the ViGEm
                             // behavior where pinging the virtual buzzed whatever it
                             // mapped to.)
-                            if let Some((kind_prefix, vidx)) = own_virtual_pool_target(dev_id) {
+                            if let Some((kinds, vidx)) = own_virtual_pool_target(dev_id) {
                                 let mut pool = shared_virtual_devices.lock().unwrap();
                                 if let Some(dev) = pool
                                     .iter_mut()
                                     .filter(|d| {
-                                        flexinput_virtual::kind_prefix(d.id()).as_str() == kind_prefix
+                                        kinds.contains(&flexinput_virtual::kind_prefix(d.id()).as_str())
                                     })
                                     .nth(vidx)
                                 {
