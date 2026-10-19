@@ -7882,3 +7882,72 @@ fn bound_settings_are_checked_and_say_how_long_they_last() {
     let c = compile("S = \"SCREEN_RESOLUTION_X = 1920\"");
     assert!(c.lines[0].notes.iter().any(|n| n.contains("isn't live here")), "{:?}", c.lines[0].notes);
 }
+
+
+// A double press is timed JSM's way: after a tap, the window counts from its
+// RELEASE. A user's `N = r e` / `N,N = Y` never doubled at a normal pace: the
+// window counted from the first press's start, leaving a 90 ms tap only 60 ms
+// for the gap — so the second press became a press of its own, `r` then a
+// held `e`, and `N,N` looked like it did nothing.
+#[test]
+fn a_double_press_counts_its_window_from_the_taps_release() {
+    let cfg = "N = r e
+N,N = Y";
+    let mut r = Rig::new(cfg);
+    let mut seen = std::collections::HashSet::new();
+    for (down, n) in [(true, 9), (false, 9), (true, 5), (false, 30)] {
+        r.set(Btn::N, down);
+        for _ in 0..n {
+            seen.extend(r.tick());
+        }
+    }
+    assert!(seen.contains("key_y"), "a 90 ms tap, a 90 ms gap: a double press: {seen:?}");
+    assert!(!seen.contains("key_r") && !seen.contains("key_e"), "and nothing of N's own: {seen:?}");
+
+    // Past the window from the release, it is two presses: the tap, then N again.
+    let mut r = Rig::new(cfg);
+    let mut seen = std::collections::HashSet::new();
+    for (down, n) in [(true, 9), (false, 17), (true, 30), (false, 5)] {
+        r.set(Btn::N, down);
+        for _ in 0..n {
+            seen.extend(r.tick());
+        }
+    }
+    assert!(!seen.contains("key_y"), "170 ms after the release is too late: {seen:?}");
+    assert!(seen.contains("key_r") && seen.contains("key_e"), "the tap, then the hold: {seen:?}");
+
+    // A first press held past the hold time has no double: JSM counts that
+    // window from the press's start, long gone by its release.
+    let mut r = Rig::new(cfg);
+    let mut seen = std::collections::HashSet::new();
+    for (down, n) in [(true, 30), (false, 3), (true, 5), (false, 30)] {
+        r.set(Btn::N, down);
+        for _ in 0..n {
+            seen.extend(r.tick());
+        }
+    }
+    assert!(!seen.contains("key_y"), "a held press doesn't lead to a double: {seen:?}");
+}
+
+// After a double press the next press starts afresh: a third press straight
+// after is N's own, not a second double.
+#[test]
+fn a_third_press_after_a_double_starts_afresh() {
+    let mut r = Rig::new("N = R
+N,N = Y");
+    let mut ys = 0;
+    let mut was = false;
+    let mut saw_r_after = false;
+    for (i, (down, n)) in [(true, 5), (false, 5), (true, 5), (false, 5), (true, 5), (false, 30)].into_iter().enumerate() {
+        r.set(Btn::N, down);
+        for _ in 0..n {
+            let pins = r.tick();
+            let y = pins.contains("key_y");
+            if y && !was { ys += 1; }
+            was = y;
+            saw_r_after |= i >= 4 && pins.contains("key_r");
+        }
+    }
+    assert_eq!(ys, 1, "one double press");
+    assert!(saw_r_after, "the third press is N's own");
+}

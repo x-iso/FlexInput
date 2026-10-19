@@ -59,8 +59,13 @@ impl Default for Role {
 struct BtnRun {
     down: bool,
     role: Role,
-    /// When this button last went down — the double-press window measures from it.
-    last_down: Secs,
+    /// Until when a press of this button would be its double press. Set as a
+    /// press of its own binding ends, JSM's way: a tap counts the window from
+    /// its release (it is held back for that long, `pending_tap`), a press held
+    /// past the hold time from its start — so with the default timings only a
+    /// tap leads to a double press. Measuring from the press start for a tap
+    /// too left a normal double tap 50–70 ms for the gap where JSM gives 150.
+    double_until: Option<Secs>,
     /// A tap held back to see whether a second press turns it into a double
     /// press: (binding, when to give up waiting).
     pending_tap: Option<(usize, Secs)>,
@@ -312,9 +317,8 @@ impl Runtime {
         }
 
         // A second press inside the window turns into the double-press binding.
-        let last_down = self.buttons[&b].last_down;
-        let repeat = self.buttons[&b].last_down > 0.0 && self.t - last_down <= Secs::from(timings.double);
-        self.buttons.entry(b).or_default().last_down = self.t;
+        let repeat = self.buttons[&b].double_until.is_some_and(|until| self.t <= until);
+        self.buttons.entry(b).or_default().double_until = None;
         if repeat {
             if let Some(i) = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)) {
                 self.buttons.entry(b).or_default().pending_tap = None;
@@ -434,16 +438,24 @@ impl Runtime {
         if press.ended { return; }
         let (binding, held_long, start) = (press.binding, press.hold_fired, press.start);
         self.fire(binding, EventMod::Release, cfg, None);
+        // A press can lead to a double press when the button has one — but not
+        // the double press itself: after one, the next press starts afresh.
+        let leads_to_double = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)).is_some()
+            && !matches!(cfg.bindings.get(binding).map(|x| x.trigger), Some(Trigger::Double(_)));
+        let window = Secs::from(timings.double);
         if !held_long && self.t - start < Secs::from(timings.hold) {
-            // A tap waits out the double-press window when the button has a
-            // double-press binding, so the two don't both fire.
-            let has_double = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)).is_some();
-            if has_double {
-                self.buttons.entry(b).or_default().pending_tap =
-                    Some((binding, self.t + Secs::from(timings.double)));
+            // A tap waits out the double-press window, counted from now, so
+            // the two don't both fire.
+            if leads_to_double {
+                let run = self.buttons.entry(b).or_default();
+                run.pending_tap = Some((binding, self.t + window));
+                run.double_until = Some(self.t + window);
             } else {
                 self.fire(binding, EventMod::Tap, cfg, None);
             }
+        } else if leads_to_double {
+            // Held past the hold time: counted from where the press began.
+            self.buttons.entry(b).or_default().double_until = Some(start + window);
         }
         self.end_press(idx);
     }

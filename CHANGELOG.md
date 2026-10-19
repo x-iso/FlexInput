@@ -188,6 +188,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **JSM: double presses at a normal pace.** `N,N = Y` needed the second press
+  within 150 ms of the first press going DOWN, which left a 90 ms tap 60 ms for
+  the gap — so most double taps came out as N's own binding twice (with
+  `N = r e`: `r`, then a held `e`), and the double press seemed not to work.
+  JSM counts the window from the tap's release (`DBL_PRESS_WINDOW`, 150 ms by
+  default), and now so does FlexInput. A double press's own tap fires on
+  release instead of waiting out a window, and a third press straight after a
+  double is a fresh press rather than another double, as in JSM.
+
 - **JSM: a press that switches tabs still taps.** `L3 = PS_L3' "L3.txt"\`
   switches on the press, and switching threw the press away, so its tap never
   came — and the new tab took the still-held L3 for a press of its own, firing
