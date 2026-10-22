@@ -1497,6 +1497,8 @@ fn parse_device_id(id: &str) -> Option<[u8; 6]> {
 }
 
 impl DeviceBackend for ClassicBtBackend {
+    fn name(&self) -> &'static str { "BT Classic" }
+
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         let pads = self.shared.pads.lock().unwrap();
         pads.values()

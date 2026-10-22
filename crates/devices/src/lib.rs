@@ -64,6 +64,8 @@ pub struct PhysicalDevice {
 }
 
 pub trait DeviceBackend: Send {
+    /// Short label for diagnostics (the I/O loop's per-backend timings).
+    fn name(&self) -> &'static str { "backend" }
     fn enumerate(&mut self) -> Vec<PhysicalDevice>;
     fn poll(&mut self) -> Vec<(String, String, Signal)>;
     /// Route a signal to a physical output pin (e.g. MIDI CC send).

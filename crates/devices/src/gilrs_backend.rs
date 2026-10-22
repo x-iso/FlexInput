@@ -92,36 +92,34 @@ pub struct XInputSlotInfo {
     pub sub_type:  u8,
 }
 
-/// Probe all four XInput user-index slots. Pure read via the XInput API (no
-/// SetupAPI / hidapi enumeration), so it is cheap enough to call periodically and
-/// safe off the device-io hot path. Off Windows returns four empty slots.
+/// The four XInput user-index slots. Reads only the slots known to hold a
+/// controller ([`XINPUT_LIVE`]) — an empty slot is reported empty without asking
+/// XInput, since that's the expensive question. Off Windows returns four empty
+/// slots.
 pub fn probe_xinput_slots() -> [XInputSlotInfo; 4] {
     let mut out = [XInputSlotInfo::default(); 4];
+    #[cfg(windows)]
+    initial_xinput_probe();
     for i in 0..4u32 {
         out[i as usize].index = i;
         #[cfg(windows)]
-        unsafe {
-            use xinput_ffi::*;
-            let mut st: XINPUT_STATE = Default::default();
-            if XInputGetState(i, &mut st) == 0 {
-                let slot = &mut out[i as usize];
-                slot.connected = true;
-                slot.packet = st.dw_packet_number;
-                slot.buttons = st.gamepad.w_buttons;
-                let mut caps: XINPUT_CAPABILITIES = Default::default();
-                if XInputGetCapabilities(i, 0, &mut caps) == 0 {
-                    slot.sub_type = caps.b_sub_type;
-                }
+        if let Some(st) = xinput_read_live(i) {
+            let slot = &mut out[i as usize];
+            slot.connected = true;
+            slot.packet = st.dw_packet_number;
+            slot.buttons = st.gamepad.w_buttons;
+            let mut caps = xinput_ffi::XINPUT_CAPABILITIES::default();
+            if unsafe { xinput_ffi::XInputGetCapabilities(i, 0, &mut caps) } == 0 {
+                slot.sub_type = caps.b_sub_type;
             }
         }
     }
     out
 }
 
-/// Throttled cache over [`probe_xinput_slots`]. `XInputGetState` on an *empty*
-/// slot is comparatively expensive, so polling all four every UI frame would add
-/// latency; this refreshes at most every ~200 ms and returns the cached snapshot
-/// otherwise. Safe to call from per-frame UI code (e.g. the slot indicator).
+/// Throttled cache over [`probe_xinput_slots`]: refreshes at most every ~200 ms
+/// and returns the cached snapshot otherwise. Safe to call from per-frame UI
+/// code (e.g. the slot indicator).
 pub fn probe_xinput_slots_cached() -> [XInputSlotInfo; 4] {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -138,6 +136,100 @@ pub fn probe_xinput_slots_cached() -> [XInputSlotInfo; 4] {
     let slots = probe_xinput_slots();
     *guard = Some((Instant::now(), slots));
     slots
+}
+
+/// The XInput slots that have a controller in them (bit i = slot i).
+/// `XInputGetState` on an EMPTY slot costs ~0.9 ms (measured on the dev laptop;
+/// Microsoft's XInput guidance is not to poll empty slots every frame). The
+/// device-io poll used to read all four slots on every pass whenever any XInput
+/// pad existed — our own virtual Xbox 360 included — which cost ~2.6 ms a pass
+/// and held the I/O loop to ~380 Hz at a 1000 Hz setting. Now everything reads
+/// only live slots. Empty ones are never polled on a timer: they're checked at
+/// startup and after a controller connects ([`request_xinput_probe`]), and a read
+/// that finds a live slot gone clears its bit.
+#[cfg(windows)]
+static XINPUT_LIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Read a slot only if it's live (see [`XINPUT_LIVE`]); a failed read marks it
+/// empty for the probe thread to pick up again.
+#[cfg(windows)]
+fn xinput_read_live(slot: u32) -> Option<xinput_ffi::XINPUT_STATE> {
+    use std::sync::atomic::Ordering;
+    if slot >= 4 || XINPUT_LIVE.load(Ordering::Relaxed) & (1 << slot) == 0 {
+        return None;
+    }
+    let mut st = xinput_ffi::XINPUT_STATE::default();
+    if unsafe { xinput_ffi::XInputGetState(slot, &mut st) } == 0 {
+        Some(st)
+    } else {
+        XINPUT_LIVE.fetch_and(!(1u8 << slot), Ordering::Relaxed);
+        None
+    }
+}
+
+/// Look for controllers in the empty XInput slots: right away, then a few more
+/// times over the next seconds — XInput can give a newly arrived pad its slot a
+/// moment after Windows reports the device — and then not again until the next
+/// request. Called once at startup and whenever gilrs sees a controller connect.
+/// The checks run on the "xinput-probe" thread, which otherwise sleeps on its
+/// channel, so the device-io loop never pays for an empty slot.
+#[cfg(windows)]
+fn request_xinput_probe() {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::sync::OnceLock;
+    // Waits before each check: at 0, 0.3, 1.3 and 4.3 s.
+    const RECHECKS: [Duration; 4] = [
+        Duration::ZERO,
+        Duration::from_millis(300),
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+    ];
+    static TX: OnceLock<Option<mpsc::Sender<()>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new().name("xinput-probe".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                let mut step = 0;
+                while step < RECHECKS.len() {
+                    match rx.recv_timeout(RECHECKS[step]) {
+                        // Another request: start the schedule over.
+                        Ok(()) => step = 0,
+                        Err(RecvTimeoutError::Timeout) => {
+                            probe_empty_xinput_slots();
+                            step += 1;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            }
+        });
+        spawned.ok().map(|_| tx)
+    });
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+}
+
+/// The startup check, once per process, whoever reads the slots first.
+#[cfg(windows)]
+fn initial_xinput_probe() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(request_xinput_probe);
+}
+
+#[cfg(windows)]
+fn probe_empty_xinput_slots() {
+    use std::sync::atomic::Ordering;
+    let live = XINPUT_LIVE.load(Ordering::Relaxed);
+    for i in 0..4u32 {
+        if live & (1 << i) != 0 {
+            continue;
+        }
+        let mut st = xinput_ffi::XINPUT_STATE::default();
+        if unsafe { xinput_ffi::XInputGetState(i, &mut st) } == 0 {
+            XINPUT_LIVE.fetch_or(1 << i, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct GilrsBackend {
@@ -250,6 +342,8 @@ impl GilrsBackend {
     pub fn try_new() -> Option<Self> {
         let gilrs = GilrsBuilder::new().with_default_filters(false).build().ok()?;
         let gyro = GyroManager::new();
+        #[cfg(windows)]
+        initial_xinput_probe();
 
         // Spawn the background refresh/classify worker. It shares the gyro
         // layer's hidapi instance (single HidApi per process) and is the only
@@ -419,6 +513,8 @@ impl GilrsBackend {
 }
 
 impl DeviceBackend for GilrsBackend {
+    fn name(&self) -> &'static str { "gilrs" }
+
     fn set_sdl_all_pads(&mut self, on: bool) {
         self.sdl_all_pads = on;
     }
@@ -575,7 +671,17 @@ impl DeviceBackend for GilrsBackend {
         // SDL owns every pad in the global-SDL mode — drain gilrs's own event
         // queue so it doesn't back up, but emit nothing.
         if self.sdl_all_pads {
-            while self.gilrs.next_event().is_some() {}
+            let mut connected = false;
+            while let Some(ev) = self.gilrs.next_event() {
+                connected |= matches!(ev.event, EventType::Connected);
+            }
+            // The XInput slot indicator still needs to see a new pad.
+            #[cfg(windows)]
+            if connected {
+                request_xinput_probe();
+            }
+            #[cfg(not(windows))]
+            let _ = connected;
             return Vec::new();
         }
         // Rebuild XInput slot map at the start of each poll so it stays in sync
@@ -602,6 +708,12 @@ impl DeviceBackend for GilrsBackend {
                 // time the ~200 ms hidapi refresh is worth paying). See `dev_set_dirty`.
                 if matches!(ev.event, EventType::Connected | EventType::Disconnected | EventType::Dropped) {
                     self.dev_set_dirty = true;
+                }
+                // A new pad may have taken an empty XInput slot: the only time
+                // the empty slots are looked at (see `XINPUT_LIVE`).
+                #[cfg(windows)]
+                if matches!(ev.event, EventType::Connected) {
+                    request_xinput_probe();
                 }
                 self.gilrs.update(&ev);
                 ev_count += 1;
@@ -906,12 +1018,10 @@ impl DeviceBackend for GilrsBackend {
 
             #[cfg(windows)]
             if kind == ControllerKind::XInput && !is_virt {
-                use xinput_ffi::*;
                 // Land on the pad's correlated slot (falls back to the arrival index
                 // until live state resolves it — see `xinput_slot_for`).
                 let slot = self.xinput_slot_for.get(&dev).copied().unwrap_or(inst as u32);
-                let mut st: XINPUT_STATE = Default::default();
-                if unsafe { XInputGetState(slot, &mut st) } == 0 {
+                if let Some(st) = xinput_read_live(slot) {
                     let gp = st.gamepad;
                     let b = gp.w_buttons;
                     let has = |mask: u16| (b & mask) != 0;
@@ -987,12 +1097,11 @@ impl DeviceBackend for GilrsBackend {
         // onto our own virtual (which would feed our output back as input).
         #[cfg(windows)]
         if !xi_corr.is_empty() {
-            use xinput_ffi::*;
-            // Snapshot all four slots once: (connected, buttons, lx, ly).
+            // Snapshot the live slots once: (connected, buttons, lx, ly). Empty
+            // ones aren't read here — see `XINPUT_LIVE`.
             let mut slots = [(false, 0u16, 0i16, 0i16); 4];
             for i in 0..4u32 {
-                let mut st: XINPUT_STATE = Default::default();
-                if unsafe { XInputGetState(i, &mut st) } == 0 {
+                if let Some(st) = xinput_read_live(i) {
                     slots[i as usize] =
                         (true, st.gamepad.w_buttons, st.gamepad.s_thumb_lx, st.gamepad.s_thumb_ly);
                 }

@@ -590,6 +590,9 @@ impl VirtualDevice for VirtualKeyMouseHm {
         let has_motion = rep[1..7] != [0; 6];
         if has_motion || rep != self.last_mouse_report || self.mouse_report_dirty {
             self.mouse.write_raw_input(&rep);
+            if rep[1..5] != [0; 4] {
+                crate::count_mouse_report();
+            }
             self.mouse_report_dirty = false;
             self.last_mouse_report = rep;
         }

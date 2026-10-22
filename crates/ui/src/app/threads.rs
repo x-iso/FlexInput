@@ -4,6 +4,74 @@
 use super::*;
 use flexinput_core::PinMapExt;
 
+/// Where the I/O loop's time goes: `(what, average ms per iteration, worst ms)`
+/// over the last second, slowest first. Published by the loop once a second;
+/// Settings → Performance shows it when you hover the measured I/O rate.
+pub(crate) static IO_TIMINGS: std::sync::Mutex<Vec<(String, f32, f32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Sums the I/O loop's per-iteration section times for [`IO_TIMINGS`]. Keys
+/// are inserted once and looked up by `&str` after that, so a steady loop
+/// doesn't allocate here.
+#[derive(Default)]
+struct IoTimingAcc {
+    // One map per row group (see `IO_TIMING_GROUPS`): name → (sum, worst).
+    groups: [HashMap<String, (std::time::Duration, std::time::Duration)>; 4],
+    since: Option<std::time::Instant>,
+    iters: u32,
+}
+
+/// Row-name prefixes of [`IoTimingAcc::groups`]: loop sections, then each
+/// input backend's poll, then each virtual device's flush and output drain.
+const IO_TIMING_GROUPS: [&str; 4] = ["", "poll ", "flush ", "outputs "];
+const IO_SECTION: usize = 0;
+const IO_BACKEND: usize = 1;
+const IO_FLUSH: usize = 2;
+const IO_OUTPUTS: usize = 3;
+
+impl IoTimingAcc {
+    fn add(&mut self, group: usize, name: &str, d: std::time::Duration) {
+        let map = &mut self.groups[group];
+        match map.get_mut(name) {
+            Some((sum, worst)) => {
+                *sum += d;
+                if d > *worst {
+                    *worst = d;
+                }
+            }
+            None => {
+                map.insert(name.to_string(), (d, d));
+            }
+        }
+    }
+
+    /// Close one iteration; once a second, publish the averages and restart.
+    fn end_iteration(&mut self, now: std::time::Instant) {
+        self.iters += 1;
+        let since = *self.since.get_or_insert(now);
+        if now - since < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let n = self.iters as f32;
+        let mut rows: Vec<(String, f32, f32)> = Vec::new();
+        for (prefix, map) in IO_TIMING_GROUPS.iter().zip(&mut self.groups) {
+            for (k, (sum, worst)) in map.iter_mut() {
+                if !sum.is_zero() {
+                    rows.push((format!("{prefix}{k}"), sum.as_secs_f32() * 1e3 / n, worst.as_secs_f32() * 1e3));
+                }
+                *sum = Default::default();
+                *worst = Default::default();
+            }
+        }
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if let Ok(mut t) = IO_TIMINGS.lock() {
+            *t = rows;
+        }
+        self.iters = 0;
+        self.since = Some(now);
+    }
+}
+
 // ── Device I/O thread (polling-rate setting, default 500 Hz) ──────────────────
 
 pub(crate) fn spawn_io_thread(
@@ -169,6 +237,9 @@ pub(crate) fn spawn_io_thread(
             let engine_waiter = flexinput_engine::HrWaiter::new();
             let mut skip_engine_wait_until = Instant::now();
             let mut engine_wait_misses = 0u32;
+            // The loop's next wake-up deadline; see the pacing wait at the end.
+            let mut next_tick = Instant::now();
+            let mut timings = IoTimingAcc::default();
 
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
@@ -254,6 +325,7 @@ pub(crate) fn spawn_io_thread(
                             *dev_event_acc.entry(dev).or_insert(0) += n;
                         }
                         backend_marks.push(bt.elapsed());
+                        timings.add(IO_BACKEND, backend.name(), bt.elapsed());
                     }
                 }
                 mark!("backends_poll");
@@ -469,7 +541,9 @@ pub(crate) fn spawn_io_thread(
                         // Silence devices not referenced by the active tab.
                         for dev in devs.iter_mut() {
                             if !active_ids.contains(dev.id()) {
+                                let ft = Instant::now();
                                 dev.reset_outputs();
+                                timings.add(IO_FLUSH, dev.id(), ft.elapsed());
                             }
                         }
                         // Route signals to active-tab devices only (every tick —
@@ -489,7 +563,9 @@ pub(crate) fn spawn_io_thread(
                             let active = active_ids.contains(dev.id());
                             let is_km = dev.id() == "virtual.keymouse";
                             if !active || is_km || flush_gamepad {
+                                let ft = Instant::now();
                                 dev.flush();
+                                timings.add(IO_FLUSH, dev.id(), ft.elapsed());
                             }
                         }
                     }
@@ -533,7 +609,9 @@ pub(crate) fn spawn_io_thread(
                     // these rates) and far cheaper.
                     for dev in devs.iter_mut() {
                         let id = dev.id().to_string();
+                        let pt = Instant::now();
                         let sigs = dev.poll_outputs(); // always drain the ring
+                        timings.add(IO_OUTPUTS, &id, pt.elapsed());
                         if !active_ids.contains(&id) { continue; } // gate routing only
                         for (pin_id, sig) in sigs {
                             last_virt_sigs.insert((id.clone(), pin_id.to_string()), sig);
@@ -746,10 +824,26 @@ pub(crate) fn spawn_io_thread(
                     eprintln!("{line}");
                 }
 
-                let elapsed = t0.elapsed();
-                if elapsed < interval {
-                    waiter.wait(interval - elapsed);
+                // Pace on an absolute deadline, not "interval minus this
+                // iteration's busy time": every timer wake lands a little late,
+                // and waiting a fresh interval from each late wake lost that
+                // lateness every tick — 500 Hz ran at ~430 and 1000 Hz at
+                // ~760–800 (measured). Carrying the deadline forward makes the
+                // next wait shorter by however late this one was. More than a
+                // period behind (a stall, a lowered rate) resyncs instead of
+                // running a burst of back-to-back iterations to catch up.
+                for (name, d) in &sect_marks {
+                    timings.add(IO_SECTION, name, *d);
                 }
+                next_tick += interval;
+                let now = Instant::now();
+                if next_tick > now {
+                    waiter.wait(next_tick - now);
+                } else if now - next_tick > interval {
+                    next_tick = now;
+                }
+                timings.add(IO_SECTION, "pacing wait (idle)", now.elapsed());
+                timings.end_iteration(Instant::now());
 
                 // Measured per-loop Hz via inter-iteration interval. EMA
                 // smooths it so the UI label doesn't strobe at frame rate.

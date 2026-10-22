@@ -691,6 +691,8 @@ impl Default for SdlBackend {
 }
 
 impl DeviceBackend for SdlBackend {
+    fn name(&self) -> &'static str { "SDL" }
+
     fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
         // Same lookup shape as `send`: pads are keyed by SDL joystick id, and
         // the UI addresses them by the `sdl:<kind>:<inst>` string. Cheap to do

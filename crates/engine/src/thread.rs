@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -122,6 +122,18 @@ pub fn current_io_rate() -> u32 {
 /// Update the live I/O rate. Called by the device-io thread.
 pub fn set_io_rate(hz: u32) {
     LIVE_IO_RATE.store(hz, Ordering::Relaxed);
+}
+
+/// Engine passes that ran at least one tick, and the ticks they ran, since
+/// start. The engine publishes its outputs once per pass, so passes/s is how
+/// often the sink pins can change; ticks/s below the sample rate means the
+/// engine is dropping catch-up ticks. The UI differences these for a live rate.
+static ENGINE_PASSES: AtomicU64 = AtomicU64::new(0);
+static ENGINE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// `(passes, ticks)` run since start. See [`ENGINE_PASSES`].
+pub fn engine_counters() -> (u64, u64) {
+    (ENGINE_PASSES.load(Ordering::Relaxed), ENGINE_TICKS.load(Ordering::Relaxed))
 }
 
 /// Per-device measured event rate (Hz). Populated by the device-io thread
@@ -594,6 +606,8 @@ pub fn spawn_processing_thread(
             let ticks = ticks.min((sr / 100).max(16));
 
             if ticks > 0 {
+                ENGINE_PASSES.fetch_add(1, Ordering::Relaxed);
+                ENGINE_TICKS.fetch_add(ticks as u64, Ordering::Relaxed);
                 // Refcount-bump reads — no cloning of graph or signal map.
                 // The Arc<…> handles point at whatever the publishers most
                 // recently stored. Stable across the catchup loop because

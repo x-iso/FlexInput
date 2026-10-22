@@ -1059,6 +1059,7 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     // ticks to 1.5–3 ms; a fixed per-tick distance then makes cursor speed
     // lurch with scheduling jitter. dt-scaling keeps motion wall-clock-correct.
     let mut last_emit = Instant::now();
+    let mut next_tick = Instant::now();
 
     loop {
         let t0 = Instant::now();
@@ -1148,6 +1149,7 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                     carry_y -= dy as f32;
                     if dx != 0 || dy != 0 {
                         let _ = e.move_mouse(dx, dy, Coordinate::Rel);
+                        crate::count_mouse_report();
                     }
                 }
                 // Scroll: digital clicks plus dt-scaled analog rate (sub-notch
@@ -1193,9 +1195,15 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             }
         }
 
-        let elapsed = t0.elapsed();
-        if elapsed < tick {
-            std::thread::sleep(tick - elapsed);
+        // Absolute-deadline pacing, as in the device-io loop: sleeping a fresh
+        // `tick - busy` from each (always slightly late) wake held this "1 kHz"
+        // thread to ~650–800 Hz. Carry the deadline; resync after a stall.
+        next_tick += tick;
+        let now = Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        } else if now - next_tick > tick {
+            next_tick = now;
         }
     }
 }

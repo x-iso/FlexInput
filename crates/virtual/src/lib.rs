@@ -56,6 +56,20 @@ pub fn mouse_suppression_effective() -> (bool, u32) {
     (on, MOUSE_SUPPRESSION_RELEASE_MS.load(Ordering::Relaxed).clamp(50, 2000))
 }
 
+/// Pointer-motion reports the virtual mouse has sent since start (a HID report
+/// on HIDMaestro, a relative move on SendInput). The UI differences it into a
+/// live reports/s, to compare with what Windows actually receives.
+static MOUSE_REPORTS_SENT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn count_mouse_report() {
+    MOUSE_REPORTS_SENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// See [`MOUSE_REPORTS_SENT`].
+pub fn mouse_reports_sent() -> u64 {
+    MOUSE_REPORTS_SENT.load(Ordering::Relaxed)
+}
+
 // ── Mixed-output braiding (experimental) ────────────────────────────────────
 //
 // Probes games whose input arbiter behaves differently with mixed virtual

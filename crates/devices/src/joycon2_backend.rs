@@ -422,6 +422,8 @@ fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState
 }
 
 impl DeviceBackend for Joycon2Backend {
+    fn name(&self) -> &'static str { "Joy-Con 2" }
+
     fn set_spike_filter(&mut self, device_id: &str, enabled: bool, sensitivity_pct: f32, window: u8) {
         // Create on demand: settings are pushed every I/O tick and may arrive
         // before the pad's first poll. `set_config` is a no-op when unchanged.

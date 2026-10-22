@@ -3,6 +3,43 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-10-23
+
+### Added
+
+- **Live performance readout.** Settings → Performance now shows what the
+  polling and sample rates actually achieve: the I/O loop's measured rate, how
+  many reports the virtual mouse is sending, and the engine's ticks and passes
+  per second (amber when it can't keep up at the rate set). Expand **Where the
+  I/O loop's time goes** for each part of a polling pass — every input backend
+  and every virtual device — with its average and worst time over the last
+  second. If the polling rate falls short on your machine, a screenshot of that
+  table shows why.
+
+### Changed
+
+- **Max polling rate's description says what it sets.** Besides how often
+  controllers are read, it's how fast the virtual gamepads and the HIDMaestro
+  virtual mouse report to games; the description only mentioned the virtual
+  Xbox 360.
+
+### Fixed
+
+- **The polling rate is actually reached.** The I/O loop waited a full period
+  after every wake-up, and every wake-up comes slightly late, so each pass lost
+  that lateness: 500 Hz ran at about 430 and 1000 Hz at about 780. It now keeps
+  to the rate set. The SendInput virtual mouse's 1 kHz thread had the same flaw
+  and ran at 650–800 Hz; it now runs at 1 kHz.
+
+- **An Xbox pad no longer caps the polling rate at about 380 Hz.** Whenever
+  any XInput pad was present — FlexInput's own virtual Xbox 360 included, from
+  any open tab — every polling pass asked Windows about all four XInput slots,
+  and asking about an empty slot takes about 0.9 ms. Three empty slots cost
+  2.6 ms a pass, which held a 1000 Hz setting to about 380 Hz and the virtual
+  mouse to about 330 reports a second, whatever controller drove it. Empty
+  slots are now checked only at startup and when a controller connects, and
+  Easy mode's player-slot circles no longer poll them either.
+
 ## [0.15.9] - 2026-10-15
 
 ### Added

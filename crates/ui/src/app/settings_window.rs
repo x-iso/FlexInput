@@ -1675,7 +1675,7 @@ impl FlexInputApp {
     fn settings_performance(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("Max polling rate")
-                .on_hover_text("Upper bound for the I/O loop, and the rate the virtual Xbox 360 (HIDMaestro XInput) delivers to games. Steps are whole-millisecond periods: 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
+                .on_hover_text("Upper bound for the I/O loop, and the rate the virtual devices report to games: the virtual gamepads, and the virtual mouse when it runs on HIDMaestro (one report per tick while it moves). Steps are whole-millisecond periods: 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
             // The slider drives the STEP INDEX (0..=7), not the raw Hz, so
             // the handle is evenly spaced and snaps to a valid whole-ms
             // period *while* dragging (an in-between rate would just round
@@ -1703,8 +1703,38 @@ impl FlexInputApp {
             }
         });
         ui.label(egui::RichText::new(
-            "How often the I/O thread polls gamepads and MIDI devices, and how fast the virtual Xbox 360 reports to games."
+            "How often the I/O thread polls gamepads and MIDI devices, and how fast the virtual gamepads and the HIDMaestro virtual mouse report to games."
         ).small().color(egui::Color32::from_gray(140)));
+        let live = live_rates(ui.ctx());
+        let mouse = match live.mouse_hz {
+            Some(0) | None => "idle".to_string(),
+            Some(hz) => format!("{hz} reports/s"),
+        };
+        ui.label(egui::RichText::new(format!(
+            "Now: I/O loop {} Hz · virtual mouse {mouse}",
+            flexinput_engine::current_io_rate(),
+        )).small().color(egui::Color32::from_gray(170)))
+            .on_hover_text("Measured live. The virtual mouse sends a report only when the pointer moves at least one whole count, so slow motion sends fewer than the polling rate.");
+        // Inline rather than a tooltip: it's read while a controller moves the
+        // pointer, which a hover can't survive.
+        egui::CollapsingHeader::new(egui::RichText::new("Where the I/O loop's time goes").small())
+            .id_salt("io_timings_details")
+            .show(ui, |ui| {
+                let rows = super::threads::IO_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
+                egui::Grid::new("io_timings").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| egui::RichText::new(s).small().strong();
+                    ui.label(head("per loop pass, last second"));
+                    ui.label(head("avg ms"));
+                    ui.label(head("worst ms"));
+                    ui.end_row();
+                    for (name, avg, worst) in rows.iter().take(20) {
+                        ui.label(egui::RichText::new(name.as_str()).small());
+                        ui.label(egui::RichText::new(format!("{avg:.3}")).small());
+                        ui.label(egui::RichText::new(format!("{worst:.2}")).small());
+                        ui.end_row();
+                    }
+                });
+            });
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
@@ -1721,6 +1751,21 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(
             "Engine tick rate. Higher = lower latency, more CPU."
         ).small().color(egui::Color32::from_gray(140)));
+        if let (Some(passes), Some(ticks)) = (live.passes_hz, live.ticks_hz) {
+            // Below ~90% of the setting, catch-up ticks are being dropped: the
+            // patch costs more per tick than this machine has at this rate.
+            let behind = ticks < self.settings.sample_rate_hz * 9 / 10;
+            let text = egui::RichText::new(format!(
+                "Now: engine {ticks} ticks/s in {passes} passes/s{}",
+                if behind { " — can't keep up at this rate" } else { "" },
+            )).small();
+            ui.label(if behind {
+                text.color(egui::Color32::from_rgb(230, 170, 80))
+            } else {
+                text.color(egui::Color32::from_gray(170))
+            })
+            .on_hover_text("The engine publishes its outputs once per pass, so passes/s is how often outputs can change.");
+        }
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -2227,4 +2272,44 @@ fn settings_subheading(ui: &mut egui::Ui, title: &str) {
 /// Small explanatory text under a setting.
 fn settings_note(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).small().color(egui::Color32::from_gray(140)));
+}
+
+/// The Performance section's live readout: per-second rates differenced from
+/// the engine's and the virtual mouse's running counters over half-second
+/// windows. `None` until a first window completes.
+#[derive(Clone, Copy, Default)]
+struct LiveRates {
+    at: Option<std::time::Instant>,
+    passes: u64,
+    ticks: u64,
+    mouse: u64,
+    passes_hz: Option<u32>,
+    ticks_hz: Option<u32>,
+    mouse_hz: Option<u32>,
+}
+
+fn live_rates(ctx: &egui::Context) -> LiveRates {
+    use std::time::{Duration, Instant};
+    let id = egui::Id::new("settings_live_rates");
+    let now = Instant::now();
+    let (passes, ticks) = flexinput_engine::engine_counters();
+    let mouse = flexinput_virtual::mouse_reports_sent();
+    let mut r: LiveRates = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
+    let elapsed = r.at.map(|at| now - at);
+    if elapsed.is_none_or(|e| e >= Duration::from_millis(500)) {
+        // A window much longer than asked for means the section wasn't on
+        // screen: start over rather than show an average over the gap.
+        if let Some(e) = elapsed.filter(|e| *e < Duration::from_secs(2)) {
+            let per_s = |now: u64, then: u64| {
+                Some((now.saturating_sub(then) as f64 / e.as_secs_f64()).round() as u32)
+            };
+            r.passes_hz = per_s(passes, r.passes);
+            r.ticks_hz = per_s(ticks, r.ticks);
+            r.mouse_hz = per_s(mouse, r.mouse);
+        }
+        r = LiveRates { at: Some(now), passes, ticks, mouse, ..r };
+        ctx.data_mut(|d| d.insert_temp(id, r));
+    }
+    ctx.request_repaint_after(Duration::from_millis(250));
+    r
 }
