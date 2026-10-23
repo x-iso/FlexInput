@@ -12,17 +12,25 @@ use egui_snarl::Snarl;
 
 use crate::canvas::NodeData;
 
-/// Polling / sample rate ranges exposed by the Settings UI.
-pub const POLLING_HZ_MIN: u32 = 125;
-pub const POLLING_HZ_MAX: u32 = 1000;
+/// Default polling rate. The valid rates are [`POLLING_HZ_STEPS`].
 pub const POLLING_HZ_DEFAULT: u32 = 500;
 
-/// The only polling rates we expose: each is exactly 1000/N for N = 1..8 ms.
-/// Whole-ms periods were chosen when FlexInput's rebuilt XUSB companion pumped
-/// XInput on a whole-ms timer. The stock companion instead reports each frame as
-/// it's written, so the virtual Xbox 360 follows the I/O rate directly; the steps
-/// stay so saved settings remain valid. Descending = ms ascending.
-pub const POLLING_HZ_STEPS: [u32; 8] = [1000, 500, 333, 250, 200, 167, 143, 125];
+/// The only polling rates we expose: 2000 Hz (0.5 ms), then exactly 1000/N for
+/// N = 1..8 ms. Whole-ms periods were chosen when FlexInput's rebuilt XUSB
+/// companion pumped XInput on a whole-ms timer. The stock companion instead
+/// reports each frame as it's written, so the virtual Xbox 360 follows the I/O
+/// rate directly; the steps stay so saved settings remain valid. Descending = ms
+/// ascending. The output rate ([`AppSettings::output_hz`]) uses the same steps.
+pub const POLLING_HZ_STEPS: [u32; 9] = [2000, 1000, 500, 333, 250, 200, 167, 143, 125];
+
+/// [`AppSettings::output_hz`] value meaning "report once per poll" (the
+/// default, and the only behavior before the output rate was its own setting).
+pub const OUTPUT_HZ_SAME_AS_POLLING: u32 = 0;
+
+/// A saved output rate made valid: "same as polling", or snapped to a step.
+pub fn snap_output_hz(hz: u32) -> u32 {
+    if hz == OUTPUT_HZ_SAME_AS_POLLING { hz } else { snap_polling_hz(hz) }
+}
 
 /// Snap an arbitrary Hz to the nearest exposed step in [`POLLING_HZ_STEPS`].
 /// Used to migrate older saved values to a valid step on load.
@@ -193,6 +201,13 @@ pub struct AppSettings {
     pub bt_key_dir: Option<String>,
     #[serde(default = "default_polling_hz")]
     pub polling_hz: u32,
+    /// How often the virtual devices report to games, separate from how often
+    /// controllers are polled: below it saves work, above it gives virtual
+    /// output finer steps than the controllers' own rate (output can't change
+    /// faster than the processing sample rate, though). One of
+    /// [`POLLING_HZ_STEPS`], or [`OUTPUT_HZ_SAME_AS_POLLING`] (default).
+    #[serde(default)]
+    pub output_hz: u32,
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: u32,
     #[serde(default = "default_true")]
@@ -723,6 +738,7 @@ impl Default for AppSettings {
             user_models_dir: None,
             bt_key_dir: None,
             polling_hz: POLLING_HZ_DEFAULT,
+            output_hz: OUTPUT_HZ_SAME_AS_POLLING,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
             keep_workspace: true,
             device_nodes_default_collapsed: true,
@@ -1123,9 +1139,20 @@ mod polling_step_tests {
         assert_eq!(snap_polling_hz(450), 500);
         // A legacy saved value of 300 -> nearest step.
         assert_eq!(snap_polling_hz(300), 333);
+        // Between 1000 and 2000 -> nearer step.
+        assert_eq!(snap_polling_hz(1400), 1000);
+        assert_eq!(snap_polling_hz(1600), 2000);
         // Out-of-range clamps to the ends.
         assert_eq!(snap_polling_hz(50), 125);
-        assert_eq!(snap_polling_hz(5000), 1000);
+        assert_eq!(snap_polling_hz(5000), 2000);
+    }
+
+    #[test]
+    fn output_rate_keeps_same_as_polling_and_snaps_the_rest() {
+        assert_eq!(snap_output_hz(OUTPUT_HZ_SAME_AS_POLLING), OUTPUT_HZ_SAME_AS_POLLING);
+        assert_eq!(snap_output_hz(2000), 2000);
+        assert_eq!(snap_output_hz(900), 1000);
+        assert_eq!(snap_output_hz(1), 125);
     }
 
     #[test]

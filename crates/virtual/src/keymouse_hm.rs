@@ -230,11 +230,13 @@ impl KeysHeld {
     }
 }
 
-/// Clamp on the dt applied per flush, so a scheduler gap moves at most this
-/// much worth of distance in one report instead of lurching (see the enigo
-/// thread's MAX_DT rationale). 4× the default 500 Hz tick — note this equals
-/// ONE tick at the 125 Hz minimum polling setting, where the clamp is a no-op.
-const MAX_DT: f32 = 0.008;
+/// Floor of the clamp on the dt applied per flush, so a scheduler gap moves at
+/// most this much worth of distance in one report instead of lurching (see the
+/// enigo thread's max_dt rationale). The clamp is 4× the flush interval (see
+/// `flush`), never below this: 4× the default 500 Hz tick. Without the scaling
+/// a slow output rate would sit at the clamp — 125 Hz is one 8 ms tick — and
+/// every late flush would drop motion.
+const MAX_DT_FLOOR: f32 = 0.008;
 /// Velocity unit: pixels per 60 Hz reference frame (unchanged pin semantics).
 const REF: f32 = 60.0;
 /// Analog scroll rate unit: notches per second at |rate| = 1.0. A full-deflection
@@ -495,7 +497,8 @@ impl VirtualDevice for VirtualKeyMouseHm {
         // ── Mouse ────────────────────────────────────────────────────────────
         // dt-scaled velocity → sub-pixel carry → int16 mickeys (same math as
         // the enigo thread, at flush cadence).
-        let dt = (now - self.last_emit).as_secs_f32().min(MAX_DT);
+        let max_dt = (4.0 / crate::output_hz() as f32).max(MAX_DT_FLOOR);
+        let dt = (now - self.last_emit).as_secs_f32().min(max_dt);
         self.last_emit = now;
 
         // Physical-mouse suppression: pointer motion yields for the configured

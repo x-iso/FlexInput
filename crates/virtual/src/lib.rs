@@ -56,6 +56,35 @@ pub fn mouse_suppression_effective() -> (bool, u32) {
     (on, MOUSE_SUPPRESSION_RELEASE_MS.load(Ordering::Relaxed).clamp(50, 2000))
 }
 
+/// The rate the I/O loop flushes the virtual devices at (Hz), and the user's
+/// output-rate setting behind it (0 = same as polling). Set by the I/O thread;
+/// read by the virtual mouse for its catch-up clamp and by the SendInput mouse
+/// thread, which runs its own loop.
+static OUTPUT_HZ_EFFECTIVE: AtomicU32 = AtomicU32::new(500);
+static OUTPUT_HZ_SETTING: AtomicU32 = AtomicU32::new(0);
+
+/// Called by the I/O thread with the output-rate setting (0 = same as polling)
+/// and the rate it actually flushes at.
+pub fn set_output_rate(setting: u32, effective: u32) {
+    OUTPUT_HZ_SETTING.store(setting, Ordering::Relaxed);
+    OUTPUT_HZ_EFFECTIVE.store(effective.max(1), Ordering::Relaxed);
+}
+
+/// The rate the virtual devices are flushed at.
+pub(crate) fn output_hz() -> u32 {
+    OUTPUT_HZ_EFFECTIVE.load(Ordering::Relaxed).max(1)
+}
+
+/// The SendInput mouse thread's rate: the output rate when the user picked one,
+/// else its own 1 kHz (finer than the default polling rate, for smooth slow aim
+/// — what it always ran at before the output rate was a setting).
+pub(crate) fn sendinput_mouse_hz() -> u32 {
+    match OUTPUT_HZ_SETTING.load(Ordering::Relaxed) {
+        0 => 1000,
+        hz => hz,
+    }
+}
+
 /// Pointer-motion reports the virtual mouse has sent since start (a HID report
 /// on HIDMaestro, a relative move on SendInput). The UI differences it into a
 /// live reports/s, to compare with what Windows actually receives.

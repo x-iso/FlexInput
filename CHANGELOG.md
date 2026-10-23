@@ -16,12 +16,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   second. If the polling rate falls short on your machine, a screenshot of that
   table shows why.
 
-### Changed
+- **Output rate, separate from the polling rate.** Settings → Performance →
+  **Output rate** sets how fast the virtual gamepads and the virtual mouse
+  report to games, on its own schedule. Below the polling rate it saves work
+  (or suits an old game that misbehaves with a fast mouse); above it, virtual
+  output moves in finer steps than your controllers report — a held gyro or
+  stick moves the mouse in smaller, more frequent steps — for less CPU than
+  raising the polling rate as high, since controllers aren't read any more
+  often. The default, **Same as polling**, works as before. Output from the
+  patch can't change faster than the processing sample rate; the setting says
+  so when it's set higher. The readout now shows the polling and output rates
+  separately.
 
-- **Max polling rate's description says what it sets.** Besides how often
-  controllers are read, it's how fast the virtual gamepads and the HIDMaestro
-  virtual mouse report to games; the description only mentioned the virtual
-  Xbox 360.
+- **2000 Hz polling and output.** Both rates go up to 2000 Hz (0.5 ms), for
+  those who want it. CPU use rises with the rate.
 
 ### Fixed
 
@@ -39,6 +47,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   mouse to about 330 reports a second, whatever controller drove it. Empty
   slots are now checked only at startup and when a controller connects, and
   Easy mode's player-slot circles no longer poll them either.
+
+- **The gamepad settings panel can change the polling rate.** Its nudge moved
+  the rate 50 Hz and snapped it to the nearest valid rate — straight back to
+  where it was. Polling rate and the new output rate step through their valid
+  rates instead.
 
 ## [0.15.9] - 2026-10-15
 

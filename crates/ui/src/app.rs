@@ -510,6 +510,9 @@ pub struct FlexInputApp {
     sample_rate_hz: Arc<AtomicU32>,
     /// Live device polling rate handed to the I/O thread.
     polling_hz: Arc<AtomicU32>,
+    /// Live virtual-device output rate handed to the I/O thread (0 = same as
+    /// polling).
+    output_hz: Arc<AtomicU32>,
     /// Global "route every pad through SDL" switch, shared with the I/O thread
     /// so the Settings toggle re-arbitrates backends live. Mirrors
     /// `app_settings.sdl_all_pads`.
@@ -765,6 +768,7 @@ impl FlexInputApp {
         // Migrate any previously-saved arbitrary polling rate to a valid step
         // (the slider is now quantized to whole-ms periods).
         app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
+        app_settings.output_hz = settings::snap_output_hz(app_settings.output_hz);
         // UI scale: snap a hand-edited value to a step, then apply it as egui's
         // zoom factor (pixels_per_point = zoom × OS scale, so fonts rasterize at
         // the scaled resolution and stay sharp). The window already exists at
@@ -777,6 +781,7 @@ impl FlexInputApp {
         cc.egui_ctx.set_zoom_factor(app_settings.ui_scale);
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
+        let output_hz      = Arc::new(AtomicU32::new(app_settings.output_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
         // Mirror the virtual-mouse physical-suppression settings to the
         // flexinput-virtual globals the keymouse thread reads. Pushed again on
@@ -1020,6 +1025,7 @@ impl FlexInputApp {
             Arc::clone(&shared_devices),
             Arc::clone(&shared_midi_devices),
             Arc::clone(&polling_hz),
+            Arc::clone(&output_hz),
             Arc::clone(&device_rates),
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
@@ -1224,6 +1230,7 @@ impl FlexInputApp {
             gamepad_nav: crate::gamepad_nav::GamepadNav::default(),
             sample_rate_hz,
             polling_hz,
+            output_hz,
             sdl_all_pads,
             device_rates,
             scope_taps,
@@ -3364,6 +3371,7 @@ pub(crate) enum NavWidgetKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpSettingKey {
     PollingHz,
+    OutputHz,
     SampleRateHz,
     BgRepaintHz,
     NavDefault,
@@ -3449,14 +3457,10 @@ pub(crate) enum GpSettingKind {
     Toggle { key: GpSettingKey },
     IntSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
     FloatSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
-    /// Discrete cycle through a fixed list of (value, label) pairs. The
-    /// underlying value is stored as `f32` (matching IntSlider) but the
-    /// display string comes from the label. Used for enum settings where
-    /// a slider doesn't make sense (e.g. Repaint rate: Monitor / 60 / 30 / 15 Hz).
-    /// RESERVED: no settings row constructs this yet (the planned "Repaint
-    /// rate" row was never added), but the nav/step/format handlers below
-    /// fully support it — construct a row with it and it works.
-    #[allow(dead_code)]
+    /// Steps through a fixed list of (value, label) pairs, stopping at the
+    /// ends. The underlying value is stored as `f32` (matching IntSlider) but
+    /// the display string comes from the label. Used where only some values
+    /// are valid or a slider doesn't make sense (the polling and output rates).
     Cycle { key: GpSettingKey, opts: &'static [(f32, &'static str)] },
     /// Gamepad shortcut chord: South closes the panel and starts a chord
     /// capture for `target` (so the user can press the combo with the panel

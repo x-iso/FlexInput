@@ -1675,16 +1675,15 @@ impl FlexInputApp {
     fn settings_performance(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("Max polling rate")
-                .on_hover_text("Upper bound for the I/O loop, and the rate the virtual devices report to games: the virtual gamepads, and the virtual mouse when it runs on HIDMaestro (one report per tick while it moves). Steps are whole-millisecond periods: 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
-            // The slider drives the STEP INDEX (0..=7), not the raw Hz, so
-            // the handle is evenly spaced and snaps to a valid whole-ms
-            // period *while* dragging (an in-between rate would just round
-            // on the driver side anyway). The custom formatter shows the Hz
-            // for the current step instead of the bare index.
+                .on_hover_text("How often controllers and MIDI devices are read. Unless Output rate is set, also how fast the virtual devices report to games. Steps are whole periods: 2000 = 0.5 ms, 1000 = 1 ms … 125 = 8 ms. A controller's own input rate depends on the controller — see the live Hz on each device header.");
+            // The slider drives the STEP INDEX, not the raw Hz, so the handle
+            // is evenly spaced and snaps to a valid period *while* dragging.
+            // The custom formatter shows the Hz for the current step instead
+            // of the bare index.
             //
-            // POLLING_HZ_STEPS is DESCENDING (index 0 = 1000 Hz), but the
+            // POLLING_HZ_STEPS is DESCENDING (index 0 = fastest), but the
             // slider should read low→high left→right. So the slider drives
-            // a POSITION = last - index; 125 Hz lands at the left, 1000 Hz
+            // a POSITION = last - index; 125 Hz lands at the left, 2000 Hz
             // at the right. Convert back to an index with the same mirror.
             let last = settings::POLLING_HZ_STEPS.len() - 1;
             let idx = settings::polling_hz_to_index(self.settings.polling_hz);
@@ -1703,18 +1702,61 @@ impl FlexInputApp {
             }
         });
         ui.label(egui::RichText::new(
-            "How often the I/O thread polls gamepads and MIDI devices, and how fast the virtual gamepads and the HIDMaestro virtual mouse report to games."
+            "How often the I/O thread reads gamepads and MIDI devices."
         ).small().color(egui::Color32::from_gray(140)));
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Output rate")
+                .on_hover_text("How fast the virtual gamepads and the virtual mouse report to games, separately from the polling rate. Lower than polling saves work (or suits an old game that misbehaves with fast mice); higher gives virtual output finer steps than your controllers' own rate — mouse motion from a held gyro or stick moves in smaller, more frequent steps. Output can't change faster than the processing sample rate. \"Same as polling\" reports once per poll, as before, with the SendInput virtual mouse at its own 1000 Hz.");
+            // Position 0 = "Same as polling", then the polling steps low→high.
+            let steps = settings::POLLING_HZ_STEPS.len();
+            let mut pos = if self.settings.output_hz == settings::OUTPUT_HZ_SAME_AS_POLLING {
+                0i64
+            } else {
+                (steps - settings::polling_hz_to_index(self.settings.output_hz)) as i64
+            };
+            let hz_at = move |pos: usize| -> u32 {
+                if pos == 0 {
+                    settings::OUTPUT_HZ_SAME_AS_POLLING
+                } else {
+                    settings::polling_hz_from_index(steps - pos.min(steps))
+                }
+            };
+            let resp = ui.add(egui::Slider::new(&mut pos, 0..=steps as i64)
+                .integer()
+                .custom_formatter(move |n, _| match hz_at(n as usize) {
+                    settings::OUTPUT_HZ_SAME_AS_POLLING => "Same as polling".to_string(),
+                    hz => format!("{hz} Hz"),
+                }));
+            if resp.changed() {
+                self.settings.output_hz = hz_at(pos.max(0) as usize);
+                self.output_hz.store(self.settings.output_hz, Ordering::Relaxed);
+                *dirty = true;
+            }
+        });
+        ui.label(egui::RichText::new(
+            "How fast the virtual gamepads and virtual mouse report to games."
+        ).small().color(egui::Color32::from_gray(140)));
+        if self.settings.output_hz > self.settings.sample_rate_hz {
+            ui.label(egui::RichText::new(format!(
+                "Above the processing sample rate ({} Hz): outputs from the patch only change that often.",
+                self.settings.sample_rate_hz,
+            )).small().color(egui::Color32::from_rgb(230, 170, 80)));
+        }
+
         let live = live_rates(ui.ctx());
         let mouse = match live.mouse_hz {
             Some(0) | None => "idle".to_string(),
             Some(hz) => format!("{hz} reports/s"),
         };
+        let output = live.output_hz.map_or_else(|| "…".to_string(), |hz| format!("{hz} Hz"));
+        ui.add_space(4.0);
         ui.label(egui::RichText::new(format!(
-            "Now: I/O loop {} Hz · virtual mouse {mouse}",
+            "Now: polling {} Hz · output {output} · virtual mouse {mouse}",
             flexinput_engine::current_io_rate(),
         )).small().color(egui::Color32::from_gray(170)))
-            .on_hover_text("Measured live. The virtual mouse sends a report only when the pointer moves at least one whole count, so slow motion sends fewer than the polling rate.");
+            .on_hover_text("Measured live. The virtual mouse sends a report only when the pointer moves at least one whole count, so slow motion sends fewer than the output rate.");
         // Inline rather than a tooltip: it's read while a controller moves the
         // pointer, which a hover can't survive.
         egui::CollapsingHeader::new(egui::RichText::new("Where the I/O loop's time goes").small())
@@ -2283,9 +2325,11 @@ struct LiveRates {
     passes: u64,
     ticks: u64,
     mouse: u64,
+    outputs: u64,
     passes_hz: Option<u32>,
     ticks_hz: Option<u32>,
     mouse_hz: Option<u32>,
+    output_hz: Option<u32>,
 }
 
 fn live_rates(ctx: &egui::Context) -> LiveRates {
@@ -2294,6 +2338,7 @@ fn live_rates(ctx: &egui::Context) -> LiveRates {
     let now = Instant::now();
     let (passes, ticks) = flexinput_engine::engine_counters();
     let mouse = flexinput_virtual::mouse_reports_sent();
+    let outputs = super::threads::OUTPUT_PASSES.load(std::sync::atomic::Ordering::Relaxed);
     let mut r: LiveRates = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
     let elapsed = r.at.map(|at| now - at);
     if elapsed.is_none_or(|e| e >= Duration::from_millis(500)) {
@@ -2306,8 +2351,9 @@ fn live_rates(ctx: &egui::Context) -> LiveRates {
             r.passes_hz = per_s(passes, r.passes);
             r.ticks_hz = per_s(ticks, r.ticks);
             r.mouse_hz = per_s(mouse, r.mouse);
+            r.output_hz = per_s(outputs, r.outputs);
         }
-        r = LiveRates { at: Some(now), passes, ticks, mouse, ..r };
+        r = LiveRates { at: Some(now), passes, ticks, mouse, outputs, ..r };
         ctx.data_mut(|d| d.insert_temp(id, r));
     }
     ctx.request_repaint_after(Duration::from_millis(250));

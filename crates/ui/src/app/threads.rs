@@ -10,6 +10,10 @@ use flexinput_core::PinMapExt;
 pub(crate) static IO_TIMINGS: std::sync::Mutex<Vec<(String, f32, f32)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// I/O loop passes that flushed the virtual devices, since start. The Settings
+/// readout differences it into the live output rate.
+pub(crate) static OUTPUT_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Sums the I/O loop's per-iteration section times for [`IO_TIMINGS`]. Keys
 /// are inserted once and looked up by `&str` after that, so a steady loop
 /// doesn't allocate here.
@@ -93,6 +97,8 @@ pub(crate) fn spawn_io_thread(
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     polling_hz: Arc<AtomicU32>,
+    // Virtual-device flush rate; 0 = with every poll. See the loop's schedules.
+    output_hz: Arc<AtomicU32>,
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
     spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32, u8)>>>,
@@ -237,8 +243,10 @@ pub(crate) fn spawn_io_thread(
             let engine_waiter = flexinput_engine::HrWaiter::new();
             let mut skip_engine_wait_until = Instant::now();
             let mut engine_wait_misses = 0u32;
-            // The loop's next wake-up deadline; see the pacing wait at the end.
-            let mut next_tick = Instant::now();
+            // When the next poll and the next flush are due; see the pacing
+            // wait at the end of the loop.
+            let mut next_poll = Instant::now();
+            let mut next_output = next_poll;
             let mut timings = IoTimingAcc::default();
 
             loop {
@@ -260,15 +268,44 @@ pub(crate) fn spawn_io_thread(
                         }
                     }};
                 }
-                // Re-read polling rate each iteration so live retunes apply.
-                let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
-                let interval = Duration::from_nanos(1_000_000_000 / hz as u64);
+                // Two schedules: controllers are polled at the polling rate and
+                // the virtual devices flushed at the output rate. Each pass does
+                // whichever is due — both, every pass, while the output rate is
+                // "same as polling". The engine is kicked on every pass: on a
+                // poll so no input frame goes unseen, on a flush so outputs that
+                // integrate over time (mouse motion from a held gyro) advance
+                // between polls. Re-read each pass so live retunes apply.
+                let poll_hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
+                let out_setting = output_hz.load(Ordering::Relaxed);
+                let out_hz = if out_setting == 0 { poll_hz } else { out_setting.clamp(60, 4000) };
+                flexinput_virtual::set_output_rate(out_setting, out_hz);
+                let poll_interval = Duration::from_nanos(1_000_000_000 / poll_hz as u64);
+                let out_interval = Duration::from_nanos(1_000_000_000 / out_hz as u64);
+                // The shorter period: what one pass has to fit in.
+                let interval = poll_interval.min(out_interval);
+                // A deadline this close counts as due now, rather than costing a
+                // wake-up of its own a fraction of a period later.
+                let slack = interval / 4;
+                let input_due = t0 + slack >= next_poll;
+                let output_due = t0 + slack >= next_output;
+                if !input_due && !output_due {
+                    // Woke early: wait out the rest.
+                    let wake = next_poll.min(next_output);
+                    let now = Instant::now();
+                    if wake > now {
+                        waiter.wait(wake - now);
+                    }
+                    continue;
+                }
+                if output_due {
+                    OUTPUT_PASSES.fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Push per-device snap-back spike-filter settings to backends.
                 // Cheap: each backend's `set_spike_filter` early-returns when
                 // the value is unchanged. We do this BEFORE polling so the
                 // filter applies to this iteration's samples.
-                {
+                if input_due {
                     puffin::profile_scope!("push_spike_filter");
                     let settings = spike_filter_settings.read().unwrap();
                     for (dev_id, (on, sens, win)) in settings.iter() {
@@ -282,7 +319,7 @@ pub(crate) fn spawn_io_thread(
                 // Push measured resting gyro drift the same way and for the same
                 // reason: it must be in place before this iteration's samples are
                 // decoded, and the backend early-returns when it has not changed.
-                {
+                if input_due {
                     puffin::profile_scope!("push_gyro_drift");
                     let settings = gyro_drift_settings.read().unwrap();
                     for (dev_id, drift) in settings.iter() {
@@ -296,7 +333,7 @@ pub(crate) fn spawn_io_thread(
                 // Push the learned raw-pad layouts before polling, so the first
                 // poll after an edit already reads the pad the new way. The
                 // backend compares the Arc by pointer: no work while unchanged.
-                {
+                if input_due {
                     let profiles = Arc::clone(&raw_pad_profiles.read().unwrap());
                     for backend in &mut backends {
                         backend.set_raw_pad_profiles(&profiles);
@@ -305,7 +342,7 @@ pub(crate) fn spawn_io_thread(
 
                 // Push the global-SDL switch before enumerate/poll so a live
                 // toggle takes effect this iteration.
-                {
+                if input_due {
                     let on = sdl_all_pads.load(Ordering::Relaxed);
                     for backend in &mut backends {
                         backend.set_sdl_all_pads(on);
@@ -314,7 +351,7 @@ pub(crate) fn spawn_io_thread(
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
-                {
+                if input_due {
                     puffin::profile_scope!("backends_poll");
                     for backend in &mut backends {
                         let bt = Instant::now();
@@ -329,7 +366,7 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("backends_poll");
-                {
+                if input_due {
                     puffin::profile_scope!("midi_poll");
                     if let Ok(mut mg) = midi.try_lock() {
                         if let Some(m) = mg.as_mut() {
@@ -384,7 +421,7 @@ pub(crate) fn spawn_io_thread(
                 }
                 mark!("scope_taps");
 
-                {
+                if input_due {
                     puffin::profile_scope!("publish_signals");
                     // Fold the most recent virtual-device feedback into this
                     // tick's physical signals BEFORE publishing, so the engine
@@ -410,7 +447,7 @@ pub(crate) fn spawn_io_thread(
                 // MIDI enumeration is handled by spawn_midi_watch_thread() so
                 // the slow Win32 MIDI calls (60–70 ms with loopMIDI loaded)
                 // don't stall this I/O loop.
-                if last_enum.elapsed() > Duration::from_secs(2) {
+                if input_due && last_enum.elapsed() > Duration::from_secs(2) {
                     puffin::profile_scope!("enumerate_devices");
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
                     // Per-backend rows in the stall report (absolute durations,
@@ -471,7 +508,7 @@ pub(crate) fn spawn_io_thread(
                 // bus holds — the previous frame's outputs, as before. Three
                 // misses in a row means the machine can't keep up: stop waiting
                 // for a second rather than hold this loop up for nothing.
-                if Instant::now() >= skip_engine_wait_until {
+                if output_due && Instant::now() >= skip_engine_wait_until {
                     puffin::profile_scope!("wait_engine");
                     if engine_sync.wait_consumed(frame, interval.mul_f32(0.85), &engine_waiter) {
                         engine_wait_misses = 0;
@@ -484,7 +521,7 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("engine_wait");
-                {
+                if output_due {
                     puffin::profile_scope!("read_sink_bus");
                     flexinput_engine::drain_sink_bus_into(&sink_bus, &mut sink_outputs);
                 }
@@ -499,7 +536,7 @@ pub(crate) fn spawn_io_thread(
                 let bypass = io_bypass.load(Ordering::Relaxed)
                     || ui_nav_suppress.load(Ordering::Relaxed);
                 let active_ids = active_tab_device_ids.read().unwrap().clone();
-                {
+                if output_due {
                     puffin::profile_scope!("route_virtual_devices");
                     let mut devs = shared_virtual_devices.lock().unwrap();
                     // Mixed mode: a virtual gamepad active alongside the
@@ -619,184 +656,187 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("virtual_route");
+                // Physical-device feedback goes out at the output rate too.
+                if output_due {
 
-                // Physical device outputs (rumble, lightbar) to gilrs pads run
-                // regardless of bypass: these carry *incoming* feedback the game
-                // sends back to a virtual pad (rumble/FFB), routed to a physical
-                // pad via AutoMap — not FlexInput's own mapped input, which is
-                // what bypass suppresses. Gating these on !bypass meant a game's
-                // rumble never reached the physical pad whenever FlexInput was
-                // unfocused (bypass stale-true). HD-rumble amplitude pins get a
-                // default frequency injected below so they're audible on Switch
-                // Pro (whose HD motors need a non-zero frequency).
-                for ((device_id, pin_id), &signal) in &sink_outputs {
-                    // Forward feedback to any PHYSICAL-backend pad — gilrs: (native),
-                    // sdl: (route-all-through-SDL), or jc2: (Joy-Con 2 over BLE).
-                    // Gating on gilrs: alone meant no mapped rumble/lightbar/HD-rumble
-                    // ever reached an SDL pad (the "ping" worked only because it sends
-                    // to backends directly, bypassing this loop). Each backend's send()
-                    // ignores ids that aren't its own prefix, so fanning out to all is
-                    // safe.
-                    if crate::app::graph::is_physical_pad_id(device_id) {
-                        for backend in &mut backends {
-                            backend.send(device_id, pin_id, signal);
-                        }
-                    }
-                }
-                // Default HD-rumble frequency: when AutoMap feedback drives an
-                // hd_*_amp pin (amplitude only) without a paired hd_*_freq, the
-                // Switch Pro stays silent (its voice-coil needs a frequency). If
-                // a side's amp is non-zero and no explicit freq was routed this
-                // tick, inject ~320 Hz (0.6) so the rumble is audible — matching
-                // what the manual ping pulse does.
-                for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
+                    // Physical device outputs (rumble, lightbar) to gilrs pads run
+                    // regardless of bypass: these carry *incoming* feedback the game
+                    // sends back to a virtual pad (rumble/FFB), routed to a physical
+                    // pad via AutoMap — not FlexInput's own mapped input, which is
+                    // what bypass suppresses. Gating these on !bypass meant a game's
+                    // rumble never reached the physical pad whenever FlexInput was
+                    // unfocused (bypass stale-true). HD-rumble amplitude pins get a
+                    // default frequency injected below so they're audible on Switch
+                    // Pro (whose HD motors need a non-zero frequency).
                     for ((device_id, pin_id), &signal) in &sink_outputs {
-                        let is_phys = crate::app::graph::is_physical_pad_id(device_id);
-                        if !is_phys || pin_id != amp_pin { continue; }
-                        let amp = signal.as_float();
-                        let has_freq = sink_outputs
-                            .get_pin(device_id, freq_pin)
-                            .map(|s| s.as_float() > 0.0)
-                            .unwrap_or(false);
-                        if amp > 0.01 && !has_freq {
+                        // Forward feedback to any PHYSICAL-backend pad — gilrs: (native),
+                        // sdl: (route-all-through-SDL), or jc2: (Joy-Con 2 over BLE).
+                        // Gating on gilrs: alone meant no mapped rumble/lightbar/HD-rumble
+                        // ever reached an SDL pad (the "ping" worked only because it sends
+                        // to backends directly, bypassing this loop). Each backend's send()
+                        // ignores ids that aren't its own prefix, so fanning out to all is
+                        // safe.
+                        if crate::app::graph::is_physical_pad_id(device_id) {
                             for backend in &mut backends {
-                                backend.send(device_id, freq_pin, Signal::Float(0.6));
+                                backend.send(device_id, pin_id, signal);
                             }
                         }
                     }
-                }
-                // Zero-on-drop: if a physical-pad haptic pin we drove last tick is
-                // absent from sink_outputs this tick, its feedback producer went
-                // away (network link dropped, wire disconnected, game closed).
-                // Actively send 0 once so the motor/coil turns off instead of
-                // sticking on its last value. Producers that are still live write
-                // their pin every tick (0.0 when idle), so this only fires on a
-                // genuine disappearance — no flicker in normal operation.
-                for (key, &last) in &last_phys_haptics {
-                    if sink_outputs.contains_key(key) { continue; }
-                    if last.as_float() == 0.0 { continue; } // already silent
-                    for backend in &mut backends {
-                        backend.send(&key.0, &key.1, Signal::Float(0.0));
-                    }
-                }
-                // Default lightbar colour (the device-card swatch). Applies while
-                // nothing drives the pad's lightbar this tick — no game colour
-                // routed back through AutoMap, no module wired to it. Runs after
-                // zero-on-drop, so a producer that just vanished hands the bar
-                // back to the default instead of leaving it dark. Sent only on a
-                // change and refreshed every 2 s (catches a reconnect): the SDL
-                // backend writes the pad on every set_led call.
-                if let Ok(defaults) = led_defaults.read() {
-                    const REFRESH: Duration = Duration::from_secs(2);
-                    for (dev, &rgb) in defaults.iter() {
-                        let driven = ["lightbar_r", "lightbar_g", "lightbar_b"].iter()
-                            .any(|p| sink_outputs.has_pin(dev, p));
-                        if driven {
-                            led_default_sent.remove(dev);
-                            continue;
-                        }
-                        let due = led_default_sent.get(dev)
-                            .is_none_or(|(sent, at)| *sent != rgb || at.elapsed() >= REFRESH);
-                        if !due { continue; }
-                        for (pin, v) in [("lightbar_r", rgb[0]), ("lightbar_g", rgb[1]), ("lightbar_b", rgb[2])] {
-                            for backend in &mut backends {
-                                backend.send(dev, pin, Signal::Float(v as f32 / 255.0));
-                            }
-                        }
-                        led_default_sent.insert(dev.clone(), (rgb, Instant::now()));
-                    }
-                    led_default_sent.retain(|d, _| defaults.contains_key(d));
-                }
-                // Snapshot this tick's physical-pad outputs for next-tick drop
-                // detection (gilrs:, sdl: and jc2: feedback pins).
-                last_phys_haptics.clear();
-                for ((device_id, pin_id), &signal) in &sink_outputs {
-                    if crate::app::graph::is_physical_pad_id(device_id) {
-                        last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
-                    }
-                }
-                // MIDI output. Each port's encoder turns this tick's pin levels
-                // into messages (edges, quantised changes). Bypass hands every
-                // port an empty frame, which releases sounding notes and
-                // returns values to rest instead of leaving them stuck. A tick
-                // that can't take the lock is simply skipped: the encoders keep
-                // their state and catch up next tick.
-                if let Ok(mut mg) = midi.try_lock() {
-                    if let Some(m) = mg.as_mut() {
-                        let mut frames: HashMap<String, Vec<(String, Signal)>> = HashMap::new();
-                        if !bypass {
-                            for ((device_id, pin_id), &signal) in &sink_outputs {
-                                if device_id.starts_with("midi_out:") {
-                                    frames.entry(device_id.clone()).or_default().push((pin_id.clone(), signal));
+                    // Default HD-rumble frequency: when AutoMap feedback drives an
+                    // hd_*_amp pin (amplitude only) without a paired hd_*_freq, the
+                    // Switch Pro stays silent (its voice-coil needs a frequency). If
+                    // a side's amp is non-zero and no explicit freq was routed this
+                    // tick, inject ~320 Hz (0.6) so the rumble is audible — matching
+                    // what the manual ping pulse does.
+                    for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
+                        for ((device_id, pin_id), &signal) in &sink_outputs {
+                            let is_phys = crate::app::graph::is_physical_pad_id(device_id);
+                            if !is_phys || pin_id != amp_pin { continue; }
+                            let amp = signal.as_float();
+                            let has_freq = sink_outputs
+                                .get_pin(device_id, freq_pin)
+                                .map(|s| s.as_float() > 0.0)
+                                .unwrap_or(false);
+                            if amp > 0.01 && !has_freq {
+                                for backend in &mut backends {
+                                    backend.send(device_id, freq_pin, Signal::Float(0.6));
                                 }
                             }
                         }
-                        m.send_frames(&frames);
                     }
-                }
-
-                // ── Rumble ping ──────────────────────────────────────────────
-                // Diagnostic pulse so the user can confirm which physical pad a
-                // card maps to. Runs regardless of bypass — it's a deliberate,
-                // user-initiated action, not patch output. New requests start a
-                // 200 ms pulse; we drive both motors while active and send a
-                // single rumble-off when the deadline passes.
-                {
-                    let now = Instant::now();
-                    if let Ok(mut reqs) = ping_requests.try_lock() {
-                        for dev_id in reqs.drain(..) {
-                            ping_until.insert(dev_id, now + Duration::from_millis(PING_RUMBLE_MS));
+                    // Zero-on-drop: if a physical-pad haptic pin we drove last tick is
+                    // absent from sink_outputs this tick, its feedback producer went
+                    // away (network link dropped, wire disconnected, game closed).
+                    // Actively send 0 once so the motor/coil turns off instead of
+                    // sticking on its last value. Producers that are still live write
+                    // their pin every tick (0.0 when idle), so this only fires on a
+                    // genuine disappearance — no flicker in normal operation.
+                    for (key, &last) in &last_phys_haptics {
+                        if sink_outputs.contains_key(key) { continue; }
+                        if last.as_float() == 0.0 { continue; } // already silent
+                        for backend in &mut backends {
+                            backend.send(&key.0, &key.1, Signal::Float(0.0));
                         }
                     }
-                    if !ping_until.is_empty() {
-                        let mut expired: Vec<String> = Vec::new();
-                        for (dev_id, deadline) in ping_until.iter() {
-                            let active = now < *deadline;
-                            let amp = if active { Signal::Float(1.0) } else { Signal::Float(0.0) };
-                            let amp_f = if active { 1.0 } else { 0.0 };
-                            // Pinging an OWN-VIRTUAL pad (its loopback shown as a
-                            // physical `gilrs:<kind>:v<N>`) can't go through a
-                            // backend — those rumble a real device, and our virtual
-                            // has no motor. Instead inject the rumble into the
-                            // matching virtual device's feedback, so it flows
-                            // poll_outputs → AutoMap → the mapped physical pad,
-                            // exactly as a game's rumble would. (Restores the ViGEm
-                            // behavior where pinging the virtual buzzed whatever it
-                            // mapped to.)
-                            if let Some((kinds, vidx)) = own_virtual_pool_target(dev_id) {
-                                let mut pool = shared_virtual_devices.lock().unwrap();
-                                if let Some(dev) = pool
-                                    .iter_mut()
-                                    .filter(|d| {
-                                        kinds.contains(&flexinput_virtual::kind_prefix(d.id()).as_str())
-                                    })
-                                    .nth(vidx)
-                                {
-                                    dev.inject_rumble_ping(amp_f, amp_f);
-                                }
-                                if !active { expired.push(dev_id.clone()); }
+                    // Default lightbar colour (the device-card swatch). Applies while
+                    // nothing drives the pad's lightbar this tick — no game colour
+                    // routed back through AutoMap, no module wired to it. Runs after
+                    // zero-on-drop, so a producer that just vanished hands the bar
+                    // back to the default instead of leaving it dark. Sent only on a
+                    // change and refreshed every 2 s (catches a reconnect): the SDL
+                    // backend writes the pad on every set_led call.
+                    if let Ok(defaults) = led_defaults.read() {
+                        const REFRESH: Duration = Duration::from_secs(2);
+                        for (dev, &rgb) in defaults.iter() {
+                            let driven = ["lightbar_r", "lightbar_g", "lightbar_b"].iter()
+                                .any(|p| sink_outputs.has_pin(dev, p));
+                            if driven {
+                                led_default_sent.remove(dev);
                                 continue;
                             }
-                            // Drive every rumble pin family so the ping works
-                            // regardless of controller type — each backend ignores
-                            // pins it doesn't recognise:
-                            //   rumble_strong/weak → XInput motors, DS4/DualSense
-                            //                        classic motors
-                            //   hd_l_amp/hd_r_amp  → Switch Pro HD rumble (needs a
-                            //                        non-zero freq to be audible, so
-                            //                        we set ~320 Hz too)
-                            let freq = if active { Signal::Float(0.6) } else { Signal::Float(0.0) };
-                            for backend in &mut backends {
-                                backend.send(dev_id, "rumble_strong", amp);
-                                backend.send(dev_id, "rumble_weak", amp);
-                                backend.send(dev_id, "hd_l_amp", amp);
-                                backend.send(dev_id, "hd_r_amp", amp);
-                                backend.send(dev_id, "hd_l_freq", freq);
-                                backend.send(dev_id, "hd_r_freq", freq);
+                            let due = led_default_sent.get(dev)
+                                .is_none_or(|(sent, at)| *sent != rgb || at.elapsed() >= REFRESH);
+                            if !due { continue; }
+                            for (pin, v) in [("lightbar_r", rgb[0]), ("lightbar_g", rgb[1]), ("lightbar_b", rgb[2])] {
+                                for backend in &mut backends {
+                                    backend.send(dev, pin, Signal::Float(v as f32 / 255.0));
+                                }
                             }
-                            if !active { expired.push(dev_id.clone()); }
+                            led_default_sent.insert(dev.clone(), (rgb, Instant::now()));
                         }
-                        for dev_id in expired { ping_until.remove(&dev_id); }
+                        led_default_sent.retain(|d, _| defaults.contains_key(d));
+                    }
+                    // Snapshot this tick's physical-pad outputs for next-tick drop
+                    // detection (gilrs:, sdl: and jc2: feedback pins).
+                    last_phys_haptics.clear();
+                    for ((device_id, pin_id), &signal) in &sink_outputs {
+                        if crate::app::graph::is_physical_pad_id(device_id) {
+                            last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
+                        }
+                    }
+                    // MIDI output. Each port's encoder turns this tick's pin levels
+                    // into messages (edges, quantised changes). Bypass hands every
+                    // port an empty frame, which releases sounding notes and
+                    // returns values to rest instead of leaving them stuck. A tick
+                    // that can't take the lock is simply skipped: the encoders keep
+                    // their state and catch up next tick.
+                    if let Ok(mut mg) = midi.try_lock() {
+                        if let Some(m) = mg.as_mut() {
+                            let mut frames: HashMap<String, Vec<(String, Signal)>> = HashMap::new();
+                            if !bypass {
+                                for ((device_id, pin_id), &signal) in &sink_outputs {
+                                    if device_id.starts_with("midi_out:") {
+                                        frames.entry(device_id.clone()).or_default().push((pin_id.clone(), signal));
+                                    }
+                                }
+                            }
+                            m.send_frames(&frames);
+                        }
+                    }
+
+                    // ── Rumble ping ──────────────────────────────────────────────
+                    // Diagnostic pulse so the user can confirm which physical pad a
+                    // card maps to. Runs regardless of bypass — it's a deliberate,
+                    // user-initiated action, not patch output. New requests start a
+                    // 200 ms pulse; we drive both motors while active and send a
+                    // single rumble-off when the deadline passes.
+                    {
+                        let now = Instant::now();
+                        if let Ok(mut reqs) = ping_requests.try_lock() {
+                            for dev_id in reqs.drain(..) {
+                                ping_until.insert(dev_id, now + Duration::from_millis(PING_RUMBLE_MS));
+                            }
+                        }
+                        if !ping_until.is_empty() {
+                            let mut expired: Vec<String> = Vec::new();
+                            for (dev_id, deadline) in ping_until.iter() {
+                                let active = now < *deadline;
+                                let amp = if active { Signal::Float(1.0) } else { Signal::Float(0.0) };
+                                let amp_f = if active { 1.0 } else { 0.0 };
+                                // Pinging an OWN-VIRTUAL pad (its loopback shown as a
+                                // physical `gilrs:<kind>:v<N>`) can't go through a
+                                // backend — those rumble a real device, and our virtual
+                                // has no motor. Instead inject the rumble into the
+                                // matching virtual device's feedback, so it flows
+                                // poll_outputs → AutoMap → the mapped physical pad,
+                                // exactly as a game's rumble would. (Restores the ViGEm
+                                // behavior where pinging the virtual buzzed whatever it
+                                // mapped to.)
+                                if let Some((kinds, vidx)) = own_virtual_pool_target(dev_id) {
+                                    let mut pool = shared_virtual_devices.lock().unwrap();
+                                    if let Some(dev) = pool
+                                        .iter_mut()
+                                        .filter(|d| {
+                                            kinds.contains(&flexinput_virtual::kind_prefix(d.id()).as_str())
+                                        })
+                                        .nth(vidx)
+                                    {
+                                        dev.inject_rumble_ping(amp_f, amp_f);
+                                    }
+                                    if !active { expired.push(dev_id.clone()); }
+                                    continue;
+                                }
+                                // Drive every rumble pin family so the ping works
+                                // regardless of controller type — each backend ignores
+                                // pins it doesn't recognise:
+                                //   rumble_strong/weak → XInput motors, DS4/DualSense
+                                //                        classic motors
+                                //   hd_l_amp/hd_r_amp  → Switch Pro HD rumble (needs a
+                                //                        non-zero freq to be audible, so
+                                //                        we set ~320 Hz too)
+                                let freq = if active { Signal::Float(0.6) } else { Signal::Float(0.0) };
+                                for backend in &mut backends {
+                                    backend.send(dev_id, "rumble_strong", amp);
+                                    backend.send(dev_id, "rumble_weak", amp);
+                                    backend.send(dev_id, "hd_l_amp", amp);
+                                    backend.send(dev_id, "hd_r_amp", amp);
+                                    backend.send(dev_id, "hd_l_freq", freq);
+                                    backend.send(dev_id, "hd_r_freq", freq);
+                                }
+                                if !active { expired.push(dev_id.clone()); }
+                            }
+                            for dev_id in expired { ping_until.remove(&dev_id); }
+                        }
                     }
                 }
                 mark!("outputs_misc");
@@ -824,42 +864,54 @@ pub(crate) fn spawn_io_thread(
                     eprintln!("{line}");
                 }
 
-                // Pace on an absolute deadline, not "interval minus this
-                // iteration's busy time": every timer wake lands a little late,
-                // and waiting a fresh interval from each late wake lost that
-                // lateness every tick — 500 Hz ran at ~430 and 1000 Hz at
-                // ~760–800 (measured). Carrying the deadline forward makes the
-                // next wait shorter by however late this one was. More than a
-                // period behind (a stall, a lowered rate) resyncs instead of
-                // running a burst of back-to-back iterations to catch up.
+                // Pace on absolute deadlines, not "interval minus this pass's
+                // busy time": every timer wake lands a little late, and waiting
+                // a fresh interval from each late wake lost that lateness every
+                // pass — 500 Hz ran at ~430 and 1000 Hz at ~760–800 (measured).
+                // Carrying a deadline forward makes the next wait shorter by
+                // however late this one was. More than a period behind (a
+                // stall, a lowered rate) resyncs instead of running a burst of
+                // back-to-back passes to catch up. Then sleep until whichever
+                // of the poll and the flush is due first.
                 for (name, d) in &sect_marks {
                     timings.add(IO_SECTION, name, *d);
                 }
-                next_tick += interval;
                 let now = Instant::now();
-                if next_tick > now {
-                    waiter.wait(next_tick - now);
-                } else if now - next_tick > interval {
-                    next_tick = now;
+                if input_due {
+                    next_poll += poll_interval;
+                    if now.saturating_duration_since(next_poll) > poll_interval {
+                        next_poll = now;
+                    }
+                }
+                if output_due {
+                    next_output += out_interval;
+                    if now.saturating_duration_since(next_output) > out_interval {
+                        next_output = now;
+                    }
+                }
+                let wake = next_poll.min(next_output);
+                if wake > now {
+                    waiter.wait(wake - now);
                 }
                 timings.add(IO_SECTION, "pacing wait (idle)", now.elapsed());
                 timings.end_iteration(Instant::now());
 
-                // Measured per-loop Hz via inter-iteration interval. EMA
+                // Measured polling rate, from the time between polls. EMA
                 // smooths it so the UI label doesn't strobe at frame rate.
-                let now = Instant::now();
-                let dt = now.duration_since(last_loop_t).as_secs_f32().max(1e-4);
-                last_loop_t = now;
-                let inst_hz = 1.0 / dt;
-                // EMA time constant scales with the loop rate: alpha 0.02
-                // ≈ 0.1 s at the default 500 Hz, ≈ 0.4 s at the 125 Hz floor.
-                let alpha = 0.02_f32;
-                if measured_hz_ema == 0.0 {
-                    measured_hz_ema = inst_hz;
-                } else {
-                    measured_hz_ema = measured_hz_ema * (1.0 - alpha) + inst_hz * alpha;
+                if input_due {
+                    let dt = t0.duration_since(last_loop_t).as_secs_f32().max(1e-4);
+                    last_loop_t = t0;
+                    let inst_hz = 1.0 / dt;
+                    // EMA time constant scales with the rate: alpha 0.02
+                    // ≈ 0.1 s at the default 500 Hz, ≈ 0.4 s at the 125 Hz floor.
+                    let alpha = 0.02_f32;
+                    if measured_hz_ema == 0.0 {
+                        measured_hz_ema = inst_hz;
+                    } else {
+                        measured_hz_ema = measured_hz_ema * (1.0 - alpha) + inst_hz * alpha;
+                    }
+                    flexinput_engine::set_io_rate(measured_hz_ema.round() as u32);
                 }
-                flexinput_engine::set_io_rate(measured_hz_ema.round() as u32);
 
                 // Publish per-device rates every ~150 ms. Hz is computed from
                 // raw event counts accumulated since the last publish, EMA-

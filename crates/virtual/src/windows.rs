@@ -1022,13 +1022,14 @@ struct MouseShared {
     stop: bool,
 }
 
-// ── 1 kHz mouse thread ──────────────────────────────────────────────────────
+// ── Mouse thread (1 kHz unless an output rate is set) ───────────────────────
 
 fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
-    // Run the emission loop at 1 kHz: smaller per-tick deltas mean the integer
-    // mickey quantization (SendInput only takes whole pixels) steps twice as
-    // often, so slow stick-aim reads noticeably smoother than at 500 Hz.
-    const HZ: f32  = 1000.0;
+    // Run the emission loop at 1 kHz by default: smaller per-tick deltas mean
+    // the integer mickey quantization (SendInput only takes whole pixels) steps
+    // twice as often, so slow stick-aim reads noticeably smoother than at 500 Hz.
+    // An output rate set in Settings replaces it (see `sendinput_mouse_hz`),
+    // re-read every tick so a change applies live.
     const REF: f32 = 60.0; // velocity unit = pixels per 60 Hz reference frame
 
     // Raise this thread above the game's render/worker threads. Without it the
@@ -1052,7 +1053,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     const SCROLL_REF: f32 = 18.0;
     let mut os_buttons = MouseButtons::default();
 
-    let tick = Duration::from_micros((1_000_000.0 / HZ) as u64);
     // Wall-clock time of the previous emission, used to scale velocity by the
     // REAL elapsed interval instead of assuming a perfect tick. Under load
     // (e.g. a virtual gamepad flushing concurrently) the OS scheduler stretches
@@ -1063,6 +1063,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
 
     loop {
         let t0 = Instant::now();
+        let hz = crate::sendinput_mouse_hz();
+        let tick = Duration::from_nanos(1_000_000_000 / hz as u64);
 
         // Real elapsed time since the previous tick, used to scale velocity so
         // average cursor speed is wall-clock-correct. CRITICAL: clamp it small.
@@ -1076,8 +1078,9 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
         // big gap loses a sliver of distance (imperceptible for relative aim)
         // instead of lurching. carry_x/y stays sub-pixel as a result, so no
         // banked backlog can build up and discharge as a jump later.
-        const MAX_DT: f32 = 0.004; // 4 ms = 4× the nominal 1 kHz tick
-        let dt = (t0 - last_emit).as_secs_f32().min(MAX_DT);
+        // 4× the tick (4 ms at the default 1 kHz), never below 4 ms.
+        let max_dt = (4.0 / hz as f32).max(0.004);
+        let dt = (t0 - last_emit).as_secs_f32().min(max_dt);
         last_emit = t0;
 
         // Snapshot desired state; consume scroll atomically.

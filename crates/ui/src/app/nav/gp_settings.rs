@@ -3,6 +3,22 @@
 
 use super::*;
 
+/// The polling-rate steps ([`settings::POLLING_HZ_STEPS`]), slowest first, as
+/// gamepad-panel options.
+const POLLING_RATE_OPTS: &[(f32, &str)] = &[
+    (125.0, "125 Hz"), (143.0, "143 Hz"), (167.0, "167 Hz"), (200.0, "200 Hz"),
+    (250.0, "250 Hz"), (333.0, "333 Hz"), (500.0, "500 Hz"), (1000.0, "1000 Hz"),
+    (2000.0, "2000 Hz"),
+];
+
+/// The output-rate options: "same as polling", then the polling steps.
+const OUTPUT_RATE_OPTS: &[(f32, &str)] = &[
+    (0.0, "Same as polling"),
+    (125.0, "125 Hz"), (143.0, "143 Hz"), (167.0, "167 Hz"), (200.0, "200 Hz"),
+    (250.0, "250 Hz"), (333.0, "333 Hz"), (500.0, "500 Hz"), (1000.0, "1000 Hz"),
+    (2000.0, "2000 Hz"),
+];
+
 impl FlexInputApp {
 
     /// Ordered list of gamepad-navigable settings rows. Keeps the panel and the
@@ -11,10 +27,12 @@ impl FlexInputApp {
     pub(crate) fn gp_settings_rows(&self) -> Vec<GpSettingRow> {
         use GpSettingKind::*;
         vec![
+            // Stepped lists, not sliders: only these rates are valid, and a
+            // slider's 50 Hz nudge snapped straight back to the rate it left.
             GpSettingRow { label: "Max polling rate".into(),
-                kind: IntSlider { lo: settings::POLLING_HZ_MIN as f32,
-                    hi: settings::POLLING_HZ_MAX as f32, step: 50.0,
-                    key: GpSettingKey::PollingHz }, suffix: " Hz" },
+                kind: Cycle { key: GpSettingKey::PollingHz, opts: POLLING_RATE_OPTS }, suffix: "" },
+            GpSettingRow { label: "Output rate".into(),
+                kind: Cycle { key: GpSettingKey::OutputHz, opts: OUTPUT_RATE_OPTS }, suffix: "" },
             GpSettingRow { label: "Processing sample rate".into(),
                 kind: IntSlider { lo: settings::SAMPLE_RATE_HZ_MIN as f32,
                     hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
@@ -71,6 +89,7 @@ impl FlexInputApp {
         use GpSettingKey::*;
         match key {
             PollingHz => self.settings.polling_hz as f32,
+            OutputHz => self.settings.output_hz as f32,
             SampleRateHz => self.settings.sample_rate_hz as f32,
             BgRepaintHz => self.settings.bg_repaint_hz as f32,
             NavDefault => self.settings.gamepad_ui_nav_default as i32 as f32,
@@ -94,12 +113,16 @@ impl FlexInputApp {
         use GpSettingKey::*;
         match key {
             PollingHz => {
-                // Snap to a valid whole-ms step (same quantization as the
-                // Settings slider). The virtual Xbox 360 follows on its own: it
-                // reports each frame the I/O thread writes.
+                // Snap to a valid step (same quantization as the Settings
+                // slider).
                 let v = settings::snap_polling_hz(val.round() as u32);
                 self.settings.polling_hz = v;
                 self.polling_hz.store(v, Ordering::Relaxed);
+            }
+            OutputHz => {
+                let v = settings::snap_output_hz(val.round() as u32);
+                self.settings.output_hz = v;
+                self.output_hz.store(v, Ordering::Relaxed);
             }
             SampleRateHz => {
                 let v = (val.round() as u32)
@@ -237,16 +260,16 @@ impl FlexInputApp {
             let row = &rows[idx];
             let fine = nav.pressed.contains("btn_west");
             // Cycle gets its own handler — left/right step by one option,
-            // wrapping. No fine step / stick deflection (it's a discrete
-            // choice). Done early so the slider math below doesn't fire.
+            // stopping at the ends. No fine step / stick deflection (it's a
+            // discrete choice). Done early so the slider math below doesn't fire.
             if let GpSettingKind::Cycle { key, opts } = &row.kind {
                 let cur = self.gp_setting_value(*key);
                 let cur_idx = opts.iter().position(|(v, _)| (v - cur).abs() < 0.5)
                     .unwrap_or(0) as i32;
-                let n = opts.len() as i32;
+                let last = opts.len() as i32 - 1;
                 let new_idx = match dir {
-                    Some(NavDir::Right) | Some(NavDir::Up) => (cur_idx + 1).rem_euclid(n),
-                    Some(NavDir::Left)  | Some(NavDir::Down) => (cur_idx - 1).rem_euclid(n),
+                    Some(NavDir::Right) | Some(NavDir::Up) => (cur_idx + 1).min(last),
+                    Some(NavDir::Left)  | Some(NavDir::Down) => (cur_idx - 1).max(0),
                     _ => cur_idx,
                 };
                 if new_idx != cur_idx {
@@ -470,5 +493,22 @@ impl FlexInputApp {
                 }
             });
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The panel's rate lists must offer exactly the steps the settings accept.
+    #[test]
+    fn rate_options_match_the_polling_steps() {
+        let mut steps: Vec<f32> = settings::POLLING_HZ_STEPS.iter().map(|&hz| hz as f32).collect();
+        steps.reverse();
+        let polling: Vec<f32> = POLLING_RATE_OPTS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(polling, steps);
+        assert_eq!(OUTPUT_RATE_OPTS[0].0, settings::OUTPUT_HZ_SAME_AS_POLLING as f32);
+        let output: Vec<f32> = OUTPUT_RATE_OPTS[1..].iter().map(|(v, _)| *v).collect();
+        assert_eq!(output, steps);
     }
 }
