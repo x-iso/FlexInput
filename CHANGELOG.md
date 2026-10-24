@@ -44,12 +44,22 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
-- **FlexInput no longer disturbs other programs that use HIDMaestro.** With
+- **FlexInput and other programs that use HIDMaestro run side by side.** With
   another HIDMaestro program installed (PadForge, say), FlexInput replaced that
   program's newer driver with its own at every start, and with "Keep virtual
   controllers alive" off it removed every HIDMaestro device on the machine,
   that program's included. Now a newer driver, or the same one signed by
-  another program, stays, and FlexInput only cleans up its own devices.
+  another program, stays; an older one is only replaced at a start when no
+  other program is using it; and FlexInput only cleans up its own devices.
+  FlexInput also registers its virtual devices the way HIDMaestro 2.0 programs
+  do, so starting one of them no longer removes FlexInput's virtual keyboard
+  and mouse, and the two never end up driving the same virtual device.
+
+- **Another program's virtual controllers are no longer read as physical
+  ones.** A virtual pad made by another HIDMaestro program showed up as a real
+  controller, and FlexInput read it as input. If that program mapped
+  FlexInput's own virtual pad onto it, the two fed each other, and gamepad
+  navigation drifted on its own. FlexInput now ignores those pads.
 
 - **The virtual DualSense's lightbar and LEDs hold when a game reads the pad's
   settings.** Each feature report a game read passed an empty report to the

@@ -457,6 +457,13 @@ impl SdlBackend {
                 rejected.insert(id);
                 continue;
             }
+            // Nor any HIDMaestro pad SDL reaches by HID path, ours or another
+            // program's: a virtual output read back as input loops.
+            #[cfg(windows)]
+            if gamepad.path().is_some_and(|p| crate::devnode::hidmaestro_maker_of_interface(&p).is_some()) {
+                rejected.insert(id);
+                continue;
+            }
             if !sdl_all && kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
@@ -576,12 +583,24 @@ impl SdlBackend {
                 let pr = SDL_GetJoystickProductForID(id);
                 (name, (v != 0).then_some(v), (pr != 0).then_some(pr))
             };
-            // Never our own virtual, whatever the switch says (see the same
-            // guard in `sync_open_pads`).
+            // Never our own virtual, whatever the switch says, nor another
+            // HIDMaestro program's (see the same guards in `sync_open_pads`).
             if let (Some(v), Some(p)) = (vid, pid) {
                 if crate::gilrs_backend::is_hidmaestro_virtual_xinput(v, p, &name) {
                     self.raw_rejected.insert(id);
                     continue;
+                }
+            }
+            #[cfg(windows)]
+            {
+                // SAFETY: SDL's cached enumeration string for a listed id.
+                let path = unsafe { sdl3::sys::joystick::SDL_GetJoystickPathForID(id) };
+                if !path.is_null() {
+                    let path = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
+                    if crate::devnode::hidmaestro_maker_of_interface(&path).is_some() {
+                        self.raw_rejected.insert(id);
+                        continue;
+                    }
                 }
             }
             // A pad one of the native parsers reads (DualShock 4, DualSense,

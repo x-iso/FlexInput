@@ -253,12 +253,15 @@ pub struct GilrsBackend {
     /// `poll()` so the I/O thread can convert event counts to per-device
     /// rates.
     id_to_dev: HashMap<usize, String>,
-    /// Cached own-virtual classification for PS-family pads, keyed by
-    /// `(vid, pid, vp_idx)`. Rebuilt by `refresh_virtual_classification()` during
-    /// `enumerate()` (which does the hidapi path lookup) and read without I/O by
+    /// Cached origin (real / own virtual / another program's virtual) of
+    /// PS-family pads, keyed by `(vid, pid, vp_idx)`. Rebuilt by the classify
+    /// worker (which does the hidapi path lookup) and read without I/O by
     /// `poll()` / `lookup_phys()` at full rate. See those methods for why the
     /// HID instance path is the discriminator (gilrs name/uuid are unusable).
-    virt_cache: HashMap<(u16, u16, usize), bool>,
+    virt_cache: HashMap<(u16, u16, usize), gyro::PadOrigin>,
+    /// Other HIDMaestro programs' XInput pads present now (see
+    /// [`ForeignXInput`]), re-read whenever a pad connects or goes.
+    foreign_xinput: Vec<ForeignXInput>,
     /// Set when a gilrs Connected/Disconnected/Dropped event is seen in `poll()`,
     /// and on first run. `enumerate()` only re-runs the own-virtual classification
     /// (the ~200 ms hidapi `refresh_devices`) when this is set, then clears it.
@@ -301,10 +304,25 @@ struct ClassifyJob {
     keys: Vec<(u16, u16, usize)>,
 }
 
-/// Worker result: the freshly-computed own-virtual cache for `gen`'s key set.
+/// Worker result: the freshly-computed origin cache for `gen`'s key set.
 struct ClassifyDone {
     gen: u64,
-    cache: HashMap<(u16, u16, usize), bool>,
+    cache: HashMap<(u16, u16, usize), gyro::PadOrigin>,
+}
+
+/// Another HIDMaestro program's XInput pad, as the device tree describes its
+/// XUSB companion. gilrs (WGI) gives no device path for an XInput pad, so it is
+/// matched by VID/PID and display name: the SDK names its companion after the
+/// profile ("Controller (XBOX 360 For Windows)"), where a real pad keeps its
+/// driver's name.
+#[derive(Clone, Debug)]
+struct ForeignXInput {
+    vid_pid: (u16, u16),
+    /// Its names, lowercase, minus any a real XInput device also shows.
+    names: Vec<String>,
+    /// No real XInput device has this VID/PID, so every pad with it is
+    /// another program's whatever its name.
+    exclusive: bool,
 }
 
 /// Background worker loop: owns the slow side of the shared hidapi instance.
@@ -327,7 +345,7 @@ fn classify_worker(
                 let _ = a.refresh_devices();
                 job.keys
                     .iter()
-                    .map(|&(v, p, i)| ((v, p, i), gyro::classify_own_virtual(&a, v, p, i)))
+                    .map(|&(v, p, i)| ((v, p, i), gyro::classify_origin(&a, v, p, i)))
                     .collect()
             }
             Err(_) => HashMap::new(),
@@ -372,6 +390,7 @@ impl GilrsBackend {
             event_counts: HashMap::new(),
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
+            foreign_xinput: Vec::new(),
             dev_set_dirty: true, // force classification on first enumerate
             xinput_slot_for: HashMap::new(),
             class_tx,
@@ -393,7 +412,8 @@ enum PadDisposition {
     Keep { is_virt: bool },
     /// Hide this pad from the device list entirely: a redundant second face of a
     /// device we already keep (the HIDMaestro identity HID node when the OS
-    /// surfaces it alongside the companion — see `disposition_for`).
+    /// surfaces it alongside the companion — see `disposition_for`), or another
+    /// HIDMaestro program's virtual pad.
     Drop,
 }
 
@@ -407,6 +427,7 @@ impl GilrsBackend {
     /// gilrs walk order — the same index the gyro layer uses, keeping them
     /// correlated.
     fn kick_classification(&mut self) {
+        self.refresh_foreign_xinput();
         // Cheap pass: snapshot PS-family (vid, pid, vp_idx) keys from the gilrs
         // walk. (Only PS-family is path-classifiable: DS4/DualSense expose a real
         // HID path hidapi can read. The HIDMaestro XInput companion is an
@@ -454,20 +475,57 @@ impl GilrsBackend {
         }
     }
 
+    /// Re-read which XInput pads other HIDMaestro programs have up. A device
+    /// tree walk of XInput's devices, well under a millisecond, run only when a
+    /// pad connects or goes.
+    fn refresh_foreign_xinput(&mut self) {
+        #[cfg(windows)]
+        {
+            self.foreign_xinput = other_programs_xinput_pads();
+        }
+    }
+
+    /// Every pad's disposition in gilrs walk order, from cached state only (no
+    /// I/O) — the one list `enumerate()`, `poll()` and `lookup_phys()` all walk
+    /// by, so their ids can't disagree.
+    fn dispositions(&self) -> Vec<PadDisposition> {
+        let pads: Vec<(Option<(u16, u16)>, String)> = self
+            .gilrs
+            .gamepads()
+            .map(|(_, pad)| (pad.vendor_id().zip(pad.product_id()), pad.name().to_string()))
+            .collect();
+        let foreign = foreign_xinput_positions(&pads, &self.foreign_xinput);
+        let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+        pads.iter()
+            .zip(foreign)
+            .map(|((vp, name), foreign)| self.disposition_for(*vp, name, foreign, &mut vp_idx))
+            .collect()
+    }
+
     /// Per-pad disposition from cached state only (no I/O) — safe to call at
     /// the polling rate. `vp_idx` accumulates the per-VID/PID running index for the PS-family
-    /// own-virtual cache lookup, threaded through the caller's walk. (XInput pads
+    /// origin cache lookup, threaded through the caller's walk. (XInput pads
     /// are resolved separately by `find_own_virtual_gilrs_idx`, so they don't use
-    /// `vp_idx` and the old ViGEm kept-count is gone.)
+    /// `vp_idx` and the old ViGEm kept-count is gone.) `foreign_xinput`: the pad
+    /// is another HIDMaestro program's XInput pad ([`foreign_xinput_positions`]).
     fn disposition_for(
         &self,
         vp: Option<(u16, u16)>,
         name: &str,
+        foreign_xinput: bool,
         vp_idx: &mut HashMap<(u16, u16), usize>,
     ) -> PadDisposition {
         let Some(vp) = vp else {
             return PadDisposition::Keep { is_virt: false };
         };
+
+        // Another HIDMaestro program's virtual pad: no controller in anyone's
+        // hands, and not ours to drive. Read as input it loops that program
+        // and FlexInput into each other (PadForge mapping FlexInput's virtual
+        // pad back onto its own, which FlexInput then read as a physical pad).
+        if foreign_xinput {
+            return PadDisposition::Drop;
+        }
 
         // OUR HIDMaestro virtual Xbox 360 surfaces to gilrs's WGI backend as a
         // pad named "HIDMaestro XInput Companion" with the profile USB PID 0x02FF —
@@ -496,11 +554,16 @@ impl GilrsBackend {
         let idx = *vp_idx.entry(vp).or_insert(0);
         *vp_idx.get_mut(&vp).unwrap() += 1;
 
-        // PS-family: own-virtual decided by cached HID-path classification (DS4 /
-        // DualSense expose a real HID path hidapi can read and match by HIDMAESTRO).
+        // PS-family: origin decided by cached HID-path classification (DS4 /
+        // DualSense expose a real HID path hidapi can read and the device tree
+        // places). The index advances for a dropped pad too: it counts hidapi's
+        // list, which lists every pad of the VID/PID.
         if is_ps_family(vp.0, vp.1) {
-            let is_virt = self.virt_cache.get(&(vp.0, vp.1, idx)).copied().unwrap_or(false);
-            return PadDisposition::Keep { is_virt };
+            return match self.virt_cache.get(&(vp.0, vp.1, idx)).copied() {
+                Some(gyro::PadOrigin::Own) => PadDisposition::Keep { is_virt: true },
+                Some(gyro::PadOrigin::OtherProgram) => PadDisposition::Drop,
+                Some(gyro::PadOrigin::Physical) | None => PadDisposition::Keep { is_virt: false },
+            };
         }
 
         // Any other XInput-kind pad (physical Xbox 360/One, etc.) is a real device:
@@ -575,20 +638,9 @@ impl DeviceBackend for GilrsBackend {
         // the pad); only virtual/real classification lags one worker round,
         // guarded by the hotplug re-kick below.
 
-        // Per-pad keep/virtual decision (path-based for PS, correlation-based for
-        // XInput). Snapshot VID/PID first (drops the gilrs borrow), then resolve
-        // dispositions from caches so it can't drift between walks.
-        let disp: Vec<PadDisposition> = {
-            let pads: Vec<(Option<(u16, u16)>, String)> = self
-                .gilrs
-                .gamepads()
-                .map(|(_, pad)| (pad.vendor_id().zip(pad.product_id()), pad.name().to_string()))
-                .collect();
-            let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
-            pads.into_iter()
-                .map(|(vp, name)| self.disposition_for(vp, &name, &mut vp_idx))
-                .collect()
-        };
+        // Per-pad keep/virtual decision (path-based for PS, name/PID for
+        // XInput), resolved from caches so it can't drift between walks.
+        let disp = self.dispositions();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut result = Vec::new();
@@ -708,6 +760,10 @@ impl DeviceBackend for GilrsBackend {
                 // time the ~200 ms hidapi refresh is worth paying). See `dev_set_dirty`.
                 if matches!(ev.event, EventType::Connected | EventType::Disconnected | EventType::Dropped) {
                     self.dev_set_dirty = true;
+                    // Cheap, so at once rather than with the deferred
+                    // classification: another program's pad mustn't feed
+                    // even the next few polls.
+                    self.refresh_foreign_xinput();
                 }
                 // A new pad may have taken an empty XInput slot: the only time
                 // the empty slots are looked at (see `XINPUT_LIVE`).
@@ -741,19 +797,9 @@ impl DeviceBackend for GilrsBackend {
         self.id_to_dev.clear();
 
         // Resolve per-pad dispositions from caches (no I/O) before the walk, so
-        // `disposition_for(&self)` doesn't conflict with `&mut self.id_to_dev`
+        // `dispositions(&self)` doesn't conflict with `&mut self.id_to_dev`
         // inside the loop. Uses the same cached classification enumerate() built.
-        let disp: Vec<PadDisposition> = {
-            let pads: Vec<(Option<(u16, u16)>, String)> = self
-                .gilrs
-                .gamepads()
-                .map(|(_, pad)| (pad.vendor_id().zip(pad.product_id()), pad.name().to_string()))
-                .collect();
-            let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
-            pads.into_iter()
-                .map(|(vp, name)| self.disposition_for(vp, &name, &mut vp_idx))
-                .collect()
-        };
+        let disp = self.dispositions();
 
         // Per-XInput-pad live gilrs state (dev_id, button mask, lx, ly), collected
         // during the walk and correlated to actual XInput slots afterward.
@@ -1248,18 +1294,17 @@ impl GilrsBackend {
     fn lookup_phys(&self, device_id: &str) -> Option<(u16, u16, usize)> {
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
-        let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
         // REAL-only gyro idx (matches poll's `gyro_idx`, which now skips is_virt):
         // our own virtual is excluded from the HID handle index space (see
-        // gyro::open_device), so count and match real pads only. `disposition_for`
-        // is still called for every pad so its classification index (`vp_idx`)
-        // advances over the full list; a virtual `device_id` has no gyro handle and
-        // falls through to None.
+        // gyro::open_device), so count and match real pads only. `dispositions`
+        // classifies every pad, so its classification index advances over the
+        // full list; a virtual `device_id` has no gyro handle and falls through
+        // to None.
         let mut vp_seen: HashMap<(u16, u16), usize> = HashMap::new();
-        for (_id, pad) in self.gilrs.gamepads() {
+        for ((_id, pad), disp) in self.gilrs.gamepads().zip(self.dispositions()) {
             let vp = pad.vendor_id().zip(pad.product_id());
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-            let is_virt = match self.disposition_for(vp, pad.name(), &mut vp_idx) {
+            let is_virt = match disp {
                 PadDisposition::Keep { is_virt } => is_virt,
                 // Dropped face: not in the device-id space and never a gyro
                 // target; skip before vp_seen so real-pad indices stay aligned
@@ -1305,7 +1350,64 @@ fn is_ps_family(vid: u16, pid: u16) -> bool {
 /// ours from physical with no slot/correlation guessing. The name check is the primary
 /// signal; the 0x02FF PID is belt-and-suspenders (and the reason the profile keeps it).
 pub(crate) fn is_hidmaestro_virtual_xinput(vid: u16, pid: u16, name: &str) -> bool {
-    (vid == 0x045E && pid == 0x02FF) || name.to_ascii_lowercase().contains("hidmaestro")
+    (vid, pid) == OWN_XINPUT_VID_PID || name.to_ascii_lowercase().contains("hidmaestro")
+}
+
+/// The VID/PID FlexInput's virtual Xbox 360 profile reports.
+const OWN_XINPUT_VID_PID: (u16, u16) = (0x045E, 0x02FF);
+
+/// Which pads, by gilrs walk position, are other HIDMaestro programs' XInput
+/// pads (`foreign`). A pad with an exclusive entry's VID/PID always is; one
+/// matching an entry's VID/PID and name is, each entry matching once. While any
+/// is present, so is a pad named like a HIDMaestro companion that isn't
+/// FlexInput's VID/PID: WGI read its name before that program's SDK renamed it,
+/// or a v1 SDK never did.
+fn foreign_xinput_positions(pads: &[(Option<(u16, u16)>, String)], foreign: &[ForeignXInput]) -> Vec<bool> {
+    if foreign.is_empty() {
+        return vec![false; pads.len()];
+    }
+    let mut unmatched: Vec<&ForeignXInput> = foreign.iter().filter(|f| !f.exclusive).collect();
+    pads.iter()
+        .map(|(vp, name)| {
+            let Some(vp) = *vp else { return false };
+            if vp == OWN_XINPUT_VID_PID {
+                return false;
+            }
+            if foreign.iter().any(|f| f.exclusive && f.vid_pid == vp) {
+                return true;
+            }
+            let name = name.to_lowercase();
+            if let Some(i) = unmatched.iter().position(|f| f.vid_pid == vp && f.names.contains(&name)) {
+                unmatched.remove(i);
+                return true;
+            }
+            name.contains("hidmaestro") && foreign.iter().any(|f| f.vid_pid == vp)
+        })
+        .collect()
+}
+
+/// Other HIDMaestro programs' XInput pads present now, from XInput's devices
+/// in the device tree.
+#[cfg(windows)]
+fn other_programs_xinput_pads() -> Vec<ForeignXInput> {
+    use crate::devnode::{xinput_devnodes, HidMaestroMaker};
+    let all = xinput_devnodes();
+    let real: Vec<_> = all.iter().filter(|d| d.maker.is_none()).collect();
+    // A name a real XInput device shows too tells nothing.
+    let real_names: std::collections::HashSet<String> =
+        real.iter().flat_map(|d| d.names.iter().map(|n| n.to_lowercase())).collect();
+    all.iter()
+        .filter(|d| d.maker == Some(HidMaestroMaker::OtherProgram))
+        .filter_map(|d| {
+            let vid_pid = d.vid_pid?;
+            Some(ForeignXInput {
+                vid_pid,
+                names: d.names.iter().map(|n| n.to_lowercase()).filter(|n| !real_names.contains(n)).collect(),
+                // Only when every real device's VID/PID is known to differ.
+                exclusive: real.iter().all(|r| r.vid_pid.is_some_and(|v| v != vid_pid)),
+            })
+        })
+        .collect()
 }
 
 /// Compute the stable `gilrs:` device id for a pad given its pre-computed
@@ -1478,3 +1580,59 @@ const BUTTON_MAP_SWITCH_BT: &[(Button, &str)] = &[
     (Button::C,      "btn_back"),    // Minus (if it fires C in BT)
     // DPad omitted: emitted separately via axis+button combo in poll().
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const X360: (u16, u16) = (0x045E, 0x028E);
+
+    fn pads(list: &[((u16, u16), &str)]) -> Vec<(Option<(u16, u16)>, String)> {
+        list.iter().map(|(vp, n)| (Some(*vp), n.to_string())).collect()
+    }
+
+    fn padforge(exclusive: bool) -> ForeignXInput {
+        ForeignXInput {
+            vid_pid: X360,
+            names: vec!["controller (xbox 360 for windows)".into(), "hidmaestro xinput companion".into()],
+            exclusive,
+        }
+    }
+
+    #[test]
+    fn nothing_is_foreign_without_another_programs_pad() {
+        let p = pads(&[(X360, "Xbox 360 Controller for Windows"), (OWN_XINPUT_VID_PID, "HIDMaestro XInput Companion")]);
+        assert_eq!(foreign_xinput_positions(&p, &[]), vec![false, false]);
+    }
+
+    #[test]
+    fn an_exclusive_vid_pid_is_foreign_whatever_its_name() {
+        // PadForge's companion and the HID face Windows 11 surfaces beside it;
+        // FlexInput's own pad stays ours.
+        let p = pads(&[
+            (X360, "Controller (XBOX 360 For Windows)"),
+            (X360, "Xbox 360 Controller"),
+            (OWN_XINPUT_VID_PID, "HIDMaestro XInput Companion"),
+        ]);
+        assert_eq!(foreign_xinput_positions(&p, &[padforge(true)]), vec![true, true, false]);
+    }
+
+    #[test]
+    fn beside_a_real_pad_of_the_same_model_the_name_decides() {
+        let p = pads(&[(X360, "Xbox 360 Controller for Windows"), (X360, "Controller (XBOX 360 For Windows)")]);
+        assert_eq!(foreign_xinput_positions(&p, &[padforge(false)]), vec![false, true]);
+    }
+
+    #[test]
+    fn each_companion_matches_one_pad() {
+        let p = pads(&[(X360, "Controller (XBOX 360 For Windows)"), (X360, "Controller (XBOX 360 For Windows)")]);
+        assert_eq!(foreign_xinput_positions(&p, &[padforge(false)]), vec![true, false]);
+    }
+
+    #[test]
+    fn a_companion_read_before_its_rename_is_foreign() {
+        let p = pads(&[(X360, "HIDMaestro XInput Companion")]);
+        let unnamed = ForeignXInput { vid_pid: X360, names: Vec::new(), exclusive: false };
+        assert_eq!(foreign_xinput_positions(&p, &[unnamed]), vec![true]);
+    }
+}

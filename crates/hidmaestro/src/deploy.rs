@@ -354,6 +354,10 @@ pub enum Reconcile {
     NotNeeded { legacy_certs_removed: usize },
     /// Another program installed a newer driver, which stays.
     KeptNewer,
+    /// A reinstall is needed (`from`), but another running program's devices
+    /// are bound to the installed driver (`holder` describes it). Replacing it
+    /// would remove them, so it waits for a start without that program.
+    Deferred { from: InstalledDriver, holder: String },
     /// The install was out of date or foreign-signed (`from`) and has been
     /// replaced with this build's packages, signed by this machine.
     Reinstalled { from: InstalledDriver },
@@ -384,7 +388,14 @@ pub enum Reconcile {
 /// Failed attempts are counted in the registry, and after
 /// [`MAX_RECONCILE_ATTEMPTS`] the helper stops trying, so a machine where the
 /// reinstall can't succeed doesn't lose its devices on every launch.
-pub fn reconcile_installed_driver(clear_devices: impl FnOnce()) -> Reconcile {
+///
+/// `held_elsewhere` names a running program whose devices use the installed
+/// driver, if there is one; the reinstall then waits (upstream never replaces a
+/// driver another program's devices hold either).
+pub fn reconcile_installed_driver(
+    clear_devices: impl FnOnce(),
+    held_elsewhere: impl FnOnce() -> Option<String>,
+) -> Reconcile {
     let from = installed_driver();
     match from {
         InstalledDriver::NotInstalled | InstalledDriver::Current => {
@@ -399,6 +410,9 @@ pub fn reconcile_installed_driver(clear_devices: impl FnOnce()) -> Reconcile {
         InstalledDriver::Newer => return Reconcile::KeptNewer,
         InstalledDriver::Indeterminate => return Reconcile::Skipped,
         InstalledDriver::OtherVersion | InstalledDriver::ForeignSigner => {}
+    }
+    if let Some(holder) = held_elsewhere() {
+        return Reconcile::Deferred { from, holder };
     }
     let attempts = registry::read_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS).unwrap_or(0);
     if attempts >= MAX_RECONCILE_ATTEMPTS {

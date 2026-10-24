@@ -26,6 +26,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography_Sip",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
+    # Ownership claims (claims.rs): one-instance named pipes, and the
+    # process's start time for its owner record.
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }
 
 # Standalone protocol-proof binary (Phase 1 verification gate). Opens a

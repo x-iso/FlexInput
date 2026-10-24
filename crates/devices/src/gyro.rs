@@ -792,16 +792,17 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
     let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
     let (device, path) = {
         let guard = api.lock().ok()?;
-        // Real devices only: our own virtual (ROOT-enumerated `HIDCLASS`/
-        // `HIDMAESTRO` path) must never be a gyro/HID target. Excluding it here
-        // — combined with the real-only index the gilrs walk produces (poll
-        // skips is_virt) and lookup_phys — keeps the (vid,pid,idx) handle
-        // selection stable even when a same-VID/PID virtual shares the bus,
-        // where the raw list order is not. The virtual/real CLASSIFIER
-        // (`classify_own_virtual`) still reads the full list.
+        // Real devices only: a virtual pad, ours (ROOT-enumerated `HIDCLASS`/
+        // `HIDMAESTRO` path) or another HIDMaestro program's, must never be a
+        // gyro/HID target. Excluding them here — combined with the real-only
+        // index the gilrs walk produces (poll skips is_virt and dropped pads)
+        // and lookup_phys — keeps the (vid,pid,idx) handle selection stable
+        // even when a same-VID/PID virtual shares the bus, where the raw list
+        // order is not. The CLASSIFIER (`classify_origin`) still reads the
+        // full list.
         let paths: Vec<hidapi::DeviceInfo> = gamepad_device_list_of(&guard, vid, pid)
             .into_iter()
-            .filter(|d| !path_is_own_virtual(&d.path().to_string_lossy()))
+            .filter(|d| path_origin(&d.path().to_string_lossy()) == PadOrigin::Physical)
             .collect();
 
         #[cfg(debug_assertions)]
@@ -854,8 +855,21 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
     })
 }
 
-/// True if the Nth physical device with this VID/PID is one of FlexInput's
-/// OWN emulated HIDMaestro controllers, judged by its device instance path.
+/// Who made a pad hidapi lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PadOrigin {
+    /// A controller in someone's hands.
+    Physical,
+    /// One of FlexInput's own emulated controllers.
+    Own,
+    /// A virtual pad another HIDMaestro program made (see
+    /// [`crate::devnode::HidMaestroMaker::OtherProgram`]).
+    OtherProgram,
+}
+
+/// Who made the Nth device with this VID/PID, judged by its device instance
+/// path: one of FlexInput's OWN emulated HIDMaestro controllers, another
+/// HIDMaestro program's, or a real one.
 ///
 /// This is the discriminator that finally works where the name/uuid markers
 /// failed: gilrs's WGI backend reports a generic name ("HID-compliant game
@@ -865,14 +879,29 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
 /// while a HIDMaestro device is ROOT-enumerated and appears as
 /// `HID\HIDCLASS\..` (its path has no `VID_`/`PID_` tokens). `idx` is the
 /// same Nth-device index the gilrs walk derives per VID/PID, so the two
-/// stay correlated. Returns false for non-PS devices and out-of-range idx.
+/// stay correlated. Physical for non-PS devices and out-of-range idx.
 ///
 /// Reads the list as-is (no refresh) — the classify worker refreshes the
 /// shared api first, then calls this against the same locked instance.
-pub(crate) fn classify_own_virtual(api: &HidApi, vid: u16, pid: u16, idx: usize) -> bool {
+pub(crate) fn classify_origin(api: &HidApi, vid: u16, pid: u16, idx: usize) -> PadOrigin {
     match gamepad_device_list_of(api, vid, pid).get(idx) {
-        Some(info) => path_is_own_virtual(&info.path().to_string_lossy()),
-        None => false,
+        Some(info) => path_origin(&info.path().to_string_lossy()),
+        None => PadOrigin::Physical,
+    }
+}
+
+/// Who made the pad behind a HID path. Another program's HIDMaestro pad is
+/// told by the device tree; the path tests below would take a ROOT\HIDCLASS
+/// one for ours.
+fn path_origin(path: &str) -> PadOrigin {
+    #[cfg(windows)]
+    if crate::devnode::hidmaestro_maker_of_interface(path) == Some(crate::devnode::HidMaestroMaker::OtherProgram) {
+        return PadOrigin::OtherProgram;
+    }
+    if path_is_own_virtual(path) {
+        PadOrigin::Own
+    } else {
+        PadOrigin::Physical
     }
 }
 

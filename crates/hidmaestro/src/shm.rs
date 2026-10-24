@@ -97,7 +97,7 @@ const VERSION_LAYOUT: u32 = 1;
 /// contract (v2.0.0). The v2.0 HID driver serves 4 and 5, the companion 4.
 const SDK_PROTOCOL: u32 = 4;
 /// The HIDMaestro release whose SDK FlexInput's half stands in for.
-const SDK_VERSION: [u16; 3] = [2, 0, 1];
+pub(crate) const SDK_VERSION: [u16; 3] = [2, 0, 1];
 
 /// SDDL for the `Global\` sections + events shared between the elevated helper
 /// (which CREATES them) and the normally-launched, unelevated app (which OPENS

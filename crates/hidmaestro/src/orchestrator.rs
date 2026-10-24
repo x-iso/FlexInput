@@ -2188,6 +2188,7 @@ pub(crate) mod registry {
     const REG_BINARY: u32 = 3;
     const REG_DWORD: u32 = 4;
     const REG_MULTI_SZ: u32 = 7;
+    const REG_QWORD: u32 = 11;
     const ERROR_SUCCESS: i32 = 0;
     const ERROR_MORE_DATA: i32 = 234;
 
@@ -2337,6 +2338,17 @@ pub(crate) mod registry {
             )
         };
         if rc != ERROR_SUCCESS { Err(rc as u32) } else { Ok(h) }
+    }
+
+    pub fn write_qword(root: *mut c_void, path: &str, name: &str, value: u64) -> Result<(), u32> {
+        let h = create(root, path)?;
+        let wn = wide(name);
+        let bytes = value.to_le_bytes();
+        let rc = unsafe {
+            RegSetValueExW(h, wn.as_ptr(), 0, REG_QWORD, bytes.as_ptr(), bytes.len() as u32)
+        };
+        unsafe { RegCloseKey(h) };
+        if rc == ERROR_SUCCESS { Ok(()) } else { Err(rc as u32) }
     }
 
     pub fn write_dword(root: *mut c_void, path: &str, name: &str, value: u32) -> Result<(), u32> {

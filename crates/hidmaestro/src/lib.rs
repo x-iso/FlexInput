@@ -22,6 +22,7 @@
 #![cfg(windows)]
 
 pub mod answers;
+pub mod claims;
 pub mod deploy;
 pub mod descriptor;
 pub mod encode;

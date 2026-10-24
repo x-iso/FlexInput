@@ -25,6 +25,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::claims;
 use crate::deploy::ensure_driver_installed;
 use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
@@ -108,7 +109,8 @@ struct LiveDevice {
     index: u32,
     device_id: String,
     /// The controller's identity token, the last segment of every one of its
-    /// devnodes' instance IDs ([`identity`]); its identity entry goes with it.
+    /// devnodes' instance IDs ([`identity`]); its identity entry and its entry
+    /// in the owner record ([`claims`]) go with it.
     token: String,
     /// For Xbox360/XInput pads: the XUSB companion node's instance id (under
     /// `SWD\HIDMAESTRO`), created alongside the HID node. `None` for plain-HID pads.
@@ -122,6 +124,11 @@ struct LiveDevice {
     /// (`create_own_container_node`: keyboard, mouse). Dropping it removes the
     /// node, so these never outlive the helper. `None` for ROOT nodes.
     node_handle: Option<crate::orchestrator::SwdHandle>,
+    /// The claim on `index`, held while the controller lives so no other
+    /// HIDMaestro program takes the index or sweeps the devices. `None` when
+    /// claims couldn't be made (see [`claims::ClaimRefused::Failed`]). Last
+    /// field: fields drop in order, and the claim must outlast the node handles.
+    _index_claim: Option<claims::Claim>,
 }
 
 /// The HidHide masking the helper applied for the app, retained so teardown can
@@ -200,6 +207,8 @@ impl HelperState {
                     let _ = batch.remove(&id);
                 }
                 identity::delete_entry(&dev.token);
+                claims::remove_controller(&dev.token);
+                // The index claim goes last, with `dev`.
             }
         }
     }
@@ -269,6 +278,15 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // anything else, so a user's controller can never stay dark across restarts.
     crate::orchestrator::recover_xinput_reorder();
 
+    // Claim ownership before the first machine-wide write (the driver
+    // reconcile below), as HIDMaestro's SDK does, so other HIDMaestro programs
+    // see a running owner from here on and never sweep this helper's devices.
+    if let Err(e) = claims::take_owner() {
+        diag_log(&format!(
+            "[helper] ownership claim refused (err {e}); other HIDMaestro programs may remove our devices"
+        ));
+    }
+
     // Bring the installed driver in line with this build: the vendored
     // HIDMaestro version, signed by this machine's own cert. That's how a driver
     // update reaches existing installs (nothing else replaces an installed
@@ -280,13 +298,14 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     use crate::deploy::Reconcile;
     // Every program's devices, not only ours: nothing may stay bound to a
     // package being replaced. (A reinstall only happens for an older driver or
-    // our own legacy signature — see `deploy::installed_driver`.)
+    // our own legacy signature — see `deploy::installed_driver` — and never
+    // while another running program's record lists a controller.)
     let clear_devices = || {
         if !crate::orchestrator::clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(15), false) {
             diag_log("[helper] driver: device nodes still present after 15 s; reinstalling anyway");
         }
     };
-    match crate::deploy::reconcile_installed_driver(clear_devices) {
+    match crate::deploy::reconcile_installed_driver(clear_devices, claims::other_live_owner) {
         Reconcile::NotNeeded { legacy_certs_removed: 0 } => {}
         Reconcile::NotNeeded { legacy_certs_removed: n } => {
             diag_log(&format!("[helper] driver: withdrew {n} legacy certificate trust entries"))
@@ -298,6 +317,10 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
         Reconcile::KeptNewer => diag_log(
             "[helper] driver: kept the newer HIDMaestro driver another program installed",
         ),
+        Reconcile::Deferred { from, holder } => diag_log(&format!(
+            "[helper] driver: install needs replacing (was {from:?}) but {holder} is using it; \
+             replacing it at a start when that program isn't running"
+        )),
         Reconcile::Skipped => diag_log(
             "[helper] driver: check skipped (driver half-installed, or its INFs or catalogs unreadable)",
         ),
@@ -353,6 +376,8 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     if !persist_at_exit {
         state.teardown_tracked();
         diag_log("[helper] exit cleanup (persist off): removed tracked device(s)");
+        // Kept with persistence on: it names the devices left behind.
+        claims::delete_own_record();
     }
     // Always undo HidHide masking on exit (independent of device persistence),
     // bar what the app asked to keep hidden.
@@ -583,6 +608,12 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 let n = identity::sweep_stale(present.iter().map(|d| identity::token_of(&d.instance_id)));
                 if n > 0 {
                     diag_log(&format!("[helper] hello (startup): removed {n} stale identity entr(y/ies)"));
+                }
+                // Owner records an earlier helper left when it was killed or
+                // kept devices at exit.
+                let n = claims::sweep_own_dead_records();
+                if n > 0 {
+                    diag_log(&format!("[helper] hello (startup): removed {n} stale owner record(s)"));
                 }
             }
             // A live toggle changes only the EXIT policy (read at exit /
@@ -817,11 +848,27 @@ fn handle_create(
         // and identity entry are made again for it before its driver re-opens
         // the section.
         let token = identity::token_of(&found.instance_id).to_string();
+        let index_claim = match claims::claim_index(found.index) {
+            Ok(c) => Some(c),
+            Err(claims::ClaimRefused::Held) => {
+                diag_log(&format!(
+                    "[helper] reclaim: index {} is claimed by another program; reclaiming anyway",
+                    found.index
+                ));
+                None
+            }
+            Err(claims::ClaimRefused::Failed(_)) => None,
+        };
+        claims::add_controller(&token, found.index, device_id);
+        claims::set_controller_instance(&token, &found.instance_id);
         let mut input = match InputSection::create(found.index, identity::tag(&token))
             .or_else(|_| InputSection::open(found.index))
         {
             Ok(s) => s,
-            Err(e) => return Response::err(format!("reclaim input section idx={}: {e}", found.index)),
+            Err(e) => {
+                claims::remove_controller(&token);
+                return Response::err(format!("reclaim input section idx={}: {e}", found.index));
+            }
         };
         if identity::is_ours(&token) {
             if let Err(e) = identity::write_entry(&token, found.index) {
@@ -863,6 +910,7 @@ fn handle_create(
                     companion_instance_id,
                     _companion_handle: None,
                     node_handle: None,
+                    _index_claim: index_claim,
                 },
             );
         }
@@ -879,17 +927,23 @@ fn handle_create(
         return Response::Created { instance_id: found.instance_id.clone(), index: found.index };
     }
 
-    // ALLOCATE a globally-unique index: lowest free, considering both nodes
-    // present in the system and indices we already hold this session.
-    let index = allocate_index(&existing, state, index_hint);
+    // ALLOCATE a machine-wide unique index, and claim it for the controller's
+    // life (see `allocate_index`).
+    let (index, index_claim) = allocate_index(&existing, state, index_hint);
 
     // The controller's identity: every devnode of it ends in this token, and
     // the version section carries its tag. Both, and the identity entry below,
-    // before any PnP work — the driver reads them at add (see `identity`).
+    // before any PnP work — the driver reads them at add (see `identity`). Its
+    // entry in the owner record too, so another program's sweep reads its
+    // devices as a running program's from the moment they appear.
     let token = identity::new_token();
+    claims::add_controller(&token, index, device_id);
     let mut input = match InputSection::create(index, identity::tag(&token)) {
         Ok(s) => s,
-        Err(e) => return Response::err(format!("create input section idx={index}: {e}")),
+        Err(e) => {
+            claims::remove_controller(&token);
+            return Response::err(format!("create input section idx={index}: {e}"));
+        }
     };
     // Seed an initial NEUTRAL frame BEFORE the device node enumerates, so the very
     // first report a host can read already has centered sticks and a FULL battery.
@@ -960,6 +1014,7 @@ fn handle_create(
             // start failed. A companion protocol means it started under the
             // contract, which is also when it registers its XInput interface.
             let half = input.driver_half();
+            claims::set_controller_instance(&token, &dev.instance_id);
             if let Ok(mut devs) = state.devices.lock() {
                 devs.insert(
                     dev.instance_id.clone(),
@@ -972,6 +1027,7 @@ fn handle_create(
                         companion_instance_id: companion_instance_id.clone(),
                         _companion_handle: companion_handle,
                         node_handle,
+                        _index_claim: index_claim,
                     },
                 );
             }
@@ -999,20 +1055,26 @@ fn handle_create(
         }
         Err(e) => {
             identity::delete_entry(&token);
+            claims::remove_controller(&token);
             diag_log(&format!("[helper] create FAILED device_id={device_id} idx={index}: {e}"));
             Response::err(format!("create device node: {e}"))
         }
     }
 }
 
-/// Pick the lowest controller index not in use — neither present in the system
-/// (`existing`) nor held by us this session. `index_hint` is the app's legacy
-/// per-kind number, used only to bias toward a stable choice when free.
+/// Pick the lowest controller index not in use, and claim it. In use: present in
+/// the system (`existing`, any program's), held by us this session, served by
+/// another HIDMaestro program's owner pipe, or claimed by one — a create of
+/// theirs in flight, before its devnode exists. `index_hint` is the app's legacy
+/// per-kind number, tried first to keep a stable choice when free.
+///
+/// The claim comes back with the index. Where claims can't be made at all the
+/// index comes back without one, chosen as before claims.
 fn allocate_index(
     existing: &[crate::orchestrator::ExistingDevice],
     state: &Arc<HelperState>,
     index_hint: u32,
-) -> u32 {
+) -> (u32, Option<claims::Claim>) {
     use std::collections::HashSet;
     let mut used: HashSet<u32> = existing.iter().map(|d| d.index).collect();
     if let Ok(devs) = state.devices.lock() {
@@ -1020,11 +1082,17 @@ fn allocate_index(
             used.insert(d.index);
         }
     }
-    // Prefer the hint if it happens to be free (keeps single-device patches at 0).
-    if !used.contains(&index_hint) {
-        return index_hint;
+    for i in std::iter::once(index_hint).chain(0..claims::INDEX_LIMIT) {
+        if used.contains(&i) || claims::legacy_owner_holds(i) {
+            continue;
+        }
+        match claims::claim_index(i) {
+            Ok(claim) => return (i, Some(claim)),
+            Err(claims::ClaimRefused::Held) => continue,
+            Err(claims::ClaimRefused::Failed(_)) => return (i, None),
+        }
     }
-    (0u32..).find(|i| !used.contains(i)).unwrap_or(index_hint)
+    (index_hint, None)
 }
 
 /// Re-arrive our own virtual XInput device's XUSB companion so it re-acquires an
@@ -1144,14 +1212,20 @@ fn handle_assign_xinput_slot(
 fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
     // Pull the tracked device first so we can also remove its XUSB companion.
     let tracked = state.devices.lock().ok().and_then(|mut devs| devs.remove(instance_id));
-    // The identity entry outlives the devnodes by a moment at most.
+    // The identity entry, the record entry and the index claim outlive the
+    // devnodes by a moment at most — no other program takes the index while
+    // they're still leaving.
     let token = identity::token_of(instance_id);
-    let forget = || {
+    let forget = |index_claim: Option<claims::Claim>| {
         if identity::is_ours(token) {
             identity::delete_entry(token);
         }
+        claims::remove_controller(token);
+        drop(index_claim);
     };
+    let mut index_claim = None;
     if let Some(mut dev) = tracked {
+        index_claim = dev._index_claim.take();
         // Drop the SWD companion's held handle — that removes the companion node
         // (default Handle lifetime). Fallback to an explicit remove for a
         // legacy/reclaimed companion with no live handle.
@@ -1161,7 +1235,7 @@ fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
         }
         // An own-container node goes the same way: its handle is the node.
         if dev.node_handle.take().is_some() {
-            forget();
+            forget(index_claim);
             return Response::Ok { detail: Some("removed=true".into()) };
         }
     }
@@ -1169,7 +1243,7 @@ fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
         Ok(g) => g,
         Err(e) => return Response::err(format!("remove device: {e}")),
     };
-    forget();
+    forget(index_claim);
     Response::Ok { detail: Some(format!("removed={removed}")) }
 }
 
