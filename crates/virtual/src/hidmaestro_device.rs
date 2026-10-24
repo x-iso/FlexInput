@@ -76,6 +76,11 @@ fn classify_rumble_frame(data: &[u8]) -> RumbleFrame {
 /// explicit `Command(0,0)`, which stops immediately regardless of this.)
 const RUMBLE_HOLD: std::time::Duration = std::time::Duration::from_millis(900);
 
+/// `HIDMAESTRO_OUTPUT_SOURCE_HID_OUTPUT` (driver.h): an output report a host
+/// wrote, as opposed to a feature report (1), XInput rumble (2) or a feature
+/// read notice (3).
+const OUTPUT_SOURCE_HID_OUTPUT: u8 = 0;
+
 /// A HIDMaestro-backed virtual controller (plain-HID path: DS4 / DualSense).
 pub struct HidMaestroDevice {
     id: String,
@@ -380,11 +385,17 @@ impl crate::VirtualDevice for HidMaestroDevice {
             ];
         }
         // Drain the output ring (frames arrive with the report id stripped) and
-        // fold this tick's reports into the feedback pins.
+        // fold this tick's output reports into the feedback pins. Only output
+        // reports (Source 0): the v2.0 driver also publishes a feature-read
+        // notice, empty, for every Sony feature report a host reads (Source 3),
+        // and an empty frame would stand as the last output report the LEDs are
+        // decoded from.
         let mut frames = Vec::new();
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
-                frames.push(frame.data);
+                if frame.source == OUTPUT_SOURCE_HID_OUTPUT {
+                    frames.push(frame.data);
+                }
             }
         }
         self.sony.poll(&self.profile, &mut self.rumble, frames.iter().map(Vec::as_slice))

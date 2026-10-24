@@ -1,29 +1,30 @@
 ﻿;
-; HIDMaestro XUSB/WinExInput Companion â€” provides XInput + browser detection.
+; HIDMaestro XUSB Companion: provides XInput + browser detection.
 ; Built from driver/companion.c into HMXInput.dll (function driver, no filter).
-; Registers XUSB (XInput) + WinExInput (WGI GamepadAdded) interfaces.
+; Its driver registers the XUSB (XInput) interface when it starts.
 ; Reads gamepad state from per-instance shared memory (Global\HIDMaestroInput<N>).
 ;
 
 [Version]
 Signature   = "$WINDOWS NT$"
-; Class = System (not XnaComposite) â€” intentionally chosen so
+; Class = System (not XnaComposite), intentionally chosen so
 ; Windows.Gaming.Input.dll::ProviderManagerWorker::OnPnpDeviceAdded does NOT
 ; classify HIDMAESTRO as a WGI Gamepad. XnaComposite auto-publishes the
 ; {D61CA365} XnaComposite interface, which hits classifier branch 1 and
 ; creates a second WGI entity alongside the main HID virtual's HID-path
-; Gamepad â€” that's the duplicate that hangs Windows.Gaming.Input.
+; Gamepad, the duplicate that hangs Windows.Gaming.Input.
 ; System class is not matched by any classifier branch.
 ;
 ; xinput1_4.dll's XInput discovery enumerates GUID_DEVINTERFACE_XUSB
 ; {EC87F1E3} interfaces directly and does NOT filter by setup class, so
-; HIDMAESTRO remains XInput-discoverable via its AddInterface entry below.
+; HIDMAESTRO remains XInput-discoverable through the interface its driver
+; registers (companion.c).
 ; See memory:feedback-one-wgi-device-per-controller.md.
 Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 CatalogFile = hidmaestro_xusb.cat
-DriverVer   = 09/03/2026,1.4.7.48
+DriverVer   = 10/19/2026,2.0.0.2201
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -40,7 +41,7 @@ HMXInput.dll = 1
 %ManufacturerName% = Standard,NTamd64
 
 [Standard.NTamd64]
-; VID-specific aliases â€” PnP's DEVPKEY_Device_MatchingDeviceId will carry
+; VID-specific aliases: PnP's DEVPKEY_Device_MatchingDeviceId will carry
 ; the VID_045E string when our Gate 2 fix writes this HwID into the
 ; device's multi-sz HardwareID list. Covers the common Xbox 360 family
 ; PIDs HIDMaestro may emulate.
@@ -61,7 +62,7 @@ AddReg = XUSB_HW_AddReg
 
 [XUSB_HW_AddReg]
 HKR,,"XusbMode",0x00010001,1
-; "xinputhid" UpperFilter string â€” this is the WGI dispatch tripwire.
+; "xinputhid" UpperFilter string: this is the WGI dispatch tripwire.
 ; ProviderManagerWorker::OnPnpDeviceAdded (all-core.c:~41617) walks the
 ; ancestor UpperFilters chain with IsDeviceOrAncestorFilteredBy(path,
 ; L"xinputhid"). When that returns true AND the device publishes
@@ -70,26 +71,24 @@ HKR,,"XusbMode",0x00010001,1
 ; under System class matches NO dispatch branch and WGI silently skips it,
 ; which is why vibration never reached our SET_STATE handler in prior tests.
 ;
-; xinputhid.sys is a HID-class filter â€” it won't actually attach to this
+; xinputhid.sys is a HID-class filter. It won't actually attach to this
 ; System-class device, so no 16-button descriptor rewrite. This is a pure
 ; registry-string tripwire. See memory:project-wgi-pnp-device-settings-registry.md.
 HKR,,"UpperFilters",0x00010008,"xinputhid"
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
 
-[XUSB_Install.NT.Interfaces]
-AddInterface = {EC87F1E3-C13B-4100-B5F7-8B84D54260CB},,XUSB_Interface
-; WinExInput {6C53D5FD-6480-440F-B618-476750C5E1A6} intentionally NOT
-; registered. It has ZERO references in Windows.Gaming.Input.dll
+; No AddInterface. The driver registers GUID_DEVINTERFACE_XUSB itself when
+; it starts, as xusb22.sys does: xusb22.inf adds no interface. An
+; AddInterface here failed the install of a companion whose instance had
+; carried the interface in an earlier life (DIF_INSTALLINTERFACES,
+; 0xE0000225), and Windows.Gaming.Input listed no gamepad for that life.
+;
+; WinExInput {6C53D5FD-6480-440F-B618-476750C5E1A6} is registered by
+; nothing. It has ZERO references in Windows.Gaming.Input.dll
 ; (verified via full decomp of 3,449 functions on 2026-04-23). Registering
 ; both XUSB and WinExInput on this one device causes WGI to see two distinct
 ; WGI entities for one virtual controller and hang the entire subsystem.
 ; See memory:feedback-one-wgi-device-per-controller.md.
-
-[XUSB_Interface]
-AddReg = XUSB_Interface_AddReg
-
-[XUSB_Interface_AddReg]
-HKR,,"DeviceEnabled",0x00010001,1
 
 [XUSB_Install.NT.Services]
 AddService = WUDFRd,0x000001fa,WUDFRD_Service
@@ -108,7 +107,7 @@ UmdfKernelModeClientPolicy  = AllowKernelModeClients
 UmdfFileObjectPolicy        = AllowNullAndUnknownFileObjects
 UmdfMethodNeitherAction     = Copy
 UmdfFsContextUsePolicy      = CanUseFsContext2
-; Per-instance WUDFHost â€” see hidmaestro.inf for rationale. The async
+; Per-instance WUDFHost: see hidmaestro.inf for rationale. The async
 ; WAIT_FOR_INPUT pump + 8ms timer would otherwise serialize across
 ; every HIDMAESTRO instance in a single host.
 UmdfHostProcessSharing      = ProcessSharingDisabled

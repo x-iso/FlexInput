@@ -31,7 +31,29 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **2000 Hz polling and output.** Both rates go up to 2000 Hz (0.5 ms), for
   those who want it. CPU use rises with the rate.
 
+### Changed
+
+- **Virtual controllers run on HIDMaestro 2.0.1.** The driver behind the
+  virtual DualSense, DualShock 4, Xbox 360, keyboard and mouse moves from 1.7.3
+  to 2.0.1, which its author recommends for FlexInput. Starting FlexInput once
+  updates it, which recreates the virtual devices that are up at the time. 2.0
+  moved the Sony pads' calibration, pairing and firmware replies, and the Xbox
+  360's XInput answers, out of the driver: FlexInput now supplies them itself,
+  compiled from HIDMaestro's own device data, so the pads answer exactly as
+  before.
+
 ### Fixed
+
+- **FlexInput no longer disturbs other programs that use HIDMaestro.** With
+  another HIDMaestro program installed (PadForge, say), FlexInput replaced that
+  program's newer driver with its own at every start, and with "Keep virtual
+  controllers alive" off it removed every HIDMaestro device on the machine,
+  that program's included. Now a newer driver, or the same one signed by
+  another program, stays, and FlexInput only cleans up its own devices.
+
+- **The virtual DualSense's lightbar and LEDs hold when a game reads the pad's
+  settings.** Each feature report a game read passed an empty report to the
+  feedback decoder, which could reset the decoded lightbar and player LEDs.
 
 - **The polling rate is actually reached.** The I/O loop waited a full period
   after every wake-up, and every wake-up comes slightly late, so each pass lost

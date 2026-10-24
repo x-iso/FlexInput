@@ -130,7 +130,9 @@ fn run_input(args: &[String]) {
 fn run_create_input(args: &[String]) {
     let index = parse_index(args);
     let base = parse_report(args);
-    let mut section = match InputSection::create(index) {
+    // Tag 0: no identity, so the driver serves the device without the v2.0
+    // contract, from the index in its hardware key.
+    let mut section = match InputSection::create(index, 0) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("create input section {index} failed: {e}");
@@ -235,13 +237,14 @@ fn run_create(args: &[String]) {
 
     // Pre-create the Global\ sections (elevated) so the driver can OpenFileMapping
     // them once it binds.
-    let _input = InputSection::create(index).unwrap_or_else(|e| {
+    let _input = InputSection::create(index, 0).unwrap_or_else(|e| {
         eprintln!("create input section failed: {e} (run elevated)");
         std::process::exit(1);
     });
     let _output = OutputSection::create(index);
 
-    match create_device_node(&profile, &inf, index, "probe") {
+    let token = flexinput_hidmaestro::identity::new_token();
+    match create_device_node(&profile, &inf, index, "probe", &token) {
         Ok(dev) => {
             println!("CREATED instance_id={} controller_index={}", dev.instance_id, dev.controller_index);
             println!("(keeping section handles alive; Ctrl-C after verifying. inf={inf})");

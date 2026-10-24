@@ -41,7 +41,6 @@ const GUID_DEVINTERFACE_XUSB: Guid = Guid {
 };
 
 // SetupAPI / CfgMgr constants.
-const DICD_GENERATE_ID: u32 = 0x0000_0001;
 const SPDRP_HARDWAREID: u32 = 0x0000_0001;
 const DIF_REGISTERDEVICE: u32 = 0x0000_0019;
 const DIF_REMOVE: u32 = 0x0000_0005;
@@ -670,15 +669,21 @@ pub struct CreatedDevice {
 /// binding the HIDMaestro driver at `inf_path`. Requires elevation.
 ///
 /// Port of the plain-HID branch of `DeviceNodeCreator.CreateDeviceNode`:
-/// SetupDi create-info-list → create-device (`HIDClass`, generate id) → set
+/// SetupDi create-info-list → create-device (`ROOT\<enumerator>\<token>`) → set
 /// HardwareID multi-sz (`root\VID_xxxx&PID_yyyy`, `root\HIDMaestro`) →
-/// `DIF_REGISTERDEVICE` → locate our new node → write `ControllerIndex` →
+/// `DIF_REGISTERDEVICE` → write `ControllerIndex` →
 /// `UpdateDriverForPlugAndPlayDevicesW`.
+///
+/// The instance ID ends in the controller's identity `token`
+/// ([`crate::identity`]), which the driver reads at add to find the index and
+/// check the version contract. The caller writes the identity entry and the
+/// version section's tag first.
 pub fn create_device_node(
     profile: &Profile,
     inf_path: &str,
     controller_index: u32,
     device_id: &str,
+    token: &str,
 ) -> Result<CreatedDevice, OrchestratorError> {
     let desc = &profile.name;
     // The main HID node is the gamepad's HID identity. For an Xbox360-family
@@ -731,16 +736,20 @@ pub fn create_device_node(
         // Ensure the info list is always destroyed.
         let _guard = DisGuard(dis);
 
+        // A full instance ID, not DICD_GENERATE_ID: the token in its last
+        // segment is how the v2.0 driver finds this controller (a generated
+        // `0000` would be shared by our nodes under different enumerators).
+        let instance_id = format!(r"ROOT\{enumerator}\{token}");
         let mut devinfo = new_devinfo();
-        let w_enum = to_wide(enumerator);
+        let w_id = to_wide(&instance_id);
         let w_desc = to_wide(desc);
         if SetupDiCreateDeviceInfoW(
             dis,
-            w_enum.as_ptr(),
+            w_id.as_ptr(),
             &class_guid,
             w_desc.as_ptr(),
             std::ptr::null_mut(),
-            DICD_GENERATE_ID,
+            0,
             &mut devinfo,
         ) == 0
         {
@@ -787,9 +796,15 @@ pub fn create_device_node(
             ));
         }
 
-        // Locate the node we just created (the first HIDMaestro-owned node
-        // under ROOT\HIDClass without a ControllerIndex) and stamp it.
-        let instance_id = claim_new_node(enumerator, controller_index)?;
+        // The index in the node's hardware key too, before its driver is bound:
+        // the driver falls back to it when the contract doesn't hold, and v2.0
+        // programs read it to keep off this index.
+        {
+            use registry::*;
+            let dp = format!(r"SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters");
+            write_dword(HKLM, &dp, "ControllerIndex", controller_index)
+                .map_err(|e| OrchestratorError::Win32("write ControllerIndex", e))?;
+        }
 
         // Bind the HIDMaestro driver to the new hardware id.
         let w_hw = to_wide(&hw_id);
@@ -870,24 +885,6 @@ fn container_id_for(controller_index: u32) -> String {
     )
 }
 
-/// Monotonic per-process sequence so every `SwDeviceCreate` gets a UNIQUE
-/// instance-id suffix. Required: Windows keeps a sticky per-(container+suffix)
-/// record after teardown; a subsequent create with an identical tuple takes a
-/// fast "re-enumerate" path that leaves the devnode an EMPTY SHELL (no driver
-/// bound, no XUSB interface). A fresh suffix every create dodges it.
-static SWD_CREATE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Build the unique SWD instance-id suffix: `<pidhex><seqhex>_<ctrlidx:04>`
-/// (mirrors upstream `DeviceOrchestrator.NextSwdSuffix` intent — a session-unique
-/// prefix + per-create counter + the controller index for human-readable teardown
-/// matching). The companion is found by `ControllerIndex` in Device Parameters, not
-/// by suffix, so varying the suffix per call is transparent to teardown.
-fn next_swd_suffix(controller_index: u32) -> String {
-    let pid = std::process::id();
-    let seq = SWD_CREATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{pid:08X}{seq:04X}_{controller_index:04}")
-}
-
 /// Create the XUSB/XInput **companion** devnode for an Xbox360-family profile via
 /// in-process [`swd_create`] (`SwDeviceCreate`), matching the shipping HIDMaestro
 /// design (`DeviceOrchestrator.CreateXusbCompanion`). Requires elevation.
@@ -911,10 +908,18 @@ fn next_swd_suffix(controller_index: u32) -> String {
 ///
 /// The `_xusb_inf_path` is unused (the INF binds from the DriverStore); kept for
 /// signature stability. Returns `(instance_id, owning handle)`.
+///
+/// The instance suffix is the controller's identity `token`, the same as its HID
+/// node's: the v2.0 companion reads its answers, and registers its XInput
+/// interface, only when the version section carries its own token's tag. Unique
+/// per create, it also dodges the sticky per-(container+suffix) record Windows
+/// keeps after teardown, which turned a create with an identical tuple into an
+/// EMPTY SHELL (no driver bound, no XUSB interface).
 pub fn create_xusb_companion_node(
     profile: &Profile,
     _xusb_inf_path: &str,
     controller_index: u32,
+    token: &str,
 ) -> Result<(String, SwdHandle), OrchestratorError> {
     let vid = format!("{:04X}", profile.vid);
     let pid = format!("{:04X}", profile.pid);
@@ -932,10 +937,9 @@ pub fn create_xusb_companion_node(
         "USB\\Class_FF",
     ];
     let container = container_id_for(controller_index);
-    let suffix = next_swd_suffix(controller_index);
 
     let (instance_id, handle) =
-        swd_create("HIDMAESTRO", &suffix, &container, &hw_ids, &compat_ids, &desc, true)?;
+        swd_create("HIDMAESTRO", token, &container, &hw_ids, &compat_ids, &desc, true)?;
 
     // The driver reads ControllerIndex from Device Parameters at startup to attach
     // to the right shared section (Global\HIDMaestroInput<N>).
@@ -946,8 +950,9 @@ pub fn create_xusb_companion_node(
     }
 
     // SwDeviceCreate(DriverRequired) binds the INF synchronously, but the XUSB
-    // interface coinstaller can lag a few seconds after the callback. Wait for the
-    // {EC87F1E3} interface to actually publish on this node before returning.
+    // interface, which the v2.0 companion registers itself as it starts, can lag
+    // a few seconds after the callback. Wait for the {EC87F1E3} interface to
+    // actually publish on this node before returning.
     for _ in 0..30 {
         if count_xusb_interfaces(Some(&instance_id)) >= 1 {
             break;
@@ -988,12 +993,17 @@ const OWN_CONTAINER_ENUMERATOR: &str = "HIDMAESTRO_KBM";
 ///
 /// Returns whether that restart was needed, for the helper log.
 ///
+/// The instance suffix is the controller's identity `token`. The v2.0 driver
+/// reads the index from the identity entry before its first start, so the
+/// watcher's write is only the fallback now.
+///
 /// **Lifetime:** like the XUSB companion, the returned [`SwdHandle`] owns the
 /// node; dropping it removes the node.
 pub fn create_own_container_node(
     profile: &Profile,
     controller_index: u32,
     device_id: &str,
+    token: &str,
 ) -> Result<(CreatedDevice, SwdHandle, bool), OrchestratorError> {
     write_instance_config(profile, controller_index, device_id, profile.function_mode);
 
@@ -1005,7 +1015,7 @@ pub fn create_own_container_node(
         .or(profile.product_string.as_deref())
         .unwrap_or(&profile.name);
     let container = container_id_for(controller_index);
-    let suffix = next_swd_suffix(controller_index);
+    let suffix = token;
     let expected_id = format!(r"SWD\{OWN_CONTAINER_ENUMERATOR}\{suffix}");
     let stop = std::sync::atomic::AtomicBool::new(false);
     let (created, early) = std::thread::scope(|s| {
@@ -1527,45 +1537,6 @@ fn wait_for_hid_child(instance_id: &str, timeout_ms: u64) -> bool {
     }
 }
 
-/// Find the freshly-created HIDMaestro node under `ROOT\<enumerator>` and write
-/// its `ControllerIndex`. Mirrors the post-DIF_REGISTERDEVICE registry walk in
-/// `CreateDeviceNode`: the first present, HIDMaestro-owned node lacking a
-/// `ControllerIndex` is the one we just made.
-fn claim_new_node(enumerator: &str, controller_index: u32) -> Result<String, OrchestratorError> {
-    use registry::*;
-    let base = format!(r"SYSTEM\CurrentControlSet\Enum\ROOT\{enumerator}");
-    let subkeys = enum_subkeys(HKLM, &base).unwrap_or_default();
-    for inst in subkeys {
-        let instance_id = format!(r"ROOT\{enumerator}\{inst}");
-        // Must be present.
-        if unsafe {
-            CM_Locate_DevNodeW(
-                &mut 0u32,
-                to_wide(&instance_id).as_ptr(),
-                CM_LOCATE_DEVNODE_NORMAL,
-            )
-        } != CR_SUCCESS
-        {
-            continue;
-        }
-        // Must be HIDMaestro-owned (HardwareID multi-sz contains "HIDMaestro").
-        if !node_is_hidmaestro_owned(&instance_id) {
-            continue;
-        }
-        let dp = format!(r"{base}\{inst}\Device Parameters");
-        if read_dword(HKLM, &dp, "ControllerIndex").is_some() {
-            continue; // already claimed
-        }
-        write_dword(HKLM, &dp, "ControllerIndex", controller_index)
-            .map_err(|e| OrchestratorError::Win32("write ControllerIndex", e))?;
-        return Ok(instance_id);
-    }
-    Err(OrchestratorError::NodeNotFound)
-}
-
-/// Find the freshly-created XUSB companion node under `ROOT\System` and stamp its
-/// `ControllerIndex`. Like [`claim_new_node`] but scoped to System + nodes whose
-/// HardwareID carries the XUSB tag, so it never collides with the HIDClass claim.
 /// True if the node's HardwareID multi-sz contains the "HIDMaestro" ownership
 /// tag. Port of the conservative `DeviceManager.IsHidMaestroOwned` check.
 fn node_is_hidmaestro_owned(instance_id: &str) -> bool {
@@ -1595,30 +1566,43 @@ pub fn write_instance_config(
 ) {
     use registry::*;
     let path = format!(r"SOFTWARE\HIDMaestro\Controller{controller_index}");
-    let instance_suffix = format!("\\{controller_index:04}");
-    let device_instance_id = format!(
-        // Must mirror the enumerator string create_device_node builds (IG_01 —
-        // see the xinputhid.inf note there).
-        "ROOT\\VID_{:04X}&PID_{:04X}&IG_01{instance_suffix}",
-        profile.vid, profile.pid
-    );
     let display_name = profile
         .device_description
         .as_deref()
         .or(profile.product_string.as_deref())
         .unwrap_or("HIDMaestro Controller");
 
+    // Written anew on every create, as HIDMaestro's SDK does
+    // (`DeviceOrchestrator.WriteInstanceConfig`): no value another profile left
+    // on this index survives — an Xbox 360's XusbAnswers on a DualSense's index,
+    // say. VendorId and ProductId first: another program's sweep reads them from
+    // a configuration a create may still be writing.
+    delete_tree(HKLM, &path);
     // Best-effort: each write is independent; a failure on one shouldn't abort
     // creation (the driver tolerates some missing optional values).
-    let _ = write_string(HKLM, &path, "DeviceInstanceId", &device_instance_id);
+    let _ = write_dword(HKLM, &path, "VendorId", profile.vid as u32);
+    let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
     // FlexInput's own ownership tag: which app-side device id owns this index, so
     // we can reclaim the right device across runs (and which index is free).
     let _ = write_string(HKLM, &path, "FlexInputDeviceId", device_id);
     let _ = write_dword(HKLM, &path, "FunctionMode", function_mode);
+    // The XUSB companion's replies (v2.0): without them, read only under the
+    // version contract, the companion registers no XInput interface.
+    if profile.requires_xusb_companion {
+        let answers = crate::answers::xusb_answers(profile.vid, profile.pid, controller_index);
+        let _ = write_binary(HKLM, &path, "XusbAnswers", &answers);
+        let _ = write_dword(HKLM, &path, "XusbCompanion", 1);
+    }
     let _ = write_binary(HKLM, &path, "ReportDescriptor", &profile.descriptor);
-    let _ = write_dword(HKLM, &path, "VendorId", profile.vid as u32);
-    let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
     let _ = write_dword(HKLM, &path, "VersionNumber", profile.version_number);
+    // v2.0, read only under the version contract and both required there: the
+    // GET_FEATURE answers (the Sony calibration, pairing and firmware reports),
+    // the header alone for a profile without, and the input report IDs a polled
+    // GET_INPUT_REPORT answers from a cache of their own — none of ours, so every
+    // frame, as the v1 driver did.
+    let features = crate::answers::feature_answers(profile.vid, profile.pid, controller_index);
+    let _ = write_binary(HKLM, &path, "FeatureAnswers", &features);
+    let _ = write_binary(HKLM, &path, "CachedInputReportIds", &[]);
     if let Some(ps) = profile.product_string.as_deref() {
         // Clean product string ("Wireless Controller") so games see a faithful
         // DualSense/DS4. We do NOT mark it: the input enumerator distinguishes our
@@ -1782,13 +1766,31 @@ fn scan_enumerator(enumerator: &str) -> Vec<ExistingDevice> {
     out
 }
 
-/// Remove every HIDMaestro-owned device node currently present. Returns the
-/// number of nodes removed. Used for orphan cleanup when persistence is off
-/// (on startup, and on parent-death teardown). Best-effort: a failure on one
-/// node doesn't stop the others.
+/// Whether a HIDMaestro devnode is FlexInput's: its instance ID ends in one of
+/// FlexInput's identity tokens ([`crate::identity`]), or — a node from before
+/// tokens — its index's configuration names the FlexInput device that owns it.
+/// Another HIDMaestro program's devices are never FlexInput's to sweep.
+pub fn is_flexinput_device(d: &ExistingDevice) -> bool {
+    crate::identity::is_ours(crate::identity::token_of(&d.instance_id)) || !d.device_id.is_empty()
+}
+
+/// Remove every HIDMaestro-owned device node currently present, any program's.
+/// Returns the number of nodes removed. Only for replacing or removing the
+/// driver package, which nothing may stay bound to. Best-effort: a failure on
+/// one node doesn't stop the others.
 pub fn remove_all_hidmaestro_devices() -> usize {
+    remove_devices(|_| true)
+}
+
+/// Remove FlexInput's own HIDMaestro device nodes ([`is_flexinput_device`]):
+/// the orphan cleanup when persistence is off. Leaves another program's alone.
+pub fn remove_flexinput_devices() -> usize {
+    remove_devices(is_flexinput_device)
+}
+
+fn remove_devices(which: impl Fn(&ExistingDevice) -> bool) -> usize {
     let mut removed = 0;
-    let devices = list_hidmaestro_devices();
+    let devices: Vec<ExistingDevice> = list_hidmaestro_devices().into_iter().filter(|d| which(d)).collect();
 
     // SWD companion orphans are removed by an out-of-process `pnputil
     // /remove-device` each — a ~100-300ms subprocess. Kick them ALL off
@@ -1853,13 +1855,17 @@ pub fn remove_all_hidmaestro_devices() -> usize {
 /// own sweep is harmless — whichever removes a node first, both then observe it
 /// gone. A node we don't manage to clear within the timeout is left for the
 /// per-`Create` reclaim path rather than blocking startup forever.
-pub fn clear_hidmaestro_devices_and_wait(timeout: std::time::Duration) -> bool {
+///
+/// `ours_only` limits it to FlexInput's devices ([`is_flexinput_device`]), as
+/// every sweep but a driver replacement must be.
+pub fn clear_hidmaestro_devices_and_wait(timeout: std::time::Duration, ours_only: bool) -> bool {
     let deadline = std::time::Instant::now() + timeout;
+    let which = |d: &ExistingDevice| !ours_only || is_flexinput_device(d);
     loop {
-        let n = remove_all_hidmaestro_devices();
+        let n = remove_devices(which);
         // Re-enumerate AFTER removing: removal/CM teardown can lag, and the old
         // helper may still be releasing handles, so a node can linger one round.
-        let remaining = list_hidmaestro_devices().len();
+        let remaining = list_hidmaestro_devices().iter().filter(|d| which(d)).count();
         if remaining == 0 {
             return true;
         }
@@ -2204,6 +2210,14 @@ pub(crate) mod registry {
         fn RegSetValueExW(
             key: *mut c_void, name: *const u16, reserved: u32, ty: u32, data: *const u8, data_len: u32,
         ) -> i32;
+        fn RegDeleteTreeW(key: *mut c_void, sub: *const u16) -> i32;
+    }
+
+    /// Delete a key and everything under it. Best-effort: a key that isn't
+    /// there is already deleted.
+    pub fn delete_tree(root: *mut c_void, path: &str) {
+        let w = wide(path);
+        unsafe { RegDeleteTreeW(root, w.as_ptr()) };
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -2421,18 +2435,6 @@ mod tests {
         // don't collapse into one PnP container).
         assert_ne!(container_id_for(0), container_id_for(1));
         assert_ne!(container_id_for(2), container_id_for(3));
-    }
-
-    #[test]
-    fn swd_suffix_is_unique_and_well_formed() {
-        // Fresh suffix every call (sticky-container fast-path dodge) and the
-        // controller index is preserved in the human-readable tail.
-        let a = next_swd_suffix(0);
-        let b = next_swd_suffix(0);
-        assert_ne!(a, b, "consecutive suffixes must differ");
-        assert!(a.ends_with("_0000"), "suffix tail encodes ctrl index: {a}");
-        let c = next_swd_suffix(3);
-        assert!(c.ends_with("_0003"), "suffix tail encodes ctrl index: {c}");
     }
 
     #[test]

@@ -3,10 +3,25 @@
 //! Layout is a verbatim transcription of
 //! `sdk/HIDMaestro.Core/Internal/SharedMemoryIO.cs` (`@main`, 2026-06-11), which
 //! the file's own header notes must match `driver/driver.h`. Rechecked against
-//! v1.7.3, the vendored driver: both section layouts are unchanged. That release
+//! v2.0.1, the vendored driver: the input and output layouts are unchanged. v1.7.3
 //! added the companion input doorbell (see `InputSection::write_frame`), and its
-//! producers now reserve an output slot before publishing it, which the reader
-//! below already treats as "nothing new yet".
+//! producers reserve an output slot before publishing it, which the reader below
+//! already treats as "nothing new yet". v2.0.0 added the version section and the
+//! objects beside the input section ([`InputSection::create`]):
+//!
+//! ```text
+//! Global\HIDMaestroInputAck{i}       688 bytes, delivery acknowledgement (v1.12.0)
+//! Global\HIDMaestroInputAckEvent{i}  its doorbell, signalled by the driver
+//! Global\HIDMaestroRemoveEvent{i}    ask the driver to fail its device (protocol 5)
+//! Global\HIDMaestroRemovedEvent{i}   its answer
+//! Global\HIDMaestroVersion{i}        64 bytes, HIDMAESTRO_VERSION_INFO:
+//!   off 0  i32 LayoutVersion (1)   off 4 i32 SdkProtocolMin   off 8 i32 SdkProtocolMax
+//!   off 12 u16[4] SdkVersion       off 20 i32 DriverProtocol  off 24 u16[4] DriverVersion
+//!   off 32 i32 DriverCapabilities  off 36 i32 DriverProtocolMin
+//!   off 40 i32 CompanionProtocol   off 44 i32 CompanionProtocolMin
+//!   off 48 u64 IdentityTag         off 56 i32 DriverConfigError
+//!   off 60 i32 CompanionConfigError
+//! ```
 //!
 //! ## Input section `Global\HIDMaestroInput{i}` — 362 bytes, seqlock writer
 //! ```text
@@ -59,6 +74,30 @@ const OUTPUT_SLOT_OFFSET_SOURCE: usize = 4;
 const OUTPUT_SLOT_OFFSET_REPORT_ID: usize = 5;
 const OUTPUT_SLOT_OFFSET_SIZE: usize = 6;
 const OUTPUT_SLOT_OFFSET_DATA: usize = 8;
+
+// ── v2.0 objects beside the input section (driver.h, hm_contract.h) ─────────
+/// `Global\HIDMaestroInputAck{i}`, `HIDMAESTRO_INPUT_ACK`: DeliveredSeqNo,
+/// Capabilities, ReleaseSeq and ReleaseCount, then 8 release frames of a u32
+/// size and 80 bytes.
+const INPUT_ACK_SIZE: usize = 16 + 8 * (4 + 80);
+/// `Global\HIDMaestroVersion{i}`, `HIDMAESTRO_VERSION_INFO`.
+const VERSION_INFO_SIZE: usize = 64;
+const VERSION_OFFSET_LAYOUT: usize = 0;
+const VERSION_OFFSET_SDK_PROTOCOL_MIN: usize = 4;
+const VERSION_OFFSET_SDK_PROTOCOL_MAX: usize = 8;
+const VERSION_OFFSET_SDK_VERSION: usize = 12;
+const VERSION_OFFSET_DRIVER_PROTOCOL: usize = 20;
+const VERSION_OFFSET_DRIVER_VERSION: usize = 24;
+const VERSION_OFFSET_COMPANION_PROTOCOL: usize = 40;
+const VERSION_OFFSET_IDENTITY_TAG: usize = 48;
+const VERSION_OFFSET_DRIVER_CONFIG_ERROR: usize = 56;
+const VERSION_OFFSET_COMPANION_CONFIG_ERROR: usize = 60;
+const VERSION_LAYOUT: u32 = 1;
+/// The protocol FlexInput speaks, both ends of its range: 4, the version
+/// contract (v2.0.0). The v2.0 HID driver serves 4 and 5, the companion 4.
+const SDK_PROTOCOL: u32 = 4;
+/// The HIDMaestro release whose SDK FlexInput's half stands in for.
+const SDK_VERSION: [u16; 3] = [2, 0, 1];
 
 /// SDDL for the `Global\` sections + events shared between the elevated helper
 /// (which CREATES them) and the normally-launched, unelevated app (which OPENS
@@ -264,6 +303,16 @@ impl MappedSection {
         debug_assert!(off + 4 <= self.size);
         std::ptr::write_unaligned(self.view.add(off) as *mut u32, v);
     }
+    #[inline]
+    unsafe fn write_u16(&self, off: usize, v: u16) {
+        debug_assert!(off + 2 <= self.size);
+        std::ptr::write_unaligned(self.view.add(off) as *mut u16, v);
+    }
+    #[inline]
+    unsafe fn write_u64(&self, off: usize, v: u64) {
+        debug_assert!(off + 8 <= self.size);
+        std::ptr::write_unaligned(self.view.add(off) as *mut u64, v);
+    }
     /// Volatile store of the seqlock SeqNo (always at offset 0, page-aligned).
     /// Volatile so the compiler can't elide or reorder the odd→payload→even
     /// publish sequence; the fences in the writer pair with the readers' loads.
@@ -404,26 +453,110 @@ pub struct InputSection {
     /// companion works without it (on its 8 ms timer), so a failure to create or
     /// open it must not take the device down with it.
     companion_event: Option<EventHandle>,
+    /// The v2.0 objects beside the section, held by the side that created it
+    /// (the elevated helper). `None` when opened.
+    driver_objects: Option<DriverObjects>,
     seq_no: u32,
 }
 
+/// The objects a v2.0 driver opens beside the input section when the input
+/// event first opens: the delivery acknowledgement and its event, the remove
+/// events, and the version section. Held for the controller's life.
+struct DriverObjects {
+    _input_ack: MappedSection,
+    _input_ack_event: EventHandle,
+    _remove_event: EventHandle,
+    _removed_event: EventHandle,
+    version: MappedSection,
+}
+
+/// What the drivers wrote into a controller's version section (driver.c
+/// `AnnounceVersion`, companion.c `CompanionDeviceAdd`). Zero until each has
+/// started; a config error is written before a failed start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverHalf {
+    /// The HID driver's protocol (5 for v2.0.x), 0 until it has written its half.
+    pub driver_protocol: u32,
+    pub driver_version: [u16; 3],
+    /// `HIDMAESTRO_CONFIG_ERROR_*`: 1 FeatureAnswers, 2 CachedInputReportIds,
+    /// 3 LiveFeatureReport.
+    pub driver_config_error: u32,
+    /// The XUSB companion's protocol: nonzero only once it started under the
+    /// contract, which is also when it registers its XInput interface.
+    pub companion_protocol: u32,
+    /// 1 when it couldn't read XusbAnswers.
+    pub companion_config_error: u32,
+}
+
 impl InputSection {
-    /// Create the input section + signaling events for `controller_index`.
+    /// Create the input section, its events and the v2.0 objects beside it for
+    /// `controller_index`, in the order HIDMaestro's SDK makes them
+    /// (`SharedMemoryIO.EnsureInputMapping`): the driver's worker opens the
+    /// acknowledgement and the version section once, when the input event first
+    /// opens, so that event comes last. `identity_tag` ([`crate::identity::tag`])
+    /// goes into the version section before any PnP work: the driver reads the
+    /// controller's v2.0 values only when it carries its devnode's own tag.
+    ///
     /// Requires the caller to hold `SeCreateGlobalPrivilege` (i.e. run elevated)
-    /// — WUDFHost cannot create `Global\` objects itself. For the Phase-1 gate,
-    /// prefer [`open`](Self::open) against a C#-created section instead.
-    pub fn create(controller_index: u32) -> Result<Self, ShmError> {
-        let section = MappedSection::create(
-            &format!(r"Global\HIDMaestroInput{controller_index}"),
-            SHARED_INPUT_SIZE,
-        )?;
-        let event = EventHandle::create(&format!(r"Global\HIDMaestroInputEvent{controller_index}"))?;
-        // A second event rather than sharing the one above: the HID driver's
+    /// — WUDFHost cannot create `Global\` objects itself.
+    pub fn create(controller_index: u32, identity_tag: u64) -> Result<Self, ShmError> {
+        let i = controller_index;
+        let section = MappedSection::create(&format!(r"Global\HIDMaestroInput{i}"), SHARED_INPUT_SIZE)?;
+        // A second event rather than sharing the input event: the HID driver's
         // worker consumes that auto-reset event, and one auto-reset event can't
         // wake two waiters. Created here, by the elevated helper, for the same
         // reason as the section — the unelevated app can only open `Global\` names.
-        let companion_event = EventHandle::create(&companion_event_name(controller_index)).ok();
-        Ok(InputSection { section, event, companion_event, seq_no: 0 })
+        let companion_event = EventHandle::create(&companion_event_name(i)).ok();
+        let input_ack = MappedSection::create(&format!(r"Global\HIDMaestroInputAck{i}"), INPUT_ACK_SIZE)?;
+        let input_ack_event = EventHandle::create(&format!(r"Global\HIDMaestroInputAckEvent{i}"))?;
+        let remove_event = EventHandle::create(&format!(r"Global\HIDMaestroRemoveEvent{i}"))?;
+        let removed_event = EventHandle::create(&format!(r"Global\HIDMaestroRemovedEvent{i}"))?;
+        let version = MappedSection::create(&format!(r"Global\HIDMaestroVersion{i}"), VERSION_INFO_SIZE)?;
+        // SAFETY: every offset is inside the 64-byte section just mapped.
+        unsafe {
+            version.write_u32(VERSION_OFFSET_LAYOUT, VERSION_LAYOUT);
+            version.write_u32(VERSION_OFFSET_SDK_PROTOCOL_MIN, SDK_PROTOCOL);
+            version.write_u32(VERSION_OFFSET_SDK_PROTOCOL_MAX, SDK_PROTOCOL);
+            for (k, part) in SDK_VERSION.iter().enumerate() {
+                version.write_u16(VERSION_OFFSET_SDK_VERSION + 2 * k, *part);
+            }
+            version.write_u64(VERSION_OFFSET_IDENTITY_TAG, identity_tag);
+        }
+        fence(Ordering::SeqCst);
+        let event = EventHandle::create(&format!(r"Global\HIDMaestroInputEvent{i}"))?;
+        Ok(InputSection {
+            section,
+            event,
+            companion_event,
+            driver_objects: Some(DriverObjects {
+                _input_ack: input_ack,
+                _input_ack_event: input_ack_event,
+                _remove_event: remove_event,
+                _removed_event: removed_event,
+                version,
+            }),
+            seq_no: 0,
+        })
+    }
+
+    /// The drivers' half of the version section, on the side that created it.
+    pub fn driver_half(&self) -> Option<DriverHalf> {
+        let v = &self.driver_objects.as_ref()?.version;
+        // SAFETY: every offset is inside the 64-byte section. The drivers write
+        // each word with an interlocked store.
+        unsafe {
+            Some(DriverHalf {
+                driver_protocol: v.read_u32(VERSION_OFFSET_DRIVER_PROTOCOL),
+                driver_version: [
+                    v.read_u16(VERSION_OFFSET_DRIVER_VERSION),
+                    v.read_u16(VERSION_OFFSET_DRIVER_VERSION + 2),
+                    v.read_u16(VERSION_OFFSET_DRIVER_VERSION + 4),
+                ],
+                driver_config_error: v.read_u32(VERSION_OFFSET_DRIVER_CONFIG_ERROR),
+                companion_protocol: v.read_u32(VERSION_OFFSET_COMPANION_PROTOCOL),
+                companion_config_error: v.read_u32(VERSION_OFFSET_COMPANION_CONFIG_ERROR),
+            })
+        }
     }
 
     /// Open an input section + events already created by another process
@@ -438,7 +571,7 @@ impl InputSection {
         // Resume from whatever sequence the section currently holds so the driver
         // (which tracks last-seen SeqNo) sees our first write as a real change.
         let seq_no = unsafe { section.read_u32(0) };
-        Ok(InputSection { section, event, companion_event, seq_no })
+        Ok(InputSection { section, event, companion_event, driver_objects: None, seq_no })
     }
 
     /// Publish one legacy input frame (Report-ID stripped `report`), optionally
@@ -686,5 +819,19 @@ mod tests {
         assert_eq!(SHARED_INPUT_SIZE, 362);
         assert_eq!(OUTPUT_SLOT_SIZE, 264);
         assert_eq!(SHARED_OUTPUT_SIZE, 16904);
+    }
+
+    #[test]
+    fn v2_layouts_match_driver_h_and_hm_contract_h() {
+        // sizeof(HIDMAESTRO_INPUT_ACK): four LONGs, 8 frames of ULONG + 80 bytes.
+        assert_eq!(INPUT_ACK_SIZE, 688);
+        // hm_contract.h's C_ASSERTs.
+        assert_eq!(VERSION_INFO_SIZE, 64);
+        assert_eq!(VERSION_OFFSET_IDENTITY_TAG, 48);
+        assert_eq!(VERSION_OFFSET_DRIVER_CONFIG_ERROR, 56);
+        // The rest follow from the struct's packing.
+        assert_eq!(VERSION_OFFSET_SDK_VERSION + 8, VERSION_OFFSET_DRIVER_PROTOCOL);
+        assert_eq!(VERSION_OFFSET_DRIVER_VERSION + 8 + 4 + 4, VERSION_OFFSET_COMPANION_PROTOCOL);
+        assert_eq!(VERSION_OFFSET_COMPANION_CONFIG_ERROR + 4, VERSION_INFO_SIZE);
     }
 }

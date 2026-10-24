@@ -21,6 +21,7 @@
 
 #![cfg(windows)]
 
+pub mod answers;
 pub mod deploy;
 pub mod descriptor;
 pub mod encode;
@@ -29,6 +30,7 @@ pub mod helper;
 #[cfg(windows)]
 pub mod hidhide;
 pub mod helper_ipc;
+pub mod identity;
 pub mod install;
 pub mod orchestrator;
 pub mod profile;

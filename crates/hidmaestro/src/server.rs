@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use crate::deploy::ensure_driver_installed;
 use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
+use crate::identity;
 use crate::orchestrator::{
     clear_hidmaestro_devices_and_wait, create_device_node, create_own_container_node,
     create_xusb_companion_node, list_hidmaestro_devices, remove_all_hidmaestro_devices,
@@ -106,6 +107,9 @@ struct LiveDevice {
     _output: Option<OutputSection>,
     index: u32,
     device_id: String,
+    /// The controller's identity token, the last segment of every one of its
+    /// devnodes' instance IDs ([`identity`]); its identity entry goes with it.
+    token: String,
     /// For Xbox360/XInput pads: the XUSB companion node's instance id (under
     /// `SWD\HIDMAESTRO`), created alongside the HID node. `None` for plain-HID pads.
     companion_instance_id: Option<String>,
@@ -195,6 +199,7 @@ impl HelperState {
                 if dev.node_handle.is_none() {
                     let _ = batch.remove(&id);
                 }
+                identity::delete_entry(&dev.token);
             }
         }
     }
@@ -273,8 +278,11 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // so they're cleared (and recreated later) when a reinstall is needed. Later
     // starts find the install current and only confirm no legacy cert is trusted.
     use crate::deploy::Reconcile;
+    // Every program's devices, not only ours: nothing may stay bound to a
+    // package being replaced. (A reinstall only happens for an older driver or
+    // our own legacy signature — see `deploy::installed_driver`.)
     let clear_devices = || {
-        if !crate::orchestrator::clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(15)) {
+        if !crate::orchestrator::clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(15), false) {
             diag_log("[helper] driver: device nodes still present after 15 s; reinstalling anyway");
         }
     };
@@ -287,6 +295,9 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
             "[helper] driver: reinstalled (was {from:?}) with this build's HIDMaestro, signed by \
              this machine's certificate; virtual devices will be recreated"
         )),
+        Reconcile::KeptNewer => diag_log(
+            "[helper] driver: kept the newer HIDMaestro driver another program installed",
+        ),
         Reconcile::Skipped => diag_log(
             "[helper] driver: check skipped (driver half-installed, or its INFs or catalogs unreadable)",
         ),
@@ -557,10 +568,22 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 // and orphan a half-removed node. Idempotent vs the old helper's
                 // own sweep. Bounded so a stuck node can't hang startup; an
                 // un-cleared node falls to the per-Create reclaim path.
-                let clear = clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(5));
+                //
+                // FlexInput's leftovers only: another HIDMaestro program
+                // (PadForge, say) may be running its controllers right now.
+                let clear = clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(5), true);
                 diag_log(&format!(
                     "[helper] hello (startup): persist off; swept leftovers, clear={clear}"
                 ));
+            }
+            if first {
+                // Identity entries a crashed or killed helper left: ours whose
+                // token no devnode still carries.
+                let present = list_hidmaestro_devices();
+                let n = identity::sweep_stale(present.iter().map(|d| identity::token_of(&d.instance_id)));
+                if n > 0 {
+                    diag_log(&format!("[helper] hello (startup): removed {n} stale identity entr(y/ies)"));
+                }
             }
             // A live toggle changes only the EXIT policy (read at exit /
             // parent-death). It must NOT tear down a device the user is using
@@ -790,10 +813,21 @@ fn handle_create(
         .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion
             && d.vid == profile.vid && d.pid == profile.pid && !wrong_kind(d))
     {
-        let mut input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
+        // The node keeps the token it was created with; its version section
+        // and identity entry are made again for it before its driver re-opens
+        // the section.
+        let token = identity::token_of(&found.instance_id).to_string();
+        let mut input = match InputSection::create(found.index, identity::tag(&token))
+            .or_else(|_| InputSection::open(found.index))
+        {
             Ok(s) => s,
             Err(e) => return Response::err(format!("reclaim input section idx={}: {e}", found.index)),
         };
+        if identity::is_ours(&token) {
+            if let Err(e) = identity::write_entry(&token, found.index) {
+                diag_log(&format!("[helper] reclaim: identity entry for {token} failed (err {e})"));
+            }
+        }
         // Seed a neutral, full-battery frame (same rationale as the create path)
         // so a host reading right after reclaim doesn't catch a zeroed section.
         {
@@ -825,6 +859,7 @@ fn handle_create(
                     _output: output,
                     index: found.index,
                     device_id: device_id.to_string(),
+                    token,
                     companion_instance_id,
                     _companion_handle: None,
                     node_handle: None,
@@ -848,7 +883,11 @@ fn handle_create(
     // present in the system and indices we already hold this session.
     let index = allocate_index(&existing, state, index_hint);
 
-    let mut input = match InputSection::create(index) {
+    // The controller's identity: every devnode of it ends in this token, and
+    // the version section carries its tag. Both, and the identity entry below,
+    // before any PnP work — the driver reads them at add (see `identity`).
+    let token = identity::new_token();
+    let mut input = match InputSection::create(index, identity::tag(&token)) {
         Ok(s) => s,
         Err(e) => return Response::err(format!("create input section idx={index}: {e}")),
     };
@@ -868,9 +907,14 @@ fn handle_create(
         input.write_frame(&neutral, gip.as_ref());
     }
     let output = OutputSection::create(index).ok();
+    if let Err(e) = identity::write_entry(&token, index) {
+        // The devnode still starts, from the index in its hardware key, but
+        // without the contract: no Sony feature answers, no XInput.
+        diag_log(&format!("[helper] identity entry for {token} idx={index} failed (err {e})"));
+    }
 
     let created = if profile.own_container {
-        create_own_container_node(&profile, index, device_id).map(|(dev, h, restarted)| {
+        create_own_container_node(&profile, index, device_id, &token).map(|(dev, h, restarted)| {
             diag_log(&format!(
                 "[helper] own-container node {} {}",
                 dev.instance_id,
@@ -883,7 +927,7 @@ fn handle_create(
             (dev, Some(h))
         })
     } else {
-        create_device_node(&profile, &inf.display().to_string(), index, device_id).map(|dev| (dev, None))
+        create_device_node(&profile, &inf.display().to_string(), index, device_id, &token).map(|dev| (dev, None))
     };
     match created {
         Ok((dev, node_handle)) => {
@@ -897,7 +941,7 @@ fn handle_create(
             if profile.requires_xusb_companion {
                 match installed_xusb_inf_path() {
                     Some(xusb_inf) => {
-                        match create_xusb_companion_node(&profile, &xusb_inf.display().to_string(), index) {
+                        match create_xusb_companion_node(&profile, &xusb_inf.display().to_string(), index, &token) {
                             Ok((cid, handle)) => {
                                 diag_log(&format!("[helper] created XUSB companion idx={index} instance={cid}"));
                                 companion_instance_id = Some(cid);
@@ -911,6 +955,11 @@ fn handle_create(
                     None => diag_log("[helper] XUSB companion INF not found; XInput off"),
                 }
             }
+            // What the drivers wrote back into the version section: their
+            // protocol once each started, and the value one couldn't read if a
+            // start failed. A companion protocol means it started under the
+            // contract, which is also when it registers its XInput interface.
+            let half = input.driver_half();
             if let Ok(mut devs) = state.devices.lock() {
                 devs.insert(
                     dev.instance_id.clone(),
@@ -919,7 +968,8 @@ fn handle_create(
                         _output: output,
                         index,
                         device_id: device_id.to_string(),
-                        companion_instance_id,
+                        token: token.clone(),
+                        companion_instance_id: companion_instance_id.clone(),
                         _companion_handle: companion_handle,
                         node_handle,
                     },
@@ -929,9 +979,26 @@ fn handle_create(
                 "[helper] created device_id={device_id} vid={:04x} pid={:04x} idx={index} instance={}",
                 profile.vid, profile.pid, dev.instance_id
             ));
+            if let Some(h) = half {
+                let [major, minor, patch] = h.driver_version;
+                let companion = if companion_instance_id.is_some() {
+                    format!(
+                        ", companion protocol {} config error {}",
+                        h.companion_protocol, h.companion_config_error
+                    )
+                } else {
+                    String::new()
+                };
+                diag_log(&format!(
+                    "[helper] contract idx={index} token={token}: driver {major}.{minor}.{patch} protocol {} \
+                     config error {}{companion}",
+                    h.driver_protocol, h.driver_config_error
+                ));
+            }
             Response::Created { instance_id: dev.instance_id, index }
         }
         Err(e) => {
+            identity::delete_entry(&token);
             diag_log(&format!("[helper] create FAILED device_id={device_id} idx={index}: {e}"));
             Response::err(format!("create device node: {e}"))
         }
@@ -1077,6 +1144,13 @@ fn handle_assign_xinput_slot(
 fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
     // Pull the tracked device first so we can also remove its XUSB companion.
     let tracked = state.devices.lock().ok().and_then(|mut devs| devs.remove(instance_id));
+    // The identity entry outlives the devnodes by a moment at most.
+    let token = identity::token_of(instance_id);
+    let forget = || {
+        if identity::is_ours(token) {
+            identity::delete_entry(token);
+        }
+    };
     if let Some(mut dev) = tracked {
         // Drop the SWD companion's held handle — that removes the companion node
         // (default Handle lifetime). Fallback to an explicit remove for a
@@ -1087,6 +1161,7 @@ fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
         }
         // An own-container node goes the same way: its handle is the node.
         if dev.node_handle.take().is_some() {
+            forget();
             return Response::Ok { detail: Some("removed=true".into()) };
         }
     }
@@ -1094,6 +1169,7 @@ fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
         Ok(g) => g,
         Err(e) => return Response::err(format!("remove device: {e}")),
     };
+    forget();
     Response::Ok { detail: Some(format!("removed={removed}")) }
 }
 

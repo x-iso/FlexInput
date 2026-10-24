@@ -16,9 +16,10 @@
 //! and trusted those certs on every install.
 //!
 //! An installed driver is only ever replaced deliberately: at helper startup,
-//! [`reconcile_installed_driver`] reinstalls when [`installed_driver`] finds a
-//! different driver version than this build vendors, or catalogs signed by
-//! anything but this machine's cert, then removes the legacy certs.
+//! [`reconcile_installed_driver`] reinstalls when [`installed_driver`] finds an
+//! older driver version than this build vendors, or catalogs signed by the
+//! certs earlier FlexInput builds shared, then removes those certs. A newer
+//! driver, or the same one signed by another HIDMaestro program, stays.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ use crate::install::{driver_state, inf_driver_version, installed_inf_names, publ
 use crate::orchestrator::registry;
 use crate::signing::{self, DriverPackage, Scope, SignError, Thumbprint};
 
-/// The vendored driver payload (HIDMaestro v1.7.3, unmodified), embedded at
+/// The vendored driver payload (HIDMaestro v2.0.1, unmodified), embedded at
 /// compile time so the helper can stage it regardless of cwd. The binaries ship
 /// unsigned; they're signed and catalogued on the target machine. Each INF's
 /// `DriverVer` is what [`installed_driver`] compares an install against, so a
@@ -251,15 +252,20 @@ pub fn uninstall_driver() -> Result<(), DeployError> {
 pub enum InstalledDriver {
     /// No HIDMaestro package is installed.
     NotInstalled,
-    /// Same driver version as this build's payload, and every catalog is signed by
-    /// this machine's current cert. Nothing to do.
+    /// Same driver version as this build's payload, signed by this machine's
+    /// current cert or by another HIDMaestro program's own. Nothing to do.
     Current,
-    /// A different driver version than this build ships — typically an older
-    /// one, after FlexInput updated its vendored HIDMaestro.
+    /// A newer driver than this build ships, which another HIDMaestro program
+    /// installed. Kept: v2.0 drivers keep every older protocol, and HIDMaestro's
+    /// own rule is never to downgrade — replacing it would tear that program's
+    /// devices down, and it would put its own back at its next create.
+    Newer,
+    /// An older driver than this build ships — typically after FlexInput updated
+    /// its vendored HIDMaestro.
     OtherVersion,
-    /// The right version, but a catalog is signed by something other than this
-    /// machine's current cert: an earlier build's vendored cert, or a machine cert
-    /// that has since been replaced.
+    /// The right version, but a catalog is signed by one of the certs earlier
+    /// FlexInput builds shared ([`LEGACY_SIGNERS`]), or carries no signature
+    /// that can be read.
     ForeignSigner,
     /// Half-installed, or the installed INFs or catalogs couldn't be read. Left
     /// alone rather than guessed at: "Reinstall drivers" resolves it.
@@ -286,6 +292,7 @@ pub fn installed_driver() -> InstalledDriver {
     if published.is_empty() {
         return InstalledDriver::Indeterminate;
     }
+    let mut newer = false;
     for pkg in &published {
         let payload = if pkg.is_xusb { payload::HIDMAESTRO_XUSB_INF } else { payload::HIDMAESTRO_INF };
         // A version this parser can't read is left alone rather than treated as a
@@ -293,9 +300,17 @@ pub fn installed_driver() -> InstalledDriver {
         let (Some(installed), Some(shipped)) = (&pkg.version, inf_driver_version(payload)) else {
             return InstalledDriver::Indeterminate;
         };
-        if *installed != shipped {
-            return InstalledDriver::OtherVersion;
+        let (Some(installed), Some(shipped)) = (version_parts(installed), version_parts(&shipped)) else {
+            return InstalledDriver::Indeterminate;
+        };
+        match installed.cmp(&shipped) {
+            std::cmp::Ordering::Less => return InstalledDriver::OtherVersion,
+            std::cmp::Ordering::Greater => newer = true,
+            std::cmp::Ordering::Equal => {}
         }
+    }
+    if newer {
+        return InstalledDriver::Newer;
     }
     let ours = signing::find_signing_cert(Scope::LocalMachine).and_then(|c| c.thumbprint().ok());
     let catroot = windows_dir().join(DRIVER_CATROOT);
@@ -306,10 +321,29 @@ pub fn installed_driver() -> InstalledDriver {
         }
         match signing::signer_thumbprint(&catalog) {
             Ok(Some(signer)) if Some(signer) == ours => {}
+            // Another HIDMaestro program signs the same build with its own
+            // per-machine cert. Windows accepted it; replacing it would only
+            // tear that program's devices down.
+            Ok(Some(signer)) if !LEGACY_SIGNERS.contains(&signer) => {}
             _ => return InstalledDriver::ForeignSigner,
         }
     }
     InstalledDriver::Current
+}
+
+/// A `DriverVer` version's parts, for ordering: up to four dot-separated
+/// numbers, missing ones zero. `None` for anything else.
+fn version_parts(version: &str) -> Option<[u32; 4]> {
+    let mut parts = [0u32; 4];
+    let mut n = 0;
+    for p in version.trim().split('.') {
+        if n == 4 {
+            return None;
+        }
+        parts[n] = p.trim().parse().ok()?;
+        n += 1;
+    }
+    Some(parts)
 }
 
 /// What [`reconcile_installed_driver`] did.
@@ -318,6 +352,8 @@ pub enum Reconcile {
     /// Already current, or nothing installed. Any leftover legacy certs were
     /// removed; the count says how many store entries went.
     NotNeeded { legacy_certs_removed: usize },
+    /// Another program installed a newer driver, which stays.
+    KeptNewer,
     /// The install was out of date or foreign-signed (`from`) and has been
     /// replaced with this build's packages, signed by this machine.
     Reinstalled { from: InstalledDriver },
@@ -360,6 +396,7 @@ pub fn reconcile_installed_driver(clear_devices: impl FnOnce()) -> Reconcile {
             }
             return Reconcile::NotNeeded { legacy_certs_removed: remove_legacy_trust() };
         }
+        InstalledDriver::Newer => return Reconcile::KeptNewer,
         InstalledDriver::Indeterminate => return Reconcile::Skipped,
         InstalledDriver::OtherVersion | InstalledDriver::ForeignSigner => {}
     }
@@ -684,17 +721,33 @@ mod tests {
         // installed_driver() treats an unreadable version as Indeterminate and
         // never upgrades, so the shipped INFs must always parse. Pinned to the
         // vendored release; update alongside the driver files.
-        assert_eq!(inf_driver_version(payload::HIDMAESTRO_INF).as_deref(), Some("1.4.7.48"));
-        assert_eq!(inf_driver_version(payload::HIDMAESTRO_XUSB_INF).as_deref(), Some("1.4.7.48"));
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_INF).as_deref(), Some("2.0.0.2201"));
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_XUSB_INF).as_deref(), Some("2.0.0.2201"));
     }
 
     #[test]
-    fn only_version_or_signer_mismatches_reinstall() {
+    fn only_an_older_driver_or_a_legacy_signer_reinstalls() {
         assert!(InstalledDriver::OtherVersion.needs_reinstall());
         assert!(InstalledDriver::ForeignSigner.needs_reinstall());
-        for state in [InstalledDriver::NotInstalled, InstalledDriver::Current, InstalledDriver::Indeterminate] {
+        for state in [
+            InstalledDriver::NotInstalled,
+            InstalledDriver::Current,
+            InstalledDriver::Newer,
+            InstalledDriver::Indeterminate,
+        ] {
             assert!(!state.needs_reinstall(), "{state:?}");
         }
+    }
+
+    #[test]
+    fn driver_versions_order_numerically() {
+        let v = |s| version_parts(s).unwrap();
+        assert!(v("1.4.7.48") < v("2.0.0.2201"));
+        assert!(v("2.0.0.2201") < v("2.0.0.10000"), "numerically, not as text");
+        assert!(v("2.0.1.0") > v("2.0.0.2201"));
+        assert_eq!(v("2.0"), [2, 0, 0, 0]);
+        assert_eq!(version_parts("2.0.0.x"), None);
+        assert_eq!(version_parts("1.2.3.4.5"), None);
     }
 
     #[test]
