@@ -272,8 +272,12 @@ impl ScopeBuffer {
 #[derive(Clone, Default)]
 struct GyroSession {
     sampling: bool,
+    /// Frames sampled (the progress).
     n: u32,
-    /// Welford running mean per axis [gx, gy, gz_unused, ax, ay].
+    /// Samples each axis kept: an outlier is dropped from its own axis only,
+    /// so each axis's mean has to divide by its own count.
+    na: [u32; 5],
+    /// Welford running mean per axis [gx, gy, gz, ax, ay].
     mean:  [f64; 5],
     m2:    [f64; 5],
     scope: ScopeBuffer,
@@ -344,9 +348,12 @@ impl SpikeRun {
         *self = SpikeRun::Idle;
     }
 
-    /// Advance one frame. Returns the setting to apply when a check has just
-    /// found one.
-    fn tick(&mut self, dev_id: &str) -> Option<(u8, f32)> {
+    /// Advance one frame. Returns what to apply: the gyro offset measured
+    /// again from the last seconds of the recording, the moment it completes
+    /// (the pad lay still all along, past whatever was still settling when the
+    /// calibration took its first one — see `gyro_cal_overlay::late_gyro_cal`);
+    /// the spike filter setting once the check has found one.
+    fn tick(&mut self, dev_id: &str) -> SpikeTick {
         use crate::gyro_cal_overlay::{steady, STEADY_S};
         match self {
             SpikeRun::Recording { begun, started, cursor, samples, recent, moved_at } => {
@@ -354,7 +361,7 @@ impl SpikeRun {
                 if now.duration_since(*begun).as_secs_f32() > SPIKE_GIVE_UP_S {
                     flexinput_devices::spike::capture_stop(dev_id);
                     *self = SpikeRun::GaveUp;
-                    return None;
+                    return SpikeTick::default();
                 }
                 let (got, total) = flexinput_devices::spike::capture_read(dev_id, *cursor);
                 *cursor = total;
@@ -363,7 +370,7 @@ impl SpikeRun {
                         flexinput_devices::spike::capture_stop(dev_id);
                         *self = SpikeRun::Unavailable;
                     }
-                    return None;
+                    return SpikeTick::default();
                 }
                 for (t, x) in got {
                     samples.push(x);
@@ -382,24 +389,29 @@ impl SpikeRun {
                         recent.clear();
                         *started = now;
                         *moved_at = Some(now);
-                        return None;
+                        return SpikeTick::default();
                     }
                 }
-                if now.duration_since(*started).as_secs_f32() >= SPIKE_CHECK_S {
+                let held = now.duration_since(*started).as_secs_f64();
+                if held >= SPIKE_CHECK_S as f64 {
                     flexinput_devices::spike::capture_stop(dev_id);
+                    let gyro = crate::gyro_cal_overlay::late_gyro_cal(samples, held);
                     *self = match crate::gyro_cal_overlay::spawn_tune(std::mem::take(samples)) {
                         Some(slot) => SpikeRun::Analysing(slot),
                         None => SpikeRun::Done { tuning: None, prev: None },
                     };
+                    return SpikeTick { gyro, setting: None };
                 }
-                None
+                SpikeTick::default()
             }
             SpikeRun::Analysing(slot) => {
-                let result = slot.lock().ok().and_then(|mut r| r.take())?;
+                let Some(result) = slot.lock().ok().and_then(|mut r| r.take()) else {
+                    return SpikeTick::default();
+                };
                 *self = SpikeRun::Done { tuning: result, prev: None };
-                result.and_then(|t| t.setting)
+                SpikeTick { gyro: None, setting: result.and_then(|t| t.setting) }
             }
-            _ => None,
+            _ => SpikeTick::default(),
         }
     }
 
@@ -438,6 +450,13 @@ impl SpikeRun {
             SpikeRun::GaveUp => ("Spike check stopped: the pad didn't stay still".into(), ORANGE),
         })
     }
+}
+
+/// What one frame of a [`SpikeRun`] hands back to apply.
+#[derive(Default)]
+struct SpikeTick {
+    gyro: Option<crate::gyro_cal_overlay::GyroCal>,
+    setting: Option<(u8, f32)>,
 }
 
 /// Per-axis orientation-calibration sample buffer. Each Vec collects raw
@@ -888,12 +907,8 @@ pub fn auto_cal_tick(ctx: &egui::Context, canvas: &mut Canvas, live: &LiveSignal
         });
         let Some((mean, var)) = fired else { continue };
 
-        // Same quantization snap as the manual path.
-        const SNAP_EPS: f32 = 1.0 / 16384.0;
-        let snap = |v: f64| -> f32 {
-            let f = v as f32;
-            if f.abs() < SNAP_EPS { 0.0 } else { f }
-        };
+        // The means as measured — no snapping to zero (see the manual path).
+        let snap = |v: f64| v as f32;
         let g_floor = (var[0] + var[1] + var[2]).sqrt() as f32;
         let a_floor = ((var[3] + var[4]) * 1.5).sqrt() as f32;
         if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
@@ -1270,69 +1285,63 @@ fn gyro_section(
 
     // Step the running mean over RAW values; outliers reject 3σ from current mean.
     // While sampling, we push fresh offsets to the node every frame so the
-    // displayed scope visibly converges on 0 — except gz (gravity-coupled
-    // in some mounts) and az, which we never write.
+    // displayed scope visibly converges on 0 — all but az, which carries
+    // gravity and is never written.
     let (sampling_now, n_now, gyro_done_at) = ui.ctx().data_mut(|d| {
         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
         st.gyro.scope.push(disp);
         let raw = [raw_gx, raw_gy, raw_gz, raw_ax, raw_ay];
-        let mut bumped = false;
         if st.gyro.sampling {
+            st.gyro.n += 1;
             for i in 0..5 {
                 let x = raw[i] as f64;
-                let n_f = (st.gyro.n + 1) as f64;
+                let k = st.gyro.na[i];
                 let mean = st.gyro.mean[i];
                 let m2   = st.gyro.m2[i];
-                let var  = if st.gyro.n > 16 { m2 / (st.gyro.n as f64) } else { 0.0 };
+                let var  = if k > 16 { m2 / k as f64 } else { 0.0 };
                 let sd   = var.sqrt() as f32;
-                if st.gyro.n > 32 && sd > 1e-6 && (raw[i] - mean as f32).abs() > 3.0 * sd {
+                if k > 32 && sd > 1e-6 && (raw[i] - mean as f32).abs() > 3.0 * sd {
                     continue; // outlier
                 }
+                let k = k + 1;
+                st.gyro.na[i] = k;
                 let delta = x - mean;
-                let new_mean = mean + delta / n_f;
+                let new_mean = mean + delta / k as f64;
                 st.gyro.mean[i] = new_mean;
                 st.gyro.m2[i]   = m2 + delta * (x - new_mean);
-                if i == 0 { st.gyro.n += 1; bumped = true; }
             }
-            // Quantization-aware: snap means closer to 0 if they fall within
-            // half a quantization step of their integer LSB grid. For gyro
-            // (±2000 dps → ±1.0 graph) the LSB ≈ 2000/32767/2000 ≈ 3.05e-5;
-            // for accel (±8 G → ±1.0 graph) LSB ≈ 8/32767/8 ≈ 3.05e-5. We
-            // use a slightly wider window so small jitter biases don't move
-            // the offset farther than the true center.
-            const SNAP_EPS: f32 = 1.0 / 16384.0;
+            // ⛔ No snapping to zero. A mean over hundreds of noisy samples
+            // resolves a bias far finer than one sensor step (~3e-5), and the
+            // old "within two steps of zero is zero" rule threw away exactly
+            // the bias that shows as a DC offset on a zoomed-in scope.
             let mut writeback = [0.0_f32; 3];
             for i in 0..3 {
-                let m = st.gyro.mean[i] as f32;
-                writeback[i] = if m.abs() < SNAP_EPS { 0.0 } else { m };
+                writeback[i] = st.gyro.mean[i] as f32;
             }
             let mut a_write = [0.0_f32; 3];
             for i in 0..2 { // ax, ay
-                let m = st.gyro.mean[3 + i] as f32;
-                a_write[i] = if m.abs() < SNAP_EPS { 0.0 } else { m };
+                a_write[i] = st.gyro.mean[3 + i] as f32;
             }
-            // gz / az are gravity-coupled in some orientations; never write.
-            if bumped {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("gyro_offset".into(), serde_json::json!(writeback));
-                    // Skip accelerometer writes if the user toggled that off.
-                    let skip_accel = skip_accel_cal(&n.params);
-                    if !skip_accel {
-                        n.params.insert("accel_offset".into(), serde_json::json!(a_write));
-                    }
-                    // Noise floors from the running Welford variance — written
-                    // every frame once the estimate is meaningful, so the
-                    // scope's deadzone brackets visibly converge into place
-                    // while sampling runs. Gyro floor = RMS magnitude of the
-                    // 3-axis noise (the engine gates on |g|); accel floor
-                    // scales the 2 sampled axes up to a 3-axis distance.
-                    if st.gyro.n > 16 {
-                        let var = |i: usize| st.gyro.m2[i] / st.gyro.n as f64;
-                        let g_floor = (var(0) + var(1) + var(2)).sqrt() as f32;
-                        let a_floor = ((var(3) + var(4)) * 1.5).sqrt() as f32;
-                        n.params.insert("gyro_noise_floor".into(), serde_json::json!(g_floor));
-                        n.params.insert("accel_noise_floor".into(), serde_json::json!(a_floor));
-                    }
+            // az carries gravity; it is never written.
+            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                n.params.insert("gyro_offset".into(), serde_json::json!(writeback));
+                // Skip accelerometer writes if the user toggled that off.
+                let skip_accel = skip_accel_cal(&n.params);
+                if !skip_accel {
+                    n.params.insert("accel_offset".into(), serde_json::json!(a_write));
+                }
+                // Noise floors from the running Welford variance — written
+                // every frame once the estimate is meaningful, so the
+                // scope's deadzone brackets visibly converge into place
+                // while sampling runs. Gyro floor = RMS magnitude of the
+                // 3-axis noise (the engine gates on |g|); accel floor
+                // scales the 2 sampled axes up to a 3-axis distance.
+                if st.gyro.na.iter().all(|k| *k > 16) {
+                    let var = |i: usize| st.gyro.m2[i] / st.gyro.na[i] as f64;
+                    let g_floor = (var(0) + var(1) + var(2)).sqrt() as f32;
+                    let a_floor = ((var(3) + var(4)) * 1.5).sqrt() as f32;
+                    n.params.insert("gyro_noise_floor".into(), serde_json::json!(g_floor));
+                    n.params.insert("accel_noise_floor".into(), serde_json::json!(a_floor));
                 }
             }
             if st.gyro.n >= GYRO_SAMPLE_FRAMES {
@@ -1561,12 +1570,17 @@ fn gyro_section(
 
             // The spike check running beside a calibration: advance it, and
             // apply what it recommends before the row below reads the node.
-            let (spike_found, spike_line, spike_busy) = ui.ctx().data_mut(|d| {
+            let (spike_tick, spike_line, spike_busy) = ui.ctx().data_mut(|d| {
                 let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
-                let found = st.spikes.tick(dev_id);
-                (found, st.spikes.line(), st.spikes.busy())
+                let tick = st.spikes.tick(dev_id);
+                (tick, st.spikes.line(), st.spikes.busy())
             });
-            if let Some((w, sens)) = spike_found {
+            if let (Some(cal), Some(n)) = (spike_tick.gyro, canvas.snarl.get_node_mut(node_id)) {
+                n.params.insert("gyro_offset".into(), serde_json::json!(cal.offset));
+                n.params.insert("gyro_noise_floor".into(), serde_json::json!(cal.floor));
+                n.params.insert("gyro_calibrated".into(), Value::Bool(true));
+            }
+            if let Some((w, sens)) = spike_tick.setting {
                 let prev = canvas.snarl.get_node_mut(node_id).map(|n| {
                     let prev = spike_params(&n.params);
                     n.params.insert("spike_suppress".into(), Value::Bool(true));
@@ -2250,7 +2264,96 @@ fn gyro_scope(
             st.scope_win_ms = next;
         });
     }
+
+    // Save-as-picture button, left of the time window it saves. Its label
+    // doubles as the status: saving, saved, failed.
+    let status = ui.ctx().data(|d| d.get_temp::<ExportStatus>(export_status_id(_node_id)));
+    let recent = status.as_ref().is_some_and(|s| s.at.elapsed().as_secs_f32() < 3.0);
+    let (label, label_col) = match &status {
+        Some(s) if s.busy => ("Saving…", Color32::from_gray(200)),
+        Some(ExportStatus { result: Some(Ok(_)), .. }) if recent => ("Saved", Color32::from_rgb(90, 200, 110)),
+        Some(ExportStatus { result: Some(Err(_)), .. }) if recent => ("Failed", ORANGE),
+        _ if chip_x + 120.0 < win_rect.left() => ("Save image", Color32::from_gray(220)),
+        _ => ("PNG", Color32::from_gray(220)),
+    };
+    let exp_galley = ui.painter().layout_no_wrap(label.to_string(), legend_font.clone(), label_col);
+    let exp_size = exp_galley.size();
+    let exp_rect = egui::Rect::from_min_size(
+        egui::pos2(win_rect.left() - 6.0 - exp_size.x - 2.0 * pad_x, win_rect.top()),
+        egui::vec2(exp_size.x + 2.0 * pad_x, win_rect.height()),
+    );
+    let exp_resp = ui.interact(exp_rect, ui.id().with(("scope_export_btn", _node_id)), Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(exp_rect, 3.0, if exp_resp.hovered() { Color32::from_gray(45) } else { Color32::from_gray(28) });
+    painter.rect_stroke(exp_rect, 3.0, Stroke::new(1.0, Color32::from_gray(70)), egui::epaint::StrokeKind::Inside);
+    painter.galley(
+        egui::pos2(exp_rect.center().x - exp_size.x * 0.5, exp_rect.center().y - exp_size.y * 0.5),
+        exp_galley,
+        label_col,
+    );
+    let hover = match &status {
+        Some(ExportStatus { result: Some(Ok(path)), .. }) => format!("Saved to {}", path.display()),
+        Some(ExportStatus { result: Some(Err(e)), .. }) => format!("Couldn't save: {e}"),
+        _ => format!(
+            "Save the last {} ms of this scope as a picture: about two pixels per sample \
+             down the image, with labelled value and time guides.",
+            scope_win_ms as i32
+        ),
+    };
+    let exp_resp = exp_resp.on_hover_text(hover);
+    if exp_resp.clicked() && !status.as_ref().is_some_and(|s| s.busy) {
+        let device = canvas.snarl.get_node(_node_id)
+            .map(|n| n.display_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| dev_id.to_string());
+        let newest = active.iter().filter_map(|&ch| samples_ch[ch].last().map(|(t, _)| *t)).max();
+        if let Some(newest) = newest {
+            use super::scope_export::{self as se, Channel, Export};
+            let channels = active.iter().map(|&ch| Channel {
+                name: labels[ch],
+                color: colors[ch],
+                accel: ch >= 3,
+                samples: samples_ch[ch].iter().rev()
+                    .map(|(t, v)| (newest.saturating_duration_since(*t).as_secs_f64() * 1000.0, *v))
+                    .take_while(|(ms, _)| *ms <= scope_win_ms as f64)
+                    .collect(),
+            }).collect();
+            let (shown, safe) = se::local_stamp();
+            let name = se::file_safe(&format!("{device} gyro {safe}.png"));
+            let export = Export { device, taken: shown, window_ms: scope_win_ms as f64, channels };
+            let path = crate::overlay::with_overlay_not_topmost(|| {
+                rfd::FileDialog::new()
+                    .add_filter("PNG image", &["png"])
+                    .set_file_name(&name)
+                    .save_file()
+            });
+            if let Some(path) = path {
+                let id = export_status_id(_node_id);
+                let ctx = ui.ctx().clone();
+                ctx.data_mut(|d| d.insert_temp(id, ExportStatus { busy: true, at: Instant::now(), result: None }));
+                // A tall picture takes a moment to render; off the UI thread.
+                std::thread::spawn(move || {
+                    let (svg, w, h) = se::build_svg(&export);
+                    let result = se::render_png(&svg, w, h)
+                        .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()))
+                        .map(|_| path);
+                    ctx.data_mut(|d| d.insert_temp(id, ExportStatus { busy: false, at: Instant::now(), result: Some(result) }));
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
 }
+
+/// Where a gyro scope's picture export stands (ctx temp, per node).
+#[derive(Clone)]
+struct ExportStatus {
+    busy: bool,
+    at: Instant,
+    result: Option<Result<std::path::PathBuf, String>>,
+}
+
+fn export_status_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_scope_export", node)) }
 
 // ── Sticks section ───────────────────────────────────────────────────────────
 

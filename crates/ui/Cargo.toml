@@ -73,6 +73,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_Globalization",
+    # Local time for the gyro scope export's file name and caption.
+    "Win32_System_SystemInformation",
 ] }
 # Fallback system fonts (fonts.rs): mapped rather than read, and checked to
 # parse before epaint gets them (it panics on a font it cannot parse). Both

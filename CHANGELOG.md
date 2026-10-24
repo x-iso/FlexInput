@@ -31,6 +31,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **2000 Hz polling and output.** Both rates go up to 2000 Hz (0.5 ms), for
   those who want it. CPU use rises with the rate.
 
+- **Save the gyro scope as a picture.** The Calibration window's gyro scope
+  has a **Save image** button beside its time window. It saves that window at
+  full detail: time runs down the picture at about two pixels per sample, as
+  tall as that takes, with every sample marked, value and time guides
+  sub-divided and labelled (the value labels repeat down the picture), and
+  the scale fitted to the bulk of the samples so noise and offsets stay
+  readable — a spike past it is pinned to the edge with its value.
+
 ### Changed
 
 - **Virtual controllers run on HIDMaestro 2.0.1.** The driver behind the
@@ -43,6 +51,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   before.
 
 ### Fixed
+
+- **Gyro calibration centres every axis.** All three calibrations — the
+  Calibration window, auto-calibrate, and Calibrate Gyro — rounded any offset
+  under about 0.12 °/s to zero, which left exactly that much DC offset on a
+  pad whose bias was small: visible on a zoomed-in scope, and slow drift in a
+  game. Offsets are now kept as measured. The Calibration window also
+  averaged each axis by the first axis's sample count, slightly off whenever
+  an outlier was dropped from one axis only. And when a calibration is
+  followed by the spike check, the offset is measured again from the last
+  three seconds of it, after anything still settling has settled — a Joy-Con
+  2 still learning its own bias, or an IMU cooling after the hands.
 
 - **FlexInput and other programs that use HIDMaestro run side by side.** With
   another HIDMaestro program installed (PadForge, say), FlexInput replaced that

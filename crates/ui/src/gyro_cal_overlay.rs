@@ -109,15 +109,12 @@ const AXIS_COLORS: [Color32; 3] = [
     Color32::from_rgb(120, 170, 255),
 ];
 
-/// The quantization snap the Calibration window applies to its offsets.
-const SNAP_EPS: f32 = 1.0 / 16384.0;
-
 /// A finished gyro calibration, in normalized units.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct GyroCal {
-    offset: [f32; 3],
+pub(crate) struct GyroCal {
+    pub(crate) offset: [f32; 3],
     /// RMS magnitude of the three axes' noise (the engine gates on |g|).
-    floor: f32,
+    pub(crate) floor: f32,
 }
 
 /// Where a pad's samples come from.
@@ -237,6 +234,13 @@ impl PadCal {
             if self.source != Source::Capture {
                 self.spikes = SpikeCheck::Unavailable;
             } else if held >= SPIKE_S {
+                // The pad has lain still the whole spike check: measure the
+                // offset again from its last CAL_S, past whatever was still
+                // settling when it was first taken — see `late_gyro_cal`.
+                if let Some(cal) = late_gyro_cal(&self.stretch, held) {
+                    self.gyro = Some(cal);
+                    self.gyro_applied = false;
+                }
                 self.spikes = analyse(self.stretch.clone());
             }
         }
@@ -327,7 +331,12 @@ fn median(v: &mut [f32]) -> f32 {
 /// The resting gyro of a still stretch: per axis, the mean of what lies
 /// within [`OUTLIER_SIGMA`] robust σ of the median — a spike can't move it.
 /// `None` when that isn't plausibly bias.
-fn gyro_cal(stretch: &[Sample]) -> Option<GyroCal> {
+///
+/// ⛔ Never snapped to zero. The mean of hundreds of noisy samples resolves a
+/// bias far finer than one sensor step, and the old "within two steps of zero
+/// is zero" rule threw away exactly the bias that shows as a DC offset on a
+/// zoomed-in scope (~0.1 °/s on a Joy-Con 2).
+pub(crate) fn gyro_cal(stretch: &[Sample]) -> Option<GyroCal> {
     let limit = MAX_BIAS_DPS / GYRO_REF_DPS;
     let mut offset = [0.0f32; 3];
     let mut var = 0.0f64;
@@ -346,9 +355,23 @@ fn gyro_cal(stretch: &[Sample]) -> Option<GyroCal> {
         if (mean as f32).abs() > limit {
             return None;
         }
-        offset[a] = if (mean as f32).abs() < SNAP_EPS { 0.0 } else { mean as f32 };
+        offset[a] = mean as f32;
     }
     Some(GyroCal { offset, floor: var.sqrt() as f32 })
+}
+
+/// [`gyro_cal`] over the last [`CAL_S`] of a still stretch `held` seconds
+/// long. The start of a stretch carries whatever was still settling when the
+/// pad went down — a Joy-Con 2's decoder still converging on its own resting
+/// bias (its pins are already corrected by it, ~2 s time constant), or an IMU
+/// warmed by the hands cooling — and the offset has to match what the pad
+/// reads from now on, not then.
+pub(crate) fn late_gyro_cal(stretch: &[Sample], held: f64) -> Option<GyroCal> {
+    if held <= 0.0 || stretch.is_empty() {
+        return None;
+    }
+    let take = ((stretch.len() as f64 * CAL_S / held).round() as usize).clamp(MIN_SAMPLES, stretch.len());
+    gyro_cal(&stretch[stretch.len() - take..])
 }
 
 /// Tune the spike filter from `samples` (a pad lying still) on a worker
@@ -1083,6 +1106,43 @@ mod tests {
             assert!((cal.offset[i] - BIAS[i]).abs() < 1e-5, "{:?}", cal.offset);
         }
         assert!(cal.floor > 0.0 && cal.floor < 0.0001, "{}", cal.floor);
+    }
+
+    #[test]
+    fn a_bias_under_two_sensor_steps_is_kept() {
+        // 0.1 °/s on yaw: below the old snap (1/16384), a visible DC offset.
+        let tiny = [0.00003, -0.00002, 0.00005];
+        let mut p = pad(Source::Signals);
+        run(&mut p, 0.0, STEADY_S + CAL_S + 0.5, |k| {
+            let n = if k % 2 == 0 { 0.00001 } else { -0.00001 };
+            Some([tiny[0] + n, tiny[1] - n, tiny[2] + n, 0.0, 0.0, 0.125])
+        });
+        let cal = p.gyro.expect("calibrated");
+        for i in 0..3 {
+            assert!((cal.offset[i] - tiny[i]).abs() < 2e-6, "{:?}", cal.offset);
+        }
+    }
+
+    #[test]
+    fn a_settling_bias_is_measured_once_it_has_settled() {
+        // Starts 0.3 °/s high and settles onto BIAS with a 1 s time constant,
+        // like a decoder still learning or an IMU cooling after the hands.
+        let settling = |k: usize| {
+            let mut s = rest(k);
+            s[2] += 0.00015 * (-(k as f64 * DT)).exp() as f32;
+            Some(s)
+        };
+        let mut p = pad(Source::Capture);
+        // First taken while it still settles: off by ~0.07 °/s...
+        let t = run(&mut p, 0.0, STEADY_S + CAL_S + 0.3, settling);
+        let first = p.gyro.expect("calibrated").offset[2];
+        assert!((first - BIAS[2]).abs() > 1e-5, "{first}");
+        // ...then measured again at the end of the spike check.
+        let k0 = (t / DT).round() as usize;
+        let t = run(&mut p, t, SPIKE_S - CAL_S, |k| settling(k0 + k));
+        wait_for_spikes(&mut p, t);
+        let last = p.gyro.expect("calibrated").offset[2];
+        assert!((last - BIAS[2]).abs() < 5e-6, "{last} vs {}", BIAS[2]);
     }
 
     #[test]
