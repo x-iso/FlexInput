@@ -78,17 +78,31 @@ pub(crate) fn apply_display_state(
                         let rising = node.extra.trig_prev <= 0.0 && trig_val > 0.0;
                         node.extra.trig_prev = trig_val;
                         if rising && !node.extra.trig_armed {
+                            // A capture starts with what led up to the trigger,
+                            // so the scope can scroll back before it.
                             node.extra.trig_armed = true;
-                            node.extra.trig_acc.clear();
+                            let pre: Vec<Vec<Option<f32>>> = node.extra.history.iter().cloned().collect();
+                            node.extra.trig_acc = std::sync::Arc::new(crate::canvas::node::TrigCapture { t0: pre.len(), rows: pre });
                         }
                         if node.extra.trig_armed {
-                            node.extra.trig_acc.push(s);
-                            if node.extra.trig_acc.len() >= win_samples {
+                            let acc = std::sync::Arc::make_mut(&mut node.extra.trig_acc);
+                            acc.rows.push(s.clone());
+                            if acc.rows.len() - acc.t0 >= win_samples {
                                 node.extra.trig_capture = Some(std::mem::take(&mut node.extra.trig_acc));
                                 node.extra.trig_armed = false;
                             }
                         }
+                        // The rolling lead-up the next capture starts from.
+                        let h = std::sync::Arc::make_mut(&mut node.extra.history);
+                        if h.len() >= HISTORY_LEN { h.pop_front(); }
+                        h.push_back(s);
                     }
+                } else if node.module_id == "display.oscilloscope"
+                    && node.params.get("osc_freeze").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    // Frozen: hold what is shown — the samples are dropped here,
+                    // so the body, a sub-patch editor and a pinned copy (which
+                    // all show this history) freeze together.
                 } else {
                     let h = std::sync::Arc::make_mut(&mut node.extra.history);
                     for s in samples {
@@ -133,7 +147,7 @@ pub(crate) fn strip_display_buffers(snarl: &mut Snarl<NodeData>) {
     for (_, node) in snarl.nodes_ids_data_mut() {
         let extra = &mut node.value.extra;
         extra.history = Default::default();
-        extra.trig_acc = Vec::new();
+        extra.trig_acc = Default::default();
         extra.trig_capture = None;
         if let Some(sp) = node.value.subpatch.as_mut() {
             strip_display_buffers(&mut sp.snarl);
@@ -2589,7 +2603,7 @@ mod subpatch_bus_tests {
     /// inlet — and not when its inputs disagree.
     #[test]
     fn plain_curves_trace_a_motion_source_through_their_wires() {
-        use crate::canvas::viewer::{refresh_curve_motion_units, MotionUnit};
+        use crate::canvas::viewer::{refresh_motion_units, MotionUnit};
         let p = egui::Pos2::ZERO;
         let mut s: Snarl<NodeData> = Snarl::new();
         let pad = s.insert_node(p, {
@@ -2631,7 +2645,7 @@ mod subpatch_bus_tests {
         });
         wire(&mut s, pad, 1, sp, 0);
 
-        refresh_curve_motion_units(&mut s);
+        refresh_motion_units(&mut s);
         let unit = |s: &Snarl<NodeData>, id| MotionUnit::of(s.get_node(id).unwrap());
         assert_eq!(unit(&s, gyro_curve), Some(MotionUnit::Gyro));
         assert_eq!(unit(&s, chained), Some(MotionUnit::Gyro));
@@ -2649,7 +2663,7 @@ mod subpatch_bus_tests {
 
         // Steering integrates the rates: not gyro units any more.
         s.get_node_mut(dof).unwrap().params.insert("family".into(), json!("steering"));
-        refresh_curve_motion_units(&mut s);
+        refresh_motion_units(&mut s);
         assert_eq!(unit(&s, vec_curve), None);
     }
 

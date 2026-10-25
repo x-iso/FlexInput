@@ -86,7 +86,7 @@ fn perf_handoff() {
     let tab_ix: usize = std::env::var("FXI_BENCH_TAB").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
     let mut tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
-    crate::canvas::viewer::refresh_curve_motion_units(&mut tab.snarl);
+    crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
     let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
     let devs = source_devices(&graph);
 
@@ -278,7 +278,7 @@ fn perf_bench() {
         "tab", "nodes", "build µs", "build al", "tick µs", "(median)", "tick al", "sinks");
     for (ti, mut tab) in ws.tabs.into_iter().enumerate() {
         if only.is_some_and(|o| o != ti) { continue; }
-        crate::canvas::viewer::refresh_curve_motion_units(&mut tab.snarl);
+        crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
 
         // UI side: the graph rebuild that runs every frame.
         // Timings are the FASTEST of several blocks: this machine shares its
@@ -357,7 +357,7 @@ fn perf_sample() {
     let secs: f32 = std::env::var("FXI_BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0);
     let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
     let mut tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
-    crate::canvas::viewer::refresh_curve_motion_units(&mut tab.snarl);
+    crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
     let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
     let devs = source_devices(&graph);
     let mut state: HashMap<usize, NodeState> = HashMap::new();

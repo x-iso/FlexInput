@@ -1976,7 +1976,7 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("build_and_publish_graph");
             // Which curves a motion sensor feeds — read by the graph builder
             // (they run on the whole sensor) and by the curve bodies (units).
-            crate::canvas::viewer::refresh_curve_motion_units(&mut self.tabs[self.active_tab].canvas.snarl);
+            crate::canvas::viewer::refresh_motion_units(&mut self.tabs[self.active_tab].canvas.snarl);
             let (graph_snap, dirty_uids) = {
                 puffin::profile_scope!("build_processing_graph");
                 let defaults = self.nav_device_defaults();

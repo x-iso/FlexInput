@@ -1262,7 +1262,7 @@ pub(crate) fn paint_curve_legend(
 
 /// The motion sensor behind a curve: an AutoMap curve's gyro / accel pick
 /// (whole or one axis), or what a plain curve's wires carry (see
-/// [`refresh_curve_motion_units`]). Such a curve runs on the sensor's full range, and its In/Out fields
+/// [`refresh_motion_units`]). Such a curve runs on the sensor's full range, and its In/Out fields
 /// only choose how much of that range the graph shows — in the sensor's own
 /// units, with nothing rescaled. The shown range is stored per sensor
 /// (`gyro_view_*` in °/s, `accel_view_*` in G), apart from the In/Out ranges a
@@ -1359,6 +1359,14 @@ pub(crate) fn is_plain_curve(module_id: &str) -> bool {
         "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
 }
 
+/// What one oscilloscope channel's wire carries: its motion sensor, if it is
+/// one (so the scope reads in °/s or G), and a short name for its legend.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ScopeChannel {
+    pub(crate) unit: Option<MotionUnit>,
+    pub(crate) name: String,
+}
+
 /// Trace every plain curve's wires back to their source and record on the node
 /// (`extra.motion_unit`) whether they carry a motion sensor, so the curve can
 /// read in °/s or G and zoom instead of rescale, like an AutoMap curve's pick.
@@ -1366,24 +1374,35 @@ pub(crate) fn is_plain_curve(module_id: &str) -> bool {
 /// in Pointer mode (still angular velocity, in the gyro's units — Steering
 /// integrates it into something else), curves in between (a motion curve hands
 /// on the same units), and sub-patch boundaries both ways. Every wired input
-/// must agree. Runs once a frame, before the graph is built.
-pub(crate) fn refresh_curve_motion_units(snarl: &mut Snarl<NodeData>) {
+/// must agree. Oscilloscopes and Trigger Scopes get the same trace per input
+/// (`extra.scope_channels`), each on its own. Runs once a frame, before
+/// the graph is built.
+pub(crate) fn refresh_motion_units(snarl: &mut Snarl<NodeData>) {
     let mut found = Vec::new();
-    collect_curve_motion_units(snarl, &mut Vec::new(), &mut Vec::new(), &mut found);
+    let mut scopes = Vec::new();
+    collect_motion_units(snarl, &mut Vec::new(), &mut Vec::new(), &mut found, &mut scopes);
     for (path, unit) in found {
         if let Some(n) = node_at_path_mut(snarl, &path) {
             n.extra.motion_unit = unit;
+        }
+    }
+    for (path, channels) in scopes {
+        if let Some(n) = node_at_path_mut(snarl, &path) {
+            if n.extra.scope_channels != channels {
+                n.extra.scope_channels = channels;
+            }
         }
     }
 }
 
 type Frames<'a> = Vec<(&'a Snarl<NodeData>, NodeId)>;
 
-fn collect_curve_motion_units<'a>(
+fn collect_motion_units<'a>(
     snarl: &'a Snarl<NodeData>,
     path: &mut Vec<NodeId>,
     frames: &mut Frames<'a>,
     out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>)>,
+    scopes: &mut Vec<(Vec<NodeId>, Vec<ScopeChannel>)>,
 ) {
     for (id, n) in snarl.nodes_ids_data() {
         let node = &n.value;
@@ -1392,13 +1411,47 @@ fn collect_curve_motion_units<'a>(
             out.push((path.clone(), curve_inputs_motion_unit(snarl, id, frames)));
             path.pop();
         }
+        if matches!(node.module_id.as_str(), "display.oscilloscope" | "display.trigscope") {
+            let channels = (0..node.inputs.len())
+                .map(|i| match snarl.in_pin(InPinId { node: id, input: i }).remotes.first() {
+                    Some(&src) => ScopeChannel {
+                        unit: source_motion_unit(snarl, src, frames, 0),
+                        name: source_name(snarl, src, frames),
+                    },
+                    None => ScopeChannel::default(),
+                })
+                .collect();
+            path.push(id);
+            scopes.push((path.clone(), channels));
+            path.pop();
+        }
         if let Some(sp) = node.subpatch.as_ref() {
             path.push(id);
             frames.push((snarl, id));
-            collect_curve_motion_units(&sp.snarl, path, frames, out);
+            collect_motion_units(&sp.snarl, path, frames, out, scopes);
             frames.pop();
             path.pop();
         }
+    }
+}
+
+/// A short name for what an output pin carries, for a scope's legend: a
+/// device's or Splitter's pin by its own name ("Gyro X (roll)"), a sub-patch
+/// inlet by what feeds it outside, anything else by its node — plus the pin
+/// when the node has several.
+fn source_name(snarl: &Snarl<NodeData>, src: OutPinId, frames: &[(&Snarl<NodeData>, NodeId)]) -> String {
+    let Some(node) = snarl.get_node(src.node) else { return String::new() };
+    let pin = node.outputs.get(src.output).map(|p| p.name.as_str()).unwrap_or("");
+    match node.module_id.as_str() {
+        "device.source" | "module.automap_split" => pin.to_string(),
+        "subpatch.inlet" => frames.last()
+            .and_then(|&(outer, sp_id)| {
+                let up = *outer.in_pin(InPinId { node: sp_id, input: pin_index_of(node)? }).remotes.first()?;
+                Some(source_name(outer, up, &frames[..frames.len() - 1]))
+            })
+            .unwrap_or_else(|| node.display_name.clone()),
+        _ if node.outputs.len() > 1 => format!("{} · {pin}", node.display_name),
+        _ => node.display_name.clone(),
     }
 }
 
@@ -1440,7 +1493,7 @@ fn pin_index_of(node: &NodeData) -> Option<usize> {
 }
 
 /// The sensor an output pin carries, following it upstream (see
-/// [`refresh_curve_motion_units`]).
+/// [`refresh_motion_units`]).
 fn source_motion_unit(
     snarl: &Snarl<NodeData>,
     src: OutPinId,

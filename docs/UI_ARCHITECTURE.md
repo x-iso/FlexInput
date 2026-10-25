@@ -659,7 +659,9 @@ Per-module-type renderers in `canvas/viewer/` subdirectory:
 - `curve_*.rs` - Response curve editors
 - `remapper_*.rs` - Remapper card editors
 - `touch_zones.rs` - Zone configuration UI
-- `scopes.rs` - Oscilloscope/vector scope rendering
+- `waveform.rs` - Oscilloscope and Trigger Scope: bodies, pinned displays and control rows
+  (one painter; a `Spec` per module — param keys, trigger column, time direction, Freeze)
+- `scopes.rs` - Readout and vectorscope rendering
 
 ---
 

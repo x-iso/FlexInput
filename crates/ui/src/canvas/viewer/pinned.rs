@@ -767,6 +767,10 @@ pub(crate) fn render_pinned_element_impl(
             render_oscilloscope_controls(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("display.oscilloscope", "grid_row") => {
+            render_oscilloscope_grid_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Vectorscope — bare display.
         ("display.vectorscope", "display") => {
             render_vectorscope_display(inner_id, ui, inner_snarl, container_size, graph_ov_ref);
@@ -779,6 +783,10 @@ pub(crate) fn render_pinned_element_impl(
         }
         ("display.trigscope", "controls") => {
             render_trigscope_controls(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("display.trigscope", "grid_row") => {
+            render_trigscope_grid_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
         _ => {}

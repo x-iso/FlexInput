@@ -25,8 +25,11 @@ pub struct NodeExtra {
     pub last_out: Vec<Option<Signal>>,
     /// For a plain curve wired from a motion sensor (gyro / accel pins, or the
     /// rates a 3DOF to 2D in Pointer mode hands on): which one. Traced from the
-    /// wiring each frame by `refresh_curve_motion_units`.
+    /// wiring each frame by `refresh_motion_units`.
     pub(crate) motion_unit: Option<crate::canvas::viewer::MotionUnit>,
+    /// For an Oscilloscope or Trigger Scope: what each input's wire carries
+    /// (sensor and name), traced the same way, per input.
+    pub(crate) scope_channels: Vec<crate::canvas::viewer::ScopeChannel>,
     /// UI-side aux scratch used by the counter reset button.
     /// Set by the viewer; read once during graph snapshot building then cleared.
     pub aux_f32: Vec<f32>,
@@ -36,12 +39,12 @@ pub struct NodeExtra {
     pub layout_unlocked: bool,
     /// Frozen waveform capture for trigger-scope nodes. Updated only on a
     /// rising edge of the trigger input; `None` until the first trigger fires.
-    /// Each entry is one sample: `[trig_val, ch1, ch2, …]`.
-    pub trig_capture: Option<Vec<Vec<Option<f32>>>>,
+    /// Shared (`Arc`), so a scope drawing it every frame doesn't copy it.
+    pub trig_capture: Option<std::sync::Arc<TrigCapture>>,
     /// Previous trigger-pin value used for rising-edge detection.
     pub trig_prev: f32,
     /// Accumulation buffer filled while capture is in progress.
-    pub trig_acc: Vec<Vec<Option<f32>>>,
+    pub trig_acc: std::sync::Arc<TrigCapture>,
     /// True when a capture is currently being accumulated.
     pub trig_armed: bool,
     /// Hash of the input signal(s) the last time this node's renderer asked
@@ -57,6 +60,16 @@ pub struct NodeExtra {
     /// completing) catches up. Reset to 0 whenever the input changes;
     /// incremented every frame the input looks stable.
     pub idle_frames_since_change: u32,
+}
+
+/// A Trigger Scope capture: what led up to the trigger (the scope's rolling
+/// `history`, up to its length), then the window after it.
+#[derive(Debug, Clone, Default)]
+pub struct TrigCapture {
+    /// One sample each: `[trig_val, ch1, ch2, …]`.
+    pub rows: Vec<Vec<Option<f32>>>,
+    /// The trigger sample's index.
+    pub t0: usize,
 }
 
 /// Which point of ONE axis an overlay element is anchored to when the viewport

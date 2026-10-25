@@ -59,7 +59,7 @@ const LABEL_EVERY_PX: f64 = 1000.0;
 const FONT: &str = "Segoe UI, Arial, sans-serif";
 
 /// 1, 2 or 5 × a power of ten, the smallest at least `x`.
-fn nice_step(x: f64) -> f64 {
+pub(crate) fn nice_step(x: f64) -> f64 {
     if !(x > 0.0) || !x.is_finite() {
         return 1.0;
     }
@@ -73,7 +73,7 @@ fn nice_step(x: f64) -> f64 {
 }
 
 /// Decimals that show every value on a `step` grid exactly.
-fn decimals(step: f64) -> usize {
+pub(crate) fn decimals(step: f64) -> usize {
     (0..8)
         .find(|d| {
             let x = step * 10f64.powi(*d as i32);

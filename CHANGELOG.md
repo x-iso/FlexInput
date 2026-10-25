@@ -31,6 +31,29 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **2000 Hz polling and output.** Both rates go up to 2000 Hz (0.5 ms), for
   those who want it. CPU use rises with the rate.
 
+- **Oscilloscope: units, labelled guides, statistics.** Each channel now reads
+  in what its wire carries — °/s for a gyro, G for an accelerometer, through
+  curves, the 3DOF module and sub-patches — and the Scale field is set in that
+  unit. A gyro and an accelerometer on one scope get an axis each, left and
+  right, and each keeps its own scale (with Auto, each fits its own channels);
+  the unit button beside Scale picks which one is on the left and in the Scale
+  field. Guides sit on round values
+  and are labelled, with times along the bottom; a new row sets the time and
+  value divisions (**Grid H** / **V**), minor guides between them (**Sub**),
+  and turns on **Labels**, **Stats** (per channel: now, min, max, mean — a DC
+  offset — and σ, the noise; a table whose columns never move, refreshed four
+  times a second) and **Peaks** (dashed lines at each channel's min and max).
+  Hover over the plot for the time and every channel's value at that point,
+  and **Freeze** holds what is shown, with a scrollbar under the plot to go
+  back through it. Long windows keep one-sample spikes at their full height
+  instead of averaging them away. The plot is as wide as its controls and
+  taller to start with, and sized by its corner grip. The new row can be
+  pinned and reached with a controller like the existing one. The **Trigger
+  Scope** gets all of it except Freeze, with its times counted from the
+  trigger — and a scrollbar of its own: each capture now starts with what led
+  up to the trigger (up to the history an Oscilloscope keeps), so you can
+  scroll back before it, the trigger marked on the plot and on the bar.
+
 - **Save the gyro scope as a picture.** The Calibration window's gyro scope
   has a **Save image** button beside its time window. It saves that window at
   full detail: time runs down the picture at about two pixels per sample, as

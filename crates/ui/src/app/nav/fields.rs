@@ -641,7 +641,9 @@ impl FlexInputApp {
             | ("generator.envelope", "mode_row") | ("generator.envelope", "grid_row")
             | ("generator.envelope", "grid_options_row")
             | ("display.oscilloscope", "controls")
+            | ("display.oscilloscope", "grid_row")
             | ("display.trigscope", "controls")
+            | ("display.trigscope", "grid_row")
             | ("module.audio_stream_haptics", "asth_mode_row")
             | ("module.audio_stream_haptics", "asth_volume")
             | ("module.audio_stream_haptics", "asth_release")
@@ -1135,12 +1137,21 @@ impl FlexInputApp {
                 f!("Grid", Toggle{key:"show_grid"}),
                 f!("Labels", Toggle{key:"show_grid_labels"}),
             ],
-            // ── Trigger scope controls (mirror the oscilloscope controls row) ──
+            // ── Trigger scope rows (the oscilloscope's, without Freeze) ──
             ("display.trigscope", "controls") => vec![
                 f!("Win ms", v("ts_win_ms",10.0,10_000.0,200.0,Decade)),
-                f!("Scale", v("ts_scale",0.001,100.0,1.0,Decade)),
+                f!("Scale", v("ts_scale",0.000001,100.0,1.0,Decade)),
+                f!("Scale in", Enum{key:"ts_axis",opts:&["gyro","accel","value"]}),
                 f!("Auto", Toggle{key:"ts_auto"}),
                 f!("Uni", Toggle{key:"ts_uni"}),
+            ],
+            ("display.trigscope", "grid_row") => vec![
+                f!("Grid H", v("ts_grid_x",0.0,20.0,4.0,Linear)),
+                f!("Grid V", v("ts_grid_y",0.0,20.0,4.0,Linear)),
+                f!("Sub", v("ts_grid_sub",1.0,10.0,1.0,Linear)),
+                f!("Labels", Toggle{key:"ts_labels"}),
+                f!("Stats", Toggle{key:"ts_stats"}),
+                f!("Peaks", Toggle{key:"ts_peaks"}),
             ],
             ("module.twoway_response_curve", "hyst_row") => vec![
                 f!("Hyst %", v("hysteresis_pct",0.0,10.0,0.5,Linear)),
@@ -1155,12 +1166,25 @@ impl FlexInputApp {
             ("module.twoway_response_curve", "lane_toggle") => vec![
                 f!("Lane", Enum{key:"active_lane",opts:&["up","dn","hy"]}),
             ],
-            // Oscilloscope controls row: Win (log ms) / Scale / Auto / Bi-Uni.
+            // Oscilloscope controls row — order matches the rects
+            // `render_oscilloscope_controls` publishes: Win (log ms) / Scale
+            // (the picked kind's) / its unit / Auto / Bi-Uni / Freeze.
             ("display.oscilloscope", "controls") => vec![
                 f!("Win ms", v("osc_win_ms",10.0,10_000.0,200.0,Decade)),
-                f!("Scale", v("osc_scale",0.001,100.0,1.0,Decade)),
+                f!("Scale", v("osc_scale",0.000001,100.0,1.0,Decade)),
+                f!("Scale in", Enum{key:"osc_axis",opts:&["gyro","accel","value"]}),
                 f!("Auto", Toggle{key:"osc_auto"}),
                 f!("Uni", Toggle{key:"osc_uni"}),
+                f!("Freeze", Toggle{key:"osc_freeze"}),
+            ],
+            // Oscilloscope guides row — order matches `osc_grid_row_ui`'s rects.
+            ("display.oscilloscope", "grid_row") => vec![
+                f!("Grid H", v("osc_grid_x",0.0,20.0,4.0,Linear)),
+                f!("Grid V", v("osc_grid_y",0.0,20.0,4.0,Linear)),
+                f!("Sub", v("osc_grid_sub",1.0,10.0,1.0,Linear)),
+                f!("Labels", Toggle{key:"osc_labels"}),
+                f!("Stats", Toggle{key:"osc_stats"}),
+                f!("Peaks", Toggle{key:"osc_peaks"}),
             ],
             // Audio Stream Haptics calibration rows + mode block. Ranges/defaults
             // mirror the sliders in viewer.rs `asth_draw_row` / `asth_draw_mode_block`.

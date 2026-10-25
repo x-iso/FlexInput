@@ -605,7 +605,37 @@ pub struct ModuleDescriptor {
 - **Purpose:** Real-time waveform visualization
 - **Inputs:** N channels (Float)
 - **Outputs:** None (display-only)
-- **Behavior:** Plots signal history over time window
+- **Behavior:** Plots signal history over time window. Each channel reads in what its
+  wire carries, traced upstream each frame (`refresh_motion_units`): °/s for a gyro, G
+  for an accelerometer, the bus value otherwise. A gyro and an accelerometer on one
+  scope read on two axes (left, right); with Auto each fits its own channels. Long
+  windows draw each pixel column's min and max, so one-sample spikes keep their height.
+  Hovering shows the time and every channel's value under the pointer.
+- **Parameters:**
+  - `osc_win_ms: f64` - Time window, ms (10..10000, default 200)
+  - `osc_scale: f64` - Bus value at the top of the plot (± in Bi), 1e-6..100, default 1,
+    for the kind picked for the left axis (edited in its unit). Each kind keeps its own:
+    the others wait in `osc_scale_gyro` / `osc_scale_accel` / `osc_scale_value` and swap
+    in when picked (`osc_scale_kind` records whose `osc_scale` is)
+  - `osc_axis: String` - The kind on the left axis and in the Scale field: `gyro`, `accel`,
+    `value` (absent = the first on the scope in that order); the unit button beside Scale,
+    shown with two kinds or more
+  - `osc_freeze: bool` - Stop taking samples and hold what is shown (default false); a
+    scrollbar under the plot then goes back through the held history (`osc_scroll_ms`,
+    how far back, reset on unfreezing)
+  - `osc_w` / `osc_h: f64` - The plot's size, set by its corner grip; until then it is as
+    wide as the control rows and 220 tall, and never narrower than the rows
+  - `osc_auto: bool` - Fit the scale to the window's peak, rounded so labelled guides land
+    on round values (default false)
+  - `osc_uni: bool` - 0..scale instead of ±scale (default false)
+  - `osc_grid_x: f64` / `osc_grid_y: f64` - Time / value divisions (0..20, default 4; 0 =
+    none)
+  - `osc_grid_sub: f64` - Minor guides per division (1..10, default 1 = none)
+  - `osc_labels: bool` - Value labels on the guides (unit on the top one) and times along
+    the bottom (default true)
+  - `osc_stats: bool` - Per channel over the window: now, min, max, mean, σ — a fixed-width
+    table refreshed four times a second (default true)
+  - `osc_peaks: bool` - Dashed lines at each channel's min and max (default false)
 
 #### Trigger Scope
 - **ID:** `display.trigscope`
@@ -614,6 +644,15 @@ pub struct ModuleDescriptor {
   - Input 0: Trigger signal (Float)
   - Inputs 1..N: Channels to display (Float)
 - **Outputs:** None (display-only)
+- **Behavior:** Captures a window from each rising trigger edge and holds it, times
+  counted from the trigger. Each capture starts with the scope's rolling history (up to
+  the same length an Oscilloscope keeps), so a scrollbar under the plot goes back
+  into what led up to the trigger; `ts_scroll_ms` is how far before the trigger the
+  window starts (0 = at it), kept across captures, and the trigger is marked. Drawn by the Oscilloscope's painter (`waveform.rs`) with
+  the same units, axes, guides, labels, statistics, peaks and hover readout; its params
+  are the Oscilloscope's with `ts_` in place of `osc_` (`ts_win_ms`, `ts_scale`,
+  `ts_auto`, `ts_uni`, `ts_grid_x/y`, `ts_grid_sub`, `ts_labels`, `ts_stats`,
+  `ts_peaks`, `ts_axis`, `ts_w/h`), without Freeze.
 
 #### Vectorscope
 - **ID:** `display.vectorscope`
