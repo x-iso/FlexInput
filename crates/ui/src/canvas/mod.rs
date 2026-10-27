@@ -1043,7 +1043,7 @@ impl Canvas {
         // close to the body's we use a low alpha on the header itself.
         let body_fill   = egui::Color32::from_rgba_unmultiplied(22, 24, 28, 160);
         let header_fill = egui::Color32::from_rgba_unmultiplied(0,  0,  0,  38);
-        let border      = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 70, 76, 200));
+        let border      = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 70, 76, 200));
         style.node_frame = Some(
             egui::Frame::default()
                 .fill(body_fill)
@@ -1547,7 +1547,7 @@ impl Canvas {
             };
             if let Some(f) = self.style.node_frame.as_mut() {
                 f.fill = body_fill;
-                f.stroke = egui::Stroke::new(1.0, border_color);
+                f.stroke = egui::Stroke::new(1.0_f32, border_color);
             }
             if let Some(f) = self.style.header_frame.as_mut() {
                 f.fill = header_fill;
@@ -2822,13 +2822,13 @@ fn draw_spawn_glow(
         painter.rect_stroke(
             rect.expand(7.0),
             egui::CornerRadius::same(10),
-            egui::Stroke::new(8.0, bloom),
+            egui::Stroke::new(8.0_f32, bloom),
             egui::epaint::StrokeKind::Outside,
         );
         painter.rect_stroke(
             rect.expand(3.0),
             egui::CornerRadius::same(8),
-            egui::Stroke::new(2.5, halo),
+            egui::Stroke::new(2.5_f32, halo),
             egui::epaint::StrokeKind::Outside,
         );
     }
@@ -2893,7 +2893,7 @@ fn draw_zoom_controls(
         let frame = egui::Frame::default()
             .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 230))
             .stroke(egui::Stroke::new(
-                1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
             .corner_radius(6.0)
             .inner_margin(egui::Margin::symmetric(6, 4));
         frame.show(ui, |ui| {

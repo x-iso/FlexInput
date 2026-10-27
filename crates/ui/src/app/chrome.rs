@@ -220,7 +220,7 @@ pub(crate) fn show_tab_bar(
             let dot_cx = rect.left() + pad.x + galley.size().x + gap + dot_d / 2.0;
             ui.painter().circle(
                 egui::pos2(dot_cx, rect.center().y),
-                4.0, text_color, egui::Stroke::new(1.2, text_color));
+                4.0, text_color, egui::Stroke::new(1.2_f32, text_color));
             if resp.on_hover_text(auto_hover).clicked() {
                 *auto_switch = !*auto_switch;
             }
@@ -234,7 +234,7 @@ pub(crate) fn show_tab_bar(
         ui.painter().line_segment(
             [egui::pos2(x, sep_rect.top() + inset),
              egui::pos2(x, sep_rect.bottom() - inset)],
-            egui::Stroke::new(1.0, sep_color),
+            egui::Stroke::new(1.0_f32, sep_color),
         );
         ui.add_space(2.0);
 
@@ -315,7 +315,7 @@ pub(crate) fn show_tab_bar(
                     }
                     let c = x_rect.center();
                     let d = 3.2_f32;
-                    let xs = egui::Stroke::new(1.2, text_color);
+                    let xs = egui::Stroke::new(1.2_f32, text_color);
                     ui.painter().line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], xs);
                     ui.painter().line_segment([egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)], xs);
 
@@ -335,7 +335,7 @@ pub(crate) fn show_tab_bar(
                         egui::Color32::TRANSPARENT
                     };
                     let (bp_fill, bp_stroke_color) = (dot_color, dot_color);
-                    ui.painter().circle(bp_center, 4.0, bp_fill, egui::Stroke::new(1.2, bp_stroke_color));
+                    ui.painter().circle(bp_center, 4.0, bp_fill, egui::Stroke::new(1.2_f32, bp_stroke_color));
                     if bp_resp.clicked() {
                         bypass_toggle = Some(i);
                     }
@@ -351,7 +351,7 @@ pub(crate) fn show_tab_bar(
                         let sx = tab_rect.right();
                         ui.painter().line_segment(
                             [egui::pos2(sx, tab_rect.top() + 5.0), egui::pos2(sx, tab_rect.bottom() - 5.0)],
-                            egui::Stroke::new(1.0, sep_color),
+                            egui::Stroke::new(1.0_f32, sep_color),
                         );
                     }
                 }
@@ -362,7 +362,7 @@ pub(crate) fn show_tab_bar(
                     ui.painter().rect_filled(plus_rect, egui::CornerRadius::ZERO, hover_fill);
                 }
                 let c = plus_rect.center();
-                let ps = egui::Stroke::new(1.5, text_color);
+                let ps = egui::Stroke::new(1.5_f32, text_color);
                 ui.painter().line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], ps);
                 ui.painter().line_segment([egui::pos2(c.x, c.y - 5.0), egui::pos2(c.x, c.y + 5.0)], ps);
                 if plus_resp.clicked() {
@@ -621,7 +621,7 @@ pub(crate) fn show_title_bar(
             ui.painter().line_segment(
                 [egui::pos2(x, sep_rect.top() + inset),
                  egui::pos2(x, sep_rect.bottom() - inset)],
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
             ui.add_space(4.0);
 
@@ -647,7 +647,7 @@ pub(crate) fn show_title_bar(
             ui.painter().line_segment(
                 [egui::pos2(x, sep_rect.top() + inset),
                  egui::pos2(x, sep_rect.bottom() - inset)],
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
             ui.add_space(4.0);
 
@@ -700,7 +700,7 @@ pub(crate) fn show_title_bar(
             };
             let c = rect.center();
             let d = 5.0_f32;
-            let s = egui::Stroke::new(1.5, close_color);
+            let s = egui::Stroke::new(1.5_f32, close_color);
             ui.painter().line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], s);
             ui.painter().line_segment([egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)], s);
             if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
@@ -710,7 +710,7 @@ pub(crate) fn show_title_bar(
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(btn_w, h), egui::Sense::click());
             if resp.hovered() { ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, hover_fill); }
             let c = rect.center();
-            let s = egui::Stroke::new(1.5, icon_color);
+            let s = egui::Stroke::new(1.5_f32, icon_color);
             if maximized {
                 let back  = egui::Rect::from_min_size(egui::pos2(c.x - 1.5, c.y - 5.5), egui::vec2(9.0, 8.0));
                 let front = egui::Rect::from_min_size(egui::pos2(c.x - 5.0, c.y - 2.0), egui::vec2(9.0, 8.0));
@@ -734,7 +734,7 @@ pub(crate) fn show_title_bar(
             let c = rect.center();
             ui.painter().line_segment(
                 [egui::pos2(c.x - 5.5, c.y + 2.0), egui::pos2(c.x + 5.5, c.y + 2.0)],
-                egui::Stroke::new(1.5, icon_color),
+                egui::Stroke::new(1.5_f32, icon_color),
             );
             if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
         });
@@ -763,10 +763,10 @@ pub(crate) fn show_title_bar(
                 let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
                 if *panic_active {
                     btn = btn.fill(egui::Color32::from_rgb(196, 43, 28))
-                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 80, 60)));
+                             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 80, 60)));
                 } else if *panic_learning {
                     btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
                 }
                 let resp = ui.add(btn).on_hover_text(
                     if *panic_active {
@@ -884,7 +884,7 @@ pub(crate) fn show_title_bar(
         egui::Color32::from_rgb(27, 27, 27) // #1B1B1B
     };
     let pill_stroke = if logo_resp.hovered() {
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110))
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(110))
     } else {
         egui::Stroke::NONE
     };
@@ -942,7 +942,7 @@ pub(crate) fn show_title_bar(
                 egui::Color32::from_rgb(27, 27, 27)
             },
             if bt.hovered() {
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110))
+                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(110))
             } else {
                 egui::Stroke::NONE
             },
@@ -1093,7 +1093,7 @@ pub(crate) fn render_eye_toggle(ui: &mut egui::Ui, bar_h: f32) {
             let bg = ui.visuals().window_fill();
             egui::Frame::default()
                 .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
-                .stroke(egui::Stroke::new(1.0,
+                .stroke(egui::Stroke::new(1.0_f32,
                     ui.visuals().widgets.noninteractive.bg_stroke.color))
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::same(6))

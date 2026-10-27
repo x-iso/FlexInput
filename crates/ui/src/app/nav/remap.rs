@@ -82,7 +82,7 @@ pub(crate) fn draw_remap_card_glow(
                 }
                 let bg = egui::Rect::from_min_size(pos, galley.size()).expand(5.0);
                 tp.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(235));
-                tp.rect_stroke(bg, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+                tp.rect_stroke(bg, 4.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
                 tp.galley(pos, galley, egui::Color32::WHITE);
             }
         }

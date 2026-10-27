@@ -48,7 +48,7 @@ impl FlexInputApp {
                                             }
                                             let c = rect.center();
                                             let d = 3.2_f32;
-                                            let s = egui::Stroke::new(1.2, ui.visuals().text_color());
+                                            let s = egui::Stroke::new(1.2_f32, ui.visuals().text_color());
                                             ui.painter().line_segment(
                                                 [egui::pos2(c.x-d, c.y-d), egui::pos2(c.x+d, c.y+d)], s);
                                             ui.painter().line_segment(
@@ -114,7 +114,7 @@ impl FlexInputApp {
                             // Checkmark for bound entries
                             let text_x = if is_bound {
                                 let c = egui::pos2(rect.left() + 12.0, rect.center().y);
-                                let s = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
+                                let s = egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color);
                                 ui.painter().line_segment(
                                     [egui::pos2(c.x - 4.0, c.y), egui::pos2(c.x - 1.0, c.y + 3.5)], s);
                                 ui.painter().line_segment(

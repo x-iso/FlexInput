@@ -489,7 +489,7 @@ fn show_preset_picker(
                     outer_rect,
                     egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 },
                     egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
-                    egui::Stroke::new(1.0,
+                    egui::Stroke::new(1.0_f32,
                         ui.visuals().widgets.noninteractive.bg_stroke.color),
                     egui::StrokeKind::Inside,
                 ));
@@ -550,7 +550,7 @@ fn preset_dropdown_bar(
     // seamlessly as one continuous shape. Bar fill matches the
     // dropdown body fill (#1a1a1a) for visual continuity.
     let bg = egui::Color32::from_rgb(0x1a, 0x1a, 0x1a);
-    let stroke = egui::Stroke::new(1.0,
+    let stroke = egui::Stroke::new(1.0_f32,
         ui.visuals().widgets.noninteractive.bg_stroke.color);
     if is_open {
         let cr = egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
@@ -948,7 +948,7 @@ fn preset_row(
         let accent = ui.visuals().selection.stroke.color;
         ui.painter().rect_filled(rect, 4.0, accent.gamma_multiply(0.25));
         ui.painter().rect_stroke(rect, 4.0,
-            egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+            egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Inside);
     }
 
     // Record geometry once per favorites section so drag reorder
@@ -999,7 +999,7 @@ fn preset_row(
         );
         let h_resp = ui.interact(h_rect, handle_id, egui::Sense::click_and_drag());
         if row_hovered || h_resp.hovered() || h_resp.dragged() {
-            let stroke = egui::Stroke::new(1.5, ui.visuals().weak_text_color());
+            let stroke = egui::Stroke::new(1.5_f32, ui.visuals().weak_text_color());
             let cx = h_rect.center().x;
             let half = 5.0;
             for k in 0..3 {
@@ -1556,7 +1556,7 @@ fn render_subpatch_body(
                         if a == 0 { continue; }
                         painter.rect_stroke(
                             rect.expand(grow), base_round + grow,
-                            egui::Stroke::new(2.0,
+                            egui::Stroke::new(2.0_f32,
                                 egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
                             egui::StrokeKind::Outside,
                         );
@@ -1564,7 +1564,7 @@ fn render_subpatch_body(
                     painter.rect_stroke(
                         rect.expand(1.0),
                         base_round,
-                        egui::Stroke::new(if editing { 2.0 } else { 1.25 },
+                        egui::Stroke::new(if editing { 2.0 } else { 1.25_f32 },
                             accent.gamma_multiply(if editing { 1.0 } else { 0.75 })),
                         egui::StrokeKind::Outside,
                     );

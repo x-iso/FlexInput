@@ -176,7 +176,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         card_rect,
         outer_cr,
         C_CARD_BG,
-        egui::Stroke::new(1.0, C_BORDER),
+        egui::Stroke::new(1.0_f32, C_BORDER),
         egui::epaint::StrokeKind::Inside,
     );
     // Body fills the bottom portion (header strip is whatever sits above).
@@ -766,7 +766,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         };
         painter.rect_stroke(
             card_rect, warn_cr,
-            egui::Stroke::new(1.5, C_WARN),
+            egui::Stroke::new(1.5_f32, C_WARN),
             egui::epaint::StrokeKind::Inside,
         );
         let bsz = 18.0 * s;

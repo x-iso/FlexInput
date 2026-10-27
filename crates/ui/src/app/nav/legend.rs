@@ -512,7 +512,7 @@ impl FlexInputApp {
                 const ITEM_PAD: f32 = 4.8; // around the "/" between multi-glyphs
                 const LABEL_GAP: f32 = 2.4; // glyph → label
                 const DIV_GAP: f32 = 5.0;   // around the inter-hint divider
-                let div_stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+                let div_stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
                 let label_font = egui::FontId::proportional(14.4);
                 let slash_font = egui::FontId::proportional(13.2);
                 let token_font = egui::FontId::proportional(14.4);

@@ -440,7 +440,7 @@ pub(crate) fn curve_box(ui: &mut egui::Ui, exp: &mut f32, def: f32) {
             plot.bottom() - y * plot.height(),
         ));
     }
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4, visuals.selection.bg_fill)));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.4_f32, visuals.selection.bg_fill)));
 
     resp.on_hover_text(
         "Response curve for forwarded rumble (exponent). Drag to bend: up = boost \

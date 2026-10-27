@@ -487,7 +487,7 @@ fn input_card(
     } else {
         CARD_STROKE_INACTIVE
     };
-    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
     ui.painter()
         .with_clip_rect(viewport_clip)
         .rect(card_rect, CARD_ROUND, CARD_FILL_INACTIVE,
@@ -796,7 +796,7 @@ fn midi_input_card(
     let (stroke_col, stroke_w) = if is_active {
         (ui.visuals().selection.stroke.color, 1.5)
     } else {
-        (CARD_STROKE_INACTIVE, 1.0)
+        (CARD_STROKE_INACTIVE, 1.0_f32)
     };
     let fill = if is_active { active_accent_fill(ui) } else { CARD_FILL_INACTIVE };
     ui.painter().with_clip_rect(clip).rect(
@@ -1441,7 +1441,7 @@ fn xinput_slot_circles(
         } else if is_mine {
             (1.5, base_stroke)
         } else {
-            (1.0, base_stroke)
+            (1.0_f32, base_stroke)
         };
         painter.circle(center, dot_d / 2.0, fill, egui::Stroke::new(stroke_w, stroke_c));
         painter.text(center, egui::Align2::CENTER_CENTER, format!("{}", i + 1),
@@ -1721,7 +1721,7 @@ fn gamepad_selector_card(
     // ── bg + (if a pad is active) LEFT-half accent fill ──
     let is_active = active.is_some();
     let stroke_col = if is_active { ui.visuals().selection.stroke.color } else { CARD_STROKE_INACTIVE };
-    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
     ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
         egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     if is_active {
@@ -1916,7 +1916,7 @@ fn keymouse_card(
     } else {
         CARD_STROKE_INACTIVE
     };
-    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
     ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
         egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     if is_active {

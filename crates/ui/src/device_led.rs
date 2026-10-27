@@ -62,9 +62,9 @@ pub fn swatch_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let stroke = if resp.hovered() {
-            egui::Stroke::new(1.5, egui::Color32::WHITE)
+            egui::Stroke::new(1.5_f32, egui::Color32::WHITE)
         } else {
-            egui::Stroke::new(1.0, egui::Color32::from_gray(80))
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80))
         };
         match current {
             Some([r, g, b]) => {
@@ -76,7 +76,7 @@ pub fn swatch_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
                     egui::StrokeKind::Inside);
                 let inner = rect.shrink(5.0);
                 painter.line_segment([inner.left_bottom(), inner.right_top()],
-                    egui::Stroke::new(1.2, egui::Color32::from_gray(110)));
+                    egui::Stroke::new(1.2_f32, egui::Color32::from_gray(110)));
             }
         }
     }

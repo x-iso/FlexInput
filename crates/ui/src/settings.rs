@@ -397,7 +397,10 @@ pub struct AppSettings {
     /// the standalone `puffin_viewer` GUI (`cargo install puffin_viewer`)
     /// to inspect a live flamegraph. NOT persisted — it's a dev-time tool
     /// and we don't want users accidentally leaving it on across sessions.
+    /// Only read by the debug-only Developer section, so release builds
+    /// see it as dead — `#[allow(dead_code)]` keeps that warning down.
     #[serde(default, skip)]
+    #[allow(dead_code)]
     pub profiler_enabled: bool,
     /// Top-level UI mode. Easy = factory-default preset-driven view;
     /// Advanced = legacy snarl canvas + side panels. Global across tabs.

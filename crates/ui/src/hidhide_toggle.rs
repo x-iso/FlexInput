@@ -78,13 +78,13 @@ pub fn eye_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
         let v = ui.visuals();
         let accent = v.selection.stroke.color;
         let (fill, stroke) = if st.blocked.is_some() {
-            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)))
         } else if st.hidden {
-            (v.selection.bg_fill, egui::Stroke::new(1.5, accent))
+            (v.selection.bg_fill, egui::Stroke::new(1.5_f32, accent))
         } else if resp.hovered() {
             (v.widgets.hovered.bg_fill, v.widgets.hovered.bg_stroke)
         } else {
-            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, egui::Color32::from_gray(80)))
+            (egui::Color32::TRANSPARENT, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)))
         };
         let painter = ui.painter();
         painter.rect(rect, 4.0, fill, stroke, egui::StrokeKind::Inside);
@@ -141,7 +141,7 @@ fn paint_eye(painter: &egui::Painter, c: egui::Pos2, w: f32, color: egui::Color3
             })
             .collect()
     };
-    let stroke = egui::Stroke::new(1.6, color);
+    let stroke = egui::Stroke::new(1.6_f32, color);
     painter.add(egui::Shape::line(arc(-1.0), stroke));
     painter.add(egui::Shape::line(arc(1.0), stroke));
     painter.circle_filled(c, h * 0.62, color);

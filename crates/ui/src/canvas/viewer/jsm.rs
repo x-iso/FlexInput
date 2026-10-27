@@ -1469,7 +1469,7 @@ fn resize_handle(ui: &mut egui::Ui, node_id: NodeId, size: egui::Vec2) -> Option
         painter.line_segment(
             [egui::pos2(grip.right() - o - 2.0, grip.bottom() - 2.0),
              egui::pos2(grip.right() - 2.0, grip.bottom() - o - 2.0)],
-            egui::Stroke::new(1.0, color),
+            egui::Stroke::new(1.0_f32, color),
         );
     }
     resp.dragged().then(|| {

@@ -395,7 +395,7 @@ pub(crate) fn tz_pick_banner(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     painter: &egui::Painter, rect: egui::Rect, accent: egui::Color32)
 {
     let Some(kind) = tz_pick_kind(snarl, node_id) else { return; };
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(2.0, accent), egui::epaint::StrokeKind::Inside);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(2.0_f32, accent), egui::epaint::StrokeKind::Inside);
     let msg = if kind == "migrate" { "Tap a zone to MOVE the mappings there" }
               else { "Tap a zone to INHERIT the mappings, then merge" };
     let br = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 14.0),
@@ -761,7 +761,7 @@ pub(crate) fn mapping_curve_editor(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 104.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
-    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, visuals.weak_text_color()), egui::StrokeKind::Inside);
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, visuals.weak_text_color()), egui::StrokeKind::Inside);
     let g = rect.shrink(8.0);
     let to = |x: f32, y: f32| egui::pos2(
         g.left() + x.clamp(0.0, 1.0) * g.width(),
@@ -794,7 +794,7 @@ pub(crate) fn mapping_curve_editor(
             .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", uid))))
             .map(|p| crate::widgets::nav_pass_matches(ui.ctx(), p)).unwrap_or(false);
         if nav_focused || nav_sel_dot.is_some() {
-            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Inside);
         }
         // Gamepad users can't scroll manually, and the whole-module wrapper uses a
         // MANUAL scroll offset (not an egui ScrollArea, so `scroll_to_rect` is a
@@ -824,10 +824,10 @@ pub(crate) fn mapping_curve_editor(
     let grid = visuals.weak_text_color().gamma_multiply(0.35);
     for k in 1..4 {
         let t = k as f32 / 4.0;
-        painter.line_segment([to(t, 0.0), to(t, 1.0)], egui::Stroke::new(0.5, grid));
-        painter.line_segment([to(0.0, t), to(1.0, t)], egui::Stroke::new(0.5, grid));
+        painter.line_segment([to(t, 0.0), to(t, 1.0)], egui::Stroke::new(0.5_f32, grid));
+        painter.line_segment([to(0.0, t), to(1.0, t)], egui::Stroke::new(0.5_f32, grid));
     }
-    painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5, grid));
+    painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5_f32, grid));
 
     // Add-area first (bottom of z-order); handles after so they win their rects.
     // NOTE: `interact_pointer_pos()` is ALREADY in this UI's local space (even
@@ -901,11 +901,11 @@ pub(crate) fn mapping_curve_editor(
         let thr_col = egui::Color32::from_rgb(255, 170, 60);
         painter.add(egui::Shape::dashed_line(
             &[egui::pos2(g.left(), ly), egui::pos2(g.right(), ly)],
-            egui::Stroke::new(if thr_focused { 2.2 } else { 1.2 }, thr_col), 5.0, 4.0));
+            egui::Stroke::new(if thr_focused { 2.2 } else { 1.2_f32 }, thr_col), 5.0, 4.0));
         let knob = egui::pos2(g.right() - 4.0, ly);
         painter.circle_filled(knob, if thr_focused { 4.5 } else { 3.5 }, thr_col);
         if thr_focused {
-            painter.circle_stroke(knob, 6.5, egui::Stroke::new(1.5, accent));
+            painter.circle_stroke(knob, 6.5, egui::Stroke::new(1.5_f32, accent));
         }
     } else if thr_focused {
         // Threshold OFF but focused → hint the line at the default so South-to-
@@ -913,21 +913,21 @@ pub(crate) fn mapping_curve_editor(
         let ly = to(0.0, 0.5).y;
         painter.add(egui::Shape::dashed_line(
             &[egui::pos2(g.left(), ly), egui::pos2(g.right(), ly)],
-            egui::Stroke::new(1.0, accent.gamma_multiply(0.6)), 4.0, 4.0));
+            egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.6)), 4.0, 4.0));
     }
 
     // Curve polyline (over the possibly-just-edited points) + handles.
     for wnd in pts.windows(2) {
         painter.line_segment([to(wnd[0][0], wnd[0][1]), to(wnd[1][0], wnd[1][1])],
-            egui::Stroke::new(1.8, accent));
+            egui::Stroke::new(1.8_f32, accent));
     }
     for (i, p) in pts.iter().enumerate() {
         painter.circle_filled(to(p[0], p[1]), 4.0, accent);
-        painter.circle_stroke(to(p[0], p[1]), 4.0, egui::Stroke::new(1.0, visuals.extreme_bg_color));
+        painter.circle_stroke(to(p[0], p[1]), 4.0, egui::Stroke::new(1.0_f32, visuals.extreme_bg_color));
         // Gamepad-selected dot: accent ring (thicker while being moved/entered).
         if nav_sel_dot == Some(i) {
             painter.circle_stroke(to(p[0], p[1]), if nav_editing { 8.0 } else { 6.5 },
-                egui::Stroke::new(2.0, accent));
+                egui::Stroke::new(2.0_f32, accent));
         }
     }
     // Live input→output dot; green while it would hold a thresholded binding.
@@ -1025,7 +1025,7 @@ pub(crate) fn mapping_curve_editor(
         // the "toggle / adjust threshold" target is unmistakable.
         if thr_focused {
             ui.painter().rect_stroke(row.response.rect.expand(2.0), 3.0,
-                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+                egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
         }
         *slot = thr_val;
     }
@@ -1111,7 +1111,7 @@ pub(crate) fn mapping_card_curve_section(
     };
     let out = egui::Frame::default()
         .fill(C_BODY_BG)
-        .stroke(egui::Stroke::new(1.0, C_BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, C_BORDER))
         .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 })
         .inner_margin(egui::Margin { left: 0, right: 0, top: 1, bottom: 2 })
         .show(ui, |ui| {
@@ -1210,7 +1210,7 @@ pub(crate) fn mapping_card_curve_section(
             }
             if focused {
                 ui.painter().rect_stroke(sl.rect.expand(2.0), 3.0,
-                    egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+                    egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
                 sl.scroll_to_me(None);
             }
             if a.editable && sl.changed() {
@@ -1267,7 +1267,7 @@ fn imu_scale_rows(
     let ring = |ui: &egui::Ui, r: &egui::Response, field: u64| {
         if nav_field == Some(field) {
             ui.painter().rect_stroke(r.rect.expand(2.0), 3.0,
-                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+                egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
             r.scroll_to_me(None);
         }
     };
@@ -1562,17 +1562,17 @@ pub(crate) fn tz_paint_zone_mapping(
         let bx = tz_zone_scope_rect(zr);
         painter.rect_filled(bx, 2.0, visuals.extreme_bg_color.gamma_multiply(0.7));
         let grid = visuals.weak_text_color().gamma_multiply(0.5);
-        painter.rect_stroke(bx, 2.0, egui::Stroke::new(1.0, visuals.weak_text_color()), egui::StrokeKind::Inside);
+        painter.rect_stroke(bx, 2.0, egui::Stroke::new(1.0_f32, visuals.weak_text_color()), egui::StrokeKind::Inside);
         if let Some((dx, dy)) = deflect {
             // ACTIVE → vectorscope: crosshair + live dot.
             painter.line_segment([egui::pos2(bx.center().x, bx.top()), egui::pos2(bx.center().x, bx.bottom())],
-                egui::Stroke::new(0.5, grid));
+                egui::Stroke::new(0.5_f32, grid));
             painter.line_segment([egui::pos2(bx.left(), bx.center().y), egui::pos2(bx.right(), bx.center().y)],
-                egui::Stroke::new(0.5, grid));
+                egui::Stroke::new(0.5_f32, grid));
             let p = egui::pos2(
                 bx.center().x + dx.clamp(-1.0, 1.0) * 0.5 * bx.width(),
                 bx.center().y - dy.clamp(-1.0, 1.0) * 0.5 * bx.height()); // +Y up
-            painter.line_segment([bx.center(), p], egui::Stroke::new(1.5, accent.gamma_multiply(0.6)));
+            painter.line_segment([bx.center(), p], egui::Stroke::new(1.5_f32, accent.gamma_multiply(0.6)));
             painter.circle_filled(p, 3.0, accent);
         } else {
             // IDLE → response curve over the 0..1 deflection magnitude.
@@ -1581,10 +1581,10 @@ pub(crate) fn tz_paint_zone_mapping(
                 bx.left() + x.clamp(0.0, 1.0) * bx.width(),
                 bx.bottom() - y.clamp(0.0, 1.5) * bx.height());
             // Faint linear reference (identity).
-            painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5, grid));
+            painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5_f32, grid));
             for w in pts.windows(2) {
                 painter.line_segment([to(w[0][0], w[0][1]), to(w[1][0], w[1][1])],
-                    egui::Stroke::new(1.5, accent));
+                    egui::Stroke::new(1.5_f32, accent));
             }
             for p in &pts {
                 painter.circle_filled(to(p[0], p[1]), 2.0, accent);
@@ -1747,7 +1747,7 @@ pub(crate) fn tz_draw_field(
                 let accent = crate::widgets::NavHighlightStyle::of(&ctx).accent;
                 painter.rect_filled(zr.shrink(1.0), 2.0, accent.gamma_multiply(0.22));
                 painter.rect_stroke(zr.shrink(1.0), 2.0,
-                    egui::Stroke::new(2.5, accent), egui::StrokeKind::Inside);
+                    egui::Stroke::new(2.5_f32, accent), egui::StrokeKind::Inside);
             }
         }
     }
@@ -1760,7 +1760,7 @@ pub(crate) fn tz_draw_field(
         }
     }
     painter.rect_stroke(rect, 4.0,
-        egui::Stroke::new(1.0, frame_col), egui::StrokeKind::Inside);
+        egui::Stroke::new(1.0_f32, frame_col), egui::StrokeKind::Inside);
 
     // Gamepad-nav focus: the driver publishes (pass, field, axis, line, grabbed)
     // keyed by this node id when line-editing this pad in Easy mode. Highlight
@@ -1846,7 +1846,7 @@ pub(crate) fn tz_draw_field(
                 Some(match acc { Some(a) => a | resp, None => resp })
             });
             let Some(r) = r else {
-                painter.line_segment([p0, p1], egui::Stroke::new(1.0, visuals.weak_text_color()));
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0_f32, visuals.weak_text_color()));
                 continue;
             };
             let hot = r.hovered() || r.dragged();
@@ -2114,7 +2114,7 @@ pub(crate) fn render_touch_zones_pinned(
             if sel_field == field {
                 if let Some([x0, y0, x1, y1]) = tree.zone_rect(sel_zone as u32) {
                     let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
-                    painter.rect_stroke(zr.shrink(1.5), 2.0, egui::Stroke::new(2.0, accent), egui::StrokeKind::Inside);
+                    painter.rect_stroke(zr.shrink(1.5), 2.0, egui::Stroke::new(2.0_f32, accent), egui::StrokeKind::Inside);
                 }
             }
         }
@@ -3272,7 +3272,7 @@ pub(crate) fn render_touch_zone_cards(
                         if focused {
                             let accent = crate::widgets::NavHighlightStyle::of(&ctx).accent;
                             ui.painter().rect_stroke(r.expand(2.0), 4.0,
-                                egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                                egui::Stroke::new(2.0_f32, accent), egui::StrokeKind::Outside);
                         }
                     });
                 }
@@ -3474,7 +3474,7 @@ pub(crate) fn render_touch_field(
         if sel_field == field {
             if let Some([x0, y0, x1, y1]) = tree.zone_rect(sel_zone as u32) {
                 let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
-                painter.rect_stroke(zr.shrink(1.5), 2.0, egui::Stroke::new(2.0, accent), egui::StrokeKind::Inside);
+                painter.rect_stroke(zr.shrink(1.5), 2.0, egui::Stroke::new(2.0_f32, accent), egui::StrokeKind::Inside);
             }
         }
     }
@@ -3500,7 +3500,7 @@ pub(crate) fn render_touch_field(
             let o = k as f32 * 3.5;
             painter.line_segment(
                 [egui::pos2(rect.right() - o, rect.bottom()), egui::pos2(rect.right(), rect.bottom() - o)],
-                egui::Stroke::new(1.0, grip),
+                egui::Stroke::new(1.0_f32, grip),
             );
         }
         if hr.dragged() {

@@ -283,15 +283,15 @@ pub(crate) fn paint_stick_rotation(
     let radius = (side - label_h) * 0.5 - 6.0;
     let deadzone = deadzone.clamp(0.0, 1.0);
 
-    painter.circle_stroke(c, radius, egui::Stroke::new(1.0, line));
+    painter.circle_stroke(c, radius, egui::Stroke::new(1.0_f32, line));
     painter.circle_filled(c, radius * deadzone, weak.gamma_multiply(0.15));
-    painter.circle_stroke(c, radius * deadzone, egui::Stroke::new(1.0, weak.gamma_multiply(0.5)));
+    painter.circle_stroke(c, radius * deadzone, egui::Stroke::new(1.0_f32, weak.gamma_multiply(0.5)));
     if let Some(o) = outer {
-        painter.circle_stroke(c, radius * o.clamp(0.0, 1.0), egui::Stroke::new(1.0, accent.gamma_multiply(0.35)));
+        painter.circle_stroke(c, radius * o.clamp(0.0, 1.0), egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.35)));
     }
     // Up, as the compass the offset is measured from.
     painter.line_segment([c - egui::vec2(0.0, radius), c - egui::vec2(0.0, radius - 5.0)],
-        egui::Stroke::new(1.0, line));
+        egui::Stroke::new(1.0_f32, line));
 
     let get = |i: usize| out.get(base + i).copied().flatten();
     let vec = |i: usize| match get(i) {
@@ -322,16 +322,16 @@ pub(crate) fn paint_stick_rotation(
                 at(glam::Vec2::new(a.sin(), a.cos()) * len)
             })
             .collect();
-        painter.add(egui::Shape::line(arc, egui::Stroke::new(1.5, accent.gamma_multiply(0.6))));
-        painter.line_segment([c, at(rotated)], egui::Stroke::new(1.5, accent));
-        painter.line_segment([c, at(raw)], egui::Stroke::new(1.0, weak.gamma_multiply(0.6)));
+        painter.add(egui::Shape::line(arc, egui::Stroke::new(1.5_f32, accent.gamma_multiply(0.6))));
+        painter.line_segment([c, at(rotated)], egui::Stroke::new(1.5_f32, accent));
+        painter.line_segment([c, at(raw)], egui::Stroke::new(1.0_f32, weak.gamma_multiply(0.6)));
     }
-    painter.circle_stroke(at(raw), 4.0, egui::Stroke::new(1.5, weak));
+    painter.circle_stroke(at(raw), 4.0, egui::Stroke::new(1.5_f32, weak));
     if engaged {
         painter.circle_filled(at(rotated), 4.5, accent);
         if taken {
             // The gyro has the aim: ring the dot it is turning.
-            painter.circle_stroke(at(rotated), 7.0, egui::Stroke::new(1.0, accent));
+            painter.circle_stroke(at(rotated), 7.0, egui::Stroke::new(1.0_f32, accent));
         }
     }
 

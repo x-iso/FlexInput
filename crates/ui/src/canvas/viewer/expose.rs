@@ -269,7 +269,7 @@ pub(crate) fn register_exposable_element(
                            egui::Color32::from_rgb(230, 160, 40)),
     };
     painter.rect_filled(rect, 4.0, fill);
-    let s = egui::Stroke::new(1.5, outline);
+    let s = egui::Stroke::new(1.5_f32, outline);
     painter.line_segment([rect.left_top(),     rect.right_top()],    s);
     painter.line_segment([rect.right_top(),    rect.right_bottom()], s);
     painter.line_segment([rect.right_bottom(), rect.left_bottom()],  s);

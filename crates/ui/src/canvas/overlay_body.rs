@@ -179,7 +179,7 @@ pub(crate) fn show_overlay_body(
     // Edit-mode snap grid, drawn under everything.
     if edit && snap_enabled && step_x >= 2.0 && step_y >= 2.0 {
         let painter = ui.painter().with_clip_rect(rect);
-        let stroke = egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
+        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
         let mut x = 0.0f32;
         while x <= rect.width() {
             painter.line_segment(
@@ -203,7 +203,7 @@ pub(crate) fn show_overlay_body(
     // stretches). Drawn brighter than the snap grid so the two read apart.
     if edit {
         let painter = ui.painter().with_clip_rect(rect);
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 60));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 60));
         for k in 1..=2 {
             let x = origin.x + rect.width() * (k as f32 / 3.0);
             painter.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], stroke);
@@ -224,7 +224,7 @@ pub(crate) fn show_overlay_body(
         painter.rect_filled(bg, 8.0, egui::Color32::from_rgba_unmultiplied(40, 60, 90, 235));
         painter.rect_stroke(
             bg, 8.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 220)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 220)),
             egui::StrokeKind::Inside,
         );
         painter.galley(bg.center() - galley.size() * 0.5, galley, egui::Color32::WHITE);
@@ -269,7 +269,7 @@ pub(crate) fn show_overlay_body(
                     painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(120, 180, 255, 30));
                     painter.rect_stroke(
                         r, egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -337,7 +337,7 @@ pub(crate) fn show_overlay_body(
                         let painter = ui.painter();
                         painter.rect_stroke(
                             item_rect, 4.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 120, 120, 180)),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 120, 120, 180)),
                             egui::StrokeKind::Inside,
                         );
                         painter.text(
@@ -421,7 +421,7 @@ pub(crate) fn show_overlay_body(
         };
         ui.painter().rect_stroke(
             item_rect, 0.0,
-            egui::Stroke::new(1.0, outline_col),
+            egui::Stroke::new(1.0_f32, outline_col),
             egui::StrokeKind::Inside,
         );
 
@@ -445,10 +445,10 @@ pub(crate) fn show_overlay_body(
             };
             let pivot = egui::pos2(px, py);
             let painter = ui.painter();
-            painter.circle_stroke(pivot, 5.0, egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 200)));
+            painter.circle_stroke(pivot, 5.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 200)));
             painter.circle_filled(pivot, 3.5, egui::Color32::from_rgb(255, 200, 80));
             // Tiny crosshair so it reads as a pivot, not a handle.
-            let t = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 160));
+            let t = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(20, 20, 20, 160));
             painter.line_segment([pivot - egui::vec2(7.0, 0.0), pivot + egui::vec2(7.0, 0.0)], t);
             painter.line_segment([pivot - egui::vec2(0.0, 7.0), pivot + egui::vec2(0.0, 7.0)], t);
         }
@@ -618,7 +618,7 @@ pub(crate) fn show_overlay_body(
                     egui::Color32::from_rgba_unmultiplied(255, 220, 120, 90)
                 };
                 ui.painter().rect_filled(handle_rect, 2.0, fill);
-                let s = egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 220, 120));
+                let s = egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(255, 220, 120));
                 for k in 1..=3 {
                     let off = k as f32 * (RESIZE_HANDLE / 4.0);
                     ui.painter().line_segment(
@@ -684,9 +684,9 @@ pub(crate) fn show_overlay_body(
                     let (fp, fs) = resolve_layout_rect(&items, i, authored, cur);
                     let (tp, ts) = resolve_layout_rect(&items, j, authored, cur);
                     let col = egui::Color32::from_rgba_unmultiplied(120, 210, 160, 210);
-                    painter.line_segment([center(fp, fs), center(tp, ts)], egui::Stroke::new(1.5, col));
+                    painter.line_segment([center(fp, fs), center(tp, ts)], egui::Stroke::new(1.5_f32, col));
                     painter.circle_filled(center(tp, ts), 4.0, col); // dot at the target
-                    painter.circle_stroke(center(fp, fs), 3.5, egui::Stroke::new(1.5, col)); // ring at follower
+                    painter.circle_stroke(center(fp, fs), 3.5, egui::Stroke::new(1.5_f32, col)); // ring at follower
                 }
             }
         }
@@ -702,7 +702,7 @@ pub(crate) fn show_overlay_body(
                     );
                     painter.rect_stroke(
                         r, 4.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 220, 120)),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(150, 220, 120)),
                         egui::StrokeKind::Outside,
                     );
                 }

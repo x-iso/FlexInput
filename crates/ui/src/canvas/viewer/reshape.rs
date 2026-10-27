@@ -173,13 +173,13 @@ pub(crate) fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, 
 
     // Reference unit circle + crosshair.
     let refc = Color32::from_rgba_unmultiplied(150, 150, 150, 110);
-    painter.circle_stroke(c, r, egui::Stroke::new(1.0, refc));
-    painter.line_segment([egui::pos2(rect.left(), c.y), egui::pos2(rect.right(), c.y)], egui::Stroke::new(0.5, refc));
-    painter.line_segment([egui::pos2(c.x, rect.top()), egui::pos2(c.x, rect.bottom())], egui::Stroke::new(0.5, refc));
+    painter.circle_stroke(c, r, egui::Stroke::new(1.0_f32, refc));
+    painter.line_segment([egui::pos2(rect.left(), c.y), egui::pos2(rect.right(), c.y)], egui::Stroke::new(0.5_f32, refc));
+    painter.line_segment([egui::pos2(c.x, rect.top()), egui::pos2(c.x, rect.bottom())], egui::Stroke::new(0.5_f32, refc));
     // Full-square reference (the √2 envelope target) so "how close to square" reads.
     let sq = Color32::from_rgba_unmultiplied(150, 150, 150, 50);
     painter.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)), 0.0,
-        egui::Stroke::new(0.75, sq), egui::StrokeKind::Inside);
+        egui::Stroke::new(0.75_f32, sq), egui::StrokeKind::Inside);
 
     // Reshaped envelope outline (the reachable output gate).
     let nseg = 128usize;
@@ -188,7 +188,7 @@ pub(crate) fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, 
         v2s(glam::Vec2::new(th.cos(), th.sin()) * p.envelope_at(th))
     }).collect();
     for wv in gate.windows(2) {
-        painter.line_segment([wv[0], wv[1]], egui::Stroke::new(1.5, Color32::from_rgb(120, 220, 140)));
+        painter.line_segment([wv[0], wv[1]], egui::Stroke::new(1.5_f32, Color32::from_rgb(120, 220, 140)));
     }
 
     // Live input (blue) → output (green) dots.
@@ -196,7 +196,7 @@ pub(crate) fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, 
         let inp = v / p.in_max.max(f32::EPSILON);
         painter.circle_filled(v2s(inp), 3.0, Color32::from_rgba_unmultiplied(120, 180, 255, 220));
         let out = vec_reshape_apply(v, &p.boundary, &p.gain, &p.gain_biases, &p.symmetry, p.renorm, p.in_max, p.out_max) / p.out_max.max(f32::EPSILON);
-        painter.line_segment([v2s(inp), v2s(out)], egui::Stroke::new(0.75, Color32::from_rgba_unmultiplied(210, 210, 210, 130)));
+        painter.line_segment([v2s(inp), v2s(out)], egui::Stroke::new(0.75_f32, Color32::from_rgba_unmultiplied(210, 210, 210, 130)));
         painter.circle_filled(v2s(out), 4.0, Color32::from_rgb(140, 255, 170));
         request_repaint_throttled(ui.ctx());
     }
@@ -441,14 +441,14 @@ pub(crate) fn draw_reshape_curve_editor(
             painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
             let (grid_faint, grid_axis) = graph_grid_colors(None);
-            let gs = egui::Stroke::new(0.5, grid_faint);
+            let gs = egui::Stroke::new(0.5_f32, grid_faint);
             // Vertical grid (direction).
             for i in 1..grid_x { let x = i as f32 / grid_x as f32; painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
             // Horizontal grid (value) — the previously-missing Y axis.
             for i in 1..grid_y { let y = i as f32 / grid_y as f32; painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
             // Unity reference line (radius/gain = 1) at 1/y_max.
             let unity = (1.0 / y_max).clamp(0.0, 1.0);
-            painter.line_segment([c2s(x_lo, unity), c2s(x_hi, unity)], egui::Stroke::new(1.0, grid_axis));
+            painter.line_segment([c2s(x_lo, unity), c2s(x_hi, unity)], egui::Stroke::new(1.0_f32, grid_axis));
 
             // Corner labels: axis↔diagonal (X), and value extremes (Y).
             let lbl = Color32::from_rgba_unmultiplied(170, 170, 170, 150);
@@ -474,7 +474,7 @@ pub(crate) fn draw_reshape_curve_editor(
                     c2s(x, y)
                 }).collect();
                 let col = if editing_gain { Color32::from_rgb(120, 220, 140) } else { Color32::from_rgb(120, 180, 255) };
-                for w in line.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, col)); }
+                for w in line.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, col)); }
             }
 
             // Bias handles (Alt) — gain curve only.
@@ -517,7 +517,7 @@ pub(crate) fn draw_reshape_curve_editor(
                 }
                 let col = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_gray(200) };
                 painter.circle_filled(screen, 4.0, col);
-                painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0, Color32::from_gray(70)));
+                painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(70)));
             }
             // Biases stay on their own segments (boundary has none; its all-zero
             // list is never written back).
@@ -539,7 +539,7 @@ pub(crate) fn draw_reshape_curve_editor(
                     let y = sample_curve(&pts, a01, &biases).clamp(y_lo, y_hi);
                     let head = if editing_gain { Color32::from_rgb(140, 255, 170) } else { Color32::from_rgb(150, 200, 255) };
                     painter.line_segment([c2s(a01, y_lo), c2s(a01, y_hi)],
-                        egui::Stroke::new(0.75, Color32::from_rgba_unmultiplied(head.r(), head.g(), head.b(), 90)));
+                        egui::Stroke::new(0.75_f32, Color32::from_rgba_unmultiplied(head.r(), head.g(), head.b(), 90)));
                     painter.circle_filled(c2s(a01, y), 3.0, head);
                     request_repaint_throttled(ui.ctx());
                 }
@@ -558,7 +558,7 @@ pub(crate) fn draw_reshape_curve_editor(
             if let Some((_, idx, editing)) = nav_sel.filter(|(pp, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *pp)) {
                 if let Some(&[px, py]) = pts.get(idx) {
                     let ring = if editing { Color32::from_rgb(255, 210, 80) } else { Color32::from_rgb(120, 200, 255) };
-                    painter.circle_stroke(c2s(px, py), 7.0, egui::Stroke::new(1.5, ring));
+                    painter.circle_stroke(c2s(px, py), 7.0, egui::Stroke::new(1.5_f32, ring));
                 }
             }
     }

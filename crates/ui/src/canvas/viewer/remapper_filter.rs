@@ -317,7 +317,7 @@ pub(crate) fn filter_chip(
     if active {
         painter.rect_stroke(
             rect, 4.0,
-            egui::Stroke::new(1.0, Color32::from_white_alpha(180)),
+            egui::Stroke::new(1.0_f32, Color32::from_white_alpha(180)),
             egui::epaint::StrokeKind::Inside,
         );
     }

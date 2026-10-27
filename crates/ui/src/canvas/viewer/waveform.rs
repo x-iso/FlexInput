@@ -631,7 +631,7 @@ fn paint_scope(
             let y = y_of(val);
             let major = k % v.sub == 0;
             let is_zero = val.abs() < scale * 1e-4;
-            let (w, col) = if is_zero { (1.0, grid_axis) } else if major { (0.5, grid_faint) } else { (0.5, grid_minor) };
+            let (w, col) = if is_zero { (1.0, grid_axis) } else if major { (0.5, grid_faint) } else { (0.5_f32, grid_minor) };
             if !major && rect.height() * 0.9 / (total as f32) < 4.0 {
                 continue;
             }
@@ -639,10 +639,10 @@ fn paint_scope(
         }
     } else if !v.uni {
         let y = rect.center().y;
-        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0, grid_axis));
+        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0_f32, grid_axis));
     }
     if v.uni {
-        painter.line_segment([egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())], egui::Stroke::new(1.0, grid_axis));
+        painter.line_segment([egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())], egui::Stroke::new(1.0_f32, grid_axis));
     }
 
     // ── The trigger, where it is in view ──
@@ -652,7 +652,7 @@ fn paint_scope(
             let amber = Color32::from_rgb(255, 196, 90);
             painter.extend(egui::Shape::dashed_line(
                 &[egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, amber.gamma_multiply(0.8)), 4.0, 3.0,
+                egui::Stroke::new(1.0_f32, amber.gamma_multiply(0.8)), 4.0, 3.0,
             ));
             painter.add(egui::Shape::convex_polygon(
                 vec![egui::pos2(x - 4.0, rect.top()), egui::pos2(x + 4.0, rect.top()), egui::pos2(x, rect.top() + 6.0)],
@@ -671,7 +671,7 @@ fn paint_scope(
                 continue;
             }
             painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(0.5, if major { grid_faint } else { grid_minor }));
+                egui::Stroke::new(0.5_f32, if major { grid_faint } else { grid_minor }));
         }
     }
 
@@ -704,7 +704,7 @@ fn paint_scope(
             pts
         };
         if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, col)));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, col)));
         }
         // Dashed lines at the window's min and max.
         if v.peaks && stats[ch].n > 0 {
@@ -712,7 +712,7 @@ fn paint_scope(
                 let y = y_of(val);
                 painter.extend(egui::Shape::dashed_line(
                     &[egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    egui::Stroke::new(1.0, col.gamma_multiply(0.7)), 5.0, 4.0,
+                    egui::Stroke::new(1.0_f32, col.gamma_multiply(0.7)), 5.0, 4.0,
                 ));
             }
         }
@@ -835,7 +835,7 @@ fn paint_scope(
             let idx = (idx_f.round().max(0.0) as usize).min(n - 1);
             let x = x_of(idx as f32);
             painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, Color32::from_white_alpha(110)));
+                egui::Stroke::new(1.0_f32, Color32::from_white_alpha(110)));
             let t_ms = t_of(idx as f32);
             let mut lines: Vec<(String, Color32)> = vec![(
                 if t_ms.abs() >= 1000.0 { fmt_t(t_ms, true, 3) } else { fmt_t(t_ms, false, 1) },
@@ -874,7 +874,7 @@ fn paint_scope(
     // statistics and the value labels.
     if v.freeze {
         let ice = Color32::from_rgb(140, 200, 255);
-        painter.rect_stroke(rect.shrink(1.0), 2.0, egui::Stroke::new(2.0, ice), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect.shrink(1.0), 2.0, egui::Stroke::new(2.0_f32, ice), egui::StrokeKind::Inside);
         let x = rect.left() + 4.0 + if left_w > 0.0 { left_w + 6.0 } else { 0.0 };
         let _ = backed_text(&painter, egui::pos2(x, rect.bottom() - 3.0), egui::Align2::LEFT_BOTTOM, "FROZEN".into(), 10.0, ice);
     }
@@ -899,7 +899,7 @@ fn scrollbar(ui: &mut egui::Ui, rect: egui::Rect, f: &Frame, salt: impl std::has
     if let Rows::Capture(c) = &f.rows {
         let x = to_x(c.t0 as f32);
         p.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(2.0, Color32::from_rgb(255, 196, 90).gamma_multiply(0.7)));
+            egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 196, 90).gamma_multiply(0.7)));
     }
     let thumb_w = (sp.win as f32 / sp.total as f32 * rect.width()).max(12.0);
     let x0 = to_x(sp.start as f32).min(rect.right() - thumb_w);
@@ -926,7 +926,7 @@ fn size_grip(ui: &mut egui::Ui, plot: egui::Rect, salt: impl std::hash::Hash) ->
     let p = ui.painter();
     for d in [4.0, 8.0, 12.0] {
         p.line_segment([egui::pos2(grip.right() - d, grip.bottom() - 1.0), egui::pos2(grip.right() - 1.0, grip.bottom() - d)],
-            egui::Stroke::new(1.0, col));
+            egui::Stroke::new(1.0_f32, col));
     }
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);

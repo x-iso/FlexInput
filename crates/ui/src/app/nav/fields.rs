@@ -471,7 +471,7 @@ impl FlexInputApp {
             egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
             galley.size() + pad * 2.0);
         painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230));
-        painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+        painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
         painter.text(egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
             egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
     }

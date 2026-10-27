@@ -817,6 +817,7 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
             Err(e) => {
                 #[cfg(debug_assertions)]
                 eprintln!("[gyro] open_path failed: {e}");
+                let _ = e;
                 return None;
             }
         }

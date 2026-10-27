@@ -639,7 +639,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         painter.image(tex.id(), left, uv, egui::Color32::from_white_alpha(179));
                         painter.line_segment(
                             [egui::pos2(rect.center().x, rect.min.y), egui::pos2(rect.center().x, rect.max.y)],
-                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(130)),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(130)),
                         );
                         painter.text(
                             egui::pos2(left.center().x, rect.min.y + 40.0),
@@ -759,7 +759,7 @@ fn config_toolbar(
         let bg = ui.visuals().window_fill();
         egui::Frame::default()
             .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 140, 200)))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 140, 200)))
             .corner_radius(8.0)
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
@@ -846,13 +846,13 @@ fn paint_nav_cursor(ui: &mut egui::Ui, pos: egui::Pos2) {
         p.circle_stroke(
             pos,
             r,
-            egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a as u8)),
+            egui::Stroke::new(3.0_f32, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a as u8)),
         );
     }
-    p.circle_stroke(pos, 8.0, egui::Stroke::new(2.0, accent));
+    p.circle_stroke(pos, 8.0, egui::Stroke::new(2.0_f32, accent));
     p.circle_filled(pos, 2.0, accent);
     // Crosshair ticks.
-    let tick = egui::Stroke::new(1.5, accent);
+    let tick = egui::Stroke::new(1.5_f32, accent);
     for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
         let d = egui::vec2(dx, dy);
         p.line_segment([pos + d * 8.0, pos + d * 13.0], tick);
@@ -902,7 +902,7 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
     p.rect_stroke(
         bar,
         8.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 140, 200, 150)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(120, 140, 200, 150)),
         egui::StrokeKind::Inside,
     );
 
@@ -914,7 +914,7 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
     for (gi, (glyphs, label)) in legend.iter().enumerate() {
         if gi > 0 {
             x += DIV_GAP;
-            p.vline(x, (cy - GLYPH * 0.5)..=(cy + GLYPH * 0.5), egui::Stroke::new(1.0, div_col));
+            p.vline(x, (cy - GLYPH * 0.5)..=(cy + GLYPH * 0.5), egui::Stroke::new(1.0_f32, div_col));
             x += DIV_GAP;
         }
         for (j, g) in glyphs.iter().enumerate() {
@@ -973,14 +973,14 @@ fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect, editing: bool) {
         p.rect_stroke(
             rect.expand(grow),
             5.0 + grow,
-            egui::Stroke::new(if editing { 2.5 } else { 2.0 }, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+            egui::Stroke::new(if editing { 2.5 } else { 2.0_f32 }, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
             egui::StrokeKind::Outside,
         );
     }
     p.rect_stroke(
         rect.expand(1.5),
         5.0,
-        egui::Stroke::new(if editing { 2.5 } else { 2.0 }, accent),
+        egui::Stroke::new(if editing { 2.5 } else { 2.0_f32 }, accent),
         egui::StrokeKind::Outside,
     );
 }
@@ -1007,7 +1007,7 @@ fn paint_reject_hint(ui: &mut egui::Ui, rect: egui::Rect) {
     p.rect_filled(chip, 8.0, egui::Color32::from_rgba_unmultiplied(40, 26, 10, a(235)));
     p.rect_stroke(
         chip, 8.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 160, 60, a(255))),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(230, 160, 60, a(255))),
         egui::StrokeKind::Inside,
     );
     p.galley(chip.min + pad, galley, egui::Color32::from_rgba_unmultiplied(255, 235, 200, a(255)));

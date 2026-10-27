@@ -697,7 +697,7 @@ pub(crate) fn ring_row(ui: &egui::Ui, rect: egui::Rect) {
     let accent = ui.visuals().selection.stroke.color;
     let [r, g, b, _] = accent.to_array();
     ui.painter().rect_filled(rect.expand(2.0), 4.0, Color32::from_rgba_unmultiplied(r, g, b, 40));
-    ui.painter().rect_stroke(rect.expand(2.0), 4.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+    ui.painter().rect_stroke(rect.expand(2.0), 4.0, egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Outside);
 }
 
 /// One editable row of a MIDI chip already on a card.

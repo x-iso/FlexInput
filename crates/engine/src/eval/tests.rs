@@ -5277,7 +5277,7 @@ mod rws_tests {
         // Roll clockwise through 24 positions (15° each) = 360°, then hold to let
         // the smoothed tracking finish paying out.
         let mut total = 0.0_f32;
-        let mut push = |stick: glam::Vec2, st: &mut NodeState, total: &mut f32| {
+        let push = |stick: glam::Vec2, st: &mut NodeState, total: &mut f32| {
             let out = compute_rws(
                 &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(stick))],
                 st, &p, 0.01,

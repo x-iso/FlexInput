@@ -422,7 +422,7 @@ fn paint_trigger_bar(painter: &egui::Painter, r: egui::Rect, value: f32, accent:
         let fill = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - r.height() * v), r.max);
         painter.rect_filled(fill, 3.0 * s, accent.gamma_multiply(0.35 + 0.65 * v));
     }
-    painter.rect_stroke(r, 3.0 * s, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+    painter.rect_stroke(r, 3.0 * s, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
 }
 
 fn paint_touchpad_strip(
@@ -465,7 +465,7 @@ fn paint_stick_scope(
     ui: &egui::Ui,
     accent: egui::Color32,
 ) {
-    let faint = egui::Stroke::new(0.5, egui::Color32::from_gray(70));
+    let faint = egui::Stroke::new(0.5_f32, egui::Color32::from_gray(70));
     painter.circle_filled(center, radius, egui::Color32::from_gray(38));
     painter.line_segment([center - egui::vec2(radius, 0.0), center + egui::vec2(radius, 0.0)], faint);
     painter.line_segment([center - egui::vec2(0.0, radius), center + egui::vec2(0.0, radius)], faint);
@@ -511,7 +511,7 @@ fn paint_dpad(
     let gmax = dirs.iter().map(|(_, g)| *g).fold(0.0f32, f32::max);
     if gmax > 0.02 {
         painter.circle_filled(center, size * 0.62, accent.gamma_multiply(0.30 * gmax));
-        painter.circle_stroke(center, size * 0.62, egui::Stroke::new(1.0, accent.gamma_multiply(0.7 * gmax)));
+        painter.circle_stroke(center, size * 0.62, egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.7 * gmax)));
     }
     let r = egui::Rect::from_center_size(center, egui::vec2(size, size));
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -543,7 +543,7 @@ fn glyph_chip(
 ) {
     if glow > 0.02 {
         painter.circle_filled(center, size * 0.72, accent.gamma_multiply(0.30 * glow));
-        painter.circle_stroke(center, size * 0.72, egui::Stroke::new(1.0, accent.gamma_multiply(0.7 * glow)));
+        painter.circle_stroke(center, size * 0.72, egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.7 * glow)));
     }
     let Some(tex) = glyph_texture(ui, skin, pin, size) else {
         // No glyph mapped: text pill fallback.

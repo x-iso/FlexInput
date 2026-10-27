@@ -1160,7 +1160,7 @@ pub(crate) fn render_rws_field(
     // Fixed centre reference marker (where the camera points "now").
     painter.line_segment(
         [egui::pos2(cx, rect.top() + 2.0), egui::pos2(cx, rect.bottom() - 2.0)],
-        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255)),
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 200, 255)),
     );
 
     // Status label (bottom-left).
@@ -1220,11 +1220,11 @@ fn paint_rws_ruler(
     let (minor_h, major_h) = if compact { (4.0, 8.0) } else { (6.0, 12.0) };
     painter.line_segment(
         [egui::pos2(rect.left(), cy), egui::pos2(rect.right(), cy)],
-        egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
     );
 
     // Minor ticks at the chosen spacing.
-    let minor_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(115));
+    let minor_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(115));
     let mut d = ((phase - half) / tick_deg).ceil() * tick_deg;
     while d <= phase + half {
         let x = cx + (d - phase) * ppd;
@@ -1233,7 +1233,7 @@ fn paint_rws_ruler(
     }
 
     // Major ticks + labels at each 90° (independent of the minor spacing).
-    let major_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(170));
+    let major_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(170));
     let font = egui::FontId::proportional((rect.height() * 0.16).clamp(7.0, 11.0));
     let mut d = ((phase - half) / 90.0).ceil() * 90.0;
     while d <= phase + half {
@@ -1402,7 +1402,7 @@ fn paint_rws_room(painter: &egui::Painter, rect: egui::Rect, yaw_deg: f32, fov_d
     // Wireframe grid over every face.
     let n = 4; // grid divisions per face
     let step = 2.0 * r / n as f32;
-    let s = |c: egui::Color32| egui::Stroke::new(1.0, c);
+    let s = |c: egui::Color32| egui::Stroke::new(1.0_f32, c);
     for i in 0..=n {
         let t = -r + i as f32 * step;
         // Floor (y = −r) and ceiling (y = +r): grid over x,z.

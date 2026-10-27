@@ -468,7 +468,7 @@ pub(crate) fn paint_pick_frame(ui: &mut egui::Ui, rect: egui::Rect) {
         galley.size() + pad * 2.0,
     );
     p.rect_filled(chip, 8.0, egui::Color32::from_rgba_unmultiplied(30, 22, 8, 230));
-    p.rect_stroke(chip, 8.0, egui::Stroke::new(1.0, base), egui::StrokeKind::Inside);
+    p.rect_stroke(chip, 8.0, egui::Stroke::new(1.0_f32, base), egui::StrokeKind::Inside);
     p.galley(chip.min + pad, galley, egui::Color32::WHITE);
 
     // The pulse needs frames; the parent-paced overlay interval covers it.
@@ -491,7 +491,7 @@ fn overlay_edit_toolbar(
         let bg = ui.visuals().window_fill();
         egui::Frame::default()
             .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
-            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
             .corner_radius(8.0)
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {

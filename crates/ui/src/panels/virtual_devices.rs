@@ -103,7 +103,7 @@ impl VirtualDevicePanel {
                     .inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 })
                     .corner_radius(10.0)
                     .fill(ui.visuals().widgets.inactive.bg_fill)
-                    .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+                    .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color));
 
                 chip.show(ui, |ui| {
                     ui.set_height(CHIP_H);

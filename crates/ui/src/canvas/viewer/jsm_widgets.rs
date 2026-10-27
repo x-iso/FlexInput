@@ -567,7 +567,7 @@ pub(crate) fn curve_graph(
 
     // ── grid ─────────────────────────────────────────────────────────────────
     let grid = egui::Stroke::new(
-        1.0,
+        1.0_f32,
         col(paint.and_then(|p| p.gridline))
             .unwrap_or_else(|| vis.weak_text_color().gamma_multiply(0.28)),
     );
@@ -608,12 +608,12 @@ pub(crate) fn curve_graph(
     let out_line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, output_at(p))).collect();
     painter.extend(egui::Shape::dashed_line(
         &out_line,
-        egui::Stroke::new(1.3, output_color),
+        egui::Stroke::new(1.3_f32, output_color),
         5.0,
         5.0,
     ));
     let line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, p.sens)).collect();
-    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8, sens_color)));
+    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8_f32, sens_color)));
 
     // ── where the pad is right now ───────────────────────────────────────────
     // The dots are the point of drawing this live rather than as a static
@@ -632,7 +632,7 @@ pub(crate) fn curve_graph(
             let x = dps.min(axis_x);
             painter.line_segment(
                 [egui::pos2(to_pos(x, 0.0).x, plot.top()), egui::pos2(to_pos(x, 0.0).x, plot.bottom())],
-                egui::Stroke::new(1.0, Color32::from_white_alpha(36)),
+                egui::Stroke::new(1.0_f32, Color32::from_white_alpha(36)),
             );
             painter.circle_filled(to_pos(x, p.sens), 3.5, sens_color);
             painter.circle_filled(to_pos(x, output_at(&p)), 3.0, output_color);
@@ -645,7 +645,7 @@ pub(crate) fn curve_graph(
         if let Some(p) = sample_at(dps) {
             painter.line_segment(
                 [egui::pos2(pos.x, plot.top()), egui::pos2(pos.x, plot.bottom())],
-                egui::Stroke::new(1.0, vis.weak_text_color()),
+                egui::Stroke::new(1.0_f32, vis.weak_text_color()),
             );
             painter.circle_filled(to_pos(p.dps, p.sens), 2.5, sens_color);
             let text = format!("{:.0}°/s → {}", p.dps, trim((p.sens * 100.0).round() / 100.0));

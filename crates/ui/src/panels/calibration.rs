@@ -1197,7 +1197,7 @@ fn button_border_trail(ui: &egui::Ui, rect: egui::Rect) {
         let p1 = point_at(head - f1 * TRAIL);
         // Segments are short enough that one spanning a corner just cuts it.
         painter.line_segment([p0, p1],
-            Stroke::new(2.0, ORANGE.gamma_multiply(1.0 - f1)));
+            Stroke::new(2.0_f32, ORANGE.gamma_multiply(1.0 - f1)));
     }
     ui.ctx().request_repaint();
 }
@@ -1211,10 +1211,10 @@ fn button_done_glow(ui: &egui::Ui, rect: egui::Rect, done_at: Instant) {
     let g = Color32::from_rgb(80, 200, 100);
     let painter = ui.painter();
     painter.rect_stroke(rect.expand(1.0), 4.0,
-        Stroke::new(2.0, g.gamma_multiply(a)),
+        Stroke::new(2.0_f32, g.gamma_multiply(a)),
         egui::epaint::StrokeKind::Outside);
     painter.rect_stroke(rect.expand(3.5), 6.0,
-        Stroke::new(3.0, g.gamma_multiply(a * 0.35)),
+        Stroke::new(3.0_f32, g.gamma_multiply(a * 0.35)),
         egui::epaint::StrokeKind::Outside);
     ui.ctx().request_repaint();
 }
@@ -1844,7 +1844,7 @@ fn gyro_scope(
 
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     // Read raw poll-rate samples directly from the I/O thread's scope-tap rings.
@@ -2003,22 +2003,22 @@ fn gyro_scope(
     let guide = Color32::from_gray(55);
     painter.line_segment(
         [egui::pos2(center_x, scope_rect.top() + 4.0), egui::pos2(center_x, scope_rect.bottom() - 4.0)],
-        Stroke::new(1.0, guide),
+        Stroke::new(1.0_f32, guide),
     );
     painter.line_segment(
         [egui::pos2(center_x - half_w * 0.5, scope_rect.top() + 4.0),
          egui::pos2(center_x - half_w * 0.5, scope_rect.bottom() - 4.0)],
-        Stroke::new(1.0, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, Color32::from_gray(38)),
     );
     painter.line_segment(
         [egui::pos2(center_x + half_w * 0.5, scope_rect.top() + 4.0),
          egui::pos2(center_x + half_w * 0.5, scope_rect.bottom() - 4.0)],
-        Stroke::new(1.0, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, Color32::from_gray(38)),
     );
     let mid_y = scope_rect.top() + scope_rect.height() * 0.5;
     painter.line_segment(
         [egui::pos2(scope_rect.left() + 8.0, mid_y), egui::pos2(scope_rect.right() - 8.0, mid_y)],
-        Stroke::new(1.0, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, Color32::from_gray(38)),
     );
     // Active channel set. When the user skips accelerometer calibration the
     // accel rows are hidden entirely so the remaining gyro channels can
@@ -2108,8 +2108,8 @@ fn gyro_scope(
             let alpha = fade.sqrt();
             let glow = scale_color(colors[ch], alpha * 0.55);
             let core = scale_color(colors[ch], alpha);
-            painter.line_segment([pp, p], Stroke::new(3.5, glow));
-            painter.line_segment([pp, p], Stroke::new(1.4, core));
+            painter.line_segment([pp, p], Stroke::new(3.5_f32, glow));
+            painter.line_segment([pp, p], Stroke::new(1.4_f32, core));
         }
         // Edge dot at the newest sample (top of waterfall).
         if let Some(&(head, _)) = pts.first() {
@@ -2146,13 +2146,13 @@ fn gyro_scope(
             for side in [-1.0_f32, 1.0] {
                 let x = center_x + side * dx;
                 painter.line_segment([egui::pos2(x, top), egui::pos2(x, bot)],
-                    Stroke::new(1.3, col));
+                    Stroke::new(1.3_f32, col));
                 // Bracket feet point inward, toward the zero line.
                 let foot = -side * 5.0;
                 painter.line_segment([egui::pos2(x, top), egui::pos2(x + foot, top)],
-                    Stroke::new(1.3, col));
+                    Stroke::new(1.3_f32, col));
                 painter.line_segment([egui::pos2(x, bot), egui::pos2(x + foot, bot)],
-                    Stroke::new(1.3, col));
+                    Stroke::new(1.3_f32, col));
             }
         }
     }
@@ -2243,7 +2243,7 @@ fn gyro_scope(
     painter.rect_filled(win_rect, 3.0, bg);
     painter.rect_stroke(
         win_rect, 3.0,
-        Stroke::new(1.0, Color32::from_gray(70)),
+        Stroke::new(1.0_f32, Color32::from_gray(70)),
         egui::epaint::StrokeKind::Inside,
     );
     let text_color = if win_resp.hovered() { Color32::WHITE } else { Color32::from_gray(220) };
@@ -2285,7 +2285,7 @@ fn gyro_scope(
     let exp_resp = ui.interact(exp_rect, ui.id().with(("scope_export_btn", _node_id)), Sense::click());
     let painter = ui.painter();
     painter.rect_filled(exp_rect, 3.0, if exp_resp.hovered() { Color32::from_gray(45) } else { Color32::from_gray(28) });
-    painter.rect_stroke(exp_rect, 3.0, Stroke::new(1.0, Color32::from_gray(70)), egui::epaint::StrokeKind::Inside);
+    painter.rect_stroke(exp_rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(70)), egui::epaint::StrokeKind::Inside);
     painter.galley(
         egui::pos2(exp_rect.center().x - exp_size.x * 0.5, exp_rect.center().y - exp_size.y * 0.5),
         exp_galley,
@@ -2946,26 +2946,26 @@ fn stick_scope(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(lo.cell_w, lo.cell_h), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     let center_p = rect.center();
     let r_outer = (rect.width().min(rect.height()) * 0.5) - 8.0;
 
     // Outer unit circle.
-    painter.circle_stroke(center_p, r_outer, Stroke::new(1.0, Color32::from_gray(80)));
+    painter.circle_stroke(center_p, r_outer, Stroke::new(1.0_f32, Color32::from_gray(80)));
     // Crosshair through the center (no extra grid lines beyond this).
     painter.line_segment(
         [egui::pos2(rect.left() + 8.0, center_p.y), egui::pos2(rect.right() - 8.0, center_p.y)],
-        Stroke::new(1.0, Color32::from_gray(45)),
+        Stroke::new(1.0_f32, Color32::from_gray(45)),
     );
     painter.line_segment(
         [egui::pos2(center_p.x, rect.top() + 8.0), egui::pos2(center_p.x, rect.bottom() - 8.0)],
-        Stroke::new(1.0, Color32::from_gray(45)),
+        Stroke::new(1.0_f32, Color32::from_gray(45)),
     );
     // Inner magnified region indicator (40% of outer = 10% deflection display).
     let r_inner_visible = r_outer * 0.4;
-    painter.circle_stroke(center_p, r_inner_visible, Stroke::new(1.0, Color32::from_rgb(70, 110, 130)));
+    painter.circle_stroke(center_p, r_inner_visible, Stroke::new(1.0_f32, Color32::from_rgb(70, 110, 130)));
 
     // Edge-trace polyline (already-traced circularity).
     {
@@ -2983,14 +2983,14 @@ fn stick_scope(
             );
             if first.is_none() { first = Some(p); }
             if let Some(pp) = prev {
-                painter.line_segment([pp, p], Stroke::new(1.6, Color32::from_rgb(80, 200, 100)));
+                painter.line_segment([pp, p], Stroke::new(1.6_f32, Color32::from_rgb(80, 200, 100)));
             }
             prev = Some(p);
         }
         // Close the loop if the trace is sufficiently complete.
         if let (Some(a), Some(b)) = (prev, first) {
             if filled_buckets(edges) >= (STICK_BUCKETS * 9 / 10) {
-                painter.line_segment([a, b], Stroke::new(1.6, Color32::from_rgb(80, 200, 100)));
+                painter.line_segment([a, b], Stroke::new(1.6_f32, Color32::from_rgb(80, 200, 100)));
             }
         }
     }
@@ -3040,7 +3040,7 @@ fn stick_scope(
                     Some(z) if z == inner => run.push(p),
                     _ => {
                         if run.len() >= 2 {
-                            painter.line(run.clone(), Stroke::new(1.25, stroke_color));
+                            painter.line(run.clone(), Stroke::new(1.25_f32, stroke_color));
                         }
                         run.clear();
                         run.push(p);
@@ -3049,7 +3049,7 @@ fn stick_scope(
                 }
             }
             if run.len() >= 2 {
-                painter.line(run, Stroke::new(1.25, stroke_color));
+                painter.line(run, Stroke::new(1.25_f32, stroke_color));
             }
         }
     }
@@ -3449,7 +3449,7 @@ fn effect_fader(
         let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * t, rect.bottom()));
         painter.rect_filled(fill, 3.0, Color32::from_rgb(52, 92, 128));
     }
-    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(if active { 80 } else { 50 })),
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(if active { 80 } else { 50 })),
         egui::epaint::StrokeKind::Inside);
     let font = egui::FontId::proportional(11.5);
     let mut name = prm.name.to_string();
@@ -3530,7 +3530,7 @@ fn trigger_widget(
     let resp = ui.interact(arc_rect, ui.id().with(("trig_arc", label)), Sense::click_and_drag());
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     let start = -std::f32::consts::FRAC_PI_2;
@@ -3587,15 +3587,15 @@ fn trigger_widget(
     let thr_a = start + (end - start) * thr_t;
     let thr_pin = polar(egui::pos2(cx, cy), r_in, thr_a);
     painter.circle_filled(thr_pin, 5.0, Color32::from_rgb(240, 220, 60));
-    painter.circle_stroke(thr_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+    painter.circle_stroke(thr_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
 
     // Range pins on outer ring.
     let min_pin = polar(egui::pos2(cx, cy), r_out, a_min);
     let max_pin = polar(egui::pos2(cx, cy), r_out, a_max);
     painter.circle_filled(min_pin, 5.0, Color32::from_rgb(80, 200, 110));
-    painter.circle_stroke(min_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+    painter.circle_stroke(min_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
     painter.circle_filled(max_pin, 5.0, Color32::from_rgb(230, 90, 90));
-    painter.circle_stroke(max_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+    painter.circle_stroke(max_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
 
     let mut out = TriggerWidgetEdit::default();
 

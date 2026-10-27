@@ -72,7 +72,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
             };
             painter.line_segment(
                 [egui::pos2(rect.left(), zero_y), egui::pos2(rect.right(), zero_y)],
-                egui::Stroke::new(0.5, egui::Color32::from_gray(55)),
+                egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
             );
 
             // Waveform
@@ -92,7 +92,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
                 };
                 egui::pos2(x, y.clamp(rect.top(), rect.bottom()))
             }).collect();
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 180, 255))));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 180, 255))));
         }
     });
 
@@ -242,7 +242,7 @@ pub(crate) fn paint_envelope_curve_graph(
     // Grid lines
     if show_grid {
         let (grid_faint, _grid_axis) = graph_grid_colors(graph_ov);
-        let gs = egui::Stroke::new(0.5, grid_faint);
+        let gs = egui::Stroke::new(0.5_f32, grid_faint);
         for &x in &grid_x_positions { painter.line_segment([c2s(x, 0.0), c2s(x, 1.0)], gs); }
         for &y in &grid_y_positions  { painter.line_segment([c2s(0.0, y), c2s(1.0, y)], gs); }
     }
@@ -290,14 +290,14 @@ pub(crate) fn paint_envelope_curve_graph(
             let y0 = flexinput_engine::sample_curve(&new_points, x0, &new_biases).clamp(0.0, 1.0);
             let y1 = flexinput_engine::sample_curve(&new_points, x1, &new_biases).clamp(0.0, 1.0);
             let col = if buffer_mode && x0 >= sustain_snapped { dim_col } else { main_col };
-            painter.line_segment([c2s(x0, y0), c2s(x1, y1)], egui::Stroke::new(1.5, col));
+            painter.line_segment([c2s(x0, y0), c2s(x1, y1)], egui::Stroke::new(1.5_f32, col));
         }
         // Hold+Bounce: held horizontal path at the sustain value across the buffer.
         if buffer_mode {
             let hold_y = flexinput_engine::sample_curve(&new_points, sustain_snapped, &new_biases).clamp(0.0, 1.0);
             painter.line_segment(
                 [c2s(sustain_snapped, hold_y), c2s(1.0, hold_y)],
-                egui::Stroke::new(1.5, main_col),
+                egui::Stroke::new(1.5_f32, main_col),
             );
         }
     }
@@ -326,7 +326,7 @@ pub(crate) fn paint_envelope_curve_graph(
                 Color32::from_rgb(255, 220, 50)
             } else { Color32::from_rgb(180, 140, 20) };
             painter.circle_filled(hpos, 4.0, hcol);
-            painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0, Color32::from_gray(100)));
+            painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
         }
     }
 
@@ -373,7 +373,7 @@ pub(crate) fn paint_envelope_curve_graph(
         }
         let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
-        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
 
         // Gamepad-nav dot highlight — mirror the response curve painter so the
         // user sees which ADSR point is selected (works in sub-patch AND config
@@ -390,11 +390,11 @@ pub(crate) fn paint_envelope_curve_graph(
                     let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
                     if a == 0 { continue; }
                     painter.circle_stroke(screen, rr,
-                        egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                        egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
                 }
                 painter.circle_filled(screen, if editing_dot { 6.0 } else { 5.0 }, accent);
                 painter.circle_stroke(screen, if editing_dot { 6.0 } else { 5.0 },
-                    egui::Stroke::new(1.5, Color32::WHITE));
+                    egui::Stroke::new(1.5_f32, Color32::WHITE));
             }
         }
     }
@@ -433,13 +433,13 @@ pub(crate) fn paint_envelope_curve_graph(
     let (sus_w, sus_col) = if sustain_focused {
         (3.0, Color32::from_rgb(255, 190, 60))
     } else {
-        (1.5, Color32::from_rgba_unmultiplied(255, 155, 30, 200))
+        (1.5_f32, Color32::from_rgba_unmultiplied(255, 155, 30, 200))
     };
     if sustain_focused {
         // Soft glow behind the line.
         painter.line_segment(
             [egui::pos2(sus_x, rect.top()), egui::pos2(sus_x, rect.bottom())],
-            egui::Stroke::new(7.0, Color32::from_rgba_unmultiplied(255, 155, 30, 60)),
+            egui::Stroke::new(7.0_f32, Color32::from_rgba_unmultiplied(255, 155, 30, 60)),
         );
     }
     painter.line_segment(
@@ -461,7 +461,7 @@ pub(crate) fn paint_envelope_curve_graph(
         let ph_x = rect.left() + ph * rect.width();
         painter.line_segment(
             [egui::pos2(ph_x, rect.top()), egui::pos2(ph_x, rect.bottom())],
-            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 80)),
+            egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 80)),
         );
 
         // Trail covers ~1/3 of the envelope period so it traces ~1/3 of the graph.
@@ -499,7 +499,7 @@ pub(crate) fn paint_envelope_curve_graph(
                 let ix = x0 + (x1 - x0) * t;
                 let iy = sample_y(&new_points, &new_biases, ix);
                 let next = c2s(ix, iy);
-                painter.line_segment([prev, next], egui::Stroke::new(1.5, col));
+                painter.line_segment([prev, next], egui::Stroke::new(1.5_f32, col));
                 prev = next;
             }
         }

@@ -1442,7 +1442,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
             };
             if svg_src.is_empty() {
                 painter.rect_stroke(r, 2.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
                     egui::StrokeKind::Inside);
                 painter.text(r.center(), egui::Align2::CENTER_CENTER, "SVG",
                     egui::FontId::proportional(11.0), egui::Color32::from_gray(140));

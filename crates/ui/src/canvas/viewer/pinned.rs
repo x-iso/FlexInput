@@ -2541,7 +2541,7 @@ pub(crate) fn render_oscillator_preview(
     let zero_y = if bipolar { rect.center().y } else { rect.bottom() };
     painter.line_segment(
         [egui::pos2(rect.left(), zero_y), egui::pos2(rect.right(), zero_y)],
-        egui::Stroke::new(0.5, egui::Color32::from_gray(55)),
+        egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
     );
     let n = 128usize;
     let pts: Vec<egui::Pos2> = (0..=n).map(|i| {
@@ -2559,7 +2559,7 @@ pub(crate) fn render_oscillator_preview(
         };
         egui::pos2(x, y.clamp(rect.top(), rect.bottom()))
     }).collect();
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 180, 255))));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 180, 255))));
 }
 
 

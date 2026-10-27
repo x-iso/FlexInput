@@ -1075,7 +1075,7 @@ N,N = X";
     let mut r = Rig::new(cfg);
     let mut saw_x = false;
     let mut saw_scroll = false;
-    let mut watch = |r: &mut Rig, n: usize, saw_x: &mut bool, saw_scroll: &mut bool| {
+    let watch = |r: &mut Rig, n: usize, saw_x: &mut bool, saw_scroll: &mut bool| {
         for _ in 0..n {
             let pins = r.tick();
             *saw_x |= pins.contains("key_x");

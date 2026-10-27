@@ -661,7 +661,7 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
     let base_y = rect.bottom() - 2.0;
     painter.line_segment(
         [egui::pos2(rect.left(), base_y), egui::pos2(rect.right(), base_y)],
-        egui::Stroke::new(0.5, visuals.weak_text_color()),
+        egui::Stroke::new(0.5_f32, visuals.weak_text_color()),
     );
 
     #[cfg(windows)]
@@ -681,7 +681,7 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
             let audio: Vec<egui::Pos2> = points.iter().enumerate()
                 .map(|(i, p)| egui::pos2(x_at(i), y_at(p.audio_l.max(p.audio_r)))).collect();
             for w in audio.windows(2) {
-                painter.line_segment([w[0], w[1]], egui::Stroke::new(1.0, visuals.weak_text_color()));
+                painter.line_segment([w[0], w[1]], egui::Stroke::new(1.0_f32, visuals.weak_text_color()));
             }
             // Two SHAPED haptic-carrier traces, colored to match the spectrum bars
             // (warm = LF carrier, cool = HF carrier). Each is the shaped envelope
@@ -701,8 +701,8 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
                     let (_, frac) = params.balance_fracs(p.env_lf, p.env_hf);
                     egui::pos2(x_at(i), y_at(params.shape_amp(p.env_l.max(p.env_r)) * frac))
                 }).collect();
-            for w in lf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, lf_col)); }
-            for w in hf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, hf_col)); }
+            for w in lf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, lf_col)); }
+            for w in hf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, hf_col)); }
         } else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                 "no signal", egui::FontId::proportional(11.0), visuals.weak_text_color());
@@ -822,7 +822,7 @@ pub(crate) fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut 
     // ── Crossover divider line. ───────────────────────────────────────────────
     let xc = x_of(xpos);
     painter.line_segment([egui::pos2(xc, rect.top()), egui::pos2(xc, rect.bottom())],
-        egui::Stroke::new(1.0, visuals.weak_text_color()));
+        egui::Stroke::new(1.0_f32, visuals.weak_text_color()));
 
     // ── EQ curve polyline. ────────────────────────────────────────────────────
     let curve_col = visuals.text_color();
@@ -831,7 +831,7 @@ pub(crate) fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut 
         egui::pos2(x_of(t), y_of(crate::canvas::curve::sample_curve(&eq_points, t, &[])))
     }).collect();
     for w in poly.windows(2) {
-        painter.line_segment([w[0], w[1]], egui::Stroke::new(1.2, curve_col));
+        painter.line_segment([w[0], w[1]], egui::Stroke::new(1.2_f32, curve_col));
     }
 
     // ── Editable control points. ──────────────────────────────────────────────
@@ -869,11 +869,11 @@ pub(crate) fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut 
                     let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
                     if a == 0 { continue; }
                     painter.circle_stroke(c, rr,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
                 }
                 painter.circle_filled(c, if editing_dot { 6.0 } else { 5.0 }, accent);
                 painter.circle_stroke(c, if editing_dot { 6.0 } else { 5.0 },
-                    egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
             }
         }
     }

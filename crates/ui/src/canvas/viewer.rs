@@ -581,7 +581,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     }
                     painter.rect_filled(rect, 2.0, tint);
                     painter.rect_stroke(rect, 2.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
                         egui::StrokeKind::Inside);
                     if resp.clicked() {
                         egui::Popup::toggle_id(ui.ctx(), id);

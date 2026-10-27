@@ -114,7 +114,7 @@ pub fn draw_floating_heading(
             // visible gaps at the corner radius.
             let rect = frame_resp.response.rect;
             let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-            let stroke = egui::Stroke::new(1.0, stroke_color);
+            let stroke = egui::Stroke::new(1.0_f32, stroke_color);
             let painter = ui.painter();
             const R: f32 = 6.0;
             const ARC_SEGS: usize = 6;
@@ -230,7 +230,7 @@ pub fn draw_devices_tab(
             // Outline the three free sides (top, right, bottom); the left edge
             // stays open where it attaches to the panel border.
             let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-            let stroke = egui::Stroke::new(1.0, stroke_color);
+            let stroke = egui::Stroke::new(1.0_f32, stroke_color);
             const ARC_SEGS: usize = 6;
             use std::f32::consts::FRAC_PI_2;
             let arc = |center: egui::Pos2, a0: f32, a1: f32| -> Vec<egui::Pos2> {
@@ -404,7 +404,7 @@ fn device_card(
     egui::Frame::default()
         .inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 0 })
         .corner_radius(12.0)
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
         .show(ui, |ui| {
             ui.set_width(card_w);
             ui.set_height(CARD_H);
@@ -456,7 +456,7 @@ pub(crate) fn canvas_status_button_sized(
 
     if on_canvas {
         let stroke = egui::Stroke::new(
-            1.0,
+            1.0_f32,
             ui.visuals().widgets.noninteractive.bg_stroke.color,
         );
         let btn = egui::Button::new(RichText::new("On canvas").weak())

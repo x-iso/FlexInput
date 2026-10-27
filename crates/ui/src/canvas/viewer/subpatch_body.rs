@@ -192,7 +192,7 @@ pub(crate) fn show_subpatch_body(
     // Layout mode: faint snap grid for visual feedback. Drawn under widgets.
     if is_unlocked && snap_enabled && snap_grid >= 2.0 {
         let painter = ui.painter().with_clip_rect(body_rect);
-        let stroke = egui::Stroke::new(0.5, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
+        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
         let mut x = 0.0f32;
         while x <= body_w {
             painter.line_segment(
@@ -320,7 +320,7 @@ pub(crate) fn show_subpatch_body(
                     };
                     painter.rect_filled(element_rect, 4.0, fill);
                     painter.rect_stroke(element_rect, 4.0,
-                        egui::Stroke::new(1.5, outline), egui::StrokeKind::Inside);
+                        egui::Stroke::new(1.5_f32, outline), egui::StrokeKind::Inside);
                     if resp.clicked() {
                         put_overlay_pick_result(
                             ui.ctx(), vec![outer_id.0], m.inner_node_id,
@@ -558,7 +558,7 @@ pub(crate) fn show_subpatch_body(
         painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(120, 180, 255, 30));
         painter.rect_stroke(
             r, egui::CornerRadius::ZERO,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
             egui::StrokeKind::Inside,
         );
         request_repaint_throttled(ui.ctx());
@@ -651,7 +651,7 @@ pub(crate) fn show_subpatch_body(
         } else {
             egui::Color32::from_rgba_unmultiplied(150, 220, 255, 140)
         };
-        let stroke = egui::Stroke::new(1.0, outline_col);
+        let stroke = egui::Stroke::new(1.0_f32, outline_col);
         ui.painter().line_segment([rect.left_top(),     rect.right_top()],    stroke);
         ui.painter().line_segment([rect.right_top(),    rect.right_bottom()], stroke);
         ui.painter().line_segment([rect.right_bottom(), rect.left_bottom()],  stroke);
@@ -784,7 +784,7 @@ pub(crate) fn show_subpatch_body(
                     egui::Color32::from_rgba_unmultiplied(255, 220, 120, 90)
                 };
                 ui.painter().rect_filled(handle_rect, 2.0, fill);
-                let s = egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 220, 120));
+                let s = egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(255, 220, 120));
                 for k in 1..=3 {
                     let off = k as f32 * (RESIZE_HANDLE / 4.0);
                     ui.painter().line_segment(

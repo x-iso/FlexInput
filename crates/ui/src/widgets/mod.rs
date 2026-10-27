@@ -474,7 +474,7 @@ mod tests {
             let p = nav_highlight_painter(ctx, egui::Id::new("test_glow"), host(), ctx.content_rect());
             p.rect_stroke(
                 egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(400.0, 300.0)),
-                0.0, egui::Stroke::new(2.0, MARK), egui::StrokeKind::Outside);
+                0.0, egui::Stroke::new(2.0_f32, MARK), egui::StrokeKind::Outside);
             egui::Window::new("cover")
                 .fixed_pos(egui::pos2(100.0, 100.0))
                 .fixed_size(egui::vec2(200.0, 150.0))

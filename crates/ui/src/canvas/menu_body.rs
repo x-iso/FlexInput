@@ -324,7 +324,7 @@ pub(crate) fn paint_menu_cursor(
     pos: egui::Pos2,
     accent: egui::Color32,
 ) {
-    p.line_segment([origin, pos], egui::Stroke::new(2.0, accent.gamma_multiply(0.35)));
+    p.line_segment([origin, pos], egui::Stroke::new(2.0_f32, accent.gamma_multiply(0.35)));
     p.circle_filled(pos, 6.0, accent.gamma_multiply(0.45));
     p.circle_filled(pos, 2.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200));
 }
@@ -689,7 +689,7 @@ pub(crate) fn paint_radial_ring(
     }
 
     // Dead-center hub: the region where the pointer hovers nothing.
-    p.circle_stroke(geom.center, geom.r_in, egui::Stroke::new(1.0, colors.main.gamma_multiply(0.7)));
+    p.circle_stroke(geom.center, geom.r_in, egui::Stroke::new(1.0_f32, colors.main.gamma_multiply(0.7)));
 
     // Live cursor: the pointer's deflection from the origin (unit-rect coords
     // → centered vector; full deflection = rim). Drawn last, translucent, so
@@ -882,11 +882,11 @@ pub(crate) fn paint_radial_zone(
         plate_fill(colors.main)
     };
     let stroke = if hovered {
-        egui::Stroke::new(2.0, colors.hi)
+        egui::Stroke::new(2.0_f32, colors.hi)
     } else if is_sel {
-        egui::Stroke::new(2.0, colors.hi.gamma_multiply(0.6))
+        egui::Stroke::new(2.0_f32, colors.hi.gamma_multiply(0.6))
     } else {
-        egui::Stroke::new(1.0, colors.main)
+        egui::Stroke::new(1.0_f32, colors.main)
     };
     for s in radial_sector_shapes(geom.center, r0, r1, a0, a1, fill, stroke) {
         p.add(s);
@@ -1022,9 +1022,9 @@ pub(crate) fn paint_grid_zone_cell(
     let p = ui.painter();
     if hovered {
         p.rect_filled(zr, 5.0, colors.hi.gamma_multiply(0.30));
-        p.rect_stroke(zr, 5.0, egui::Stroke::new(2.0, colors.hi), egui::StrokeKind::Inside);
+        p.rect_stroke(zr, 5.0, egui::Stroke::new(2.0_f32, colors.hi), egui::StrokeKind::Inside);
     } else {
-        p.rect_stroke(zr, 5.0, egui::Stroke::new(1.0, colors.main), egui::StrokeKind::Inside);
+        p.rect_stroke(zr, 5.0, egui::Stroke::new(1.0_f32, colors.main), egui::StrokeKind::Inside);
     }
 
     let meta = zone_meta.get(&zid);
@@ -1216,7 +1216,7 @@ pub(crate) fn paint_radial_nav_focus(
             if let Some((_, band)) = zones.into_iter().find(|(id, _)| *id as u64 == zid) {
                 if let Some((r0, r1, a0, a1)) = radial_band_geom(&geom, band) {
                     let fill = style.accent.gamma_multiply(0.22);
-                    let stroke = egui::Stroke::new(2.5, style.accent);
+                    let stroke = egui::Stroke::new(2.5_f32, style.accent);
                     for s in radial_sector_shapes(geom.center, r0, r1, a0, a1, fill, stroke) {
                         painter.add(s);
                     }
@@ -1246,7 +1246,7 @@ pub(crate) fn paint_radial_nav_focus(
     for b in &borders {
         if b.seam {
             if seam_hot {
-                paint_ring_border(&painter, &geom, b, egui::Stroke::new(4.0, style.accent));
+                paint_ring_border(&painter, &geom, b, egui::Stroke::new(4.0_f32, style.accent));
             }
             continue;
         }
@@ -1266,7 +1266,7 @@ pub(crate) fn paint_radial_nav_focus(
         };
         if let Some(g) = grab {
             let col = if g { style.grabbed } else { style.accent };
-            paint_ring_border(&painter, &geom, b, egui::Stroke::new(3.0, col));
+            paint_ring_border(&painter, &geom, b, egui::Stroke::new(3.0_f32, col));
         }
     }
     let pass_nr = ui.ctx().cumulative_pass_nr();
@@ -1387,11 +1387,11 @@ pub(crate) fn radial_border_editor(
             || (dragged_border.is_none()
                 && ptr.and_then(hit_at) == Some(i));
         let stroke = if hot {
-            egui::Stroke::new(if b.seam { 4.0 } else { 2.0 }, accent)
+            egui::Stroke::new(if b.seam { 4.0 } else { 2.0_f32 }, accent)
         } else if b.seam {
-            egui::Stroke::new(3.0, visuals.weak_text_color().gamma_multiply(1.4))
+            egui::Stroke::new(3.0_f32, visuals.weak_text_color().gamma_multiply(1.4))
         } else {
-            egui::Stroke::new(1.0, visuals.weak_text_color())
+            egui::Stroke::new(1.0_f32, visuals.weak_text_color())
         };
         paint_ring_border(&painter, &geom, b, stroke);
     }
@@ -1560,7 +1560,7 @@ fn render_radial_field(
             let o = k as f32 * 3.5;
             painter.line_segment(
                 [egui::pos2(rect.right() - o, rect.bottom()), egui::pos2(rect.right(), rect.bottom() - o)],
-                egui::Stroke::new(1.0, grip),
+                egui::Stroke::new(1.0_f32, grip),
             );
         }
         if hr.dragged() {

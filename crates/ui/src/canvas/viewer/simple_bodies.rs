@@ -990,7 +990,7 @@ pub(crate) fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
 
     let painter = ui.painter_at(rect);
     painter.rect(rect, 4.0, visuals,
-        egui::Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+        egui::Stroke::new(1.0_f32, stroke_col), egui::StrokeKind::Inside);
     paint_switch_content(ui, rect, node_id.0, &state, active, text_col);
 
     if resp.clicked() {
@@ -1038,7 +1038,7 @@ pub(crate) fn show_label_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sn
         egui::Color32::from_rgba_unmultiplied(150, 220, 255, 90)
     };
     // Three diagonal corner stripes for the grip.
-    let stroke = egui::Stroke::new(1.2, col);
+    let stroke = egui::Stroke::new(1.2_f32, col);
     for k in 1..=3 {
         let off = k as f32 * (GRIP / 4.0);
         painter.line_segment(
@@ -1161,7 +1161,7 @@ pub(crate) fn show_svg_body_sized(
     if data.is_empty() {
         let painter = ui.painter_at(rect);
         painter.rect_stroke(rect, 4.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
             egui::StrokeKind::Inside);
         painter.text(
             rect.center(),
@@ -1837,7 +1837,7 @@ pub(crate) fn draw_knob_rotary_styled(
     let n = 64usize;
 
     painter.circle_filled(center, radius, Color32::from_gray(30));
-    painter.circle_stroke(center, radius, egui::Stroke::new(1.0, Color32::from_gray(55)));
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, Color32::from_gray(55)));
 
     let arc_pts = |t0: f32, t1: f32| -> Vec<egui::Pos2> {
         (0..=n).map(|i| {
@@ -1850,14 +1850,14 @@ pub(crate) fn draw_knob_rotary_styled(
     // Background track
     painter.add(egui::Shape::line(
         arc_pts(0.0, 1.0),
-        egui::Stroke::new(3.0, paint.track.unwrap_or(Color32::from_gray(50))),
+        egui::Stroke::new(3.0_f32, paint.track.unwrap_or(Color32::from_gray(50))),
     ));
 
     // Value arc
     let accent = paint.accent(bipolar);
     let (a0, a1) = if bipolar { if t >= 0.5 { (0.5, t) } else { (t, 0.5) } } else { (0.0, t) };
     if (a1 - a0).abs() > 0.001 {
-        painter.add(egui::Shape::line(arc_pts(a0, a1), egui::Stroke::new(3.0, accent)));
+        painter.add(egui::Shape::line(arc_pts(a0, a1), egui::Stroke::new(3.0_f32, accent)));
     }
 
     // Indicator
@@ -1867,7 +1867,7 @@ pub(crate) fn draw_knob_rotary_styled(
             egui::pos2(center.x + radius * 0.18 * va.cos(), center.y + radius * 0.18 * va.sin()),
             egui::pos2(center.x + radius * 0.62 * va.cos(), center.y + radius * 0.62 * va.sin()),
         ],
-        egui::Stroke::new(2.0, paint.handle(active)),
+        egui::Stroke::new(2.0_f32, paint.handle(active)),
     );
     painter.circle_filled(center, 2.5, Color32::from_gray(85));
 }
@@ -1910,7 +1910,7 @@ pub(crate) fn draw_knob_h_fader_styled(
         let cx = track_rect.center().x;
         painter.line_segment(
             [egui::pos2(cx, track_rect.top() - 2.0), egui::pos2(cx, track_rect.bottom() + 2.0)],
-            egui::Stroke::new(1.0, Color32::from_gray(110)),
+            egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
         );
     }
 
@@ -1957,7 +1957,7 @@ pub(crate) fn draw_knob_v_fader_styled(
         let cy = track_rect.center().y;
         painter.line_segment(
             [egui::pos2(track_rect.left() - 2.0, cy), egui::pos2(track_rect.right() + 2.0, cy)],
-            egui::Stroke::new(1.0, Color32::from_gray(110)),
+            egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
         );
     }
 

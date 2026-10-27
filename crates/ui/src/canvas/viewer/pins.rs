@@ -159,7 +159,7 @@ pub(crate) fn pin_info(t: SignalType) -> PinInfo {
         (g as u16 * 9 / 20) as u8,
         (b as u16 * 9 / 20) as u8,
     );
-    let stroke = egui::Stroke::new(1.5, outline);
+    let stroke = egui::Stroke::new(1.5_f32, outline);
     if t == SignalType::AutoMap {
         // AutoMap chip needs more presence at rest — bump the dark interior
         // from ~20% to ~40% of the type color so the square reads clearly
@@ -285,7 +285,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         if let Some(side) = self.half {
             if inner.shape == Some(egui_snarl::ui::PinShape::Square) {
                 let fill = inner.fill.unwrap_or(Color32::from_gray(20));
-                let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5, Color32::WHITE));
+                let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5_f32, Color32::WHITE));
                 let size = rect.width().min(rect.height());
                 let center = rect.center();
                 // Build the visible (outward) half of the square. Flat edge
@@ -336,7 +336,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
             }
             use egui::epaint::{PathShape, PathStroke};
             let fill = inner.fill.unwrap_or(Color32::from_gray(20));
-            let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5, Color32::WHITE));
+            let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5_f32, Color32::WHITE));
             let center = rect.center();
             let r = (rect.width().min(rect.height())) * 0.5;
             // Flat edge is vertical: x = center.x for inputs (flat on right,

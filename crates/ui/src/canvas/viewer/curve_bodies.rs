@@ -225,14 +225,14 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     .collect();
 
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
-                let gs = egui::Stroke::new(0.5, grid_faint);
+                let gs = egui::Stroke::new(0.5_f32, grid_faint);
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
                 for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
-                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); }
+                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); }
 
                 // Labels: show the real input/output value at each grid line.
                 // Graph x is the SCALED domain (curve_scale maps real→graph), so
@@ -256,7 +256,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         .collect();
                     for w in curve_pts.windows(2) {
                         painter.line_segment([w[0], w[1]],
-                            egui::Stroke::new(1.5, Color32::from_gray(200)));
+                            egui::Stroke::new(1.5_f32, Color32::from_gray(200)));
                     }
                 }
 
@@ -294,7 +294,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         };
                         painter.circle_filled(hpos, 4.0, hcol);
                         painter.circle_stroke(hpos, 4.0,
-                            egui::Stroke::new(1.0, Color32::from_gray(100)));
+                            egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
@@ -351,14 +351,14 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                             let rad = 6.0 + k as f32 * 2.5;
                             let a = (120.0 * (1.0 - k as f32 / 5.0)) as u8;
                             painter.circle_stroke(screen, rad,
-                                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, a)));
+                                egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(r, g, b, a)));
                         }
-                        painter.circle_stroke(screen, 7.0, egui::Stroke::new(2.0, accent));
+                        painter.circle_stroke(screen, 7.0, egui::Stroke::new(2.0_f32, accent));
                     }
                     let nav_here = nav_sel_dot == Some(i);
                     let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
-                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
                     // The dot's output value: always with the grid labels, else while handled.
                     if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
                         paint_point_value(&painter, rect, screen, view.value_out(py));
@@ -424,7 +424,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                             let ix = x0 + (x1 - x0) * t;
                             let iy = sample_curve(&new_points, ix, &new_biases).clamp(y_lo, y_hi);
                             let next = c2s(ix, iy);
-                            painter.line_segment([prev, next], egui::Stroke::new(1.5, col));
+                            painter.line_segment([prev, next], egui::Stroke::new(1.5_f32, col));
                             prev = next;
                         }
                     }
@@ -769,14 +769,14 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 let grid_y_positions: Vec<f32> = (1..grid_y).map(|i| y_lo + snap_nodes_y[i] * y_range).collect();
 
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
-                let gs = egui::Stroke::new(0.5, grid_faint);
+                let gs = egui::Stroke::new(0.5_f32, grid_faint);
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
                 for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
-                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); }
+                if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); }
 
                 if show_grid_labels {
                     let xs = grid_x_positions.iter().map(|&x| c2s(x, y_hi).x).zip(view.labels_in(&grid_x_positions));
@@ -795,7 +795,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         .collect();
                     for w in curve_pts.windows(2) {
                         painter.line_segment([w[0], w[1]],
-                            egui::Stroke::new(1.5, Color32::from_gray(200)));
+                            egui::Stroke::new(1.5_f32, Color32::from_gray(200)));
                     }
                 }
 
@@ -826,7 +826,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         } else { Color32::from_rgb(180, 140, 20) };
                         painter.circle_filled(hpos, 4.0, hcol);
                         painter.circle_stroke(hpos, 4.0,
-                            egui::Stroke::new(1.0, Color32::from_gray(100)));
+                            egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
@@ -875,7 +875,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     }
                     let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
-                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
                     // The dot's output value: always with the grid labels, else while handled.
                     if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
                         paint_point_value(&painter, rect, screen, view.value_out(py));
@@ -930,7 +930,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                             let ix = x0 + (x1 - x0) * t;
                             let iy = sample_curve(&new_points, ix, &new_biases).clamp(y_lo, y_hi);
                             let next = c2s(ix, iy);
-                            painter.line_segment([prev, next], egui::Stroke::new(1.5, col));
+                            painter.line_segment([prev, next], egui::Stroke::new(1.5_f32, col));
                             prev = next;
                         }
                     }
@@ -1313,10 +1313,10 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let gxp: Vec<f32> = (1..gx_f).map(|i| x_lo + sx[i] * x_range).collect();
                 let gyp: Vec<f32> = (1..gy_f).map(|i| y_lo + sy[i] * y_range).collect();
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
-                let gs = egui::Stroke::new(0.5, grid_faint);
+                let gs = egui::Stroke::new(0.5_f32, grid_faint);
                 for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
                 for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-                if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); } }
+                if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); } }
 
                 let mut label_inset = egui::Vec2::ZERO;
                 if sgl {
@@ -1337,7 +1337,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 if inact_pts.len() >= 2 {
                     let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
                     let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
-                    for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0, ic)); pp = np; }
+                    for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0_f32, ic)); pp = np; }
                 }
                 }
 
@@ -1353,7 +1353,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 // A one-dot Hyst graph draws as its flat band.
                 if !new_edit_pts.is_empty() {
                     let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(new_edit_pts, x, new_edit_biases).clamp(y_lo, y_hi)) }).collect();
-                    for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
+                    for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, Color32::from_gray(200))); }
                 }
 
                 // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
@@ -1375,7 +1375,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
                         let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
                         painter.circle_filled(hpos, 4.0, hcol);
-                        painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0, Color32::from_gray(100)));
+                        painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
@@ -1422,16 +1422,16 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                             let a = ((if nav_editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
                             if a == 0 { continue; }
                             painter.circle_stroke(screen, rr,
-                                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                                egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
                         }
                         painter.circle_filled(screen, if nav_editing_dot { 6.0 } else { 5.0 }, accent);
                         painter.circle_stroke(screen, if nav_editing_dot { 6.0 } else { 5.0 },
-                            egui::Stroke::new(1.5, Color32::WHITE));
+                            egui::Stroke::new(1.5_f32, Color32::WHITE));
                     }
                     let nav_here = nav_sel_dot == Some(i);
                     let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
-                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
                     // The dot's output value: always with the grid labels, else while handled.
                     if sgl || pt_resp.hovered() || pt_resp.dragged() {
                         paint_point_value(&painter, rect, screen, if hyst_lane { value_label((py - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%") } else { view.value_out(py) });
@@ -1842,10 +1842,10 @@ pub(crate) fn paint_twoway_curve_graph(
     let gxp: Vec<f32> = (1..grid_x).map(|i| x_lo + i as f32 / grid_x as f32 * x_range).collect();
     let gyp: Vec<f32> = (1..grid_y).map(|i| y_lo + i as f32 / grid_y as f32 * y_range).collect();
     let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
-    let gs = egui::Stroke::new(0.5, grid_faint);
+    let gs = egui::Stroke::new(0.5_f32, grid_faint);
     for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-    if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5, grid_axis)); } }
+    if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); } }
 
     let mut label_inset = egui::Vec2::ZERO;
     if sgl {
@@ -1866,7 +1866,7 @@ pub(crate) fn paint_twoway_curve_graph(
     if inact_pts.len() >= 2 {
         let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
         let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
-        for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0, ic)); pp = np; }
+        for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0_f32, ic)); pp = np; }
     }
     }
 
@@ -1882,7 +1882,7 @@ pub(crate) fn paint_twoway_curve_graph(
     // A one-dot Hyst graph draws as its flat band.
     if !new_edit_pts.is_empty() {
         let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(&new_edit_pts, x, &new_edit_biases).clamp(y_lo, y_hi)) }).collect();
-        for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
+        for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, Color32::from_gray(200))); }
     }
 
     // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
@@ -1901,7 +1901,7 @@ pub(crate) fn paint_twoway_curve_graph(
             else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); bias_changed = true; }
             let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
             painter.circle_filled(hpos, 4.0, hcol);
-            painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0, Color32::from_gray(100)));
+            painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
         }
     }
 
@@ -1948,16 +1948,16 @@ pub(crate) fn paint_twoway_curve_graph(
                 let a = ((if nav_editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
                 if a == 0 { continue; }
                 painter.circle_stroke(screen, rr,
-                    egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                    egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
             }
             painter.circle_filled(screen, if nav_editing_dot { 6.0 } else { 5.0 }, accent);
             painter.circle_stroke(screen, if nav_editing_dot { 6.0 } else { 5.0 },
-                egui::Stroke::new(1.5, Color32::WHITE));
+                egui::Stroke::new(1.5_f32, Color32::WHITE));
         }
         let nav_here = nav_sel_dot == Some(i);
         let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
-        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
         // The dot's output value: always with the grid labels, else while handled.
         if sgl || pt_resp.hovered() || pt_resp.dragged() {
             paint_point_value(&painter, rect, screen, if hyst_lane { value_label((py - y_lo) / y_range * TWOWAY_HYST_MAX_PCT, "%") } else { view.value_out(py) });
@@ -2202,7 +2202,7 @@ impl TwowayGeom {
             0.0, Color32::from_rgba_unmultiplied(cr, cg, cb, 34));
         let ex = self.c2s(self.gx(edge), self.y_lo).x;
         painter.line_segment([egui::pos2(ex, self.rect.top()), egui::pos2(ex, self.rect.bottom())],
-            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(cr, cg, cb, 140)));
+            egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(cr, cg, cb, 140)));
         painter.text(egui::pos2(ex, self.rect.top() + 1.0), egui::Align2::CENTER_TOP, glyph,
             egui::FontId::proportional(9.0), Color32::from_rgba_unmultiplied(cr, cg, cb, 200));
     }
@@ -2257,7 +2257,7 @@ pub(crate) fn paint_twoway_live(
         // Raw input tick on the floor — inside the band it moves, the dot doesn't.
         let rx = g.c2s(g.gx(raw), g.y_lo).x;
         painter.line_segment([egui::pos2(rx, g.rect.bottom()), egui::pos2(rx, g.rect.bottom() - 7.0)],
-            egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220)));
+            egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220)));
 
         let graph_x = g.gx(held);
         if let Some((hp, hb)) = hyst_curve {
@@ -2293,7 +2293,7 @@ pub(crate) fn paint_twoway_live(
             for s in 1..=steps {
                 let ix = x0 + (x1 - x0) * s as f32 / steps as f32;
                 let np = g.c2s(ix, sample_curve(apts, ix, abias).clamp(g.y_lo, g.y_hi));
-                painter.line_segment([pp, np], egui::Stroke::new(1.5, tc));
+                painter.line_segment([pp, np], egui::Stroke::new(1.5_f32, tc));
                 pp = np;
             }
         }

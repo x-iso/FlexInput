@@ -1070,7 +1070,7 @@ impl FlexInputApp {
             let pos = rect.center_bottom() + egui::vec2(-galley.size().x * 0.5, 6.0);
             let bg = egui::Rect::from_min_size(pos, galley.size()).expand(4.0);
             painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(230));
-            painter.rect_stroke(bg, 3.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+            painter.rect_stroke(bg, 3.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
             painter.galley(pos, galley, egui::Color32::WHITE);
         }
 
@@ -1124,7 +1124,7 @@ impl FlexInputApp {
                         painter.rect_filled(rect, 4.0,
                             egui::Color32::from_rgba_unmultiplied(r, g, b, 55));
                         painter.rect_stroke(rect, 4.0,
-                            egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                            egui::Stroke::new(1.5_f32, accent), egui::StrokeKind::Inside);
                     }
                     painter.text(rect.left_center() + egui::vec2(10.0, 0.0),
                         egui::Align2::LEFT_CENTER, glyph,

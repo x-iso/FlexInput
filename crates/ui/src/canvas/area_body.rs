@@ -1381,19 +1381,19 @@ fn paint_bubbles(
         let full = look.hard_cell.filter(|id| look.weights.get(id).copied().unwrap_or(0.0) >= 0.999);
         let lit = r.is_some_and(|r| look.lit.contains(&r));
         let stroke = if lit {
-            egui::Stroke::new(2.5, if look.lit_grabbed { look.nav_grabbed } else { look.lit_color })
+            egui::Stroke::new(2.5_f32, if look.lit_grabbed { look.nav_grabbed } else { look.lit_color })
         } else if touches(look.nav_cell) {
-            egui::Stroke::new(2.5, look.nav_accent)
+            egui::Stroke::new(2.5_f32, look.nav_accent)
         } else if touches(full) {
-            egui::Stroke::new(2.0, look.colors.hi)
+            egui::Stroke::new(2.0_f32, look.colors.hi)
         } else if touches(Some(look.sel)) {
-            egui::Stroke::new(2.0, look.colors.hi.gamma_multiply(0.6))
+            egui::Stroke::new(2.0_f32, look.colors.hi.gamma_multiply(0.6))
         } else {
-            egui::Stroke::new(1.5, look.colors.main)
+            egui::Stroke::new(1.5_f32, look.colors.main)
         };
         p.line_segment([g.pt(*a), g.pt(*b)], stroke);
     }
-    p.rect_stroke(g.square(), 4.0, egui::Stroke::new(1.5, look.colors.main), egui::StrokeKind::Middle);
+    p.rect_stroke(g.square(), 4.0, egui::Stroke::new(1.5_f32, look.colors.main), egui::StrokeKind::Middle);
 }
 
 /// What a cell painter needs to know beyond the geometry.
@@ -1461,11 +1461,11 @@ fn paint_curved_cell(
     let fill = if hovered { colors.hi.gamma_multiply(0.30) } else { plate_fill(colors.main) };
     p.add(region_mesh(layout, g, region, fill));
     let stroke = if hovered {
-        egui::Stroke::new(2.0, colors.hi)
+        egui::Stroke::new(2.0_f32, colors.hi)
     } else if selected {
-        egui::Stroke::new(2.0, colors.hi.gamma_multiply(0.6))
+        egui::Stroke::new(2.0_f32, colors.hi.gamma_multiply(0.6))
     } else {
-        egui::Stroke::new(1.0, colors.main)
+        egui::Stroke::new(1.0_f32, colors.main)
     };
     p.add(egui::Shape::closed_line(region_outline(layout, g, region), stroke));
 
@@ -1576,11 +1576,11 @@ fn paint_analog_view(
     match layout.shape {
         Shape::Circle => {
             p.circle_filled(g.center, g.unit, plate_fill(main));
-            p.circle_stroke(g.center, g.unit, egui::Stroke::new(1.5, main));
+            p.circle_stroke(g.center, g.unit, egui::Stroke::new(1.5_f32, main));
         }
         Shape::Rect => {
             p.rect_filled(g.square(), 4.0, plate_fill(main));
-            p.rect_stroke(g.square(), 4.0, egui::Stroke::new(1.5, main), egui::StrokeKind::Middle);
+            p.rect_stroke(g.square(), 4.0, egui::Stroke::new(1.5_f32, main), egui::StrokeKind::Middle);
         }
     }
     let share = |id: u32| look.weights.get(&id).copied().unwrap_or(0.0);
@@ -1592,10 +1592,10 @@ fn paint_analog_view(
             Shape::Circle => g.to_screen(dx, dy),
             Shape::Rect => at,
         };
-        p.line_segment([from, to], egui::Stroke::new(1.0, main.gamma_multiply(0.6)));
+        p.line_segment([from, to], egui::Stroke::new(1.0_f32, main.gamma_multiply(0.6)));
         let w = share(id);
         if w > 0.0 {
-            p.line_segment([from, from + (to - from) * w], egui::Stroke::new(5.0, look.colors.hi.gamma_multiply(0.8)));
+            p.line_segment([from, from + (to - from) * w], egui::Stroke::new(5.0_f32, look.colors.hi.gamma_multiply(0.8)));
         }
         let plate = room * 0.62;
         p.circle_filled(at, plate, if w > 0.0 {
@@ -1604,20 +1604,20 @@ fn paint_analog_view(
             plate_fill(main)
         });
         let ring = if look.nav_cell == Some(id) {
-            egui::Stroke::new(2.5, look.nav_accent)
+            egui::Stroke::new(2.5_f32, look.nav_accent)
         } else if look.sel == id {
-            egui::Stroke::new(2.0, look.colors.hi.gamma_multiply(0.6))
+            egui::Stroke::new(2.0_f32, look.colors.hi.gamma_multiply(0.6))
         } else {
-            egui::Stroke::new(1.0, main)
+            egui::Stroke::new(1.0_f32, main)
         };
         p.circle_stroke(at, plate, ring);
         paint_cell_content(ui, p, at, room, id, look.zone_maps, look.meta, w >= 0.5, egui::Color32::WHITE);
     }
     // The full-push ring: beyond it the keys hold steadily.
     let ring = if full_lit {
-        egui::Stroke::new(2.5, look.colors.accent)
+        egui::Stroke::new(2.5_f32, look.colors.accent)
     } else {
-        egui::Stroke::new(1.5, look.colors.accent.gamma_multiply(0.6))
+        egui::Stroke::new(1.5_f32, look.colors.accent.gamma_multiply(0.6))
     };
     p.circle_stroke(g.center, full.max(dz) * g.unit, ring);
     if layout.has_centre_disc() {
@@ -1626,9 +1626,9 @@ fn paint_analog_view(
         let full = share(id) >= 0.999;
         p.circle_filled(g.center, r, if full { look.colors.hi.gamma_multiply(0.3) } else { main.gamma_multiply(0.18) });
         if look.nav_cell == Some(id) {
-            p.circle_stroke(g.center, r, egui::Stroke::new(2.5, look.nav_accent));
+            p.circle_stroke(g.center, r, egui::Stroke::new(2.5_f32, look.nav_accent));
         } else if look.sel == id {
-            p.circle_stroke(g.center, r, egui::Stroke::new(2.0, look.colors.hi.gamma_multiply(0.6)));
+            p.circle_stroke(g.center, r, egui::Stroke::new(2.0_f32, look.colors.hi.gamma_multiply(0.6)));
         }
         paint_cell_content(ui, p, g.center, r * 1.2, id, look.zone_maps, look.meta, full, egui::Color32::WHITE);
     }
@@ -1777,7 +1777,7 @@ fn area_field(
                     let zr = egui::Rect::from_two_pos(g.to_screen(v0, hi), g.to_screen(v1, lo)).shrink(1.5);
                     paint_grid_zone_cell(ui, zr, id, full, &zone_maps, &meta, colors);
                     if sel == id {
-                        p.rect_stroke(zr, 5.0, egui::Stroke::new(2.0, colors.hi.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                        p.rect_stroke(zr, 5.0, egui::Stroke::new(2.0_f32, colors.hi.gamma_multiply(0.6)), egui::StrokeKind::Inside);
                     }
                 }
             }
@@ -1788,7 +1788,7 @@ fn area_field(
             if focused {
                 p.add(region_mesh(&layout, &g, region, nav_style.accent.gamma_multiply(0.22)));
                 p.add(egui::Shape::closed_line(region_outline(&layout, &g, region),
-                    egui::Stroke::new(2.5, nav_style.accent)));
+                    egui::Stroke::new(2.5_f32, nav_style.accent)));
             }
         }
     }
@@ -1839,7 +1839,7 @@ fn area_field(
                 if other_analog && !(other.has_centre_disc() && r == BorderRef::Edge(0)) {
                     continue; // an analog layer's borders don't apply
                 }
-                paint_border(&p, &other, &g, r, egui::Stroke::new(1.0, col));
+                paint_border(&p, &other, &g, r, egui::Stroke::new(1.0_f32, col));
             }
             // Its mappings where its cells are, in its colour.
             let cards: Vec<Value> = all_cards.iter().filter(|c| card_layer(c) == k).cloned().collect();
@@ -1883,18 +1883,18 @@ fn area_field(
         let graded = layout.border(*r).is_some_and(|b| b.gradient.is_some());
         let stroke = match nav_border {
             Some((nr, grabbed)) if lit.contains(r) && lit_from == Some(nr) && !seamed.contains(r) => {
-                egui::Stroke::new(3.0, if grabbed { nav_style.grabbed } else { nav_style.accent })
+                egui::Stroke::new(3.0_f32, if grabbed { nav_style.grabbed } else { nav_style.accent })
             }
-            _ if lit.contains(r) && !seamed.contains(r) => egui::Stroke::new(2.5, colors.accent),
-            _ if bubbles.is_some() => egui::Stroke::new(1.0, colors.main.gamma_multiply(if graded { 0.5 } else { 0.3 })),
-            _ if graded => egui::Stroke::new(1.0, colors.accent.gamma_multiply(0.7)),
-            _ => egui::Stroke::new(1.5, colors.main),
+            _ if lit.contains(r) && !seamed.contains(r) => egui::Stroke::new(2.5_f32, colors.accent),
+            _ if bubbles.is_some() => egui::Stroke::new(1.0_f32, colors.main.gamma_multiply(if graded { 0.5 } else { 0.3 })),
+            _ if graded => egui::Stroke::new(1.0_f32, colors.accent.gamma_multiply(0.7)),
+            _ => egui::Stroke::new(1.5_f32, colors.main),
         };
         paint_border(&p, &layout, &g, *r, stroke);
     }
     if (layout.shape == Shape::Circle || curved) && !analog {
         p.add(egui::Shape::closed_line(area_outline(&layout, &g),
-            egui::Stroke::new(1.0, colors.main.gamma_multiply(0.6))));
+            egui::Stroke::new(1.0_f32, colors.main.gamma_multiply(0.6))));
     }
 
     if !live_only {
@@ -2040,7 +2040,7 @@ fn area_field(
         for k in 0..3 {
             let o = 3.0 + k as f32 * 3.0;
             p.line_segment([grip.right_bottom() - egui::vec2(o, 1.0), grip.right_bottom() - egui::vec2(1.0, o)],
-                egui::Stroke::new(1.0, col));
+                egui::Stroke::new(1.0_f32, col));
         }
         if gr.hovered() || gr.dragged() {
             ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);

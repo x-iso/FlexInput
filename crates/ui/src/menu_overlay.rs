@@ -501,7 +501,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         let mut r = a.rect;
                         let px = to_px(r);
                         ui.painter().rect_stroke(px, 4.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60)), egui::StrokeKind::Inside);
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(60)), egui::StrokeKind::Inside);
                         {
                             let (tab, _, _) = app.overlay_parts();
                             if let Some(s) = snarl_at(&mut tab.canvas.snarl, a.outer) {
@@ -587,7 +587,7 @@ fn paint_menu(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst, editing: bool) {
     }
 
     p.rect_filled(px, 8.0, crate::canvas::menu_body::plate_fill(m.colors.main));
-    p.rect_stroke(px, 8.0, egui::Stroke::new(1.5, m.colors.main), egui::StrokeKind::Inside);
+    p.rect_stroke(px, 8.0, egui::Stroke::new(1.5_f32, m.colors.main), egui::StrokeKind::Inside);
 
     // Zone cells (plate/hover/icons/labels) via the shared painter — the
     // select-linger fade draws the same cell, so they must match exactly.
@@ -684,7 +684,7 @@ fn menu_edit_chrome(ui: &mut egui::Ui, screen: egui::Rect, exit_edit: &mut bool)
         let bg = ui.visuals().window_fill();
         egui::Frame::default()
             .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
-            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
             .corner_radius(8.0)
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {

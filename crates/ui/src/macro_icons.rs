@@ -154,7 +154,7 @@ pub fn paint_menu_target_badge(
     let r = (icon.width().min(icon.height()) * 0.22).clamp(4.5, 9.0);
     let c = pos2(icon.right() - r, icon.top() + r);
     painter.circle(c, r, egui::Color32::from_black_alpha(225),
-        Stroke::new(1.0, egui::Color32::from_gray(150)));
+        Stroke::new(1.0_f32, egui::Color32::from_gray(150)));
     let g = r * 0.62;
     let at = |x: f32, y: f32| -> Pos2 { pos2(c.x + x * g, c.y + y * g) };
     match target {

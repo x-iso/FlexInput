@@ -409,7 +409,7 @@ impl FlexInputApp {
                         painter.rect_filled(rect, 5.0,
                             egui::Color32::from_rgba_unmultiplied(r, g, b, 60));
                         painter.rect_stroke(rect, 5.0,
-                            egui::Stroke::new(2.0, warm), egui::StrokeKind::Inside);
+                            egui::Stroke::new(2.0_f32, warm), egui::StrokeKind::Inside);
                     } else if is_sel {
                         let bright = editing && !matches!(row.kind, GpSettingKind::Toggle { .. });
                         let [r, g, b, _] = accent.to_array();
@@ -417,7 +417,7 @@ impl FlexInputApp {
                             egui::Color32::from_rgba_unmultiplied(r, g, b,
                                 if bright { 70 } else { 40 }));
                         painter.rect_stroke(rect, 5.0,
-                            egui::Stroke::new(if bright { 2.0 } else { 1.0 }, accent),
+                            egui::Stroke::new(if bright { 2.0 } else { 1.0_f32 }, accent),
                             egui::StrokeKind::Inside);
                     }
                     // Row label (left). Measure its width so combo glyphs know

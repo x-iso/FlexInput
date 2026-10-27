@@ -3248,7 +3248,7 @@ impl eframe::App for FlexInputApp {
             painter.rect_stroke(
                 border_rect,
                 egui::CornerRadius::ZERO,
-                egui::Stroke::new(1.0, stroke_color),
+                egui::Stroke::new(1.0_f32, stroke_color),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4830,7 +4830,7 @@ impl FlexInputApp {
                 painter.rect_stroke(
                     card,
                     egui::CornerRadius::same(10),
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
                     egui::StrokeKind::Inside,
                 );
                 // Spinner + text laid out inside the card.

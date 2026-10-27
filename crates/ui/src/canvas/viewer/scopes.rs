@@ -65,14 +65,14 @@ pub(crate) fn render_vectorscope_display(
     let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
     painter.line_segment(
         [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-        egui::Stroke::new(0.5, grid_axis),
+        egui::Stroke::new(0.5_f32, grid_axis),
     );
     painter.line_segment(
         [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-        egui::Stroke::new(0.5, grid_axis),
+        egui::Stroke::new(0.5_f32, grid_axis),
     );
     painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-        egui::Stroke::new(0.5, grid_faint));
+        egui::Stroke::new(0.5_f32, grid_faint));
 
     // Trail rendering: instead of one circle per sample (was up to 2000
     // painter calls per channel per frame), we emit a small number of
@@ -129,7 +129,7 @@ pub(crate) fn render_vectorscope_display(
                     col.r(), col.g(), col.b(), alpha,
                 );
                 let chunk_pts: Vec<egui::Pos2> = pts[lo..hi].iter().map(|(_, p)| *p).collect();
-                painter.line(chunk_pts, egui::Stroke::new(1.25, stroke_color));
+                painter.line(chunk_pts, egui::Stroke::new(1.25_f32, stroke_color));
             }
         }
 
@@ -140,7 +140,7 @@ pub(crate) fn render_vectorscope_display(
             let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
             painter.circle_filled(egui::pos2(px, py), 4.0, col);
             painter.circle_stroke(egui::pos2(px, py), 4.0,
-                egui::Stroke::new(1.0, Color32::from_gray(100)));
+                egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
         }
     }
     // Only force a repaint while the trail still has live samples or
@@ -292,14 +292,14 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
         let (grid_faint, grid_axis) = graph_grid_colors(None);
         painter.line_segment(
             [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-            egui::Stroke::new(0.5, grid_axis),
+            egui::Stroke::new(0.5_f32, grid_axis),
         );
         painter.line_segment(
             [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-            egui::Stroke::new(0.5, grid_axis),
+            egui::Stroke::new(0.5_f32, grid_axis),
         );
         painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-            egui::Stroke::new(0.5, grid_faint));
+            egui::Stroke::new(0.5_f32, grid_faint));
 
         // Fading polyline trail. Replaces the per-sample circle dot
         // cloud — 600 samples ⇒ 12 polyline shapes per channel rather
@@ -341,7 +341,7 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
                         col.r(), col.g(), col.b(), alpha,
                     );
                     painter.line(pts[lo..hi].to_vec(),
-                        egui::Stroke::new(1.25, stroke_color));
+                        egui::Stroke::new(1.25_f32, stroke_color));
                 }
             }
 
@@ -352,7 +352,7 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
                 let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
                 painter.circle_filled(egui::pos2(px, py), 4.0, col);
                 painter.circle_stroke(egui::pos2(px, py), 4.0,
-                    egui::Stroke::new(1.0, Color32::from_gray(100)));
+                    egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
             }
         }
 
@@ -360,7 +360,7 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
         // (mirrors egui's internal `paint_resize_corner_with_style`).
         {
             let grip_color = ui.style().interact(&handle_resp).fg_stroke.color;
-            let grip_stroke = egui::Stroke::new(1.0, grip_color);
+            let grip_stroke = egui::Stroke::new(1.0_f32, grip_color);
             let cp = handle_rect.right_bottom();
             let mut w = 2.0;
             while w <= handle_rect.width() && w <= handle_rect.height() {

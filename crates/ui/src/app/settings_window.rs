@@ -14,7 +14,7 @@ fn shortcut_chord_widget(
         return ui.add(egui::Button::new(
             egui::RichText::new("Hold combo, release…").size(12.0))
             .fill(egui::Color32::from_rgb(80, 60, 30))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80))));
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80))));
     }
     if combo.is_empty() {
         return ui.add(egui::Button::new(egui::RichText::new("(none)").size(12.0)));
@@ -1072,7 +1072,7 @@ impl FlexInputApp {
             let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
             if self.pin_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
             }
             let resp = ui.add(btn).on_hover_text(
                 if self.pin_learning {
@@ -1121,7 +1121,7 @@ impl FlexInputApp {
             let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
             if self.overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
             }
             let resp = ui.add(btn).on_hover_text(
                 if self.overlay_learning {
@@ -1173,7 +1173,7 @@ impl FlexInputApp {
             let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
             if self.edit_overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
             }
             let resp = ui.add(btn).on_hover_text(
                 if self.edit_overlay_learning {
@@ -1224,7 +1224,7 @@ impl FlexInputApp {
             let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
             if self.config_overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
             }
             let resp = ui.add(btn).on_hover_text(
                 if self.config_overlay_learning {
@@ -1320,7 +1320,7 @@ impl FlexInputApp {
         let amber = egui::Color32::from_rgb(230, 170, 80);
         egui::Frame::new()
             .fill(egui::Color32::from_rgba_unmultiplied(230, 170, 80, 28))
-            .stroke(egui::Stroke::new(1.0, amber))
+            .stroke(egui::Stroke::new(1.0_f32, amber))
             .corner_radius(4.0)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {

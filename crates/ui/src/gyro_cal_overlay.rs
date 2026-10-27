@@ -754,7 +754,7 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
     );
     let p = ui.painter();
     p.rect_filled(card, 14.0, Color32::from_rgba_unmultiplied(18, 20, 24, 228));
-    p.rect_stroke(card, 14.0, Stroke::new(1.0, Color32::from_white_alpha(40)), egui::StrokeKind::Inside);
+    p.rect_stroke(card, 14.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), egui::StrokeKind::Inside);
     p.text(egui::pos2(card.center().x, card.top() + 26.0), Align2::CENTER_CENTER,
         flexinput_core::imu::GYRO_CAL_NAME, FontId::proportional(19.0), Color32::from_gray(235));
 
@@ -859,11 +859,11 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
 /// the filter removes show here too.
 fn scope(p: &egui::Painter, rect: egui::Rect, pad: &PadCal, offset: [f32; 3]) {
     p.rect_filled(rect, 5.0, Color32::from_gray(12));
-    p.rect_stroke(rect, 5.0, Stroke::new(1.0, Color32::from_gray(48)), egui::StrokeKind::Inside);
+    p.rect_stroke(rect, 5.0, Stroke::new(1.0_f32, Color32::from_gray(48)), egui::StrokeKind::Inside);
     let plot = rect.shrink2(egui::vec2(8.0, 9.0));
     let mid = plot.center().y;
     p.line_segment([egui::pos2(plot.left(), mid), egui::pos2(plot.right(), mid)],
-        Stroke::new(1.0, Color32::from_gray(40)));
+        Stroke::new(1.0_f32, Color32::from_gray(40)));
 
     let n = pad.recent.len();
     let small = FontId::proportional(10.0);
@@ -907,7 +907,7 @@ fn scope(p: &egui::Painter, rect: egui::Rect, pad: &PadCal, offset: [f32; 3]) {
             }
             pts
         };
-        p.add(egui::Shape::line(pts, Stroke::new(1.3, *col)));
+        p.add(egui::Shape::line(pts, Stroke::new(1.3_f32, *col)));
     }
     for &tm in &pad.marks {
         let i = pad.recent.partition_point(|(t, _)| *t < tm);
@@ -929,7 +929,7 @@ const RING_R: f32 = 38.0;
 /// short comet circles inside it while it works.
 fn ring(p: &egui::Painter, c: Pos2, progress: f32, share: f32, spin: Option<f64>) {
     use std::f32::consts::{FRAC_PI_2, TAU};
-    p.circle_stroke(c, RING_R, Stroke::new(6.0, Color32::from_white_alpha(28)));
+    p.circle_stroke(c, RING_R, Stroke::new(6.0_f32, Color32::from_white_alpha(28)));
     let arc = |r: f32, a0: f32, sweep: f32| -> Vec<Pos2> {
         let n = ((sweep.abs() / TAU) * 72.0).ceil().max(2.0) as usize;
         (0..=n).map(|k| {
@@ -940,17 +940,17 @@ fn ring(p: &egui::Painter, c: Pos2, progress: f32, share: f32, spin: Option<f64>
     let top = -FRAC_PI_2;
     let gyro_end = progress.min(share);
     if gyro_end > 0.001 {
-        p.add(egui::Shape::line(arc(RING_R, top, gyro_end * TAU), Stroke::new(6.0, ORANGE)));
+        p.add(egui::Shape::line(arc(RING_R, top, gyro_end * TAU), Stroke::new(6.0_f32, ORANGE)));
     }
     if progress > share + 0.001 {
-        p.add(egui::Shape::line(arc(RING_R, top + share * TAU, (progress - share) * TAU), Stroke::new(6.0, CYAN)));
+        p.add(egui::Shape::line(arc(RING_R, top + share * TAU, (progress - share) * TAU), Stroke::new(6.0_f32, CYAN)));
     }
     if share < 0.999 {
         // Where the spike check starts.
         let a = top + share * TAU;
         let (i, o) = (RING_R - 5.0, RING_R + 5.0);
         p.line_segment([egui::pos2(c.x + i * a.cos(), c.y + i * a.sin()), egui::pos2(c.x + o * a.cos(), c.y + o * a.sin())],
-            Stroke::new(1.5, Color32::from_white_alpha(90)));
+            Stroke::new(1.5_f32, Color32::from_white_alpha(90)));
     }
     if let Some(t) = spin {
         const SEGS: usize = 14;
@@ -960,7 +960,7 @@ fn ring(p: &egui::Painter, c: Pos2, progress: f32, share: f32, spin: Option<f64>
         for k in 0..SEGS {
             let a0 = head - 0.09 * k as f32;
             let fade = 1.0 - k as f32 / SEGS as f32;
-            p.add(egui::Shape::line(arc(r, a0, -0.09), Stroke::new(2.5, col.gamma_multiply(fade * 0.8))));
+            p.add(egui::Shape::line(arc(r, a0, -0.09), Stroke::new(2.5_f32, col.gamma_multiply(fade * 0.8))));
         }
     }
 }
@@ -980,13 +980,13 @@ fn check(p: &egui::Painter, c: Pos2, k: f32) {
         len -= l;
     }
     if line.len() > 1 {
-        p.add(egui::Shape::line(line, Stroke::new(5.0, GREEN)));
+        p.add(egui::Shape::line(line, Stroke::new(5.0_f32, GREEN)));
     }
 }
 
 fn cross(p: &egui::Painter, c: Pos2, col: Color32) {
     let d = 13.0;
-    let st = Stroke::new(4.5, col);
+    let st = Stroke::new(4.5_f32, col);
     p.line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], st);
     p.line_segment([egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)], st);
 }
@@ -1018,7 +1018,7 @@ fn lay_down(ui: &egui::Ui, p: &egui::Painter, c: Pos2, t: f64) {
     let ph = (t / PERIOD).fract() as f32;
     let table_y = c.y + 26.0;
     p.line_segment([egui::pos2(c.x - 82.0, table_y), egui::pos2(c.x + 82.0, table_y)],
-        Stroke::new(2.0, Color32::from_white_alpha(70)));
+        Stroke::new(2.0_f32, Color32::from_white_alpha(70)));
 
     // Lower over the first half (ease-out), rest for the second.
     let fall = (ph / 0.5).min(1.0);
@@ -1036,7 +1036,7 @@ fn lay_down(ui: &egui::Ui, p: &egui::Painter, c: Pos2, t: f64) {
     if ph > 0.5 {
         let k = (ph - 0.5) / 0.5;
         let r = 40.0 + k * 60.0;
-        let st = Stroke::new(2.0, ORANGE.gamma_multiply((1.0 - k) * 0.6));
+        let st = Stroke::new(2.0_f32, ORANGE.gamma_multiply((1.0 - k) * 0.6));
         p.line_segment([egui::pos2(c.x - r, table_y + 5.0), egui::pos2(c.x - r + 14.0, table_y + 5.0)], st);
         p.line_segment([egui::pos2(c.x + r - 14.0, table_y + 5.0), egui::pos2(c.x + r, table_y + 5.0)], st);
     }
