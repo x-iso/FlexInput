@@ -1,0 +1,16 @@
+Title: Steam Controller 3D model
+Copyright: © 2026 Valve Corporation
+License: CC BY-NC-SA 4.0 (http://creativecommons.org/licenses/by-nc-sa/4.0/)
+Source: https://gitlab.steamos.cloud/SteamHardware/SteamController
+
+Title: Steam Controller 3D model (modified)
+Copyright: © 2026 FlickStick Videos
+License: CC BY-NC-SA 4.0 (http://creativecommons.org/licenses/by-nc-sa/4.0/)
+Source: https://drive.google.com/drive/folders/1OT_c4CndF8xH4TQE4p_jnaXv3XRnoKoF
+Changes: These files are based on Valve's original model and modified to reduce polygon count.
+
+Title: Steam Controller 3D model (modified) (for 3D Controller Overlay)
+Copyright: © 2026 ceski
+License: CC BY-NC-SA 4.0 (http://creativecommons.org/licenses/by-nc-sa/4.0/)
+Source: https://github.com/ceski-1/3d-controller-overlay
+Changes: These files are based on FlickStick Video's model and modified to fix errors and to improve compatibility with 3D Controller Overlay.

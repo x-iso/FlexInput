@@ -1575,6 +1575,12 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("read_devices_clone");
             self.devices = self.shared_devices.read().unwrap().clone();
         }
+        // The 3D viewer picks a model from the device id, which names no
+        // product for an SDL pad (a Steam Controller is `sdl:generic:…`), so
+        // it gets the USB ids as well.
+        crate::model::note_device_models(
+            self.devices.iter().filter_map(|d| Some((d.id.as_str(), d.vid?, d.pid?))),
+        );
 
         // Publish the current gamepad skin (VID/PID kind of the connected physical
         // pad, skipping our own virtual outputs; else Xbox) so dynamic `gp:<pin>`

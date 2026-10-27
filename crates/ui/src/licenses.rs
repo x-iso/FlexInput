@@ -206,11 +206,31 @@ pub const LICENSES: &[License] = &[
     License {
         name: "3D controller models",
         what: "The controller meshes in app/assets/models, adapted from \
-               larfingshnew/3d-controller-overlay.",
+               larfingshnew/3d-controller-overlay — all but the Steam \
+               Controller, which has its own entry below.",
         spdx: "MIT",
         url: "https://github.com/larfingshnew/3d-controller-overlay",
         note: None,
         text: include_str!("../../../licenses/3d-controller-overlay.txt"),
+    },
+    License {
+        name: "Steam Controller 3D model",
+        what: "The Steam Controller mesh in app/assets/models/Steam Controller. \
+               Unlike the rest of FlexInput it is not under MIT: its licence \
+               allows non-commercial use only.",
+        spdx: "CC-BY-NC-SA-4.0",
+        url: "https://github.com/ceski-1/3d-controller-overlay",
+        note: Some(
+            "Steam Controller 3D model © 2026 Valve Corporation, from \
+             gitlab.steamos.cloud/SteamHardware/SteamController.\n\
+             Modified to reduce its polygon count © 2026 FlickStick Videos.\n\
+             Modified to fix errors and to suit 3D Controller Overlay © 2026 ceski, \
+             in ceski-1/3d-controller-overlay.\n\
+             FlexInput bundles ceski's version file for file, unmodified, beside \
+             its own colour palette (colors.fxcol). FlexInput is not affiliated \
+             with or endorsed by Valve.",
+        ),
+        text: include_str!("../../../app/assets/models/Steam Controller/license.txt"),
     },
     License {
         name: "game-icons.net icons",

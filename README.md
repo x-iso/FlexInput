@@ -137,6 +137,15 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
   [larfingshnew/3d-controller-overlay](https://github.com/larfingshnew/3d-controller-overlay)
   (MIT). That repo is also the reference for the model format when adding
   custom controllers — see `app/assets/models/README.md`.
+- The **Steam Controller** 3D model (`app/assets/models/Steam Controller`) is
+  **not** under MIT. It is © 2026 Valve Corporation
+  ([SteamHardware/SteamController](https://gitlab.steamos.cloud/SteamHardware/SteamController)),
+  modified by FlickStick Videos and then by ceski for
+  [ceski-1/3d-controller-overlay](https://github.com/ceski-1/3d-controller-overlay),
+  and licensed [CC BY-NC-SA 4.0](http://creativecommons.org/licenses/by-nc-sa/4.0/)
+  (non-commercial use only). It is bundled unmodified; its `license.txt` and
+  `license_attribution.txt` travel with it. FlexInput is not affiliated with
+  or endorsed by Valve.
 - The **JSM Config** module reimplements the config language and mapping rules
   of [Electronicks/JoyShockMapper](https://github.com/Electronicks/JoyShockMapper)
   (MIT, by Julian "Jibb" Smart and Nicolas Lessard), followed as of 3.6.2, and

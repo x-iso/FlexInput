@@ -18,7 +18,7 @@ pub use obj::{Mesh, Part, ControllerModel, PartTransform, ObjError};
 // Runtime model cache + render-widget builder + device→model mapping.
 pub use callback::{
     available_models, load_model_cached, model_for_device, model_for_devices, models_base_dir,
-    paint_controller_model, set_target_format, set_user_models_dir,
+    note_device_models, paint_controller_model, set_target_format, set_user_models_dir,
     ControllerLive, LoadedModel,
 };
 pub use material::{default_scheme, MaterialGroup, Scheme, MIC_COLOR, N_GROUPS};

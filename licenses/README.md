@@ -16,6 +16,7 @@ straight at it instead — no copy, so it can't drift:
 | egui-snarl | [`vendor/egui-snarl/LICENSE-MIT`](../vendor/egui-snarl/LICENSE-MIT) |
 | btleplug | [`vendor/btleplug/LICENSE.md`](../vendor/btleplug/LICENSE.md) |
 | SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, the copy gilrs 0.10.10 ships) is embedded by `crates/core/src/sdl_db.rs` |
+| Steam Controller 3D model | [`app/assets/models/Steam Controller/license.txt`](../app/assets/models/Steam%20Controller/license.txt) — CC BY-NC-SA 4.0 (non-commercial), from `ceski-1/3d-controller-overlay` commit `587d1be`; the attribution chain is in `license_attribution.txt` beside it |
 
 ## Where each copy came from
 
@@ -32,7 +33,7 @@ straight at it instead — no copy, so it can't drift:
 | `enigo.txt` | `enigo` 0.6.1 crate source, `LICENSE` |
 | `JoyShockMapper.txt` | `Electronicks/JoyShockMapper` branch `master`, `LICENSE.md` — the rules the JSM Config module ports. Byte-identical to the `LICENSE.md` of `evan1mclean/JSM_custom_curve`, so both entries point at this one copy |
 | `TriggerEffectGenerator.txt` | Nielk1's gist `6d54cc2c00d2201ccb8c2720ad7538db`, the MIT header of `ExtendInput.DataTools.DualSense.TriggerEffectGenerator.cs` with its comment markers removed |
-| `3d-controller-overlay.txt` | `larfingshnew/3d-controller-overlay`, `LICENSE` — the models in `app/assets/models` |
+| `3d-controller-overlay.txt` | `larfingshnew/3d-controller-overlay`, `LICENSE` — the models in `app/assets/models`, except the Steam Controller (above) |
 | `CC-BY-3.0.txt` | creativecommons.org legal code — the game-icons.net icons in `app/assets/general` |
 | `CC0-1.0.txt` | creativecommons.org legal code — the Kenney input-prompt icons |
 

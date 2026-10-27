@@ -428,6 +428,14 @@ pub(crate) fn controller3d_live(
         ("paddle3", "btn_paddle_l2"),
         ("paddle2", "btn_paddle_r2"),
         ("paddle4", "btn_paddle_r1"),
+        // Models in SDL's naming (the Steam Controller's back grips) name each
+        // paddle after the pin it answers to.
+        ("paddle_l1", "btn_paddle_l1"),
+        ("paddle_l2", "btn_paddle_l2"),
+        ("paddle_r1", "btn_paddle_r1"),
+        ("paddle_r2", "btn_paddle_r2"),
+        // SDL's Misc 1 (the Steam Controller's "…" quick-access button).
+        ("misc1", "btn_misc1"),
     ];
     for (part, pin) in BUTTON_PART_PINS {
         if b(pin) {
@@ -467,8 +475,20 @@ pub(crate) fn controller3d_live(
     }
     glow("left_cap", live.left_stick_press);
     glow("right_cap", live.right_stick_press);
-    // Touchpad click lights the whole pad surface.
-    glow("touchpad", if b("btn_touchpad") { 1.0 } else { 0.0 });
+    // A pad click lights the whole pad surface — the touchpad, and a two-pad
+    // controller's right pad (`touchpad2`), whose click SDL reports as Misc 2.
+    for (part, field) in [("touchpad", 0), ("touchpad2", 1)] {
+        let click = flexinput_core::touchzones::field_click_pins(field).iter().any(|p| b(p));
+        glow(part, if click { 1.0 } else { 0.0 });
+    }
+    // Grip sense (Steam Controller): a hand on a grip shows that grip's patch.
+    // The grips' capacitive pads arrive on Misc 5 / 6, read only when the
+    // backend marks those pins capacitive — on other pads they're buttons.
+    let capacitive = get(flexinput_core::automap::CAPACITIVE_MASK_PIN).map_or(0, |s| s.as_float() as u8);
+    for (part, misc) in [("left_gripsense", 4), ("right_gripsense", 5)] {
+        let held = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
+        glow(part, if held { 1.0 } else { 0.0 });
+    }
     live
 }
 

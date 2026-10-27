@@ -25,11 +25,14 @@ pub struct Part {
     pub pos: Vec3,
     /// Rotation as quaternion (from axis-angle or single-axis angle stored in info.txt).
     pub rot: Quat,
-    /// Optional surface half-extents (from the trailing two info.txt values):
-    /// used by `touch_point*` parts as the touchpad's `(half_x, half_z)` so
-    /// normalized touch input can be mapped onto the model. `None` for parts
-    /// whose trailing values are zero.
+    /// Optional touch-area half-extents (from the touch width / depth values
+    /// in info.txt): used by `touch_point*` parts as the touchpad's
+    /// `(half_x, half_z)` so normalized touch input can be mapped onto the
+    /// model. `None` for parts whose values are zero.
     pub extent: Option<glam::Vec2>,
+    /// Tilt of that touch area — the plane the finger dot slides in. Identity
+    /// for a flat pad and for every block in the original 16-value layout.
+    pub touch_rot: Quat,
 }
 
 /// A complete controller model assembled from parts with their transforms.
@@ -152,27 +155,31 @@ pub fn parse_obj(text: &str) -> Result<Mesh, ObjError> {
 /// Parse `info.txt` for a controller model folder. Returns the ordered list of
 /// parts with their transforms.
 ///
-/// Format per part block (16 lines after filename):
-///   Line 1: filename (`left_trigger.obj`)
-///   Lines 2-4: `[pos_x, pos_y, pos_z]` — position offset in model space
-///   Lines 5-7: axis-angle rotation vector `[ax, ay, az]` (mostly zeros)
-///   Line 8: padding zero
-///   Lines 9-10: scale factors (always 0 → use default 1.0)
-///   Line 11: rotation angle in radians
-///     • If axis (lines 5-7) is non-zero: rotate around that axis by this angle
-///     • If axis is all zeros but angle ≠ 0: single-axis X rotation
-///   Lines 12-14: padding zeros
-///   Lines 15-16: surface half-extents `(half_x, half_z)` — non-zero only on
-///     `touch_point*` parts, giving the touchpad size for input mapping.
+/// Each part is its filename line (`left_trigger.obj`) followed by one number
+/// per line, in either of two layouts: the original 3d-controller-overlay's 16
+/// values, or the 19 of ceski's fork (the same 16 plus the touch area's tilt).
+/// A block runs until the next line that isn't a number, so both parse.
+///
+/// What is read, by value index after the filename (0-based):
+///   0-2: `[pos_x, pos_y, pos_z]` — position offset in model space
+///   3-5: axis-angle rotation vector `[ax, ay, az]` (mostly zeros)
+///   10: rotation angle in radians
+///     • If the axis is non-zero: rotate around that axis by this angle
+///     • If the axis is all zeros but angle ≠ 0: single-axis X rotation
+///   14-15: touch area width and depth — non-zero only on `touch_point*`
+///     parts; the finger dot ranges over half of each either side of its
+///     rest point.
+///   16-18: touch area tilt in radians, about X, then Y, then Z (the fork's
+///     layout only; the Steam Controller's angled pads set it).
+/// Values 6-9 and 11-13 are unused (upstream's pop-up offsets and angles,
+/// trigger and stick tilt limits): this viewer animates parts its own way.
 pub fn parse_info_txt(text: &str) -> Vec<PartTransform> {
     let mut parts = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty()).peekable();
 
-    while i < lines.len() {
-        let line = lines[i].trim();
-        if line.is_empty() {
-            i += 1;
+    while let Some(line) = lines.next() {
+        // A number outside any block has no part to belong to.
+        if line.parse::<f32>().is_ok() {
             continue;
         }
         // Start of a part block: filename on this line.
@@ -180,19 +187,11 @@ pub fn parse_info_txt(text: &str) -> Vec<PartTransform> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| line.trim_end_matches(".obj").to_string());
 
-        // Collect the 16 lines of transform data (skip empty lines between blocks).
-        let mut vals: Vec<f32> = Vec::with_capacity(16);
-        i += 1;
-        while i < lines.len() && vals.len() < 16 {
-            if let Ok(v) = lines[i].trim().parse::<f32>() {
-                vals.push(v);
-            }
-            // Empty line after we've started collecting → end of this block.
-            if lines[i].trim().is_empty() && !vals.is_empty() {
-                i += 1;
-                break;
-            }
-            i += 1;
+        // Its values: every numeric line up to the next filename.
+        let mut vals: Vec<f32> = Vec::with_capacity(19);
+        while let Some(v) = lines.peek().and_then(|l| l.parse::<f32>().ok()) {
+            vals.push(v);
+            lines.next();
         }
 
         // Interpret the transform data.
@@ -229,15 +228,27 @@ pub fn parse_info_txt(text: &str) -> Vec<PartTransform> {
             _ => (Vec3::ZERO, Quat::IDENTITY),
         };
 
-        // Trailing surface half-extents (lines 15-16); non-zero only for
-        // touch_point parts.
+        // Touch area size (values 14-15); non-zero only for touch_point
+        // parts. Both upstreams store the FULL width and depth — the DualSense
+        // block's 0.55 sits inside its 0.81-wide pad mesh, and its overlay
+        // offsets the dot by `width * (x - 0.5)` — so halve them.
         let extent = if vals.len() >= 16 && (vals[14].abs() > 1e-6 || vals[15].abs() > 1e-6) {
-            Some(glam::Vec2::new(vals[14], vals[15]))
+            Some(glam::Vec2::new(vals[14], vals[15]) * 0.5)
         } else {
             None
         };
 
-        parts.push(PartTransform { name, pos, rot, extent });
+        // Touch area tilt (values 16-18), composed in the order the fork's
+        // renderer applies it: X, then Y, then Z.
+        let touch_rot = if vals.len() >= 19 {
+            Quat::from_rotation_x(vals[16])
+                * Quat::from_rotation_y(vals[17])
+                * Quat::from_rotation_z(vals[18])
+        } else {
+            Quat::IDENTITY
+        };
+
+        parts.push(PartTransform { name, pos, rot, extent, touch_rot });
     }
 
     parts
@@ -249,20 +260,62 @@ pub struct PartTransform {
     pub pos: Vec3,
     pub rot: Quat,
     pub extent: Option<glam::Vec2>,
+    pub touch_rot: Quat,
 }
+
+// ── Part names ────────────────────────────────────────────────────────────────
+
+/// Part names in ceski's fork of 3d-controller-overlay, which renamed the
+/// buttons after SDL's gamepad layout, mapped onto the names this viewer
+/// animates and colours by. Applied only to a model that uses the fork's names
+/// (see [`SDL_ONLY_PART_NAMES`]), because two of them mean something else in
+/// the original layout: there `paddle1`-`paddle4` count by grip-rail position
+/// (the Joy-Con SL/SR), while the fork numbers them in SDL's button order, and
+/// the fork's `misc2` is a two-pad controller's right trackpad.
+const SDL_PART_NAMES: &[(&str, &str)] = &[
+    ("south_button", "a_button"),
+    ("east_button", "b_button"),
+    ("west_button", "x_button"),
+    ("north_button", "y_button"),
+    ("left_shoulder", "left_bumper"),
+    ("right_shoulder", "right_bumper"),
+    ("left_stick_base", "left_stick"),
+    ("right_stick_base", "right_stick"),
+    ("left_stick_ring", "left_ring"),
+    ("right_stick_ring", "right_ring"),
+    ("left_stick_cap", "left_cap"),
+    ("right_stick_cap", "right_cap"),
+    // SDL order: right paddle 1, left paddle 1, right paddle 2, left paddle 2.
+    ("paddle1", "paddle_r1"),
+    ("paddle2", "paddle_l1"),
+    ("paddle3", "paddle_r2"),
+    ("paddle4", "paddle_l2"),
+    // The right trackpad (its click is SDL's Misc 2).
+    ("misc2", "touchpad2"),
+];
+
+/// Names only the fork's layout has; a model with any of them uses it.
+const SDL_ONLY_PART_NAMES: &[&str] = &[
+    "south_button", "east_button", "west_button", "north_button",
+    "left_shoulder", "right_shoulder", "left_stick_base", "right_stick_base",
+];
 
 // ── Model assembly ────────────────────────────────────────────────────────────
 
 /// Load a complete controller model through a file-reading closure — the same
 /// assembly path serves on-disk folders AND the compiled-in (embedded) copies.
 /// `read_file("info.txt")` / `read_file("left_stick.obj")` return the file's
-/// text or `None` when absent.
+/// text or `None` when absent. Parts come out under this viewer's names
+/// whichever layout the folder uses (see [`SDL_PART_NAMES`]).
 pub fn load_controller_model_with(
     read_file: &dyn Fn(&str) -> Option<String>,
     display_name: String,
 ) -> Result<ControllerModel, ObjError> {
     let info_text = read_file("info.txt").ok_or(ObjError::InfoFileMissing)?;
     let parts_transforms = parse_info_txt(&info_text);
+    let sdl_names = parts_transforms
+        .iter()
+        .any(|pt| SDL_ONLY_PART_NAMES.contains(&pt.name.as_str()));
 
     let mut assembled_parts: Vec<Part> = Vec::new();
     for pt in &parts_transforms {
@@ -271,12 +324,17 @@ pub fn load_controller_model_with(
             continue;
         };
         let mesh = parse_obj(&obj_text)?;
+        let name = SDL_PART_NAMES
+            .iter()
+            .find(|(sdl, _)| sdl_names && *sdl == pt.name)
+            .map_or_else(|| pt.name.clone(), |(_, ours)| ours.to_string());
         assembled_parts.push(Part {
-            name: pt.name.clone(),
+            name,
             mesh,
             pos: pt.pos,
             rot: pt.rot,
             extent: pt.extent,
+            touch_rot: pt.touch_rot,
         });
     }
 
@@ -360,5 +418,46 @@ mod tests {
         // Pentagon = 3 tris; the second face loses its 99 corner so it has only
         // 2 valid corners and contributes nothing.
         assert_eq!(m.tri_count, 3);
+    }
+
+    /// One `info.txt` block in the original 16-value layout, then one in the
+    /// fork's 19 with a tilt. Reading a fixed 16 used to take the fork's three
+    /// extra values for the next part's filename.
+    #[test]
+    fn info_txt_reads_both_block_layouts() {
+        let legacy = "left_stick.obj\n-0.3\n0.2\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0.35\n0\n0\n";
+        let fork = "touch_point1.obj\n-0.4\n0.2\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0\n0.4\n0.2\n0.3\n0\n0\n";
+        let parts = parse_info_txt(&format!("{legacy}{fork}top_shell.obj\n0\n0\n0\n"));
+        let names: Vec<_> = parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["left_stick", "touch_point1", "top_shell"]);
+
+        assert_eq!(parts[0].pos, Vec3::new(-0.3, 0.2, 0.0));
+        assert_eq!(parts[0].extent, None);
+        assert_eq!(parts[0].touch_rot, Quat::IDENTITY);
+
+        let tp = &parts[1];
+        assert_eq!(tp.pos, Vec3::new(-0.4, 0.2, 0.0));
+        // Width and depth are stored whole; the dot ranges over half of each.
+        assert_eq!(tp.extent, Some(glam::Vec2::new(0.2, 0.1)));
+        let up = tp.touch_rot * Vec3::Y;
+        assert!((up - Vec3::new(0.0, 0.3f32.cos(), 0.3f32.sin())).length() < 1e-5, "{up}");
+    }
+
+    /// A model in the fork's SDL naming loads under this viewer's part names,
+    /// paddles by SDL order; one in the original naming keeps its own.
+    #[test]
+    fn sdl_part_names_load_as_ours() {
+        let tri = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+        let load = |info: &'static str| {
+            let read = move |f: &str| (f == "info.txt").then(|| info.to_string())
+                .or_else(|| f.ends_with(".obj").then(|| tri.to_string()));
+            let m = load_controller_model_with(&read, "t".into()).expect("loads");
+            m.parts.into_iter().map(|p| p.name).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            load("south_button.obj\n0\nleft_stick_cap.obj\n0\npaddle1.obj\n0\npaddle2.obj\n0\nmisc2.obj\n0\nmisc1.obj\n0\n"),
+            ["a_button", "left_cap", "paddle_r1", "paddle_l1", "touchpad2", "misc1"],
+        );
+        assert_eq!(load("a_button.obj\n0\npaddle1.obj\n0\n"), ["a_button", "paddle1"]);
     }
 }

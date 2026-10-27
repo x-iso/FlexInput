@@ -2084,6 +2084,23 @@ impl FlexInputApp {
             ui.label(egui::RichText::new("by larfingshnew (MIT).").small());
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(
+                "Steam Controller 3D model © Valve Corporation, modified by FlickStick Videos and",
+            ).small());
+            ui.hyperlink_to(
+                egui::RichText::new("ceski").small(),
+                "https://github.com/ceski-1/3d-controller-overlay",
+            );
+            ui.label(egui::RichText::new("—").small());
+            ui.hyperlink_to(
+                egui::RichText::new("CC BY-NC-SA 4.0").small(),
+                "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+            );
+            ui.label(egui::RichText::new(
+                "(non-commercial use only). Not affiliated with or endorsed by Valve.",
+            ).small());
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("JSM Config follows").small());
             ui.hyperlink_to(
                 egui::RichText::new("JoyShockMapper").small(),

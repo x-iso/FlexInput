@@ -34,21 +34,34 @@ pub struct LoadedModel {
     pub center: Vec3,
     /// Bounding radius from `center` (camera distance is derived from this).
     pub radius: f32,
-    /// Touchpad surface for mapping normalized touch input onto the model, if
-    /// the model has `touch_point*` parts with extents in `info.txt`.
-    pub touch_surface: Option<TouchSurface>,
+    /// The surface each finger dot moves on, mapping normalized touch input
+    /// onto the model — `[touch_point1, touch_point2]`. A single-pad controller
+    /// gives both the same pad (two fingers on one surface); a two-pad one
+    /// (Steam Controller) gives each dot its own. `None` when the model has no
+    /// touch area for that dot.
+    pub touch_surfaces: [Option<TouchSurface>; 2],
     /// Part indices of `touch_point1` / `touch_point2` (the movable finger dots),
     /// or `None` when the model has no such part.
     pub touch_point_parts: [Option<usize>; 2],
 }
 
-/// The touchpad's flat surface in model space: finger dots rest at `center` and
-/// move within `± half` on the X (width) and Z (depth) axes.
+/// A touchpad's surface in model space: finger dots rest at `center` and move
+/// within `± half` on the pad's own X (width) and Z (depth) axes — the model's,
+/// turned by `rot` for a tilted pad.
 #[derive(Clone, Copy)]
 pub struct TouchSurface {
     pub center: Vec3,
     /// Half-extents `(half_x, half_z)`.
     pub half: glam::Vec2,
+    /// The pad's tilt (identity for a flat pad).
+    pub rot: Quat,
+}
+
+/// Steam Controller grip-sense patches (`left_gripsense` / `right_gripsense`):
+/// flat markers buried inside the grips. They draw only while their grip is
+/// touched, as the x-ray ghost through the shell.
+pub(crate) fn is_grip_sense(part: &str) -> bool {
+    part.ends_with("gripsense")
 }
 
 /// Live input state that animates the model: touch dots, stick tilt, trigger
@@ -391,7 +404,10 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
     // dots must stay within (far more reliable than baked-in numbers).
     let mut pad_min = Vec3::splat(f32::INFINITY);
     let mut pad_max = Vec3::splat(f32::NEG_INFINITY);
-    let mut pad_extent_fallback: Option<TouchSurface> = None;
+    // Each dot's touch area as its info.txt block gives it (`None` without a
+    // size), and where it rests.
+    let mut touch_info: [Option<TouchSurface>; 2] = [None, None];
+    let mut touch_rest: [Option<Vec3>; 2] = [None, None];
     let mut touch_point_parts: [Option<usize>; 2] = [None, None];
     for (idx, p) in model.parts.iter().enumerate() {
         let tf = part_transform(p.pos, p.rot);
@@ -429,17 +445,13 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
         } else {
             Vec3::ZERO
         };
-        // Record the movable touch-point dots (+ a fallback surface from the
-        // extents baked into their info.txt block, used only if the model has
-        // no touchpad mesh to measure).
+        // Record the movable touch-point dots and the touch area baked into
+        // their info.txt blocks (see `touch_surfaces` below for which wins).
         if lname.starts_with("touch_point") {
             let slot = if lname.ends_with('2') { 1 } else { 0 };
             touch_point_parts[slot] = Some(idx);
-            if pad_extent_fallback.is_none() {
-                if let Some(half) = p.extent {
-                    pad_extent_fallback = Some(TouchSurface { center: p.pos, half });
-                }
-            }
+            touch_rest[slot] = Some(p.pos);
+            touch_info[slot] = p.extent.map(|half| TouchSurface { center: p.pos, half, rot: p.touch_rot });
         }
         // Surface samples for the x-ray visibility test: stride the vertex list
         // so the points spread over the whole part instead of clustering in
@@ -472,14 +484,25 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
         });
     }
 
-    // Prefer the measured touchpad box; fall back to the info.txt extents.
-    let touch_surface = if pad_min.x.is_finite() && pad_max.x.is_finite() {
-        Some(TouchSurface {
-            center: (pad_min + pad_max) * 0.5,
-            half: glam::Vec2::new((pad_max.x - pad_min.x) * 0.5, (pad_max.z - pad_min.z) * 0.5),
-        })
+    // Two dots resting apart sit on two separate pads (Steam Controller: one
+    // finger per pad), and only each dot's own info.txt block knows its pad's
+    // size and tilt. Otherwise both fingers share one pad: prefer the measured
+    // touchpad box, falling back to the info.txt extents.
+    let two_pads = matches!(touch_rest, [Some(a), Some(b)] if a.distance(b) > 1e-3);
+    let touch_surfaces = if two_pads {
+        touch_info
     } else {
-        pad_extent_fallback
+        let fallback = touch_info[0].or(touch_info[1]);
+        let shared = if pad_min.x.is_finite() && pad_max.x.is_finite() {
+            Some(TouchSurface {
+                center: (pad_min + pad_max) * 0.5,
+                half: glam::Vec2::new((pad_max.x - pad_min.x) * 0.5, (pad_max.z - pad_min.z) * 0.5),
+                rot: fallback.map_or(Quat::IDENTITY, |s| s.rot),
+            })
+        } else {
+            fallback
+        };
+        [shared, shared]
     };
 
     let (center, radius) = if min.x.is_finite() && max.x.is_finite() {
@@ -494,15 +517,57 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
         parts,
         center,
         radius,
-        touch_surface,
+        touch_surfaces,
         touch_point_parts,
     }))
+}
+
+/// Models for connected pads their device id doesn't identify, keyed by id.
+/// An SDL pad's id names only its kind (`sdl:generic:<serial>`), so a Steam
+/// Controller reads like any other generic pad; the app hands over each pad's
+/// USB ids instead ([`note_device_models`]).
+static DEVICE_MODELS: OnceLock<std::sync::RwLock<HashMap<String, &'static str>>> = OnceLock::new();
+
+/// The model for a pad by its USB vendor / product id, where that's the only
+/// way to tell it apart.
+fn model_for_vid_pid(vid: u16, pid: u16) -> Option<&'static str> {
+    match (vid, pid) {
+        // Steam Controller (2nd gen, "Triton") and its dongles — the range
+        // `automap::capacitive_misc_mask` knows its grips by.
+        (0x28DE, 0x1302..=0x1305) => Some("Steam Controller"),
+        _ => None,
+    }
+}
+
+/// Record the connected pads' USB ids `(device id, vid, pid)` for
+/// [`model_for_device`]. Called every frame with the current device list;
+/// writes only when the result changes.
+pub fn note_device_models<'a>(devices: impl IntoIterator<Item = (&'a str, u16, u16)>) {
+    let lock = DEVICE_MODELS.get_or_init(Default::default);
+    let fresh: Vec<(&str, &'static str)> = devices
+        .into_iter()
+        .filter_map(|(id, vid, pid)| model_for_vid_pid(vid, pid).map(|m| (id, m)))
+        .collect();
+    let unchanged = lock.read().is_ok_and(|known| {
+        known.len() == fresh.len() && fresh.iter().all(|(id, m)| known.get(*id) == Some(m))
+    });
+    if !unchanged {
+        if let Ok(mut known) = lock.write() {
+            *known = fresh.into_iter().map(|(id, m)| (id.to_string(), m)).collect();
+        }
+    }
 }
 
 /// Best-guess model folder for a connected device id, used when the node's
 /// model override is left on "auto". Falls back to any available model when the
 /// preferred one isn't present.
 pub fn model_for_device(dev_id: &str) -> String {
+    let noted = DEVICE_MODELS
+        .get()
+        .and_then(|lock| lock.read().ok()?.get(dev_id).copied());
+    if let Some(want) = noted {
+        return pick_available(want);
+    }
     // A Joy-Con half before the skin: its id names no "switch" at all
     // (`jc2:joycon2_l:<address>`), so it fell through to the Xbox model.
     let want = match crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
@@ -1033,7 +1098,7 @@ impl CallbackTrait for MeshRenderState {
             * Mat4::from_translation(-center);
 
         let tp = self.model.touch_point_parts;
-        let surf = self.model.touch_surface;
+        let surfs = self.model.touch_surfaces;
         let hl = self.live.highlight;
         let hl4 = [hl[0], hl[1], hl[2], 1.0];
         let cam_pos4 = [cam.x, cam.y, cam.z, 1.0]; // w unused (matte is a blit pass)
@@ -1073,21 +1138,33 @@ impl CallbackTrait for MeshRenderState {
                 None
             };
             let (model_m, base_color, glow_color, glow) = match touch_slot {
-                Some(k) => match (self.live.touch[k], surf) {
+                Some(k) => match (self.live.touch[k], surfs[k]) {
                     (Some(uv), Some(s)) => {
                         // `uv` is already normalized [0,1] (x: left→right,
-                        // y: top→bottom). Map onto the measured pad box, pulled in
+                        // y: top→bottom). Map onto this dot's pad, pulled in
                         // ~10% so a full-scale touch stays on the pad. If Y still
                         // reads inverted, negate the `dz` term.
                         const PAD_INSET: f32 = 0.9;
                         let dx = (uv.x * 2.0 - 1.0) * s.half.x * PAD_INSET;
                         let dz = (uv.y * 2.0 - 1.0) * s.half.y * PAD_INSET;
-                        let m = orient * Mat4::from_translation(Vec3::new(dx, 0.0, dz)) * part_tf;
+                        // Slide in the pad's own plane: tilt about the dot's
+                        // rest point (a no-op on a flat pad), then offset.
+                        let rest = part_tf.w_axis.truncate();
+                        let m = orient
+                            * Mat4::from_translation(rest)
+                            * Mat4::from_quat(s.rot)
+                            * Mat4::from_translation(Vec3::new(dx, 0.0, dz))
+                            * Mat4::from_translation(-rest)
+                            * part_tf;
                         (m, hl4, hl4, 0.6)
                     }
                     // Hidden: collapse to a zero-area point (draws nothing).
                     _ => (Mat4::from_scale(Vec3::splat(0.0)), [0.0; 4], [0.0; 4], 0.0),
                 },
+                // An untouched grip-sense patch draws nothing either.
+                None if is_grip_sense(name) && self.live.glow.get(name).is_none_or(|g| *g <= 0.02) => {
+                    (Mat4::from_scale(Vec3::splat(0.0)), base, hl4, 0.0)
+                }
                 None => {
                     // Animate presses/tilts/pulls via the part's extra transform.
                     let fp = part.map(|p| p.height).unwrap_or(0.0);
@@ -2039,5 +2116,38 @@ mod model_choice_tests {
         let mixed = ["gilrs:dualsense:0".to_string(), "jc2:joycon2_l:aa".to_string()];
         assert_eq!(model_for_devices(&mixed).as_deref(), Some("DualSense"), "else the top device's");
         assert_eq!(model_for_devices(&[]), None);
+    }
+
+    /// A Steam Controller reaches SDL as `sdl:generic:<serial>`, an id that
+    /// names nothing; its USB ids pick the model, and forgetting the pad
+    /// forgets the pick.
+    #[test]
+    fn steam_controller_is_known_by_its_usb_ids() {
+        let id = "sdl:generic:steamtestserial";
+        note_device_models([(id, 0x28DE, 0x1302), ("sdl:generic:other", 0x045E, 0x0B12)]);
+        assert_eq!(model_for_device(id), "Steam Controller");
+        assert_eq!(model_for_device("sdl:generic:other"), "Xbox One");
+        note_device_models([]);
+        assert_eq!(model_for_device(id), "Xbox One");
+    }
+
+    /// The bundled Steam Controller loads under this viewer's part names, with
+    /// one tilted touch surface per trackpad.
+    #[test]
+    fn steam_controller_model_has_a_surface_per_pad() {
+        let m = load_model_cached("Steam Controller").expect("bundled model loads");
+        let names: Vec<_> = m.parts.iter().map(|p| p.name.as_str()).collect();
+        for want in ["a_button", "left_bumper", "left_stick", "left_cap", "touchpad", "touchpad2",
+                     "paddle_l1", "paddle_r2", "misc1", "left_gripsense", "touch_point2"] {
+            assert!(names.contains(&want), "missing {want} in {names:?}");
+        }
+        assert!(!names.contains(&"south_button"), "SDL names are translated");
+
+        let [Some(l), Some(r)] = m.touch_surfaces else { panic!("a surface per pad") };
+        assert!(l.center.x < -0.3 && r.center.x > 0.3, "left pad left, right pad right");
+        assert!((l.half.x - 0.205).abs() < 1e-4, "half of the 0.41 width: {}", l.half.x);
+        // Each pad faces up, tipped toward the player and out to its own side.
+        let (lu, ru) = (l.rot * Vec3::Y, r.rot * Vec3::Y);
+        assert!(lu.z > 0.2 && lu.x < 0.0 && ru.x > 0.0, "{lu} {ru}");
     }
 }

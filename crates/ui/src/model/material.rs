@@ -330,6 +330,17 @@ pub fn builtin_scheme(model: &str) -> Scheme {
             put(&mut s, &sticks, [30, 31, 35]);
             put(&mut s, &caps, [56, 58, 65]);
         }
+        // Black body, its two trackpads a shade lighter; no lightbar.
+        "Steam Controller" => {
+            put(&mut s, &[ShellMain, ShellSecondary, Led], [36, 37, 41]);
+            put(&mut s, &[Touchpad], [44, 45, 51]);
+            put(&mut s, &faces, [58, 60, 67]);
+            put(&mut s, &[Menu], [62, 64, 71]);
+            put(&mut s, &[Logo], [70, 72, 80]);
+            put(&mut s, &[Bumper, Trigger], [42, 43, 49]);
+            put(&mut s, &sticks, [30, 31, 35]);
+            put(&mut s, &caps, [56, 58, 65]);
+        }
         // Black plastic, translucent-grey sticks.
         "Xbox One" | "Xbox 360" => {
             put(&mut s, &[ShellMain, ShellSecondary], [38, 40, 45]);
