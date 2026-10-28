@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui_snarl::NodeId;
 use flexinput_devices::{ControllerKind, PhysicalDevice};
-use flexinput_virtual::{create_device, kind_prefix};
+use flexinput_virtual::{create_device, is_known_kind, kind_prefix};
 use serde_json::Value;
 
 use crate::canvas::remapper_icons;
@@ -1335,7 +1335,11 @@ fn show_output_section(
         ui.horizontal(|ui| {
             ui.add_space(PANEL_PADDING + 4.0);
             ui.add(egui::Label::new(
-                egui::RichText::new("Selecting a gamepad installs the HIDMaestro driver (one admin prompt).")
+                egui::RichText::new(if cfg!(windows) {
+                    "Selecting a gamepad installs the HIDMaestro driver (one admin prompt)."
+                } else {
+                    "Selecting a gamepad asks for your password once, to allow virtual devices."
+                })
                     .small()
                     .color(egui::Color32::from_rgb(220, 160, 40)),
             ));
@@ -2210,7 +2214,9 @@ fn ensure_sink_of_kind(
         if let Some(d) = devs.iter().find(|d| kind_prefix(d.id()) == kind_id) {
             canvas.add_virtual_sink(d.as_ref(), default_collapsed, defaults);
         }
-    } else {
+    } else if is_known_kind(kind_id) {
+        // Unknown on a platform without this kind (no virtual devices on Linux
+        // yet); create_device would panic.
         let dev = create_device(kind_id, 0);
         canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
         let mut devs = pool.lock().unwrap();

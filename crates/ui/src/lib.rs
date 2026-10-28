@@ -7,6 +7,8 @@ mod easy;
 mod gamepad_nav;
 mod hidhide_toggle;
 mod kbm_picker;
+#[cfg(target_os = "linux")]
+mod kwin;
 mod licenses;
 mod guide_watcher;
 mod gyro_cal_overlay;
@@ -17,13 +19,16 @@ mod config_overlay;
 mod overlay;
 mod panels;
 mod panic_hotkey;
-#[cfg(test)]
+// Windows-only: times itself with GetProcessTimes and a Win32 sampler.
+#[cfg(all(test, windows))]
 mod perf_bench;
 mod pin_hotkey;
 mod raw_learn;
 mod widgets;
 pub mod process_list;
 mod settings;
+#[cfg(target_os = "linux")]
+mod thread_cpu;
 mod win_app;
 pub mod model;
 
@@ -35,9 +40,14 @@ pub use settings::{
     write_render_attempt, RendererChoice, WindowGeometry,
 };
 pub use win_app::{onscreen_position, try_become_primary_instance};
+/// The Linux controller-hiding helper (this binary, run as root through
+/// pkexec): see `flexinput_devices::linux_hide`.
+#[cfg(target_os = "linux")]
+pub use flexinput_devices::linux_hide::{run_helper as run_linux_hide_helper, HELPER_FLAG as LINUX_HIDE_HELPER_FLAG};
 
-/// Append a timestamped crash/diagnostic entry to `%APPDATA%\FlexInput\crash.log`
-/// — the same directory that holds `settings.json` and the recovery snapshot.
+/// Append a timestamped crash/diagnostic entry to `crash.log` in the per-user
+/// data folder ([`flexinput_core::paths::app_data_dir`]) — the same directory
+/// that holds `settings.json` and the recovery snapshot.
 ///
 /// Used by the last-ditch panic hook in `app/src/main.rs` so any panic (GPU
 /// loss, monitor hot-plug, or an unexpected one) leaves a durable breadcrumb the
@@ -50,7 +60,7 @@ pub use win_app::{onscreen_position, try_become_primary_instance};
 /// hook, so every step is fallible and silently ignored on error. The log is
 /// appended (not truncated) and capped so it can't grow without bound.
 pub fn log_crash(kind: &str, detail: &str) {
-    let Some(dir) = settings::appdata_dir() else { return; };
+    let Some(dir) = flexinput_core::paths::app_data_dir() else { return; };
     let path = dir.join("crash.log");
 
     // Cap the log: if it's grown past ~256 KiB, start fresh so a relaunch loop

@@ -19,35 +19,48 @@
 //! `driver/driver.h`). Pin to a known HIDMaestro commit — the layout is
 //! version-coupled.
 
-#![cfg(windows)]
-
+// Portable: the profiles, the report encoder and the feature answers describe
+// a controller, not a driver. Linux serves the same pads through UHID with them.
 pub mod answers;
-pub mod claims;
-pub mod deploy;
 pub mod descriptor;
 pub mod encode;
+pub mod profile;
+
+#[cfg(windows)]
+pub mod claims;
+#[cfg(windows)]
+pub mod deploy;
 #[cfg(windows)]
 pub mod helper;
 #[cfg(windows)]
 pub mod hidhide;
+#[cfg(windows)]
 pub mod helper_ipc;
+#[cfg(windows)]
 pub mod identity;
+#[cfg(windows)]
 pub mod install;
+#[cfg(windows)]
 pub mod orchestrator;
-pub mod profile;
+#[cfg(windows)]
 pub mod server;
+#[cfg(windows)]
 pub mod shm;
 #[cfg(windows)]
 pub mod signing;
+#[cfg(windows)]
 pub mod usbip_bundled;
+#[cfg(windows)]
 pub mod usbip_install;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
 pub use encode::{encode_report, encode_report_into, gip_from_state, GamepadState, Hat, PinState};
+#[cfg(windows)]
 pub use install::{
     driver_state, hidmaestro_available, installed_inf_names, installed_inf_path,
     installed_xusb_inf_path, DriverState,
 };
+#[cfg(windows)]
 pub use orchestrator::{
     create_device_node, create_own_container_node, create_xusb_companion_node,
     list_hidmaestro_devices, node_diag,
@@ -55,6 +68,8 @@ pub use orchestrator::{
     write_instance_config, CreatedDevice, ExistingDevice, NodeDiag, OrchestratorError,
     RemovalBatch, SwdHandle,
 };
+#[cfg(windows)]
 pub use server::run_helper_server;
 pub use profile::{Profile, ProfileError};
+#[cfg(windows)]
 pub use shm::{InputSection, OutputFrame, OutputSection, ShmError};

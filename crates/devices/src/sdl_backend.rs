@@ -464,6 +464,12 @@ impl SdlBackend {
                 rejected.insert(id);
                 continue;
             }
+            // Nor our own uinput / UHID pad on Linux, told by its node's phys.
+            #[cfg(target_os = "linux")]
+            if gamepad.path().is_some_and(|p| flexinput_core::own_virtual::node_is_own(&p)) {
+                rejected.insert(id);
+                continue;
+            }
             if !sdl_all && kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
@@ -591,13 +597,17 @@ impl SdlBackend {
                     continue;
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 // SAFETY: SDL's cached enumeration string for a listed id.
                 let path = unsafe { sdl3::sys::joystick::SDL_GetJoystickPathForID(id) };
                 if !path.is_null() {
                     let path = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
-                    if crate::devnode::hidmaestro_maker_of_interface(&path).is_some() {
+                    #[cfg(windows)]
+                    let virtual_pad = crate::devnode::hidmaestro_maker_of_interface(&path).is_some();
+                    #[cfg(target_os = "linux")]
+                    let virtual_pad = flexinput_core::own_virtual::node_is_own(&path);
+                    if virtual_pad {
                         self.raw_rejected.insert(id);
                         continue;
                     }

@@ -178,7 +178,56 @@ struct FeatureEntry {
     page: Vec<u8>,
 }
 
+/// The same answers as [`feature_answers`], one `(report id, reply)` per report
+/// instead of the driver's table: what a host reading a feature report gets,
+/// the report id its first byte. For a transport that answers GET_FEATURE
+/// itself (Linux UHID). The reply is the largest size the model serves; a host
+/// asking for less takes its first bytes, which every model lays out to read
+/// the same either way. Empty for an identity without a model.
+pub fn feature_reports(vid: u16, pid: u16, index: u32) -> Vec<(u8, Vec<u8>)> {
+    sony_model(vid, pid)
+        .and_then(|json| feature_entries(json, index).ok())
+        .map(|entries| entries.into_iter().map(|e| (e.id, e.page)).collect())
+        .unwrap_or_default()
+}
+
 fn compile_feature_answers(json: &str, index: u32) -> Result<Vec<u8>, String> {
+    let entries = feature_entries(json, index)?;
+    let arena: usize = entries.iter().map(|e| e.sizes.len() + e.page.len()).sum();
+    if arena > FEATURE_MAX_ARENA {
+        return Err(format!("an arena of {arena} bytes, past the driver's {FEATURE_MAX_ARENA}"));
+    }
+    let arena_start = FEATURE_HEADER + entries.len() * FEATURE_ENTRY;
+    let mut blob = vec![0u8; arena_start + arena];
+    let len = blob.len() as u32;
+    blob[0..4].copy_from_slice(&len.to_le_bytes());
+    blob[4..8].copy_from_slice(&FEATURE_FORMAT.to_le_bytes());
+    blob[8..10].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    // blob[10]: no reports a message entry follows; [11] reserved; [12..16] none.
+    let mut offset = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let h = &mut blob[FEATURE_HEADER + i * FEATURE_ENTRY..FEATURE_HEADER + (i + 1) * FEATURE_ENTRY];
+        h[0] = e.id;
+        h[1] = e.flags;
+        // [2..7]: report slot, message offset and length, parameter offset and
+        // byte, all 0 for a plain entry.
+        h[7] = 1; // one page
+        h[8] = e.size;
+        h[9] = e.min_length;
+        h[10] = e.sizes.len() as u8;
+        h[12..14].copy_from_slice(&(offset as u16).to_le_bytes());
+        let a = arena_start + offset;
+        blob[a..a + e.sizes.len()].copy_from_slice(&e.sizes);
+        let p = a + e.sizes.len();
+        blob[p..p + e.page.len()].copy_from_slice(&e.page);
+        offset += e.sizes.len() + e.page.len();
+    }
+    Ok(blob)
+}
+
+/// A model's reports, checked against what the driver holds and patched for
+/// `index`.
+fn feature_entries(json: &str, index: u32) -> Result<Vec<FeatureEntry>, String> {
     let model: ModelFile = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let reports = model.feature_stubs.ok_or("the model has no featureStubs")?.reports;
     if reports.len() > FEATURE_MAX_ENTRIES {
@@ -230,36 +279,7 @@ fn compile_feature_answers(json: &str, index: u32) -> Result<Vec<u8>, String> {
             page,
         });
     }
-    let arena: usize = entries.iter().map(|e| e.sizes.len() + e.page.len()).sum();
-    if arena > FEATURE_MAX_ARENA {
-        return Err(format!("an arena of {arena} bytes, past the driver's {FEATURE_MAX_ARENA}"));
-    }
-    let arena_start = FEATURE_HEADER + entries.len() * FEATURE_ENTRY;
-    let mut blob = vec![0u8; arena_start + arena];
-    let len = blob.len() as u32;
-    blob[0..4].copy_from_slice(&len.to_le_bytes());
-    blob[4..8].copy_from_slice(&FEATURE_FORMAT.to_le_bytes());
-    blob[8..10].copy_from_slice(&(entries.len() as u16).to_le_bytes());
-    // blob[10]: no reports a message entry follows; [11] reserved; [12..16] none.
-    let mut offset = 0usize;
-    for (i, e) in entries.iter().enumerate() {
-        let h = &mut blob[FEATURE_HEADER + i * FEATURE_ENTRY..FEATURE_HEADER + (i + 1) * FEATURE_ENTRY];
-        h[0] = e.id;
-        h[1] = e.flags;
-        // [2..7]: report slot, message offset and length, parameter offset and
-        // byte, all 0 for a plain entry.
-        h[7] = 1; // one page
-        h[8] = e.size;
-        h[9] = e.min_length;
-        h[10] = e.sizes.len() as u8;
-        h[12..14].copy_from_slice(&(offset as u16).to_le_bytes());
-        let a = arena_start + offset;
-        blob[a..a + e.sizes.len()].copy_from_slice(&e.sizes);
-        let p = a + e.sizes.len();
-        blob[p..p + e.page.len()].copy_from_slice(&e.page);
-        offset += e.sizes.len() + e.page.len();
-    }
-    Ok(blob)
+    Ok(entries)
 }
 
 /// The `XusbAnswers` value for an Xbox 360 controller of this identity at
@@ -504,6 +524,21 @@ mod tests {
         assert_eq!((sizes, min_len, page.len()), (vec![41, 37], 37, 41));
         // Firmware 0x20 is the captured 64 bytes.
         assert_eq!(served(&blob, 0x20).unwrap().3.len(), 64);
+    }
+
+    /// The per-report form serves what the table does, report by report.
+    #[test]
+    fn feature_reports_match_the_table() {
+        for pid in [0x09CC, 0x0CE6, 0x0DF2] {
+            let blob = feature_answers(0x054C, pid, 2);
+            let reports = feature_reports(0x054C, pid, 2);
+            assert_eq!(reports.len(), u16_at(&blob, 8) as usize, "{pid:04X}");
+            for (id, reply) in &reports {
+                assert_eq!(reply[0], *id, "{pid:04X}: a reply leads with its report id");
+                assert_eq!(Some(reply), served(&blob, *id).map(|a| a.3).as_ref(), "{pid:04X} {id:02X}");
+            }
+        }
+        assert!(feature_reports(0x045E, 0x028E, 0).is_empty(), "no model, no answers");
     }
 
     #[test]

@@ -461,6 +461,9 @@ impl Opened {
 }
 
 fn open(api: &hidapi::HidApi, path: &CString) -> Result<Opened, String> {
+    // A pad FlexInput hides from games opens through its private node.
+    #[cfg(target_os = "linux")]
+    let path = &crate::linux_hide::reachable(path);
     let dev = api.open_path(path).map_err(|e| format!("open failed: {e}"))?;
     let mut desc = vec![0u8; 4096];
     let n = dev.get_report_descriptor(&mut desc).map_err(|e| format!("no report descriptor: {e}"))?;

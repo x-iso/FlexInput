@@ -253,17 +253,52 @@ pub mod windows;
 #[cfg(windows)]
 pub mod hidmaestro_device;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod sony_feedback;
 
 #[cfg(windows)]
 pub mod composite_device;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod keymouse_hm;
 
 #[cfg(windows)]
 mod physical_mouse;
+
+/// No physical-mouse detection off Windows yet: the virtual mouse always moves.
+#[cfg(not(windows))]
+mod physical_mouse {
+    pub(crate) fn suppressing() -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+/// One sink-pin write into the encoder's accumulator. Vec2 pins decompose into
+/// the x/y entries; scalar pins pass both views and PinState picks the one it
+/// needs. Shared by every backend that encodes through a HIDMaestro profile.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn apply_pin(pins: &mut flexinput_hidmaestro::encode::PinState, pin: &str, value: Signal) {
+    match (pin, value) {
+        ("left_stick", Signal::Vec2(v)) => {
+            pins.set("left_stick_x", v.x, true);
+            pins.set("left_stick_y", v.y, true);
+        }
+        ("right_stick", Signal::Vec2(v)) => {
+            pins.set("right_stick_x", v.x, true);
+            pins.set("right_stick_y", v.y, true);
+        }
+        ("dpad", Signal::Vec2(v)) => {
+            pins.set("dpad_left", 0.0, v.x < -0.5);
+            pins.set("dpad_right", 0.0, v.x > 0.5);
+            pins.set("dpad_up", 0.0, v.y > 0.5);
+            pins.set("dpad_down", 0.0, v.y < -0.5);
+        }
+        _ => pins.set(pin, value.as_float(), value.as_bool()),
+    }
+}
 
 /// Physical keys held right now (Raw Input, whatever has focus; our own virtual
 /// keyboard and injected keys left out), or `None` when that can't be known.
@@ -276,6 +311,8 @@ pub fn physical_keys_held() -> Option<Vec<&'static str>> { None }
 pub fn available_device_kinds() -> &'static [DeviceKind] {
     #[cfg(windows)]
     { return windows::DEVICE_KINDS; }
+    #[cfg(target_os = "linux")]
+    { return linux::DEVICE_KINDS; }
     #[allow(unreachable_code)]
     &[]
 }
@@ -289,11 +326,13 @@ pub const USB_AUDIO_VARIANTS: &[(&str, &str)] = &[
     ("virtual.hm.dualsense_edge", "virtual.usb.dualsense_edge"),
 ];
 
-/// Whether `kind_id` names a device this crate can build: a listed kind, or a
-/// pad's USB audio variant.
+/// Whether `kind_id` names a device this crate can build: a listed kind, or the
+/// USB audio variant of a listed pad (Windows only: the composite is usbip-win2).
 pub fn is_known_kind(kind_id: &str) -> bool {
-    available_device_kinds().iter().any(|k| k.kind_id == kind_id)
-        || USB_AUDIO_VARIANTS.iter().any(|(_, usb)| *usb == kind_id)
+    let listed = |id: &str| available_device_kinds().iter().any(|k| k.kind_id == id);
+    listed(kind_id)
+        || cfg!(windows)
+            && USB_AUDIO_VARIANTS.iter().any(|(plain, usb)| *usb == kind_id && listed(plain))
 }
 
 /// Whether the device `dev_id` is a pad's USB audio variant.
@@ -323,20 +362,27 @@ pub fn usb_audio_toggled_id(dev_id: &str) -> Option<String> {
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     #[cfg(windows)]
     return windows::create_device(kind_id, instance);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    return linux::create_device(kind_id, instance);
+    #[cfg(not(any(windows, target_os = "linux")))]
     panic!("No virtual devices on this platform: {kind_id} #{instance}")
 }
 
 /// Static pin metadata (sink pins, source pins, display name) for a kind without
 /// building the device or touching any OS resource. Lets the UI add a canvas
 /// sink node instantly; the device itself is built asynchronously and installed
-/// into the pool by the device-ops worker. `None` for an unknown kind.
-#[cfg(windows)]
+/// into the pool by the device-ops worker. `None` for an unknown kind (every
+/// kind on a platform with no virtual devices yet).
 pub fn kind_pin_metadata(
     kind_id: &str,
     instance: usize,
 ) -> Option<(&'static [SinkPin], &'static [SourcePin], String)> {
-    windows::kind_pin_metadata(kind_id, instance)
+    #[cfg(windows)]
+    return windows::kind_pin_metadata(kind_id, instance);
+    #[cfg(target_os = "linux")]
+    return linux::kind_pin_metadata(kind_id, instance);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    { let _ = (kind_id, instance); None }
 }
 
 /// Best-effort: extract the kind prefix (e.g. "virtual.xinput",
@@ -372,7 +418,8 @@ mod usb_audio_tests {
     fn composite_kinds_are_known_but_not_listed() {
         assert_eq!(kind_prefix("virtual.usb.dualsense.4"), "virtual.usb.dualsense");
         for (_, usb) in USB_AUDIO_VARIANTS {
-            assert!(is_known_kind(usb));
+            // The composite is usbip-win2: Windows only.
+            assert_eq!(is_known_kind(usb), cfg!(windows));
             assert!(!available_device_kinds().iter().any(|k| k.kind_id == *usb));
         }
         assert!(is_known_kind("virtual.hm.dualsense"));

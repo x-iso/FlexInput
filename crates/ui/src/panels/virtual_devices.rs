@@ -230,9 +230,13 @@ impl VirtualDevicePanel {
                     } else if {
                         let mut resp = ui.button(kind.display_name);
                         if will_install_driver {
-                            resp = resp.on_hover_text(
+                            resp = resp.on_hover_text(if cfg!(windows) {
                                 "First add installs the HIDMaestro driver (one Windows \
-                                 elevation prompt), then creates the controller.");
+                                 elevation prompt), then creates the controller."
+                            } else {
+                                "First add asks for your password once, to allow virtual \
+                                 devices, then creates the controller."
+                            });
                         }
                         resp.clicked()
                     } {
@@ -261,14 +265,17 @@ impl VirtualDevicePanel {
                     }
                     if will_install_driver && !already {
                         ui.add(egui::Label::new(
-                            RichText::new("installs driver")
+                            RichText::new(if cfg!(windows) { "installs driver" } else { "asks for password" })
                                 .small()
                                 .color(Color32::from_rgb(220, 160, 40)),
                         ))
-                        .on_hover_text(
+                        .on_hover_text(if cfg!(windows) {
                             "The HIDMaestro driver isn't installed yet; adding this \
-                             controller installs it (one Windows elevation prompt).",
-                        );
+                             controller installs it (one Windows elevation prompt)."
+                        } else {
+                            "FlexInput isn't allowed to create virtual devices yet; adding \
+                             this controller asks for your password once to allow it."
+                        });
                     }
                     });
                 }

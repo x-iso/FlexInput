@@ -812,7 +812,12 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
             paths.get(idx).map(|p| p.path()));
 
         let info = paths.get(idx)?;
-        match guard.open_path(info.path()) {
+        // A pad FlexInput hides from games opens through its private node.
+        #[cfg(target_os = "linux")]
+        let open_at = crate::linux_hide::reachable(info.path());
+        #[cfg(not(target_os = "linux"))]
+        let open_at = info.path();
+        match guard.open_path(&open_at) {
             Ok(d) => (d, info.path().to_string_lossy().into_owned()),
             Err(e) => {
                 #[cfg(debug_assertions)]
@@ -908,7 +913,8 @@ fn path_origin(path: &str) -> PadOrigin {
 
 /// Whether a HID path is one of our own virtual pads: a HIDMaestro UMDF one
 /// (told by its instance path), or a composite USB persona, whose path is a
-/// real wired pad's and is told by its USB device's serial instead.
+/// real wired pad's and is told by its USB device's serial instead. On Linux,
+/// a UHID pad's hidraw node, told by the phys we gave it.
 fn path_is_own_virtual(path: &str) -> bool {
     if instance_path_is_virtual(path) {
         return true;
@@ -917,7 +923,11 @@ fn path_is_own_virtual(path: &str) -> bool {
     {
         crate::devnode::is_own_composite_interface(path)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        flexinput_core::own_virtual::node_is_own(path)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     false
 }
 

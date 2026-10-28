@@ -36,7 +36,12 @@ use std::time::Instant;
 
 use flexinput_core::Signal;
 
+// The three nodes: HIDMaestro on Windows, UHID on Linux, with the same
+// profiles and reports.
+#[cfg(windows)]
 use crate::hidmaestro_device::HidMaestroDevice;
+#[cfg(target_os = "linux")]
+use crate::linux::uhid::UhidDevice as HidMaestroDevice;
 use crate::{layouts, SinkPin, VirtualDevice};
 
 /// Modifier bits of report byte 0 (left-hand variants).

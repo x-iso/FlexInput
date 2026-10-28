@@ -6,14 +6,19 @@ license.workspace = true
 
 [dependencies]
 flexinput-core = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Everything but the profiles, the report encoder and the feature answers is
+# Windows: the driver, its helper, the shared sections. Linux builds the
+# portable half for its UHID pads (flexinput-virtual's linux module).
+[target.'cfg(windows)'.dependencies]
 # The helper deploys usbip-win2 for the composite personas (usbip_install.rs)
 # and checks for its host controller through flexinput-usbip's vhci client.
 flexinput-usbip = { workspace = true }
 # Pins the bundled usbip-win2 installer (usbip_bundled.rs). Already in the graph
 # via crates/net.
 sha2       = "0.10"
-serde      = { workspace = true }
-serde_json = { workspace = true }
 # Per-machine driver package signing (signing.rs): self-signed cert on a CNG
 # key, Authenticode via mssign32, catalogs via wintrust's CDF engine — all
 # in-box Windows DLLs, no SDK tooling. 0.61 to match the other crates.

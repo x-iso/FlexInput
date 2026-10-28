@@ -979,9 +979,18 @@ pub(crate) fn show_title_bar(
     // over. Win32 itself decides click vs drag based on actual cursor
     // travel, so this is safe — single clicks still register, and
     // double-clicks still fire on the second press.
-    if drag.is_pointer_button_down_on()
-        && ctx.input(|i| i.pointer.primary_pressed())
-    {
+    //
+    // NOT safe elsewhere: the bar's drag sense also reports the press when
+    // it lands on a click-only button above it (egui hands the click to the
+    // button and the drag to the bar), and a Wayland/X11 move hands the
+    // pointer to the compositor at once, so the release never comes back and
+    // no title-bar button could be clicked. There, wait for real travel.
+    #[cfg(windows)]
+    let start_drag = drag.is_pointer_button_down_on()
+        && ctx.input(|i| i.pointer.primary_pressed());
+    #[cfg(not(windows))]
+    let start_drag = drag.drag_started_by(egui::PointerButton::Primary);
+    if start_drag {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     if drag.double_clicked() {

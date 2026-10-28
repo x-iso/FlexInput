@@ -8,7 +8,11 @@
 
 use std::time::Instant;
 
-/// Where long-lived logs belong: `%APPDATA%\FlexInput\logs`.
+/// Where long-lived logs belong: `%APPDATA%\FlexInput\logs`, or
+/// `~/.config/FlexInput/logs` on Linux (honouring `XDG_CONFIG_HOME`).
+///
+/// Mirrors `flexinput_core::paths::log_dir`, which this crate can't call (it
+/// deliberately has no core dependency; see Cargo.toml). Change both together.
 ///
 /// ⛔ **Not beside the executable.** An installed app sits somewhere the user
 /// cannot write, so the log either failed to open or landed in a temp directory
@@ -17,8 +21,14 @@ use std::time::Instant;
 /// cleans up. AppData is writable, per-user, and the same place the settings
 /// and crash log already live.
 pub(crate) fn log_dir() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    let dir = std::path::PathBuf::from(appdata).join("FlexInput").join("logs");
+    #[cfg(windows)]
+    let base = std::path::PathBuf::from(std::env::var_os("APPDATA")?);
+    #[cfg(not(windows))]
+    let base = match std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    let dir = base.join("FlexInput").join("logs");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

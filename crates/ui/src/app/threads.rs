@@ -177,6 +177,8 @@ pub(crate) fn spawn_io_thread(
                 let ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
                 eprintln!("[device-io] SetThreadPriority(TIME_CRITICAL) -> {} (nonzero == ok)", ok);
             }
+            // Linux: the same, through rtkit (see thread_priority).
+            flexinput_engine::raise_input_thread("device-io");
             // High-resolution waiter for the per-iteration pacing wait below —
             // precise without raising the global timer resolution (see hr_timer).
             let waiter = flexinput_engine::HrWaiter::new();

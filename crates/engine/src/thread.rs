@@ -525,7 +525,8 @@ pub fn spawn_processing_thread(
     // an input frame (see `EngineSync`).
     sync: Arc<EngineSync>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+    // Named, so it can be told apart in a per-thread CPU list.
+    thread::Builder::new().name("engine".into()).spawn(move || {
         // Raise this thread above the UI/render threads. The engine ticks at
         // the sample rate (default 2 kHz) and feeds the I/O thread's sink bus;
         // if a busy render frame delays the tick, fresh output is late and
@@ -541,6 +542,7 @@ pub fn spawn_processing_thread(
             };
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         }
+        crate::raise_input_thread("engine");
 
         let mut next_tick = Instant::now();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
@@ -757,7 +759,7 @@ pub fn spawn_processing_thread(
             };
             sync.wait_kick(fallback, &waiter);
         }
-    })
+    }).expect("failed to spawn engine thread")
 }
 
 #[cfg(test)]

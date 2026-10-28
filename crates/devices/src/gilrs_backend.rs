@@ -495,10 +495,27 @@ impl GilrsBackend {
             .map(|(_, pad)| (pad.vendor_id().zip(pad.product_id()), pad.name().to_string()))
             .collect();
         let foreign = foreign_xinput_positions(&pads, &self.foreign_xinput);
+        // Linux: our own uinput / UHID pads carry a version gilrs's uuid shows
+        // (see flexinput_core::own_virtual). That alone decides. The PS-family
+        // path classification pairs gilrs's walk with hidapi's list by index,
+        // and evdev and hidraw don't list in the same order here.
+        let own: Vec<bool> = self
+            .gilrs
+            .gamepads()
+            .map(|(_, pad)| cfg!(target_os = "linux") && flexinput_core::own_virtual::uuid_is_own(&pad.uuid()))
+            .collect();
         let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
         pads.iter()
             .zip(foreign)
-            .map(|((vp, name), foreign)| self.disposition_for(*vp, name, foreign, &mut vp_idx))
+            .zip(own)
+            .map(|(((vp, name), foreign), own)| {
+                let d = self.disposition_for(*vp, name, foreign, &mut vp_idx);
+                match d {
+                    _ if !cfg!(target_os = "linux") => d,
+                    PadDisposition::Keep { .. } => PadDisposition::Keep { is_virt: own },
+                    PadDisposition::Drop => d,
+                }
+            })
             .collect()
     }
 

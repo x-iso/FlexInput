@@ -3357,7 +3357,8 @@ impl Canvas {
 
 // ── Regression tests for canvas clipboard semantics ──────────────────────────
 
-#[cfg(test)]
+// Windows-only until another platform has a virtual DualSense kind.
+#[cfg(all(test, windows))]
 mod usb_audio_switch_tests {
     use super::*;
 

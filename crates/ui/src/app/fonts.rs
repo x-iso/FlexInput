@@ -3,11 +3,12 @@
 //! egui's bundled fonts (Ubuntu-Light, Hack, a monochrome emoji set) cover
 //! Latin, Greek, Cyrillic and a few symbol ranges; every other character
 //! drew as a box. Windows ships a UI font for each script it can display, so
-//! those go after egui's in every family. egui draws each character with the
-//! first font in the family that has it, so text that rendered before keeps
-//! its look and only the former boxes change.
+//! those go after egui's in every family; on Linux the desktop's own fallback
+//! chain from fontconfig does. egui draws each character with the first font
+//! in the family that has it, so text that rendered before keeps its look and
+//! only the former boxes change.
 //!
-//! The Windows fonts are memory-mapped, not read. The CJK faces alone are
+//! The system fonts are memory-mapped, not read. The CJK faces alone are
 //! ~70 MB; a mapped system font costs only the pages glyphs are actually
 //! drawn from, and those pages are shared with every other process using
 //! the font. A heap copy would cost all of it, twice: epaint clones owned
@@ -24,7 +25,7 @@ pub(crate) fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(font_definitions());
 }
 
-/// egui's fonts, then [`invisible_font`], then the Windows fallbacks, in
+/// egui's fonts, then [`invisible_font`], then the system fallbacks, in
 /// every family.
 pub(crate) fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
@@ -35,7 +36,7 @@ pub(crate) fn font_definitions() -> egui::FontDefinitions {
         }
     };
     push("invisible", egui::FontData::from_static(invisible_font()));
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     for face in system::faces() {
         let mut data = egui::FontData::from_static(face.data);
         data.index = face.index;
@@ -306,6 +307,77 @@ mod system {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod system {
+    use std::sync::OnceLock;
+
+    pub(super) struct Loaded {
+        pub(super) key: String,
+        pub(super) data: &'static [u8],
+        pub(super) index: u32,
+    }
+
+    /// The desktop's fallback chain for sans-serif, as fontconfig sorts it
+    /// for the user's languages and font settings. `fc-match --sort` trims
+    /// the list to fonts that add characters the ones before them lack, so
+    /// this is the same chain GTK and Qt apps fall back through, CJK order
+    /// included. Bold and italic faces are left out (they'd draw a fallback
+    /// character heavier or slanted), and so are faces with no outlines,
+    /// such as bitmap colour emoji, which epaint can't draw. Empty when
+    /// fontconfig isn't installed.
+    pub(super) fn faces() -> &'static [Loaded] {
+        static FACES: OnceLock<Vec<Loaded>> = OnceLock::new();
+        FACES.get_or_init(|| {
+            let Ok(out) = std::process::Command::new("fc-match")
+                .args(["--sort", "--format", "%{index}|%{file}\\n", "sans-serif"])
+                .output()
+            else {
+                return Vec::new();
+            };
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let (index, file) = line.split_once('|')?;
+                    load(std::path::Path::new(file), index.parse().ok()?)
+                })
+                .collect()
+        })
+    }
+
+    fn load(path: &std::path::Path, index: u32) -> Option<Loaded> {
+        let data = map(path)?;
+        // epaint panics on a font it cannot parse, so only faces that parse
+        // here are handed to it.
+        let face = ttf_parser::Face::parse(data, index).ok()?;
+        let tables = face.tables();
+        let outlines = tables.glyf.is_some() || tables.cff.is_some() || tables.cff2.is_some();
+        if !outlines || face.is_bold() || face.is_italic() || face.is_oblique() {
+            return None;
+        }
+        Some(Loaded { key: format!("fc:{}#{index}", path.display()), data, index })
+    }
+
+    /// Map a root-owned font file read-only and keep the mapping for the
+    /// rest of the process; read any other font into memory instead. Linux
+    /// can't shut writers out the way Windows does, and touching a mapped
+    /// file that was truncated kills the process (SIGBUS). A font the user
+    /// installed can be overwritten in place; a root-owned one can't be by
+    /// the user, and package managers replace files rather than rewrite
+    /// them, which leaves the mapped original intact.
+    fn map(path: &std::path::Path) -> Option<&'static [u8]> {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.uid() != 0 {
+            return Some(Vec::leak(std::fs::read(path).ok()?));
+        }
+        // SAFETY: the file is root-owned, so (see above) nothing running as
+        // the user can truncate it under the mapping; the mapping is leaked,
+        // so the slice stays valid for the life of the process.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        Some(&**Box::leak(Box::new(mmap)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::font_definitions;
@@ -333,6 +405,18 @@ mod tests {
             // Japanese, Chinese, Korean, Devanagari, Thai, Ethiopic, an emoji
             // newer than egui's set, and the full-width plus Touch Zones uses.
             for c in ['あ', '这', '這', '한', 'क', 'ก', 'ሀ', '🫨', '＋'] {
+                assert!(fonts.has_glyph(id, c), "{c} (U+{:04X}) has no font", c as u32);
+            }
+        });
+    }
+
+    /// The title bar's undo/redo arrows and the menu chevron, which egui's own
+    /// fonts lack. Needs a desktop font set (DejaVu or Noto Symbols).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fallbacks_cover_ui_symbols() {
+        with_fonts(|fonts, id| {
+            for c in ['↶', '↷', '▾'] {
                 assert!(fonts.has_glyph(id, c), "{c} (U+{:04X}) has no font", c as u32);
             }
         });

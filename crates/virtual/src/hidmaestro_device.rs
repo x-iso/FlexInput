@@ -236,29 +236,6 @@ impl HidMaestroDevice {
     }
 }
 
-/// One sink-pin write into the encoder's accumulator. Vec2 pins decompose into
-/// the x/y entries; scalar pins pass both views and PinState picks the one it
-/// needs. Shared with the composite backend.
-pub(crate) fn apply_pin(pins: &mut PinState, pin: &str, value: Signal) {
-    match (pin, value) {
-        ("left_stick", Signal::Vec2(v)) => {
-            pins.set("left_stick_x", v.x, true);
-            pins.set("left_stick_y", v.y, true);
-        }
-        ("right_stick", Signal::Vec2(v)) => {
-            pins.set("right_stick_x", v.x, true);
-            pins.set("right_stick_y", v.y, true);
-        }
-        ("dpad", Signal::Vec2(v)) => {
-            pins.set("dpad_left", 0.0, v.x < -0.5);
-            pins.set("dpad_right", 0.0, v.x > 0.5);
-            pins.set("dpad_up", 0.0, v.y > 0.5);
-            pins.set("dpad_down", 0.0, v.y < -0.5);
-        }
-        _ => pins.set(pin, value.as_float(), value.as_bool()),
-    }
-}
-
 impl crate::VirtualDevice for HidMaestroDevice {
     fn id(&self) -> &str {
         &self.id
@@ -273,7 +250,7 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 
     fn send(&mut self, pin: &str, value: Signal) {
-        apply_pin(&mut self.pins, pin, value);
+        crate::apply_pin(&mut self.pins, pin, value);
     }
 
     fn flush(&mut self) {

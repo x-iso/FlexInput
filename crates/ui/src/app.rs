@@ -294,8 +294,12 @@ pub struct FlexInputApp {
     /// elevated helper from opening the exclusive control device).
     hidhide: Option<HidHideClient>,
     /// Whether the HidHide driver is installed (detected once at startup without
-    /// holding the handle). Gates the "Hide originals" toggle.
+    /// holding the handle). Gates the "Hide originals" toggle. On Linux: whether
+    /// the hide helper can start (pkexec is there).
     hidhide_installed: bool,
+    /// The Linux hide helper, started on the first controller to hide.
+    #[cfg(target_os = "linux")]
+    linux_hide: flexinput_devices::linux_hide::HideClient,
     /// Debounce for HidHide reconcile: the (active, sorted vid/pid targets, each
     /// with its keep-after-exit flag) last sent to the helper, so we don't
     /// re-apply identical state.
@@ -606,6 +610,10 @@ pub struct FlexInputApp {
     /// once the level change has settled. `Some((hwnd_or_0, frames_left))`;
     /// hwnd 0 means "no specific target — yield to whatever's beneath us".
     pin_pending_yield: Option<(isize, u8)>,
+    /// The window was minimized when it was pinned, so unpinning minimizes it
+    /// again. (KDE on Wayland can't tell an app it's minimized; KWin's pin
+    /// script remembers there instead, see `kwin`.)
+    pin_restore_minimized: bool,
     /// FlexInput's own HWND (set on first `update()` call by reading
     /// `eframe::Frame::window_handle()`). Used for direct Win32
     /// operations that can't be routed through eframe — dropping
@@ -706,6 +714,9 @@ impl FlexInputApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         // Gamepad-nav glows yield to whatever window or popup covers their target.
         crate::widgets::install_nav_glow_cut(&cc.egui_ctx);
+        // Plasma on Wayland ignores always-on-top; KWin keeps the overlays up.
+        #[cfg(target_os = "linux")]
+        crate::kwin::keep_overlays_above();
         let descriptors = all_modules().into_iter().map(|r| r.descriptor).collect();
         let backends    = init_backends();
         let midi_backend = Arc::new(Mutex::new(Some(MidiBackend::new())));
@@ -716,7 +727,12 @@ impl FlexInputApp {
         // transiently, record presence, and drop the handle immediately. All WRITES
         // go through the helper; `self.hidhide` is opened on demand only while the
         // legacy HidHide window is in use (released when it closes).
+        // Linux hides through its own helper (flexinput_devices::linux_hide),
+        // which needs only pkexec.
+        #[cfg(not(target_os = "linux"))]
         let hidhide_installed = HidHideClient::try_open().is_some();
+        #[cfg(target_os = "linux")]
+        let hidhide_installed = flexinput_devices::linux_hide::HideClient::available();
         let hidhide: Option<HidHideClient> = None;
         // Title-bar logo tile. Loaded from a pre-baked 256px PNG (rendered
         // from icon_v2.svg at build time) rather than rasterizing the SVG
@@ -1155,6 +1171,8 @@ impl FlexInputApp {
             logo_texture,
             hidhide,
             hidhide_installed,
+            #[cfg(target_os = "linux")]
+            linux_hide: Default::default(),
             hidhide_last_active: None,
             hidhide_last_targets: Vec::new(),
             hidhide_auto_ids: HashSet::new(),
@@ -1257,6 +1275,7 @@ impl FlexInputApp {
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
             pin_pending_yield: None,
+            pin_restore_minimized: false,
             self_hwnd: None,
             profiler_server: None,
             #[cfg(debug_assertions)]
@@ -1438,6 +1457,8 @@ impl eframe::App for FlexInputApp {
                 }
             }
         }
+        #[cfg(not(windows))]
+        log_display_scale(ctx, _frame);
 
         // Apply selected theme + contrast only when the relevant
         // settings actually changed (plus once at startup before any
@@ -1473,6 +1494,16 @@ impl eframe::App for FlexInputApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 egui::WindowLevel::AlwaysOnTop,
             ));
+            // Plasma on Wayland ignores the level; KWin pins it instead. Once:
+            // nothing fills `last_fg_exe` on Linux (or with auto-switch off), so
+            // this block runs every frame there.
+            #[cfg(target_os = "linux")]
+            {
+                static RESTORED: AtomicBool = AtomicBool::new(false);
+                if !RESTORED.swap(true, Ordering::Relaxed) {
+                    crate::kwin::pin_main_window(true);
+                }
+            }
         }
 
         // Read the latest device signals written by the I/O thread (polling rate).
@@ -1811,6 +1842,8 @@ impl eframe::App for FlexInputApp {
             }
         }
 
+        #[cfg(not(windows))]
+        self.raise_focused_hotkeys(ctx);
         // Consume any global-hotkey toggle requests from the hook thread BEFORE
         // computing effective_bypass, so the visible tab-dot flips this frame.
         if self.panic_toggle_requested.swap(false, Ordering::Relaxed) {
@@ -3474,6 +3507,29 @@ pub(crate) enum GpSettingKind {
     ChordLearn { target: crate::gamepad_nav::ChordTarget },
 }
 
+/// Log the windowing system and the display scale the compositor reports for
+/// the main window, once and again whenever the scale changes (a Wayland
+/// fractional scale can arrive after the first frame). A UI that looks
+/// unscaled is either the compositor reporting 1.0 or the app running under
+/// XWayland; this tells which. Printed to stderr (a terminal launch shows it).
+#[cfg(not(windows))]
+fn log_display_scale(ctx: &egui::Context, frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::sync::atomic::AtomicU32;
+    static LOGGED_BITS: AtomicU32 = AtomicU32::new(0);
+    let Some(scale) = ctx.input(|i| i.viewport().native_pixels_per_point) else { return };
+    if LOGGED_BITS.swap(scale.to_bits(), Ordering::Relaxed) == scale.to_bits() {
+        return;
+    }
+    let backend = match frame.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Wayland(_)) => "Wayland",
+        Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)) => "X11",
+        Ok(_) => "other",
+        Err(_) => "unknown",
+    };
+    eprintln!("FlexInput display: {backend}, scale {scale}");
+}
+
 /// One row in the gamepad-native settings panel.
 pub(crate) struct GpSettingRow {
     label: String,
@@ -3482,6 +3538,36 @@ pub(crate) struct GpSettingRow {
 }
 
 impl FlexInputApp {
+    /// The hotkey listener threads are Windows-only (RegisterHotKey). Elsewhere
+    /// the same chords work while FlexInput has keyboard focus: raise the flags
+    /// those threads would. Not while a chord is being recorded, which would
+    /// otherwise toggle on the very press that sets it.
+    #[cfg(not(windows))]
+    fn raise_focused_hotkeys(&self, ctx: &egui::Context) {
+        use crate::pin_hotkey::chord_pressed;
+        if self.panic_learning || self.pin_learning || self.overlay_learning
+            || self.config_overlay_learning || self.edit_overlay_learning
+        {
+            return;
+        }
+        let p = &self.panic_shortcut;
+        let s = &self.settings;
+        ctx.input(|i| {
+            let pin = |c: &PinShortcut| chord_pressed(i, c.ctrl, c.shift, c.alt, c.win, c.key.as_deref());
+            for (hit, flag) in [
+                (chord_pressed(i, p.ctrl, p.shift, p.alt, p.win, p.key.as_deref()), &self.panic_toggle_requested),
+                (pin(&s.pin_shortcut), &self.pin_toggle_requested),
+                (pin(&s.overlay_shortcut), &self.overlay_toggle_requested),
+                (pin(&s.config_overlay_shortcut), &self.config_overlay_toggle_requested),
+                (pin(&s.edit_overlay_shortcut), &self.edit_overlay_toggle_requested),
+            ] {
+                if hit {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     /// Persist the main window's position/size/maximized state into settings so
     /// the next launch restores it (see `main.rs` + `startup_window_geometry`).
     /// Called each frame; only marks `settings_dirty` on a real change.
@@ -5040,6 +5126,14 @@ impl FlexInputApp {
     ///     has passed; see `process_list::bring_hwnd_to_front`).
     fn toggle_pin(&mut self, ctx: &egui::Context) {
         let new_state = !self.settings.pin_active;
+        // Pinned while minimized: it comes back up now (below) and goes back
+        // down when unpinned.
+        let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
+        if new_state {
+            self.pin_restore_minimized = minimized;
+        } else if std::mem::take(&mut self.pin_restore_minimized) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         if new_state && self.settings.focus_flip_flop {
             // Use the continuously-tracked last-external HWND rather than
             // a fresh `foreground_hwnd()` call: by the time the user
@@ -5056,6 +5150,8 @@ impl FlexInputApp {
             egui::WindowLevel::Normal
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        #[cfg(target_os = "linux")]
+        crate::kwin::pin_main_window(new_state);
         // Pin-on: AlwaysOnTop raises z-order but does NOT activate the
         // window, so Windows can leave us topmost-but-unfocused — keyboard
         // input and gamepad-nav focus paths then misbehave (the window is
@@ -5065,6 +5161,13 @@ impl FlexInputApp {
         if new_state {
             if let Some(hwnd) = self.self_hwnd {
                 let _ = crate::process_list::bring_hwnd_to_front(hwnd);
+            }
+            // bring_hwnd_to_front restores a minimized window on Windows; the
+            // viewport commands do elsewhere, where the OS reports it (X11).
+            #[cfg(not(windows))]
+            if minimized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         // Pin-off: drop our topmost synchronously via Win32. eframe

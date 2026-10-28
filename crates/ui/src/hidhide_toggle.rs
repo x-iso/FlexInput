@@ -101,8 +101,10 @@ pub fn eye_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
             painter.circle_filled(c, 2.5, egui::Color32::from_rgb(230, 170, 60));
         }
     }
+    // Linux hides through FlexInput's own helper, not HidHide.
+    let via = if cfg!(windows) { " (HidHide)" } else { "" };
     let tip = match st.blocked {
-        Some(why) => format!("Hide from games (HidHide) — unavailable.\n{why}"),
+        Some(why) => format!("Hide from games{via} — unavailable.\n{why}"),
         None => {
             let state = if st.hidden { "Hidden from games" } else { "Visible to games" };
             let mode = if st.manual {
@@ -111,7 +113,7 @@ pub fn eye_button(ui: &mut egui::Ui, device_id: &str) -> Option<egui::Rect> {
                 "automatic — hidden while remapped to a virtual output, when \
                  Settings → Hide original controllers is on"
             };
-            format!("{state} (HidHide), {mode}.\nClick to {} it.",
+            format!("{state}{via}, {mode}.\nClick to {} it.",
                 if st.hidden { "show" } else { "hide" })
         }
     };

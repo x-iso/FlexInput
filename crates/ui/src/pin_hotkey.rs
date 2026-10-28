@@ -22,6 +22,27 @@ pub const HOTKEY_ID_CONFIG: i32 = 0xF1E4;
 /// HOTKEY_ID for the info-overlay EDIT-mode chord.
 pub const HOTKEY_ID_OVERLAY_EDIT: i32 = 0xF1E5;
 
+/// Whether this frame's input holds a fresh press of a chord stored the way
+/// the listeners take it (modifier flags + egui::Key Debug name). Stands in
+/// for the global listener where there is none, so it only sees keys while
+/// FlexInput has keyboard focus. egui reports no Windows/Super modifier, so a
+/// chord that needs one never matches here.
+#[cfg(not(windows))]
+pub(crate) fn chord_pressed(
+    input: &egui::InputState,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    win: bool,
+    key: Option<&str>,
+) -> bool {
+    let Some(key) = key else { return false };
+    !win && input.events.iter().any(|e| matches!(e,
+        egui::Event::Key { key: k, pressed: true, repeat: false, modifiers, .. }
+            if modifiers.ctrl == ctrl && modifiers.shift == shift && modifiers.alt == alt
+                && format!("{k:?}") == key))
+}
+
 pub fn spawn_pin_hotkey_listener(
     hotkey_id: i32,
     thread_label: &'static str,

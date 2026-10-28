@@ -26,16 +26,18 @@ eframe       = { workspace = true }
 # logger those are silently dropped — which hid the swapchain errors behind
 # the overlay-viewport "white ghost" bug. Filter default lives in main().
 env_logger   = { version = "0.11", default-features = false, features = ["humantime"] }
+# Direct dep so wgpu's backend features (dx12/vulkan/metal) reach
+# the final binary. Without this, wgpu compiles with zero backends
+# and panics at runtime when eframe tries to create an Instance.
+# main.rs also names `wgpu::Backends` for the renderer cascade on every
+# platform, so this is not Windows-only.
+wgpu         = { workspace = true }
 
 # The bundled elevated helper: when launched with `--hidmaestro-helper` the app
 # re-execs itself elevated and runs the HIDMaestro named-pipe server, so a
 # single binary ships (no sibling helper exe).
 [target.'cfg(windows)'.dependencies]
 flexinput-hidmaestro = { workspace = true }
-# Direct dep so wgpu's backend features (dx12/vulkan/metal) reach
-# the final binary. Without this, wgpu compiles with zero backends
-# and panics at runtime when eframe tries to create an Instance.
-wgpu         = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

@@ -130,6 +130,13 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 # AMD. See the FLEXINPUT PATCH in vendor/egui-winit/src/lib.rs
 # (create_winit_window_attributes).
 egui-winit = { path = "vendor/egui-winit" }
+# Vendored for a Linux fallback: a controller FlexInput hides from games has
+# its public device node made unreadable and a private one made for FlexInput
+# in /dev/flexinput/ (flexinput_devices::linux_hide). gilrs opens the public
+# node itself, so its open (and the force-feedback one) falls back to the
+# private node when refused. See the FLEXINPUT PATCH comments in
+# vendor/gilrs-core/src/platform/linux/{gamepad,ff}.rs.
+gilrs-core = { path = "vendor/gilrs-core" }
 
 # ── Debug-build performance ─────────────────────────────────────────────────
 # The processing thread runs at 2 kHz (500 µs/tick budget) and the device-io

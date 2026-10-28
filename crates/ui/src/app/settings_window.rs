@@ -248,7 +248,9 @@ impl FlexInputApp {
     /// slow SetupAPI instance-id lookup + blocking helper IPC run on a spawned
     /// thread. Never spawns the elevated helper just to apply/clear *nothing*
     /// (avoids a spurious UAC when the feature is on but nothing is mapped yet).
-    #[cfg(windows)]
+    /// Linux: the same rules, applied by its own hide helper
+    /// (`flexinput_devices::linux_hide`), which has no keep-on-exit.
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn reconcile_hidhide(&mut self) {
         // Only do real work on a relevant change: an explicit dirty (toggle /
         // startup), a device plug/unplug, or a slow fallback that catches patch
@@ -279,10 +281,14 @@ impl FlexInputApp {
         for dev in &self.devices {
             if matches!(
                 dev.kind,
-                flexinput_devices::ControllerKind::XInput
-                    | flexinput_devices::ControllerKind::MidiIn
+                flexinput_devices::ControllerKind::MidiIn
                     | flexinput_devices::ControllerKind::MidiOut
             ) {
+                continue;
+            }
+            // Linux hides an Xbox pad's evdev node like any other.
+            #[cfg(windows)]
+            if dev.kind == flexinput_devices::ControllerKind::XInput {
                 continue;
             }
             // Joy-Con 2 is read by OUR OWN hidapi transport (`joycon2::usb`),
@@ -322,7 +328,8 @@ impl FlexInputApp {
         // A manual hide needs HidHide on even with "Hide original controllers" off.
         let active = auto_on || !targets.is_empty();
         // Pads a previous session left hidden at exit, to unhide unless still wanted.
-        let release = self.settings.hidhide_kept_ids.clone();
+        // (Linux keeps nothing hidden past exit.)
+        let release = if cfg!(windows) { self.settings.hidhide_kept_ids.clone() } else { Vec::new() };
         // Right after launch the device list may still be empty; releasing then
         // would unhide a kept pad for the moment until it enumerates.
         if targets.is_empty()
@@ -344,67 +351,78 @@ impl FlexInputApp {
             return;
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            // The helper takes the set as is; an empty one shows everything.
+            let set: Vec<(u16, u16)> = targets.iter().map(|&(vid, pid, _)| (vid, pid)).collect();
+            eprintln!("[linux-hide] hiding {} controller(s)", set.len());
+            self.linux_hide.apply(&set);
+        }
+
         // FlexInput's own exe stays whitelisted so it keeps reading the hidden pads.
-        let whitelist: Vec<String> = HidHideClient::current_exe_path().into_iter().collect();
-        let sticky = self.settings.hidhide_sticky;
-        let inst_cache = std::sync::Arc::clone(&self.hidhide_instance_cache);
-        let kept_report = std::sync::Arc::clone(&self.hidhide_kept_report);
-        std::thread::spawn(move || {
-            // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
-            let resolved: Vec<(String, bool)> = targets
-                .iter()
-                .filter_map(|&(vid, pid, keep)| {
-                    let (vid, pid) = (&vid, &pid);
-                    let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
-                    // Remember every id we resolve; when sticky is on and the pad
-                    // is currently absent, fall back to the remembered one so the
-                    // entry survives the gap instead of being unmasked.
-                    let id = match id {
-                        Some(id) => {
-                            if let Ok(mut c) = inst_cache.lock() {
-                                c.insert((*vid, *pid), id.clone());
+        #[cfg(windows)]
+        {
+            let whitelist: Vec<String> = HidHideClient::current_exe_path().into_iter().collect();
+            let sticky = self.settings.hidhide_sticky;
+            let inst_cache = std::sync::Arc::clone(&self.hidhide_instance_cache);
+            let kept_report = std::sync::Arc::clone(&self.hidhide_kept_report);
+            std::thread::spawn(move || {
+                // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
+                let resolved: Vec<(String, bool)> = targets
+                    .iter()
+                    .filter_map(|&(vid, pid, keep)| {
+                        let (vid, pid) = (&vid, &pid);
+                        let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
+                        // Remember every id we resolve; when sticky is on and the pad
+                        // is currently absent, fall back to the remembered one so the
+                        // entry survives the gap instead of being unmasked.
+                        let id = match id {
+                            Some(id) => {
+                                if let Ok(mut c) = inst_cache.lock() {
+                                    c.insert((*vid, *pid), id.clone());
+                                }
+                                Some(id)
                             }
-                            Some(id)
+                            None if sticky => inst_cache
+                                .lock()
+                                .ok()
+                                .and_then(|c| c.get(&(*vid, *pid)).cloned()),
+                            None => None,
+                        };
+                        eprintln!(
+                            "[hidhide] target {:04X}:{:04X} -> instance {:?} (keep on exit: {keep})",
+                            vid, pid, id
+                        );
+                        id.map(|id| (id, keep))
+                    })
+                    .collect();
+                let blacklist: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();
+                let keep: Vec<String> = resolved.iter()
+                    .filter(|(_, k)| *k)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                match flexinput_hidmaestro::helper::hidhide_apply(
+                    &blacklist, &whitelist, active, &keep, &release,
+                ) {
+                    Ok(st) if !st.present => eprintln!("[hidhide] driver not present at apply time"),
+                    Ok(st) => {
+                        eprintln!(
+                            "[hidhide] applied: active={} hidden={} (requested {}, kept on exit {})",
+                            st.active, st.hidden.len(), blacklist.len(), keep.len()
+                        );
+                        if let Ok(mut r) = kept_report.lock() {
+                            *r = Some(keep);
                         }
-                        None if sticky => inst_cache
-                            .lock()
-                            .ok()
-                            .and_then(|c| c.get(&(*vid, *pid)).cloned()),
-                        None => None,
-                    };
-                    eprintln!(
-                        "[hidhide] target {:04X}:{:04X} -> instance {:?} (keep on exit: {keep})",
-                        vid, pid, id
-                    );
-                    id.map(|id| (id, keep))
-                })
-                .collect();
-            let blacklist: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();
-            let keep: Vec<String> = resolved.iter()
-                .filter(|(_, k)| *k)
-                .map(|(id, _)| id.clone())
-                .collect();
-            match flexinput_hidmaestro::helper::hidhide_apply(
-                &blacklist, &whitelist, active, &keep, &release,
-            ) {
-                Ok(st) if !st.present => eprintln!("[hidhide] driver not present at apply time"),
-                Ok(st) => {
-                    eprintln!(
-                        "[hidhide] applied: active={} hidden={} (requested {}, kept on exit {})",
-                        st.active, st.hidden.len(), blacklist.len(), keep.len()
-                    );
-                    if let Ok(mut r) = kept_report.lock() {
-                        *r = Some(keep);
                     }
+                    Err(e) => eprintln!("[hidhide] apply failed: {e}"),
                 }
-                Err(e) => eprintln!("[hidhide] apply failed: {e}"),
-            }
-        });
+            });
+        }
     }
 
     /// Fold eye-button clicks into the overrides (forcing a reconcile), and pick
     /// up the keep list the last apply reported. Every frame, before the reconcile.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn drain_hidhide_requests(&mut self) {
         use crate::hidhide_toggle::HideRequest;
         for (id, req) in crate::hidhide_toggle::drain_requests() {
@@ -414,6 +432,7 @@ impl FlexInputApp {
             }
             self.settings_dirty = true;
             self.hidhide_dirty = true;
+            self.allow_hide_prompt();
         }
         let reported = self.hidhide_kept_report.lock().ok().and_then(|mut r| r.take());
         if let Some(kept) = reported {
@@ -424,12 +443,22 @@ impl FlexInputApp {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub(crate) fn drain_hidhide_requests(&mut self) {}
+
+    /// The user asked to hide or show something: on Linux a dismissed password
+    /// prompt may come up again, and the set is re-sent even if it's the same.
+    fn allow_hide_prompt(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_hide.allow_prompt();
+            self.hidhide_last_active = None;
+        }
+    }
 
     /// Publish every device's eye-button state. Every frame, after the reconcile:
     /// it only reads the cached auto set, never walks the patch.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn publish_hidhide_ui(&mut self) {
         use crate::hidhide_toggle::HideUiState;
         let own_virtual = self.own_virtual_device_ids();
@@ -446,7 +475,7 @@ impl FlexInputApp {
         crate::hidhide_toggle::publish(states);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub(crate) fn publish_hidhide_ui(&mut self) {}
 
     /// Fold light-bar swatch edits into `settings.led_defaults` (mirrored for
@@ -519,11 +548,41 @@ impl FlexInputApp {
 
     /// `(hidden, manual)` for a device: its eye-button override when it has one,
     /// else whether the auto rule ("Hide original controllers" + remapped) hides it.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn hidhide_effective(&self, device_id: &str) -> (bool, bool) {
         match self.settings.hidhide_overrides.get(device_id) {
             Some(&v) => (v, true),
             None => (self.hidhide_auto_ids.contains(device_id), false),
+        }
+    }
+
+    /// Why a device can't be hidden on Linux, or `None` when it can. FlexInput
+    /// keeps reading a hidden pad through private nodes its gilrs and hidraw
+    /// readers fall back to; SDL and the Joy-Con 2 transport don't.
+    #[cfg(target_os = "linux")]
+    fn hidhide_block_reason(
+        &self,
+        dev: &PhysicalDevice,
+        own_virtual: &HashSet<String>,
+    ) -> Option<&'static str> {
+        use flexinput_devices::ControllerKind as K;
+        if !self.hidhide_installed {
+            return Some("Hiding needs pkexec (polkit), which isn't installed.");
+        }
+        if own_virtual.contains(&dev.id) {
+            return Some("This is FlexInput's own virtual controller.");
+        }
+        if dev.id.starts_with("sdl:") {
+            return Some("FlexInput reads this controller through SDL, which can't reach it once it's hidden.");
+        }
+        match dev.kind {
+            K::JoyCon2L | K::JoyCon2R => {
+                Some("FlexInput reads Joy-Con 2 directly; hiding it would cut FlexInput off too.")
+            }
+            _ if dev.vid.is_none() || dev.pid.is_none() => {
+                Some("This controller reports no USB vendor/product id to hide it by.")
+            }
+            _ => None,
         }
     }
 
@@ -566,10 +625,15 @@ impl FlexInputApp {
     /// live device that can be hidden and is (by override or the auto rule),
     /// plus — with sticky masking on — remembered devices that are briefly
     /// absent but still wanted hidden. Sorted and deduped by (vid, pid).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn hidhide_targets(&self) -> Vec<(u16, u16, bool)> {
         let own_virtual = self.own_virtual_device_ids();
-        let keep_mode = self.settings.hidhide_keep_on_exit;
+        // Linux keeps nothing hidden past exit: its helper gives every node back.
+        let keep_mode = if cfg!(windows) {
+            self.settings.hidhide_keep_on_exit
+        } else {
+            crate::settings::HidHideKeepOnExit::Never
+        };
         let mut out: Vec<(u16, u16, bool)> = Vec::new();
         let mut live: HashSet<&str> = HashSet::new();
         for dev in &self.devices {
@@ -618,13 +682,13 @@ impl FlexInputApp {
         out
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub(crate) fn reconcile_hidhide(&mut self) {}
 
     /// Ids of the physical controllers in the active patch that feed a
     /// `virtual.*` output — what "Hide original controllers" hides. Whether each
     /// can actually be hidden is `hidhide_block_reason`'s call.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(crate) fn remapped_physical_ids(&self) -> HashSet<String> {
         let snarl = &self.tabs[self.active_tab].canvas.snarl;
         // Physical device ids that feed a virtual.* sink (via an AutoMap wire).
@@ -694,7 +758,8 @@ impl FlexInputApp {
         let mut nav: SettingsNav = ctx.data(|d| d.get_temp(nav_id)).unwrap_or_default();
         let sections = SettingsSection::visible();
         let now = ctx.input(|i| i.time);
-        let hidhide_missing = !self.hidhide_installed;
+        // HidHide is Windows-only; Linux has nothing to install.
+        let hidhide_missing = cfg!(windows) && !self.hidhide_installed;
 
         egui::Window::new("Settings")
             .id(egui::Id::new("settings_window"))
@@ -1353,7 +1418,13 @@ impl FlexInputApp {
 
     fn settings_hidhide(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         if !self.hidhide_installed {
-            self.hidhide_missing_banner(ui);
+            if cfg!(windows) {
+                self.hidhide_missing_banner(ui);
+            } else {
+                ui.label(egui::RichText::new(
+                    "Hiding controllers needs pkexec (polkit), which this system doesn't have.",
+                ).color(egui::Color32::from_rgb(230, 170, 80)));
+            }
             ui.add_space(6.0);
         }
         let hidhide_installed = self.hidhide_installed;
@@ -1364,15 +1435,31 @@ impl FlexInputApp {
             hidhide_installed,
             egui::Checkbox::new(
                 &mut hide_effective,
-                "Hide original controllers from games (HidHide)",
+                if cfg!(windows) {
+                    "Hide original controllers from games (HidHide)"
+                } else {
+                    "Hide original controllers from games"
+                },
             ),
         );
         if resp.changed() {
             self.settings.hide_originals = Some(hide_effective);
             *dirty = true;
             self.hidhide_dirty = true; // apply on the next frame's reconcile
+            self.allow_hide_prompt();
         }
-        if hidhide_installed {
+        if hidhide_installed && !cfg!(windows) {
+            ui.label(egui::RichText::new(
+                "On by default. When on, any physical controller you remap to a virtual \
+                 output is hidden from games, so the game sees only the virtual pad, while \
+                 FlexInput keeps reading the original. Hiding asks for your password once \
+                 per session. Start FlexInput before the game: a game that already has the \
+                 controller open keeps it. The eye button on a device card overrides this per \
+                 controller (right-click it to go back to automatic). Controllers FlexInput \
+                 reads through SDL, and Joy-Con 2, can't be hidden.",
+            ).small().color(egui::Color32::from_gray(140)));
+        }
+        if hidhide_installed && cfg!(windows) {
             ui.label(egui::RichText::new(
                 "Defaults ON because HidHide is installed. When on, any physical controller \
                  you remap to a virtual output is hidden from games, so the game sees only \
@@ -1410,6 +1497,13 @@ impl FlexInputApp {
 
         // ── What stays hidden after FlexInput exits ──────────────────
         ui.add_space(4.0);
+        // Linux's helper gives everything back when FlexInput closes.
+        if !cfg!(windows) {
+            ui.label(egui::RichText::new(
+                "Everything FlexInput hid is shown again when it closes.",
+            ).small().color(egui::Color32::from_gray(140)));
+            return;
+        }
         ui.add_enabled_ui(hidhide_installed, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Keep controllers hidden after FlexInput exits:");
@@ -1777,6 +1871,33 @@ impl FlexInputApp {
                     }
                 });
             });
+        // Which thread the process's CPU time goes to; nice shows whether the
+        // input threads got their raised priority (thread_priority).
+        #[cfg(target_os = "linux")]
+        egui::CollapsingHeader::new(egui::RichText::new("Where the CPU goes, by thread").small())
+            .id_salt("thread_cpu_details")
+            .show(ui, |ui| {
+                let rows = crate::thread_cpu::snapshot();
+                let total: f32 = rows.iter().map(|r| r.percent).sum();
+                ui.label(egui::RichText::new(format!(
+                    "FlexInput: {total:.0}% of one core ({} cores here)",
+                    std::thread::available_parallelism().map_or(1, |n| n.get()),
+                )).small());
+                egui::Grid::new("thread_cpu").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| egui::RichText::new(s).small().strong();
+                    ui.label(head("thread, last second"));
+                    ui.label(head("% of a core"));
+                    ui.label(head("nice"));
+                    ui.end_row();
+                    for r in rows.iter().take(14) {
+                        let name = if r.count > 1 { format!("{} ×{}", r.name, r.count) } else { r.name.clone() };
+                        ui.label(egui::RichText::new(name).small());
+                        ui.label(egui::RichText::new(format!("{:.1}", r.percent)).small());
+                        ui.label(egui::RichText::new(r.nice.to_string()).small());
+                        ui.end_row();
+                    }
+                });
+            });
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
@@ -1797,9 +1918,18 @@ impl FlexInputApp {
             // Below ~90% of the setting, catch-up ticks are being dropped: the
             // patch costs more per tick than this machine has at this rate.
             let behind = ticks < self.settings.sample_rate_hz * 9 / 10;
+            // A rate it would sustain: under what it manages now, with room.
+            let suggest = (ticks * 4 / 5 / 100 * 100)
+                .clamp(settings::SAMPLE_RATE_HZ_MIN, self.settings.sample_rate_hz);
             let text = egui::RichText::new(format!(
                 "Now: engine {ticks} ticks/s in {passes} passes/s{}",
-                if behind { " — can't keep up at this rate" } else { "" },
+                if !behind {
+                    String::new()
+                } else if suggest < self.settings.sample_rate_hz {
+                    format!(" — can't keep up at this rate; try {suggest} Hz")
+                } else {
+                    " — can't keep up at this rate".to_string()
+                },
             )).small();
             ui.label(if behind {
                 text.color(egui::Color32::from_rgb(230, 170, 80))

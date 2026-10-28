@@ -1,6 +1,7 @@
-//! User-configurable application settings persisted to
-//! `%APPDATA%\FlexInput\settings.json` (and `workspace.json` for the
-//! opt-in tabs-on-relaunch feature).
+//! User-configurable application settings persisted to `settings.json` in the
+//! per-user data folder (`%APPDATA%\FlexInput`, `~/.config/FlexInput` on Linux;
+//! see [`flexinput_core::paths`]), and `workspace.json` for the opt-in
+//! tabs-on-relaunch feature.
 //!
 //! Mirrors the panic-hotkey pattern in [`crate::panic_hotkey`]: simple JSON
 //! files, no external config crate. New fields default-in via
@@ -862,22 +863,14 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
 }
 
 
-pub fn appdata_dir() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    let mut p = std::path::PathBuf::from(appdata);
-    p.push("FlexInput");
-    let _ = std::fs::create_dir_all(&p);
-    Some(p)
-}
-
 fn settings_path() -> Option<std::path::PathBuf> {
-    let mut p = appdata_dir()?;
+    let mut p = flexinput_core::paths::app_data_dir()?;
     p.push("settings.json");
     Some(p)
 }
 
 fn render_attempt_path() -> Option<std::path::PathBuf> {
-    let mut p = appdata_dir()?;
+    let mut p = flexinput_core::paths::app_data_dir()?;
     p.push("render_attempt");
     Some(p)
 }
@@ -908,7 +901,7 @@ pub fn clear_render_attempt() {
 }
 
 fn workspace_path() -> Option<std::path::PathBuf> {
-    let mut p = appdata_dir()?;
+    let mut p = flexinput_core::paths::app_data_dir()?;
     p.push("workspace.json");
     Some(p)
 }
@@ -1082,7 +1075,7 @@ pub fn load_workspace_from(path: &std::path::Path) -> Option<PersistedWorkspace>
 //     `take_recovery_workspace` and `app/src/main.rs`'s relaunch path.
 
 fn recovery_path() -> Option<std::path::PathBuf> {
-    let mut p = appdata_dir()?;
+    let mut p = flexinput_core::paths::app_data_dir()?;
     p.push("recovery.json");
     Some(p)
 }

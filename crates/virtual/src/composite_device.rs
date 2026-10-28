@@ -19,7 +19,7 @@ use flexinput_hidmaestro::encode::{encode_report_into, PinState};
 use flexinput_hidmaestro::Profile;
 use flexinput_usbip::{vhci, EmulatedDevice, OutputKind};
 
-use crate::hidmaestro_device::apply_pin;
+use crate::apply_pin;
 use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 

@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 flexinput-core = { workspace = true }
+# The controller profiles, report encoder and feature answers: HIDMaestro's
+# nodes on Windows, UHID devices on Linux.
+flexinput-hidmaestro = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_notification"] }
@@ -13,9 +16,12 @@ vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_
 # requirement resolve to 0.58, which the wgpu dx12 backend needs (see the
 # wgpu comment in the workspace Cargo.toml).
 enigo = "0.6"
-flexinput-hidmaestro = { workspace = true }
 # The composite USB personas (a virtual DualSense with its audio interfaces).
 flexinput-usbip = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# uinput / UHID: open, poll, ioctl. Already in the graph.
+libc = "0.2"
 
 [dev-dependencies]
 glam = { workspace = true }

@@ -76,3 +76,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Same sdl3 as above; Cargo unions the features. SDL's CMake refuses to build on
+# Linux without X11 or Wayland dev headers, but FlexInput only initialises the
+# gamepad/joystick subsystems and never opens an SDL window, so the console
+# build drops that requirement (and the X11/Wayland packages from the build box).
+sdl3 = { version = "0.18", features = ["build-from-source-unix-console"] }
+# The hide helper (linux_hide.rs): device nodes, xattrs, a netlink socket.
+# Already in the tree.
+libc = "0.2"

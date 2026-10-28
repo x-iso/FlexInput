@@ -8,6 +8,8 @@ pub use flexinput_core::haptic_pcm;
 pub mod hidhide;
 pub mod identification;
 pub mod layouts;
+#[cfg(target_os = "linux")]
+pub mod linux_hide;
 pub mod midi;
 pub mod raw_hid;
 pub mod sdl_backend;

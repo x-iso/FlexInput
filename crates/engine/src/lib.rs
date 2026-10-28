@@ -9,8 +9,10 @@ pub mod hr_timer;
 pub mod router;
 pub mod state;
 pub mod thread;
+pub mod thread_priority;
 
 pub use hr_timer::HrWaiter;
+pub use thread_priority::raise_input_thread;
 
 pub use eval::{
     analog_axis_for_cardinal,

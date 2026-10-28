@@ -1958,6 +1958,7 @@ dependencies = [
  "gilrs",
  "glam",
  "hidapi",
+ "libc",
  "midir",
  "puffin",
  "rustfft",
@@ -1971,10 +1972,12 @@ name = "flexinput-engine"
 version = "0.16.0"
 dependencies = [
  "arc-swap",
+ "dbus",
  "flexinput-core",
  "flexinput-devices",
  "flexinput-net",
  "glam",
+ "libc",
  "puffin",
  "serde_json",
  "smallvec",
@@ -2040,6 +2043,7 @@ name = "flexinput-ui"
 version = "0.16.0"
 dependencies = [
  "bytemuck",
+ "dbus",
  "eframe",
  "egui",
  "egui-snarl",
@@ -2093,6 +2097,7 @@ dependencies = [
  "flexinput-hidmaestro",
  "flexinput-usbip",
  "glam",
+ "libc",
  "vigem-client",
 ]
 
@@ -2405,8 +2410,6 @@ dependencies = [
 [[package]]
 name = "gilrs-core"
 version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "732dadc05170599ddec9a89653f10d7a2af54da9181b3fa6e2bd49907ec8f7e4"
 dependencies = [
  "core-foundation 0.9.4",
  "inotify",

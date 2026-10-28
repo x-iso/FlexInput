@@ -3,6 +3,62 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.2] - 2026-10-28
+
+### Added
+
+- **Linux builds.** FlexInput now runs on Linux; it's tested on Bazzite (KDE
+  Plasma on Wayland). The app, controllers, gamepad navigation and the
+  overlays work. Settings and the workspace live in `~/.config/FlexInput`.
+  Symbols and non-Latin text use the desktop's own fallback fonts. Keyboard
+  shortcuts work while FlexInput's window is focused; system-wide shortcuts
+  aren't there on Linux yet.
+
+- **Virtual controllers on Linux.** Virtual Xbox 360, DualShock 4, DualSense,
+  DualSense Edge and Keyboard & Mouse (with media keys) work on Linux under
+  the same device names as on Windows, so a patch moves between the two
+  unchanged. The Xbox 360 pad looks exactly like a wired one to SDL, Steam
+  and Wine; the Sony pads are driven by the kernel's own PlayStation driver,
+  so games get their motion sensors and touchpad. Rumble, the lightbar, the
+  player and mic LEDs and adaptive triggers that games send come back as on
+  Windows. The first virtual device asks for your password once, to allow
+  FlexInput to create virtual devices. The DualSense with USB audio is
+  Windows-only.
+
+- **Hiding controllers on Linux.** Settings → Hide controllers and the eye
+  button on each device card work as on Windows, through FlexInput's own
+  helper instead of HidHide: it asks for your password once per session,
+  then takes the controllers you remap away from every other program, so
+  games and Steam see only the virtual pad while FlexInput keeps reading the
+  original. A program that already had the controller open (Steam always
+  does) is cut off by reconnecting the controller once; a controller that
+  drops out and reconnects comes back already hidden. Everything is visible
+  again when FlexInput closes, even after a crash. Xbox controllers can be
+  hidden on Linux too; controllers FlexInput reads through SDL, and Joy-Con 2,
+  can't. There's no "keep hidden after exit" on Linux.
+
+- **Overlays and Pin stay on top on KDE Plasma.** Wayland ignores
+  always-on-top, so FlexInput asks KDE's window manager to keep its overlays
+  and the pinned main window above other windows. They don't cover a game
+  that's fullscreen and focused.
+
+- **Where the CPU goes, by thread (Linux).** Settings → Performance lists
+  FlexInput's threads with their share of a core and their priority.
+
+- **Controller input ahead of a busy desktop on Linux.** The I/O and engine
+  threads ask the system for a higher priority, as they run above the UI on
+  Windows, so a busy browser or a slow frame doesn't hold up virtual output.
+
+### Changed
+
+- **Pin brings a minimized FlexInput back, and unpin minimizes it again.**
+  Pinning FlexInput while it's minimized (from a shortcut, say) restores and
+  focuses it; unpinning returns it to minimized.
+
+- **The performance readout suggests a sample rate.** When the engine can't
+  keep up at the processing sample rate, Settings → Performance now names a
+  rate this machine sustains.
+
 ## [0.16.0] - 2026-10-23
 
 ### Added

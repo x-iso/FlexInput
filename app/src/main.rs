@@ -177,7 +177,18 @@ fn run_as_helper_if_requested() -> bool {
     true
 }
 
-#[cfg(not(windows))]
+/// If launched as the controller-hiding helper (root, through pkexec; see
+/// `flexinput_devices::linux_hide`), run it and exit before touching the GPU
+/// or opening a window.
+#[cfg(target_os = "linux")]
+fn run_as_helper_if_requested() -> bool {
+    if !std::env::args().any(|a| a == flexinput_ui::LINUX_HIDE_HELPER_FLAG) {
+        return false;
+    }
+    std::process::exit(flexinput_ui::run_linux_hide_helper());
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_as_helper_if_requested() -> bool {
     false
 }

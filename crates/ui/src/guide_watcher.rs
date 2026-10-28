@@ -482,6 +482,8 @@ pub fn spawn_chord_watcher(
                     .map_or(false, |c| combo_held(&snap, c, targets[i].1)));
 
                 let mut fired = [false; 5];
+                #[cfg(target_os = "linux")]
+                let pin_raised_before = watches[3].last_toggle;
                 for i in 0..5 {
                     let mut superset_assigned = false;
                     let mut superset_held = false;
@@ -495,6 +497,14 @@ pub fn spawn_chord_watcher(
                     }
                     fired[i] = service_target(&mut watches[i], targets[i].0, flags[i], held[i],
                         superset_assigned, superset_held, started_at);
+                }
+                // Linux: a minimized window's UI thread can sit idle until it is
+                // shown again (Wayland stops its frames), so the pin also goes to
+                // KWin from here. The UI applies the same state when it next
+                // runs, which KWin is spared.
+                #[cfg(target_os = "linux")]
+                if watches[3].last_toggle != pin_raised_before {
+                    crate::kwin::toggle_pin();
                 }
 
                 // The leader stays in `owned` while it's replayed; the engine

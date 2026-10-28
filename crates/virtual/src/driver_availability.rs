@@ -104,7 +104,18 @@ pub fn hidmaestro_status() -> HidMaestroStatus {
             }
         }
     }
-    #[cfg(not(windows))]
+    // Linux has no driver to install: its devices need write access to
+    // /dev/uinput and /dev/uhid, which the first device asks for (one polkit
+    // prompt), the way the first HIDMaestro device installs the driver.
+    #[cfg(target_os = "linux")]
+    {
+        if crate::linux::access::granted() {
+            HidMaestroStatus::Ok
+        } else {
+            HidMaestroStatus::Missing
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         HidMaestroStatus::Missing
     }

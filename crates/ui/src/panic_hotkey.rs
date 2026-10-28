@@ -19,10 +19,7 @@ use crate::app::PanicShortcut;
 
 /// Path to the JSON file where the configured shortcut is persisted.
 fn settings_path() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    let mut p = std::path::PathBuf::from(appdata);
-    p.push("FlexInput");
-    let _ = std::fs::create_dir_all(&p);
+    let mut p = flexinput_core::paths::app_data_dir()?;
     p.push("panic_shortcut.json");
     Some(p)
 }
@@ -41,8 +38,8 @@ pub fn save_panic_shortcut(s: &PanicShortcut) {
 }
 
 /// Spawns the platform-specific global hotkey listener. On non-Windows
-/// targets this is currently a no-op (the panic button in the UI still
-/// works manually).
+/// targets this is currently a no-op; the chord works only while FlexInput
+/// has keyboard focus (`FlexInputApp::raise_focused_hotkeys`).
 pub fn spawn_panic_hotkey_listener(
     shortcut: Arc<RwLock<PanicShortcut>>,
     toggle_requested: Arc<AtomicBool>,
