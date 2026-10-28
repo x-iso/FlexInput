@@ -2074,9 +2074,11 @@ dependencies = [
  "tiny-skia",
  "ttf-parser",
  "usvg",
+ "wayland-client",
  "wgpu",
  "windows 0.62.2",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]
@@ -8020,8 +8022,6 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
  "ahash",
  "android-activity",
@@ -8030,7 +8030,6 @@ dependencies = [
  "block2 0.5.1",
  "bytemuck",
  "calloop 0.13.0",
- "cfg_aliases",
  "concurrent-queue",
  "core-foundation 0.9.4",
  "core-graphics 0.23.2",

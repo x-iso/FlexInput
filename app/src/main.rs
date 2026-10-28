@@ -393,6 +393,10 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport,
         wgpu_options,
+        // X11 on a Wayland desktop without layer shell (GNOME), where the
+        // overlays couldn't otherwise stay above a game.
+        #[cfg(target_os = "linux")]
+        event_loop_builder: flexinput_ui::event_loop_hook(),
         // 32-bit depth buffer for egui's render pass (Depth32Float). egui's own
         // pipeline ignores it (depth_compare: Always, no write), so 2D UI is
         // unaffected — but it lets the 3D Controller viewer's paint callback do

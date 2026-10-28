@@ -1744,13 +1744,34 @@ pub fn create_winit_window_attributes(
     }
 
     #[cfg(all(feature = "wayland", target_os = "linux"))]
-    if let Some(app_id) = _app_id {
+    {
         use winit::platform::wayland::WindowAttributesExtWayland as _;
-        window_attributes = window_attributes.with_name(app_id, "");
+        // FLEXINPUT PATCH: transparent taskbar-less viewports (FlexInput's
+        // over-the-game windows: the overlays and the pickers) open as
+        // layer-shell overlays where the compositor offers layer shell, so
+        // they sit above every window, fullscreen games included, and are
+        // never tiled or listed. Same key as the Windows patch below. The
+        // vendored winit adds `with_overlay_layer`.
+        if transparent.unwrap_or(false) && !_taskbar.unwrap_or(true) {
+            window_attributes =
+                window_attributes.with_overlay_layer(_app_id.clone().unwrap_or_default());
+        }
+        if let Some(app_id) = _app_id {
+            window_attributes = window_attributes.with_name(app_id, "");
+        }
     }
 
     #[cfg(all(feature = "x11", target_os = "linux"))]
     {
+        // FLEXINPUT PATCH: the same viewports are notification windows on X11.
+        // GNOME's Mutter stacks those in its top layer (the popup menus' one,
+        // above a fullscreen game) and leaves them out of the dash and
+        // Alt+Tab; window managers generally keep them out of the taskbar.
+        // FlexInput runs under XWayland on GNOME for this (see its
+        // `xwayland.rs`).
+        let over_game = transparent.unwrap_or(false) && !_taskbar.unwrap_or(true);
+        let _window_type =
+            _window_type.or(over_game.then_some(egui::X11WindowType::Notification));
         if let Some(window_type) = _window_type {
             use winit::platform::x11::WindowAttributesExtX11 as _;
             use winit::platform::x11::WindowType;

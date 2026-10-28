@@ -11,9 +11,13 @@
 //!   minimized window restores and focuses it, and unpinning minimizes it
 //!   again, as on Windows.
 //!
-//! X11 sessions honour always-on-top as they are; other Wayland desktops have
-//! no equivalent here yet. "Keep above" stacks over ordinary windows, not over
-//! a game that is fullscreen and focused: KWin layers that one higher.
+//! The overlays and pickers are layer-shell surfaces wherever the compositor
+//! offers layer shell, KWin included (see the vendored winit's
+//! `with_overlay_layer`), which stack above every window, a fullscreen game
+//! too. The overlays script only matters where they open as ordinary windows
+//! instead: "keep above" stacks those over ordinary windows, not over a game
+//! that is fullscreen and focused. X11 sessions honour always-on-top as they
+//! are.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};

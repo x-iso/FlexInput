@@ -32,6 +32,8 @@ mod settings;
 #[cfg(target_os = "linux")]
 mod thread_cpu;
 mod win_app;
+#[cfg(target_os = "linux")]
+mod xwayland;
 pub mod model;
 
 pub use app::{render_app_icon, FlexInputApp};
@@ -48,9 +50,12 @@ pub use win_app::{onscreen_position, try_become_primary_instance};
 pub use flexinput_devices::linux_hide::{run_helper as run_linux_hide_helper, HELPER_FLAG as LINUX_HIDE_HELPER_FLAG};
 #[cfg(target_os = "linux")]
 pub use desktop_entry::install as install_desktop_entry;
+#[cfg(target_os = "linux")]
+pub use xwayland::event_loop_hook;
 
 /// The app id every FlexInput window carries. On Wayland it names the desktop
-/// entry the desktop takes the window's icon from (see `desktop_entry`);
+/// entry the desktop takes the window's icon from (see `desktop_entry`); on X11
+/// it's the window class, which the entry's `StartupWMClass` matches;
 /// elsewhere it's unused.
 pub const APP_ID: &str = "flexinput";
 

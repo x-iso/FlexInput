@@ -17,6 +17,19 @@ All notable changes to FlexInput are documented here. This project adheres to
   `~/.local/share` when it starts. FlexInput also shows up in the application
   menu.
 
+### Changed
+
+- **Overlays sit above everything on most Linux desktops.** On desktops with
+  Wayland's layer shell (KDE Plasma, Hyprland, Sway and most others) the
+  overlays, and the pickers that open over a game, now sit in the desktop's
+  top layer: above every window, a fullscreen game included, never tiled and
+  never in the taskbar or Alt+Tab.
+
+- **FlexInput runs as an X11 app on GNOME.** GNOME has no layer shell, so
+  FlexInput runs there under XWayland, where GNOME keeps the overlays and
+  pickers above a fullscreen game and out of the dash and Alt+Tab. At a
+  fractional display scale (125%, 150%) FlexInput looks slightly soft there.
+
 ### Fixed
 
 - **Hidden controllers stay hidden on Linux.** Cutting Steam off from a
@@ -33,9 +46,6 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **Switch Pro Controller setup on Linux.** The kernel's own driver sets the
   controller up on Linux, so FlexInput no longer repeats that over it and
   only reads the stick calibration.
-
-- **Overlays stay out of the taskbar and Alt+Tab on KDE Plasma**, as they do
-  on Windows.
 
 ## [0.16.2] - 2026-10-28
 

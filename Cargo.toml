@@ -137,6 +137,15 @@ egui-winit = { path = "vendor/egui-winit" }
 # private node when refused. See the FLEXINPUT PATCH comments in
 # vendor/gilrs-core/src/platform/linux/{gamepad,ff}.rs.
 gilrs-core = { path = "vendor/gilrs-core" }
+# Vendored for Wayland layer shell: winit makes every window an xdg toplevel,
+# which a compositor tiles, lists and stacks below a fullscreen game, and whose
+# position it ignores. FlexInput's over-the-game windows (overlays, pickers)
+# ask for `with_overlay_layer` instead and become wlr-layer-shell surfaces in
+# the overlay layer where the compositor offers it (KDE, Hyprland, Sway, …).
+# See the FLEXINPUT PATCH comments in vendor/winit/src/platform_impl/linux/
+# wayland/ (window/shell.rs, window/mod.rs, window/state.rs, state.rs) and
+# vendor/winit/src/platform/wayland.rs.
+winit = { path = "vendor/winit" }
 
 # ── Debug-build performance ─────────────────────────────────────────────────
 # The processing thread runs at 2 kHz (500 µs/tick budget) and the device-io

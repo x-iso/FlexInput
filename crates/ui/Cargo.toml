@@ -96,3 +96,7 @@ ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 # KWin's scripting interface (kwin.rs). Already in the tree under btleplug, and
 # libdbus is already linked.
 dbus = "0.9"
+# The X11-or-Wayland pick (xwayland.rs): winit's X11 event loop selector and a
+# Wayland registry probe for layer shell. Both already in the tree under eframe.
+winit          = { version = "0.30", default-features = false, features = ["x11"] }
+wayland-client = "0.31"
