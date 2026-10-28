@@ -1,0 +1,306 @@
+name: SDL refresh
+
+# Monthly: move SDL to the newest release the `sdl3` requirement allows, refresh
+# the vendored SDL_GameControllerDB, build both platforms, and open (or update)
+# one PR. An SDL release `cargo update` can't reach gets an issue instead.
+on:
+  # 06:00 UTC on the 4th. SDL releases on the 1st or 2nd and sdl3-sys follows
+  # within a day.
+  schedule:
+    - cron: '0 6 4 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdl-refresh
+
+# An explicit `shell: bash` runs with -eo pipefail, on Windows too (Git Bash).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  refresh:
+    name: Refresh SDL and the controller database
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      changed: ${{ steps.summary.outputs.changed }}
+      title: ${{ steps.summary.outputs.title }}
+      body: ${{ steps.summary.outputs.body }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Record the locked SDL crates
+        id: before
+        run: |
+          locked() { awk -v n="$1" '$0 == "name = \"" n "\"" { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock; }
+          for c in sdl3 sdl3-sys sdl3-src; do
+            if [ -z "$(locked "$c")" ]; then echo "::error::$c is not in Cargo.lock"; exit 1; fi
+          done
+          {
+            echo "sdl3=$(locked sdl3)"
+            echo "sys=$(locked sdl3-sys)"
+            echo "sdl=$(locked sdl3-src)"
+          } >> "$GITHUB_OUTPUT"
+
+      # sdl3-sys pins sdl3-src exactly, so SDL moves only with sdl3-sys, and
+      # only as far as the `sdl3` requirement in crates/devices/Cargo.toml
+      # allows. Anything past that is the issue step below.
+      - name: Update SDL within the range sdl3 allows
+        run: cargo update -p sdl3 -p sdl3-sys -p sdl3-src
+
+      - name: Record the updated SDL crates
+        id: after
+        run: |
+          locked() { awk -v n="$1" '$0 == "name = \"" n "\"" { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock; }
+          {
+            echo "sdl3=$(locked sdl3)"
+            echo "sys=$(locked sdl3-sys)"
+            echo "sdl=$(locked sdl3-src)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Pinned to the commit that last touched the file, so the PR names the
+      # exact upstream version it carries. The provenance notes in licenses.rs
+      # and licenses/README.md change with the data.
+      - name: Refresh SDL_GameControllerDB
+        id: db
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read -r sha date < <(gh api 'repos/mdqinc/SDL_GameControllerDB/commits?path=gamecontrollerdb.txt&per_page=1' \
+            --jq '.[0] | "\(.sha) \(.commit.committer.date[0:10])"')
+          tmp="$RUNNER_TEMP/gamecontrollerdb.txt"
+          curl -fsSL --retry 3 -o "$tmp" \
+            "https://raw.githubusercontent.com/mdqinc/SDL_GameControllerDB/$sha/gamecontrollerdb.txt"
+          # Never replace the vendored copy with an error page.
+          if ! head -n1 "$tmp" | grep -q '^# Game Controller DB'; then
+            echo "::error::the download from $sha doesn't look like gamecontrollerdb.txt"
+            exit 1
+          fi
+          mv "$tmp" vendor/SDL_GameControllerDB/gamecontrollerdb.txt
+          if git diff --quiet -- vendor/SDL_GameControllerDB/gamecontrollerdb.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i -E "/name: \"SDL_GameControllerDB\"/,/text:/ s/note: Some\(\"[^\"]*\"\)/note: Some(\"Upstream copy of $date.\")/" \
+            crates/ui/src/licenses.rs
+          sed -i -E "/^\| SDL_GameControllerDB \|/ s/\(\`gamecontrollerdb.txt\`, [^)]*\)/(\`gamecontrollerdb.txt\`, upstream \`master\` as of $date)/" \
+            licenses/README.md
+          check() { grep -qF "$1" "$2" || { echo "::error file=$2::expected \"$1\" after the rewrite"; exit 1; }; }
+          check "Upstream copy of $date." crates/ui/src/licenses.rs
+          check "upstream \`master\` as of $date" licenses/README.md
+          {
+            echo "changed=true"
+            echo "sha=$sha"
+            echo "date=$date"
+          } >> "$GITHUB_OUTPUT"
+
+      # The license copies are verbatim from the crate sources cargo builds.
+      - name: Update the SDL version notes and license copies
+        if: steps.after.outputs.sdl3 != steps.before.outputs.sdl3 || steps.after.outputs.sys != steps.before.outputs.sys
+        env:
+          SDL3: ${{ steps.after.outputs.sdl3 }}
+          SYS: ${{ steps.after.outputs.sys }}
+          SDL: ${{ steps.after.outputs.sdl }}
+        run: |
+          meta=$(cargo metadata --format-version 1 --locked)
+          src() { jq -r --arg n "$1" '.packages[] | select(.name == $n) | .manifest_path' <<<"$meta" | xargs dirname; }
+          cp "$(src sdl3-src)/SDL/LICENSE.txt" licenses/SDL.txt
+          cp "$(src sdl3-sys)/LICENSE.md" licenses/sdl3-sys.txt
+          cp "$(src sdl3)/LICENSE" licenses/sdl3.txt
+          sed -i -E "s/Bundled version: SDL [0-9][0-9.]*[0-9]\./Bundled version: SDL $SDL./" crates/ui/src/licenses.rs
+          sed -i -E "/^\| \`SDL.txt\`/ s/release-[0-9][0-9.]*/release-$SDL/" licenses/README.md
+          sed -i -E "/^\| \`sdl3.txt\`/ s/\`sdl3\` [^ ]+ crate/\`sdl3\` $SDL3 crate/" licenses/README.md
+          sed -i -E "/^\| \`sdl3-sys.txt\`/ s/\`sdl3-sys\` [^ ]+ crate/\`sdl3-sys\` $SYS crate/" licenses/README.md
+          check() { grep -qF "$1" "$2" || { echo "::error file=$2::expected \"$1\" after the rewrite"; exit 1; }; }
+          check "Bundled version: SDL $SDL." crates/ui/src/licenses.rs
+          check "release-$SDL\`" licenses/README.md
+          check "\`sdl3\` $SDL3 crate" licenses/README.md
+          check "\`sdl3-sys\` $SYS crate" licenses/README.md
+
+      - name: Summarize
+        id: summary
+        env:
+          SDL3_BEFORE: ${{ steps.before.outputs.sdl3 }}
+          SYS_BEFORE: ${{ steps.before.outputs.sys }}
+          SDL_BEFORE: ${{ steps.before.outputs.sdl }}
+          SDL3: ${{ steps.after.outputs.sdl3 }}
+          SYS: ${{ steps.after.outputs.sys }}
+          SDL: ${{ steps.after.outputs.sdl }}
+          DB_CHANGED: ${{ steps.db.outputs.changed }}
+          DB_SHA: ${{ steps.db.outputs.sha }}
+          DB_DATE: ${{ steps.db.outputs.date }}
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to refresh."
+            exit 0
+          fi
+          git diff --stat
+
+          parts=()
+          if [ "$SDL_BEFORE" != "$SDL" ]; then parts+=("SDL $SDL")
+          elif [ "$SYS_BEFORE" != "$SYS" ]; then parts+=("sdl3-sys $SYS"); fi
+          if [ "$SDL3_BEFORE" != "$SDL3" ]; then parts+=("sdl3 $SDL3"); fi
+          if [ "$DB_CHANGED" = true ]; then parts+=("SDL_GameControllerDB"); fi
+          joined=$(printf '%s, ' "${parts[@]}")
+          title="chore(deps): refresh ${joined%, }"
+
+          {
+            echo "changed=true"
+            echo "title=$title"
+            echo 'body<<EOF_BODY'
+            echo 'Monthly refresh from `.github/workflows/sdl-refresh.yml`.'
+            echo
+            if [ "$SDL_BEFORE" != "$SDL" ]; then
+              echo "- SDL $SDL_BEFORE → $SDL (sdl3-sys $SYS_BEFORE → $SYS)"
+            elif [ "$SYS_BEFORE" != "$SYS" ]; then
+              echo "- sdl3-sys $SYS_BEFORE → $SYS (SDL stays $SDL)"
+            fi
+            if [ "$SDL3_BEFORE" != "$SDL3" ]; then echo "- sdl3 $SDL3_BEFORE → $SDL3"; fi
+            if [ "$DB_CHANGED" = true ]; then
+              echo "- SDL_GameControllerDB → upstream commit $DB_SHA ($DB_DATE)"
+            fi
+            if [ "$SDL_BEFORE" != "$SDL" ] || [ "$DB_CHANGED" = true ]; then
+              echo
+              echo '### CHANGELOG lines'
+              echo
+              echo '```markdown'
+              if [ "$SDL_BEFORE" != "$SDL" ]; then
+                echo "- **SDL updated to $SDL.** The bundled SDL, which runs the controllers FlexInput doesn't read natively (Steam Controller, 8BitDo and other third-party pads), moves from $SDL_BEFORE to $SDL."
+              fi
+              if [ "$DB_CHANGED" = true ]; then
+                echo "- **Controller database refreshed.** A controller SDL has no built-in mapping for starts from the SDL_GameControllerDB layouts of $DB_DATE."
+              fi
+              echo '```'
+            fi
+            echo
+            echo 'The build check passed on Windows and Linux before this PR opened. Merge with *Rebase and merge* to keep `main` linear.'
+            echo 'EOF_BODY'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Hand the refreshed files to the build check
+        if: steps.summary.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdl-refresh
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            Cargo.lock
+            vendor/SDL_GameControllerDB/gamecontrollerdb.txt
+            crates/ui/src/licenses.rs
+            licenses/README.md
+            licenses/SDL.txt
+            licenses/sdl3.txt
+            licenses/sdl3-sys.txt
+
+      # A newer SDL release than `cargo update` reached means either sdl3-sys
+      # hasn't published it yet, or the sdl3-sys that has it is semver-breaking
+      # and `sdl3` needs a bump by hand (as 0.18 → 0.20 did). One issue, kept
+      # current, closed once the update reaches upstream again.
+      - name: Flag an SDL release cargo update can't reach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SDL: ${{ steps.after.outputs.sdl }}
+          SYS: ${{ steps.after.outputs.sys }}
+        run: |
+          latest=$(gh api repos/libsdl-org/SDL/releases/latest --jq .tag_name)
+          latest=${latest#release-}
+          title='SDL is behind upstream: sdl3 crate bump needed'
+          open=$(gh issue list --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"$title\") | .number] | first // empty")
+          if [ "$(printf '%s\n' "$SDL" "$latest" | sort -V | tail -n1)" != "$SDL" ]; then
+            body="SDL $latest is out, but \`cargo update\` reaches only SDL $SDL (sdl3-sys $SYS). Either sdl3-sys hasn't published $latest yet (it usually follows within a day), or the sdl3-sys release that has it is semver-breaking, so the \`sdl3\` requirement in \`crates/devices/Cargo.toml\` (both entries) needs bumping by hand."
+            if [ -n "$open" ]; then
+              gh issue edit "$open" --body "$body"
+            else
+              gh issue create --title "$title" --body "$body"
+            fi
+            echo "::warning::SDL $latest is out; cargo update reaches $SDL"
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Caught up: \`cargo update\` now reaches SDL $SDL."
+          fi
+
+  build:
+    name: Build check (${{ matrix.os }})
+    needs: refresh
+    if: needs.refresh.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply the refreshed files
+        uses: actions/download-artifact@v4
+        with:
+          name: sdl-refresh
+          path: .
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Same setup as release.yml: SDL builds from source via CMake.
+      - name: Install CMake
+        if: runner.os == 'Windows'
+        uses: lukka/get-cmake@latest
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libudev-dev libasound2-dev libdbus-1-dev libusb-1.0-0-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # The database tests: it loads, and every entry converts to a layout.
+      - name: Test the controller database
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p flexinput-core --lib sdl_db
+
+  # Needs Settings → Actions → General → "Allow GitHub Actions to create and
+  # approve pull requests". A PR opened with the workflow token starts no other
+  # workflows, which is fine: the build check above already ran, and
+  # release.yml only runs on tags. One fixed branch, so an unmerged PR is
+  # updated in place next month instead of piling up.
+  pr:
+    name: Open the refresh PR
+    needs: [refresh, build]
+    if: needs.refresh.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply the refreshed files
+        uses: actions/download-artifact@v4
+        with:
+          name: sdl-refresh
+          path: .
+
+      - name: Open or update the PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deps/sdl-refresh
+          delete-branch: true
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          commit-message: ${{ needs.refresh.outputs.title }}
+          title: ${{ needs.refresh.outputs.title }}
+          body: ${{ needs.refresh.outputs.body }}

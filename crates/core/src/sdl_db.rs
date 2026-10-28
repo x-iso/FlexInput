@@ -2,13 +2,14 @@
 //!
 //! SDL only maps a gamepad its built-in list knows; a DirectInput pad outside
 //! it arrives as a raw joystick (`raw_pad`) for the user to Learn. The
-//! community database (`vendor/SDL_GameControllerDB`, the same file gilrs
-//! ships) knows many more. Its Windows entries were recorded through SDL's
-//! DirectInput driver, so their `b3` / `a1` / `h0.4` name exactly the
-//! elements a raw pad publishes as `raw:b3` / `raw:a1` / `raw:h0` — an entry
-//! converts into a [`RawPadProfile`] with nothing lost. The app gives a raw
-//! pad nobody has taught yet the layout its entry describes; Learn then
-//! changes any part of it like any other.
+//! community database (`vendor/SDL_GameControllerDB`, refreshed from upstream
+//! monthly by `.github/workflows/sdl-refresh.yml`) knows many more. Its
+//! Windows entries were recorded through SDL's DirectInput driver, so their
+//! `b3` / `a1` / `h0.4` name exactly the elements a raw pad publishes as
+//! `raw:b3` / `raw:a1` / `raw:h0` — an entry converts into a
+//! [`RawPadProfile`] with nothing lost. The app gives a raw pad nobody has
+//! taught yet the layout its entry describes; Learn then changes any part of
+//! it like any other.
 
 use std::sync::OnceLock;
 
