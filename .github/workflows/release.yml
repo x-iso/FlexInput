@@ -39,8 +39,61 @@ jobs:
           Compress-Archive -Path "target/release/flexinput.exe" -DestinationPath $archive
           echo "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ steps.package.outputs.archive }}
+
+  build-linux:
+    name: Build Linux binary
+    # The binary needs the glibc it was built against or newer: 24.04's 2.39
+    # covers Bazzite, SteamOS, Fedora 40+ and Ubuntu 24.04+.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # What the crates link against: udev (hidapi, gilrs), ALSA (midir),
+      # D-Bus (btleplug, KWin and rtkit calls), libusb (the Bluetooth dongle).
+      # SDL3 builds as a console library on Linux, so no X11/Wayland headers.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libudev-dev libasound2-dev libdbus-1-dev libusb-1.0-0-dev
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # tar keeps the executable bit, so the binary runs as extracted.
+      - name: Package
+        id: package
+        run: |
+          archive="FlexInput-${{ github.ref_name }}-linux-x64.tar.gz"
+          tar -czf "$archive" -C target/release flexinput
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ${{ steps.package.outputs.archive }}
+
+  # One job creates the release with both archives, so the two builds can't
+  # race each other to create it.
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.archive }}
+          files: dist/*
           generate_release_notes: true
