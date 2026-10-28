@@ -544,6 +544,188 @@ impl Drop for Xbox360 {
     }
 }
 
+// ── The switcher's keyboard ──────────────────────────────────────────────────
+
+const KEY_TAB: u16 = 15;
+const KEY_LEFTALT: u16 = 56;
+const KEY_UP: u16 = 103;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_DOWN: u16 = 108;
+/// The last key of a full keyboard (`KEY_MICMUTE`). The device offers all of
+/// them so udev tags it a keyboard and the compositor takes its keys as one.
+const KEY_LAST_KEYBOARD: u16 = 248;
+
+/// A key the switcher taps, by the names the Windows tapper takes.
+fn switcher_key(name: &str) -> Option<u16> {
+    Some(match name {
+        "tab" => KEY_TAB,
+        "arrowleft" => KEY_LEFT,
+        "arrowright" => KEY_RIGHT,
+        "arrowup" => KEY_UP,
+        "arrowdown" => KEY_DOWN,
+        _ => return None,
+    })
+}
+
+/// Whether the button holding Alt is still down.
+type StillHeld = Box<dyn Fn() -> bool + Send>;
+
+enum KeyCmd {
+    AltDown(StillHeld),
+    AltUp,
+    Tap(u16),
+}
+
+/// A command queued behind the access prompt is dropped once it is this old,
+/// so granting access doesn't replay a switch the user gave up on.
+const KEY_CMD_STALE: Duration = Duration::from_secs(1);
+/// How long a new keyboard is left before its first key: the compositor opens
+/// it a moment after it appears, and keys sent before that are lost.
+const KEYBOARD_SETTLE: Duration = Duration::from_millis(300);
+/// How often a held Alt checks the button holding it.
+const KEY_HOLD_POLL: Duration = Duration::from_millis(20);
+
+/// The gamepad Alt+Tab switcher's keyboard: a uinput keyboard of its own,
+/// independent of the virtual-device pool, which the compositor's own Alt+Tab
+/// answers (KDE and GNOME bind it; Hyprland and Sway don't by default). A
+/// worker thread owns the device and writes the keys, so the UI thread never
+/// waits on it, nor on the access prompt the first one may need.
+pub struct UiKeyTapper {
+    tx: std::sync::mpsc::Sender<(Instant, KeyCmd)>,
+}
+
+impl Default for UiKeyTapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiKeyTapper {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("switcher-keys".into())
+            .spawn(move || serve_keys(rx));
+        UiKeyTapper { tx }
+    }
+
+    /// Hold Alt while `still_held` says the button holding it is down. The
+    /// worker lets go as soon as it isn't: the UI, which releases it too,
+    /// can stop running while the switcher covers its window (Wayland stops
+    /// a hidden window's frames), and Alt must not stay down.
+    pub fn alt_down_while(&mut self, still_held: impl Fn() -> bool + Send + 'static) {
+        let _ = self.tx.send((Instant::now(), KeyCmd::AltDown(Box::new(still_held))));
+    }
+
+    /// Release Alt if held (commits the switcher's selection).
+    pub fn alt_up(&mut self) {
+        let _ = self.tx.send((Instant::now(), KeyCmd::AltUp));
+    }
+
+    /// Tap a key once: "tab" or an arrow ("arrowleft" …).
+    pub fn tap(&mut self, name: &str) {
+        if let Some(code) = switcher_key(name) {
+            let _ = self.tx.send((Instant::now(), KeyCmd::Tap(code)));
+        }
+    }
+}
+
+fn serve_keys(rx: std::sync::mpsc::Receiver<(Instant, KeyCmd)>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let phys = format!("{}switcher-keys", flexinput_core::own_virtual::PHYS_PREFIX);
+    // Steam's udev rules usually grant uinput already; ask only when they don't.
+    let built = match build_keyboard(&phys) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => super::access::ensure()
+            .map_err(std::io::Error::other)
+            .and_then(|()| build_keyboard(&phys)),
+        r => r,
+    };
+    let file = match built {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[uinput] switcher keyboard: {e}");
+            return;
+        }
+    };
+    std::thread::sleep(KEYBOARD_SETTLE);
+    let key = |code: u16, down: bool| {
+        write_events(&file, &[event(EV_KEY, code, down as i32), event(EV_SYN, SYN_REPORT, 0)]);
+    };
+    let mut held: Option<StillHeld> = None;
+    // Alt went stale, so its taps would land without it.
+    let mut skipping = false;
+    loop {
+        match rx.recv_timeout(KEY_HOLD_POLL) {
+            Ok((at, cmd)) => {
+                let stale = at.elapsed() > KEY_CMD_STALE;
+                match cmd {
+                    KeyCmd::AltDown(_) if stale => skipping = true,
+                    KeyCmd::AltDown(f) => {
+                        if held.is_none() {
+                            key(KEY_LEFTALT, true);
+                        }
+                        held = Some(f);
+                    }
+                    KeyCmd::AltUp => {
+                        skipping = false;
+                        if held.take().is_some() {
+                            key(KEY_LEFTALT, false);
+                        }
+                    }
+                    KeyCmd::Tap(_) if stale || skipping => {}
+                    KeyCmd::Tap(code) => {
+                        key(code, true);
+                        key(code, false);
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if held.as_ref().is_some_and(|still_held| !still_held()) {
+            held = None;
+            key(KEY_LEFTALT, false);
+        }
+    }
+    if held.is_some() {
+        key(KEY_LEFTALT, false);
+    }
+    let _ = ioctl(file.as_raw_fd(), ioc::UI_DEV_DESTROY, std::ptr::null::<u8>());
+}
+
+/// Make the switcher's keyboard: every key, so it's taken as a keyboard, though
+/// only Alt, Tab and the arrows are ever pressed.
+fn build_keyboard(phys: &str) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(super::access::UINPUT)?;
+    let fd = file.as_raw_fd();
+    ioctl_int(fd, ioc::UI_SET_EVBIT, EV_KEY)?;
+    for k in 1..=KEY_LAST_KEYBOARD {
+        ioctl_int(fd, ioc::UI_SET_KEYBIT, k)?;
+    }
+    let phys = std::ffi::CString::new(phys).map_err(std::io::Error::other)?;
+    // SAFETY: UI_SET_PHYS takes a NUL-terminated string the kernel copies.
+    if unsafe { libc::ioctl(fd, ioc::UI_SET_PHYS as _, phys.as_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut setup = UinputSetup {
+        // USB, so libinput takes it for an external keyboard and never pairs
+        // it with a touchpad's disable-while-typing.
+        id: InputId { bustype: BUS_USB, vendor: 0, product: 0, version: flexinput_core::own_virtual::VERSION },
+        name: [0; 80],
+        ff_effects_max: 0,
+    };
+    let name = b"FlexInput Switcher Keys";
+    setup.name[..name.len()].copy_from_slice(name);
+    ioctl(fd, ioc::UI_DEV_SETUP, &setup)?;
+    ioctl(fd, ioc::UI_DEV_CREATE, std::ptr::null::<u8>())?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +777,18 @@ mod tests {
         assert_eq!(axes[3], 0, "right stick centred");
         let pressed: Vec<u16> = KEYS.iter().zip(KEY_BITS).filter(|(_, b)| keys & b != 0).map(|(k, _)| *k).collect();
         assert_eq!(pressed, [0x133, 0x13c], "X is BTN_X, guide is BTN_MODE");
+    }
+
+    #[test]
+    fn switcher_keys_are_the_kernels() {
+        // <linux/input-event-codes.h>
+        assert_eq!(switcher_key("tab"), Some(15));
+        assert_eq!(switcher_key("arrowup"), Some(103));
+        assert_eq!(switcher_key("arrowleft"), Some(105));
+        assert_eq!(switcher_key("arrowright"), Some(106));
+        assert_eq!(switcher_key("arrowdown"), Some(108));
+        assert_eq!(switcher_key("enter"), None);
+        assert_eq!((KEY_LEFTALT, KEY_LAST_KEYBOARD), (56, 248));
     }
 
     #[test]

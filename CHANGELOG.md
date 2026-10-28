@@ -3,6 +3,40 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.3] - 2026-10-28
+
+### Added
+
+- **Gamepad window switcher on Linux.** Holding Select / minus opens the
+  desktop's Alt+Tab switcher, as on Windows: right-stick flicks move the
+  selection and releasing the button switches. It needs a desktop that binds
+  Alt+Tab (KDE Plasma and GNOME do; Hyprland and Sway don't by default).
+
+- **FlexInput's icon on Linux.** Wayland takes a window's icon from the app's
+  desktop entry, so FlexInput now writes one, with its icon, to
+  `~/.local/share` when it starts. FlexInput also shows up in the application
+  menu.
+
+### Fixed
+
+- **Hidden controllers stay hidden on Linux.** Cutting Steam off from a
+  hidden controller reconnects it, and FlexInput briefly took the
+  reconnecting controller off its hide list, so Steam got it back. Hiding
+  now holds through the reconnect. It also works on NixOS, where the helper
+  couldn't find the system tools it uses.
+
+- **The DualSense lightbar no longer blinks on Linux.** FlexInput rewrote the
+  lightbar every second, fading it out, even when nothing in FlexInput had
+  set it. It now writes only the LEDs FlexInput sets, and fades out the
+  connect animation once per connection. Same for the DualShock 4 lightbar.
+
+- **Switch Pro Controller setup on Linux.** The kernel's own driver sets the
+  controller up on Linux, so FlexInput no longer repeats that over it and
+  only reads the stick calibration.
+
+- **Overlays stay out of the taskbar and Alt+Tab on KDE Plasma**, as they do
+  on Windows.
+
 ## [0.16.2] - 2026-10-28
 
 ### Added

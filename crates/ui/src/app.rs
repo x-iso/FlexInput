@@ -4467,14 +4467,32 @@ impl FlexInputApp {
             if let Some(hwnd) = self.self_hwnd {
                 crate::process_list::drop_topmost(hwnd);
             }
+            #[cfg(target_os = "linux")]
+            crate::kwin::pin_main_window(false);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
+            // Linux: the tapper watches Select itself, through the same signals
+            // nav reads, since this thread may stop while the switcher is up.
+            #[cfg(target_os = "linux")]
+            let select_held = {
+                let signals = Arc::clone(&self.proc_device_signals);
+                let navs = Arc::clone(&self.nav_enabled_devices);
+                move || {
+                    let Ok(navs) = navs.read() else { return false };
+                    signals.load().iter().any(|((dev, pin), v)| {
+                        pin == "btn_back" && matches!(v, Signal::Bool(true)) && navs.contains(dev)
+                    })
+                }
+            };
             let tapper = self
                 .gamepad_nav
                 .key_tapper
-                .get_or_insert_with(flexinput_virtual::windows::UiKeyTapper::new);
+                .get_or_insert_with(flexinput_virtual::UiKeyTapper::new);
+            #[cfg(windows)]
             tapper.alt_down();
+            #[cfg(target_os = "linux")]
+            tapper.alt_down_while(select_held);
             tapper.tap("tab");
         }
         self.gamepad_nav.alt_tab_active = true;
@@ -4489,7 +4507,7 @@ impl FlexInputApp {
             self.alt_tab_release();
             return;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let rs = nav.rstick;
             let mag = rs.length();
@@ -4512,7 +4530,7 @@ impl FlexInputApp {
 
     /// Release a held Alt (ends the switcher) and clear switcher state.
     fn alt_tab_release(&mut self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(tapper) = &mut self.gamepad_nav.key_tapper {
             tapper.alt_up();
         }

@@ -426,6 +426,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
     let viewport_id = egui::ViewportId::from_hash_of("fxi_menu_overlay");
     let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
         .with_title(MENU_OVERLAY_TITLE)
         .with_decorations(false)
         .with_transparent(true)

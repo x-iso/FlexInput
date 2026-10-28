@@ -452,6 +452,7 @@ pub(crate) fn show_subpatch_editors(
         ctx.show_viewport_immediate(
             viewport_id,
             egui::ViewportBuilder::default()
+                .with_app_id(crate::APP_ID)
                 .with_title(window_title)
                 .with_inner_size([720.0, 540.0])
                 .with_min_inner_size([400.0, 300.0]),

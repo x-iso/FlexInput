@@ -558,8 +558,8 @@ pub struct GamepadNav {
     pub config_nav_sel: Option<(egui_snarl::NodeId, egui_snarl::NodeId, String)>,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
-    #[cfg(windows)]
-    pub key_tapper: Option<flexinput_virtual::windows::UiKeyTapper>,
+    #[cfg(any(windows, target_os = "linux"))]
+    pub key_tapper: Option<flexinput_virtual::UiKeyTapper>,
 }
 
 impl Default for GamepadNav {
@@ -644,7 +644,7 @@ impl Default for GamepadNav {
             chord_learn: None,
             chord_draft: Vec::new(),
             chord_arm_idle: false,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             key_tapper: None,
         }
     }

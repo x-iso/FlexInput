@@ -653,6 +653,7 @@ pub(crate) fn show(
         .unwrap_or(egui::vec2(1920.0, 1080.0));
     let viewport_id = egui::ViewportId::from_hash_of("fxi_gyro_cal_overlay");
     let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
         .with_title(TITLE)
         .with_decorations(false)
         .with_transparent(true)

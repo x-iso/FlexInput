@@ -364,6 +364,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
     let viewport_id = egui::ViewportId::from_hash_of("fxi_config_overlay");
     let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
         .with_title(CONFIG_OVERLAY_TITLE)
         .with_decorations(false)
         .with_transparent(true)

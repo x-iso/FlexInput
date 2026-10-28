@@ -285,6 +285,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
     let viewport_id = egui::ViewportId::from_hash_of("fxi_overlay");
     let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
         .with_title(OVERLAY_WINDOW_TITLE)
         .with_decorations(false)
         .with_transparent(true)

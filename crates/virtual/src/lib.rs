@@ -276,6 +276,12 @@ mod physical_mouse {
 #[cfg(target_os = "linux")]
 mod linux;
 
+/// The keyboard the gamepad Alt+Tab switcher presses.
+#[cfg(windows)]
+pub use windows::UiKeyTapper;
+#[cfg(target_os = "linux")]
+pub use linux::UiKeyTapper;
+
 /// One sink-pin write into the encoder's accumulator. Vec2 pins decompose into
 /// the x/y entries; scalar pins pass both views and PinState picks the one it
 /// needs. Shared by every backend that encodes through a HIDMaestro profile.

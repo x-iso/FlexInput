@@ -3,6 +3,8 @@ mod canvas;
 mod capture;
 mod device_led;
 mod device_ops;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod easy;
 mod gamepad_nav;
 mod hidhide_toggle;
@@ -44,6 +46,13 @@ pub use win_app::{onscreen_position, try_become_primary_instance};
 /// pkexec): see `flexinput_devices::linux_hide`.
 #[cfg(target_os = "linux")]
 pub use flexinput_devices::linux_hide::{run_helper as run_linux_hide_helper, HELPER_FLAG as LINUX_HIDE_HELPER_FLAG};
+#[cfg(target_os = "linux")]
+pub use desktop_entry::install as install_desktop_entry;
+
+/// The app id every FlexInput window carries. On Wayland it names the desktop
+/// entry the desktop takes the window's icon from (see `desktop_entry`);
+/// elsewhere it's unused.
+pub const APP_ID: &str = "flexinput";
 
 /// Append a timestamped crash/diagnostic entry to `crash.log` in the per-user
 /// data folder ([`flexinput_core::paths::app_data_dir`]) — the same directory

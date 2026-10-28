@@ -263,6 +263,10 @@ fn main() -> eframe::Result<()> {
     // (rendered from icon_v2.svg). Decoding is instant; rasterizing the
     // source SVG at 256px takes ~45s and was stalling startup.
     let icon = flexinput_ui::render_app_icon().expect("bundled app icon PNG is valid");
+    // Wayland ignores that icon: the desktop takes it from the desktop entry
+    // named by the app id, which this writes.
+    #[cfg(target_os = "linux")]
+    flexinput_ui::install_desktop_entry();
 
     // Transparent viewport is enabled at startup so the runtime "see-through"
     // toggle (eye icon next to the zoom controls) can show whatever is behind
@@ -377,7 +381,8 @@ fn main() -> eframe::Result<()> {
         .with_decorations(false)
         .with_resizable(true)
         .with_transparent(true)
-        .with_icon(icon);
+        .with_icon(icon)
+        .with_app_id(flexinput_ui::APP_ID);
     if let Some(pos) = win_geom.pos {
         viewport = viewport.with_position(pos);
     }

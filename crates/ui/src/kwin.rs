@@ -5,7 +5,8 @@
 //! - one at startup that sets "keep above" on this process's windows whose
 //!   title starts with "FlexInput " (the overlays and the pickers that open
 //!   over a game; the main window is plain "FlexInput" and the sub-patch
-//!   editors start with "✦", so neither matches);
+//!   editors start with "✦", so neither matches), and keeps them out of the
+//!   taskbar and Alt+Tab;
 //! - one per pin toggle that sets or clears it on the main window. Pinning a
 //!   minimized window restores and focuses it, and unpinning minimizes it
 //!   again, as on Windows.
@@ -19,14 +20,19 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Plasma 6 names the window list `windowList` / `windowAdded`, Plasma 5
-/// `clientList` / `clientAdded`. `PID` is replaced with this process's.
+/// The overlays also leave the taskbar and Alt+Tab, as their
+/// `with_taskbar(false)` makes them do on Windows. Plasma 6 names the window
+/// list `windowList` / `windowAdded`, Plasma 5 `clientList` / `clientAdded`.
+/// `PID` is replaced with this process's.
 const OVERLAYS_SCRIPT: &str = r#"// Written by FlexInput (pid PID): keeps its over-the-game windows above
 // other windows. Replaced on FlexInput's next start; inert once it exits.
 (function () {
     function keepAbove(w) {
         if (w && w.pid === PID && String(w.caption).indexOf("FlexInput ") === 0) {
             w.keepAbove = true;
+            w.skipTaskbar = true;
+            w.skipSwitcher = true;
+            w.skipPager = true;
         }
     }
     function watch(w) {

@@ -522,6 +522,7 @@ pub(crate) fn show_over_game<R: Default>(ctx: &egui::Context, f: impl FnOnce(&eg
         .filter(|s| s.x > 1.0 && s.y > 1.0)
         .unwrap_or(egui::vec2(1920.0, 1080.0));
     let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
         .with_title("FlexInput Picker")
         .with_decorations(false)
         .with_transparent(true)

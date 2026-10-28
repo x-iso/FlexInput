@@ -10,6 +10,8 @@ mod uinput;
 
 use crate::{layouts, DeviceKind, SinkPin, SourcePin, VirtualDevice};
 
+pub use uinput::UiKeyTapper;
+
 pub static DEVICE_KINDS: &[DeviceKind] = &[
     DeviceKind { kind_id: "virtual.hm.xinput",    display_name: "Virtual Xbox 360",          allows_multiple: true },
     DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4",       allows_multiple: true },

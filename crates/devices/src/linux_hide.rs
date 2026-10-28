@@ -29,6 +29,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Where the private nodes live. On devtmpfs: the user's runtime dir and /run
 /// are mounted `nodev`, so a device node there can't be opened. Root-owned,
@@ -45,6 +46,28 @@ const RULES_FILE: &str = "/run/udev/rules.d/72-flexinput-hide.rules";
 
 /// The POSIX ACL xattr udev's `uaccess` grants the user through.
 const ACL_XATTR: &str = "system.posix_acl_access";
+
+/// How long a controller that leaves the set stays hidden. FlexInput drops a
+/// controller from the set while it's disconnected, which the eviction below
+/// does to it for a second or two: showing it right away handed it to Steam
+/// as it came back.
+const RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+/// Where the helper looks for the system tools it runs: pkexec gives it a PATH
+/// of the first four, which NixOS doesn't use.
+const TOOL_DIRS: [&str; 7] = [
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/run/current-system/sw/bin",
+];
+
+fn tool(name: &str) -> Option<String> {
+    TOOL_DIRS.iter().map(|d| format!("{d}/{name}")).find(|p| Path::new(p).is_file())
+}
 
 /// The node FlexInput should open for `path`: the public one while it can, else
 /// the private one the helper made for it. For FlexInput's hidraw opens.
@@ -199,7 +222,15 @@ pub fn run_helper() -> i32 {
     }
     // pkexec execs the helper in its own place, so its parent is FlexInput: its
     // handles on a controller aren't someone else's.
-    let mut helper = Helper { uid, parent, set: Vec::new(), evicted: HashSet::new() };
+    let mut helper = Helper {
+        uid,
+        parent,
+        set: Vec::new(),
+        releasing: Vec::new(),
+        evicted: HashSet::new(),
+        rule_since: None,
+        reported: HashSet::new(),
+    };
     let netlink = open_uevent_socket();
     println!("READY");
     let _ = std::io::stdout().flush();
@@ -214,7 +245,8 @@ pub fn run_helper() -> i32 {
         // SAFETY: valid pollfds. A second's timeout re-checks the hidden nodes,
         // in case something (a session switch) granted one to the user again.
         // A signal interrupts it, and the loop condition sees STOP.
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) } < 0 {
+        let timeout = if helper.releasing.is_empty() { 1000 } else { 250 };
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } < 0 {
             continue;
         }
         if fds[0].revents != 0 {
@@ -236,9 +268,10 @@ pub fn run_helper() -> i32 {
                 while unsafe { libc::recv(nl, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) } > 0 {}
             }
         }
+        helper.expire_releases();
         helper.rescan();
     }
-    helper.set_to(Vec::new());
+    helper.release_all();
     let _ = std::fs::remove_dir(PRIVATE_DIR);
     println!("stopped; every controller is visible again");
     0
@@ -248,10 +281,19 @@ struct Helper {
     uid: u32,
     /// FlexInput's pid.
     parent: i32,
+    /// What FlexInput asked to hide.
     set: Vec<(u16, u16)>,
+    /// Controllers that left the set, hidden until their deadline
+    /// ([`RELEASE_GRACE`]).
+    releasing: Vec<((u16, u16), Instant)>,
     /// HID devices already re-attached to cut another program off: once each,
     /// or a program that reopens through other means would loop it.
     evicted: HashSet<PathBuf>,
+    /// When the rule was last written for a non-empty set: a node that turns
+    /// up visible after that slipped past it, which the log says.
+    rule_since: Option<Instant>,
+    /// Nodes (path, device number) already reported as slipping past the rule.
+    reported: HashSet<(String, u64)>,
 }
 
 /// A controller node found in sysfs.
@@ -281,28 +323,77 @@ impl Helper {
         }
     }
 
-    /// Hide exactly `set`: the rule for new nodes, the nodes that exist now, and
-    /// give back what left the set.
+    /// What is hidden: the set, and what left it within the grace period.
+    fn hidden_set(&self) -> Vec<(u16, u16)> {
+        let mut all = self.set.clone();
+        all.extend(self.releasing.iter().map(|(v, _)| *v).filter(|v| !self.set.contains(v)));
+        all.sort_unstable();
+        all
+    }
+
+    /// Hide `set`. What leaves it stays hidden for [`RELEASE_GRACE`].
     fn set_to(&mut self, set: Vec<(u16, u16)>) {
-        let old = std::mem::replace(&mut self.set, set);
-        if old == self.set {
+        let before = self.hidden_set();
+        let deadline = Instant::now() + RELEASE_GRACE;
+        for v in &self.set {
+            if !set.contains(v) && !self.releasing.iter().any(|(r, _)| r == v) {
+                self.releasing.push((*v, deadline));
+            }
+        }
+        // Back in the set: no longer on its way out.
+        self.releasing.retain(|(v, _)| !set.contains(v));
+        self.set = set;
+        self.apply(before);
+    }
+
+    /// Show what's past its grace period.
+    fn expire_releases(&mut self) {
+        let now = Instant::now();
+        if self.releasing.iter().all(|(_, until)| *until > now) {
             return;
         }
-        if let Err(e) = write_rules(&self.set, self.uid) {
-            println!("ERROR writing {RULES_FILE}: {e}");
+        let before = self.hidden_set();
+        self.releasing.retain(|(_, until)| *until > now);
+        self.apply(before);
+    }
+
+    /// Show everything, now: the helper is stopping.
+    fn release_all(&mut self) {
+        let before = self.hidden_set();
+        self.set.clear();
+        self.releasing.clear();
+        self.apply(before);
+    }
+
+    /// Bring the rule and the nodes from hiding `before` to hiding
+    /// [`Self::hidden_set`]: the rule for new nodes, the nodes that exist now,
+    /// and give back what left.
+    fn apply(&mut self, before: Vec<(u16, u16)>) {
+        let after = self.hidden_set();
+        if after == before {
+            return;
+        }
+        match write_rules(&after, self.uid) {
+            Ok(()) => {
+                self.rule_since = (!after.is_empty()).then(Instant::now);
+                println!("RULE {RULES_FILE} for {} controller(s)", after.len());
+            }
+            Err(e) => println!("ERROR writing {RULES_FILE}: {e}"),
         }
         udevadm(&["control", "--reload"]);
-        let dropped: Vec<(u16, u16)> = old.iter().filter(|v| !self.set.contains(v)).copied().collect();
+        let dropped: Vec<(u16, u16)> = before.iter().filter(|v| !after.contains(v)).copied().collect();
         give_back(&dropped);
         let fresh = self.rescan();
         self.evict_holders(&fresh);
+        let _ = std::io::stdout().flush();
     }
 
     /// Take away every node of the set the user can still open — made before
     /// the rule, or granted again since — and drop private nodes whose device
     /// is gone. The nodes it took just now.
     fn rescan(&mut self) -> Vec<Node> {
-        let nodes: Vec<Node> = controller_nodes().into_iter().filter(|n| self.set.contains(&(n.vid, n.pid))).collect();
+        let set = self.hidden_set();
+        let nodes: Vec<Node> = controller_nodes().into_iter().filter(|n| set.contains(&(n.vid, n.pid))).collect();
         let mut fresh: Vec<String> = Vec::new();
         for n in &nodes {
             if revoked(&n.path) {
@@ -316,6 +407,13 @@ impl Helper {
                     }
                 }
                 continue;
+            }
+            // Visible though the rule had a moment to apply: say why, once.
+            if self.rule_since.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+                let key = (n.path.clone(), node_rdev(&n.path).unwrap_or(0));
+                if self.reported.insert(key) {
+                    println!("SLIPPED {}", slipped_report(n));
+                }
             }
             match hide(n, self.uid) {
                 Ok(()) => fresh.push(n.path.clone()),
@@ -451,10 +549,37 @@ fn write_rules(set: &[(u16, u16)], uid: u32) -> std::io::Result<()> {
         };
     }
     std::fs::create_dir_all(Path::new(RULES_FILE).parent().expect("has a parent"))?;
-    std::fs::write(RULES_FILE, rules(set, uid))
+    let tools = RunTools::find();
+    if tools.is_none() {
+        println!("ERROR no sh / mkdir / rm / mknod / chown in {TOOL_DIRS:?}: new nodes get FlexInput's copy late");
+    }
+    std::fs::write(RULES_FILE, rules(set, uid, tools.as_ref()))
 }
 
-fn rules(set: &[(u16, u16)], uid: u32) -> String {
+/// The tools the rule's RUN makes the private node with, by full path: udev
+/// runs it with a PATH of its own, which on NixOS has none of them.
+struct RunTools {
+    sh: String,
+    mkdir: String,
+    rm: String,
+    mknod: String,
+    chown: String,
+}
+
+impl RunTools {
+    fn find() -> Option<Self> {
+        Some(RunTools {
+            sh: tool("sh")?,
+            mkdir: tool("mkdir")?,
+            rm: tool("rm")?,
+            mknod: tool("mknod")?,
+            chown: tool("chown")?,
+        })
+    }
+}
+
+/// `tools: None` leaves the private node to the helper's own rescan.
+fn rules(set: &[(u16, u16)], uid: u32, tools: Option<&RunTools>) -> String {
     let ids: String = set.iter().map(|(v, p)| format!(" {v:04x}:{p:04x}")).collect();
     let mut r = format!(
         "# Written by FlexInput's controller-hiding helper; removed when it exits.\n# set:{ids}\n"
@@ -472,17 +597,50 @@ fn rules(set: &[(u16, u16)], uid: u32) -> String {
     }
     r.push_str("GOTO=\"flexinput_hide_end\"\nLABEL=\"flexinput_hide\"\n");
     r.push_str("ACTION!=\"remove\", TAG-=\"uaccess\", MODE=\"0600\"\n");
-    r.push_str(&format!(
-        "ACTION!=\"remove\", KERNEL==\"hidraw*|event*\", RUN+=\"/bin/sh -c 'mkdir -p {PRIVATE_DIR} \
-         && rm -f {PRIVATE_DIR}/%k && mknod -m 600 {PRIVATE_DIR}/%k c $major $minor \
-         && chown {uid} {PRIVATE_DIR}/%k'\"\n"
-    ));
+    if let Some(RunTools { sh, mkdir, rm, mknod, chown }) = tools {
+        r.push_str(&format!(
+            "ACTION!=\"remove\", KERNEL==\"hidraw*|event*\", RUN+=\"{sh} -c '{mkdir} -p {PRIVATE_DIR} \
+             && {rm} -f {PRIVATE_DIR}/%k && {mknod} -m 600 {PRIVATE_DIR}/%k c $major $minor \
+             && {chown} {uid} {PRIVATE_DIR}/%k'\"\n"
+        ));
+    }
     r.push_str("LABEL=\"flexinput_hide_end\"\n");
     r
 }
 
+/// Why a node of a hidden controller was visible after the rule had time to
+/// apply: its mode, who its ACL grants, and the tags udev left it.
+fn slipped_report(n: &Node) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::symlink_metadata(&n.path) else { return format!("{}: gone", n.name) };
+    let users: Vec<u32> = get_xattr(&n.path, ACL_XATTR)
+        .map(|acl| {
+            acl.get(4..)
+                .unwrap_or_default()
+                .chunks_exact(8)
+                .filter(|e| u16::from_le_bytes([e[0], e[1]]) == 0x02)
+                .map(|e| u32::from_le_bytes([e[4], e[5], e[6], e[7]]))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (major, minor) = (libc::major(m.rdev() as libc::dev_t), libc::minor(m.rdev() as libc::dev_t));
+    let tags: Vec<String> = std::fs::read_to_string(format!("/run/udev/data/c{major}:{minor}"))
+        .map(|db| db.lines().filter(|l| l.starts_with("G:") || l.starts_with("Q:")).map(str::to_string).collect())
+        .unwrap_or_default();
+    format!(
+        "{}: visible after the rule (mode {:o}, ACL users {users:?}, udev tags {tags:?}, rule file {})",
+        n.name,
+        m.mode() & 0o777,
+        if Path::new(RULES_FILE).exists() { "present" } else { "missing" },
+    )
+}
+
 fn udevadm(args: &[&str]) {
-    match std::process::Command::new("udevadm").args(args).status() {
+    let Some(udevadm) = tool("udevadm") else {
+        println!("ERROR udevadm not found in {TOOL_DIRS:?}");
+        return;
+    };
+    match std::process::Command::new(udevadm).args(args).status() {
         Ok(s) if s.success() => {}
         Ok(s) => println!("ERROR udevadm {}: {s}", args.first().copied().unwrap_or("")),
         Err(e) => println!("ERROR udevadm: {e}"),
@@ -749,7 +907,14 @@ mod tests {
 
     #[test]
     fn the_rule_names_each_controller_both_ways_and_records_the_set() {
-        let r = rules(&[(0x057E, 0x2009)], 1000);
+        let tools = RunTools {
+            sh: "/bin/sh".into(),
+            mkdir: "/usr/bin/mkdir".into(),
+            rm: "/usr/bin/rm".into(),
+            mknod: "/usr/bin/mknod".into(),
+            chown: "/usr/bin/chown".into(),
+        };
+        let r = rules(&[(0x057E, 0x2009)], 1000, Some(&tools));
         // FXI_DUMP_RULES=<path> writes it out, for `udevadm verify <path>`.
         if let Ok(out) = std::env::var("FXI_DUMP_RULES") {
             std::fs::write(out, &r).unwrap();
@@ -757,7 +922,8 @@ mod tests {
         assert!(r.contains("# set: 057e:2009\n"), "{r}");
         assert!(r.contains("KERNELS==\"*:057E:2009.*\""), "hidraw by HID device name, upper case");
         assert!(r.contains("ATTRS{id/vendor}==\"057e\", ATTRS{id/product}==\"2009\""), "evdev by input id");
-        assert!(r.contains("chown 1000 /dev/flexinput/%k"));
+        assert!(r.contains("/usr/bin/chown 1000 /dev/flexinput/%k"), "tools by full path");
+        assert!(!rules(&[(0x057E, 0x2009)], 1000, None).contains("RUN+="), "no tools, no RUN");
         assert!(r.contains("DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\""), "never our own UHID pads");
         // The set line reads back.
         let back: Vec<(u16, u16)> = r

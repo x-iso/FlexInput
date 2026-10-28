@@ -188,6 +188,11 @@ enum DeviceKind {
         connection: Option<Connection>,
         /// 4-bit sequence counter for BT output reports (low 4 bits used).
         bt_seq: u8,
+        /// The lightbar setup (fade out the firmware's connect animation, so
+        /// a colour we set shows) has gone out. Once per open: sent with every
+        /// report it faded the bar out every heartbeat, and on Linux, where the
+        /// kernel driver or Steam then sets it again, the bar flashed.
+        lightbar_set_up: bool,
         /// Lazily-initialized WASAPI haptic stream (USB only). `None` while
         /// the audio endpoint hasn't been resolved yet or on non-Windows builds.
         #[cfg(windows)]
@@ -294,7 +299,17 @@ pub(crate) struct OutputState {
     hd2_l_freq: u8,
     hd2_r_amp:  u8,
     hd2_r_freq: u8,
+    /// Which LEDs something in FlexInput has set ([`LED_LIGHTBAR`] …). Only
+    /// those go out flagged valid: an LED nobody set stays the pad's own (or
+    /// its kernel driver's, or Steam's) instead of being written dark every
+    /// heartbeat.
+    leds_owned: u8,
 }
+
+/// [`OutputState::leds_owned`] bits.
+const LED_LIGHTBAR: u8 = 1 << 0;
+const LED_PLAYER: u8 = 1 << 1;
+const LED_MIC: u8 = 1 << 2;
 
 impl OutputState {
     /// Stage one output byte by pin name. `false` for a pin this state does
@@ -324,9 +339,9 @@ impl OutputState {
             "ds_l_freq" => { self.hd_l_freq = byte; true }
             "ds_r_amp"  => { self.hd_r_amp  = byte; true }
             "ds_r_freq" => { self.hd_r_freq = byte; true }
-            "lightbar_r"    => { self.lightbar_r = byte; true }
-            "lightbar_g"    => { self.lightbar_g = byte; true }
-            "lightbar_b"    => { self.lightbar_b = byte; true }
+            "lightbar_r"    => { self.lightbar_r = byte; self.leds_owned |= LED_LIGHTBAR; true }
+            "lightbar_g"    => { self.lightbar_g = byte; self.leds_owned |= LED_LIGHTBAR; true }
+            "lightbar_b"    => { self.lightbar_b = byte; self.leds_owned |= LED_LIGHTBAR; true }
             // Adaptive trigger pins — caller passes Float 0–1 already scaled to
             // the appropriate range before calling set_output_byte:
             //   mode:      0–6  (index into `TriggerMode::ALL`)
@@ -348,8 +363,8 @@ impl OutputState {
             "trigger_l_strength2" => { self.trigger_l_strength2 = byte; true }
             "trigger_l_period"    => { self.trigger_l_period    = byte; true }
             // DualSense LEDs — caller passes scaled byte
-            "player_led" => { self.player_led = byte; true }
-            "mic_led"    => { self.mic_led    = byte; true }
+            "player_led" => { self.player_led = byte; self.leds_owned |= LED_PLAYER; true }
+            "mic_led"    => { self.mic_led    = byte; self.leds_owned |= LED_MIC; true }
             _ => false,
         }
     }
@@ -459,6 +474,7 @@ impl GyroManager {
                         KindTag::DualSense => DeviceKind::DualSense {
                             connection: None,
                             bt_seq: 0,
+                            lightbar_set_up: false,
                             #[cfg(windows)]
                             haptic: None,
                             #[cfg(windows)]
@@ -666,17 +682,19 @@ impl GyroManager {
                 DeviceKind::Ds4 => {
                     hid_write(device, &build_ds4_usb_out(out));
                 }
-                DeviceKind::DualSense { connection, bt_seq, #[cfg(windows)] haptic, #[cfg(windows)] container } => {
+                DeviceKind::DualSense { connection, bt_seq, lightbar_set_up, #[cfg(windows)] haptic, #[cfg(windows)] container } => {
+                    let setup = out.leds_owned & LED_LIGHTBAR != 0 && !*lightbar_set_up;
+                    *lightbar_set_up |= setup;
                     match connection {
                         Some(Connection::Bt) => {
-                            let pkt = build_dualsense_bt_out(out, *bt_seq);
+                            let pkt = build_dualsense_bt_out(out, *bt_seq, setup);
                             *bt_seq = bt_seq.wrapping_add(1) & 0x0F;
                             hid_write(device, &pkt);
                         }
                         // USB (or unknown — default to USB report which is what
                         // the firmware accepts when the device is on interface 3).
                         _ => {
-                            hid_write(device, &build_dualsense_usb_out(out));
+                            hid_write(device, &build_dualsense_usb_out(out, setup));
                             #[cfg(windows)]
                             {
                                 // HD haptics over the USB audio endpoint: synthesize
@@ -832,7 +850,7 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
     let container = matches!(kind_tag, KindTag::DualSense)
         .then(|| dualsense_haptic::container_of_interface(&path))
         .flatten();
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = path;
     device.set_blocking_mode(false).ok()?;
 
@@ -850,7 +868,15 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
         // is a failed open: the entry never ships half-initialized, and the
         // rate-limited retry gets a clean attempt — the old lazy re-init that
         // ran on every read() from the I/O thread is gone.
-        if !init_switch_pro(&device, &mut packet_counter, &mut calib) {
+        // Linux: hid-nintendo, when it has the pad, ran this handshake itself
+        // and keeps it in full report mode with the IMU and rumble on. Running
+        // it again over the driver's head disrupts both; the calibration is
+        // all that's ours to read.
+        #[cfg(target_os = "linux")]
+        let kernel_set_up = hid_driver_of(&path).as_deref() == Some("nintendo");
+        #[cfg(not(target_os = "linux"))]
+        let kernel_set_up = false;
+        if !init_switch_pro(&device, &mut packet_counter, &mut calib, kernel_set_up) {
             return None;
         }
     }
@@ -1016,8 +1042,33 @@ pub(crate) fn switch_pro_fallback_calib() -> SwitchProCalib {
     }
 }
 
-fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<SwitchProCalib>) -> bool {
+/// The kernel driver bound to a hidraw node's HID device (`nintendo`,
+/// `playstation`, `hid-generic`), if any.
+#[cfg(target_os = "linux")]
+fn hid_driver_of(hidraw_path: &str) -> Option<String> {
+    let name = hidraw_path.rsplit('/').next()?;
+    let link = std::fs::read_link(format!("/sys/class/hidraw/{name}/device/driver")).ok()?;
+    Some(link.file_name()?.to_string_lossy().into_owned())
+}
+
+/// `kernel_set_up`: a kernel driver already ran the handshake (Linux's
+/// hid-nintendo); only the stick calibration is read.
+fn init_switch_pro(
+    device: &HidDevice,
+    counter: &mut u8,
+    calib: &mut Option<SwitchProCalib>,
+    kernel_set_up: bool,
+) -> bool {
     let mut buf = [0u8; 64];
+    if kernel_set_up {
+        let reads = SWITCH_PRO_CALIB_READS.map(|(addr, len)| spi_read(device, addr, len, counter, &mut buf));
+        *calib = switch_pro_calib_from_spi(reads[0].as_deref(), reads[1].as_deref(), reads[2].as_deref(), reads[3].as_deref());
+        eprintln!(
+            "[gyro] Switch Pro set up by the kernel driver; read calibration only (cal={})",
+            calib.is_some()
+        );
+        return true;
+    }
 
     // USB handshake (silently ignored / fails on BT — that's fine).
     let _ = device.write(&pad64([0x80, 0x02]));
@@ -1710,7 +1761,9 @@ fn ri16(buf: &[u8], off: usize) -> i16 {
 fn build_ds4_usb_out(out: &OutputState) -> [u8; 32] {
     let mut r = [0u8; 32];
     r[0] = 0x05;                // Report ID
-    r[1] = 0x07;                // valid: bit0 = rumble, bit1 = lightbar, bit2 = flash
+    // valid: bit0 = rumble, bit1 = lightbar, bit2 = flash. The lightbar only
+    // once FlexInput sets it (see `OutputState::leds_owned`).
+    r[1] = if out.leds_owned & LED_LIGHTBAR != 0 { 0x07 } else { 0x01 };
     r[2] = 0x04;                // packet type — must be 0x04
     r[4] = out.rumble_weak;     // small motor (high-freq / right)
     r[5] = out.rumble_strong;   // large motor (low-freq  / left)
@@ -2108,7 +2161,7 @@ fn player_led_mask(idx: u8) -> u8 {
 /// Valid-flag values mirror pydualsense / DS4Windows: enable everything except
 /// One-shot lightbar init report: sends LIGHTBAR_SETUP=LIGHT_ON so the firmware
 /// DualSense USB output report 0x02.
-fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
+fn build_dualsense_usb_out(out: &OutputState, lightbar_setup: bool) -> [u8; 63] {
     // Layout: Linux hid-playstation.c dualsense_output_report_common (47 bytes, __packed).
     // Report ID 0x02 at buf[0]; common struct starts at buf[1] (struct offset + 1).
     //
@@ -2136,7 +2189,7 @@ fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
     // so their 0x00 = our r[1], their 0x2C = our r[45], etc.)
     let mut r = [0u8; 63];
     r[0] = 0x02;
-    fill_dualsense_common(&mut r[1..48], out);
+    fill_dualsense_common(&mut r[1..48], out, lightbar_setup);
     r
 }
 
@@ -2144,12 +2197,12 @@ fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
 /// Wraps the same 47-byte common struct as USB, prefixed with seq_tag + tag
 /// and signed with a CRC32 over the report contents (excluding the 4 CRC bytes).
 /// Without the CRC the firmware silently drops the packet.
-fn build_dualsense_bt_out(out: &OutputState, seq: u8) -> [u8; 78] {
+fn build_dualsense_bt_out(out: &OutputState, seq: u8, lightbar_setup: bool) -> [u8; 78] {
     let mut r = [0u8; 78];
     r[0] = 0x31;                       // report id
     r[1] = (seq & 0x0F) << 4;          // seq_tag: high nibble = sequence, low nibble = 0
     r[2] = 0x10;                       // DS_OUTPUT_TAG
-    fill_dualsense_common(&mut r[3..50], out);
+    fill_dualsense_common(&mut r[3..50], out, lightbar_setup);
     // bytes 50..73 = reserved (zero)
     let crc = dualsense_bt_crc32(&r[..74]);
     r[74..78].copy_from_slice(&crc.to_le_bytes());
@@ -2158,7 +2211,8 @@ fn build_dualsense_bt_out(out: &OutputState, seq: u8) -> [u8; 78] {
 
 /// Populate the 47-byte `dualsense_output_report_common` struct shared by USB
 /// (offset +1) and BT (offset +3). Pure function so both transports stay in sync.
-fn fill_dualsense_common(dst: &mut [u8], out: &OutputState) {
+/// `lightbar_setup` adds the one-shot fade-out of the connect animation.
+fn fill_dualsense_common(dst: &mut [u8], out: &OutputState, lightbar_setup: bool) {
     debug_assert_eq!(dst.len(), 47);
     // +0 valid_flag0:
     //   bit0 COMPATIBLE_VIBRATION  — enables motor_left/motor_right (classic rumble)
@@ -2174,7 +2228,11 @@ fn fill_dualsense_common(dst: &mut [u8], out: &OutputState) {
     //   bit3 RELEASE_LEDS  — must be 0
     //   bit4 PLAYER_INDICATOR_CONTROL_ENABLE
     //   bit7 AUDIO_CONTROL2_ENABLE
-    dst[1] = 0xF7;
+    // The three LED bits only for the LEDs FlexInput sets (`leds_owned`).
+    dst[1] = 0xE2
+        | if out.leds_owned & LED_MIC != 0 { 0x01 } else { 0 }
+        | if out.leds_owned & LED_LIGHTBAR != 0 { 0x04 } else { 0 }
+        | if out.leds_owned & LED_PLAYER != 0 { 0x10 } else { 0 };
     // +2 motor_right (weak / high-freq), +3 motor_left (strong / low-freq)
     dst[2] = out.rumble_weak;
     dst[3] = out.rumble_strong;
@@ -2203,12 +2261,13 @@ fn fill_dualsense_common(dst: &mut [u8], out: &OutputState) {
     dst[10..21].copy_from_slice(&rt);
     dst[21..32].copy_from_slice(&lt);
     // +38 valid_flag2:
-    //   bit1 LIGHTBAR_SETUP_CONTROL_ENABLE
-    //   bit2 COMPATIBLE_VIBRATION2 — newer firmware requires this alongside FLAG0 bit0
-    dst[38] = 0x03;
+    //   bit0 LED_BRIGHTNESS_CONTROL_ENABLE — with the LEDs we set
+    //   bit1 LIGHTBAR_SETUP_CONTROL_ENABLE — the one-shot setup below
+    let leds = out.leds_owned & (LED_LIGHTBAR | LED_PLAYER) != 0;
+    dst[38] = if leds { 0x01 } else { 0 } | if lightbar_setup { 0x02 } else { 0 };
     // +41 lightbar_setup (LIGHT_OUT), +42 led_brightness (0=firmware default),
     // +43 player_leds bitmask, +44..+46 RGB
-    dst[41] = 0x02;
+    dst[41] = if lightbar_setup { 0x02 } else { 0 };
     dst[42] = 0x00;
     dst[43] = player_led_mask(out.player_led);
     dst[44] = out.lightbar_r;
@@ -2491,11 +2550,11 @@ mod tests {
     fn dualsense_bt_crc_is_deterministic() {
         // Two identical reports must produce identical CRCs.
         let out = OutputState::default();
-        let a = build_dualsense_bt_out(&out, 0);
-        let b = build_dualsense_bt_out(&out, 0);
+        let a = build_dualsense_bt_out(&out, 0, false);
+        let b = build_dualsense_bt_out(&out, 0, false);
         assert_eq!(a, b);
         // Different sequence numbers produce different CRCs (seq is covered).
-        let c = build_dualsense_bt_out(&out, 1);
+        let c = build_dualsense_bt_out(&out, 1, false);
         assert_ne!(a[74..78], c[74..78], "seq counter must affect CRC");
     }
 
@@ -2510,15 +2569,15 @@ mod tests {
         out.lightbar_r    = 0x10;
         out.lightbar_g    = 0x20;
         out.lightbar_b    = 0x30;
-        let usb = build_dualsense_usb_out(&out);
-        let bt  = build_dualsense_bt_out(&out, 0);
+        let usb = build_dualsense_usb_out(&out, false);
+        let bt  = build_dualsense_bt_out(&out, 0, false);
         assert_eq!(&usb[1..48], &bt[3..50], "common struct must be identical");
     }
 
     #[test]
     fn dualsense_bt_report_has_correct_framing() {
         let out = OutputState::default();
-        let bt  = build_dualsense_bt_out(&out, 0x5);
+        let bt  = build_dualsense_bt_out(&out, 0x5, false);
         assert_eq!(bt[0], 0x31);              // report id
         assert_eq!(bt[1], 0x50);              // seq high-nibble = 5, low = 0
         assert_eq!(bt[2], 0x10);              // DS_OUTPUT_TAG
@@ -2528,9 +2587,33 @@ mod tests {
     #[test]
     fn dualsense_usb_report_has_correct_framing() {
         let out = OutputState::default();
-        let usb = build_dualsense_usb_out(&out);
+        let usb = build_dualsense_usb_out(&out, false);
         assert_eq!(usb[0], 0x02);             // report id
         assert_eq!(usb.len(), 63);            // DS_OUTPUT_REPORT_USB_SIZE
+    }
+
+    /// Rumble alone claims no LED: a pad's lightbar, player and mic LEDs stay
+    /// whatever its driver or another program set until FlexInput sets one.
+    /// The lightbar setup (fade out) goes only when asked, once per open.
+    #[test]
+    fn only_the_leds_flexinput_sets_are_written() {
+        let mut out = OutputState::default();
+        out.stage("rumble_strong", 0x80);
+        let usb = build_dualsense_usb_out(&out, false);
+        assert_eq!(usb[2] & 0x15, 0, "no mic / lightbar / player-LED control");
+        assert_eq!((usb[39], usb[42]), (0, 0), "no brightness, no lightbar setup");
+        assert_eq!(build_ds4_usb_out(&out)[1], 0x01, "DS4: rumble only");
+
+        out.stage("lightbar_b", 0xFF);
+        let usb = build_dualsense_usb_out(&out, true);
+        assert_eq!(usb[2] & 0x15, 0x04, "the lightbar, and only it");
+        assert_eq!((usb[39], usb[42]), (0x03, 0x02), "brightness + the one-shot fade out");
+        assert_eq!(build_dualsense_usb_out(&out, false)[42], 0, "fade out only when asked");
+        assert_eq!(build_ds4_usb_out(&out)[1], 0x07, "DS4: rumble + lightbar");
+
+        out.stage("player_led", 1);
+        out.stage("mic_led", 1);
+        assert_eq!(build_dualsense_usb_out(&out, false)[2] & 0x15, 0x15);
     }
 
     #[test]
@@ -2539,7 +2622,7 @@ mod tests {
         let mut out = OutputState::default();
         out.rumble_weak   = 0xAA; // → motor_right
         out.rumble_strong = 0xBB; // → motor_left
-        let usb = build_dualsense_usb_out(&out);
+        let usb = build_dualsense_usb_out(&out, false);
         assert_eq!(usb[3], 0xAA, "motor_right (rumble_weak) at USB byte 3");
         assert_eq!(usb[4], 0xBB, "motor_left  (rumble_strong) at USB byte 4");
     }
