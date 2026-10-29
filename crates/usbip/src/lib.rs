@@ -8,7 +8,9 @@
 //! virtual host controller attaches it: Windows then binds its own
 //! usbaudio.sys and hidusb to a device that is a real pad at every level a
 //! filter can inspect, and a game streams its authored haptic waveforms to it
-//! as it would to the pad.
+//! as it would to the pad. Linux's UHID has the same limit, and the kernel's
+//! own USB/IP host controller attaches the same server's device there
+//! (`vhci_linux.rs`, as [`vhci`]).
 //!
 //! Port of HIDMaestro's usbip backend (hifihedgehog/HIDMaestro,
 //! `sdk/HIDMaestro.Core/Internal/Usbip`, MIT) — its protocol, descriptor,
@@ -26,6 +28,9 @@ mod feature;
 mod pacer;
 mod server;
 #[cfg(windows)]
+pub mod vhci;
+#[cfg(target_os = "linux")]
+#[path = "vhci_linux.rs"]
 pub mod vhci;
 
 use std::sync::Arc;
@@ -71,13 +76,11 @@ pub fn serial_for(key: &str) -> String {
 
 /// Whether a USB serial is one [`serial_for`] makes.
 pub fn is_own_serial(serial: &str) -> bool {
-    serial.len() == 14
-        && serial.starts_with("FX")
-        && serial[2..].bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+    flexinput_core::own_virtual::is_own_usb_serial(serial)
 }
 
 /// One composite device, registered with the process's USB/IP server and
-/// waiting for usbip-win2 to attach it. Dropping it unregisters the device and
+/// waiting for the host controller to attach it. Dropping it unregisters the device and
 /// closes its connection; detach it from the host controller first, so the
 /// driver closes the socket and unplugs the device cleanly.
 pub struct EmulatedDevice {

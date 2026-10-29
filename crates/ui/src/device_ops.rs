@@ -142,6 +142,16 @@ fn worker_loop(
                         eprintln!("[device-ops] usbip-win2 install failed: {e}");
                     }
                 }
+                // On Linux the kernel's USB/IP host controller: the build
+                // below sets it up (one password prompt) under this overlay.
+                #[cfg(target_os = "linux")]
+                if flexinput_virtual::has_usb_audio(&device_id) && !flexinput_usbip::vhci::is_available() {
+                    set(Some(DeviceOpProgress {
+                        kind: ProgressKind::Installing,
+                        label: "Setting up USB audio support…".into(),
+                        detail: Some("One-time setup: Linux asks for your password.".into()),
+                    }));
+                }
                 set(Some(DeviceOpProgress::new(
                     ProgressKind::Deploying,
                     format!("Deploying {}…", friendly(&device_id)),

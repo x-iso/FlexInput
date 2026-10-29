@@ -595,6 +595,16 @@ impl Gamepad {
                 return None;
             }
         };
+        // FLEXINPUT PATCH: FlexInput's pads with USB audio are real USB
+        // devices to the kernel (attached over USB/IP), told by the serial
+        // FlexInput gave them. Their uuid gets the version FlexInput's uinput
+        // and UHID pads carry, the mark FlexInput reads its own pads by
+        // (flexinput_core::own_virtual).
+        let input_id = if flexinput_own_usb(syspath) {
+            ioctl::input_id { version: FLEXINPUT_OWN_VERSION, ..input_id }
+        } else {
+            input_id
+        };
 
         let name = Self::get_name(fd).unwrap_or_else(|| {
             error!("Failed to get name of device {:?}", path);
@@ -1072,6 +1082,30 @@ pub(crate) fn flexinput_private_node(path: &[u8]) -> Option<CString> {
     let mut private = b"/dev/flexinput/".to_vec();
     private.extend_from_slice(name);
     CString::new(private).ok()
+}
+
+/// FLEXINPUT PATCH: `flexinput_core::own_virtual::VERSION`.
+const FLEXINPUT_OWN_VERSION: u16 = 0xF1E0;
+
+/// FLEXINPUT PATCH: whether the input device at `syspath` hangs off a USB
+/// device whose serial FlexInput made ("FX" and twelve uppercase hex digits;
+/// `flexinput_core::own_virtual::sysfs_usb_is_own`, inlined: this crate can't
+/// depend on FlexInput's).
+fn flexinput_own_usb(syspath: &Path) -> bool {
+    let Ok(mut dir) = std::fs::canonicalize(syspath) else { return false };
+    loop {
+        if dir.join("idVendor").exists() {
+            if let Ok(serial) = std::fs::read_to_string(dir.join("serial")) {
+                let s = serial.trim();
+                return s.len() == 14
+                    && s.starts_with("FX")
+                    && s[2..].bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b));
+            }
+        }
+        if !dir.pop() || dir.as_os_str() == "/sys/devices" {
+            return false;
+        }
+    }
 }
 
 fn create_uuid(iid: ioctl::input_id) -> Uuid {

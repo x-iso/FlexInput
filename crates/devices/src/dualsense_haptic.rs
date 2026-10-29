@@ -1,4 +1,5 @@
-//! DualSense HD haptics over WASAPI.
+//! DualSense HD haptics over the pad's USB audio: WASAPI on Windows, ALSA on
+//! Linux.
 //!
 //! The PS5 firmware exposes the controller as a 4-channel USB audio render
 //! endpoint:
@@ -12,23 +13,31 @@
 //! the waveform encodes. Bluetooth does not expose the audio endpoint, so this
 //! path is USB-only — the caller filters by `Connection::Usb` before opening.
 //!
-//! The render thread runs WASAPI in shared mode (event-driven) and pulls fresh
-//! amplitude/frequency targets from an atomic each period. The atomic shape
-//! lets the gyro I/O thread call `set_targets()` without blocking.
+//! The render thread pulls fresh amplitude/frequency targets from an atomic
+//! each period. The atomic shape lets the gyro I/O thread call `set_targets()`
+//! without blocking. On Windows it runs WASAPI in shared mode (event-driven);
+//! on Linux it writes the pad's own sound card, found through sysfs from its
+//! hidraw node, which it then holds (no other program can play to the pad
+//! meanwhile).
 
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
+#[cfg(windows)]
 use wasapi::{
     initialize_mta, AudioClient, AudioRenderClient, DeviceCollection, Direction, SampleType,
     StreamMode, WaveFormat,
 };
 
+#[cfg(windows)]
 use crate::devnode::container_of_endpoint;
+#[cfg(windows)]
 pub use crate::devnode::{container_of_interface, ContainerId};
+#[cfg(target_os = "linux")]
+pub use linux::{container_of_interface, ContainerId};
 
 /// Frequency range exposed by the `ds_l_freq` / `ds_r_freq` pins.
 /// The DualSense LRAs resonate around ~160 Hz; useful band is ~80–500 Hz.
@@ -59,11 +68,12 @@ pub struct HapticStream {
 impl HapticStream {
     /// Start the render thread on the audio endpoint of the pad in `container`
     /// (see [`container_of_interface`]). With `None` — the pad's container
-    /// couldn't be read — it takes the first DualSense-named endpoint, which
-    /// can be the wrong pad's or a virtual one's. The thread exits if no
-    /// endpoint matches (controller not on USB, or its audio driver hasn't
-    /// enumerated yet).
-    pub fn open(container: Option<ContainerId>) -> Option<Self> {
+    /// couldn't be read — Windows takes the first DualSense-named endpoint,
+    /// which can be the wrong pad's or a virtual one's, and Linux gives up.
+    /// The thread exits if no endpoint matches (controller not on USB, or its
+    /// audio driver hasn't enumerated yet).
+    pub fn open(container: Option<&ContainerId>) -> Option<Self> {
+        let container = container.cloned();
         let shared = Arc::new(Shared {
             targets: AtomicU32::new(0),
             targets2: AtomicU32::new(0),
@@ -74,7 +84,11 @@ impl HapticStream {
         let thread = thread::Builder::new()
             .name("dualsense-haptic".into())
             .spawn(move || {
-                if let Err(e) = render_loop(shared_for_thread, container) {
+                #[cfg(windows)]
+                let result = render_loop(shared_for_thread, container);
+                #[cfg(target_os = "linux")]
+                let result = linux::render_loop(shared_for_thread, container);
+                if let Err(e) = result {
                     #[cfg(debug_assertions)]
                     eprintln!("[ds-haptic] render loop exited: {e}");
                     let _ = e;
@@ -114,8 +128,57 @@ impl Drop for HapticStream {
     }
 }
 
+// ── synthesis ─────────────────────────────────────────────────────────────────
+
+/// Both carriers per LRA as continuous-phase sines, retuned each period from
+/// the latest targets. The two carriers are summed per actuator and kept
+/// within the drive ceiling, so two loud ones don't clip past the safe
+/// amplitude.
+#[derive(Default)]
+struct Synth {
+    /// Per sine — left LF, right LF, left HF, right HF — its phase, its phase
+    /// step per sample and its drive, the last two for the current period.
+    phase: [f32; 4],
+    step: [f32; 4],
+    drive: [f32; 4],
+}
+
+impl Synth {
+    /// Take the latest amp/freq snapshot, both carriers.
+    fn retune(&mut self, shared: &Shared, sample_rate: f32) {
+        let unpack = |packed: u32| {
+            (
+                (packed         & 0xFF) as f32 / 255.0, // l_amp
+                ((packed >>  8) & 0xFF) as f32 / 255.0, // l_freq
+                ((packed >> 16) & 0xFF) as f32 / 255.0, // r_amp
+                ((packed >> 24) & 0xFF) as f32 / 255.0, // r_freq
+            )
+        };
+        let (l1_amp, l1_freq, r1_amp, r1_freq) = unpack(shared.targets.load(Ordering::Acquire));
+        let (l2_amp, l2_freq, r2_amp, r2_freq) = unpack(shared.targets2.load(Ordering::Acquire));
+        let hz = |f: f32| FREQ_MIN_HZ + f * (FREQ_MAX_HZ - FREQ_MIN_HZ);
+        self.step = [l1_freq, r1_freq, l2_freq, r2_freq].map(|f| std::f32::consts::TAU * hz(f) / sample_rate);
+        self.drive = [l1_amp, r1_amp, l2_amp, r2_amp].map(|a| a * DRIVE_CEILING);
+    }
+
+    /// The next sample for the left and right LRA, in -1..1.
+    fn next(&mut self) -> (f32, f32) {
+        let s = |i: usize| self.drive[i] * self.phase[i].sin();
+        let l = (s(0) + s(2)).clamp(-1.0, 1.0);
+        let r = (s(1) + s(3)).clamp(-1.0, 1.0);
+        for (phase, step) in self.phase.iter_mut().zip(self.step) {
+            *phase += step;
+            if *phase > std::f32::consts::TAU {
+                *phase -= std::f32::consts::TAU;
+            }
+        }
+        (l, r)
+    }
+}
+
 // ── render thread ─────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
 fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<(), String> {
     // COM init for this thread (MTA — matches what the wasapi crate documents).
     // Ignored if already initialized.
@@ -131,13 +194,7 @@ fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<()
 
     client.start_stream().map_err(|e| format!("start: {e}"))?;
 
-    // Continuous-phase sine oscillators per side, per carrier (LF + HF).
-    let mut phase_l: f32 = 0.0;   // carrier 1 (LF) left
-    let mut phase_r: f32 = 0.0;   // carrier 1 (LF) right
-    let mut phase_l2: f32 = 0.0;  // carrier 2 (HF) left
-    let mut phase_r2: f32 = 0.0;  // carrier 2 (HF) right
-    let two_pi = std::f32::consts::TAU;
-
+    let mut synth = Synth::default();
     let mut scratch: Vec<u8> = Vec::new();
 
     while shared.running.load(Ordering::Acquire) {
@@ -156,37 +213,9 @@ fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<()
         let needed = frames * bytes_per_frame;
         if scratch.len() != needed { scratch.resize(needed, 0); }
 
-        // Latest amp/freq snapshot for this period — both carriers.
-        let unpack = |packed: u32| {
-            (
-                (packed         & 0xFF) as f32 / 255.0, // l_amp
-                ((packed >>  8) & 0xFF) as f32 / 255.0, // l_freq
-                ((packed >> 16) & 0xFF) as f32 / 255.0, // r_amp
-                ((packed >> 24) & 0xFF) as f32 / 255.0, // r_freq
-            )
-        };
-        let (l1_amp, l1_freq, r1_amp, r1_freq) = unpack(shared.targets.load(Ordering::Acquire));
-        let (l2_amp, l2_freq, r2_amp, r2_freq) = unpack(shared.targets2.load(Ordering::Acquire));
-
-        let hz = |f: f32| FREQ_MIN_HZ + f * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        let step = |f: f32| two_pi * hz(f) / sample_rate;
-        let l1_step = step(l1_freq); let r1_step = step(r1_freq);
-        let l2_step = step(l2_freq); let r2_step = step(r2_freq);
-        // Each carrier is driven independently; we sum then keep the LRA within the
-        // drive ceiling (so two loud carriers don't clip past the safe amplitude).
-        let l1_d = l1_amp * DRIVE_CEILING; let r1_d = r1_amp * DRIVE_CEILING;
-        let l2_d = l2_amp * DRIVE_CEILING; let r2_d = r2_amp * DRIVE_CEILING;
-
+        synth.retune(&shared, sample_rate);
         for f in 0..frames {
-            let sl = (l1_d * phase_l.sin() + l2_d * phase_l2.sin()).clamp(-1.0, 1.0);
-            let sr = (r1_d * phase_r.sin() + r2_d * phase_r2.sin()).clamp(-1.0, 1.0);
-            phase_l  += l1_step; phase_r  += r1_step;
-            phase_l2 += l2_step; phase_r2 += r2_step;
-            if phase_l  > two_pi { phase_l  -= two_pi; }
-            if phase_r  > two_pi { phase_r  -= two_pi; }
-            if phase_l2 > two_pi { phase_l2 -= two_pi; }
-            if phase_r2 > two_pi { phase_r2 -= two_pi; }
-
+            let (sl, sr) = synth.next();
             let off = f * bytes_per_frame;
             write_frame(&mut scratch[off..off + bytes_per_frame], channels, &sample_type, sl, sr);
         }
@@ -203,6 +232,7 @@ fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<()
 /// Write one interleaved frame: silence on channels 1/2 (headphone L/R) and
 /// the haptic sine on channels 3/4 (left/right LRA). Extra channels (5.1 / 7.1
 /// pseudo-layouts) are zeroed defensively, though DualSense always reports 4.
+#[cfg(windows)]
 fn write_frame(frame: &mut [u8], channels: usize, sample_type: &SampleType, hl: f32, hr: f32) {
     // For each channel position, the sample value we want.
     let pick = |ch: usize| -> f32 {
@@ -257,6 +287,7 @@ fn write_frame(frame: &mut [u8], channels: usize, sample_type: &SampleType, hl: 
 /// Without a container, the first 4-channel endpoint whose friendly name
 /// contains "Wireless Controller" (Sony's USB Audio product name, shared by
 /// DS4 and DualSense) or "DualSense" (some Windows drivers).
+#[cfg(windows)]
 fn open_dualsense_stream(
     container: Option<ContainerId>,
 ) -> Option<(AudioClient, AudioRenderClient, WaveFormat, wasapi::Handle)> {
@@ -298,4 +329,142 @@ fn open_dualsense_stream(
         return Some((client, render, fmt, event));
     }
     None
+}
+
+// ── Linux: ALSA ───────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Shared, Synth};
+
+    /// The pad's USB device, as its sysfs directory: its sound card hangs off
+    /// the same one.
+    pub type ContainerId = PathBuf;
+
+    /// The USB device behind a hidraw node (hidapi's `/dev/hidrawN`, or the
+    /// private twin of a hidden pad, `/dev/flexinput/hidrawN`). `None` off USB
+    /// (Bluetooth).
+    pub fn container_of_interface(path: &str) -> Option<ContainerId> {
+        let name = path.rsplit('/').next()?;
+        let mut dir = std::fs::canonicalize(format!("/sys/class/hidraw/{name}/device")).ok()?;
+        loop {
+            if dir.join("idVendor").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() || dir.as_os_str() == "/sys/devices" {
+                return None;
+            }
+        }
+    }
+
+    /// The number of the sound card on the USB device `usb`.
+    fn sound_card_of(usb: &Path) -> Option<u32> {
+        std::fs::read_dir("/sys/class/sound").ok()?.flatten().find_map(|e| {
+            let n: u32 = e.file_name().to_str()?.strip_prefix("card")?.parse().ok()?;
+            // A card's device is the USB interface it was made for.
+            let interface = std::fs::canonicalize(e.path().join("device")).ok()?;
+            (interface.parent()? == usb).then_some(n)
+        })
+    }
+
+    const RATE: u32 = 48_000;
+    const CHANNELS: usize = 4;
+    /// 5 ms periods, four buffered: about the Windows path's 10 ms
+    /// shared-mode buffer.
+    const PERIOD: usize = 240;
+    /// How soon a card that's busy or not there yet is tried again.
+    const RETRY: Duration = Duration::from_millis(500);
+
+    pub(super) fn render_loop(shared: Arc<Shared>, container: Option<ContainerId>) -> Result<(), String> {
+        use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
+        use alsa::{Direction, ValueOr};
+
+        let usb = container.ok_or("the pad isn't on USB")?;
+        // Opened non-blocking: a card another program holds (PipeWire, while
+        // something plays to the pad) fails at once instead of parking this
+        // thread past `Drop`, and is tried again.
+        let pcm = loop {
+            if !shared.running.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(card) = sound_card_of(&usb) {
+                if let Ok(pcm) = PCM::new(&format!("hw:{card},0"), Direction::Playback, true) {
+                    break pcm;
+                }
+            }
+            if !usb.exists() {
+                return Err("the pad went away".into());
+            }
+            std::thread::sleep(RETRY);
+        };
+        {
+            let e = |what: &str, e: alsa::Error| format!("{what}: {e}");
+            let hwp = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
+            hwp.set_access(Access::RWInterleaved).map_err(|x| e("access", x))?;
+            hwp.set_format(Format::s16()).map_err(|x| e("format", x))?;
+            hwp.set_channels(CHANNELS as u32).map_err(|x| e("channels", x))?;
+            hwp.set_rate(RATE, ValueOr::Nearest).map_err(|x| e("rate", x))?;
+            hwp.set_period_size_near(PERIOD as Frames, ValueOr::Nearest).map_err(|x| e("period", x))?;
+            hwp.set_buffer_size_near(4 * PERIOD as Frames).map_err(|x| e("buffer", x))?;
+            pcm.hw_params(&hwp).map_err(|x| e("hw params", x))?;
+        }
+        let rate = pcm.hw_params_current().and_then(|h| h.get_rate()).map_err(|e| format!("rate: {e}"))? as f32;
+        let io = pcm.io_i16().map_err(|e| format!("io: {e}"))?;
+
+        let mut synth = Synth::default();
+        let mut buf = vec![0i16; PERIOD * CHANNELS];
+        while shared.running.load(Ordering::Acquire) {
+            // 100 ms ceiling, so unplugging the pad can't trap the thread.
+            if let Err(e) = pcm.wait(Some(100)) {
+                pcm.try_recover(e, true).map_err(|e| format!("wait: {e}"))?;
+                continue;
+            }
+            let frames = match pcm.avail_update() {
+                Ok(n) => (n.max(0) as usize).min(PERIOD),
+                Err(e) => {
+                    pcm.try_recover(e, true).map_err(|e| format!("avail: {e}"))?;
+                    continue;
+                }
+            };
+            if frames == 0 {
+                continue;
+            }
+            synth.retune(&shared, rate);
+            for frame in buf.chunks_exact_mut(CHANNELS).take(frames) {
+                let (l, r) = synth.next();
+                // Headphones silent, the actuators on channels 3 and 4.
+                frame.copy_from_slice(&[0, 0, (l * 32767.0) as i16, (r * 32767.0) as i16]);
+            }
+            if let Err(e) = io.writei(&buf[..frames * CHANNELS]) {
+                pcm.try_recover(e, true).map_err(|e| format!("write: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_synth_drives_only_the_targeted_actuator() {
+        // Left LF carrier at full amplitude, mid band; everything else off.
+        let shared = Shared {
+            targets: AtomicU32::new(0xFF | (0x80 << 8)),
+            targets2: AtomicU32::new(0),
+            running: AtomicBool::new(true),
+        };
+        let mut synth = Synth::default();
+        synth.retune(&shared, 48_000.0);
+        let samples: Vec<(f32, f32)> = (0..480).map(|_| synth.next()).collect();
+        let peak = samples.iter().map(|s| s.0.abs()).fold(0.0, f32::max);
+        assert!((peak - DRIVE_CEILING).abs() < 0.01, "left peaks at the drive ceiling: {peak}");
+        assert!(samples.iter().all(|s| s.1 == 0.0), "right silent");
+    }
 }

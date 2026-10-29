@@ -647,15 +647,18 @@ fn rules(set: &[(u16, u16)], uid: u32, tools: Option<&RunTools>) -> String {
     let mut r = format!(
         "# Written by FlexInput's controller-hiding helper; removed when it exits.\n# set:{ids}\n"
     );
+    // Never FlexInput's own pads of the same model: UHID ones, and the ones
+    // with USB audio, which hang off the kernel's USB/IP host controller.
     for (v, p) in set {
         r.push_str(&format!(
             "SUBSYSTEM==\"hidraw\", KERNELS==\"*:{v:04X}:{p:04X}.*\", \
-             DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\", GOTO=\"flexinput_hide\"\n"
+             DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\", DEVPATH!=\"/devices/platform/vhci_hcd.*\", \
+             GOTO=\"flexinput_hide\"\n"
         ));
         r.push_str(&format!(
             "SUBSYSTEM==\"input\", KERNEL==\"event*|js*\", DEVPATH!=\"/devices/virtual/input/*\", \
-             DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\", ATTRS{{id/vendor}}==\"{v:04x}\", \
-             ATTRS{{id/product}}==\"{p:04x}\", GOTO=\"flexinput_hide\"\n"
+             DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\", DEVPATH!=\"/devices/platform/vhci_hcd.*\", \
+             ATTRS{{id/vendor}}==\"{v:04x}\", ATTRS{{id/product}}==\"{p:04x}\", GOTO=\"flexinput_hide\"\n"
         ));
     }
     r.push_str("GOTO=\"flexinput_hide_end\"\nLABEL=\"flexinput_hide\"\n");
@@ -767,9 +770,11 @@ fn clean_private_dir(hidden: &[Node]) {
 }
 
 /// Every hidraw, evdev and js node of a real controller, with its vendor and
-/// product id. Left out: FlexInput's own virtual devices (their phys says so)
-/// and any program's uinput devices (Steam's, other mappers').
+/// product id. Left out: FlexInput's own virtual devices (their phys says so,
+/// or for a pad with USB audio its USB serial) and any program's uinput
+/// devices (Steam's, other mappers').
 fn controller_nodes() -> Vec<Node> {
+    use flexinput_core::own_virtual::{sysfs_usb_is_own, PHYS_PREFIX};
     let mut out = Vec::new();
     if let Ok(dir) = std::fs::read_dir("/sys/class/hidraw") {
         for e in dir.flatten() {
@@ -777,7 +782,7 @@ fn controller_nodes() -> Vec<Node> {
             let Ok(sysdev) = std::fs::canonicalize(e.path().join("device")) else { continue };
             let Ok(uevent) = std::fs::read_to_string(sysdev.join("uevent")) else { continue };
             let field = |k: &str| uevent.lines().find_map(|l| l.strip_prefix(k)).map(str::to_string);
-            if field("HID_PHYS=").is_some_and(|p| p.starts_with(flexinput_core::own_virtual::PHYS_PREFIX)) {
+            if field("HID_PHYS=").is_some_and(|p| p.starts_with(PHYS_PREFIX)) || sysfs_usb_is_own(&sysdev) {
                 continue;
             }
             // HID_ID=0005:0000057E:00002009
@@ -802,7 +807,7 @@ fn controller_nodes() -> Vec<Node> {
                 continue;
             }
             let read = |f: &str| std::fs::read_to_string(sysdev.join(f)).map(|s| s.trim().to_string()).ok();
-            if read("phys").is_some_and(|p| p.starts_with(flexinput_core::own_virtual::PHYS_PREFIX)) {
+            if read("phys").is_some_and(|p| p.starts_with(PHYS_PREFIX)) || sysfs_usb_is_own(&sysdev) {
                 continue;
             }
             let hex = |f: &str| read(f).and_then(|s| u16::from_str_radix(&s, 16).ok());
@@ -988,6 +993,7 @@ mod tests {
         assert!(r.contains("/usr/bin/chown 1000 /dev/flexinput/%k"), "tools by full path");
         assert!(!rules(&[(0x057E, 0x2009)], 1000, None).contains("RUN+="), "no tools, no RUN");
         assert!(r.contains("DEVPATH!=\"/devices/virtual/misc/uhid/0003:*\""), "never our own UHID pads");
+        assert!(r.contains("DEVPATH!=\"/devices/platform/vhci_hcd.*\""), "nor the ones with USB audio");
         // The set line reads back.
         let back: Vec<(u16, u16)> = r
             .lines()

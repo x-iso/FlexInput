@@ -3,6 +3,23 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.4] - 2026-10-29
+
+### Added
+
+- **Audio & Haptics on Linux.** As on Windows, the virtual DualSense and
+  DualSense Edge can now come with their USB audio on Linux: a speaker and
+  haptics output and a microphone, so games that author HD haptics stream
+  them to FlexInput. Linux sees them as real wired pads, attached through
+  the kernel's USB/IP host controller. The first time, Linux asks for your
+  password once to set that up.
+
+- **HD haptics on a wired DualSense on Linux.** FlexInput now plays HD
+  haptics on a DualSense connected by USB on Linux, as it does on Windows:
+  the HD haptics outputs, Audio Stream Haptics, or a game's haptics passed
+  on from the virtual pad. They play on the pad's own sound card, so while
+  they do, no other program can play sound to the pad.
+
 ## [0.16.3] - 2026-10-28
 
 ### Added

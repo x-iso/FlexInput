@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 use crate::spike::SpikeFilter;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::dualsense_haptic;
 
 const SONY_VID: u16           = 0x054C;
@@ -193,13 +193,14 @@ enum DeviceKind {
         /// report it faded the bar out every heartbeat, and on Linux, where the
         /// kernel driver or Steam then sets it again, the bar flashed.
         lightbar_set_up: bool,
-        /// Lazily-initialized WASAPI haptic stream (USB only). `None` while
-        /// the audio endpoint hasn't been resolved yet or on non-Windows builds.
-        #[cfg(windows)]
+        /// Lazily-initialized haptic stream (USB only; WASAPI, or ALSA on
+        /// Linux). `None` while the audio endpoint hasn't been resolved yet.
+        #[cfg(any(windows, target_os = "linux"))]
         haptic: Option<dualsense_haptic::HapticStream>,
-        /// The pad's device container, read at open: the haptic stream opens
-        /// the audio endpoint that shares it. `None` if Windows couldn't say.
-        #[cfg(windows)]
+        /// The pad's device container (on Linux its USB device), read at
+        /// open: the haptic stream opens the audio endpoint that shares it.
+        /// `None` if the system couldn't say.
+        #[cfg(any(windows, target_os = "linux"))]
         container: Option<dualsense_haptic::ContainerId>,
     },
     SwitchPro {
@@ -411,7 +412,7 @@ struct OpenedDevice {
     calib: Option<SwitchProCalib>,
     packet_counter: u8,
     /// DualSense only: the pad's device container (see `DeviceKind::DualSense`).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     container: Option<dualsense_haptic::ContainerId>,
 }
 
@@ -475,9 +476,9 @@ impl GyroManager {
                             connection: None,
                             bt_seq: 0,
                             lightbar_set_up: false,
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             haptic: None,
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             container: o.container,
                         },
                         KindTag::SwitchPro => DeviceKind::SwitchPro {
@@ -682,7 +683,11 @@ impl GyroManager {
                 DeviceKind::Ds4 => {
                     hid_write(device, &build_ds4_usb_out(out));
                 }
-                DeviceKind::DualSense { connection, bt_seq, lightbar_set_up, #[cfg(windows)] haptic, #[cfg(windows)] container } => {
+                DeviceKind::DualSense {
+                    connection, bt_seq, lightbar_set_up,
+                    #[cfg(any(windows, target_os = "linux"))] haptic,
+                    #[cfg(any(windows, target_os = "linux"))] container,
+                } => {
                     let setup = out.leds_owned & LED_LIGHTBAR != 0 && !*lightbar_set_up;
                     *lightbar_set_up |= setup;
                     match connection {
@@ -695,7 +700,7 @@ impl GyroManager {
                         // the firmware accepts when the device is on interface 3).
                         _ => {
                             hid_write(device, &build_dualsense_usb_out(out, setup));
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             {
                                 // HD haptics over the USB audio endpoint: synthesize
                                 // BOTH carriers (LF = hd_*, HF = hd2_*) as PCM sines
@@ -704,7 +709,7 @@ impl GyroManager {
                                 let want_haptic = out.hd_l_amp != 0 || out.hd_r_amp != 0
                                     || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
                                 if want_haptic && haptic.is_none() {
-                                    *haptic = dualsense_haptic::HapticStream::open(*container);
+                                    *haptic = dualsense_haptic::HapticStream::open(container.as_ref());
                                 }
                                 if let Some(h) = haptic.as_mut() {
                                     h.set_targets_dual(
@@ -845,8 +850,8 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
             }
         }
     };
-    // Outside the api lock: a CfgMgr32 lookup, nothing hidapi needs.
-    #[cfg(windows)]
+    // Outside the api lock: a CfgMgr32 (or sysfs) lookup, nothing hidapi needs.
+    #[cfg(any(windows, target_os = "linux"))]
     let container = matches!(kind_tag, KindTag::DualSense)
         .then(|| dualsense_haptic::container_of_interface(&path))
         .flatten();
@@ -882,7 +887,7 @@ fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Op
     }
     Some(OpenedDevice {
         device, kind_tag, calib, packet_counter,
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         container,
     })
 }

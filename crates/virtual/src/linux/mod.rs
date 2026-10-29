@@ -2,7 +2,9 @@
 //! moves between the two unchanged: the Xbox 360 pad through uinput, the Sony
 //! pads and the keyboard / mouse / media keys through UHID with the HIDMaestro
 //! profiles. Both need write access to their `/dev` node, which [`access`] asks
-//! for once.
+//! for once. The DualSense and the Edge with USB audio (`virtual.usb.*`) are
+//! USB/IP composites (`composite_device`), which need the kernel's vhci-hcd,
+//! also set up once by [`access`].
 
 pub(crate) mod access;
 pub(crate) mod uhid;
@@ -31,6 +33,16 @@ fn sony_profile_json(kind_id: &str) -> Option<&'static str> {
     }
 }
 
+/// The composite profile a pad with USB audio is built from.
+fn composite_profile_json(kind_id: &str) -> Option<&'static str> {
+    use flexinput_usbip::profiles;
+    match kind_id {
+        "virtual.usb.dualsense" => Some(profiles::DUALSENSE_COMPOSITE_JSON),
+        "virtual.usb.dualsense_edge" => Some(profiles::DUALSENSE_EDGE_COMPOSITE_JSON),
+        _ => None,
+    }
+}
+
 /// See `crate::kind_pin_metadata`.
 pub fn kind_pin_metadata(
     kind_id: &str,
@@ -41,6 +53,8 @@ pub fn kind_pin_metadata(
         "virtual.hm.ds4" => (layouts::DS4_SINK_PINS, layouts::DS4_SOURCE_PINS, "Virtual DualShock 4"),
         "virtual.hm.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DUALSENSE_SOURCE_PINS, "Virtual DualSense"),
         "virtual.hm.dualsense_edge" => (layouts::DUALSENSE_EDGE_SINK_PINS, layouts::DUALSENSE_SOURCE_PINS, "Virtual DualSense Edge"),
+        "virtual.usb.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DUALSENSE_USB_SOURCE_PINS, "Virtual DualSense"),
+        "virtual.usb.dualsense_edge" => (layouts::DUALSENSE_EDGE_SINK_PINS, layouts::DUALSENSE_USB_SOURCE_PINS, "Virtual DualSense Edge"),
         "virtual.keymouse" => (layouts::KEYMOUSE_DEFAULT_PINS, &[], "Virtual Keyboard & Mouse"),
         _ => return None,
     };
@@ -48,13 +62,16 @@ pub fn kind_pin_metadata(
 }
 
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
-    let base_name = DEVICE_KINDS
-        .iter()
-        .find(|k| k.kind_id == kind_id)
-        .map_or("Virtual Controller", |k| k.display_name);
-    let (device_id, display_name) = instance_label(kind_id, base_name, instance);
+    // Instance 0's name is the kind's own, the USB audio variants' included.
+    let base_name = kind_pin_metadata(kind_id, 0).map_or_else(|| "Virtual Controller".to_string(), |(_, _, n)| n);
+    let (device_id, display_name) = instance_label(kind_id, &base_name, instance);
     if kind_id == "virtual.hm.xinput" {
         return Box::new(uinput::Xbox360::create(device_id, display_name));
+    }
+    if let Some(json) = composite_profile_json(kind_id) {
+        // `None` only for an invalid bundled profile, a build bug.
+        let dev = crate::composite_device::CompositeDevice::create(&device_id, &display_name, json, instance as u8);
+        return Box::new(dev.expect("bundled composite profile parses"));
     }
     if let Some(json) = sony_profile_json(kind_id) {
         // `None` only for an invalid bundled profile, a build bug.
@@ -118,6 +135,9 @@ mod tests {
             }
         }
         assert_eq!(kind_pin_metadata("virtual.hm.xinput", 2).unwrap().2, "Virtual Xbox 360 #3");
-        assert!(kind_pin_metadata("virtual.usb.dualsense", 0).is_none(), "no USB audio composite here");
+        for (_, usb) in crate::USB_AUDIO_VARIANTS {
+            assert!(kind_pin_metadata(usb, 0).is_some(), "{usb}");
+            assert!(flexinput_hidmaestro::Profile::from_json(composite_profile_json(usb).unwrap()).is_ok(), "{usb}");
+        }
     }
 }

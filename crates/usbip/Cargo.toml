@@ -8,12 +8,15 @@ license.workspace = true
 # Edge) with its real USB audio interfaces beside the HID one, so a game can
 # stream its haptic waveforms to it. Windows reaches the server through
 # usbip-win2's signed virtual host controller and binds its own in-box
-# usbaudio.sys / hidusb to the device. Ported from HIDMaestro's usbip backend
-# (MIT); see src/lib.rs.
+# usbaudio.sys / hidusb to the device; Linux through the kernel's vhci-hcd,
+# with snd-usb-audio and hid-playstation. Ported from HIDMaestro's usbip
+# backend (MIT); see src/lib.rs.
 
 [dependencies]
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# The own-pad serial test, shared with the Linux device checks there.
+flexinput-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # The 1 ms isochronous pacing needs a high-resolution waitable timer (a plain

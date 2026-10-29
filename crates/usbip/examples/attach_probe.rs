@@ -1,14 +1,17 @@
-//! Live check against an installed usbip-win2: serve a composite DualSense (or
-//! Edge), attach it, keep it up for a while reporting what the host does with
-//! it, then detach.
+//! Live check against a USB/IP host controller (usbip-win2 on Windows, the
+//! kernel's vhci-hcd on Linux): serve a composite DualSense (or Edge), attach
+//! it, keep it up for a while reporting what the host does with it, then
+//! detach.
 //!
 //!   cargo run -p flexinput-usbip --example attach_probe -- [seconds] [edge]
 //!
 //! While it runs, Windows should show "DualSense Wireless Controller" under
-//! Sound (a 4-channel output and a microphone) and as a game controller. Play
-//! audio to that output, or a game's haptics, and the PCM counters move.
+//! Sound (a 4-channel output and a microphone) and as a game controller; Linux
+//! a sound card and a hidraw node for it. Play audio to that output, or a
+//! game's haptics, and the PCM counters move. On Linux it needs the attach
+//! file writable (root, or FlexInput's one-time setup).
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn main() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -22,9 +25,10 @@ fn main() {
     let json = if edge { profiles::DUALSENSE_EDGE_COMPOSITE_JSON } else { profiles::DUALSENSE_COMPOSITE_JSON };
 
     if !vhci::is_available() {
-        eprintln!("usbip-win2's host controller isn't present.");
+        eprintln!("the USB/IP host controller isn't present, or isn't writable.");
         std::process::exit(2);
     }
+    #[cfg(windows)]
     println!("usbip-win2 request layout: {:?}", vhci::installed_layout());
 
     // Before serving anything (see vhci::sweep_stale).
@@ -100,7 +104,7 @@ fn main() {
     println!("connected after detach: {}", dev.is_connected());
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn main() {
-    eprintln!("usbip-win2 is Windows-only");
+    eprintln!("no USB/IP host controller on this platform");
 }

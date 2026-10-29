@@ -256,7 +256,7 @@ pub mod hidmaestro_device;
 #[cfg(any(windows, target_os = "linux"))]
 mod sony_feedback;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod composite_device;
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -333,12 +333,10 @@ pub const USB_AUDIO_VARIANTS: &[(&str, &str)] = &[
 ];
 
 /// Whether `kind_id` names a device this crate can build: a listed kind, or the
-/// USB audio variant of a listed pad (Windows only: the composite is usbip-win2).
+/// USB audio variant of a listed pad.
 pub fn is_known_kind(kind_id: &str) -> bool {
     let listed = |id: &str| available_device_kinds().iter().any(|k| k.kind_id == id);
-    listed(kind_id)
-        || cfg!(windows)
-            && USB_AUDIO_VARIANTS.iter().any(|(plain, usb)| *usb == kind_id && listed(plain))
+    listed(kind_id) || USB_AUDIO_VARIANTS.iter().any(|(plain, usb)| *usb == kind_id && listed(plain))
 }
 
 /// Whether the device `dev_id` is a pad's USB audio variant.
@@ -424,8 +422,7 @@ mod usb_audio_tests {
     fn composite_kinds_are_known_but_not_listed() {
         assert_eq!(kind_prefix("virtual.usb.dualsense.4"), "virtual.usb.dualsense");
         for (_, usb) in USB_AUDIO_VARIANTS {
-            // The composite is usbip-win2: Windows only.
-            assert_eq!(is_known_kind(usb), cfg!(windows));
+            assert!(is_known_kind(usb));
             assert!(!available_device_kinds().iter().any(|k| k.kind_id == *usb));
         }
         assert!(is_known_kind("virtual.hm.dualsense"));

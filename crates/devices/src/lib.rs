@@ -20,7 +20,7 @@ pub mod spike_tune;
 #[cfg(feature = "joycon2")]
 pub mod joycon2_backend;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod dualsense_haptic;
 #[cfg(windows)]
 mod devnode;

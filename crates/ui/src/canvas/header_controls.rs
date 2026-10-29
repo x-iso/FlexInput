@@ -161,14 +161,19 @@ pub fn render_usb_audio_toggle(ui: &mut egui::Ui, dev_id: &str) -> Option<String
     let confirm_id = egui::Id::new(("usb_audio_install_confirm", dev_id));
     let asking = ui.ctx().data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
     let mut on = has || asking;
+    #[cfg(windows)]
+    const SETUP: &str = "Needs usbip-win2. The first time, FlexInput installs it: one \
+                         Windows elevation prompt, and USB devices reconnect for a moment.";
+    #[cfg(not(windows))]
+    const SETUP: &str = "Needs the kernel's USB/IP host controller (vhci-hcd). The first \
+                         time, FlexInput sets it up: one password prompt.";
     let resp = ui
         .checkbox(&mut on, egui::RichText::new("Audio & Haptics").small())
-        .on_hover_text(
+        .on_hover_text(format!(
             "Present this pad as a wired DualSense with its USB audio: a speaker and \
              haptics output, and a microphone. Games that author HD haptics stream \
-             them to it.\n\nNeeds usbip-win2. The first time, FlexInput installs it: \
-             one Windows elevation prompt, and USB devices reconnect for a moment.",
-        );
+             them to it.\n\n{SETUP}",
+        ));
     if resp.changed() {
         if asking {
             // Unticked while the question is open: the answer is no.

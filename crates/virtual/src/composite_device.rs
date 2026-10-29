@@ -1,14 +1,16 @@
 //! `VirtualDevice` backend for the composite USB personas: a virtual DualSense
 //! (or Edge) with its USB audio interfaces beside the HID one, served by
-//! `flexinput-usbip` and attached through usbip-win2's virtual host
-//! controller. To a game it is a wired pad with a speaker / haptics output and
-//! a microphone, so the haptic waveforms it authors stream to us.
+//! `flexinput-usbip` and attached through a USB/IP host controller:
+//! usbip-win2's on Windows, the kernel's vhci-hcd on Linux. To a game it is a
+//! wired pad with a speaker / haptics output and a microphone, so the haptic
+//! waveforms it authors stream to us.
 //!
 //! The HID side is the plain profile's: the same encoder builds the input
 //! report and the same decode reads the game's output report. What differs is
 //! the transport — an in-process USB/IP server instead of HIDMaestro's UMDF
-//! driver and shared memory — and that nothing outlives the app: the device
-//! is served from this process, so it can't persist past it.
+//! driver and shared memory (Windows) or UHID (Linux) — and that nothing
+//! outlives the app: the device is served from this process, so it can't
+//! persist past it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,11 +51,11 @@ pub struct CompositeDevice {
 }
 
 impl CompositeDevice {
-    /// Build the persona `profile_json` describes and attach it, installing
-    /// usbip-win2 through the elevated helper first if it isn't there (one
-    /// UAC, and the USB root hubs re-enumerate once). Blocking: call from the
-    /// device-ops worker. `None` only for an invalid bundled profile; a failed
-    /// attach returns a disconnected device, with the reason logged.
+    /// Build the persona `profile_json` describes and attach it, setting the
+    /// host controller up first if it isn't (see [`ensure_host_controller`]).
+    /// Blocking: call from the device-ops worker. `None` only for an invalid
+    /// bundled profile; a failed attach returns a disconnected device, with
+    /// the reason logged.
     pub fn create(
         id: impl Into<String>,
         display_name: impl Into<String>,
@@ -85,9 +87,7 @@ impl CompositeDevice {
     }
 
     fn connect(&mut self, profile_json: &str, index: u8) -> Result<(), String> {
-        if !vhci::is_available() {
-            flexinput_hidmaestro::helper::ensure_usbip().map_err(|e| e.to_string())?;
-        }
+        ensure_host_controller()?;
         // Before the server exports anything, or the driver's re-attach loop
         // for a dead session's device could import this one first.
         if !SWEPT.swap(true, Ordering::AcqRel) {
@@ -109,6 +109,20 @@ impl CompositeDevice {
     fn is_edge(&self) -> bool {
         self.profile.id.contains("dualsense-edge")
     }
+}
+
+/// A host controller this process can attach to. Windows: usbip-win2,
+/// installed through the elevated helper when missing (one UAC, and the USB
+/// root hubs re-enumerate once). Linux: the kernel's vhci-hcd, loaded and
+/// handed to the user through pkexec the first time (see `linux::access`).
+fn ensure_host_controller() -> Result<(), String> {
+    #[cfg(windows)]
+    if !vhci::is_available() {
+        flexinput_hidmaestro::helper::ensure_usbip().map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    crate::linux::access::ensure_vhci()?;
+    Ok(())
 }
 
 impl crate::VirtualDevice for CompositeDevice {
@@ -197,8 +211,8 @@ mod tests {
     #[test]
     fn composite_pins_match_the_plain_pads() {
         for (plain, usb) in crate::USB_AUDIO_VARIANTS {
-            let (ps, po, pn) = crate::windows::kind_pin_metadata(plain, 0).unwrap();
-            let (us, uo, un) = crate::windows::kind_pin_metadata(usb, 0).unwrap();
+            let (ps, po, pn) = crate::kind_pin_metadata(plain, 0).unwrap();
+            let (us, uo, un) = crate::kind_pin_metadata(usb, 0).unwrap();
             let ids = |p: &[SinkPin]| p.iter().map(|p| p.id).collect::<Vec<_>>();
             let src = |p: &[SourcePin]| p.iter().map(|p| p.id).collect::<Vec<_>>();
             assert_eq!(ids(ps), ids(us), "{usb} sink pins");

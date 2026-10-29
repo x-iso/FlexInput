@@ -4,6 +4,11 @@
 //! that finds one closed asks once, through polkit (the desktop's own password
 //! prompt), to install a udev rule that does and to apply it to this session at
 //! once. The Linux counterpart of the one UAC prompt that installs HIDMaestro.
+//!
+//! The pads with USB audio need the kernel's USB/IP host controller instead
+//! ([`ensure_vhci`]): loaded, and its attach / detach files writable by the
+//! user. Asked for the same way, the first time one is built, like the one UAC
+//! prompt that installs usbip-win2.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -60,6 +65,102 @@ pub(crate) fn ensure() -> Result<(), String> {
     let result = grant();
     *last = result.as_ref().err().map(|e| (Instant::now(), e.clone()));
     result
+}
+
+/// The module, loaded at every boot, and the rule that hands the controller's
+/// attach and detach files to the user (root's alone otherwise). The kernel
+/// takes an attach's socket from the writer, so this lets FlexInput attach its
+/// own server's devices without root.
+const VHCI_MODULES_PATH: &str = "/etc/modules-load.d/flexinput-usbip.conf";
+const VHCI_RULES_PATH: &str = "/etc/udev/rules.d/61-flexinput-usbip.rules";
+/// The script's exit code when the kernel has no vhci-hcd module.
+const NO_VHCI_MODULE: i32 = 3;
+
+/// Make sure the kernel's USB/IP host controller is loaded and this process
+/// may attach to it, asking through pkexec when it isn't. Blocks while the
+/// password prompt is up, so it runs on the device-build worker.
+pub(crate) fn ensure_vhci() -> Result<(), String> {
+    use flexinput_usbip::vhci;
+    static LAST: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    if vhci::is_available() {
+        return Ok(());
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if vhci::is_available() {
+        return Ok(());
+    }
+    if let Some((at, err)) = last.as_ref() {
+        if at.elapsed() < RETRY_AFTER {
+            return Err(err.clone());
+        }
+    }
+    let result = grant_vhci();
+    *last = result.as_ref().err().map(|e| (Instant::now(), e.clone()));
+    result
+}
+
+fn grant_vhci() -> Result<(), String> {
+    use flexinput_usbip::vhci;
+    // SAFETY: getuid() has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let sysfs = vhci::SYSFS;
+    let script = vhci_script(uid);
+    eprintln!("[linux-access] the USB/IP host controller isn't set up; asking through pkexec");
+    let status = std::process::Command::new("pkexec")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .map_err(|e| format!("couldn't run pkexec: {e}"))?;
+    if !status.success() {
+        return Err(match status.code() {
+            Some(NO_VHCI_MODULE) => "this kernel has no USB/IP host controller (the vhci-hcd module)".to_string(),
+            Some(126) => "the password prompt was dismissed".to_string(),
+            Some(c) => format!("pkexec exited with {c} (not authorized, or no polkit agent running)"),
+            None => "pkexec was killed".to_string(),
+        });
+    }
+    if !vhci::is_available() {
+        return Err(format!("set up, but {sysfs}/attach is still not writable"));
+    }
+    eprintln!("[linux-access] USB/IP host controller ready");
+    Ok(())
+}
+
+/// The root half of [`ensure_vhci`], for user `uid`. udev runs RUN programs
+/// without a PATH worth the name, so the rule names chown by the full path
+/// this shell finds (NixOS keeps it outside /usr).
+fn vhci_script(uid: u32) -> String {
+    let sysfs = flexinput_usbip::vhci::SYSFS;
+    format!(
+        "PATH=/run/current-system/sw/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH\n\
+         modprobe -q vhci-hcd || exit {NO_VHCI_MODULE}\n\
+         set -e\n\
+         chown_bin=$(command -v chown)\n\
+         mkdir -p /etc/modules-load.d /etc/udev/rules.d\n\
+         printf '# Written by FlexInput: the USB/IP host controller its pads with USB audio attach to.\\nvhci-hcd\\n' > {VHCI_MODULES_PATH}\n\
+         cat > {VHCI_RULES_PATH} <<FLEXINPUT_RULES\n\
+         # Written by FlexInput: lets user {uid} attach and detach FlexInput's virtual\n\
+         # pads with USB audio (USB/IP).\n\
+         ACTION==\"add\", SUBSYSTEM==\"platform\", KERNEL==\"vhci_hcd.0\", RUN+=\"$chown_bin {uid} /sys%p/attach /sys%p/detach\"\n\
+         FLEXINPUT_RULES\n\
+         udevadm control --reload-rules || true\n\
+         $chown_bin {uid} {sysfs}/attach {sysfs}/detach\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vhci_script_parses_and_names_the_user() {
+        let script = vhci_script(1000);
+        let check = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).status().unwrap();
+        assert!(check.success(), "{script}");
+        assert!(script.contains("RUN+=\"$chown_bin 1000 /sys%p/attach /sys%p/detach\""), "{script}");
+        assert!(script.contains("$chown_bin 1000 /sys/devices/platform/vhci_hcd.0/attach"), "{script}");
+    }
 }
 
 fn grant() -> Result<(), String> {

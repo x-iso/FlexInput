@@ -22,6 +22,8 @@ flexinput-usbip = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # uinput / UHID: open, poll, ioctl. Already in the graph.
 libc = "0.2"
+# The composite USB personas, attached through the kernel's vhci-hcd.
+flexinput-usbip = { workspace = true }
 
 [dev-dependencies]
 glam = { workspace = true }
