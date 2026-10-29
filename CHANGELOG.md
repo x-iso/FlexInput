@@ -20,6 +20,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   on from the virtual pad. They play on the pad's own sound card, so while
   they do, no other program can play sound to the pad.
 
+- **A Bluetooth dongle for FlexInput on Linux.** FlexInput's own Bluetooth,
+  which Joy-Con 2 and Bluetooth Classic controllers connect through, can now
+  run on a USB adapter on Linux too. Hand one over in the Bluetooth window
+  ("Use with FlexInput", one password prompt) — where Windows needs Zadig.
+  While FlexInput runs it takes that adapter from Linux's own Bluetooth, so
+  a second adapter is best; "Give back to Linux" undoes it.
+
 ## [0.16.3] - 2026-10-28
 
 ### Added

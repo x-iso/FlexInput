@@ -443,7 +443,7 @@ fn run(shared: Arc<Shared>) {
             if self.0.swap(DONGLE_ABSENT, Ordering::Relaxed) == DONGLE_ACTIVE {
                 eprintln!(
                     "[jc2-dongle] dongle thread exiting — Joy-Cons handed back to the \
-                     Windows stack, which will grab them within seconds"
+                     system's Bluetooth stack, which will grab them within seconds"
                 );
             }
         }
@@ -452,11 +452,11 @@ fn run(shared: Arc<Shared>) {
 
     let Some((vid, pid)) = configured_dongle() else {
         eprintln!(
-            "[jc2-dongle] no WinUSB-bound Bluetooth adapter found — bind one with \
-             Zadig, or set FLEXINPUT_JC2_DONGLE=vid:pid. Joy-Cons will fall back \
-             to the Windows stack."
+            "[jc2-dongle] {}, or set FLEXINPUT_JC2_DONGLE=vid:pid. Joy-Cons will \
+             fall back to the system's Bluetooth stack.",
+            flexinput_btle::NO_ADAPTER
         );
-        dlog!("no WinUSB-bound adapter present");
+        dlog!("no usable adapter present");
         return;
     };
     // ⭐ SHARED, not owned. This hub and the Bluetooth Classic transport run on
@@ -470,9 +470,9 @@ fn run(shared: Arc<Shared>) {
     // the conversation.
     let Some(radio) = flexinput_btle::radio::shared(vid, pid) else {
         eprintln!(
-            "[jc2-dongle] no usable dongle {vid:04x}:{pid:04x} — is it bound to \
-             WinUSB via Zadig?\n\
-             [jc2-dongle] Joy-Cons will fall back to the Windows stack."
+            "[jc2-dongle] no usable dongle {vid:04x}:{pid:04x} (to use one: {})\n\
+             [jc2-dongle] Joy-Cons will fall back to the system's Bluetooth stack.",
+            flexinput_btle::SETUP_HINT
         );
         dlog!("no usable dongle {vid:04x}:{pid:04x}");
         return;

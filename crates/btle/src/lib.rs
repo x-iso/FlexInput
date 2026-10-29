@@ -1,4 +1,6 @@
-//! HCI transport over a USB Bluetooth dongle bound to WinUSB.
+//! HCI transport over a USB Bluetooth dongle FlexInput owns: one bound to
+//! WinUSB on Windows, one handed over in the Bluetooth panel on Linux (see
+//! [`linux`]).
 //!
 //! See `Cargo.toml` for why this crate exists. In short: the OS Bluetooth stack
 //! cannot hold a Joy-Con 2 link and cannot bond with one, so FlexInput drives a
@@ -28,9 +30,23 @@ pub mod l2cap;
 pub mod radio;
 pub mod hci;
 pub mod joycon;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 pub use acl::{AclPacket, Notification};
 pub use hci::{CommandComplete, Event, Opcode};
+
+/// How a user gives FlexInput a dongle, for messages that find none.
+#[cfg(not(target_os = "linux"))]
+pub const SETUP_HINT: &str = "bind one to WinUSB with Zadig";
+#[cfg(target_os = "linux")]
+pub const SETUP_HINT: &str = "hand one to FlexInput in its Bluetooth panel";
+
+/// What [`Error::NoAdapter`] says.
+#[cfg(not(target_os = "linux"))]
+pub const NO_ADAPTER: &str = "no WinUSB-bound Bluetooth adapter found — bind one to WinUSB with Zadig";
+#[cfg(target_os = "linux")]
+pub const NO_ADAPTER: &str = "no Bluetooth adapter handed to FlexInput — hand one over in its Bluetooth panel";
 
 /// Errors from the dongle transport.
 #[derive(Debug)]
@@ -80,24 +96,32 @@ pub enum Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Linux has no WinUSB: an adapter is FlexInput's once handed over in
+        // the Bluetooth panel (see `linux`), and the USB reset in
+        // `Dongle::open` drops whatever firmware the kernel loaded.
+        #[cfg(not(target_os = "linux"))]
+        const OWNED: &str = "WinUSB-bound";
+        #[cfg(target_os = "linux")]
+        const OWNED: &str = "handed to FlexInput";
+        #[cfg(not(target_os = "linux"))]
+        const PATH: &str = "the WinUSB path";
+        #[cfg(target_os = "linux")]
+        const PATH: &str = "FlexInput's own Bluetooth stack";
         match self {
             Error::NoHciResponse => write!(
                 f,
                 "the adapter never answered HCI — it most likely needs vendor \
-                 firmware, which the WinUSB path cannot load (Broadcom and Intel \
+                 firmware, which {PATH} cannot load (Broadcom and Intel \
                  dongles usually do; Realtek and CSR usually do not)"
             ),
-            Error::NoAdapter => write!(
-                f,
-                "no WinUSB-bound Bluetooth adapter found — bind one with Zadig"
-            ),
+            Error::NoAdapter => f.write_str(NO_ADAPTER),
             Error::NotFound { vid, pid } => write!(
                 f,
-                "no USB device {vid:04x}:{pid:04x} (is it bound to WinUSB via Zadig?)"
+                "no USB device {vid:04x}:{pid:04x} (is it plugged in and {OWNED}?)"
             ),
             Error::Busy { vid, pid, source } => write!(
                 f,
-                "dongle {vid:04x}:{pid:04x} is present and WinUSB-bound but already \
+                "dongle {vid:04x}:{pid:04x} is present and {OWNED} but already \
                  in use ({source}) — another FlexInput instance, a jc2_*/bt_classic \
                  probe, or this app's other Bluetooth transport holds it"
             ),
@@ -279,7 +303,8 @@ pub fn holding_any() -> bool {
 /// Manufacturer and product strings last read from each adapter.
 ///
 /// Remembered so an adapter this process is streaming from can still be named
-/// without being opened a second time to ask.
+/// without being opened a second time to ask. (Linux reads names from sysfs.)
+#[cfg(not(target_os = "linux"))]
 fn adapter_names() -> &'static std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>> {
     static NAMES: std::sync::OnceLock<
         std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>>,
@@ -316,7 +341,7 @@ pub fn preferred_dongle() -> Option<(u16, u16)> {
     let all = discover();
     all.iter()
         .find(|d| d.ours)
-        .or_else(|| all.iter().find(|d| d.available))
+        .or_else(|| all.iter().find(|d| d.available && d.dedicated))
         .map(|d| (d.vid, d.pid))
 }
 
@@ -359,6 +384,10 @@ pub struct DongleInfo {
     /// meaningful when `available` is false, and the whole reason "in use" can
     /// be reported as something other than a problem.
     pub ours: bool,
+    /// Whether it's FlexInput's to use at all. Always on Windows, which lists
+    /// only WinUSB-bound adapters; on Linux, whether it was handed over in the
+    /// Bluetooth panel (see [`linux`]). One that isn't is never opened.
+    pub dedicated: bool,
     /// USB manufacturer string, when it can be read.
     ///
     /// ❗ Reading a string descriptor requires OPENING the device, so an
@@ -427,13 +456,15 @@ impl DongleInfo {
 
 /// Every Bluetooth dongle libusb can see.
 ///
-/// ❗ Only adapters this app could USE appear — that is, WinUSB-bound ones. A
-/// radio owned by the Windows Bluetooth stack is not a candidate and never can
-/// be, so listing it would only invite the question of why the thing on screen
-/// does not work.
+/// ❗ On Windows only adapters this app could USE appear — that is,
+/// WinUSB-bound ones. A radio owned by the Windows Bluetooth stack is not a
+/// candidate and never can be, so listing it would only invite the question of
+/// why the thing on screen does not work. An entry with `available = false` is
+/// therefore a usable dongle that something already holds — this app's own
+/// shared radio, in the ordinary case.
 ///
-/// An entry with `available = false` is therefore a usable dongle that
-/// something already holds — this app's own shared radio, in the ordinary case.
+/// On Linux every adapter appears, with whether it was handed to FlexInput
+/// (`dedicated`): that list is where the user hands one over.
 ///
 /// The class triple is checked on the DEVICE descriptor and, failing that, on
 /// every interface: composite dongles report `0x00` at device level and put the
@@ -441,6 +472,8 @@ impl DongleInfo {
 /// them.
 pub fn discover() -> Vec<DongleInfo> {
     let Ok(devices) = rusb::devices() else { return Vec::new() };
+    #[cfg(target_os = "linux")]
+    let dedicated = linux::dedicated();
     let mut out = Vec::new();
     for device in devices.iter() {
         let Ok(desc) = device.device_descriptor() else { continue };
@@ -461,81 +494,120 @@ pub fn discover() -> Vec<DongleInfo> {
         if !is_bt {
             continue;
         }
-        // ⛔ An adapter with no WinUSB driver is not listed at all.
-        //
-        // ⭐ libusb enumerates every USB device on Windows but can only OPEN
-        // the ones bound to WinUSB, and the two failures are distinguishable:
-        // a device owned by another driver refuses with `NotSupported`, while
-        // one that is WinUSB-bound but busy refuses with `Access`/`Busy`.
-        //
-        // ❗ Only the second is worth showing. A machine's built-in radio, and
-        // every other Bluetooth device Windows owns, can never be used by this
-        // app — listing them invites the user to wonder why the thing they can
-        // see does not work, and the honest answer is that it was never a
-        // candidate. What IS worth showing is our own dongle while a transport
-        // has it open, which is the normal working state.
-        // ⭐ A WHITELIST, not a blacklist. Only two outcomes mean "this adapter
-        // is one we could use": it opened, or it refused because something
-        // already holds it. Every other refusal — no WinUSB driver, access
-        // denied at the OS level, gone mid-enumeration — means it is not a
-        // candidate and listing it only invites the question of why the thing
-        // on screen does not work.
-        //
-        // ❗ Written as a whitelist because guessing which error code Windows
-        // returns for "no driver" got it wrong: the list showed adapters the
-        // app could never touch, and the Bluetooth button appeared on machines
-        // with no usable dongle at all.
-        let (vid, pid) = (desc.vendor_id(), desc.product_id());
-        // ⛔ **Never open the adapter we are streaming from.**
-        //
-        // This runs every two seconds for the title-bar Bluetooth button, and
-        // it used to open every adapter — including the one a transport was
-        // actively streaming a controller from — and read its string
-        // descriptors over USB. Those are control transfers on the same
-        // endpoint the HCI commands use, issued from the UI thread into a live
-        // link, on a timer. Nothing it learned was new: whether we hold an
-        // adapter is known without asking the hardware.
-        let ours = is_ours(vid, pid);
-        let opened = if ours {
-            None
-        } else {
-            match device.open() {
-                Ok(h) => Some(h),
-                Err(rusb::Error::Access) | Err(rusb::Error::Busy) => None,
-                Err(_) => continue,
-            }
-        };
-        let (manufacturer, product) = match &opened {
-            Some(h) => {
-                let names = (
-                    h.read_manufacturer_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
-                    h.read_product_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
-                );
-                if let Ok(mut cache) = adapter_names().lock() {
-                    cache.retain(|(k, _)| *k != (vid, pid));
-                    cache.push(((vid, pid), names.clone()));
-                }
-                names
-            }
-            None => adapter_names()
-                .lock()
-                .ok()
-                .and_then(|c| c.iter().find(|(k, _)| *k == (vid, pid)).map(|(_, n)| n.clone()))
-                .unwrap_or((None, None)),
-        };
-        out.push(DongleInfo {
-            vid,
-            pid,
-            bus: device.bus_number(),
-            address: device.address(),
-            available: opened.is_some(),
-            ours,
-            manufacturer: manufacturer.filter(|s| !s.is_empty()),
-            product: product.filter(|s| !s.is_empty()),
-            problem: last_open_failure(vid, pid),
-        });
+        #[cfg(target_os = "linux")]
+        out.push(linux_entry(&device, &desc, &dedicated));
+        #[cfg(not(target_os = "linux"))]
+        out.extend(winusb_entry(&device, &desc));
     }
     out
+}
+
+/// A Windows adapter's row, or `None` for one this app can't use.
+#[cfg(not(target_os = "linux"))]
+fn winusb_entry(device: &rusb::Device<rusb::GlobalContext>, desc: &rusb::DeviceDescriptor) -> Option<DongleInfo> {
+    // ⛔ An adapter with no WinUSB driver is not listed at all.
+    //
+    // ⭐ libusb enumerates every USB device on Windows but can only OPEN
+    // the ones bound to WinUSB, and the two failures are distinguishable:
+    // a device owned by another driver refuses with `NotSupported`, while
+    // one that is WinUSB-bound but busy refuses with `Access`/`Busy`.
+    //
+    // ❗ Only the second is worth showing. A machine's built-in radio, and
+    // every other Bluetooth device Windows owns, can never be used by this
+    // app — listing them invites the user to wonder why the thing they can
+    // see does not work, and the honest answer is that it was never a
+    // candidate. What IS worth showing is our own dongle while a transport
+    // has it open, which is the normal working state.
+    // ⭐ A WHITELIST, not a blacklist. Only two outcomes mean "this adapter
+    // is one we could use": it opened, or it refused because something
+    // already holds it. Every other refusal — no WinUSB driver, access
+    // denied at the OS level, gone mid-enumeration — means it is not a
+    // candidate and listing it only invites the question of why the thing
+    // on screen does not work.
+    //
+    // ❗ Written as a whitelist because guessing which error code Windows
+    // returns for "no driver" got it wrong: the list showed adapters the
+    // app could never touch, and the Bluetooth button appeared on machines
+    // with no usable dongle at all.
+    let (vid, pid) = (desc.vendor_id(), desc.product_id());
+    // ⛔ **Never open the adapter we are streaming from.**
+    //
+    // This runs every two seconds for the title-bar Bluetooth button, and
+    // it used to open every adapter — including the one a transport was
+    // actively streaming a controller from — and read its string
+    // descriptors over USB. Those are control transfers on the same
+    // endpoint the HCI commands use, issued from the UI thread into a live
+    // link, on a timer. Nothing it learned was new: whether we hold an
+    // adapter is known without asking the hardware.
+    let ours = is_ours(vid, pid);
+    let opened = if ours {
+        None
+    } else {
+        match device.open() {
+            Ok(h) => Some(h),
+            Err(rusb::Error::Access) | Err(rusb::Error::Busy) => None,
+            Err(_) => return None,
+        }
+    };
+    let (manufacturer, product) = match &opened {
+        Some(h) => {
+            let names = (
+                h.read_manufacturer_string_ascii(desc).ok().map(|s| s.trim().to_string()),
+                h.read_product_string_ascii(desc).ok().map(|s| s.trim().to_string()),
+            );
+            if let Ok(mut cache) = adapter_names().lock() {
+                cache.retain(|(k, _)| *k != (vid, pid));
+                cache.push(((vid, pid), names.clone()));
+            }
+            names
+        }
+        None => adapter_names()
+            .lock()
+            .ok()
+            .and_then(|c| c.iter().find(|(k, _)| *k == (vid, pid)).map(|(_, n)| n.clone()))
+            .unwrap_or((None, None)),
+    };
+    Some(DongleInfo {
+        vid,
+        pid,
+        bus: device.bus_number(),
+        address: device.address(),
+        available: opened.is_some(),
+        ours,
+        dedicated: true,
+        manufacturer: manufacturer.filter(|s| !s.is_empty()),
+        product: product.filter(|s| !s.is_empty()),
+        problem: last_open_failure(vid, pid),
+    })
+}
+
+/// A Linux adapter's row. One Linux's Bluetooth keeps is never opened — not
+/// even to read its name, which sysfs has — so nothing here can disturb it.
+/// One handed over is opened to see whether it can be: refused means the
+/// permission hasn't reached this session yet (or something holds it).
+#[cfg(target_os = "linux")]
+fn linux_entry(
+    device: &rusb::Device<rusb::GlobalContext>,
+    desc: &rusb::DeviceDescriptor,
+    dedicated: &[(u16, u16)],
+) -> DongleInfo {
+    let (vid, pid) = (desc.vendor_id(), desc.product_id());
+    let dedicated = dedicated.contains(&(vid, pid));
+    let ours = is_ours(vid, pid);
+    let available = dedicated && !ours && device.open().is_ok();
+    let (manufacturer, product) = linux::names(device.bus_number(), &device.port_numbers().unwrap_or_default());
+    DongleInfo {
+        vid,
+        pid,
+        bus: device.bus_number(),
+        address: device.address(),
+        available,
+        ours,
+        dedicated,
+        manufacturer,
+        product,
+        problem: last_open_failure(vid, pid),
+    }
 }
 
 /// Find a device by ids and open it, keeping the two failures apart.
@@ -561,10 +633,7 @@ impl Dongle {
     /// Interface 0 is the HCI interface on every spec-compliant dongle;
     /// interface 1 carries isochronous SCO (voice), which is of no interest.
     pub fn open(vid: u16, pid: u16) -> Result<Self> {
-        // `mut` is required by `set_auto_detach_kernel_driver` below, which is
-        // compiled out on Windows — hence unused there specifically.
-        #[cfg_attr(windows, allow(unused_mut))]
-        let mut handle = open_by_ids(vid, pid)?;
+        let handle = open_by_ids(vid, pid)?;
 
         // Windows has no kernel driver to detach once WinUSB is bound, and this
         // is unsupported there — hence best-effort. It matters on Linux, where
@@ -572,7 +641,15 @@ impl Dongle {
         #[cfg(not(windows))]
         let _ = handle.set_auto_detach_kernel_driver(true);
 
-        // ⭐ RESET THE DONGLE before claiming it.
+        let interface = 0u8;
+        // ⭐ Linux: claim BEFORE the reset below. The claim detaches btusb, and
+        // libusb keeps the interface ours across the reset; reset first and
+        // the kernel rebinds btusb afterwards, which sets the adapter up again
+        // (firmware download included) while this claims it out from under it.
+        #[cfg(not(windows))]
+        handle.claim_interface(interface)?;
+
+        // ⭐ RESET THE DONGLE before claiming it (on Linux, just after).
         //
         // A BLE link lives in the dongle's firmware, not in this process. When
         // FlexInput exits without tearing its links down — which the logs show
@@ -596,7 +673,15 @@ impl Dongle {
         // reset says the device went away, and carry on if it refuses outright.
         let handle = match handle.reset() {
             Ok(()) => handle,
-            Err(rusb::Error::NotFound) => open_by_ids(vid, pid)?,
+            Err(rusb::Error::NotFound) => {
+                let handle = open_by_ids(vid, pid)?;
+                #[cfg(not(windows))]
+                {
+                    let _ = handle.set_auto_detach_kernel_driver(true);
+                    handle.claim_interface(interface)?;
+                }
+                handle
+            }
             Err(e) => {
                 eprintln!("[btle] USB reset refused ({e}); continuing without it");
                 handle
@@ -605,7 +690,7 @@ impl Dongle {
         // The firmware needs a moment after a reset before it will answer.
         std::thread::sleep(Duration::from_millis(150));
 
-        let interface = 0u8;
+        #[cfg(windows)]
         handle.claim_interface(interface)?;
         // Recorded only once the interface is actually CLAIMED — an open that
         // failed here would otherwise leave this process looking like the owner
@@ -3168,7 +3253,7 @@ mod adapter_tests {
     fn the_silent_adapter_error_names_firmware() {
         let text = Error::NoHciResponse.to_string();
         assert!(text.contains("firmware"), "unhelpful: {text}");
-        assert!(text.contains("WinUSB"), "does not say why it cannot load: {text}");
+        assert!(text.contains("cannot load"), "does not say why it cannot load: {text}");
     }
 
     /// No vendor id is baked in as the answer: with nothing plugged in there

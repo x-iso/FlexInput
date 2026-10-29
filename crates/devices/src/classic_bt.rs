@@ -231,7 +231,7 @@ impl Drop for ClassicBtBackend {
 /// ⭐ **Nothing here is specific to one adapter.** A Bluetooth dongle announces
 /// itself by USB CLASS — wireless controller / RF / Bluetooth — so the first
 /// one that is actually openable is picked automatically and any WinUSB-bound
-/// adapter works. The Realtek ids are only a last-resort fallback for the case
+/// adapter works (on Linux, any adapter handed to FlexInput). The Realtek ids are only a last-resort fallback for the case
 /// where discovery finds nothing at all, which keeps the error message naming a
 /// concrete device instead of `0000:0000`.
 ///
@@ -635,15 +635,9 @@ fn run_inner(shared: &Arc<Shared>) {
                     radio = Some(r);
                 }
                 None => {
-                    set_status(
-                        &shared,
-                        Status::NoRadio("no WinUSB-bound Bluetooth dongle".into()),
-                    );
+                    set_status(&shared, Status::NoRadio(flexinput_btle::NO_ADAPTER.into()));
                     if !shared.yielded.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "[bt-classic] no usable dongle — is one bound to WinUSB \
-                             via Zadig?"
-                        );
+                        eprintln!("[bt-classic] {}", flexinput_btle::NO_ADAPTER);
                     }
                 }
             }

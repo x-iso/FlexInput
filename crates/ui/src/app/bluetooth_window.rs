@@ -7,6 +7,9 @@
 //! the dongle not being used right now. Those are exactly the questions asked
 //! when something does not work, and answering them in a log the user has to be
 //! told to find is not answering them.
+//!
+//! On Linux it's also where an adapter is handed to FlexInput (Zadig's job on
+//! Windows): see `flexinput_btle::linux`.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,114 @@ pub struct BluetoothState {
     last_scan: Option<Instant>,
     /// Set when a removal fails, so the reason is on screen rather than lost.
     error: Option<String>,
+    /// Linux: an adapter being handed over or back, while the password prompt
+    /// is up.
+    #[cfg(target_os = "linux")]
+    handover: Option<Handover>,
+    /// Linux: what came of the last handover, kept on screen.
+    #[cfg(target_os = "linux")]
+    handover_note: Option<Result<String, String>>,
+}
+
+#[cfg(target_os = "linux")]
+struct Handover {
+    to_flexinput: bool,
+    /// `None` until the password prompt is answered.
+    result: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl BluetoothState {
+    /// Hand an adapter to FlexInput or back to Linux, on a thread of its own:
+    /// it waits on the password prompt.
+    fn start_handover(&mut self, (vid, pid): (u16, u16), to_flexinput: bool) {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&result);
+        std::thread::spawn(move || {
+            let r = flexinput_btle::linux::set_dedicated(vid, pid, to_flexinput);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(r);
+            }
+        });
+        self.handover = Some(Handover { to_flexinput, result });
+        self.handover_note = None;
+    }
+}
+
+/// While a handover waits on the password prompt, say so; once it's answered,
+/// what came of it.
+#[cfg(target_os = "linux")]
+fn handover_status(ui: &mut egui::Ui, st: &mut BluetoothState) {
+    let progress = st
+        .handover
+        .as_ref()
+        .map(|h| (h.to_flexinput, h.result.lock().ok().and_then(|mut r| r.take())));
+    match progress {
+        Some((_, None)) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Waiting for your password…").small());
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        Some((to_flexinput, Some(r))) => {
+            st.handover_note = Some(r.map(|()| {
+                if to_flexinput {
+                    "Done. Bluetooth Classic controllers can use it now; restart \
+                     FlexInput for Joy-Con 2 controllers to."
+                        .to_string()
+                } else {
+                    "Done. Linux's Bluetooth gets it back once FlexInput lets go of \
+                     it — at the latest when FlexInput closes."
+                        .to_string()
+                }
+            }));
+            st.handover = None;
+            // The list shows the change at once.
+            st.last_scan = None;
+        }
+        None => {}
+    }
+    match &st.handover_note {
+        Some(Ok(note)) => {
+            ui.label(egui::RichText::new(note).small().color(egui::Color32::from_rgb(120, 200, 120)));
+        }
+        Some(Err(e)) => {
+            ui.label(
+                egui::RichText::new(format!("Couldn't change that: {e}"))
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 140, 60)),
+            );
+        }
+        None => {}
+    }
+}
+
+/// An adapter row's handover button: `Some(true)` to hand it to FlexInput,
+/// `Some(false)` to give it back to Linux, when clicked.
+#[cfg(target_os = "linux")]
+fn handover_button(ui: &mut egui::Ui, busy: bool, a: &DongleInfo) -> Option<bool> {
+    let (label, tip) = if a.dedicated {
+        (
+            "Give back to Linux",
+            "Stop FlexInput using this adapter. Linux's Bluetooth gets it back once \
+             FlexInput lets go of it, at the latest when FlexInput closes.\n\nAsks for \
+             your password.",
+        )
+    } else {
+        (
+            "Use with FlexInput",
+            "Hand this adapter to FlexInput's own Bluetooth, for Joy-Con 2 and \
+             Bluetooth Classic controllers. While FlexInput runs it takes the \
+             adapter from Linux's Bluetooth: anything connected through it now \
+             (headphones, a mouse) disconnects. Use a second adapter if you have \
+             one.\n\nAsks for your password once.",
+        )
+    };
+    ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(label).small()))
+        .on_hover_text(tip)
+        .clicked()
+        .then_some(!a.dedicated)
 }
 
 impl BluetoothState {
@@ -108,14 +219,13 @@ fn pair_row(ui: &mut egui::Ui) {
     let ctl = pair_control();
 
     if !ctl.transport_enabled() {
-        ui.label(
-            egui::RichText::new(
-                "Pairing needs a WinUSB-bound Bluetooth dongle. Bind one with \
-                 Zadig and restart.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(150)),
-        );
+        #[cfg(not(target_os = "linux"))]
+        const NEEDS: &str = "Pairing needs a WinUSB-bound Bluetooth dongle. Bind one with \
+                             Zadig and restart.";
+        #[cfg(target_os = "linux")]
+        const NEEDS: &str = "Pairing needs a Bluetooth adapter handed to FlexInput: use \
+                             the button beside one above.";
+        ui.label(egui::RichText::new(NEEDS).small().color(egui::Color32::from_gray(150)));
         return;
     }
 
@@ -190,15 +300,17 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
     );
     ui.add_space(2.0);
     if st.adapters.is_empty() {
-        ui.label(
-            egui::RichText::new(
-                "No WinUSB-bound Bluetooth dongle. Adapters owned by Windows are \
-                 not listed — bind one with Zadig to use it here.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(160)),
-        );
+        #[cfg(not(target_os = "linux"))]
+        const NONE: &str = "No WinUSB-bound Bluetooth dongle. Adapters owned by Windows are \
+                            not listed — bind one with Zadig to use it here.";
+        #[cfg(target_os = "linux")]
+        const NONE: &str = "No USB Bluetooth adapter.";
+        ui.label(egui::RichText::new(NONE).small().color(egui::Color32::from_gray(160)));
     }
+    #[cfg(target_os = "linux")]
+    handover_status(ui, st);
+    #[cfg(target_os = "linux")]
+    let mut start_handover: Option<((u16, u16), bool)> = None;
     for a in &st.adapters {
         ui.horizontal(|ui| {
             // ⭐ The state names say what they MEAN for the user, not what
@@ -217,7 +329,12 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             // "idle" row, which is the most misleading thing this panel could
             // possibly say — the user goes looking for a configuration mistake
             // that does not exist.
-            let (mark, colour, what) = if let Some(why) = &a.problem {
+            //
+            // Linux lists the adapters its Bluetooth keeps too: FlexInput's
+            // only once handed over, with the button at the end of the row.
+            let (mark, colour, what) = if !a.dedicated {
+                ("○", egui::Color32::from_gray(150), "Linux's Bluetooth uses it")
+            } else if let Some(why) = &a.problem {
                 ("⛔", egui::Color32::from_rgb(225, 90, 90), why.as_str())
             } else if a.ours {
                 (
@@ -253,7 +370,15 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                     .small()
                     .color(egui::Color32::from_gray(150)),
             );
+            #[cfg(target_os = "linux")]
+            if let Some(to_flexinput) = handover_button(ui, st.handover.is_some(), a) {
+                start_handover = Some(((a.vid, a.pid), to_flexinput));
+            }
         });
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((ids, to_flexinput)) = start_handover {
+        st.start_handover(ids, to_flexinput);
     }
 
     ui.add_space(8.0);
@@ -350,7 +475,11 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             if ui.small_button("Open folder").clicked() {
                 // Best-effort: a missing folder is not worth an error dialog,
                 // and the path is on screen either way.
-                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                #[cfg(windows)]
+                const OPEN: &str = "explorer";
+                #[cfg(not(windows))]
+                const OPEN: &str = "xdg-open";
+                let _ = std::process::Command::new(OPEN).arg(dir).spawn();
             }
         }
     });
