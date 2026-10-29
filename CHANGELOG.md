@@ -30,6 +30,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   pickers above a fullscreen game and out of the dash and Alt+Tab. At a
   fractional display scale (125%, 150%) FlexInput looks slightly soft there.
 
+- **SDL updated to 3.4.18.** The bundled SDL, which runs the controllers
+  FlexInput doesn't read natively (Steam Controller, 8BitDo and other
+  third-party pads), was four releases behind at 3.4.10.
+
+- **A newer controller database.** A controller SDL has no built-in mapping
+  for starts Learn from its SDL_GameControllerDB layout. That database is now
+  upstream's copy of 2026-10-27 instead of the older one gilrs ships, with
+  layouts for 59 more Windows controllers.
+
 ### Fixed
 
 - **Hidden controllers stay hidden on Linux.** Cutting Steam off from a

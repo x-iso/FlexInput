@@ -24,9 +24,9 @@ straight at it instead — no copy, so it can't drift:
 |------|--------|
 | `egui.txt` | `emilk/egui` tag `0.33.3`, `LICENSE-MIT` — covers egui, eframe, egui_extras, and the vendored egui-wgpu / egui-winit forks |
 | `gilrs.txt` | `gilrs-project/gilrs`, `LICENSE-MIT` |
-| `SDL.txt` | `libsdl-org/SDL` tag `release-3.4.14`, `LICENSE.txt` — SDL is built from source and linked statically, so it ships inside `flexinput.exe` |
-| `sdl3.txt` | `sdl3` 0.18.4 crate source, `LICENSE` |
-| `sdl3-sys.txt` | `sdl3-sys` 0.6.8+SDL-3.4.14 crate source, `LICENSE.md` |
+| `SDL.txt` | `libsdl-org/SDL` tag `release-3.4.18`, `LICENSE.txt` — SDL is built from source and linked statically, so it ships inside `flexinput.exe` |
+| `sdl3.txt` | `sdl3` 0.20.0 crate source, `LICENSE` |
+| `sdl3-sys.txt` | `sdl3-sys` 0.7.2+SDL-3.4.18 crate source, `LICENSE.md` |
 | `midir.txt` | `midir` 0.11.0 crate source, `LICENSE` |
 | `rfd.txt` | `rfd` 0.15.4 crate source, `LICENSE` |
 | `serde.txt` | `serde` 1.0.228 crate source, `LICENSE-MIT` |

@@ -110,7 +110,7 @@ pub const LICENSES: &[License] = &[
                ships inside flexinput.exe.",
         spdx: "Zlib",
         url: "https://github.com/libsdl-org/SDL",
-        note: Some("Bundled version: SDL 3.4.14."),
+        note: Some("Bundled version: SDL 3.4.18."),
         text: include_str!("../../../licenses/SDL.txt"),
     },
     License {

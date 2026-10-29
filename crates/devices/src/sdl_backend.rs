@@ -579,14 +579,14 @@ impl SdlBackend {
                 use sdl3::sys::joystick::{
                     SDL_GetJoystickNameForID, SDL_GetJoystickProductForID, SDL_GetJoystickVendorForID,
                 };
-                let p = SDL_GetJoystickNameForID(id);
+                let p = SDL_GetJoystickNameForID(id.into());
                 let name = if p.is_null() {
                     String::new()
                 } else {
                     std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
                 };
-                let v = SDL_GetJoystickVendorForID(id);
-                let pr = SDL_GetJoystickProductForID(id);
+                let v = SDL_GetJoystickVendorForID(id.into());
+                let pr = SDL_GetJoystickProductForID(id.into());
                 (name, (v != 0).then_some(v), (pr != 0).then_some(pr))
             };
             // Never our own virtual, whatever the switch says, nor another
@@ -600,7 +600,7 @@ impl SdlBackend {
             #[cfg(any(windows, target_os = "linux"))]
             {
                 // SAFETY: SDL's cached enumeration string for a listed id.
-                let path = unsafe { sdl3::sys::joystick::SDL_GetJoystickPathForID(id) };
+                let path = unsafe { sdl3::sys::joystick::SDL_GetJoystickPathForID(id.into()) };
                 if !path.is_null() {
                     let path = unsafe { std::ffi::CStr::from_ptr(path) }.to_string_lossy();
                     #[cfg(windows)]
@@ -637,7 +637,7 @@ impl SdlBackend {
             }
             let serial = unsafe {
                 use sdl3::sys::joystick::{SDL_GetJoystickFromID, SDL_GetJoystickSerial};
-                let js = SDL_GetJoystickFromID(id);
+                let js = SDL_GetJoystickFromID(id.into());
                 let p = if js.is_null() { std::ptr::null() } else { SDL_GetJoystickSerial(js) };
                 (!p.is_null()).then(|| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
             };
@@ -671,7 +671,7 @@ impl SdlBackend {
             // The HID tier opens the collection SDL reads, by SDL's own path
             // (DirectInput reports the HID interface path), off this thread.
             let path = unsafe {
-                let p = sdl3::sys::joystick::SDL_GetJoystickPathForID(id);
+                let p = sdl3::sys::joystick::SDL_GetJoystickPathForID(id.into());
                 (!p.is_null()).then(|| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
             };
             let hid_path = path.filter(|p| p.to_ascii_lowercase().contains("hid"));
@@ -1276,7 +1276,7 @@ fn read_touchpad_fingers(id: JoystickId, touchpad: i32) -> Vec<Option<(f32, f32)
     const MAX: i32 = 2;
     let mut out = Vec::with_capacity(MAX as usize);
     unsafe {
-        let gp = SDL_GetGamepadFromID(id);
+        let gp = SDL_GetGamepadFromID(id.into());
         if gp.is_null() {
             return vec![None; MAX as usize];
         }
