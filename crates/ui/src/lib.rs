@@ -47,7 +47,10 @@ pub use win_app::{onscreen_position, try_become_primary_instance};
 /// The Linux controller-hiding helper (this binary, run as root through
 /// pkexec): see `flexinput_devices::linux_hide`.
 #[cfg(target_os = "linux")]
-pub use flexinput_devices::linux_hide::{run_helper as run_linux_hide_helper, HELPER_FLAG as LINUX_HIDE_HELPER_FLAG};
+pub use flexinput_devices::linux_hide::{
+    open_or_private as linux_open_or_private, run_helper as run_linux_hide_helper,
+    HELPER_FLAG as LINUX_HIDE_HELPER_FLAG,
+};
 #[cfg(target_os = "linux")]
 pub use desktop_entry::install as install_desktop_entry;
 #[cfg(target_os = "linux")]

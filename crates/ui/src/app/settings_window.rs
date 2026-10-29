@@ -557,8 +557,9 @@ impl FlexInputApp {
     }
 
     /// Why a device can't be hidden on Linux, or `None` when it can. FlexInput
-    /// keeps reading a hidden pad through private nodes its gilrs and hidraw
-    /// readers fall back to; SDL and the Joy-Con 2 transport don't.
+    /// keeps reading a hidden pad through private nodes its gilrs, hidraw and
+    /// SDL readers fall back to (SDL's through the wrapped `open`, see
+    /// `linux_hide::open_or_private`); the Joy-Con 2 transport doesn't.
     #[cfg(target_os = "linux")]
     fn hidhide_block_reason(
         &self,
@@ -571,9 +572,6 @@ impl FlexInputApp {
         }
         if own_virtual.contains(&dev.id) {
             return Some("This is FlexInput's own virtual controller.");
-        }
-        if dev.id.starts_with("sdl:") {
-            return Some("FlexInput reads this controller through SDL, which can't reach it once it's hidden.");
         }
         match dev.kind {
             K::JoyCon2L | K::JoyCon2R => {
@@ -1455,8 +1453,8 @@ impl FlexInputApp {
                  FlexInput keeps reading the original. Hiding asks for your password once \
                  per session. Start FlexInput before the game: a game that already has the \
                  controller open keeps it. The eye button on a device card overrides this per \
-                 controller (right-click it to go back to automatic). Controllers FlexInput \
-                 reads through SDL, and Joy-Con 2, can't be hidden.",
+                 controller (right-click it to go back to automatic). Joy-Con 2 can't be \
+                 hidden.",
             ).small().color(egui::Color32::from_gray(140)));
         }
         if hidhide_installed && cfg!(windows) {

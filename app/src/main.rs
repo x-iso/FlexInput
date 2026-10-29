@@ -193,6 +193,26 @@ fn run_as_helper_if_requested() -> bool {
     false
 }
 
+/// Every C `open` in this binary lands here: build.rs links it with
+/// `-Wl,--wrap=open`. It's what lets SDL read a controller FlexInput hid; see
+/// `flexinput_devices::linux_hide::open_or_private`. Defined in the binary
+/// itself so the linker always has it, whatever order it reads the libraries
+/// in.
+///
+/// `open` is variadic and Rust can't define a variadic function. On the
+/// x86-64 and AArch64 Linux ABIs a variadic call passes `mode` in the same
+/// register a third fixed argument uses, so this signature reads it (or,
+/// without `O_CREAT`, whatever is there, which nothing then looks at).
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[no_mangle]
+pub unsafe extern "C" fn __wrap_open(
+    path: *const std::ffi::c_char,
+    flags: std::ffi::c_int,
+    mode: std::ffi::c_uint,
+) -> std::ffi::c_int {
+    flexinput_ui::linux_open_or_private(path, flags, mode)
+}
+
 /// Ordered backend cascade for `RendererChoice::Auto`. Startup tries element
 /// `[0]`; if that backend fails to *initialize* (surface/device creation errors
 /// out of `run_native`), the process advances to the next element and relaunches

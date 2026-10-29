@@ -17,6 +17,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   `~/.local/share` when it starts. FlexInput also shows up in the application
   menu.
 
+- **Hiding controllers FlexInput reads through SDL on Linux.** Third-party
+  pads and the other controllers FlexInput reads through SDL couldn't be
+  hidden on Linux, so games saw them next to the virtual pad. They're now
+  hidden like any other remapped controller. Joy-Con 2 still can't be.
+
 ### Changed
 
 - **Overlays sit above everything on most Linux desktops.** On desktops with
@@ -40,6 +45,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   layouts for 59 more Windows controllers.
 
 ### Fixed
+
+- **"Route all pads through SDL" no longer loses hidden controllers on
+  Linux.** With the switch on, a controller FlexInput was hiding disappeared
+  from FlexInput too: SDL couldn't open it, and FlexInput kept it hidden
+  because it seemed to be missing. SDL now reads hidden controllers the way
+  the rest of FlexInput does.
 
 - **Hidden controllers stay hidden on Linux.** Cutting Steam off from a
   hidden controller reconnects it, and FlexInput briefly took the

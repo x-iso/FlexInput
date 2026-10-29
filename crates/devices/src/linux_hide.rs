@@ -9,7 +9,9 @@
 //! for the same device in [`PRIVATE_DIR`], owned by the user. Games find the
 //! public nodes (udev, SDL, Steam), can't open them, and skip the controller.
 //! FlexInput's own opens fall back to the private node: [`reachable`] for its
-//! hidraw readers, a patch in the vendored gilrs-core for evdev.
+//! hidraw readers, a patch in the vendored gilrs-core for evdev, and for SDL,
+//! [`open_or_private`], which the linker puts behind every C `open` call in
+//! the binary.
 //!
 //! - Nodes that already exist are taken away directly. Another program that
 //!   already has one open (Steam keeps every controller it supports open) is
@@ -85,6 +87,67 @@ pub fn reachable(path: &std::ffi::CStr) -> CString {
         Ok(p) if unsafe { libc::access(p.as_ptr(), libc::R_OK | libc::W_OK) } == 0 => p,
         _ => path.to_owned(),
     }
+}
+
+/// The private twin of a public controller node, written NUL-terminated into
+/// `buf`: `/dev/hidrawN` or `/dev/input/eventN` → `/dev/flexinput/<name>`, the
+/// two kinds the helper makes private nodes for. `None` for any other path.
+fn private_twin<'a>(path: &[u8], buf: &'a mut [u8; 64]) -> Option<&'a std::ffi::CStr> {
+    let rest = path.strip_prefix(b"/dev/")?;
+    let name = if rest.starts_with(b"hidraw") {
+        rest
+    } else {
+        rest.strip_prefix(b"input/").filter(|n| n.starts_with(b"event"))?
+    };
+    if name.contains(&b'/') {
+        return None;
+    }
+    let dir = PRIVATE_DIR.as_bytes();
+    let len = dir.len() + 1 + name.len();
+    if len >= buf.len() {
+        return None;
+    }
+    buf[..dir.len()].copy_from_slice(dir);
+    buf[dir.len()] = b'/';
+    buf[dir.len() + 1..len].copy_from_slice(name);
+    buf[len] = 0;
+    std::ffi::CStr::from_bytes_with_nul(&buf[..=len]).ok()
+}
+
+/// `open(2)` for every C caller in the `flexinput` binary on Linux: the linker
+/// wraps their `open` into this (`-Wl,--wrap=open`, app/build.rs). Reading a
+/// hidden controller is the point — SDL's joystick and HID code open the
+/// public node, which hiding refuses, and SDL has no way to be told about the
+/// private one. So a refused open of a controller node is retried on its
+/// private twin; every other open behaves exactly as `open` does. SDL keeps the
+/// public path, so its udev lookups and the own-virtual test still work.
+///
+/// No allocation and nothing but syscalls: callers may be anywhere, a forked
+/// child included.
+///
+/// # Safety
+/// `path` is a valid NUL-terminated string, as for `open`. `mode` is read only
+/// with `O_CREAT` / `O_TMPFILE`, as for `open`.
+pub unsafe fn open_or_private(path: *const libc::c_char, flags: libc::c_int, mode: libc::c_uint) -> libc::c_int {
+    // glibc's open is this same openat(AT_FDCWD, …), which isn't wrapped.
+    let fd = libc::openat(libc::AT_FDCWD, path, flags, mode);
+    if fd >= 0 || path.is_null() {
+        return fd;
+    }
+    let err = *libc::__errno_location();
+    if err != libc::EACCES && err != libc::EPERM {
+        return fd;
+    }
+    let mut buf = [0u8; 64];
+    if let Some(private) = private_twin(std::ffi::CStr::from_ptr(path).to_bytes(), &mut buf) {
+        let fd = libc::openat(libc::AT_FDCWD, private.as_ptr(), flags, mode);
+        if fd >= 0 {
+            return fd;
+        }
+    }
+    // The caller sees the public node's refusal, not the twin's absence.
+    *libc::__errno_location() = err;
+    -1
 }
 
 // ── Client: FlexInput's side ────────────────────────────────────────────────
@@ -950,6 +1013,35 @@ mod tests {
     fn a_public_node_stays_put_while_it_opens() {
         let null = CString::new("/dev/null").unwrap();
         assert_eq!(reachable(&null), null);
+    }
+
+    #[test]
+    fn only_controller_nodes_have_a_private_twin() {
+        let twin = |p: &str| {
+            let mut buf = [0u8; 64];
+            private_twin(p.as_bytes(), &mut buf).map(|c| c.to_str().unwrap().to_string())
+        };
+        assert_eq!(twin("/dev/hidraw3").as_deref(), Some("/dev/flexinput/hidraw3"));
+        assert_eq!(twin("/dev/input/event17").as_deref(), Some("/dev/flexinput/event17"));
+        assert_eq!(twin("/dev/input/js0"), None, "the helper makes none for js");
+        assert_eq!(twin("/dev/input/by-id/usb-pad-event-joystick"), None);
+        assert_eq!(twin("/dev/null"), None);
+        assert_eq!(twin("/dev/hidraw3/../../etc/shadow"), None);
+        assert_eq!(twin("/home/u/hidraw3"), None);
+        assert_eq!(twin(&format!("/dev/hidraw{}", "9".repeat(60))), None, "too long for the buffer");
+    }
+
+    #[test]
+    fn open_or_private_is_open_for_everything_else() {
+        let null = CString::new("/dev/null").unwrap();
+        // SAFETY: valid paths; the fds are closed below.
+        let fd = unsafe { open_or_private(null.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC, 0) };
+        assert!(fd >= 0);
+        unsafe { libc::close(fd) };
+        let missing = CString::new("/dev/hidraw-flexinput-test-missing").unwrap();
+        let fd = unsafe { open_or_private(missing.as_ptr(), libc::O_RDONLY, 0) };
+        assert_eq!(fd, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOENT), "not retried, errno kept");
     }
 
     #[test]
