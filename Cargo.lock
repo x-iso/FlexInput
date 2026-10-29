@@ -2048,6 +2048,7 @@ dependencies = [
  "egui",
  "egui-snarl",
  "egui-wgpu",
+ "egui-winit",
  "egui_extras",
  "flexinput-btle",
  "flexinput-core",

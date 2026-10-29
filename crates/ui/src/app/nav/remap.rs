@@ -19,6 +19,8 @@ pub(crate) fn draw_remap_card_glow(
     host: egui::LayerId,
 ) {
     let cur_pass = ctx.cumulative_pass_nr();
+    // The rect channels are per viewport: this one's copy of the body.
+    let vp = ctx.viewport_id();
     let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
     // The action-button glow uses the full-screen painter (the action row sits at
     // the top of the body and never scrolls); the card glow below re-clips to the
@@ -36,12 +38,12 @@ pub(crate) fn draw_remap_card_glow(
     // out of view has its ring cropped at the visible edge, not spilling past.
     if let Some((pass, card, field, entered)) = ctx.data(|d|
         d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
-            egui::Id::new(("gp_nav_remap_card_rects", inner.0, scope))))
+            egui::Id::new(("gp_nav_remap_card_rects", vp, inner.0, scope))))
     {
         if cur_pass.saturating_sub(pass) <= 2 {
             let mut whole = card;
             if let Some((sp, sect)) = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
-                egui::Id::new(("gp_nav_card_section_rect", inner.0, scope))))
+                egui::Id::new(("gp_nav_card_section_rect", vp, inner.0, scope))))
             {
                 // Only union when the section actually butts the bottom of THIS
                 // card (flush, 0-gap) — rejects a rect left over from a
@@ -53,7 +55,7 @@ pub(crate) fn draw_remap_card_glow(
                 }
             }
             let clipped = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
-                    egui::Id::new(("gp_nav_remap_viewport", inner.0, scope))))
+                    egui::Id::new(("gp_nav_remap_viewport", vp, inner.0, scope))))
                 .filter(|(p, r)| cur_pass.saturating_sub(*p) <= 2 && r.is_finite())
                 .map(|(_, vp)| painter.with_clip_rect(vp));
             let cp = clipped.as_ref().unwrap_or(&painter);
@@ -66,7 +68,7 @@ pub(crate) fn draw_remap_card_glow(
             }
             // What the focused option does, as its hover tooltip says it.
             let tip = ctx.data(|d| d.get_temp::<(u64, String)>(
-                    egui::Id::new(("gp_nav_remap_card_tip", inner.0, scope))))
+                    egui::Id::new(("gp_nav_remap_card_tip", vp, inner.0, scope))))
                 .filter(|(p, t)| cur_pass.saturating_sub(*p) <= 2 && !t.is_empty())
                 .map(|(_, t)| t);
             if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
@@ -98,7 +100,7 @@ pub(crate) fn draw_remap_card_glow(
         .filter(|i| *i != usize::MAX);
     if let Some(ai) = act_sel {
         if let Some((pass, rects)) = ctx.data(|d|
-            d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0, scope))))
+            d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", vp, inner.0, scope))))
         {
             if cur_pass.saturating_sub(pass) <= 2 {
                 if let Some(rect) = rects.get(ai) { ring(*rect, 4.0, 130.0, 6.0); }

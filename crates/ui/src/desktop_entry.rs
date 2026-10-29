@@ -6,6 +6,13 @@
 //! installer, so it writes its own entry and icon into the user's data folder
 //! (`~/.local/share`) on every start, with `Exec` pointing at the binary that
 //! ran. That also lists it in the application menu.
+//!
+//! KWin also reads the entry whose `Exec` is the calling binary to decide
+//! whether it may use KWin's screenshot interface, which the RWS calibration
+//! reference frame does (`capture.rs`); the entry asks for it. KWin looks
+//! entries up in KDE's application cache, which is rebuilt only when a
+//! folder's modification time moves, so a changed entry is renamed into
+//! place rather than rewritten (`write_if_changed`).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,14 +42,25 @@ fn try_install() -> io::Result<()> {
     write_if_changed(&data.join("applications").join(format!("{APP_ID}.desktop")), entry.as_bytes())
 }
 
+/// Put `bytes` at `path` unless it already holds them, through a sibling temp
+/// file renamed over it, so the folder's modification time moves and KDE's
+/// application cache notices (a file rewritten in place goes unnoticed). A
+/// file newer than its folder was rewritten in place, as earlier builds did,
+/// and is renamed into place again for the same reason.
 fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+    let dir = path.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let newer_than_dir = matches!((modified(path), modified(dir)), (Some(f), Some(d)) if f > d);
+    if !newer_than_dir && std::fs::read(path).is_ok_and(|old| old == bytes) {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, bytes)
+    std::fs::create_dir_all(dir)?;
+    let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?;
+    let temp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
 }
 
 fn entry(exe: &Path) -> Option<String> {
@@ -55,7 +73,8 @@ fn entry(exe: &Path) -> Option<String> {
          Icon={APP_ID}\n\
          Terminal=false\n\
          Categories=Game;Utility;\n\
-         StartupWMClass={APP_ID}\n",
+         StartupWMClass={APP_ID}\n\
+         X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n",
         exec_arg(exe)?
     ))
 }
@@ -96,5 +115,36 @@ mod tests {
         assert!(exec_arg(Path::new("/a\nb")).is_none());
         let e = entry(Path::new("/opt/fi")).unwrap();
         assert!(e.contains("Exec=\"/opt/fi\"\nIcon=flexinput\n"), "{e}");
+    }
+
+    #[test]
+    fn writes_by_rename_and_redoes_an_in_place_rewrite() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("fi-desktop-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("a.desktop");
+        let modified = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let set_modified = |t: SystemTime| {
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(t).unwrap();
+        };
+
+        write_if_changed(&path, b"one").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "the temp file is gone");
+
+        // Same bytes, older than the folder: left alone.
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        set_modified(old);
+        write_if_changed(&path, b"one").unwrap();
+        assert_eq!(modified(&path), old);
+
+        // Same bytes, newer than the folder (rewritten in place): renamed in
+        // again, which brings the folder level with it.
+        set_modified(SystemTime::now() + Duration::from_secs(3600));
+        write_if_changed(&path, b"one").unwrap();
+        assert!(modified(&path) <= modified(&dir));
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -17,6 +17,8 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use crate::dpi::{PhysicalPosition, PhysicalSize};
+use crate::error::ExternalError;
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
@@ -81,6 +83,18 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// FLEXINPUT PATCH: take pointer input only inside `rects` (physical
+    /// pixels, window-relative), or everywhere for `None`; no rects is
+    /// click-through. Wayland has no global cursor position, so an overlay
+    /// can't flip [`Window::set_cursor_hittest`] as the cursor crosses its
+    /// controls: it hands the compositor where they are instead. Also works
+    /// on an X11 window (its input shape). Like `set_cursor_hittest`, it ends
+    /// the focus a layer surface was given.
+    fn set_input_region(
+        &self,
+        rects: Option<&[(PhysicalPosition<i32>, PhysicalSize<u32>)]>,
+    ) -> Result<(), ExternalError>;
 }
 
 impl WindowExtWayland for Window {
@@ -93,6 +107,14 @@ impl WindowExtWayland for Window {
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
         }
+    }
+
+    #[inline]
+    fn set_input_region(
+        &self,
+        rects: Option<&[(PhysicalPosition<i32>, PhysicalSize<u32>)]>,
+    ) -> Result<(), ExternalError> {
+        self.window.maybe_wait_on_main(|w| w.set_input_region(rects))
     }
 }
 
@@ -110,8 +132,11 @@ pub trait WindowAttributesExtWayland {
     /// FLEXINPUT PATCH: open the window as a wlr-layer-shell surface instead of
     /// a toplevel, where the compositor offers layer shell: it covers a whole
     /// output in the overlay layer (above every window, fullscreen ones too),
-    /// is never tiled or listed, and takes keyboard focus only when clicked.
-    /// The compositor picks the output and the size; position, size and window
+    /// and is never tiled or listed. It takes keyboard focus from the start
+    /// unless built inactive (`with_active(false)`), then only while it was
+    /// focused (until it next turns click-through) or a text field in it wants
+    /// typing, so an inactive overlay leaves the keyboard with the game. The
+    /// compositor picks the output and the size; position, size and window
     /// management requests do nothing. `namespace` names it to the compositor.
     fn with_overlay_layer(self, namespace: impl Into<String>) -> Self;
 }

@@ -169,12 +169,15 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
     // another's closure deadlocks epaint (the freeze the user hit). So read every
     // ctx value into a plain local FIRST, then operate on locals.
     let pass = ui.ctx().cumulative_pass_nr();
+    // Rects and scroll are per viewport (see `remapper_card`); the selection is
+    // the nav driver's, so it isn't.
+    let vp = ui.ctx().viewport_id();
     let action_sel: Option<(u64, usize)> = ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(("gp_nav_remap_action", node_id.0, scope))));
     let clip = ui.clip_rect();
 
     ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_action_rects", node_id.0, scope)), (pass, rects)));
+        egui::Id::new(("gp_nav_action_rects", vp, node_id.0, scope)), (pass, rects)));
 
     // If an action button is the current nav selection and it's (partly) above/
     // below the visible band, request a scroll so it comes into view. The action
@@ -194,7 +197,7 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
                 // two consumers read it unscoped, and lean left/right action
                 // rows live in separate scroll bodies so cross-talk is harmless.
                 ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
+                    egui::Id::new(("gp_nav_remap_scroll", vp, node_id.0)),
                     (pass, need)));
                 request_repaint_throttled(ui.ctx());
             }

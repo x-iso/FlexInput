@@ -458,6 +458,15 @@ impl Window {
         x11_or_wayland!(match self; Window(w) => w.set_cursor_hittest(hittest))
     }
 
+    /// FLEXINPUT PATCH: see `WindowExtWayland::set_input_region`.
+    #[inline]
+    pub fn set_input_region(
+        &self,
+        rects: Option<&[(PhysicalPosition<i32>, PhysicalSize<u32>)]>,
+    ) -> Result<(), ExternalError> {
+        x11_or_wayland!(match self; Window(w) => w.set_input_region(rects))
+    }
+
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         x11_or_wayland!(match self; Window(w) => w.scale_factor())

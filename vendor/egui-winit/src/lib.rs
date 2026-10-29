@@ -106,6 +106,33 @@ pub struct State {
 
     allow_ime: bool,
     ime_rect_px: Option<egui::Rect>,
+
+    /// FLEXINPUT PATCH: the input region last handed to the window, in
+    /// physical pixels (see [`set_input_region`]).
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    input_region_px: Option<Option<Vec<egui::Rect>>>,
+}
+
+/// FLEXINPUT PATCH: ctx-data value behind [`set_input_region`].
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[derive(Clone)]
+struct InputRegion(Option<Vec<egui::Rect>>);
+
+/// FLEXINPUT PATCH: let viewport `viewport`'s window take pointer input only
+/// inside `rects` (points), or everywhere for `None`; no rects is
+/// click-through. Applied with the viewport's next platform output through
+/// winit's `WindowExtWayland::set_input_region`, on Wayland and X11 alike.
+/// A viewport that never calls this keeps whatever
+/// `ViewportCommand::MousePassthrough` set; one that does should use only
+/// this.
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+pub fn set_input_region(ctx: &egui::Context, viewport: ViewportId, rects: Option<Vec<egui::Rect>>) {
+    ctx.data_mut(|d| d.insert_temp(input_region_id(viewport), InputRegion(rects)));
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+fn input_region_id(viewport: ViewportId) -> egui::Id {
+    egui::Id::new(("egui_winit_input_region", viewport))
 }
 
 impl State {
@@ -148,6 +175,9 @@ impl State {
 
             allow_ime: false,
             ime_rect_px: None,
+
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            input_region_px: None,
         };
 
         slf.egui_input
@@ -907,6 +937,9 @@ impl State {
 
         self.set_cursor_icon(window, cursor_icon);
 
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        self.apply_input_region(window);
+
         let allow_ime = ime.is_some();
         if self.allow_ime != allow_ime {
             self.allow_ime = allow_ime;
@@ -944,6 +977,47 @@ impl State {
             profiling::scope!("accesskit");
             accesskit.update_if_active(|| update);
         }
+    }
+
+    /// FLEXINPUT PATCH: hand the window the input region last set for this
+    /// viewport with [`set_input_region`], when it changed.
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    fn apply_input_region(&mut self, window: &Window) {
+        use winit::platform::wayland::WindowExtWayland as _;
+        let Some(InputRegion(rects)) =
+            self.egui_ctx.data(|d| d.get_temp::<InputRegion>(input_region_id(self.viewport_id)))
+        else {
+            return;
+        };
+        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        // Whole pixels, rounded outward.
+        let rects_px = rects.map(|rects| {
+            rects
+                .iter()
+                .map(|r| pixels_per_point * *r)
+                .map(|r| Rect::from_min_max(r.min.floor(), r.max.ceil()))
+                .filter(|r| r.is_finite() && r.is_positive())
+                .collect::<Vec<_>>()
+        });
+        if self.input_region_px.as_ref() == Some(&rects_px) {
+            return;
+        }
+        let physical = rects_px.as_ref().map(|rects| {
+            rects
+                .iter()
+                .map(|r| {
+                    (
+                        winit::dpi::PhysicalPosition::new(r.min.x as i32, r.min.y as i32),
+                        winit::dpi::PhysicalSize::new(r.width() as u32, r.height() as u32),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        profiling::scope!("set_input_region");
+        if let Err(err) = window.set_input_region(physical.as_deref()) {
+            log::warn!("set_input_region: {err}");
+        }
+        self.input_region_px = Some(rects_px);
     }
 
     fn set_cursor_icon(&mut self, window: &Window, cursor_icon: egui::CursorIcon) {

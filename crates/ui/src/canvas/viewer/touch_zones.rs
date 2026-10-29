@@ -813,8 +813,9 @@ pub(crate) fn mapping_curve_editor(
                 need = target.bottom() - (clip.bottom() - 4.0);
             }
             if need.abs() > 1.0 {
+                let vp = ui.ctx().viewport_id();
                 ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_remap_scroll", uid)), (pass, need)));
+                    egui::Id::new(("gp_nav_remap_scroll", vp, uid)), (pass, need)));
                 request_repaint_throttled(ui.ctx());
             }
         }
@@ -1223,12 +1224,14 @@ pub(crate) fn mapping_card_curve_section(
     });
     // Publish this section's GLOBAL rect for the selected card so the nav driver's
     // card glow expands to wrap header + section as ONE ring (instead of a separate
-    // border here). Keyed per node+scope; only the selected card publishes.
+    // border here). Keyed per viewport+node+scope, like the card's own rects;
+    // only the selected card publishes.
     if selected_here {
         let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
             .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let vp = ui.ctx().viewport_id();
         ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_card_section_rect", node_id.0, scope.to_string())),
+            egui::Id::new(("gp_nav_card_section_rect", vp, node_id.0, scope.to_string())),
             (pass, to_global * out.response.rect)));
     }
     out.inner

@@ -229,17 +229,35 @@ fn rws_reference_frame(
     });
 
     let tex_key = egui::Id::new("fxi_rws_ref_tex");
+    let pending_key = egui::Id::new("fxi_rws_ref_pending");
     let prev_key = egui::Id::new("fxi_rws_ref_active");
     let prev = ctx.data(|d| d.get_temp::<bool>(prev_key)).unwrap_or(false);
     if active && !prev {
-        // Sweep just started — capture the game frame (our layered overlay is
-        // excluded by the plain BitBlt), cache as a texture on this ctx.
-        let tex = crate::capture::capture_primary_monitor()
-            .map(|img| ctx.load_texture("fxi_rws_ref", img, egui::TextureOptions::LINEAR));
-        ctx.data_mut(|d| d.insert_temp(tex_key, tex));
+        // Sweep just started — capture the game frame (our overlays are left
+        // out: by the plain BitBlt on Windows, by KWin on Linux).
+        let pending = crate::capture::capture_primary_monitor();
+        ctx.data_mut(|d| {
+            d.insert_temp(tex_key, None::<egui::TextureHandle>);
+            d.insert_temp(pending_key, Some(pending));
+        });
+    }
+    if active {
+        // Cache it as a texture on this ctx once it's in (at once on Windows,
+        // a frame or two later from KWin).
+        let pending = ctx.data(|d| d.get_temp::<Option<crate::capture::PendingCapture>>(pending_key)).flatten();
+        if let Some(image) = pending.and_then(|p| p.take()) {
+            let tex = image.map(|img| ctx.load_texture("fxi_rws_ref", img, egui::TextureOptions::LINEAR));
+            ctx.data_mut(|d| {
+                d.insert_temp(tex_key, tex);
+                d.insert_temp(pending_key, None::<crate::capture::PendingCapture>);
+            });
+        }
     }
     if !active && prev {
-        ctx.data_mut(|d| d.insert_temp(tex_key, None::<egui::TextureHandle>));
+        ctx.data_mut(|d| {
+            d.insert_temp(tex_key, None::<egui::TextureHandle>);
+            d.insert_temp(pending_key, None::<crate::capture::PendingCapture>);
+        });
     }
     ctx.data_mut(|d| d.insert_temp(prev_key, active));
     if active {
@@ -425,11 +443,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             resolved_rects.get(i).copied().unwrap_or(egui::Rect::NOTHING)
         };
         // OS cursor in overlay-local points (the overlay fills the monitor at
-        // origin, so screen points == item coords). None during a pick.
+        // origin, so screen points == item coords). None during a pick, and on
+        // Linux whenever it's off the input region set below.
         let cursor = if pick {
             None
         } else {
-            crate::overlay::os_cursor_in_points(vctx.pixels_per_point())
+            crate::overlay::overlay_cursor(vctx)
         };
 
         // Publish the gamepad-navigable pin targets each live frame. Only pins
@@ -536,30 +555,44 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // pinned item, or during a drag/popup; click-through elsewhere so the game
         // stays reachable. During a pick the window is fully click-through so the
         // pin click lands on FlexInput behind it, and hands-off (above) is too.
+        let toolbar_rect = vctx.data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id())).map(|r| r.expand(4.0));
+        let whole = egui::Popup::is_any_open(vctx) || dragging;
         let interactive = if pick || hands_off {
             false
         } else {
-            let over_toolbar = cursor
-                .and_then(|c| {
-                    vctx.data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
-                        .map(|r| r.expand(4.0).contains(c))
-                })
-                .unwrap_or(false);
+            let over_toolbar = cursor.zip(toolbar_rect).is_some_and(|(c, r)| r.contains(c));
             let over_item = cursor
                 .map(|c| (0..config_layout.items.len()).any(|i| item_rect(i).expand(HIT_MARGIN).contains(c)))
                 .unwrap_or(false);
-            egui::Popup::is_any_open(vctx) || dragging || over_toolbar || over_item || cursor.is_none()
+            // No cursor reading on Windows → stay interactive. On Linux it
+            // only means the cursor is off the input region.
+            whole || over_toolbar || over_item || (cfg!(not(target_os = "linux")) && cursor.is_none())
         };
-        let pt_id = egui::Id::new("fxi_config_passthrough_applied");
         let want_passthrough = !interactive;
-        let applied: Option<bool> = vctx.data(|d| d.get_temp(pt_id));
-        if applied != Some(want_passthrough) {
-            // No `Focus` when turning interactive: that fired on mere hover —
-            // including a game's hidden cursor parked over a pin when the overlay
-            // is summoned — and took foreground from the game. A real click still
-            // activates the overlay on its own.
-            vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
-            vctx.data_mut(|d| d.insert_temp(pt_id, want_passthrough));
+        // Linux: the same rects become the window's input region (see
+        // `overlay::set_input_rects`).
+        #[cfg(target_os = "linux")]
+        crate::overlay::set_input_rects(vctx, if pick || hands_off {
+            Some(Vec::new())
+        } else if whole {
+            None
+        } else {
+            Some(toolbar_rect.into_iter()
+                .chain((0..config_layout.items.len()).map(|i| item_rect(i).expand(HIT_MARGIN)))
+                .collect())
+        });
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pt_id = egui::Id::new("fxi_config_passthrough_applied");
+            let applied: Option<bool> = vctx.data(|d| d.get_temp(pt_id));
+            if applied != Some(want_passthrough) {
+                // No `Focus` when turning interactive: that fired on mere hover —
+                // including a game's hidden cursor parked over a pin when the overlay
+                // is summoned — and took foreground from the game. A real click still
+                // activates the overlay on its own.
+                vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
+                vctx.data_mut(|d| d.insert_temp(pt_id, want_passthrough));
+            }
         }
 
         // Hand foreground back to the game once the overlay no longer needs it:

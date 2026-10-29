@@ -28,7 +28,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   Wayland's layer shell (KDE Plasma, Hyprland, Sway and most others) the
   overlays, and the pickers that open over a game, now sit in the desktop's
   top layer: above every window, a fullscreen game included, never tiled and
-  never in the taskbar or Alt+Tab.
+  never in the taskbar or Alt+Tab. They leave the keyboard with the game,
+  taking it only while you type into one or arrange one in edit mode.
+
+- **The config overlay lets clicks through on Linux.** As on Windows, it
+  takes the mouse only over its pins and toolbar, and clicks anywhere else
+  reach the game; on Linux it used to cover the whole screen. The same goes
+  for the info overlay in edit mode.
 
 - **FlexInput runs as an X11 app on GNOME.** GNOME has no layer shell, so
   FlexInput runs there under XWayland, where GNOME keeps the overlays and
@@ -66,6 +72,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **Switch Pro Controller setup on Linux.** The kernel's own driver sets the
   controller up on Linux, so FlexInput no longer repeats that over it and
   only reads the stick calibration.
+
+- **Gamepad editing of a Remapper pinned to the config overlay.** With the
+  same Remapper also showing in the main window, entering it from the config
+  overlay scrolled its cards to the bottom and left gamepad navigation stuck.
+  The same could happen to Touch Zones and the other card lists.
+
+- **RWS calibration's screenshot reference on Linux.** The 360° reference
+  frame had no screenshot on Linux. On KDE Plasma it now captures the game
+  through KWin; other Linux desktops still go without.
 
 ## [0.16.2] - 2026-10-28
 

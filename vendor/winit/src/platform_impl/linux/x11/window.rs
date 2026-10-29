@@ -1657,6 +1657,41 @@ impl UnownedWindow {
         Ok(())
     }
 
+    /// FLEXINPUT PATCH: take pointer input only inside `rects` (physical
+    /// pixels), or everywhere for `None`: the input shape, as above.
+    pub(crate) fn set_input_region(
+        &self,
+        rects: Option<&[(PhysicalPosition<i32>, PhysicalSize<u32>)]>,
+    ) -> Result<(), ExternalError> {
+        let Some(rects) = rects else {
+            return self.set_cursor_hittest(true);
+        };
+        let rectangles: Vec<Rectangle> = rects
+            .iter()
+            .map(|(position, size)| Rectangle {
+                x: position.x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                y: position.y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                width: size.width.min(u16::MAX as u32) as u16,
+                height: size.height.min(u16::MAX as u32) as u16,
+            })
+            .collect();
+        self.xconn
+            .xcb_connection()
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                self.xwindow,
+                0,
+                0,
+                &rectangles,
+            )
+            .map_err(|_e| ExternalError::Ignored)?;
+        // Not a full shape, so a resize mustn't restore one.
+        self.shared_state_lock().cursor_hittest = Some(false);
+        Ok(())
+    }
+
     /// Moves the window while it is being dragged.
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         self.drag_initiate(util::MOVERESIZE_MOVE)

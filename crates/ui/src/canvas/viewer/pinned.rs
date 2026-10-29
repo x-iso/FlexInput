@@ -1189,11 +1189,13 @@ where
         }
     }
     // Gamepad-nav scroll: the nav driver publishes a body-space scroll delta
-    // (px) keyed by inner node id while the user is inside this widget
-    // (RemapScroll level). Apply it directly — no pointer-over gate, since the
-    // driver only targets the selected widget.
+    // (px) keyed by viewport and inner node id while the user is inside this
+    // widget (RemapScroll level). Apply it directly — no pointer-over gate,
+    // since the driver only targets the selected widget. Without the viewport
+    // in the key, the copy in the main window pushed this one (on the config
+    // overlay) all the way down, every frame.
     if !is_layout_mode {
-        let scroll_id = egui::Id::new(("gp_nav_remap_scroll", inner_id.0));
+        let scroll_id = egui::Id::new(("gp_nav_remap_scroll", ui.ctx().viewport_id(), inner_id.0));
         let cur_pass = ui.ctx().cumulative_pass_nr();
         if let Some((pass, delta)) = ui.ctx().data(|d| d.get_temp::<(u64, f32)>(scroll_id)) {
             // Accept this frame's or last frame's stamp (driver runs before the

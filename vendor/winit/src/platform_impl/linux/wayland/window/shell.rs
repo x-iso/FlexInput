@@ -4,12 +4,16 @@
 //! surface instead, covering an output in the overlay layer. A layer surface
 //! has none of a toplevel's window management (title, app id, sizes,
 //! maximize, move, decorations), so those requests are dropped for it.
+//!
+//! An overlay must not take the keyboard from the game under it, so a layer
+//! surface takes keyboard focus only while it was asked to be focused or a
+//! text field in it wants typing (see `Window::set_layer_keyboard`).
 
 use sctk::reexports::client::protocol::wl_output::WlOutput;
 use sctk::reexports::client::protocol::wl_seat::WlSeat;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
-use sctk::shell::wlr_layer::LayerSurface;
+use sctk::shell::wlr_layer::{KeyboardInteractivity, LayerSurface};
 use sctk::shell::xdg::window::{DecorationMode, Window as XdgWindow};
 use sctk::shell::{Unsupported, WaylandSurface};
 
@@ -51,6 +55,21 @@ impl Window {
         match self {
             Window::Xdg(window) => window.set_buffer_scale(scale),
             Window::Layer(layer) => layer.set_buffer_scale(scale),
+        }
+    }
+
+    // Layer surface only.
+
+    /// Whether the layer surface takes keyboard focus. A compositor focuses
+    /// an overlay-layer surface the moment it starts accepting the keyboard
+    /// (KWin activates it), so this is also how one is focused.
+    pub fn set_keyboard(&self, on: bool) {
+        if let Window::Layer(layer) = self {
+            layer.set_keyboard_interactivity(if on {
+                KeyboardInteractivity::OnDemand
+            } else {
+                KeyboardInteractivity::None
+            });
         }
     }
 

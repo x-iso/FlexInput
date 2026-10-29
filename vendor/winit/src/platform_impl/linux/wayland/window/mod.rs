@@ -78,6 +78,24 @@ pub struct Window {
 
     /// The event sink to deliver synthetic events.
     window_events_sink: Arc<Mutex<EventSink>>,
+
+    /// FLEXINPUT PATCH: why a layer surface takes the keyboard.
+    layer_keyboard: Mutex<LayerKeyboard>,
+}
+
+/// FLEXINPUT PATCH: a layer surface takes keyboard focus while it was focused
+/// (until it next turns click-through) or a text field in it wants typing,
+/// and never otherwise, so an overlay leaves the keyboard with the game.
+#[derive(Default)]
+struct LayerKeyboard {
+    focused: bool,
+    typing: bool,
+}
+
+impl LayerKeyboard {
+    fn wanted(&self) -> bool {
+        self.focused || self.typing
+    }
 }
 
 impl Window {
@@ -125,7 +143,13 @@ impl Window {
                 layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
                 // Over panels too, not beside them.
                 layer.set_exclusive_zone(-1);
-                layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+                // An inactive one leaves the keyboard where it is: a surface
+                // accepting it is focused the moment it maps.
+                layer.set_keyboard_interactivity(if attributes.active {
+                    KeyboardInteractivity::OnDemand
+                } else {
+                    KeyboardInteractivity::None
+                });
                 layer.set_size(0, 0);
                 SctkWindow::Layer(layer)
             },
@@ -245,6 +269,8 @@ impl Window {
         let event_loop_awakener = event_loop_window_target.event_loop_awakener.clone();
         event_loop_awakener.ping();
 
+        let layer_keyboard = Mutex::new(LayerKeyboard { focused: attributes.active, typing: false });
+
         Ok(Self {
             window,
             display,
@@ -258,11 +284,58 @@ impl Window {
             event_loop_awakener,
             window_requests,
             window_events_sink,
+            layer_keyboard,
         })
     }
 
     pub(crate) fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
         NonNull::new(self.window.xdg()?.xdg_toplevel().id().as_ptr().cast())
+    }
+
+    /// FLEXINPUT PATCH: update why a layer surface takes the keyboard. The
+    /// change rides on the next commit, so a redraw is asked for.
+    fn set_layer_keyboard(&self, update: impl FnOnce(&mut LayerKeyboard)) {
+        if !self.window.is_layer() {
+            return;
+        }
+        let mut keyboard = self.layer_keyboard.lock().unwrap();
+        let before = keyboard.wanted();
+        update(&mut keyboard);
+        if keyboard.wanted() != before {
+            self.window.set_keyboard(keyboard.wanted());
+            self.request_redraw();
+        }
+    }
+
+    /// FLEXINPUT PATCH: take pointer input only inside `rects` (physical
+    /// pixels), or everywhere for `None`. No rects is click-through, which
+    /// also drops a layer surface's focus the way `set_cursor_hittest` does.
+    pub(crate) fn set_input_region(
+        &self,
+        rects: Option<&[(PhysicalPosition<i32>, PhysicalSize<u32>)]>,
+    ) -> Result<(), ExternalError> {
+        let surface = self.window.wl_surface();
+        let Some(rects) = rects else {
+            surface.set_input_region(None);
+            return Ok(());
+        };
+        let region = Region::new(&*self.compositor).map_err(|_| {
+            ExternalError::Os(os_error!(OsError::Misc("failed to set input region.")))
+        })?;
+        // Surface coordinates are logical: round each rect outward.
+        let scale = self.window_state.lock().unwrap().scale_factor();
+        for (position, size) in rects {
+            let x0 = (position.x as f64 / scale).floor();
+            let y0 = (position.y as f64 / scale).floor();
+            let x1 = ((position.x as f64 + size.width as f64) / scale).ceil();
+            let y1 = ((position.y as f64 + size.height as f64) / scale).ceil();
+            region.add(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+        }
+        surface.set_input_region(Some(region.wl_region()));
+        if rects.is_empty() {
+            self.set_layer_keyboard(|keyboard| keyboard.focused = false);
+        }
+        Ok(())
     }
 }
 
@@ -623,6 +696,9 @@ impl Window {
             })?;
             region.add(0, 0, 0, 0);
             surface.set_input_region(Some(region.wl_region()));
+            // FLEXINPUT PATCH: a click-through overlay gives up the focus it
+            // was given.
+            self.set_layer_keyboard(|keyboard| keyboard.focused = false);
             Ok(())
         }
     }
@@ -647,6 +723,9 @@ impl Window {
             self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
             self.event_loop_awakener.ping();
         }
+        drop(window_state);
+        // FLEXINPUT PATCH: a focused text field needs the keyboard.
+        self.set_layer_keyboard(|keyboard| keyboard.typing = allowed);
     }
 
     #[inline]
@@ -655,7 +734,10 @@ impl Window {
     }
 
     #[inline]
-    pub fn focus_window(&self) {}
+    pub fn focus_window(&self) {
+        // FLEXINPUT PATCH: a layer surface is focused by taking the keyboard.
+        self.set_layer_keyboard(|keyboard| keyboard.focused = true);
+    }
 
     #[inline]
     pub fn surface(&self) -> &WlSurface {

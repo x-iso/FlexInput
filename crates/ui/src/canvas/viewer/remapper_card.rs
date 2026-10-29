@@ -713,6 +713,12 @@ pub(crate) fn remapper_mapping_card_pixel(
         // gets its ring cropped at the visible edge instead of spilling past it.
         let clip_g = to_global * ui.clip_rect();
         let pass = ui.ctx().cumulative_pass_nr();
+        // These rect channels, and the scroll request below, are keyed by
+        // viewport as well: the same card can be on screen in the main window
+        // and on the config overlay at once, and each copy's rects and scroll
+        // are its own. (The pass stamps can't tell them apart: each viewport
+        // counts its own passes.)
+        let vp = ui.ctx().viewport_id();
         // The focused option's tooltip, as a hover would show it (drawn by
         // the nav driver beside the field's glow).
         let field_tip = match nav_card_field {
@@ -723,13 +729,13 @@ pub(crate) fn remapper_mapping_card_pixel(
         };
         ui.ctx().data_mut(|d| {
             d.insert_temp(
-                egui::Id::new(("gp_nav_remap_card_tip", node_id.0, nav_scope)),
+                egui::Id::new(("gp_nav_remap_card_tip", vp, node_id.0, nav_scope)),
                 (pass, field_tip));
             d.insert_temp(
-                egui::Id::new(("gp_nav_remap_card_rects", node_id.0, nav_scope)),
+                egui::Id::new(("gp_nav_remap_card_rects", vp, node_id.0, nav_scope)),
                 (pass, card_g, field_g, nav_card_entered));
             d.insert_temp(
-                egui::Id::new(("gp_nav_remap_viewport", node_id.0, nav_scope)),
+                egui::Id::new(("gp_nav_remap_viewport", vp, node_id.0, nav_scope)),
                 (pass, clip_g));
         });
 
@@ -746,7 +752,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         if need.abs() > 1.0 {
             let body_delta = need / s.max(0.01);
             ui.ctx().data_mut(|d| d.insert_temp(
-                egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
+                egui::Id::new(("gp_nav_remap_scroll", vp, node_id.0)),
                 (pass, body_delta)));
             request_repaint_throttled(ui.ctx());
         }
