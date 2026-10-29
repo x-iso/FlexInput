@@ -15,7 +15,7 @@ straight at it instead — no copy, so it can't drift:
 | HIDMaestro | [`crates/hidmaestro/driver/LICENSE`](../crates/hidmaestro/driver/LICENSE) |
 | egui-snarl | [`vendor/egui-snarl/LICENSE-MIT`](../vendor/egui-snarl/LICENSE-MIT) |
 | btleplug | [`vendor/btleplug/LICENSE.md`](../vendor/btleplug/LICENSE.md) |
-| SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, the copy gilrs 0.10.10 ships) is embedded by `crates/core/src/sdl_db.rs` |
+| SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, upstream `master` as of 2026-10-27) is embedded by `crates/core/src/sdl_db.rs` |
 | Steam Controller 3D model | [`app/assets/models/Steam Controller/license.txt`](../app/assets/models/Steam%20Controller/license.txt) — CC BY-NC-SA 4.0 (non-commercial), from `ceski-1/3d-controller-overlay` commit `587d1be`; the attribution chain is in `license_attribution.txt` beside it |
 
 ## Where each copy came from
@@ -24,9 +24,9 @@ straight at it instead — no copy, so it can't drift:
 |------|--------|
 | `egui.txt` | `emilk/egui` tag `0.33.3`, `LICENSE-MIT` — covers egui, eframe, egui_extras, and the vendored egui-wgpu / egui-winit forks |
 | `gilrs.txt` | `gilrs-project/gilrs`, `LICENSE-MIT` |
-| `SDL.txt` | `libsdl-org/SDL` tag `release-3.4.10`, `LICENSE.txt` — SDL is built from source and linked statically, so it ships inside `flexinput.exe` |
+| `SDL.txt` | `libsdl-org/SDL` tag `release-3.4.14`, `LICENSE.txt` — SDL is built from source and linked statically, so it ships inside `flexinput.exe` |
 | `sdl3.txt` | `sdl3` 0.18.4 crate source, `LICENSE` |
-| `sdl3-sys.txt` | `sdl3-sys` 0.6.6+SDL-3.4.10 crate source, `LICENSE.md` |
+| `sdl3-sys.txt` | `sdl3-sys` 0.6.8+SDL-3.4.14 crate source, `LICENSE.md` |
 | `midir.txt` | `midir` 0.11.0 crate source, `LICENSE` |
 | `rfd.txt` | `rfd` 0.15.4 crate source, `LICENSE` |
 | `serde.txt` | `serde` 1.0.228 crate source, `LICENSE-MIT` |

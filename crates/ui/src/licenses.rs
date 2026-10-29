@@ -110,7 +110,7 @@ pub const LICENSES: &[License] = &[
                ships inside flexinput.exe.",
         spdx: "Zlib",
         url: "https://github.com/libsdl-org/SDL",
-        note: Some("Bundled version: SDL 3.4.10."),
+        note: Some("Bundled version: SDL 3.4.14."),
         text: include_str!("../../../licenses/SDL.txt"),
     },
     License {
@@ -134,7 +134,7 @@ pub const LICENSES: &[License] = &[
         what: "Community controller mappings, bundled as data: the starting                layout for a controller SDL has no built-in mapping for.",
         spdx: "Zlib",
         url: "https://github.com/mdqinc/SDL_GameControllerDB",
-        note: Some("The copy gilrs 0.10.10 ships."),
+        note: Some("Upstream copy of 2026-10-27."),
         text: include_str!("../../../vendor/SDL_GameControllerDB/LICENSE"),
     },
     License {
