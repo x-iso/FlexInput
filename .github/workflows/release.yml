@@ -13,7 +13,7 @@ jobs:
     name: Build Windows binary
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,7 @@ jobs:
           Compress-Archive -Path "target/release/flexinput.exe" -DestinationPath $archive
           echo "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: ${{ steps.package.outputs.archive }}
@@ -50,7 +50,7 @@ jobs:
     # covers Bazzite, SteamOS, Fedora 40+ and Ubuntu 24.04+.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -75,7 +75,7 @@ jobs:
           tar -czf "$archive" -C target/release flexinput
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: ${{ steps.package.outputs.archive }}
@@ -87,13 +87,13 @@ jobs:
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true

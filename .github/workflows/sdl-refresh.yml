@@ -33,7 +33,7 @@ jobs:
       title: ${{ steps.summary.outputs.title }}
       body: ${{ steps.summary.outputs.body }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -189,7 +189,7 @@ jobs:
 
       - name: Hand the refreshed files to the build check
         if: steps.summary.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdl-refresh
           if-no-files-found: error
@@ -242,10 +242,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Apply the refreshed files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdl-refresh
           path: .
@@ -287,16 +287,16 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Apply the refreshed files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdl-refresh
           path: .
 
       - name: Open or update the PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: deps/sdl-refresh
           delete-branch: true
