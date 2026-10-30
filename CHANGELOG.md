@@ -58,6 +58,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   refused the controller's Bluetooth reports by one byte, so motion and the
   touchpad didn't come through it on Linux.
 
+### Fixed
+
+- **Pinned widgets in sub-patch layouts find their controller.** In Easy
+  mode and on a sub-patch's layout, a pinned JSM Config sensitivity curve
+  (or the pinned editor) showed no live gyro dot, and a pinned Input Viewer
+  showed no device: they couldn't follow the sub-patch's input back to the
+  controller. They now do, as they already did on the config overlay.
+
 ## [0.16.3] - 2026-10-28
 
 ### Added

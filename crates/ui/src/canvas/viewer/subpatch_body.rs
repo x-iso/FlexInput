@@ -141,15 +141,15 @@ pub(crate) fn show_subpatch_body(
         .map(|sp| sp.items.clone())
         .unwrap_or_default();
 
-    // Snapshot the outer snarl for whole-module / Text pin renderers that
-    // need AutomapGlowParent chain or per-pin override lookup. Touch Zones'
-    // "field"/"cards" pins need the chain too: live-dot device resolution and
-    // the Special-picker `outer` addressing both walk it — without a snapshot
-    // the pinned widget shows no dots and the picker writes to the wrong snarl.
-    let needs_outer_snapshot = !is_unlocked && items.iter().any(|it| matches!(it,
-        LayoutItem::Module(m) if m.element_id == "whole_module" || m.element_id == "text"
-            || m.element_id == "field" || m.element_id == "cards"
-    ));
+    // Snapshot the outer snarl for pin renderers that walk the
+    // AutomapGlowParent chain (device resolution, live dots, the Special-picker
+    // `outer` addressing) or look up per-pin overrides. Not gated per element
+    // id, as the config overlay's isn't: the list this used to be went stale as
+    // elements learned to read the chain, and pins past it stopped at the inlet
+    // — a JSM curve found no pad and drew no live dot, an Input Viewer showed
+    // no device.
+    let needs_outer_snapshot = !is_unlocked
+        && items.iter().any(|it| matches!(it, LayoutItem::Module(_)));
     let outer_snapshot: Option<Snarl<NodeData>> = if needs_outer_snapshot {
         Some(snarl.clone())
     } else { None };
