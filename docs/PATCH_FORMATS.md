@@ -9,6 +9,7 @@ FlexInput persists to JSON via serde. The on-disk formats are:
 | Full patch | `.fxp` | `UiPatch` | `crates/ui/src/canvas/mod.rs` |
 | Sub-patch preset | `.fxsp` | `SubPatchFile` | `crates/ui/src/app/subpatch.rs` |
 | Response curve | `.fxc` | `CurveFile` | `crates/ui/src/canvas/viewer/curve_support.rs` |
+| Pad calibration | `.fxcal` | `CalFile` | `crates/ui/src/panels/calibration.rs` |
 | Workspace autosave | `workspace.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
 | Crash recovery | `recovery.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
 | Settings | `settings.json` | `AppSettings` | `crates/ui/src/settings.rs` |
@@ -236,6 +237,25 @@ and a non-empty `items` layout) the app switches to Easy mode.
 
 ---
 
+## Pad Calibration Format (`.fxcal`)
+
+Saved and loaded from the Calibration window's title bar.
+
+```json
+{
+  "flexinput_calibration": 1,
+  "device": "Mobapad M12-S",
+  "settings": { "gyro_offset": [0.001, -0.002, 0.0], "deadzone": 0.07 }
+}
+```
+
+`settings` holds the `device.source` params in `CAL_FILE_KEYS`, under their param
+names. `device` is only a name to show: no id is saved, so a file applies to the same
+pad over another connection. A load replaces every key in `CAL_FILE_KEYS`, removing
+those the file lacks (they were at their defaults when it was saved), and ignores
+anything else in `settings`. A file with a higher `flexinput_calibration` than the app
+knows is refused.
+
 ## Response Curve Format (`.fxc`)
 
 ### Root type — `CurveFile`
@@ -355,6 +375,7 @@ Expected: the snarl serializes every node's full `inputs`/`outputs`/`params`. Li
 - `NodeData` / `UiSubPatch` / `LayoutItem` / `OverlayLayout` / overlay attribute+materialize:
   `crates/ui/src/canvas/node.rs`
 - `.fxc` / `CurveFile`: `crates/ui/src/canvas/viewer/curve_support.rs`
+- `.fxcal` / `CalFile`: `crates/ui/src/panels/calibration.rs`
 - `PersistedWorkspace` / `PersistedTab` / save/load: `crates/ui/src/settings.rs`
 - Workspace/recovery orchestration: `crates/ui/src/app/persistence.rs`
 - Snarl serialization: `vendor/egui-snarl/src/lib.rs`

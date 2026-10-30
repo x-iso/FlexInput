@@ -18,7 +18,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke};
 use egui_snarl::NodeId;
 use flexinput_core::Signal;
-use flexinput_devices::click_gate::{self, ClickGateConfig, ClickGateSettings, JoltAnalyzer};
+use flexinput_devices::click_gate::{self, ClickGateConfig, ClickGateSettings, ClickPlot, ClickScope, JoltAnalyzer, PlotPoint};
 use flexinput_devices::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
 use serde_json::Value;
 
@@ -655,6 +655,229 @@ pub(crate) fn spike_params(params: &HashMap<String, Value>) -> (bool, f32, u8) {
     )
 }
 
+// ── Save / Load ──────────────────────────────────────────────────────────────
+//
+// A `.fxcal` file holds what this window sets on a device node, and nothing that
+// says which device that was beyond a name to show. So it applies to the same pad
+// on another patch or PC, or over another dongle or channel, whose id differs.
+
+/// Every node param this window sets, which is what a file saves and a load
+/// replaces. A setting added to this window belongs here (a test checks).
+const CAL_FILE_KEYS: &[&str] = &[
+    "gyro_offset", "accel_offset", "gyro_calibrated", "gyro_noise_floor", "accel_noise_floor",
+    "skip_accel_cal", "gyro_auto_cal", "gyro_orient_matrix", "gyro_invert", "accel_invert",
+    "gyro_dz_enabled", "gyro_dz_width", "spike_suppress", "spike_sensitivity", "spike_window",
+    "click_gate_on", "click_gate_buttons", "click_gate_lookahead_ms", "click_gate_release_ms",
+    "click_gate_auto", "orientation_baseline",
+    "lstick_center", "rstick_center", "lstick_radial", "rstick_radial", "lstick_scale",
+    "rstick_scale", "sticks_calibrated", "stick_rebound_enabled", "stick_rebound_ms",
+    "deadzone", "deadzone_r",
+    "ltrig_min", "ltrig_max", "rtrig_min", "rtrig_max", "triggers_calibrated",
+    "ltrig_digital_threshold", "rtrig_digital_threshold",
+    "ltrig_effect_mode", "ltrig_effect_values", "rtrig_effect_mode", "rtrig_effect_values",
+];
+/// The format's marker, and its version.
+const CAL_FILE_MARKER: &str = "flexinput_calibration";
+const CAL_FILE_VERSION: u64 = 1;
+/// How long the result of a save or load stays up.
+const CAL_FILE_STATUS_SECS: f32 = 8.0;
+
+/// A calibration file's contents.
+#[derive(Debug, Clone, PartialEq)]
+struct CalFile {
+    /// The name of the pad it was saved from.
+    device: String,
+    settings: serde_json::Map<String, Value>,
+}
+
+/// What came of a file dialog, which runs on its own thread.
+#[derive(Clone)]
+enum CalFileEvent {
+    Saved(String),
+    Loaded(String, CalFile),
+    Failed(String),
+}
+
+/// The result of a save or load, as the window shows it.
+#[derive(Clone)]
+struct CalFileStatus {
+    text: String,
+    failed: bool,
+    at: Instant,
+}
+
+fn cal_file_event_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_file_event", node)) }
+fn cal_file_status_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_file_status", node)) }
+
+fn cal_file_contents(params: &HashMap<String, Value>, device: &str) -> Value {
+    let settings: serde_json::Map<String, Value> = CAL_FILE_KEYS.iter()
+        .filter_map(|k| params.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    serde_json::json!({ CAL_FILE_MARKER: CAL_FILE_VERSION, "device": device, "settings": settings })
+}
+
+fn cal_file_parse(text: &str) -> Result<CalFile, String> {
+    let doc: Value = serde_json::from_str(text).map_err(|_| "it isn't a calibration file".to_string())?;
+    let version = doc.get(CAL_FILE_MARKER).and_then(|v| v.as_u64())
+        .ok_or("it isn't a calibration file")?;
+    if version > CAL_FILE_VERSION {
+        return Err("it was saved by a newer version of FlexInput".to_string());
+    }
+    Ok(CalFile {
+        device: doc.get("device").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        settings: doc.get("settings").and_then(|v| v.as_object()).cloned().unwrap_or_default(),
+    })
+}
+
+/// Make a node's calibration what the file says. A setting the file doesn't have
+/// was at its default when saved, so it goes back to that here too; nothing but
+/// [`CAL_FILE_KEYS`] is touched, whatever the file holds.
+fn cal_file_apply(params: &mut HashMap<String, Value>, file: &CalFile) {
+    for key in CAL_FILE_KEYS {
+        match file.settings.get(*key).filter(|v| !v.is_null()) {
+            Some(v) => { params.insert(key.to_string(), v.clone()); }
+            None => { params.remove(*key); }
+        }
+    }
+}
+
+/// A file name to suggest for a pad, whatever its name has in it.
+fn cal_file_name(device: &str) -> String {
+    let name: String = device.chars()
+        .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+        .collect();
+    let name = name.trim().trim_end_matches('.');
+    format!("{}.fxcal", if name.is_empty() { "calibration" } else { name })
+}
+
+fn cal_file_send(ctx: &egui::Context, node: NodeId, event: CalFileEvent) {
+    ctx.data_mut(|d| d.insert_temp(cal_file_event_id(node), event));
+    ctx.request_repaint();
+}
+
+/// Ask where, and write. The dialog gets its own thread: on the UI thread it
+/// starves the overlay viewport until dismissed.
+fn cal_file_save(ctx: &egui::Context, node: NodeId, device: String, contents: Value) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+            rfd::FileDialog::new()
+                .add_filter("FlexInput Calibration", &["fxcal"])
+                .set_file_name(cal_file_name(&device))
+                .save_file()
+        }) else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let written = serde_json::to_string_pretty(&contents).map_err(|e| e.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
+        cal_file_send(&ctx, node, match written {
+            Ok(()) => CalFileEvent::Saved(name),
+            Err(e) => CalFileEvent::Failed(format!("Couldn't save {name}: {e}")),
+        });
+    });
+}
+
+/// Ask which, and read. See [`cal_file_save`] about the thread.
+fn cal_file_load(ctx: &egui::Context, node: NodeId) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+            rfd::FileDialog::new().add_filter("FlexInput Calibration", &["fxcal"]).pick_file()
+        }) else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let read = std::fs::read_to_string(&path).map_err(|e| e.to_string())
+            .and_then(|text| cal_file_parse(&text));
+        cal_file_send(&ctx, node, match read {
+            Ok(file) => CalFileEvent::Loaded(name, file),
+            Err(e) => CalFileEvent::Failed(format!("Couldn't load {name}: {e}.")),
+        });
+    });
+}
+
+/// Act on a dialog's result, if one has arrived for this window.
+fn cal_file_receive(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, dev_id: &str, display_name: &str) {
+    let Some(event) = ctx.data(|d| d.get_temp::<CalFileEvent>(cal_file_event_id(node_id))) else { return };
+    ctx.data_mut(|d| d.remove::<CalFileEvent>(cal_file_event_id(node_id)));
+    let (text, failed) = match event {
+        CalFileEvent::Saved(name) => (format!("Saved to {name}."), false),
+        CalFileEvent::Failed(text) => (text, true),
+        CalFileEvent::Loaded(name, file) => {
+            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                cal_file_apply(&mut n.params, &file);
+            }
+            // Nothing running may finish on top of what was just loaded, and the
+            // Click jolts window has its own idea of what was set by hand.
+            close_click_jolt_window(ctx, node_id, dev_id);
+            ctx.data_mut(|d| {
+                if let Some(mut st) = d.get_temp::<WindowState>(state_id(node_id)) {
+                    st.spikes.cancel(dev_id);
+                    d.insert_temp(state_id(node_id), WindowState { scope_win_ms: st.scope_win_ms, ..Default::default() });
+                }
+                d.insert_temp(orient_baseline_id(node_id), OrientBaseline::default());
+            });
+            mark_calibrated(ctx, node_id);
+            let from = if file.device.is_empty() || file.device == display_name {
+                String::new()
+            } else {
+                format!(" It was saved from {}.", file.device)
+            };
+            (format!("Loaded {name}.{from}"), false)
+        }
+    };
+    ctx.data_mut(|d| d.insert_temp(cal_file_status_id(node_id), CalFileStatus { text, failed, at: Instant::now() }));
+}
+
+/// The result of the last save or load, for a few seconds.
+fn cal_file_status_line(ui: &mut egui::Ui, node_id: NodeId) {
+    let Some(status) = ui.ctx().data(|d| d.get_temp::<CalFileStatus>(cal_file_status_id(node_id))) else { return };
+    if status.at.elapsed().as_secs_f32() > CAL_FILE_STATUS_SECS {
+        ui.ctx().data_mut(|d| d.remove::<CalFileStatus>(cal_file_status_id(node_id)));
+        return;
+    }
+    let text = egui::RichText::new(status.text).size(INSTRUCT_SIZE);
+    ui.label(if status.failed { text.color(ORANGE) } else { text.weak() });
+}
+
+/// Save and Load, in the window's title bar: (save clicked, load clicked).
+///
+/// egui has no place for them there, so they go on top once the window is done.
+/// Inside the window they would be under its title bar, whose double-click area
+/// is laid out after the contents and would take their clicks. Their backdrop
+/// cuts off a title too long to fit beside them, rather than drawing over it.
+fn cal_file_buttons(
+    ctx: &egui::Context,
+    window: &egui::Response,
+    margin: egui::Margin,
+    node_id: NodeId,
+) -> (bool, bool) {
+    let style = ctx.style();
+    let height = ctx.fonts_mut(|f| f.row_height(&egui::TextStyle::Heading.resolve(&style)))
+        .max(style.spacing.interact_size.y) + margin.sum().y;
+    // The rest of the title bar's width is the close button, which is square.
+    let strip = egui::Rect::from_min_size(window.rect.min, egui::vec2((window.rect.width() - height).max(0.0), height));
+    let mut ui = egui::Ui::new(
+        ctx.clone(),
+        egui::Id::new(("cal_file_buttons", node_id)),
+        egui::UiBuilder::new()
+            .layer_id(window.layer_id)
+            .max_rect(strip)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let backdrop = ui.painter().add(egui::Shape::Noop);
+    ui.spacing_mut().item_spacing.x = 4.0;
+    let load = ui.small_button("Load…")
+        .on_hover_text("Replace this pad's calibration settings with those in a .fxcal file.")
+        .clicked();
+    let save = ui.small_button("Save…")
+        .on_hover_text("Save this pad's calibration settings to a .fxcal file, to use them on\n\
+                        another patch or PC, or when it connects another way.")
+        .clicked();
+    let used = ui.min_rect();
+    // Short of the strip's edges: those are the window's border and the title's rule.
+    let cover = egui::Rect::from_x_y_ranges((used.left() - 6.0)..=used.right(), strip.shrink(2.0).y_range());
+    ui.painter().set(backdrop, egui::epaint::RectShape::filled(cover, 0, style.visuals.window_fill));
+    (save, load)
+}
+
 pub fn show_windows(
     ctx: &egui::Context,
     canvas: &mut Canvas,
@@ -681,6 +904,7 @@ pub fn show_windows(
             to_close.push(node_id);
             continue;
         }
+        cal_file_receive(ctx, canvas, node_id, &dev_id, &display_name);
         let mut is_open = true;
         let title = format!("{} Calibration", display_name);
         // Default size capped to ~85% of the host window so the cal window
@@ -696,7 +920,7 @@ pub fn show_windows(
         // drop-shadow from underneath bleeds through the window content.
         let mut window_frame = egui::Frame::window(&ctx.style());
         window_frame.fill = ctx.style().visuals.window_fill;
-        egui::Window::new(title)
+        let window = egui::Window::new(title.as_str())
             .id(egui::Id::new(("cal_window", node_id)))
             .open(&mut is_open)
             .resizable(true)
@@ -708,10 +932,22 @@ pub fn show_windows(
             .min_height(min_h)
             .show(ctx, |ui| {
                 scaled_below_ref_width(ui, |ui| {
+                    cal_file_status_line(ui, node_id);
                     draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps,
                         spike_settings, gyro_drift, click_gates);
                 });
             });
+        if let Some(window) = window {
+            let (save, load) = cal_file_buttons(ctx, &window.response, window_frame.inner_margin, node_id);
+            if save {
+                if let Some(n) = canvas.snarl.get_node(node_id) {
+                    cal_file_save(ctx, node_id, display_name.clone(), cal_file_contents(&n.params, &display_name));
+                }
+            }
+            if load {
+                cal_file_load(ctx, node_id);
+            }
+        }
         click_jolt_window(ctx, canvas, node_id, &dev_id, &display_name);
         if !is_open {
             to_close.push(node_id);
@@ -720,6 +956,8 @@ pub fn show_windows(
                     st.spikes.cancel(&dev_id);
                 }
                 d.remove::<WindowState>(state_id(node_id));
+                d.remove::<CalFileEvent>(cal_file_event_id(node_id));
+                d.remove::<CalFileStatus>(cal_file_status_id(node_id));
             });
             close_click_jolt_window(ctx, node_id, &dev_id);
         }
@@ -1858,6 +2096,7 @@ struct ClickJoltWindow {
     /// The pad's buttons, and what to call them.
     pins: Vec<(String, String)>,
     analyzer: JoltAnalyzer,
+    scope: ClickScope,
     /// Buttons ticked or unticked by hand: measuring leaves that alone.
     ticked_by_hand: HashSet<String>,
     /// Buttons given a hold time by hand: measuring leaves that alone.
@@ -1868,14 +2107,29 @@ struct ClickJoltWindow {
 
 /// The Click-jolt window's width, and its table's columns. Fixed, so that nothing
 /// moves as measurements arrive and a long line can't reach under the scrollbar.
-const CLICK_WINDOW_W: f32 = 470.0;
+const CLICK_WINDOW_W: f32 = 640.0;
 const CLICK_COL_TICK: f32 = 22.0;
 const CLICK_COL_BUTTON: f32 = 140.0;
 const CLICK_COL_PEAK: f32 = 68.0;
 const CLICK_COL_LENGTH: f32 = 54.0;
 const CLICK_COL_CLICKS: f32 = 50.0;
 const CLICK_COL_HOLD: f32 = 62.0;
-const CLICK_ROW_H: f32 = 22.0;
+const CLICK_COL_PLOT: f32 = 160.0;
+const CLICK_ROW_H: f32 = 30.0;
+const CLICK_PLOT_H: f32 = 28.0;
+const CLICK_PLOT_ZOOM: egui::Vec2 = egui::vec2(480.0, 180.0);
+const CLICK_PLOT_RED: Color32 = Color32::from_rgb(235, 80, 80);
+const CLICK_PLOT_BLUE: Color32 = Color32::from_rgb(90, 170, 255);
+const CLICK_PLOT_AMBER: Color32 = Color32::from_rgb(255, 196, 90);
+/// The tightest a graph scales to, normalized (8 °/s), so that the noise of a
+/// still pad stays low instead of filling it.
+const CLICK_PLOT_MIN_SCALE: f32 = 8.0 / GYRO_REF_DPS;
+const CLICK_PLOT_HINT: &str = "Each button's last click, redrawn by the next.\n\
+    Red: all the gyro axes added up, as they arrive.\n\
+    Blue, in front: what the filter leaves of that with the settings here, on\n\
+    ticked buttons. Change a Hold, Release or Look-ahead and it redraws on the\n\
+    same click.\n\
+    Amber: the button going down or up. Scaled to fit; hover a graph to enlarge it.";
 
 /// One table cell, exactly `width` wide.
 fn click_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
@@ -1895,6 +2149,81 @@ fn click_value(ui: &mut egui::Ui, text: Option<String>) {
     match text {
         Some(t) => { ui.add(egui::Label::new(t).truncate()); }
         None => { ui.label(egui::RichText::new("—").weak()); }
+    }
+}
+
+/// One line of a click's graph, at most a few points per pixel however many polls
+/// it covers: where each column of pixels comes in, its extremes, where it leaves.
+fn click_plot_line(points: &[PlotPoint], x: impl Fn(f32) -> f32, y: impl Fn(f32) -> f32, value: fn(&PlotPoint) -> f32) -> Vec<Pos2> {
+    fn flush(out: &mut Vec<Pos2>, px: f32, first: f32, lo: f32, hi: f32, last: f32) {
+        let order = if first <= last { [first, lo, hi, last] } else { [first, hi, lo, last] };
+        for v in order {
+            let p = egui::pos2(px, v);
+            if out.last() != Some(&p) { out.push(p); }
+        }
+    }
+    let mut out = Vec::new();
+    let mut column: Option<(f32, f32, f32, f32, f32)> = None;
+    for point in points {
+        let (px, v) = (x(point.ms).floor(), y(value(point)));
+        match &mut column {
+            Some((at, _, lo, hi, last)) if *at == px => {
+                *lo = lo.min(v);
+                *hi = hi.max(v);
+                *last = v;
+            }
+            _ => {
+                if let Some((at, first, lo, hi, last)) = column {
+                    flush(&mut out, at, first, lo, hi, last);
+                }
+                column = Some((px, v, v, v, v));
+            }
+        }
+    }
+    if let Some((at, first, lo, hi, last)) = column {
+        flush(&mut out, at, first, lo, hi, last);
+    }
+    out
+}
+
+/// A button's last click. `zoomed` adds what's only legible at a larger size.
+fn click_plot(painter: &egui::Painter, area: egui::Rect, plot: Option<&ClickPlot>, zoomed: bool) {
+    let painter = painter.with_clip_rect(area);
+    // Enlarged, the times get a strip of their own: a quiet line runs along the bottom.
+    let rect = if zoomed { area.with_max_y(area.bottom() - 14.0) } else { area };
+    painter.rect_filled(rect, 2.0, Color32::from_gray(20));
+    let span = click_gate::SCOPE_BEFORE_MS + click_gate::SCOPE_AFTER_MS;
+    let x = |ms: f32| rect.left() + (ms + click_gate::SCOPE_BEFORE_MS) / span * rect.width();
+    let font = egui::FontId::proportional(11.0);
+    let mut ms = 0.0;
+    while ms < click_gate::SCOPE_AFTER_MS {
+        painter.vline(x(ms), rect.y_range(), Stroke::new(1.0_f32, Color32::from_gray(if ms == 0.0 { 60 } else { 38 })));
+        if zoomed {
+            painter.text(egui::pos2(x(ms), area.bottom()), egui::Align2::CENTER_BOTTOM,
+                format!("{ms:.0} ms"), font.clone(), Color32::from_gray(130));
+        }
+        ms += 50.0;
+    }
+    let Some(plot) = plot else { return };
+    let top = plot.points.iter().map(|p| p.motion.max(p.filtered)).fold(CLICK_PLOT_MIN_SCALE, f32::max);
+    let y = |v: f32| rect.bottom() - 1.0 - (v / top).min(1.0) * (rect.height() - 2.0);
+    for ms in &plot.edges {
+        painter.vline(x(*ms), rect.y_range(), Stroke::new(1.0_f32, CLICK_PLOT_AMBER.gamma_multiply(0.6)));
+    }
+    let width = if zoomed { 1.5_f32 } else { 1.0 };
+    painter.add(egui::Shape::line(
+        click_plot_line(&plot.points, x, y, |p| p.motion),
+        Stroke::new(width, CLICK_PLOT_RED),
+    ));
+    if plot.has_filtered {
+        painter.add(egui::Shape::line(
+            click_plot_line(&plot.points, x, y, |p| p.filtered),
+            Stroke::new(width, CLICK_PLOT_BLUE),
+        ));
+    }
+    if zoomed {
+        painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP,
+            fmt_dps(top), font, Color32::from_gray(170));
     }
 }
 
@@ -1977,6 +2306,7 @@ fn click_jolt_row(
                 click_gate::measure_start(dev_id, &ids);
                 let state = ClickJoltWindow {
                     analyzer: JoltAnalyzer::new(pins.len()),
+                    scope: ClickScope::new(ids),
                     pins,
                     ticked_by_hand: HashSet::new(),
                     timed_by_hand: HashSet::new(),
@@ -2027,7 +2357,10 @@ fn click_jolt_window(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, 
     ctx.request_repaint();
 
     match click_gate::measure_read(dev_id) {
-        Some(samples) => samples.into_iter().for_each(|s| st.analyzer.push(s)),
+        Some(samples) => samples.into_iter().for_each(|s| {
+            st.analyzer.push(s);
+            st.scope.push(s);
+        }),
         None => {
             let ids: Vec<String> = st.pins.iter().map(|(p, _)| p.clone()).collect();
             click_gate::measure_start(dev_id, &ids);
@@ -2098,8 +2431,14 @@ fn click_jolt_window(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, 
                 click_cell(ui, CLICK_COL_LENGTH, |ui| head(ui, "Length", "How long a jolt lasts."));
                 click_cell(ui, CLICK_COL_CLICKS, |ui| head(ui, "Clicks", "Presses and releases that jolted, of those measured."));
                 click_cell(ui, CLICK_COL_HOLD, |ui| head(ui, "Hold", "How long the IMU is held after this button's press or release."));
+                click_cell(ui, CLICK_COL_PLOT, |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    head(ui, "Last click:", CLICK_PLOT_HINT);
+                    ui.label(egui::RichText::new("gyro").small().color(CLICK_PLOT_RED)).on_hover_text(CLICK_PLOT_HINT);
+                    ui.label(egui::RichText::new("filtered").small().color(CLICK_PLOT_BLUE)).on_hover_text(CLICK_PLOT_HINT);
+                });
             });
-            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
                 for (i, (pin, label)) in st.pins.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let r = st.analyzer.report(i);
@@ -2155,6 +2494,18 @@ fn click_jolt_window(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, 
                                 }
                             }
                         });
+                        click_cell(ui, CLICK_COL_PLOT, |ui| {
+                            let size = egui::vec2(CLICK_COL_PLOT, CLICK_PLOT_H);
+                            let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+                            let plot = st.scope.plot(i, &cfg);
+                            click_plot(ui.painter(), rect, plot, false);
+                            if plot.is_some() {
+                                resp.on_hover_ui(|ui| {
+                                    let (big, _) = ui.allocate_exact_size(CLICK_PLOT_ZOOM, Sense::hover());
+                                    click_plot(ui.painter(), big, plot, true);
+                                });
+                            }
+                        });
                     });
                 }
             });
@@ -2205,6 +2556,7 @@ fn click_jolt_window(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, 
             ui.horizontal(|ui| {
                 if ui.button("Measure again").clicked() {
                     st.analyzer.reset();
+                    st.scope.clear();
                     st.ticked_by_hand.clear();
                     st.timed_by_hand.clear();
                     st.auto.clear();
@@ -4147,5 +4499,194 @@ mod unit_fmt_tests {
     #[test]
     fn negatives_format_like_their_magnitude() {
         assert_eq!(fmt_dps(-0.0028), "-5.60 °/s");
+    }
+
+    // ── Save / Load ──────────────────────────────────────────────────────────
+
+    fn calibrated_params() -> HashMap<String, Value> {
+        HashMap::from([
+            ("device_id".to_string(), serde_json::json!("jc2:right:aa:bb")),
+            ("output_pin_ids".to_string(), serde_json::json!(["gyro_x"])),
+            ("gyro_offset".to_string(), serde_json::json!([0.1, 0.2, 0.3])),
+            ("deadzone".to_string(), serde_json::json!(0.07)),
+            ("click_gate_buttons".to_string(), serde_json::json!({"btn_rb": 28.0})),
+            ("rtrig_effect_mode".to_string(), serde_json::json!("RESISTANCE")),
+        ])
+    }
+
+    #[test]
+    fn a_file_carries_the_calibration_and_not_the_device() {
+        let doc = cal_file_contents(&calibrated_params(), "M12-S");
+        let text = serde_json::to_string(&doc).unwrap();
+        assert!(!text.contains("jc2:right"), "{text}");
+        assert!(!text.contains("output_pin_ids"), "{text}");
+        let file = cal_file_parse(&text).unwrap();
+        assert_eq!(file.device, "M12-S");
+        assert_eq!(file.settings.len(), 4);
+    }
+
+    #[test]
+    fn a_saved_file_makes_another_node_the_same() {
+        let text = serde_json::to_string(&cal_file_contents(&calibrated_params(), "M12-S")).unwrap();
+        let file = cal_file_parse(&text).unwrap();
+        // The same pad, connected another way: another id, and its own settings.
+        let mut other = HashMap::from([
+            ("device_id".to_string(), serde_json::json!("sdl:dongle:1")),
+            ("gyro_offset".to_string(), serde_json::json!([9.0, 9.0, 9.0])),
+            ("sticks_calibrated".to_string(), serde_json::json!(true)),
+            ("spike_suppress".to_string(), serde_json::json!(true)),
+        ]);
+        cal_file_apply(&mut other, &file);
+        assert_eq!(other["device_id"], "sdl:dongle:1", "still that pad");
+        for key in CAL_FILE_KEYS {
+            assert_eq!(other.get(*key), calibrated_params().get(*key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_file_cant_set_anything_else_on_the_node() {
+        let file = cal_file_parse(r#"{"flexinput_calibration": 1, "settings": {
+            "device_id": "someone_elses", "module_id": "x", "gyro_offset": null
+        }}"#).unwrap();
+        let mut params = calibrated_params();
+        cal_file_apply(&mut params, &file);
+        assert_eq!(params["device_id"], "jc2:right:aa:bb");
+        assert!(!params.contains_key("module_id"));
+        assert!(!params.contains_key("gyro_offset"), "null is no value");
+    }
+
+    #[test]
+    fn only_a_calibration_file_loads() {
+        assert!(cal_file_parse("not json").is_err());
+        assert!(cal_file_parse(r#"{"points": [], "biases": []}"#).is_err(), "a curve");
+        assert!(cal_file_parse(r#"[1, 2]"#).is_err());
+        assert!(cal_file_parse(r#"{"flexinput_calibration": 2, "settings": {}}"#).is_err(), "from a newer version");
+        assert!(cal_file_parse(r#"{"flexinput_calibration": 1}"#).is_ok());
+    }
+
+    #[test]
+    fn every_setting_the_window_writes_is_in_a_file() {
+        // Only what can't be told from the signal stays out: which view is showing.
+        let view_only = ["dz_view_after"];
+        let source = include_str!("calibration.rs").split("#[cfg(test)]").next().unwrap();
+        let needle = concat!("params.ins", "ert(\"");
+        let mut seen = 0;
+        for part in source.split(needle).skip(1) {
+            let key = part.split('"').next().unwrap();
+            assert!(CAL_FILE_KEYS.contains(&key) || view_only.contains(&key), "{key} is not saved");
+            seen += 1;
+        }
+        assert!(seen > 30, "{seen}");
+    }
+
+    #[test]
+    fn a_suggested_file_name_is_a_valid_one() {
+        assert_eq!(cal_file_name("Mobapad M12-S"), "Mobapad M12-S.fxcal");
+        assert_eq!(cal_file_name("Pad: \"A/B\"?"), "Pad_ _A_B__.fxcal");
+        assert_eq!(cal_file_name("  "), "calibration.fxcal");
+    }
+
+    #[test]
+    fn a_loaded_file_takes_over_from_whatever_the_window_was_doing() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::default();
+        let mut params = calibrated_params();
+        params.insert("sticks_calibrated".into(), Value::Bool(true));
+        let node = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), crate::canvas::NodeData {
+            module_id: "device.source".into(), display_name: "M12-S".into(), category: "".into(),
+            inputs: vec![], outputs: vec![], params, subpatch: None, extra: Default::default(),
+        });
+        let mut st = WindowState { scope_win_ms: 5000.0, ..Default::default() };
+        st.stick.sampling = true;
+        ctx.data_mut(|d| {
+            d.insert_temp(state_id(node), st);
+            d.insert_temp(click_window_id(node), Arc::new(Mutex::new(ClickJoltWindow {
+                analyzer: JoltAnalyzer::new(0),
+                scope: ClickScope::new(Vec::new()),
+                pins: Vec::new(),
+                ticked_by_hand: HashSet::new(),
+                timed_by_hand: HashSet::new(),
+                auto: HashSet::new(),
+            })));
+        });
+        let settings = serde_json::Map::from_iter([("gyro_offset".to_string(), serde_json::json!([1.0, 2.0, 3.0]))]);
+        let file = CalFile { device: "Another pad".into(), settings };
+        cal_file_send(&ctx, node, CalFileEvent::Loaded("a.fxcal".into(), file));
+
+        cal_file_receive(&ctx, &mut canvas, node, "jc2:right:aa:bb", "M12-S");
+
+        let n = canvas.snarl.get_node(node).unwrap();
+        assert_eq!(n.params["gyro_offset"], serde_json::json!([1.0, 2.0, 3.0]));
+        assert!(!n.params.contains_key("sticks_calibrated"), "not in the file: back to its default");
+        assert_eq!(n.params["device_id"], "jc2:right:aa:bb");
+        let st = ctx.data(|d| d.get_temp::<WindowState>(state_id(node))).unwrap();
+        assert!(!st.stick.sampling, "a capture can't finish on top of it");
+        assert_eq!(st.scope_win_ms, 5000.0, "the view stays as it was");
+        assert!(ctx.data(|d| d.get_temp::<Arc<Mutex<ClickJoltWindow>>>(click_window_id(node))).is_none());
+        let status = ctx.data(|d| d.get_temp::<CalFileStatus>(cal_file_status_id(node))).unwrap();
+        assert!(!status.failed);
+        assert!(status.text.contains("a.fxcal") && status.text.contains("Another pad"), "{}", status.text);
+    }
+
+    #[test]
+    fn a_failed_load_changes_nothing() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::default();
+        let node = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), crate::canvas::NodeData {
+            module_id: "device.source".into(), display_name: "M12-S".into(), category: "".into(),
+            inputs: vec![], outputs: vec![], params: calibrated_params(), subpatch: None, extra: Default::default(),
+        });
+        cal_file_send(&ctx, node, CalFileEvent::Failed("Couldn't load x: nope.".into()));
+        cal_file_receive(&ctx, &mut canvas, node, "jc2:right:aa:bb", "M12-S");
+        assert_eq!(canvas.snarl.get_node(node).unwrap().params, calibrated_params());
+        assert!(ctx.data(|d| d.get_temp::<CalFileStatus>(cal_file_status_id(node))).unwrap().failed);
+    }
+
+    #[test]
+    fn the_title_bar_buttons_take_their_clicks() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let title = "Mobapad Calibration";
+        let node = NodeId(1);
+        let window_rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let frame = |events: Vec<egui::Event>, time: f64| {
+            let raw = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
+            let mut got = (false, false);
+            let _ = ctx.run(raw, |ctx| {
+                let f = egui::Frame::window(&ctx.style());
+                let w = egui::Window::new(title).id(egui::Id::new("w")).frame(f)
+                    .fixed_pos(egui::pos2(20.0, 20.0)).fixed_size(egui::vec2(500.0, 200.0))
+                    .show(ctx, |ui| { ui.set_min_width(500.0); ui.label("body"); })
+                    .unwrap();
+                window_rect.set(w.response.rect);
+                got = cal_file_buttons(ctx, &w.response, f.inner_margin, node);
+            });
+            got
+        };
+        frame(vec![], 0.0);
+        frame(vec![], 0.1);
+        // Just left of the close button, on Load, then well left of it, on Save.
+        let click = |at: egui::Pos2, pressed| egui::Event::PointerButton {
+            pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+        };
+        let top = window_rect.get().min;
+        let width = window_rect.get().width();
+        assert!(width >= 500.0, "{width}");
+        let load_at = egui::pos2(top.x + width - 55.0, top.y + 15.0);
+        let save_at = egui::pos2(top.x + width - 100.0, top.y + 15.0);
+        let title_at = egui::pos2(top.x + width * 0.5, top.y + 15.0);
+
+        let click_at = |at: egui::Pos2, t: f64| {
+            let mut got = frame(vec![egui::Event::PointerMoved(at)], t);
+            for (i, pressed) in [true, false].into_iter().enumerate() {
+                let r = frame(vec![click(at, pressed)], t + 0.05 * (i + 1) as f64);
+                got = (got.0 || r.0, got.1 || r.1);
+            }
+            let r = frame(vec![], t + 0.2);
+            (got.0 || r.0, got.1 || r.1)
+        };
+        assert_eq!(click_at(load_at, 1.0), (false, true), "Load");
+        assert_eq!(click_at(save_at, 2.0), (true, false), "Save");
+        assert_eq!(click_at(title_at, 3.0), (false, false), "the title itself");
     }
 }

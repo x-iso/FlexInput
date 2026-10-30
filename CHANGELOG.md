@@ -18,7 +18,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   slope back to the live signal over the **Release** time, and nothing else is
   touched or delayed. If a pad reports the jolt before the click, the window says
   so and offers **Look-ahead** of up to 5 ms, which catches that part too at the
-  cost of delaying the motion by that much.
+  cost of delaying the motion by that much. A small graph on each button's row
+  shows its last click: the gyro in red and, on ticked buttons, what the filter
+  leaves of it in blue. Change a time and blue redraws on that same click, so you
+  can see how much hold and release it needs. Hover a graph to enlarge it.
+- **Save and load calibration.** The Calibration window's title bar now has
+  **Save…** and **Load…**, which keep all of its settings in a `.fxcal` file: gyro,
+  orientation, stick and trigger calibration, deadzones and filters. Use them to
+  apply the same settings on another patch or PC, or when a pad connects through
+  another dongle or channel. Loading replaces all of that pad's calibration
+  settings, including any the file doesn't have, which go back to their defaults.
 
 ### Changed
 

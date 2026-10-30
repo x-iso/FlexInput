@@ -35,6 +35,9 @@
 //! pins carry before the gate ([`measure_start`]). Each click is judged against
 //! a rolling median as wide as the longest jolt worth holding, so a hand moving
 //! the pad around it doesn't count and a click doesn't need a still table.
+//! [`ClickScope`] keeps each button's last click to look at, and [`replay`] runs
+//! it back through the same gate code, so that a change of settings shows on that
+//! click without pressing again.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -176,13 +179,27 @@ impl Gate {
         }
         for i in 0..self.button_keys.len() {
             let Some(Signal::Bool(b)) = signals.get(&self.button_keys[i]) else { continue };
-            let b = *b;
-            if self.pressed[i].is_some_and(|was| was != b) {
-                let ms = self.cfg.buttons[i].1.clamp(0.0, MAX_HOLD_MS);
-                self.begin_hold(now, Duration::from_secs_f32(ms / 1000.0));
-            }
-            self.pressed[i] = Some(b);
+            self.button(i, *b, now);
         }
+        let out = self.emit(now);
+        for (a, key) in self.imu_keys.iter().enumerate() {
+            if present[a] {
+                signals.insert(key.clone(), Signal::Float(out[a]));
+            }
+        }
+    }
+
+    /// Button `i` (of the config's) reads `pressed` at `now`.
+    fn button(&mut self, i: usize, pressed: bool, now: Instant) {
+        if self.pressed[i].is_some_and(|was| was != pressed) {
+            let ms = self.cfg.buttons[i].1.clamp(0.0, MAX_HOLD_MS);
+            self.begin_hold(now, Duration::from_secs_f32(ms / 1000.0));
+        }
+        self.pressed[i] = Some(pressed);
+    }
+
+    /// The IMU's value at `now`, with [`Self::latest`] as its newest input.
+    fn emit(&mut self, now: Instant) -> [f32; 6] {
         self.history.push_back((now, self.latest));
         let keep = self.lookahead + REFERENCE + Duration::from_millis(5);
         if let Some(oldest) = now.checked_sub(keep) {
@@ -198,7 +215,7 @@ impl Gate {
             .find(|(t, _)| *t <= emit_at)
             .or(self.history.front())
             .map_or(self.latest, |(_, s)| *s);
-        let out = match self.hold {
+        match self.hold {
             Some(h) if emit_at >= h.end + self.release => {
                 self.hold = None;
                 sample
@@ -209,11 +226,6 @@ impl Gate {
             }
             Some(h) if emit_at >= h.start => h.value,
             _ => sample,
-        };
-        for (a, key) in self.imu_keys.iter().enumerate() {
-            if present[a] {
-                signals.insert(key.clone(), Signal::Float(out[a]));
-            }
         }
     }
 }
@@ -581,6 +593,163 @@ impl JoltAnalyzer {
     }
 }
 
+// ── Looking at a click ───────────────────────────────────────────────────────
+
+/// What `cfg`'s gate makes of a recording, per sample. `pins` names the bits of
+/// each sample's mask. Takes the code path of the real gate, polls and all.
+pub fn replay(samples: &[MeasureSample], pins: &[String], cfg: &ClickGateConfig) -> Vec<[f32; 3]> {
+    let bits: Vec<Option<usize>> = cfg.buttons.iter()
+        .map(|(pin, _)| pins.iter().position(|p| p == pin))
+        .collect();
+    let mut gate = Gate::new("", Arc::new(cfg.clone()));
+    samples.iter().map(|s| {
+        gate.latest[..3].copy_from_slice(&s.gyro);
+        for (i, bit) in bits.iter().enumerate() {
+            if let Some(bit) = bit {
+                gate.button(i, s.mask >> bit & 1 != 0, s.at);
+            }
+        }
+        let out = gate.emit(s.at);
+        [out[0], out[1], out[2]]
+    }).collect()
+}
+
+/// How much of a click [`ClickScope`] shows, in ms before the edge...
+pub const SCOPE_BEFORE_MS: f32 = 25.0;
+/// ...and after it. An edge inside this is part of that click's trace, the way a
+/// tap's release shows on its press; one after it starts a new trace.
+pub const SCOPE_AFTER_MS: f32 = 175.0;
+/// Signal kept from before an edge, for [`replay`] to find the gate as it was:
+/// the longest hold and release of a click just before, and what to hold after it.
+const SCOPE_WARMUP: Duration = Duration::from_millis(
+    MAX_HOLD_MS as u64 + MAX_RELEASE_MS as u64 + REFERENCE.as_millis() as u64 + MAX_LOOKAHEAD_MS as u64,
+);
+
+/// One poll of a [`ClickPlot`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlotPoint {
+    /// From the edge that started the trace.
+    pub ms: f32,
+    /// All gyro axes added up, as they arrive.
+    pub motion: f32,
+    /// The same, after the filter.
+    pub filtered: f32,
+}
+
+/// A button's last click, ready to draw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClickPlot {
+    pub points: Vec<PlotPoint>,
+    /// `filtered` is meaningful: the filter acts on this button.
+    pub has_filtered: bool,
+    /// When this button went up or down, ms from the first of them.
+    pub edges: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct ClickTrace {
+    button: usize,
+    edge: Instant,
+    samples: Vec<MeasureSample>,
+    /// What [`Self::plot`] last worked out, and from how many samples and which
+    /// settings: replaying every button every frame would add up.
+    plot: ClickPlot,
+    plotted: Option<(usize, ClickGateConfig)>,
+}
+
+fn motion(g: [f32; 3]) -> f32 {
+    g[0].abs() + g[1].abs() + g[2].abs()
+}
+
+impl ClickTrace {
+    fn plot(&mut self, pins: &[String], cfg: &ClickGateConfig) -> &ClickPlot {
+        if self.plotted.as_ref().is_none_or(|(n, c)| *n != self.samples.len() || c != cfg) {
+            let has_filtered = cfg.buttons.iter().any(|(p, _)| *p == pins[self.button]);
+            let filtered = has_filtered.then(|| replay(&self.samples, pins, cfg));
+            let ms = |t: Instant| {
+                if t >= self.edge { (t - self.edge).as_secs_f32() * 1000.0 } else { -((self.edge - t).as_secs_f32() * 1000.0) }
+            };
+            let mut plot = ClickPlot { has_filtered, ..ClickPlot::default() };
+            let mut was = None;
+            for (k, s) in self.samples.iter().enumerate() {
+                let down = s.mask & (1 << self.button) != 0;
+                let at = ms(s.at);
+                if at >= -SCOPE_BEFORE_MS {
+                    let raw = motion(s.gyro);
+                    plot.points.push(PlotPoint {
+                        ms: at,
+                        motion: raw,
+                        filtered: filtered.as_ref().map_or(raw, |f| motion(f[k])),
+                    });
+                    if was.is_some_and(|w| w != down) {
+                        plot.edges.push(at);
+                    }
+                }
+                was = Some(down);
+            }
+            self.plot = plot;
+            self.plotted = Some((self.samples.len(), cfg.clone()));
+        }
+        &self.plot
+    }
+}
+
+/// Every button's last click, from a [`measure_read`] stream, the way a trigger
+/// scope keeps its last sweep: an edge starts a new one, and it stays up until
+/// the next.
+#[derive(Debug, Clone)]
+pub struct ClickScope {
+    pins: Vec<String>,
+    recent: VecDeque<MeasureSample>,
+    mask: Option<u64>,
+    traces: Vec<Option<ClickTrace>>,
+}
+
+impl ClickScope {
+    /// `pins` names the bits of the masks to come.
+    pub fn new(pins: Vec<String>) -> Self {
+        let traces = vec![None; pins.len().min(64)];
+        Self { pins, recent: VecDeque::new(), mask: None, traces }
+    }
+
+    /// Forget every button's last click.
+    pub fn clear(&mut self) {
+        self.traces.iter_mut().for_each(|t| *t = None);
+    }
+
+    pub fn push(&mut self, s: MeasureSample) {
+        let changed = self.mask.map_or(0, |was| was ^ s.mask);
+        self.mask = Some(s.mask);
+        self.recent.push_back(s);
+        if let Some(oldest) = s.at.checked_sub(SCOPE_WARMUP) {
+            while self.recent.front().is_some_and(|f| f.at < oldest) {
+                self.recent.pop_front();
+            }
+        }
+        let after = Duration::from_secs_f32(SCOPE_AFTER_MS / 1000.0);
+        for (i, slot) in self.traces.iter_mut().enumerate() {
+            match slot {
+                Some(t) if s.at <= t.edge + after => t.samples.push(s),
+                _ if changed & (1 << i) != 0 => {
+                    *slot = Some(ClickTrace {
+                        button: i,
+                        edge: s.at,
+                        samples: self.recent.iter().copied().collect(),
+                        plot: ClickPlot::default(),
+                        plotted: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Button `i`'s last click, filtered as `cfg` says, if it has had one.
+    pub fn plot(&mut self, i: usize, cfg: &ClickGateConfig) -> Option<&ClickPlot> {
+        self.traces.get_mut(i)?.as_mut().map(|t| t.plot(&self.pins, cfg))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +1105,150 @@ mod tests {
         assert!(measure_read(dev).unwrap().is_empty(), "drained");
         measure_stop(dev);
         assert!(measure_read(dev).is_none());
+    }
+
+    // ── Looking at a click ───────────────────────────────────────────────────
+
+    fn sample(ms: u64, t0: Instant, gyro: f32, mask: u64) -> MeasureSample {
+        MeasureSample { at: t0 + Duration::from_millis(ms), gyro: [gyro, 0.0, 0.0], mask }
+    }
+
+    /// `ms` of polls at 1 kHz, with `mask(ms)` as the buttons, at rest but for
+    /// `gyro`.
+    fn scoped(ms: u64, gyro: impl Fn(u64) -> f32, mask: impl Fn(u64) -> u64) -> ClickScope {
+        let mut scope = ClickScope::new(vec![BTN.into(), "btn_other".into()]);
+        let t0 = Instant::now();
+        for i in 0..ms {
+            scope.push(sample(i, t0, gyro(i), mask(i)));
+        }
+        scope
+    }
+
+    fn ticked(hold_ms: f32, release_ms: f32) -> ClickGateConfig {
+        ClickGateConfig { enabled: true, buttons: vec![(BTN.into(), hold_ms)], lookahead_ms: 0.0, release_ms }
+    }
+
+    #[test]
+    fn a_replay_is_what_the_real_gate_does() {
+        // Look-ahead, a slope, a pad turning through it, and a click during it.
+        for (hold, look, release) in [(25.0, 0.0, 0.0), (25.0, 2.0, 10.0), (10.0, 5.0, 40.0)] {
+            let input: Vec<(f32, bool)> = (0..300).map(|i| {
+                let turning = i as f32 * 1e-3;
+                let jolt = if (100..120).contains(&i) { 0.5 } else { 0.0 };
+                (turning + jolt, (100..140).contains(&i) || (170..190).contains(&i))
+            }).collect();
+            let mut settings = cfg(hold, look);
+            Arc::make_mut(settings.get_mut(DEV).unwrap()).release_ms = release;
+            let real = run(&settings, &input);
+
+            let t0 = Instant::now();
+            let samples: Vec<MeasureSample> = input.iter().enumerate()
+                .map(|(i, (v, b))| sample(i as u64, t0, *v, *b as u64))
+                .collect();
+            let replayed = replay(&samples, &[BTN.into()], &settings[DEV]);
+            for (i, (r, p)) in real.iter().zip(&replayed).enumerate() {
+                assert_eq!(*r, p[0], "poll {i}, hold {hold} look {look} release {release}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_starts_a_trace_with_what_came_before_it() {
+        let mut s = scoped(300, |i| if i == 95 { 0.5 } else { 0.0 }, |i| (i >= 100) as u64);
+        let p = s.plot(0, &ticked(10.0, 0.0)).unwrap();
+        let first = p.points.first().unwrap();
+        assert!((first.ms + SCOPE_BEFORE_MS).abs() <= 1.0, "{first:?}");
+        assert!((p.points.last().unwrap().ms - SCOPE_AFTER_MS).abs() <= 1.0);
+        let before = p.points.iter().find(|q| q.ms == -5.0).unwrap();
+        assert_eq!(before.motion, 0.5, "the part of the jolt before the edge");
+    }
+
+    #[test]
+    fn it_shows_the_jolt_red_and_the_result_blue() {
+        let mut s = scoped(300, |i| if (100..110).contains(&i) { 0.5 } else { 0.01 }, |i| (i >= 100) as u64);
+        let p = s.plot(0, &ticked(20.0, 0.0)).unwrap();
+        assert!(p.has_filtered);
+        let at = |ms: f32| *p.points.iter().find(|q| q.ms == ms).unwrap();
+        assert_eq!(at(5.0).motion, 0.5);
+        assert!((at(5.0).filtered - 0.01).abs() < 1e-6);
+        assert_eq!(at(50.0).motion, at(50.0).filtered, "outside the hold they are the same line");
+    }
+
+    #[test]
+    fn all_axes_add_up() {
+        let mut scope = ClickScope::new(vec![BTN.into()]);
+        let t0 = Instant::now();
+        scope.push(MeasureSample { at: t0, gyro: [0.1, -0.2, 0.3], mask: 0 });
+        scope.push(MeasureSample { at: t0 + Duration::from_millis(1), gyro: [0.1, -0.2, 0.3], mask: 1 });
+        let p = scope.plot(0, &ClickGateConfig::default()).unwrap();
+        assert!((p.points[1].motion - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_button_the_filter_doesnt_act_on_has_no_result_line() {
+        let mut s = scoped(300, |_| 0.1, |i| (i >= 100) as u64);
+        assert!(!s.plot(0, &ClickGateConfig::default()).unwrap().has_filtered);
+    }
+
+    #[test]
+    fn new_settings_show_on_the_same_click() {
+        let gyro = |i: u64| if (100..200).contains(&i) { 0.5 } else { 0.01 };
+        let mut s = scoped(300, gyro, |i| (i >= 100) as u64);
+        let at_40 = |p: &ClickPlot| p.points.iter().find(|q| q.ms == 40.0).unwrap().filtered;
+        assert_eq!(at_40(s.plot(0, &ticked(20.0, 0.0)).unwrap()), 0.5);
+        assert!((at_40(s.plot(0, &ticked(60.0, 0.0)).unwrap()) - 0.01).abs() < 1e-6, "a longer hold");
+        let sloping = at_40(s.plot(0, &ticked(20.0, 40.0)).unwrap());
+        assert!((sloping - 0.255).abs() < 0.01, "half way down a slope: {sloping}");
+    }
+
+    #[test]
+    fn a_release_inside_the_sweep_is_part_of_it() {
+        let mut s = scoped(400, |_| 0.0, |i| (100..200).contains(&i) as u64);
+        let p = s.plot(0, &ClickGateConfig::default()).unwrap();
+        assert!(p.points.iter().any(|q| q.ms == -SCOPE_BEFORE_MS), "still the press's trace");
+        assert_eq!(p.edges, vec![0.0, 100.0]);
+    }
+
+    #[test]
+    fn a_release_after_the_sweep_starts_a_new_one() {
+        let mut s = scoped(800, |i| i as f32, |i| (100..500).contains(&i) as u64);
+        let p = s.plot(0, &ClickGateConfig::default()).unwrap();
+        assert_eq!(p.edges, vec![0.0]);
+        let zero = p.points.iter().find(|q| q.ms == 0.0).unwrap();
+        assert_eq!(zero.motion, 500.0);
+    }
+
+    #[test]
+    fn each_button_keeps_its_own_click() {
+        let mut s = scoped(300, |_| 0.0, |i| (i >= 100) as u64);
+        assert!(s.plot(0, &ClickGateConfig::default()).is_some());
+        assert!(s.plot(1, &ClickGateConfig::default()).is_none(), "never clicked");
+        assert!(s.plot(2, &ClickGateConfig::default()).is_none(), "no such button");
+    }
+
+    #[test]
+    fn another_buttons_hold_shows_on_this_buttons_trace() {
+        // As it would on the pad: the hold is the pad's, whichever button began it.
+        let mask = |i: u64| (i >= 110) as u64 | ((i >= 100) as u64) << 1;
+        let gyro = |i: u64| if (100..125).contains(&i) { 0.5 } else { 0.01 };
+        let mut s = scoped(300, gyro, mask);
+        let mut both = ticked(20.0, 0.0);
+        both.buttons.push(("btn_other".into(), 30.0));
+        let p = s.plot(0, &both).unwrap();
+        let start = p.points.iter().find(|q| q.ms == -5.0).unwrap();
+        assert!((start.filtered - 0.01).abs() < 1e-6, "{start:?}");
+    }
+
+    #[test]
+    fn being_connected_with_a_button_down_is_not_a_click() {
+        let mut s = scoped(100, |_| 0.0, |_| 1);
+        assert!(s.plot(0, &ClickGateConfig::default()).is_none());
+    }
+
+    #[test]
+    fn clearing_forgets_the_clicks() {
+        let mut s = scoped(300, |_| 0.0, |i| (i >= 100) as u64);
+        s.clear();
+        assert!(s.plot(0, &ClickGateConfig::default()).is_none());
     }
 }
