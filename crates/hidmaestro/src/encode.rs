@@ -662,19 +662,23 @@ impl PinState {
             right_trigger: self.rt.clamp(0.0, 1.0),
             buttons: self.buttons,
             hat: Hat::from_dpad(self.dpad_up, self.dpad_down, self.dpad_left, self.dpad_right),
-            // Inverse of the physical DS4/DualSense IMU decode (see
-            // flexinput_devices::gyro::build): the physical side reads wire
-            // (pitch,yaw,roll)/(side,vertical,fwd) and remaps to the standard
-            // signal-graph (roll,pitch,yaw)/(side,fwd,vertical). We invert so a
-            // virtual pad's wire report matches what a real pad would emit:
-            //   gyroPitch = gyro_y, gyroYaw = -gyro_z, gyroRoll = gyro_x
-            //   accelX = accel_x, accelY(vertical) = accel_z, accelZ(fwd) = accel_y
+            // Exact inverse of the physical DS4/DualSense IMU decode
+            // (flexinput_devices::gyro::build), so a virtual pad's wire report
+            // matches what a real pad would emit in the same pose. The wire
+            // carries gyro (pitch, yaw, roll) and accel (side, vertical,
+            // fwd-tilt); the signal graph is the canonical frame on `HidReading`:
+            //   gyroPitch = gyro_y, gyroYaw = -gyro_z, gyroRoll = -gyro_x
+            //   accelX(side) = -accel_y, accelY(vertical) = accel_z, accelZ(fwd) = -accel_x
+            // Keep this in lockstep with `build`. When they drift apart the
+            // virtual pad's gravity no longer matches its gyro, and a game that
+            // combines the two (player/world space) turns a pitch on a tilted
+            // hold into a diagonal.
             gyro_pitch: self.gyro_y,
             gyro_yaw: -self.gyro_z,
-            gyro_roll: self.gyro_x,
-            accel_x: self.accel_x,
+            gyro_roll: -self.gyro_x,
+            accel_x: -self.accel_y,
             accel_y: self.accel_z,
-            accel_z: self.accel_y,
+            accel_z: -self.accel_x,
             // Touchpad passes through unchanged (already in the read-side's
             // normalized [-1,1] range); the encoder packs it into finger bytes.
             touch1: TouchOut { active: self.t1_active, x: self.t1x, y: self.t1y },
@@ -1118,8 +1122,31 @@ mod tests {
         ps.set("gyro_x", 0.5, true); // roll
         ps.set("gyro_z", 0.25, true); // yaw
         let st = ps.state();
-        assert_eq!(st.gyro_roll, 0.5, "gyro_x → wire roll");
+        assert_eq!(st.gyro_roll, -0.5, "gyro_x → wire roll (negated)");
         assert_eq!(st.gyro_yaw, -0.25, "gyro_z → wire yaw (negated)");
+    }
+
+    // The raw values a real Sony pad sends in each pose, as pinned on the read
+    // side by flexinput_devices' `sony_accel_maps_to_canonical_frame`: nose-up
+    // → raw fwd-tilt negative, right grip down → raw side negative, flat → raw
+    // vertical positive. A virtual pad fed the canonical reading must send the
+    // same, or games see a nose-up hold as a sideways roll.
+    #[test]
+    fn pinstate_accel_matches_a_real_sony_pad_pose() {
+        let accel = |x: f32, y: f32, z: f32| {
+            let mut ps = PinState::new();
+            ps.set("accel_x", x, true);
+            ps.set("accel_y", y, true);
+            ps.set("accel_z", z, true);
+            let st = ps.state();
+            (st.accel_x, st.accel_y, st.accel_z) // wire (side, vertical, fwd)
+        };
+        let (side, vert, fwd) = accel(0.0, 0.0, 0.125);
+        assert!(side == 0.0 && vert > 0.0 && fwd == 0.0, "flat, got ({side},{vert},{fwd})");
+        let (side, vert, fwd) = accel(0.125, 0.0, 0.0);
+        assert!(side == 0.0 && vert == 0.0 && fwd < 0.0, "nose-up, got ({side},{vert},{fwd})");
+        let (side, vert, fwd) = accel(0.0, 0.125, 0.0);
+        assert!(side < 0.0 && vert == 0.0 && fwd == 0.0, "right grip down, got ({side},{vert},{fwd})");
     }
 
     // Locks the GIP layout mapped live against XInputGetState (2026-06-15). If

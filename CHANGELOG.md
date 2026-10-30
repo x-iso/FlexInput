@@ -3,6 +3,19 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.5] - 2026-10-30
+
+### Fixed
+
+- **Gyro aim on the virtual DualSense and DualShock 4 no longer goes
+  diagonal.** The virtual pad reported its tilt on the wrong axes, forward
+  and sideways swapped, and its roll reversed. A game that aims relative to
+  gravity (player or world space gyro) then read a pad held nose-up as
+  tipped to one side, so raising a pad held at an angle moved the aim
+  diagonally. The virtual DualSense Edge and the Audio & Haptics DualSense
+  had the same fault. They now send motion as a real pad in the same pose
+  would. Local-space gyro only had its roll reversed.
+
 ## [0.16.4] - 2026-10-29
 
 ### Added
