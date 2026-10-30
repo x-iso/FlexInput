@@ -130,7 +130,7 @@ fn left_after(samples: &[[f32; AXES]], det: &Detection, warm: &SpikeFilter, wind
     let w = window as usize;
     let mut left = 0;
     for (k, x) in samples.iter().enumerate() {
-        let y = f.push(*x);
+        let y = f.judge(*x);
         let j = if k + 1 >= w { k - w / 2 } else { 0 };
         if (0..AXES).any(|a| (y[a] - det.baseline[j][a]).abs() > det.thresh[a]) {
             left += 1;
@@ -155,7 +155,7 @@ pub fn tune(samples: &[[f32; AXES]]) -> Option<Tuning> {
     let mut warm = SpikeFilter::new();
     warm.set_config(true, 50.0, 3);
     for x in samples {
-        warm.push(*x);
+        warm.judge(*x);
     }
     let mut best: Option<((u8, f32), usize)> = None;
     for window in [3u8, 5, 7] {

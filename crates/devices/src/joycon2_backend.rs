@@ -574,8 +574,8 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
     let mut out = Vec::new();
     // A throwaway filter per call: these helpers assert the pin VOCABULARY and
     // routing, one snapshot at a time, so there is no stream for a window to
-    // span. A fresh filter is in warm-up and passes its sample through, which
-    // keeps these assertions about the mapping rather than about smoothing.
+    // span. A fresh filter is off and passes its sample through, which keeps
+    // these assertions about the mapping rather than about smoothing.
     let mut spike = SpikeFilter::new();
     push_common(&mut out, "dev", &pad, &mut spike);
     match side {

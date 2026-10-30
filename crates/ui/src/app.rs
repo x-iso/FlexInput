@@ -534,6 +534,8 @@ pub struct FlexInputApp {
     /// Per-device measured resting gyro drift, deg/s on the device's rate
     /// axes — see `DeviceBackend::set_gyro_drift`.
     pub gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
+    /// Per-device click-jolt holds, read by the I/O thread each poll.
+    pub click_gate_settings: flexinput_devices::click_gate::ClickGateSettings,
     /// Per-device default lightbar colour (`settings.led_defaults`), mirrored
     /// for the I/O thread, which sends it while nothing else drives the lightbar.
     led_defaults: Arc<RwLock<HashMap<String, [u8; 3]>>>,
@@ -992,6 +994,21 @@ impl FlexInputApp {
             }
             Arc::new(RwLock::new(seed))
         };
+        // Seeded the same way, for the same reason.
+        let click_gate_settings: flexinput_devices::click_gate::ClickGateSettings = {
+            let mut seed = HashMap::new();
+            for tab in &tabs {
+                for (_, node) in tab.canvas.snarl.node_ids() {
+                    if node.module_id != "device.source" || !node.params.contains_key("click_gate_buttons") {
+                        continue;
+                    }
+                    let Some(dev) = node.params.get("device_id").and_then(|v| v.as_str())
+                    else { continue };
+                    seed.insert(dev.to_string(), Arc::new(crate::panels::calibration::click_gate_params(&node.params)));
+                }
+            }
+            Arc::new(RwLock::new(seed))
+        };
         // ⭐ Seeded from the SAVED graph, not left empty for the calibration
         // window to fill.
         //
@@ -1046,6 +1063,7 @@ impl FlexInputApp {
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
             Arc::clone(&gyro_drift_settings),
+            Arc::clone(&click_gate_settings),
             Arc::clone(&sdl_all_pads),
             Arc::clone(&ping_requests),
             Arc::clone(&led_defaults),
@@ -1254,6 +1272,7 @@ impl FlexInputApp {
             scope_taps,
             spike_filter_settings,
             gyro_drift_settings,
+            click_gate_settings,
             led_defaults,
             raw_pad_profiles,
             raw_db_tried: HashSet::new(),
@@ -3110,7 +3129,7 @@ impl eframe::App for FlexInputApp {
             // Hands-free gyro auto-calibration watcher — runs whether or not
             // a calibration window is open.
             crate::panels::calibration::auto_cal_tick(ctx, canvas, &self.last_signals);
-            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings, &self.gyro_drift_settings);
+            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings, &self.gyro_drift_settings, &self.click_gate_settings);
         }
 
         // Only update app_clipboard from outer canvas when the user actually copied

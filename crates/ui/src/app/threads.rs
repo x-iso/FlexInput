@@ -107,6 +107,8 @@ pub(crate) fn spawn_io_thread(
     // that reconnects gets its calibration back without the user reopening
     // the window. See `DeviceBackend::set_gyro_drift`.
     gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
+    // Per-device click-jolt holds, applied to the merged poll below.
+    click_gate_settings: flexinput_devices::click_gate::ClickGateSettings,
     // Global "route every pad through SDL" switch — pushed to every backend
     // each iteration so a live toggle re-arbitrates without a restart.
     sdl_all_pads: Arc<AtomicBool>,
@@ -250,6 +252,7 @@ pub(crate) fn spawn_io_thread(
             let mut next_poll = Instant::now();
             let mut next_output = next_poll;
             let mut timings = IoTimingAcc::default();
+            let mut click_gates = flexinput_devices::click_gate::ClickGates::default();
 
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
@@ -382,6 +385,14 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("midi_poll");
+                // Hold the IMU through button clicks picked for it: here, where
+                // every backend's buttons and motion have met, and before the
+                // taps so the calibration scope shows what the engine gets.
+                if input_due {
+                    puffin::profile_scope!("click_gates");
+                    let settings = click_gate_settings.read().unwrap();
+                    click_gates.apply(&settings, &mut signals, Instant::now());
+                }
                 // Tap gyro/accel samples into the per-pin scope rings so the
                 // calibration window can render at true polling Hz rather than
                 // UI repaint Hz. We do this BEFORE moving `signals` into the

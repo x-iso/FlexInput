@@ -136,6 +136,13 @@ pub fn eval_graph_tick(
 - Scales gyro signals by multiplier from settings
 - Filters noise spikes if spike filter enabled
 
+**Click-jolt holds (before any of this):** the I/O thread runs each merged poll
+through `flexinput_devices::click_gate` before publishing it. An edge on a button
+picked for it holds that pad's six IMU pins, so the engine and the calibration
+scope both get the held values. Settings live on the `device.source` node
+(`click_gate_on`, `click_gate_buttons`: pin to ms, `click_gate_lookahead_ms`,
+`click_gate_release_ms`).
+
 **Source-block suppression (menu / config-overlay):**
 - When a Virtual Menu is open OR the config overlay is tweaking a param, specific
   physical input pins are zeroed so the game doesn't receive nav inputs.

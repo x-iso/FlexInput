@@ -560,7 +560,7 @@ fn arm(tabs: &[PatchTab], active_tab: usize, spike_settings: &SpikeSettings, dev
                     .and_then(|id| t.canvas.snarl.get_node(*id))
                     .map(|n| crate::panels::calibration::spike_params(&n.params))
             });
-            map.insert(dev.to_string(), saved.unwrap_or((true, 50.0, 3)));
+            map.insert(dev.to_string(), saved.unwrap_or((false, 50.0, 3)));
         }
     }
     spike::capture_start(dev);

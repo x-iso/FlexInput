@@ -14,6 +14,7 @@ pub mod midi;
 pub mod raw_hid;
 pub mod sdl_backend;
 pub mod spectrum;
+pub mod click_gate;
 pub mod spike;
 pub mod spike_tune;
 

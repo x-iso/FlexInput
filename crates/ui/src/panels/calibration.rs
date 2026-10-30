@@ -11,13 +11,14 @@
 //! Per-session UI state lives in `egui::Memory` keyed by NodeId.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke};
 use egui_snarl::NodeId;
 use flexinput_core::Signal;
+use flexinput_devices::click_gate::{self, ClickGateConfig, ClickGateSettings, JoltAnalyzer};
 use flexinput_devices::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
 use serde_json::Value;
 
@@ -628,11 +629,27 @@ pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32, u8)>>>;
 /// app restarted.
 pub type GyroDriftSettings = Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>;
 
+/// A `device.source` node's click-jolt settings as the device thread takes them.
+pub(crate) fn click_gate_params(params: &HashMap<String, Value>) -> ClickGateConfig {
+    ClickGateConfig {
+        enabled: params.get("click_gate_on").and_then(|v| v.as_bool()).unwrap_or(false),
+        buttons: params.get("click_gate_buttons").and_then(|v| v.as_object())
+            .map(|o| o.iter()
+                .map(|(pin, ms)| (pin.clone(), ms.as_f64().unwrap_or(click_gate::DEFAULT_HOLD_MS as f64) as f32))
+                .collect())
+            .unwrap_or_default(),
+        lookahead_ms: (params.get("click_gate_lookahead_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32)
+            .clamp(0.0, click_gate::MAX_LOOKAHEAD_MS),
+        release_ms: params.get("click_gate_release_ms").and_then(|v| v.as_f64())
+            .map_or(click_gate::DEFAULT_RELEASE_MS, |v| v as f32),
+    }
+}
+
 /// A `device.source` node's spike-filter settings as the device thread takes
 /// them: (enabled, sensitivity %, window), defaulting like the filter itself.
 pub(crate) fn spike_params(params: &HashMap<String, Value>) -> (bool, f32, u8) {
     (
-        params.get("spike_suppress").and_then(|v| v.as_bool()).unwrap_or(true),
+        params.get("spike_suppress").and_then(|v| v.as_bool()).unwrap_or(false),
         params.get("spike_sensitivity").and_then(|v| v.as_f64()).unwrap_or(50.0) as f32,
         params.get("spike_window").and_then(|v| v.as_u64()).unwrap_or(3) as u8,
     )
@@ -646,6 +663,7 @@ pub fn show_windows(
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
     gyro_drift: &GyroDriftSettings,
+    click_gates: &ClickGateSettings,
 ) {
     let entries: Vec<(NodeId, String, String, Vec<String>)> = open.iter()
         .filter_map(|&nid| {
@@ -691,9 +709,10 @@ pub fn show_windows(
             .show(ctx, |ui| {
                 scaled_below_ref_width(ui, |ui| {
                     draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps,
-                        spike_settings, gyro_drift);
+                        spike_settings, gyro_drift, click_gates);
                 });
             });
+        click_jolt_window(ctx, canvas, node_id, &dev_id, &display_name);
         if !is_open {
             to_close.push(node_id);
             ctx.data_mut(|d| {
@@ -702,6 +721,7 @@ pub fn show_windows(
                 }
                 d.remove::<WindowState>(state_id(node_id));
             });
+            close_click_jolt_window(ctx, node_id, &dev_id);
         }
     }
     for nid in to_close { open.remove(&nid); }
@@ -944,10 +964,11 @@ fn draw_window_body(
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
     gyro_drift: &GyroDriftSettings,
+    click_gates: &ClickGateSettings,
 ) {
     let lo = Layout::compute(ui);
     if caps.gyro {
-        gyro_section(ui, canvas, node_id, dev_id, live, lo, scope_taps, spike_settings);
+        gyro_section(ui, canvas, node_id, dev_id, live, lo, scope_taps, spike_settings, click_gates);
         ui.separator();
     }
     if caps.orientation {
@@ -1143,9 +1164,9 @@ fn cal_button_with_progress(ui: &mut egui::Ui, label: &str, progress: f32) -> eg
     resp
 }
 
-/// Generic variant — same progress overlay, but for arbitrary-sized buttons
-/// (the axis-alignment Roll/Pitch/Yaw rotate buttons are taller than the
-/// standard cal button). Renders the supplied button and overlays the bar.
+/// Generic variant — same progress overlay, but for any button (the
+/// axis-alignment Roll/Pitch/Yaw rotate buttons aren't the standard cal
+/// button). Renders the supplied button and overlays the bar.
 fn add_button_with_progress(ui: &mut egui::Ui, button: egui::Button<'_>, progress: f32) -> egui::Response {
     let resp = ui.add(button);
     let p = progress.clamp(0.0, 1.0);
@@ -1258,6 +1279,7 @@ fn gyro_section(
     lo: Layout,
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
+    click_gates: &ClickGateSettings,
 ) {
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("gyro_calibrated").and_then(|v| v.as_bool()))
@@ -1372,7 +1394,11 @@ fn gyro_section(
             .unwrap_or((None, 0, [false; 3]))
     });
     let axis_names = ["Roll", "Pitch", "Yaw"];
-    let axis_hints = ["tilt side-to-side", "rock front-to-back", "rotate like a wheel"];
+    let axis_hints = [
+        "Roll: tilt side-to-side, around this axis alone.",
+        "Pitch: rock front-to-back, around this axis alone.",
+        "Yaw: rotate like a wheel, around this axis alone.",
+    ];
 
     ui.horizontal(|ui| {
         // ── LEFT COLUMN ────────────────────────────────────────────────
@@ -1467,98 +1493,114 @@ fn gyro_section(
 
             ui.add_space(8.0);
 
-            // "Axis alignment" header + inline solve / reset buttons.
-            ui.horizontal_wrapped(|ui| {
+            click_jolt_row(ui, canvas, node_id, dev_id, live, click_gates);
+
+            ui.add_space(8.0);
+
+            // Axis alignment: rarely needed, so folded away. The fold says when
+            // an alignment is in effect, since nothing else would.
+            let aligned = canvas.snarl.get_node(node_id)
+                .is_some_and(|n| n.params.contains_key("gyro_orient_matrix"));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(), egui::Id::new(("cal_axis_align", node_id)), false,
+            )
+            .show_header(ui, |ui| {
                 ui.label(egui::RichText::new("Axis alignment").size(INSTRUCT_SIZE).strong());
-                let all = or_captured.iter().all(|c| *c);
-                if ui.add_enabled(all && or_sampling_axis.is_none(),
-                    egui::Button::new(egui::RichText::new("solve").size(INSTRUCT_SIZE - 1.0))).clicked()
-                {
-                    let (samples, accel_mean) = ui.ctx().data(|d| {
-                        let st = d.get_temp::<WindowState>(state_id(node_id));
-                        let samples = st.as_ref().map(|s| s.orient.samples.clone()).unwrap_or_default();
-                        let accel_mean = st.as_ref().and_then(|s| {
-                            let mut sum = [0.0_f64; 3];
-                            let mut n   = 0_u64;
-                            for ai in 0..3 {
-                                if !s.orient.captured[ai] || s.orient.accel_n[ai] == 0 { continue; }
-                                let inv = 1.0 / s.orient.accel_n[ai] as f64;
-                                sum[0] += s.orient.accel_sum[ai][0] * inv;
-                                sum[1] += s.orient.accel_sum[ai][1] * inv;
-                                sum[2] += s.orient.accel_sum[ai][2] * inv;
-                                n += 1;
-                            }
-                            if n == 0 { return None; }
-                            let k = 1.0 / n as f64;
-                            Some([(sum[0] * k) as f32, (sum[1] * k) as f32, (sum[2] * k) as f32])
-                        });
-                        (samples, accel_mean)
-                    });
-                    if let Some(m) = solve_orient_matrix(&samples, accel_mean) {
-                        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                            n.params.insert("gyro_orient_matrix".into(), serde_json::json!(m.to_vec()));
+                if aligned {
+                    ui.label(egui::RichText::new("applied").size(INSTRUCT_SIZE - 2.0).weak());
+                }
+            })
+            .body(|ui| {
+                // Roll / Pitch / Yaw axis-capture buttons. The active button
+                // gets an orange progress overlay; the "N/M" sampling text is
+                // dropped because the fill IS the progress indicator (and
+                // avoids button-label width jitter). Wraps when narrow.
+                ui.horizontal_wrapped(|ui| {
+                    for ai in 0..3 {
+                        let active = or_sampling_axis == Some(ai);
+                        let label = if or_captured[ai] {
+                            format!("{} ✓", axis_names[ai])
+                        } else {
+                            axis_names[ai].to_string()
+                        };
+                        let btn = egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0));
+                        let progress = if active {
+                            (or_n as f32 / ORIENT_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
+                        } else { 0.0 };
+                        let enabled = or_sampling_axis.is_none() || active;
+                        let resp = if enabled {
+                            add_button_with_progress(ui, btn, progress)
+                        } else {
+                            ui.add_enabled(false, btn)
+                        };
+                        if resp.on_hover_text(axis_hints[ai]).clicked() {
+                            ui.ctx().data_mut(|d| {
+                                let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                                if active {
+                                    st.orient.sampling_axis = None;
+                                    st.orient.sampling_n = 0;
+                                } else {
+                                    st.orient.sampling_axis = Some(ai);
+                                    st.orient.sampling_n = 0;
+                                    st.orient.samples[ai].clear();
+                                    st.orient.captured[ai] = false;
+                                }
+                            });
                         }
                     }
-                }
-                if ui.button(egui::RichText::new("reset").size(INSTRUCT_SIZE - 1.0)).clicked() {
-                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                        n.params.remove("gyro_orient_matrix");
-                    }
-                    ui.ctx().data_mut(|d| {
-                        let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
-                        st.orient = OrientSession::default();
-                    });
-                }
-            });
+                });
 
-            // Roll / Pitch / Yaw axis-capture buttons — three across.
-            // The active button gets an orange progress overlay; the
-            // "N/M" sampling text is dropped because the fill IS the
-            // progress indicator (and avoids button-label width jitter).
-            // Wraps onto more lines when the column is narrow.
-            ui.horizontal_wrapped(|ui| {
-                for ai in 0..3 {
-                    let active = or_sampling_axis == Some(ai);
-                    let core = if or_captured[ai] {
-                        format!("{} ✓", axis_names[ai])
-                    } else {
-                        axis_names[ai].to_string()
-                    };
-                    let label = format!("{}\n{}", core, axis_hints[ai]);
-                    let btn = egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0));
-                    let progress = if active {
-                        (or_n as f32 / ORIENT_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
-                    } else { 0.0 };
-                    let enabled = or_sampling_axis.is_none() || active;
-                    let resp = if enabled {
-                        add_button_with_progress(ui, btn, progress)
-                    } else {
-                        ui.add_enabled(false, btn)
-                    };
-                    if resp.clicked() {
+                // Solve / reset.
+                ui.horizontal_wrapped(|ui| {
+                    let all = or_captured.iter().all(|c| *c);
+                    if ui.add_enabled(all && or_sampling_axis.is_none(),
+                        egui::Button::new(egui::RichText::new("solve").size(INSTRUCT_SIZE - 1.0))).clicked()
+                    {
+                        let (samples, accel_mean) = ui.ctx().data(|d| {
+                            let st = d.get_temp::<WindowState>(state_id(node_id));
+                            let samples = st.as_ref().map(|s| s.orient.samples.clone()).unwrap_or_default();
+                            let accel_mean = st.as_ref().and_then(|s| {
+                                let mut sum = [0.0_f64; 3];
+                                let mut n   = 0_u64;
+                                for ai in 0..3 {
+                                    if !s.orient.captured[ai] || s.orient.accel_n[ai] == 0 { continue; }
+                                    let inv = 1.0 / s.orient.accel_n[ai] as f64;
+                                    sum[0] += s.orient.accel_sum[ai][0] * inv;
+                                    sum[1] += s.orient.accel_sum[ai][1] * inv;
+                                    sum[2] += s.orient.accel_sum[ai][2] * inv;
+                                    n += 1;
+                                }
+                                if n == 0 { return None; }
+                                let k = 1.0 / n as f64;
+                                Some([(sum[0] * k) as f32, (sum[1] * k) as f32, (sum[2] * k) as f32])
+                            });
+                            (samples, accel_mean)
+                        });
+                        if let Some(m) = solve_orient_matrix(&samples, accel_mean) {
+                            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                                n.params.insert("gyro_orient_matrix".into(), serde_json::json!(m.to_vec()));
+                            }
+                        }
+                    }
+                    if ui.button(egui::RichText::new("reset").size(INSTRUCT_SIZE - 1.0)).clicked() {
+                        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                            n.params.remove("gyro_orient_matrix");
+                        }
                         ui.ctx().data_mut(|d| {
                             let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
-                            if active {
-                                st.orient.sampling_axis = None;
-                                st.orient.sampling_n = 0;
-                            } else {
-                                st.orient.sampling_axis = Some(ai);
-                                st.orient.sampling_n = 0;
-                                st.orient.samples[ai].clear();
-                                st.orient.captured[ai] = false;
-                            }
+                            st.orient = OrientSession::default();
                         });
                     }
-                }
-            });
+                });
 
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(
-                "if normal calibration method doesn't help\n\
-                 or you have some IMU misalignment:\n\
-                 do pure single-axis rotation per button, then solve")
-                .size(INSTRUCT_SIZE - 2.0)
-                .color(Color32::from_gray(140)));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "if normal calibration method doesn't help\n\
+                     or you have some IMU misalignment:\n\
+                     do pure single-axis rotation per button, then solve")
+                    .size(INSTRUCT_SIZE - 2.0)
+                    .color(Color32::from_gray(140)));
+            });
         });
 
         // ── RIGHT COLUMN ───────────────────────────────────────────────
@@ -1602,25 +1644,20 @@ fn gyro_section(
             // Outlier spike-filter row — directly beneath the scope so
             // dragging sensitivity gives instant visual feedback on the
             // trace above.
-            let mut enabled = canvas.snarl.get_node(node_id)
-                .and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool()))
-                .unwrap_or(true);
-            let mut sens = canvas.snarl.get_node(node_id)
-                .and_then(|n| n.params.get("spike_sensitivity").and_then(|v| v.as_f64()))
-                .unwrap_or(50.0) as f32;
-            let mut window = canvas.snarl.get_node(node_id)
-                .and_then(|n| n.params.get("spike_window").and_then(|v| v.as_u64()))
-                .unwrap_or(3) as u8;
+            let (mut enabled, mut sens, mut window) = canvas.snarl.get_node(node_id)
+                .map(|n| spike_params(&n.params))
+                .unwrap_or((false, 50.0, 3));
             let mut filter_changed = false;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Outlier spike filter")
                     .size(INSTRUCT_SIZE).strong());
                 if ui.checkbox(&mut enabled, "")
-                    .on_hover_text("Suppress outlier spikes at the device-poll layer — samples\n\
-                                    that jump off the local trajectory and snap straight back.\n\
-                                    Spikes that get through still show on the scope above, so\n\
-                                    tune against it until the trace is clean.")
+                    .on_hover_text("Suppress outlier spikes as reports arrive from the pad —\n\
+                                    samples that jump off the local trajectory and snap straight\n\
+                                    back. Delays the gyro by at least one report. Spikes that get\n\
+                                    through still show on the scope above, so tune against it\n\
+                                    until the trace is clean.")
                     .changed() { filter_changed = true; }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.label(egui::RichText::new("sensitivity").weak());
@@ -1647,12 +1684,11 @@ fn gyro_section(
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.label(egui::RichText::new("window").size(INSTRUCT_SIZE).weak());
                     for (w, label, hint) in [
-                        (3_u8, "3", "Isolated single-sample spikes only. Lowest latency:\n\
-                                     the 1 sample the filter always costs, nothing more."),
-                        (5_u8, "5", "Bursts up to 2 samples long. One extra sample of\n\
-                                     delay — about 1 ms at 1000 Hz, 4 ms at 250 Hz."),
-                        (7_u8, "7", "Bursts up to 3 samples long. Two extra samples of\n\
-                                     delay — about 2 ms at 1000 Hz, 8 ms at 250 Hz."),
+                        (3_u8, "3", "Spikes one report long. Lowest latency: the 1 report the\n\
+                                     filter always costs — 1 ms at 1000 Hz, 4 ms at 250 Hz,\n\
+                                     5-15 ms on a Joy-Con 2."),
+                        (5_u8, "5", "Bursts up to 2 reports long. One extra report of delay."),
+                        (7_u8, "7", "Bursts up to 3 reports long. Two extra reports of delay."),
                     ] {
                         if ui.selectable_label(window == w, label)
                             .on_hover_text(hint)
@@ -1664,8 +1700,8 @@ fn gyro_section(
                     }
                     ui.label(egui::RichText::new(match window {
                         3 => "isolated spikes · lowest latency",
-                        5 => "bursts to 2 · +1 sample",
-                        _ => "bursts to 3 · +2 samples",
+                        5 => "bursts to 2 · +1 report",
+                        _ => "bursts to 3 · +2 reports",
                     }).size(INSTRUCT_SIZE - 2.0).weak());
                 });
             });
@@ -1809,6 +1845,384 @@ fn gyro_section(
             } else { false }
         });
         if !done { ui.ctx().request_repaint(); }
+    }
+}
+
+// ── Click-jolt filter ────────────────────────────────────────────────────────
+//
+// See `flexinput_devices::click_gate`. The settings live on the device node;
+// the window measures what each button does and picks them.
+
+/// The Click-jolt window's state, while it is open.
+struct ClickJoltWindow {
+    /// The pad's buttons, and what to call them.
+    pins: Vec<(String, String)>,
+    analyzer: JoltAnalyzer,
+    /// Buttons ticked or unticked by hand: measuring leaves that alone.
+    ticked_by_hand: HashSet<String>,
+    /// Buttons given a hold time by hand: measuring leaves that alone.
+    timed_by_hand: HashSet<String>,
+    /// Buttons measuring ticked, so that it can untick them.
+    auto: HashSet<String>,
+}
+
+/// The Click-jolt window's width, and its table's columns. Fixed, so that nothing
+/// moves as measurements arrive and a long line can't reach under the scrollbar.
+const CLICK_WINDOW_W: f32 = 470.0;
+const CLICK_COL_TICK: f32 = 22.0;
+const CLICK_COL_BUTTON: f32 = 140.0;
+const CLICK_COL_PEAK: f32 = 68.0;
+const CLICK_COL_LENGTH: f32 = 54.0;
+const CLICK_COL_CLICKS: f32 = 50.0;
+const CLICK_COL_HOLD: f32 = 62.0;
+const CLICK_ROW_H: f32 = 22.0;
+
+/// One table cell, exactly `width` wide.
+fn click_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, CLICK_ROW_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, CLICK_ROW_H));
+            ui.set_max_width(width);
+            add(ui);
+        },
+    );
+}
+
+/// A measured value, or a dash until there is one.
+fn click_value(ui: &mut egui::Ui, text: Option<String>) {
+    match text {
+        Some(t) => { ui.add(egui::Label::new(t).truncate()); }
+        None => { ui.label(egui::RichText::new("—").weak()); }
+    }
+}
+
+fn click_window_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_click_jolt", node)) }
+
+/// A button's name on this pad: "ZR", not "RT (dig)", on the pads that print it.
+fn click_button_name(dev_id: &str, pin: &str) -> String {
+    use flexinput_core::automap;
+    let slug = crate::canvas::remapper_icons::phys_pad_slug(dev_id)
+        .map(|s| if s.starts_with("joycon2") { "switch_pro" } else { s });
+    automap::family_label(pin, slug)
+        .or_else(|| automap::ALL_PINS.iter().find(|p| p.id == pin).map(|p| p.display_name))
+        .unwrap_or(pin)
+        .to_string()
+}
+
+/// The pad's buttons: every on/off pin it declares that a finger clicks.
+fn click_buttons(canvas: &Canvas, node: NodeId, dev_id: &str, live: &LiveSignals) -> Vec<(String, String)> {
+    let pins = canvas.snarl.get_node(node).map(node_pin_ids).unwrap_or_default();
+    pins.into_iter()
+        .filter(|p| {
+            let named = p.starts_with("btn_")
+                || matches!(p.as_str(), "dpad_up" | "dpad_down" | "dpad_left" | "dpad_right");
+            // A learned pad's extra buttons have no fixed name to go by.
+            let on_off = matches!(live.get(&(dev_id.to_string(), p.clone())), Some(Signal::Bool(_)));
+            let not_a_click = p.contains("touch") && p != "btn_touchpad"
+                || p.contains("contact") || p == "charging";
+            (named || on_off) && !not_a_click
+        })
+        .take(64)
+        .map(|p| { let name = click_button_name(dev_id, &p); (p, name) })
+        .collect()
+}
+
+fn write_click_gate(canvas: &mut Canvas, node: NodeId, cfg: &ClickGateConfig) {
+    let Some(n) = canvas.snarl.get_node_mut(node) else { return };
+    let buttons: serde_json::Map<String, Value> = cfg.buttons.iter()
+        .map(|(pin, ms)| (pin.clone(), serde_json::json!(ms)))
+        .collect();
+    n.params.insert("click_gate_on".into(), Value::Bool(cfg.enabled));
+    n.params.insert("click_gate_buttons".into(), Value::Object(buttons));
+    n.params.insert("click_gate_lookahead_ms".into(), serde_json::json!(cfg.lookahead_ms));
+    n.params.insert("click_gate_release_ms".into(), serde_json::json!(cfg.release_ms));
+}
+
+/// The filter's row in the gyro section: on/off, the window, what it's set to.
+/// Also hands the node's settings to the device thread.
+fn click_jolt_row(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+    click_gates: &ClickGateSettings,
+) {
+    let mut cfg = canvas.snarl.get_node(node_id)
+        .map(|n| click_gate_params(&n.params))
+        .unwrap_or_default();
+    let open = ui.ctx().data(|d| d.get_temp::<Arc<Mutex<ClickJoltWindow>>>(click_window_id(node_id))).is_some();
+    let mut enabled = cfg.enabled;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(egui::RichText::new("Click-jolt filter").size(INSTRUCT_SIZE).strong());
+        ui.checkbox(&mut enabled, "")
+            .on_hover_text("For microswitches on the same board as the IMU, which knock\n\
+                            the sensor every time they click. Holds the gyro and accel\n\
+                            through the jolt of a press or release of the buttons you\n\
+                            pick. It only acts on those clicks and delays nothing\n\
+                            (unless you add look-ahead).");
+        if ui.selectable_label(open, egui::RichText::new("buttons…").size(INSTRUCT_SIZE - 1.0))
+            .on_hover_text("Pick the buttons, or press them and let it measure which\n\
+                            ones jolt the gyro, and for how long.")
+            .clicked()
+        {
+            if open {
+                close_click_jolt_window(ui.ctx(), node_id, dev_id);
+            } else {
+                let pins = click_buttons(canvas, node_id, dev_id, live);
+                let ids: Vec<String> = pins.iter().map(|(p, _)| p.clone()).collect();
+                click_gate::measure_start(dev_id, &ids);
+                let state = ClickJoltWindow {
+                    analyzer: JoltAnalyzer::new(pins.len()),
+                    pins,
+                    ticked_by_hand: HashSet::new(),
+                    timed_by_hand: HashSet::new(),
+                    auto: HashSet::new(),
+                };
+                ui.ctx().data_mut(|d| d.insert_temp(click_window_id(node_id), Arc::new(Mutex::new(state))));
+            }
+        }
+    });
+    let summary = if cfg.buttons.is_empty() {
+        "no buttons picked".to_string()
+    } else {
+        let names: Vec<String> = cfg.buttons.iter().map(|(p, _)| click_button_name(dev_id, p)).collect();
+        let longest = cfg.buttons.iter().map(|(_, ms)| *ms).fold(0.0, f32::max);
+        let ahead = if cfg.lookahead_ms > 0.0 {
+            format!(" · look-ahead {:.0} ms", cfg.lookahead_ms)
+        } else {
+            String::new()
+        };
+        format!("{} · held up to {longest:.0} ms, {:.0} ms release{ahead}", names.join(", "), cfg.release_ms)
+    };
+    ui.label(egui::RichText::new(summary).size(INSTRUCT_SIZE - 2.0).color(Color32::from_gray(140)));
+    if enabled != cfg.enabled {
+        cfg.enabled = enabled;
+        write_click_gate(canvas, node_id, &cfg);
+    }
+    let stale = click_gates.read().map_or(false, |m| m.get(dev_id).is_none_or(|c| **c != cfg));
+    if stale {
+        if let Ok(mut m) = click_gates.write() {
+            m.insert(dev_id.to_string(), Arc::new(cfg));
+        }
+    }
+}
+
+fn close_click_jolt_window(ctx: &egui::Context, node: NodeId, dev_id: &str) {
+    click_gate::measure_stop(dev_id);
+    ctx.data_mut(|d| d.remove::<Arc<Mutex<ClickJoltWindow>>>(click_window_id(node)));
+}
+
+/// The window behind "buttons…": the pad's buttons, ticked by hand or by
+/// pressing them. Measures while it is open, so it holds gamepad nav: those
+/// presses are for it.
+fn click_jolt_window(ctx: &egui::Context, canvas: &mut Canvas, node_id: NodeId, dev_id: &str, name: &str) {
+    let Some(state) = ctx.data(|d| d.get_temp::<Arc<Mutex<ClickJoltWindow>>>(click_window_id(node_id))) else { return };
+    let Ok(mut st) = state.lock() else { return };
+    let st = &mut *st;
+    crate::widgets::hold_nav_for_capture(ctx);
+    ctx.request_repaint();
+
+    match click_gate::measure_read(dev_id) {
+        Some(samples) => samples.into_iter().for_each(|s| st.analyzer.push(s)),
+        None => {
+            let ids: Vec<String> = st.pins.iter().map(|(p, _)| p.clone()).collect();
+            click_gate::measure_start(dev_id, &ids);
+        }
+    }
+
+    let saved = canvas.snarl.get_node(node_id).map(|n| click_gate_params(&n.params)).unwrap_or_default();
+    let mut cfg = saved.clone();
+    // Apply what the measuring says, unless asked not to or already set by hand.
+    let mut auto_apply = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("click_gate_auto").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    if auto_apply {
+        for (i, (pin, _)) in st.pins.iter().enumerate() {
+            let r = st.analyzer.report(i);
+            if !st.ticked_by_hand.contains(pin) {
+                let ticked = cfg.buttons.iter().any(|(p, _)| p == pin);
+                if r.jolting() {
+                    if !ticked {
+                        cfg.buttons.push((pin.clone(), r.hold_ms.ceil()));
+                    }
+                    st.auto.insert(pin.clone());
+                } else if st.auto.remove(pin) {
+                    cfg.buttons.retain(|(p, _)| p != pin);
+                }
+            }
+            if r.jolting() && !st.timed_by_hand.contains(pin) {
+                if let Some(b) = cfg.buttons.iter_mut().find(|(p, _)| p == pin) {
+                    b.1 = r.hold_ms.ceil();
+                }
+            }
+        }
+    }
+
+    let mut open = true;
+    let mut done = false;
+    egui::Window::new(format!("Click jolts: {name}"))
+        .id(egui::Id::new(("cal_click_jolt_window", node_id)))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.content_rect().center())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_width(CLICK_WINDOW_W);
+            ui.label("Press each button a few times, keeping the pad as still as you can, \
+                      and see how much each click jolts the gyro.");
+            if ui.checkbox(&mut auto_apply, "Apply measurements automatically")
+                .on_hover_text("Ticks the buttons that jolt the gyro and sets each one's hold\n\
+                                time to what it needs. A tick or a time you set by hand stays.")
+                .changed()
+            {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("click_gate_auto".into(), Value::Bool(auto_apply));
+                }
+            }
+            ui.add_space(6.0);
+            let skin = crate::canvas::remapper_icons::skin_from_device_id(dev_id);
+            ui.horizontal(|ui| {
+                let head = |ui: &mut egui::Ui, text: &str, hint: &str| {
+                    ui.add(egui::Label::new(egui::RichText::new(text).weak().small()).truncate())
+                        .on_hover_text(hint);
+                };
+                click_cell(ui, CLICK_COL_TICK, |_| {});
+                click_cell(ui, CLICK_COL_BUTTON, |ui| head(ui, "Button", "Lights up while pressed."));
+                click_cell(ui, CLICK_COL_PEAK, |ui| head(ui, "Jolt", "The biggest jolt measured."));
+                click_cell(ui, CLICK_COL_LENGTH, |ui| head(ui, "Length", "How long a jolt lasts."));
+                click_cell(ui, CLICK_COL_CLICKS, |ui| head(ui, "Clicks", "Presses and releases that jolted, of those measured."));
+                click_cell(ui, CLICK_COL_HOLD, |ui| head(ui, "Hold", "How long the IMU is held after this button's press or release."));
+            });
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, (pin, label)) in st.pins.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let r = st.analyzer.report(i);
+                        click_cell(ui, CLICK_COL_TICK, |ui| {
+                            let mut on = cfg.buttons.iter().any(|(p, _)| p == pin);
+                            if ui.checkbox(&mut on, "").changed() {
+                                st.ticked_by_hand.insert(pin.clone());
+                                st.auto.remove(pin);
+                                if on {
+                                    let ms = if r.jolting() { r.hold_ms.ceil() } else { click_gate::DEFAULT_HOLD_MS };
+                                    cfg.buttons.push((pin.clone(), ms));
+                                } else {
+                                    cfg.buttons.retain(|(p, _)| p != pin);
+                                }
+                            }
+                        });
+                        click_cell(ui, CLICK_COL_BUTTON, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            // Same width with or without a glyph, so the names line up.
+                            match crate::canvas::input_viewer::glyph_texture(ui, skin, pin, 18.0) {
+                                Some(tex) => { ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(18.0, 18.0))); }
+                                None => { ui.allocate_space(egui::vec2(18.0, 18.0)); }
+                            }
+                            let mut text = egui::RichText::new(label);
+                            if st.analyzer.pressed(i) { text = text.color(ORANGE); }
+                            ui.add(egui::Label::new(text).truncate());
+                        });
+                        click_cell(ui, CLICK_COL_PEAK, |ui| {
+                            if r.clicks > 0 && r.jolts == 0 {
+                                ui.add(egui::Label::new(egui::RichText::new("no jolt").weak()).truncate())
+                                    .on_hover_text(format!("The most the gyro moved around a click: {}.", fmt_dps(r.largest)));
+                            } else {
+                                click_value(ui, (r.jolts > 0).then(|| fmt_dps(r.peak)));
+                            }
+                        });
+                        click_cell(ui, CLICK_COL_LENGTH, |ui| {
+                            click_value(ui, (r.jolts > 0).then(|| format!("{:.0} ms", r.length_ms)));
+                        });
+                        click_cell(ui, CLICK_COL_CLICKS, |ui| {
+                            click_value(ui, (r.clicks > 0).then(|| format!("{}/{}", r.jolts, r.clicks)));
+                        });
+                        click_cell(ui, CLICK_COL_HOLD, |ui| {
+                            if let Some(b) = cfg.buttons.iter_mut().find(|(p, _)| p == pin) {
+                                let changed = ui.add(egui::DragValue::new(&mut b.1)
+                                    .range(1.0..=click_gate::MAX_HOLD_MS)
+                                    .speed(0.5)
+                                    .fixed_decimals(0)
+                                    .suffix(" ms"))
+                                    .on_hover_text("How long the IMU is held after this button's press or release.")
+                                    .changed();
+                                if changed {
+                                    st.timed_by_hand.insert(pin.clone());
+                                }
+                            }
+                        });
+                    });
+                }
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Release");
+                ui.add(egui::DragValue::new(&mut cfg.release_ms)
+                    .range(0.0..=click_gate::MAX_RELEASE_MS)
+                    .speed(0.5)
+                    .fixed_decimals(0)
+                    .suffix(" ms"))
+                    .on_hover_text("After a hold, how long the gyro and accel take to slope back\n\
+                                    to the live signal. Fades out what is left of a jolt, and\n\
+                                    avoids a step if the pad turned during the hold. For every\n\
+                                    button. 0 = straight back.");
+                ui.add_space(12.0);
+                // Look-ahead: only ever by hand, it costs every sample.
+                ui.label("Look-ahead");
+                ui.add(egui::DragValue::new(&mut cfg.lookahead_ms)
+                    .range(0.0..=click_gate::MAX_LOOKAHEAD_MS)
+                    .speed(0.1)
+                    .max_decimals(1)
+                    .suffix(" ms"))
+                    .on_hover_text("Delays the whole gyro and accel stream by this much, to also\n\
+                                    hold a jolt that shows up before its click does. Costs this\n\
+                                    delay on every sample, all the time, so use as little as\n\
+                                    gets rid of the jolt. A couple of ms is often enough.");
+            });
+            let lead = st.pins.iter().enumerate()
+                .filter(|(_, (p, _))| cfg.buttons.iter().any(|(b, _)| b == p))
+                .map(|(i, _)| st.analyzer.report(i))
+                .filter(|r| r.jolting())
+                .map(|r| r.lead_ms)
+                .fold(0.0, f32::max);
+            let suggest = lead.ceil().min(click_gate::MAX_LOOKAHEAD_MS);
+            if suggest > cfg.lookahead_ms + 1.0 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!(
+                        "Jolts start about {lead:.0} ms before their click arrives. \
+                         Look-ahead can catch that part, and less than this often does.")).weak());
+                    if ui.button(format!("Use {suggest:.0} ms")).clicked() {
+                        cfg.lookahead_ms = suggest;
+                    }
+                });
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Measure again").clicked() {
+                    st.analyzer.reset();
+                    st.ticked_by_hand.clear();
+                    st.timed_by_hand.clear();
+                    st.auto.clear();
+                }
+                if ui.button("Done").clicked() {
+                    done = true;
+                }
+            });
+        });
+
+    if saved.buttons.is_empty() && !cfg.buttons.is_empty() {
+        cfg.enabled = true; // the first button picked is what it was opened for
+    }
+    if cfg != saved {
+        write_click_gate(canvas, node_id, &cfg);
+    }
+    if !open || done {
+        close_click_jolt_window(ctx, node_id, dev_id);
     }
 }
 
@@ -3722,6 +4136,14 @@ mod unit_fmt_tests {
     }
 
     /// Negative values keep their sign and their precision bracket.
+    #[test]
+    fn the_spike_filter_is_off_until_something_turns_it_on() {
+        let mut params = HashMap::new();
+        assert_eq!(spike_params(&params), (false, 50.0, 3));
+        params.insert("spike_suppress".to_string(), Value::Bool(true));
+        assert!(spike_params(&params).0, "saved settings keep what they had");
+    }
+
     #[test]
     fn negatives_format_like_their_magnitude() {
         assert_eq!(fmt_dps(-0.0028), "-5.60 °/s");

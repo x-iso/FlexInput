@@ -5,6 +5,10 @@
 //! owns one filter per device; the UI pushes settings down each I/O tick via
 //! `DeviceBackend::set_spike_filter`.
 //!
+//! Off until asked for: it delays the gyro by at least one report, which only
+//! a pad with spikes should pay. The user turns it on, or a calibration does
+//! when it finds spikes ([`crate::spike_tune`]).
+//!
 //! # What it catches
 //!
 //! Single- and multi-packet excursions — a sample (or short run of samples)
@@ -45,20 +49,28 @@
 //! updates on every sample (accepted or not) so it can never deadlock at a
 //! value that rejects everything.
 //!
+//! # One sample per report
+//!
+//! The window counts reports, what the pad actually sent, whatever the polling
+//! rate. Raw HID and Bluetooth Classic push once per report, but SDL and the
+//! Joy-Con 2 push once per poll, repeating the last report until the next one
+//! arrives. Windowing those repeats made the filter blind: a report held for
+//! as many polls as the window is wide agrees with its own copies, so nothing
+//! was ever rejected. So a sample identical to the last one on all six axes is
+//! not a new sample ([`REPEAT_FLUSH`] covers a pad truly sitting on one value).
+//!
 //! # Capture
 //!
 //! While the UI asks for it ([`capture_start`]), a filter bound to a device id
-//! ([`SpikeFilter::bind_capture`]) also records every sample it is fed, before
-//! judging it. This is the one point every backend's IMU stream passes at the
-//! rate the filter sees it — one HID report each on raw HID, one poll each on
-//! SDL and the Joy-Con 2 — so it is the input [`crate::spike_tune`] tunes the
-//! filter from. A tap further down sees fewer samples, and none of the spikes
-//! the filter already removed.
+//! ([`SpikeFilter::bind_capture`]) also records every new sample, before
+//! judging it. This is the one point every backend's IMU stream passes, so it
+//! is the input [`crate::spike_tune`] tunes the filter from. A tap further down
+//! sees repeats, and none of the spikes the filter already removed.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Axis count: gyro x/y/z then accel x/y/z.
 pub const AXES: usize = 6;
@@ -98,6 +110,12 @@ const GATE_K: f32 = 2.0;
 
 /// Widest supported window. Bounds the fixed-size scratch buffers below.
 pub const MAX_WINDOW: usize = 7;
+
+/// A repeated sample counts as new once it has repeated for this long: the pad
+/// isn't between reports, it is sitting on one value, and the window must still
+/// move on or the output stays a report behind for as long as it sits. Longer
+/// than the gap between reports on the slowest link (15 ms at 67 Hz).
+const REPEAT_FLUSH: Duration = Duration::from_millis(40);
 
 /// Clamp an arbitrary window request to a supported odd width in 3..=7.
 pub fn sanitize_window(w: u8) -> u8 {
@@ -141,17 +159,17 @@ fn median_of(buf: &mut [f32]) -> f32 {
 
 /// Per-device outlier filter over the six IMU axes.
 ///
-/// Holds a window of the last `window` raw samples and judges the CENTRE one
+/// Holds a window of the last `window` reports and judges the CENTRE one
 /// against the median of the rest, which is why output lags input by
-/// `window / 2` samples. A rejected sample is replaced by that median and
+/// `window / 2` reports. A rejected sample is replaced by that median and
 /// written back into the window, so a burst can't poison the windows that
 /// follow it.
 ///
 /// Width sets how long a burst can be repaired: a window of `W` tolerates
-/// `(W - 1) / 2` contaminated samples, so 3 catches isolated spikes only,
-/// 5 catches bursts up to 2 samples, 7 up to 3. Wider costs latency in
+/// `(W - 1) / 2` contaminated reports, so 3 catches isolated spikes only,
+/// 5 catches bursts up to 2 reports, 7 up to 3. Wider costs latency in
 /// direct proportion, which is why it is a user-facing setting rather than a
-/// constant — on a 250 Hz pad the difference between 3 and 7 is 4 ms of
+/// constant — on a 250 Hz pad the difference between 3 and 7 is 8 ms of
 /// added aim delay.
 #[derive(Debug, Clone)]
 pub struct SpikeFilter {
@@ -164,17 +182,24 @@ pub struct SpikeFilter {
     noise: [f32; AXES],
     /// The device id this filter's input is captured under, once bound.
     capture_id: Option<String>,
+    /// The last new sample, when it arrived, and what it published.
+    last_in: Option<[f32; AXES]>,
+    last_new: Option<Instant>,
+    last_out: [f32; AXES],
 }
 
 impl Default for SpikeFilter {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             sensitivity: 50.0,
             window: 3,
             ring: VecDeque::with_capacity(MAX_WINDOW),
             noise: [NOISE_SEED; AXES],
             capture_id: None,
+            last_in: None,
+            last_new: None,
+            last_out: [0.0; AXES],
         }
     }
 }
@@ -212,7 +237,7 @@ impl SpikeFilter {
         self.sensitivity = s;
         if self.window != w || !enabled {
             self.window = w;
-            self.ring.clear();
+            self.reset();
         }
     }
 
@@ -220,6 +245,7 @@ impl SpikeFilter {
     /// transport stall) so stale samples can't be judged against fresh ones.
     pub fn reset(&mut self) {
         self.ring.clear();
+        self.last_in = None;
     }
 
     /// Name the device this filter belongs to, so [`capture_start`] for that
@@ -231,18 +257,36 @@ impl SpikeFilter {
         }
     }
 
-    /// Feed one raw sample; get back the sample to publish.
-    ///
-    /// Exactly one output per input, so the stream's rate is unchanged — but
-    /// the value returned is the one from `window / 2` samples ago. While the
-    /// window is still filling, the oldest buffered sample is repeated, which
-    /// costs a brief hold at connect and nothing after.
+    /// Feed what the pad reads now, a new report or a repeat of the last; get
+    /// back the sample to publish. Repeats change nothing and publish the same
+    /// value again — see the module docs.
     pub fn push(&mut self, sample: [f32; AXES]) -> [f32; AXES] {
+        self.push_at(sample, Instant::now())
+    }
+
+    fn push_at(&mut self, sample: [f32; AXES], now: Instant) -> [f32; AXES] {
+        if self.last_in == Some(sample)
+            && self.last_new.is_some_and(|t| now.saturating_duration_since(t) < REPEAT_FLUSH)
+        {
+            return self.last_out;
+        }
+        self.last_in = Some(sample);
+        self.last_new = Some(now);
         if ARMED.load(Ordering::Relaxed) > 0 {
             if let Some(id) = &self.capture_id {
                 record(id, sample);
             }
         }
+        self.last_out = self.judge(sample);
+        self.last_out
+    }
+
+    /// Advance the window by one sample, repeat or not, and get back the sample
+    /// to publish: exactly one output per input, the one from `window / 2`
+    /// samples ago. While the window is still filling, the oldest buffered
+    /// sample is repeated, which costs a brief hold at connect and nothing
+    /// after. Replaying a recording goes through here, sample for sample.
+    pub(crate) fn judge(&mut self, sample: [f32; AXES]) -> [f32; AXES] {
         if !self.enabled {
             if !self.ring.is_empty() {
                 self.ring.clear();
@@ -431,10 +475,101 @@ mod tests {
             // measure without any RNG dependency in the test.
             *v = if i % 2 == 0 { 1e-5 } else { -1e-5 };
         }
-        for v in s.iter_mut().skip(300).take(width) {
-            *v = amp;
+        // A hair apart: identical samples would be one report repeated.
+        for (i, v) in s.iter_mut().skip(300).take(width).enumerate() {
+            *v = amp + i as f32 * 1e-6;
         }
         s
+    }
+
+    /// `reports` each repeated for `polls` polls, 1 ms apart; gyro_x out per poll.
+    fn run_polled(reports: &[f32], polls: usize, window: u8) -> Vec<f32> {
+        let mut f = SpikeFilter::new();
+        f.set_config(true, 100.0, window);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for (r, &v) in reports.iter().enumerate() {
+            for p in 0..polls {
+                let mut s = [0.0; AXES];
+                s[0] = v;
+                let at = t0 + Duration::from_millis((r * polls + p) as u64);
+                out.push(f.push_at(s, at)[0]);
+            }
+        }
+        out
+    }
+
+    /// The bug this rule is for: polling faster than the pad reports used to
+    /// hide every spike behind its own copies.
+    #[test]
+    fn polling_faster_than_reports_changes_nothing_it_catches() {
+        for polls in [1, 2, 3, 5, 10, 20] {
+            for window in [3_u8, 5, 7] {
+                let out = run_polled(&quiet_with_burst(1, 0.02), polls, window);
+                let peak = out.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+                assert!(peak < 1e-3, "{polls} polls a report, window {window}: {peak}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_window_is_counted_in_reports_however_fast_the_polling() {
+        for polls in [1_usize, 5, 20] {
+            let burst = |width| run_polled(&quiet_with_burst(width, 0.02), polls, 5)
+                .iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+            assert!(burst(2) < 1e-3, "{polls} polls: a 5 window repairs two reports");
+            assert!(burst(3) > 1e-3, "{polls} polls: but not three");
+        }
+    }
+
+    #[test]
+    fn it_lags_by_reports_not_polls() {
+        let reports: Vec<f32> = (0..50).map(|i| i as f32 * 1e-3).collect();
+        let out = run_polled(&reports, 10, 3);
+        // Report 20 arrives at poll 200 and publishes report 19.
+        assert_eq!(out[200], reports[19]);
+        assert_eq!(out[209], reports[19], "held until the next report");
+        assert_eq!(out[210], reports[20]);
+    }
+
+    #[test]
+    fn a_pad_sitting_on_one_value_still_catches_up() {
+        let mut f = SpikeFilter::new();
+        f.set_config(true, 50.0, 3);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        f.push_at([1.0; AXES], at(0));
+        f.push_at([2.0; AXES], at(5));
+        assert_eq!(f.push_at([3.0; AXES], at(10))[0], 2.0, "a report behind");
+        assert_eq!(f.push_at([3.0; AXES], at(40))[0], 2.0, "could be between reports");
+        assert_eq!(f.push_at([3.0; AXES], at(50))[0], 3.0, "it isn't");
+    }
+
+    #[test]
+    fn only_new_samples_are_captured() {
+        let id = "test:capture-reports";
+        let mut f = SpikeFilter::new();
+        f.bind_capture(id);
+        capture_start(id);
+        let t0 = Instant::now();
+        for (ms, v) in [(0, 1.0), (1, 1.0), (2, 1.0), (3, 2.0), (4, 2.0)] {
+            f.push_at([v; AXES], t0 + Duration::from_millis(ms));
+        }
+        let (got, total) = capture_read(id, 0);
+        assert_eq!(total, 2);
+        assert_eq!(got.iter().map(|(_, s)| s[0]).collect::<Vec<_>>(), vec![1.0, 2.0]);
+        capture_stop(id);
+    }
+
+    #[test]
+    fn a_new_filter_passes_everything_until_turned_on() {
+        let mut f = SpikeFilter::new();
+        let sig = quiet_with_burst(1, 0.02);
+        for &v in &sig {
+            let mut s = [0.0; AXES];
+            s[0] = v;
+            assert_eq!(f.push(s)[0], v);
+        }
     }
 
     /// The regression this filter was rewritten for: a spike well below the

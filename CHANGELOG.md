@@ -5,7 +5,43 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [0.16.5] - 2026-10-30
 
+### Added
+
+- **Click-jolt filter for gyro.** On pads whose microswitches sit on the same
+  board as the motion sensor, every click knocks the sensor, and the gyro reads
+  it as a sharp flick. In the Calibration window, turn on **Click-jolt filter**
+  and open **buttons…**, then press each button a few times to see how big and
+  how long each one's jolt is. Buttons that jolt the gyro tick themselves, with
+  the time they need, unless you turn off **Apply measurements automatically**,
+  and you can tick or adjust any of them by hand. The gyro and accelerometer then
+  hold their value through the jolt of those buttons' presses and releases, then
+  slope back to the live signal over the **Release** time, and nothing else is
+  touched or delayed. If a pad reports the jolt before the click, the window says
+  so and offers **Look-ahead** of up to 5 ms, which catches that part too at the
+  cost of delaying the motion by that much.
+
+### Changed
+
+- **Tidier gyro section in the Calibration window.** **Axis alignment** is now
+  folded away under a chevron, and says "applied" when an alignment is in
+  effect. Its Roll, Pitch and Yaw buttons fit on one line, with the movement for
+  each in a tooltip.
+- **The spike filter is now off by default.** Now that it works everywhere (see
+  below), it delays the gyro by at least one report, so only a pad with spikes
+  should pay for it. Calibrating turns it on when it finds spikes, with the least
+  setting that removes them, and leaves it alone when it finds none. A pad you
+  have already changed its settings on keeps them.
+
 ### Fixed
+
+- **The spike filter now works on SDL and Joy-Con 2 pads.** It counted polls
+  rather than reports from the pad, so once polling ran a few times faster than
+  the pad reports, spikes went straight through at every setting. Its window now
+  counts real reports whatever the polling rate. On these pads it now really
+  does delay the gyro while on: by one report at window 3 (1 ms at 1000 Hz, 4 ms
+  at 250 Hz) and more at wider windows, so check your window if you raised it
+  while it wasn't doing anything. The spike check in calibration tunes from real
+  reports too.
 
 - **Gyro aim on the virtual DualSense and DualShock 4 no longer goes
   diagonal.** The virtual pad reported its tilt on the wrong axes, forward
