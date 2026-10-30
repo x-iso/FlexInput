@@ -12,7 +12,6 @@
 //! outlives the app: the device is served from this process, so it can't
 //! persist past it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flexinput_core::haptic_pcm::HapticConverter;
@@ -27,12 +26,6 @@ use crate::{layouts, SinkPin, SourcePin};
 
 /// The DualSense's USB output report.
 const OUTPUT_REPORT_ID: u8 = 0x02;
-
-/// Stale state a crashed session left in the host controller is swept once per
-/// process, before the first device is served. That session most likely used
-/// this one's port (the first free in the range), so the sweep spares nothing:
-/// nothing of this process is attached yet.
-static SWEPT: AtomicBool = AtomicBool::new(false);
 
 pub struct CompositeDevice {
     id: String,
@@ -90,9 +83,7 @@ impl CompositeDevice {
         ensure_host_controller()?;
         // Before the server exports anything, or the driver's re-attach loop
         // for a dead session's device could import this one first.
-        if !SWEPT.swap(true, Ordering::AcqRel) {
-            vhci::sweep_stale(None);
-        }
+        flexinput_usbip::sweep_stale_once();
         let usb = EmulatedDevice::new(profile_json, &self.id, index).map_err(|e| e.to_string())?;
         let haptics = Arc::clone(&self.haptics);
         usb.set_pcm_sink(Some(Box::new(move |pcm: &[u8]| haptics.lock().unwrap().push_pcm(pcm))));

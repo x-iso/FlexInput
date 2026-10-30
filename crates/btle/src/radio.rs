@@ -157,6 +157,9 @@ pub struct Radio {
     /// behind a read that is already in flight.
     paused: AtomicBool,
     shutdown: AtomicBool,
+    /// The adapter went away: unplugged, or given back to the system, which
+    /// re-plugs it (see `linux`). See [`Radio::is_gone`].
+    gone: AtomicBool,
 }
 
 /// One transport's view of the radio.
@@ -432,6 +435,10 @@ fn cell() -> &'static Mutex<Option<Arc<Radio>>> {
 /// adapter is shared; later callers get it regardless of the ids they pass,
 /// because there is one radio and sharing it is the point.
 pub fn shared(vid: u16, pid: u16) -> Option<Arc<Radio>> {
+    // One being given back is left alone (`crate::withhold`).
+    if crate::is_withheld(vid, pid) {
+        return None;
+    }
     let mut slot = cell().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = slot.as_ref() {
         return Some(Arc::clone(r));
@@ -479,6 +486,7 @@ fn open_and_start(vid: u16, pid: u16) -> Result<Arc<Radio>> {
         started: Instant::now(),
         paused: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
+        gone: AtomicBool::new(false),
     });
     let r = Arc::clone(&radio);
     std::thread::Builder::new()
@@ -526,8 +534,68 @@ fn clear_stale_links(dongle: &Dongle) {
     let _ = dongle.drain_events();
 }
 
+/// Consecutive failed reads, other than a plain "no such device", after which
+/// the adapter counts as gone. A read is a few milliseconds, so this is about
+/// a second of nothing but errors.
+const GONE_AFTER_ERRORS: u32 = 300;
+
+impl Radio {
+    /// Whether the adapter went away. A gone radio never comes back; its
+    /// holders drop it, and the next [`shared`] opens whatever is there now.
+    ///
+    /// ⛔ Without this, a radio whose adapter disappeared was held for the
+    /// rest of the session: reads failing in silence, and the shared slot
+    /// handing the dead radio to anyone who asked — so an adapter given back
+    /// and taken over again stayed dead until FlexInput restarted.
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Relaxed)
+    }
+}
+
+/// Shut the shared radio if it runs on `vid:pid`: out of the slot, marked
+/// gone, its reader stopped. Its holders drop it when they next look, and the
+/// adapter closes with the last of them. See `crate::withhold`.
+pub(crate) fn let_go(vid: u16, pid: u16) {
+    let radio = {
+        let mut slot = cell().lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(r) if (r.dongle.vid, r.dongle.pid) == (vid, pid) => slot.take(),
+            _ => None,
+        }
+    };
+    if let Some(r) = radio {
+        r.gone.store(true, Ordering::Relaxed);
+        r.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Mark `radio` gone and take it out of the shared slot.
+fn went_away(radio: &Arc<Radio>) {
+    radio.gone.store(true, Ordering::Relaxed);
+    let mut slot = cell().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_some_and(|r| Arc::ptr_eq(r, radio)) {
+        *slot = None;
+    }
+    eprintln!("[radio] the Bluetooth adapter went away — letting go of it");
+}
+
 /// The single reader.
 fn route(radio: Arc<Radio>) {
+    let mut errors = 0u32;
+    // `true` when a read's error says the adapter is gone.
+    let mut tally = |err: Option<&crate::Error>| -> bool {
+        match err {
+            Some(crate::Error::Usb(rusb::Error::NoDevice)) => true,
+            Some(_) => {
+                errors += 1;
+                errors >= GONE_AFTER_ERRORS
+            }
+            None => {
+                errors = 0;
+                false
+            }
+        }
+    };
     while !radio.shutdown.load(Ordering::Relaxed) {
         // ❗ Checked before every read, and the lock is taken with `try_lock`.
         // Blocking on the lease lock here would let a long setup hold the
@@ -544,11 +612,15 @@ fn route(radio: Arc<Radio>) {
         // Short timeouts: this loop must return to the pause check quickly, and
         // a subscriber's own timeout is what governs how long IT waits.
         let mut idle = true;
-        if let Ok(Some(e)) = radio.dongle.read_event_timeout(Duration::from_millis(2)) {
+        let event = radio.dongle.read_event_timeout(Duration::from_millis(2));
+        let event_gone = tally(event.as_ref().err());
+        if let Ok(Some(e)) = event {
             radio.broadcast(Inbound::Event(e));
             idle = false;
         }
-        if let Ok(Some(p)) = radio.dongle.read_acl(Duration::from_millis(2)) {
+        let acl = radio.dongle.read_acl(Duration::from_millis(2));
+        let acl_gone = tally(acl.as_ref().err());
+        if let Ok(Some(p)) = acl {
             radio
                 .last_acl_ms
                 .store(radio.started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -556,6 +628,10 @@ fn route(radio: Arc<Radio>) {
             idle = false;
         }
         drop(_guard);
+        if event_gone || acl_gone {
+            went_away(&radio);
+            return;
+        }
         if idle {
             // Nothing waiting: yield rather than spin the USB stack flat.
             std::thread::sleep(Duration::from_millis(1));

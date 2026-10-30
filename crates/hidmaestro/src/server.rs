@@ -654,6 +654,14 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             ),
             Err(e) => (Response::err(format!("usbip-win2 install failed: {e}")), false),
         },
+        Request::BindWinusb { instance_id } => match crate::winusb_bind::bind(&instance_id) {
+            Ok(()) => (Response::Ok { detail: Some(format!("WinUSB installed on {instance_id}")) }, false),
+            Err(e) => (Response::err(e.to_string()), false),
+        },
+        Request::UnbindWinusb { instance_id } => match crate::winusb_bind::unbind(&instance_id) {
+            Ok(()) => (Response::Ok { detail: Some(format!("{instance_id} given back to Windows")) }, false),
+            Err(e) => (Response::err(e.to_string()), false),
+        },
         Request::ReinstallDriver => {
             // Live nodes can pin the driver and make /delete-driver fail, so tear
             // them all down first (the app re-creates them after this returns).

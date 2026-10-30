@@ -23,9 +23,40 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **A Bluetooth dongle for FlexInput on Linux.** FlexInput's own Bluetooth,
   which Joy-Con 2 and Bluetooth Classic controllers connect through, can now
   run on a USB adapter on Linux too. Hand one over in the Bluetooth window
-  ("Use with FlexInput", one password prompt) — where Windows needs Zadig.
+  ("Use with FlexInput", one password prompt).
   While FlexInput runs it takes that adapter from Linux's own Bluetooth, so
-  a second adapter is best; "Give back to Linux" undoes it.
+  a second adapter is best; "Give back to Linux" returns it at once.
+
+- **No more Zadig on Windows.** The Bluetooth window hands an adapter to
+  FlexInput on Windows too: "Use with FlexInput" installs Windows' own
+  WinUSB driver on it, as Zadig did, after one Windows permission prompt.
+  "Give back to Windows" removes it again, from an adapter Zadig set up as
+  well.
+
+- **The Bluetooth window lists every adapter.** It shows which one the
+  system's own Bluetooth uses (Windows runs one at a time; Linux all of
+  them, with a default), including one whose Windows driver couldn't start
+  because another adapter already runs, and warns before handing over an adapter that
+  likely won't find controllers, such as a laptop's built-in one or an Intel
+  or MediaTek adapter, whose firmware FlexInput can't load.
+- **Any Bluetooth Classic controller over FlexInput's own adapter.** Pairing
+  asks each controller what it is. FlexInput reads Switch Pro controllers
+  itself, and on Windows Xbox controllers (and pads in their Xbox mode),
+  DualShock 4 and DualSense controllers too (the Edge included), with
+  motion, touchpad, rumble, lightbar and adaptive triggers where they have
+  them.
+  Every other controller goes to the system with its own report layout, so
+  its driver, games and FlexInput read it as usual: on Linux the way Linux's
+  own Bluetooth would, on Windows as a USB controller through usbip-win2,
+  which handing an adapter over now installs under the same permission
+  prompt (the Bluetooth window offers it for adapters handed over before).
+  Controllers that pair the old way, with a PIN, pair too.
+- **Pairing keeps looking.** "Pair new controller" searches until a
+  controller pairs, you cancel, or the Bluetooth window closes, and controllers
+  already connected keep working while it does.
+- **Linux: Bluetooth DualSense motion.** FlexInput's own DualSense reader
+  refused the controller's Bluetooth reports by one byte, so motion and the
+  touchpad didn't come through it on Linux.
 
 ## [0.16.3] - 2026-10-28
 

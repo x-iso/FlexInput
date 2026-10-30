@@ -12,6 +12,7 @@ mod uinput;
 
 use crate::{layouts, DeviceKind, SinkPin, SourcePin, VirtualDevice};
 
+pub use uhid::{Passthrough, PassthroughSpec, BUS_BLUETOOTH};
 pub use uinput::UiKeyTapper;
 
 pub static DEVICE_KINDS: &[DeviceKind] = &[

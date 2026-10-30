@@ -120,6 +120,9 @@ pub enum DeployError {
     UsbipInstaller(i32),
     /// The installer finished but the host controller never appeared.
     UsbipDidNotAppear,
+    /// Handing a Bluetooth adapter to FlexInput, or back, failed (see
+    /// `winusb_bind`).
+    WinUsb(String),
 }
 
 impl std::fmt::Display for DeployError {
@@ -152,6 +155,7 @@ impl std::fmt::Display for DeployError {
             }
             DeployError::UsbipInstaller(-1) => write!(f, "the usbip-win2 installer didn't finish in time"),
             DeployError::UsbipInstaller(code) => write!(f, "the usbip-win2 installer failed (exit code {code})"),
+            DeployError::WinUsb(m) => f.write_str(m),
             DeployError::UsbipDidNotAppear => write!(
                 f,
                 "the usbip-win2 installer finished but its virtual host controller didn't                  appear; check Device Manager for 'USBip 3.X Emulated Host Controller' and                  for a pending reboot"

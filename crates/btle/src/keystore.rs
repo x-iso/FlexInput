@@ -30,6 +30,16 @@ use std::sync::{OnceLock, RwLock};
 /// their own pairing.
 const FILE_NAME: &str = "bt-classic-keys.txt";
 
+/// What each paired device IS, beside the keys: its ids and HID report
+/// descriptor, as it answered over SDP. One device per line,
+/// `address vid:pid:version descriptor-hex`.
+///
+/// ⭐ A file of its own rather than more columns in the key file: a descriptor
+/// is hundreds of bytes of hex, and the key file stays the short list a person
+/// reads when a controller won't reconnect. Losing this one costs nothing but
+/// a second SDP query.
+const DEVICES_FILE_NAME: &str = "bt-classic-devices.txt";
+
 /// Environment override, for the probe binaries and for anyone who would rather
 /// not go through the UI.
 const ENV_DIR: &str = "FLEXINPUT_BT_KEY_DIR";
@@ -183,6 +193,75 @@ pub fn put(
     write_all(&all)
 }
 
+/// What a paired device said it is, over SDP. See [`DEVICES_FILE_NAME`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub vid: u16,
+    pub pid: u16,
+    pub version: u16,
+    /// Its HID report descriptor; empty when it had no HID record.
+    pub descriptor: Vec<u8>,
+}
+
+fn devices_path() -> PathBuf {
+    dir().join(DEVICES_FILE_NAME)
+}
+
+/// Every stored device record, keyed like [`load`]. Missing or unreadable is
+/// empty, and a malformed line is skipped.
+pub fn load_devices() -> BTreeMap<String, DeviceInfo> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(devices_path()) else {
+        return out;
+    };
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(addr), Some(ids)) = (it.next(), it.next()) else { continue };
+        let mut ids = ids.split(':').map(|v| u16::from_str_radix(v, 16).ok());
+        let (Some(Some(vid)), Some(Some(pid)), Some(Some(version))) = (ids.next(), ids.next(), ids.next())
+        else {
+            continue;
+        };
+        let Some(descriptor) = parse_hex(it.next().unwrap_or_default()) else { continue };
+        if parse_addr(addr).is_some() {
+            out.insert(addr.to_ascii_lowercase(), DeviceInfo { vid, pid, version, descriptor });
+        }
+    }
+    out
+}
+
+/// Store one device record, keeping every other.
+pub fn put_device(addr: [u8; 6], info: &DeviceInfo) -> std::io::Result<()> {
+    let mut all = load_devices();
+    all.insert(format_addr(addr), info.clone());
+    write_devices(&all)
+}
+
+fn write_devices(all: &BTreeMap<String, DeviceInfo>) -> std::io::Result<()> {
+    let p = devices_path();
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut body = String::new();
+    for (a, d) in all {
+        body.push_str(&format!("{a} {:04x}:{:04x}:{:04x} ", d.vid, d.pid, d.version));
+        for b in &d.descriptor {
+            body.push_str(&format!("{b:02x}"));
+        }
+        body.push('\n');
+    }
+    std::fs::write(&p, body)
+}
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
 /// Remove one device's key. Returns whether it was there.
 ///
 /// ❗ This is only HALF the bond. The controller keeps its own copy and will
@@ -190,6 +269,12 @@ pub fn put(
 /// it, which is what you want when retiring a controller, but it is not the
 /// same as unpairing on the device. Re-pairing is what puts both halves back.
 pub fn forget(addr: [u8; 6]) -> std::io::Result<bool> {
+    // Its record goes with it: a different pad re-paired at the same address
+    // is not a reason to keep the old one's descriptor.
+    let mut devices = load_devices();
+    if devices.remove(&format_addr(addr)).is_some() {
+        write_devices(&devices)?;
+    }
     let mut all = load();
     if all.remove(&format_addr(addr)).is_none() {
         return Ok(false);
@@ -407,6 +492,34 @@ mod tests {
         let p = load().get(&format_addr(pad)).cloned().expect("entry missing");
         assert_eq!(p.adapter, None);
         assert_eq!(p.name.as_deref(), Some("Pro Controller"));
+
+        set_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device record round-trips, an empty descriptor included, and
+    /// forgetting the pairing takes the record with it.
+    #[test]
+    fn device_records_round_trip_and_leave_with_their_key() {
+        let _guard = exclusive();
+        let dir = std::env::temp_dir().join("flexinput-keystore-devices");
+        let _ = std::fs::remove_dir_all(&dir);
+        set_dir(Some(dir.clone()));
+
+        let (ds, pad) = ([0x11u8; 6], [0x22u8; 6]);
+        let info = DeviceInfo { vid: 0x054C, pid: 0x0CE6, version: 0x0100, descriptor: vec![0x05, 0x01, 0x09, 0x05] };
+        let bare = DeviceInfo { vid: 0x057E, pid: 0x2009, version: 0, descriptor: Vec::new() };
+        put(ds, [1; 16], None, None).unwrap();
+        put_device(ds, &info).unwrap();
+        put_device(pad, &bare).unwrap();
+        let back = load_devices();
+        assert_eq!(back.get(&format_addr(ds)), Some(&info));
+        assert_eq!(back.get(&format_addr(pad)), Some(&bare));
+
+        forget(ds).unwrap();
+        let back = load_devices();
+        assert!(back.get(&format_addr(ds)).is_none(), "the record outlived its key");
+        assert_eq!(back.get(&format_addr(pad)), Some(&bare));
 
         set_dir(None);
         let _ = std::fs::remove_dir_all(&dir);

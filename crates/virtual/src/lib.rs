@@ -281,6 +281,11 @@ mod linux;
 pub use windows::UiKeyTapper;
 #[cfg(target_os = "linux")]
 pub use linux::UiKeyTapper;
+/// A real pad's HID interface served through UHID — the Bluetooth pads on
+/// FlexInput's own adapter (`flexinput_devices::classic_bt`). Its requests are
+/// `flexinput_usbip`'s, as the Windows passthrough's are.
+#[cfg(target_os = "linux")]
+pub use linux::{Passthrough, PassthroughSpec, BUS_BLUETOOTH};
 
 /// One sink-pin write into the encoder's accumulator. Vec2 pins decompose into
 /// the x/y entries; scalar pins pass both views and PinState picks the one it

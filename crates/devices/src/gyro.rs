@@ -1447,7 +1447,10 @@ fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<Hi
     // USB: report 0x01, payload base po=1. BT: report 0x31, payload base po=2.
     let (conn, po, go, ao, t1, t2) = match buf[0] {
         0x01 if buf.len() >= 41 => (Connection::Usb, 1usize, 16, 22, 33, 37),
-        0x31 if buf.len() >= 79 => (Connection::Bt,  2usize, 17, 23, 34, 38),
+        // 78 bytes with its id and CRC, hid-playstation's DS_INPUT_REPORT_BT_SIZE:
+        // what hidraw and the dongle hand over. Windows pads every read to the
+        // collection's longest report, so it never came up there.
+        0x31 if buf.len() >= 78 => (Connection::Bt,  2usize, 17, 23, 34, 38),
         _ => return None,
     };
     *connection = Some(conn);
@@ -1526,7 +1529,7 @@ fn decode_battery(b: u8) -> f32 {
 /// max → a visible jump to ≈+1); holding the last position keeps the downstream
 /// pin steady where the finger left it. Before any touch, `prev` is the default
 /// (0,0) so the pin rests at 0. Active fingers are left exactly as parsed.
-fn hold_inactive_touch(cur: &mut TouchPoint, prev: &TouchPoint) {
+pub(crate) fn hold_inactive_touch(cur: &mut TouchPoint, prev: &TouchPoint) {
     if !cur.active {
         cur.x = prev.x;
         cur.y = prev.y;
@@ -1647,6 +1650,155 @@ pub(crate) fn push_switch_pro_buttons(
     out.push((dev.into(), "dpad_x".into(), Signal::Float(nx)));
     out.push((dev.into(), "dpad_y".into(), Signal::Float(ny)));
     out.push((dev.into(), "dpad".into(), Signal::Vec2(Vec2::new(nx, ny))));
+}
+
+/// The Sony half of a pad's raw-HID pins: touchpad, mute, battery, and — the
+/// DualSense and DualShock 4 state in `g.dualsense` — every stick, trigger
+/// and button, with the Edge's back and Fn buttons when `edge`.
+///
+/// ⭐ Shared by the HID path, where these override gilrs's mis-mapped Windows
+/// axes, and the dongle transport, where they are the only source. Same
+/// reason as [`push_switch_pro_buttons`]: one mapping, not two that drift.
+pub(crate) fn push_sony_reading(
+    out: &mut Vec<(String, String, flexinput_core::Signal)>,
+    dev: &str,
+    g: &HidReading,
+    dualsense: bool,
+    edge: bool,
+) {
+    use flexinput_core::Signal;
+    use glam::Vec2;
+    if g.has_touchpad {
+        out.push((dev.into(), "touch1_x".into(),      Signal::Float(g.touch1.x)));
+        out.push((dev.into(), "touch1_y".into(),      Signal::Float(g.touch1.y)));
+        out.push((dev.into(), "touch1_active".into(), Signal::Bool(g.touch1.active)));
+        out.push((dev.into(), "touch2_x".into(),      Signal::Float(g.touch2.x)));
+        out.push((dev.into(), "touch2_y".into(),      Signal::Float(g.touch2.y)));
+        out.push((dev.into(), "touch2_active".into(), Signal::Bool(g.touch2.active)));
+        // gilrs's Windows backend doesn't fire Button::C for the touchpad
+        // click on DS4/DualSense, and DualSense's mute button isn't mapped
+        // at all — so we override with the values parsed from the raw HID
+        // report. Pushed last so the per-frame HashMap lookup wins.
+        out.push((dev.into(), "btn_touchpad".into(),  Signal::Bool(g.touchpad_click)));
+    }
+    if dualsense {
+        out.push((dev.into(), "btn_mute".into(), Signal::Bool(g.mic_button)));
+    }
+    // Physical battery charge (DS4/DualSense), surfaced on the
+    // `battery` source pin so FlexInput's representation can show
+    // the real pad's level. Virtual pads always report 100% (the
+    // encode side), so this is informational and never loops into
+    // a virtual report.
+    if let Some(bat) = g.battery {
+        out.push((dev.into(), "battery".into(), Signal::Float(bat)));
+    }
+    // DualSense: override all axes and buttons with raw HID values.
+    // gilrs on Windows HID maps the 6 axes by USB Usage ID order rather than
+    // logical gamepad position, placing L2/R2 where RightStickX/Y should be
+    // and RX/RY under LeftZ/RightZ. Parsing the report directly avoids this.
+    if let Some(ds) = g.dualsense {
+        out.push((dev.into(), "left_stick_x".into(),  Signal::Float(ds.lx)));
+        out.push((dev.into(), "left_stick_y".into(),  Signal::Float(ds.ly)));
+        out.push((dev.into(), "right_stick_x".into(), Signal::Float(ds.rx)));
+        out.push((dev.into(), "right_stick_y".into(), Signal::Float(ds.ry)));
+        out.push((dev.into(), "left_stick".into(),    Signal::Vec2(Vec2::new(ds.lx, ds.ly))));
+        out.push((dev.into(), "right_stick".into(),   Signal::Vec2(Vec2::new(ds.rx, ds.ry))));
+        out.push((dev.into(), "left_trigger".into(),  Signal::Float(ds.l2)));
+        out.push((dev.into(), "right_trigger".into(), Signal::Float(ds.r2)));
+        out.push((dev.into(), "btn_south".into(),   Signal::Bool(ds.btn_south)));
+        out.push((dev.into(), "btn_east".into(),    Signal::Bool(ds.btn_east)));
+        out.push((dev.into(), "btn_west".into(),    Signal::Bool(ds.btn_west)));
+        out.push((dev.into(), "btn_north".into(),   Signal::Bool(ds.btn_north)));
+        out.push((dev.into(), "btn_lb".into(),      Signal::Bool(ds.btn_l1)));
+        out.push((dev.into(), "btn_rb".into(),      Signal::Bool(ds.btn_r1)));
+        out.push((dev.into(), "btn_lt_dig".into(),  Signal::Bool(ds.btn_l2)));
+        out.push((dev.into(), "btn_rt_dig".into(),  Signal::Bool(ds.btn_r2)));
+        out.push((dev.into(), "btn_ls".into(),      Signal::Bool(ds.btn_ls)));
+        out.push((dev.into(), "btn_rs".into(),      Signal::Bool(ds.btn_rs)));
+        out.push((dev.into(), "btn_start".into(),   Signal::Bool(ds.btn_options)));
+        out.push((dev.into(), "btn_back".into(),    Signal::Bool(ds.btn_create)));
+        out.push((dev.into(), "btn_guide".into(),   Signal::Bool(ds.btn_ps)));
+        out.push((dev.into(), "dpad_up".into(),     Signal::Bool(ds.dpad_up)));
+        out.push((dev.into(), "dpad_down".into(),   Signal::Bool(ds.dpad_down)));
+        out.push((dev.into(), "dpad_left".into(),   Signal::Bool(ds.dpad_left)));
+        out.push((dev.into(), "dpad_right".into(),  Signal::Bool(ds.dpad_right)));
+        let dx = if ds.dpad_right { 1.0f32 } else if ds.dpad_left { -1.0 } else { 0.0 };
+        let dy = if ds.dpad_up    { 1.0f32 } else if ds.dpad_down { -1.0 } else { 0.0 };
+        let (ndx, ndy) = if dx != 0.0 && dy != 0.0 {
+            (dx * std::f32::consts::FRAC_1_SQRT_2, dy * std::f32::consts::FRAC_1_SQRT_2)
+        } else { (dx, dy) };
+        out.push((dev.into(), "dpad_x".into(),  Signal::Float(ndx)));
+        out.push((dev.into(), "dpad_y".into(),  Signal::Float(ndy)));
+        out.push((dev.into(), "dpad".into(),    Signal::Vec2(Vec2::new(ndx, ndy))));
+        // DualSense Edge: back buttons and Fn buttons, which gilrs
+        // doesn't report at all (see layouts::outputs_for_pad).
+        if edge {
+            out.push((dev.into(), "btn_paddle_l1".into(), Signal::Bool(ds.btn_back_l)));
+            out.push((dev.into(), "btn_paddle_r1".into(), Signal::Bool(ds.btn_back_r)));
+            out.push((dev.into(), "btn_paddle_l2".into(), Signal::Bool(ds.btn_fn_l)));
+            out.push((dev.into(), "btn_paddle_r2".into(), Signal::Bool(ds.btn_fn_r)));
+        }
+    }
+}
+
+/// An output pin's 0–1 value as the byte [`OutputState::stage`] takes:
+/// each pin's own range (trigger zones 0–9, forces 0–7, LEDs by index),
+/// 0–255 for everything else.
+pub(crate) fn output_pin_byte(pin_id: &str, f: f32) -> u8 {
+    match pin_id {
+        // Trigger mode: which of the seven effects, as its index in
+        // `TriggerMode::ALL` (the pin holds it in sixths).
+        "trigger_r_mode" | "trigger_l_mode" => {
+            use flexinput_core::automap::TriggerMode;
+            let m = TriggerMode::from_pin(f);
+            TriggerMode::ALL.iter().position(|x| *x == m).unwrap_or(0) as u8
+        }
+        // Trigger zones: 0–9 along trigger travel → scale to 0–9
+        "trigger_r_start" | "trigger_r_end" |
+        "trigger_l_start" | "trigger_l_end" => (f * 9.0).round() as u8,
+        // Trigger forces: 0–7 → scale to 0–7
+        "trigger_r_strength" | "trigger_l_strength" |
+        "trigger_r_strength2" | "trigger_l_strength2" => (f * 7.0).round() as u8,
+        // Machine's period: a raw byte, like the frequency.
+        "trigger_r_period" | "trigger_l_period" => (f * 255.0).round() as u8,
+        // Player LED: 0=off, 1=P1, 2=P2, 3=P3, 4=P4 → scale to 0–4
+        "player_led" => (f * 4.0).round() as u8,
+        // Mic LED: 0=off, 1=on, 2=pulsing → scale to 0–2
+        "mic_led" => (f * 2.0).round() as u8,
+        // Everything else (rumble 0–255, lightbar 0–255, trigger freq 0–255): linear
+        _ => (f * 255.0) as u8,
+    }
+}
+
+/// A Sony pad's full Bluetooth input report off the dongle's HID interrupt
+/// channel — `0x31` from a DualSense, `0x11` from a DualShock 4 — decoded as
+/// the HID path decodes it. `None` for anything else, the short `0x01`
+/// report the pad sends until it is asked for the full one included.
+pub(crate) fn parse_sony_bt(report: &[u8], dualsense: bool) -> Option<HidReading> {
+    match report.first() {
+        Some(0x31) if dualsense => parse_dualsense(report, &mut None),
+        Some(0x11) if !dualsense => parse_ds4(report),
+        _ => None,
+    }
+}
+
+/// The Bluetooth output report for a Sony pad on the dongle, from the HID
+/// path's encoders. `seq` and `lightbar_set_up` are the link's, kept as
+/// `DeviceKind::DualSense` keeps them.
+pub(crate) fn sony_bt_output(
+    out: &OutputState,
+    dualsense: bool,
+    seq: &mut u8,
+    lightbar_set_up: &mut bool,
+) -> [u8; 78] {
+    if !dualsense {
+        return build_ds4_bt_out(out);
+    }
+    let setup = out.leds_owned & LED_LIGHTBAR != 0 && !*lightbar_set_up;
+    *lightbar_set_up |= setup;
+    let pkt = build_dualsense_bt_out(out, *seq, setup);
+    *seq = seq.wrapping_add(1) & 0x0F;
+    pkt
 }
 
 fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidReading> {
@@ -1776,6 +1928,29 @@ fn build_ds4_usb_out(out: &OutputState) -> [u8; 32] {
     r[7] = out.lightbar_g;
     r[8] = out.lightbar_b;
     // bytes 9, 10: flash on/off durations — leave at 0 (steady)
+    r
+}
+
+/// An Xbox controller's Bluetooth rumble report (`0x03`), as SDL's HIDAPI
+/// driver sends it: all four motors enabled, triggers still, the two grip
+/// motors as magnitudes 0–100, for the longest duration (2.55 s), which the
+/// caller's heartbeat renews.
+pub(crate) fn xbox_bt_rumble(out: &OutputState) -> [u8; 9] {
+    let magnitude = |b: u8| (b as u32 * 100 / 255) as u8;
+    [0x03, 0x0F, 0x00, 0x00, magnitude(out.rumble_strong), magnitude(out.rumble_weak), 0xFF, 0x00, 0xEB]
+}
+
+/// DualShock 4 Bluetooth output report 0x11 (78 bytes incl. report ID), per
+/// hid-playstation's `dualshock4_output_report_bt`: HID data + CRC32 flags,
+/// the USB report's common block from byte 3, and the DualSense's CRC32.
+fn build_ds4_bt_out(out: &OutputState) -> [u8; 78] {
+    let mut r = [0u8; 78];
+    r[0] = 0x11;
+    r[1] = 0xC0; // hw_control: HID data (0x80) + CRC32 (0x40)
+    // r[2] audio_control: 0
+    r[3..13].copy_from_slice(&build_ds4_usb_out(out)[1..11]);
+    let crc = dualsense_bt_crc32(&r[..74]);
+    r[74..78].copy_from_slice(&crc.to_le_bytes());
     r
 }
 
@@ -2595,6 +2770,42 @@ mod tests {
         let usb = build_dualsense_usb_out(&out, false);
         assert_eq!(usb[0], 0x02);             // report id
         assert_eq!(usb.len(), 63);            // DS_OUTPUT_REPORT_USB_SIZE
+    }
+
+    /// The DS4's Bluetooth report carries the USB report's common block
+    /// behind its two control bytes, signed like the DualSense's.
+    #[test]
+    fn ds4_bt_report_wraps_the_usb_block() {
+        let mut out = OutputState::default();
+        out.rumble_strong = 0xAB;
+        out.rumble_weak   = 0xCD;
+        let usb = build_ds4_usb_out(&out);
+        let bt  = build_ds4_bt_out(&out);
+        assert_eq!(bt[0], 0x11);
+        assert_eq!(bt[1], 0xC0, "HID data + CRC32 flags");
+        assert_eq!(&bt[3..13], &usb[1..11]);
+        assert_eq!((bt[6], bt[7]), (0xCD, 0xAB), "right (weak), then left (strong)");
+        assert_eq!(bt[74..78], dualsense_bt_crc32(&bt[..74]).to_le_bytes());
+    }
+
+    /// ⛔ A DualSense's Bluetooth report is 78 bytes with its id and CRC, as
+    /// hidraw and the dongle hand it over — not padded the way Windows pads a
+    /// read. Refusing it left Bluetooth DualSenses on Linux without motion.
+    #[test]
+    fn a_78_byte_dualsense_bt_report_parses() {
+        let mut r = vec![0u8; 78];
+        r[0] = 0x31;
+        r[2] = 0xFF; // left stick X full right (payload base 2)
+        let g = parse_sony_bt(&r, true).expect("a 78-byte 0x31 report must parse");
+        assert!(g.dualsense.unwrap().lx > 0.99);
+        assert!(parse_sony_bt(&r[..77], true).is_none(), "a truncated report must not");
+        // The short report a pad sends before it is asked for the full one.
+        assert!(parse_sony_bt(&[0x01, 0x80, 0x80, 0x80, 0x80, 0x08, 0, 0, 0, 0], true).is_none());
+        // And a DS4's full report is not a DualSense's.
+        let mut ds4 = vec![0u8; 78];
+        ds4[0] = 0x11;
+        assert!(parse_sony_bt(&ds4, true).is_none());
+        assert!(parse_sony_bt(&ds4, false).is_some());
     }
 
     /// Rumble alone claims no LED: a pad's lightbar, player and mic LEDs stay

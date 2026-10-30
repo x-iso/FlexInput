@@ -52,6 +52,8 @@ pub mod signing;
 pub mod usbip_bundled;
 #[cfg(windows)]
 pub mod usbip_install;
+#[cfg(windows)]
+pub mod winusb_bind;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
 pub use encode::{encode_report, encode_report_into, gip_from_state, GamepadState, Hat, PinState};

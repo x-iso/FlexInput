@@ -35,6 +35,9 @@ windows-sys = { version = "0.61", features = [
     # process's start time for its owner record.
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    # Handing a Bluetooth adapter to FlexInput (winusb_bind.rs): the forced
+    # driver install, UpdateDriverForPlugAndPlayDevices.
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 
 # Standalone protocol-proof binary (Phase 1 verification gate). Opens a

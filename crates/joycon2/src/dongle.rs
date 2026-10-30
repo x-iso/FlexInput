@@ -452,9 +452,9 @@ fn run(shared: Arc<Shared>) {
 
     let Some((vid, pid)) = configured_dongle() else {
         eprintln!(
-            "[jc2-dongle] {}, or set FLEXINPUT_JC2_DONGLE=vid:pid. Joy-Cons will \
+            "[jc2-dongle] {} (or set FLEXINPUT_JC2_DONGLE=vid:pid). Joy-Cons will \
              fall back to the system's Bluetooth stack.",
-            flexinput_btle::NO_ADAPTER
+            flexinput_btle::Error::NoAdapter
         );
         dlog!("no usable adapter present");
         return;
@@ -496,6 +496,13 @@ fn run(shared: Arc<Shared>) {
     let mut scan_backoff = SCAN_RETRY_MIN;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
+        // The adapter went away — unplugged, or given back to the system:
+        // its links went with it, and the Joy-Cons go back to the system's
+        // Bluetooth (see `ReleaseUnlessActive`).
+        if radio.is_gone() {
+            links.clear();
+            break;
+        }
         // ⭐ SCAN CONTINUOUSLY until every half is connected. No windowing.
         //
         // This used to scan for 2 s, stop, and rest 3 s — and with a link held

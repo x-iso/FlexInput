@@ -192,6 +192,12 @@ pub fn find_signing_cert(scope: Scope) -> Option<SigningCert> {
 /// Thumbprints of every cert named [`SIGNING_CERT_NAME`] in `scope`'s `My`,
 /// usable or not: for retiring superseded certs, and for uninstall.
 pub fn signing_cert_thumbprints(scope: Scope) -> Vec<Thumbprint> {
+    cert_thumbprints_named(scope, SIGNING_CERT_NAME)
+}
+
+/// Thumbprints of every cert with common name `name` in `scope`'s `My`,
+/// usable or not. Never creates one.
+pub fn cert_thumbprints_named(scope: Scope, name: &str) -> Vec<Thumbprint> {
     let Ok(my) = Store::open(scope, "MY") else { return Vec::new() };
     let mut out = Vec::new();
     let mut ctx: *mut CERT_CONTEXT = null_mut();
@@ -200,7 +206,7 @@ pub fn signing_cert_thumbprints(scope: Scope) -> Vec<Thumbprint> {
         if ctx.is_null() {
             break;
         }
-        if simple_name(ctx).as_deref() == Some(SIGNING_CERT_NAME) {
+        if simple_name(ctx).as_deref() == Some(name) {
             if let Ok(t) = thumbprint_of(ctx) {
                 out.push(t);
             }

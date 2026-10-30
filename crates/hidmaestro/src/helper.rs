@@ -247,6 +247,29 @@ pub fn ensure_usbip() -> Result<(), HelperError> {
     }
 }
 
+/// Hand the Bluetooth adapter `instance_id` to FlexInput's own Bluetooth stack
+/// (WinUSB, what Zadig does) via the helper. Blocking — run off the UI thread.
+/// One UAC if the helper isn't already up.
+pub fn bind_winusb(instance_id: &str) -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::BindWinusb { instance_id: instance_id.to_string() })? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to BindWinusb".into())),
+    }
+}
+
+/// Give the Bluetooth adapter `instance_id` back to Windows via the helper.
+/// Blocking — run off the UI thread. One UAC if the helper isn't already up.
+pub fn unbind_winusb(instance_id: &str) -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::UnbindWinusb { instance_id: instance_id.to_string() })? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to UnbindWinusb".into())),
+    }
+}
+
 /// Force a clean driver reinstall via the helper (delete every HIDMaestro
 /// package, then install fresh). The helper tears down all live device nodes
 /// first; the caller must re-create its devices afterward. Blocking — run off

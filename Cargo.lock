@@ -1933,6 +1933,7 @@ dependencies = [
  "glam",
  "log",
  "rusb",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1956,6 +1957,7 @@ dependencies = [
  "flexinput-core",
  "flexinput-joycon2",
  "flexinput-usbip",
+ "flexinput-virtual",
  "gilrs",
  "glam",
  "hidapi",

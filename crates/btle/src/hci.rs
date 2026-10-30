@@ -126,6 +126,9 @@ impl Opcode {
     pub const LINK_KEY_REQUEST_REPLY: Opcode = Opcode::new(0x01, 0x000B);
     /// "I have no key for this device" — which is what starts SSP.
     pub const LINK_KEY_REQUEST_NEGATIVE_REPLY: Opcode = Opcode::new(0x01, 0x000C);
+    /// Answer a legacy `PIN Code Request`, for the pads that never adopted
+    /// Secure Simple Pairing.
+    pub const PIN_CODE_REQUEST_REPLY: Opcode = Opcode::new(0x01, 0x000D);
     /// Ask the remote to authenticate, which is what kicks off pairing when the
     /// controller does not demand it first.
     pub const AUTHENTICATION_REQUESTED: Opcode = Opcode::new(0x01, 0x0011);
@@ -248,6 +251,8 @@ pub enum Event {
     ConnectionRequest { address: [u8; 6], class_of_device: [u8; 3], link_type: u8 },
     /// The controller wants a stored link key for this device.
     LinkKeyRequest { address: [u8; 6] },
+    /// Legacy pairing: the remote wants a PIN.
+    PinCodeRequest { address: [u8; 6] },
     /// Pairing produced a link key — this is the thing worth persisting.
     LinkKeyNotification { address: [u8; 6], key: [u8; 16], key_type: u8 },
     /// The remote is asking what this host can display and input.
@@ -361,6 +366,8 @@ const EVT_CONNECTION_COMPLETE: u8 = 0x03;
 const EVT_CONNECTION_REQUEST: u8 = 0x04;
 /// `Authentication Complete`.
 const EVT_AUTHENTICATION_COMPLETE: u8 = 0x06;
+/// `PIN Code Request`.
+const EVT_PIN_CODE_REQUEST: u8 = 0x16;
 /// `Link Key Request`.
 const EVT_LINK_KEY_REQUEST: u8 = 0x17;
 /// `Link Key Notification`.
@@ -685,6 +692,9 @@ pub fn parse_event(buf: &[u8]) -> crate::Result<Event> {
             conn_handle: u16::from_le_bytes([params[1], params[2]]) & 0x0FFF,
         }),
         EVT_LINK_KEY_REQUEST if params.len() >= 6 => Ok(Event::LinkKeyRequest {
+            address: addr_at(params, 0),
+        }),
+        EVT_PIN_CODE_REQUEST if params.len() >= 6 => Ok(Event::PinCodeRequest {
             address: addr_at(params, 0),
         }),
         EVT_LINK_KEY_NOTIFICATION if params.len() >= 23 => {

@@ -33,6 +33,12 @@ pub enum Request {
     /// (idempotent), from the installer bundled in the exe. The composite USB
     /// personas need it. Replies `Ok`.
     EnsureUsbip,
+    /// Hand the Bluetooth adapter `instance_id` to FlexInput's own Bluetooth
+    /// stack: install WinUSB on it (see `winusb_bind`). Replies `Ok`.
+    BindWinusb { instance_id: String },
+    /// Give the Bluetooth adapter `instance_id` back to Windows: remove the
+    /// WinUSB package it runs, FlexInput's or Zadig's. Replies `Ok`.
+    UnbindWinusb { instance_id: String },
     /// Force a clean driver reinstall: remove every installed HIDMaestro package
     /// then install fresh. Tears down all live HIDMaestro device nodes first (a
     /// bound driver can refuse removal). Unlike `EnsureDriver` this runs even

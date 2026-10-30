@@ -25,28 +25,29 @@ use std::time::Duration;
 
 pub mod acl;
 pub mod cadence;
+pub mod hidp;
 pub mod keystore;
 pub mod l2cap;
 pub mod radio;
 pub mod hci;
+pub mod sdp;
 pub mod joycon;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(windows)]
+pub mod windows;
 
 pub use acl::{AclPacket, Notification};
 pub use hci::{CommandComplete, Event, Opcode};
 
 /// How a user gives FlexInput a dongle, for messages that find none.
 #[cfg(not(target_os = "linux"))]
-pub const SETUP_HINT: &str = "bind one to WinUSB with Zadig";
+pub const SETUP_HINT: &str = "hand one to FlexInput in its Bluetooth window (or bind one to WinUSB with Zadig)";
 #[cfg(target_os = "linux")]
-pub const SETUP_HINT: &str = "hand one to FlexInput in its Bluetooth panel";
+pub const SETUP_HINT: &str = "hand one to FlexInput in its Bluetooth window";
 
 /// What [`Error::NoAdapter`] says.
-#[cfg(not(target_os = "linux"))]
-pub const NO_ADAPTER: &str = "no WinUSB-bound Bluetooth adapter found — bind one to WinUSB with Zadig";
-#[cfg(target_os = "linux")]
-pub const NO_ADAPTER: &str = "no Bluetooth adapter handed to FlexInput — hand one over in its Bluetooth panel";
+pub const NO_ADAPTER: &str = "no Bluetooth adapter handed to FlexInput";
 
 /// Errors from the dongle transport.
 #[derive(Debug)]
@@ -114,7 +115,7 @@ impl std::fmt::Display for Error {
                  firmware, which {PATH} cannot load (Broadcom and Intel \
                  dongles usually do; Realtek and CSR usually do not)"
             ),
-            Error::NoAdapter => f.write_str(NO_ADAPTER),
+            Error::NoAdapter => write!(f, "{NO_ADAPTER} — {SETUP_HINT}"),
             Error::NotFound { vid, pid } => write!(
                 f,
                 "no USB device {vid:04x}:{pid:04x} (is it plugged in and {OWNED}?)"
@@ -304,12 +305,45 @@ pub fn holding_any() -> bool {
 ///
 /// Remembered so an adapter this process is streaming from can still be named
 /// without being opened a second time to ask. (Linux reads names from sysfs.)
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 fn adapter_names() -> &'static std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>> {
     static NAMES: std::sync::OnceLock<
         std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>>,
     > = std::sync::OnceLock::new();
     NAMES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Adapters being given back to the system: see [`withhold`].
+fn withheld() -> &'static std::sync::Mutex<Vec<(u16, u16)>> {
+    static WITHHELD: std::sync::OnceLock<std::sync::Mutex<Vec<(u16, u16)>>> = std::sync::OnceLock::new();
+    WITHHELD.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Let go of the adapter `vid:pid` and leave it alone (`true`), or allow it
+/// again. Withheld, it's never chosen or opened, and a radio running on it is
+/// shut: its transports drop it and the adapter closes with the last of them
+/// ([`is_ours`] turns false).
+///
+/// ⭐ What giving an adapter back starts with. The system can't take one
+/// FlexInput still holds — Windows finishes the driver change only once it's
+/// closed, and Linux's re-plug can fail to configure an adapter FlexInput is
+/// mid-conversation with — and without withholding it, the transports would
+/// open it again the moment they lost it.
+pub fn withhold(vid: u16, pid: u16, on: bool) {
+    if let Ok(mut w) = withheld().lock() {
+        w.retain(|&id| id != (vid, pid));
+        if on {
+            w.push((vid, pid));
+        }
+    }
+    if on {
+        radio::let_go(vid, pid);
+    }
+}
+
+/// Whether `vid:pid` is withheld: see [`withhold`].
+pub fn is_withheld(vid: u16, pid: u16) -> bool {
+    withheld().lock().map(|w| w.contains(&(vid, pid))).unwrap_or(false)
 }
 
 /// Whether this process holds `vid:pid` open right now.
@@ -338,7 +372,7 @@ pub fn is_ours(vid: u16, pid: u16) -> bool {
 /// can hand them different ones — at which point the sharing that makes classic
 /// and LE coexist quietly stops happening.
 pub fn preferred_dongle() -> Option<(u16, u16)> {
-    let all = discover();
+    let all: Vec<DongleInfo> = discover().into_iter().filter(|d| !is_withheld(d.vid, d.pid)).collect();
     all.iter()
         .find(|d| d.ours)
         .or_else(|| all.iter().find(|d| d.available && d.dedicated))
@@ -365,9 +399,13 @@ pub fn open_preferred() -> Result<Dongle> {
 /// every dongle that speaks standard HCI over USB reports it. That is what
 /// makes this stack work with any adapter rather than the one it was written
 /// against: nothing here is specific to a Realtek `0bda:a728` except the
-/// default in some probe binaries.
+/// default in some probe binaries. (Windows reads the same triple from the
+/// device tree instead: `windows::adapters`.)
+#[cfg(not(windows))]
 const CLASS_WIRELESS: u8 = 0xE0;
+#[cfg(not(windows))]
 const SUBCLASS_RF: u8 = 0x01;
+#[cfg(not(windows))]
 const PROTOCOL_BLUETOOTH: u8 = 0x01;
 
 /// A Bluetooth dongle visible to libusb.
@@ -384,10 +422,17 @@ pub struct DongleInfo {
     /// meaningful when `available` is false, and the whole reason "in use" can
     /// be reported as something other than a problem.
     pub ours: bool,
-    /// Whether it's FlexInput's to use at all. Always on Windows, which lists
-    /// only WinUSB-bound adapters; on Linux, whether it was handed over in the
-    /// Bluetooth panel (see [`linux`]). One that isn't is never opened.
+    /// Whether it's FlexInput's to use at all: on Windows, bound to WinUSB
+    /// (see [`windows`]); on Linux, handed over in the Bluetooth window (see
+    /// [`linux`]). One that isn't is never opened.
     pub dedicated: bool,
+    /// What the system's own Bluetooth does with it.
+    pub system: SystemUse,
+    /// Built into the machine rather than a USB dongle, as the system reports
+    /// it (Windows: not removable; Linux: `removable` is `fixed`).
+    pub built_in: bool,
+    /// Windows: its device instance, which handing it over or back names.
+    pub instance_id: Option<String>,
     /// USB manufacturer string, when it can be read.
     ///
     /// ❗ Reading a string descriptor requires OPENING the device, so an
@@ -404,6 +449,20 @@ pub struct DongleInfo {
     /// firmware was never loaded. Without this the panel showed a healthy row
     /// and the reason sat in a log nobody was told to read.
     pub problem: Option<String>,
+}
+
+/// What the system's own Bluetooth does with an adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SystemUse {
+    /// Nothing: it's FlexInput's, or no driver has it.
+    #[default]
+    None,
+    /// The system's Bluetooth runs on it. Windows runs one radio at a time and
+    /// this is it; Linux runs every adapter, `name` being its `hciN` and
+    /// `default` marking the one its tools use first.
+    Active { name: Option<String>, default: bool },
+    /// Windows': its Bluetooth driver has it, but Windows runs another one.
+    Standby,
 }
 
 /// USB vendor ids seen on Bluetooth adapters, for when the descriptor strings
@@ -433,6 +492,24 @@ impl DongleInfo {
     /// `vid:pid` in the form the env overrides take.
     pub fn ids(&self) -> String {
         format!("{:04x}:{:04x}", self.vid, self.pid)
+    }
+
+    /// Why this adapter, handed to FlexInput, will likely not find controllers:
+    /// it needs vendor firmware that this stack can't load (see
+    /// [`Error::NoHciResponse`]). Intel and MediaTek chips answer nothing
+    /// without theirs; Broadcom/Cypress ones usually don't either; and a
+    /// built-in adapter is almost always a laptop's Wi-Fi/Bluetooth combo
+    /// module, from one of those. Dongles with HCI in ROM (Realtek RTL8761,
+    /// CSR) work. A guess from the ids, not a test: nothing here talks to an
+    /// adapter the system is using.
+    pub fn likely_unusable(&self) -> Option<&'static str> {
+        Some(match self.vid {
+            0x8087 => "Intel adapters need firmware FlexInput can't load",
+            0x0E8D => "MediaTek adapters need firmware FlexInput can't load",
+            0x0A5C | 0x05AC => "Broadcom adapters usually need firmware FlexInput can't load",
+            _ if self.built_in => "built-in adapters usually need firmware FlexInput can't load",
+            _ => return None,
+        })
     }
 
     /// The best name available: the device's own strings if they could be read,
@@ -471,6 +548,30 @@ impl DongleInfo {
 /// real class on interface 0, and looking only at the device descriptor misses
 /// them.
 pub fn discover() -> Vec<DongleInfo> {
+    // Windows: from the device tree, which lists an adapter whatever its
+    // driver's state (see `windows::adapters`); libusb only for the ones
+    // FlexInput can open.
+    #[cfg(windows)]
+    {
+        let usb: Vec<rusb::Device<rusb::GlobalContext>> =
+            rusb::devices().map(|l| l.iter().collect()).unwrap_or_default();
+        return windows::adapters()
+            .into_iter()
+            .map(|(vid, pid, node)| {
+                let device = usb.iter().find(|d| {
+                    d.device_descriptor().is_ok_and(|x| x.vendor_id() == vid && x.product_id() == pid)
+                });
+                windows_entry(device, vid, pid, node)
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    discover_usb()
+}
+
+/// The adapters libusb lists, by their class codes: Linux's.
+#[cfg(not(windows))]
+fn discover_usb() -> Vec<DongleInfo> {
     let Ok(devices) = rusb::devices() else { return Vec::new() };
     #[cfg(target_os = "linux")]
     let dedicated = linux::dedicated();
@@ -496,40 +597,57 @@ pub fn discover() -> Vec<DongleInfo> {
         }
         #[cfg(target_os = "linux")]
         out.push(linux_entry(&device, &desc, &dedicated));
-        #[cfg(not(target_os = "linux"))]
-        out.extend(winusb_entry(&device, &desc));
     }
     out
 }
 
-/// A Windows adapter's row, or `None` for one this app can't use.
-#[cfg(not(target_os = "linux"))]
-fn winusb_entry(device: &rusb::Device<rusb::GlobalContext>, desc: &rusb::DeviceDescriptor) -> Option<DongleInfo> {
-    // ⛔ An adapter with no WinUSB driver is not listed at all.
-    //
-    // ⭐ libusb enumerates every USB device on Windows but can only OPEN
-    // the ones bound to WinUSB, and the two failures are distinguishable:
-    // a device owned by another driver refuses with `NotSupported`, while
-    // one that is WinUSB-bound but busy refuses with `Access`/`Busy`.
-    //
-    // ❗ Only the second is worth showing. A machine's built-in radio, and
-    // every other Bluetooth device Windows owns, can never be used by this
-    // app — listing them invites the user to wonder why the thing they can
-    // see does not work, and the honest answer is that it was never a
-    // candidate. What IS worth showing is our own dongle while a transport
-    // has it open, which is the normal working state.
-    // ⭐ A WHITELIST, not a blacklist. Only two outcomes mean "this adapter
-    // is one we could use": it opened, or it refused because something
-    // already holds it. Every other refusal — no WinUSB driver, access
-    // denied at the OS level, gone mid-enumeration — means it is not a
-    // candidate and listing it only invites the question of why the thing
-    // on screen does not work.
-    //
-    // ❗ Written as a whitelist because guessing which error code Windows
-    // returns for "no driver" got it wrong: the list showed adapters the
-    // app could never touch, and the Bluetooth button appeared on machines
-    // with no usable dongle at all.
-    let (vid, pid) = (desc.vendor_id(), desc.product_id());
+/// A Windows adapter's row. `device` is libusb's view of it, when libusb has
+/// one.
+///
+/// The driver decides whose it is, read from the device tree (see [`windows`]):
+/// WinUSB makes it FlexInput's, anything else Windows'. One of Windows' is
+/// listed — it's where the user hands one over — but never opened.
+///
+/// ❗ Not by trying to open it, as this used to: libusb refuses a device another
+/// driver owns with an error that guessing got wrong once (the list showed
+/// adapters the app could never touch), and opening says nothing about whether
+/// Windows' Bluetooth is running on it.
+#[cfg(windows)]
+fn windows_entry(
+    device: Option<&rusb::Device<rusb::GlobalContext>>,
+    vid: u16,
+    pid: u16,
+    node: windows::Node,
+) -> DongleInfo {
+    let (bus, address) = device.map_or((0, 0), |d| (d.bus_number(), d.address()));
+    let (built_in, instance_id) = (node.built_in, Some(node.instance_id.clone()));
+    if !node.is_winusb() {
+        let n = &node;
+        let cached = adapter_names()
+            .lock()
+            .ok()
+            .and_then(|c| c.iter().find(|(k, _)| *k == (vid, pid)).map(|(_, n)| n.clone()))
+            .unwrap_or((None, None));
+        return DongleInfo {
+            vid,
+            pid,
+            bus,
+            address,
+            available: false,
+            ours: false,
+            dedicated: false,
+            system: if n.active {
+                SystemUse::Active { name: None, default: true }
+            } else {
+                SystemUse::Standby
+            },
+            built_in,
+            instance_id,
+            manufacturer: cached.0,
+            product: cached.1.or_else(|| n.description.clone()),
+            problem: None,
+        };
+    }
     // ⛔ **Never open the adapter we are streaming from.**
     //
     // This runs every two seconds for the title-bar Bluetooth button, and
@@ -540,17 +658,11 @@ fn winusb_entry(device: &rusb::Device<rusb::GlobalContext>, desc: &rusb::DeviceD
     // link, on a timer. Nothing it learned was new: whether we hold an
     // adapter is known without asking the hardware.
     let ours = is_ours(vid, pid);
-    let opened = if ours {
-        None
-    } else {
-        match device.open() {
-            Ok(h) => Some(h),
-            Err(rusb::Error::Access) | Err(rusb::Error::Busy) => None,
-            Err(_) => return None,
-        }
-    };
+    // A WinUSB one libusb won't open is held by something, or isn't one it can
+    // use; either way it isn't available.
+    let opened = if ours { None } else { device.and_then(|d| Some((d.open().ok()?, d.device_descriptor().ok()?))) };
     let (manufacturer, product) = match &opened {
-        Some(h) => {
+        Some((h, desc)) => {
             let names = (
                 h.read_manufacturer_string_ascii(desc).ok().map(|s| s.trim().to_string()),
                 h.read_product_string_ascii(desc).ok().map(|s| s.trim().to_string()),
@@ -567,24 +679,30 @@ fn winusb_entry(device: &rusb::Device<rusb::GlobalContext>, desc: &rusb::DeviceD
             .and_then(|c| c.iter().find(|(k, _)| *k == (vid, pid)).map(|(_, n)| n.clone()))
             .unwrap_or((None, None)),
     };
-    Some(DongleInfo {
+    DongleInfo {
         vid,
         pid,
-        bus: device.bus_number(),
-        address: device.address(),
+        bus,
+        address,
         available: opened.is_some(),
         ours,
         dedicated: true,
+        system: SystemUse::None,
+        built_in,
+        instance_id,
         manufacturer: manufacturer.filter(|s| !s.is_empty()),
         product: product.filter(|s| !s.is_empty()),
         problem: last_open_failure(vid, pid),
-    })
+    }
 }
 
 /// A Linux adapter's row. One Linux's Bluetooth keeps is never opened — not
 /// even to read its name, which sysfs has — so nothing here can disturb it.
 /// One handed over is opened to see whether it can be: refused means the
 /// permission hasn't reached this session yet (or something holds it).
+///
+/// Linux's Bluetooth runs every adapter btusb drives, not just one; the
+/// lowest-numbered `hciN` is the one its tools use when not told which.
 #[cfg(target_os = "linux")]
 fn linux_entry(
     device: &rusb::Device<rusb::GlobalContext>,
@@ -595,7 +713,14 @@ fn linux_entry(
     let dedicated = dedicated.contains(&(vid, pid));
     let ours = is_ours(vid, pid);
     let available = dedicated && !ours && device.open().is_ok();
-    let (manufacturer, product) = linux::names(device.bus_number(), &device.port_numbers().unwrap_or_default());
+    let info = linux::sysfs_info(device.bus_number(), &device.port_numbers().unwrap_or_default());
+    let system = match info.hci {
+        Some(hci) => {
+            let default = linux::default_hci().as_deref() == Some(hci.as_str());
+            SystemUse::Active { name: Some(hci), default }
+        }
+        None => SystemUse::None,
+    };
     DongleInfo {
         vid,
         pid,
@@ -604,8 +729,11 @@ fn linux_entry(
         available,
         ours,
         dedicated,
-        manufacturer,
-        product,
+        system,
+        built_in: info.built_in,
+        instance_id: None,
+        manufacturer: info.manufacturer,
+        product: info.product,
         problem: last_open_failure(vid, pid),
     }
 }
@@ -2336,6 +2464,17 @@ impl Dongle {
                         }
                     }
                 }
+                // ⭐ Legacy pairing, for the pads that predate SSP. "0000"
+                // is the PIN such a pad expects from a host with no keypad.
+                Event::PinCodeRequest { address } if address == addr => {
+                    let mut p = Vec::with_capacity(23);
+                    p.extend_from_slice(&addr);
+                    p.push(4);
+                    p.extend_from_slice(b"0000");
+                    p.extend_from_slice(&[0u8; 12]);
+                    self.command_sync(Opcode::PIN_CODE_REQUEST_REPLY, &p)?;
+                    on_event("legacy pairing — answered PIN 0000");
+                }
                 Event::IoCapabilityRequest { address } if address == addr => {
                     // NoInputNoOutput, no OOB data, MITM protection not
                     // required — "Just Works". A dongle has no screen and no
@@ -2493,13 +2632,7 @@ impl Dongle {
         secs: f32,
         wanted: &mut dyn FnMut(&hci::InquiryResult) -> bool,
     ) -> Result<Vec<hci::InquiryResult>> {
-        const GIAC: [u8; 3] = [0x33, 0x8B, 0x9E];
-        let units = ((secs / 1.28).round() as u8).clamp(1, 48);
-        let mut params = Vec::with_capacity(5);
-        params.extend_from_slice(&GIAC);
-        params.push(units);
-        params.push(0x00);
-        self.send_command(Opcode::INQUIRY, &params)?;
+        let units = self.start_inquiry(secs)?;
 
         let mut found = Vec::new();
         let mut satisfied = false;
@@ -2522,9 +2655,33 @@ impl Dongle {
                 _ => {}
             }
         }
-        // ❗ Always cancelled, and the completion WAITED FOR. An inquiry still
-        // running blocks paging outright, so returning while it winds down
-        // guarantees the very Page Timeout this exists to avoid.
+        self.cancel_inquiry();
+        Ok(found)
+    }
+
+    /// Start a general inquiry of about `secs` and return at once; the
+    /// results arrive as events (`InquiryResults`, then `InquiryComplete`).
+    /// For a caller reading events off the shared radio rather than holding
+    /// it — a search that runs until a person stops it can't keep the radio
+    /// from everything else that long. Returns the length asked for, in
+    /// 1.28 s units.
+    pub fn start_inquiry(&self, secs: f32) -> Result<u8> {
+        const GIAC: [u8; 3] = [0x33, 0x8B, 0x9E];
+        let units = ((secs / 1.28).round() as u8).clamp(1, 48);
+        let mut params = Vec::with_capacity(5);
+        params.extend_from_slice(&GIAC);
+        params.push(units);
+        params.push(0x00);
+        self.send_command(Opcode::INQUIRY, &params)?;
+        Ok(units)
+    }
+
+    /// Stop an inquiry; harmless when none is running.
+    ///
+    /// ❗ The completion is WAITED FOR. An inquiry still running blocks paging
+    /// outright, so returning while it winds down guarantees the very Page
+    /// Timeout a page straight after it would hit.
+    pub fn cancel_inquiry(&self) {
         let _ = self.command_sync(Opcode::INQUIRY_CANCEL, &[]);
         let settle = std::time::Instant::now() + Duration::from_millis(500);
         while std::time::Instant::now() < settle {
@@ -2534,7 +2691,6 @@ impl Dongle {
                 Err(_) => break,
             }
         }
-        Ok(found)
     }
 
     /// Make this radio answer incoming pages, so a bonded controller can

@@ -32,3 +32,8 @@ rusb = "0.9"
 log  = "0.4"
 # Quaternion maths for the IMU decode probes (bin/jc2_imu only).
 glam = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Which driver each adapter runs, from the device tree (windows.rs): WinUSB is
+# FlexInput's, anything else Windows' Bluetooth. Already in the tree.
+windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation"] }

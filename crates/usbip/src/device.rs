@@ -6,14 +6,19 @@
 //! Port of HIDMaestro's `UsbipEmulatedDevice` (MIT) for the Sony composites:
 //! FlexInput feeds it in-process, so it has no shared-memory bridge, and it
 //! drops the Switch 2 and Valve personas' paths.
+//!
+//! A passthrough device (`crate::passthrough`) is the same machine with the
+//! host's report requests handed out instead of answered here: each waits,
+//! parked by its sequence number, for the real device's answer.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::audio::{AudioEngine, PcmSink, PendingIso};
 use crate::descriptors::{DescriptorSet, TransferType};
 use crate::feature::sony_feature;
+use crate::passthrough::{HostRequest, ReportKind};
 use crate::protocol::{
     write_iso_descriptor, write_ret_submit, write_ret_unlink, Command, IsoPacket, ECONNRESET, EPIPE,
     HEADER_SIZE, ISO_DESCRIPTOR_SIZE, NON_ISOCH,
@@ -32,6 +37,10 @@ pub(crate) trait Wire: Send + Sync {
 /// keeps 8, for an SDK whose callers submit at their own pace). A real pad
 /// likewise reports its state as of the poll.
 const MAX_FRAME_QUEUE: usize = 1;
+/// The same for a passthrough: a real pad's reports, each one an event —
+/// a press and its release can arrive within one poll, and the newest alone
+/// would lose the press.
+const MAX_PASSTHROUGH_QUEUE: usize = 16;
 /// Output reports kept for the consumer to collect.
 const MAX_OUTPUTS: usize = 64;
 
@@ -118,6 +127,12 @@ pub(crate) struct DeviceInner {
     outputs: Mutex<VecDeque<OutputFrame>>,
     /// The interrupt-IN endpoint the input reports go out on.
     primary_in: u8,
+    /// A passthrough's owner: report requests and output reports go here.
+    forward: Option<mpsc::Sender<HostRequest>>,
+    /// A passthrough's report requests waiting for the device, by sequence
+    /// number: the length to answer with.
+    deferred: Mutex<HashMap<u32, u16>>,
+    frame_queue: usize,
 }
 
 impl DeviceInner {
@@ -141,6 +156,31 @@ impl DeviceInner {
             audio,
             outputs: Mutex::new(VecDeque::new()),
             primary_in,
+            forward: None,
+            deferred: Mutex::new(HashMap::new()),
+            frame_queue: MAX_FRAME_QUEUE,
+        }
+    }
+
+    /// A passthrough: what the host asks or writes goes to `forward`, and
+    /// report requests wait for [`complete`](Self::complete).
+    pub(crate) fn passthrough(desc: DescriptorSet, busid: String, devid: u32, forward: mpsc::Sender<HostRequest>) -> Self {
+        DeviceInner {
+            forward: Some(forward),
+            frame_queue: MAX_PASSTHROUGH_QUEUE,
+            ..Self::new(desc, busid, devid, 0)
+        }
+    }
+
+    /// Answer a request a passthrough handed out: `Some` with a read's report
+    /// (`[]` for a write), `None` to stall it. A request the host has since
+    /// cancelled, or one that died with its connection, is dropped.
+    pub(crate) fn complete(&self, seqnum: u32, result: Option<&[u8]>) {
+        let Some(len) = self.deferred.lock().unwrap().remove(&seqnum) else { return };
+        match result {
+            Some(data) if !data.is_empty() => self.reply(seqnum, data, len),
+            Some(_) => self.ok(seqnum, len as usize),
+            None => self.stall(seqnum),
         }
     }
 
@@ -186,6 +226,7 @@ impl DeviceInner {
         let mut h = self.hid.lock().unwrap();
         h.parked.clear();
         h.frames.clear();
+        self.deferred.lock().unwrap().clear();
     }
 
     fn reset_alt_settings(&self) {
@@ -230,7 +271,7 @@ impl DeviceInner {
         match seq {
             Some(seq) => self.slot.ret_submit(seq, 0, report.len(), Some(report)),
             None => {
-                if h.frames.len() >= MAX_FRAME_QUEUE {
+                if h.frames.len() >= self.frame_queue {
                     h.frames.pop_front();
                 }
                 h.frames.push_back(report.to_vec());
@@ -291,9 +332,14 @@ impl DeviceInner {
             TransferType::Interrupt => {
                 // A whole output report, report id first.
                 let p = payload.unwrap_or_default();
-                let (rid, data) = p.split_first().map_or((0, &[][..]), |(r, d)| (*r, d));
-                self.push_output(OutputKind::Output, rid, data);
-                self.ok(cmd.seqnum, p.len());
+                let n = p.len();
+                if let Some(f) = &self.forward {
+                    let _ = f.send(HostRequest::Output(p));
+                } else {
+                    let (rid, data) = p.split_first().map_or((0, &[][..]), |(r, d)| (*r, d));
+                    self.push_output(OutputKind::Output, rid, data);
+                }
+                self.ok(cmd.seqnum, n);
             }
             _ => self.stall(cmd.seqnum),
         }
@@ -301,6 +347,9 @@ impl DeviceInner {
 
     pub(crate) fn handle_unlink(&self, seqnum: u32, victim: u32) {
         let mut removed = self.audio.unlink(victim);
+        if !removed {
+            removed = self.deferred.lock().unwrap().remove(&victim).is_some();
+        }
         if !removed {
             let mut h = self.hid.lock().unwrap();
             for q in h.parked.values_mut() {
@@ -411,6 +460,28 @@ impl DeviceInner {
 
     fn handle_hid_class(&self, seq: u32, request: u8, value: u16, length: u16, to_host: bool, out: &[u8]) {
         let (report_type, report_id) = ((value >> 8) as u8, value as u8);
+        // A passthrough's reads and writes go to the real device.
+        if let Some(f) = &self.forward {
+            let kind = match report_type {
+                0x01 => ReportKind::Input,
+                0x02 => ReportKind::Output,
+                _ => ReportKind::Feature,
+            };
+            let request = match request {
+                0x01 if to_host => Some((length, HostRequest::GetReport { id: seq, kind, number: report_id })),
+                0x09 if !to_host => {
+                    Some((out.len() as u16, HostRequest::SetReport { id: seq, kind, data: out.to_vec() }))
+                }
+                _ => None,
+            };
+            if let Some((len, req)) = request {
+                self.deferred.lock().unwrap().insert(seq, len);
+                if f.send(req).is_err() {
+                    self.complete(seq, None);
+                }
+                return;
+            }
+        }
         match request {
             0x01 if to_host => match report_type {
                 // GET_REPORT(Input): the newest report.

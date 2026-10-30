@@ -965,77 +965,16 @@ impl DeviceBackend for GilrsBackend {
                     out.push((dev.clone(), "accel_x".into(), Signal::Float(g.accel_x)));
                     out.push((dev.clone(), "accel_y".into(), Signal::Float(g.accel_y)));
                     out.push((dev.clone(), "accel_z".into(), Signal::Float(g.accel_z)));
-                    if g.has_touchpad {
-                        out.push((dev.clone(), "touch1_x".into(),      Signal::Float(g.touch1.x)));
-                        out.push((dev.clone(), "touch1_y".into(),      Signal::Float(g.touch1.y)));
-                        out.push((dev.clone(), "touch1_active".into(), Signal::Bool(g.touch1.active)));
-                        out.push((dev.clone(), "touch2_x".into(),      Signal::Float(g.touch2.x)));
-                        out.push((dev.clone(), "touch2_y".into(),      Signal::Float(g.touch2.y)));
-                        out.push((dev.clone(), "touch2_active".into(), Signal::Bool(g.touch2.active)));
-                        // gilrs's Windows backend doesn't fire Button::C for the touchpad
-                        // click on DS4/DualSense, and DualSense's mute button isn't mapped
-                        // at all — so we override with the values parsed from the raw HID
-                        // report. Pushed last so the per-frame HashMap lookup wins.
-                        out.push((dev.clone(), "btn_touchpad".into(),  Signal::Bool(g.touchpad_click)));
-                    }
-                    if matches!(kind, ControllerKind::DualSense) {
-                        out.push((dev.clone(), "btn_mute".into(), Signal::Bool(g.mic_button)));
-                    }
-                    // Physical battery charge (DS4/DualSense), surfaced on the
-                    // `battery` source pin so FlexInput's representation can show
-                    // the real pad's level. Virtual pads always report 100% (the
-                    // encode side), so this is informational and never loops into
-                    // a virtual report.
-                    if let Some(bat) = g.battery {
-                        out.push((dev.clone(), "battery".into(), Signal::Float(bat)));
-                    }
-                    // DualSense: override all axes and buttons with raw HID values.
-                    // gilrs on Windows HID maps the 6 axes by USB Usage ID order rather than
-                    // logical gamepad position, placing L2/R2 where RightStickX/Y should be
-                    // and RX/RY under LeftZ/RightZ. Parsing the report directly avoids this.
-                    if let Some(ds) = g.dualsense {
-                        out.push((dev.clone(), "left_stick_x".into(),  Signal::Float(ds.lx)));
-                        out.push((dev.clone(), "left_stick_y".into(),  Signal::Float(ds.ly)));
-                        out.push((dev.clone(), "right_stick_x".into(), Signal::Float(ds.rx)));
-                        out.push((dev.clone(), "right_stick_y".into(), Signal::Float(ds.ry)));
-                        out.push((dev.clone(), "left_stick".into(),    Signal::Vec2(Vec2::new(ds.lx, ds.ly))));
-                        out.push((dev.clone(), "right_stick".into(),   Signal::Vec2(Vec2::new(ds.rx, ds.ry))));
-                        out.push((dev.clone(), "left_trigger".into(),  Signal::Float(ds.l2)));
-                        out.push((dev.clone(), "right_trigger".into(), Signal::Float(ds.r2)));
-                        out.push((dev.clone(), "btn_south".into(),   Signal::Bool(ds.btn_south)));
-                        out.push((dev.clone(), "btn_east".into(),    Signal::Bool(ds.btn_east)));
-                        out.push((dev.clone(), "btn_west".into(),    Signal::Bool(ds.btn_west)));
-                        out.push((dev.clone(), "btn_north".into(),   Signal::Bool(ds.btn_north)));
-                        out.push((dev.clone(), "btn_lb".into(),      Signal::Bool(ds.btn_l1)));
-                        out.push((dev.clone(), "btn_rb".into(),      Signal::Bool(ds.btn_r1)));
-                        out.push((dev.clone(), "btn_lt_dig".into(),  Signal::Bool(ds.btn_l2)));
-                        out.push((dev.clone(), "btn_rt_dig".into(),  Signal::Bool(ds.btn_r2)));
-                        out.push((dev.clone(), "btn_ls".into(),      Signal::Bool(ds.btn_ls)));
-                        out.push((dev.clone(), "btn_rs".into(),      Signal::Bool(ds.btn_rs)));
-                        out.push((dev.clone(), "btn_start".into(),   Signal::Bool(ds.btn_options)));
-                        out.push((dev.clone(), "btn_back".into(),    Signal::Bool(ds.btn_create)));
-                        out.push((dev.clone(), "btn_guide".into(),   Signal::Bool(ds.btn_ps)));
-                        out.push((dev.clone(), "dpad_up".into(),     Signal::Bool(ds.dpad_up)));
-                        out.push((dev.clone(), "dpad_down".into(),   Signal::Bool(ds.dpad_down)));
-                        out.push((dev.clone(), "dpad_left".into(),   Signal::Bool(ds.dpad_left)));
-                        out.push((dev.clone(), "dpad_right".into(),  Signal::Bool(ds.dpad_right)));
-                        let dx = if ds.dpad_right { 1.0f32 } else if ds.dpad_left { -1.0 } else { 0.0 };
-                        let dy = if ds.dpad_up    { 1.0f32 } else if ds.dpad_down { -1.0 } else { 0.0 };
-                        let (ndx, ndy) = if dx != 0.0 && dy != 0.0 {
-                            (dx * std::f32::consts::FRAC_1_SQRT_2, dy * std::f32::consts::FRAC_1_SQRT_2)
-                        } else { (dx, dy) };
-                        out.push((dev.clone(), "dpad_x".into(),  Signal::Float(ndx)));
-                        out.push((dev.clone(), "dpad_y".into(),  Signal::Float(ndy)));
-                        out.push((dev.clone(), "dpad".into(),    Signal::Vec2(Vec2::new(ndx, ndy))));
-                        // DualSense Edge: back buttons and Fn buttons, which gilrs
-                        // doesn't report at all (see layouts::outputs_for_pad).
-                        if crate::identification::is_dualsense_edge(Some(vid), Some(pid)) {
-                            out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(ds.btn_back_l)));
-                            out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(ds.btn_back_r)));
-                            out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(ds.btn_fn_l)));
-                            out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(ds.btn_fn_r)));
-                        }
-                    }
+                    // Touchpad, mute, battery, and the DualSense's own sticks and
+                    // buttons over gilrs's mis-mapped ones — shared with the dongle
+                    // transport, see `gyro::push_sony_reading`.
+                    crate::gyro::push_sony_reading(
+                        &mut out,
+                        &dev,
+                        &g,
+                        matches!(kind, ControllerKind::DualSense),
+                        crate::identification::is_dualsense_edge(Some(vid), Some(pid)),
+                    );
                     // Switch Pro: override gilrs button output with raw-HID button data.
                     // This bypasses gilrs's WGI backend which loses D-Pad diagonals (8-position
                     // switch only emits cardinal events), garbles A/B/X/Y vs South/East/West/North
@@ -1253,29 +1192,7 @@ impl DeviceBackend for GilrsBackend {
             Signal::Bool(b)  => if b { 1.0 } else { 0.0 },
             _ => return,
         };
-        let byte = match pin_id {
-            // Trigger mode: which of the seven effects, as its index in
-            // `TriggerMode::ALL` (the pin holds it in sixths).
-            "trigger_r_mode" | "trigger_l_mode" => {
-                use flexinput_core::automap::TriggerMode;
-                let m = TriggerMode::from_pin(f);
-                TriggerMode::ALL.iter().position(|x| *x == m).unwrap_or(0) as u8
-            }
-            // Trigger zones: 0–9 along trigger travel → scale to 0–9
-            "trigger_r_start" | "trigger_r_end" |
-            "trigger_l_start" | "trigger_l_end" => (f * 9.0).round() as u8,
-            // Trigger forces: 0–7 → scale to 0–7
-            "trigger_r_strength" | "trigger_l_strength" |
-            "trigger_r_strength2" | "trigger_l_strength2" => (f * 7.0).round() as u8,
-            // Machine's period: a raw byte, like the frequency.
-            "trigger_r_period" | "trigger_l_period" => (f * 255.0).round() as u8,
-            // Player LED: 0=off, 1=P1, 2=P2, 3=P3, 4=P4 → scale to 0–4
-            "player_led" => (f * 4.0).round() as u8,
-            // Mic LED: 0=off, 1=on, 2=pulsing → scale to 0–2
-            "mic_led" => (f * 2.0).round() as u8,
-            // Everything else (rumble 0–255, lightbar 0–255, trigger freq 0–255): linear
-            _ => (f * 255.0) as u8,
-        };
+        let byte = crate::gyro::output_pin_byte(pin_id, f);
         self.gyro.set_output_byte(vid, pid, idx, pin_id, byte);
     }
 

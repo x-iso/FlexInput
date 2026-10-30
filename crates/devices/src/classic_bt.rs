@@ -10,6 +10,14 @@
 //! the stored link key, open the two HID L2CAP channels, and read input reports
 //! off the interrupt channel.
 //!
+//! ⭐ **Which pads, and who reads them.** What a pad answers over SDP decides
+//! (see [`Family`]): a Switch Pro is read here on every system; on Windows an
+//! Xbox controller, DualShock 4 or DualSense is read here too.
+//! Every other HID pad is handed to the system with its own report
+//! descriptor — on Linux through UHID, which is what BlueZ does; on Windows
+//! as a USB device over USB/IP — so its driver, SDL and FlexInput's own pad
+//! backends read it as any pad.
+//!
 //! ❗ **Pairing is NOT done here, deliberately.** Pairing replaces whatever host
 //! the controller was bonded to — on a Switch Pro, its console — and a
 //! background thread that quietly re-bonds any gamepad it can see would be a
@@ -28,18 +36,20 @@
 //! — paging, pairing, opening an L2CAP channel — runs under
 //! `Radio::with_dongle`, which holds the shared reader off for the length of
 //! that conversation.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use flexinput_btle::{keystore, l2cap};
+use flexinput_btle::{hidp, keystore, l2cap};
 use flexinput_core::Signal;
 
 use crate::gyro::{
-    parse_switch_pro_report_calibrated, push_switch_pro_buttons, switch_pro_calib_from_spi,
+    hold_inactive_touch, output_pin_byte, parse_sony_bt, parse_switch_pro_report_calibrated,
+    push_sony_reading, push_switch_pro_buttons, sony_bt_output, switch_pro_calib_from_spi,
     switch_pro_enable_vibration, switch_pro_spi_reply, switch_pro_spi_request,
-    switch_rumble_report, HidReading, OutputState, SwitchProCalib, SWITCH_PRO_CALIB_READS,
+    switch_rumble_report, xbox_bt_rumble, DualSenseState, HidReading, OutputState, SwitchProCalib,
+    SWITCH_PRO_CALIB_READS,
 };
 use crate::spike::SpikeFilter;
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
@@ -64,9 +74,211 @@ const STALE: Duration = Duration::from_secs(3);
 /// does not spin the radio.
 const RETRY_GAP: Duration = Duration::from_secs(5);
 
+/// What a paired controller is, and so who reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    /// Read here, in its own protocol, with the Switch Pro decode `gyro`
+    /// shares with the HID path. Also what a pairing made before device
+    /// records existed is taken for until it answers SDP: every one of those
+    /// was a Switch Pro, the only pad this transport used to read.
+    SwitchPro,
+    /// A DualShock 4 or DualSense, read here with the HID path's Sony decode.
+    /// Windows: the only other way to it is Windows' own Bluetooth stack,
+    /// which doesn't own this radio.
+    Sony { dualsense: bool, edge: bool },
+    /// Windows: an Xbox controller (or a pad in its Xbox mode), read here
+    /// with SDL's Bluetooth decode ([`XboxState`]).
+    ///
+    /// ⛔ Not handed over as a USB device like other pads: FlexInput reads
+    /// every Microsoft pad through XInput, which a plain USB HID device isn't
+    /// on, and those empty reads overrode the pad's real input — it reported,
+    /// and nothing moved. SDL is no way round it either: its Xbox driver
+    /// picks the Bluetooth report format by the bus, and a USB device gets the
+    /// wired protocol.
+    Xbox,
+    /// Handed to the system with its own report descriptor ([`Bridge`]): on
+    /// Linux through UHID, as BlueZ hands a Bluetooth pad over; on Windows as
+    /// a USB device over USB/IP. Any HID pad: the system's driver for it reads
+    /// it, and FlexInput reads it like any pad — so this backend never lists
+    /// it itself.
+    Passthrough,
+    /// Nothing on this system reads it over the dongle yet.
+    Unsupported,
+}
+
+/// A pad's family from what it answered over SDP.
+fn family_of(info: Option<&keystore::DeviceInfo>) -> Family {
+    let Some(d) = info else { return Family::SwitchPro };
+    if (d.vid, d.pid) == (0x057E, 0x2009) {
+        return Family::SwitchPro;
+    }
+    // ❗ Windows reads the Sony pads here, not through a passthrough: SDL
+    // would take a USB device for a USB pad, and a Sony pad's USB reports are
+    // not its Bluetooth ones. Linux hands the kernel a Bluetooth device, whose
+    // driver knows the difference.
+    if !cfg!(target_os = "linux") {
+        if d.vid == 0x045E {
+            return Family::Xbox;
+        }
+        match (d.vid, ControllerKind::detect("", Some(d.vid), Some(d.pid))) {
+            (0x054C, ControllerKind::DualShock4) => return Family::Sony { dualsense: false, edge: false },
+            (0x054C, ControllerKind::DualSense) => {
+                return Family::Sony {
+                    dualsense: true,
+                    edge: crate::identification::is_dualsense_edge(Some(d.vid), Some(d.pid)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if d.descriptor.is_empty() {
+        Family::Unsupported
+    } else {
+        Family::Passthrough
+    }
+}
+
+/// Why a paired controller can't be read over the dongle right now, for the
+/// paired list: `None` for one that can, or that hasn't said what it is yet.
+pub fn unusable_reason(info: Option<&keystore::DeviceInfo>) -> Option<&'static str> {
+    not_readable(family_of(info))
+}
+
+/// Why a pad of `family` can't be read here now, if it can't.
+fn not_readable(family: Family) -> Option<&'static str> {
+    match family {
+        Family::Unsupported => Some(unsupported_reason()),
+        Family::Passthrough if !bridge_available() => Some(NEEDS_USBIP),
+        _ => None,
+    }
+}
+
+/// Whether a pad streams reports whether or not anything changes, so silence
+/// means its link is gone. Xbox and most generic pads report only on change:
+/// for them it's the link going down that says so (`DisconnectionComplete`).
+fn streams(family: Family) -> bool {
+    matches!(family, Family::SwitchPro | Family::Sony { .. })
+}
+
+/// An Xbox controller's Bluetooth reports, as SDL's HIDAPI driver reads them
+/// (`SDL_hidapi_xboxone.c`, `HIDAPI_DriverXboxOneBluetooth_*`, every
+/// firmware's layout): `0x01` the state, `0x02` the guide button on early
+/// firmware, `0x04` the battery. Kept between reports, since the guide
+/// button and battery come in reports of their own.
+///
+/// The state rides in the struct a PlayStation pad's does: the pins it lands
+/// on are positional and shared (`gyro::push_sony_reading`).
+#[derive(Default, Clone, Copy)]
+struct XboxState {
+    pad: DualSenseState,
+    /// Early firmware sends the guide button in a report of its own; once one
+    /// has, the state report's guide bit isn't it.
+    guide_report: bool,
+    battery: Option<f32>,
+}
+
+/// XInput's digital-trigger threshold, about 30 of 255.
+const TRIGGER_DIGITAL: f32 = 0.117;
+
+impl XboxState {
+    /// Take one report: the pad's reading after it, or `None` for a report
+    /// this doesn't read.
+    fn take(&mut self, r: &[u8]) -> Option<HidReading> {
+        match *r.first()? {
+            0x01 if r.len() >= 16 => {
+                let word = |i: usize| u16::from_le_bytes([r[i], r[i + 1]]);
+                let stick = |i: usize| ((word(i) as f32 - 32768.0) / 32768.0).clamp(-1.0, 1.0);
+                let trigger = |i: usize| (word(i) & 0x03FF) as f32 / 1023.0;
+                let p = &mut self.pad;
+                p.lx = stick(1);
+                p.ly = -stick(3); // down-positive in the report
+                p.rx = stick(5);
+                p.ry = -stick(7);
+                p.l2 = trigger(9);
+                p.r2 = trigger(11);
+                p.btn_l2 = p.l2 > TRIGGER_DIGITAL;
+                p.btn_r2 = p.r2 > TRIGGER_DIGITAL;
+                // The hat: 1 = up, clockwise to 8; 0 = centred.
+                let hat = r[13];
+                p.dpad_up = matches!(hat, 1 | 2 | 8);
+                p.dpad_right = matches!(hat, 2..=4);
+                p.dpad_down = matches!(hat, 4..=6);
+                p.dpad_left = matches!(hat, 6..=8);
+                let (b14, b15) = (r[14], r[15]);
+                if r.len() == 16 {
+                    // The original Xbox One S.
+                    p.btn_south = b14 & 0x01 != 0;
+                    p.btn_east = b14 & 0x02 != 0;
+                    p.btn_west = b14 & 0x04 != 0;
+                    p.btn_north = b14 & 0x08 != 0;
+                    p.btn_l1 = b14 & 0x10 != 0;
+                    p.btn_r1 = b14 & 0x20 != 0;
+                    p.btn_create = b14 & 0x40 != 0;
+                    p.btn_options = b14 & 0x80 != 0;
+                    p.btn_ls = b15 & 0x01 != 0;
+                    p.btn_rs = b15 & 0x02 != 0;
+                } else {
+                    p.btn_south = b14 & 0x01 != 0;
+                    p.btn_east = b14 & 0x02 != 0;
+                    p.btn_west = b14 & 0x08 != 0;
+                    p.btn_north = b14 & 0x10 != 0;
+                    p.btn_l1 = b14 & 0x40 != 0;
+                    p.btn_r1 = b14 & 0x80 != 0;
+                    if !self.guide_report {
+                        p.btn_ps = b15 & 0x10 != 0;
+                    }
+                    p.btn_options = b15 & 0x08 != 0;
+                    p.btn_ls = b15 & 0x20 != 0;
+                    p.btn_rs = b15 & 0x40 != 0;
+                    // View: byte 15 on current firmware, byte 16 on 4.8.
+                    p.btn_create = b15 & 0x04 != 0 || r.get(16).is_some_and(|b| b & 0x01 != 0);
+                }
+            }
+            0x02 if r.len() >= 2 => {
+                self.guide_report = true;
+                self.pad.btn_ps = r[1] & 0x01 != 0;
+            }
+            // Four charge levels, in the low two bits.
+            0x04 if r.len() >= 2 => self.battery = Some([0.1, 0.4, 0.7, 1.0][(r[1] & 0x03) as usize]),
+            _ => return None,
+        }
+        Some(HidReading { dualsense: Some(self.pad), battery: self.battery, ..Default::default() })
+    }
+}
+
+/// Never send an Xbox controller rumble faster than this: SDL holds 50 ms
+/// between its Bluetooth rumble reports.
+const XBOX_RUMBLE_GAP: Duration = Duration::from_millis(50);
+
+/// Why an [`Family::Unsupported`] pad isn't read, for the log and the panel.
+fn unsupported_reason() -> &'static str {
+    "it offers no HID service to read"
+}
+
+/// Why a passthrough pad waits on Windows.
+const NEEDS_USBIP: &str = "it needs usbip-win2, which the Bluetooth window installs";
+
+/// Whether the system can take a passthrough pad: on Windows, usbip-win2's
+/// host controller is installed. Linux asks for UHID access when it first
+/// needs it, as the virtual pads do.
+fn bridge_available() -> bool {
+    #[cfg(windows)]
+    return flexinput_usbip::vhci::is_available();
+    #[cfg(not(windows))]
+    true
+}
+
+/// A pad handed to the system: UHID on Linux, USB/IP on Windows. Both take
+/// the same requests (`flexinput_usbip::HostRequest`).
+#[cfg(target_os = "linux")]
+type Bridge = flexinput_virtual::Passthrough;
+#[cfg(windows)]
+type Bridge = flexinput_usbip::Passthrough;
+
 /// One connected classic controller.
 #[derive(Clone)]
 struct PadState {
+    family: Family,
     address: [u8; 6],
     reading: HidReading,
     last: Instant,
@@ -91,7 +303,9 @@ struct PadState {
 pub enum PairPhase {
     #[default]
     Idle,
-    Searching,
+    /// Looking, until a controller pairs or the search is cancelled. The note
+    /// says how the last attempt went, when one failed.
+    Searching(Option<String>),
     Pairing(String),
     Done(String),
     Failed(String),
@@ -130,6 +344,9 @@ struct Shared {
     /// exact conflict that already cost a debugging session. The button sets a
     /// flag; the thread that owns the hardware does the work and reports back.
     pair_requested: AtomicBool,
+    /// Set by the UI to stop a search: its Cancel button, or the window
+    /// closing. Cleared by the next request.
+    pair_cancel: AtomicBool,
     pair_phase: Mutex<PairPhase>,
     pads: Mutex<HashMap<[u8; 6], PadState>>,
     /// Feedback staged by `send`, per controller, for the worker to write.
@@ -163,8 +380,21 @@ pub struct PairControl {
 
 impl PairControl {
     /// Ask the backend to look for a controller in pairing mode and bond it.
+    /// It keeps looking until one pairs or [`cancel`](Self::cancel).
     pub fn request(&self) {
+        self.shared.pair_cancel.store(false, Ordering::Relaxed);
         self.shared.pair_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop a search. Harmless when none is running.
+    pub fn cancel(&self) {
+        self.shared.pair_requested.store(false, Ordering::Relaxed);
+        self.shared.pair_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a search, or the pairing it found, is under way.
+    pub fn busy(&self) -> bool {
+        matches!(self.phase(), PairPhase::Searching(_) | PairPhase::Pairing(_))
     }
 
     /// What the current (or last) run is doing.
@@ -390,9 +620,32 @@ struct Link {
     vib_on: bool,
     vib_tries: u8,
     vib_next: Option<Instant>,
-    /// What rumble state the controller last received, and when.
+    /// What output state (Switch Pro rumble, a Sony pad's whole output
+    /// report) the controller last received, and when.
     rumble_sent: Option<OutputState>,
     rumble_at: Option<Instant>,
+    family: Family,
+    /// What it answered over SDP, when it has: on Linux, what its passthrough
+    /// is created from.
+    info: Option<keystore::DeviceInfo>,
+    /// Control-channel transactions: one in flight, the rest waiting — see
+    /// `flexinput_btle::hidp`.
+    ctl_queue: VecDeque<Ctl>,
+    ctl_in_flight: Option<(Ctl, Instant)>,
+    /// Sony: whether full reports (`0x31` / `0x11`) are arriving yet, and the
+    /// asks for them.
+    full: bool,
+    full_tries: u8,
+    full_next: Option<Instant>,
+    /// Sony: the DualSense's output sequence and one-shot lightbar setup, as
+    /// the HID path keeps them.
+    sony_seq: u8,
+    lightbar_set_up: bool,
+    /// Xbox: the pad's state between its reports.
+    xbox: XboxState,
+    /// The device the system reads this pad through, for a passthrough pad.
+    #[cfg(any(target_os = "linux", windows))]
+    passthrough: Option<Bridge>,
 }
 
 impl Link {
@@ -401,6 +654,244 @@ impl Link {
         self.counter = self.counter.wrapping_add(1);
         c
     }
+}
+
+/// One control-channel transaction, and who wants its answer.
+struct Ctl {
+    frame: Vec<u8>,
+    answer: Answer,
+}
+
+#[derive(Clone, Copy)]
+enum Answer {
+    /// Ours; nothing to pass on.
+    Ignore,
+    /// A report read or write the host made through the passthrough, by the
+    /// id it came with.
+    Get(u32),
+    Set(u32),
+}
+
+/// How long a control transaction may go unanswered before it is failed and
+/// the next one sent. Well inside the five seconds the kernel gives a UHID
+/// report request.
+const CTL_PATIENCE: Duration = Duration::from_millis(1500);
+
+/// Asks for a Sony pad's full reports, and the gap between them.
+const FULL_ATTEMPTS: u8 = 5;
+const FULL_RETRY: Duration = Duration::from_secs(1);
+
+/// Send the next waiting control transaction when none is in flight, failing
+/// one the pad has sat on too long first.
+fn pump_control(radio: &flexinput_btle::radio::Radio, link: &mut Link) {
+    if let Some((_, at)) = &link.ctl_in_flight {
+        if at.elapsed() < CTL_PATIENCE {
+            return;
+        }
+        if let Some((ctl, _)) = link.ctl_in_flight.take() {
+            answer_host(link, ctl.answer, None);
+        }
+    }
+    if let Some(ctl) = link.ctl_queue.pop_front() {
+        let _ = radio.with_dongle(|d| d.send_att_raw(link.conn, link.control.remote_cid, &ctl.frame));
+        link.ctl_in_flight = Some((ctl, Instant::now()));
+    }
+}
+
+/// A packet on the control channel: the answer to the transaction in flight.
+fn control_reply(link: &mut Link, payload: &[u8]) {
+    let Some(reply) = hidp::parse_control(payload) else { return };
+    let Some((ctl, _)) = link.ctl_in_flight.take() else { return };
+    let result = match reply {
+        hidp::ControlReply::Data { report, .. } => Some(report.to_vec()),
+        hidp::ControlReply::Handshake(code) => (code == hidp::HANDSHAKE_SUCCESSFUL).then(Vec::new),
+    };
+    answer_host(link, ctl.answer, result);
+}
+
+/// Pass a control transaction's outcome to whoever asked; `None` failed.
+fn answer_host(link: &Link, answer: Answer, result: Option<Vec<u8>>) {
+    #[cfg(any(target_os = "linux", windows))]
+    if let Some(p) = &link.passthrough {
+        match answer {
+            // A read answered by a bare success handshake brought no report.
+            Answer::Get(id) => p.reply_get(id, result.as_deref().filter(|r| !r.is_empty())),
+            Answer::Set(id) => p.reply_set(id, result.is_some()),
+            Answer::Ignore => {}
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = (link, answer, result);
+}
+
+/// Put what the host asked of a passthrough pad to the pad. Output reports
+/// go straight out; report reads and writes queue on the control channel and
+/// are answered as the pad answers.
+#[cfg(any(target_os = "linux", windows))]
+fn serve_host(radio: &flexinput_btle::radio::Radio, link: &mut Link) {
+    use flexinput_usbip::{HostRequest, ReportKind};
+    let kind = |k: ReportKind| match k {
+        ReportKind::Input => hidp::REPORT_INPUT,
+        ReportKind::Output => hidp::REPORT_OUTPUT,
+        ReportKind::Feature => hidp::REPORT_FEATURE,
+    };
+    let Some(p) = &link.passthrough else { return };
+    while let Some(req) = p.next_request() {
+        match req {
+            HostRequest::Output(report) => {
+                let frame = hidp::output(&report);
+                let _ = radio.with_dongle(|d| d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame));
+            }
+            HostRequest::GetReport { id, kind: k, number } => link.ctl_queue.push_back(Ctl {
+                frame: hidp::get_report(kind(k), number),
+                answer: Answer::Get(id),
+            }),
+            HostRequest::SetReport { id, kind: k, data } => link.ctl_queue.push_back(Ctl {
+                frame: hidp::set_report(kind(k), &data),
+                answer: Answer::Set(id),
+            }),
+        }
+    }
+}
+
+/// Make a fresh link ready for what it carries. `Err` says why it can't be
+/// used; the caller closes it.
+fn start_link(link: &mut Link, adapter: Option<[u8; 6]>) -> Result<(), String> {
+    match link.family {
+        Family::SwitchPro | Family::Sony { .. } | Family::Xbox => Ok(()),
+        Family::Unsupported => Err(unsupported_reason().into()),
+        Family::Passthrough => {
+            if let Some(why) = not_readable(link.family) {
+                return Err(why.into());
+            }
+            #[cfg(windows)]
+            {
+                let _ = adapter;
+                let d = link.info.as_ref().ok_or("no device record")?;
+                let name = link.name.clone().unwrap_or_else(|| "Bluetooth controller".into());
+                // The pad's own address: its USB instance, and so its HidHide
+                // entry, stays the same across connections.
+                let serial: String = link.addr.iter().map(|b| format!("{b:02X}")).collect();
+                let p = flexinput_usbip::Passthrough::create(&flexinput_usbip::PassthroughSpec {
+                    vid: d.vid,
+                    pid: d.pid,
+                    version: d.version,
+                    product: &name,
+                    serial: &serial,
+                    descriptor: &d.descriptor,
+                })?;
+                eprintln!(
+                    "[bt-classic] {} handed to the system as \"{name}\" ({:04x}:{:04x})",
+                    keystore::format_addr(link.addr),
+                    d.vid,
+                    d.pid
+                );
+                link.passthrough = Some(p);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let d = link.info.as_ref().ok_or("no device record")?;
+                let name = link.name.clone().unwrap_or_else(|| "Bluetooth controller".into());
+                let phys = adapter.map(keystore::format_addr).unwrap_or_default();
+                let uniq = keystore::format_addr(link.addr);
+                let p = flexinput_virtual::Passthrough::create(&flexinput_virtual::PassthroughSpec {
+                    name: &name,
+                    phys: &phys,
+                    uniq: &uniq,
+                    bus: flexinput_virtual::BUS_BLUETOOTH,
+                    vid: d.vid,
+                    pid: d.pid,
+                    version: d.version,
+                    descriptor: &d.descriptor,
+                })?;
+                eprintln!(
+                    "[bt-classic] {uniq} handed to the system as \"{name}\" ({:04x}:{:04x})",
+                    d.vid, d.pid
+                );
+                link.passthrough = Some(p);
+                Ok(())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                let _ = adapter;
+                Err(unsupported_reason().into())
+            }
+        }
+    }
+}
+
+/// A report decoded: the pad is alive and sending, its state goes out, and
+/// its cadence is measured.
+fn took_report(shared: &Shared, link: &mut Link, reading: HidReading) {
+    if !link.reported {
+        link.reported = true;
+        eprintln!(
+            "[bt-classic] {} is sending input",
+            keystore::format_addr(link.addr)
+        );
+    }
+    link.last = Instant::now();
+    publish(shared, link, reading);
+    // ⛔ Debug builds, or when explicitly asked for. A line every five
+    // seconds per pad is a diagnostic, not something a shipped build
+    // should print at a user forever.
+    if let Some(c) = link.cadence.tick(Instant::now(), Duration::from_secs(5)) {
+        if cadence_logging() {
+            eprintln!(
+                "[bt-classic] {} cadence: {:.1} Hz over {} reports, mean {:.2} ms                          (min {:.2}, max {:.2}), jitter {:.2} ms/step",
+                keystore::format_addr(link.addr),
+                c.hz,
+                c.samples,
+                c.mean_ms,
+                c.min_ms,
+                c.max_ms,
+                c.jitter_ms,
+            );
+        }
+    }
+}
+
+/// Put one decoded report on the pad's shared state.
+///
+/// ⛔ **ONE lock, held once.** This used to call `pads.lock()` a second time
+/// inside the value expression of an `insert` whose own guard was still
+/// alive — and `std::sync::Mutex` is not reentrant, so the transport thread
+/// deadlocked against itself on the FIRST input report to arrive. Everything
+/// up to that point looked perfect: paired, encrypted, both HID channels
+/// configured, "is sending input" printed once, and then the whole backend
+/// stopped dead. `enumerate` blocked on the same mutex from the UI thread, so
+/// no device ever appeared either.
+///
+/// The `entry` API does the read and the write under the single guard, which
+/// is both correct and shorter than what it replaces.
+fn publish(shared: &Shared, link: &Link, mut reading: HidReading) {
+    let mut pads = shared.pads.lock().unwrap();
+    let slot = pads.entry(link.addr).or_insert_with(|| PadState {
+        family: link.family,
+        address: link.addr,
+        reading,
+        last: link.last,
+        name: link.name.clone(),
+        events: 0,
+        spike: SpikeFilter::new(),
+    });
+    // A lifted finger keeps its last position, as on the HID path.
+    if reading.has_touchpad {
+        hold_inactive_touch(&mut reading.touch1, &slot.reading.touch1);
+        hold_inactive_touch(&mut reading.touch2, &slot.reading.touch2);
+    }
+    let imu = slot.spike.push([
+        reading.gyro_x, reading.gyro_y, reading.gyro_z,
+        reading.accel_x, reading.accel_y, reading.accel_z,
+    ]);
+    [reading.gyro_x, reading.gyro_y, reading.gyro_z] = [imu[0], imu[1], imu[2]];
+    [reading.accel_x, reading.accel_y, reading.accel_z] = [imu[3], imu[4], imu[5]];
+    slot.family = link.family;
+    slot.reading = reading;
+    slot.last = link.last;
+    slot.name = link.name.clone();
+    slot.events = slot.events.saturating_add(1);
 }
 
 /// How many times to ask for vibration before giving up on it.
@@ -497,10 +988,10 @@ fn answer_signalling(
 /// alone: unknown is not the same as wrong, and guessing would cry wolf on
 /// every pairing that predates this.
 fn warn_about_foreign_keys(
-    radio: &flexinput_btle::radio::Radio,
+    ours: Option<[u8; 6]>,
     known: &std::collections::BTreeMap<String, keystore::Pairing>,
 ) {
-    let Ok(ours) = radio.with_dongle(|d| d.read_bd_addr()) else { return };
+    let Some(ours) = ours else { return };
     if trace() {
         eprintln!("[bt-classic] this adapter is {}", keystore::format_addr(ours));
     }
@@ -548,15 +1039,26 @@ fn run_inner(shared: &Arc<Shared>) {
     let mut last_note: Option<Instant> = None;
     let mut radio: Option<Arc<flexinput_btle::radio::Radio>> = None;
     let mut sub: Option<flexinput_btle::radio::Subscriber> = None;
+    // The adapter's own address: the `phys` of a passthrough pad.
+    let mut adapter: Option<[u8; 6]> = None;
 
     // ❗ Cached. `keystore::load` reads a file, and this loop runs as fast as
     // the radio delivers packets — a disk read per input report is absurd, and
     // it is time not spent draining the queue that carries them.
     let mut known = keystore::load();
+    let mut devices = keystore::load_devices();
     let mut known_at = Instant::now();
+    // Pads nothing here reads (see `Family::Unsupported`): neither paged nor
+    // answered, and said once.
+    let unusable = |devices: &std::collections::BTreeMap<String, keystore::DeviceInfo>, a: [u8; 6]| {
+        not_readable(family_of(devices.get(&keystore::format_addr(a)))).is_some()
+    };
+    let mut said_unusable: HashSet<[u8; 6]> = HashSet::new();
+    let mut search: Option<Search> = None;
     while !shared.shutdown.load(Ordering::Relaxed) {
         if known_at.elapsed() > Duration::from_secs(2) {
             known = keystore::load();
+            devices = keystore::load_devices();
             known_at = Instant::now();
         }
         // ⛔ Read BEFORE the empty-store early return.
@@ -566,7 +1068,7 @@ fn run_inner(shared: &Arc<Shared>) {
         // pairing code below — so pairing from scratch, the one case the button
         // exists for, was the exact case it could not serve. An empty store is
         // a reason to keep the radio closed, not a reason to ignore the user.
-        let want_pair = shared.pair_requested.load(Ordering::Relaxed);
+        let want_pair = shared.pair_requested.load(Ordering::Relaxed) || search.is_some();
         if known.is_empty() && !want_pair {
             set_status(&shared, Status::Idle);
             // ⭐ Said ONCE, with the path. "Enabled but nothing happens" is the
@@ -589,6 +1091,18 @@ fn run_inner(shared: &Arc<Shared>) {
             continue;
         }
         shared.said_empty.store(false, Ordering::Relaxed);
+        // ⭐ An adapter that went away — unplugged, or given back to the
+        // system — is let go of, links and all, so the next pass opens
+        // whatever FlexInput has now instead of holding a dead one.
+        if radio.as_ref().is_some_and(|r| r.is_gone()) {
+            links.clear();
+            sub = None;
+            radio = None;
+            adapter = None;
+            if let Ok(mut pads) = shared.pads.lock() {
+                pads.clear();
+            }
+        }
         if radio.is_none() {
             match dongle_ids().and_then(|(v, p)| flexinput_btle::radio::shared(v, p)) {
                 Some(r) => {
@@ -626,7 +1140,8 @@ fn run_inner(shared: &Arc<Shared>) {
                         ),
                         Err(e) => eprintln!("[bt-classic] could not enable page scan: {e}"),
                     }
-                    warn_about_foreign_keys(&r, &known);
+                    adapter = r.with_dongle(|d| d.read_bd_addr()).ok();
+                    warn_about_foreign_keys(adapter, &known);
                     // Without adverts: this transport reads none, and a
                     // Joy-Con scan's flood of them evicted the Connection
                     // Requests it does need. See `radio::subscribe_without_adverts`.
@@ -637,7 +1152,7 @@ fn run_inner(shared: &Arc<Shared>) {
                 None => {
                     set_status(&shared, Status::NoRadio(flexinput_btle::NO_ADAPTER.into()));
                     if !shared.yielded.swap(true, Ordering::Relaxed) {
-                        eprintln!("[bt-classic] {}", flexinput_btle::NO_ADAPTER);
+                        eprintln!("[bt-classic] {}", flexinput_btle::Error::NoAdapter);
                     }
                 }
             }
@@ -655,8 +1170,13 @@ fn run_inner(shared: &Arc<Shared>) {
         // still connected at the radio level never calls again. Forgetting it
         // here stranded the pad exactly as a failed setup did: searching,
         // unreachable, until power-cycled.
+        //
+        // ❗ Only a pad that streams (see `streams`): an Xbox or generic HID
+        // pad sends a report when something changes and nothing while it lies
+        // still, so silence there is not a dead link. Its link going down is
+        // (`DisconnectionComplete`).
         links.retain(|l| {
-            let alive = l.last.elapsed() < STALE;
+            let alive = !streams(l.family) || l.last.elapsed() < STALE;
             if !alive {
                 eprintln!("[bt-classic] {} disconnected", keystore::format_addr(l.addr));
                 shared.pads.lock().unwrap().remove(&l.addr);
@@ -709,7 +1229,7 @@ fn run_inner(shared: &Arc<Shared>) {
             let missing = known
                 .iter()
                 .filter_map(|(t, p)| keystore::parse_addr(t).map(|a| (a, p.key)))
-                .find(|(a, _)| !links.iter().any(|l| l.addr == *a));
+                .find(|(a, _)| !links.iter().any(|l| l.addr == *a) && !unusable(&devices, *a));
             if let Some((addr, key)) = missing {
                 // ❗ A CID pair per SLOT. Channel ids are scoped to their ACL
                 // link so reuse would in fact be legal, but distinct ids make a
@@ -719,16 +1239,25 @@ fn run_inner(shared: &Arc<Shared>) {
                 if trace() {
                     eprintln!("[bt-classic] paging {}", keystore::format_addr(addr));
                 }
-                let outcome = connect(sub, addr, key, base);
+                let text = keystore::format_addr(addr);
+                let outcome = connect(sub, addr, key, base, devices.get(&text).cloned());
                 next_try = Instant::now() + gap;
                 match outcome {
                     Ok(mut link) => {
-                        link.name = known
-                            .get(&keystore::format_addr(addr))
-                            .and_then(|p| p.name.clone());
-                        eprintln!("[bt-classic] {} connected", keystore::format_addr(addr));
-                        last_note = None;
-                        links.push(link);
+                        link.name = known.get(&text).and_then(|p| p.name.clone());
+                        match start_link(&mut link, adapter) {
+                            Ok(()) => {
+                                eprintln!("[bt-classic] {text} connected");
+                                last_note = None;
+                                links.push(link);
+                            }
+                            Err(e) => {
+                                if said_unusable.insert(addr) {
+                                    eprintln!("[bt-classic] {text} connected but can't be used: {e}");
+                                }
+                                let _ = r.with_dongle(|d| d.disconnect(link.conn));
+                            }
+                        }
                     }
                     Err(ref e) if trace() => {
                         eprintln!("[bt-classic] page {} failed: {e}",
@@ -773,41 +1302,83 @@ fn run_inner(shared: &Arc<Shared>) {
         let streaming = shared
             .pads
             .lock()
-            .map(|p| p.values().filter(|s| s.last.elapsed() < STALE).count())
+            // A pad that reports only on change and has reported once is
+            // streaming, quiet or not — see the staleness rule above.
+            .map(|p| p.values().filter(|s| !streams(s.family) || s.last.elapsed() < STALE).count())
             .unwrap_or(0);
         set_status(
             shared,
             Status::Running { paired: known.len(), connected: links.len(), streaming },
         );
 
-        // ── A pairing run, if the UI asked for one ───────────────────────
+        // ── A pairing search, while the UI wants one ─────────────────────
         //
         // ❗ Done HERE rather than anywhere else because this thread owns the
-        // radio. An inquiry takes seconds and blocks connected controllers, so
-        // it happens only when explicitly requested — never on a timer.
-        if shared.pair_requested.swap(false, Ordering::Relaxed) {
-            let began = Instant::now();
-            run_pairing(r, &shared);
-            // ⛔ **Do not count our own inquiry against the pads.**
-            //
-            // An inquiry holds the radio for about eight seconds, and `STALE`
-            // is three — so pairing a second controller silently killed every
-            // controller already connected, which is exactly what a live trace
-            // showed: link up at 1.7 s, pairing requested, "disconnected" a few
-            // seconds later, with the pad still sitting there perfectly happy.
-            //
-            // The pad was not quiet; WE were not listening. Pushing `last`
-            // forward by the time we spent elsewhere makes staleness mean what
-            // it is supposed to mean.
-            let held = began.elapsed();
-            for l in &mut links {
-                l.last += held;
-            }
-            if let Ok(mut pads) = shared.pads.lock() {
-                for s in pads.values_mut() {
-                    s.last += held;
+        // radio. It runs until a controller pairs or the person stops it — the
+        // window's Cancel, or closing the window — never on its own.
+        if shared.pair_requested.swap(false, Ordering::Relaxed) && search.is_none() {
+            search = Some(Search::default());
+            set_phase(shared, PairPhase::Searching(None));
+        }
+        if shared.pair_cancel.swap(false, Ordering::Relaxed) && search.take().is_some() {
+            r.with_dongle(|d| d.cancel_inquiry());
+            set_phase(shared, PairPhase::Idle);
+        }
+        let mut finished: Option<PairPhase> = None;
+        if let Some(s) = search.as_mut() {
+            // ⛔ No background page meanwhile: an inquiry blocks paging outright.
+            next_try = next_try.max(Instant::now() + Duration::from_secs(1));
+            if !s.running && s.next_round.is_none_or(|t| Instant::now() >= t) {
+                s.heard.clear();
+                s.round_over = false;
+                match r.with_dongle(|d| {
+                    d.set_inquiry_mode(0x01).and_then(|()| d.start_inquiry(SEARCH_ROUND))
+                }) {
+                    Ok(_) => s.running = true,
+                    Err(e) => {
+                        s.next_round = Some(Instant::now() + Duration::from_secs(1));
+                        if trace() {
+                            eprintln!("[bt-classic] inquiry not started: {e}");
+                        }
+                    }
                 }
             }
+            if let Some(found) = s.pick(&known) {
+                let began = Instant::now();
+                let outcome = pair_one(r, shared, &found);
+                // The pairing's lease stopped the round.
+                s.running = false;
+                match outcome {
+                    Paired::Done(label) => finished = Some(PairPhase::Done(label)),
+                    Paired::Stop(msg) => finished = Some(PairPhase::Failed(msg)),
+                    Paired::Retry(msg) => set_phase(shared, PairPhase::Searching(Some(msg))),
+                }
+                // ⛔ **Do not count our own pairing against the pads.**
+                //
+                // A pairing holds the radio for up to half a minute, and
+                // `STALE` is three seconds — so pairing a second controller
+                // silently killed every controller already connected, which is
+                // exactly what a live trace showed: link up at 1.7 s, pairing
+                // requested, "disconnected" a few seconds later, with the pad
+                // still sitting there perfectly happy.
+                //
+                // The pad was not quiet; WE were not listening. Pushing `last`
+                // forward by the time we spent elsewhere makes staleness mean
+                // what it is supposed to mean.
+                let held = began.elapsed();
+                for l in &mut links {
+                    l.last += held;
+                }
+                if let Ok(mut pads) = shared.pads.lock() {
+                    for p in pads.values_mut() {
+                        p.last += held;
+                    }
+                }
+            }
+        }
+        if let Some(phase) = finished {
+            search = None;
+            set_phase(shared, phase);
             continue;
         }
 
@@ -826,6 +1397,29 @@ fn run_inner(shared: &Arc<Shared>) {
             }
             let address = match evt {
                 flexinput_btle::Event::ConnectionRequest { address, .. } => address,
+                // A pairing search's answers — see `Search`.
+                flexinput_btle::Event::InquiryResults(found) => {
+                    if let Some(s) = search.as_mut() {
+                        s.hear(found);
+                    }
+                    continue;
+                }
+                flexinput_btle::Event::InquiryComplete { .. } => {
+                    if let Some(s) = search.as_mut() {
+                        s.running = false;
+                        s.round_over = true;
+                    }
+                    continue;
+                }
+                flexinput_btle::Event::CommandStatus { status, opcode }
+                    if opcode == flexinput_btle::Opcode::INQUIRY && status != 0 =>
+                {
+                    if let Some(s) = search.as_mut() {
+                        s.running = false;
+                        s.next_round = Some(Instant::now() + Duration::from_secs(1));
+                    }
+                    continue;
+                }
                 // ⭐ A link that went down is dropped NOW, not after `STALE`.
                 // Until it is, a controller calling straight back is taken for
                 // one that is already connected and ignored below.
@@ -865,6 +1459,10 @@ fn run_inner(shared: &Arc<Shared>) {
                 // one retry.
                 continue;
             };
+            // Ours, but nothing here reads it: left unanswered the same way.
+            if unusable(&devices, address) {
+                continue;
+            }
             // ⛔ **A controller that is calling us is NOT connected to us.**
             // It cannot page while it holds a link, so any link we still have
             // for it is dead and only not yet timed out. Ignoring the call on
@@ -883,12 +1481,22 @@ fn run_inner(shared: &Arc<Shared>) {
             // not: `Connection Complete` can arrive in the gap, get broadcast,
             // and never be seen by the code waiting for it — which shows up as
             // a reconnect that times out for no visible reason.
-            match adopt(sub, address, key, base) {
+            match adopt(sub, address, key, base, devices.get(&text).cloned()) {
                 Ok(mut link) => {
                     link.name = known.get(&text).and_then(|p| p.name.clone());
-                    eprintln!("[bt-classic] {text} connected (incoming)");
-                    last_note = None;
-                    links.push(link);
+                    match start_link(&mut link, adapter) {
+                        Ok(()) => {
+                            eprintln!("[bt-classic] {text} connected (incoming)");
+                            last_note = None;
+                            links.push(link);
+                        }
+                        Err(e) => {
+                            if said_unusable.insert(address) {
+                                eprintln!("[bt-classic] {text} connected but can't be used: {e}");
+                            }
+                            let _ = r.with_dongle(|d| d.disconnect(link.conn));
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[bt-classic] {text} incoming link failed: {e}");
@@ -910,7 +1518,11 @@ fn run_inner(shared: &Arc<Shared>) {
         // perfectly well — it simply keeps the square response, which is what
         // every Classic link did before this existed.
         for link in links.iter_mut() {
-            if link.calib.is_some() || !link.reported || link.spi.attempts >= SPI_ATTEMPTS {
+            if link.family != Family::SwitchPro
+                || link.calib.is_some()
+                || !link.reported
+                || link.spi.attempts >= SPI_ATTEMPTS
+            {
                 continue;
             }
             if link.spi.next_try.is_some_and(|t| Instant::now() < t) {
@@ -942,7 +1554,7 @@ fn run_inner(shared: &Arc<Shared>) {
         // the same policy as the HID path, from the same encoder.
         let staged = shared.outputs.lock().map(|o| o.clone()).unwrap_or_default();
         for link in links.iter_mut() {
-            if !link.reported {
+            if link.family != Family::SwitchPro || !link.reported {
                 continue;
             }
             if !link.vib_on
@@ -980,6 +1592,65 @@ fn run_inner(shared: &Arc<Shared>) {
             link.rumble_at = Some(Instant::now());
         }
 
+        // ── Sony: full reports, then outputs ─────────────────────────────
+        //
+        // ⭐ A DualShock 4 or DualSense on Bluetooth sends a short report with
+        // no motion or touch until the host reads its calibration (feature
+        // `0x05`), which is what switches it to the full one. Asked until the
+        // full reports arrive. Outputs follow the Switch Pro's policy: on
+        // change, on a heartbeat, never faster than the gap — a whole output
+        // report each time, as the HID path sends it.
+        for link in links.iter_mut() {
+            let Family::Sony { dualsense, .. } = link.family else { continue };
+            if !link.full
+                && link.full_tries < FULL_ATTEMPTS
+                && link.full_next.is_none_or(|t| Instant::now() >= t)
+            {
+                link.full_tries += 1;
+                link.full_next = Some(Instant::now() + FULL_RETRY);
+                link.ctl_queue.push_back(Ctl {
+                    frame: hidp::get_report(hidp::REPORT_FEATURE, 0x05),
+                    answer: Answer::Ignore,
+                });
+            }
+            let Some(out) = staged.get(&link.addr).copied() else { continue };
+            let since = link.rumble_at.map(|t| t.elapsed());
+            if !link.full || since.is_some_and(|d| d < RUMBLE_MIN_GAP) {
+                continue;
+            }
+            if link.rumble_sent == Some(out) && since.is_some_and(|d| d < RUMBLE_HEARTBEAT) {
+                continue;
+            }
+            let report = sony_bt_output(&out, dualsense, &mut link.sony_seq, &mut link.lightbar_set_up);
+            let frame = hidp::output(&report);
+            let _ = r.with_dongle(|d| d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame));
+            link.rumble_sent = Some(out);
+            link.rumble_at = Some(Instant::now());
+        }
+
+        // ── Xbox: rumble ─────────────────────────────────────────────────
+        for link in links.iter_mut().filter(|l| l.family == Family::Xbox) {
+            let Some(out) = staged.get(&link.addr).copied() else { continue };
+            let since = link.rumble_at.map(|t| t.elapsed());
+            if since.is_some_and(|d| d < XBOX_RUMBLE_GAP) {
+                continue;
+            }
+            if link.rumble_sent == Some(out) && since.is_some_and(|d| d < RUMBLE_HEARTBEAT) {
+                continue;
+            }
+            let frame = hidp::output(&xbox_bt_rumble(&out));
+            let _ = r.with_dongle(|d| d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame));
+            link.rumble_sent = Some(out);
+            link.rumble_at = Some(Instant::now());
+        }
+
+        // ── The host's requests (Linux passthrough), then the control queue
+        for link in links.iter_mut() {
+            #[cfg(any(target_os = "linux", windows))]
+            serve_host(r, link);
+            pump_control(r, link);
+        }
+
         // ── Service every link from ONE read ─────────────────────────────
         //
         // The whole point of the restructure: reports for all connected
@@ -1009,6 +1680,11 @@ fn run_inner(shared: &Arc<Shared>) {
                 answer_signalling(r, link, &pkt);
                 continue;
             }
+            // The answer to a report read or write — see `pump_control`.
+            if pkt.cid == link.control.local_cid {
+                control_reply(link, &pkt.payload);
+                continue;
+            }
             if pkt.cid != link.interrupt.local_cid {
                 continue;
             }
@@ -1016,6 +1692,41 @@ fn run_inner(shared: &Arc<Shared>) {
         // input pipe), not part of the report. Handing it to the parser shifts
         // every field by one and yields plausible nonsense.
             if pkt.payload.len() < 2 || pkt.payload[0] != 0xA1 {
+                continue;
+            }
+            if link.family != Family::SwitchPro {
+                let report = &pkt.payload[1..];
+                match link.family {
+                    Family::Sony { dualsense, .. } => {
+                        // Any report proves the link alive, the short one the
+                        // pad sends before it is asked for the full one too.
+                        link.last = Instant::now();
+                        let Some(g) = parse_sony_bt(report, dualsense) else { continue };
+                        if !link.full {
+                            link.full = true;
+                            if trace() {
+                                eprintln!(
+                                    "[bt-classic] {} sending full reports",
+                                    keystore::format_addr(link.addr)
+                                );
+                            }
+                        }
+                        took_report(shared, link, g);
+                    }
+                    Family::Xbox => {
+                        link.last = Instant::now();
+                        let Some(g) = link.xbox.take(report) else { continue };
+                        took_report(shared, link, g);
+                    }
+                    Family::Passthrough => {
+                        #[cfg(any(target_os = "linux", windows))]
+                        if let Some(p) = &link.passthrough {
+                            p.input(report);
+                        }
+                        took_report(shared, link, HidReading::default());
+                    }
+                    Family::SwitchPro | Family::Unsupported => {}
+                }
                 continue;
             }
             // Vibration acknowledged — subcommand id echoed at byte 14 of the
@@ -1098,65 +1809,7 @@ fn run_inner(shared: &Arc<Shared>) {
             ) else {
                 continue;
             };
-            if !link.reported {
-                link.reported = true;
-                eprintln!(
-                    "[bt-classic] {} is sending input",
-                    keystore::format_addr(link.addr)
-                );
-            }
-            link.last = Instant::now();
-            // ⛔ **ONE lock, held once.** This used to call `pads.lock()` a
-            // second time inside the value expression of an `insert` whose own
-            // guard was still alive — and `std::sync::Mutex` is not reentrant,
-            // so the transport thread deadlocked against itself on the FIRST
-            // input report to arrive. Everything up to that point looked
-            // perfect: paired, encrypted, both HID channels configured, "is
-            // sending input" printed once, and then the whole backend stopped
-            // dead. `enumerate` blocked on the same mutex from the UI thread,
-            // so no device ever appeared either.
-            //
-            // The `entry` API does the read and the write under the single
-            // guard, which is both correct and shorter than what it replaces.
-            {
-                let mut pads = shared.pads.lock().unwrap();
-                let slot = pads.entry(link.addr).or_insert_with(|| PadState {
-                    address: link.addr,
-                    reading,
-                    last: link.last,
-                    name: link.name.clone(),
-                    events: 0,
-                    spike: SpikeFilter::new(),
-                });
-                let mut reading = reading;
-                let imu = slot.spike.push([
-                    reading.gyro_x, reading.gyro_y, reading.gyro_z,
-                    reading.accel_x, reading.accel_y, reading.accel_z,
-                ]);
-                [reading.gyro_x, reading.gyro_y, reading.gyro_z] = [imu[0], imu[1], imu[2]];
-                [reading.accel_x, reading.accel_y, reading.accel_z] = [imu[3], imu[4], imu[5]];
-                slot.reading = reading;
-                slot.last = link.last;
-                slot.name = link.name.clone();
-                slot.events = slot.events.saturating_add(1);
-            }
-            // ⛔ Debug builds, or when explicitly asked for. A line every five
-            // seconds per pad is a diagnostic, not something a shipped build
-            // should print at a user forever.
-            if let Some(c) = link.cadence.tick(Instant::now(), Duration::from_secs(5)) {
-                if cadence_logging() {
-                    eprintln!(
-                        "[bt-classic] {} cadence: {:.1} Hz over {} reports, mean {:.2} ms                          (min {:.2}, max {:.2}), jitter {:.2} ms/step",
-                        keystore::format_addr(link.addr),
-                        c.hz,
-                        c.samples,
-                        c.mean_ms,
-                        c.min_ms,
-                        c.max_ms,
-                        c.jitter_ms,
-                    );
-                }
-            }
+            took_report(shared, link, reading);
         }
     }
 
@@ -1186,92 +1839,139 @@ fn run_inner(shared: &Arc<Shared>) {
     }
 }
 
-/// Find a controller in pairing mode and bond it.
-///
-/// ⭐ Picks by Class of Device, and only ever an unpaired one. Bonding a
-/// controller REPLACES the host it belongs to, so choosing the wrong device
-/// here means walking to a console and re-pairing it — the reason this is one
-/// deliberate button and not something that happens on its own.
-fn run_pairing(radio: &flexinput_btle::radio::Radio, shared: &Arc<Shared>) {
-    let set = |p: PairPhase| {
-        if let Ok(mut g) = shared.pair_phase.lock() {
-            *g = p;
-        }
-    };
-    set(PairPhase::Searching);
-    let _ = radio.with_dongle(|d| d.set_inquiry_mode(0x01));
-    let known = keystore::load();
+fn set_phase(shared: &Shared, p: PairPhase) {
+    if let Ok(mut g) = shared.pair_phase.lock() {
+        *g = p;
+    }
+}
 
-    // ⭐ Stop inquiring the INSTANT a new gamepad answers.
-    //
-    // ❗ A device answers a page only while it is page-scanning, and a
-    // controller in pairing mode cycles through that state rather than sitting
-    // in it. Running the inquiry to its full length and paging afterwards
-    // spends exactly the window in which the answer was easy — which is why a
-    // controller that had plainly just replied to the inquiry then failed to be
-    // paged with `Page Timeout`. Cancelling early puts the page out while it is
-    // still listening for one.
-    // ⭐ ONE lease across inquiry AND page. Releasing between them would let
-    // the shared reader consume the very Connection Complete the page is
-    // waiting for — and an inquiry that has to be cancelled cleanly before a
-    // page can go out is a single conversation, not two.
-    let lease = radio.exclusive();
-    let dongle = lease.dongle();
-    // Recorded WITH the bond: a key only works for the adapter that made it.
-    let adapter = dongle.read_bd_addr().ok();
-    let found = dongle
-        .inquiry_until(8.0, &mut |r| {
-            r.looks_like_a_gamepad()
-                && !known.contains_key(&keystore::format_addr(r.address))
-        })
-        .unwrap_or_default();
-    // ⭐ Every answer, not just the ones that qualify. "No controller found"
-    // has two very different causes — nothing on the air, or something on the
-    // air that was filtered out — and they need opposite fixes.
-    if trace() {
-        eprintln!("[bt-classic] inquiry heard {} device(s)", found.len());
-        for r in &found {
-            eprintln!(
-                "[bt-classic]   {} class {:02x?} rssi {:?} gamepad={} known={}",
-                keystore::format_addr(r.address),
-                r.class_of_device,
-                r.rssi,
-                r.looks_like_a_gamepad(),
-                known.contains_key(&keystore::format_addr(r.address)),
-            );
+/// How long one inquiry round of a pairing search runs. Another starts as
+/// each ends, until a controller pairs or the search is cancelled.
+const SEARCH_ROUND: f32 = 6.4;
+
+/// A pairing search: inquiry rounds until a controller in pairing mode
+/// answers, then pairing it.
+///
+/// ⭐ Picks by Class of Device. Bonding a controller REPLACES the host it
+/// belongs to, so choosing the wrong device here means walking to a console
+/// and re-pairing it — the reason this is one deliberate button and not
+/// something that happens on its own.
+///
+/// ⭐ **Rounds on the shared radio, not one long lease.** A search runs until
+/// a person stops it, and an exclusive lease that long would stop every other
+/// link on the radio for as long, Joy-Cons included. The rounds are started
+/// and their answers read off the subscription like any other event; only
+/// pairing what they found takes the radio.
+#[derive(Default)]
+struct Search {
+    /// A round is running.
+    running: bool,
+    /// When to start the next round, after the radio refused one.
+    next_round: Option<Instant>,
+    /// Gamepads heard this round.
+    heard: HashMap<[u8; 6], flexinput_btle::hci::InquiryResult>,
+    /// The round has ended: already-paired pads heard in it may be picked.
+    round_over: bool,
+}
+
+impl Search {
+    fn hear(&mut self, results: Vec<flexinput_btle::hci::InquiryResult>) {
+        for r in results {
+            // ⭐ Every answer, not just the ones that qualify. "No controller
+            // found" has two very different causes — nothing on the air, or
+            // something on the air that was filtered out — and they need
+            // opposite fixes.
+            if trace() {
+                eprintln!(
+                    "[bt-classic]   heard {} class {:02x?} rssi {:?} gamepad={}",
+                    keystore::format_addr(r.address),
+                    r.class_of_device,
+                    r.rssi,
+                    r.looks_like_a_gamepad(),
+                );
+            }
+            if r.looks_like_a_gamepad() {
+                self.heard.insert(r.address, r);
+            }
         }
     }
 
-    // ⛔ **Already-paired controllers are CANDIDATES, not exclusions.**
-    //
-    // This used to filter them out entirely, on the reasoning that re-bonding a
-    // working pad by accident would be bad. The effect was that the single case
-    // most in need of this button — a stored key that no longer matches, after
-    // a dongle swap, a re-pair on a console, or a key file copied between
-    // machines — was the one case it refused to handle. The user held Sync, the
-    // controller answered the inquiry, and pairing reported "No new controller
-    // found" about a controller sitting right in front of them.
-    //
-    // The original worry is met by ORDERING rather than by exclusion: an
-    // unpaired pad always outranks a paired one, so pairing a genuinely new
-    // controller still cannot grab a working one, and within each group the
-    // strongest signal wins — the pad the user just picked up is the near one.
-    let mut pads: Vec<_> = found.iter().filter(|r| r.looks_like_a_gamepad()).collect();
-    pads.sort_by_key(|r| {
-        let already = known.contains_key(&keystore::format_addr(r.address));
-        (already, -(r.rssi.unwrap_or(-127) as i32))
-    });
+    /// The controller to pair now, if any.
+    ///
+    /// ⭐ An unpaired one the INSTANT it answers.
+    ///
+    /// ❗ A device answers a page only while it is page-scanning, and a
+    /// controller in pairing mode cycles through that state rather than
+    /// sitting in it. Running the inquiry to its full length and paging
+    /// afterwards spends exactly the window in which the answer was easy —
+    /// which is why a controller that had plainly just replied to the inquiry
+    /// then failed to be paged with `Page Timeout`. Taking it at once puts the
+    /// page out while it is still listening for one.
+    ///
+    /// ⛔ **Already-paired controllers are CANDIDATES, not exclusions.**
+    ///
+    /// They used to be filtered out entirely, on the reasoning that re-bonding
+    /// a working pad by accident would be bad. The effect was that the single
+    /// case most in need of this button — a stored key that no longer
+    /// matches, after a dongle swap, a re-pair on a console, or a key file
+    /// copied between machines — was the one case it refused to handle. The
+    /// user held Sync, the controller answered the inquiry, and pairing
+    /// reported "No new controller found" about a controller sitting right in
+    /// front of them.
+    ///
+    /// The original worry is met by ORDERING rather than by exclusion: a
+    /// paired pad waits for the end of the round, so an unpaired one heard in
+    /// it still wins, and within each group the strongest signal wins — the
+    /// pad the user just picked up is the near one.
+    fn pick(
+        &mut self,
+        known: &std::collections::BTreeMap<String, keystore::Pairing>,
+    ) -> Option<flexinput_btle::hci::InquiryResult> {
+        let paired = |r: &flexinput_btle::hci::InquiryResult| {
+            known.contains_key(&keystore::format_addr(r.address))
+        };
+        let best = self
+            .heard
+            .values()
+            .filter(|r| self.round_over || !paired(r))
+            .min_by_key(|r| (paired(r), -(r.rssi.unwrap_or(-127) as i32)))
+            .cloned();
+        if best.is_some() {
+            self.heard.clear();
+        }
+        best
+    }
+}
 
-    let Some(r) = pads.first() else {
-        set(PairPhase::Failed(
-            "No controller found. Hold its Sync button until the lights run, then try again."
-                .into(),
-        ));
-        return;
-    };
+/// How pairing one controller went.
+enum Paired {
+    Done(String),
+    /// An outcome the search ends on: the controller paired but can't be
+    /// used, or its key couldn't be kept.
+    Stop(String),
+    /// It didn't pair; the search carries on.
+    Retry(String),
+}
+
+/// Pair a controller the search found: stop the round, page and bond it, ask
+/// what it is, keep the key.
+fn pair_one(
+    radio: &flexinput_btle::radio::Radio,
+    shared: &Shared,
+    r: &flexinput_btle::hci::InquiryResult,
+) -> Paired {
     let addr = r.address;
     let text = keystore::format_addr(addr);
-    set(PairPhase::Pairing(text.clone()));
+    set_phase(shared, PairPhase::Pairing(text.clone()));
+    // ⭐ ONE lease across stopping the round AND the page. Releasing between
+    // them would let the shared reader consume the very Connection Complete
+    // the page is waiting for — and an inquiry that has to be cancelled
+    // cleanly before a page can go out is a single conversation, not two.
+    let lease = radio.exclusive();
+    let dongle = lease.dongle();
+    dongle.cancel_inquiry();
+    // Recorded WITH the bond: a key only works for the adapter that made it.
+    let adapter = dongle.read_bd_addr().ok();
 
     let mut quiet = |_: &str| {};
     // ⭐ Retried, because a Page Timeout is an ordinary event rather than a
@@ -1299,10 +1999,11 @@ fn run_pairing(radio: &flexinput_btle::radio::Radio, shared: &Arc<Shared>) {
                 // remote made, and asking again just annoys it.
                 let retryable = msg.contains("0x04") || msg.contains("timed out");
                 outcome = Err(msg);
-                if !retryable || attempt == 3 {
+                // Nor after the person stopped the search.
+                if !retryable || attempt == 3 || shared.pair_cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                set(PairPhase::Pairing(format!("{text} (attempt {})", attempt + 1)));
+                set_phase(shared, PairPhase::Pairing(format!("{text} (attempt {})", attempt + 1)));
                 std::thread::sleep(Duration::from_millis(600));
             }
         }
@@ -1314,22 +2015,44 @@ fn run_pairing(radio: &flexinput_btle::radio::Radio, shared: &Arc<Shared>) {
                 .ok()
                 .filter(|n| !n.is_empty());
             let label = name.clone().unwrap_or_else(|| text.clone());
-            match link.link_key {
+            // ⭐ What it is, asked while the link is up: its ids say how it is
+            // read, and its descriptor is what the system reads it by on
+            // Linux. A pad that doesn't answer is asked again when it next
+            // connects (`bring_up`).
+            let info = dongle
+                .sdp_identify(link.conn_handle, SDP_CID_PAIRING, &mut quiet)
+                .ok()
+                .map(device_info);
+            let family = family_of(info.as_ref());
+            if family == Family::Unsupported {
+                let _ = dongle.disconnect(link.conn_handle);
+                return Paired::Stop(format!(
+                    "{label} paired, but {} — pair it with this computer's own Bluetooth again to use it there.",
+                    unsupported_reason()
+                ));
+            }
+            if let Some(i) = &info {
+                if let Err(e) = keystore::put_device(addr, i) {
+                    eprintln!("[bt-classic] {text}: device record not saved: {e}");
+                }
+            }
+            let result = match link.link_key {
                 Some(k) => match keystore::put(addr, k, name.as_deref(), adapter) {
-                    Ok(_) => set(PairPhase::Done(label)),
+                    // Paired and kept; one that waits on usbip-win2 says so.
+                    Ok(_) => Paired::Done(match not_readable(family) {
+                        Some(why) => format!("{label}, but {why}"),
+                        None => label,
+                    }),
                     // The bond already replaced the controller's old host, so a
                     // key that did not save is a real loss, not a retry.
-                    Err(e) => set(PairPhase::Failed(format!(
-                        "Paired, but the key could not be saved: {e}"
-                    ))),
+                    Err(e) => Paired::Stop(format!("Paired, but the key could not be saved: {e}")),
                 },
-                None => set(PairPhase::Failed("Paired but no link key arrived".into())),
-            }
+                None => Paired::Retry("Paired but no link key arrived".into()),
+            };
             let _ = dongle.disconnect(link.conn_handle);
+            result
         }
-        Err(e) => set(PairPhase::Failed(format!(
-            "{text} did not pair after 3 tries: {e}"
-        ))),
+        Err(e) => Paired::Retry(format!("{text} did not pair after 3 tries: {e}")),
     }
 }
 
@@ -1341,8 +2064,9 @@ fn adopt(
     addr: [u8; 6],
     key: [u8; 16],
     cid_base: u16,
+    info: Option<keystore::DeviceInfo>,
 ) -> Result<Link, String> {
-    bring_up(sub, addr, key, cid_base, flexinput_btle::NO_PAGE, 0x0000)
+    bring_up(sub, addr, key, cid_base, flexinput_btle::NO_PAGE, 0x0000, info)
 }
 
 /// Page a known device and bring its HID interrupt channel up.
@@ -1351,6 +2075,7 @@ fn connect(
     addr: [u8; 6],
     key: [u8; 16],
     cid_base: u16,
+    info: Option<keystore::DeviceInfo>,
 ) -> Result<Link, String> {
     // ⭐ Page scan repetition mode R2 and an UNKNOWN clock offset.
     //
@@ -1358,9 +2083,25 @@ fn connect(
     // there is no fresh inquiry result to take these from. R2 with a zero
     // offset is the conservative pair: the radio listens across the full
     // page-scan window instead of assuming it knows when the remote wakes.
-    bring_up(sub, addr, key, cid_base, 0x02, 0x0000)
+    bring_up(sub, addr, key, cid_base, 0x02, 0x0000, info)
 }
 
+/// Where a pairing run opens its SDP channel. Its link is new and carries
+/// nothing else yet.
+const SDP_CID_PAIRING: u16 = 0x0070;
+
+/// A device record from an SDP answer; zeros and an empty descriptor for
+/// what it didn't say.
+fn device_info(r: flexinput_btle::sdp::DeviceRecord) -> keystore::DeviceInfo {
+    keystore::DeviceInfo {
+        vid: r.vid.unwrap_or(0),
+        pid: r.pid.unwrap_or(0),
+        version: r.version.unwrap_or(0),
+        descriptor: r.descriptor.unwrap_or_default(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bring_up(
     sub: &flexinput_btle::radio::Subscriber,
     addr: [u8; 6],
@@ -1368,6 +2109,7 @@ fn bring_up(
     cid_base: u16,
     psrm: u8,
     clock: u16,
+    mut info: Option<keystore::DeviceInfo>,
 ) -> Result<Link, String> {
     // Silent normally; under trace, the whole conversation. A setup that
     // fails at one step is unreadable without the steps that came before it.
@@ -1453,7 +2195,37 @@ fn bring_up(
                 return Err(e.to_string());
             }
         };
+    // ⭐ What it is, asked once and kept: a pairing made before device
+    // records existed, or one that didn't answer while pairing. Asked after
+    // the HID channels so the pad's own setup isn't kept waiting; the few
+    // reports that arrive meanwhile are dropped. One that won't say is read
+    // as before, as a Switch Pro.
+    if info.is_none() {
+        // Clear of the HID pair's ids (`cid_base`, `cid_base + 1`) for every slot.
+        match dongle.sdp_identify(link.conn_handle, cid_base + 0x20, &mut quiet) {
+            Ok(rec) => {
+                let d = device_info(rec);
+                if let Err(e) = keystore::put_device(addr, &d) {
+                    eprintln!("[bt-classic] {}: device record not saved: {e}", keystore::format_addr(addr));
+                }
+                info = Some(d);
+            }
+            Err(e) => quiet(&format!("SDP failed ({e}) — reading it as a Switch Pro")),
+        }
+    }
     Ok(Link {
+        family: family_of(info.as_ref()),
+        info,
+        ctl_queue: VecDeque::new(),
+        ctl_in_flight: None,
+        full: false,
+        full_tries: 0,
+        full_next: None,
+        sony_seq: 0,
+        lightbar_set_up: false,
+        xbox: XboxState::default(),
+        #[cfg(any(target_os = "linux", windows))]
+        passthrough: None,
         addr,
         conn: link.conn_handle,
         control,
@@ -1473,13 +2245,27 @@ fn bring_up(
     })
 }
 
-fn device_id(addr: [u8; 6]) -> String {
-    format!("btc:switch_pro:{}", addr.iter().map(|b| format!("{b:02x}")).collect::<String>())
+/// What a pad this backend lists is, by family: `None` for one it doesn't
+/// list (a passthrough pad is listed by whichever backend reads it from the
+/// system).
+fn kind_of(family: Family) -> Option<ControllerKind> {
+    match family {
+        Family::SwitchPro => Some(ControllerKind::SwitchPro),
+        Family::Sony { dualsense: true, .. } => Some(ControllerKind::DualSense),
+        Family::Sony { dualsense: false, .. } => Some(ControllerKind::DualShock4),
+        Family::Xbox => Some(ControllerKind::XInput),
+        Family::Passthrough | Family::Unsupported => None,
+    }
+}
+
+/// `btc:<kind slug>:<address hex>`, the shape the UI reads a pad's kind from.
+fn device_id(kind: ControllerKind, addr: [u8; 6]) -> String {
+    format!("btc:{}:{}", kind.id_slug(), addr.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// The address back out of a [`device_id`]; `None` for anybody else's id.
 fn parse_device_id(id: &str) -> Option<[u8; 6]> {
-    let hex = id.strip_prefix("btc:switch_pro:")?;
+    let (_, hex) = id.strip_prefix("btc:")?.split_once(':')?;
     if hex.len() != 12 {
         return None;
     }
@@ -1496,23 +2282,34 @@ impl DeviceBackend for ClassicBtBackend {
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         let pads = self.shared.pads.lock().unwrap();
         pads.values()
-            .filter(|p| p.last.elapsed() < STALE)
-            .map(|p| PhysicalDevice {
-                id: device_id(p.address),
-                // ⭐ The controller's OWN name, captured at pair time. A
-                // device list that reads "Pro Controller" beats one that reads
-                // a hard-coded guess, and with several pads it is the only way
-                // to tell them apart.
-                display_name: p.name.clone().unwrap_or_else(|| "Pro Controller (dongle)".into()),
-                kind: ControllerKind::SwitchPro,
-                outputs: layouts::outputs_for(ControllerKind::SwitchPro),
-                inputs: layouts::inputs_for(ControllerKind::SwitchPro),
-                // No Windows HID node exists for it — the OS never bound a
-                // driver, which is the whole point — so there is nothing for
-                // HidHide to mask and nothing to look up.
-                instance_path: None,
-                vid: None,
-                pid: None,
+            .filter(|p| !streams(p.family) || p.last.elapsed() < STALE)
+            .filter_map(|p| {
+                let kind = kind_of(p.family)?;
+                // The Edge's back and Fn buttons come with its ids.
+                let (vid, pid) = match p.family {
+                    Family::Sony { edge: true, .. } => (Some(0x054C), Some(0x0DF2)),
+                    _ => (None, None),
+                };
+                Some(PhysicalDevice {
+                    id: device_id(kind, p.address),
+                    // ⭐ The controller's OWN name, captured at pair time. A
+                    // device list that reads "Pro Controller" beats one that
+                    // reads a hard-coded guess, and with several pads it is the
+                    // only way to tell them apart.
+                    display_name: p
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{} (dongle)", kind.display_name())),
+                    kind,
+                    outputs: layouts::outputs_for_pad(kind, vid, pid),
+                    inputs: layouts::inputs_for(kind),
+                    // No Windows HID node exists for it — the OS never bound a
+                    // driver, which is the whole point — so there is nothing
+                    // for HidHide to mask and nothing to look up.
+                    instance_path: None,
+                    vid: None,
+                    pid: None,
+                })
             })
             .collect()
     }
@@ -1524,9 +2321,9 @@ impl DeviceBackend for ClassicBtBackend {
             Signal::Bool(b) => if b { 1.0 } else { 0.0 },
             _ => return,
         };
-        // Only rumble reaches a Pro Controller, and every rumble pin is a
-        // linear 0–255 byte — the same scaling the HID path uses for them.
-        let byte = (f * 255.0) as u8;
+        // Each pin in its own range, as the HID path scales it: rumble is a
+        // linear byte, a Sony pad's trigger effects and LEDs are not.
+        let byte = output_pin_byte(pin_id, f);
         if let Ok(mut outs) = self.shared.outputs.lock() {
             outs.entry(addr).or_default().stage(pin_id, byte);
         }
@@ -1547,9 +2344,10 @@ impl DeviceBackend for ClassicBtBackend {
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {
         let mut pads = self.shared.pads.lock().unwrap();
         pads.values_mut()
-            .map(|p| {
+            .filter_map(|p| {
+                let kind = kind_of(p.family)?;
                 let n = std::mem::take(&mut p.events);
-                (device_id(p.address), n)
+                Some((device_id(kind, p.address), n))
             })
             .collect()
     }
@@ -1557,31 +2355,42 @@ impl DeviceBackend for ClassicBtBackend {
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
         let pads = self.shared.pads.lock().unwrap();
         let mut out = Vec::with_capacity(pads.len() * 32);
-        for p in pads.values().filter(|p| p.last.elapsed() < STALE) {
-            let dev = device_id(p.address);
+        for p in pads.values().filter(|p| !streams(p.family) || p.last.elapsed() < STALE) {
+            let Some(kind) = kind_of(p.family) else { continue };
+            let dev = device_id(kind, p.address);
             let g = &p.reading;
-            for (pin, v) in [
-                ("gyro_x", g.gyro_x),
-                ("gyro_y", g.gyro_y),
-                ("gyro_z", g.gyro_z),
-                ("accel_x", g.accel_x),
-                ("accel_y", g.accel_y),
-                ("accel_z", g.accel_z),
-            ] {
-                out.push((dev.clone(), pin.into(), Signal::Float(v)));
+            // Motion: the pads that have it.
+            if matches!(p.family, Family::SwitchPro | Family::Sony { .. }) {
+                for (pin, v) in [
+                    ("gyro_x", g.gyro_x),
+                    ("gyro_y", g.gyro_y),
+                    ("gyro_z", g.gyro_z),
+                    ("accel_x", g.accel_x),
+                    ("accel_y", g.accel_y),
+                    ("accel_z", g.accel_z),
+                ] {
+                    out.push((dev.clone(), pin.into(), Signal::Float(v)));
+                }
             }
-            if let Some(sb) = g.switch_buttons {
-                push_switch_pro_buttons(&mut out, &dev, &sb);
-            }
-            if let Some(b) = g.battery {
-                out.push((dev.clone(), "battery".into(), Signal::Float(b)));
+            match p.family {
+                Family::Sony { dualsense, edge } => push_sony_reading(&mut out, &dev, g, dualsense, edge),
+                // Same positional pins; see `XboxState`.
+                Family::Xbox => push_sony_reading(&mut out, &dev, g, false, false),
+                _ => {
+                    if let Some(sb) = g.switch_buttons {
+                        push_switch_pro_buttons(&mut out, &dev, &sb);
+                    }
+                    if let Some(b) = g.battery {
+                        out.push((dev.clone(), "battery".into(), Signal::Float(b)));
+                    }
+                }
             }
         }
         out
     }
 }
 
-/// Pins a classic controller publishes, for tests and for the device list.
+/// Pins a Switch Pro on the dongle publishes, for tests and for the device list.
 pub fn outputs() -> Vec<DevicePin> {
     layouts::outputs_for(ControllerKind::SwitchPro)
 }
@@ -1683,7 +2492,8 @@ mod tests {
     #[test]
     fn a_device_id_parses_back_to_its_address() {
         let a = [0xda, 0x2d, 0x16, 0x0f, 0x01, 0x69];
-        assert_eq!(parse_device_id(&device_id(a)), Some(a));
+        assert_eq!(parse_device_id(&device_id(ControllerKind::SwitchPro, a)), Some(a));
+        assert_eq!(parse_device_id(&device_id(ControllerKind::DualSense, a)), Some(a));
         assert_eq!(parse_device_id("gilrs:switch_pro:0"), None);
         assert_eq!(parse_device_id("btc:switch_pro:da2d"), None);
     }
@@ -1691,9 +2501,92 @@ mod tests {
     #[test]
     fn a_device_id_is_stable_and_address_tagged() {
         let a = [0xda, 0x2d, 0x16, 0x0f, 0x01, 0x69];
-        assert_eq!(device_id(a), "btc:switch_pro:da2d160f0169");
+        // ⛔ Unchanged for the Switch Pro: saved patches name it this way.
+        assert_eq!(device_id(ControllerKind::SwitchPro, a), "btc:switch_pro:da2d160f0169");
+        assert_eq!(device_id(ControllerKind::DualShock4, a), "btc:ds4:da2d160f0169");
         // Two controllers must not collide.
-        assert_ne!(device_id(a), device_id([0; 6]));
+        assert_ne!(device_id(ControllerKind::SwitchPro, a), device_id(ControllerKind::SwitchPro, [0; 6]));
+    }
+
+    fn info(vid: u16, pid: u16, descriptor: &[u8]) -> keystore::DeviceInfo {
+        keystore::DeviceInfo { vid, pid, version: 0x0100, descriptor: descriptor.to_vec() }
+    }
+
+    /// ⛔ A pairing with no device record is a Switch Pro: every one made
+    /// before records existed was, and they must keep working.
+    #[test]
+    fn families_follow_the_device_record() {
+        assert_eq!(family_of(None), Family::SwitchPro);
+        assert_eq!(family_of(Some(&info(0x057E, 0x2009, &[0x05]))), Family::SwitchPro);
+        let ds = family_of(Some(&info(0x054C, 0x0CE6, &[0x05])));
+        let edge = family_of(Some(&info(0x054C, 0x0DF2, &[0x05])));
+        let ds4 = family_of(Some(&info(0x054C, 0x09CC, &[0x05])));
+        let xbox = family_of(Some(&info(0x045E, 0x02E0, &[0x05])));
+        let other = family_of(Some(&info(0x2DC8, 0x6001, &[0x05])));
+        let no_hid = family_of(Some(&info(0x2DC8, 0x6001, &[])));
+        if cfg!(target_os = "linux") {
+            for f in [ds, edge, ds4, xbox] {
+                assert_eq!(f, Family::Passthrough);
+            }
+        } else {
+            assert_eq!(xbox, Family::Xbox);
+            assert_eq!(ds, Family::Sony { dualsense: true, edge: false });
+            assert_eq!(edge, Family::Sony { dualsense: true, edge: true });
+            assert_eq!(ds4, Family::Sony { dualsense: false, edge: false });
+        }
+        // Everything else with a HID service goes to the system, everywhere.
+        assert_eq!(other, Family::Passthrough);
+        assert_eq!(no_hid, Family::Unsupported);
+        assert_eq!(not_readable(Family::Unsupported), Some(unsupported_reason()));
+        assert_eq!(not_readable(Family::SwitchPro), None);
+    }
+
+    /// A 17-byte state report (current firmware) as SDL decodes it: sticks
+    /// centred at 0x8000 with Y down-positive, 10-bit triggers, the hat 1–8
+    /// from up, the face buttons with gaps where the original's were.
+    #[test]
+    fn an_xbox_state_report_decodes_as_sdl_reads_it() {
+        let mut r = [0u8; 17];
+        r[0] = 0x01;
+        r[1..3].copy_from_slice(&0xFFFFu16.to_le_bytes()); // left X full right
+        r[3..5].copy_from_slice(&0x0000u16.to_le_bytes()); // left Y full UP (report is down-positive)
+        r[5..7].copy_from_slice(&0x8000u16.to_le_bytes());
+        r[7..9].copy_from_slice(&0x8000u16.to_le_bytes());
+        r[9..11].copy_from_slice(&1023u16.to_le_bytes()); // left trigger full
+        r[13] = 3; // hat right
+        r[14] = 0x01 | 0x08; // A, X
+        r[15] = 0x10 | 0x08; // guide, menu
+        let mut x = XboxState::default();
+        let ds = x.take(&r).unwrap().dualsense.unwrap();
+        assert!(ds.lx > 0.99 && ds.ly > 0.99, "{} {}", ds.lx, ds.ly);
+        assert!(ds.rx.abs() < 1e-3 && ds.ry.abs() < 1e-3);
+        assert!((ds.l2 - 1.0).abs() < 1e-6 && ds.btn_l2 && !ds.btn_r2);
+        assert!(ds.dpad_right && !ds.dpad_up && !ds.dpad_down);
+        assert!(ds.btn_south && ds.btn_west && !ds.btn_east && !ds.btn_north);
+        assert!(ds.btn_ps && ds.btn_options && !ds.btn_create);
+        // A guide report of its own takes the guide button over from then on.
+        assert!(x.take(&[0x02, 0x00]).unwrap().dualsense.unwrap().btn_ps == false);
+        assert!(!x.take(&r).unwrap().dualsense.unwrap().btn_ps, "the state report's bit is no longer the guide");
+        // The battery, in four steps.
+        assert_eq!(x.take(&[0x04, 0x02]).unwrap().battery, Some(0.7));
+        // The original Xbox One S's 16-byte layout.
+        let mut old = [0u8; 16];
+        old[0] = 0x01;
+        old[14] = 0x04 | 0x40; // X, View
+        old[15] = 0x02; // right stick
+        let ds = XboxState::default().take(&old).unwrap().dualsense.unwrap();
+        assert!(ds.btn_west && ds.btn_create && ds.btn_rs && !ds.btn_south);
+    }
+
+    /// Only what this backend reads itself is listed.
+    #[test]
+    fn passthrough_pads_are_not_listed_here() {
+        assert_eq!(kind_of(Family::Passthrough), None);
+        assert_eq!(kind_of(Family::Unsupported), None);
+        assert_eq!(kind_of(Family::Sony { dualsense: false, edge: false }), Some(ControllerKind::DualShock4));
+        assert_eq!(kind_of(Family::Xbox), Some(ControllerKind::XInput));
+        // Only the pads that stream are timed out by silence.
+        assert!(streams(Family::SwitchPro) && !streams(Family::Xbox) && !streams(Family::Passthrough));
     }
 
     /// ⛔ The dongle selector must not silently fall back on a typo.

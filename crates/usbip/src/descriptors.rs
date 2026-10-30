@@ -436,6 +436,65 @@ impl DescriptorSet {
         })
     }
 
+    /// A plain one-interface HID device: `report` as its report descriptor,
+    /// an interrupt endpoint each way, full speed, its product name and
+    /// serial as strings. What a passthrough of a Bluetooth pad is.
+    pub fn hid(vid: u16, pid: u16, bcd_device: u16, product: &str, serial: &str, report: &[u8]) -> Result<Self, DescriptorError> {
+        let Ok(report_len) = u16::try_from(report.len()) else {
+            return err("report descriptor too long");
+        };
+        let [vl, vh] = vid.to_le_bytes();
+        let [pl, ph] = pid.to_le_bytes();
+        let [bl, bh] = bcd_device.to_le_bytes();
+        // No manufacturer string: the pad never said; product 1, serial 2.
+        let device = vec![18, 0x01, 0x00, 0x02, 0, 0, 0, 64, vl, vh, pl, ph, bl, bh, 0, 1, 2, 1];
+        let [rl, rh] = report_len.to_le_bytes();
+        let mut configuration = vec![
+            9, 0x02, 0, 0, 1, 1, 0, 0x80, 50, // one interface, bus powered, 100 mA
+            9, 0x04, 0, 0, 2, 0x03, 0, 0, 0, // HID, two endpoints, no boot protocol
+            9, 0x21, 0x11, 0x01, 0, 1, 0x22, rl, rh, // HID 1.11, one report descriptor
+            7, 0x05, 0x81, 0x03, 64, 0, 1, // interrupt IN, 64 bytes, 1 ms
+            7, 0x05, 0x02, 0x03, 64, 0, 1, // interrupt OUT
+        ];
+        let total = configuration.len() as u16;
+        configuration[2..4].copy_from_slice(&total.to_le_bytes());
+        let endpoint = |address: u8| EndpointInfo {
+            address,
+            attributes: 0x03,
+            max_packet_size: 64,
+            interval: 1,
+            interface: 0,
+            alt_setting: 0,
+        };
+        Ok(DescriptorSet {
+            profile_id: "passthrough".into(),
+            qualifier: [0x0A, 0x06, device[2], device[3], device[4], device[5], device[6], device[7], device[17], 0],
+            hid_class: configuration[18..27].to_vec(),
+            device,
+            configuration,
+            other_speed: None,
+            report: report.to_vec(),
+            configuration_value: 1,
+            num_interfaces: 1,
+            vid,
+            pid,
+            bcd_device,
+            speed: SPEED_FULL,
+            endpoints: [(0x81, endpoint(0x81)), (0x02, endpoint(0x02))].into(),
+            hid_interface: 0,
+            audio_streams: Vec::new(),
+            audio_controls: Vec::new(),
+            manufacturer: None,
+            product: Some(product.to_string()),
+            serial: Some(serial.to_string()),
+            configuration_name: None,
+            i_manufacturer: 0,
+            i_product: 1,
+            i_serial: 2,
+            i_configuration: 0,
+        })
+    }
+
     /// The serial served at the device's serial index.
     pub fn serial(&self) -> Option<&str> {
         self.serial.as_deref()

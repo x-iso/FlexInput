@@ -17,6 +17,10 @@
 //! device and isochronous-engine logic, and the transport behaviour its notes
 //! record — restricted to the Sony composites and fed in-process instead of
 //! through shared memory.
+//!
+//! The same server also passes a real HID device through
+//! ([`passthrough`]): the Bluetooth pads on FlexInput's own adapter, which
+//! Windows then reads as the USB controllers they'd be on a cable.
 
 pub mod descriptors;
 pub mod profiles;
@@ -26,6 +30,8 @@ mod audio;
 mod device;
 mod feature;
 mod pacer;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod passthrough;
 mod server;
 #[cfg(windows)]
 pub mod vhci;
@@ -33,11 +39,14 @@ pub mod vhci;
 #[path = "vhci_linux.rs"]
 pub mod vhci;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use audio::PcmSink;
 pub use descriptors::{AudioStream, DescriptorError, DescriptorSet};
 pub use device::{OutputFrame, OutputKind};
+#[cfg(any(windows, target_os = "linux"))]
+pub use passthrough::{HostRequest, Passthrough, PassthroughSpec, ReportKind};
 pub use server::{is_our_location, BASE_PORT, HOST, PORT_RANGE};
 
 use device::DeviceInner;
@@ -72,6 +81,19 @@ pub fn serial_for(key: &str) -> String {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("FX{:012X}", h & 0xFFFF_FFFF_FFFF)
+}
+
+/// Plug out what a crashed session left attached, once per process: before
+/// the server exports its first device, or the driver's re-attach loop for a
+/// dead session's device could import the new one first. See
+/// [`vhci::sweep_stale`]. Every kind of device this server exports goes
+/// through here, so a later one never sweeps an earlier one away.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn sweep_stale_once() {
+    static SWEPT: AtomicBool = AtomicBool::new(false);
+    if !SWEPT.swap(true, Ordering::AcqRel) {
+        vhci::sweep_stale(None);
+    }
 }
 
 /// Whether a USB serial is one [`serial_for`] makes.
@@ -267,6 +289,58 @@ mod tests {
         drop(dev);
         let mut b = [0u8; 1];
         assert_eq!(first.read(&mut b).unwrap_or(0), 0, "the connection closes");
+    }
+
+    /// A passthrough serves the pad's own descriptor and serial, and the
+    /// host's report reads wait for the device's answer.
+    #[test]
+    fn a_passthrough_forwards_report_requests_and_answers_with_the_reply() {
+        let report = [0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0xC0];
+        let desc = DescriptorSet::hid(0x045E, 0x02E0, 0x0903, "Xbox Wireless Controller", "98B6E9ABCDEF", &report).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = server::global().unwrap();
+        let dev = server.register(|busid, devid| Arc::new(DeviceInner::passthrough(desc, busid, devid, tx)));
+        let mut s = {
+            let mut s = TcpStream::connect((HOST, server.port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut req = vec![0u8; 8 + BUS_ID_SIZE];
+            write_op_common(&mut req, OP_REQ_IMPORT, 0);
+            req[8..8 + dev.busid.len()].copy_from_slice(dev.busid.as_bytes());
+            s.write_all(&req).unwrap();
+            let mut rep = vec![0u8; 8 + USB_DEVICE_SIZE];
+            s.read_exact(&mut rep).unwrap();
+            s
+        };
+        let control = |seqnum: u32, setup: [u8; 8], len: i32| Command {
+            command: CMD_SUBMIT,
+            seqnum,
+            direction: 1,
+            transfer_buffer_length: len,
+            number_of_packets: NON_ISOCH,
+            setup,
+            ..Default::default()
+        };
+        // The serial, string 2.
+        s.write_all(&control(1, [0x80, 0x06, 0x02, 0x03, 0x09, 0x04, 0xFF, 0], 255).to_bytes()).unwrap();
+        let (_, _, status, actual, data) = read_reply(&mut s, 26);
+        assert_eq!((status, actual), (0, 26));
+        let serial: String = char::decode_utf16(data[2..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])))
+            .map(|c| c.unwrap())
+            .collect();
+        assert_eq!(serial, "98B6E9ABCDEF");
+        assert!(!is_own_serial(&serial));
+        // The report descriptor, as the pad gave it.
+        s.write_all(&control(2, [0x81, 0x06, 0x00, 0x22, 0, 0, 0xFF, 0], 255).to_bytes()).unwrap();
+        assert_eq!(read_reply(&mut s, report.len()).4, report);
+        // GET_REPORT(Feature 3): handed out, answered by the "device".
+        s.write_all(&control(3, [0xA1, 0x01, 0x03, 0x03, 0, 0, 0x10, 0], 16).to_bytes()).unwrap();
+        let req = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(req, HostRequest::GetReport { id: 3, kind: ReportKind::Feature, number: 3 });
+        dev.complete(3, Some(&[0x03, 0xAA, 0xBB]));
+        let (_, seq, status, actual, data) = read_reply(&mut s, 3);
+        assert_eq!((seq, status, actual), (3, 0, 3));
+        assert_eq!(data, vec![0x03, 0xAA, 0xBB]);
+        server.unregister(&dev.busid);
     }
 
     #[test]
