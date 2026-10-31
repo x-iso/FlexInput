@@ -222,7 +222,7 @@ fn show_preset_picker(
     } else {
         "(unsaved)".into()
     };
-    let dirty = is_subpatch_dirty(canvas, easy_state, presets);
+    let dirty = is_subpatch_dirty_cached(canvas, easy_state, presets);
 
     // Layout: a single pill bar that extends downward when opened to
     // become one continuous body (header pill + section list below,
@@ -363,6 +363,7 @@ fn show_preset_picker(
                     &canvas.snarl, oid.0, tab_overlay, tab_config)
                 {
                     if let Some(path) = crate::app::save_subpatch_file(&sp) {
+                        super::presets::invalidate_index();
                         let hash = hash_subpatch(&sp);
                         easy_state.loaded_preset = Some((path, hash));
                     }
@@ -1585,6 +1586,22 @@ fn render_subpatch_body(
 }
 
 // ── Dirty detection + preset application ────────────────────────────
+
+/// [`is_subpatch_dirty`] for the preset bar, drawn every frame. Working it out
+/// serializes the whole sub-patch, so it's only done after an edit, a new preset,
+/// or a second: long enough for an indicator, but anything that acts on the answer
+/// asks [`is_subpatch_dirty`] itself.
+fn is_subpatch_dirty_cached(canvas: &Canvas, easy_state: &mut EasyState, presets: &[PresetInfo]) -> bool {
+    let key = (canvas.mutation_gen, easy_state.loaded_preset.as_ref().map(|(_, h)| *h));
+    if let Some((at, k, dirty)) = easy_state.dirty_cache {
+        if k == key && at.elapsed() < std::time::Duration::from_secs(1) {
+            return dirty;
+        }
+    }
+    let dirty = is_subpatch_dirty(canvas, easy_state, presets);
+    easy_state.dirty_cache = Some((std::time::Instant::now(), key, dirty));
+    dirty
+}
 
 fn is_subpatch_dirty(canvas: &Canvas, easy_state: &EasyState, presets: &[PresetInfo]) -> bool {
     let Some(outer_id) = find_subpatch(canvas) else { return false; };

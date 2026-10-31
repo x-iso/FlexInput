@@ -2057,22 +2057,22 @@ pub(crate) fn show_delay_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutP
 }
 
 pub(crate) fn show_average_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (buf_size, spike_mad) = snarl
+    let (window_ms, spike_mad) = snarl
         .get_node(node_id)
         .map(|n| {
-            let bs = n.params.get("buf_size").and_then(|v| v.as_f64()).unwrap_or(10.0) as f32;
+            let ms = flexinput_engine::eval::average_window_ms(&n.params) as f32;
             let sm = n.params.get("spike_mad").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-            (bs, sm)
+            (ms, sm)
         })
-        .unwrap_or((10.0, 0.0));
+        .unwrap_or((5.0, 0.0));
 
-    let mut bs = buf_size;
+    let mut ms = window_ms;
     let mut sm = spike_mad;
     let mut changed = false;
 
     let r1 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Samples").small());
-        changed |= ui.add(egui::DragValue::new(&mut bs).speed(1.0).range(1.0..=10_000.0)).changed();
+        ui.label(egui::RichText::new("Window ms").small());
+        changed |= ui.add(egui::DragValue::new(&mut ms).speed(0.5).range(0.5..=5_000.0).max_decimals(1)).changed();
     });
     let r2 = ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Spike MAD").small())
@@ -2084,7 +2084,7 @@ pub(crate) fn show_average_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
-            if let Some(n) = Number::from_f64(bs as f64) { node.params.insert("buf_size".into(),  Value::Number(n)); }
+            if let Some(n) = Number::from_f64(ms as f64) { node.params.insert("window_ms".into(), Value::Number(n)); }
             if let Some(n) = Number::from_f64(sm as f64) { node.params.insert("spike_mad".into(), Value::Number(n)); }
         }
     }

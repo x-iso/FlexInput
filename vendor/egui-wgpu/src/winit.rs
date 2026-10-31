@@ -537,6 +537,25 @@ impl Painter {
             return vsync_sec;
         }
 
+        // FLEXINPUT PATCH: a frozen window keeps the frame it has. Its texture
+        // changes still go in: egui hands them to whichever viewport's pass ends
+        // first, and they don't come round again.
+        if crate::take_keep_frame(viewport_id) && !capture {
+            let mut renderer = render_state.renderer.write();
+            for (id, image_delta) in &textures_delta.set {
+                renderer.update_texture(
+                    &render_state.device,
+                    &render_state.queue,
+                    *id,
+                    image_delta,
+                );
+            }
+            for id in &textures_delta.free {
+                renderer.free_texture(id);
+            }
+            return vsync_sec;
+        }
+
         let mut encoder =
             render_state
                 .device

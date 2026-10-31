@@ -290,7 +290,7 @@ pub(crate) fn derive_imu_pins(upstream: &mut PinSigs, est: &mut ImuEstimator, dt
     };
     let r = est.tick(glam::Vec3::new(gx, gy, gz), accel, dt);
     for p in IMU_PINS {
-        upstream.insert(flexinput_core::pooled_string(p.id), Signal::Float(p.bus_value(&r)));
+        upstream.insert(p.id, Signal::Float(p.bus_value(&r)));
     }
 }
 
@@ -422,17 +422,15 @@ pub(crate) fn eval_touch_combo(in_pins: &[&str], upstream: &PinSigs) -> TouchCom
 pub(crate) fn publish_touch_points(
     key: &str,
     fingers: &[(f32, f32)],
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
 ) {
     for (i, (xk, yk, ak)) in [
         ("touch1_x", "touch1_y", "touch1_active"),
         ("touch2_x", "touch2_y", "touch2_active"),
     ].iter().enumerate() {
         if let Some((x, y)) = fingers.get(i) {
-            collector_sigs.insert((key.to_string(), xk.to_string()),
-                Signal::Float(x.clamp(-1.0, 1.0)));
-            collector_sigs.insert((key.to_string(), yk.to_string()),
-                Signal::Float(y.clamp(-1.0, 1.0)));
+            collector_sigs.set_pin(&key, xk, Signal::Float(x.clamp(-1.0, 1.0)));
+            collector_sigs.set_pin(&key, yk, Signal::Float(y.clamp(-1.0, 1.0)));
             collector_sigs.set_pin(&key, &ak, Signal::Bool(true));
         } else {
             collector_sigs.set_pin(&key, &ak, Signal::Bool(false));

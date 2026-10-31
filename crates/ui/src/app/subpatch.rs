@@ -284,11 +284,14 @@ pub(crate) fn show_subpatch_editors(
                 last_clipboard_gen: 0,
                 last_synced_parent_gen: None,
                 last_inner_gen: None,
+                freeze: Default::default(),
             });
         }
     }
 
     // Render each open editor window.
+    let may_freeze = !app.windows_must_draw(ctx);
+    let freeze_unfocused = app.freeze_unfocused_windows();
     let mut to_close: Vec<usize> = Vec::new();
     // Collect nested-open requests outside the loop to avoid borrow issues.
     let mut pending_nested: Vec<(usize, NodeId)> = Vec::new(); // (parent_editor_idx, child_node_id)
@@ -327,6 +330,44 @@ pub(crate) fn show_subpatch_editors(
             }).unwrap_or_else(|| "Sub-patch".to_string())
         };
 
+        let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
+        // Build breadcrumb: "Parent Name > This Name" for nested editors.
+        let window_title = if let Some(p) = parent_editor_idx {
+            let parent_name = app.sub_patch_editors[p].canvas.snarl
+                .get_node(app.sub_patch_editors[p].node_id)
+                .map(|n| n.display_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Sub-patch".to_string());
+            format!("✦ {} › {}", parent_name, display_name)
+        } else {
+            format!("✦ {}", display_name)
+        };
+
+        let viewport_builder = egui::ViewportBuilder::default()
+            .with_app_id(crate::APP_ID)
+            .with_title(window_title)
+            .with_inner_size([720.0, 540.0])
+            .with_min_inner_size([400.0, 300.0]);
+
+        let has_active_child = app.sub_patch_editors.iter().enumerate().any(|(j, e)| {
+            j != i && e.tab_idx == active && e.parent_editor_idx == Some(i)
+        });
+
+        // A parent editor carries its child's write-back up to the tab canvas,
+        // so it can't sit out while the child is open.
+        let facts = super::window_facts(ctx, viewport_id);
+        let step = app.sub_patch_editors[i].freeze.step(
+            &facts, may_freeze && !has_active_child, freeze_unfocused);
+        if step == super::WindowStep::KeepFrame {
+            let mut close_requested = false;
+            ctx.show_viewport_immediate(viewport_id, viewport_builder, |vctx, _class| {
+                close_requested = vctx.input(|i| i.viewport().close_requested());
+                eframe::egui_wgpu::keep_frame_on_screen(viewport_id);
+            });
+            if close_requested { to_close.push(i); }
+            continue;
+        }
+
         // Extract inner canvas.
         let mut inner_canvas = std::mem::replace(&mut app.sub_patch_editors[i].canvas, Canvas::new());
         let mut open = app.sub_patch_editors[i].open;
@@ -354,9 +395,6 @@ pub(crate) fn show_subpatch_editors(
         // Skip when a child editor is open: the child will write-back into this
         // editor's canvas this same frame (reverse loop order), and pre-sync would
         // overwrite those changes with the stale parent state.
-        let has_active_child = app.sub_patch_editors.iter().enumerate().any(|(j, e)| {
-            j != i && e.tab_idx == active && e.parent_editor_idx == Some(i)
-        });
         let parent_gen = match parent_editor_idx {
             None    => app.tabs[active].canvas.mutation_gen,
             Some(p) => app.sub_patch_editors[p].canvas.mutation_gen,
@@ -435,27 +473,10 @@ pub(crate) fn show_subpatch_editors(
         // holds `&app`); applied after it returns.
         let mut picker_result = crate::app::nav::PickerInteraction::default();
 
-        let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
-        // Build breadcrumb: "Parent Name > This Name" for nested editors.
-        let window_title = if let Some(p) = parent_editor_idx {
-            let parent_name = app.sub_patch_editors[p].canvas.snarl
-                .get_node(app.sub_patch_editors[p].node_id)
-                .map(|n| n.display_name.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "Sub-patch".to_string());
-            format!("✦ {} › {}", parent_name, display_name)
-        } else {
-            format!("✦ {}", display_name)
-        };
-
         puffin::profile_scope!("editor_viewport_show");
         ctx.show_viewport_immediate(
             viewport_id,
-            egui::ViewportBuilder::default()
-                .with_app_id(crate::APP_ID)
-                .with_title(window_title)
-                .with_inner_size([720.0, 540.0])
-                .with_min_inner_size([400.0, 300.0]),
+            viewport_builder,
             |vctx, _class| {
                 if vctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -567,6 +588,9 @@ pub(crate) fn show_subpatch_editors(
                     picker_result = app.kbm_picker_window(vctx);
                 }
                 crate::canvas::viewer::set_layout_mode_active(vctx, false);
+                if step == super::WindowStep::DrawDimmed {
+                    super::paint_window_veil(vctx);
+                }
             },
         );
 
@@ -805,6 +829,7 @@ pub(crate) fn show_subpatch_editors(
                 last_clipboard_gen: 0,
                 last_synced_parent_gen: None,
                 last_inner_gen: None,
+                freeze: Default::default(),
             });
         }
     }

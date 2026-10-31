@@ -29,8 +29,32 @@ All notable changes to FlexInput are documented here. This project adheres to
   another dongle or channel. Loading replaces all of that pad's calibration
   settings, including any the file doesn't have, which go back to their defaults.
 
+- **Lower processing rates.** The processing sample rate can now go down to the
+  polling rate, as low as 125 Hz, and can follow the output rate instead: **Same
+  as output** uses the least CPU, **2x output** costs twice that and makes timers,
+  gestures and PWM twice as fine. Set by hand stays the default, and your rate is
+  unchanged. On the patches we measured, even 1x barely changed the output.
+- **Freeze and dim unused windows.** A new option beside Background repaint rate
+  in Settings, off by default. FlexInput windows without focus stop drawing and
+  stay dimmed on their last frame, including when another FlexInput window has
+  focus. Mappings and overlays keep running. Your first click on a dimmed main window
+  works straight away, and passing the pointer over it costs nothing. A sub-patch
+  editor wakes when the pointer moves over it. A pinned or see-through window
+  stays live.
+
 ### Changed
 
+- **Mappings use about half the CPU.** The engine no longer looks up and copies
+  every pin by name on every tick, which was most of its work, so a patch runs
+  about twice as fast with exactly the same outputs. Nothing to set up, and nothing
+  is locked: every edit still applies at once.
+- **Easy mode draws faster.** Every frame re-read and re-hashed all presets and
+  serialized the whole sub-patch to JSON, about a third of a frame even without a
+  presets folder. A new or edited preset now shows up within 2 seconds.
+- **A minimized FlexInput uses less CPU.** Minimized windows no longer draw
+  anything. Mappings, overlays and shortcuts carry on as before. On Linux this
+  needs a desktop that reports minimized windows, which Wayland doesn't; the new
+  option below covers it there, since a minimized window has no focus.
 - **Tidier gyro section in the Calibration window.** **Axis alignment** is now
   folded away under a chevron, and says "applied" when an alignment is in
   effect. Its Roll, Pitch and Yaw buttons fit on one line, with the movement for
@@ -42,6 +66,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   have already changed its settings on keeps them.
 
 ### Fixed
+
+- **Average's window is now set in milliseconds.** It counted processing ticks,
+  so the same patch averaged over a different length of time at every sample
+  rate. Existing patches load with the length they had at the default 2000 Hz: a
+  window of 10 becomes 5 ms. If you run a different sample rate, your window was
+  already a different length of time and now becomes that one, so check it.
 
 - **The spike filter now works on SDL and Joy-Con 2 pads.** It counted polls
   rather than reports from the pad, so once polling ran a few times faster than

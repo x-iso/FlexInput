@@ -18,8 +18,8 @@ use super::*;
 pub(crate) fn eval_touch_zones_map_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) {
@@ -32,17 +32,7 @@ pub(crate) fn eval_touch_zones_map_node(
     // raw device) into an owned map, so the publish pass can mutate collector_sigs
     // without aliasing the read side. Mirrors eval_remapper_node's `upstream`.
     let mut upstream: PinSigs = PinSigs::default();
-    for ap in automap::ALL_PINS {
-        let sig = if !collector_id.is_empty() {
-            collector_sigs.get_pin(&collector_id, &ap.id).copied()
-        } else { None }
-        .or_else(|| {
-            if !dev_id.is_empty() {
-                dev_sigs.get_pin(&dev_id, &ap.id).copied()
-            } else { None }
-        });
-        if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-    }
+    upstream.fill_canonical(collector_sigs.view(&collector_id), dev_sigs.view(&dev_id));
     let read = |pin: &str| -> Option<Signal> { upstream.get(pin).copied() };
     let read_edges = |field: usize, which: &str| -> Vec<f32> {
         let k = if field == 0 { which.to_string() } else { format!("{which}{field}") };

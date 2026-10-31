@@ -2666,6 +2666,7 @@ fn gyro_scope(
     let sgn_for_ch = [g_sign[0], g_sign[1], g_sign[2], a_sign[0], a_sign[1]];
     let mut samples_ch: [Vec<(Instant, f32)>; 5] = Default::default();
     {
+        flexinput_engine::note_scope_taps_read();
         let taps = scope_taps.read().unwrap();
         if orient_active {
             // Pull gyro_{x,y,z} as parallel rings; matrix-transform per

@@ -35,6 +35,28 @@ pub use wgpu;
 /// from your `eframe::App::update`.
 pub static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// FLEXINPUT PATCH: viewports whose next paint keeps the frame on screen.
+static KEEP_FRAME: std::sync::Mutex<Vec<egui::ViewportId>> = std::sync::Mutex::new(Vec::new());
+
+/// FLEXINPUT PATCH: the next paint of this viewport renders nothing and presents
+/// nothing, leaving the frame it last presented on screen. egui has no such thing
+/// as a pass that keeps its shapes, so a host that drew nothing would otherwise
+/// present an empty window. One-shot: ask again every pass that should keep it.
+pub fn keep_frame_on_screen(viewport: egui::ViewportId) {
+    let mut keep = KEEP_FRAME.lock().unwrap();
+    if !keep.contains(&viewport) {
+        keep.push(viewport);
+    }
+}
+
+#[cfg(feature = "winit")]
+fn take_keep_frame(viewport: egui::ViewportId) -> bool {
+    let mut keep = KEEP_FRAME.lock().unwrap();
+    let before = keep.len();
+    keep.retain(|v| *v != viewport);
+    keep.len() != before
+}
+
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 mod renderer;
 

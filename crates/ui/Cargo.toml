@@ -107,3 +107,6 @@ egui-winit     = { version = "0.33", default-features = false, features = ["wayl
 # setup of a pad's USB audio variant (already a transitive dep via
 # flexinput-virtual).
 flexinput-usbip = { workspace = true }
+
+[dev-dependencies]
+mimalloc = { version = "0.1", default-features = false }

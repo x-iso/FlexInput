@@ -191,7 +191,7 @@ pub struct TickOutput {
     /// Latest outputs per twoway_response_curve node (blended engine output for UI arrow).
     pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Latest signals destined for each (device_id, pin_id) sink slot.
-    pub sink_outputs: SigMap,
+    pub sink_outputs: BusMap,
     /// Devices a card started sending Calibrate Gyro to this tick (one entry
     /// per press — see `gyro_cal_edges`), for the UI to calibrate.
     pub gyro_cal_requests: Vec<String>,
@@ -199,8 +199,17 @@ pub struct TickOutput {
     /// signals — kept here between ticks, empty, so each tick reuses their
     /// tables and (through `recycle_keys`) their key Strings rather than
     /// rebuilding a few hundred entries from nothing.
-    pub(crate) bus_scratch: SigMap,
-    pub(crate) dev_scratch: SigMap,
+    pub(crate) bus_scratch: BusMap,
+    pub(crate) dev_scratch: BusMap,
+    /// The preprocessed input of the last new `dev_sigs`.
+    pub(crate) dev_base: BusMap,
+    /// This tick gets the same `graph` and `dev_sigs` as the one before, as the
+    /// ticks of a burst do between polls: skip preprocessing what it already has.
+    pub same_input: bool,
+    /// Leave `outputs`, `last_inputs` and `last_outputs` empty this tick: nothing
+    /// will read them. Only a burst's last tick reaches the UI, and writing them
+    /// is a clone per node.
+    pub skip_display: bool,
 }
 
 impl TickOutput {
@@ -213,6 +222,6 @@ impl TickOutput {
         self.last_inputs.clear();
         self.last_outputs.clear();
         self.gyro_cal_requests.clear();
-        flexinput_core::recycle_keys(&mut self.sink_outputs);
+        self.sink_outputs.clear();
     }
 }

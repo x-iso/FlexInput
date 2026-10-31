@@ -1627,7 +1627,7 @@ pub(crate) fn build_processing_graph_rec(
                 .map(|d| digital_trigger_devs.contains(&d))
                 .unwrap_or(false);
 
-            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources, is_self_sink: false, digital_trigger_bridge })
+            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources, is_self_sink: false, digital_trigger_bridge, compiled: Default::default() })
         } else {
             None
         };
@@ -2189,7 +2189,7 @@ pub(crate) fn build_processing_graph_rec(
         snap
     }).collect();
 
-    (ProcessingGraph { nodes }, dirty_uids)
+    (ProcessingGraph::new(nodes), dirty_uids)
 }
 
 #[cfg(test)]

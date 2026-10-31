@@ -153,6 +153,14 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
             node.value.params.insert("cal_measure".to_string(), Value::from("off"));
             node.value.params.insert("cal_finish".to_string(), Value::Bool(false));
         }
+        // Average's window was a tick count, so what it meant followed the
+        // Sample rate. It is milliseconds now; a saved count is read at the
+        // rate patches were authored for (see `average_window_ms`).
+        if node.value.module_id == "module.average" && node.value.params.contains_key("buf_size") {
+            let ms = flexinput_engine::eval::average_window_ms(&node.value.params);
+            node.value.params.remove("buf_size");
+            node.value.params.insert("window_ms".to_string(), Value::from(ms));
+        }
         if node.value.module_id == "module.map_action" && node.value.outputs.len() < 2 {
             node.value.outputs = vec![
                 PinDescriptor::new("Gate",   SignalType::Bool),
@@ -809,6 +817,39 @@ mod migration_tests {
         assert_eq!(cards[2]["mode"], "analog");
         assert_eq!(cards[3]["mode"], "long");
         assert_eq!(cards[3]["window_ms"], 300.0);
+    }
+
+    /// An Average saved with a tick count loads with its window in ms, also
+    /// inside a sub-patch, and without the old param lingering to confuse it.
+    #[test]
+    fn migrate_turns_averages_tick_count_into_milliseconds() {
+        let average = || NodeData {
+            module_id: "module.average".to_string(),
+            display_name: "Average".to_string(),
+            category: "Processing".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            params: HashMap::from([("buf_size".to_string(), Value::from(100.0))]),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let inner_id = inner.insert_node(egui::Pos2::ZERO, average());
+        let mut sp = UiSubPatch::default();
+        sp.snarl = Box::new(inner);
+        let mut host = average();
+        host.module_id = "subpatch".to_string();
+        host.subpatch = Some(Box::new(sp));
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let top = snarl.insert_node(egui::Pos2::ZERO, average());
+        let host_id = snarl.insert_node(egui::pos2(10.0, 0.0), host);
+        migrate_loaded_snarl(&mut snarl);
+        let check = |n: &NodeData| {
+            assert_eq!(n.params.get("window_ms").and_then(|v| v.as_f64()), Some(50.0));
+            assert!(!n.params.contains_key("buf_size"));
+        };
+        check(snarl.get_node(top).unwrap());
+        check(snarl.get_node(host_id).unwrap().subpatch.as_ref().unwrap().snarl.get_node(inner_id).unwrap());
     }
 
     #[test]

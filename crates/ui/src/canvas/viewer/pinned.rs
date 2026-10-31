@@ -666,7 +666,7 @@ pub(crate) fn render_pinned_element_impl(
         // Average / Delay / DC Filter — bare DragValue rows.
         ("module.average", "samples") => {
             render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
-                "Samples", "buf_size", 10.0, 1.0, 1.0..=10_000.0, None);
+                "Window ms", "window_ms", 5.0, 0.5, 0.5..=5_000.0, Some(1));
             return;
         }
         ("module.average", "spike_mad") => {

@@ -10,7 +10,7 @@
 //! cargo test --release -p flexinput-ui perf_bench -- --ignored --nocapture
 //! ```
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -28,23 +28,23 @@ static LIVE_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        sampler::on_alloc(ALLOCS.fetch_add(1, Ordering::Relaxed));
         LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
-        System.alloc(layout)
+        mimalloc::MiMalloc.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        mimalloc::MiMalloc.dealloc(ptr, layout)
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        sampler::on_alloc(ALLOCS.fetch_add(1, Ordering::Relaxed));
         LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
-        System.alloc_zeroed(layout)
+        mimalloc::MiMalloc.alloc_zeroed(layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        sampler::on_alloc(ALLOCS.fetch_add(1, Ordering::Relaxed));
         LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
+        mimalloc::MiMalloc.realloc(ptr, layout, new_size)
     }
 }
 
@@ -54,6 +54,309 @@ fn heap_bytes_of<T>(f: impl FnOnce() -> T) -> (T, i64) {
     let before = LIVE_BYTES.load(Ordering::Relaxed);
     let v = f();
     (v, LIVE_BYTES.load(Ordering::Relaxed) - before)
+}
+
+/// What the extra ticks buy: the same 500 Hz input through two engines, one at
+/// 2 kHz (four ticks per input frame) and one at 500 Hz (one tick per frame),
+/// comparing what reaches the sinks after every frame. Displacement pins
+/// (banked by the real thread) are compared as a per-frame sum. Per tab.
+#[test]
+#[ignore]
+fn perf_rate_equiv() {
+    use flexinput_core::Signal;
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    // One input frame: 2 ms by default, FXI_FRAME_MS to match a polling rate.
+    // A runs FXI_TICKS_A ticks per frame (default 4, so 2 kHz), B FXI_TICKS_B.
+    let frame_s: f32 = std::env::var("FXI_FRAME_MS").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0) / 1000.0;
+    let ticks_a: u32 = std::env::var("FXI_TICKS_A").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let frames: u32 = (8.0 / frame_s) as u32; // 8 s of input
+    let ticks_b: u32 = std::env::var("FXI_TICKS_B").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let warm: u32 = frames / 8;
+    let frame_sigs = pad_signals_at;
+    eprintln!("{:<26} | {:>6} {:>9} {:>11} | {:>9} {:>7} | {:>9} | worst float pin",
+        "tab", "pins", "rms Δ", "max Δ", "bool miss", "longest", "disp sum");
+    for (ti, mut tab) in ws.tabs.into_iter().enumerate() {
+        crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
+        let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
+        let devs = source_devices(&graph);
+        let (mut st_a, mut st_b) = (HashMap::new(), HashMap::new());
+        let (mut out_a, mut out_b) = (TickOutput::default(), TickOutput::default());
+        let (mut sq, mut n_float, mut max_d, mut worst) = (0f64, 0u64, 0f32, String::new());
+        let (mut miss, mut n_bool) = (0u64, 0u64);
+        let mut run: HashMap<(String, String), u32> = HashMap::new();
+        let (mut longest, mut worst_b) = (0u32, String::new());
+        let (mut disp_a, mut disp_b) = (0f64, 0f64);
+        for f in 0..frames {
+            let sigs = frame_sigs(&devs, f as f32 * frame_s);
+            // A: its ticks, displacement summed across them.
+            let mut sum_a: HashMap<(String, String), Vec2> = HashMap::new();
+            for _ in 0..ticks_a {
+                eval_graph_tick(&graph, &mut st_a, &sigs, frame_s / ticks_a as f32, &mut out_a);
+                for (k, v) in &flexinput_core::SigMap::from(&out_a.sink_outputs) {
+                    if flexinput_engine::is_displacement_pin(&k.1) {
+                        let d = match v { Signal::Vec2(p) => *p, o => Vec2::new(o.as_float(), 0.0) };
+                        *sum_a.entry(k.clone()).or_default() += d;
+                    }
+                }
+            }
+            let mut sum_b: HashMap<(String, String), Vec2> = HashMap::new();
+            for _ in 0..ticks_b {
+                eval_graph_tick(&graph, &mut st_b, &sigs, frame_s / ticks_b as f32, &mut out_b);
+                for (k, v) in &flexinput_core::SigMap::from(&out_b.sink_outputs) {
+                    if flexinput_engine::is_displacement_pin(&k.1) {
+                        let d = match v { Signal::Vec2(p) => *p, o => Vec2::new(o.as_float(), 0.0) };
+                        *sum_b.entry(k.clone()).or_default() += d;
+                    }
+                }
+            }
+            if f < warm { continue; }
+            let sinks_b = flexinput_core::SigMap::from(&out_b.sink_outputs);
+            for (k, a) in &flexinput_core::SigMap::from(&out_a.sink_outputs) {
+                if flexinput_engine::is_displacement_pin(&k.1) {
+                    disp_a += sum_a.get(k).map_or(0.0, |v| v.length() as f64);
+                    disp_b += sum_b.get(k).map_or(0.0, |v| v.length() as f64);
+                    continue;
+                }
+                let Some(b) = sinks_b.get(k) else { continue };
+                match (a, b) {
+                    (Signal::Bool(x), Signal::Bool(y)) => {
+                        n_bool += 1;
+                        let r = run.entry(k.clone()).or_default();
+                        if x != y { miss += 1; *r += 1; if *r > longest { longest = *r; worst_b = k.1.clone(); } } else { *r = 0; }
+                    }
+                    _ => {
+                        let (va, vb) = match (a, b) {
+                            (Signal::Vec2(p), Signal::Vec2(q)) => (*p, *q),
+                            _ => (Vec2::new(a.as_float(), 0.0), Vec2::new(b.as_float(), 0.0)),
+                        };
+                        let d = (va - vb).length();
+                        sq += (d * d) as f64;
+                        n_float += 1;
+                        if d > max_d { max_d = d; worst = k.1.clone(); }
+                    }
+                }
+            }
+        }
+        let rms = (sq / n_float.max(1) as f64).sqrt();
+        let title: String = tab.title.chars().take(21).collect();
+        eprintln!("{:<26} | {:>6} {:>9.5} {:>11.5} | {:>8.3}% {:>7} | {:>14} | {worst}  {worst_b}",
+            format!("{ti} {title}"), out_a.sink_outputs.len(), rms, max_d,
+            miss as f64 * 100.0 / n_bool.max(1) as f64, longest,
+            if disp_a > 0.0 { format!("{:.3}x/{:.0}", disp_b / disp_a, disp_a) } else { "-".into() });
+    }
+}
+
+const PIN_SKIP: &[&str] = &["mouse", "scroll", "key_", "trackpad", "rumble", "hd_", "lightbar", "media_", "trigger_", "touch"];
+
+/// A pad being played: sticks sweep, triggers ride, gyro wobbles, and buttons
+/// press and release several times a second. Only what a real pad publishes, so
+/// no mouse / key / feedback pins.
+fn busy_signals_at(devs: &HashMap<String, Vec<(String, SignalType)>>, t: f32) -> HashMap<(String, String), Signal> {
+    let mut m = HashMap::new();
+    for (dev, pins) in devs {
+        for (i, (pin, ty)) in pins.iter().enumerate() {
+            let p = pin.as_str();
+            if PIN_SKIP.iter().any(|x| p.starts_with(x)) { continue; }
+            let ph = t * 7.0 * (1.0 + (i % 7) as f32 * 0.37);
+            let sig = match ty {
+                SignalType::Vec2 => Signal::Vec2(Vec2::new(ph.sin() * 0.8, ph.cos() * 0.8)),
+                SignalType::Bool => Signal::Bool(((t * 9.0 + i as f32 * 0.13) as i32) % 3 == 0),
+                SignalType::Int => Signal::Int(0),
+                // Gyro is normalized to +-2000 deg/s: wobble around 100 deg/s.
+                _ if p.starts_with("gyro") => Signal::Float(ph.sin() * 0.05),
+                _ if p == "accel_z" => Signal::Float(1.0),
+                _ if p.starts_with("accel") => Signal::Float(ph.sin() * 0.02),
+                _ => Signal::Float(ph.sin() * 0.5),
+            };
+            m.insert((dev.clone(), pin.clone()), sig);
+        }
+    }
+    m
+}
+
+/// [`busy_signals_at`] with each stick's `_x` / `_y` pins agreeing with its Vec2
+/// pin, as a real pad's do. RWS Aim reads one when its source is blocked and the
+/// other when not, so disagreeing ones make its block flip every tick.
+fn pad_signals_at(devs: &HashMap<String, Vec<(String, SignalType)>>, t: f32) -> HashMap<(String, String), Signal> {
+    let mut m = busy_signals_at(devs, t);
+    for dev in devs.keys() {
+        for stick in ["left_stick", "right_stick"] {
+            let Some(&Signal::Vec2(v)) = m.get(&(dev.clone(), stick.to_string())) else { continue };
+            for (axis, val) in [("x", v.x), ("y", v.y)] {
+                let key = (dev.clone(), format!("{stick}_{axis}"));
+                if m.contains_key(&key) {
+                    m.insert(key, Signal::Float(val));
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Everything the engine produces, tick by tick, on every tab of a workspace, as
+/// one hash per frame in the file `FXI_GOLDEN_OUT`. For proving a change to the
+/// evaluator changes nothing: run it before and after, and compare the files.
+/// `FXI_GOLDEN_DUMP=tab:frame` prints that frame in full, to find what differs.
+#[test]
+#[ignore]
+fn perf_golden() {
+    use std::fmt::Write as _;
+    use std::hash::{Hash, Hasher};
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    let out_path = std::env::var("FXI_GOLDEN_OUT").expect("FXI_GOLDEN_OUT");
+    let dump: Option<(usize, u32)> = std::env::var("FXI_GOLDEN_DUMP").ok().and_then(|s| {
+        let (a, b) = s.split_once(':')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    const FRAMES: u32 = 1500; // 3 s at 500 Hz
+    const TICKS: u32 = 4;
+    let mut file = String::new();
+    for (ti, mut tab) in ws.tabs.into_iter().enumerate() {
+        crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
+        let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
+        let devs = source_devices(&graph);
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        for f in 0..FRAMES {
+            let sigs = busy_signals_at(&devs, f as f32 * 0.002);
+            let mut lines: Vec<String> = Vec::new();
+            for t in 0..TICKS {
+                out.same_input = t != 0;
+                eval_graph_tick(&graph, &mut state, &sigs, 0.0005, &mut out);
+                for (k, v) in &out.sink_outputs { lines.push(format!("{t} sink {k:?} {v:?}")); }
+                for (k, v) in &out.outputs { lines.push(format!("{t} out {k:?} {v:?}")); }
+                for (k, v) in &out.last_inputs { lines.push(format!("{t} in {k:?} {v:?}")); }
+                for (k, v) in &out.last_outputs { lines.push(format!("{t} lo {k:?} {v:?}")); }
+                for (k, v) in &out.scope_samples { lines.push(format!("{t} sc {k:?} {v:?}")); }
+                for v in &out.gyro_cal_requests { lines.push(format!("{t} cal {v:?}")); }
+            }
+            lines.sort_unstable();
+            if dump == Some((ti, f)) {
+                for l in &lines { eprintln!("{l}"); }
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            lines.hash(&mut h);
+            let _ = writeln!(file, "{ti} {f} {} {:016x}", lines.len(), h.finish());
+        }
+        eprintln!("tab {ti} done");
+    }
+    std::fs::write(out_path, file).expect("write golden");
+}
+
+/// One UI frame of Easy mode's center panel on a workspace tab, headless: egui's
+/// layout and tessellation, no GPU. `FXI_BENCH_TAB` (default 1). With
+/// `FXI_BENCH_SAMPLE` set, profiles it as `perf_sample` does.
+#[test]
+#[ignore]
+fn perf_ui_frame() {
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let tab_ix: usize = std::env::var("FXI_BENCH_TAB").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let presets_dir = std::env::var("FXI_BENCH_PRESETS").ok().map(std::path::PathBuf::from);
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    let tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
+    let mut canvas = crate::canvas::Canvas::new();
+    canvas.snarl = tab.snarl;
+    crate::canvas::viewer::refresh_motion_units(&mut canvas.snarl);
+    let (graph, _) = crate::app::graph::build_processing_graph(&canvas.snarl, Default::default());
+    let devs = source_devices(&graph);
+    let descriptors: Vec<_> = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).collect();
+    let mut easy_state = crate::app::EasyState::default();
+    let mut overlay = crate::canvas::OverlayLayout::default();
+    let mut config = crate::canvas::OverlayLayout::default();
+    let mut nav = crate::gamepad_nav::GamepadNav::default();
+    let mut favorites = Vec::new();
+    let panic = crate::app::PanicShortcut::default();
+    let rates = HashMap::new();
+    let live_ids = std::collections::HashSet::new();
+    let defaults = crate::canvas::DeviceParamDefaults::default();
+    let ctx = egui::Context::default();
+    let mut frame = |i: u32, canvas: &mut crate::canvas::Canvas| {
+        let live = signals_at(&devs, i as f32 / 60.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            time: Some(i as f64 / 60.0),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::easy::center_panel::show(
+                    ui, canvas, &mut easy_state, &mut overlay, &mut config,
+                    presets_dir.as_deref(), defaults, &descriptors, &[], &live_ids, &live,
+                    &panic, &rates, &mut favorites, &mut nav,
+                );
+            });
+        });
+        std::hint::black_box(ctx.tessellate(out.shapes, out.pixels_per_point));
+    };
+    for i in 0..30 { frame(i, &mut canvas); }
+    if std::env::var("FXI_BENCH_SAMPLE").is_ok() {
+        let sampler = sampler::Sampler::start();
+        let t0 = Instant::now();
+        let mut i = 30;
+        while t0.elapsed().as_secs_f32() < 6.0 { frame(i, &mut canvas); i += 1; }
+        sampler.stop_and_report(40);
+        return;
+    }
+    let mut best = f64::MAX;
+    let a0 = ALLOCS.load(Ordering::Relaxed);
+    for b in 0..6 {
+        let t0 = Instant::now();
+        for i in 0..20 { frame(30 + b * 20 + i, &mut canvas); }
+        best = best.min(t0.elapsed().as_secs_f64() * 1e3 / 20.0);
+    }
+    eprintln!("{:.2} ms per frame, {} allocations", best, (ALLOCS.load(Ordering::Relaxed) - a0) / 120);
+}
+
+/// What a freshly published graph costs the engine: ticks against one graph, then
+/// against a new snapshot every `n` ticks (the UI at 60 Hz gives 2 at 125 Hz, 8 at
+/// 500 Hz), with the old one dropped on the engine's side as it is in the app.
+/// Building the snapshot isn't timed: that's the UI's. `FXI_BENCH_TAB` (default 1).
+#[test]
+#[ignore]
+fn perf_republish() {
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let tab_ix: usize = std::env::var("FXI_BENCH_TAB").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    let mut tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
+    crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
+    let build = || crate::app::graph::build_processing_graph(&tab.snarl, Default::default()).0;
+    let devs = source_devices(&build());
+    let sigs = pad_signals_at(&devs, 1.0);
+    for every in [u32::MAX, 8, 2, 1] {
+        let mut best = f64::MAX;
+        for _ in 0..8 {
+            let mut state: HashMap<usize, NodeState> = HashMap::new();
+            let mut out = TickOutput::default();
+            let mut graph = build();
+            for _ in 0..200 { eval_graph_tick(&graph, &mut state, &sigs, 0.002, &mut out); }
+            let mut ns = 0u128;
+            const TICKS: u32 = 400;
+            for k in 0..TICKS {
+                let fresh = (every != u32::MAX && k % every == 0).then(&build);
+                let t = Instant::now();
+                if let Some(g) = fresh { graph = g; }
+                eval_graph_tick(&graph, &mut state, &sigs, 0.002, &mut out);
+                ns += t.elapsed().as_nanos();
+            }
+            best = best.min(ns as f64 / 1e3 / TICKS as f64);
+        }
+        let label = if every == u32::MAX { "one graph".to_string() } else { format!("new graph every {every} ticks") };
+        eprintln!("{label:<30} {best:>8.1} us per tick");
+    }
 }
 
 /// CPU seconds this process has used (user + kernel).
@@ -317,6 +620,8 @@ fn perf_bench() {
             let mut ns = 0u128;
             for _ in 0..block {
                 if k % 4 == 0 { sigs = signals_at(&devs, (2000 + k) as f32 * dt); }
+                out.skip_display = k % 4 != 3; // as the engine does: only a burst's last tick is read
+                out.same_input = k % 4 != 0;
                 let a = ALLOCS.load(Ordering::Relaxed);
                 let t = Instant::now();
                 eval_graph_tick(&graph, &mut state, &sigs, dt, &mut out);
@@ -383,6 +688,39 @@ fn perf_sample() {
     sampler.stop_and_report(30);
 }
 
+/// Where a tick allocates: every 4th allocation's call stack, as a share of them.
+/// `FXI_BENCH_TAB` (default 0), with the same profile build as `perf_sample`.
+#[test]
+#[ignore]
+fn perf_alloc_sites() {
+    let Ok(path) = std::env::var("FXI_BENCH_WORKSPACE") else {
+        eprintln!("FXI_BENCH_WORKSPACE not set — nothing to measure");
+        return;
+    };
+    let tab_ix: usize = std::env::var("FXI_BENCH_TAB").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ws = crate::settings::load_workspace_from(std::path::Path::new(&path)).expect("workspace parses");
+    let mut tab = ws.tabs.into_iter().nth(tab_ix).expect("tab exists");
+    crate::canvas::viewer::refresh_motion_units(&mut tab.snarl);
+    let (graph, _) = crate::app::graph::build_processing_graph(&tab.snarl, Default::default());
+    let devs = source_devices(&graph);
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut out = TickOutput::default();
+    let dt = 1.0 / 2000.0;
+    let sigs = signals_at(&devs, 0.0);
+    for _ in 0..2000u32 {
+        eval_graph_tick(&graph, &mut state, &sigs, dt, &mut out);
+    }
+    let before = ALLOCS.load(Ordering::Relaxed);
+    sampler::trace_allocs(true);
+    const TICKS: u64 = 500;
+    for _ in 0..TICKS {
+        eval_graph_tick(&graph, &mut state, &sigs, dt, &mut out);
+    }
+    sampler::trace_allocs(false);
+    eprintln!("{} allocations per tick", (ALLOCS.load(Ordering::Relaxed) - before) / TICKS);
+    sampler::report_traced_allocs(60);
+}
+
 #[cfg(windows)]
 mod sampler {
     //! Minimal in-process sampling profiler: a second thread suspends the
@@ -392,7 +730,7 @@ mod sampler {
     //! lock). Symbolized with dbghelp at the end.
     use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::Arc;
 
     type Handle = *mut c_void;
@@ -419,6 +757,7 @@ mod sampler {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentThreadId() -> u32;
+        fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16;
         fn GetCurrentProcess() -> Handle;
         fn OpenThread(access: u32, inherit: i32, tid: u32) -> Handle;
         fn SuspendThread(h: Handle) -> u32;
@@ -457,6 +796,42 @@ mod sampler {
             out = out.replace(from, to);
         }
         out
+    }
+
+    /// Stacks of traced allocations; capacity reserved up front, so tracing
+    /// doesn't allocate. Only one test traces, and only from its own thread.
+    static ALLOC_TRACE: AtomicPtr<Vec<([u64; MAX_FRAMES], usize)>> = AtomicPtr::new(std::ptr::null_mut());
+
+    #[inline]
+    pub fn on_alloc(n: u64) {
+        let trace = ALLOC_TRACE.load(Ordering::Relaxed);
+        if trace.is_null() { return; }
+        let _ = n;
+        // SAFETY: set only by `trace_allocs`, which keeps it alive until cleared.
+        let trace = unsafe { &mut *trace };
+        if trace.len() == trace.capacity() { return; }
+        let mut frames = [0u64; MAX_FRAMES];
+        let got = unsafe {
+            RtlCaptureStackBackTrace(2, MAX_FRAMES as u32, frames.as_mut_ptr() as *mut *mut c_void, std::ptr::null_mut())
+        };
+        trace.push((frames, got as usize));
+    }
+
+    pub fn trace_allocs(on: bool) {
+        if on {
+            let v = Box::new(Vec::with_capacity(200_000));
+            ALLOC_TRACE.store(Box::into_raw(v), Ordering::Relaxed);
+        } else {
+            TRACED.store(ALLOC_TRACE.swap(std::ptr::null_mut(), Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    static TRACED: AtomicPtr<Vec<([u64; MAX_FRAMES], usize)>> = AtomicPtr::new(std::ptr::null_mut());
+
+    pub fn report_traced_allocs(top: usize) {
+        // SAFETY: the pointer came from `Box::into_raw` in `trace_allocs`.
+        let samples = unsafe { Box::from_raw(TRACED.swap(std::ptr::null_mut(), Ordering::Relaxed)) };
+        report(*samples, top);
     }
 
     pub struct Sampler {
@@ -517,7 +892,12 @@ mod sampler {
 
         pub fn stop_and_report(self, top: usize) {
             self.stop.store(true, Ordering::Relaxed);
-            let samples = self.join.join().unwrap();
+            report(self.join.join().unwrap(), top);
+        }
+    }
+
+    fn report(samples: Vec<([u64; MAX_FRAMES], usize)>, top: usize) {
+        {
             let total = samples.len().max(1);
             let proc = unsafe { GetCurrentProcess() };
             // Search next to the test exe, where cargo leaves its PDB.

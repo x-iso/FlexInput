@@ -453,9 +453,55 @@ pub const ALL_PINS: &[AutoMapPin] = &[
 /// bus entry every tick, where a scan of the list cost a hundred-odd string
 /// compares each time.
 pub fn is_canonical_pin(id: &str) -> bool {
-    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str, crate::FastHasher>> =
-        std::sync::OnceLock::new();
-    SET.get_or_init(|| ALL_PINS.iter().map(|p| p.id).collect()).contains(id)
+    known_index(id).is_some_and(|ix| ix < ALL_PINS.len())
+}
+
+/// Marks a bus pin as taken over by a mapping module upstream: `{prefix}{pin}`.
+pub const CONSUMED_PREFIX: &str = "__consumed__:";
+
+/// Pins with a fixed slot in the engine's dense maps: [`ALL_PINS`] first, at the
+/// same indices, then the ones a mapping module derives every tick, then each
+/// canonical pin's consumed marker.
+pub struct KnownPins {
+    pub names: Vec<&'static str>,
+    index: std::collections::HashMap<&'static str, u32, crate::FastHasher>,
+    consumed_base: usize,
+}
+
+/// The slot of `ALL_PINS[pin_ix]`'s consumed marker.
+#[inline]
+pub fn consumed_marker_index(pin_ix: usize) -> usize {
+    known_pins().consumed_base + pin_ix
+}
+
+const DERIVED_PINS: &[&str] = &[
+    "left_stick_up", "left_stick_down", "left_stick_left", "left_stick_right",
+    "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
+    "touchpad_left", "touchpad_center", "touchpad_right", "touchpad_any",
+    "touch_left", "touch_center", "touch_right",
+];
+
+pub fn known_pins() -> &'static KnownPins {
+    static KNOWN: std::sync::OnceLock<KnownPins> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut names: Vec<&'static str> = ALL_PINS.iter().map(|p| p.id).collect();
+        for &p in DERIVED_PINS.iter().chain(crate::imu::IMU_PINS.iter().map(|p| &p.id)) {
+            if !names.contains(&p) {
+                names.push(p);
+            }
+        }
+        let consumed_base = names.len();
+        names.extend(ALL_PINS.iter().map(|p| -> &'static str {
+            Box::leak(format!("{CONSUMED_PREFIX}{}", p.id).into_boxed_str())
+        }));
+        let index = names.iter().enumerate().map(|(i, &n)| (n, i as u32)).collect();
+        KnownPins { names, index, consumed_base }
+    })
+}
+
+#[inline]
+pub fn known_index(id: &str) -> Option<usize> {
+    known_pins().index.get(id).map(|&i| i as usize)
 }
 
 /// Family-specific button glyph for a cross-family pin, or `None` if the pin

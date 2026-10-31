@@ -336,7 +336,7 @@ pub struct ModuleDescriptor {
 - **Inputs:** N channels (Float or Vec2)
 - **Outputs:** N averaged channels
 - **Parameters:**
-  - `buf_size: f64` - Window size in samples (1 to 10,000)
+  - `window_ms: f64` - Window length in milliseconds (0.5 to 5,000), independent of the Sample rate. Older patches' `buf_size` (a tick count) is migrated on load at 2 kHz, so 10 becomes 5 ms
   - `spike_mad: f64` - MAD threshold for spike rejection (0.0 = disabled)
 
 #### DC Filter

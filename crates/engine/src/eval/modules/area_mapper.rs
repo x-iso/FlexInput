@@ -403,15 +403,15 @@ struct LayerLive {
 pub(crate) fn eval_area_mapper_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
     let key = format!("collector:{uid}");
     let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let bus = |pin: &str, cs: &SigMap| -> Option<Signal> {
+    let bus = |pin: &str, cs: &BusMap| -> Option<Signal> {
         cs.get_pin(&key, &pin).copied()
             .or_else(|| dev_sigs.get_pin(&dev_id, &pin).copied())
     };
@@ -707,11 +707,11 @@ pub(crate) fn eval_area_mapper_node(
         local.insert(x, Signal::Float(ax));
         local.insert(y, Signal::Float(ay));
         derive_stick_cardinals(&mut local);
-        for (k, v) in local {
+        for (k, v) in local.iter() {
             if k.starts_with(stick) && (k.ends_with("_up") || k.ends_with("_down")
                 || k.ends_with("_left") || k.ends_with("_right"))
             {
-                collector_sigs.set_pin(&key, &k, v);
+                collector_sigs.set_pin(&key, k, *v);
             }
         }
     }

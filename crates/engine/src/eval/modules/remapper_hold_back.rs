@@ -777,12 +777,12 @@ pub(crate) fn remapper_hold_back_pass(
         }
         match *sig {
             Signal::Float(v) => {
-                if let Some(&caps) = axis_caps.get(pin.as_str()) {
+                if let Some(&caps) = axis_caps.get(pin) {
                     *sig = Signal::Float(limit(v, caps));
                 }
             }
             Signal::Vec2(v) => {
-                let axes = match pin.as_str() {
+                let axes = match pin {
                     "left_stick"  => ("left_stick_x",  "left_stick_y"),
                     "right_stick" => ("right_stick_x", "right_stick_y"),
                     "dpad"        => ("dpad_x",        "dpad_y"),

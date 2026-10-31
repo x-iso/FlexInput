@@ -43,8 +43,8 @@ pub(crate) fn compute_node(
     snap: &NodeSnap,
     inputs: &[Option<Signal>],
     state: &mut NodeState,
-    dev_sigs: &SigMap,
-    collector_sigs: &SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &BusMap,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     puffin::profile_function!();
@@ -314,7 +314,7 @@ pub(crate) fn compute_node(
             out
         }
         "module.average" => {
-            let out = compute_average(inputs, state, &snap.params);
+            let out = compute_average(inputs, state, &snap.params, dt);
             state.last_signals = out.clone();
             out
         }
@@ -1005,13 +1005,29 @@ pub(crate) fn compute_delay(
     results
 }
 
+/// The Sample rate patches were authored at when Average's window was a tick
+/// count: a legacy `buf_size` of N meant N ticks at this rate.
+const AVERAGE_LEGACY_TICK_HZ: f64 = 2000.0;
+
+/// An Average node's window in milliseconds. `window_ms`, or a patch saved
+/// before it existed: its `buf_size` read at the rate it was authored for.
+pub fn average_window_ms(params: &HashMap<String, Value>) -> f64 {
+    params.get("window_ms").and_then(|v| v.as_f64())
+        .or_else(|| params.get("buf_size").and_then(|v| v.as_f64())
+            .map(|n| n * 1000.0 / AVERAGE_LEGACY_TICK_HZ))
+        .unwrap_or(5.0)
+}
+
 pub(crate) fn compute_average(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
     params: &HashMap<String, Value>,
+    dt: f32,
 ) -> Vec<Option<Signal>> {
-    let buf_size = params.get("buf_size").and_then(|v| v.as_f64())
-        .map(|f| f as u64).unwrap_or(10).clamp(1, 10_000) as usize;
+    // The window is time, so the average means the same at any Sample rate.
+    // Upper bound: the longest window (5 s) at the highest rate (8 kHz).
+    let ticks = average_window_ms(params) / 1000.0 / (dt as f64).max(1e-6);
+    let buf_size = (ticks.round() as usize).clamp(1, 40_000);
     let spike_mad = params.get("spike_mad").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
 
     while state.avg_bufs.len()    < inputs.len() { state.avg_bufs.push(VecDeque::new()); }

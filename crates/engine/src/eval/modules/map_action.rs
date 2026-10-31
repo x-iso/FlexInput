@@ -10,8 +10,8 @@ use super::*;
 pub(crate) fn eval_map_action_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -20,17 +20,7 @@ pub(crate) fn eval_map_action_node(
             let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
             // Snapshot upstream values for every canonical pin once.
             let mut upstream: PinSigs = PinSigs::default();
-            for ap in automap::ALL_PINS {
-                let sig = if !collector_id.is_empty() {
-                    collector_sigs.get_pin(&collector_id, &ap.id).copied()
-                } else { None }
-                .or_else(|| {
-                    if !dev_id.is_empty() {
-                        dev_sigs.get_pin(&dev_id, &ap.id).copied()
-                    } else { None }
-                });
-                if let Some(s) = sig { upstream.insert(flexinput_core::pooled_string(ap.id), s); }
-            }
+            upstream.fill_canonical(collector_sigs.view(collector_id), dev_sigs.view(dev_id));
             // MIDI pins are dynamic (never in ALL_PINS): take whatever the bus
             // carries, so a note or a knob can trigger an action.
             fill_upstream_midi(collector_id, dev_id, collector_sigs, dev_sigs, &mut upstream);
@@ -66,13 +56,13 @@ pub(crate) fn eval_map_action_node(
             let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
             let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
             if touch_click { touch_only = [false;3]; }
-            upstream.insert(flexinput_core::pooled_string("touchpad_left"),   Signal::Bool(click_zone[0]));
-            upstream.insert(flexinput_core::pooled_string("touchpad_center"), Signal::Bool(click_zone[1]));
-            upstream.insert(flexinput_core::pooled_string("touchpad_right"),  Signal::Bool(click_zone[2]));
-            upstream.insert(flexinput_core::pooled_string("touchpad_any"),    Signal::Bool(touch_click && any_zone));
-            upstream.insert(flexinput_core::pooled_string("touch_left"),      Signal::Bool(touch_only[0]));
-            upstream.insert(flexinput_core::pooled_string("touch_center"),    Signal::Bool(touch_only[1]));
-            upstream.insert(flexinput_core::pooled_string("touch_right"),     Signal::Bool(touch_only[2]));
+            upstream.insert("touchpad_left",   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center", Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right",  Signal::Bool(click_zone[2]));
+            upstream.insert("touchpad_any",    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left",      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center",    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right",     Signal::Bool(touch_only[2]));
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
@@ -178,7 +168,6 @@ pub(crate) fn eval_map_action_node(
                 max_analog_mag
             } else if any_trigger && !any_analog_present { 1.0 } else { max_analog_mag };
             // Hand the per-tick pin snapshot's key Strings back for the next tick.
-            flexinput_core::recycle_strings(&mut upstream);
             return vec![
                 Some(Signal::Bool(any_trigger)),
                 Some(Signal::Float(analog_mag.clamp(0.0, 1.0))),

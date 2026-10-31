@@ -87,9 +87,23 @@ pub fn snap_ui_scale(scale: f32) -> f32 {
     ui_scale_from_index(ui_scale_to_index(scale))
 }
 
-pub const SAMPLE_RATE_HZ_MIN: u32 = 500;
+/// The lowest polling step: a slower engine would skip input.
+pub const SAMPLE_RATE_HZ_MIN: u32 = 125;
 pub const SAMPLE_RATE_HZ_MAX: u32 = 8000;
 pub const SAMPLE_RATE_HZ_DEFAULT: u32 = 2000;
+
+/// How the processing sample rate is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SampleRateMode {
+    /// [`AppSettings::sample_rate_hz`], as set.
+    #[default]
+    Manual,
+    /// One tick per output: the least CPU.
+    SameAsOutput,
+    /// Two ticks per output: timers and PWM get twice the resolution for twice
+    /// the CPU, and patches measure nearly the same as at any higher rate.
+    TwiceOutput,
+}
 
 fn default_polling_hz() -> u32 { POLLING_HZ_DEFAULT }
 fn default_sample_rate_hz() -> u32 { SAMPLE_RATE_HZ_DEFAULT }
@@ -181,6 +195,28 @@ pub enum UiMode {
     Advanced,
 }
 
+impl AppSettings {
+    /// The rate outputs actually go out at.
+    pub fn effective_output_hz(&self) -> u32 {
+        if self.output_hz == OUTPUT_HZ_SAME_AS_POLLING { self.polling_hz } else { self.output_hz }
+    }
+
+    /// The rate the engine actually ticks at.
+    pub fn effective_sample_rate_hz(&self) -> u32 {
+        match self.sample_rate_mode {
+            SampleRateMode::Manual => self.sample_rate_hz,
+            SampleRateMode::SameAsOutput => self.effective_output_hz(),
+            SampleRateMode::TwiceOutput => self.effective_output_hz() * 2,
+        }.clamp(SAMPLE_RATE_HZ_MIN, SAMPLE_RATE_HZ_MAX)
+    }
+
+    /// The manual slider's floor: the polling rate, or lower if a saved rate
+    /// already is, so that opening Settings never changes it.
+    pub fn sample_rate_floor_hz(&self) -> u32 {
+        self.polling_hz.min(self.sample_rate_hz).max(SAMPLE_RATE_HZ_MIN)
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
     /// Optional user 3D-controller-models directory. Same folder structure as
@@ -211,6 +247,8 @@ pub struct AppSettings {
     pub output_hz: u32,
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: u32,
+    #[serde(default)]
+    pub sample_rate_mode: SampleRateMode,
     #[serde(default = "default_true")]
     pub keep_workspace: bool,
     #[serde(default = "default_true")]
@@ -517,6 +555,10 @@ pub struct AppSettings {
     /// Focused window always paints at vsync. Range BG_REPAINT_HZ_MIN..=MAX.
     #[serde(default = "default_bg_repaint_hz")]
     pub bg_repaint_hz: u32,
+    /// Stop drawing windows that aren't focused and dim them, leaving the last
+    /// frame on screen. Input processing isn't affected.
+    #[serde(default)]
+    pub freeze_background: bool,
     /// Master switch for the Virtual Keyboard & Mouse "physical mouse
     /// suppression" heuristic: when on, the virtual mouse briefly yields if it
     /// sees the real cursor move on its own, so a stick-driven cursor doesn't
@@ -744,6 +786,7 @@ impl Default for AppSettings {
             polling_hz: POLLING_HZ_DEFAULT,
             output_hz: OUTPUT_HZ_SAME_AS_POLLING,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
+            sample_rate_mode: SampleRateMode::Manual,
             keep_workspace: true,
             device_nodes_default_collapsed: true,
             default_stick_deadzone: 0.1,
@@ -809,6 +852,7 @@ impl Default for AppSettings {
             gamepad_chords_nav_only: true,
             gamepad_home_exclusive: false,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
+            freeze_background: false,
             mouse_suppression_enabled: true,
             mouse_suppress_release_ms: MOUSE_SUPPRESS_RELEASE_MS_DEFAULT,
             mixed_braid_enabled: false,
@@ -1111,6 +1155,44 @@ pub fn load_recovery() -> Option<PersistedWorkspace> {
 pub fn delete_recovery() {
     if let Some(p) = recovery_path() {
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod sample_rate_tests {
+    use super::*;
+
+    fn with(polling: u32, output: u32, manual: u32, mode: SampleRateMode) -> AppSettings {
+        AppSettings {
+            polling_hz: polling,
+            output_hz: output,
+            sample_rate_hz: manual,
+            sample_rate_mode: mode,
+            ..AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn linked_rates_follow_the_output_which_can_follow_polling() {
+        use SampleRateMode::*;
+        assert_eq!(with(125, OUTPUT_HZ_SAME_AS_POLLING, 2000, SameAsOutput).effective_sample_rate_hz(), 125);
+        assert_eq!(with(125, OUTPUT_HZ_SAME_AS_POLLING, 2000, TwiceOutput).effective_sample_rate_hz(), 250);
+        assert_eq!(with(125, 500, 2000, SameAsOutput).effective_sample_rate_hz(), 500);
+        assert_eq!(with(1000, 250, 2000, TwiceOutput).effective_sample_rate_hz(), 500);
+        assert_eq!(with(2000, 2000, 2000, TwiceOutput).effective_sample_rate_hz(), 4000);
+    }
+
+    #[test]
+    fn by_hand_is_the_default_and_leaves_a_saved_rate_alone() {
+        assert_eq!(AppSettings::default().sample_rate_mode, SampleRateMode::Manual);
+        assert_eq!(with(2000, 0, 500, SampleRateMode::Manual).effective_sample_rate_hz(), 500);
+    }
+
+    #[test]
+    fn the_slider_floor_is_polling_unless_the_saved_rate_is_lower() {
+        assert_eq!(with(125, 0, 2000, SampleRateMode::Manual).sample_rate_floor_hz(), 125);
+        assert_eq!(with(500, 0, 2000, SampleRateMode::Manual).sample_rate_floor_hz(), 500);
+        assert_eq!(with(2000, 0, 500, SampleRateMode::Manual).sample_rate_floor_hz(), 500);
     }
 }
 

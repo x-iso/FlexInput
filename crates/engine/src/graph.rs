@@ -6,10 +6,26 @@ use serde_json::Value;
 #[derive(Clone, Default)]
 pub struct ProcessingGraph {
     pub nodes: Vec<NodeSnap>,
+    /// What a tick needs of `nodes` that doesn't change while this snapshot lives,
+    /// worked out on first use. `nodes` must not change after a tick has seen it.
+    pub(crate) device_params: std::sync::OnceLock<crate::eval::DeviceParams>,
+}
+
+/// By content: the caches are worked out from it.
+impl PartialEq for ProcessingGraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes
+    }
+}
+
+impl ProcessingGraph {
+    pub fn new(nodes: Vec<NodeSnap>) -> Self {
+        Self { nodes, ..Self::default() }
+    }
 }
 
 /// Inner graph for a sub-patch node, produced by recursively building the inner snarl.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct InlineSubgraph {
     pub graph: ProcessingGraph,
     /// For each outer output pin k: (inner flat node index, output pin 0) of the outlet node.
@@ -20,7 +36,7 @@ pub struct InlineSubgraph {
 /// per-device rumble shaping configured on that virtual device's sink node. The
 /// shaping applies ONLY to AutoMap feedback (game/app rumble forwarded back to a
 /// physical pad) — the user's own direct rumble wiring is never reshaped.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct FeedbackSource {
     /// The virtual device id whose output (rumble/lightbar) flows back.
     pub device_id: String,
@@ -34,7 +50,7 @@ pub struct FeedbackSource {
 }
 
 /// Routing metadata for device.sink nodes: how to dispatch computed signals to a device.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SinkTarget {
     /// The virtual or physical device_id this sink drives.
     pub device_id: String,
@@ -65,9 +81,83 @@ pub struct SinkTarget {
     /// upstream physical source's `digital_triggers` opt-in (always on for
     /// digital-only pads like Switch Pro). Default false.
     pub digital_trigger_bridge: bool,
+    /// What a tick needs of the lists above, worked out on first use. They must
+    /// not change after a tick has seen them.
+    pub compiled: std::sync::OnceLock<CompiledSink>,
 }
 
+/// One source pin AutoMap feeds to one pin of a sink.
 #[derive(Clone)]
+pub(crate) struct AutomapPair {
+    pub src: String,
+    pub dst: String,
+    /// Their fixed slots, where they have one (see `automap::known_pins`).
+    pub src_ix: Option<usize>,
+    pub dst_ix: Option<usize>,
+    /// A direct wire drives `dst`, and beats AutoMap.
+    pub wired: bool,
+    /// `btn_lt_dig`→`left_trigger` or its twin: a lowest-priority fallback.
+    pub digital_trigger_bridge: bool,
+}
+
+/// A sink's AutoMap pairing and wiring, from [`SinkTarget::compiled`].
+#[derive(Clone)]
+pub struct CompiledSink {
+    pub(crate) pairs: Vec<AutomapPair>,
+    /// Pins with at least one actual direct wire.
+    pub(crate) directly_wired: std::collections::HashSet<String>,
+}
+
+/// By content: the cache is worked out from it.
+impl PartialEq for SinkTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.device_id == other.device_id
+            && self.pin_ids == other.pin_ids
+            && self.multi_sources == other.multi_sources
+            && self.automap_source == other.automap_source
+            && self.automap_fallback_dev == other.automap_fallback_dev
+            && self.feedback_sources == other.feedback_sources
+            && self.is_self_sink == other.is_self_sink
+            && self.digital_trigger_bridge == other.digital_trigger_bridge
+    }
+}
+
+impl SinkTarget {
+    pub(crate) fn compiled(&self) -> &CompiledSink {
+        self.compiled.get_or_init(|| {
+            use flexinput_core::automap::{known_index, resolve_mapping};
+            let directly_wired: std::collections::HashSet<String> = self.pin_ids.iter().enumerate()
+                .filter(|(i, pid)| !pid.is_empty() && self.multi_sources.get(*i).is_some_and(|s| !s.is_empty()))
+                .map(|(_, pid)| pid.clone())
+                .collect();
+            let pairs = match &self.automap_source {
+                None => Vec::new(),
+                Some((_, src_pins)) => {
+                    let dst_ids: Vec<&str> = self.pin_ids.iter()
+                        .filter(|pid| !pid.is_empty())
+                        .map(|pid| pid.as_str())
+                        .collect();
+                    let src_ids: Vec<&str> = src_pins.iter()
+                        .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
+                        .map(|p| p.as_str())
+                        .collect();
+                    resolve_mapping(&src_ids, &dst_ids).into_iter().map(|(s, d)| AutomapPair {
+                        src_ix: known_index(s),
+                        dst_ix: known_index(d),
+                        wired: directly_wired.contains(d),
+                        digital_trigger_bridge: matches!((s, d),
+                            ("btn_lt_dig", "left_trigger") | ("btn_rt_dig", "right_trigger")),
+                        src: s.to_string(),
+                        dst: d.to_string(),
+                    }).collect()
+                }
+            };
+            CompiledSink { pairs, directly_wired }
+        })
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct NodeSnap {
     /// egui_snarl::NodeId.0 — key into shared state maps.
     pub node_uid: usize,

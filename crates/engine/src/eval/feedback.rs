@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flexinput_core::automap::{self, FeedbackGroup};
-use flexinput_core::{PinMapExt, Signal, SigMap};
+use flexinput_core::{BusMap, PinMapExt, Signal};
 
 use crate::graph::{NodeSnap, SinkTarget};
 
@@ -49,7 +49,7 @@ fn needs_game_feedback(nodes: &[NodeSnap]) -> bool {
     })
 }
 
-fn put_max(collector_sigs: &mut SigMap, key: &str, pin: &str, v: f32) {
+fn put_max(collector_sigs: &mut BusMap, key: &str, pin: &str, v: f32) {
     collector_sigs.merge_pin(key, pin, Signal::Float(v), |s| *s = Signal::Float(s.as_float().max(v)));
 }
 
@@ -65,8 +65,8 @@ fn put_max(collector_sigs: &mut SigMap, key: &str, pin: &str, v: f32) {
 ///     as game feedback by [`apply_pad_feedback`] / the receiver frame fold.
 pub(crate) fn gather_game_feedback(
     nodes: &[NodeSnap],
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
 ) {
     if !needs_game_feedback(nodes) { return; }
     // Main-loop auto-feedback only runs for top-level pads, so only those.
@@ -90,10 +90,10 @@ pub(crate) fn gather_game_feedback(
 }
 
 fn read_virtual_feedback(
-    dev_sigs: &SigMap,
+    dev_sigs: &BusMap,
     virtual_dev: &str,
     key: &str,
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
 ) {
     for pin in automap::FEEDBACK_INLET_PINS {
         if let Some(sig) = dev_sigs.get_pin(&virtual_dev, &pin.id) {
@@ -111,7 +111,7 @@ fn gather_net_send_feedback(
     nodes: &[NodeSnap],
     outer_uid: usize,
     nested: bool,
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
 ) {
     for node in nodes {
         let uid = if nested { namespaced_uid(outer_uid, node.node_uid) } else { node.node_uid };
@@ -140,7 +140,7 @@ fn gather_net_send_feedback(
 /// The strongest value the game requests on any of `pins` across `targets`
 /// (pad or bus ids; empty ids are skipped). 0 when the game asks for nothing.
 pub(crate) fn game_feedback(
-    collector_sigs: &SigMap,
+    collector_sigs: &BusMap,
     targets: &[&str],
     pins: &[&str],
 ) -> f32 {
@@ -159,7 +159,7 @@ pub(crate) fn game_feedback(
 /// An AutoMap Selector's output id reads the game feedback of the input it is
 /// gating from, so a module placed after the Selector still sees the game.
 pub(crate) fn forward_game_feedback(
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     from: &str,
     to: &str,
 ) {
@@ -174,7 +174,7 @@ pub(crate) fn forward_game_feedback(
 
 /// The feedback groups a target's overrides take over this tick.
 pub(crate) fn overridden_groups(
-    collector_sigs: &SigMap,
+    collector_sigs: &BusMap,
     target: &str,
 ) -> HashSet<FeedbackGroup> {
     let key = format!("{FEEDBACK_OVERRIDE}{target}");
@@ -224,7 +224,7 @@ fn route_pin<'a>(
 }
 
 fn combine_into(
-    sink_outputs: &mut SigMap,
+    sink_outputs: &mut BusMap,
     dev: &str,
     dst: &str,
     sig: Signal,
@@ -235,7 +235,7 @@ fn combine_into(
 }
 
 /// True if any module or peer wrote a feedback layer this tick.
-pub(crate) fn any_feedback_layer(collector_sigs: &SigMap) -> bool {
+pub(crate) fn any_feedback_layer(collector_sigs: &BusMap) -> bool {
     collector_sigs.keys().any(|(k, _)| FEEDBACK_WRITE_CHANNELS.iter().any(|c| k.starts_with(c)))
 }
 
@@ -244,8 +244,8 @@ pub(crate) fn any_feedback_layer(collector_sigs: &SigMap) -> bool {
 /// Direct wires are never touched.
 pub(crate) fn apply_pad_feedback(
     st: &SinkTarget,
-    collector_sigs: &SigMap,
-    sink_outputs: &mut SigMap,
+    collector_sigs: &BusMap,
+    sink_outputs: &mut BusMap,
 ) {
     let dev = st.device_id.as_str();
     let layer = |prefix: &str| -> Vec<(&'static str, Signal)> {
@@ -323,8 +323,8 @@ pub const TRIGGER_DEFAULT_VALUES_PARAMS: [&str; 2] = ["ltrig_effect_values", "rt
 pub(crate) fn apply_default_trigger_effects(
     st: &SinkTarget,
     params: &HashMap<String, serde_json::Value>,
-    collector_sigs: &SigMap,
-    sink_outputs: &mut SigMap,
+    collector_sigs: &BusMap,
+    sink_outputs: &mut BusMap,
 ) {
     for side in 0..2 {
         let Some(mode) = params.get(TRIGGER_DEFAULT_MODE_PARAMS[side]).and_then(|v| v.as_str()) else {

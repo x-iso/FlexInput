@@ -27,9 +27,6 @@ pub type FastHasher = rustc_hash::FxBuildHasher;
 /// its preprocessed device signals and its sink outputs.
 pub type SigMap = HashMap<(String, String), Signal, FastHasher>;
 
-/// A `pin_id → Signal` map on [`FastHasher`] (one bus's pins).
-pub type PinSigs = HashMap<String, Signal, FastHasher>;
-
 // Spare `(String, String)` keys, so a map rebuilt every tick reuses last tick's
 // key allocations instead of allocating two Strings per entry. Per thread: the
 // engine runs on one. Filled by [`recycle_keys`], drawn by [`PinMapExt::set_pin`].
@@ -51,67 +48,6 @@ pub fn pooled_key(dev: &str, pin: &str) -> (String, String) {
         }
         None => (dev.to_string(), pin.to_string()),
     }
-}
-
-thread_local! {
-    static COPY_STAGE: RefCell<Vec<((String, String), Signal)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Copy every `(from, pin)` entry whose pin `keep` accepts to `(to, pin)`,
-/// overwriting what `to` already carries — one bus handed on under another
-/// node's key. Keys come from the pool and the staging buffer is reused, so a
-/// steady-state copy allocates nothing.
-pub fn copy_bus(map: &mut SigMap, from: &str, to: &str, mut keep: impl FnMut(&str) -> bool) {
-    COPY_STAGE.with(|stage| {
-        let mut stage = stage.borrow_mut();
-        for ((d, p), v) in map.iter() {
-            if d == from && keep(p) {
-                stage.push((pooled_key(to, p), *v));
-            }
-        }
-        for (k, v) in stage.drain(..) {
-            match map.get_mut(&k) {
-                Some(slot) => {
-                    *slot = v;
-                    KEY_POOL.with(|p| {
-                        let mut p = p.borrow_mut();
-                        if p.len() < KEY_POOL_CAP { p.push(k); }
-                    });
-                }
-                None => { map.insert(k, v); }
-            }
-        }
-    });
-}
-
-// Spare single-String keys, for the per-node `pin → Signal` snapshots
-// ([`PinSigs`]) a mapping module rebuilds every tick.
-thread_local! {
-    static STR_POOL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-/// An owned copy of `s`, reusing a pooled String's buffer when one is spare.
-pub fn pooled_string(s: &str) -> String {
-    match STR_POOL.with(|p| p.borrow_mut().pop()) {
-        Some(mut b) => {
-            b.clear();
-            b.push_str(s);
-            b
-        }
-        None => s.to_string(),
-    }
-}
-
-/// Empty `map`, handing its String keys to the pool [`pooled_string`] draws from.
-pub fn recycle_strings<V, S>(map: &mut HashMap<String, V, S>) {
-    STR_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        for (k, _) in map.drain() {
-            if p.len() < KEY_POOL_CAP {
-                p.push(k);
-            }
-        }
-    });
 }
 
 /// Empty `map`, keeping its table capacity and handing its keys to the pool.
@@ -263,21 +199,6 @@ mod tests {
             ("collector:123456".to_string(), "right_trigger_long_name".to_string()),
         ]);
         assert_eq!(m.get_pin("c:1", "a"), Some(&Signal::Float(2.0)));
-    }
-
-    #[test]
-    fn copy_bus_overwrites_and_filters() {
-        let mut m: SigMap = SigMap::default();
-        m.set_pin("collector:1", "btn_a", Signal::Bool(true));
-        m.set_pin("collector:1", "key_f", Signal::Bool(true));
-        m.set_pin("collector:2", "btn_a", Signal::Bool(false));
-        m.set_pin("collector:9", "btn_a", Signal::Float(9.0));
-        copy_bus(&mut m, "collector:1", "collector:2", |_| true);
-        assert_eq!(m.get_pin("collector:2", "btn_a"), Some(&Signal::Bool(true)));
-        assert_eq!(m.get_pin("collector:2", "key_f"), Some(&Signal::Bool(true)));
-        copy_bus(&mut m, "collector:9", "collector:3", |p| p != "btn_a");
-        assert!(!m.has_pin("collector:3", "btn_a"));
-        assert_eq!(m.len(), 5);
     }
 
     #[test]

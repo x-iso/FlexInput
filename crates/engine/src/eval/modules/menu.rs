@@ -33,8 +33,8 @@ pub(crate) fn eval_menu_node(
     snap: &NodeSnap,
     uid: usize,
     inputs: &[Option<Signal>],
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -47,22 +47,12 @@ pub(crate) fn eval_menu_node(
     // Upstream snapshot (collector override first, else raw device), owned so
     // the publish pass below can mutate collector_sigs freely.
     let mut upstream: PinSigs = PinSigs::default();
-    for ap in automap::ALL_PINS {
-        let sig = if !collector_id.is_empty() {
-            collector_sigs.get_pin(&collector_id, &ap.id).copied()
-        } else { None }
-        .or_else(|| {
-            if !dev_id.is_empty() {
-                dev_sigs.get_pin(&dev_id, &ap.id).copied()
-            } else { None }
-        });
-        if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-    }
+    upstream.fill_canonical(collector_sigs.view(&collector_id), dev_sigs.view(&dev_id));
     // Navigation reads: the source-block zeroed the menu's pointer pins in
     // `dev_sigs` (so nothing ELSE in the patch sees them), but the menu is the
     // reason they're blocked and must still steer from them — so it reads the
     // pre-block snapshot, falling back to the (unblocked) bus for everything else.
-    let unblocked_nav: SigMap = state.get(&MACRO_CARRY_UID)
+    let unblocked_nav: flexinput_core::SigMap = state.get(&MACRO_CARRY_UID)
         .map(|s| s.unblocked_src.clone()).unwrap_or_default();
     let read_nav = |pin: &str| -> Option<Signal> {
         unblocked_nav.get_pin(&dev_id, &pin).copied()
@@ -116,7 +106,7 @@ pub(crate) fn eval_menu_node(
     // stale is imperceptible at kHz. Captured before the mutable `state.entry`
     // below so the immutable borrow ends first (NLL).
     let macro_prev = state.get(&MACRO_CARRY_UID).map(|s| &s.macro_prev);
-    let macro_on = |cs: &SigMap, pin: String| -> bool {
+    let macro_on = |cs: &BusMap, pin: String| -> bool {
         let key = (flexinput_core::macros::SIGS_NS.to_string(), pin);
         cs.get(&key).map(|s| s.as_bool()).unwrap_or(false)
             || macro_prev.and_then(|m| m.get(&key)).map(|s| s.as_bool()).unwrap_or(false)
@@ -609,11 +599,11 @@ pub(crate) fn eval_menu_node(
             }
         }
         derive_stick_cardinals(&mut local);
-        for (k, v) in local {
+        for (k, v) in local.iter() {
             if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
                 || k.ends_with("_left") || k.ends_with("_right"))
             {
-                collector_sigs.set_pin(&key, &k, v);
+                collector_sigs.set_pin(&key, k, *v);
             }
         }
     }

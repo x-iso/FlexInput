@@ -15,8 +15,8 @@ use super::*;
 pub(crate) fn eval_automap_curve_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> (Vec<Option<Signal>>, Vec<Option<Signal>>) {
@@ -69,7 +69,7 @@ fn write_curved_pin(
     key: &str,
     pin: &str,
     output: Signal,
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
 ) {
     collector_sigs.set_pin(&key, &pin, output);
     let mut set_if_carried = |p: &str, sig: Signal| {
@@ -86,10 +86,9 @@ fn write_curved_pin(
         }
         Signal::Float(f) => {
             if let Some(vec_pin) = vec2_pin_for_axis(pin) {
-                let vec_key = (key.to_string(), vec_pin.to_string());
-                if let Some(Signal::Vec2(v)) = collector_sigs.get(&vec_key).copied() {
+                if let Some(Signal::Vec2(v)) = collector_sigs.get_pin(key, vec_pin).copied() {
                     let v = if pin.ends_with("_x") { Vec2::new(f, v.y) } else { Vec2::new(v.x, f) };
-                    collector_sigs.insert(vec_key, Signal::Vec2(v));
+                    collector_sigs.set_pin(key, vec_pin, Signal::Vec2(v));
                 }
             }
         }

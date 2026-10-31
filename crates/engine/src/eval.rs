@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use glam::Vec2;
-use flexinput_core::{PinMapExt, PinSigs, Signal, SignalType, SigMap, automap};
+use flexinput_core::{PinMapExt, PinSigs, Signal, SignalType, SigMap, BusMap, automap};
 use serde_json::Value;
 
 use crate::graph::{NodeSnap, ProcessingGraph};
@@ -90,17 +90,19 @@ fn eval_subgraph(
     graph: &ProcessingGraph,
     outer_inputs: &[Option<Signal>],
     state: &mut HashMap<usize, NodeState>,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     scope_samples: &mut Vec<(usize, Vec<Option<f32>>)>,
     last_inputs: &mut HashMap<usize, Vec<Option<Signal>>>,
     last_outputs: &mut HashMap<usize, Vec<Option<Signal>>>,
     fb_routes: &mut HashMap<String, String>,
     outer_uid: usize,
     dt: f32,
+    display: bool,
 ) -> Vec<Vec<Option<Signal>>> {
     let n = graph.nodes.len();
     let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
+    let mut inputs_buf: Vec<Option<Signal>> = Vec::new();
 
     for (idx, snap) in graph.nodes.iter().enumerate() {
         // Compute a namespaced UID for this inner node early so inner-node
@@ -125,7 +127,7 @@ fn eval_subgraph(
             let nested_uid = namespaced_uid(outer_uid, snap.node_uid);
             let inner_computed = eval_subgraph(
                 &sg.graph, &inner_inputs, state, dev_sigs, collector_sigs,
-                scope_samples, last_inputs, last_outputs, fb_routes, nested_uid, dt,
+                scope_samples, last_inputs, last_outputs, fb_routes, nested_uid, dt, display,
             );
             computed[idx] = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -157,21 +159,10 @@ fn eval_subgraph(
             let upstream_collector = snap.params.get("_automap_collector_id")
                 .and_then(|v| v.as_str()).unwrap_or("");
             if !upstream_collector.is_empty() {
-                flexinput_core::copy_bus(collector_sigs, upstream_collector, &uid_key, |_| true);
-                if !upstream_dev.is_empty() {
-                    for pin in flexinput_core::automap::ALL_PINS {
-                        if collector_sigs.has_pin(&uid_key, pin.id) { continue; }
-                        if let Some(&sig) = dev_sigs.get_pin(upstream_dev, pin.id) {
-                            collector_sigs.set_pin(&uid_key, pin.id, sig);
-                        }
-                    }
-                }
+                collector_sigs.copy_bus(upstream_collector, &uid_key, |_| true);
+                collector_sigs.fill_canonical(&uid_key, dev_sigs.view(upstream_dev));
             } else if !upstream_dev.is_empty() {
-                for pin in flexinput_core::automap::ALL_PINS {
-                    if let Some(&sig) = dev_sigs.get_pin(&upstream_dev, &pin.id) {
-                        collector_sigs.set_pin(&uid_key, &pin.id, sig);
-                    }
-                }
+                collector_sigs.pass_canonical(&uid_key, "", dev_sigs.view(upstream_dev));
             }
             // A MIDI device's pins are dynamic (not in ALL_PINS).
             fill_raw_dynamic(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
@@ -221,7 +212,7 @@ fn eval_subgraph(
                 .collect();
             computed[idx] = eval_menu_node(
                 snap, ns_uid, &inputs, dev_sigs, collector_sigs, state, dt);
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -234,7 +225,7 @@ fn eval_subgraph(
                 }))
                 .collect();
             computed[idx] = eval_rws_node(snap, ns_uid, &inputs, collector_sigs, state, dt);
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -243,8 +234,8 @@ fn eval_subgraph(
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
             let (inputs, outputs) = eval_automap_curve_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
             let inputs = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID { twoway_live_inputs(&inputs, state.get(&ns_uid)) } else { inputs };
-            last_inputs.insert(ns_uid, inputs);
-            last_outputs.insert(ns_uid, outputs);
+            if display { last_inputs.insert(ns_uid, inputs); }
+            if display { last_outputs.insert(ns_uid, outputs); }
             computed[idx] = vec![None];
             continue;
         }
@@ -253,7 +244,7 @@ fn eval_subgraph(
         // so a downstream sink's `collector:` lookup finds the mapped bus.
         if snap.module_id == AREA_MAPPER_ID {
             let out = eval_area_mapper_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out); }
             computed[idx] = vec![None];
             continue;
         }
@@ -262,7 +253,7 @@ fn eval_subgraph(
         // namespaced uid. Its live values ride in last_outputs for the body.
         if snap.module_id == STICK_ROT_ID {
             let out = eval_stick_rotation_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out); }
             computed[idx] = vec![None];
             continue;
         }
@@ -273,7 +264,7 @@ fn eval_subgraph(
         if snap.module_id == "module.map_action" {
             // Shared Map Action evaluation (identical at top level and sub-patch).
             computed[idx] = eval_map_action_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -287,19 +278,19 @@ fn eval_subgraph(
         if snap.module_id == "module.automap_fork" {
             automap_fork_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
             computed[idx] = vec![None; snap.n_outputs];
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
         if snap.module_id == "module.automap_combiner" {
             automap_combiner_publish(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
             computed[idx] = vec![None];
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
         if snap.module_id == "module.automap_selector" {
             automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs, fb_routes);
             computed[idx] = vec![None];
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
         // Feedback Control inside a sub-patch — the common case (device pins
@@ -309,7 +300,7 @@ fn eval_subgraph(
         // stamped virtual destination id. Identical to the top-level arm.
         if snap.module_id == "module.feedback_control" {
             let out = feedback_control_publish(snap, &computed, dev_sigs, collector_sigs);
-            last_outputs.insert(ns_uid, out.clone());
+            if display { last_outputs.insert(ns_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
@@ -321,16 +312,16 @@ fn eval_subgraph(
         // Stream Haptics (was a doesn't-work-when-nested bug before it got this uid).
         if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish) {
             let out = publish(snap, ns_uid, dev_sigs, collector_sigs);
-            computed[idx] = out.clone();
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out.clone()); }
+            computed[idx] = out;
             continue;
         }
         // Same seam, for a module that runs a state machine over its own node
         // state (and so needs `state` + `dt`). Migrated: module.jsm.
         if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish_stateful) {
             let out = publish(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
-            computed[idx] = out.clone();
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out.clone()); }
+            computed[idx] = out;
             continue;
         }
         // Network Send / Receive nested in a sub-patch. Publish under the
@@ -338,22 +329,23 @@ fn eval_subgraph(
         // sink lookup all agree (mirrors ASTH's nested arm above).
         if snap.module_id == NET_SEND_ID {
             let out = net_send_publish(snap, ns_uid, dev_sigs, collector_sigs);
-            computed[idx] = out.clone();
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out.clone()); }
+            computed[idx] = out;
             continue;
         }
         if snap.module_id == NET_RECV_ID {
             let out = net_recv_publish(snap, ns_uid, dev_sigs, collector_sigs);
-            computed[idx] = out.clone();
-            last_outputs.insert(ns_uid, out);
+            if display { last_outputs.insert(ns_uid, out.clone()); }
+            computed[idx] = out;
             continue;
         }
 
-        let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+        inputs_buf.clear();
+        inputs_buf.extend(snap.input_sources.iter()
             .map(|src| src.and_then(|(si, op)| {
                 computed.get(si).and_then(|v| v.get(op)).copied().flatten()
-            }))
-            .collect();
+            })));
+        let inputs = &inputs_buf;
 
         let node_state = state.entry(ns_uid).or_insert_with(NodeState::default);
         if let Some(ref vals) = snap.aux_f32_override {
@@ -383,19 +375,19 @@ fn eval_subgraph(
             "display.oscilloscope" => {
                 let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
                 scope_samples.push((ns_uid, sample));
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             // A readout shows only its latest value: no per-tick scope samples
             // (the UI kept 20k of them per readout that nothing read).
             "display.readout" => {
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             "display.trigscope" => {
                 // inputs[0] is trigger; inputs[1..] are data channels.
                 // Emit all inputs so the UI can do trigger-edge detection.
                 let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
                 scope_samples.push((ns_uid, sample));
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             "display.vectorscope" => {
                 let sample = inputs.iter().flat_map(|sig| match sig {
@@ -403,27 +395,27 @@ fn eval_subgraph(
                     _ => [None, None],
                 }).collect();
                 scope_samples.push((ns_uid, sample));
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             // The 3D controller viewer reads its Orientation quaternion (input
             // pin 1, a Vec4) from the mirrored inputs.
             "display.controller3d" => {
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
-                last_inputs.insert(ns_uid, inputs.clone());
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
             "module.twoway_response_curve" => {
-                last_inputs.insert(ns_uid, twoway_live_inputs(&inputs, Some(node_state)));
+                if display { last_inputs.insert(ns_uid, twoway_live_inputs(&inputs, Some(node_state))); }
             }
             "generator.envelope" => {
-                last_inputs.insert(ns_uid, node_state.last_signals.clone());
+                if display { last_inputs.insert(ns_uid, node_state.last_signals.clone()); }
             }
             _ => {}
         }
         // Populate last_outputs for every node — used by the UI to drive the
         // per-pin signal glow on downstream device-sink inputs.
-        last_outputs.insert(ns_uid, node_outputs.clone());
+        if display { last_outputs.insert(ns_uid, node_outputs.clone()); }
 
         computed[idx] = node_outputs;
     }
@@ -447,18 +439,24 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
 ) {
     puffin::profile_function!();
     out.clear();
+    let display = !out.skip_display;
     let n = graph.nodes.len();
     let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
+    let mut inputs_buf: Vec<Option<Signal>> = Vec::new();
 
     // Apply per-device source-side post-processing (stick deadzone + gyro
     // multiplier) ONCE up front so every downstream consumer — direct wires,
     // AutoMap split/collector, sink AutoMap, remapper — sees the processed
     // values. Avoids the prior leak where AutoMap pulled raw dev_sigs and
     // bypassed the source node's params.
-    let mut dev_sigs_owned: SigMap = std::mem::take(&mut out.dev_scratch);
+    let mut dev_sigs_owned: BusMap = std::mem::take(&mut out.dev_scratch);
     {
         puffin::profile_scope!("preprocess_dev_sigs");
-        preprocess_dev_sigs_into(graph, dev_sigs, &mut dev_sigs_owned);
+        if !out.same_input || device_params(graph).preprocessing_has_state {
+            out.dev_base.clear();
+            preprocess_dev_sigs_into(graph, dev_sigs, &mut out.dev_base);
+        }
+        dev_sigs_owned.clone_from(&out.dev_base);
     }
     // Device-level stick rebound filter (opt-in per device.source): on the
     // calibrated sticks, before anything — the source-block snapshot included —
@@ -497,7 +495,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
     // Borrows live until the end of the function; final
     // `TickOutput { … }` packing is no longer needed.
     // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
-    let mut collector_sigs: SigMap = std::mem::take(&mut out.bus_scratch);
+    let mut collector_sigs: BusMap = std::mem::take(&mut out.bus_scratch);
     let TickOutput {
         ref mut outputs,
         ref mut scope_samples,
@@ -525,7 +523,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         if snap.module_id == "module.map_action" {
             // Shared Map Action evaluation (identical at top level and sub-patch).
             computed[idx] = eval_map_action_node(snap, snap.node_uid, dev_sigs, &collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, computed[idx].clone());
+            if display { last_outputs.insert(snap.node_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -560,7 +558,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 .collect();
             computed[idx] = eval_menu_node(
                 snap, snap.node_uid, &inputs, dev_sigs, &mut collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, computed[idx].clone());
+            if display { last_outputs.insert(snap.node_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -573,7 +571,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 }))
                 .collect();
             computed[idx] = eval_rws_node(snap, snap.node_uid, &inputs, &mut collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, computed[idx].clone());
+            if display { last_outputs.insert(snap.node_uid, computed[idx].clone()); }
             continue;
         }
 
@@ -584,8 +582,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         if snap.module_id == AUTOMAP_CURVE_ID || snap.module_id == AUTOMAP_TWOWAY_CURVE_ID {
             let (inputs, outputs) = eval_automap_curve_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             let inputs = if snap.module_id == AUTOMAP_TWOWAY_CURVE_ID { twoway_live_inputs(&inputs, state.get(&snap.node_uid)) } else { inputs };
-            last_inputs.insert(snap.node_uid, inputs);
-            last_outputs.insert(snap.node_uid, outputs);
+            if display { last_inputs.insert(snap.node_uid, inputs); }
+            if display { last_outputs.insert(snap.node_uid, outputs); }
             computed[idx] = vec![None];
             continue;
         }
@@ -594,7 +592,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         // its cells. The live point and cell weights ride in last_outputs.
         if snap.module_id == AREA_MAPPER_ID {
             let out = eval_area_mapper_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, out);
+            if display { last_outputs.insert(snap.node_uid, out); }
             computed[idx] = vec![None];
             continue;
         }
@@ -604,7 +602,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         // for the body's circle.
         if snap.module_id == STICK_ROT_ID {
             let out = eval_stick_rotation_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, out);
+            if display { last_outputs.insert(snap.node_uid, out); }
             computed[idx] = vec![None];
             continue;
         }
@@ -645,25 +643,14 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 .and_then(|v| v.as_str()).unwrap_or("");
             if !upstream_collector.is_empty() {
                 // Copy EVERY entry from the upstream collector key.
-                flexinput_core::copy_bus(&mut collector_sigs, upstream_collector, &uid_key, |_| true);
+                collector_sigs.copy_bus(upstream_collector, &uid_key, |_| true);
                 // For canonical pins not present on the upstream collector
                 // (e.g. when upstream is a Remapper that only writes mapped
                 // pins, not pass-through), fall back to raw device samples.
-                if !upstream_dev.is_empty() {
-                    for pin in flexinput_core::automap::ALL_PINS {
-                        if collector_sigs.has_pin(&uid_key, pin.id) { continue; }
-                        if let Some(&sig) = dev_sigs.get_pin(upstream_dev, pin.id) {
-                            collector_sigs.set_pin(&uid_key, pin.id, sig);
-                        }
-                    }
-                }
+                collector_sigs.fill_canonical(&uid_key, dev_sigs.view(upstream_dev));
             } else if !upstream_dev.is_empty() {
                 // No upstream collector — pure raw device pass-through.
-                for pin in flexinput_core::automap::ALL_PINS {
-                    if let Some(&sig) = dev_sigs.get_pin(&upstream_dev, &pin.id) {
-                        collector_sigs.set_pin(&uid_key, &pin.id, sig);
-                    }
-                }
+                collector_sigs.pass_canonical(&uid_key, "", dev_sigs.view(upstream_dev));
             }
             // A MIDI device's pins are dynamic (not in ALL_PINS): copy its live
             // ones too, under whatever the upstream collector already carried.
@@ -715,7 +702,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         //    feedback channel; tap outlets from the virtual destination. ──────
         if snap.module_id == "module.feedback_control" {
             let out = feedback_control_publish(snap, &computed, dev_sigs, &mut collector_sigs);
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
@@ -728,13 +715,13 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         // node's top-level uid here.
         if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish_stateful) {
             let out = publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
         if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish) {
             let out = publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
@@ -742,7 +729,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         //    inject peer feedback into the upstream pad. ────────────────────────
         if snap.module_id == NET_SEND_ID {
             let out = net_send_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
@@ -750,7 +737,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         //    gather downstream feedback to ship back. ──────────────────────────
         if snap.module_id == NET_RECV_ID {
             let out = net_recv_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
@@ -758,10 +745,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         if let Some(ref st) = snap.sink_target {
             // Pins that have at least one actual direct wire (non-empty multi_sources).
             // These take priority over auto-mapped signals for the same pin.
-            let directly_wired: HashSet<&str> = st.pin_ids.iter().enumerate()
-                .filter(|(i, pid)| !pid.is_empty() && st.multi_sources.get(*i).map_or(false, |s| !s.is_empty()))
-                .map(|(_, pid)| pid.as_str())
-                .collect();
+            let compiled = st.compiled();
+            let directly_wired = &compiled.directly_wired;
 
             // Per-sink scaling params. Currently: mouse sensitivity on
             // virtual.keymouse — applied to mouse_x / mouse_y / mouse pins.
@@ -820,15 +805,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
 
             // AutoMap: semantic-map source device pins → sink device pins.
             // Uses resolve_mapping() for cross-family translation (e.g. btn_cross → btn_south).
-            if let Some((ref src_dev, ref src_pins)) = st.automap_source {
-                let dst_ids: Vec<&str> = st.pin_ids.iter()
-                    .filter(|pid| !pid.is_empty())
-                    .map(|pid| pid.as_str())
-                    .collect();
-                let src_ids: Vec<&str> = src_pins.iter()
-                    .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
-                    .map(|p| p.as_str())
-                    .collect();
+            if let Some((ref src_dev, _)) = st.automap_source {
                 let is_collector = is_namespaced_source(src_dev);
                 // Digital→analog trigger bridges (`btn_lt_dig`→`left_trigger`,
                 // `btn_rt_dig`→`right_trigger`) are a LOWEST-PRIORITY fallback:
@@ -849,29 +826,41 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         dev_sigs.get_pin(&src_dev, &mapped_src).copied()
                     }
                 };
-                let pairs = crate::state::AutomapPairs::resolve(
-                    &mut state.entry(snap.node_uid).or_default().automap_pairs, &src_ids, &dst_ids,
-                ).to_vec();
-                for (mapped_src, mapped_dst) in pairs.iter().map(|&(s, d)| (src_ids[s as usize], dst_ids[d as usize])) {
-                    if directly_wired.contains(mapped_dst) { continue; }
-                    let is_digital_trigger_bridge =
-                        matches!((mapped_src, mapped_dst),
-                            ("btn_lt_dig", "left_trigger") | ("btn_rt_dig", "right_trigger"));
-                    if is_digital_trigger_bridge {
+                let (first, second) = if is_collector {
+                    (collector_sigs.view(src_dev),
+                     dev_sigs.view(st.automap_fallback_dev.as_deref().unwrap_or("")))
+                } else {
+                    (dev_sigs.view(src_dev), dev_sigs.view(""))
+                };
+                let sink_bus = sink_outputs.bus_id(&st.device_id);
+                for p in &compiled.pairs {
+                    if p.wired { continue; }
+                    if p.digital_trigger_bridge {
                         // Only honour the bridge when the upstream source opted in
                         // (or is a digital-only pad). Otherwise a pad with real
                         // analog triggers would have its digital button leak into
                         // the analog trigger.
                         if st.digital_trigger_bridge {
-                            deferred_digital_triggers.push((mapped_src, mapped_dst));
+                            deferred_digital_triggers.push((&p.src, &p.dst));
                         }
                         continue;
                     }
-                    if let Some(sig) = resolve_sig(mapped_src) {
+                    let sig = match p.src_ix {
+                        Some(ix) => first.at(ix).or_else(|| second.at(ix)).copied(),
+                        None => resolve_sig(&p.src),
+                    };
+                    if let Some(sig) = sig {
                         // Type coercion (Bool↔Float) is performed by the virtual device's
                         // send() via Signal::as_float / as_bool, so we just hand the raw
                         // signal off — semantic groups already routed it to the right pin.
-                        sink_outputs.set_pin_if_absent(&st.device_id, mapped_dst, scale_for_sink(mapped_dst, sig));
+                        match p.dst_ix {
+                            Some(ix) => {
+                                if sink_outputs.at(sink_bus, ix).is_none() {
+                                    sink_outputs.set_at(sink_bus, ix, scale_for_sink(&p.dst, sig));
+                                }
+                            }
+                            None => sink_outputs.set_pin_if_absent(&st.device_id, &p.dst, scale_for_sink(&p.dst, sig)),
+                        }
                     }
                 }
                 // Second pass: digital-trigger fallback. Writes the analog trigger
@@ -895,9 +884,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 // learned_keys fallback, so users can drive any custom key (F1, Space,
                 // letters, …) by adding it to the Collector via the Learn-key UI.
                 if is_collector && st.device_id.starts_with("virtual.keymouse") {
-                    for ((dev, pin), &sig) in collector_sigs.iter() {
-                        if dev != src_dev { continue; }
-                        if directly_wired.contains(pin.as_str()) { continue; }
+                    for (pin, &sig) in collector_sigs.pins_of(src_dev) {
+                        if directly_wired.contains(pin) { continue; }
                         sink_outputs.set_pin_if_absent(&st.device_id, pin, scale_for_sink(pin, sig));
                     }
                 }
@@ -1071,21 +1059,22 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 .collect();
             let inner_computed = eval_subgraph(
                 &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
-                scope_samples, last_inputs, last_outputs, &mut fb_routes, snap.node_uid, dt,
+                scope_samples, last_inputs, last_outputs, &mut fb_routes, snap.node_uid, dt, display,
             );
             let out: Vec<Option<Signal>> = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
                 .collect();
-            last_outputs.insert(snap.node_uid, out.clone());
+            if display { last_outputs.insert(snap.node_uid, out.clone()); }
             computed[idx] = out;
             continue;
         }
 
-        let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+        inputs_buf.clear();
+        inputs_buf.extend(snap.input_sources.iter()
             .map(|src| src.and_then(|(src_idx, out_pin)| {
                 computed.get(src_idx).and_then(|v| v.get(out_pin)).copied().flatten()
-            }))
-            .collect();
+            })));
+        let inputs = &inputs_buf;
 
         let node_state = state.entry(snap.node_uid).or_insert_with(NodeState::default);
 
@@ -1125,17 +1114,17 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
             "display.oscilloscope" => {
                 let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
                 scope_samples.push((snap.node_uid, sample));
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             // A readout shows only its latest value: no per-tick scope samples
             // (the UI kept 20k of them per readout that nothing read).
             "display.readout" => {
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             "display.trigscope" => {
                 let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
                 scope_samples.push((snap.node_uid, sample));
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             "display.vectorscope" => {
                 let sample = inputs.iter().flat_map(|sig| match sig {
@@ -1143,33 +1132,33 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                     _ => [None, None],
                 }).collect();
                 scope_samples.push((snap.node_uid, sample));
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             // The 3D controller viewer reads its Orientation quaternion (input
             // pin 1, a Vec4) from the mirrored inputs.
             "display.controller3d" => {
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
-                last_inputs.insert(snap.node_uid, inputs.clone());
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             "module.twoway_response_curve" => {
-                last_inputs.insert(snap.node_uid, twoway_live_inputs(&inputs, Some(node_state)));
+                if display { last_inputs.insert(snap.node_uid, twoway_live_inputs(&inputs, Some(node_state))); }
             }
             "generator.envelope" => {
                 // last_signals = [output, phase]; UI reads phase from index 1 for playhead
-                last_inputs.insert(snap.node_uid, node_state.last_signals.clone());
+                if display { last_inputs.insert(snap.node_uid, node_state.last_signals.clone()); }
             }
             _ => {}
         }
         // Populate last_outputs for every node — used by the UI to drive the
         // per-pin signal glow on downstream device-sink inputs.
-        last_outputs.insert(snap.node_uid, node_outputs.clone());
+        if display { last_outputs.insert(snap.node_uid, node_outputs.clone()); }
 
         // Exclude device.source from the exported outputs; UI evaluates those fresh.
         if snap.module_id != "device.source" {
             for (out_pin, sig) in node_outputs.iter().enumerate() {
-                outputs.insert((snap.node_uid, out_pin), *sig);
+                if display { outputs.insert((snap.node_uid, out_pin), *sig); }
             }
         }
 
@@ -1241,9 +1230,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
             for channel in FEEDBACK_WRITE_CHANNELS {
                 let from_key = format!("{channel}{from_id}");
                 let to_key = format!("{channel}{terminal}");
-                let entries: Vec<(String, Signal)> = collector_sigs.iter()
-                    .filter(|((d, _), _)| d == &from_key)
-                    .map(|((_, p), s)| (p.clone(), *s))
+                let entries: Vec<(String, Signal)> = collector_sigs.pins_of(&from_key)
+                    .map(|(p, s)| (p.to_string(), *s))
                     .collect();
                 for (pin, sig) in entries {
                     collector_sigs.merge_pin(&to_key, &pin, sig, |cur| *cur = combine_signals(*cur, sig));
@@ -1304,11 +1292,15 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         carry.source_block.clear();
         carry.orient_neutral_req.clear();
         let mut gyro_cal: HashSet<String> = HashSet::new();
-        for ((k, pin), sig) in collector_sigs.iter() {
+        for k in collector_sigs.buses() {
             if k == SIGS_NS || k == SIGS_NS_VEC2 {
-                carry.macro_prev.insert((k.clone(), pin.clone()), *sig);
+                for (pin, sig) in collector_sigs.pins_of(k) {
+                    carry.macro_prev.insert((k.to_string(), pin.to_string()), *sig);
+                }
             } else if let Some(dev) = k.strip_prefix(SRC_BLOCK_PREFIX) {
-                carry.source_block.insert((dev.to_string(), pin.clone()));
+                for (pin, _) in collector_sigs.pins_of(k) {
+                    carry.source_block.insert((dev.to_string(), pin.to_string()));
+                }
             } else if let Some(dev) = k.strip_prefix(ORIENT_NEUTRAL_PREFIX) {
                 carry.orient_neutral_req.insert(dev.to_string());
             } else if let Some(dev) = k.strip_prefix(GYRO_CAL_PREFIX) {
@@ -1322,9 +1314,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
     }
 
     // Hand the working maps back, emptied, for the next tick to reuse.
-    flexinput_core::recycle_keys(&mut collector_sigs);
+    collector_sigs.clear();
     out.bus_scratch = collector_sigs;
-    flexinput_core::recycle_keys(&mut dev_sigs_owned);
     out.dev_scratch = dev_sigs_owned;
 }
 

@@ -1830,10 +1830,10 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(
             "How fast the virtual gamepads and virtual mouse report to games."
         ).small().color(egui::Color32::from_gray(140)));
-        if self.settings.output_hz > self.settings.sample_rate_hz {
+        if self.settings.effective_output_hz() > self.settings.effective_sample_rate_hz() {
             ui.label(egui::RichText::new(format!(
                 "Above the processing sample rate ({} Hz): outputs from the patch only change that often.",
-                self.settings.sample_rate_hz,
+                self.settings.effective_sample_rate_hz(),
             )).small().color(egui::Color32::from_rgb(230, 170, 80)));
         }
 
@@ -1869,6 +1869,38 @@ impl FlexInputApp {
                     }
                 });
             });
+        // Whether the engine is computing, blocked, or short of ticks.
+        egui::CollapsingHeader::new(egui::RichText::new("Where the engine's time goes").small())
+            .id_salt("engine_timings_details")
+            .show(ui, |ui| {
+                let rows = flexinput_engine::ENGINE_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
+                egui::Grid::new("engine_timings").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| egui::RichText::new(s).small().strong();
+                    ui.label(head("per engine pass, last second"));
+                    ui.label(head("avg ms"));
+                    ui.label(head("worst ms"));
+                    ui.end_row();
+                    for (name, avg, worst) in &rows {
+                        ui.label(egui::RichText::new(name.as_str()).small());
+                        ui.label(egui::RichText::new(format!("{avg:.3}")).small());
+                        ui.label(egui::RichText::new(format!("{worst:.2}")).small());
+                        ui.end_row();
+                    }
+                });
+            });
+        // The main window's passes, before it paints. The second line keeps the
+        // last figures from without focus, when the window can't show them live.
+        egui::CollapsingHeader::new(egui::RichText::new("Where the window's time goes").small())
+            .id_salt("ui_pass_details")
+            .show(ui, |ui| {
+                let (now, away) = super::main_window::UI_PASSES.lock().map(|t| *t).unwrap_or_default();
+                let line = |r: super::main_window::UiPassRow| format!(
+                    "{} passes/s, {} drawn, {} let go, {:.2} ms each",
+                    r.passes, r.drawn, r.waited, r.avg_ms,
+                );
+                ui.label(egui::RichText::new(format!("Now: {}", line(now))).small());
+                ui.label(egui::RichText::new(format!("Last time without focus: {}", line(away))).small());
+            });
         // Which thread the process's CPU time goes to; nice shows whether the
         // input threads got their raised priority (thread_priority).
         #[cfg(target_os = "linux")]
@@ -1900,30 +1932,57 @@ impl FlexInputApp {
 
         ui.horizontal(|ui| {
             ui.label("Processing sample rate");
-            let resp = ui.add(egui::Slider::new(
-                &mut self.settings.sample_rate_hz,
-                settings::SAMPLE_RATE_HZ_MIN..=settings::SAMPLE_RATE_HZ_MAX,
-            ).suffix(" Hz"));
-            if resp.changed() {
-                self.sample_rate_hz.store(self.settings.sample_rate_hz, Ordering::Relaxed);
-                *dirty = true;
+            use settings::SampleRateMode as Mode;
+            let label = |m: Mode| match m {
+                Mode::Manual => "Set by hand",
+                Mode::SameAsOutput => "Same as output",
+                Mode::TwiceOutput => "2x output",
+            };
+            egui::ComboBox::from_id_salt("sample_rate_mode")
+                .selected_text(label(self.settings.sample_rate_mode))
+                .show_ui(ui, |ui| {
+                    for (m, tip) in [
+                        (Mode::Manual, "Pick the rate yourself, no lower than polling."),
+                        (Mode::SameAsOutput, "One tick per output: the least CPU. Timers, gestures and PWM are only as fine as the output rate."),
+                        (Mode::TwiceOutput, "Two ticks per output: twice the CPU of Same as output, and twice as fine for timers, gestures and PWM."),
+                    ] {
+                        if ui.selectable_value(&mut self.settings.sample_rate_mode, m, label(m))
+                            .on_hover_text(tip)
+                            .changed()
+                        {
+                            *dirty = true;
+                        }
+                    }
+                });
+            if self.settings.sample_rate_mode == Mode::Manual {
+                let floor = self.settings.sample_rate_floor_hz();
+                let resp = ui.add(egui::Slider::new(
+                    &mut self.settings.sample_rate_hz,
+                    floor..=settings::SAMPLE_RATE_HZ_MAX,
+                ).suffix(" Hz"));
+                if resp.changed() {
+                    *dirty = true;
+                }
+            } else {
+                ui.label(format!("{} Hz", self.settings.effective_sample_rate_hz()));
             }
         });
         ui.label(egui::RichText::new(
-            "Engine tick rate. Higher = lower latency, more CPU."
+            "Engine tick rate. Higher = finer timing, more CPU."
         ).small().color(egui::Color32::from_gray(140)));
         if let (Some(passes), Some(ticks)) = (live.passes_hz, live.ticks_hz) {
             // Below ~90% of the setting, catch-up ticks are being dropped: the
             // patch costs more per tick than this machine has at this rate.
-            let behind = ticks < self.settings.sample_rate_hz * 9 / 10;
+            let rate = self.settings.effective_sample_rate_hz();
+            let behind = ticks < rate * 9 / 10;
             // A rate it would sustain: under what it manages now, with room.
             let suggest = (ticks * 4 / 5 / 100 * 100)
-                .clamp(settings::SAMPLE_RATE_HZ_MIN, self.settings.sample_rate_hz);
+                .clamp(self.settings.sample_rate_floor_hz().min(rate), rate);
             let text = egui::RichText::new(format!(
                 "Now: engine {ticks} ticks/s in {passes} passes/s{}",
                 if !behind {
                     String::new()
-                } else if suggest < self.settings.sample_rate_hz {
+                } else if suggest < rate && self.settings.sample_rate_mode == settings::SampleRateMode::Manual {
                     format!(" — can't keep up at this rate; try {suggest} Hz")
                 } else {
                     " — can't keep up at this rate".to_string()
@@ -1952,6 +2011,14 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(
             "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused."
         ).small().color(egui::Color32::from_gray(140)));
+
+        ui.add_space(8.0);
+        if ui.checkbox(&mut self.settings.freeze_background, "Freeze and dim unused windows")
+            .on_hover_text("Windows without focus stop drawing and stay dimmed on their last frame until you click them. A sub-patch editor also wakes when the pointer moves over it. Mappings and overlays keep running. A pinned or see-through window stays live.")
+            .changed()
+        {
+            *dirty = true;
+        }
     }
 
     fn settings_midi(&mut self, ui: &mut egui::Ui) {

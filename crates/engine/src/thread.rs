@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use flexinput_core::{Signal, SigMap};
+use flexinput_core::{BusMap, Signal, SigMap};
 
 use crate::eval::{eval_graph_tick, TickOutput};
 use crate::graph::ProcessingGraph;
@@ -170,6 +170,117 @@ pub const SCOPE_TAP_RETAIN_MS: u64 = 5500;
 /// 5 s at ~4 kHz polling with headroom.
 pub const SCOPE_TAP_MAX_LEN: usize = 32768;
 
+/// Which ticks are due at a wake-up. Ticks are spaced by the sample rate and the
+/// wake-ups by the polling rate, on separate clocks. At equal rates, ticks falling
+/// due right where the polls land would make jitter give one poll no tick and the
+/// next two: an output a whole period late, every so often. So a tick counts from
+/// half an interval before it's due, and the schedule drifts onto the wake-ups,
+/// which puts that edge as far from them as it can be. Only the phase moves: the
+/// pull is too gentle to hold a rate more than about 1% off the wake-ups' (ticks
+/// carry a fixed dt, so that would be time running fast), and it only acts while
+/// every wake-up gets ticks, since faster wake-ups always find the next tick ahead.
+#[derive(Default)]
+struct TickClock {
+    next: Option<Instant>,
+    interval: Duration,
+    ticked_last: bool,
+}
+
+impl TickClock {
+    fn due(&mut self, now: Instant, interval: Duration) -> u32 {
+        // A new rate starts its schedule here.
+        let mut next = match self.next {
+            Some(next) if self.interval == interval => next,
+            _ => now,
+        };
+        self.interval = interval;
+        let mut ticks = 0;
+        while next <= now + interval / 2 {
+            next += interval;
+            ticks += 1;
+        }
+        if ticks > 0 && self.ticked_last {
+            // How far this wake-up is from the last tick it counted, either way.
+            let tick = next - interval;
+            next = if now >= tick { next + (now - tick) / 64 } else { next - (tick - now) / 64 };
+        }
+        self.ticked_last = ticks > 0;
+        self.next = Some(next);
+        ticks
+    }
+}
+
+/// What the engine thread's passes spent their time on, refreshed once a second
+/// for Settings → Performance: name, average ms per pass, worst ms.
+pub static ENGINE_TIMINGS: Mutex<Vec<(String, f32, f32)>> = Mutex::new(Vec::new());
+
+const ENGINE_TIMING_NAMES: [&str; 4] =
+    ["running ticks", "writing the sink bus", "waiting for the output lock", "waiting for input (idle)"];
+
+#[derive(Default)]
+struct EngineTimingAcc {
+    sum: [Duration; 4],
+    worst: [Duration; 4],
+    ticks: u64,
+    dropped: u64,
+    passes: u32,
+    since: Option<Instant>,
+}
+
+impl EngineTimingAcc {
+    fn add(&mut self, row: usize, d: Duration) {
+        self.sum[row] += d;
+        self.worst[row] = self.worst[row].max(d);
+    }
+
+    fn counts(&mut self, ticks: u32, dropped: u32) {
+        self.ticks += ticks as u64;
+        self.dropped += dropped as u64;
+    }
+
+    fn end_pass(&mut self, now: Instant) {
+        self.passes += 1;
+        let since = *self.since.get_or_insert(now);
+        if now - since < Duration::from_secs(1) {
+            return;
+        }
+        let n = self.passes.max(1) as f32;
+        let mut rows: Vec<(String, f32, f32)> = ENGINE_TIMING_NAMES.iter().enumerate()
+            .map(|(i, name)| (name.to_string(), self.sum[i].as_secs_f32() * 1e3 / n, self.worst[i].as_secs_f32() * 1e3))
+            .collect();
+        rows.push(("ticks per pass".to_string(), self.ticks as f32 / n, 0.0));
+        rows.push(("ticks dropped, per second".to_string(), self.dropped as f32, 0.0));
+        if let Ok(mut t) = ENGINE_TIMINGS.lock() {
+            *t = rows;
+        }
+        *self = Self { since: Some(now), ..Self::default() };
+    }
+}
+
+/// Milliseconds since the first call, for [`note_scope_taps_read`].
+fn taps_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Last time the UI read the taps, +1 so that 0 means never.
+static SCOPE_TAPS_READ_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long the I/O loop keeps tapping after the last read.
+const SCOPE_TAPS_LINGER_MS: u64 = 2000;
+
+/// Call when reading the taps: the I/O loop only fills them while it's told so.
+pub fn note_scope_taps_read() {
+    SCOPE_TAPS_READ_AT.store(taps_clock_ms() + 1, Ordering::Relaxed);
+}
+
+/// Whether anything has read the taps lately. A scope that just opened starts
+/// empty and fills within a frame.
+pub fn scope_taps_wanted() -> bool {
+    let at = SCOPE_TAPS_READ_AT.load(Ordering::Relaxed);
+    at != 0 && taps_clock_ms() + 1 - at < SCOPE_TAPS_LINGER_MS
+}
+
 /// Build a fresh `ScopeTaps` handle. The I/O thread writes; the UI reads.
 pub fn new_scope_taps() -> ScopeTaps {
     Arc::new(RwLock::new(HashMap::new()))
@@ -239,12 +350,13 @@ fn is_banked_pin(pin: &str) -> bool {
     is_displacement_pin(pin) || is_click_pin(pin)
 }
 
-fn add_displacement<S: std::hash::BuildHasher>(into: &mut HashMap<(String, String), Signal, S>, key: &(String, String), v: Signal) {
-    match (into.get_mut(key), v) {
+fn add_displacement<S: std::hash::BuildHasher>(into: &mut HashMap<(String, String), Signal, S>, key: (&str, &str), v: Signal) {
+    use flexinput_core::PinMapExt;
+    match (into.get_pin_mut(key.0, key.1), v) {
         (Some(Signal::Vec2(a)), Signal::Vec2(b)) => *a += b,
         (Some(Signal::Float(a)), Signal::Float(b)) => *a += b,
         // First sighting, or a type that changed under us: the new value stands.
-        _ => { into.insert(key.clone(), v); }
+        _ => { into.insert((key.0.to_string(), key.1.to_string()), v); }
     }
 }
 
@@ -253,16 +365,17 @@ fn add_displacement<S: std::hash::BuildHasher>(into: &mut HashMap<(String, Strin
 fn bank_displacement(
     bank: &mut SigMap,
     levels: &mut HashMap<(String, String), bool>,
-    sinks: &SigMap,
+    sinks: &BusMap,
 ) {
-    for (k, &v) in sinks {
-        if is_displacement_pin(&k.1) {
+    use flexinput_core::PinMapExt;
+    for (k, &v) in sinks.iter() {
+        if is_displacement_pin(k.1) {
             add_displacement(bank, k, v);
-        } else if is_click_pin(&k.1) {
+        } else if is_click_pin(k.1) {
             let on = matches!(v, Signal::Bool(true));
-            let was = match levels.get_mut(k) {
+            let was = match levels.get_pin_mut(k.0, k.1) {
                 Some(l) => std::mem::replace(l, on),
-                None => { levels.insert(k.clone(), on); false }
+                None => { levels.insert((k.0.to_string(), k.1.to_string()), on); false }
             };
             if on && !was {
                 add_displacement(bank, k, Signal::Float(1.0));
@@ -281,20 +394,20 @@ fn bank_displacement(
 /// the sample rate), and a rebuild cloned two key Strings per sink pin each time.
 fn publish_sink_bus(
     bus: &mut HashMap<(String, String), Signal>,
-    sinks: &SigMap,
+    sinks: &BusMap,
     bank: &mut SigMap,
 ) {
     use flexinput_core::PinMapExt;
     // Level pins that left the outputs go; banked pins keep what the reader
     // has not drained yet.
     bus.retain(|k, _| is_banked_pin(&k.1) || sinks.contains_key(k));
-    for (k, &v) in sinks {
-        if !is_banked_pin(&k.1) {
-            bus.set_pin(&k.0, &k.1, v);
+    for (k, &v) in sinks.iter() {
+        if !is_banked_pin(k.1) {
+            bus.set_pin(k.0, k.1, v);
         }
     }
     for (k, v) in bank.drain() {
-        add_displacement(bus, &k, v);
+        add_displacement(bus, (&k.0, &k.1), v);
     }
 }
 
@@ -544,7 +657,7 @@ pub fn spawn_processing_thread(
         }
         crate::raise_input_thread("engine");
 
-        let mut next_tick = Instant::now();
+        let mut clock = TickClock::default();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         // Owns the per-node WASAPI loopback captures for Audio Stream Haptics
         // nodes. Reconciled once per wakeup against the live graph; eval reads the
@@ -579,6 +692,7 @@ pub fn spawn_processing_thread(
         // The device-I/O thread no longer calls timeBeginPeriod, so a plain
         // timed wait would round up to ~15.6 ms when the kicks stop.
         let waiter = crate::hr_timer::HrWaiter::new();
+        let mut timings = EngineTimingAcc::default();
 
         loop {
             puffin::GlobalProfiler::lock().new_frame();
@@ -596,16 +710,14 @@ pub fn spawn_processing_thread(
             let interval = Duration::from_nanos(1_000_000_000 / sr as u64);
 
             // How many ticks have elapsed since we last processed?
-            let mut ticks = 0u32;
-            while next_tick <= now {
-                next_tick += interval;
-                ticks += 1;
-            }
+            let ticks = clock.due(now, interval);
             // Cap catchup to avoid spiral-of-death on heavy load: 10 ms worth,
             // at least 16. A wakeup normally runs one polling period's ticks
             // (4 at the defaults); the slowest polling step (125 Hz, 8 ms)
             // must still fit at any sample rate.
+            let due_ticks = ticks;
             let ticks = ticks.min((sr / 100).max(16));
+            timings.counts(ticks, due_ticks - ticks);
 
             if ticks > 0 {
                 ENGINE_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -685,7 +797,10 @@ pub fn spawn_processing_thread(
 
                 {
                     puffin::profile_scope!("eval_ticks");
-                    for _ in 0..ticks {
+                    let eval_t = Instant::now();
+                    for t in 0..ticks {
+                        tick_out.skip_display = t + 1 != ticks;
+                        tick_out.same_input = t != 0;
                         if !ui_block.is_empty() {
                             let carry = state.entry(crate::eval::MACRO_CARRY_UID).or_default();
                             for k in &ui_block {
@@ -700,17 +815,22 @@ pub fn spawn_processing_thread(
                         gyro_cal_acc.append(&mut tick_out.gyro_cal_requests);
                         bank_displacement(&mut disp_bank, &mut click_levels, &tick_out.sink_outputs);
                     }
+                    timings.add(0, eval_t.elapsed());
                 }
 
                 // tick_out now holds the LAST tick's outputs/inputs/sinks; the
                 // displacement pins carry every tick's share instead.
                 {
                     puffin::profile_scope!("write_sink_bus");
+                    let sink_t = Instant::now();
                     publish_sink_bus(&mut sink_bus.write().unwrap(), &tick_out.sink_outputs, &mut disp_bank);
+                    timings.add(1, sink_t.elapsed());
                 }
                 {
                     puffin::profile_scope!("write_proc_outputs");
+                    let lock_t = Instant::now();
                     let mut out = output.lock().unwrap();
+                    timings.add(2, lock_t.elapsed());
                     for sample in scope_acc.drain(..) {
                         if out.scope_pending.len() < MAX_SCOPE_PENDING {
                             out.scope_pending.push(sample);
@@ -757,7 +877,10 @@ pub fn spawn_processing_thread(
             } else {
                 Duration::from_millis(2)
             };
+            let wait_t = Instant::now();
             sync.wait_kick(fallback, &waiter);
+            timings.add(3, wait_t.elapsed());
+            timings.end_pass(Instant::now());
         }
     }).expect("failed to spawn engine thread")
 }
@@ -767,12 +890,67 @@ mod tests {
     use super::*;
     use glam::Vec2;
 
+    /// Wake-ups `period` apart with alternating jitter; the ticks each one gets.
+    fn wake_ticks(clock: &mut TickClock, start: Instant, period: Duration, interval: Duration, n: u32) -> Vec<u32> {
+        (0..n).map(|i| {
+            let jitter = Duration::from_micros(if i % 2 == 0 { 300 } else { 0 });
+            clock.due(start + period * i + jitter, interval)
+        }).collect()
+    }
+
+    #[test]
+    fn equal_rates_give_exactly_one_tick_per_wake_up_despite_jitter() {
+        let t = Duration::from_millis(8);
+        let start = Instant::now();
+        let mut clock = TickClock::default();
+        // Any phase: a schedule started half a period off settles too.
+        clock.due(start, t);
+        let later = start + Duration::from_millis(4);
+        let got = wake_ticks(&mut clock, later, t, t, 400);
+        assert!(got[50..].iter().all(|&n| n == 1), "{:?}", &got[50..]);
+    }
+
+    #[test]
+    fn twice_the_rate_gives_exactly_two_ticks_per_wake_up() {
+        let start = Instant::now();
+        let mut clock = TickClock::default();
+        clock.due(start, Duration::from_millis(4));
+        let later = start + Duration::from_millis(3);
+        let got = wake_ticks(&mut clock, later, Duration::from_millis(8), Duration::from_millis(4), 400);
+        assert!(got[50..].iter().all(|&n| n == 2), "{:?}", &got[50..]);
+    }
+
+    #[test]
+    fn the_clock_keeps_time_whatever_the_rates() {
+        let start = Instant::now();
+        for (period_us, interval_us) in [(8000u64, 8000u64), (8000, 500), (2000, 500), (6993, 2000), (1000, 8000)] {
+            let mut clock = TickClock::default();
+            let n = 8_000_000 / period_us as u32 / 2;
+            let ticks: u32 = (0..n).map(|i| {
+                clock.due(start + Duration::from_micros(period_us) * i, Duration::from_micros(interval_us))
+            }).sum();
+            // n wake-ups span n - 1 periods, and the first counts one tick.
+            let want = ((n as u64 - 1) * period_us / interval_us) as i64 + 1;
+            assert!((ticks as i64 - want).abs() <= 2, "{period_us}/{interval_us}: {ticks} vs {want}");
+        }
+    }
+
+    #[test]
+    fn a_stall_is_caught_up_and_a_new_rate_starts_fresh() {
+        let t = Duration::from_millis(2);
+        let start = Instant::now();
+        let mut clock = TickClock::default();
+        assert_eq!(clock.due(start, t), 1);
+        assert_eq!(clock.due(start + Duration::from_millis(100), t), 50);
+        assert_eq!(clock.due(start + Duration::from_millis(100), Duration::from_millis(8)), 1);
+    }
+
     fn key(pin: &str) -> (String, String) {
         ("virtual.keymouse:0".to_string(), pin.to_string())
     }
 
-    fn tick(disp: Vec2, lmb: bool) -> SigMap {
-        SigMap::from_iter([
+    fn tick(disp: Vec2, lmb: bool) -> BusMap {
+        BusMap::from_iter([
             (key("mouse_move"), Signal::Vec2(disp)),
             (key("mouse_move_x"), Signal::Float(disp.x)),
             (key("mouse_left"), Signal::Bool(lmb)),
@@ -852,7 +1030,7 @@ mod tests {
         let mut got = 0.0;
         for (i, &on) in levels.iter().enumerate() {
             let t = i + 1;
-            let last = SigMap::from_iter([(key("scroll_up"), Signal::Bool(on))]);
+            let last = BusMap::from_iter([(key("scroll_up"), Signal::Bool(on))]);
             bank_displacement(&mut bank, &mut prev, &last);
             if t % ticks_per_wakeup == 0 {
                 publish_sink_bus(&mut bus.write().unwrap(), &last, &mut bank);
@@ -882,9 +1060,9 @@ mod tests {
     #[test]
     fn unwired_scroll_gate_reads_as_released() {
         let (mut bank, mut prev) = (SigMap::default(), HashMap::new());
-        let held = SigMap::from_iter([(key("scroll_up"), Signal::Bool(true))]);
+        let held = BusMap::from_iter([(key("scroll_up"), Signal::Bool(true))]);
         bank_displacement(&mut bank, &mut prev, &held);
-        bank_displacement(&mut bank, &mut prev, &SigMap::default());
+        bank_displacement(&mut bank, &mut prev, &BusMap::default());
         bank_displacement(&mut bank, &mut prev, &held);
         assert_eq!(bank.get(&key("scroll_up")), Some(&Signal::Float(2.0)));
     }

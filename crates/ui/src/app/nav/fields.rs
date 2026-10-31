@@ -331,7 +331,7 @@ impl FlexInputApp {
         // grid 1..20 → step ~0.38) rounds back to the current value and looks
         // dead. For those, a discrete dpad/stick press must move at least one
         // whole unit in the press direction.
-        let whole = matches!(key, "buf_size" | "grid_x" | "grid_y" | "trail_ms");
+        let whole = matches!(key, "grid_x" | "grid_y" | "trail_ms");
         let mut next = (cur + delta).clamp(lo, hi);
 
         // Fixed-step fields SNAP onto their step grid on a discrete dpad press,
@@ -785,7 +785,7 @@ impl FlexInputApp {
         use NavStep::*;
         let (key, lo, hi, default, step) = match (mid.as_str(), elem.as_str()) {
             ("module.delay", "ms")            => ("delay_ms",   0.0,  60_000.0, 100.0, Decade),
-            ("module.average", "samples")     => ("buf_size",   1.0,  10_000.0, 10.0,  Decade),
+            ("module.average", "samples")     => ("window_ms",  0.5,  5_000.0,  5.0,   Decade),
             ("module.average", "spike_mad")   => ("spike_mad",  0.0,  20.0,     0.0,   Linear),
             ("module.dc_filter", "window_ms") => ("window_ms",  10.0, 60_000.0, 500.0, Decade),
             ("module.dc_filter", "decay_ms")  => ("decay_ms",   10.0, 60_000.0, 200.0, Decade),
@@ -907,7 +907,7 @@ impl FlexInputApp {
         match (mid.as_str(), elem.as_str()) {
             // ── single-field elements (also driven by the unified editor) ──
             ("module.delay", "ms")            => vec![f!("ms", v("delay_ms",0.0,60_000.0,100.0,Decade))],
-            ("module.average", "samples")     => vec![f!("Samples", v("buf_size",1.0,10_000.0,10.0,Decade))],
+            ("module.average", "samples")     => vec![f!("Window ms", v("window_ms",0.5,5_000.0,5.0,Decade))],
             ("module.average", "spike_mad")   => vec![f!("Spike MAD", v("spike_mad",0.0,20.0,0.0,Linear))],
             ("module.dc_filter", "window_ms") => vec![f!("Window ms", v("window_ms",10.0,60_000.0,500.0,Decade))],
             ("module.dc_filter", "decay_ms")  => vec![f!("Decay ms", v("decay_ms",10.0,60_000.0,200.0,Decade))],
@@ -1523,9 +1523,6 @@ impl FlexInputApp {
         if delta == 0.0 { return; }
 
         let next = (cur + delta).clamp(lo, hi);
-        // Decade params that represent whole units (samples) read better rounded;
-        // ms/Hz tolerate fractions. Round sample counts to integers.
-        let next = if spec.key == "buf_size" { next.round() } else { next };
         self.set_subpatch_param_f32(outer_id, inner, spec.key, next);
     }
 

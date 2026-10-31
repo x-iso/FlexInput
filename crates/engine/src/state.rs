@@ -135,46 +135,6 @@ pub struct NodeState {
     /// (`flexinput_core::imu::GYRO_CAL_PIN`), so only a fresh press reaches
     /// the UI. Only `MACRO_CARRY_UID` uses this.
     pub gyro_cal_held: HashSet<String>,
-    /// A sink's AutoMap source→destination pin pairing, kept between ticks:
-    /// `automap::resolve_mapping` compares every source pin with every
-    /// destination pin, and its answer only changes when the pin lists do.
-    pub automap_pairs: Option<AutomapPairs>,
-}
-
-/// See `NodeState::automap_pairs`: the pin lists a pairing was resolved for,
-/// and the pairs as indices into them.
-#[derive(Default, Clone)]
-pub struct AutomapPairs {
-    pub src: Vec<String>,
-    pub dst: Vec<String>,
-    pub pairs: Vec<(u16, u16)>,
-}
-
-impl AutomapPairs {
-    /// The pairing for `src` → `dst`, resolved again only when either changed.
-    pub fn resolve<'a>(cache: &'a mut Option<AutomapPairs>, src: &[&str], dst: &[&str]) -> &'a [(u16, u16)] {
-        let fresh = cache.as_ref().is_some_and(|c| {
-            c.src.len() == src.len() && c.dst.len() == dst.len()
-                && c.src.iter().zip(src).all(|(a, b)| a == b)
-                && c.dst.iter().zip(dst).all(|(a, b)| a == b)
-        });
-        if !fresh {
-            // By value: resolve_mapping hands back the digital-trigger bridge
-            // pairs as literals, not as elements of `src` / `dst`.
-            let index_of = |list: &[&str], p: &str| {
-                list.iter().position(|s| *s == p).unwrap_or(0) as u16
-            };
-            let pairs = flexinput_core::automap::resolve_mapping(src, dst).into_iter()
-                .map(|(s, d)| (index_of(src, s), index_of(dst, d)))
-                .collect();
-            *cache = Some(AutomapPairs {
-                src: src.iter().map(|s| s.to_string()).collect(),
-                dst: dst.iter().map(|s| s.to_string()).collect(),
-                pairs,
-            });
-        }
-        &cache.as_ref().unwrap().pairs
-    }
 }
 
 /// Progress of one order-aware Remapper card (see `NodeState::order_state`).

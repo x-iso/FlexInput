@@ -19,6 +19,11 @@ const OUTPUT_RATE_OPTS: &[(f32, &str)] = &[
     (2000.0, "2000 Hz"),
 ];
 
+/// The processing rate modes, in the order of [`settings::SampleRateMode`].
+const SAMPLE_RATE_MODE_OPTS: &[(f32, &str)] = &[
+    (0.0, "Set by hand"), (1.0, "Same as output"), (2.0, "2x output"),
+];
+
 impl FlexInputApp {
 
     /// Ordered list of gamepad-navigable settings rows. Keeps the panel and the
@@ -26,21 +31,21 @@ impl FlexInputApp {
     /// numeric kinds carry their range/step so the driver can nudge them.
     pub(crate) fn gp_settings_rows(&self) -> Vec<GpSettingRow> {
         use GpSettingKind::*;
-        vec![
+        let mut rows = vec![
             // Stepped lists, not sliders: only these rates are valid, and a
             // slider's 50 Hz nudge snapped straight back to the rate it left.
             GpSettingRow { label: "Max polling rate".into(),
                 kind: Cycle { key: GpSettingKey::PollingHz, opts: POLLING_RATE_OPTS }, suffix: "" },
             GpSettingRow { label: "Output rate".into(),
                 kind: Cycle { key: GpSettingKey::OutputHz, opts: OUTPUT_RATE_OPTS }, suffix: "" },
-            GpSettingRow { label: "Processing sample rate".into(),
-                kind: IntSlider { lo: settings::SAMPLE_RATE_HZ_MIN as f32,
-                    hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
-                    key: GpSettingKey::SampleRateHz }, suffix: " Hz" },
+            GpSettingRow { label: "Processing rate".into(),
+                kind: Cycle { key: GpSettingKey::SampleRateMode, opts: SAMPLE_RATE_MODE_OPTS }, suffix: "" },
             GpSettingRow { label: "Background repaint rate".into(),
                 kind: IntSlider { lo: settings::BG_REPAINT_HZ_MIN as f32,
                     hi: settings::BG_REPAINT_HZ_MAX as f32, step: 1.0,
                     key: GpSettingKey::BgRepaintHz }, suffix: " Hz" },
+            GpSettingRow { label: "Freeze and dim unused windows".into(),
+                kind: Toggle { key: GpSettingKey::FreezeBackground }, suffix: "" },
             GpSettingRow { label: "Gamepad UI nav by default".into(),
                 kind: Toggle { key: GpSettingKey::NavDefault }, suffix: "" },
             GpSettingRow { label: "Cursor max speed".into(),
@@ -81,7 +86,15 @@ impl FlexInputApp {
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::ConfigOverlay }, suffix: "" },
             GpSettingRow { label: "Shortcut: Pin".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Pin }, suffix: "" },
-        ]
+        ];
+        // By hand only: the row goes while the rate follows the output.
+        if self.settings.sample_rate_mode == settings::SampleRateMode::Manual {
+            rows.insert(3, GpSettingRow { label: "Processing sample rate".into(),
+                kind: IntSlider { lo: self.settings.sample_rate_floor_hz() as f32,
+                    hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
+                    key: GpSettingKey::SampleRateHz }, suffix: " Hz" });
+        }
+        rows
     }
 
     /// Current numeric value of a settings key (bools as 0/1).
@@ -91,7 +104,9 @@ impl FlexInputApp {
             PollingHz => self.settings.polling_hz as f32,
             OutputHz => self.settings.output_hz as f32,
             SampleRateHz => self.settings.sample_rate_hz as f32,
+            SampleRateMode => self.settings.sample_rate_mode as i32 as f32,
             BgRepaintHz => self.settings.bg_repaint_hz as f32,
+            FreezeBackground => self.settings.freeze_background as i32 as f32,
             NavDefault => self.settings.gamepad_ui_nav_default as i32 as f32,
             CursorMaxSpeed => self.settings.cursor_max_speed,
             CursorAccel => self.settings.cursor_accel,
@@ -126,15 +141,22 @@ impl FlexInputApp {
             }
             SampleRateHz => {
                 let v = (val.round() as u32)
-                    .clamp(settings::SAMPLE_RATE_HZ_MIN, settings::SAMPLE_RATE_HZ_MAX);
+                    .clamp(self.settings.sample_rate_floor_hz(), settings::SAMPLE_RATE_HZ_MAX);
                 self.settings.sample_rate_hz = v;
-                self.sample_rate_hz.store(v, Ordering::Relaxed);
+            }
+            SampleRateMode => {
+                self.settings.sample_rate_mode = match val as i32 {
+                    1 => settings::SampleRateMode::SameAsOutput,
+                    2 => settings::SampleRateMode::TwiceOutput,
+                    _ => settings::SampleRateMode::Manual,
+                };
             }
             BgRepaintHz => {
                 let v = (val.round() as u32)
                     .clamp(settings::BG_REPAINT_HZ_MIN, settings::BG_REPAINT_HZ_MAX);
                 self.settings.bg_repaint_hz = v;
             }
+            FreezeBackground => self.settings.freeze_background = val != 0.0,
             NavDefault => self.settings.gamepad_ui_nav_default = val != 0.0,
             CursorMaxSpeed => self.settings.cursor_max_speed = val.clamp(1000.0, 30000.0),
             CursorAccel => self.settings.cursor_accel = val.clamp(1.0, 4.0),

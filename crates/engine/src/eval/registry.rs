@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use flexinput_core::{Signal, SigMap};
+use flexinput_core::{Signal, BusMap};
 
 use crate::graph::NodeSnap;
 
@@ -27,8 +27,8 @@ use super::{audio_stream_haptics_publish, jsm_publish, AUDIO_STREAM_HAPTICS_ID, 
 pub(crate) type PublishFn = fn(
     &NodeSnap,
     usize,
-    &SigMap,
-    &mut SigMap,
+    &BusMap,
+    &mut BusMap,
 ) -> Vec<Option<Signal>>;
 
 /// The same shape as [`PublishFn`], for a module that also needs its own
@@ -36,8 +36,8 @@ pub(crate) type PublishFn = fn(
 pub(crate) type PublishStatefulFn = fn(
     &NodeSnap,
     usize,
-    &SigMap,
-    &mut SigMap,
+    &BusMap,
+    &mut BusMap,
     &mut HashMap<usize, NodeState>,
     f32,
 ) -> Vec<Option<Signal>>;

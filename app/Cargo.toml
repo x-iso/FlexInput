@@ -21,6 +21,9 @@ joycon2 = ["flexinput-ui/joycon2"]
 
 [dependencies]
 flexinput-ui = { workspace = true }
+# Every thread here allocates per frame or per tick; the Windows heap took about
+# a quarter of an engine tick and half of a graph build.
+mimalloc     = { version = "0.1", default-features = false }
 eframe       = { workspace = true }
 # Surface `log::warn!`/`log::error!` from wgpu/winit/egui on stderr. Without a
 # logger those are silently dropped — which hid the swapchain errors behind

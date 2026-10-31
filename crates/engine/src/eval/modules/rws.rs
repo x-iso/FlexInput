@@ -38,7 +38,7 @@ pub(crate) fn eval_rws_node(
     snap: &NodeSnap,
     uid: usize,
     inputs: &[Option<Signal>],
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -56,7 +56,7 @@ pub(crate) fn eval_rws_node(
     // Recover the flick stick from the pre-block snapshot (we're the reason it's
     // blocked, so we must still read it); falls back to the resolved input when
     // it isn't (yet) being blocked.
-    let unblocked: SigMap = state
+    let unblocked: flexinput_core::SigMap = state
         .get(&MACRO_CARRY_UID)
         .map(|s| s.unblocked_src.clone())
         .unwrap_or_default();

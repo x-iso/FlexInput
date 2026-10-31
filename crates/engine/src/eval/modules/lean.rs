@@ -12,7 +12,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
     uid: usize,
     node_outputs: &[Option<Signal>],
     node_state: &mut NodeState,
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     dt: f32,
 ) {
     let lean_val = node_outputs.get(3)
@@ -183,16 +183,16 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                         let sig = Signal::Float(new_v);
                         // Combine if multiple mappings target the same axis
                         // — use the larger-magnitude write (winning sign).
-                        asserted
-                            .entry(axis_pin.to_string())
-                            .and_modify(|existing| {
+                        match asserted.get_mut(axis_pin) {
+                            Some(existing) => {
                                 if let Signal::Float(prev) = existing {
                                     if new_v.abs() > prev.abs() {
                                         *existing = Signal::Float(new_v);
                                     }
                                 }
-                            })
-                            .or_insert(sig);
+                            }
+                            None => asserted.insert(axis_pin, sig),
+                        }
                     }
                     continue;
                 }
@@ -220,7 +220,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                     SignalType::Int   => Signal::Int(1),
                     _                 => Signal::Bool(true),
                 };
-                asserted.entry(p.clone()).or_insert(sig);
+                asserted.insert_if_absent(p, sig);
             }
         }
     }

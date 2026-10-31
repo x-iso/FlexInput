@@ -251,6 +251,9 @@ fn auto_backends() -> wgpu::Backends {
     wgpu::Backends::PRIMARY | wgpu::Backends::GL
 }
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> eframe::Result<()> {
     // Helper mode short-circuits everything else (no GPU, no window).
     if run_as_helper_if_requested() {

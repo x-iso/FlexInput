@@ -483,7 +483,7 @@ pub(crate) fn analog_digital_pulse(
 pub(crate) fn vec2_authoritative_axis_fill(
     upstream: &mut PinSigs,
     collector_id: &str,
-    collector_sigs: &SigMap,
+    collector_sigs: &BusMap,
 ) {
     if collector_id.is_empty() { return; }
     let coll = |pin: &str| collector_sigs.get_pin(&collector_id, &pin).copied();
@@ -506,8 +506,8 @@ pub(crate) fn vec2_authoritative_axis_fill(
             Some(a) => (a - comp).abs() > 1e-3,
             None => true,
         };
-        if disagree(ax, v.x) { upstream.insert(flexinput_core::pooled_string(xa), Signal::Float(v.x)); }
-        if disagree(ay, v.y) { upstream.insert(flexinput_core::pooled_string(ya), Signal::Float(v.y)); }
+        if disagree(ax, v.x) { upstream.insert(xa, Signal::Float(v.x)); }
+        if disagree(ay, v.y) { upstream.insert(ya, Signal::Float(v.y)); }
     }
 }
 
@@ -551,10 +551,10 @@ pub(crate) fn derive_stick_cardinals(upstream: &mut PinSigs) {
             || y >  T_CARDINAL && (ax < T_CARDINAL ||  y >  DOM * ax);
         let down_on  = diagonal && y < -T_DIAGONAL
             || y < -T_CARDINAL && (ax < T_CARDINAL || -y >  DOM * ax);
-        upstream.insert(flexinput_core::pooled_string(up),    Signal::Bool(up_on));
-        upstream.insert(flexinput_core::pooled_string(down),  Signal::Bool(down_on));
-        upstream.insert(flexinput_core::pooled_string(left),  Signal::Bool(left_on));
-        upstream.insert(flexinput_core::pooled_string(right), Signal::Bool(right_on));
+        upstream.insert(up,    Signal::Bool(up_on));
+        upstream.insert(down,  Signal::Bool(down_on));
+        upstream.insert(left,  Signal::Bool(left_on));
+        upstream.insert(right, Signal::Bool(right_on));
     }
 }
 
@@ -682,21 +682,20 @@ pub(crate) fn is_macro_style_target(pin: &str) -> bool {
 }
 
 pub(crate) fn merge_macro_ns(
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     ns: &str,
     pin: &str,
     sig: Signal,
 ) {
-    let key = (ns.to_string(), pin.to_string());
-    match collector_sigs.get(&key) {
+    match collector_sigs.get_pin(ns, pin) {
         Some(&prev) if sig_magnitude(prev) >= sig_magnitude(sig) => {}
-        _ => { collector_sigs.insert(key, sig); }
+        _ => collector_sigs.set_pin(ns, pin, sig),
     }
 }
 
 /// Publish the scalar/bool aspect of a macro-port write.
 pub(crate) fn merge_macro_scalar(
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     pin: &str,
     sig: Signal,
 ) {
@@ -705,7 +704,7 @@ pub(crate) fn merge_macro_scalar(
 
 /// Publish the Vec2 aspect of a macro-port write (zone-local deflection).
 pub(crate) fn merge_macro_vec2(
-    collector_sigs: &mut SigMap,
+    collector_sigs: &mut BusMap,
     pin: &str,
     v: Vec2,
 ) {

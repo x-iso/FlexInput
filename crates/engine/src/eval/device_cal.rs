@@ -397,12 +397,45 @@ pub(crate) fn post_process_device_pin(
 /// deadzone and gyro_multiplier applied to its own device's pins. Called once
 /// at the top of `eval_graph_tick` so AutoMap (which reads dev_sigs directly)
 /// sees the same processed values as direct wires.
+/// Each `device.source`'s settings: read out of its JSON once per graph snapshot,
+/// where a tick used to parse them all again.
+#[derive(Clone)]
+pub struct DeviceParams {
+    /// Per device id: stick deadzone, gyro multiplier, calibration.
+    by_dev: HashMap<String, (f32, f32, DeviceCal)>,
+    /// A device's accel deadzone keeps a baseline that every run of the
+    /// preprocessing moves, so that can't be skipped for a repeated input.
+    pub(crate) preprocessing_has_state: bool,
+}
+
+pub(crate) fn device_params(graph: &ProcessingGraph) -> &DeviceParams {
+    graph.device_params.get_or_init(|| {
+        let mut by_dev = HashMap::new();
+        for snap in &graph.nodes {
+            if snap.module_id != "device.source" { continue; }
+            let Some(dev_id) = snap.device_id.as_deref() else { continue; };
+            let dz = snap.params.get("deadzone").and_then(|v| v.as_f64())
+                .map(|v| v as f32).unwrap_or(DEFAULT_STICK_DEADZONE);
+            let gm = snap.params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let cal = load_device_cal(&snap.params);
+            by_dev.insert(dev_id.to_string(), (dz, gm, cal));
+        }
+        let preprocessing_has_state = by_dev.values().any(|(_, _, cal)| cal.accel_dz > 0.0);
+        DeviceParams { by_dev, preprocessing_has_state }
+    })
+}
+
+thread_local! {
+    /// The IMU values of one preprocessing run, kept for the next one's tables.
+    static IMU_SCRATCH: std::cell::RefCell<BusMap> = std::cell::RefCell::new(BusMap::default());
+}
+
 #[cfg(test)]
 pub(crate) fn preprocess_dev_sigs<S: std::hash::BuildHasher>(
     graph: &ProcessingGraph,
     dev_sigs: &HashMap<(String, String), Signal, S>,
-) -> SigMap {
-    let mut out = SigMap::default();
+) -> BusMap {
+    let mut out = BusMap::default();
     preprocess_dev_sigs_into(graph, dev_sigs, &mut out);
     out
 }
@@ -413,18 +446,9 @@ pub(crate) fn preprocess_dev_sigs<S: std::hash::BuildHasher>(
 pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     graph: &ProcessingGraph,
     dev_sigs: &HashMap<(String, String), Signal, S>,
-    out: &mut SigMap,
+    out: &mut BusMap,
 ) {
-    let mut params: HashMap<String, (f32, f32, DeviceCal)> = HashMap::new();
-    for snap in &graph.nodes {
-        if snap.module_id != "device.source" { continue; }
-        let Some(dev_id) = snap.device_id.as_deref() else { continue; };
-        let dz = snap.params.get("deadzone").and_then(|v| v.as_f64())
-            .map(|v| v as f32).unwrap_or(DEFAULT_STICK_DEADZONE);
-        let gm = snap.params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-        let cal = load_device_cal(&snap.params);
-        params.insert(dev_id.to_string(), (dz, gm, cal));
-    }
+    let params = &device_params(graph).by_dev;
     // Fallback for devices whose signals reach AutoMap consumers without a
     // `device.source` node in the graph. Stick deadzone still applies (using
     // the default) so analog stick→key / stick→button mappings don't pass raw
@@ -437,8 +461,8 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     // pipeline can't see. We collect each device's gyro/accel triples,
     // apply offset → matrix → sign, and pre-write the corrected values
     // into a side map that pass 2 reads from instead of the raw signal.
-    let mut imu_override: SigMap = SigMap::default();
-    for (dev_id, (_, _, cal)) in &params {
+    let mut imu_override: BusMap = IMU_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    for (dev_id, (_, _, cal)) in params {
         let read_f = |pin: &str| -> Option<f32> {
             dev_sigs.get_pin(&dev_id, &pin).and_then(|s| {
                 if let Signal::Float(v) = s { Some(*v) } else { None }
@@ -513,9 +537,13 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     }
 
     // ── Pass 2: per-pin pipeline ──────────────────────────────────────────────
-    out.reserve(dev_sigs.len());
+    let mut last: Option<(&str, &(f32, f32, DeviceCal))> = None;
     for (key, sig) in dev_sigs.iter() {
-        let entry = params.get(&key.0).unwrap_or(&default_entry);
+        let entry = match last {
+            Some((dev, entry)) if dev == key.0 => entry,
+            _ => params.get(&key.0).unwrap_or(&default_entry),
+        };
+        last = Some((&key.0, entry));
         // Use the matrix-transformed value when this is a gyro/accel pin
         // that we pre-processed; the per-pin function will still apply
         // gyro_multiplier (gyro only) but skip its own offset + sign.
@@ -545,17 +573,18 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     // pad's real analog travel to read as digital everywhere downstream. Pads
     // without an analog `left_trigger`/`right_trigger` (e.g. Switch Pro) have
     // nothing to snap here and fall through to that sink-side bridge unchanged.
-    for (dev_id, (_, _, cal)) in &params {
+    imu_override.clear();
+    IMU_SCRATCH.with(|s| *s.borrow_mut() = imu_override);
+    for (dev_id, (_, _, cal)) in params {
         if !cal.digital_triggers { continue; }
         for (analog_pin, dig_pin, thr) in [
             ("left_trigger",  "btn_lt_dig", cal.ltrig_threshold),
             ("right_trigger", "btn_rt_dig", cal.rtrig_threshold),
         ] {
-            let key = (dev_id.clone(), analog_pin.to_string());
-            let Some(Signal::Float(v)) = out.get(&key).copied() else { continue };
+            let Some(Signal::Float(v)) = out.get_pin(dev_id, analog_pin).copied() else { continue };
             // Guard against a threshold pinned at 0.0 firing on rest jitter.
             let over = v >= thr.max(f32::EPSILON);
-            out.insert(key, Signal::Float(if over { 1.0 } else { 0.0 }));
+            out.set_pin(dev_id, analog_pin, Signal::Float(if over { 1.0 } else { 0.0 }));
             out.set_pin(&dev_id, &dig_pin, Signal::Bool(over));
         }
     }
@@ -573,7 +602,7 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     // devices_pool.rs) — that half is what stops a Remapper / Touch Zones / Lean
     // "Learn" from capturing the sensor instead of the button the user pressed.
     // Both halves read the same param and the same mask, so they cannot disagree.
-    for (dev_id, (_, _, cal)) in &params {
+    for (dev_id, (_, _, cal)) in params {
         if !cal.suppress_touch_misc { continue; }
         let mask = flexinput_core::automap::capacitive_mask_of(dev_sigs, dev_id);
         for pin in flexinput_core::automap::capacitive_pins(mask) {
@@ -589,7 +618,7 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     // (keeping the 3D pose 1:1 while the multiplier still scales the 2D pointer
     // output). "__gyro_mult" is not a real pin, so per-name pin lookups and the
     // canonical pin lists never surface it.
-    for (dev_id, (_, gm, _)) in &params {
+    for (dev_id, (_, gm, _)) in params {
         out.set_pin(&dev_id, "__gyro_mult", Signal::Float(*gm));
     }
 }
@@ -727,7 +756,7 @@ pub struct StickReboundState {
 /// (the Vec2 and its two axes) so no reader sees the bounce through another.
 pub(crate) fn filter_stick_rebound(
     graph: &ProcessingGraph,
-    sigs: &mut SigMap,
+    sigs: &mut BusMap,
     st: &mut StickReboundState,
     dt: f32,
 ) {
@@ -838,7 +867,7 @@ mod stick_rebound_tests {
             sink_target: None,
             inline_subgraph: None,
         };
-        let sigs_at = |x: f32| -> SigMap {
+        let sigs_at = |x: f32| -> BusMap {
             [
                 (("pad".into(), "right_stick".into()), Signal::Vec2(Vec2::new(x, 0.0))),
                 (("pad".into(), "right_stick_x".into()), Signal::Float(x)),
@@ -853,11 +882,11 @@ mod stick_rebound_tests {
             filter_stick_rebound(graph, &mut bounce, &mut st, 0.001);
             bounce
         };
-        let off = drive(&ProcessingGraph { nodes: vec![snap.clone()] });
+        let off = drive(&ProcessingGraph { nodes: vec![snap.clone()], ..Default::default() });
         assert_eq!(off[&("pad".to_string(), "right_stick_x".to_string())], Signal::Float(-0.4), "off by default");
 
         snap.params.insert("stick_rebound_enabled".into(), Value::Bool(true));
-        let on = drive(&ProcessingGraph { nodes: vec![snap] });
+        let on = drive(&ProcessingGraph { nodes: vec![snap], ..Default::default() });
         assert_eq!(on[&("pad".to_string(), "right_stick".to_string())], Signal::Vec2(Vec2::ZERO));
         assert_eq!(on[&("pad".to_string(), "right_stick_x".to_string())], Signal::Float(0.0));
         assert_eq!(on[&("pad".to_string(), "right_stick_y".to_string())], Signal::Float(0.0));

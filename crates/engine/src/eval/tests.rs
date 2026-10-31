@@ -77,6 +77,7 @@ mod trigger_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: bridge,
+            compiled: Default::default(),
         });
         n
     }
@@ -111,7 +112,7 @@ mod trigger_tests {
         remap.n_outputs = 1;
         let mac = macro_node(3, &[("aa11bb22", "bool"), ("cc33dd44", "float")]);
         let sink = sink_node(4, "virtual.xinput:0", "remap:2", true);
-        let graph = ProcessingGraph { nodes: vec![src, remap, mac, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, mac, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let press = |on: bool| {
@@ -173,7 +174,7 @@ mod trigger_tests {
         // Sink pulls the menu's published bus (where the zone card writes btn_north).
         let sink = sink_node(4, "virtual.xinput:0", "menumap:2", false);
 
-        let graph = ProcessingGraph { nodes: vec![src, menu, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, menu, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -251,7 +252,7 @@ mod trigger_tests {
         // source the menu keys its block by.
         let sink = sink_node(5, "virtual.xinput:0", "combiner:4", false);
 
-        let graph = ProcessingGraph { nodes: vec![src, menu, remap, comb, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, menu, remap, comb, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -293,7 +294,7 @@ mod trigger_tests {
         remap.input_sources = vec![Some((0, 0))];
         remap.n_outputs = 1;
         let mac = macro_node(3, &[("f1f1f1f1", "float")]);
-        let graph = ProcessingGraph { nodes: vec![src, remap, mac] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, mac], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let push = |y: f32| {
@@ -323,11 +324,11 @@ mod trigger_tests {
         tz.params.insert("zone_maps".into(), serde_json::json!([
             {"f":0,"z":0,"in":["tz_touch"],"out":["right_stick_left"]},
         ]));
-        let mut m: SigMap = SigMap::default();
+        let mut m: BusMap = BusMap::default();
         m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
         m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
         m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_touch_zones_map_node(&tz, 1, &m, &mut c, &mut HashMap::new(), 0.016);
         let get = |p: &str| c.get(&("touchmap:1".to_string(), p.to_string())).copied();
         assert_eq!(get("right_stick_x"), Some(Signal::Float(-1.0)));
@@ -351,14 +352,14 @@ mod trigger_tests {
         // Finger at pad center then pushed right: unit x 0.5→0.75 within the
         // single full-pad zone → deflection x ≈ +0.5 from the zone center.
         let finger = |px: f32| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         // Land at center (adaptive center latches there), then move right.
         eval_touch_zones_map_node(&tz, 1, &finger(0.0), &mut c, &mut state, 0.016);
         c.clear();
@@ -374,7 +375,7 @@ mod trigger_tests {
 
         // Coercion: read the same namespace back through each port type.
         let mut ns = NodeState::default();
-        let dev_sigs = SigMap::default();
+        let dev_sigs = BusMap::default();
         let mac = macro_node(2, &[("abcd0123", "vec2")]);
         let out = compute_node(&mac, &[], &mut ns, &dev_sigs, &c, 0.016);
         assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x > 0.4),
@@ -414,13 +415,13 @@ mod trigger_tests {
         n.n_outputs = n.output_pin_ids.len();
 
         // Finger at pad (0.5, -0.5) → unit (0.75, 0.75) → bottom-right = leaf 2.
-        let mut dev_sigs = SigMap::default();
+        let mut dev_sigs = BusMap::default();
         dev_sigs.insert((dev.to_string(), "touch1_x".to_string()), Signal::Float(0.5));
         dev_sigs.insert((dev.to_string(), "touch1_y".to_string()), Signal::Float(-0.5));
         dev_sigs.insert((dev.to_string(), "touch1_active".to_string()), Signal::Bool(true));
 
         let mut ns = NodeState::default();
-        let c = SigMap::default();
+        let c = BusMap::default();
         let out = compute_node(&n, &[], &mut ns, &dev_sigs, &c, 0.016);
         assert_eq!(out[1], Some(Signal::Bool(true)), "leaf 2 active");
         assert!(matches!(out[2], Some(Signal::Float(f)) if (f - 0.5).abs() < 1e-4),
@@ -457,13 +458,13 @@ mod trigger_tests {
             n
         };
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
-        let get = |c: &SigMap|
+        let get = |c: &BusMap|
             c.get(&("macro".to_string(), "macro:11aa22bb".to_string())).copied();
 
         // Analog: leaning left at 0.8 → Float(0.8) on the macro namespace.
         let snap = mk("analog");
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
         let v = get(&c).map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((v - 0.8).abs() < 1e-4, "analog lean should pass magnitude, got {v}");
@@ -475,7 +476,7 @@ mod trigger_tests {
         // Down mode: asserts Bool while the side is active.
         let snap = mk("down");
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c), Some(Signal::Bool(true)));
     }
@@ -491,11 +492,11 @@ mod trigger_tests {
         remap.input_sources = vec![Some((0, 0))];
         remap.n_outputs = 1;
         let sink = sink_node(3, "virtual.xinput:0", "remap:2", true);
-        ProcessingGraph { nodes: vec![src, remap, sink] }
+        ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() }
     }
 
-    fn stick_y(y: f32) -> SigMap {
-        let mut m = SigMap::default();
+    fn stick_y(y: f32) -> BusMap {
+        let mut m = BusMap::default();
         m.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(y));
         m
     }
@@ -514,7 +515,7 @@ mod trigger_tests {
         }));
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut state, &stick_y(1.0), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(1.0)), 0.016, &mut out);
         let v = sinkv(&out, "right_trigger").map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((v - 0.5).abs() < 0.05, "halving curve should give ~0.5 at full push, got {v}");
     }
@@ -548,15 +549,15 @@ mod trigger_tests {
         let mut out = TickOutput::default();
         let east = |out: &TickOutput| sinkv(out, "btn_east").map(|s| s.as_bool()).unwrap_or(false);
 
-        eval_graph_tick(&graph, &mut state, &stick_y(0.4), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.4)), 0.016, &mut out);
         assert!(!east(&out), "below threshold must stay released");
         // Above threshold: held EVERY tick — the legacy pulse train would
         // toggle off within this window.
         for tick in 0..20 {
-            eval_graph_tick(&graph, &mut state, &stick_y(0.8), 0.016, &mut out);
+            eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.8)), 0.016, &mut out);
             assert!(east(&out), "threshold hold must be steady (tick {tick})");
         }
-        eval_graph_tick(&graph, &mut state, &stick_y(0.4), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.4)), 0.016, &mut out);
         assert!(!east(&out), "dipping below the line must release");
     }
 
@@ -573,11 +574,11 @@ mod trigger_tests {
         let mut out = TickOutput::default();
         let east = |out: &TickOutput| sinkv(out, "btn_east").map(|s| s.as_bool()).unwrap_or(false);
 
-        eval_graph_tick(&graph, &mut state, &stick_y(0.6), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.6)), 0.016, &mut out);
         assert!(!east(&out), "0.6 push is past the built-in derivation but below the card threshold");
-        eval_graph_tick(&graph, &mut state, &stick_y(0.9), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.9)), 0.016, &mut out);
         assert!(east(&out), "0.9 push crosses the card threshold");
-        eval_graph_tick(&graph, &mut state, &stick_y(0.6), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&stick_y(0.6)), 0.016, &mut out);
         assert!(!east(&out), "falling back below the threshold releases");
     }
 
@@ -592,10 +593,10 @@ mod trigger_tests {
             { "out": ["btn_south"], "mode": "down", "threshold": 0.7 }
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
-        let get = |c: &SigMap, pin: &str|
+        let get = |c: &BusMap, pin: &str|
             c.get(&("lean:1".to_string(), pin.to_string())).copied();
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.5), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c, "btn_south"), Some(Signal::Bool(false)),
             "below the card threshold the mapping must not fire");
@@ -610,7 +611,7 @@ mod trigger_tests {
               "curve": [[0.0, 0.0], [1.0, 0.5]] }
         ]));
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
         let v = get(&c, "right_trigger").map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((v - 0.5).abs() < 0.01, "curve must shape the analog lean magnitude, got {v}");
@@ -620,7 +621,7 @@ mod trigger_tests {
     // arrival order — an asserted mapping beats an idle/weaker one.
     #[test]
     fn macro_merge_larger_magnitude_wins() {
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.3));
         merge_macro_scalar(&mut c, "macro:x", Signal::Bool(true)); // mag 1.0
         merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.6));
@@ -644,7 +645,7 @@ mod trigger_tests {
         // deadzone curve (deadzone is covered by the dedicated tests above).
         let src = source_node(3, "gilrs:switch_pro:0", 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
 
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
@@ -686,7 +687,7 @@ mod trigger_tests {
         ]));
         let src = source_node(3, "gilrs:switch_pro:0", 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -711,7 +712,7 @@ mod trigger_tests {
             { "in": ["left_stick_up"], "out": ["left_stick_up"],  "mode": "analog" }
         ]));
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -753,7 +754,7 @@ mod trigger_tests {
         ]));
         let src = source_node(3, dev, 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -821,8 +822,8 @@ mod trigger_tests {
             rig
         }
 
-        fn tick_sigs(&mut self, sigs: &[(&str, Signal)]) -> SigMap {
-            let mut dev = SigMap::default();
+        fn tick_sigs(&mut self, sigs: &[(&str, Signal)]) -> BusMap {
+            let mut dev = BusMap::default();
             for b in ["btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb"] {
                 dev.insert((RIG_DEV.to_string(), b.to_string()), Signal::Bool(false));
             }
@@ -832,18 +833,18 @@ mod trigger_tests {
             for (pin, sig) in sigs {
                 dev.insert((RIG_DEV.to_string(), pin.to_string()), *sig);
             }
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_remapper_node(&self.snap, 1, &dev, &mut c, &mut self.state, RIG_DT);
             c
         }
 
-        fn tick(&mut self, down: &[&str]) -> SigMap {
+        fn tick(&mut self, down: &[&str]) -> BusMap {
             let sigs: Vec<(&str, Signal)> = down.iter().map(|p| (*p, Signal::Bool(true))).collect();
             self.tick_sigs(&sigs)
         }
     }
 
-    fn on(c: &SigMap, pin: &str) -> bool {
+    fn on(c: &BusMap, pin: &str) -> bool {
         c.get(&("remap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
     }
 
@@ -852,7 +853,7 @@ mod trigger_tests {
     // only (both at once would cancel in the menu), chord in order or not.
     #[test]
     fn menu_next_on_a_button_previous_on_its_chord() {
-        let mac = |c: &SigMap, pin: &str| c.get(&(flexinput_core::macros::SIGS_NS.to_string(), pin.to_string()))
+        let mac = |c: &BusMap, pin: &str| c.get(&(flexinput_core::macros::SIGS_NS.to_string(), pin.to_string()))
             .map(|s| s.as_bool()).unwrap_or(false);
         for in_order in [true, false] {
             let mut rig = RemapRig::new(serde_json::json!([
@@ -874,7 +875,7 @@ mod trigger_tests {
 
     // ── Set Neutral Forward ──────────────────────────────────────────────────
 
-    fn neutral_req(c: &SigMap, dev: &str) -> bool {
+    fn neutral_req(c: &BusMap, dev: &str) -> bool {
         c.get(&(format!("{ORIENT_NEUTRAL_PREFIX}{dev}"), flexinput_core::imu::ORIENT_NEUTRAL_PIN.to_string()))
             .is_some_and(|s| s.as_bool())
     }
@@ -894,7 +895,7 @@ mod trigger_tests {
 
     // ── Calibrate Gyro ───────────────────────────────────────────────────────
 
-    fn gyro_cal_req(c: &SigMap, dev: &str) -> bool {
+    fn gyro_cal_req(c: &BusMap, dev: &str) -> bool {
         c.get(&(format!("{GYRO_CAL_PREFIX}{dev}"), flexinput_core::imu::GYRO_CAL_PIN.to_string()))
             .is_some_and(|s| s.as_bool())
     }
@@ -940,13 +941,13 @@ mod trigger_tests {
         let key = (dev.to_string(), "orientation".to_string());
         let mut carry = NodeState::default();
         carry.orient_neutral_req.insert(dev.to_string());
-        let mut sigs = SigMap::from_iter([(key.clone(), pose(0.8))]);
+        let mut sigs = BusMap::from_iter([(key.clone(), pose(0.8))]);
         apply_orient_neutral(&mut carry, &mut sigs);
         assert!(heading(&sigs[&key]).abs() < 1e-4, "facing forward: {}", heading(&sigs[&key]));
         assert!(sigs[&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())].as_bool(), "and modules hear it");
         // Released: the new forward holds, and turning reads from it.
         carry.orient_neutral_req.clear();
-        let mut sigs = SigMap::from_iter([(key.clone(), pose(1.1))]);
+        let mut sigs = BusMap::from_iter([(key.clone(), pose(1.1))]);
         apply_orient_neutral(&mut carry, &mut sigs);
         assert!((heading(&sigs[&key]) - 0.3).abs() < 1e-4, "{}", heading(&sigs[&key]));
         assert!(!sigs.contains_key(&(dev.to_string(), ORIENT_NEUTRAL_DEV_PIN.to_string())));
@@ -1081,7 +1082,7 @@ mod trigger_tests {
     }
 
     /// Run `steps` of held inputs; returns each tick's published map.
-    fn rig_steps(rig: &mut RemapRig, steps: &[&[&str]]) -> Vec<SigMap> {
+    fn rig_steps(rig: &mut RemapRig, steps: &[&[&str]]) -> Vec<BusMap> {
         steps.iter().map(|down| rig.tick(down)).collect()
     }
 
@@ -1340,11 +1341,11 @@ mod trigger_tests {
         assert!(seen[8..].iter().all(|v| *v), "live once the gap runs out: {seen:?}");
     }
 
-    fn rig_stick_y(c: &SigMap) -> f32 {
+    fn rig_stick_y(c: &BusMap) -> f32 {
         c.get(&("remap:1".to_string(), "left_stick_y".to_string())).map(|s| s.as_float()).unwrap_or(f32::NAN)
     }
 
-    fn push_y(rig: &mut RemapRig, v: f32) -> SigMap {
+    fn push_y(rig: &mut RemapRig, v: f32) -> BusMap {
         rig.tick_sigs(&[("left_stick_y", Signal::Float(v))])
     }
 
@@ -1547,7 +1548,7 @@ mod trigger_tests {
         combiner.n_outputs = 1;
 
         let sink = sink_node(20, "virtual.xinput:0", "combiner:4", true);
-        let graph = ProcessingGraph { nodes: vec![src, collect, remap, combiner, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, collect, remap, combiner, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let getb = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -1601,7 +1602,7 @@ mod trigger_tests {
             { "in": ["btn_east"],  "out": ["touch_right"] }
         ]));
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let getf = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -1652,20 +1653,20 @@ mod trigger_tests {
         };
         // px in [-1,1] → unit x in [0,1]: -0.5→0.25 (zone 0), +0.5→0.75 (zone 1).
         let finger = |px: f32| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
-        let getb = |c: &SigMap, pin: &str|
+        let getb = |c: &BusMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
 
         // WITH hold on zone 0.
         {
             let snap = mk(true);
             let mut state = HashMap::new();
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
             c.clear();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
@@ -1679,7 +1680,7 @@ mod trigger_tests {
         {
             let snap = mk(false);
             let mut state = HashMap::new();
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
             c.clear();
             eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
@@ -1706,14 +1707,14 @@ mod trigger_tests {
         ]));
         n.params.insert("hold_zones".into(), serde_json::json!([[0,0]]));
         let finger = |px: f32| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         // Land in zone 0 (analog origin), establish the start zone.
         eval_touch_zones_map_node(&n, 1, &finger(-0.5), &mut c, &mut state, 0.016);
         c.clear();
@@ -1741,16 +1742,16 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["scroll_y","scroll_x"],"mode":"analog"},
         ]));
         let finger = |px: f32, py: f32| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(py));
             m
         };
-        let getf = |c: &SigMap, pin: &str|
+        let getf = |c: &BusMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
         let mut state = HashMap::new();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         // Land at centre to establish the adaptive centre, then deflect up-right
         // (raw pad +Y is up; pad_point_to_unit flips it into y-down unit space).
         eval_touch_zones_map_node(&n, 1, &finger(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -1775,18 +1776,18 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":"touchpad"},
         ]));
         let finger = |px: f32| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
-        let getv = |c: &SigMap, pin: &str| match
+        let getv = |c: &BusMap, pin: &str| match
             c.get(&("touchmap:1".to_string(), pin.to_string())) {
                 Some(Signal::Vec2(v)) => Some((v.x, v.y)), _ => None };
         let mut state = HashMap::new();
         // Touchdown (delta seeds 0), then slide right → positive x velocity.
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_touch_zones_map_node(&n, 1, &finger(0.0), &mut c, &mut state, 0.016);
         c.clear();
         eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
@@ -1816,17 +1817,17 @@ mod trigger_tests {
             {"f":0,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
         ]));
         let input = |click: bool| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "btn_touchpad".into()), Signal::Bool(click));
             m
         };
-        let getb = |c: &SigMap, pin: &str|
+        let getb = |c: &BusMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
         let mut state = HashMap::new();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_touch_zones_map_node(&n, 1, &input(false), &mut c, &mut state, 0.016);
         c.clear();
         eval_touch_zones_map_node(&n, 1, &input(true), &mut c, &mut state, 0.016);
@@ -1848,7 +1849,7 @@ mod trigger_tests {
             {"f":1,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
         ]));
         let input = |left_click: bool, misc2: bool| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch2_active".into()), Signal::Bool(true));
             m.insert(("pad".into(), "touch2_x".into()), Signal::Float(0.3));
             m.insert(("pad".into(), "touch2_y".into()), Signal::Float(0.3));
@@ -1856,10 +1857,10 @@ mod trigger_tests {
             m.insert(("pad".into(), "btn_misc2".into()), Signal::Bool(misc2));
             m
         };
-        let getb = |c: &SigMap, pin: &str|
+        let getb = |c: &BusMap, pin: &str|
             c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
         let mut state = HashMap::new();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_touch_zones_map_node(&n, 1, &input(true, false), &mut c, &mut state, 0.016);
         assert!(!getb(&c, "btn_east"), "the left pad's click is Pad A's, not Pad B's");
         c.clear();
@@ -1879,7 +1880,7 @@ mod trigger_tests {
             { "in": ["left_stick_right"], "out": ["touch_swipe_x"], "mode": "analog" }
         ]));
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let getf = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -1919,7 +1920,7 @@ mod trigger_tests {
         // Zero-deadzone source so the test measures the mapping, not the curve.
         let src = source_node(3, dev, 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let getf = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -1981,7 +1982,7 @@ mod trigger_tests {
         ]));
         let src = source_node(3, dev, 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let getf = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -2030,7 +2031,7 @@ mod trigger_tests {
             { "in": ["btn_south"], "out": ["btn_mute"] }
         ]));
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let mut dev_sigs = HashMap::new();
@@ -2047,7 +2048,7 @@ mod trigger_tests {
     fn digital_bridge_presses_and_releases() {
         // Direct device → sink (no remapper); src_dev is the physical device.
         let sink = sink_node(1, "virtual.xinput:0", "gilrs:switch_pro:0", true);
-        let graph = ProcessingGraph { nodes: vec![sink] };
+        let graph = ProcessingGraph { nodes: vec![sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2072,7 +2073,7 @@ mod trigger_tests {
     #[test]
     fn digital_bridge_disabled_does_not_leak() {
         let sink = sink_node(1, "virtual.xinput:0", "gilrs:xinput:0", false);
-        let graph = ProcessingGraph { nodes: vec![sink] };
+        let graph = ProcessingGraph { nodes: vec![sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2094,7 +2095,7 @@ mod trigger_tests {
         src.device_id = Some(dev_id.to_string());
         src.params.insert("digital_triggers".into(), Value::Bool(true));
         src.params.insert("ltrig_digital_threshold".into(), Value::from(0.5));
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
 
         // Below threshold: analog snaps to 0, digital button ignores the pad's
         // early-fired flag and stays off.
@@ -2128,7 +2129,7 @@ mod trigger_tests {
         let mut src = empty_node(1, "device.source");
         src.device_id = Some(dev_id.to_string());
         src.params.insert("suppress_touch_misc".into(), Value::Bool(true));
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
 
         let k = |pin: &str| (dev_id.to_string(), pin.to_string());
         let mut dev = HashMap::new();
@@ -2169,7 +2170,7 @@ mod trigger_tests {
         let mut src = empty_node(1, "device.source");
         src.device_id = Some(dev_id.to_string());
         src.params.insert("suppress_touch_misc".into(), Value::Bool(true));
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
 
         let k = |pin: &str| (dev_id.to_string(), pin.to_string());
         let mut dev = HashMap::new();
@@ -2188,7 +2189,7 @@ mod trigger_tests {
         let dev_id = "sdl:generic:i0";
         let mut src = empty_node(1, "device.source");
         src.device_id = Some(dev_id.to_string());
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
 
         let k = |pin: &str| (dev_id.to_string(), pin.to_string());
         let mut dev = HashMap::new();
@@ -2207,7 +2208,7 @@ mod trigger_tests {
         let mut src = empty_node(1, "device.source");
         src.device_id = Some(dev_id.to_string());
         // digital_triggers absent → defaults to off.
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
 
         let mut dev = HashMap::new();
         dev.insert((dev_id.to_string(), "left_trigger".to_string()), Signal::Float(0.3));
@@ -2232,7 +2233,7 @@ mod trigger_tests {
     fn automap_stick_respects_source_deadzone() {
         let src = source_node(1, "gilrs:xinput:0", 0.2);
         let sink = sink_node(2, "virtual.xinput:0", "gilrs:xinput:0", false);
-        let graph = ProcessingGraph { nodes: vec![src, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2264,7 +2265,7 @@ mod trigger_tests {
     fn the_right_stick_can_have_its_own_deadzone() {
         let mut src = source_node(1, "gilrs:xinput:0", 0.05);
         src.params.insert("deadzone_r".into(), Value::from(0.3));
-        let graph = ProcessingGraph { nodes: vec![src] };
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
         let mut dev = HashMap::new();
         dev.insert(("gilrs:xinput:0".to_string(), "left_stick_x".to_string()), Signal::Float(0.2));
         dev.insert(("gilrs:xinput:0".to_string(), "right_stick_x".to_string()), Signal::Float(0.2));
@@ -2285,7 +2286,7 @@ mod trigger_tests {
         let dev = "gilrs:xinput:0";
         let src = source_node(1, dev, 0.0); // no deadzone — raw passthrough
         let sink = sink_node(2, "virtual.xinput:0", dev, false);
-        let graph = ProcessingGraph { nodes: vec![src, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2354,8 +2355,9 @@ mod trigger_tests {
                 feedback_sources: Vec::new(),
                 is_self_sink: false,
                 digital_trigger_bridge: false,
+                compiled: Default::default(),
             });
-            ProcessingGraph { nodes: vec![sink] }
+            ProcessingGraph { nodes: vec![sink], ..Default::default() }
         };
         let touch = |fingers: &[(f32, f32)]| {
             let mut s = HashMap::new();
@@ -2412,7 +2414,7 @@ mod trigger_tests {
             sink.params.insert("route_optical_mouse".into(), Value::Bool(route));
             sink.params.insert("optical_mouse_speed".into(), Value::from(2.0));
             sink.params.insert("mouse_sensitivity".into(), Value::from(100.0));
-            let graph = ProcessingGraph { nodes: vec![remap, sink] };
+            let graph = ProcessingGraph { nodes: vec![remap, sink], ..Default::default() };
             let mut sigs = HashMap::new();
             sigs.insert((dev.to_string(), "optical_x".to_string()), Signal::Float(0.03));
             sigs.insert((dev.to_string(), "optical_y".to_string()), Signal::Float(-0.01));
@@ -2446,6 +2448,7 @@ mod trigger_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
         n
     }
@@ -2475,8 +2478,9 @@ mod trigger_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
-        let graph = ProcessingGraph { nodes: vec![tz, sink] };
+        let graph = ProcessingGraph { nodes: vec![tz, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let mut sigs = HashMap::new();
@@ -2516,8 +2520,9 @@ mod trigger_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
-        let graph = ProcessingGraph { nodes: vec![tz, sink] };
+        let graph = ProcessingGraph { nodes: vec![tz, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let finger = |px: f32| {
@@ -2550,7 +2555,7 @@ mod trigger_tests {
             { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog" }
         ]));
         let sink = keymouse_sink_from_remap(3, remap_uid);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2584,7 +2589,7 @@ mod trigger_tests {
             { "in": ["btn_rt_dig"], "out": ["mouse_left"] }
         ]));
         let sink = keymouse_sink_from_remap(3, remap_uid);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let get = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -2624,7 +2629,7 @@ mod trigger_tests {
             { "in": ["key_e"], "out": ["key_q"] }
         ]));
         let sink = keymouse_sink_from_remap(4, 3);
-        let graph = ProcessingGraph { nodes: vec![src, first, second, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, first, second, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let get = |out: &TickOutput, pin: &str| out.sink_outputs
@@ -2666,7 +2671,7 @@ mod trigger_tests {
             { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog" }
         ]));
         let sink = keymouse_sink_from_remap(3, remap_uid);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2699,7 +2704,7 @@ mod trigger_tests {
         }
         remap.params.insert("mappings".into(), serde_json::Value::Array(vec![mapping]));
         let sink = keymouse_sink_from_remap(3, remap_uid);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let mut sigs = HashMap::new();
@@ -2891,7 +2896,7 @@ mod trigger_tests {
         ]));
         let sink = keymouse_sink_from_remap(5, remap_uid);
 
-        let graph = ProcessingGraph { nodes: vec![src, konst, collect, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, konst, collect, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -2951,7 +2956,7 @@ mod trigger_tests {
         let combiner = combiner_node(3, remap_uid, dev, policy);
         // Sink auto-maps FROM the combiner.
         let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -3000,7 +3005,7 @@ mod trigger_tests {
         combiner.input_sources = vec![Some((0, 0)), Some((1, 0))];
 
         let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let mut sigs = HashMap::new();
@@ -3024,7 +3029,7 @@ mod trigger_tests {
         combiner.params.insert("_automap_input_collectors".into(), serde_json::json!(["", ""]));
         combiner.params.insert("combiner_port_default".into(), serde_json::json!({"0": "ADD"}));
         let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
-        let graph = ProcessingGraph { nodes: vec![combiner, sink] };
+        let graph = ProcessingGraph { nodes: vec![combiner, sink], ..Default::default() };
         let mut sigs = HashMap::new();
         for (pin, lv, rv) in [("gyro_x", 0.0, 0.3), ("gyro_y", 0.1, 0.4), ("gyro_z", 0.0, 0.5),
                               ("accel_z", 0.12, -0.12)] {
@@ -3058,7 +3063,7 @@ mod trigger_tests {
             { "in": ["dpad_left"], "out": ["btn_south"], "mode": "down" }
         ]));
         let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -3115,7 +3120,7 @@ mod trigger_tests {
             { "in": ["btn_capture"], "out": ["dpad_down"], "mode": "down" }
         ]));
         let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = Default::default();
 
@@ -3171,7 +3176,7 @@ mod trigger_tests {
             { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog", "window_ms": 30.0 }
         ]));
         let sink = keymouse_sink_from_remap(5, remap_uid);
-        let graph = ProcessingGraph { nodes: vec![src, collect, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, collect, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -3205,7 +3210,7 @@ mod trigger_tests {
             { "in": ["dpad_left"], "out": ["btn_west"], "mode": "on_press" }
         ]));
         let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -3248,13 +3253,13 @@ mod trigger_tests {
             { "in": ["dpad_left"], "out": ["dpad_left"],  "mode": "down" }
         ]));
         let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
-        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
-        let mut sigs = SigMap::default();
+        let mut sigs = BusMap::default();
         sigs.insert((dev.to_string(), "dpad_left".to_string()), Signal::Bool(true));
-        for _ in 0..20 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+        for _ in 0..20 { eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&sigs), 0.016, &mut out); }
 
         let dl = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad_left".to_string()))
             .map(|s| s.as_bool()).unwrap_or(false);
@@ -3299,6 +3304,7 @@ mod trigger_tests {
             }).collect(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
         pad
     }
@@ -3319,18 +3325,18 @@ mod trigger_tests {
         asth
     }
 
-    fn game_rumble(level: f32) -> SigMap {
-        let mut sigs = SigMap::default();
+    fn game_rumble(level: f32) -> BusMap {
+        let mut sigs = BusMap::default();
         sigs.insert((FB_VIRT.to_string(), "rumble_strong".to_string()), Signal::Float(level));
         sigs.insert((FB_VIRT.to_string(), "rumble_weak".to_string()), Signal::Float(level));
         sigs
     }
 
-    fn fb_tick(nodes: Vec<NodeSnap>, sigs: &SigMap) -> TickOutput {
-        let graph = ProcessingGraph { nodes };
+    fn fb_tick(nodes: Vec<NodeSnap>, sigs: &BusMap) -> TickOutput {
+        let graph = ProcessingGraph { nodes, ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut state, sigs, 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
         out
     }
 
@@ -3399,7 +3405,7 @@ mod trigger_tests {
         inlet: &str,
         value: f32,
         override_game: bool,
-        sigs: &SigMap,
+        sigs: &BusMap,
     ) -> TickOutput {
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
         let mut konst = empty_node(2, "module.constant");
@@ -3457,7 +3463,7 @@ mod trigger_tests {
     // trigger, with no default, is left alone.
     #[test]
     fn a_pads_default_trigger_effect_fills_in_when_nothing_asks() {
-        let out = fb_tick(vec![ds_with_default_trigger()], &SigMap::default());
+        let out = fb_tick(vec![ds_with_default_trigger()], &BusMap::default());
         let want = crate::eval::jsm_effect_pins("RESISTANCE", &[2, 5]).unwrap();
         for (pin, v) in crate::eval::JSM_TRIGGER_PINS[1].iter().zip(want) {
             assert!((pad_value(&out, FB_DS, pin) - v).abs() < 1e-6, "{pin}");
@@ -3470,7 +3476,7 @@ mod trigger_tests {
     #[test]
     fn the_games_trigger_effect_beats_the_default() {
         use flexinput_core::automap::TriggerMode;
-        let mut sigs = SigMap::default();
+        let mut sigs = BusMap::default();
         sigs.insert((FB_VIRT.to_string(), "trigger_r_mode".to_string()), Signal::Float(TriggerMode::Off.pin()));
         let out = fb_tick(vec![ds_with_default_trigger()], &sigs);
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), TriggerMode::Off.pin());
@@ -3501,7 +3507,7 @@ mod trigger_tests {
             .collect();
         fc.n_outputs = 1;
         pad.sink_target.as_mut().unwrap().feedback_sources.clear();
-        let out = fb_tick(vec![pad, konst, fc], &SigMap::default());
+        let out = fb_tick(vec![pad, konst, fc], &BusMap::default());
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_mode"), 0.0);
         assert_eq!(pad_value(&out, FB_DS, "trigger_r_strength"), 0.0);
     }
@@ -3525,7 +3531,7 @@ mod trigger_tests {
     fn network_peer_rumble_reaches_pad() {
         peer_rumble(9201, 0.6);
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
-        let out = fb_tick(vec![pad, net_send_node(9201, 0, FB_DS)], &SigMap::default());
+        let out = fb_tick(vec![pad, net_send_node(9201, 0, FB_DS)], &BusMap::default());
         let v = pad_value(&out, FB_DS, "rumble_strong");
         assert!((v - 0.6).abs() < 0.01, "peer rumble 0.6 must reach the pad, got {v}");
     }
@@ -3538,7 +3544,7 @@ mod trigger_tests {
         let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
         let asth = asth_node(9203, FB_DS, FB_DS, 0.0, 0.5);
         let send = net_send_node(9202, 1, FB_DS);
-        let out = fb_tick(vec![pad, asth, send], &SigMap::default());
+        let out = fb_tick(vec![pad, asth, send], &BusMap::default());
         assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "peer rumble must not play alongside");
         let v = pad_value(&out, FB_DS, "hd_l_amp");
         assert!((v - 0.3).abs() < 0.01, "gate: audio 0.5 × peer 0.6, got {v}");
@@ -3613,8 +3619,8 @@ mod menu_eval_tests {
         n
     }
 
-    fn dev_stick(x: f32, y: f32) -> SigMap {
-        let mut m = SigMap::default();
+    fn dev_stick(x: f32, y: f32) -> BusMap {
+        let mut m = BusMap::default();
         m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
         m
     }
@@ -3632,7 +3638,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
 
         let out = eval_menu_node(&snap, 1, &show(false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -3675,7 +3681,7 @@ mod menu_eval_tests {
     fn passthrough_republishes_full_bus() {
         // Closed menu = pure passthrough: the stick passes straight through.
         let snap = menu_snap(8);
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         eval_menu_node(&snap, 8, &show(false), &dev_stick(0.6, -0.3), &mut c, &mut state, 0.016);
         assert_eq!(
@@ -3687,7 +3693,7 @@ mod menu_eval_tests {
         // Open with suppression OFF: still passes through (suppression is opt-in).
         let mut snap2 = menu_snap(9);
         snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
-        let mut c2: SigMap = SigMap::default();
+        let mut c2: BusMap = BusMap::default();
         let mut st2 = HashMap::new();
         eval_menu_node(&snap2, 9, &show(true), &dev_stick(0.6, -0.3), &mut c2, &mut st2, 0.016);
         assert_eq!(
@@ -3705,7 +3711,7 @@ mod menu_eval_tests {
     #[test]
     fn suppress_publishes_source_block() {
         let snap = menu_snap(11); // default: suppress = true, left-stick pointer
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         // Open (wired Show) while the left stick is deflected (active).
         eval_menu_node(&snap, 11, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
@@ -3729,7 +3735,7 @@ mod menu_eval_tests {
 
         // Partial mode: an IDLE enabled driver (stick inside deadzone) is NOT
         // blocked, so it still reaches the game.
-        let mut c_idle: SigMap = SigMap::default();
+        let mut c_idle: BusMap = BusMap::default();
         let mut st_idle = HashMap::new();
         eval_menu_node(&snap, 11, &show(true), &dev_stick(0.05, 0.0), &mut c_idle, &mut st_idle, 0.016);
         assert!(c_idle.get(&(sk.clone(), "left_stick".to_string())).is_none(),
@@ -3738,7 +3744,7 @@ mod menu_eval_tests {
         // Full mode: the enabled driver is blocked even when idle.
         let mut snap_full = menu_snap(14);
         snap_full.params.insert("suppress_mode".into(), Value::String("full".into()));
-        let mut c_full: SigMap = SigMap::default();
+        let mut c_full: BusMap = BusMap::default();
         let mut st_full = HashMap::new();
         eval_menu_node(&snap_full, 14, &show(true), &dev_stick(0.0, 0.0), &mut c_full, &mut st_full, 0.016);
         assert_eq!(
@@ -3749,7 +3755,7 @@ mod menu_eval_tests {
         // Suppression OFF → no block published.
         let mut snap2 = menu_snap(12);
         snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
-        let mut c2: SigMap = SigMap::default();
+        let mut c2: BusMap = BusMap::default();
         let mut st2 = HashMap::new();
         eval_menu_node(&snap2, 12, &show(true), &dev_stick(0.8, -0.8), &mut c2, &mut st2, 0.016);
         assert!(c2.get(&(sk, "left_stick".to_string())).is_none());
@@ -3765,8 +3771,8 @@ mod menu_eval_tests {
         let mut snap = menu_snap(15);
         snap.params.insert("ptr_ls".into(), Value::Bool(false));
         snap.params.insert("ptr_gyro".into(), Value::Bool(true));
-        let dev_gyro = |rate: f32| -> SigMap {
-            let mut m = SigMap::default();
+        let dev_gyro = |rate: f32| -> BusMap {
+            let mut m = BusMap::default();
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
                 m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
             }
@@ -3778,25 +3784,25 @@ mod menu_eval_tests {
         // Tick 1 opens (prev_open false → no integration yet); tick 2 rotates,
         // driving the cursor past the deadzone. Fresh collector map per tick,
         // like the real pipeline — a stale block entry can't fake a pass.
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
             "rotating gyro must be source-blocked in partial mode");
 
         // Rotation stops (holding on a target): the cursor is still deflected,
         // so the block must hold.
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
             "block must latch while the gyro cursor is out of the deadzone");
 
         // A menu opened without ever tilting keeps gyro passing in partial mode.
         let mut st2 = HashMap::new();
-        let mut c2: SigMap = SigMap::default();
+        let mut c2: BusMap = BusMap::default();
         for _ in 0..3 {
-            c2 = SigMap::default();
+            c2 = BusMap::default();
             eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c2, &mut st2, 0.016);
         }
         assert!(c2.get(&gk).is_none(),
@@ -3813,8 +3819,8 @@ mod menu_eval_tests {
         snap.params.insert("ptr_ls".into(), Value::Bool(true));
         snap.params.insert("ptr_gyro".into(), Value::Bool(true));
         snap.params.insert("suppress_mode".into(), Value::String("latch".into()));
-        let dev = |x: f32, y: f32, rate: f32| -> SigMap {
-            let mut m = SigMap::default();
+        let dev = |x: f32, y: f32, rate: f32| -> BusMap {
+            let mut m = BusMap::default();
             m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
                 m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
@@ -3829,9 +3835,9 @@ mod menu_eval_tests {
         // Tick 1 opens (no engagement while prev_open is false); tick 2: LS
         // deflects AND gyro rotates at once — LS engages first and takes the
         // latch, so LS is blocked while gyro passes untouched.
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
         assert_eq!(c.get(&lk).map(|s| s.as_bool()), Some(true),
             "the latched driver must be source-blocked");
@@ -3840,7 +3846,7 @@ mod menu_eval_tests {
 
         // LS returns to the deadzone while gyro keeps rotating: ownership hands
         // over — gyro is now blocked, LS passes again.
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         eval_menu_node(&snap, 16, &show(true), &dev(0.0, 0.0, 1.0), &mut c, &mut state, 0.016);
         assert!(c.get(&lk).is_none(),
             "a disengaged driver must be released from the block");
@@ -3859,7 +3865,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_north"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         // Wired Show + Select: [_, Show, Select, _].
         let sel = |sh: bool, se: bool|
@@ -3888,7 +3894,7 @@ mod menu_eval_tests {
     #[test]
     fn macro_style_show_target_opens() {
         let snap = menu_snap(2);
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         merge_macro_scalar(&mut c, "menu:abcd1234_show", Signal::Bool(true));
         let mut state = HashMap::new();
         let out = eval_menu_node(&snap, 2, &[], &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
@@ -3901,7 +3907,7 @@ mod menu_eval_tests {
     fn toggle_mode_edges() {
         let mut snap = menu_snap(3);
         snap.params.insert("activation_mode".into(), Value::String("toggle".into()));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let dev = dev_stick(0.0, 0.0);
 
@@ -3929,8 +3935,8 @@ mod menu_eval_tests {
         snap: &NodeSnap,
         pin: &str,
         show_b: bool,
-        dev: &SigMap,
-        c: &mut SigMap,
+        dev: &BusMap,
+        c: &mut BusMap,
         state: &mut HashMap<usize, NodeState>,
     ) -> Vec<Option<Signal>> {
         let uid = snap.node_uid;
@@ -3949,7 +3955,7 @@ mod menu_eval_tests {
     #[test]
     fn next_prev_select_while_closed() {
         let snap = menu_snap(20);
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let dev = dev_stick(0.0, 0.0);
         let mut tap = |pin: &str| {
@@ -3978,7 +3984,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_east"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         tap_target(&snap, NEXT, false, &dev_stick(0.0, 0.0), &mut c, &mut state);
         assert_eq!(c.get(&("menumap:21".to_string(), "btn_east".to_string())).copied(),
@@ -3992,7 +3998,7 @@ mod menu_eval_tests {
     fn next_moves_highlight_while_open_and_release_selects_it() {
         let mut snap = menu_snap(22);
         snap.params.insert("hover_sticky".into(), Value::Bool(false));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let rest = dev_stick(0.0, 0.0);
 
@@ -4038,7 +4044,7 @@ mod menu_eval_tests {
         let mut snap = menu_snap(23);
         snap.params.insert("activation_mode".into(), Value::String("never".into()));
         snap.params.insert("select_on".into(), Value::String("press".into()));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let dev = dev_stick(0.8, 0.8);
 
@@ -4062,7 +4068,7 @@ mod menu_eval_tests {
         let mut snap = menu_snap(24);
         snap.params.insert("ptr_ls".into(), Value::Bool(false));
         snap.params.insert("select_on".into(), Value::String("press".into()));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let dev = dev_stick(0.8, 0.8); // deflected, but no source reads it
 
@@ -4086,7 +4092,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_west"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let sel = |show_b: bool, sel_b: bool| {
             vec![None, Some(Signal::Bool(show_b)), Some(Signal::Bool(sel_b)), None]
@@ -4111,7 +4117,7 @@ mod menu_eval_tests {
         // Synthetic 1×4 strip = 4 sectors (up, right, down, left).
         snap.params.insert("col_edges".into(), serde_json::json!([0.25, 0.5, 0.75]));
         snap.params.insert("row_edges".into(), serde_json::json!([] as [f32; 0]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
 
         // Stick up (+y = up in stick coords) → sector 0.
@@ -4139,7 +4145,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
 
         let out = eval_menu_node(&snap, 7, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
@@ -4165,7 +4171,7 @@ mod menu_eval_tests {
         snap.params.insert("zone_maps".into(), serde_json::json!([
             { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["macro:ff00ff00"] }
         ]));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         // Two frames: hover establishes on frame 1, the Select edge rises on
         // frame 2 (prev_sel must be low for the edge to register).
@@ -4485,8 +4491,8 @@ mod lean_axis_tests {
             &inputs,
             &mut state,
             &HashMap::new(),
-            &SigMap::default(),
-            &SigMap::default(),
+            &BusMap::default(),
+            &BusMap::default(),
             1.0 / 60.0,
         );
         match out.get(LEAN_OUT) {
@@ -4516,7 +4522,7 @@ mod lean_axis_tests {
         for _ in 0..600 {
             let out = compute_gyro_3dof(
                 &inputs, &mut state, &params,
-                &SigMap::default(), &SigMap::default(), 1.0 / 60.0,
+                &BusMap::default(), &BusMap::default(), 1.0 / 60.0,
             );
             lean = match out.get(LEAN_OUT) {
                 Some(Some(Signal::Float(f))) => *f,
@@ -4590,7 +4596,7 @@ mod lean_axis_tests {
         for _ in 0..600 {
             out = compute_gyro_3dof(
                 &inputs, &mut state, &params,
-                &SigMap::default(), &SigMap::default(), 1.0 / 60.0,
+                &BusMap::default(), &BusMap::default(), 1.0 / 60.0,
             );
         }
         let x = match out.get(1) { Some(Some(Signal::Float(f))) => *f, o => panic!("x: {o:?}") };
@@ -5139,7 +5145,7 @@ mod rws_tests {
         let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
         let push = Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)));
         let run = |ctl: Option<Signal>| {
-            let mut c: SigMap = SigMap::default();
+            let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
             let out = eval_rws_node(&snap, 27, &[gyro, push, ctl], &mut c, &mut state, 0.01);
             (vec_at(&out, 0), c.is_empty())
@@ -5364,7 +5370,7 @@ mod rws_tests {
     #[test]
     fn rws_full_suppress_publishes_block() {
         let snap = rws_snap(21, "full");
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
         eval_rws_node(&snap, 21, &inputs, &mut c, &mut state, 0.016);
@@ -5382,7 +5388,7 @@ mod rws_tests {
     #[test]
     fn rws_suppress_off_publishes_nothing() {
         let snap = rws_snap(22, "off");
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
         eval_rws_node(&snap, 22, &inputs, &mut c, &mut state, 0.016);
@@ -5395,13 +5401,13 @@ mod rws_tests {
         let snap = rws_snap(23, "deadzone");
         let sk = format!("{SRC_BLOCK_PREFIX}dev");
         // Inside the deadzone (0.85) → not blocked, still reaches the game.
-        let mut c1: SigMap = SigMap::default();
+        let mut c1: BusMap = BusMap::default();
         let mut s1 = HashMap::new();
         let inside = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
         eval_rws_node(&snap, 23, &inside, &mut c1, &mut s1, 0.016);
         assert!(c1.get(&(sk.clone(), "right_stick".to_string())).is_none(), "inside deadzone: not blocked");
         // Past the deadzone → blocked.
-        let mut c2: SigMap = SigMap::default();
+        let mut c2: BusMap = BusMap::default();
         let mut s2 = HashMap::new();
         let past = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
         eval_rws_node(&snap, 23, &past, &mut c2, &mut s2, 0.016);
@@ -5418,7 +5424,7 @@ mod rws_tests {
         let mut snap = rws_snap(24, "full");
         snap.params.insert("scale".into(), serde_json::json!(1.0));
         snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
-        let mut c: SigMap = SigMap::default();
+        let mut c: BusMap = BusMap::default();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         // Block is active: the resolved Flick input is zeroed, but the snapshot
         // holds the real stick (pushed full right).
@@ -5442,7 +5448,7 @@ mod rws_tests {
         let mut snap = rws_snap(25, "off");
         snap.params.insert("stick_aim_enabled".into(), Value::Bool(true));
         for v in [glam::Vec2::new(0.3, 0.0), glam::Vec2::new(1.0, 0.0)] {
-            let mut c: SigMap = SigMap::default();
+            let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(v))];
             eval_rws_node(&snap, 25, &inputs, &mut c, &mut state, 0.016);
@@ -5459,7 +5465,7 @@ mod rws_tests {
             let mut snap = rws_snap(26, "off");
             snap.params.insert("flick_output".into(), Value::String("mouse".into()));
             snap.params.insert("cal_measure".into(), Value::String(axis.into()));
-            let mut c: SigMap = SigMap::default();
+            let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
             eval_rws_node(&snap, 26, &inputs, &mut c, &mut state, 0.016);
@@ -5609,9 +5615,9 @@ mod midi_source_tests {
     #[test]
     fn untouched_midi_pins_read_as_rest_on_a_midi_source() {
         let snap = midi_source(&["cc_7", "pitch_bend", "midi:note:1:60", "midi:cc:2:1", "btn_south"]);
-        let mut dev_sigs = SigMap::default();
+        let mut dev_sigs = BusMap::default();
         dev_sigs.insert(("midi_in:0".to_string(), "midi:cc:2:1".to_string()), Signal::Float(0.5));
-        let out = compute_node(&snap, &[], &mut NodeState::default(), &dev_sigs, &SigMap::default(), 0.016);
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &dev_sigs, &BusMap::default(), 0.016);
         assert_eq!(out, vec![
             Some(Signal::Float(0.0)),
             Some(Signal::Float(0.0)),
@@ -5641,12 +5647,13 @@ mod midi_source_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
         n
     }
 
-    fn played() -> SigMap {
-        let mut m = SigMap::default();
+    fn played() -> BusMap {
+        let mut m = BusMap::default();
         m.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
         m.insert(("midi_in:0".to_string(), "midi:cc:1:7".to_string()), Signal::Float(0.5));
         m.insert(("midi_in:0".to_string(), "cc_7".to_string()), Signal::Float(0.5));
@@ -5655,8 +5662,8 @@ mod midi_source_tests {
 
     fn midi_sent(out: &TickOutput) -> Vec<String> {
         let mut v: Vec<String> = out.sink_outputs.keys()
-            .filter(|(d, _)| d == "midi_out:0")
-            .map(|(_, p)| p.clone())
+            .filter(|(d, _)| *d == "midi_out:0")
+            .map(|(_, p)| p.to_string())
             .collect();
         v.sort();
         v
@@ -5669,10 +5676,10 @@ mod midi_source_tests {
     fn raw_midi_reaches_a_midi_out_only_with_thru() {
         for (thru, want) in [(false, vec![]), (true, vec!["midi:cc:1:7", "midi:note:1:60"])] {
             let graph = ProcessingGraph {
-                nodes: vec![midi_source(&["automap_out"]), midi_out_sink(2, "midi_in:0", None, thru)],
+                nodes: vec![midi_source(&["automap_out"]), midi_out_sink(2, "midi_in:0", None, thru)], ..Default::default()
             };
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&played()), 0.016, &mut out);
             assert_eq!(midi_sent(&out), want, "thru={thru}");
         }
     }
@@ -5693,9 +5700,9 @@ mod midi_source_tests {
         collect.input_sources = vec![Some((1, 0)), Some((1, 1))];
         collect.n_outputs = 1;
         let sink = midi_out_sink(4, "collector:3", Some("midi_in:0"), false);
-        let graph = ProcessingGraph { nodes: vec![src, split, collect, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, split, collect, sink], ..Default::default() };
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&played()), 0.016, &mut out);
         assert_eq!(midi_sent(&out), vec!["midi:cc:2:8"]);
         assert_eq!(
             out.sink_outputs.get(&("midi_out:0".to_string(), "midi:cc:2:8".to_string())),
@@ -5715,6 +5722,7 @@ mod midi_source_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
         n
     }
@@ -5743,10 +5751,10 @@ mod midi_source_tests {
                 remapper(2, serde_json::json!([{ "in": ["midi:note:1:60"], "out": ["btn_south"] }])),
                 pad_sink(3, "remap:2"),
                 midi_out_sink(4, "remap:2", Some("midi_in:0"), true),
-            ],
+            ], ..Default::default()
         };
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&played()), 0.016, &mut out);
 
         assert_eq!(
             out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string())),
@@ -5778,7 +5786,7 @@ mod midi_source_tests {
                     { "in": ["midi:pb:1"], "out": ["left_stick_right"], "mode": "analog" },
                 ])),
                 pad_sink(3, "remap:2"),
-            ],
+            ], ..Default::default()
         };
         let mut sigs = HashMap::new();
         sigs.insert(("midi_in:0".to_string(), "midi:cc:1:7".to_string()), Signal::Float(0.3));
@@ -5824,21 +5832,21 @@ mod midi_source_tests {
                 midi_source(&["automap_out"]),
                 remapper(2, serde_json::json!([{ "in": ["midi:note:*:60"], "out": ["btn_north"] }])),
                 pad_sink(3, "remap:2"),
-            ],
+            ], ..Default::default()
         };
-        let north = |sigs: &SigMap| {
+        let north = |sigs: &BusMap| {
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
             out.sink_outputs
                 .get(&("virtual.xinput:0".to_string(), "btn_north".to_string()))
                 .map(|s| s.as_bool())
                 .unwrap_or(false)
         };
-        let mut on_ch9 = SigMap::default();
+        let mut on_ch9 = BusMap::default();
         on_ch9.insert(("midi_in:0".to_string(), "midi:note:9:60".to_string()), Signal::Bool(true));
         on_ch9.insert(("midi_in:0".to_string(), "midi:note:*:60".to_string()), Signal::Bool(true));
         assert!(north(&on_ch9));
-        assert!(!north(&SigMap::default()));
+        assert!(!north(&BusMap::default()));
     }
 
     const PAD: &str = "gilrs:xinput:0";
@@ -5861,7 +5869,7 @@ mod midi_source_tests {
         n
     }
 
-    fn pad_sigs(pairs: &[(&str, Signal)]) -> SigMap {
+    fn pad_sigs(pairs: &[(&str, Signal)]) -> BusMap {
         pairs.iter().map(|(p, s)| ((PAD.to_string(), p.to_string()), *s)).collect()
     }
 
@@ -5882,17 +5890,17 @@ mod midi_source_tests {
                     { "in": ["btn_south"], "out": ["midi:note:1:60"], "midi_vel": 64.0 }
                 ])),
                 midi_out_sink(3, "remap:2", Some(PAD), false),
-            ],
+            ], ..Default::default()
         };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_south", Signal::Bool(true))]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[("btn_south", Signal::Bool(true))])), 0.016, &mut out);
         assert_eq!(midi_out_of(&out, "midi:note:1:60"), Some(Signal::Bool(true)));
         let vel = midi_out_of(&out, "midi:vel:1:60").map(|s| s.as_float()).unwrap_or(0.0);
         assert!((vel - 64.0 / 127.0).abs() < 1e-6, "velocity {vel}");
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_south", Signal::Bool(false))]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[("btn_south", Signal::Bool(false))])), 0.016, &mut out);
         assert_eq!(midi_out_of(&out, "midi:note:1:60"), Some(Signal::Bool(false)));
         assert_eq!(midi_out_of(&out, "midi:vel:1:60"), Some(Signal::Float(0.0)));
     }
@@ -5908,15 +5916,15 @@ mod midi_source_tests {
                     { "in": ["btn_east"], "out": ["midi:cc:2:74"], "midi_on": 100.0, "midi_off": 20.0 }
                 ])),
                 midi_out_sink(3, "remap:2", Some(PAD), false),
-            ],
+            ], ..Default::default()
         };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
         let value = |o: &TickOutput| midi_out_of(o, "midi:cc:2:74").map(|s| s.as_float()).unwrap_or(-1.0);
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_east", Signal::Bool(true))]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[("btn_east", Signal::Bool(true))])), 0.016, &mut out);
         assert!((value(&out) - 100.0 / 127.0).abs() < 1e-6, "on {}", value(&out));
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("btn_east", Signal::Bool(false))]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[("btn_east", Signal::Bool(false))])), 0.016, &mut out);
         assert!((value(&out) - 20.0 / 127.0).abs() < 1e-6, "off {}", value(&out));
     }
 
@@ -5934,25 +5942,25 @@ mod midi_source_tests {
                     { "in": ["left_stick_left"], "out": ["midi:pb:1"], "mode": "analog" },
                 ])),
                 midi_out_sink(3, "remap:2", Some(PAD), false),
-            ],
+            ], ..Default::default()
         };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[
             ("left_trigger", Signal::Float(0.5)),
             ("left_stick_x", Signal::Float(0.8)),
-        ]), 0.016, &mut out);
+        ])), 0.016, &mut out);
         let cc = midi_out_of(&out, "midi:cc:1:7").map(|s| s.as_float()).unwrap_or(-1.0);
         assert!((cc - 0.5).abs() < 1e-3, "a half-pulled trigger should send half scale, got {cc}");
         let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(0.0);
         assert!((bend - 0.8).abs() < 1e-3, "stick right bends up, got {bend}");
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[("left_stick_x", Signal::Float(-0.6))]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[("left_stick_x", Signal::Float(-0.6))])), 0.016, &mut out);
         let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(0.0);
         assert!((bend + 0.6).abs() < 1e-3, "stick left bends down, got {bend}");
 
-        eval_graph_tick(&graph, &mut state, &pad_sigs(&[]), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&pad_sigs(&[])), 0.016, &mut out);
         let bend = midi_out_of(&out, "midi:pb:1").map(|s| s.as_float()).unwrap_or(9.0);
         let cc = midi_out_of(&out, "midi:cc:1:7").map(|s| s.as_float()).unwrap_or(9.0);
         assert!(bend.abs() < 1e-6 && cc.abs() < 1e-6, "released analog cards rest, got {bend} / {cc}");
@@ -5966,7 +5974,7 @@ mod midi_source_tests {
         split.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
         split.n_outputs = 3;
         split.output_pin_ids = vec!["automap_pass".into(), "midi:note:1:61".into(), "midi:pb:1".into()];
-        let out = compute_node(&split, &[], &mut NodeState::default(), &played(), &SigMap::default(), 0.016);
+        let out = compute_node(&split, &[], &mut NodeState::default(), &played(), &BusMap::default(), 0.016);
         assert_eq!(out, vec![None, Some(Signal::Bool(false)), Some(Signal::Float(0.0))]);
     }
 
@@ -5974,12 +5982,12 @@ mod midi_source_tests {
     fn non_midi_sources_are_not_rest_filled() {
         let mut snap = midi_source(&["cc_7"]);
         snap.device_id = Some("gilrs:xinput:0".to_string());
-        let out = compute_node(&snap, &[], &mut NodeState::default(), &SigMap::default(), &SigMap::default(), 0.016);
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &BusMap::default(), &BusMap::default(), 0.016);
         assert_eq!(out, vec![None]);
     }
 
-    fn note_sigs(vel: f32, pat: Option<f32>, cp: Option<f32>) -> SigMap {
-        let mut m = SigMap::default();
+    fn note_sigs(vel: f32, pat: Option<f32>, cp: Option<f32>) -> BusMap {
+        let mut m = BusMap::default();
         let d = "midi_in:0".to_string();
         m.insert((d.clone(), "midi:note:1:60".to_string()), Signal::Bool(true));
         m.insert((d.clone(), "midi:vel:1:60".to_string()), Signal::Float(vel));
@@ -5988,9 +5996,9 @@ mod midi_source_tests {
         m
     }
 
-    fn trigger_from(graph: &ProcessingGraph, sigs: &SigMap) -> f32 {
+    fn trigger_from(graph: &ProcessingGraph, sigs: &BusMap) -> f32 {
         let mut out = TickOutput::default();
-        eval_graph_tick(graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+        eval_graph_tick(graph, &mut HashMap::new(), &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
         out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
             .map(|s| s.as_float()).unwrap_or(f32::NAN)
     }
@@ -6007,7 +6015,7 @@ mod midi_source_tests {
                     { "in": ["midi:note:1:60"], "out": ["right_trigger"], "mode": "analog" },
                 ])),
                 pad_sink(3, "remap:2"),
-            ],
+            ], ..Default::default()
         };
         let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
         assert!(near(trigger_from(&graph, &note_sigs(0.8, None, None)), 0.8), "velocity alone");
@@ -6028,11 +6036,11 @@ mod midi_source_tests {
                     { "in": ["midi:note:1:60"], "out": ["btn_south"], "threshold": 0.6 },
                 ])),
                 pad_sink(3, "remap:2"),
-            ],
+            ], ..Default::default()
         };
-        let south = |sigs: &SigMap| {
+        let south = |sigs: &BusMap| {
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
             out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string()))
                 .map(|s| s.as_bool()).unwrap_or(false)
         };
@@ -6051,11 +6059,11 @@ mod midi_source_tests {
                     { "in": ["right_trigger"], "out": ["midi:note:1:60"], "mode": "analog", "threshold": 0.2 },
                 ])),
                 midi_out_sink(4, "remap:2", None, false),
-            ],
+            ], ..Default::default()
         };
         let run = |v: f32| {
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), &pad_sigs(&[("right_trigger", Signal::Float(v))]), 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&pad_sigs(&[("right_trigger", Signal::Float(v))])), 0.016, &mut out);
             (midi_out_of(&out, "midi:note:1:60"), midi_out_of(&out, "midi:vel:1:60"), midi_out_of(&out, "midi:pat:1:60"))
         };
         let (note, _, _) = run(0.1);
@@ -6078,11 +6086,11 @@ mod midi_source_tests {
                     { "in": ["midi:note:1:60"], "out": ["midi:note:2:72"], "mode": "analog" },
                 ])),
                 midi_out_sink(4, "remap:2", Some("midi_in:0"), false),
-            ],
+            ], ..Default::default()
         };
-        let run = |sigs: &SigMap| {
+        let run = |sigs: &BusMap| {
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), sigs, 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
             (midi_out_of(&out, "midi:note:2:72"), midi_out_of(&out, "midi:vel:2:72"), midi_out_of(&out, "midi:pat:2:72"))
         };
         let (note, vel, pat) = run(&note_sigs(0.7, Some(0.0), None));
@@ -6104,7 +6112,7 @@ mod midi_source_tests {
                     { "in": ["midi:note:1:60", "midi:note:1:64"], "out": ["right_trigger"], "mode": "analog" },
                 ])),
                 pad_sink(3, "remap:2"),
-            ],
+            ], ..Default::default()
         };
         let one = note_sigs(0.8, None, None);
         assert!(trigger_from(&graph, &one) == 0.0 || trigger_from(&graph, &one).is_nan(), "one key isn't the chord");
@@ -6139,11 +6147,11 @@ mod midi_source_tests {
             remap.input_sources = vec![Some((2, 0))];
             remap.n_outputs = 1;
             let sink = pad_sink(4, "remap:2");
-            let graph = ProcessingGraph { nodes: vec![midi, pad, comb, remap, sink] };
+            let graph = ProcessingGraph { nodes: vec![midi, pad, comb, remap, sink], ..Default::default() };
             let mut sigs = pad_sigs(&[("btn_south", Signal::Bool(true))]);
             sigs.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
             let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+            eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&sigs), 0.016, &mut out);
             let on = |pin: &str| out.sink_outputs
                 .get(&("virtual.xinput:0".to_string(), pin.to_string()))
                 .map(|s| s.as_bool()).unwrap_or(false);
@@ -6175,7 +6183,7 @@ mod midi_card_module_tests {
         }
     }
 
-    fn get(c: &SigMap, key: &str, pin: &str) -> Option<Signal> {
+    fn get(c: &BusMap, key: &str, pin: &str) -> Option<Signal> {
         c.get(&(key.to_string(), pin.to_string())).copied()
     }
 
@@ -6187,7 +6195,7 @@ mod midi_card_module_tests {
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c, "lean:1", "midi:note:2:60"), Some(Signal::Bool(true)), "{c:?}");
         assert_eq!(get(&c, "lean:1", "midi:vel:2:60"), Some(Signal::Float(64.0 / 127.0)));
@@ -6206,7 +6214,7 @@ mod midi_card_module_tests {
         ]));
         let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
         let mut ns = NodeState::default();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.6), &mut ns, &mut c, 0.016);
         let f = |pin: &str| get(&c, "lean:1", pin).map(|s| s.as_float()).unwrap_or(f32::NAN);
         assert!((f("midi:cc:1:11") - 0.6).abs() < 1e-4, "{c:?}");
@@ -6224,14 +6232,14 @@ mod midi_card_module_tests {
             {"f":0,"z":0,"in":["tz_touch"],"out":["midi:cc:1:20"],"midi_on": 100},
         ]));
         let finger = |on: bool| {
-            let mut m: SigMap = SigMap::default();
+            let mut m: BusMap = BusMap::default();
             m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(on));
             m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
             m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
             m
         };
         let mut state = HashMap::new();
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         for _ in 0..3 {
             c.clear();
             eval_touch_zones_map_node(&n, 1, &finger(true), &mut c, &mut state, 0.016);
@@ -6250,11 +6258,11 @@ mod midi_card_module_tests {
         let mut n = node(1, "module.map_action");
         n.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
         n.params.insert("mappings".into(), serde_json::json!([{ "in": ["midi:note:1:60"] }]));
-        let mut dev = SigMap::default();
+        let mut dev = BusMap::default();
         dev.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
-        let out = eval_map_action_node(&n, 1, &dev, &SigMap::default(), &mut HashMap::new(), 0.016);
+        let out = eval_map_action_node(&n, 1, &dev, &BusMap::default(), &mut HashMap::new(), 0.016);
         assert_eq!(out.first().copied().flatten(), Some(Signal::Bool(true)), "{out:?}");
-        let out = eval_map_action_node(&n, 1, &SigMap::default(), &SigMap::default(), &mut HashMap::new(), 0.016);
+        let out = eval_map_action_node(&n, 1, &BusMap::default(), &BusMap::default(), &mut HashMap::new(), 0.016);
         assert_ne!(out.first().copied().flatten(), Some(Signal::Bool(true)));
     }
 }
@@ -6310,12 +6318,13 @@ mod automap_curve_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
         n
     }
 
-    fn pad(lt: f32, stick: Vec2) -> SigMap {
-        let mut m = SigMap::default();
+    fn pad(lt: f32, stick: Vec2) -> BusMap {
+        let mut m = BusMap::default();
         let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
         put("left_trigger", Signal::Float(lt));
         put("right_trigger", Signal::Float(0.6));
@@ -6326,11 +6335,11 @@ mod automap_curve_tests {
         m
     }
 
-    fn tick(nodes: Vec<NodeSnap>, sigs: &SigMap) -> TickOutput {
-        let graph = ProcessingGraph { nodes };
+    fn tick(nodes: Vec<NodeSnap>, sigs: &BusMap) -> TickOutput {
+        let graph = ProcessingGraph { nodes, ..Default::default() };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut state, sigs, 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(sigs), 0.016, &mut out);
         out
     }
 
@@ -6376,20 +6385,20 @@ mod automap_curve_tests {
     #[test]
     fn a_stick_and_its_axes_stay_in_step() {
         let key = |pin: &str| ("collector:5".to_string(), pin.to_string());
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick"), 5,
             &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
         assert!(close(c.get(&key("left_stick_y")).copied(), Signal::Float(0.4)));
 
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "left_stick_x"), 5,
             &pad(0.0, Vec2::new(0.6, 0.8)), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(c.get(&key("left_stick_x")).copied(), Signal::Float(0.3)));
         assert!(close(c.get(&key("left_stick")).copied(), Signal::Vec2(Vec2::new(0.3, 0.8))));
     }
 
-    fn imu() -> SigMap {
+    fn imu() -> BusMap {
         let mut m = pad(0.0, Vec2::ZERO);
         for (pin, v) in [("gyro_x", 0.2), ("gyro_y", -0.4), ("gyro_z", 0.8),
                          ("accel_x", 0.1), ("accel_y", 0.3), ("accel_z", -0.5)] {
@@ -6398,7 +6407,7 @@ mod automap_curve_tests {
         m
     }
 
-    fn bus_value(c: &SigMap, pin: &str) -> Option<Signal> {
+    fn bus_value(c: &BusMap, pin: &str) -> Option<Signal> {
         c.get(&("collector:5".to_string(), pin.to_string())).copied()
     }
 
@@ -6408,7 +6417,7 @@ mod automap_curve_tests {
     #[test]
     fn a_gyro_pick_curves_all_three_axes() {
         for module in [AUTOMAP_CURVE_ID, AUTOMAP_TWOWAY_CURVE_ID] {
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             let (ins, outs) = eval_automap_curve_node(&curve(5, module, "gyro"), 5,
                 &imu(), &mut c, &mut HashMap::new(), 0.016);
             assert_eq!(ins.len(), 3, "{module}");
@@ -6424,7 +6433,7 @@ mod automap_curve_tests {
 
     #[test]
     fn an_accel_pick_leaves_the_gyro_alone() {
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "accel"), 5,
             &imu(), &mut c, &mut HashMap::new(), 0.016);
         assert!(close(bus_value(&c, "accel_z"), Signal::Float(-0.25)));
@@ -6440,7 +6449,7 @@ mod automap_curve_tests {
             sigs.insert((PAD.to_string(), pin.to_string()), Signal::Float(v));
         }
         sigs.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         let (ins, _) = eval_automap_curve_node(&curve(5, AUTOMAP_CURVE_ID, "touch1"), 5,
             &sigs, &mut c, &mut HashMap::new(), 0.016);
         assert_eq!(ins.len(), 2);
@@ -6509,8 +6518,8 @@ mod area_mapper_tests {
         n
     }
 
-    fn stick(v: Vec2) -> SigMap {
-        let mut m = SigMap::default();
+    fn stick(v: Vec2) -> BusMap {
+        let mut m = BusMap::default();
         let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
         put("left_stick", Signal::Vec2(v));
         put("left_stick_x", Signal::Float(v.x));
@@ -6527,19 +6536,19 @@ mod area_mapper_tests {
     /// One tick; returns the published bus and the live mirror.
     fn run(
         n: &NodeSnap,
-        sigs: &SigMap,
+        sigs: &BusMap,
         state: &mut HashMap<usize, NodeState>,
-    ) -> (SigMap, Vec<Option<Signal>>) {
-        let mut c = SigMap::default();
+    ) -> (BusMap, Vec<Option<Signal>>) {
+        let mut c = BusMap::default();
         let out = eval_area_mapper_node(n, 5, sigs, &mut c, state, DT);
         (c, out)
     }
 
-    fn bus(c: &SigMap, pin: &str) -> Option<Signal> {
+    fn bus(c: &BusMap, pin: &str) -> Option<Signal> {
         c.get(&("collector:5".to_string(), pin.to_string())).copied()
     }
 
-    fn on(c: &SigMap, pin: &str) -> bool {
+    fn on(c: &BusMap, pin: &str) -> bool {
         bus(c, pin).is_some_and(|s| s.as_bool())
     }
 
@@ -6705,7 +6714,7 @@ mod area_mapper_tests {
         ]));
         n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
         let touch = |active: bool| {
-            let mut m = SigMap::default();
+            let mut m = BusMap::default();
             // Top middle of the pad: +Y is up on the bus.
             m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.0));
             m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(0.95));
@@ -6954,10 +6963,11 @@ mod area_mapper_tests {
             feedback_sources: Vec::new(),
             is_self_sink: false,
             digital_trigger_bridge: false,
+            compiled: Default::default(),
         });
-        let graph = ProcessingGraph { nodes: vec![mapper(json!([{ "z": 1, "out": ["btn_north"] }])), sink] };
+        let graph = ProcessingGraph { nodes: vec![mapper(json!([{ "z": 1, "out": ["btn_north"] }])), sink], ..Default::default() };
         let mut out = TickOutput::default();
-        eval_graph_tick(&graph, &mut HashMap::new(), &stick(dir(0.0, 0.9)), DT, &mut out);
+        eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::from(&stick(dir(0.0, 0.9))), DT, &mut out);
         let at = |pin: &str| out.sink_outputs.get(&(VIRT.to_string(), pin.to_string())).copied();
         assert_eq!(at("btn_north"), Some(Signal::Bool(true)));
         assert_eq!(at("left_stick"), Some(Signal::Vec2(Vec2::ZERO)));
@@ -7346,8 +7356,8 @@ mod imu_input_tests {
     }
 
     /// A pad lying flat, turning at `yaw_dps` (right positive).
-    fn turning(yaw_dps: f32) -> SigMap {
-        let mut m = SigMap::default();
+    fn turning(yaw_dps: f32) -> BusMap {
+        let mut m = BusMap::default();
         for (pin, v) in [
             ("gyro_x", 0.0), ("gyro_y", 0.0), ("gyro_z", yaw_dps / 2000.0),
             ("accel_x", 0.0), ("accel_y", 0.0), ("accel_z", 1.0 / 8.0),
@@ -7359,14 +7369,14 @@ mod imu_input_tests {
         m
     }
 
-    fn run(snap: &NodeSnap, sigs: &SigMap,
-           state: &mut HashMap<usize, NodeState>) -> SigMap {
-        let mut c = SigMap::default();
+    fn run(snap: &NodeSnap, sigs: &BusMap,
+           state: &mut HashMap<usize, NodeState>) -> BusMap {
+        let mut c = BusMap::default();
         eval_remapper_node(snap, 2, sigs, &mut c, state, 0.004);
         c
     }
 
-    fn out(c: &SigMap, pin: &str) -> Option<Signal> {
+    fn out(c: &BusMap, pin: &str) -> Option<Signal> {
         c.get(&(KEY.to_string(), pin.to_string())).copied()
     }
 
@@ -7411,7 +7421,7 @@ mod imu_input_tests {
             "in": ["imu_gyro_yaw"], "out": ["right_stick_right"], "mode": "analog",
         }));
         let mut state = HashMap::new();
-        let x = |c: &SigMap| out(c, "right_stick_x").map(|s| s.as_float());
+        let x = |c: &BusMap| out(c, "right_stick_x").map(|s| s.as_float());
         let c = run(&snap, &turning(180.0), &mut state);
         assert!((x(&c).unwrap() - 0.5).abs() < 1e-3, "{:?}", x(&c));
         let c = run(&snap, &turning(-180.0), &mut state);
@@ -7451,8 +7461,8 @@ mod stick_direction_output_tests {
         }
     }
 
-    fn south(down: bool) -> SigMap {
-        let mut m = SigMap::default();
+    fn south(down: bool) -> BusMap {
+        let mut m = BusMap::default();
         m.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(down));
         for (pin, sig) in [("left_stick_x", Signal::Float(0.0)), ("left_stick_y", Signal::Float(0.0)),
                            ("left_stick", Signal::Vec2(Vec2::ZERO))] {
@@ -7470,7 +7480,7 @@ mod stick_direction_output_tests {
             if let Some(m) = mode { card["mode"] = serde_json::json!(m); }
             let snap = remapper(card);
             let mut state = HashMap::new();
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_remapper_node(&snap, 2, &south(true), &mut c, &mut state, 0.004);
             let y = c.get(&("remap:2".to_string(), "left_stick_y".to_string())).map(|s| s.as_float());
             let v = c.get(&("remap:2".to_string(), "left_stick".to_string())).copied();
@@ -7479,8 +7489,8 @@ mod stick_direction_output_tests {
         }
     }
 
-    fn stick(v: Vec2) -> SigMap {
-        let mut m = SigMap::default();
+    fn stick(v: Vec2) -> BusMap {
+        let mut m = BusMap::default();
         for (pin, sig) in [("left_stick_x", Signal::Float(v.x)), ("left_stick_y", Signal::Float(v.y)),
                            ("left_stick", Signal::Vec2(v)),
                            ("right_stick_x", Signal::Float(0.0)), ("right_stick_y", Signal::Float(0.0)),
@@ -7490,7 +7500,7 @@ mod stick_direction_output_tests {
         m
     }
 
-    fn at(c: &SigMap, pin: &str) -> Option<Signal> {
+    fn at(c: &BusMap, pin: &str) -> Option<Signal> {
         c.get(&("remap:2".to_string(), pin.to_string())).copied()
     }
 
@@ -7503,7 +7513,7 @@ mod stick_direction_output_tests {
         }));
         let mut state = HashMap::new();
         let mut step = |down: bool| {
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_remapper_node(&snap, 2, &south(down), &mut c, &mut state, 0.01);
             let on = |p: &str| c.get(&("remap:2".to_string(), p.to_string())) == Some(&Signal::Bool(true));
             (on("key_lctrl"), on("key_c"))
@@ -7522,7 +7532,7 @@ mod stick_direction_output_tests {
     #[test]
     fn a_whole_stick_moves_onto_another_and_leaves_its_own_quiet() {
         let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["right_stick"], "mode": "analog" }));
-        let mut c = SigMap::default();
+        let mut c = BusMap::default();
         eval_remapper_node(&snap, 2, &stick(Vec2::new(0.6, -0.3)), &mut c, &mut HashMap::new(), 0.004);
         assert_eq!(at(&c, "right_stick"), Some(Signal::Vec2(Vec2::new(0.6, -0.3))));
         assert_eq!(at(&c, "right_stick_x").map(|s| s.as_float()), Some(0.6));
@@ -7539,7 +7549,7 @@ mod stick_direction_output_tests {
         let snap = remapper(serde_json::json!({ "in": ["left_stick"], "out": ["btn_east"] }));
         let mut state = HashMap::new();
         let east = |v: Vec2, state: &mut HashMap<usize, NodeState>| {
-            let mut c = SigMap::default();
+            let mut c = BusMap::default();
             eval_remapper_node(&snap, 2, &stick(v), &mut c, state, 0.004);
             at(&c, "btn_east")
         };
@@ -7562,5 +7572,139 @@ mod abs_range_tests {
         let b = apply_curve(0.5, &id, &[0.0], true, -4.0, 1.0, -9.0, 1.0, 0.0);
         assert!((a - b).abs() < 1e-6, "{a} vs {b}");
         assert!((apply_curve(-0.25, &id, &[0.0], true, -4.0, 0.5, 0.0, 2.0, 0.0) + 1.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod average_window_tests {
+    use super::*;
+
+    /// Feed `input(t)` for `secs` at `rate`; the last output.
+    fn run(params: &HashMap<String, Value>, rate: f32, secs: f32, input: impl Fn(f32) -> f32) -> f32 {
+        let mut state = NodeState::default();
+        let dt = 1.0 / rate;
+        let mut out = 0.0;
+        for i in 0..(secs * rate).round() as u32 {
+            let inputs = [Some(Signal::Float(input(i as f32 * dt)))];
+            let r = compute_average(&inputs, &mut state, params, dt);
+            out = r[0].unwrap().as_float();
+        }
+        out
+    }
+
+    /// The bug: a window counted in ticks lasted 4x longer at 500 Hz than at
+    /// 2 kHz. A step 5 ms before the end must read the same at every rate.
+    #[test]
+    fn the_window_is_time_whatever_the_sample_rate() {
+        let params = HashMap::from([("window_ms".to_string(), Value::from(20.0))]);
+        let step = |t: f32| if t >= 0.095 { 1.0 } else { 0.0 };
+        for rate in [500.0, 1000.0, 2000.0, 8000.0] {
+            let got = run(&params, rate, 0.1, step);
+            assert!((got - 0.25).abs() < 0.06, "{rate} Hz: {got}");
+        }
+    }
+
+    /// A patch saved with a tick count reads as it did at the rate it was
+    /// authored for: 10 ticks at 2 kHz, 5 ms.
+    #[test]
+    fn a_saved_tick_count_reads_at_the_authored_rate() {
+        let legacy = HashMap::from([("buf_size".to_string(), Value::from(10.0))]);
+        assert_eq!(average_window_ms(&legacy), 5.0);
+        assert_eq!(average_window_ms(&HashMap::new()), 5.0);
+        let both = HashMap::from([
+            ("buf_size".to_string(), Value::from(10.0)),
+            ("window_ms".to_string(), Value::from(40.0)),
+        ]);
+        assert_eq!(average_window_ms(&both), 40.0);
+    }
+
+    /// A window shorter than a tick is that one tick, not an empty average.
+    #[test]
+    fn a_window_under_one_tick_passes_the_input() {
+        let params = HashMap::from([("window_ms".to_string(), Value::from(0.5))]);
+        // Five ticks at 2 ms: the last input is t = 8 ms, unaveraged.
+        assert!((run(&params, 500.0, 0.01, |t| t) - 0.008).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod skip_display_tests {
+    use super::*;
+
+    fn gain_to_sink() -> ProcessingGraph {
+        let node = |uid, module: &str| NodeSnap {
+            node_uid: uid,
+            module_id: module.to_string(),
+            params: HashMap::new(),
+            n_outputs: 1,
+            input_sources: vec![],
+            device_id: None,
+            output_pin_ids: vec![],
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        };
+        let mut scope = node(2, "display.oscilloscope");
+        scope.input_sources = vec![Some((0, 0))];
+        scope.n_outputs = 0;
+        let mut src = node(1, "device.source");
+        src.device_id = Some("pad".into());
+        src.output_pin_ids = vec!["left_trigger".into()];
+        let mut sink = node(3, "device.sink");
+        sink.n_outputs = 0;
+        sink.sink_target = Some(crate::graph::SinkTarget {
+            device_id: "virt".into(),
+            pin_ids: vec!["left_trigger".into()],
+            multi_sources: vec![vec![(0, 0)]],
+            automap_source: None,
+            automap_fallback_dev: None,
+            feedback_sources: vec![],
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+            compiled: Default::default(),
+        });
+        ProcessingGraph { nodes: vec![src, scope, sink], ..Default::default() }
+    }
+
+    /// The UI publishes a new snapshot only when this says it differs.
+    #[test]
+    fn a_graph_compares_by_content_not_by_what_a_tick_worked_out() {
+        let graph = gain_to_sink();
+        let fresh = gain_to_sink();
+        assert!(graph == fresh);
+        // Ticking fills the caches of one and not the other.
+        eval_graph_tick(&graph, &mut HashMap::new(), &flexinput_core::SigMap::default(), 0.001, &mut TickOutput::default());
+        assert!(graph == fresh, "caches don't count");
+
+        let mut param = gain_to_sink();
+        param.nodes[0].params.insert("deadzone".into(), serde_json::json!(0.2));
+        assert!(graph != param, "a parameter does");
+        let mut wire = gain_to_sink();
+        wire.nodes[2].sink_target.as_mut().unwrap().multi_sources = vec![vec![]];
+        assert!(graph != wire, "a wire does");
+        let mut reset = gain_to_sink();
+        reset.nodes[1].aux_f32_override = Some(vec![0.0]);
+        assert!(graph != reset, "a one-shot state reset does");
+    }
+
+    #[test]
+    fn a_skipped_tick_still_drives_the_sinks_and_the_scopes() {
+        let graph = gain_to_sink();
+        let sigs: flexinput_core::SigMap = [(("pad".to_string(), "left_trigger".to_string()), Signal::Float(0.5))]
+            .into_iter().collect();
+        let (mut shown, mut skipped) = (TickOutput::default(), TickOutput::default());
+        skipped.skip_display = true;
+        eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.001, &mut shown);
+        eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.001, &mut skipped);
+
+        assert_eq!(flexinput_core::SigMap::from(&skipped.sink_outputs), flexinput_core::SigMap::from(&shown.sink_outputs));
+        assert!(!shown.sink_outputs.is_empty());
+        assert_eq!(skipped.scope_samples, shown.scope_samples);
+        assert!(!shown.scope_samples.is_empty());
+
+        assert!(!shown.last_outputs.is_empty() && !shown.last_inputs.is_empty());
+        assert!(skipped.last_outputs.is_empty(), "{:?}", skipped.last_outputs);
+        assert!(skipped.last_inputs.is_empty());
+        assert!(skipped.outputs.is_empty());
     }
 }

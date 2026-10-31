@@ -3,6 +3,7 @@ pub mod frames;
 pub mod haptic_pcm;
 pub mod imu;
 pub mod automap;
+pub mod busmap;
 pub mod macros;
 pub mod media;
 pub mod menu;
@@ -17,7 +18,8 @@ pub mod pinkey;
 pub mod signal;
 pub mod touchzones;
 
+pub use busmap::{BusMap, BusView, PinSigs};
 pub use module::{Module, ModuleDescriptor, ModuleFactory, ModuleRegistration, PinDescriptor};
 pub use patch::{NodeInstance, Patch, SubPatch, SubPatchPin, Wire, PATCH_VERSION};
-pub use pinkey::{copy_bus, pooled_string, recycle_keys, recycle_strings, FastHasher, PinMapExt, PinSigs, SigMap};
+pub use pinkey::{recycle_keys, FastHasher, PinMapExt, SigMap};
 pub use signal::{Signal, SignalType};

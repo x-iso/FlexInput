@@ -403,8 +403,8 @@ pub struct StickRotationState {
 pub(crate) fn eval_stick_rotation_node(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -905,8 +905,8 @@ mod tests {
 
     /// The pad's bus: a stick on `stick_pin` (all three forms), a yaw rate, the
     /// pad flat, and a button to see pass through.
-    fn pad(stick_pin: &str, stick: Vec2, yaw_dps: f32) -> SigMap {
-        let mut d = SigMap::default();
+    fn pad(stick_pin: &str, stick: Vec2, yaw_dps: f32) -> BusMap {
+        let mut d = BusMap::default();
         let mut put = |pin: &str, s: Signal| { d.insert((PAD.to_string(), pin.to_string()), s); };
         for side in ["left_stick", "right_stick"] {
             let v = if side == stick_pin { stick } else { Vec2::ZERO };
@@ -925,20 +925,20 @@ mod tests {
     }
 
     /// Run the node for `secs`, a fresh bus every tick as the engine does.
-    fn run_node(snap: &NodeSnap, dev: &SigMap, secs: f32)
-        -> (SigMap, Vec<Option<Signal>>)
+    fn run_node(snap: &NodeSnap, dev: &BusMap, secs: f32)
+        -> (BusMap, Vec<Option<Signal>>)
     {
         let mut state = HashMap::new();
-        let mut last = (SigMap::default(), Vec::new());
+        let mut last = (BusMap::default(), Vec::new());
         for _ in 0..(secs / DT).round() as usize {
-            let mut cs = SigMap::default();
+            let mut cs = BusMap::default();
             let out = eval_stick_rotation_node(snap, snap.node_uid, dev, &mut cs, &mut state, DT);
             last = (cs, out);
         }
         last
     }
 
-    fn published(cs: &SigMap, pin: &str) -> Signal {
+    fn published(cs: &BusMap, pin: &str) -> Signal {
         *cs.get_pin("collector:7", &pin).unwrap_or_else(|| panic!("{pin} published"))
     }
 

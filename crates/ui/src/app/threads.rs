@@ -242,6 +242,7 @@ pub(crate) fn spawn_io_thread(
             // This iteration's sink outputs: refreshed in place from the bus each
             // iteration (see `drain_sink_bus_into`) rather than rebuilt.
             let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
+            let mut last_signal_count = 0usize;
             // Its own high-resolution waiter for the engine hand-off (the loop's
             // pacing waiter must not see this one's leftover timer signal).
             let engine_waiter = flexinput_engine::HrWaiter::new();
@@ -355,7 +356,10 @@ pub(crate) fn spawn_io_thread(
                 }
 
                 // ── Poll physical inputs ──────────────────────────────────────
-                let mut signals: HashMap<(String, String), Signal> = HashMap::new();
+                // Sized from the last poll: growing it from nothing rehashes
+                // several times, every poll.
+                let mut signals: HashMap<(String, String), Signal> =
+                    if input_due { HashMap::with_capacity(last_signal_count) } else { HashMap::new() };
                 if input_due {
                     puffin::profile_scope!("backends_poll");
                     for backend in &mut backends {
@@ -402,7 +406,10 @@ pub(crate) fn spawn_io_thread(
                 // names appear in this iteration's signals — the common case
                 // when no gyro-capable device is connected. Saves a contended
                 // RwLock write per loop iteration (polling rate) on idle setups.
-                let has_taped_pin = signals.keys()
+                //
+                // Nor with no scope open to read them: the rings cost a dozen
+                // Strings and a write lock per poll, for nobody.
+                let has_taped_pin = flexinput_engine::scope_taps_wanted() && signals.keys()
                     .any(|(_, pin)| flexinput_engine::SCOPE_TAP_PINS.iter().any(|p| *p == pin.as_str()));
                 if has_taped_pin {
                     puffin::profile_scope!("scope_taps_write");
@@ -444,8 +451,11 @@ pub(crate) fn spawn_io_thread(
                     // current tick's fresh virtual poll is merged again below and
                     // refreshes last_virt_sigs for the next tick.
                     for (k, v) in &last_virt_sigs {
-                        signals.entry(k.clone()).or_insert(*v);
+                        if !signals.contains_key(k) {
+                            signals.insert(k.clone(), *v);
+                        }
                     }
+                    last_signal_count = signals.len();
                     // ArcSwap publish — consumers (proc thread, UI) read
                     // via `load_full()`, a refcount bump rather than a
                     // map clone under a RwLock.
@@ -548,9 +558,10 @@ pub(crate) fn spawn_io_thread(
                 // device idles instead of holding its last state.
                 let bypass = io_bypass.load(Ordering::Relaxed)
                     || ui_nav_suppress.load(Ordering::Relaxed);
-                let active_ids = active_tab_device_ids.read().unwrap().clone();
                 if output_due {
                     puffin::profile_scope!("route_virtual_devices");
+                    // Held through the routing: the UI only writes it on a change.
+                    let active_ids = active_tab_device_ids.read().unwrap();
                     let mut devs = shared_virtual_devices.lock().unwrap();
                     // Mixed mode: a virtual gamepad active alongside the
                     // keyboard/mouse device. Forces physical-mouse suppression
@@ -598,10 +609,19 @@ pub(crate) fn spawn_io_thread(
                         }
                         // Route signals to active-tab devices only (every tick —
                         // braiding gates the FLUSH timing below, not the state).
+                        // Runs of pins share a device: look it up once per run.
+                        let mut target: (&str, Option<usize>) = ("", None);
                         for ((device_id, pin_id), &signal) in &sink_outputs {
-                            if !active_ids.contains(device_id) { continue; }
-                            if let Some(dev) = devs.iter_mut().find(|d| d.id() == device_id) {
-                                dev.send(pin_id, signal);
+                            if target.0 != device_id {
+                                let ix = if active_ids.contains(device_id) {
+                                    devs.iter().position(|d| d.id() == device_id)
+                                } else {
+                                    None
+                                };
+                                target = (device_id, ix);
+                            }
+                            if let Some(ix) = target.1 {
+                                devs[ix].send(pin_id, signal);
                             }
                         }
                         // Flush: background + keymouse devices every tick; the
@@ -658,13 +678,13 @@ pub(crate) fn spawn_io_thread(
                     // top-of-tick merge publish is equivalent (sub-ms latency at
                     // these rates) and far cheaper.
                     for dev in devs.iter_mut() {
-                        let id = dev.id().to_string();
                         let pt = Instant::now();
                         let sigs = dev.poll_outputs(); // always drain the ring
-                        timings.add(IO_OUTPUTS, &id, pt.elapsed());
-                        if !active_ids.contains(&id) { continue; } // gate routing only
+                        let id = dev.id();
+                        timings.add(IO_OUTPUTS, id, pt.elapsed());
+                        if !active_ids.contains(id) { continue; } // gate routing only
                         for (pin_id, sig) in sigs {
-                            last_virt_sigs.insert((id.clone(), pin_id.to_string()), sig);
+                            last_virt_sigs.set_pin(id, pin_id, sig);
                         }
                     }
                 }
@@ -681,7 +701,19 @@ pub(crate) fn spawn_io_thread(
                     // unfocused (bypass stale-true). HD-rumble amplitude pins get a
                     // default frequency injected below so they're audible on Switch
                     // Pro (whose HD motors need a non-zero frequency).
-                    for ((device_id, pin_id), &signal) in &sink_outputs {
+                    // The sink pins bound for physical pads, usually a handful of
+                    // a hundred-odd: everything below only cares about these.
+                    let mut phys_run: (&str, bool) = ("", false);
+                    let phys_pins: Vec<(&String, &String, Signal)> = sink_outputs.iter()
+                        .filter(|((device_id, _), _)| {
+                            if phys_run.0 != device_id.as_str() {
+                                phys_run = (device_id, crate::app::graph::is_physical_pad_id(device_id));
+                            }
+                            phys_run.1
+                        })
+                        .map(|((device_id, pin_id), &signal)| (device_id, pin_id, signal))
+                        .collect();
+                    for &(device_id, pin_id, signal) in &phys_pins {
                         // Forward feedback to any PHYSICAL-backend pad — gilrs: (native),
                         // sdl: (route-all-through-SDL), or jc2: (Joy-Con 2 over BLE).
                         // Gating on gilrs: alone meant no mapped rumble/lightbar/HD-rumble
@@ -689,10 +721,8 @@ pub(crate) fn spawn_io_thread(
                         // to backends directly, bypassing this loop). Each backend's send()
                         // ignores ids that aren't its own prefix, so fanning out to all is
                         // safe.
-                        if crate::app::graph::is_physical_pad_id(device_id) {
-                            for backend in &mut backends {
-                                backend.send(device_id, pin_id, signal);
-                            }
+                        for backend in &mut backends {
+                            backend.send(device_id, pin_id, signal);
                         }
                     }
                     // Default HD-rumble frequency: when AutoMap feedback drives an
@@ -702,9 +732,8 @@ pub(crate) fn spawn_io_thread(
                     // tick, inject ~320 Hz (0.6) so the rumble is audible — matching
                     // what the manual ping pulse does.
                     for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
-                        for ((device_id, pin_id), &signal) in &sink_outputs {
-                            let is_phys = crate::app::graph::is_physical_pad_id(device_id);
-                            if !is_phys || pin_id != amp_pin { continue; }
+                        for &(device_id, pin_id, signal) in &phys_pins {
+                            if pin_id != amp_pin { continue; }
                             let amp = signal.as_float();
                             let has_freq = sink_outputs
                                 .get_pin(device_id, freq_pin)
@@ -761,11 +790,9 @@ pub(crate) fn spawn_io_thread(
                     }
                     // Snapshot this tick's physical-pad outputs for next-tick drop
                     // detection (gilrs:, sdl: and jc2: feedback pins).
-                    last_phys_haptics.clear();
-                    for ((device_id, pin_id), &signal) in &sink_outputs {
-                        if crate::app::graph::is_physical_pad_id(device_id) {
-                            last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
-                        }
+                    flexinput_core::recycle_keys(&mut last_phys_haptics);
+                    for &(device_id, pin_id, signal) in &phys_pins {
+                        last_phys_haptics.set_pin(device_id, pin_id, signal);
                     }
                     // MIDI output. Each port's encoder turns this tick's pin levels
                     // into messages (edges, quantised changes). Bypass hands every

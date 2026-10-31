@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use flexinput_core::{automap, PinMapExt, PinSigs, Signal, SignalType, SigMap};
+use flexinput_core::{automap, PinMapExt, PinSigs, Signal, SignalType, BusMap};
 use glam::Vec2;
 
 use crate::eval::remapper_pass_through_and_suppress;
@@ -116,8 +116,8 @@ struct Retired {
 pub(crate) fn jsm_publish(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &SigMap,
-    collector_sigs: &mut SigMap,
+    dev_sigs: &BusMap,
+    collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
@@ -142,27 +142,7 @@ pub(crate) fn jsm_publish(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let mut upstream: PinSigs = PinSigs::default();
-    for ap in automap::ALL_PINS {
-        let sig = (!collector_id.is_empty())
-            .then(|| {
-                collector_sigs
-                    .get_pin(&collector_id, &ap.id)
-                    .copied()
-            })
-            .flatten()
-            .or_else(|| {
-                (!dev_id.is_empty())
-                    .then(|| {
-                        dev_sigs
-                            .get_pin(&dev_id, &ap.id)
-                            .copied()
-                    })
-                    .flatten()
-            });
-        if let Some(s) = sig {
-            upstream.insert(ap.id.to_string(), s);
-        }
-    }
+    upstream.fill_canonical(collector_sigs.view(collector_id), dev_sigs.view(dev_id));
     // MIDI pins are dynamic — never in ALL_PINS — so take whatever the bus
     // carries. They are what a `MIDI_*` button reads, and what the pass-through
     // carries on (or strict mode silences).
@@ -179,15 +159,12 @@ pub(crate) fn jsm_publish(
     // Nothing that carries `upstream` on reads these pins: the pass-through
     // walks the pad's pins and the MIDI ones by name.
     let shown_macros = shown_macro_pins(snap);
-    let mut shown_prev: SigMap = SigMap::default();
+    let mut shown_prev: BusMap = BusMap::default();
     {
         use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
-        let amounts = |sigs: &mut dyn Iterator<Item = (&(String, String), &Signal)>| {
+        let amounts = |sigs: &mut dyn Iterator<Item = (&str, &Signal)>| {
             let mut out: HashMap<u32, f32> = HashMap::new();
-            for ((ns, pin), sig) in sigs {
-                if ns != SIGS_NS && ns != SIGS_NS_VEC2 {
-                    continue;
-                }
+            for (pin, sig) in sigs {
                 let Some(id) = super::names::macro_btn_id(pin) else { continue };
                 let v = macro_amount(*sig);
                 let e = out.entry(id).or_insert(0.0);
@@ -195,9 +172,12 @@ pub(crate) fn jsm_publish(
             }
             out
         };
-        let mut now = amounts(&mut collector_sigs.iter());
+        let mut now = amounts(&mut collector_sigs.pins_of(SIGS_NS).chain(collector_sigs.pins_of(SIGS_NS_VEC2)));
         if let Some(prev) = state.get(&crate::eval::MACRO_CARRY_UID).map(|s| &s.macro_prev) {
-            for (id, v) in amounts(&mut prev.iter()) {
+            let mut prev_pins = prev.iter()
+                .filter(|((ns, _), _)| ns == SIGS_NS || ns == SIGS_NS_VEC2)
+                .map(|((_, pin), sig)| (pin.as_str(), sig));
+            for (id, v) in amounts(&mut prev_pins) {
                 now.entry(id).or_insert(v);
             }
             // The macros this node shows as output pins, as they stood last
