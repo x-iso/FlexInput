@@ -22,7 +22,7 @@ default-members = ["app"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.5"
+version = "0.16.6"
 edition = "2021"
 license = "MIT"
 
