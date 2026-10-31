@@ -31,6 +31,7 @@ mod win32 {
     pub const DIGCF_PRESENT:         u32 = 0x0000_0002;
     pub const DIGCF_ALLCLASSES:      u32 = 0x0000_0004;
     pub const SPDRP_HARDWAREID:      u32 = 1;
+    pub const SPDRP_CLASS:           u32 = 7;
 
     #[repr(C)]
     pub struct GUID { pub data1: u32, pub data2: u16, pub data3: u16, pub data4: [u8; 8] }
@@ -579,10 +580,55 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
 /// preferred over USB composite parents (`USB\…`) which HidHide cannot hide.
 /// Falls back to a non-HID match only when no HID instance exists.
 pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
+    let nodes = matching_instances(vid, pid);
+    let chosen = nodes.iter().find(|(id, _)| is_hid_instance(id))
+        .or_else(|| nodes.first())
+        .map(|(id, _)| id.clone());
+    #[cfg(debug_assertions)]
+    eprintln!("[hidhide] instance_id_for_vid_pid({:04X},{:04X}) = {:?}", vid, pid, chosen);
+    chosen
+}
+
+/// What to hide for a pad: the one node [`instance_id_for_vid_pid`] finds, except
+/// on a Steam Controller. That has a set of collections on every interface, and on
+/// a puck an interface per pad slot, so the first match is as likely as not an empty
+/// slot's, leaving the pad itself open to Steam. All of them go, see
+/// [`steam_controller_hides_node`]. So a second pad on the same puck goes with it.
+pub fn instance_ids_to_hide(vid: u16, pid: u16) -> Vec<String> {
+    if crate::steam_haptics::is_steam_controller(Some(vid), Some(pid)) {
+        return matching_instances(vid, pid).into_iter()
+            .filter(|(id, class)| steam_controller_hides_node(id, class))
+            .map(|(id, _)| id)
+            .collect();
+    }
+    instance_id_for_vid_pid(vid, pid).into_iter().collect()
+}
+
+/// `HID\…` and Bluetooth HID nodes, as opposed to their USB composite parents.
+/// BTHHID covers Bluetooth HID; some Windows builds expose the HID device directly
+/// under HID\{class-guid}_… as well.
+fn is_hid_instance(id: &str) -> bool {
+    let upper = id.to_uppercase();
+    upper.starts_with("HID\\") || upper.starts_with("BTHHID\\")
+}
+
+/// Whether hiding a Steam Controller takes this node: its vendor collections, which
+/// is all a program can read it through. Not its Mouse and Keyboard collections,
+/// which only move the pointer in lizard mode and read nothing a game would want.
+fn steam_controller_hides_node(id: &str, class: &str) -> bool {
+    is_hid_instance(id)
+        && !class.eq_ignore_ascii_case("Mouse")
+        && !class.eq_ignore_ascii_case("Keyboard")
+}
+
+/// Every real device node with this VID and PID, as `(instance id, setup class)`:
+/// no ViGEmBus or HIDMaestro ones.
+fn matching_instances(vid: u16, pid: u16) -> Vec<(String, String)> {
     #[cfg(windows)] {
         use win32::*;
         use std::mem;
 
+        let mut found = Vec::new();
         let hdevinfo = unsafe {
             SetupDiGetClassDevsW(
                 std::ptr::null(),
@@ -592,7 +638,7 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
             )
         };
         if hdevinfo == INVALID_HANDLE_VALUE || hdevinfo.is_null() {
-            return None;
+            return found;
         }
 
         // USB HID:       HID\VID_057E&PID_2009\...
@@ -606,8 +652,6 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
         let needle_usb = format!("VID_{:04X}&PID_{:04X}", vid, pid);
         let needle_bt  = format!("VID&02{:04X}_PID&{:04X}", vid, pid);
         let needle_bt4 = format!("VID&0002{:04X}_PID&{:04X}", vid, pid);
-        let mut hid_result: Option<String> = None;
-        let mut other_result: Option<String> = None;
         let mut idx = 0u32;
 
         loop {
@@ -654,28 +698,52 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
             } != 0 {
                 let len = (id_size as usize).saturating_sub(1);
                 let s = String::from_utf16_lossy(&id_buf[..len]);
-                let upper = s.to_uppercase();
                 if is_virtual_instance_id(&s) { continue; } // virtual (ViGEmBus or HIDMaestro)
 
-                // Prefer HID-class devices since HidHide only hides those.
-                // BTHHID covers Bluetooth HID; some Windows builds expose the
-                // HID device directly under HID\{class-guid}_… as well.
-                let is_hid = upper.starts_with("HID\\")
-                    || upper.starts_with("BTHHID\\");
-                if is_hid {
-                    if hid_result.is_none() { hid_result = Some(s); }
-                } else if other_result.is_none() {
-                    other_result = Some(s);
-                }
+                let mut class_buf  = vec![0u8; 128];
+                let mut class_size = 0u32;
+                let class = if unsafe {
+                    SetupDiGetDeviceRegistryPropertyW(
+                        hdevinfo, &mut info, SPDRP_CLASS, &mut hw_type,
+                        class_buf.as_mut_ptr(), class_buf.len() as u32, &mut class_size,
+                    )
+                } != 0 {
+                    let words: Vec<u16> = class_buf[..class_size as usize]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    from_wide_multi(&words).into_iter().next().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                found.push((s, class));
             }
         }
 
         unsafe { SetupDiDestroyDeviceInfoList(hdevinfo); }
-        let chosen = hid_result.or(other_result);
-        #[cfg(debug_assertions)]
-        eprintln!("[hidhide] instance_id_for_vid_pid({:04X},{:04X}) = {:?}",
-            vid, pid, chosen);
-        chosen
+        found
     }
-    #[cfg(not(windows))] { let _ = (vid, pid); None }
+    #[cfg(not(windows))] { let _ = (vid, pid); Vec::new() }
+}
+
+#[cfg(test)]
+mod hide_target_tests {
+    use super::*;
+
+    /// A puck's nodes as Windows lists them: the vendor collection of each pad slot
+    /// and the puck's own go, the pointer and keyboard ones and the USB parents stay.
+    #[test]
+    fn hiding_a_steam_controller_takes_its_vendor_collections() {
+        for id in [
+            r"HID\VID_28DE&PID_1304&MI_02&COL03\8&66A53BD&0&0002",
+            r"HID\VID_28DE&PID_1304&MI_03&COL03\8&2A41917F&0&0002",
+            r"HID\VID_28DE&PID_1304&MI_06\8&2E9DEB34&0&0000",
+        ] {
+            assert!(steam_controller_hides_node(id, "HIDClass"), "{id}");
+        }
+        assert!(!steam_controller_hides_node(r"HID\VID_28DE&PID_1304&MI_02&COL01\8&66A53BD&0&0000", "Mouse"));
+        assert!(!steam_controller_hides_node(r"HID\VID_28DE&PID_1304&MI_02&COL02\8&66A53BD&0&0001", "Keyboard"));
+        assert!(!steam_controller_hides_node(r"USB\VID_28DE&PID_1304&MI_02\7&32D4A490&0&0002", "HIDClass"));
+        assert!(!steam_controller_hides_node(r"USB\VID_28DE&PID_1304\FXB9962502F17", "USB"));
+    }
 }

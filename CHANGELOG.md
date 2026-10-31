@@ -58,6 +58,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **HidHide now hides a Steam Controller from Steam.** The pad has several HID
+  collections, and on a puck a set for every pad slot, but only the first found was
+  hidden, often an empty slot's, which left the pad itself open. All the ones a
+  program can read it through are hidden now, including any other pad on the same
+  puck. Restart Steam or replug the puck once, since a program that already has the
+  pad open keeps it.
 - **The Calibration window now shows trigger settings for the Steam Controller
   (2026).** It treated the pad as having digital triggers, so its analog range and
   digital threshold could not be set.

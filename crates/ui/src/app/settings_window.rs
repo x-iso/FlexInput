@@ -367,33 +367,28 @@ impl FlexInputApp {
             let inst_cache = std::sync::Arc::clone(&self.hidhide_instance_cache);
             let kept_report = std::sync::Arc::clone(&self.hidhide_kept_report);
             std::thread::spawn(move || {
-                // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
+                // (vid,pid) → HID instance ids (slow SetupAPI; safe off the UI/IO thread).
                 let resolved: Vec<(String, bool)> = targets
                     .iter()
-                    .filter_map(|&(vid, pid, keep)| {
-                        let (vid, pid) = (&vid, &pid);
-                        let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
+                    .flat_map(|&(vid, pid, keep)| {
+                        let mut ids = flexinput_devices::hidhide::instance_ids_to_hide(vid, pid);
                         // Remember every id we resolve; when sticky is on and the pad
-                        // is currently absent, fall back to the remembered one so the
-                        // entry survives the gap instead of being unmasked.
-                        let id = match id {
-                            Some(id) => {
-                                if let Ok(mut c) = inst_cache.lock() {
-                                    c.insert((*vid, *pid), id.clone());
-                                }
-                                Some(id)
+                        // is currently absent, fall back to the remembered ones so the
+                        // entries survive the gap instead of being unmasked.
+                        if !ids.is_empty() {
+                            if let Ok(mut c) = inst_cache.lock() {
+                                c.insert((vid, pid), ids.clone());
                             }
-                            None if sticky => inst_cache
-                                .lock()
-                                .ok()
-                                .and_then(|c| c.get(&(*vid, *pid)).cloned()),
-                            None => None,
-                        };
+                        } else if sticky {
+                            ids = inst_cache.lock().ok()
+                                .and_then(|c| c.get(&(vid, pid)).cloned())
+                                .unwrap_or_default();
+                        }
                         eprintln!(
-                            "[hidhide] target {:04X}:{:04X} -> instance {:?} (keep on exit: {keep})",
-                            vid, pid, id
+                            "[hidhide] target {:04X}:{:04X} -> instances {:?} (keep on exit: {keep})",
+                            vid, pid, ids
                         );
-                        id.map(|id| (id, keep))
+                        ids.into_iter().map(move |id| (id, keep))
                     })
                     .collect();
                 let blacklist: Vec<String> = resolved.iter().map(|(id, _)| id.clone()).collect();

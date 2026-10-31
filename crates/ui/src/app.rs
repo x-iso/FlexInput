@@ -335,15 +335,15 @@ pub struct FlexInputApp {
     /// unhidden system-wide until it comes back. Cleared on app exit with the
     /// process; nothing persists it.
     hidhide_vidpid_cache: HashMap<String, (u16, u16)>,
-    /// Session cache of `(vid, pid) → HID instance id`, filled by each apply's
+    /// Session cache of `(vid, pid) → HID instance ids`, filled by each apply's
     /// worker thread (the SetupAPI lookup is slow, so it runs off the UI
     /// thread). Also only used by the sticky path: while the pad is away
-    /// `instance_id_for_vid_pid` finds nothing, so without a remembered
-    /// instance id a "sticky" target would still fall out of the blacklist.
+    /// `instance_ids_to_hide` finds nothing, so without the remembered
+    /// instance ids a "sticky" target would still fall out of the blacklist.
     /// Re-listing the id of an absent device is harmless — HidHide just holds
     /// the string, and the pad is masked the moment it comes back rather than
     /// being visible for the ~2 s until our next enumeration.
-    hidhide_instance_cache: std::sync::Arc<std::sync::Mutex<HashMap<(u16, u16), String>>>,
+    hidhide_instance_cache: std::sync::Arc<std::sync::Mutex<HashMap<(u16, u16), Vec<String>>>>,
     bottom_panel_height: f32,
     /// Summed `mutation_gen` across all tabs as of the last crash-recovery
     /// snapshot write. The recovery snapshot (`recovery.json`) is rewritten
