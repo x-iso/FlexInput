@@ -98,12 +98,6 @@ pub(crate) struct DeviceCal {
     /// Written by the Calibration window's yellow pin. Defaults to 0.5.
     ltrig_threshold: f32,
     rtrig_threshold: f32,
-    /// "Suppress capacitive touch" opt-in (device.source `suppress_touch_misc`
-    /// param — the key predates the rename and is kept so saved patches keep
-    /// their setting). Mutes the pad's capacitive stick-cap / grip pins (see
-    /// `automap::capacitive_misc_mask`) so they can't hijack a capture. The UI
-    /// masks the SAME pins out of `last_signals`, so Learn and routing agree.
-    suppress_touch_misc: bool,
     /// The right stick's own deadzone (`deadzone_r`, Calibration window), when
     /// it has one; `None` = the device's `deadzone` covers both sticks.
     rstick_dz: Option<f32>,
@@ -163,7 +157,6 @@ impl Default for DeviceCal {
             digital_triggers: false,
             ltrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
             rtrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
-            suppress_touch_misc: false,
             rstick_dz: None,
         }
     }
@@ -289,8 +282,6 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
         rtrig_threshold: params.get("rtrig_digital_threshold").and_then(|v| v.as_f64())
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
-        suppress_touch_misc: params.get("suppress_touch_misc")
-            .and_then(|v| v.as_bool()).unwrap_or(false),
         rstick_dz: params.get("deadzone_r").and_then(|v| v.as_f64()).map(|v| v as f32),
     }
 }
@@ -586,30 +577,6 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
             let over = v >= thr.max(f32::EPSILON);
             out.set_pin(dev_id, analog_pin, Signal::Float(if over { 1.0 } else { 0.0 }));
             out.set_pin(&dev_id, &dig_pin, Signal::Bool(over));
-        }
-    }
-
-    // ── Pass 4: capacitive touch mute ───────────────────────────────────────
-    //
-    // "Suppress capacitive touch" on a device.source: zero the pad's capacitive
-    // stick-cap / grip pins so they stop driving anything while the user builds
-    // a mapping. Which pins those are comes from the device itself — its backend
-    // publishes the mask on `CAPACITIVE_MASK_PIN` — because the Misc slots mean
-    // different things on different pads. Zeroed rather than removed so presence
-    // probes still see the pad's real shape.
-    //
-    // The UI applies the same mask to `last_signals` (`mask_capacitive_pins` in
-    // devices_pool.rs) — that half is what stops a Remapper / Touch Zones / Lean
-    // "Learn" from capturing the sensor instead of the button the user pressed.
-    // Both halves read the same param and the same mask, so they cannot disagree.
-    for (dev_id, (_, _, cal)) in params {
-        if !cal.suppress_touch_misc { continue; }
-        let mask = flexinput_core::automap::capacitive_mask_of(dev_sigs, dev_id);
-        for pin in flexinput_core::automap::capacitive_pins(mask) {
-            let key = (dev_id.clone(), pin.to_string());
-            if let Some(sig) = out.get(&key).copied() {
-                out.insert(key, sig.zeroed());
-            }
         }
     }
 

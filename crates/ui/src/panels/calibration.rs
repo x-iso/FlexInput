@@ -82,7 +82,7 @@ impl CalCaps {
 /// gyro section despite having the best IMU of any pad here. Where a pin
 /// answers the question directly, the pin wins.
 ///
-/// Triggers stay slug-driven: layouts declare `left_trigger`/`right_trigger`
+/// Triggers stay out of the pins: layouts declare `left_trigger`/`right_trigger`
 /// for digital shoulders too, so their presence does NOT mean the trigger is
 /// analog and there is nothing to calibrate.
 pub fn caps_for_pins(dev_id: &str, pins: &[String]) -> CalCaps {
@@ -127,8 +127,10 @@ pub fn caps_for(dev_id: &str) -> CalCaps {
             // firmware fuses orientation itself, so it also gets a baseline.
             "joycon2_l"  => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: false, triggers: false, orientation: true },
             "joycon2_r"  => CalCaps { gyro: true,  sticks: true,  left_stick: false, right_stick: true, triggers: false, orientation: true },
-            // Anything else: conservative sticks-only.
-            _            => CalCaps { gyro: false, sticks: true,  left_stick: true, right_stick: true, triggers: false, orientation: false },
+            // Anything else: conservative sticks-only. A Steam Controller lands
+            // here too (`sdl:generic:<serial>`), and only its USB ids say that its
+            // triggers are analog.
+            _            => CalCaps { gyro: false, sticks: true,  left_stick: true, right_stick: true, triggers: crate::model::is_steam_controller(dev_id), orientation: false },
         };
     }
     CalCaps { gyro: false, sticks: false, left_stick: false, right_stick: false, triggers: false, orientation: false }
@@ -675,6 +677,10 @@ const CAL_FILE_KEYS: &[&str] = &[
     "ltrig_min", "ltrig_max", "rtrig_min", "rtrig_max", "triggers_calibrated",
     "ltrig_digital_threshold", "rtrig_digital_threshold",
     "ltrig_effect_mode", "ltrig_effect_values", "rtrig_effect_mode", "rtrig_effect_values",
+    "trig_click_on", "ltrig_click_gain_db", "rtrig_click_gain_db",
+    "ltrig_click_offset", "rtrig_click_offset",
+    "grip_touch", "grip_release",
+    "pad_click_on", "pad_click_release", "pad_click_strong", "pad_click_gain_db",
 ];
 /// The format's marker, and its version.
 const CAL_FILE_MARKER: &str = "flexinput_calibration";
@@ -913,9 +919,8 @@ pub fn show_windows(
         // Default to a compact size matching the min, so the window opens
         // as small as it can go and the user can grow it if needed.
         let min_w = (screen.width()  * 0.40).clamp(480.0, 700.0);
-        let min_h = (screen.height() * 0.40).clamp(280.0, 460.0);
         let default_w = min_w;
-        let default_h = min_h;
+        let default_h = (screen.height() * 0.40).clamp(280.0, 460.0);
         // Opaque window frame — without an explicit fill the tab strip's
         // drop-shadow from underneath bleeds through the window content.
         let mut window_frame = egui::Frame::window(&ctx.style());
@@ -923,13 +928,14 @@ pub fn show_windows(
         let window = egui::Window::new(title.as_str())
             .id(egui::Id::new(("cal_window", node_id)))
             .open(&mut is_open)
-            .resizable(true)
             .collapsible(true)
             .frame(window_frame)
             .default_width(default_w)
             .default_height(default_h)
             .min_width(min_w)
-            .min_height(min_h)
+            // Width only: the sections lay out by width, and with height left to
+            // the contents the window shrinks when one collapses.
+            .resizable([true, false])
             .show(ctx, |ui| {
                 scaled_below_ref_width(ui, |ui| {
                     cal_file_status_line(ui, node_id);
@@ -1192,6 +1198,11 @@ pub fn auto_cal_tick(ctx: &egui::Context, canvas: &mut Canvas, live: &LiveSignal
     }
 }
 
+/// Whether a capture in this window's state is running.
+fn window_busy(ui: &egui::Ui, node_id: NodeId, busy: impl FnOnce(&WindowState) -> bool) -> bool {
+    ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))).is_some_and(|s| busy(&s))
+}
+
 fn draw_window_body(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -1220,7 +1231,123 @@ fn draw_window_body(
     if caps.triggers {
         triggers_section(ui, canvas, node_id, dev_id, live, lo);
     }
+    if crate::model::is_steam_controller(dev_id) {
+        ui.separator();
+        grip_touch_section(ui, canvas, node_id, dev_id, live);
+    }
     ui.ctx().request_repaint();
+}
+
+// The pad's touch and release levels, and the defaults it and Steam use.
+const GRIP_TOUCH_DEFAULT: f32 = 100.0;
+const GRIP_RELEASE_DEFAULT: f32 = 80.0;
+/// A lower level is a longer reach, so the sliders read it Steam's way round:
+/// more means more, and with Steam's numbers, so the two can be compared.
+const GRIP_RANGE_FLIP: f32 = 425.0;
+const GRIP_HYSTERESIS_FLIP: f32 = 125.0;
+
+/// A Steam Controller's grip sensors, as on Steam's page of that name, and the
+/// click its trackpads give.
+fn grip_touch_section(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+) {
+    if !section_header(ui, node_id, "Grip and Touch", false, false) {
+        return;
+    }
+    grip_sensors_group(ui, canvas, node_id, dev_id, live);
+    ui.add_space(10.0);
+    pad_click_group(ui, canvas, node_id, dev_id, live);
+}
+
+fn pad_click_group(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+) {
+    let flag = |canvas: &Canvas, key: &str| canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get(key).and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let mut on = flag(canvas, "pad_click_on");
+    let mut release = flag(canvas, "pad_click_release");
+    let mut strong = flag(canvas, "pad_click_strong");
+    let mut gain = read_param_f32(canvas, node_id, "pad_click_gain_db", 0.0);
+    ui.label(egui::RichText::new("Trackpads").size(INSTRUCT_SIZE).strong());
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui.checkbox(&mut on, egui::RichText::new("Click feedback").size(INSTRUCT_SIZE))
+            .on_hover_text("FlexInput plays a click on the trackpad as you press it. With Steam \
+                running and using the pad, Steam may play its own as well.")
+            .changed();
+        if on {
+            changed |= ui.checkbox(&mut release, egui::RichText::new("On release too").size(INSTRUCT_SIZE)).changed();
+            changed |= ui.checkbox(&mut strong, egui::RichText::new("Strong").size(INSTRUCT_SIZE)).changed();
+            changed |= ui.add(egui::Slider::new(&mut gain, -18.0..=12.0)
+                .step_by(1.0).suffix(" dB").text("Strength")).changed();
+        }
+        for (name, pin) in [("L", "btn_touchpad"), ("R", "btn_misc2")] {
+            let held = read_float(live, dev_id, pin) > 0.5;
+            ui.label(egui::RichText::new(name).size(INSTRUCT_SIZE).strong()
+                .color(if held { ORANGE } else { Color32::from_gray(80) }));
+        }
+    });
+    if changed {
+        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+            n.params.insert("pad_click_on".into(), Value::Bool(on));
+            n.params.insert("pad_click_release".into(), Value::Bool(release));
+            n.params.insert("pad_click_strong".into(), Value::Bool(strong));
+            n.params.insert("pad_click_gain_db".into(), serde_json::json!(gain));
+        }
+    }
+}
+
+fn grip_sensors_group(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+) {
+    let touch = read_param_f32(canvas, node_id, "grip_touch", GRIP_TOUCH_DEFAULT);
+    let release = read_param_f32(canvas, node_id, "grip_release", GRIP_RELEASE_DEFAULT);
+    let mut range = GRIP_RANGE_FLIP - touch;
+    let mut hysteresis = GRIP_HYSTERESIS_FLIP - release;
+    ui.label(egui::RichText::new("Grip sensors").size(INSTRUCT_SIZE).strong());
+    instruct_line(ui, &[(false,
+        "How far from each grip your fingers are detected. One setting covers both grips.")]);
+    ui.add_space(6.0);
+    let range_changed = ui.add(egui::Slider::new(&mut range, 25.0..=400.0).step_by(5.0).text("Sensor range"))
+        .on_hover_text("Further reaches further from the grip.").changed();
+    let hysteresis_changed = ui.add(egui::Slider::new(&mut hysteresis, 25.0..=100.0).step_by(1.0).text("Hysteresis"))
+        .on_hover_text("The extra movement needed to turn a sensor off once on. Raise it if a \
+            sensor flickers with your fingers near the edge of its range.").changed();
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        reset = cal_button(ui, "Reset").clicked();
+        for (name, pin) in [("L", "btn_misc5"), ("R", "btn_misc6")] {
+            let held = read_float(live, dev_id, pin) > 0.5;
+            ui.label(egui::RichText::new(name).size(INSTRUCT_SIZE).strong()
+                .color(if held { ORANGE } else { Color32::from_gray(80) }));
+        }
+    });
+    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+        if range_changed {
+            n.params.insert("grip_touch".into(), serde_json::json!(GRIP_RANGE_FLIP - range));
+        }
+        if hysteresis_changed {
+            n.params.insert("grip_release".into(), serde_json::json!(GRIP_HYSTERESIS_FLIP - hysteresis));
+        }
+        // To the defaults rather than absent, or the pad would keep what it had.
+        if reset {
+            n.params.insert("grip_touch".into(), serde_json::json!(GRIP_TOUCH_DEFAULT));
+            n.params.insert("grip_release".into(), serde_json::json!(GRIP_RELEASE_DEFAULT));
+        }
+    }
 }
 
 /// How long a baseline capture averages the pose, in seconds — long enough to
@@ -1251,7 +1378,11 @@ fn orientation_section(
         .and_then(|n| n.params.get("orientation_baseline"))
         .and_then(|v| v.as_array())
         .is_some_and(|a| a.len() == 4);
-    section_header(ui, "Orientation Baseline", done);
+    let busy = ui.ctx().data(|d| d.get_temp::<OrientBaseline>(orient_baseline_id(node_id)))
+        .is_some_and(|s| s.sampling);
+    if !section_header(ui, node_id, "Orientation Baseline", done, busy) {
+        return;
+    }
 
     instruct_line(ui, &[
         (false, "Hold the Joy-Con "),
@@ -1360,15 +1491,46 @@ fn read_vec4(live: &LiveSignals, dev: &str, pin: &str) -> Option<[f32; 4]> {
     }
 }
 
-fn section_header(ui: &mut egui::Ui, title: &str, done: bool) {
-    ui.horizontal(|ui| {
+/// A section's heading, with a chevron that folds the section away; the caller
+/// draws the section's body when this returns true. `busy` = something in it is
+/// running, and it only advances while drawn, so it stays open until that's done.
+fn section_header(ui: &mut egui::Ui, node_id: NodeId, title: &str, done: bool, busy: bool) -> bool {
+    let id = egui::Id::new(("cal_section_open", node_id, title));
+    let open = ui.ctx().data_mut(|d| *d.get_persisted_mut_or_insert_with(id, || true));
+    let row = ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
         ui.label(egui::RichText::new(title).heading());
         if done {
             ui.label(egui::RichText::new("✓")
                 .color(Color32::from_rgb(80, 200, 100)).heading());
         }
+        rect
     });
+    let resp = ui.interact(row.response.rect, id.with("toggle"), Sense::click());
+    let colour = if busy {
+        Color32::from_gray(70)
+    } else if resp.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let (c, r) = (row.inner.center(), 4.0);
+    let points = if open || busy {
+        vec![c + egui::vec2(-r, -r * 0.5), c + egui::vec2(0.0, r * 0.5), c + egui::vec2(r, -r * 0.5)]
+    } else {
+        vec![c + egui::vec2(-r * 0.5, -r), c + egui::vec2(r * 0.5, 0.0), c + egui::vec2(-r * 0.5, r)]
+    };
+    ui.painter().add(egui::Shape::line(points, Stroke::new(2.0_f32, colour)));
+    if busy {
+        ui.add_space(2.0);
+        return true;
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        ui.ctx().data_mut(|d| d.insert_persisted(id, !open));
+    }
     ui.add_space(2.0);
+    open
 }
 
 fn cal_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -1523,7 +1685,10 @@ fn gyro_section(
         .and_then(|n| n.params.get("gyro_calibrated").and_then(|v| v.as_bool()))
         .unwrap_or(false);
     let _ = done; // header check intentionally suppressed per new design
-    section_header(ui, "Gyro Calibration", false);
+    let busy = window_busy(ui, node_id, |s| s.gyro.sampling || s.orient.sampling_axis.is_some() || s.spikes.busy());
+    if !section_header(ui, node_id, "Gyro Calibration", false, busy) {
+        return;
+    }
 
     // Raw samples this frame.
     let raw_gx = read_float(live, dev_id, "gyro_x");
@@ -3136,7 +3301,9 @@ fn sticks_section(
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("sticks_calibrated").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    section_header(ui, "Stick Calibration", done);
+    if !section_header(ui, node_id, "Stick Calibration", done, window_busy(ui, node_id, |s| s.stick.sampling)) {
+        return;
+    }
 
     let (raw_lx, raw_ly) = read_vec2(live, dev_id, "left_stick_x", "left_stick_y");
     let (raw_rx, raw_ry) = read_vec2(live, dev_id, "right_stick_x", "right_stick_y");
@@ -3846,7 +4013,9 @@ fn triggers_section(
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("triggers_calibrated").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    section_header(ui, "Analog Trigger Calibration", done);
+    if !section_header(ui, node_id, "Analog Trigger Calibration", done, window_busy(ui, node_id, |s| s.trig.sampling)) {
+        return;
+    }
 
     let raw_l = read_float(live, dev_id, "left_trigger");
     let raw_r = read_float(live, dev_id, "right_trigger");
@@ -3867,6 +4036,16 @@ fn triggers_section(
         .and_then(|n| n.params.get("input_pin_ids").and_then(|v| v.as_array()).cloned())
         .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(pin)));
     let adaptive = [has_inlet("trigger_l_mode"), has_inlet("trigger_r_mode")];
+
+    // A Steam Controller's trigger click, placed relative to the yellow pin.
+    let has_click = crate::model::is_steam_controller(dev_id);
+    let mut click_on = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("trig_click_on").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let lt_click = read_param_f32(canvas, node_id, "ltrig_click_offset", 0.0);
+    let rt_click = read_param_f32(canvas, node_id, "rtrig_click_offset", 0.0);
+    let lt_gain = read_param_f32(canvas, node_id, "ltrig_click_gain_db", 0.0);
+    let rt_gain = read_param_f32(canvas, node_id, "rtrig_click_gain_db", 0.0);
 
     // Step session: track min/max + tally top/bottom 1% for jitter-aware bounds.
     let sampling = ui.ctx().data_mut(|d| {
@@ -3919,6 +4098,26 @@ fn triggers_section(
                     (false, ": it holds only while nothing else drives that trigger — \
                              no game effects, no module."),
                 ]);
+            }
+            if has_click {
+                ui.add_space(8.0);
+                let toggled = ui.checkbox(&mut click_on,
+                    egui::RichText::new("Trigger click").size(INSTRUCT_SIZE))
+                    .on_hover_text("FlexInput plays a click on the grip motor as the trigger \
+                        passes the cyan pin. While this is on, the pad's own full-pull point \
+                        is out of reach, so Steam's click stays quiet, and so does anything \
+                        bound to Full Pull in Steam Input.")
+                    .changed();
+                if toggled {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("trig_click_on".into(), Value::Bool(click_on));
+                    }
+                }
+                if click_on {
+                    ui.add_space(4.0);
+                    instruct_line(ui, &[(false,
+                        "Drag the cyan pin to set where each trigger clicks. It moves along with the yellow pin.")]);
+                }
             }
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
@@ -3986,18 +4185,27 @@ fn triggers_section(
             // without, it is a square centered on the vectorscope's axis:
             // [pad-left] [widget] [pad-right], so the cells remain `lo.cell_w`
             // wide and line up with the vectorscopes above.
-            let wide = fx_l.is_some() || fx_r.is_some();
+            let wide = fx_l.is_some() || fx_r.is_some() || has_click;
             let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
             ui.add_space(pad);
-            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, lt_min, lt_max, lo, wide, fx_l.as_mut());
+            let click = |offset: f32, gain_db: f32| has_click.then_some(TriggerClickEdit { on: click_on, offset, gain_db });
+            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, click(lt_click, lt_gain), lt_min, lt_max, lo, wide, fx_l.as_mut());
             ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, rt_min, rt_max, lo, wide, fx_r.as_mut());
+            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, click(rt_click, rt_gain), rt_min, rt_max, lo, wide, fx_r.as_mut());
             if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
             if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                 if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
                 if let Some(v) = new_l.range_max { n.params.insert("ltrig_max".into(), serde_json::json!(v)); }
+                if let Some(t) = new_l.click { n.params.insert("ltrig_click_offset".into(), serde_json::json!(t - lt_thr)); }
+                if let Some(t) = new_r.click { n.params.insert("rtrig_click_offset".into(), serde_json::json!(t - rt_thr)); }
+                if let Some(v) = new_l.click_gain { n.params.insert("ltrig_click_gain_db".into(), serde_json::json!(v)); }
+                if let Some(v) = new_r.click_gain { n.params.insert("rtrig_click_gain_db".into(), serde_json::json!(v)); }
+                if new_l.reset_threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
+                if new_r.reset_threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
+                if new_l.reset_click { n.params.insert("ltrig_click_offset".into(), serde_json::json!(0.0_f32)); }
+                if new_r.reset_click { n.params.insert("rtrig_click_offset".into(), serde_json::json!(0.0_f32)); }
                 if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
                 if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
@@ -4039,10 +4247,70 @@ fn debias_range(
 #[derive(Default)]
 struct TriggerWidgetEdit {
     threshold: Option<f32>,
+    /// Where the trigger click pin was dragged to, on the same scale as `threshold`.
+    click: Option<f32>,
+    click_gain: Option<f32>,
+    reset_threshold: bool,
+    reset_click: bool,
     range_min: Option<f32>,
     range_max: Option<f32>,
     /// The default effect's mode or a number changed (written back by the caller).
     effect_changed: bool,
+}
+
+/// One trigger's click, for the box its arc sits in.
+#[derive(Clone, Copy)]
+struct TriggerClickEdit {
+    on: bool,
+    /// From the digital threshold, on the same scale.
+    offset: f32,
+    gain_db: f32,
+}
+
+const DIGITAL_LABEL_COLOR: Color32 = Color32::from_rgb(240, 220, 60);
+const HAPTICS_LABEL_COLOR: Color32 = Color32::from_rgb(90, 220, 230);
+
+/// A trigger's digital point and its click, inside `rect`, each named in its pin's
+/// colour: the box's counterpart of [`trigger_effect_controls`].
+fn trigger_click_controls(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    click: TriggerClickEdit,
+    out: &mut TriggerWidgetEdit,
+) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.y = FX_ROW_GAP;
+    let reset = |ui: &mut egui::Ui| ui.add(egui::Button::new(egui::RichText::new("Reset").small())).clicked();
+
+    ui.label(egui::RichText::new("Digital trigger").small().color(DIGITAL_LABEL_COLOR));
+    out.reset_threshold = reset(ui);
+    ui.add_space(6.0);
+    if !click.on {
+        return;
+    }
+    let name = if (click.offset * 100.0).round() == 0.0 {
+        "Haptics".to_string()
+    } else {
+        format!("Haptics {:+.0}%", click.offset * 100.0)
+    };
+    ui.label(egui::RichText::new(name).small().color(HAPTICS_LABEL_COLOR));
+    out.reset_click = reset(ui);
+    let mut gain = click.gain_db;
+    // What's left of the row once the slider's own number has its room.
+    ui.spacing_mut().slider_width = (rect.width() - 52.0).max(32.0);
+    let resp = ui.push_id(("trig_click_gain", label), |ui| {
+        ui.add(egui::Slider::new(&mut gain, -18.0..=12.0).step_by(1.0).suffix(" dB"))
+            .on_hover_text("How hard this trigger clicks.")
+    }).inner;
+    if resp.changed() {
+        out.click_gain = Some(gain);
+    }
 }
 
 // ── Default adaptive-trigger effect ──────────────────────────────────────────
@@ -4238,6 +4506,8 @@ fn effect_fader(
 ///   * Inner radius `r_in`   — threshold pin (yellow).
 ///   * Outer radius `r_out`  — range pins (green min, red max).
 /// Clicks within ±r_hit pixels of each ring are dispatched to that ring.
+/// `click` — the trigger click's position, a cyan pin between the two rings, so
+/// it stays grabbable sitting at the yellow pin's angle.
 ///
 /// `wide` puts the arc on the right of a box spanning the whole vectorscope
 /// cell, the effect controls on its left (set for both triggers when either has
@@ -4249,6 +4519,7 @@ fn trigger_widget(
     label: &str,
     norm: f32,
     threshold: f32,
+    click: Option<TriggerClickEdit>,
     range_min: f32,
     range_max: f32,
     lo: Layout,
@@ -4356,6 +4627,17 @@ fn trigger_widget(
     painter.circle_filled(thr_pin, 5.0, Color32::from_rgb(240, 220, 60));
     painter.circle_stroke(thr_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
 
+    // Trigger click pin, on a line of its own from the inner ring (cyan).
+    let click_pin = click.filter(|c| c.on).map(|c| {
+        let a = start + (end - start) * (threshold + c.offset).clamp(0.0, 1.0);
+        let pin = polar(egui::pos2(cx, cy), (r_in + r_out) * 0.5, a);
+        painter.line_segment([polar(egui::pos2(cx, cy), r_in, a), pin],
+            Stroke::new(1.5_f32, Color32::from_rgb(90, 220, 230)));
+        painter.circle_filled(pin, 4.0, Color32::from_rgb(90, 220, 230));
+        painter.circle_stroke(pin, 4.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
+        pin
+    });
+
     // Range pins on outer ring.
     let min_pin = polar(egui::pos2(cx, cy), r_out, a_min);
     let max_pin = polar(egui::pos2(cx, cy), r_out, a_max);
@@ -4384,7 +4666,9 @@ fn trigger_widget(
             let to_out = (d - r_out).abs();
             // For the outer ring, decide which pin (min vs max) is closer
             // in angle so a single click can grab the right handle.
-            let target: u8 = if to_in <= to_out {
+            let target: u8 = if click_pin.is_some_and(|p| p.distance(pos) <= 8.0) {
+                3 // trigger click
+            } else if to_in <= to_out {
                 0 // threshold
             } else {
                 let dx = pos.x - cx;
@@ -4415,12 +4699,16 @@ fn trigger_widget(
                 0 => out.threshold = Some(t),
                 1 => out.range_min = Some(t.min(rmax_t - 0.01).max(0.0)),
                 2 => out.range_max = Some(t.max(rmin_t + 0.01).min(1.0)),
+                3 => out.click = Some(t),
                 _ => {}
             }
         }
     }
     if let (Some(fx_rect), Some(fx)) = (fx_rect, effect) {
         out.effect_changed = trigger_effect_controls(ui, fx_rect, label, fx);
+    }
+    if let (Some(fx_rect), Some(click)) = (fx_rect, click) {
+        trigger_click_controls(ui, fx_rect, label, click, &mut out);
     }
     out
 }

@@ -104,6 +104,7 @@ pub enum FeedbackGroup {
     MicLed,
     TriggerLeft,
     TriggerRight,
+    Trackpad,
 }
 
 /// The feedback group a haptic / feedback pin belongs to (see [`FeedbackGroup`]).
@@ -117,6 +118,7 @@ pub fn feedback_group(pin: &str) -> Option<FeedbackGroup> {
         p if p.starts_with("trigger_l_") => TriggerLeft,
         p if p.starts_with("trigger_r_") => TriggerRight,
         p if p.starts_with("hd_") || p.starts_with("hd2_") || p.starts_with("ds_") => Rumble,
+        p if p.starts_with("tp_") => Trackpad,
         _ => return None,
     })
 }
@@ -182,11 +184,11 @@ pub const MISC_PINS: [&str; 6] = [
 /// rather than switches, as a bitmask over [`MISC_PINS`]. 0 for every pad
 /// without them.
 ///
-/// These are what the device.source "Suppress capacitive touch" toggle
-/// (`suppress_touch_misc` param) mutes. They assert just from holding the pad,
-/// so they hijack a Remapper / Touch Zones / Lean "Learn" capture before the
-/// user can press the button they meant, and keep firing any mapping bound to
-/// them. The toggle is a mute for building a mapping, switched back off after.
+/// These are what the device.source "Ignore capacitive touch in Learn" toggle
+/// (`suppress_touch_misc` param) hides from Learn. They assert just from holding
+/// the pad, so they hijack a Remapper / Touch Zones / Lean "Learn" capture before
+/// the user can press the button they meant. Only capture ignores them: a mapping
+/// bound to one still fires, chosen from the picker.
 ///
 /// It has to be a per-device table because SDL hands the Misc slots out per
 /// pad: on a GameCube-style pad Misc 3/4 are the trigger buttons, and on a
@@ -222,6 +224,32 @@ pub fn capacitive_pins(mask: u8) -> impl Iterator<Item = &'static str> {
 /// it up by name except those two mutes, and it is absent from `ALL_PINS`, so
 /// no bus, Learn or picker ever carries it.
 pub const CAPACITIVE_MASK_PIN: &str = "__capacitive_misc";
+
+/// Synthetic signal the UI sets on a device with "Ignore capacitive touch in
+/// Learn" on, carrying its [`capacitive_misc_mask`]: the pins Learn skips. In the
+/// UI's live signals only, and like [`CAPACITIVE_MASK_PIN`] no real pin.
+pub const CAPACITIVE_LEARN_MUTE_PIN: &str = "__capacitive_learn_mute";
+
+/// What a Steam Controller's pad clicks and sensors are: `(full name, picker cell
+/// name)`. They have one name on the bus, as they mean other things on other pads.
+/// SDL's mapping puts the left pad's click on `touchpad`, the right's on `misc2`.
+pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static str)> {
+    match pin {
+        "btn_touchpad" => Some(("Pad click L", "Pad L")),
+        "btn_misc2" => Some(("Pad click R", "Pad R")),
+        "btn_misc3" => Some(("Cap sens L", "Cap L")),
+        "btn_misc4" => Some(("Cap sens R", "Cap R")),
+        "btn_misc5" => Some(("Grip sens L", "Grip L")),
+        "btn_misc6" => Some(("Grip sens R", "Grip R")),
+        _ => None,
+    }
+}
+
+// What the `pad_click_mode` pin carries, as bits, from the engine to the Steam
+// Controller's backend (Calibration window, "Click feedback").
+pub const PAD_CLICK_ON: u8 = 1;
+pub const PAD_CLICK_ON_RELEASE: u8 = 2;
+pub const PAD_CLICK_STRONG: u8 = 4;
 
 /// Read a device's capacitive mask back from a signal map (0 if not published).
 pub fn capacitive_mask_of<S: std::hash::BuildHasher>(
@@ -300,6 +328,14 @@ pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "trigger_l_freq",     display_name: "L.Trigger Freq",     signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_strength2", display_name: "L.Trigger Strength 2", signal_type: SignalType::Float },
     AutoMapPin { id: "trigger_l_period",   display_name: "L.Trigger Period",   signal_type: SignalType::Float },
+    // ── Steam Controller trackpads ────────────────────────────────────────────
+    // Last, as a Feedback Control node's wires sit on these by position.
+    AutoMapPin { id: "tp_l_amp",   display_name: "Trackpad L: Amplitude", signal_type: SignalType::Float },
+    AutoMapPin { id: "tp_l_freq",  display_name: "Trackpad L: Frequency", signal_type: SignalType::Float },
+    AutoMapPin { id: "tp_r_amp",   display_name: "Trackpad R: Amplitude", signal_type: SignalType::Float },
+    AutoMapPin { id: "tp_r_freq",  display_name: "Trackpad R: Frequency", signal_type: SignalType::Float },
+    AutoMapPin { id: "tp_l_click", display_name: "Trackpad L: Click",     signal_type: SignalType::Bool },
+    AutoMapPin { id: "tp_r_click", display_name: "Trackpad R: Click",     signal_type: SignalType::Bool },
 ];
 
 /// Basic feedback OUTPUT taps the game is requesting on the virtual destination

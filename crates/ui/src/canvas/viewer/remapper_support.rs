@@ -125,8 +125,14 @@ pub(crate) fn remapper_pressed_now(
     let has = |pin: &str| live_signals.contains_key(&(dev_id.to_string(), pin.to_string()));
     let lt_analog = has("left_trigger");
     let rt_analog = has("right_trigger");
+    // "Ignore capacitive touch in Learn": this is the capture's whole view of the
+    // pad, and the rest of the UI sees these pins as they are.
+    let muted = live_signals
+        .get(&(dev_id.to_string(), am_canon::CAPACITIVE_LEARN_MUTE_PIN.to_string()))
+        .map_or(0, |s| s.as_float() as u8);
     for ap in am_canon::ALL_PINS {
         if ap.signal_type != SignalType::Bool { continue; }
+        if am_canon::capacitive_pins(muted).any(|p| p == ap.id) { continue; }
         // Touch-active pins are canonical (Splitter/Collector use them) but
         // suppressed in Remapper Learn — the zone synthesis below already
         // expresses the same information as touch_left/center/right.
@@ -953,6 +959,9 @@ pub(crate) fn imu_chip_label(p: &flexinput_core::imu::ImuPin) -> String {
 }
 
 pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
+    if let Some(name) = crate::model::connected_pad_pin_names(pin_id) {
+        return name.0.to_string();
+    }
     if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
         return p.display_name.to_string();
     }
@@ -1084,5 +1093,32 @@ pub(crate) fn remapper_press_mode_label(mode: &str) -> &'static str {
         "sequence"   => "Sequence",
         "analog"     => "Analog",
         _            => "Normal (gate)",
+    }
+}
+
+#[cfg(test)]
+mod learn_mute_tests {
+    use super::*;
+
+    /// With the toggle on, holding a grip and a stick cap leaves Learn waiting for
+    /// the button that's actually pressed. Only the pins in the mark are skipped.
+    #[test]
+    fn learn_skips_only_the_pins_marked_capacitive() {
+        let dev = "sdl:generic:a";
+        let k = |pin: &str| (dev.to_string(), pin.to_string());
+        let mut live = std::collections::HashMap::new();
+        for pin in ["btn_misc3", "btn_misc5", "btn_misc1", "btn_south"] {
+            live.insert(k(pin), Signal::Bool(true));
+        }
+        let mut seen = remapper_pressed_now(&live, dev);
+        seen.sort();
+        assert_eq!(seen, ["btn_misc1", "btn_misc3", "btn_misc5", "btn_south"], "unmarked, all count");
+
+        let mask = am_canon::capacitive_misc_mask(0x28DE, 0x1304);
+        live.insert(k(am_canon::CAPACITIVE_LEARN_MUTE_PIN), Signal::Float(mask as f32));
+        let mut seen = remapper_pressed_now(&live, dev);
+        seen.sort();
+        assert_eq!(seen, ["btn_misc1", "btn_south"]);
+        assert_eq!(live.get(&k("btn_misc5")).map(|s| s.as_bool()), Some(true), "the pin itself stays live");
     }
 }

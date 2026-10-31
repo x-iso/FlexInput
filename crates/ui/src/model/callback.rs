@@ -558,6 +558,24 @@ pub fn note_device_models<'a>(devices: impl IntoIterator<Item = (&'a str, u16, u
     }
 }
 
+/// True for a connected pad its USB ids name as a Steam Controller. Its id reads
+/// `sdl:generic:<serial>`, so nothing that goes by the id's slug can tell.
+pub fn is_steam_controller(dev_id: &str) -> bool {
+    DEVICE_MODELS
+        .get()
+        .and_then(|lock| lock.read().ok()?.get(dev_id).copied())
+        == Some("Steam Controller")
+}
+
+/// What a pin is called while a Steam Controller is connected: `(full, short)`,
+/// for the pins it has names of its own for. Pickers and chips name a pin without
+/// saying whose it is, so this goes by whether one is connected at all.
+pub fn connected_pad_pin_names(pin: &str) -> Option<(&'static str, &'static str)> {
+    let names = flexinput_core::automap::steam_controller_pin_names(pin)?;
+    let connected = DEVICE_MODELS.get()?.read().ok()?.values().any(|m| *m == "Steam Controller");
+    connected.then_some(names)
+}
+
 /// Best-guess model folder for a connected device id, used when the node's
 /// model override is left on "auto". Falls back to any available model when the
 /// preferred one isn't present.
@@ -2127,8 +2145,18 @@ mod model_choice_tests {
         note_device_models([(id, 0x28DE, 0x1302), ("sdl:generic:other", 0x045E, 0x0B12)]);
         assert_eq!(model_for_device(id), "Steam Controller");
         assert_eq!(model_for_device("sdl:generic:other"), "Xbox One");
+        // Its analog triggers calibrate; another generic pad stays sticks-only.
+        assert!(is_steam_controller(id));
+        assert!(crate::panels::calibration::caps_for(id).triggers);
+        assert!(!crate::panels::calibration::caps_for("sdl:generic:other").triggers);
+        // Its sensors go by their own names, for as long as it is connected.
+        assert_eq!(connected_pad_pin_names("btn_misc5"), Some(("Grip sens L", "Grip L")));
+        assert_eq!(connected_pad_pin_names("btn_misc2"), Some(("Pad click R", "Pad R")));
+        assert_eq!(connected_pad_pin_names("btn_misc1"), None);
         note_device_models([]);
         assert_eq!(model_for_device(id), "Xbox One");
+        assert!(!is_steam_controller(id));
+        assert_eq!(connected_pad_pin_names("btn_misc5"), None);
     }
 
     /// The bundled Steam Controller loads under this viewer's part names, with

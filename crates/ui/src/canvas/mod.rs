@@ -257,6 +257,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         clear_stuck_nav_arms(&mut node.value);
         fold_note_companions_into_notes(&mut node.value);
         drop_impossible_analog_modes(&mut node.value);
+        extend_feedback_control_inlets(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -725,6 +726,86 @@ mod migration_tests {
             assert_eq!(k.params["input_pin_ids"], serde_json::json!(["cc_74", "automap_in"]));
             assert_eq!(snarl.get_node(pad).unwrap().outputs.len(), 1, "gamepads untouched");
         }
+    }
+
+    /// A saved Feedback Control gains the inlets it doesn't have, after its own,
+    /// and only once.
+    #[test]
+    fn a_saved_feedback_control_gains_the_new_inlets() {
+        use flexinput_core::automap::FEEDBACK_INLET_PINS;
+        let mut node = NodeData {
+            module_id: "module.feedback_control".to_string(),
+            display_name: "Feedback Control".to_string(),
+            category: "AutoMap".to_string(),
+            inputs: vec![
+                PinDescriptor::new("Device", SignalType::AutoMap),
+                PinDescriptor::new(FEEDBACK_INLET_PINS[0].display_name, SignalType::Float),
+            ],
+            outputs: vec![],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        for _ in 0..2 {
+            extend_feedback_control_inlets(&mut node);
+            assert_eq!(node.inputs.len(), FEEDBACK_INLET_PINS.len() + 1);
+        }
+        for (pin, want) in node.inputs[1..].iter().zip(FEEDBACK_INLET_PINS) {
+            assert_eq!(pin.name, want.display_name);
+        }
+        assert_eq!(node.inputs.last().unwrap().name, "Trackpad R: Click");
+    }
+
+    /// A saved node gains the inputs its pad has since, after the ones it has, and
+    /// its outputs' current names, once; another pad's node doesn't.
+    #[test]
+    fn a_saved_device_node_catches_up_with_its_pads_pins() {
+        let node = |dev: &str| {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(dev));
+            params.insert("input_pin_ids".to_string(), serde_json::json!(["rumble_strong"]));
+            params.insert("output_pin_ids".to_string(), serde_json::json!(["btn_misc5"]));
+            NodeData {
+                module_id: "device.source".to_string(),
+                display_name: "Pad".to_string(),
+                category: "Device".to_string(),
+                inputs: vec![PinDescriptor::new("Rumble (strong)", SignalType::Float)],
+                outputs: vec![PinDescriptor::new("Misc 5", SignalType::Bool)],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        };
+        let pin = |id: &str, ty| flexinput_devices::DevicePin {
+            id: id.to_string(), display_name: id.to_string(), signal_type: ty,
+        };
+        let device = flexinput_devices::PhysicalDevice {
+            id: "sdl:generic:a".to_string(),
+            display_name: "Pad".to_string(),
+            kind: flexinput_devices::ControllerKind::Generic,
+            outputs: vec![flexinput_devices::DevicePin {
+                id: "btn_misc5".to_string(),
+                display_name: "Grip sens L".to_string(),
+                signal_type: SignalType::Bool,
+            }],
+            inputs: vec![pin("rumble_strong", SignalType::Float), pin("tp_l_click", SignalType::Bool)],
+            instance_path: None,
+            vid: None,
+            pid: None,
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let ours = snarl.insert_node(egui::Pos2::ZERO, node("sdl:generic:a"));
+        let other = snarl.insert_node(egui::pos2(10.0, 0.0), node("sdl:generic:b"));
+
+        assert!(sync_device_node_pins(&mut snarl, &device));
+        let n = snarl.get_node(ours).unwrap();
+        assert_eq!(n.params["input_pin_ids"], serde_json::json!(["rumble_strong", "tp_l_click"]));
+        assert_eq!(n.inputs.len(), 2);
+        assert_eq!(n.inputs[1].signal_type, SignalType::Bool);
+        assert_eq!(n.outputs[0].name, "Grip sens L");
+        let o = snarl.get_node(other).unwrap();
+        assert_eq!((o.inputs.len(), o.outputs[0].name.as_str()), (1, "Misc 5"));
+        assert!(!sync_device_node_pins(&mut snarl, &device), "nothing left to do");
     }
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
@@ -2684,6 +2765,62 @@ fn device_base_name(name: &str) -> &str {
         }
     }
     name
+}
+
+/// A saved Feedback Control node has the inlets there were when it was made. New
+/// ones go on the end of the list, so its wires stay on their pins: input `i + 1`
+/// is `FEEDBACK_INLET_PINS[i]`, which is how the engine reads them.
+fn extend_feedback_control_inlets(node: &mut NodeData) {
+    use flexinput_core::automap::FEEDBACK_INLET_PINS;
+    if node.module_id != "module.feedback_control" || node.inputs.is_empty() {
+        return;
+    }
+    for pin in FEEDBACK_INLET_PINS.iter().skip(node.inputs.len() - 1) {
+        node.inputs.push(PinDescriptor::new(pin.display_name, pin.signal_type).optional());
+    }
+}
+
+/// A device.source's pins are frozen when the node is created, so a saved node
+/// doesn't have feedback inputs its pad gained since, or what its pad's outputs are
+/// called now. Add the inputs after the ones it has, so that its wires stay where
+/// they are, and rename the outputs in place. Recurses into sub-patches.
+/// True if anything changed.
+pub fn sync_device_node_pins(
+    snarl: &mut Snarl<NodeData>,
+    device: &flexinput_devices::PhysicalDevice,
+) -> bool {
+    let mut changed = false;
+    for (_, node) in snarl.nodes_ids_data_mut() {
+        let node = &mut node.value;
+        if let Some(sp) = node.subpatch.as_mut() {
+            changed |= sync_device_node_pins(&mut sp.snarl, device);
+        }
+        if node.module_id != "device.source"
+            || node.params.get("device_id").and_then(|v| v.as_str()) != Some(device.id.as_str())
+        {
+            continue;
+        }
+        if let Some(Value::Array(ids)) = node.params.get("output_pin_ids") {
+            for (id, out) in ids.iter().zip(node.outputs.iter_mut()) {
+                let pin = device.outputs.iter().find(|p| Some(p.id.as_str()) == id.as_str());
+                if let Some(pin) = pin.filter(|p| p.display_name != out.name) {
+                    out.name = pin.display_name.clone();
+                    changed = true;
+                }
+            }
+        }
+        let Some(Value::Array(ids)) = node.params.get_mut("input_pin_ids") else { continue };
+        // Pins and ids run in parallel; a node where they don't isn't this shape.
+        if ids.len() != node.inputs.len() { continue; }
+        for pin in &device.inputs {
+            if !ids.iter().any(|id| id.as_str() == Some(pin.id.as_str())) {
+                ids.push(Value::String(pin.id.clone()));
+                node.inputs.push(PinDescriptor::new(&pin.display_name, pin.signal_type));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Swap a device.source or device.sink node to a different physical device, preserving

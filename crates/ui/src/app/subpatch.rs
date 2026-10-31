@@ -21,6 +21,9 @@ pub(crate) fn kbm_pin_label(pin: &str) -> String {
     if let Some(k) = flexinput_core::media::media_key(pin) {
         return k.short.into();
     }
+    if let Some(name) = crate::model::connected_pad_pin_names(pin) {
+        return name.1.into();
+    }
     match pin {
         "mouse_left" => "LMB".into(),
         "mouse_right" => "RMB".into(),

@@ -224,6 +224,8 @@ struct OpenPad {
     /// it is born and dropped with the connection — a reconnect gets a fresh
     /// window rather than judging new samples against pre-disconnect ones.
     spike: SpikeFilter,
+    /// A Steam Controller's haptics past SDL's rumble.
+    steam: Option<crate::steam_haptics::SteamHaptics>,
 }
 
 /// Revives a pad whose IMU stream went dead while the pad itself stayed open.
@@ -543,6 +545,9 @@ impl SdlBackend {
                  conn={conn} gyro={has_gyro} accel={has_accel} touchpads={num_touchpads} \
                  serial={serial:?} path={path:?}"
             );
+            let steam = crate::steam_haptics::is_steam_controller(vid, pid)
+                .then(|| crate::steam_haptics::SteamHaptics::spawn(path, vid, pid))
+                .flatten();
 
             pads.insert(
                 id,
@@ -561,6 +566,7 @@ impl SdlBackend {
                     last_rumble: (0, 0),
                     led: LedOut::default(),
                     spike: SpikeFilter::new(),
+                    steam,
                 },
             );
         }
@@ -798,7 +804,8 @@ impl DeviceBackend for SdlBackend {
                 kind: pad.kind,
                 outputs: layouts::outputs_for_pad(
                     pad.kind, pad.gamepad.vendor_id(), pad.gamepad.product_id()),
-                inputs: layouts::inputs_for(pad.kind),
+                inputs: layouts::inputs_for_pad(
+                    pad.kind, pad.gamepad.vendor_id(), pad.gamepad.product_id()),
                 instance_path: None,
                 vid: pad.gamepad.vendor_id(),
                 pid: pad.gamepad.product_id(),
@@ -866,6 +873,7 @@ impl DeviceBackend for SdlBackend {
         for (id, pad) in &mut state.pads {
             let dev = &pad.dev_id;
             let g = &pad.gamepad;
+            let steam = &mut pad.steam;
             let start_len = out.len();
             let presses = take_delivery(*id, &mut imu_samples);
 
@@ -888,6 +896,9 @@ impl DeviceBackend for SdlBackend {
             let rt = (g.axis(Axis::TriggerRight) as f32 / 32767.0).clamp(0.0, 1.0);
             out.push((dev.clone(), "left_trigger".into(), Signal::Float(lt)));
             out.push((dev.clone(), "right_trigger".into(), Signal::Float(rt)));
+            if let Some(steam) = steam.as_mut() {
+                steam.poll_triggers(lt, rt);
+            }
             // Digital trigger = past a small threshold (matches XInput's ~30/255).
             out.push((dev.clone(), "btn_lt_dig".into(), Signal::Bool(lt > 0.117)));
             out.push((dev.clone(), "btn_rt_dig".into(), Signal::Bool(rt > 0.117)));
@@ -981,6 +992,9 @@ impl DeviceBackend for SdlBackend {
             // (`touchzones::field_click_pins`). Finger contact on either pad comes
             // from the touchpad API below as touch1_* / touch2_*.
             out.push((dev.clone(), "btn_touchpad".into(), Signal::Bool(b(Button::Touchpad))));
+            if let Some(steam) = steam.as_mut() {
+                steam.poll_pad_clicks(b(Button::Touchpad), b(Button::Misc2));
+            }
             if pad.capacitive_mask != 0 {
                 out.push((dev.clone(), flexinput_core::automap::CAPACITIVE_MASK_PIN.into(),
                           Signal::Float(pad.capacitive_mask as f32)));
@@ -1233,6 +1247,13 @@ impl DeviceBackend for SdlBackend {
         let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) else {
             return;
         };
+        if let Some(steam) = pad.steam.as_mut() {
+            // Not `byte`: the trigger click's position wants its full resolution,
+            // and its gain is in dB.
+            if steam.set(pin_id, signal.as_float()) {
+                return;
+            }
+        }
         // Which motor (if any) this pin drives. SDL exposes only two rumble
         // motors (low-freq "strong", high-freq "weak"), so every haptic pin a
         // pad's layout declares is collapsed onto those two:

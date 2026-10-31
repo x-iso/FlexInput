@@ -473,8 +473,14 @@ pub(crate) fn controller3d_live(
     for p in ["right_stick", "right_ring"] {
         glow(p, rmag);
     }
-    glow("left_cap", live.left_stick_press);
-    glow("right_cap", live.right_stick_press);
+    // A thumb resting on a capacitive cap (Misc 3 / 4, read only when the backend
+    // marks them capacitive) lights it dimly, below what a click does.
+    const CAP_TOUCH_GLOW: f32 = 0.3;
+    let capacitive = get(flexinput_core::automap::CAPACITIVE_MASK_PIN).map_or(0, |s| s.as_float() as u8);
+    for (part, misc, press) in [("left_cap", 2, live.left_stick_press), ("right_cap", 3, live.right_stick_press)] {
+        let touched = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
+        glow(part, press.max(if touched { CAP_TOUCH_GLOW } else { 0.0 }));
+    }
     // A pad click lights the whole pad surface — the touchpad, and a two-pad
     // controller's right pad (`touchpad2`), whose click SDL reports as Misc 2.
     for (part, field) in [("touchpad", 0), ("touchpad2", 1)] {
@@ -484,7 +490,6 @@ pub(crate) fn controller3d_live(
     // Grip sense (Steam Controller): a hand on a grip shows that grip's patch.
     // The grips' capacitive pads arrive on Misc 5 / 6, read only when the
     // backend marks those pins capacitive — on other pads they're buttons.
-    let capacitive = get(flexinput_core::automap::CAPACITIVE_MASK_PIN).map_or(0, |s| s.as_float() as u8);
     for (part, misc) in [("left_gripsense", 4), ("right_gripsense", 5)] {
         let held = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
         glow(part, if held { 1.0 } else { 0.0 });

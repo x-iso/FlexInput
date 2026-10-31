@@ -880,6 +880,9 @@ pub fn extra_button_label(pin_id: &str) -> Option<&'static str> {
         "btn_paddle_r1" => Some("PR1"),
         "btn_paddle_l2" => Some("PL2"),
         "btn_paddle_r2" => Some("PR2"),
+        // The left pad's click wears the touchpad glyph, and needs telling from
+        // the right pad's on a pad that has both.
+        "btn_touchpad" if crate::model::connected_pad_pin_names(pin_id).is_some() => Some("L"),
         _ => None,
     }
 }

@@ -28,6 +28,13 @@ pub fn outputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>)
         let at = pins.len().saturating_sub(1);
         pins.splice(at..at, dualsense_edge_extra_outputs());
     }
+    if crate::steam_haptics::is_steam_controller(vid, pid) {
+        for pin in &mut pins {
+            if let Some((name, _)) = flexinput_core::automap::steam_controller_pin_names(&pin.id) {
+                pin.display_name = name.to_string();
+            }
+        }
+    }
     pins
 }
 
@@ -39,6 +46,38 @@ fn dualsense_edge_extra_outputs() -> Vec<DevicePin> {
         bo("btn_paddle_r1", "Right Back Button"),
         bo("btn_paddle_l2", "Left Fn"),
         bo("btn_paddle_r2", "Right Fn"),
+    ]
+}
+
+/// `inputs_for`, plus what a pad has beyond its kind: a Steam Controller is a
+/// Generic pad to everything else.
+pub fn inputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>) -> Vec<DevicePin> {
+    let mut pins = inputs_for(kind);
+    if crate::steam_haptics::is_steam_controller(vid, pid) {
+        pins.extend(steam_controller_extra_inputs());
+    }
+    pins
+}
+
+/// The grip motors under the same pins as a DualSense's actuators, so an Audio
+/// Stream Haptics patch drives either; then the trackpads' own. Rumble stays
+/// where it was, on the standard pins.
+fn steam_controller_extra_inputs() -> Vec<DevicePin> {
+    vec![
+        fl("hd_l_amp",   "Left Grip: Amplitude (0–1)"),
+        fl("hd_l_freq",  "Left Grip: Frequency (0=80Hz 1=500Hz)"),
+        fl("hd_r_amp",   "Right Grip: Amplitude (0–1)"),
+        fl("hd_r_freq",  "Right Grip: Frequency (0=80Hz 1=500Hz)"),
+        fl("hd2_l_amp",  "Left Grip: Amp (HF carrier)"),
+        fl("hd2_l_freq", "Left Grip: Freq (HF carrier)"),
+        fl("hd2_r_amp",  "Right Grip: Amp (HF carrier)"),
+        fl("hd2_r_freq", "Right Grip: Freq (HF carrier)"),
+        fl("tp_l_amp",   "Left Trackpad: Amplitude (0–1)"),
+        fl("tp_l_freq",  "Left Trackpad: Frequency (0=80Hz 1=500Hz)"),
+        fl("tp_r_amp",   "Right Trackpad: Amplitude (0–1)"),
+        fl("tp_r_freq",  "Right Trackpad: Frequency (0=80Hz 1=500Hz)"),
+        bo("tp_l_click", "Left Trackpad: Click"),
+        bo("tp_r_click", "Right Trackpad: Click"),
     ]
 }
 
@@ -572,5 +611,38 @@ mod automap_vocabulary_tests {
         }
         assert_eq!(edge.len(), plain.len() + extra.len());
         assert_eq!(edge.last().map(String::as_str), Some("automap_out"));
+    }
+
+    /// Its id calls it Generic, so its pins go by its USB ids, after the rumble
+    /// every pad has. No pin is claimed that the backend wouldn't take.
+    #[test]
+    fn a_steam_controller_declares_its_haptic_pins_and_a_generic_pad_doesnt() {
+        let ids = |vid, pid| -> Vec<String> {
+            inputs_for_pad(ControllerKind::Generic, Some(vid), Some(pid))
+                .into_iter().map(|p| p.id).collect()
+        };
+        let steam = ids(0x28DE, 0x1304);
+        assert_eq!(steam[..2], ["rumble_strong", "rumble_weak"]);
+        for pin in ["hd_l_amp", "hd2_r_freq", "tp_l_amp", "tp_r_freq", "tp_l_click", "tp_r_click"] {
+            assert!(steam.iter().any(|p| p == pin), "lacks {pin}");
+        }
+        // Feedback Control offers each of them.
+        for pin in &steam {
+            assert!(flexinput_core::automap::FEEDBACK_INLET_PINS.iter().any(|p| p.id == pin), "{pin}");
+        }
+        assert_eq!(ids(0x045E, 0x0B12), ["rumble_strong", "rumble_weak"]);
+    }
+
+    #[test]
+    fn a_steam_controllers_sensors_are_named_for_what_they_are() {
+        let name = |vid, pid, pin: &str| outputs_for_pad(ControllerKind::Generic, Some(vid), Some(pid))
+            .into_iter().find(|p| p.id == pin).map(|p| p.display_name);
+        for (pin, want) in [("btn_touchpad", "Pad click L"), ("btn_misc2", "Pad click R"),
+                            ("btn_misc3", "Cap sens L"), ("btn_misc4", "Cap sens R"),
+                            ("btn_misc5", "Grip sens L"), ("btn_misc6", "Grip sens R")] {
+            assert_eq!(name(0x28DE, 0x1304, pin).as_deref(), Some(want));
+        }
+        assert_eq!(name(0x045E, 0x0B12, "btn_touchpad").as_deref(), Some("Touchpad Click"), "another pad's stays");
+        assert_eq!(name(0x045E, 0x0B12, "btn_misc3").as_deref(), Some("Misc 3"), "another pad's stays");
     }
 }

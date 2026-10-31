@@ -26,14 +26,12 @@ pub(crate) fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
 }
 
 /// Collect the `device_id` of every `device.source` node with the
-/// "Suppress capacitive touch" toggle on (`suppress_touch_misc` param).
+/// "Ignore capacitive touch in Learn" toggle on (`suppress_touch_misc` param).
 /// Recurses into sub-patches — a device node can live inside one.
 ///
-/// Pairs with [`mask_capacitive_pins`]: the UI masks the capacitive pins out
-/// of `last_signals` so a Remapper / Touch Zones / Lean "Learn" can't capture a
-/// stick cap or grip instead of the button the user meant, and the card
-/// previews match what the engine routes. The engine reads the SAME param in
-/// `preprocess_dev_sigs` (pass 4) for the routing half.
+/// Pairs with [`mark_capacitive_learn_mute`], so that a Remapper / Touch Zones /
+/// Lean "Learn" can't capture a stick cap or grip instead of the button the user
+/// meant. Nothing else changes: a mapping bound to one still fires.
 pub(crate) fn collect_touch_misc_suppressed(
     snarl: &Snarl<NodeData>,
     out: &mut std::collections::HashSet<String>,
@@ -53,20 +51,20 @@ pub(crate) fn collect_touch_misc_suppressed(
     }
 }
 
-/// Zero the capacitive pins of every suppressed device — the ones its backend
-/// names on `automap::CAPACITIVE_MASK_PIN`. Zeroed rather than removed so
-/// presence probes (`contains_key`, e.g. the analog-trigger detection in
-/// `remapper_pressed_now`) still see the pad's real shape.
-pub(crate) fn mask_capacitive_pins(
+/// Tell Learn which pins to skip on every suppressed device: the ones its backend
+/// names on `automap::CAPACITIVE_MASK_PIN`. A marker rather than zeroing the pins,
+/// which would hide them from all that reads these signals, the 3D view and the
+/// cards among them. `signals` is this frame's fresh snapshot, so it needs no
+/// clearing when the toggle goes off.
+pub(crate) fn mark_capacitive_learn_mute(
     signals: &mut HashMap<(String, String), Signal>,
     suppressed: &std::collections::HashSet<String>,
 ) {
-    use flexinput_core::automap::{capacitive_mask_of, capacitive_pins};
+    use flexinput_core::automap::{capacitive_mask_of, CAPACITIVE_LEARN_MUTE_PIN};
     for dev in suppressed {
-        for pin in capacitive_pins(capacitive_mask_of(signals, dev)) {
-            if let Some(sig) = signals.get_mut(&(dev.clone(), pin.to_string())) {
-                *sig = sig.zeroed();
-            }
+        let mask = capacitive_mask_of(signals, dev);
+        if mask != 0 {
+            signals.insert((dev.clone(), CAPACITIVE_LEARN_MUTE_PIN.to_string()), Signal::Float(mask as f32));
         }
     }
 }

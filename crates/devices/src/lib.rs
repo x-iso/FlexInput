@@ -21,6 +21,7 @@ pub mod spike_tune;
 #[cfg(feature = "joycon2")]
 pub mod joycon2_backend;
 
+pub mod steam_haptics;
 #[cfg(any(windows, target_os = "linux"))]
 mod dualsense_haptic;
 #[cfg(windows)]

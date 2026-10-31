@@ -1264,6 +1264,9 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         let Some(ref st) = snap.sink_target else { continue; };
         if st.device_id.starts_with("virtual.") { continue; }
         apply_default_trigger_effects(st, &snap.params, &collector_sigs, sink_outputs);
+        apply_trigger_click(st, &snap.params, sink_outputs);
+        apply_pad_click(st, &snap.params, sink_outputs);
+        apply_grip_sensor(st, &snap.params, sink_outputs);
     }
 
     // Post-pass: network Receive feedback aggregation. Runs AFTER the

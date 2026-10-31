@@ -104,19 +104,17 @@ pub(crate) fn has_capacitive_suppression(dev: &flexinput_devices::PhysicalDevice
 
 /// Label and hover text for that toggle, shared by the Advanced node header and
 /// the Easy-mode input card.
-pub(crate) const CAPACITIVE_LABEL: &str = "Suppress capacitive touch";
+pub(crate) const CAPACITIVE_LABEL: &str = "Ignore capacitive touch in Learn";
 pub(crate) const CAPACITIVE_HOVER: &str =
-    "Mute this pad's capacitive sensors: touch on the stick caps and, on a \
-     Steam Controller, the grips.\n\
-     They fire just from holding the controller, which steals Learn captures \
-     and triggers mappings you didn't press. Turn this on while you build the \
-     mapping, then off to use those inputs.\n\
-     Trackpads, pad clicks, paddles and every other button stay live.";
+    "Learn won't capture this pad's capacitive sensors: touch on the stick caps \
+     and, on a Steam Controller, the grips. They fire just from holding the \
+     controller, which would steal the capture from the button you meant.\n\
+     Only Learn ignores them. To map one, choose it from the picker: it fires as \
+     usual with this on.";
 
-/// Advanced-mode device.source body toggle muting the capacitive stick-cap /
-/// grip pins while the user builds a mapping. Stored on `suppress_touch_misc`;
-/// consumed by the UI signal mask (Learn / previews) and the engine's
-/// `preprocess_dev_sigs` (routing) from that one param.
+/// Advanced-mode device.source body toggle hiding the capacitive stick-cap / grip
+/// pins from Learn. Stored on `suppress_touch_misc`; read by
+/// `devices_pool::collect_touch_misc_suppressed`.
 pub(crate) fn touch_misc_header_toggle(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
@@ -457,6 +455,9 @@ pub(crate) fn automap_midi_section(
 
 /// Row label for a bus pin: canonical name, MIDI name, or the raw id.
 fn bus_pin_neutral_label(pin_id: &str) -> String {
+    if let Some(name) = crate::model::connected_pad_pin_names(pin_id) {
+        return name.0.to_string();
+    }
     if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
         return p.display_name.to_string();
     }

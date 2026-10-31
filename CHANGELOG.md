@@ -3,6 +3,59 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.6] - 2026-10-31
+
+### Added
+
+- **Steam Controller (2026) haptics.** The pad's node now has inputs for all four
+  actuators: each grip motor, with two carriers like a DualSense's haptics, so an
+  Audio Stream Haptics patch drives it unchanged, and each trackpad, with an
+  amplitude, a frequency and a click. Rumble stays as it was.
+- **Trigger click for the Steam Controller (2026).** In the Calibration window,
+  turn on **Trigger click** and drag the cyan pin to where each trigger should
+  click. The pin keeps its distance from the yellow digital pin when you move that
+  one, and each trigger has its own strength. While it is on, the pad's own
+  full-pull point is out of reach, so Steam's click at the end of the pull stays
+  quiet, and so does anything bound to Full Pull in Steam Input.
+- **Grip and Touch settings for the Steam Controller (2026).** The Calibration
+  window has **Sensor range** and **Hysteresis**, the same two settings as Steam's
+  Grip Sensors page, with a live light for each grip. Under **Trackpads**, **Click
+  feedback** plays a click as you press a pad, optionally on release too, with a
+  strong option and a strength.
+- **The Steam Controller's pad clicks and sensors go by their names.** The pad
+  clicks read **Pad click L/R**, Misc 3/4 **Cap sens L/R** and Misc 5/6 **Grip sens
+  L/R**, in the picker, on cards and on the pad's node, and its 3D model lights a
+  stick cap dimly while your thumb is on it.
+- **Feedback Control can drive the Steam Controller's trackpads.** It has inlets
+  for each pad's amplitude, frequency and click, added to the end of the list so
+  saved nodes keep their wires. Its HD Rumble inlets drive the grip motors.
+- **Calibration sections fold away.** Each has a chevron on its heading, and the
+  window's height now follows what's open. A section stays open while its capture
+  is running.
+
+### Changed
+
+- **"Suppress capacitive touch" is now "Ignore capacitive touch in Learn", and
+  that is all it does.** It used to mute the sensors everywhere, so a stick cap or
+  grip mapped to something did nothing with it on. Now only Learn ignores them:
+  choose one from the picker and it works, with the toggle left on.
+- **Gyro stays accurate at low polling rates.** A pad reporting faster than it's
+  polled used to lose every motion sample but the newest, and the rotation with
+  them. All of them now count, as their average. This applies to pads read through
+  SDL and raw HID; sticks still read their newest position, which has no such loss.
+- **A button tap shorter than a poll is no longer missed.** It now reads as pressed
+  for that poll.
+- **A changing lightbar colour is sent about 30 times a second at most,** where a
+  game animating it could take a report every output pass. Rumble and triggers
+  aren't affected. A pad on SDL also no longer shows half-updated colours in
+  passing, as each colour now goes out whole.
+
+### Fixed
+
+- **The Calibration window now shows trigger settings for the Steam Controller
+  (2026).** It treated the pad as having digital triggers, so its analog range and
+  digital threshold could not be set.
+
 ## [0.16.5] - 2026-10-30
 
 ### Added
@@ -55,16 +108,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   anything. Mappings, overlays and shortcuts carry on as before. On Linux this
   needs a desktop that reports minimized windows, which Wayland doesn't; the new
   option below covers it there, since a minimized window has no focus.
-- **Gyro stays accurate at low polling rates.** A pad reporting faster than it's
-  polled used to lose every motion sample but the newest, and the rotation with
-  them. All of them now count, as their average. This applies to pads read through
-  SDL and raw HID; sticks still read their newest position, which has no such loss.
-- **A button tap shorter than a poll is no longer missed.** It now reads as pressed
-  for that poll.
-- **A changing lightbar colour is sent about 30 times a second at most,** where a
-  game animating it could take a report every output pass. Rumble and triggers
-  aren't affected. A pad on SDL also no longer shows half-updated colours in
-  passing, as each colour now goes out whole.
 - **Tidier gyro section in the Calibration window.** **Axis alignment** is now
   folded away under a chevron, and says "applied" when an alignment is in
   effect. Its Roll, Pitch and Yaw buttons fit on one line, with the movement for

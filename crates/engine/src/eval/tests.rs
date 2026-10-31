@@ -2118,12 +2118,10 @@ mod trigger_tests {
             Some(true), "above threshold must fire the digital button");
     }
 
-    // "Suppress capacitive touch": only the pins the pad's backend marks as
-    // capacitive (`CAPACITIVE_MASK_PIN`) read as rest — on a Steam Controller
-    // the stick caps (Misc 3/4) and grips (Misc 5/6). Trackpad contact, the pad
-    // clicks (touchpad / Misc 2), Misc 1, paddles and face buttons all stay live.
+    // "Ignore capacitive touch in Learn" is Learn's alone: a stick cap or grip
+    // mapped to something keeps firing with the toggle on.
     #[test]
-    fn suppress_capacitive_mutes_only_the_marked_pins() {
+    fn hiding_capacitive_touch_from_learn_leaves_routing_alone() {
         use flexinput_core::automap::{capacitive_misc_mask, CAPACITIVE_MASK_PIN};
         let dev_id = "sdl:generic:i0";
         let mut src = empty_node(1, "device.source");
@@ -2138,66 +2136,11 @@ mod trigger_tests {
         for n in 1..=6 {
             dev.insert(k(&format!("btn_misc{n}")), Signal::Bool(true));
         }
-        dev.insert(k("touch1_x"),      Signal::Float(0.8));
-        dev.insert(k("touch1_active"), Signal::Bool(true));
-        dev.insert(k("touch2_active"), Signal::Bool(true));
-        dev.insert(k("btn_touchpad"),  Signal::Bool(true));
-        dev.insert(k("btn_paddle_l1"), Signal::Bool(true));
-        dev.insert(k("btn_south"),     Signal::Bool(true));
 
         let out = preprocess_dev_sigs(&graph, &dev);
-        for pin in ["btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6"] {
-            assert_eq!(out.get(&k(pin)).map(|s| s.as_bool()), Some(false),
-                "`{pin}` (stick cap / grip) must read as untouched while suppression is on");
+        for n in 1..=6 {
+            assert_eq!(out.get(&k(&format!("btn_misc{n}"))).map(|s| s.as_bool()), Some(true), "Misc {n}");
         }
-        // Muted, NOT removed — presence probes must still see the pad's shape.
-        assert!(out.contains_key(&k("btn_misc3")),
-            "suppressed pins must stay present in the map, just zeroed");
-        for pin in ["btn_misc1", "btn_misc2", "touch1_active", "touch2_active",
-                    "btn_touchpad", "btn_paddle_l1", "btn_south"] {
-            assert_eq!(out.get(&k(pin)).map(|s| s.as_bool()), Some(true),
-                "`{pin}` is not a capacitive stick/grip sensor and must stay live");
-        }
-        assert_eq!(out.get(&k("touch1_x")).map(|s| s.as_float()), Some(0.8),
-            "trackpad coordinates must pass through");
-    }
-
-    // A pad that publishes no capacitive mask (e.g. a Flydigi, whose Misc 3-6
-    // are real buttons) has nothing muted even with the toggle on.
-    #[test]
-    fn suppress_capacitive_without_mask_mutes_nothing() {
-        let dev_id = "sdl:generic:i1";
-        let mut src = empty_node(1, "device.source");
-        src.device_id = Some(dev_id.to_string());
-        src.params.insert("suppress_touch_misc".into(), Value::Bool(true));
-        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
-
-        let k = |pin: &str| (dev_id.to_string(), pin.to_string());
-        let mut dev = HashMap::new();
-        dev.insert(k("btn_misc3"), Signal::Bool(true));
-        dev.insert(k("btn_misc5"), Signal::Bool(true));
-
-        let out = preprocess_dev_sigs(&graph, &dev);
-        assert_eq!(out.get(&k("btn_misc3")).map(|s| s.as_bool()), Some(true));
-        assert_eq!(out.get(&k("btn_misc5")).map(|s| s.as_bool()), Some(true));
-    }
-
-    // Toggle off (param absent) → capacitive pins pass through.
-    #[test]
-    fn suppress_capacitive_off_passes_through() {
-        use flexinput_core::automap::CAPACITIVE_MASK_PIN;
-        let dev_id = "sdl:generic:i0";
-        let mut src = empty_node(1, "device.source");
-        src.device_id = Some(dev_id.to_string());
-        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
-
-        let k = |pin: &str| (dev_id.to_string(), pin.to_string());
-        let mut dev = HashMap::new();
-        dev.insert(k(CAPACITIVE_MASK_PIN), Signal::Float(0b11_1100 as f32));
-        dev.insert(k("btn_misc3"), Signal::Bool(true));
-
-        let out = preprocess_dev_sigs(&graph, &dev);
-        assert_eq!(out.get(&k("btn_misc3")).map(|s| s.as_bool()), Some(true));
     }
 
     // With "Digital triggers" OFF the analog trigger passes through unchanged —
@@ -3469,6 +3412,78 @@ mod trigger_tests {
             assert!((pad_value(&out, FB_DS, pin) - v).abs() < 1e-6, "{pin}");
         }
         assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trigger_l_mode".to_string())));
+    }
+
+    // A trigger click sits at the digital threshold plus its offset, on the pad's
+    // raw travel: the calibrated range maps back out, side by side.
+    #[test]
+    fn a_trigger_click_is_sent_as_raw_travel_from_the_threshold_and_offset() {
+        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        for (key, v) in [
+            ("ltrig_digital_threshold", 0.5), ("ltrig_click_offset", 0.25),
+            ("ltrig_min", 0.2), ("ltrig_max", 0.6),
+            ("rtrig_digital_threshold", 0.5), ("rtrig_click_offset", -0.1),
+            ("ltrig_click_gain_db", -6.0), ("rtrig_click_gain_db", 3.0),
+        ] {
+            pad.params.insert(key.into(), Value::from(v));
+        }
+        pad.params.insert("trig_click_on".into(), Value::Bool(true));
+        let out = fb_tick(vec![pad], &BusMap::default());
+        assert!((pad_value(&out, FB_DS, "trig_click_l") - 0.5).abs() < 1e-6, "0.75 of 0.2..0.6");
+        assert!((pad_value(&out, FB_DS, "trig_click_r") - 0.4).abs() < 1e-6, "full range, 0.5 - 0.1");
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_l"), -6.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_r"), 3.0);
+    }
+
+    // Click feedback goes out as one mode value, and only while it is on.
+    #[test]
+    fn pad_click_feedback_reaches_the_pad_as_its_mode_bits() {
+        use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_STRONG};
+        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        pad.params.insert("pad_click_strong".into(), Value::Bool(true));
+        let out = fb_tick(vec![pad.clone()], &BusMap::default());
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "pad_click_mode".to_string())));
+        pad.params.insert("pad_click_on".into(), Value::Bool(true));
+        pad.params.insert("pad_click_gain_db".into(), Value::from(-6.0));
+        let out = fb_tick(vec![pad], &BusMap::default());
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_mode"), (PAD_CLICK_ON | PAD_CLICK_STRONG) as f32);
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_gain"), -6.0);
+    }
+
+    // A trackpad pin wired into Feedback Control reaches a pad that has it.
+    #[test]
+    fn feedback_control_drives_a_trackpad_pin() {
+        let pins: Vec<&str> = FB_DS_PINS.iter().copied().chain(["tp_r_amp"]).collect();
+        let pad = fb_pad(1, FB_DS, &pins, Some(FB_VIRT));
+        let mut collector = BusMap::default();
+        collector.set_pin(&"feedback_inject:gilrs:dualsense:0", &"tp_r_amp", Signal::Float(0.5));
+        let mut sink_outputs = BusMap::default();
+        let st = pad.sink_target.as_ref().unwrap();
+        let mut st = st.clone();
+        st.device_id = "gilrs:dualsense:0".to_string();
+        crate::eval::apply_pad_feedback(&st, &collector, &mut sink_outputs);
+        assert_eq!(sink_outputs.get_pin(&"gilrs:dualsense:0", &"tp_r_amp").map(|s| s.as_float()), Some(0.5));
+    }
+
+    // Grip settings go out once the user has set them, and not before.
+    #[test]
+    fn grip_sensor_settings_reach_the_pad_only_once_set() {
+        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let out = fb_tick(vec![fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT))], &BusMap::default());
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "grip_touch".to_string())));
+        pad.params.insert("grip_touch".into(), Value::from(150.0));
+        let out = fb_tick(vec![pad], &BusMap::default());
+        assert_eq!(pad_value(&out, FB_DS, "grip_touch"), 150.0);
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "grip_release".to_string())));
+    }
+
+    // Off means no pins at all, which is how the backend learns it went off.
+    #[test]
+    fn a_trigger_click_that_is_off_sends_nothing() {
+        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        pad.params.insert("ltrig_click_offset".into(), Value::from(0.25));
+        let out = fb_tick(vec![pad], &BusMap::default());
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_click_l".to_string())));
     }
 
     // Any instruction from the game wins over the default — Off included: a game

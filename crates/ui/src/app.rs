@@ -1573,14 +1573,12 @@ impl eframe::App for FlexInputApp {
             self.last_signals = (*snap).clone();
         }
 
-        // "Suppress capacitive touch" (device.source toggle): mute the capacitive
-        // stick-cap / grip pins of every device that opted in, BEFORE anything
-        // in the UI reads them. This is the half that lets a mapping session
-        // finish — a Steam Controller's stick caps and grips otherwise win every
-        // Remapper / Touch Zones / Lean "Learn" capture just from the user
-        // holding the pad. The engine mutes the same pins from the same param
-        // (`preprocess_dev_sigs` pass 4), so what you can Learn and what
-        // actually routes stay in agreement.
+        // "Ignore capacitive touch in Learn" (device.source toggle): mark the
+        // capacitive stick-cap / grip pins of every device that opted in. This is
+        // what lets a mapping session finish — a Steam Controller's stick caps and
+        // grips otherwise win every Remapper / Touch Zones / Lean "Learn" capture
+        // just from the user holding the pad. Only capture reads the mark; the
+        // pins stay live for mappings and everything that shows them.
         //
         // Scanned from the ACTIVE tab only: it owns the device pins this frame,
         // matching how `active_tab_device_ids` gates output.
@@ -1590,7 +1588,7 @@ impl eframe::App for FlexInputApp {
             if let Some(tab) = self.tabs.get(self.active_tab) {
                 devices_pool::collect_touch_misc_suppressed(&tab.canvas.snarl, &mut suppressed);
             }
-            devices_pool::mask_capacitive_pins(&mut self.last_signals, &suppressed);
+            devices_pool::mark_capacitive_learn_mute(&mut self.last_signals, &suppressed);
         }
 
         // Config overlay (M3): while it's summoned, suppress the physical input
@@ -1669,6 +1667,16 @@ impl eframe::App for FlexInputApp {
         crate::model::note_device_models(
             self.devices.iter().filter_map(|d| Some((d.id.as_str(), d.vid?, d.pid?))),
         );
+        // A saved Steam Controller node predates its haptic pins and sensor names.
+        for device in self.devices.iter()
+            .filter(|d| flexinput_devices::steam_haptics::is_steam_controller(d.vid, d.pid))
+        {
+            for tab in &mut self.tabs {
+                if crate::canvas::sync_device_node_pins(&mut tab.canvas.snarl, device) {
+                    tab.canvas.mutation_gen = tab.canvas.mutation_gen.wrapping_add(1);
+                }
+            }
+        }
 
         // Publish the current gamepad skin (VID/PID kind of the connected physical
         // pad, skipping our own virtual outputs; else Xbox) so dynamic `gp:<pin>`

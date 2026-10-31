@@ -304,6 +304,80 @@ pub(crate) fn apply_pad_feedback(
     }
 }
 
+/// Where a Steam Controller's trigger click sits, set in the Calibration window:
+/// the pad's digital threshold, moved by a per-trigger offset. Sent as raw trigger
+/// travel on pins no layout declares, every tick while it is on: the backend
+/// compares its own poll against them, and when they stop, zero-on-drop ends the
+/// click. Other pads ignore them.
+pub(crate) fn apply_trigger_click(
+    st: &SinkTarget,
+    params: &HashMap<String, serde_json::Value>,
+    sink_outputs: &mut BusMap,
+) {
+    let num = |key: &str| params.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
+    if !params.get("trig_click_on").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return;
+    }
+    let dev = st.device_id.as_str();
+    for (pin, min, max, threshold, offset, gain_pin, gain) in [
+        ("trig_click_l", "ltrig_min", "ltrig_max", "ltrig_digital_threshold", "ltrig_click_offset",
+         "trig_click_gain_l", "ltrig_click_gain_db"),
+        ("trig_click_r", "rtrig_min", "rtrig_max", "rtrig_digital_threshold", "rtrig_click_offset",
+         "trig_click_gain_r", "rtrig_click_gain_db"),
+    ] {
+        let at = num(threshold).unwrap_or(super::device_cal::TRIG_DIGITAL_THRESHOLD_DEFAULT)
+            + num(offset).unwrap_or(0.0);
+        let position = trigger_click_position(at, (num(min).unwrap_or(0.0), num(max).unwrap_or(1.0)));
+        sink_outputs.set_pin(&dev, &pin, Signal::Float(position));
+        sink_outputs.set_pin(&dev, &gain_pin, Signal::Float(num(gain).unwrap_or(0.0)));
+    }
+}
+
+/// A Steam Controller's click feedback on its trackpads (Calibration window), on
+/// pins no layout declares, every tick while it is on; zero-on-drop ends it.
+pub(crate) fn apply_pad_click(
+    st: &SinkTarget,
+    params: &HashMap<String, serde_json::Value>,
+    sink_outputs: &mut BusMap,
+) {
+    use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
+    let flag = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if !flag("pad_click_on") {
+        return;
+    }
+    let mode = PAD_CLICK_ON
+        | if flag("pad_click_release") { PAD_CLICK_ON_RELEASE } else { 0 }
+        | if flag("pad_click_strong") { PAD_CLICK_STRONG } else { 0 };
+    let gain = params.get("pad_click_gain_db").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let dev = st.device_id.as_str();
+    sink_outputs.set_pin(&dev, &"pad_click_mode", Signal::Float(mode as f32));
+    sink_outputs.set_pin(&dev, &"pad_click_gain", Signal::Float(gain));
+}
+
+/// A Steam Controller's grip sensor settings (Calibration window), on pins no
+/// layout declares. Absent until the user sets them, which leaves the pad as Steam
+/// or its defaults set it; the backend writes only what changed, and ignores the 0
+/// zero-on-drop sends.
+pub(crate) fn apply_grip_sensor(
+    st: &SinkTarget,
+    params: &HashMap<String, serde_json::Value>,
+    sink_outputs: &mut BusMap,
+) {
+    for pin in ["grip_touch", "grip_release"] {
+        if let Some(v) = params.get(pin).and_then(|v| v.as_f64()) {
+            sink_outputs.set_pin(&st.device_id.as_str(), &pin, Signal::Float(v as f32));
+        }
+    }
+}
+
+/// A point on the calibrated trigger (0–1) as raw travel: the inverse of
+/// `device_cal::apply_trigger_range`. Never 0, which means no click.
+fn trigger_click_position(at: f32, (mn, mx): (f32, f32)) -> f32 {
+    let at = at.clamp(0.0, 1.0);
+    let raw = if (mx - mn).abs() < 1e-4 { at } else { mn + at * (mx - mn) };
+    raw.clamp(0.01, 1.0)
+}
+
 /// Device-node params holding a pad's default adaptive-trigger effect, left then
 /// right: a JSM effect word and its numbers (Calibration window). Absent = no
 /// default; the trigger is left exactly as before.
