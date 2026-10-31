@@ -159,6 +159,104 @@ pub struct HidReading {
     pub battery: Option<f32>,
 }
 
+/// The mean of the IMU samples since the last poll. Gyro is a rate that aim adds
+/// up over time, so with a pad reporting faster than it's polled, keeping only the
+/// newest sample throws rotation away; the mean over the poll adds up to the same
+/// turn. Sticks and triggers are positions, where the newest is simply the truth
+/// and a mean would only lag, so they stay out of this.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ImuAverage {
+    sum: [f32; 6],
+    samples: u32,
+}
+
+impl ImuAverage {
+    pub(crate) fn add(&mut self, sample: [f32; 6]) {
+        for (s, v) in self.sum.iter_mut().zip(sample) {
+            *s += v;
+        }
+        self.samples += 1;
+    }
+
+    /// The mean, once there's more than one sample to take it of.
+    pub(crate) fn mean(&self) -> Option<[f32; 6]> {
+        (self.samples > 1).then(|| self.sum.map(|s| s / self.samples as f32))
+    }
+}
+
+impl DualSenseState {
+    fn hold_presses_from(&mut self, earlier: &Self) {
+        self.btn_south |= earlier.btn_south;
+        self.btn_east |= earlier.btn_east;
+        self.btn_west |= earlier.btn_west;
+        self.btn_north |= earlier.btn_north;
+        self.btn_l1 |= earlier.btn_l1;
+        self.btn_r1 |= earlier.btn_r1;
+        self.btn_l2 |= earlier.btn_l2;
+        self.btn_r2 |= earlier.btn_r2;
+        self.btn_ls |= earlier.btn_ls;
+        self.btn_rs |= earlier.btn_rs;
+        self.btn_options |= earlier.btn_options;
+        self.btn_create |= earlier.btn_create;
+        self.btn_ps |= earlier.btn_ps;
+        self.dpad_up |= earlier.dpad_up;
+        self.dpad_down |= earlier.dpad_down;
+        self.dpad_left |= earlier.dpad_left;
+        self.dpad_right |= earlier.dpad_right;
+        self.btn_back_l |= earlier.btn_back_l;
+        self.btn_back_r |= earlier.btn_back_r;
+        self.btn_fn_l |= earlier.btn_fn_l;
+        self.btn_fn_r |= earlier.btn_fn_r;
+    }
+}
+
+impl SwitchProButtons {
+    fn hold_presses_from(&mut self, earlier: &Self) {
+        self.btn_a |= earlier.btn_a;
+        self.btn_b |= earlier.btn_b;
+        self.btn_x |= earlier.btn_x;
+        self.btn_y |= earlier.btn_y;
+        self.btn_l |= earlier.btn_l;
+        self.btn_r |= earlier.btn_r;
+        self.btn_zl |= earlier.btn_zl;
+        self.btn_zr |= earlier.btn_zr;
+        self.btn_lstick |= earlier.btn_lstick;
+        self.btn_rstick |= earlier.btn_rstick;
+        self.btn_minus |= earlier.btn_minus;
+        self.btn_plus |= earlier.btn_plus;
+        self.btn_home |= earlier.btn_home;
+        self.btn_capture |= earlier.btn_capture;
+        self.dpad_up |= earlier.dpad_up;
+        self.dpad_down |= earlier.dpad_down;
+        self.dpad_left |= earlier.dpad_left;
+        self.dpad_right |= earlier.dpad_right;
+    }
+}
+
+impl HidReading {
+    /// Keep a button pressed in an earlier report since the last poll, so a tap
+    /// shorter than the polling period still reads as a press for that poll.
+    fn hold_presses_from(&mut self, earlier: &Self) {
+        self.touchpad_click |= earlier.touchpad_click;
+        self.mic_button |= earlier.mic_button;
+        if let (Some(now), Some(then)) = (self.switch_buttons.as_mut(), earlier.switch_buttons.as_ref()) {
+            now.hold_presses_from(then);
+        }
+        if let (Some(now), Some(then)) = (self.dualsense.as_mut(), earlier.dualsense.as_ref()) {
+            now.hold_presses_from(then);
+        }
+    }
+
+    fn set_imu(&mut self, imu: [f32; 6]) {
+        self.gyro_x = imu[0];
+        self.gyro_y = imu[1];
+        self.gyro_z = imu[2];
+        self.accel_x = imu[3];
+        self.accel_y = imu[4];
+        self.accel_z = imu[5];
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Connection { Usb, Bt }
 
@@ -307,12 +405,30 @@ pub(crate) struct OutputState {
     leds_owned: u8,
 }
 
+/// The least time between reports that change nothing but the lights: about 30 a
+/// second, more than an eye can follow, where a game animating its lightbar would
+/// otherwise take a report every output pass, on Bluetooth too. Rumble and
+/// triggers aren't held to this, and a report for them carries the latest lights.
+pub(crate) const LED_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(33);
+
 /// [`OutputState::leds_owned`] bits.
 const LED_LIGHTBAR: u8 = 1 << 0;
 const LED_PLAYER: u8 = 1 << 1;
 const LED_MIC: u8 = 1 << 2;
 
 impl OutputState {
+    /// Whether the two differ, if at all, only in their lights.
+    fn differs_only_in_lights(&self, other: &Self) -> bool {
+        let mut lit = *other;
+        lit.lightbar_r = self.lightbar_r;
+        lit.lightbar_g = self.lightbar_g;
+        lit.lightbar_b = self.lightbar_b;
+        lit.player_led = self.player_led;
+        lit.mic_led = self.mic_led;
+        lit.leds_owned = self.leds_owned;
+        lit == *self
+    }
+
     /// Stage one output byte by pin name. `false` for a pin this state does
     /// not carry. Shared by every transport that writes these reports, so a
     /// pin added here reaches all of them.
@@ -670,6 +786,9 @@ impl GyroManager {
                 .map(|t| now.duration_since(t) < HEARTBEAT)
                 .unwrap_or(false);
             if unchanged && within_heartbeat { continue; }
+            let lights_too_soon = entry.last_sent.is_some_and(|sent| sent.differs_only_in_lights(&entry.out))
+                && entry.last_sent_at.is_some_and(|t| now.duration_since(t) < LED_MIN_GAP);
+            if lights_too_soon { continue; }
             // Snapshot the output state we're about to send so we can stamp
             // `last_sent` after the match without re-borrowing `entry`.
             let to_send = entry.out;
@@ -1302,10 +1421,12 @@ fn pad64(prefix: impl AsRef<[u8]>) -> [u8; 64] {
 /// Returns false if the device has errored out (caller should drop the entry).
 fn drain_reports(entry: &mut HidEntry) -> bool {
     let mut buf = [0u8; 128];
-    loop {
+    let mut average = ImuAverage::default();
+    let mut drained = 0u32;
+    let done = loop {
         match entry.device.read(&mut buf) {
-            Ok(0) => break,
-            Err(_) => return false,
+            Ok(0) => break true,
+            Err(_) => break false,
             Ok(n) => {
                 if let Some(mut r) = parse_report(&buf[..n], &mut entry.kind) {
                     entry.event_count = entry.event_count.saturating_add(1);
@@ -1330,12 +1451,14 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
                         r.gyro_x, r.gyro_y, r.gyro_z,
                         r.accel_x, r.accel_y, r.accel_z,
                     ]);
-                    r.gyro_x  = imu[0];
-                    r.gyro_y  = imu[1];
-                    r.gyro_z  = imu[2];
-                    r.accel_x = imu[3];
-                    r.accel_y = imu[4];
-                    r.accel_z = imu[5];
+                    r.set_imu(imu);
+                    average.add(imu);
+                    // Everything but the held presses and, below, the IMU comes
+                    // from the freshest packet.
+                    if drained > 0 {
+                        r.hold_presses_from(&entry.last);
+                    }
+                    drained += 1;
                     entry.last = r;
                     entry.last_report_at = std::time::Instant::now();
                     if entry.stalled {
@@ -1345,8 +1468,11 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
                 }
             }
         }
+    };
+    if let Some(mean) = average.mean() {
+        entry.last.set_imu(mean);
     }
-    true
+    done
 }
 
 fn parse_report(buf: &[u8], kind: &mut DeviceKind) -> Option<HidReading> {
@@ -3120,5 +3246,89 @@ mod trigger_encode_tests {
         assert_eq!(g[3] >> 3, 3, "first foot kept below the second");
         let w = enc(WEAPON, |t| { t.start = 0; t.end = 0; t.strength = 1; });
         assert_eq!(u16::from_le_bytes([w[1], w[2]]), (1 << 2) | (1 << 3), "weapon starts at 2 at the earliest");
+    }
+}
+
+#[cfg(test)]
+mod light_report_tests {
+    use super::*;
+
+    #[test]
+    fn only_lights_counts_every_light_and_nothing_else() {
+        let base = OutputState::default();
+        for pin in ["lightbar_r", "lightbar_g", "lightbar_b"] {
+            let mut lit = base;
+            assert!(lit.stage(pin, 200));
+            assert!(base.differs_only_in_lights(&lit), "{pin}");
+        }
+        for pin in ["rumble_strong", "rumble_weak", "hd_l_amp", "trigger_r_mode"] {
+            let mut other = base;
+            assert!(other.stage(pin, 3));
+            assert!(!base.differs_only_in_lights(&other), "{pin}");
+        }
+        // Rumble with a colour change is rumble: it goes out at once.
+        let mut both = base;
+        both.stage("lightbar_r", 200);
+        both.stage("rumble_weak", 3);
+        assert!(!base.differs_only_in_lights(&both));
+        assert!(base.differs_only_in_lights(&base));
+    }
+}
+
+#[cfg(test)]
+mod between_polls_tests {
+    use super::*;
+
+    #[test]
+    fn one_sample_is_left_alone_and_several_are_averaged() {
+        let mut a = ImuAverage::default();
+        assert_eq!(a.mean(), None);
+        a.add([1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(a.mean(), None, "one sample has nothing to average");
+        a.add([3.0, 2.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(a.mean(), Some([2.0, 1.0, 0.0, 0.0, 0.0, 1.0]));
+    }
+
+    /// The point of it: rotation over a poll is the rate times the poll's length.
+    #[test]
+    fn the_mean_keeps_the_rotation_that_the_newest_sample_loses() {
+        let samples = [10.0f32, 30.0, 50.0, 10.0];
+        let turned: f32 = samples.iter().sum::<f32>() * 0.002; // 2 ms a report
+        let mut a = ImuAverage::default();
+        for s in samples {
+            a.add([s, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        }
+        let poll = samples.len() as f32 * 0.002;
+        assert!((a.mean().unwrap()[0] * poll - turned).abs() < 1e-5);
+        assert!((samples[3] * poll - turned).abs() > 0.1, "the newest alone is well off");
+    }
+
+    #[test]
+    fn a_tap_between_polls_is_held_for_the_poll_and_no_longer() {
+        let pressed = HidReading {
+            touchpad_click: true,
+            mic_button: true,
+            dualsense: Some(DualSenseState { btn_south: true, btn_fn_r: true, dpad_up: true, lx: 0.9, ..Default::default() }),
+            switch_buttons: Some(SwitchProButtons { btn_a: true, dpad_left: true, lstick_x: 0.9, ..Default::default() }),
+            ..Default::default()
+        };
+        let released = HidReading {
+            dualsense: Some(DualSenseState { lx: 0.1, ..Default::default() }),
+            switch_buttons: Some(SwitchProButtons { lstick_x: 0.1, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut now = released;
+        now.hold_presses_from(&pressed);
+        assert!(now.touchpad_click && now.mic_button);
+        let ds = now.dualsense.unwrap();
+        assert!(ds.btn_south && ds.btn_fn_r && ds.dpad_up);
+        assert_eq!(ds.lx, 0.1, "a stick stays the newest");
+        let sw = now.switch_buttons.unwrap();
+        assert!(sw.btn_a && sw.dpad_left);
+        assert_eq!(sw.lstick_x, 0.1);
+        // Nothing carries between polls: holding starts anew from what's there.
+        let mut next = released;
+        next.hold_presses_from(&released);
+        assert!(!next.touchpad_click && !next.dualsense.unwrap().btn_south);
     }
 }

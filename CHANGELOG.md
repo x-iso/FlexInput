@@ -55,6 +55,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   anything. Mappings, overlays and shortcuts carry on as before. On Linux this
   needs a desktop that reports minimized windows, which Wayland doesn't; the new
   option below covers it there, since a minimized window has no focus.
+- **Gyro stays accurate at low polling rates.** A pad reporting faster than it's
+  polled used to lose every motion sample but the newest, and the rotation with
+  them. All of them now count, as their average. This applies to pads read through
+  SDL and raw HID; sticks still read their newest position, which has no such loss.
+- **A button tap shorter than a poll is no longer missed.** It now reads as pressed
+  for that poll.
+- **A changing lightbar colour is sent about 30 times a second at most,** where a
+  game animating it could take a report every output pass. Rumble and triggers
+  aren't affected. A pad on SDL also no longer shows half-updated colours in
+  passing, as each colour now goes out whole.
 - **Tidier gyro section in the Calibration window.** **Axis alignment** is now
   folded away under a chevron, and says "applied" when an alignment is in
   effect. Its Roll, Pitch and Yaw buttons fit on one line, with the movement for

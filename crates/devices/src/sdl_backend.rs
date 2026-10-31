@@ -28,6 +28,7 @@ use glam::Vec2;
 use flexinput_core::raw_pad::{self, RawLayout, RawPadProfiles, RawReading};
 use flexinput_core::{Signal, SignalType};
 
+use crate::gyro::{ImuAverage, LED_MIN_GAP};
 use crate::{
     gyro::{ACCEL_REF_G, GYRO_REF_DPS},
     identification::ControllerKind,
@@ -217,9 +218,8 @@ struct OpenPad {
     /// `set_rumble` calls. SDL rumble is re-armed with a long duration each
     /// change and refreshed periodically so it doesn't auto-expire.
     last_rumble: (u8, u8),
-    /// Last-sent lightbar colour (r, g, b), to skip redundant `set_led` calls.
     /// SDL drives the DualSense/DS4 lightbar (and player LEDs on some pads).
-    last_led: (u8, u8, u8),
+    led: LedOut,
     /// Outlier spike filter over this pad's six IMU axes. Lives on the pad so
     /// it is born and dropped with the connection — a reconnect gets a fresh
     /// window rather than judging new samples against pre-disconnect ones.
@@ -376,6 +376,22 @@ impl SdlBackend {
         // state — SDL explicitly supports this: "If gamepad events are disabled,
         // you must call SDL_UpdateGamepads() yourself."
         gamepad_subsystem.set_events_processing_state(false);
+        // Two kinds of event are wanted back, for what the state alone doesn't
+        // keep (see `deliver_event`). The filter takes them as `update()` raises
+        // them, so they never reach the queue this backend doesn't pump.
+        {
+            use sdl3::sys::events::{
+                SDL_SetEventEnabled, SDL_SetEventFilter,
+                SDL_EVENT_GAMEPAD_BUTTON_DOWN, SDL_EVENT_GAMEPAD_SENSOR_UPDATE,
+            };
+            // SAFETY: SDL is initialized; the filter is a plain function that
+            // holds nothing of its caller's.
+            unsafe {
+                SDL_SetEventFilter(Some(deliver_event), std::ptr::null_mut());
+                SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE.0, true);
+                SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_BUTTON_DOWN.0, true);
+            }
+        }
         Some(SdlState {
             _sdl: sdl,
             gamepad_subsystem,
@@ -543,7 +559,7 @@ impl SdlBackend {
                         _ => 0,
                     },
                     last_rumble: (0, 0),
-                    last_led: (0, 0, 0),
+                    led: LedOut::default(),
                     spike: SpikeFilter::new(),
                 },
             );
@@ -839,10 +855,19 @@ impl DeviceBackend for SdlBackend {
         // Nothing else in this loop touches `self` — the change-detection
         // hashes are deferred to `sig_updates` for exactly that reason.
         let Some(state) = self.state.as_mut() else { return out };
+        // A pad without an LED just returns an error we ignore.
+        let mut imu_samples: Vec<SensorSample> = Vec::new();
+        let now = Instant::now();
+        for pad in state.pads.values_mut() {
+            if let Some((r, g, b)) = pad.led.due(now) {
+                let _ = pad.gamepad.set_led(r, g, b);
+            }
+        }
         for (id, pad) in &mut state.pads {
             let dev = &pad.dev_id;
             let g = &pad.gamepad;
             let start_len = out.len();
+            let presses = take_delivery(*id, &mut imu_samples);
 
             // ── Sticks (i16 → -1..1). SDL Y is down-positive; negate so up = +1
             // to match the rest of FlexInput (gilrs/XInput up-positive). ────────
@@ -877,7 +902,7 @@ impl DeviceBackend for SdlBackend {
             // Generic-only ids aren't in `automap::ALL_PINS`, so LS/RS/Select/
             // Guide vanished from every AutoMap path on a Steam Controller (or any
             // third-party pad) while direct wires kept working.
-            let b = |btn: Button| g.button(btn);
+            let b = |btn: Button| g.button(btn) || pressed_since_last_poll(presses, btn);
             out.push((dev.clone(), "btn_south".into(), Signal::Bool(b(Button::South))));
             out.push((dev.clone(), "btn_east".into(),  Signal::Bool(b(Button::East))));
             out.push((dev.clone(), "btn_west".into(),  Signal::Bool(b(Button::West))));
@@ -978,13 +1003,7 @@ impl DeviceBackend for SdlBackend {
                 let mut d = [0.0f32; 3];
                 if g.sensor_get_data(SensorType::Gyroscope, &mut d).is_ok() {
                     raw[..3].copy_from_slice(&d);
-                    // SDL's frame → canonical, THEN scale. SDL gyro is rad/s;
-                    // convert to deg/s and normalize to the ±ref scale.
-                    let c = sdl_gyro_to_canonical(d);
-                    let to_norm = |rad_s: f32| (rad_s.to_degrees() / GYRO_REF_DPS).clamp(-1.0, 1.0);
-                    imu[0] = to_norm(c[0]);
-                    imu[1] = to_norm(c[1]);
-                    imu[2] = to_norm(c[2]);
+                    imu[..3].copy_from_slice(&sdl_gyro_normalized(d));
                     got_gyro = true;
                 }
             }
@@ -992,14 +1011,7 @@ impl DeviceBackend for SdlBackend {
                 let mut d = [0.0f32; 3];
                 if g.sensor_get_data(SensorType::Accelerometer, &mut d).is_ok() {
                     raw[3..].copy_from_slice(&d);
-                    // SDL's frame → canonical, THEN scale. SDL accel is m/s²;
-                    // convert to G and normalize to the ±ref scale.
-                    let c = sdl_accel_to_canonical(d);
-                    const G: f32 = 9.806_65;
-                    let to_norm = |ms2: f32| ((ms2 / G) / ACCEL_REF_G).clamp(-1.0, 1.0);
-                    imu[3] = to_norm(c[0]);
-                    imu[4] = to_norm(c[1]);
-                    imu[5] = to_norm(c[2]);
+                    imu[3..].copy_from_slice(&sdl_accel_normalized(d));
                     got_accel = true;
                 }
             }
@@ -1018,7 +1030,17 @@ impl DeviceBackend for SdlBackend {
                     eprintln!("[sdl] IMU frozen on {dev} — re-enabled sensors (kick {})",
                               pad.imu_watch.kicks);
                 }
-                let imu = pad.spike.push(imu);
+                // More than one report since the last poll: each goes through
+                // the filter, as one report, and the poll gets their mean.
+                let imu = if imu_samples.len() > 1 {
+                    let mut average = ImuAverage::default();
+                    for s in &imu_samples {
+                        average.add(pad.spike.push(s.normalized(imu)));
+                    }
+                    average.mean().unwrap_or(imu)
+                } else {
+                    pad.spike.push(imu)
+                };
                 if got_gyro {
                     out.push((dev.clone(), "gyro_x".into(), Signal::Float(imu[0])));
                     out.push((dev.clone(), "gyro_y".into(), Signal::Float(imu[1])));
@@ -1241,24 +1263,183 @@ impl DeviceBackend for SdlBackend {
             return;
         }
         match pin_id {
-            // Lightbar (DualSense / DS4). SDL drives it via SDL_SetGamepadLED;
-            // a pad without an LED just returns an error we ignore. Only push
-            // on a real change so we don't spam the HID endpoint.
-            "lightbar_r" | "lightbar_g" | "lightbar_b" => {
-                match pin_id {
-                    "lightbar_r" => pad.last_led.0 = byte,
-                    "lightbar_g" => pad.last_led.1 = byte,
-                    _ => pad.last_led.2 = byte,
-                }
-                let (r, g, b) = pad.last_led;
-                let _ = pad.gamepad.set_led(r, g, b);
-            }
+            // Lightbar (DualSense / DS4). Collected here and sent from `poll`,
+            // so the three channels of one colour go out as one.
+            "lightbar_r" | "lightbar_g" | "lightbar_b" => pad.led.set_channel(pin_id, byte),
             _ => {}
         }
     }
 
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {
         self.event_counts.drain().collect()
+    }
+}
+
+/// SDL's gyro (rad/s, its frame) as the shared canonical frame and ±ref scale.
+fn sdl_gyro_normalized(d: [f32; 3]) -> [f32; 3] {
+    sdl_gyro_to_canonical(d).map(|rad_s| (rad_s.to_degrees() / GYRO_REF_DPS).clamp(-1.0, 1.0))
+}
+
+/// SDL's accel (m/s², its frame) as the shared canonical frame and ±ref scale.
+fn sdl_accel_normalized(d: [f32; 3]) -> [f32; 3] {
+    const G: f32 = 9.806_65;
+    sdl_accel_to_canonical(d).map(|ms2| ((ms2 / G) / ACCEL_REF_G).clamp(-1.0, 1.0))
+}
+
+/// One report's sensors, as SDL's raw values. A pad may send only one of the two.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct SensorSample {
+    gyro: Option<[f32; 3]>,
+    accel: Option<[f32; 3]>,
+}
+
+impl SensorSample {
+    /// Normalized for the spike filter; what it lacks comes from `fill`.
+    fn normalized(&self, fill: [f32; 6]) -> [f32; 6] {
+        let mut out = fill;
+        if let Some(g) = self.gyro {
+            out[..3].copy_from_slice(&sdl_gyro_normalized(g));
+        }
+        if let Some(a) = self.accel {
+            out[3..].copy_from_slice(&sdl_accel_normalized(a));
+        }
+        out
+    }
+}
+
+/// More than any poll gap should see; past it a stalled loop stops collecting.
+const MAX_SAMPLES_PER_POLL: usize = 256;
+
+/// What SDL raised for one pad since the last poll.
+#[derive(Default)]
+struct Delivery {
+    samples: Vec<SensorSample>,
+    /// The report being read: its sensors arrive one event each.
+    open: SensorSample,
+    /// Bit per `SDL_GamepadButton`.
+    presses: u64,
+}
+
+impl Delivery {
+    fn sensor(&mut self, is_gyro: bool, data: [f32; 3]) {
+        // A sensor coming round again means the last report is complete.
+        let again = if is_gyro { self.open.gyro.is_some() } else { self.open.accel.is_some() };
+        if again {
+            self.close_report();
+        }
+        if is_gyro {
+            self.open.gyro = Some(data);
+        } else {
+            self.open.accel = Some(data);
+        }
+    }
+
+    fn close_report(&mut self) {
+        if self.open != SensorSample::default() && self.samples.len() < MAX_SAMPLES_PER_POLL {
+            self.samples.push(self.open);
+        }
+        self.open = SensorSample::default();
+    }
+
+    fn press(&mut self, button: u8) {
+        if button < 64 {
+            self.presses |= 1 << button;
+        }
+    }
+
+    /// Hand over the reports and presses so far, and start over.
+    fn take(&mut self, samples: &mut Vec<SensorSample>) -> u64 {
+        self.close_report();
+        samples.clear();
+        samples.append(&mut self.samples);
+        std::mem::take(&mut self.presses)
+    }
+}
+
+/// What SDL raised since the last poll, per pad. Filled during `update()`.
+static DELIVERIES: std::sync::Mutex<Option<HashMap<u32, Delivery>>> = std::sync::Mutex::new(None);
+
+/// Takes the two events the state can't stand in for: SDL only keeps the newest
+/// sensor reading and the current button state, so reports between polls would
+/// otherwise be lost, gyro rotation and short taps with them. Everything else goes
+/// on as before. Called by SDL, on whichever thread raised the event.
+unsafe extern "C" fn deliver_event(_: *mut std::ffi::c_void, event: *mut sdl3::sys::events::SDL_Event) -> bool {
+    use sdl3::sys::events::{SDL_EVENT_GAMEPAD_BUTTON_DOWN, SDL_EVENT_GAMEPAD_SENSOR_UPDATE};
+    use sdl3::sys::sensor::{SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO};
+    // SAFETY: SDL passes a valid event, whose type says which union field is set.
+    let event = unsafe { &*event };
+    let ty = unsafe { event.r#type };
+    let delivering = ty == SDL_EVENT_GAMEPAD_SENSOR_UPDATE.0 || ty == SDL_EVENT_GAMEPAD_BUTTON_DOWN.0;
+    if !delivering {
+        return true;
+    }
+    let mut all = DELIVERIES.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(HashMap::new);
+    if ty == SDL_EVENT_GAMEPAD_SENSOR_UPDATE.0 {
+        // SAFETY: as above.
+        let e = unsafe { event.gsensor };
+        if e.sensor == SDL_SENSOR_GYRO.0 || e.sensor == SDL_SENSOR_ACCEL.0 {
+            all.entry(e.which.into()).or_default().sensor(e.sensor == SDL_SENSOR_GYRO.0, e.data);
+        }
+    } else {
+        // SAFETY: as above.
+        let e = unsafe { event.gbutton };
+        all.entry(e.which.into()).or_default().press(e.button);
+    }
+    false
+}
+
+/// A pad's reports since the last poll into `samples`, and its presses.
+fn take_delivery(id: JoystickId, samples: &mut Vec<SensorSample>) -> u64 {
+    let mut all = DELIVERIES.lock().unwrap_or_else(|e| e.into_inner());
+    match all.as_mut().and_then(|a| a.get_mut(&u32::from(id))) {
+        Some(d) => d.take(samples),
+        None => {
+            samples.clear();
+            0
+        }
+    }
+}
+
+fn pressed_since_last_poll(presses: u64, button: Button) -> bool {
+    let bit = button.to_ll().0;
+    (0..64).contains(&bit) && presses & (1 << bit) != 0
+}
+
+/// How often an unchanged colour is sent again: SDL drops the repeats until its
+/// own refresh is due, which keeps a pad that lost its colour from staying dark.
+const LED_REFRESH: Duration = Duration::from_secs(1);
+
+/// A pad's lightbar: the colour wanted, and what has gone out.
+#[derive(Default)]
+struct LedOut {
+    /// Nothing is sent until something sets a channel: the pad keeps its own.
+    wanted: Option<(u8, u8, u8)>,
+    sent: Option<((u8, u8, u8), Instant)>,
+}
+
+impl LedOut {
+    fn set_channel(&mut self, pin: &str, byte: u8) {
+        let c = self.wanted.get_or_insert((0, 0, 0));
+        match pin {
+            "lightbar_r" => c.0 = byte,
+            "lightbar_g" => c.1 = byte,
+            _ => c.2 = byte,
+        }
+    }
+
+    /// The colour to send now, if any: a change at most every
+    /// [`LED_MIN_GAP`], and the final colour of a change always gets there.
+    fn due(&mut self, now: Instant) -> Option<(u8, u8, u8)> {
+        let wanted = self.wanted?;
+        if let Some((colour, at)) = self.sent {
+            let wait = if colour == wanted { LED_REFRESH } else { LED_MIN_GAP };
+            if now.duration_since(at) < wait {
+                return None;
+            }
+        }
+        self.sent = Some((wanted, now));
+        Some(wanted)
     }
 }
 
@@ -1395,5 +1576,226 @@ mod tests {
         assert!(w.observe(moved, ms(t + 1000)), "last fast kick");
         assert!(!w.observe(moved, ms(t + 2000)), "then backs off to SLOW_GAP");
         assert!(w.observe(moved, ms(t + 11000)));
+    }
+}
+
+#[cfg(test)]
+mod led_out_tests {
+    use super::*;
+
+    fn set(led: &mut LedOut, (r, g, b): (u8, u8, u8)) {
+        led.set_channel("lightbar_r", r);
+        led.set_channel("lightbar_g", g);
+        led.set_channel("lightbar_b", b);
+    }
+
+    #[test]
+    fn nothing_goes_out_until_something_sets_a_colour() {
+        assert_eq!(LedOut::default().due(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_colour_goes_out_whole_and_at_once() {
+        let mut led = LedOut::default();
+        set(&mut led, (10, 20, 30));
+        assert_eq!(led.due(Instant::now()), Some((10, 20, 30)));
+    }
+
+    #[test]
+    fn an_animation_is_held_to_the_gap_and_ends_on_its_last_colour() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut led = LedOut::default();
+        set(&mut led, (1, 0, 0));
+        assert!(led.due(at(0)).is_some());
+        let mut sent = 0;
+        // A new colour every 8 ms for 408 ms, stopping just after a send.
+        for i in 1..=51u64 {
+            set(&mut led, (i as u8, 0, 0));
+            sent += led.due(at(i * 8)).is_some() as u32;
+        }
+        assert!((10..=13).contains(&sent), "{sent} sends in 408 ms");
+        // Held back when it stopped: the last colour still arrives, at the gap.
+        assert_eq!(led.due(at(408)), None);
+        assert_eq!(led.due(at(400 + LED_MIN_GAP.as_millis() as u64 + 8)), Some((51, 0, 0)));
+    }
+
+    #[test]
+    fn a_steady_colour_is_only_refreshed() {
+        let t0 = Instant::now();
+        let mut led = LedOut::default();
+        set(&mut led, (9, 9, 9));
+        assert!(led.due(t0).is_some());
+        // 8 ms apart for just under two refresh periods.
+        let sends = (1..=249u64)
+            .filter(|i| led.due(t0 + Duration::from_millis(i * 8)).is_some())
+            .count();
+        assert_eq!(sends, 1);
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    /// The whole route on a real SDL, through a virtual pad: everything raised
+    /// during `update()` reaches the filter, the newest-only state still reads as
+    /// before, and nothing is needed from a physical device.
+    #[test]
+    #[ignore = "starts SDL; run alone with --ignored"]
+    fn sdl_delivers_every_report_and_press_through_the_filter() {
+        use sdl3::sys::joystick::*;
+        use sdl3::sys::sensor::{SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO};
+        let state = SdlBackend::try_init().expect("SDL starts");
+
+        let sensors = [
+            SDL_VirtualJoystickSensorDesc { r#type: SDL_SENSOR_GYRO, rate: 1000.0 },
+            SDL_VirtualJoystickSensorDesc { r#type: SDL_SENSOR_ACCEL, rate: 1000.0 },
+        ];
+        let desc = SDL_VirtualJoystickDesc {
+            r#type: SDL_JOYSTICK_TYPE_GAMEPAD.0 as u16,
+            nbuttons: 15,
+            naxes: 6,
+            nsensors: sensors.len() as u16,
+            sensors: sensors.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: `desc` and `sensors` outlive the call, which copies them.
+        let which = unsafe { SDL_AttachVirtualJoystick(&desc) };
+        assert_ne!(which.0, 0, "virtual joystick attached");
+        let id: JoystickId = which.0.into();
+        let mut pad = state.gamepad_subsystem.open(id).expect("opens as a gamepad");
+        pad.sensor_set_enabled(SensorType::Gyroscope, true).expect("gyro on");
+        pad.sensor_set_enabled(SensorType::Accelerometer, true).expect("accel on");
+        // SAFETY: SDL hands the open joystick out for this id, and it stays open
+        // with `pad` for the rest of the test.
+        let joystick = unsafe { SDL_OpenJoystick(which) };
+        assert!(!joystick.is_null());
+
+        // Drop anything from opening.
+        state.gamepad_subsystem.update();
+        let mut got = Vec::new();
+        take_delivery(id, &mut got);
+
+        // Three reports between polls.
+        for (i, x) in [0.1f32, 0.2, 0.6].iter().enumerate() {
+            let gyro = [*x, 0.0, 0.0];
+            let accel = [0.0, 0.0, 9.8];
+            let t = (i as u64 + 1) * 1_000_000;
+            // SAFETY: the joystick is open and the arrays outlive the calls.
+            unsafe {
+                assert!(SDL_SendJoystickVirtualSensorData(joystick, SDL_SENSOR_GYRO, t, gyro.as_ptr(), 3));
+                assert!(SDL_SendJoystickVirtualSensorData(joystick, SDL_SENSOR_ACCEL, t, accel.as_ptr(), 3));
+            }
+        }
+        let south = Button::South.to_ll().0;
+        // SAFETY: the joystick is open.
+        unsafe { assert!(SDL_SetJoystickVirtualButton(joystick, south, true)) };
+        state.gamepad_subsystem.update();
+
+        let presses = take_delivery(id, &mut got);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got.iter().map(|s| s.gyro.unwrap()[0]).collect::<Vec<_>>(), [0.1, 0.2, 0.6]);
+        assert!(got.iter().all(|s| s.accel.is_some()));
+        assert!(pressed_since_last_poll(presses, Button::South));
+
+        // The state itself still has only the newest, which is why this exists.
+        let mut newest = [0.0f32; 3];
+        pad.sensor_get_data(SensorType::Gyroscope, &mut newest).expect("reads");
+        assert_eq!(newest[0], 0.6);
+
+        // Let go between polls: state says up, this poll's press is gone next time.
+        // SAFETY: the joystick is open.
+        unsafe { assert!(SDL_SetJoystickVirtualButton(joystick, south, false)) };
+        state.gamepad_subsystem.update();
+        assert!(!pad.button(Button::South));
+        assert_eq!(take_delivery(id, &mut got), 0);
+        assert!(got.is_empty());
+
+        // SAFETY: both were opened or attached above.
+        unsafe {
+            SDL_CloseJoystick(joystick);
+            drop(pad);
+            SDL_DetachVirtualJoystick(which);
+        }
+    }
+
+    fn g(x: f32) -> [f32; 3] { [x, 0.0, 0.0] }
+
+    #[test]
+    fn a_reports_sensors_pair_up_in_either_order() {
+        let mut d = Delivery::default();
+        d.sensor(true, g(1.0));
+        d.sensor(false, g(2.0));
+        d.sensor(true, g(3.0));
+        d.sensor(false, g(4.0));
+        let mut out = Vec::new();
+        d.take(&mut out);
+        assert_eq!(out, [
+            SensorSample { gyro: Some(g(1.0)), accel: Some(g(2.0)) },
+            SensorSample { gyro: Some(g(3.0)), accel: Some(g(4.0)) },
+        ]);
+
+        d.sensor(false, g(5.0));
+        d.sensor(true, g(6.0));
+        d.sensor(false, g(7.0));
+        d.take(&mut out);
+        assert_eq!(out[0], SensorSample { gyro: Some(g(6.0)), accel: Some(g(5.0)) });
+        assert_eq!(out[1], SensorSample { gyro: None, accel: Some(g(7.0)) });
+    }
+
+    #[test]
+    fn a_pad_with_one_sensor_still_gets_a_sample_per_report() {
+        let mut d = Delivery::default();
+        for v in [1.0, 2.0, 3.0] {
+            d.sensor(true, g(v));
+        }
+        let mut out = Vec::new();
+        d.take(&mut out);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|s| s.accel.is_none()));
+    }
+
+    #[test]
+    fn taking_empties_it_and_a_quiet_poll_has_nothing() {
+        let mut d = Delivery::default();
+        d.sensor(true, g(1.0));
+        d.press(3);
+        let mut out = Vec::new();
+        assert_eq!(d.take(&mut out), 1 << 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(d.take(&mut out), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_poll_cannot_grow_it_without_limit() {
+        let mut d = Delivery::default();
+        for v in 0..(MAX_SAMPLES_PER_POLL * 3) {
+            d.sensor(true, g(v as f32));
+        }
+        let mut out = Vec::new();
+        d.take(&mut out);
+        assert_eq!(out.len(), MAX_SAMPLES_PER_POLL);
+    }
+
+    #[test]
+    fn a_missing_sensor_is_filled_and_present_ones_normalized() {
+        let fill = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let s = SensorSample { gyro: None, accel: Some([0.0, 0.0, 9.806_65]) };
+        let n = s.normalized(fill);
+        assert_eq!(n[..3], fill[..3]);
+        assert_eq!(n[3..], sdl_accel_normalized([0.0, 0.0, 9.806_65]));
+    }
+
+    #[test]
+    fn a_press_reads_by_sdls_button_number() {
+        let south = Button::South.to_ll().0 as u8;
+        let mut d = Delivery::default();
+        d.press(south);
+        d.press(200); // out of range: ignored, not a shift overflow
+        let presses = d.take(&mut Vec::new());
+        assert!(pressed_since_last_poll(presses, Button::South));
+        assert!(!pressed_since_last_poll(presses, Button::East));
     }
 }

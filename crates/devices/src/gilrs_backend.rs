@@ -249,6 +249,9 @@ pub struct GilrsBackend {
     /// Per-gilrs-gamepad-id raw event count since the last `take_event_counts`.
     /// Used by the I/O thread to compute live per-device polling rates.
     event_counts: HashMap<usize, u32>,
+    /// Buttons pressed in the events of this poll, so a tap released again before
+    /// the poll still reads as a press for it. Gilrs's state only has the outcome.
+    pressed_this_poll: std::collections::HashSet<(usize, Button)>,
     /// Maps gilrs-internal gamepad id → device_id string. Refreshed each
     /// `poll()` so the I/O thread can convert event counts to per-device
     /// rates.
@@ -388,6 +391,7 @@ impl GilrsBackend {
             xinput_idx: HashMap::new(),
             xinput_rumble: HashMap::new(),
             event_counts: HashMap::new(),
+            pressed_this_poll: std::collections::HashSet::new(),
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
             foreign_xinput: Vec::new(),
@@ -763,6 +767,7 @@ impl DeviceBackend for GilrsBackend {
         // causing flicker and broken diagonals. DPad discrete outputs are derived manually
         // below from both axis_data (HAT/USB path) and button_data (BT/WGI path).
         let mut ev_count = 0u32;
+        self.pressed_this_poll.clear();
         {
             puffin::profile_scope!("gilrs_next_event_drain");
             while let Some(ev) = self.gilrs.next_event() {
@@ -787,6 +792,9 @@ impl DeviceBackend for GilrsBackend {
                 #[cfg(windows)]
                 if matches!(ev.event, EventType::Connected) {
                     request_xinput_probe();
+                }
+                if let EventType::ButtonPressed(button, _) = ev.event {
+                    self.pressed_this_poll.insert((usize::from(ev.id), button));
                 }
                 self.gilrs.update(&ev);
                 ev_count += 1;
@@ -867,7 +875,8 @@ impl DeviceBackend for GilrsBackend {
                 button_map(kind)
             };
             for (button, pin_id) in btn_map.iter() {
-                let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed());
+                let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed())
+                    || self.pressed_this_poll.contains(&(usize::from(pad.id()), *button));
                 out.push((dev.clone(), pin_id.to_string(), Signal::Bool(pressed)));
             }
 
