@@ -27,8 +27,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   L/R**, in the picker, on cards and on the pad's node, and its 3D model lights a
   stick cap dimly while your thumb is on it.
 - **Feedback Control can drive the Steam Controller's trackpads.** It has inlets
-  for each pad's amplitude, frequency and click, added to the end of the list so
-  saved nodes keep their wires. Its HD Rumble inlets drive the grip motors.
+  for each pad's amplitude, frequency and click, and a click for each grip, added
+  to the end of the list so saved nodes keep their wires. Its HD Rumble inlets drive
+  the grip motors.
+- **Area Mapper: touchpads and haptics.** On a Steam Controller the Input list reads
+  **Touchpad L** and **Touchpad R**. A cell can now give a **Haptic** as the point
+  crosses its border, with its own strength, and **All cells in layer** gives the
+  whole layer that cell's setting. It plays on the trackpad for a touchpad input and
+  on that side's grip motor for a stick, or as a short rumble on a pad without them.
 - **Calibration sections fold away.** Each has a chevron on its heading, and the
   window's height now follows what's open. A section stays open while its capture
   is running.

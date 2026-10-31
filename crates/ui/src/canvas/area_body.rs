@@ -45,7 +45,8 @@ use flexinput_core::Signal;
 use flexinput_engine::eval::{
     area_layout_of, area_touch_pin, AREA_ANALOG_MS_DEFAULT, AREA_INPUTS, AREA_INPUT_PARAM,
     AREA_LAYERS_PARAM, AREA_LAYER_ANALOG_PARAM, AREA_LAYER_COLOR_PARAM, AREA_LAYER_KEYS,
-    AREA_LAYER_LOADED_PARAM, AREA_LAYER_MS_PARAM, AREA_LAYER_STRIDE, AREA_LAYOUT_PARAM,
+    AREA_CELL_HAPTICS_PARAM, AREA_LAYER_LOADED_PARAM, AREA_LAYER_MS_PARAM, AREA_LAYER_STRIDE,
+    AREA_LAYOUT_PARAM,
     AREA_ANALOG_HOLD_DEFAULT, AREA_LAYER_HOLD_PARAM, AREA_LAYER_MIX_PARAM, AREA_LAYER_PULSE_PARAM,
     AREA_ANALOG_FULL_DEFAULT, AREA_LAYER_FULL_PARAM, AREA_LAYER_MID_PARAM, AREA_LAYER_RAMP_PARAM,
     AREA_PASS_SOURCE_PARAM, AREA_PRESS_HOLD_PARAM, AREA_PRESS_LOCK_PARAM, AREA_PRESS_MODES,
@@ -769,6 +770,9 @@ fn retain_cells(n: &mut NodeData, ids: &[u32]) {
     if let Some(meta) = n.params.get_mut("zone_meta").and_then(|v| v.as_object_mut()) {
         meta.retain(|k, _| k.parse::<u32>().is_ok_and(|id| ids.contains(&id)));
     }
+    if let Some(haptics) = n.params.get_mut(AREA_CELL_HAPTICS_PARAM).and_then(|v| v.as_object_mut()) {
+        haptics.retain(|k, _| k.parse::<u32>().is_ok_and(|id| ids.contains(&id)));
+    }
     let gates: Vec<u32> = touch_cells(n).into_iter().filter(|c| ids.contains(c)).collect();
     n.params.insert(AREA_TOUCH_CELLS_PARAM.into(), json!(gates));
 }
@@ -790,6 +794,9 @@ fn apply_merges(n: &mut NodeData, merges: &[(u32, u32)]) {
     }
     for (removed, _) in merges {
         write_zone_meta_entry(n, *removed, &ZoneMeta::default());
+        if let Some(haptics) = n.params.get_mut(AREA_CELL_HAPTICS_PARAM).and_then(|v| v.as_object_mut()) {
+            haptics.remove(&removed.to_string());
+        }
     }
     let gates: Vec<u32> = touch_cells(n).into_iter()
         .filter(|c| !merges.iter().any(|(removed, _)| removed == c)).collect();
@@ -2085,6 +2092,12 @@ fn area_field(
 /// selected cell's corner rounding (a rectangle) after the
 /// selected cell's touch gate (for a stick). Field rects publish in that order
 /// — the gamepad's field list for the `options` element mirrors it.
+/// Whether a pad carries an input. A touchpad's coordinates only exist with a
+/// finger down, so it goes by the flag it always publishes.
+fn input_carried(input: &str, carried: impl Fn(&str) -> bool) -> bool {
+    carried(input) || carried(&format!("{input}_x")) || carried(&format!("{input}_active"))
+}
+
 pub(crate) fn show_area_options_row(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2095,7 +2108,7 @@ pub(crate) fn show_area_options_row(
     let devs = remapper_upstream_device_ids(snarl, node_id, 0, automap_parent);
     let carried = |pin: &str| devs.iter().any(|d| live_signals.contains_key(&(d.clone(), pin.to_string())));
     let mut options: Vec<&str> = AREA_INPUTS.iter().copied()
-        .filter(|p| carried(p) || carried(&format!("{p}_x")))
+        .filter(|p| input_carried(p, carried))
         .collect();
     let Some(n) = snarl.get_node(node_id) else { return false };
     let current = area_input(n);
@@ -2117,9 +2130,14 @@ pub(crate) fn show_area_options_row(
     let stick = !current.starts_with("touch");
     let touch_pin = area_touch_pin(&current);
     let touch_known = devs.iter().any(|d| live_signals.contains_key(&(d.clone(), touch_pin.clone())));
+    // A pad with two touchpads has one point on each; one with a single pad, two
+    // fingers on it.
+    let two_pads = devs.iter().any(|d| crate::model::is_steam_controller(d));
     let label_of = |p: &str| match p {
         "left_stick" => "Left stick",
         "right_stick" => "Right stick",
+        "touch1" if two_pads => "Touchpad L",
+        "touch2" if two_pads => "Touchpad R",
         "touch1" => "Touch 1",
         "touch2" => "Touch 2",
         _ => "?",
@@ -2763,6 +2781,57 @@ fn border_settings(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
 // ── Selected cell ─────────────────────────────────────────────────────────────
 
 /// The selected cell's icon + name override.
+/// A cell's border-cross haptic: its strength, or `None` for none.
+fn cell_haptic(node: &NodeData, cell: u32) -> Option<f32> {
+    node.params.get(AREA_CELL_HAPTICS_PARAM)?.get(cell.to_string())?.as_f64().map(|v| v as f32)
+}
+
+/// Set the haptic of `cells`, on the loaded layer.
+fn set_cell_haptics(node: &mut NodeData, cells: &[u32], haptic: Option<f32>) {
+    let entry = node.params.entry(AREA_CELL_HAPTICS_PARAM.to_string()).or_insert_with(|| json!({}));
+    let Some(map) = entry.as_object_mut() else { return };
+    for cell in cells {
+        match haptic {
+            Some(s) => { map.insert(cell.to_string(), json!(s)); }
+            None => { map.remove(&cell.to_string()); }
+        }
+    }
+}
+
+/// The selected cell's border-cross haptic. True when anything changed.
+fn cell_haptic_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let Some(node) = snarl.get_node(node_id) else { return false };
+    let layout = area_layout(node);
+    let cell = selected_cell(node, &layout);
+    let current = cell_haptic(node, cell);
+    let mut on = current.is_some();
+    let mut pct = current.unwrap_or(1.0) * 100.0;
+    let (mut changed, mut all) = (false, false);
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(&mut on, egui::RichText::new("Haptic").small())
+            .on_hover_text("Play a haptic as the point crosses this cell's border, on the way in \
+                or out: on the trackpad for a touchpad input, on that side's grip motor for a \
+                stick. A pad without those gets a short rumble. Landing or lifting a finger \
+                doesn't count.")
+            .changed();
+        if on {
+            changed |= ui.add(egui::Slider::new(&mut pct, 5.0..=100.0).step_by(1.0).suffix("%")).changed();
+        }
+        all = ui.add(egui::Button::new(egui::RichText::new("All cells in layer").small()))
+            .on_hover_text("Give every cell in this layer this cell's haptic setting.")
+            .clicked();
+    });
+    let haptic = on.then_some(pct / 100.0);
+    let Some(node) = snarl.get_node_mut(node_id) else { return false };
+    if changed {
+        set_cell_haptics(node, &[cell], haptic);
+    }
+    if all {
+        set_cell_haptics(node, &layout.cell_ids(), haptic);
+    }
+    changed || all
+}
+
 fn cell_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
     let Some(node) = snarl.get_node(node_id) else { return false };
     let layout = area_layout(node);
@@ -2837,6 +2906,7 @@ pub(crate) fn show_area_mapper_body(
         }).response.rect;
         register_exposable_element(ui, node_id, "border", border);
         changed |= cell_row(node_id, ui, snarl);
+        changed |= cell_haptic_row(node_id, ui, snarl);
         let press = ui.vertical(|ui| {
             changed |= show_area_press_row(node_id, ui, snarl);
         }).response.rect;
@@ -2912,6 +2982,43 @@ mod tests {
         let mut n = NodeData::from(&d);
         area_sync(&mut n);
         n
+    }
+
+    /// A touchpad is on offer with no finger down, when only its flag is published.
+    #[test]
+    fn a_touchpad_is_an_input_with_no_finger_on_it() {
+        let pad = ["left_stick_x", "touch1_active", "touch2_active"];
+        let has = |p: &str| pad.contains(&p);
+        for input in ["left_stick", "touch1", "touch2"] {
+            assert!(input_carried(input, has), "{input}");
+        }
+        assert!(!input_carried("right_stick", has));
+        assert!(!input_carried("touch1", |p: &str| p == "left_stick_x"), "a pad without one");
+    }
+
+    /// A haptic sets per cell or across the layer, turns off again, and stays
+    /// with its layer when another is loaded.
+    #[test]
+    fn a_cells_haptic_sets_per_cell_or_for_the_whole_layer_and_stays_on_its_layer() {
+        let mut n = node();
+        let ids = area_layout(&n).cell_ids();
+        let (first, second) = (ids[0], ids[1]);
+        set_cell_haptics(&mut n, &[first], Some(0.5));
+        assert_eq!(cell_haptic(&n, first), Some(0.5));
+        assert_eq!(cell_haptic(&n, second), None);
+        set_cell_haptics(&mut n, &ids, Some(0.25));
+        assert!(ids.iter().all(|id| cell_haptic(&n, *id) == Some(0.25)));
+        set_cell_haptics(&mut n, &[second], None);
+        assert_eq!(cell_haptic(&n, second), None);
+
+        add_layer(&mut n);
+        area_sync(&mut n);
+        assert_eq!(loaded_layer(&n), 1);
+        assert_eq!(cell_haptic(&n, first), None, "the new layer starts without");
+        n.params.insert("area_layer".into(), json!(0));
+        area_sync(&mut n);
+        assert_eq!(loaded_layer(&n), 0);
+        assert_eq!(cell_haptic(&n, first), Some(0.25), "and the first kept its own");
     }
 
     /// The overlay shows by its mode and the live point: Off never, While

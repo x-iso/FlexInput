@@ -23,7 +23,7 @@
 //! [`PadClickFeedback`] does the like for a press on either trackpad.
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -99,6 +99,8 @@ const TONE_RENEW: Duration = Duration::from_millis(150);
 /// Tones restart when changed, so changes wait this long between them.
 const TONE_MIN_GAP: Duration = Duration::from_millis(30);
 
+/// A one-shot click pin counts as up above this.
+const CLICK_PIN_MIN: f32 = 0.02;
 const CLICK_HZ: u16 = 170;
 const CLICK_MS: u16 = 20;
 const CLICK_SAMPLES: u32 = CLICK_MS as u32 * STREAM_RATE as u32 / 1000;
@@ -253,7 +255,8 @@ pub(crate) struct SteamHaptics {
     click: TriggerClick,
     pad_feedback: PadClickFeedback,
     bit_held: bool,
-    pad_click_held: [AtomicBool; 2],
+    /// The one-shot click pins as last seen: pads, then grips.
+    click_pins: [bool; 4],
     grip_sent: [Option<i16>; GRIP_SETTINGS.len()],
 }
 
@@ -278,7 +281,7 @@ impl SteamHaptics {
             click: TriggerClick::default(),
             pad_feedback: PadClickFeedback::default(),
             bit_held: false,
-            pad_click_held: Default::default(),
+            click_pins: [false; 4],
             grip_sent: Default::default(),
         })
     }
@@ -291,14 +294,22 @@ impl SteamHaptics {
             return true;
         }
         match pin {
-            "tp_l_click" | "tp_r_click" => {
-                let side = usize::from(pin == "tp_r_click");
-                let down = level > 0.5;
-                if down && !self.pad_click_held[side].swap(true, Ordering::Relaxed) {
-                    let _ = self.cmds.send(Cmd::PadClick { side, command: COMMAND_CLICK, gain_db: 0 });
-                } else if !down {
-                    self.pad_click_held[side].store(false, Ordering::Relaxed);
+            // A click as the pin rises, as strong as it rose to: a wired button
+            // reads 1, full strength.
+            "tp_l_click" | "tp_r_click" | "grip_l_click" | "grip_r_click" => {
+                let grip = pin.starts_with("grip");
+                let side = usize::from(pin.contains("_r_"));
+                let held = &mut self.click_pins[side + if grip { 2 } else { 0 }];
+                let down = level > CLICK_PIN_MIN;
+                if down && !*held {
+                    let gain_db = amp_to_gain_db(level);
+                    let _ = self.cmds.send(if grip {
+                        Cmd::TriggerClick { side, gain_db }
+                    } else {
+                        Cmd::PadClick { side, command: COMMAND_CLICK, gain_db }
+                    });
                 }
+                *held = down;
             }
             "trig_click_l" | "trig_click_r" => {
                 self.click.position[usize::from(pin == "trig_click_r")] = level.max(0.0);

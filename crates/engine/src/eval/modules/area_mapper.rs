@@ -20,6 +20,10 @@
 //! SMOOTH (error diffusion: every press and gap at least the minimum, as many
 //! as the share allows, debt paid back at once) or at a FIXED PWM period.
 //!
+//! A cell can also give a HAPTIC as the point crosses its border, played on the
+//! pad under the input: that trackpad, or that side's grip motor for a stick. Pads
+//! without those actuators get a short rumble (`automap::FEEDBACK_PAIRS`).
+//!
 //! [`AreaLayout`]: flexinput_core::area::AreaLayout
 //! [`CellWeight::governor`]: flexinput_core::area::CellWeight
 
@@ -70,7 +74,11 @@ pub const AREA_LAYER_KEYS: &[&str] = &[
     AREA_LAYER_COLOR_PARAM, AREA_LAYER_ANALOG_PARAM, AREA_LAYER_MS_PARAM,
     AREA_LAYER_MIX_PARAM, AREA_LAYER_PULSE_PARAM, AREA_LAYER_HOLD_PARAM,
     AREA_LAYER_RAMP_PARAM, AREA_LAYER_FULL_PARAM, AREA_LAYER_MID_PARAM,
+    AREA_CELL_HAPTICS_PARAM,
 ];
+/// The loaded layer's cells that give a haptic as their border is crossed,
+/// `{ "<cell id>": strength 0..1 }`.
+pub const AREA_CELL_HAPTICS_PARAM: &str = "area_cell_haptics";
 /// One press mode for every card (`area_press_*` then rule them all).
 pub const AREA_PRESS_LOCK_PARAM: &str = "area_press_lock";
 pub const AREA_PRESS_MODE_PARAM: &str = "area_press_mode";
@@ -112,6 +120,8 @@ pub fn area_layout_of(params: &HashMap<String, Value>) -> AreaLayout {
 pub struct AreaLayerSpec {
     pub layout: AreaLayout,
     pub touch_cells: HashSet<u32>,
+    /// Cell id → its border-cross haptic's strength.
+    pub haptics: HashMap<u32, f32>,
     pub analog: bool,
     pub analog_ms: f32,
     /// Mix by direction (else per key).
@@ -130,6 +140,11 @@ impl AreaLayerSpec {
                 .unwrap_or_else(|| AreaLayout::default_for(Shape::Circle)),
             touch_cells: get(AREA_TOUCH_CELLS_PARAM).and_then(|v| v.as_array().cloned())
                 .map(|a| a.iter().filter_map(|v| v.as_u64().map(|i| i as u32)).collect())
+                .unwrap_or_default(),
+            haptics: get(AREA_CELL_HAPTICS_PARAM).and_then(|v| v.as_object().cloned())
+                .map(|m| m.iter().filter_map(|(k, v)| {
+                    Some((k.parse().ok()?, v.as_f64()? as f32))
+                }).collect())
                 .unwrap_or_default(),
             analog: get(AREA_LAYER_ANALOG_PARAM).and_then(|v| v.as_bool()).unwrap_or(false),
             analog_ms: get(AREA_LAYER_MS_PARAM).and_then(|v| v.as_f64()).map(|v| v as f32)
@@ -167,6 +182,73 @@ pub fn area_layers_of(params: &HashMap<String, Value>) -> Vec<AreaLayerSpec> {
 /// stick's capacitive `_touch` (a pin no backend publishes yet).
 pub fn area_touch_pin(input: &str) -> String {
     if input.starts_with("touch") { format!("{input}_active") } else { format!("{input}_touch") }
+}
+
+/// How long the point has to stay in a new cell for that to count as crossing into
+/// it: long enough that a finger at rest on a border doesn't buzz, with touch
+/// reports some 4 to 9 ms apart.
+const HAPTIC_SETTLE_SECS: f32 = 0.012;
+/// How long a haptic's pin stays up: enough for a rumble motor to answer.
+const HAPTIC_PULSE_SECS: f32 = 0.04;
+/// State per layer for [`area_border_crossed`].
+const HAPTIC_LAYER_SLOTS: usize = 3;
+
+/// The pin a haptic plays on for this input.
+fn area_haptic_pin(input: &str) -> &'static str {
+    match input {
+        "touch1" => "tp_l_click",
+        "touch2" => "tp_r_click",
+        "right_stick" => "grip_r_click",
+        _ => "grip_l_click",
+    }
+}
+
+/// Which of the pads behind the node a crossing belongs to: behind a Combiner
+/// there can be several, and `_automap_device_id` only names the first. The one
+/// with a finger on that touchpad, or the one pushing that stick furthest.
+fn area_haptic_pad(devs: &[&str], input: &str, dev_sigs: &BusMap) -> Option<usize> {
+    if input.starts_with("touch") {
+        let active = area_touch_pin(input);
+        return devs.iter().position(|d| dev_sigs.get_pin(d, &active).is_some_and(|s| s.as_bool()));
+    }
+    let (x, y) = (format!("{input}_x"), format!("{input}_y"));
+    let push = |d: &str| {
+        let axis = |pin: &str| dev_sigs.get_pin(&d, &pin).map_or(0.0, |s| s.as_float());
+        axis(&x).hypot(axis(&y))
+    };
+    (0..devs.len()).max_by(|a, b| push(devs[*a]).total_cmp(&push(devs[*b])))
+}
+
+/// Follow one layer's hard cell: `Some((from, to))` the tick the point has settled
+/// into a new cell. A finger landing or lifting crosses nothing. `st` is `[settled
+/// cell + 1, candidate + 1, how long]`, zeroed to start.
+pub(crate) fn area_border_crossed(hard: Option<u32>, st: &mut [f32], dt: f32) -> Option<(u32, u32)> {
+    let Some(cell) = hard else {
+        st.fill(0.0);
+        return None;
+    };
+    let now = cell as f32 + 1.0;
+    if st[0] == 0.0 {
+        st[0] = now;
+    }
+    if st[0] == now {
+        st[1] = 0.0;
+        st[2] = 0.0;
+        return None;
+    }
+    if st[1] != now {
+        st[1] = now;
+        st[2] = 0.0;
+    }
+    st[2] += dt;
+    if st[2] < HAPTIC_SETTLE_SECS {
+        return None;
+    }
+    let from = st[0] as u32 - 1;
+    st[0] = now;
+    st[1] = 0.0;
+    st[2] = 0.0;
+    Some((from, cell))
 }
 
 /// A gradient's crossfade through its curve (linear without one).
@@ -530,6 +612,41 @@ pub(crate) fn eval_area_mapper_node(
             }
         }
         live.push(LayerLive { weights, hard, digital });
+    }
+
+    // ── Border-cross haptics. State after the layers': each layer's crossing,
+    // then the pulse going out `[time left, strength, pad]`. A crossing takes the
+    // strength of the cell it enters, else of the one it leaves. The pad is fixed
+    // as it starts: it stops being "the one touched" if the finger lifts mid-pulse.
+    {
+        let need = base + layers.len() * HAPTIC_LAYER_SLOTS + 3;
+        let pads: Vec<&str> = snap.params.get("_upstream_device_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        if ns.aux_f32.len() < need {
+            ns.aux_f32.resize(need, 0.0);
+        }
+        let (crossings, pulse) = ns.aux_f32[base..need].split_at_mut(layers.len() * HAPTIC_LAYER_SLOTS);
+        for ((spec, lay), st) in layers.iter().zip(&live).zip(crossings.chunks_mut(HAPTIC_LAYER_SLOTS)) {
+            if let Some((from, to)) = area_border_crossed(lay.hard, st, dt) {
+                if let Some(s) = spec.haptics.get(&to).or_else(|| spec.haptics.get(&from)) {
+                    pulse[0] = HAPTIC_PULSE_SECS;
+                    pulse[1] = s.clamp(0.0, 1.0);
+                    pulse[2] = area_haptic_pad(&pads, input, dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
+                }
+            }
+        }
+        if pulse[0] > 0.0 {
+            pulse[0] -= dt;
+            let pad = (pulse[2] as usize).checked_sub(1).and_then(|i| pads.get(i).copied())
+                .unwrap_or(dev_id.as_str());
+            if !pad.is_empty() {
+                let target = format!("{FEEDBACK_INJECT}{pad}");
+                let sig = Signal::Float(pulse[1]);
+                collector_sigs.merge_pin(&target, area_haptic_pin(input), sig, |cur| *cur = combine_signals(*cur, sig));
+            }
+        }
     }
 
     // One press mode for all cards, when locked.

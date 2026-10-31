@@ -753,7 +753,7 @@ mod migration_tests {
         for (pin, want) in node.inputs[1..].iter().zip(FEEDBACK_INLET_PINS) {
             assert_eq!(pin.name, want.display_name);
         }
-        assert_eq!(node.inputs.last().unwrap().name, "Trackpad R: Click");
+        assert_eq!(node.inputs.last().unwrap().name, "Grip R: Click");
     }
 
     /// A saved node gains the inputs its pad has since, after the ones it has, and

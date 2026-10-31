@@ -31,6 +31,11 @@ const SEMANTIC_GROUPS: &[&[&str]] = &[
 /// To drive HD haptics, the user explicitly wires `ds_l_amp` + `ds_l_freq`
 /// (and the R pair) in their patch — same shape as Switch Pro's HD rumble.
 pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
+    // One-shot clicks, on a pad without those actuators: a short rumble.
+    ("tp_l_click",   &["rumble_weak", "hd_l_amp"]),
+    ("tp_r_click",   &["rumble_weak", "hd_r_amp"]),
+    ("grip_l_click", &["rumble_weak", "hd_l_amp"]),
+    ("grip_r_click", &["rumble_weak", "hd_r_amp"]),
     ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
     ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),
     // HD-rumble first carrier, as a virtual DualSense with USB audio measures it
@@ -119,6 +124,7 @@ pub fn feedback_group(pin: &str) -> Option<FeedbackGroup> {
         p if p.starts_with("trigger_r_") => TriggerRight,
         p if p.starts_with("hd_") || p.starts_with("hd2_") || p.starts_with("ds_") => Rumble,
         p if p.starts_with("tp_") => Trackpad,
+        "grip_l_click" | "grip_r_click" => Rumble,
         _ => return None,
     })
 }
@@ -336,6 +342,8 @@ pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "tp_r_freq",  display_name: "Trackpad R: Frequency", signal_type: SignalType::Float },
     AutoMapPin { id: "tp_l_click", display_name: "Trackpad L: Click",     signal_type: SignalType::Bool },
     AutoMapPin { id: "tp_r_click", display_name: "Trackpad R: Click",     signal_type: SignalType::Bool },
+    AutoMapPin { id: "grip_l_click", display_name: "Grip L: Click",       signal_type: SignalType::Bool },
+    AutoMapPin { id: "grip_r_click", display_name: "Grip R: Click",       signal_type: SignalType::Bool },
 ];
 
 /// Basic feedback OUTPUT taps the game is requesting on the virtual destination

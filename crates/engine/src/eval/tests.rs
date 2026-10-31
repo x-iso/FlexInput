@@ -6504,6 +6504,108 @@ mod area_mapper_tests {
     use flexinput_core::area::{AreaLayout, BorderRef, DigitalMode, Gradient, Phase};
     use serde_json::json;
 
+    #[test]
+    fn a_border_counts_as_crossed_once_the_point_has_settled_past_it() {
+        let mut st = [0.0; 3];
+        let dt = 0.004;
+        assert_eq!(area_border_crossed(Some(1), &mut st, dt), None, "landing isn't crossing");
+        assert_eq!(area_border_crossed(Some(1), &mut st, dt), None);
+        for _ in 0..2 {
+            assert_eq!(area_border_crossed(Some(2), &mut st, dt), None, "not settled yet");
+        }
+        assert_eq!(area_border_crossed(Some(2), &mut st, dt), Some((1, 2)));
+        assert_eq!(area_border_crossed(Some(2), &mut st, dt), None, "once");
+        // Jitter on the border never settles.
+        for _ in 0..10 {
+            assert_eq!(area_border_crossed(Some(3), &mut st, dt), None);
+            assert_eq!(area_border_crossed(Some(2), &mut st, dt), None);
+        }
+        // Lifting forgets the cell, so landing elsewhere crosses nothing.
+        assert_eq!(area_border_crossed(None, &mut st, dt), None);
+        for _ in 0..5 {
+            assert_eq!(area_border_crossed(Some(7), &mut st, dt), None);
+        }
+    }
+
+    /// Behind a Combiner, a touchpad's crossing reaches the pad being touched, and
+    /// stays there through a lift mid-pulse; the bus comes from the Combiner's key.
+    #[test]
+    fn a_haptic_behind_a_combiner_goes_to_the_pad_touched() {
+        const OTHER: &str = "sdl:xinput:1";
+        const STEAM: &str = "sdl:generic:steam";
+        let layout = AreaLayout::circle_ways(8);
+        let unit = |deg: f32| (dir(deg, 0.9).x, -dir(deg, 0.9).y);
+        let to = layout.locate_id(dir(90.0, 0.9).x, dir(90.0, 0.9).y);
+        let mut n = mapper(json!([]));
+        n.params.insert("_automap_device_id".into(), json!(OTHER));
+        n.params.insert("_automap_collector_id".into(), json!("combiner:9"));
+        n.params.insert("_upstream_device_ids".into(), json!([OTHER, STEAM]));
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch2"));
+        n.params.insert(AREA_CELL_HAPTICS_PARAM.into(), json!({ to.to_string(): 1.0 }));
+
+        let mut state = HashMap::new();
+        let mut hits = Vec::new();
+        let frames = [(Some(0.0), 30), (Some(90.0), 25), (None, 60)];
+        for (deg, ticks) in frames {
+            for _ in 0..ticks {
+                let mut dev = BusMap::default();
+                dev.insert((OTHER.to_string(), "touch2_active".to_string()), Signal::Bool(false));
+                dev.insert((STEAM.to_string(), "touch2_active".to_string()), Signal::Bool(deg.is_some()));
+                let mut c = BusMap::default();
+                c.set_pin(&"combiner:9", &"touch2_active", Signal::Bool(deg.is_some()));
+                if let Some(d) = deg {
+                    let (x, y) = unit(d);
+                    c.set_pin(&"combiner:9", &"touch2_x", Signal::Float(x));
+                    c.set_pin(&"combiner:9", &"touch2_y", Signal::Float(y));
+                }
+                eval_area_mapper_node(&n, 5, &dev, &mut c, &mut state, DT);
+                for pad in [OTHER, STEAM] {
+                    if c.get_pin(&format!("{FEEDBACK_INJECT}{pad}"), &"tp_r_click").is_some() {
+                        hits.push(pad);
+                    }
+                }
+            }
+        }
+        assert!((35..=45).contains(&hits.len()), "one pulse, {} ticks", hits.len());
+        assert!(hits.iter().all(|p| *p == STEAM), "{hits:?}");
+    }
+
+    /// Crossing into a cell with a haptic pulses the pad's pin at its strength, for
+    /// the pulse's length; a crossing between cells without one stays quiet.
+    #[test]
+    fn crossing_into_a_haptic_cell_pulses_the_pad() {
+        let layout = AreaLayout::circle_ways(8);
+        let (a, b, c) = (
+            layout.locate_id(dir(0.0, 0.9).x, dir(0.0, 0.9).y),
+            layout.locate_id(dir(45.0, 0.9).x, dir(45.0, 0.9).y),
+            layout.locate_id(dir(90.0, 0.9).x, dir(90.0, 0.9).y),
+        );
+        let mut n = mapper(json!([]));
+        n.params.insert(AREA_CELL_HAPTICS_PARAM.into(), json!({ c.to_string(): 0.5 }));
+        let key = (format!("{FEEDBACK_INJECT}{PAD}"), "grip_l_click".to_string());
+        let mut state = HashMap::new();
+        let settle = 20; // ticks at DT, past the settling time
+        let tick = |v: Vec2, state: &mut _| run(&n, &stick(v), state).0;
+        let mut quiet = |v: Vec2, state: &mut _, what: &str| {
+            for _ in 0..settle {
+                assert!(!tick(v, state).contains_key(&key), "{what}");
+            }
+        };
+        quiet(dir(0.0, 0.9), &mut state, "at rest in the first cell");
+        assert_ne!(a, b);
+        quiet(dir(45.0, 0.9), &mut state, "neither cell has one");
+        let mut pulsed = 0;
+        let mut level = 0.0;
+        for _ in 0..200 {
+            if let Some(s) = tick(dir(90.0, 0.9), &mut state).get(&key) {
+                pulsed += 1;
+                level = s.as_float();
+            }
+        }
+        assert_eq!(level, 0.5);
+        assert!((35..=45).contains(&pulsed), "about the pulse's length: {pulsed} ticks");
+    }
+
     const PAD: &str = "sdl:dualsense:0";
     const VIRT: &str = "virtual.xinput:0";
     const DT: f32 = 0.001;

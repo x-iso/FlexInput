@@ -78,6 +78,8 @@ fn steam_controller_extra_inputs() -> Vec<DevicePin> {
         fl("tp_r_freq",  "Right Trackpad: Frequency (0=80Hz 1=500Hz)"),
         bo("tp_l_click", "Left Trackpad: Click"),
         bo("tp_r_click", "Right Trackpad: Click"),
+        bo("grip_l_click", "Left Grip: Click"),
+        bo("grip_r_click", "Right Grip: Click"),
     ]
 }
 
