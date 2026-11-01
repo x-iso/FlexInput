@@ -2396,9 +2396,9 @@ impl crate::app::FlexInputApp {
     /// hold for Settings).
     ///
     /// Strictly contextual: only while a widget is ENTERED (edit level
-    /// `Editing`, a Remapper's `RemapScroll` / `RemapCard`, or any card picked
-    /// up to move — `RemapMove`), and only for the widgets listed here. Anywhere else the app's shortcuts keep working
-    /// exactly as before. To give another widget Select or Start, add it here
+    /// `Editing`, a card list's `RemapScroll` / `TzCards` / `RemapCard`, or a
+    /// card picked up to move — `RemapMove`), and only for the widgets listed
+    /// here. Anywhere else the app's shortcuts keep working exactly as before. To give another widget Select or Start, add it here
     /// and handle the button in that widget's driver.
     pub(crate) fn nav_claimed_buttons(&self) -> &'static [&'static str] {
         use crate::gamepad_nav::EditLevel;
@@ -2407,10 +2407,16 @@ impl crate::app::FlexInputApp {
             // Select splits / joins a pair setting's faders in the Tune pane,
             // and steps a setting's value through its words in the text pane.
             EditLevel::Editing if self.nav_is_jsm_editor(outer) => &["btn_back"],
-            // Select opens the picker on the focused card's input, Start on its
-            // output (the draft's, from the action row).
-            EditLevel::RemapScroll | EditLevel::RemapCard if self.nav_selected_is_remapper(outer) => {
-                &["btn_back", "btn_start"]
+            // A card list: Select opens the picker on the focused card's input,
+            // Start on its output (the draft's, from the action row) — each only
+            // where its cards have that side (`nav_card_picker_sides`).
+            EditLevel::RemapScroll | EditLevel::RemapCard | EditLevel::TzCards => {
+                match self.nav_card_picker_sides(outer) {
+                    (true, true) => &["btn_back", "btn_start"],
+                    (true, false) => &["btn_back"],
+                    (false, true) => &["btn_start"],
+                    (false, false) => &[],
+                }
             }
             // Nothing else acts while a card is picked up to move (any card list).
             EditLevel::RemapMove => &["btn_back", "btn_start"],

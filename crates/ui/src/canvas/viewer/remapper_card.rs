@@ -26,13 +26,40 @@ pub(crate) struct MappingCardResult {
     pub(crate) row_clicked: Option<crate::kbm_picker::PickStage>,
 }
 
-/// A card whose in / out rows can be edited in place (the Remapper's): a click
-/// on a row opens the Choose picker on that side, so the body is no longer free
-/// to grab, and the reorder drag moves to a grip on the card's right edge.
+/// A card whose rows can be edited in place: a click on a row opens the Choose
+/// picker on the side of the mapping it shows, so the body is no longer free to
+/// grab, and the reorder drag moves to a grip on the card's right edge. Every
+/// card list has one; a row whose side can't be picked (a zone's trigger) just
+/// isn't a button.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RowEdit {
+    /// The side a click on the first row asks the picker for: the card's input
+    /// — or, on a Lean card, whose one row is its outputs, its output.
+    pub(crate) in_row: Option<crate::kbm_picker::PickStage>,
+    /// The side a click on the out row asks for.
+    pub(crate) out_row: Option<crate::kbm_picker::PickStage>,
     /// The side an open picker is editing on this very card, ringed on its row.
     pub(crate) active: Option<crate::kbm_picker::PickStage>,
+}
+
+impl RowEdit {
+    /// A Remapper card: input and output both.
+    pub(crate) fn in_and_out(active: Option<crate::kbm_picker::PickStage>) -> Self {
+        use crate::kbm_picker::PickStage;
+        RowEdit { in_row: Some(PickStage::Input), out_row: Some(PickStage::Output), active }
+    }
+
+    /// A card with one row, showing side `stage`: a Map Action's input, or a
+    /// Lean card's outputs.
+    pub(crate) fn one_row(stage: crate::kbm_picker::PickStage, active: Option<crate::kbm_picker::PickStage>) -> Self {
+        RowEdit { in_row: Some(stage), out_row: None, active }
+    }
+
+    /// A zone's card (Touch Zones, Virtual Menu, Area Mapper): the output only —
+    /// its trigger is the zone.
+    pub(crate) fn out_only(active: Option<crate::kbm_picker::PickStage>) -> Self {
+        RowEdit { in_row: None, out_row: Some(crate::kbm_picker::PickStage::Output), active }
+    }
 }
 
 /// Width of a [`RowEdit`] card's reorder grip, in design px.
@@ -652,16 +679,20 @@ pub(crate) fn remapper_mapping_card_pixel(
                 Some(_) => card_origin.y + 66.0 * s + (in_rows as f32 - 1.0) * row_pitch_y,
                 None => card_rect.bottom(),
             };
-            let mut bands = vec![(PickStage::Input, egui::Rect::from_min_max(
-                egui::pos2(card_rect.left(), body_top), egui::pos2(rows_right, split)))];
-            if out_pins.is_some() {
-                bands.push((PickStage::Output, egui::Rect::from_min_max(
+            // Each row that shows a pickable side, and the side it asks for.
+            let mut bands = Vec::new();
+            if let Some(stage) = edit.in_row {
+                bands.push(("row_in", stage, egui::Rect::from_min_max(
+                    egui::pos2(card_rect.left(), body_top), egui::pos2(rows_right, split))));
+            }
+            if let (Some(_), Some(stage)) = (out_pins, edit.out_row) {
+                bands.push(("row_out", stage, egui::Rect::from_min_max(
                     egui::pos2(card_rect.left(), split), egui::pos2(rows_right, card_rect.bottom()))));
             }
-            for (stage, band) in bands {
-                let (tag, tip) = match stage {
-                    PickStage::Input => ("row_in", "Click to change the input"),
-                    PickStage::Output => ("row_out", "Click to change the output"),
+            for (tag, stage, band) in bands {
+                let tip = match stage {
+                    PickStage::Input => "Click to change the input",
+                    PickStage::Output => "Click to change the output",
                 };
                 let resp = ui.interact(band, ui.id().with((tag, mapping_idx)), egui::Sense::click())
                     .on_hover_text(tip);
@@ -1010,7 +1041,7 @@ mod row_edit_tests {
 
     #[test]
     fn a_click_on_a_row_asks_for_that_side() {
-        let edit = Some(RowEdit::default());
+        let edit = Some(RowEdit::in_and_out(None));
         let r = card_rect(edit);
         // Mid-row, clear of the in / out pills and the chips.
         let in_row = r.min + egui::vec2(200.0, 50.0);
@@ -1023,7 +1054,7 @@ mod row_edit_tests {
 
     #[test]
     fn the_grip_is_the_drag_handle_and_not_a_row() {
-        let edit = Some(RowEdit::default());
+        let edit = Some(RowEdit::in_and_out(None));
         let r = card_rect(edit);
         let grip = egui::pos2(r.right() - GRIP_DESIGN_W * 0.5, r.center().y + 10.0);
         let res = render(&click_at(grip), edit);
@@ -1031,6 +1062,26 @@ mod row_edit_tests {
         let handle = res.drag_handle.expect("reorder is on");
         assert!(handle.rect.contains(grip));
         assert!(handle.rect.width() <= GRIP_DESIGN_W + 0.5, "only the grip drags: {:?}", handle.rect);
+    }
+
+    #[test]
+    fn a_zone_card_offers_its_output_only() {
+        let edit = Some(RowEdit::out_only(None));
+        let r = card_rect(edit);
+        assert_eq!(render(&click_at(r.min + egui::vec2(200.0, 50.0)), edit).row_clicked, None,
+            "a zone's trigger isn't picked");
+        assert_eq!(render(&click_at(r.min + egui::vec2(200.0, 82.0)), edit).row_clicked, Some(PickStage::Output));
+        // It still reorders by the grip, not the body.
+        let res = render(&click_at(r.min + egui::vec2(200.0, 50.0)), edit);
+        assert!(res.drag_handle.expect("reorder is on").rect.width() <= GRIP_DESIGN_W + 0.5);
+    }
+
+    #[test]
+    fn a_one_row_card_asks_for_the_side_its_row_shows() {
+        // A Lean card's one row is its outputs.
+        let edit = Some(RowEdit::one_row(PickStage::Output, None));
+        let r = card_rect(edit);
+        assert_eq!(render(&click_at(r.min + egui::vec2(200.0, 50.0)), edit).row_clicked, Some(PickStage::Output));
     }
 
     #[test]

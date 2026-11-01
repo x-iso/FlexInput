@@ -776,10 +776,8 @@ pub(crate) fn show_remapper_body(
                                 // The in / out rows open the picker on that
                                 // side of this card; the row it is changing
                                 // now is ringed.
-                                let row_edit = RowEdit {
-                                    active: picker_card_edit_side(
-                                        ui.ctx(), &picker_path, node_id, "mappings", i),
-                                };
+                                let row_edit = RowEdit::in_and_out(picker_card_edit_side(
+                                    ui.ctx(), &picker_path, node_id, "mappings", i));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin, out_skin,
@@ -1263,6 +1261,8 @@ pub(crate) fn show_map_action_body(
             let mut rv = ReorderView::begin(
                 ui, egui::Id::new(("fxi_mapact_reorder", node_id.0)), reorder_enabled,
             );
+            // Where this node sits, for the card-edit picker to address it.
+            let picker_path = crate::canvas::viewer::subpatch_path(automap_parent);
             let mut slot = 0usize;
             for (i, m) in mappings.iter().enumerate() {
                 // Legacy Array<String> → upgrade to Object{ in, … } once edited.
@@ -1301,15 +1301,23 @@ pub(crate) fn show_map_action_body(
                                 // Analog press mode only with an analog input.
                                 let card_analog = in_pins.iter()
                                     .any(|p| flexinput_engine::pin_is_analog_input(p));
+                                // Its one row is its input: a click opens the
+                                // picker on it.
+                                let row_edit = RowEdit::one_row(crate::kbm_picker::PickStage::Input,
+                                    picker_card_edit_side(ui.ctx(), &picker_path, node_id, "mappings", i));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin, skin,
                                     card_analog, false, reorder_enabled, drag_off, "mappings", false,
                                     None, // Map Action rows aren't bus writers (out_pins None)
-                                    None,
+                                    Some(row_edit),
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
+                                if result.row_clicked.is_some() {
+                                    request_special_picker(ui.ctx(),
+                                        SpecialPickerRequest::map_action_card(node_id, picker_path.clone(), i));
+                                }
                                 // A MIDI chip: its channel, in the MIDI editor.
                                 if let Some((side_out, pin_idx)) = result.midi_chip_clicked {
                                     request_midi_modal(ui.ctx(), MidiModalRequest {

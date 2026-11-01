@@ -3234,13 +3234,22 @@ pub(crate) fn render_touch_zone_cards(
             egui::vec2(TZ_CARD_W, 1.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                // The out row opens the picker on the card's outputs; its
+                // trigger (the in row) is the zone's, not a pick.
+                let picker_path = subpatch_path(automap_parent);
+                let row_edit = RowEdit::out_only(
+                    picker_card_edit_side(ui.ctx(), &picker_path, node_id, "zone_maps", i));
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin, skin,
                     true, false, reorder_enabled, drag_off, "zone_maps", card_analog,
-                    card_conf.as_ref(), None,
+                    card_conf.as_ref(), Some(row_edit),
                 );
                 if result.delete_clicked { remove = Some(i); }
+                if result.row_clicked.is_some() {
+                    request_special_picker(ui.ctx(),
+                        SpecialPickerRequest::zone_card(node_id, picker_path, i, menu_excl.clone()));
+                }
                 if let Some((side_out, pin_idx)) = result.midi_chip_clicked {
                     request_midi_modal(ui.ctx(), MidiModalRequest {
                         inner: node_id,

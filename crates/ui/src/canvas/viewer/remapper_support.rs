@@ -917,16 +917,18 @@ pub(crate) fn clear_draft_timing(node: &mut NodeData, draft_key: &str) {
     node.params.remove(&dk);
 }
 
-/// Leave a Remapper card whose `in` / `out` were just changed in place (the
-/// Choose picker editing an existing card) the way Add leaves a new one:
+/// Leave a card whose `in` / `out` were just changed in place (the Choose
+/// picker editing an existing card) the way Add leaves a new one:
 ///   • an output gap with no pick after it — a "+ Gap" still waiting — goes,
 ///     and the timing arrays go too once nothing timed is left;
+/// and, with `input_rules` (a Remapper's or Map Action's card, whose input is
+/// a device's — not a lean's or a zone's, which are analog by nature):
 ///   • a touchpad swipe output drives in the Analog press mode (Add's rule);
 ///   • Analog stays only with an analog input to take a magnitude from, else
 ///     the card goes back to Normal (the patch-load migration's rule).
 /// Run once when the edit ends, not on every pick: emptying an input to
 /// re-pick it mustn't cost the card its Analog mode on the way. Idempotent.
-pub(crate) fn tidy_edited_card(card: &mut serde_json::Map<String, Value>) {
+pub(crate) fn tidy_edited_card(card: &mut serde_json::Map<String, Value>, input_rules: bool) {
     use flexinput_engine::eval::{OUT_DUR_KEY, OUT_GAP_KEY};
     let outs: Vec<String> = card.get("out").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -942,6 +944,9 @@ pub(crate) fn tidy_edited_card(card: &mut serde_json::Map<String, Value>) {
     } else {
         card.remove(OUT_GAP_KEY);
         card.remove(OUT_DUR_KEY);
+    }
+    if !input_rules {
+        return;
     }
     if outs.iter().any(|p| remapper_out_is_swipe(p)) {
         card.insert("mode".to_string(), Value::String("analog".to_string()));
@@ -1167,8 +1172,19 @@ mod tidy_edited_card_tests {
 
     fn tidy(card: Value) -> Value {
         let mut m = card.as_object().cloned().unwrap();
-        tidy_edited_card(&mut m);
+        tidy_edited_card(&mut m, true);
         Value::Object(m)
+    }
+
+    #[test]
+    fn a_zone_or_lean_card_keeps_its_mode_whatever_its_trigger() {
+        // A zone's trigger is no analog pin, yet its Analog mode is its own.
+        let mut m = json!({ "in": ["tz_touch"], "out": ["right_stick_x"], "mode": "analog",
+                            "out_gap": [0.0, 30.0] }).as_object().cloned().unwrap();
+        tidy_edited_card(&mut m, false);
+        assert_eq!(m["mode"], json!("analog"));
+        // Its waiting gap still goes.
+        assert!(m.get("out_gap").is_none());
     }
 
     #[test]
