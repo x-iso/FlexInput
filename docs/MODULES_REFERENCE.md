@@ -1096,6 +1096,11 @@ pub struct ModuleDescriptor {
   (`RemapScroll` / `RemapCard`) Select opens the input side and Start the output side —
   of the focused card, or of the draft from the action row; the Remapper claims both
   from their app-wide shortcuts (`nav_claimed_buttons`) only there.
+- **Reordering with a pad:** hold South on a focused card (`CARD_MOVE_HOLD_MS`, 400 ms)
+  to pick it up (`RemapMove`); up / down move it one place at a time, South puts it
+  down and enters it, East puts it down. A quick press still enters the card, now on
+  release. One undo step per move; refused while a filter narrows the list, as the
+  mouse's drag is. Map Action and Lean card lists reorder the same way.
 - **Presets:** the 💾 / 📂 icons in the body's top-right corner save the cards to a
   `.fxremap` file and load one, replacing them (see PATCH_FORMATS.md).
 

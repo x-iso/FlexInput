@@ -314,8 +314,17 @@ impl FlexInputApp {
                     v.insert(2, (vec!["btn_back"], input));
                     v.insert(3, (vec!["btn_start"], output));
                 }
+                // On a card, holding South picks it up to move.
+                if self.nav_remap_scroll_on_card() {
+                    v.insert(2, (vec!["btn_south"], "Hold: Move card"));
+                }
                 v
             }
+            EditLevel::RemapMove => vec![
+                (hint_vert(), "Move card"),
+                (vec!["btn_south"], "Edit card"),
+                (vec!["btn_east"], "Done"),
+            ],
             EditLevel::RemapCard => {
                 let mut v = vec![
                     (hint_horiz(), "Field"),

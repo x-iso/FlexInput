@@ -15,6 +15,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   With a pad, inside the Remapper widget, Select opens a card's input and Start its
   output (from the action row, the new card being drafted). Cards now move by a grip
   on their right edge.
+- **Reorder mapping cards with a pad.** Hold South on a Remapper, Map Action or Lean
+  card to pick it up, then move it with up and down. East puts it down; South puts it
+  down and opens it for editing. A quick press of South still opens the card.
 - **Steam Controller (2026) haptics.** The pad's node now has inputs for all four
   actuators: each grip motor, with two carriers like a DualSense's haptics, so an
   Audio Stream Haptics patch drives it unchanged, and each trackpad, with an

@@ -137,6 +137,62 @@ pub fn shortcut_press_mode_glyph(mode: &str) -> &'static str {
         .unwrap_or("↓")
 }
 
+/// How long South is held on a mapping card in `RemapScroll` to pick it up
+/// and move it (`EditLevel::RemapMove`) rather than enter it, ms.
+pub const CARD_MOVE_HOLD_MS: u128 = 400;
+
+/// A South press on a focused mapping card, watched for a tap or a hold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardSouthHold {
+    /// The card it went down on.
+    pub card: usize,
+    /// When it went down.
+    pub since: Instant,
+    /// The last frame it was watched. A hold counts only while watched without
+    /// a break, so one begun before the widget was left can't fire on return.
+    pub seen: Instant,
+}
+
+/// What South does to the focused card this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardSouth {
+    /// Nothing yet (or nothing at all).
+    Wait,
+    /// Let go before the hold time: enter the card.
+    Enter,
+    /// Held the hold time: pick the card up to move it.
+    PickUp,
+}
+
+/// Decide South on focused card `card` this frame: let go before
+/// [`CARD_MOVE_HOLD_MS`] it enters the card, held that long it picks the card
+/// up — where cards can move (`can_move`); where they can't, a hold is just a
+/// slow tap. `released` is South's falling edge this frame. Returns what to do
+/// and the press to keep watching.
+pub fn card_south_step(
+    hold: Option<CardSouthHold>,
+    card: usize,
+    rising: bool,
+    held: bool,
+    released: bool,
+    can_move: bool,
+    now: Instant,
+) -> (CardSouth, Option<CardSouthHold>) {
+    let hold = if rising { Some(CardSouthHold { card, since: now, seen: now }) } else { hold };
+    // Only on the card it began on (focus moving away drops it), and only
+    // watched without a break.
+    let Some(h) = hold.filter(|h| h.card == card && now.saturating_duration_since(h.seen).as_millis() < 250) else {
+        return (CardSouth::Wait, None);
+    };
+    if held {
+        if can_move && now.saturating_duration_since(h.since).as_millis() >= CARD_MOVE_HOLD_MS {
+            return (CardSouth::PickUp, None);
+        }
+        return (CardSouth::Wait, Some(CardSouthHold { seen: now, ..h }));
+    }
+    (if released { CardSouth::Enter } else { CardSouth::Wait }, None)
+}
+
 /// Selection model levels.
 /// - `Widget`: moving the selection between sub-patch widgets.
 /// - `Editing`: editing a scalar/dropdown widget's value.
@@ -159,6 +215,11 @@ pub enum EditLevel {
     /// fields (press-mode / time-gap / hold / turbo, skipping grayed-out),
     /// up/down (or South) edit the focused field, East exits to `RemapScroll`.
     RemapCard,
+    /// A mapping card picked up to reorder it (hold South on it in
+    /// `RemapScroll`): up/down move it through the list, South puts it down
+    /// and enters it (`RemapCard`), East puts it down (`RemapScroll`). The card
+    /// is `remap_card`; the move is one undo step.
+    RemapMove,
     /// Inside a Touch Zones pad (the pinned "field" element): left/right cycles
     /// the selected COLUMN divider, up/down the ROW divider; South grabs the
     /// focused line (→ `TzGrab`), North recenters it, West removes it (mapping
@@ -419,8 +480,15 @@ pub struct GamepadNav {
     /// the mapping cards. Up/down moves it; South activates / enters.
     pub card_index: usize,
     /// True mapping-card index of the ENTERED card (`RemapCard`), resolved from
-    /// the cursor at entry (cursor minus the action-button count).
+    /// the cursor at entry (cursor minus the action-button count) — or of the
+    /// card being moved (`RemapMove`), following it as it moves.
     pub remap_card: usize,
+    /// South went down on a focused card in `RemapScroll` and is being watched
+    /// for a tap (enter the card) or a hold (pick it up): [`card_south_step`].
+    pub card_south_hold: Option<CardSouthHold>,
+    /// The active tab and its canvas as they were when a card was picked up,
+    /// committed as one undo entry when it's put down.
+    pub card_move_baseline: Option<(usize, Box<egui_snarl::Snarl<crate::canvas::NodeData>>)>,
     /// Focused header field inside an entered mapping card (`RemapCard`):
     /// 0=press-mode, 1=time-gap, 2=hold, 3=turbo. Left/right moves between the
     /// fields that apply for the current mode (grayed-out ones are skipped).
@@ -621,6 +689,8 @@ impl Default for GamepadNav {
             curve_bias: false,
             card_index: 0,
             remap_card: 0,
+            card_south_hold: None,
+            card_move_baseline: None,
             card_field: 0,
             card_return_level: EditLevel::RemapScroll,
             curve_return_level: EditLevel::Widget,
@@ -1309,4 +1379,79 @@ pub struct MidiModal {
     /// over the game (config overlay); a sub-patch editor's viewport = inside
     /// that editor window, where the click came from.
     pub viewport: Option<egui::ViewportId>,
+}
+
+#[cfg(test)]
+mod card_south_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const QUICK: Duration = Duration::from_millis(16);
+
+    /// Run South on card 0 frame by frame: `frames` of (held this frame).
+    /// Returns every frame's action.
+    fn press(frames: &[bool], can_move: bool) -> Vec<CardSouth> {
+        let t0 = Instant::now();
+        let mut hold = None;
+        let mut prev = false;
+        frames.iter().enumerate().map(|(i, &held)| {
+            let now = t0 + QUICK * i as u32;
+            let (act, keep) = card_south_step(hold, 0, held && !prev, held, prev && !held, can_move, now);
+            hold = keep;
+            prev = held;
+            act
+        }).collect()
+    }
+
+    /// How many ~16 ms frames make the hold time.
+    fn hold_frames() -> usize {
+        (CARD_MOVE_HOLD_MS as usize).div_ceil(16) + 1
+    }
+
+    #[test]
+    fn a_tap_enters_the_card_on_release() {
+        let acts = press(&[true, true, false], true);
+        assert_eq!(acts, [CardSouth::Wait, CardSouth::Wait, CardSouth::Enter]);
+    }
+
+    #[test]
+    fn a_hold_picks_the_card_up_once_and_its_release_does_nothing() {
+        let mut frames = vec![true; hold_frames()];
+        frames.push(false);
+        let acts = press(&frames, true);
+        assert_eq!(acts.iter().filter(|a| **a == CardSouth::PickUp).count(), 1);
+        assert_eq!(*acts.last().unwrap(), CardSouth::Wait, "letting go after the pick-up enters nothing");
+        assert!(!acts.contains(&CardSouth::Enter));
+    }
+
+    #[test]
+    fn where_cards_cant_move_a_hold_is_a_slow_tap() {
+        let mut frames = vec![true; hold_frames() * 2];
+        frames.push(false);
+        let acts = press(&frames, false);
+        assert!(!acts.contains(&CardSouth::PickUp));
+        assert_eq!(*acts.last().unwrap(), CardSouth::Enter);
+    }
+
+    #[test]
+    fn a_press_follows_its_card_only() {
+        let t0 = Instant::now();
+        let (_, hold) = card_south_step(None, 2, true, true, false, true, t0);
+        // Focus moved to card 3 while South is down: the press is dropped.
+        let (act, hold) = card_south_step(hold, 3, false, true, false, true, t0 + QUICK);
+        assert_eq!((act, hold), (CardSouth::Wait, None));
+    }
+
+    #[test]
+    fn a_press_left_over_from_before_cant_fire() {
+        // South went down on card 1, then the widget was left (nothing watched
+        // it); back on card 1 with South held again, long after.
+        let t0 = Instant::now();
+        let (_, stale) = card_south_step(None, 1, true, true, false, true, t0);
+        let later = t0 + Duration::from_secs(2);
+        let (act, keep) = card_south_step(stale, 1, false, true, false, true, later);
+        assert_eq!((act, keep), (CardSouth::Wait, None));
+        let (act, _) = card_south_step(stale, 1, false, false, true, true, later);
+        assert_eq!(act, CardSouth::Wait);
+    }
 }

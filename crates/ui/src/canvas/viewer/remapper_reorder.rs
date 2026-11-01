@@ -252,6 +252,18 @@ pub(crate) fn reorder_array(arr: &mut Vec<Value>, from: usize, to: usize) {
     arr.insert(insert_at, item);
 }
 
+/// Move the card at `from` one place up (`dir < 0`) or down, as the pad moves
+/// a picked-up card. Returns where it landed; `None` (nothing moved) past
+/// either end.
+pub(crate) fn step_card(arr: &mut [Value], from: usize, dir: i32) -> Option<usize> {
+    let to = if dir < 0 { from.checked_sub(1)? } else { from + 1 };
+    if from >= arr.len() || to >= arr.len() {
+        return None;
+    }
+    arr.swap(from, to);
+    Some(to)
+}
+
 #[cfg(test)]
 mod mapping_list_tests {
     use crate::canvas::viewer::*;
@@ -315,6 +327,28 @@ mod mapping_list_tests {
         let mut a = arr(&["A", "B", "C"]);
         reorder_array(&mut a, 0, 99);
         assert_eq!(ids(&a), vec!["B", "C", "A"]);
+    }
+
+    // ── step_card: the pad moving a picked-up card ─────────────────────────
+
+    #[test]
+    fn step_card_moves_one_place_and_says_where() {
+        let mut a = arr(&["A", "B", "C"]);
+        assert_eq!(step_card(&mut a, 0, 1), Some(1));
+        assert_eq!(ids(&a), vec!["B", "A", "C"]);
+        assert_eq!(step_card(&mut a, 1, 1), Some(2));
+        assert_eq!(ids(&a), vec!["B", "C", "A"]);
+        assert_eq!(step_card(&mut a, 2, -1), Some(1));
+        assert_eq!(ids(&a), vec!["B", "A", "C"]);
+    }
+
+    #[test]
+    fn step_card_stops_at_either_end() {
+        let mut a = arr(&["A", "B"]);
+        assert_eq!(step_card(&mut a, 0, -1), None);
+        assert_eq!(step_card(&mut a, 1, 1), None);
+        assert_eq!(step_card(&mut a, 5, -1), None);
+        assert_eq!(ids(&a), vec!["A", "B"]);
     }
 
     // ── input_group_of ────────────────────────────────────────────────────
