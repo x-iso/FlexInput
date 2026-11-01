@@ -175,7 +175,13 @@ impl FlexInputApp {
             Some(NavDir::Right) => self.gamepad_nav.kbm_picker_list = Some((f + 1).min(stops - 1)),
             Some(d @ (NavDir::Up | NavDir::Down)) if timed && !on_add_gap => {
                 let mut c = chord;
-                c.nudge(elems[f], if d == NavDir::Up { 1 } else { -1 }, fine);
+                let dir = if d == NavDir::Up { 1 } else { -1 };
+                // On a flick, Up / Down is the turn; with LT held, its time.
+                if nav.lt > 0.5 && matches!(elems[f], crate::kbm_picker::ChordElem::Item(i) if c.flick_at(i).is_some()) {
+                    c.nudge_flick_time(elems[f], dir, fine);
+                } else {
+                    c.nudge(elems[f], dir, fine);
+                }
                 self.picker_set_chord(&c);
             }
             Some(NavDir::Down) => back(self),
@@ -776,6 +782,51 @@ impl FlexInputApp {
                                     list_edit = Some(ChordEdit::SetGap(i, ms));
                                 }
                             }
+                            // A bound flick: its turn and its time, kept in its pin.
+                            ChordElem::Item(i) if list_timed && list_chord.flick_at(i).is_some() => {
+                                use flexinput_core::flick as fl;
+                                let p = list_chord.flick_at(i).unwrap_or(fl::FlickPin::new(fl::FlickVia::Mouse));
+                                ui.label(egui::RichText::new("Turn").small());
+                                if ui.small_button(format!("−{}", fl::COARSE_DEG))
+                                    .on_hover_text("To the next 45° to the left (Down on the pad).").clicked()
+                                {
+                                    list_edit = Some(ChordEdit::SetFlick(i, p.step_deg(-1, false)));
+                                }
+                                let mut deg = p.deg;
+                                if ui.add(egui::DragValue::new(&mut deg)
+                                    .range(-fl::MAX_DEG..=fl::MAX_DEG).speed(1.0).suffix("°"))
+                                    .on_hover_text("How far it turns, in degrees: right is positive, left negative. \
+                                                    Drag or type for single degrees (West, then Up / Down, on the pad).")
+                                    .changed()
+                                {
+                                    list_edit = Some(ChordEdit::SetFlick(i, p.with_deg(deg)));
+                                }
+                                if ui.small_button(format!("+{}", fl::COARSE_DEG))
+                                    .on_hover_text("To the next 45° to the right (Up on the pad).").clicked()
+                                {
+                                    list_edit = Some(ChordEdit::SetFlick(i, p.step_deg(1, false)));
+                                }
+                                ui.add_space(6.0);
+                                let mut own = p.ms.is_some();
+                                if ui.checkbox(&mut own, egui::RichText::new("Own time").small())
+                                    .on_hover_text("How long the turn takes (LT + Up / Down on the pad). Off: the \
+                                                    target RWS Aim's flick Smooth time. A stick flick can't beat \
+                                                    that module's Stick °/s, so a big turn may take longer.")
+                                    .changed()
+                                {
+                                    let ms = own.then_some(fl::DEFAULT_MS);
+                                    list_edit = Some(ChordEdit::SetFlick(i, fl::FlickPin { ms, ..p }));
+                                }
+                                if let Some(mut ms) = p.ms {
+                                    if ui.add(egui::DragValue::new(&mut ms).range(1..=fl::MAX_MS).speed(1.0).suffix(" ms"))
+                                        .changed()
+                                    {
+                                        list_edit = Some(ChordEdit::SetFlick(i, fl::FlickPin { ms: Some(ms), ..p }));
+                                    }
+                                } else {
+                                    ui.label(egui::RichText::new("the module's flick time").small().weak());
+                                }
+                            }
                             ChordElem::Item(i) if list_timed => {
                                 let dur = list_chord.durs.get(i).copied().flatten();
                                 let mut own = dur.is_some();
@@ -1030,6 +1081,11 @@ impl FlexInputApp {
                         let lbl = match cell.pin.as_str() {
                             "left_stick" => "LS".to_string(),
                             "right_stick" => "RS".to_string(),
+                            // Picks a flick rather than being one: the turn is set
+                            // in the list once it's picked.
+                            p if flexinput_core::flick::is_flick_pin(p) => {
+                                if cell.width > 1.0 { "Mouse flick".to_string() } else { "Flick".to_string() }
+                            }
                             p => match flexinput_core::imu::imu_pin(p) {
                                 Some(imu) => imu.short.to_string(),
                                 None => kbm_pin_label(p),

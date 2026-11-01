@@ -653,6 +653,9 @@ impl Module for Gyro3DOFModule {
 // Flick pin — and the "Flick On" input (unwired = on) turns off the flick, Stick
 // aim and the stick's suppression for a mode shift.
 //
+// `flick_target` makes it the module that turns the flicks mapping cards send
+// (see `flexinput_core::flick`).
+//
 // Params (node.params): scale, rws, max_rate_dps, flick_deadzone,
 // flick_smooth_ms, flick_stabilise_ms, flick_fwd_dz_deg, flick_output,
 // stick_aim_enabled, stick_aim_rws, suppress_source, stick_out_dps.

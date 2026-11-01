@@ -146,6 +146,9 @@ pub(crate) const BINDINGS: &[&str] = &[
     "GYRO_TRACKBALL", "GYRO_TRACK_X", "GYRO_TRACK_Y", "CALIBRATE",
     // Rumble.
     "SMALL_RUMBLE", "BIG_RUMBLE",
+    // A turn by a set angle: FlexInput's own, and any angle will do — these are
+    // where to start from.
+    "FLICK_L45", "FLICK_R45", "FLICK_L90", "FLICK_R90", "FLICK_R180", "FLICK_R360",
     // Binding a button to nothing at all, which is how you take one away.
     "NONE",
     // The virtual pad, under both of JSM's spellings.
@@ -273,6 +276,8 @@ fn binding_group(name: &str) -> &'static str {
         "Gyro actions"
     } else if name.ends_with("RUMBLE") {
         "Rumble"
+    } else if name.starts_with("FLICK_") {
+        "Flicks"
     } else if name == "NONE" {
         "Nothing"
     } else if one && name.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -614,6 +619,7 @@ fn group_order(group: &str) -> u8 {
         "Punctuation" => 13,
         "Function keys" => 14,
         "Gyro actions" => 15,
+        "Flicks" => 15,
         "Virtual pad" => 16,
         "Rumble" => 17,
         "Nothing" => 18,

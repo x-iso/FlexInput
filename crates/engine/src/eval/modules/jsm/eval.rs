@@ -332,6 +332,7 @@ pub(crate) fn jsm_publish(
         outputs.rumble = outputs.rumble.or(done.rumble);
         outputs.layer = outputs.layer.take().or_else(|| done.layer.clone());
         outputs.reset |= done.reset;
+        outputs.flicks.extend(done.flicks.iter().copied());
         r.owned.retain(|&b| held(b));
     }
     st.retired.retain(|r| !r.owned.is_empty() || !r.rt.finished());
@@ -362,6 +363,9 @@ pub(crate) fn jsm_publish(
         pitch: f("gyro_y"),
         yaw: f("gyro_z"),
     };
+    for &(deg, secs) in &outputs.flicks {
+        st.aim.start_flick(deg, secs);
+    }
     let aimed: super::aim::Aimed = {
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
@@ -1378,8 +1382,8 @@ fn claimed_outputs(cfg: &Compiled) -> Vec<String> {
 
 /// Is any part of this config aiming the mouse?
 fn aims_anything(cfg: &Compiled, res: &super::parse::Resolved) -> bool {
-    let _ = cfg;
-    res.aim.min_sens != (0.0, 0.0)
+    cfg.bindings.iter().any(|b| b.steps.iter().any(|s| matches!(s.out, Out::Flick { .. })))
+        || res.aim.min_sens != (0.0, 0.0)
         || res.aim.max_sens != (0.0, 0.0)
         || res.settings.left.mode.aims()
         || res.settings.right.mode.aims()

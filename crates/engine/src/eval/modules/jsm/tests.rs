@@ -7951,3 +7951,118 @@ N,N = Y");
     assert_eq!(ys, 1, "one double press");
     assert!(saw_r_after, "the third press is N's own");
 }
+
+// ── bound flicks ─────────────────────────────────────────────────────────────
+
+// FLICK_R / FLICK_L and an angle, and its own time if it names one.
+#[test]
+fn a_bound_flick_reads_its_angle_and_its_time() {
+    use super::names::{out_from_name, Out};
+    let out = |n: &str| out_from_name(n).map(|o| o.out);
+    assert_eq!(out("FLICK_R90"), Some(Out::Flick { deg: 90.0, secs: None }));
+    assert_eq!(out("flick_l45"), Some(Out::Flick { deg: -45.0, secs: None }));
+    assert_eq!(out("FLICK_R180_120MS"), Some(Out::Flick { deg: 180.0, secs: Some(0.12) }));
+    for bad in ["FLICK_R0", "FLICK_R361", "FLICK_90", "FLICK_R", "FLICK_R90_120", "FLICK_RX", "FLICK_TIME"] {
+        assert_eq!(out(bad), None, "{bad}");
+    }
+}
+
+// A malformed one says what it should look like; event modifiers work as on a key.
+#[test]
+fn a_bound_flick_on_a_line_compiles_like_any_binding() {
+    let c = compile("S = FLICK_R90\nE = !FLICK_L45/\nN = FLICK_R0");
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert_eq!(c.lines[1].status, LineStatus::Ok);
+    let LineStatus::Error(why) = &c.lines[2].status else { panic!("{:?}", c.lines[2].status) };
+    assert!(why.contains("FLICK_R90"), "{why}");
+}
+
+// The total is the angle, in RWC counts per degree, and eased over FLICK_TIME.
+#[test]
+fn a_bound_flick_turns_its_angle_eased_over_flick_time() {
+    let mut a = Aiming::new("REAL_WORLD_CALIBRATION = 2\nFLICK_TIME = 0.1");
+    a.a.start_flick(-90.0, None);
+    let (mut total, mut biggest, mut smallest) = (0.0f32, 0.0f32, f32::MAX);
+    for _ in 0..200 {
+        let x = a.tick().x;
+        total += x;
+        if x != 0.0 {
+            biggest = biggest.max(x.abs());
+            smallest = smallest.min(x.abs());
+        }
+    }
+    assert!((total + 180.0).abs() < 0.5, "90° left at 2 counts per degree: {total}");
+    assert!(smallest < biggest, "eased, not an even stream");
+}
+
+// Its own time beats FLICK_TIME.
+#[test]
+fn a_bound_flick_with_its_own_time_ignores_flick_time() {
+    let run = |secs: Option<f32>| {
+        let mut a = Aiming::new("REAL_WORLD_CALIBRATION = 1\nFLICK_TIME = 1");
+        a.a.start_flick(90.0, secs);
+        (0..500).filter(|_| a.tick().x != 0.0).count()
+    };
+    let own = run(Some(0.05));
+    assert!(own < run(None) / 5, "far quicker than FLICK_TIME: {own}");
+}
+
+// Bound for a stick it's a camera rate, at the stick's calibration for as long
+// as the angle takes, FLICK_TIME having no say.
+#[test]
+fn a_bound_flick_to_a_stick_is_a_rate_and_lands_exactly() {
+    let cfg = "FLICK_STICK_OUTPUT = RIGHT_STICK\nVIRTUAL_STICK_CALIBRATION = 360\nFLICK_TIME = 5";
+    let mut a = Aiming::new(cfg);
+    a.a.start_flick(90.0, None);
+    let rates: Vec<f32> = (0..300).map(|_| a.aimed().flick_dps.x).collect();
+    assert!((rates[0] - 360.0).abs() < 1e-3, "right, at full rate: {}", rates[0]);
+    let turned: f32 = rates.iter().map(|r| r * DT).sum();
+    assert!((turned - 90.0).abs() < 1e-2, "{turned}");
+
+    // Its own time can slow it, never speed it past what a stick can do.
+    let mut slow = Aiming::new(cfg);
+    slow.a.start_flick(-90.0, Some(1.0));
+    assert!((slow.aimed().flick_dps.x + 90.0).abs() < 1e-3);
+    let mut fast = Aiming::new(cfg);
+    fast.a.start_flick(90.0, Some(0.01));
+    assert!((fast.aimed().flick_dps.x - 360.0).abs() < 1e-3);
+}
+
+// JSM silences a whole mouse move when the gyro is pointed at a stick. That quirk
+// is reproduced for its own aiming; a binding of ours shouldn't vanish to it.
+#[test]
+fn a_bound_flick_still_reaches_the_mouse_with_the_gyro_on_a_stick() {
+    let mut a = Aiming::new("GYRO_OUTPUT = RIGHT_STICK\nREAL_WORLD_CALIBRATION = 1\nFLICK_TIME = 0.05");
+    a.a.start_flick(90.0, None);
+    let total: f32 = (0..100).map(|_| a.tick().x).sum();
+    assert!((total - 90.0).abs() < 0.5, "{total}");
+}
+
+// The whole node: a press starts one turn, however long it's held, and a config
+// doing nothing else still gets a `mouse_move` to carry it.
+#[test]
+fn a_bound_flick_turns_once_per_press_through_the_node() {
+    let _guard = alone();
+    let uid = 4242;
+    let snap = jsm_snap(uid, "S = FLICK_R90\nREAL_WORLD_CALIBRATION = 1\nFLICK_TIME = 0.02", false);
+    let key = format!("collector:{uid}");
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut run = |down: bool, ticks: usize| {
+        let mut sum = 0.0f32;
+        for _ in 0..ticks {
+            let mut dev: BusMap = BusMap::default();
+            dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(down));
+            let mut c = BusMap::default();
+            super::eval::jsm_publish(&snap, uid, &dev, &mut c, &mut state, 0.010);
+            if let Some(Signal::Vec2(v)) = c.get(&(key.clone(), "mouse_move".to_string())) {
+                sum += v.x;
+            }
+        }
+        sum
+    };
+    assert_eq!(run(false, 3), 0.0);
+    let held = run(true, 100);
+    assert!((held - 90.0).abs() < 0.5, "held a long time, one turn: {held}");
+    assert_eq!(run(false, 10), 0.0, "letting go does nothing");
+    assert!((run(true, 100) - 90.0).abs() < 0.5, "pressed again, it turns again");
+}

@@ -13,6 +13,11 @@
 //! setting it extends (`ROLL_CONTRIBUTION`, which also works under `LOCAL` here),
 //! whose upstream words are kept and followed by a sentence saying what changed.
 
+/// FlexInput's own binding, not JoyShockMapper's, and a whole family of names, so
+/// it isn't a row in the table below.
+const BOUND_FLICK_HELP: &str =
+    "FlexInput's own, not JoyShockMapper's. Turns by a set angle, once per press: FLICK_R90 is 90 degrees right, FLICK_L45 is 45 left, anything from 1 to 360. It takes FLICK_TIME unless you name its own time: FLICK_R90_120MS. It goes where FLICK_STICK_OUTPUT says; on a stick it turns at VIRTUAL_STICK_CALIBRATION, or slower if its own time asks for that.";
+
 /// `(NAME, JSM's description)`, sorted by name.
 pub(crate) const HELP: &[(&str, &str)] = &[
     ("ACCEL_CURVE",
@@ -285,5 +290,8 @@ pub(crate) const HELP: &[(&str, &str)] = &[
 
 /// JSM's description of a name, if it has one.
 pub(crate) fn help_for(name: &str) -> Option<&'static str> {
+    if super::names::is_flick_name(name) {
+        return Some(BOUND_FLICK_HELP);
+    }
     HELP.binary_search_by(|(n, _)| n.cmp(&name)).ok().map(|i| HELP[i].1)
 }

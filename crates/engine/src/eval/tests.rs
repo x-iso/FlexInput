@@ -8089,3 +8089,250 @@ mod sample_hold_tests {
         assert_eq!(sh_tick(&n, &mut ns, Some(v), false), Some(v.zeroed()));
     }
 }
+
+#[cfg(test)]
+mod bound_flick_tests {
+    use super::*;
+    use flexinput_core::macros::SIGS_NS;
+    use std::collections::HashMap;
+
+    const UID: usize = 31;
+    const DT: f32 = 0.001;
+    const FLICK: &str = "flick:mouse:90:50";
+
+    fn node(uid: usize, module_id: &str) -> NodeSnap {
+        NodeSnap {
+            node_uid: uid,
+            module_id: module_id.to_string(),
+            params: HashMap::new(),
+            n_outputs: 3,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn target() -> NodeSnap {
+        let mut snap = node(UID, "processing.rws");
+        snap.params.insert("flick_target".into(), serde_json::json!(true));
+        snap.params.insert("scale".into(), serde_json::json!(2.0));
+        snap
+    }
+
+    /// One tick with these flick pins held by cards last tick: the outputs
+    /// (Mouse, Stick, Flick), plus what's left of them in `state`.
+    fn tick(snap: &NodeSnap, state: &mut HashMap<usize, NodeState>, held: &[&str]) -> [glam::Vec2; 3] {
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.macro_prev.clear();
+        for pin in held {
+            carry.macro_prev.insert((SIGS_NS.to_string(), pin.to_string()), Signal::Bool(true));
+        }
+        let mut c = BusMap::default();
+        let out = eval_rws_node(snap, UID, &[], &mut c, state, DT);
+        [0, 1, 2].map(|i| match out[i] {
+            Some(Signal::Vec2(v)) => v,
+            _ => glam::Vec2::ZERO,
+        })
+    }
+
+    /// Sum one output over `ticks`, a held press the whole time.
+    fn total(snap: &NodeSnap, state: &mut HashMap<usize, NodeState>, held: &[&str], which: usize, ticks: usize) -> f32 {
+        (0..ticks).map(|_| tick(snap, state, held)[which].x).sum()
+    }
+
+    #[test]
+    fn a_mouse_flick_turns_its_angle_through_scale_over_its_time_once_per_press() {
+        let snap = target();
+        let mut state = HashMap::new();
+        let first = tick(&snap, &mut state, &[FLICK])[0].x;
+        assert!((first - 90.0 * 2.0 * DT / 0.05).abs() < 1e-2, "paid out evenly over its 50 ms: {first}");
+        let rest = total(&snap, &mut state, &[FLICK], 0, 200);
+        assert!((first + rest - 180.0).abs() < 1e-2, "90° at scale 2, held or not: {}", first + rest);
+        assert!(state[&UID].rws_turns.is_empty(), "and over");
+        assert_eq!(total(&snap, &mut state, &[], 0, 5), 0.0, "letting go does nothing");
+        assert!((total(&snap, &mut state, &[FLICK], 0, 200) - 180.0).abs() < 1e-2, "pressed again, it turns again");
+    }
+
+    // A flick is a real rotation: like the flick stick's, RWS doesn't scale it.
+    #[test]
+    fn rws_does_not_scale_a_flick() {
+        let mut snap = target();
+        snap.params.insert("rws".into(), serde_json::json!(3.0));
+        let mut state = HashMap::new();
+        assert!((total(&snap, &mut state, &[FLICK], 0, 100) - 180.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn with_no_time_of_its_own_it_takes_the_modules_flick_smoothing() {
+        let mut snap = target();
+        snap.params.insert("flick_smooth_ms".into(), serde_json::json!(200.0));
+        let mut state = HashMap::new();
+        let first = tick(&snap, &mut state, &["flick:mouse:-90"])[0].x;
+        assert!((first + 90.0 * 2.0 * DT / 0.2).abs() < 1e-2, "to the left, over 200 ms: {first}");
+        // No smoothing is all at once.
+        snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
+        let mut state = HashMap::new();
+        assert!((tick(&snap, &mut state, &["flick:mouse:45"])[0].x - 90.0).abs() < 1e-3);
+    }
+
+    // The checkbox is the whole gate: not ticked, the pin moves nothing.
+    #[test]
+    fn a_module_not_set_as_target_ignores_flicks() {
+        let mut snap = target();
+        snap.params.remove("flick_target");
+        let mut state = HashMap::new();
+        assert_eq!(total(&snap, &mut state, &[FLICK], 0, 100), 0.0);
+        assert!(state[&UID].rws_turns.is_empty());
+    }
+
+    // A stick sets a rate, capped at full tilt: 90° at 360°/s can't take the
+    // 50 ms asked, so it takes 250 ms — and still turns 90°.
+    #[test]
+    fn a_stick_flick_is_capped_by_stick_rate_and_still_lands() {
+        let mut snap = target();
+        snap.params.insert("stick_out_dps".into(), serde_json::json!(360.0));
+        let mut state = HashMap::new();
+        let pin = "flick:stick:90:50";
+        let mut defl = Vec::new();
+        for _ in 0..400 {
+            defl.push(tick(&snap, &mut state, &[pin])[1].x);
+        }
+        assert!(defl.iter().all(|d| *d <= 1.0), "never past full tilt");
+        assert!((defl[0] - 1.0).abs() < 1e-3, "owed more than it can carry: full tilt, {}", defl[0]);
+        let turned: f32 = defl.iter().map(|d| d * 360.0 * DT).sum();
+        assert!((turned - 90.0).abs() < 0.01, "conserved: {turned}");
+        let held_for = defl.iter().filter(|d| **d > 0.0).count();
+        assert!((249..=252).contains(&held_for), "for 90/360 s: {held_for} ticks");
+    }
+
+    // A slower time than the stick's limit is a smaller push rather than a
+    // full-tilt burst.
+    #[test]
+    fn a_slow_stick_flick_pushes_gently() {
+        let mut snap = target();
+        snap.params.insert("stick_out_dps".into(), serde_json::json!(360.0));
+        let mut state = HashMap::new();
+        let d = tick(&snap, &mut state, &["flick:stick:90:1000"])[1].x;
+        assert!((d - 0.25).abs() < 1e-3, "90°/s of a 360°/s stick: {d}");
+    }
+
+    // The aim keeps its share of the stick; the flick takes what's left and is
+    // owed the rest, so nothing clips away.
+    #[test]
+    fn a_stick_flick_shares_the_stick_with_the_aim_without_losing_any() {
+        let mut snap = target();
+        snap.params.insert("stick_out_dps".into(), serde_json::json!(360.0));
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.macro_prev.insert((SIGS_NS.to_string(), "flick:stick:90:50".to_string()), Signal::Bool(true));
+        let rate = 180.0 / GYRO_REF_DPS;
+        let inputs = [Some(Signal::Vec2(glam::Vec2::new(rate, 0.0)))];
+        let mut sum = 0.0;
+        for _ in 0..1000 {
+            let mut c = BusMap::default();
+            let out = eval_rws_node(&snap, UID, &inputs, &mut c, &mut state, DT);
+            let Some(Signal::Vec2(v)) = out[1] else { panic!("stick output") };
+            assert!(v.x <= 1.0 + 1e-5);
+            sum += v.x * 360.0 * DT;
+        }
+        assert!((sum - (90.0 + 180.0)).abs() < 0.05, "a second of 180°/s aim plus the 90°: {sum}");
+    }
+
+    // A wired Flick pin of the same kind carries it, instead of the main output;
+    // of the other kind it changes nothing.
+    #[test]
+    fn it_takes_a_wired_flick_pin_of_its_kind() {
+        let mut snap = target();
+        snap.params.insert("_rws_flick_out_wired".into(), serde_json::json!(true));
+        let mut state = HashMap::new();
+        let v = tick(&snap, &mut state, &["flick:mouse:90:1"]);
+        assert_eq!(v[0].x, 0.0, "not on Mouse as well");
+        assert!((v[2].x - 180.0).abs() < 1e-3, "on the Flick pin: {}", v[2].x);
+
+        let mut state = HashMap::new();
+        let v = tick(&snap, &mut state, &["flick:stick:45:1"]);
+        assert!(v[1].x > 0.0, "the pin is the mouse's here, so a stick flick uses Stick");
+        assert_eq!(v[2].x, 0.0);
+
+        snap.params.insert("flick_output".into(), serde_json::json!("stick"));
+        let mut state = HashMap::new();
+        let v = tick(&snap, &mut state, &["flick:stick:45:1"]);
+        assert_eq!(v[1].x, 0.0);
+        assert!(v[2].x > 0.0, "the pin is the stick's now");
+    }
+
+    // "Flick On" is the flick stick's mode shift; a press of a bound flick is
+    // deliberate and goes through.
+    #[test]
+    fn flick_on_off_does_not_stop_a_bound_flick() {
+        let snap = target();
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.macro_prev.insert((SIGS_NS.to_string(), FLICK.to_string()), Signal::Bool(true));
+        let inputs = [None, None, Some(Signal::Bool(false))];
+        let mut c = BusMap::default();
+        let out = eval_rws_node(&snap, UID, &inputs, &mut c, &mut state, DT);
+        assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x > 0.0));
+    }
+
+    // A calibration sweep measures the game from this module alone.
+    #[test]
+    fn a_sweep_drops_turns_in_flight() {
+        let mut snap = target();
+        let mut state = HashMap::new();
+        tick(&snap, &mut state, &[FLICK]);
+        snap.params.insert("cal_measure".into(), serde_json::json!("yaw"));
+        assert_eq!(tick(&snap, &mut state, &[FLICK])[0].x, 0.0);
+        assert!(state[&UID].rws_turns.is_empty());
+    }
+
+    // Overlapping turns add up, and each lands whole.
+    #[test]
+    fn two_turns_run_side_by_side() {
+        let snap = target();
+        let mut state = HashMap::new();
+        let a = "flick:mouse:90:50";
+        let b = "flick:mouse:-45:100";
+        let mut sum = tick(&snap, &mut state, &[a])[0].x;
+        sum += total(&snap, &mut state, &[a, b], 0, 300);
+        assert!((sum - 90.0).abs() < 1e-2, "(90 - 45) at scale 2: {sum}");
+    }
+
+    // The whole route, through a real tick: a Remapper card's flick reaches the
+    // target, and only through the macro namespace, never the bus.
+    #[test]
+    fn a_remapper_card_starts_a_turn_on_the_target_through_a_tick() {
+        const DEV: &str = "gilrs:switch_pro:0";
+        let mut card = node(1, "module.remapper");
+        card.params.insert("_automap_device_id".into(), Value::String(DEV.into()));
+        card.params.insert("mappings".into(), serde_json::json!([{ "in": ["btn_south"], "out": [FLICK] }]));
+        let graph = ProcessingGraph { nodes: vec![target(), card], ..Default::default() };
+        let mut state = HashMap::new();
+        let mut run = |down: bool| {
+            let mut sigs = BusMap::default();
+            sigs.insert((DEV.to_string(), "btn_south".to_string()), Signal::Bool(down));
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&sigs), DT, &mut out);
+            assert!(out.sink_outputs.iter().all(|((_, p), _)| !p.starts_with("flick:")), "not a bus pin");
+            state[&UID].rws_turns.len()
+        };
+        assert_eq!(run(false), 0);
+        assert_eq!(run(false), 0);
+        assert_eq!(run(true), 0, "the card pressed it this tick; the target reads it next");
+        assert_eq!(run(true), 1, "one turn started");
+        for _ in 0..20 {
+            assert!(run(true) <= 1, "held: no more start");
+        }
+    }
+
+    // Every card module's publish gate is this one test.
+    #[test]
+    fn a_flick_pin_routes_like_a_macro_target() {
+        assert!(is_macro_style_target(FLICK));
+        assert!(!is_bus_out_pin(FLICK));
+        assert!(is_bus_out_pin("mouse_left"), "and a plain pin is untouched");
+    }
+}

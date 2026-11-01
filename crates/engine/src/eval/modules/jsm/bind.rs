@@ -110,6 +110,8 @@ pub struct Outputs {
     pub layer: Option<String>,
     /// A binding asked for `RESET_MAPPINGS`.
     pub reset: bool,
+    /// Turns bindings fired this tick (`FLICK_R90`), as (degrees, own time).
+    pub flicks: Vec<(f32, Option<f32>)>,
 }
 
 /// The run-time state of one JSM Config node.
@@ -525,6 +527,8 @@ impl Runtime {
             // `GYRO_OFF` binding switched the gyro off for one tick.
             Out::Gyro(g) => self.hold_pin(action, &g.pin(), event, press, true),
             Out::Calibrate => {}
+            // A turn is started, not held: it runs its time out on its own.
+            Out::Flick { deg, secs } => self.out.flicks.push((*deg, *secs)),
             Out::Command(c) => self.out.commands.push(c.clone()),
             Out::Set { name, value } => self.out.settings.push((name.clone(), value.clone())),
             // Both are acted on by `eval.rs`, which owns the tab the module runs

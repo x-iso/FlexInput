@@ -472,6 +472,24 @@ pub(crate) fn render_rws_flick_speed(
     }
 }
 
+/// RWS Aim header toggle: this module turns the flicks mapping cards send.
+pub(crate) fn rws_map_flicks_header_toggle(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node: NodeId,
+) {
+    use flexinput_core::flick::TARGET_PARAM;
+    let mut on = snarl.get_node(node)
+        .and_then(|n| n.params.get(TARGET_PARAM)).and_then(|v| v.as_bool()).unwrap_or(false);
+    let resp = ui.checkbox(&mut on, egui::RichText::new("Map flicks here").small());
+    if resp.changed() {
+        if let Some(n) = snarl.get_node_mut(node) {
+            n.params.insert(TARGET_PARAM.into(), Value::Bool(on));
+        }
+    }
+    resp.on_hover_text("Turn the flicks mapping cards send. While one RWS Aim on this tab has\nthis on, Remapper, Touch Zones, Lean, Virtual Menu and Area Mapper cards\ncan output a flick by a set angle, one per press: Choose → Keyboard & Mouse\nfor a mouse flick, Choose → Gamepad for a stick flick.\nIt goes out of the Flick pin if that's wired for the same kind, else the\nMouse or Stick output, through Scale but not RWS, like the flick stick.\nTick only one module per tab: each ticked one turns every flick.");
+}
+
 /// The `flick_output` values, in the order the dropdown and the gamepad cycle
 /// them. The first is the default.
 pub(crate) const RWS_FLICK_OUT_OPTS: &[&str] = &["mouse", "stick", "both"];

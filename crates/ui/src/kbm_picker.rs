@@ -181,6 +181,7 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
         || pin == OPTICAL_CONTACT;
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
+        || flexinput_core::flick::is_flick_pin(pin)
         || pin == flexinput_core::imu::ORIENT_NEUTRAL_PIN
         || pin == flexinput_core::imu::GYRO_CAL_PIN
         || pin.starts_with("mouse")
@@ -346,6 +347,27 @@ pub struct PickerLayout {
     /// Set Neutral Forward and Calibrate Gyro — a mapping card's outputs;
     /// nothing JSM can name.
     pub orient: bool,
+    /// The bound flicks: a mapping card's outputs, on a tab with an RWS Aim set
+    /// to take them.
+    pub flick: bool,
+}
+
+/// Where the flick cells sit. The mouse's is under the mouse cluster, wide enough
+/// to say what it is; the stick's in the inner corner of the right stick's plus.
+const FLICK_MOUSE_AT: (f32, f32, f32) = (MOUSE_X, 5.0, 2.0);
+const FLICK_STICK_AT: (f32, f32) = (STICKS_X + 4.0, STICKS_Y + 2.0);
+
+/// The cell a bound flick is picked from. Its pin is the flick it starts as;
+/// a card's list then edits the turn and the time.
+fn flick_cell(via: flexinput_core::flick::FlickVia, x: f32, y: f32, width: f32) -> PickerCell {
+    PickerCell {
+        pin: flexinput_core::flick::FlickPin::new(via).to_id(),
+        x,
+        y,
+        width,
+        analog_only: false,
+        macro_meta: None,
+    }
 }
 
 /// A caption over a cluster, and where (grid units) it goes.
@@ -415,8 +437,15 @@ pub fn picker_cells(
     layout: PickerLayout,
     macros: &[crate::macro_icons::MacroDisplayEntry],
 ) -> Vec<PickerCell> {
-    let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient } = layout;
+    let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient, flick } = layout;
     let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
+    if flick {
+        use flexinput_core::flick::FlickVia;
+        let (x, y, w) = FLICK_MOUSE_AT;
+        cells.push(flick_cell(FlickVia::Mouse, x, y, w));
+        let (x, y) = FLICK_STICK_AT;
+        cells.push(flick_cell(FlickVia::Stick, x, y, 1.0));
+    }
     if !tz {
         cells.extend(TOUCHPAD_LAYOUT.iter().map(PickerCell::from));
     } else {
@@ -783,7 +812,7 @@ mod pad_cluster_tests {
         };
         // Every cluster at once, under both touchpad variants.
         for tz in [false, true] {
-            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true, orient: true }, &[]);
+            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true, orient: true, flick: true }, &[]);
             for (i, a) in all.iter().enumerate() {
                 for b in all.iter().skip(i + 1) {
                     assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
@@ -794,6 +823,31 @@ mod pad_cluster_tests {
         let all = picker_cells(PickerLayout { pad: true, sticks: true, inputs: true, orient: true, ..Default::default() }, &[]);
         for cell in all.iter().filter(|c| c.y >= PAD_ROW_Y) {
             assert!(cell.y + 1.0 <= MACRO_Y, "{} is where macros go", cell.pin);
+        }
+    }
+
+    /// The flick cells are there only when the layout says so (a target exists),
+    /// the mouse's on the keyboard tab and the stick's on the gamepad tab, and
+    /// neither can be an input.
+    #[test]
+    fn the_flick_cells_follow_the_target_and_land_on_their_tabs() {
+        use flexinput_core::flick::{FlickPin, FlickVia};
+        let mouse = FlickPin::new(FlickVia::Mouse).to_id();
+        let stick = FlickPin::new(FlickVia::Stick).to_id();
+        let has = |cells: &[PickerCell], pin: &str| cells.iter().any(|c| c.pin == pin);
+
+        let without = picker_cells(PickerLayout { pad: true, orient: true, ..Default::default() }, &[]);
+        assert!(!has(&without, &mouse) && !has(&without, &stick), "no target, no flicks");
+
+        let layout = PickerLayout { pad: true, orient: true, flick: true, ..Default::default() };
+        let kbm = tab_cells(picker_cells(layout, &[]), PickerTab::Kbm);
+        let pad = tab_cells(picker_cells(layout, &[]), PickerTab::Gamepad);
+        assert!(has(&kbm, &mouse) && !has(&kbm, &stick));
+        assert!(has(&pad, &stick) && !has(&pad, &mouse));
+
+        for pin in [&mouse, &stick] {
+            assert!(stage_allows(PickStage::Output, pin));
+            assert!(!stage_allows(PickStage::Input, pin), "nothing to read a flick from");
         }
     }
 
@@ -1027,6 +1081,8 @@ pub enum ChordEdit {
     InsertGap(Option<ChordElem>),
     SetGap(usize, f32),
     SetDur(usize, Option<f32>),
+    /// A bound flick's turn and time, which its pin carries.
+    SetFlick(usize, flexinput_core::flick::FlickPin),
 }
 
 /// A chord list with its timing.
@@ -1153,12 +1209,33 @@ impl TimedChord {
         ChordElem::Gap(i)
     }
 
+    /// The bound flick pick `i` is, if it is one.
+    pub fn flick_at(&self, i: usize) -> Option<flexinput_core::flick::FlickPin> {
+        flexinput_core::flick::FlickPin::parse(self.pins.get(i)?)
+    }
+
+    /// One step of a bound flick's own time, by [`TIME_STEP_MS`] — or by
+    /// [`FINE_STEP_MS`] when `fine`. Nothing on any other element.
+    pub fn nudge_flick_time(&mut self, e: ChordElem, dir: i32, fine: bool) {
+        let ChordElem::Item(i) = e else { return };
+        let Some(p) = self.flick_at(i) else { return };
+        let unit = if fine { FINE_STEP_MS } else { TIME_STEP_MS };
+        self.pins[i] = p.step_ms(dir, unit as u32).to_id();
+    }
+
     /// One step up (`dir > 0`) or down, by [`TIME_STEP_MS`] — or by
     /// [`FINE_STEP_MS`] when `fine`: a gap down to [`MIN_GAP_MS`] (Delete
     /// takes it out, not a step); a pick's duration from the input's up to
     /// [`DEFAULT_DUR_MS`] and on, and back down past the smallest step to the
-    /// input's again.
+    /// input's again. A bound flick has no duration of that kind: the step is
+    /// its turn, by 45° or a degree (see `FlickPin::step_deg`).
     pub fn nudge(&mut self, e: ChordElem, dir: i32, fine: bool) {
+        if let ChordElem::Item(i) = e {
+            if let Some(p) = self.flick_at(i) {
+                self.pins[i] = p.step_deg(dir, fine).to_id();
+                return;
+            }
+        }
         let unit = if fine { FINE_STEP_MS } else { TIME_STEP_MS };
         let step = unit * dir.signum() as f32;
         match e {
@@ -1191,6 +1268,9 @@ impl TimedChord {
             ChordEdit::SetDur(i, ms) => {
                 if let Some(d) = self.durs.get_mut(i) { *d = ms.map(|m| m.max(1.0)); }
             }
+            ChordEdit::SetFlick(i, p) => {
+                if let Some(pin) = self.pins.get_mut(i) { *pin = p.to_id(); }
+            }
         }
     }
 }
@@ -1201,6 +1281,38 @@ mod timed_chord_tests {
 
     fn chord(pins: &[&str]) -> TimedChord {
         TimedChord::from_params(pins.iter().map(|p| p.to_string()).collect(), None, None)
+    }
+
+    // A flick's Up / Down is its turn (45°, or a degree on fine) and its time a
+    // step of its own, and neither touches the chord's timing: a card with one
+    // stays a plain chord.
+    #[test]
+    fn a_flick_steps_its_turn_and_its_time_in_its_pin() {
+        let mut c = chord(&["key_a", "flick:mouse:90"]);
+        c.nudge(ChordElem::Item(1), 1, false);
+        assert_eq!(c.pins[1], "flick:mouse:135");
+        c.nudge(ChordElem::Item(1), -1, true);
+        assert_eq!(c.pins[1], "flick:mouse:134");
+        c.nudge_flick_time(ChordElem::Item(1), 1, false);
+        assert_eq!(c.pins[1], "flick:mouse:134:100");
+        assert!(!c.is_timed(), "its time lives in the pin");
+        assert_eq!(c.durs_json(), serde_json::json!([]));
+        // On the other pick, Up / Down is still its duration, and the flick's
+        // time step does nothing.
+        c.nudge(ChordElem::Item(0), 1, false);
+        assert_eq!(c.durs[0], Some(DEFAULT_DUR_MS));
+        c.nudge_flick_time(ChordElem::Item(0), 1, false);
+        assert_eq!(c.pins[0], "key_a");
+    }
+
+    // Two different turns can sit in one chord; one turn repeats only after a
+    // gap, like any pin — and a new flick picked after retiming the first is new.
+    #[test]
+    fn a_flick_repeats_by_what_it_turns() {
+        let mut c = chord(&["flick:mouse:90"]);
+        assert!(!c.takes("flick:mouse:90"));
+        c.nudge(ChordElem::Item(0), 1, false);
+        assert!(c.takes("flick:mouse:90"), "the first has moved on to 135°");
     }
 
     #[test]

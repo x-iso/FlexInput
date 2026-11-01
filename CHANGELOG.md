@@ -7,6 +7,18 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **Bind a turn by a set angle to any button.** Tick **Map flicks here** in an RWS Aim's
+  header, and Remapper, Touch Zones, Lean, Virtual Menu and Area Mapper cards can output a
+  flick: pick **Mouse flick** on the picker's Keyboard & Mouse tab, or **Flick** beside
+  the right stick on its Gamepad tab. Each press turns once, however long it's held.
+  Select it in the output list to set its angle (45° steps, or single degrees on fine:
+  West on the pad, dragging or typing with the mouse; right is positive) and how long
+  it takes (LT + Up / Down on the pad; by default the module's flick Smooth time). It
+  goes through the module's Scale but not RWS, and a stick flick can't turn faster than
+  the module's Stick °/s. The output cells only appear while a module on the tab is the
+  target. If more than one is ticked, each of them turns every flick. In a JSM config,
+  bind it by name: `FLICK_R90`, `FLICK_L45`, or with its own time `FLICK_R180_120MS`.
+  It goes where `FLICK_STICK_OUTPUT` says.
 - **Has Changed can ignore small movements.** Its new **Hysteresis** setting keeps
   it quiet until the input has moved that far from where it last reacted, so noise
   and a shaky hand don't set it off, while a slow drift still does once it has gone

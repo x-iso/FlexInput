@@ -454,6 +454,10 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
         return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
             .on_hover_text(p.display_name()).rect;
     }
+    if let Some(p) = flexinput_core::flick::FlickPin::parse(pin_id) {
+        return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
+            .on_hover_text(p.display_name()).rect;
+    }
     if flexinput_core::raw_pad::is_extra_pin(pin_id) {
         let name = crate::raw_learn::extra_label(pin_id);
         return ui.label(egui::RichText::new(&name).size(13.0).strong())
@@ -693,6 +697,10 @@ pub(crate) fn paint_chord_chip_tinted(
     // MIDI: no glyph exists, and the short name IS the rendering (bright, not
     // the dimmed "icon missing" pill).
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
+        return paint_text_pill(painter, top_left, chip_h, p.short_label(), false);
+    }
+    // A bound flick says what it turns.
+    if let Some(p) = flexinput_core::flick::FlickPin::parse(pin_id) {
         return paint_text_pill(painter, top_left, chip_h, p.short_label(), false);
     }
     // Media keys have no glyphs yet: the label is the rendering.
@@ -1020,6 +1028,9 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
         return k.name.to_string();
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
+        return p.display_name();
+    }
+    if let Some(p) = flexinput_core::flick::FlickPin::parse(pin_id) {
         return p.display_name();
     }
     if flexinput_core::raw_pad::is_extra_pin(pin_id) {

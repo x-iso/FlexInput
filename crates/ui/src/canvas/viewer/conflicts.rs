@@ -60,10 +60,11 @@ fn merges_own_cards(label: &str) -> bool {
 }
 
 /// A pin worth flagging for collisions: a real bus/sink pin, NOT a macro-port or
-/// Virtual-Menu target (those merge by design).
+/// Virtual-Menu target (those merge by design), nor a bound flick (a press each).
 fn is_conflict_relevant_pin(pin: &str) -> bool {
     flexinput_core::macros::parse_macro_pin(pin).is_none()
         && flexinput_core::menu::parse_target_pin(pin).is_none()
+        && !flexinput_core::flick::is_flick_pin(pin)
 }
 
 /// Walk every mapping-module node in the patch and record each card that writes

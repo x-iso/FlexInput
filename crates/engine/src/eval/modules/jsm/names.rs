@@ -311,6 +311,10 @@ pub enum Out {
     Gyro(GyroAction),
     /// Recalibrate the gyro.
     Calibrate,
+    /// Turn by a set angle (`FLICK_R90`, `FLICK_L45_120MS`), one of ours: degrees,
+    /// right positive, and its own time in seconds if it names one. Fires like a
+    /// command, once per event, and goes where `FLICK_STICK_OUTPUT` says.
+    Flick { deg: f32, secs: Option<f32> },
     /// Rumble the pad: JSM's SMALL_RUMBLE / BIG_RUMBLE / `Rhhhh`, as the
     /// (strong, weak) amplitudes JSM sends.
     Rumble { strong: f32, weak: f32 },
@@ -492,6 +496,9 @@ pub fn out_from_name(name: &str) -> Option<OutNote> {
             if let Some(pad) = pad_pin(&upper) {
                 return plain(pad);
             }
+            if let Some(out) = flick_from_name(&upper) {
+                return Some(OutNote { out, note: None });
+            }
             if let Some(hex) = upper.strip_prefix('R') {
                 if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     if let Ok(raw) = u16::from_str_radix(hex, 16) {
@@ -502,6 +509,36 @@ pub fn out_from_name(name: &str) -> Option<OutNote> {
             return None;
         }
     })
+}
+
+/// `FLICK_R90`: 90° to the right. `FLICK_L45_120MS`: 45° to the left, over 120 ms
+/// rather than `FLICK_TIME`. FlexInput's own, and a word to JSM's tokenizer, so
+/// event modifiers follow it as they do any key (`!FLICK_L90/`). A turn must be
+/// 1° to 360°; anything else isn't this name.
+pub(crate) fn is_flick_name(name: &str) -> bool {
+    flick_from_name(&name.to_ascii_uppercase()).is_some()
+}
+
+fn flick_from_name(upper: &str) -> Option<Out> {
+    let rest = upper.strip_prefix("FLICK_")?;
+    let sign = match rest.chars().next()? {
+        'R' => 1.0,
+        'L' => -1.0,
+        _ => return None,
+    };
+    let (deg, ms) = match rest[1..].split_once('_') {
+        Some((d, t)) => (d, Some(t.strip_suffix("MS")?)),
+        None => (&rest[1..], None),
+    };
+    let deg: u32 = deg.parse().ok()?;
+    if deg == 0 || deg > flexinput_core::flick::MAX_DEG as u32 {
+        return None;
+    }
+    let secs = match ms {
+        Some(t) => Some(t.parse::<u32>().ok()?.min(flexinput_core::flick::MAX_MS) as f32 / 1000.0),
+        None => None,
+    };
+    Some(Out::Flick { deg: deg as f32 * sign, secs })
 }
 
 fn rumble_from_hex(raw: u16) -> Out {

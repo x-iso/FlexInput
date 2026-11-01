@@ -559,6 +559,15 @@ pub struct ModuleDescriptor {
     catches up over `flick_smooth_ms`. `flick_slow_lock: bool` — a steering
     gesture keeps the flick zone off until the centre (past the deadzone it aims
     at full rate). Gesture state: `NodeState::aux_f32[12..19]`.
+  - `flick_target: bool` (default off; **Map flicks here** in the header, like
+    the Scale unit not pinnable) — this module turns the bound flicks
+    mapping cards send (`flick:mouse:90`, `flick:stick:-45:120`; see
+    `flexinput_core::flick`). The card's pin goes through the macro namespace and
+    is read a tick later, a turn per rising edge, whatever `Flick On` says. It
+    leaves by the Flick pin if that's wired for its kind, else the Mouse or Stick
+    output; 1:1 through `scale`, not `rws`, over the pin's own time or else
+    `flick_smooth_ms`. A stick turn is capped by `stick_out_dps` and conserved
+    (`aux_f32[19]`). Every ticked module on the tab turns every flick.
   - `suppress_source: "off" | "full" | "deadzone"` — flick-stick source suppression.
   - `field_mode: "ruler" | "room" | "both"`, `field_fov`, `field_bg_alpha`,
     `field_tick_deg`, `field_labels` — the calibration viewport style.

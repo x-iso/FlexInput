@@ -250,6 +250,19 @@ struct StickAim {
     flick: Flick,
 }
 
+/// One turn a binding started (`FLICK_R90`), still paying out.
+struct BoundFlick {
+    /// The whole turn in degrees, right positive.
+    deg: f32,
+    /// Its own time in seconds, if the binding gave one.
+    secs: Option<f32>,
+    since: f64,
+    /// How far through its easing it is, 0..1, on the way to a mouse.
+    done: f32,
+    /// Degrees it has turned so far, on the way to a stick.
+    turned: f32,
+}
+
 /// The aiming state of one JSM Config node.
 pub struct Aim {
     /// Seconds since the config was compiled. `f64`: an `f32` this far from
@@ -264,6 +277,7 @@ pub struct Aim {
     last_abs_x: f32,
     last_abs_y: f32,
     sticks: [StickAim; 2],
+    bound_flicks: Vec<BoundFlick>,
     /// The custom-curve fork's own running state.
     decay: super::cc::Decay,
     one_euro_x: super::cc::OneEuro,
@@ -284,6 +298,7 @@ impl Default for Aim {
             last_abs_x: 0.0,
             last_abs_y: 0.0,
             sticks: [StickAim::default(), StickAim::default()],
+            bound_flicks: Vec::new(),
             decay: super::cc::Decay::default(),
             one_euro_x: super::cc::OneEuro::default(),
             one_euro_y: super::cc::OneEuro::default(),
@@ -298,6 +313,54 @@ impl Aim {
     /// turn finishes instead of stopping halfway round.
     pub fn flick_unfinished(&self, side: usize) -> bool {
         self.sticks[side].flick.paying_out
+    }
+
+    /// Start a turn a binding fired. Several run side by side and add up.
+    pub fn start_flick(&mut self, deg: f32, secs: Option<f32>) {
+        self.bound_flicks.push(BoundFlick { deg, secs, since: self.t, done: 0.0, turned: 0.0 });
+    }
+
+    /// One tick of the turns bindings started, on the terms `flick` works in: mouse
+    /// pixels eased over the time (`FLICK_TIME`, unless the binding names its own),
+    /// or for a virtual stick a camera rate in deg/s, right positive. A stick turns
+    /// at `VIRTUAL_STICK_CALIBRATION` — slower if the binding's own time asks for
+    /// that, never faster, since a stick can only be pushed so far.
+    fn tick_bound_flicks(&mut self, s: &Settings, p: &pad::Settings, dt: f32) -> (f32, f32) {
+        use std::f32::consts::PI;
+        let now = self.t;
+        let to_stick = p.flick_dest.side().is_some();
+        let cal = s.real_world_calibration / s.in_game_sens.max(1e-6);
+        let (mut px, mut dps) = (0.0, 0.0);
+        self.bound_flicks.retain_mut(|f| {
+            let elapsed = (now - f.since) as f32;
+            if to_stick {
+                let full = p.calibration.max(0.0);
+                let rate = match f.secs {
+                    Some(t) if t > 0.0 => (f.deg.abs() / t).min(full),
+                    _ => full,
+                };
+                let left = (f.deg.abs() - f.turned).max(0.0);
+                let step = (rate * dt).min(left);
+                f.turned += step;
+                if dt > 0.0 {
+                    dps += f.deg.signum() * step / dt;
+                }
+                return rate > 0.0 && left - step > 1e-4;
+            }
+            let mut percent = match f.secs {
+                Some(t) => elapsed / t.max(1e-6),
+                None => {
+                    elapsed / s.flick_time.max(1e-6)
+                        / (f.deg.abs().to_radians() / PI).powf(s.flick_time_exponent)
+                }
+            };
+            percent = percent.min(1.0);
+            let ease = |p: f32| 1.0 - (1.0 - p) * (1.0 - p);
+            px += (ease(percent) - ease(f.done)) * f.deg * cal;
+            f.done = percent;
+            percent < 1.0
+        });
+        (px, dps)
     }
 
     /// One tick of aiming. Returns the mouse displacement for this tick in our
@@ -491,6 +554,8 @@ impl Aim {
             cam += mouse;
             flick_dps.x += dps;
         }
+        let (bound_px, bound_dps) = self.tick_bound_flicks(s, p, dt);
+        flick_dps.x += bound_dps;
 
         // ── where the gyro's rate goes ───────────────────────────────────────
         // A stick carries it in camera terms (deg/s, y down, which is what
@@ -512,6 +577,9 @@ impl Aim {
         // it is what a config written against JSM was tuned on, so it is
         // reproduced — and the editor says as much on the `GYRO_OUTPUT` line so
         // nobody has to discover it the hard way.
+        //
+        // A bound flick isn't JSM's, so that gate doesn't reach it: it goes where
+        // `FLICK_STICK_OUTPUT` says and nothing else silences it.
         let mouse = if p.gyro_dest == Dest::Mouse {
             let calibration = s.real_world_calibration / s.in_game_sens.max(1e-6);
             let x = vel_x * calibration * dt + cam.x;
@@ -520,7 +588,7 @@ impl Aim {
             Vec2::new(x, y)
         } else {
             Vec2::ZERO
-        };
+        } + Vec2::new(bound_px, 0.0);
         let curve_dps = if blocked { 0.0 } else { brake_speed };
         Aimed { mouse, gyro_dps, flick_dps, turn_dps, midi_dps, curve_dps }
     }

@@ -673,12 +673,14 @@ pub(crate) fn sig_magnitude(s: Signal) -> f32 {
 }
 
 /// True for any out-pin that routes into the macro collector namespaces
-/// instead of the AutoMap bus: Macro ports (`macro:{id}`) and Virtual-Menu
-/// targets (`menu:{id}_show` / `_sel` / `_next` / `_prev`). Every publish/skip gate in the mapping
-/// evaluators goes through this so the two pin families behave identically.
+/// instead of the AutoMap bus: Macro ports (`macro:{id}`), Virtual-Menu
+/// targets (`menu:{id}_show` / `_sel` / `_next` / `_prev`) and bound flicks
+/// (`flick:…`, read by RWS Aim). Every publish/skip gate in the mapping
+/// evaluators goes through this so the pin families behave identically.
 pub(crate) fn is_macro_style_target(pin: &str) -> bool {
     flexinput_core::macros::parse_macro_pin(pin).is_some()
         || flexinput_core::menu::parse_target_pin(pin).is_some()
+        || flexinput_core::flick::is_flick_pin(pin)
 }
 
 pub(crate) fn merge_macro_ns(

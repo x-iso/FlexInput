@@ -4,6 +4,7 @@ pub mod haptic_pcm;
 pub mod imu;
 pub mod automap;
 pub mod busmap;
+pub mod flick;
 pub mod macros;
 pub mod media;
 pub mod menu;

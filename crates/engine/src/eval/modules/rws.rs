@@ -90,6 +90,7 @@ pub(crate) fn eval_rws_node(
         _ => None,
     });
 
+    start_bound_turns(snap, uid, state);
     let node_state = state.entry(uid).or_default();
     let out = rws_fit_outputs(compute_rws(&corrected, node_state, &snap.params, dt), snap.n_outputs);
 
@@ -117,6 +118,85 @@ pub(crate) fn eval_rws_node(
         }
     }
     out
+}
+
+/// One turn a card asked for (see `flexinput_core::flick`), still paying out.
+#[derive(Clone, Copy, Debug)]
+pub struct RwsTurn {
+    /// Degrees still to turn; positive is right.
+    deg: f32,
+    /// Seconds left to turn them in.
+    left_s: f32,
+    via: flexinput_core::flick::FlickVia,
+}
+
+/// With `flick_target` ticked, start a turn for each flick pin a card has just
+/// pressed. Read from last tick's macro snapshot rather than this tick's bus, so
+/// it doesn't matter which side of this node the card evaluates on: a turn starts
+/// one tick after the press, imperceptible at kHz. Two cards holding the same turn
+/// at once are one press of it.
+fn start_bound_turns(snap: &NodeSnap, uid: usize, state: &mut HashMap<usize, NodeState>) {
+    use flexinput_core::flick::{is_flick_pin, FlickPin, TARGET_PARAM};
+    use flexinput_core::macros::SIGS_NS;
+    if !snap.params.get(TARGET_PARAM).and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(ns) = state.get_mut(&uid) {
+            ns.rws_turn_held.clear();
+        }
+        return;
+    }
+    // Nothing is allocated for a tick with no flick held: this runs on every one.
+    let held: HashSet<String> = state.get(&MACRO_CARRY_UID)
+        .map(|c| c.macro_prev.iter()
+            .filter(|((ns, pin), sig)| *ns == SIGS_NS && is_flick_pin(pin) && sig_magnitude(**sig) >= 0.5)
+            .map(|((_, pin), _)| pin.to_string())
+            .collect())
+        .unwrap_or_default();
+    let ns = state.entry(uid).or_default();
+    if held.is_empty() && ns.rws_turn_held.is_empty() {
+        return;
+    }
+    let smooth_ms = snap.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32;
+    for pin in held.iter().filter(|p| !ns.rws_turn_held.contains(*p)) {
+        let Some(p) = FlickPin::parse(pin) else { continue };
+        ns.rws_turns.push(RwsTurn {
+            deg: p.deg as f32,
+            left_s: p.ms.map_or(smooth_ms, |ms| ms as f32).max(0.0) / 1000.0,
+            via: p.via,
+        });
+    }
+    ns.rws_turn_held = held;
+}
+
+/// One tick of the turns in flight: the degrees to turn now through the mouse,
+/// and the degrees owed to the stick, added to what it couldn't carry before.
+/// Linear, as a flick's own pay-out is, and each turn conserved exactly.
+fn tick_bound_turns(state: &mut NodeState, dt: f32) -> (f32, f32) {
+    use flexinput_core::flick::FlickVia;
+    let (mut mouse, mut stick) = (0.0, 0.0);
+    state.rws_turns.retain_mut(|t| {
+        let emit = if t.left_s <= dt { t.deg } else { t.deg * (dt / t.left_s) };
+        t.deg -= emit;
+        t.left_s = (t.left_s - dt).max(0.0);
+        match t.via {
+            FlickVia::Mouse => mouse += emit,
+            FlickVia::Stick => stick += emit,
+        }
+        t.left_s > 0.0
+    });
+    (mouse, stick)
+}
+
+/// How much of `owed` degrees of stick turn fits on a stick already pushed to
+/// `at` this tick, as deflection to add, and what's left owing. A stick sets a turn
+/// rate capped at full tilt (`cap` degrees a tick), so a turn it can't carry yet
+/// takes longer; it still comes out to the degree.
+fn stick_turn_fit(owed: f32, at: f32, cap: f32) -> (f32, f32) {
+    if owed == 0.0 || cap <= 0.0 {
+        return (0.0, owed);
+    }
+    let room = (1.0 - at * owed.signum()).max(0.0) * cap;
+    let emit = owed.abs().min(room) * owed.signum();
+    (emit / cap, owed - emit)
 }
 
 /// Where the flick goes (`flick_output`): "mouse" — only the Flick pin, in mouse
@@ -210,6 +290,9 @@ const GST_STEERING: f32 = 2.0;
 const GST_FLICKED: f32 = 3.0;
 /// Out past this a gesture starts; back inside it, the gesture is over.
 const GESTURE_OUT: f32 = 0.1;
+//   [19] bound turn (deg) still owed to a stick output — what a full-deflection
+//        tick couldn't carry, paid out on the ticks after
+const TURN_STICK_CARRY: usize = 19;
 
 /// Where RWS Aim's display-only measured angle lands in `last_out`: right after
 /// the node's pins. Nodes saved before the Flick pin have two pins, newer ones
@@ -324,7 +407,7 @@ pub(crate) fn compute_rws(
     // Integrate the measured axis. Signed, so turning back (repositioning, or
     // correcting an overshoot) subtracts. Restart whenever the sweep (re)starts or
     // switches axis; hold the value while off so a Finish read lands intact.
-    while state.aux_f32.len() <= GST_CATCH_S {
+    while state.aux_f32.len() <= TURN_STICK_CARRY {
         state.aux_f32.push(0.0);
     }
     let axis_code = match cal_measure.as_str() {
@@ -388,18 +471,41 @@ pub(crate) fn compute_rws(
         }
     };
     // The Flick pin carries it alone; "both" merges it into the outputs instead.
-    let flick_pin = match flick_output {
+    let mut flick_pin = match flick_output {
         "mouse" => glam::Vec2::new(flick_deg * scale, 0.0),
         "stick" => glam::Vec2::new(flick_defl, 0.0),
         _ => glam::Vec2::ZERO,
     };
+    // Turns cards asked for, through the mouse or a stick as each one says, and
+    // by the road this module's flicks take: a wired Flick pin of that kind if
+    // there is one (it may bypass a selector gating the aim), else the main
+    // output of that kind. 1:1 through `scale`, like a flick. A sweep has no
+    // business turning anything but the sweep.
+    if measuring {
+        state.rws_turns.clear();
+        state.aux_f32[TURN_STICK_CARRY] = 0.0;
+    }
+    let (turn_mouse, turn_stick) = tick_bound_turns(state, dt);
+    let pin_wired = params.get("_rws_flick_out_wired").and_then(|v| v.as_bool()).unwrap_or(false);
+    let turn_via_pin = |kind: &str| pin_wired && flick_output == kind;
+    let mut turn_to_mouse = turn_mouse;
+    if turn_via_pin("mouse") {
+        flick_pin.x += turn_mouse * scale;
+        turn_to_mouse = 0.0;
+    }
+    state.aux_f32[TURN_STICK_CARRY] += turn_stick;
+    if turn_via_pin("stick") {
+        let (defl, owed) = stick_turn_fit(state.aux_f32[TURN_STICK_CARRY], flick_pin.x, stick_max * dt);
+        flick_pin.x += defl;
+        state.aux_f32[TURN_STICK_CARRY] = owed;
+    }
     let (flick_to_mouse, flick_to_stick) = if flick_output == "both" { (flick_deg, flick_defl) } else { (0.0, 0.0) };
 
     // Mouse output: per-tick displacement in mouse counts (scale = counts/degree).
     // Right-stick output: the desired turn RATE (rws applied) normalized by the
     // game's full-deflection turn rate, clamped below to the unit range. Both
     // accumulate the primary source first, then the optional stick-aim.
-    let mut dx = yaw_dps * dt * scale * rws + flick_to_mouse * scale;
+    let mut dx = yaw_dps * dt * scale * rws + (flick_to_mouse + turn_to_mouse) * scale;
     let mut dy = pitch_dps * dt * scale * rws;
     let mut sx = yaw_dps * rws / stick_max + flick_to_stick;
     let mut sy = pitch_dps * rws / stick_max;
@@ -471,6 +577,14 @@ pub(crate) fn compute_rws(
 
     let mut sx = sx.clamp(-1.0, 1.0);
     let mut sy = sy.clamp(-1.0, 1.0);
+
+    // A bound turn with no Flick pin to take it: last onto the Stick output, so it
+    // gets whatever deflection the aim has left and none of it clips away.
+    if !turn_via_pin("stick") {
+        let (defl, owed) = stick_turn_fit(state.aux_f32[TURN_STICK_CARRY], sx, stick_max * dt);
+        sx += defl;
+        state.aux_f32[TURN_STICK_CARRY] = owed;
+    }
 
     // While MEASURING, drive ONLY the output being calibrated (`cal_output`) so a
     // patch that wires BOTH outputs (with selectors deciding which is live) can't

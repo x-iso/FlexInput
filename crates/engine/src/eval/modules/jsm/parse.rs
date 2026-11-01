@@ -1807,6 +1807,12 @@ pub(crate) fn parse_mapping(
             Out::Midi(m)
         } else {
             let Some(found) = out_from_name(&key) else {
+                if key.to_ascii_uppercase().starts_with("FLICK_") {
+                    return Err(format!(
+                        "`{key}`: a flick is FLICK_R or FLICK_L and 1 to 360 degrees, with its \
+                         own time if you like — FLICK_R90, FLICK_L45_120MS"
+                    ));
+                }
                 return Err(format!(
                     "`{key}` isn't a key, button or action JSM can bind"
                 ));

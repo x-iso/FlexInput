@@ -33,6 +33,11 @@ pub struct NodeState {
     pub rws_cal_flick: Option<Box<crate::eval::CalFlick>>,
     /// RWS Aim: the flick's tracking stabiliser, while a flick is engaged.
     pub rws_flick_stab: Option<crate::eval::AngleFilter>,
+    /// RWS Aim as a flick target: the turns cards have started, still paying out.
+    pub rws_turns: Vec<crate::eval::RwsTurn>,
+    /// RWS Aim as a flick target: the flick pins cards held last tick, so a turn
+    /// starts once per press.
+    pub rws_turn_held: HashSet<String>,
     /// Device stick rebound filter (on the reserved carry entry only): every
     /// device's trackers and their clock. See `eval::filter_stick_rebound`.
     pub stick_rebound: Option<Box<crate::eval::StickReboundState>>,

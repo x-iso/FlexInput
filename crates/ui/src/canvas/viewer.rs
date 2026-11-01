@@ -1011,6 +1011,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 feedback_override_header_toggle(ui, snarl, node);
             }
 
+            // RWS Aim: whether this module turns the flicks mapping cards send.
+            if is_rws {
+                rws_map_flicks_header_toggle(ui, snarl, node);
+            }
+
             // JSM Config: pass the rest of the pad through, or only what the config says.
             if is_jsm {
                 ui.horizontal(|ui| {

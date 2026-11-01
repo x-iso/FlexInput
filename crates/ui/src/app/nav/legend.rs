@@ -47,10 +47,15 @@ impl FlexInputApp {
                         }
                         Some(e) => {
                             if timed {
+                                let flick = matches!(e, ChordElem::Item(i) if self.picker_chord().flick_at(i).is_some());
                                 v.push((hint_vert(), match e {
                                     ChordElem::Gap(_) => "Gap time",
+                                    ChordElem::Item(_) if flick => "Turn",
                                     ChordElem::Item(_) => "Duration (below min: input's)",
                                 }));
+                                if flick {
+                                    v.push((vec!["left_trigger"], "Hold: Up / Down sets its time"));
+                                }
                                 v.push((vec!["btn_west"], if fine { "Fine: on" } else { "Fine" }));
                             }
                             v.push((vec!["btn_north"], "Delete"));

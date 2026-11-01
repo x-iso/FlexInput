@@ -1215,7 +1215,24 @@ impl FlexInputApp {
             inputs: chord && self.gamepad_nav.kbm_picker_inputs,
             // Set Neutral Forward: any mapping card can send it.
             orient: chord,
+            // A bound flick needs someone to turn it: an RWS Aim set to take them.
+            flick: chord && self.flick_target_on_tab(),
         }
+    }
+
+    /// Is an RWS Aim anywhere on the active tab (nested sub-patches too) set as
+    /// the target for the flicks cards send?
+    pub(crate) fn flick_target_on_tab(&self) -> bool {
+        fn scan(snarl: &Snarl<NodeData>) -> bool {
+            snarl.nodes_ids_data().any(|(_, node_ref)| {
+                let n = &node_ref.value;
+                (n.module_id == "processing.rws"
+                    && n.params.get(flexinput_core::flick::TARGET_PARAM)
+                        .and_then(|v| v.as_bool()).unwrap_or(false))
+                    || n.subpatch.as_ref().is_some_and(|sp| scan(&sp.snarl))
+            })
+        }
+        scan(&self.tabs[self.active_tab].canvas.snarl)
     }
 
     /// Clear the chord the picker is filling. Clearing a Remapper or Map
