@@ -145,6 +145,10 @@ pub struct SpecialPickerRequest {
     pub input_key: Option<String>,
     /// Offer the IMU and the touchpad's click zones (Remapper inputs).
     pub inputs: bool,
+    /// Edit an existing card rather than the draft: `(cards key, index)`. The
+    /// session then reads and writes that card's own `in` / `out` (and its
+    /// output timing) in place of the draft params, and moves no phase.
+    pub card: Option<(String, usize)>,
 }
 
 impl SpecialPickerRequest {
@@ -160,6 +164,26 @@ impl SpecialPickerRequest {
             stage: if latched { PickStage::Output } else { PickStage::Input },
             input_key: Some("draft_input".to_string()),
             inputs: true,
+            ..Default::default()
+        }
+    }
+
+    /// Change one of a Remapper's existing cards: its input or its output,
+    /// with the other side a West (or a click) away.
+    pub fn remapper_card(
+        inner: NodeId,
+        path: Vec<usize>,
+        card: usize,
+        stage: crate::kbm_picker::PickStage,
+    ) -> Self {
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: "out".to_string(),
+            stage,
+            input_key: Some("in".to_string()),
+            inputs: true,
+            card: Some(("mappings".to_string(), card)),
             ..Default::default()
         }
     }
@@ -212,11 +236,57 @@ impl Default for SpecialPickerRequest {
             stage: crate::kbm_picker::PickStage::Output,
             input_key: None,
             inputs: false,
+            card: None,
         }
     }
 }
 
 pub(crate) const SPECIAL_PICKER_REQ_KEY: &str = "fxi_special_picker_request";
+
+/// The card an open Choose picker is editing, so its body can mark the row
+/// being changed: `(sub-patch path, node, cards key, card index, side)`.
+#[derive(Clone, Default)]
+pub(crate) struct PickerCardEdit {
+    pub(crate) path: Vec<usize>,
+    pub(crate) inner: usize,
+    pub(crate) cards_key: String,
+    pub(crate) card: usize,
+    pub(crate) stage: crate::kbm_picker::PickStage,
+}
+
+const PICKER_CARD_EDIT_KEY: &str = "fxi_picker_card_edit";
+
+/// Published by the app once a frame from the picker session (`None` when no
+/// card is being edited). Context data is shared by every viewport, so a body
+/// on the config overlay or in a sub-patch editor reads the same value.
+pub(crate) fn set_picker_card_edit(ctx: &egui::Context, edit: Option<PickerCardEdit>) {
+    let id = egui::Id::new(PICKER_CARD_EDIT_KEY);
+    ctx.data_mut(|d| match edit {
+        Some(e) => d.insert_temp(id, e),
+        None => {
+            d.remove_temp::<PickerCardEdit>(id);
+        }
+    });
+}
+
+/// Which side of card `card` in node `inner`'s `cards_key` list (inside the
+/// sub-patch chain `path`) the open picker is editing, if any.
+///
+/// A body in a nested sub-patch editor knows only the end of its path (its
+/// editor's own frame — the editor prefixes the rest onto a request), so a
+/// non-empty `path` also matches as the tail of the published one.
+pub(crate) fn picker_card_edit_side(
+    ctx: &egui::Context,
+    path: &[usize],
+    inner: NodeId,
+    cards_key: &str,
+    card: usize,
+) -> Option<crate::kbm_picker::PickStage> {
+    ctx.data(|d| d.get_temp::<PickerCardEdit>(egui::Id::new(PICKER_CARD_EDIT_KEY)))
+        .filter(|e| e.inner == inner.0 && e.card == card && e.cards_key == cards_key)
+        .filter(|e| e.path == path || (!path.is_empty() && e.path.ends_with(path)))
+        .map(|e| e.stage)
+}
 
 /// Set from a Special button click; consumed by `app.rs` after the canvas/editor
 /// `show()` returns (which is where the sub-patch `outer` context is known).

@@ -300,21 +300,36 @@ impl FlexInputApp {
                 (vec!["btn_west"], "Fine"),
                 (vec!["btn_east"], "Back"),
             ],
-            EditLevel::RemapScroll => vec![
-                (hint_move(), "Navigate"),
-                (vec!["btn_south"], "Select / Enter"),
-                (vec!["btn_north"], "Reset card"),
-                (vec!["btn_west"], "Delete card"),
-                (vec!["left_trigger", "right_trigger"], "Filter"),
-                (vec!["btn_east"], "Back"),
-            ],
-            EditLevel::RemapCard => vec![
-                (hint_horiz(), "Field"),
-                (hint_vert(), "Adjust"),
-                (vec!["btn_south"], "Toggle / Open"),
-                (vec!["btn_north"], "Reset card"),
-                (vec!["btn_east"], "Back"),
-            ],
+            EditLevel::RemapScroll => {
+                let mut v = vec![
+                    (hint_move(), "Navigate"),
+                    (vec!["btn_south"], "Select / Enter"),
+                    (vec!["btn_north"], "Reset card"),
+                    (vec!["btn_west"], "Delete card"),
+                    (vec!["left_trigger", "right_trigger"], "Filter"),
+                    (vec!["btn_east"], "Back"),
+                ];
+                // A Remapper's Select / Start: the picker on either side.
+                if let Some((input, output)) = self.nav_remap_picker_hints() {
+                    v.insert(2, (vec!["btn_back"], input));
+                    v.insert(3, (vec!["btn_start"], output));
+                }
+                v
+            }
+            EditLevel::RemapCard => {
+                let mut v = vec![
+                    (hint_horiz(), "Field"),
+                    (hint_vert(), "Adjust"),
+                    (vec!["btn_south"], "Toggle / Open"),
+                    (vec!["btn_north"], "Reset card"),
+                    (vec!["btn_east"], "Back"),
+                ];
+                if let Some((input, output)) = self.nav_remap_picker_hints() {
+                    v.insert(3, (vec!["btn_back"], input));
+                    v.insert(4, (vec!["btn_start"], output));
+                }
+                v
+            }
             EditLevel::TzLines if self.nav_driving_outer_id().is_some_and(|o| self.nav_is_area(o)) => {
                 use crate::gamepad_nav::TzFocus;
                 let mut v = vec![(hint_move(), "Walk cells/borders")];

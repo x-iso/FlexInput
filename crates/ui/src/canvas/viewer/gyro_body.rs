@@ -1083,7 +1083,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, skin, true, false,
                         reorder_enabled, drag_off, key, true,
-                        card_conf.as_ref(),
+                        card_conf.as_ref(), None,
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }

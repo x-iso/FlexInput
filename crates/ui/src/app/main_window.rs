@@ -434,8 +434,7 @@ impl FlexInputApp {
             if let Some(inner) = self.gamepad_nav.kbm_picker_node {
                 let phase = self.picker_target_param_str(&path, inner, "_tz_phase");
                 if phase.as_deref() != Some("captured") {
-                    self.gamepad_nav.kbm_picker_open = false;
-                    self.gamepad_nav.kbm_picker_viewport = None;
+                    self.close_kbm_picker();
                 }
             }
         }
@@ -461,8 +460,7 @@ impl FlexInputApp {
             if vp == picker_vp {
                 // Config-overlay picker is valid only while the overlay is up.
                 if !crate::config_overlay::config_overlay_visible(ctx) {
-                    self.gamepad_nav.kbm_picker_open = false;
-                    self.gamepad_nav.kbm_picker_viewport = None;
+                    self.close_kbm_picker();
                 }
             } else {
                 let owner_open = self.sub_patch_editors.iter().any(|e| egui::ViewportId::from_hash_of(

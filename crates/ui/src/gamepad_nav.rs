@@ -501,6 +501,19 @@ pub struct GamepadNav {
     /// Offer the inputs only a Remapper can take: the pad's motion and the
     /// touchpad's click zones.
     pub kbm_picker_inputs: bool,
+    /// Editing an existing card instead of the draft: `(cards key, index)`.
+    /// The in / draft keys then name the card's own `in` / `out` fields, read
+    /// and written on that card (see `FlexInputApp::picker_slot_get`).
+    pub kbm_picker_card: Option<(String, usize)>,
+    /// That card's `in` and `out` as the session last left them. Anything
+    /// else changing them — the card deleted, dragged elsewhere, a preset
+    /// loaded, an undo — ends the session rather than let it edit whichever
+    /// card now sits at that index.
+    pub kbm_picker_card_seen: Option<(Option<serde_json::Value>, Option<serde_json::Value>)>,
+    /// The active tab and its canvas as they were when a card-edit session
+    /// opened, committed as one undo entry when it closes. `None` when an
+    /// enclosing edit (an entered card's `edit_baseline`) already covers it.
+    pub kbm_picker_undo: Option<(usize, Box<egui_snarl::Snarl<crate::canvas::NodeData>>)>,
     /// The picker tab showing (LB/RB, or a click on its header).
     pub kbm_picker_tab: crate::kbm_picker::PickerTab,
     /// Focus in the picker's chord list (an index into `TimedChord::elems`)
@@ -630,6 +643,9 @@ impl Default for GamepadNav {
             kbm_picker_stage: crate::kbm_picker::PickStage::Output,
             kbm_picker_in_key: None,
             kbm_picker_inputs: false,
+            kbm_picker_card: None,
+            kbm_picker_card_seen: None,
+            kbm_picker_undo: None,
             kbm_picker_tab: crate::kbm_picker::PickerTab::Kbm,
             kbm_picker_list: None,
             kbm_picker_prev_rt: false,

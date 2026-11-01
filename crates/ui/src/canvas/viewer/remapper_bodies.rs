@@ -400,9 +400,40 @@ pub(crate) fn show_remapper_body(
                 _ => (String::new(), Color32::TRANSPARENT),
             }
         };
-        if !status_txt.is_empty() {
-            ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col));
-        }
+        // The status line, with the preset Save / Load icons in the top-right
+        // corner — ending where the cards do, clear of a pinned widget's
+        // scroll bar. The status wraps in the width left of them.
+        const PRESET_ICONS_W: f32 = 64.0;
+        let cards_right = 6.0 + (BODY_W - 18.0).min(358.0);
+        let loaded = ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(cards_right - PRESET_ICONS_W, 1.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(cards_right - PRESET_ICONS_W);
+                    if !status_txt.is_empty() {
+                        ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col));
+                    }
+                },
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                ui.add_space(BODY_W - cards_right);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                remapper_preset_icons(ui, node_id, snarl, automap_parent)
+            }).inner
+        }).inner;
+        remapper_preset_status(ui, node_id, automap_parent);
+        // A preset loaded just now replaced the cards read at the top of the
+        // body: list (and write back) the loaded ones, not the old.
+        let reloaded: Vec<Value>;
+        let mappings: &Vec<Value> = if loaded {
+            reloaded = snarl.get_node(node_id)
+                .and_then(|n| n.params.get("mappings").and_then(|v| v.as_array()).cloned())
+                .unwrap_or_default();
+            &reloaded
+        } else {
+            &mappings
+        };
         let _ = upstream_dev_id;
         let _ = &pressed_now;
 
@@ -701,6 +732,8 @@ pub(crate) fn show_remapper_body(
             // Output-conflict scan (once): which of this patch's cards write each
             // bus pin, so a card whose out pin is ALSO driven elsewhere gets a ⚠.
             let conflicts = scan_mapping_conflicts(snarl);
+            // Where this node sits, for the card-edit picker to address it.
+            let picker_path = crate::canvas::viewer::subpatch_path(automap_parent);
             let mut rv = ReorderView::begin(
                 ui, egui::Id::new(("fxi_remap_reorder", node_id.0)), reorder_enabled,
             );
@@ -740,14 +773,26 @@ pub(crate) fn show_remapper_body(
                                 // magnitude to pass on.
                                 let card_analog = in_pins.iter()
                                     .any(|p| flexinput_engine::pin_is_analog_input(p));
+                                // The in / out rows open the picker on that
+                                // side of this card; the row it is changing
+                                // now is ringed.
+                                let row_edit = RowEdit {
+                                    active: picker_card_edit_side(
+                                        ui.ctx(), &picker_path, node_id, "mappings", i),
+                                };
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin, out_skin,
                                     card_analog, true, reorder_enabled, drag_off, "mappings", card_analog,
-                                    card_conf.as_ref(),
+                                    card_conf.as_ref(), Some(row_edit),
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
+                                if let Some(stage) = result.row_clicked {
+                                    request_special_picker(ui.ctx(),
+                                        SpecialPickerRequest::remapper_card(
+                                            node_id, picker_path.clone(), i, stage));
+                                }
                                 if let Some((side_out, pin_idx)) = result.midi_chip_clicked {
                                     request_midi_modal(ui.ctx(), MidiModalRequest {
                                         inner: node_id,
@@ -1261,6 +1306,7 @@ pub(crate) fn show_map_action_body(
                                     &in_pins, None, skin, skin,
                                     card_analog, false, reorder_enabled, drag_off, "mappings", false,
                                     None, // Map Action rows aren't bus writers (out_pins None)
+                                    None,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }

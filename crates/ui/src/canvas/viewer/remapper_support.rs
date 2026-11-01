@@ -917,6 +917,43 @@ pub(crate) fn clear_draft_timing(node: &mut NodeData, draft_key: &str) {
     node.params.remove(&dk);
 }
 
+/// Leave a Remapper card whose `in` / `out` were just changed in place (the
+/// Choose picker editing an existing card) the way Add leaves a new one:
+///   • an output gap with no pick after it — a "+ Gap" still waiting — goes,
+///     and the timing arrays go too once nothing timed is left;
+///   • a touchpad swipe output drives in the Analog press mode (Add's rule);
+///   • Analog stays only with an analog input to take a magnitude from, else
+///     the card goes back to Normal (the patch-load migration's rule).
+/// Run once when the edit ends, not on every pick: emptying an input to
+/// re-pick it mustn't cost the card its Analog mode on the way. Idempotent.
+pub(crate) fn tidy_edited_card(card: &mut serde_json::Map<String, Value>) {
+    use flexinput_engine::eval::{OUT_DUR_KEY, OUT_GAP_KEY};
+    let outs: Vec<String> = card.get("out").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut chord = crate::kbm_picker::TimedChord::from_params(
+        outs.clone(), card.get(OUT_GAP_KEY), card.get(OUT_DUR_KEY));
+    if let Some(waiting) = chord.gaps.last_mut() {
+        *waiting = 0.0;
+    }
+    if chord.is_timed() {
+        card.insert(OUT_GAP_KEY.into(), chord.gaps_json());
+        card.insert(OUT_DUR_KEY.into(), chord.durs_json());
+    } else {
+        card.remove(OUT_GAP_KEY);
+        card.remove(OUT_DUR_KEY);
+    }
+    if outs.iter().any(|p| remapper_out_is_swipe(p)) {
+        card.insert("mode".to_string(), Value::String("analog".to_string()));
+    }
+    let analog = card.get("mode").and_then(|v| v.as_str()) == Some("analog");
+    if analog && !flexinput_engine::card_allows_analog_mode(&Value::Object(card.clone())) {
+        card.remove("mode");
+        card.remove("window_ms");
+        card.remove("sustain");
+    }
+}
+
 /// True for the synthetic touchpad-swipe output pins (continuous → analog mode).
 pub(crate) fn remapper_out_is_swipe(pin_id: &str) -> bool {
     matches!(pin_id, "touch_swipe_x" | "touch_swipe_y")
@@ -1120,5 +1157,49 @@ mod learn_mute_tests {
         seen.sort();
         assert_eq!(seen, ["btn_misc1", "btn_south"]);
         assert_eq!(live.get(&k("btn_misc5")).map(|s| s.as_bool()), Some(true), "the pin itself stays live");
+    }
+}
+
+#[cfg(test)]
+mod tidy_edited_card_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tidy(card: Value) -> Value {
+        let mut m = card.as_object().cloned().unwrap();
+        tidy_edited_card(&mut m);
+        Value::Object(m)
+    }
+
+    #[test]
+    fn a_gap_left_waiting_after_the_last_pick_goes() {
+        // "Ctrl, 50 ms, C" then a "+ Gap" never followed by a pick.
+        let card = tidy(json!({ "in": ["btn_south"], "out": ["key_lctrl", "key_c"],
+                                "out_gap": [0.0, 50.0, 50.0] }));
+        assert_eq!(card["out_gap"], json!([0.0, 50.0]));
+        assert_eq!(card["out_dur"], json!([]));
+    }
+
+    #[test]
+    fn timing_goes_once_nothing_timed_is_left() {
+        let card = tidy(json!({ "in": ["btn_south"], "out": ["key_e"],
+                                "out_gap": [0.0, 50.0], "out_dur": [] }));
+        assert!(card.get("out_gap").is_none() && card.get("out_dur").is_none());
+        // A plain card is left as it was.
+        let plain = json!({ "in": ["btn_south"], "out": ["key_e"], "mode": "short", "window_ms": 150.0 });
+        assert_eq!(tidy(plain.clone()), plain);
+    }
+
+    #[test]
+    fn analog_needs_an_analog_input_and_a_swipe_needs_analog() {
+        // The stick taken out of an Analog card: back to Normal.
+        let card = tidy(json!({ "in": ["btn_south"], "out": ["key_w"],
+                                "mode": "analog", "window_ms": 200.0, "sustain": true }));
+        assert!(card.get("mode").is_none() && card.get("window_ms").is_none() && card.get("sustain").is_none());
+        // A swipe output on an analog input drives in Analog, as Add sets it.
+        let card = tidy(json!({ "in": ["right_stick_right"], "out": ["touch_swipe_x"] }));
+        assert_eq!(card["mode"], json!("analog"));
+        // Running it again changes nothing.
+        assert_eq!(tidy(card.clone()), card);
     }
 }

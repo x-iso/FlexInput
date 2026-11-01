@@ -91,8 +91,7 @@ impl FlexInputApp {
 
         // An empty path is valid (top-level node); only `inner` is required.
         if self.gamepad_nav.kbm_picker_node.is_none() {
-            self.gamepad_nav.kbm_picker_open = false;
-            self.gamepad_nav.kbm_picker_viewport = None;
+            self.close_kbm_picker();
             return;
         }
 
@@ -245,6 +244,8 @@ impl FlexInputApp {
     /// One place, because a session left half-set is a picker that opens next
     /// time still typing into the last thing that asked.
     pub(crate) fn close_kbm_picker(&mut self) {
+        // A card being edited is tidied and its session committed for undo.
+        self.finish_picker_card_edit();
         self.gamepad_nav.kbm_picker_open = false;
         self.gamepad_nav.kbm_picker_list = None;
         self.gamepad_nav.fine_increment = false;
@@ -470,8 +471,7 @@ impl FlexInputApp {
             self.picker_append_pin(&pin);
         }
         if interaction.done {
-            self.gamepad_nav.kbm_picker_open = false;
-            self.gamepad_nav.kbm_picker_viewport = None;
+            self.close_kbm_picker();
         }
     }
 
@@ -493,12 +493,9 @@ impl FlexInputApp {
         // The chords for the header preview (read from whichever draft params
         // this picker session targets — any sub-patch depth): the input, when
         // the card has one to choose, and the output, when it has that.
-        let draft = |key: &str| -> Vec<String> {
-            match self.gamepad_nav.kbm_picker_node {
-                Some(i) if !key.is_empty() => self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path, i, key),
-                _ => Vec::new(),
-            }
-        };
+        // (Or, editing an existing card, that card's own lists.)
+        let draft = |key: &str| -> Vec<String> { self.picker_slot_pins(key) };
+        let editing_card = self.gamepad_nav.kbm_picker_card.is_some();
         let in_chord: Option<Vec<String>> = self.gamepad_nav.kbm_picker_in_key.as_deref().map(draft);
         let has_out = !self.gamepad_nav.kbm_picker_draft_key.is_empty();
         let chord: Vec<String> = draft(&self.gamepad_nav.kbm_picker_draft_key);
@@ -563,6 +560,8 @@ impl FlexInputApp {
         let pad_skin = if stage == PickStage::Input { side_skins.0 } else { side_skins.1 };
 
         let title = match purpose {
+            crate::gamepad_nav::PickerUse::Chord if editing_card && stage == PickStage::Input => "Edit card input",
+            crate::gamepad_nav::PickerUse::Chord if editing_card => "Edit card output",
             crate::gamepad_nav::PickerUse::Chord if stage == PickStage::Input => "Choose input",
             crate::gamepad_nav::PickerUse::Chord => "Choose output",
             _ if tz => "⌨ KB/M + mouse picker",

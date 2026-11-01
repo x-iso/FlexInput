@@ -9,10 +9,11 @@ pub(crate) struct MappingCardResult {
     pub(crate) delete_clicked: bool,
     /// True if the mapping object was modified by any header control.
     pub(crate) changed: bool,
-    /// Drag interaction on the card *body* (the area below the header strip).
-    /// Used by the caller's reorder state machine. `None` when reordering is
-    /// disabled for this card.
-    pub(crate) body_drag: Option<egui::Response>,
+    /// Drag interaction on the card's reorder handle: the whole body (below
+    /// the header strip), or — on a card whose rows open the picker
+    /// ([`RowEdit`]) — the grip on its right edge. Used by the caller's
+    /// reorder state machine. `None` when reordering is disabled for this card.
+    pub(crate) drag_handle: Option<egui::Response>,
     /// The card's full on-screen rect (origin + size) at its natural (un-lifted)
     /// position, in the current UI's coordinate space.
     pub(crate) rect: egui::Rect,
@@ -20,7 +21,22 @@ pub(crate) struct MappingCardResult {
     /// MIDI editor itself — it doesn't know which sub-patch its node sits in — so
     /// it hands the click to the body, which does.
     pub(crate) midi_chip_clicked: Option<(bool, usize)>,
+    /// The in or out row was clicked ([`RowEdit`] cards only): the body opens
+    /// the Choose picker on that side of this card.
+    pub(crate) row_clicked: Option<crate::kbm_picker::PickStage>,
 }
+
+/// A card whose in / out rows can be edited in place (the Remapper's): a click
+/// on a row opens the Choose picker on that side, so the body is no longer free
+/// to grab, and the reorder drag moves to a grip on the card's right edge.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RowEdit {
+    /// The side an open picker is editing on this very card, ringed on its row.
+    pub(crate) active: Option<crate::kbm_picker::PickStage>,
+}
+
+/// Width of a [`RowEdit`] card's reorder grip, in design px.
+const GRIP_DESIGN_W: f32 = 16.0;
 
 /// Render a mapping card pixel-accurate to Figma node 358:2 (Frame 1 → Group 1).
 ///
@@ -55,6 +71,8 @@ pub(crate) fn remapper_mapping_card_pixel(
                                     // → square the bottom corners so the two read as ONE card
     conflict: Option<&CardConflict>, // Some → another card also drives one of this card's out
                                      // pins; paint a ⚠ badge + amber outline (Issue: silent override)
+    row_edit: Option<RowEdit>,       // Some (Remapper) → the in / out rows open the picker on
+                                     // click and the reorder drag moves to a right-edge grip
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -86,12 +104,14 @@ pub(crate) fn remapper_mapping_card_pixel(
 
     // Measure chord rows so the card can grow vertically when a chord wraps.
     // chip_size = 26*s, gap = 6*s, plus = 12*s; row width budget is from
-    // `chord_x_start` (62*s) to `card_w - 5*s` on the right edge.
+    // `chord_x_start` (62*s) to `card_w - 5*s` on the right edge — less the
+    // reorder grip, on a card that has one.
+    let grip_w = if row_edit.is_some() { GRIP_DESIGN_W * s } else { 0.0 };
     let chip_size = 26.0 * s;
     let chord_gap = 6.0 * s;
     let plus_w = 12.0 * s;
     let chord_x_start = 62.0 * s;
-    let chord_avail_w = (card_w - 5.0 * s) - chord_x_start;
+    let chord_avail_w = (card_w - 5.0 * s - grip_w) - chord_x_start;
     let row_pitch_y = (chip_size + 6.0 * s).max(32.0 * s);
 
     // The output list's timing (`out_gap` / `out_dur`): a gap shows as a wider
@@ -591,26 +611,107 @@ pub(crate) fn remapper_mapping_card_pixel(
     }
     drop(render_chord_row_painter);
 
-    // ── Body drag handle (reorder) ─────────────────────────────────────────
-    // The whole body strip (below the 31px header) is the drag handle. The
-    // header keeps its own button interactions; body chips are paint-only so
-    // there's no conflict. A grab cursor signals the affordance on hover.
-    let body_drag = if reorder_enabled {
-        let handle_rect = egui::Rect::from_min_max(
-            card_origin + egui::vec2(0.0, body_top_y),
-            card_rect.max,
-        );
-        let resp = ui.interact(
-            handle_rect,
-            ui.id().with(("card_drag", mapping_idx)),
-            egui::Sense::click_and_drag(),
-        );
-        if resp.hovered() || resp.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    // ── Reorder handle, and (RowEdit) the in / out rows as picker buttons ───
+    // On a plain card the whole body strip (below the 31px header) is the drag
+    // handle: the header keeps its own button interactions and the body chips
+    // are paint-only, so there's no conflict. On a RowEdit card a click on a
+    // row opens the picker on that side instead, so the drag moves to a grip
+    // on the right edge. Either way the "in order" pill and the MIDI chips
+    // register after this, on top of it.
+    let mut row_clicked: Option<crate::kbm_picker::PickStage> = None;
+    let drag_handle = match row_edit {
+        None if reorder_enabled => {
+            let handle_rect = egui::Rect::from_min_max(
+                card_origin + egui::vec2(0.0, body_top_y),
+                card_rect.max,
+            );
+            let resp = ui.interact(
+                handle_rect,
+                ui.id().with(("card_drag", mapping_idx)),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            Some(resp)
         }
-        Some(resp)
-    } else {
-        None
+        None => None,
+        Some(edit) => {
+            use crate::kbm_picker::PickStage;
+            let accent = ui.visuals().selection.stroke.color;
+            let body_top = card_origin.y + body_top_y;
+            let rows_right = card_rect.right() - grip_w;
+            // The in rows end halfway between the last in chip and the out
+            // pill (y = 66 on a one-row input), wherever wrapping put them.
+            let split = match out_pins {
+                Some(_) => card_origin.y + 66.0 * s + (in_rows as f32 - 1.0) * row_pitch_y,
+                None => card_rect.bottom(),
+            };
+            let mut bands = vec![(PickStage::Input, egui::Rect::from_min_max(
+                egui::pos2(card_rect.left(), body_top), egui::pos2(rows_right, split)))];
+            if out_pins.is_some() {
+                bands.push((PickStage::Output, egui::Rect::from_min_max(
+                    egui::pos2(card_rect.left(), split), egui::pos2(rows_right, card_rect.bottom()))));
+            }
+            for (stage, band) in bands {
+                let (tag, tip) = match stage {
+                    PickStage::Input => ("row_in", "Click to change the input"),
+                    PickStage::Output => ("row_out", "Click to change the output"),
+                };
+                let resp = ui.interact(band, ui.id().with((tag, mapping_idx)), egui::Sense::click())
+                    .on_hover_text(tip);
+                let mark = band.shrink(2.0 * s);
+                if resp.hovered() {
+                    painter.rect_filled(mark, 4.0, Color32::from_white_alpha(14));
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                // The side the open picker is changing.
+                if edit.active == Some(stage) {
+                    painter.rect_stroke(mark, 4.0, egui::Stroke::new(1.5_f32, accent),
+                        egui::epaint::StrokeKind::Inside);
+                }
+                if resp.clicked() {
+                    row_clicked = Some(stage);
+                }
+            }
+            // The grip: a column of dots down the body's right edge. While a
+            // filter hides cards it stays, dimmed, and says why it won't move.
+            let grip = egui::Rect::from_min_max(egui::pos2(rows_right, body_top), card_rect.right_bottom());
+            let grip_id = ui.id().with(("card_drag", mapping_idx));
+            let resp = if reorder_enabled {
+                ui.interact(grip, grip_id, egui::Sense::click_and_drag())
+                    .on_hover_text("Drag to reorder")
+            } else {
+                ui.interact(grip, grip_id, egui::Sense::hover())
+                    .on_hover_text("Clear the filter to reorder the cards")
+            };
+            let live = reorder_enabled && (resp.hovered() || resp.dragged());
+            if live {
+                painter.rect_filled(grip.shrink(2.0 * s), 3.0, Color32::from_white_alpha(16));
+                ui.ctx().set_cursor_icon(if resp.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                });
+            }
+            let dot = if live {
+                Color32::from_gray(230)
+            } else if reorder_enabled {
+                Color32::from_gray(150)
+            } else {
+                Color32::from_gray(85)
+            };
+            let pitch = 5.0 * s;
+            let rows = ((grip.height() - 10.0 * s) / pitch).floor().clamp(2.0, 6.0) as usize;
+            let c = grip.center();
+            for i in 0..rows {
+                let y = c.y + (i as f32 - (rows - 1) as f32 * 0.5) * pitch;
+                for x in [c.x - 2.5 * s, c.x + 2.5 * s] {
+                    painter.circle_filled(egui::pos2(x, y), 1.2 * s, dot);
+                }
+            }
+            reorder_enabled.then_some(resp)
+        }
     };
 
     // ── "in order" toggle click (on top of the drag handle) ──────────────────
@@ -776,8 +877,9 @@ pub(crate) fn remapper_mapping_card_pixel(
             egui::epaint::StrokeKind::Inside,
         );
         let bsz = 18.0 * s;
+        // Left of the reorder grip, on a card that has one.
         let badge_rect = egui::Rect::from_min_size(
-            card_rect.right_bottom() + egui::vec2(-(bsz + 5.0 * s), -(bsz + 5.0 * s)),
+            card_rect.right_bottom() + egui::vec2(-(bsz + 5.0 * s + grip_w), -(bsz + 5.0 * s)),
             egui::vec2(bsz, bsz),
         );
         painter.circle_filled(badge_rect.center(), bsz * 0.5, Color32::from_black_alpha(160));
@@ -794,8 +896,9 @@ pub(crate) fn remapper_mapping_card_pixel(
 
     MappingCardResult {
         delete_clicked, changed,
-        body_drag, rect: natural_rect,
+        drag_handle, rect: natural_rect,
         midi_chip_clicked,
+        row_clicked,
     }
 }
 
@@ -835,5 +938,91 @@ pub(crate) fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: cr
         };
         emit_sep(ui, &mut first);
         remapper_render_chip(ui, render_id, skin);
+    }
+}
+
+#[cfg(test)]
+mod row_edit_tests {
+    use super::*;
+    use crate::canvas::remapper_icons::Skin;
+    use crate::kbm_picker::PickStage;
+
+    /// Render one Remapper-style card per frame, the pointer doing `events`
+    /// on the last frame. Two quiet frames come first: egui hit-tests against
+    /// the widget rects of the frame before.
+    fn render(frames: &[Vec<egui::Event>], row_edit: Option<RowEdit>) -> MappingCardResult {
+        let ctx = egui::Context::default();
+        let mut mapping = serde_json::json!({ "in": ["btn_south"], "out": ["key_space"] })
+            .as_object().cloned().unwrap();
+        let ins = vec!["btn_south".to_string()];
+        let outs = vec!["key_space".to_string()];
+        let mut last = None;
+        for events in frames {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events: events.clone(),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    last = Some(remapper_mapping_card_pixel(
+                        ui, NodeId(0), 0, &mut mapping, &ins, Some(&outs), Skin::Xbox, Skin::Xbox,
+                        false, true, true, 0.0, "mappings", false, None, row_edit,
+                    ));
+                });
+            });
+        }
+        last.expect("the card rendered")
+    }
+
+    /// The card's rect, from a frame with no input.
+    fn card_rect(row_edit: Option<RowEdit>) -> egui::Rect {
+        render(&[vec![]], row_edit).rect
+    }
+
+    fn click_at(p: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+        };
+        vec![
+            vec![egui::Event::PointerMoved(p)],
+            vec![egui::Event::PointerMoved(p)],
+            vec![button(true)],
+            vec![button(false)],
+        ]
+    }
+
+    #[test]
+    fn a_click_on_a_row_asks_for_that_side() {
+        let edit = Some(RowEdit::default());
+        let r = card_rect(edit);
+        // Mid-row, clear of the in / out pills and the chips.
+        let in_row = r.min + egui::vec2(200.0, 50.0);
+        let out_row = r.min + egui::vec2(200.0, 82.0);
+        assert_eq!(render(&click_at(in_row), edit).row_clicked, Some(PickStage::Input));
+        assert_eq!(render(&click_at(out_row), edit).row_clicked, Some(PickStage::Output));
+        // The header's own buttons are not a row.
+        assert_eq!(render(&click_at(r.min + egui::vec2(150.0, 15.0)), edit).row_clicked, None);
+    }
+
+    #[test]
+    fn the_grip_is_the_drag_handle_and_not_a_row() {
+        let edit = Some(RowEdit::default());
+        let r = card_rect(edit);
+        let grip = egui::pos2(r.right() - GRIP_DESIGN_W * 0.5, r.center().y + 10.0);
+        let res = render(&click_at(grip), edit);
+        assert_eq!(res.row_clicked, None);
+        let handle = res.drag_handle.expect("reorder is on");
+        assert!(handle.rect.contains(grip));
+        assert!(handle.rect.width() <= GRIP_DESIGN_W + 0.5, "only the grip drags: {:?}", handle.rect);
+    }
+
+    #[test]
+    fn a_card_without_row_editing_keeps_its_whole_body_as_the_handle() {
+        let r = card_rect(None);
+        let res = render(&click_at(r.min + egui::vec2(200.0, 50.0)), None);
+        assert_eq!(res.row_clicked, None);
+        let handle = res.drag_handle.expect("reorder is on");
+        assert!(handle.rect.width() > r.width() - 1.0, "{:?}", handle.rect);
     }
 }
