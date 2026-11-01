@@ -959,7 +959,7 @@ pub(crate) fn mapping_curve_editor(
 
     // Shared curve menu — same clipboard and .fxc files as the Response
     // Curve module, so shapes travel freely between modules and cards.
-    bg.context_menu(|ui| {
+    crate::touch::context_menu(&bg, |ui| {
         if ui.button("Reset").clicked() {
             *pts = identity_curve();
             changed = true;

@@ -479,7 +479,8 @@ pub(crate) fn draw_reshape_curve_editor(
 
             // Bias handles (Alt) — gain curve only.
             let alt_held = ui.input(|i| i.modifiers.alt);
-            if editing_gain && alt_held && pts.len() >= 2 {
+            let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
+            if editing_gain && (alt_held || bends.exposed()) && pts.len() >= 2 {
                 while biases.len() < pts.len() - 1 { biases.push(0.0); }
                 for seg in 0..(pts.len() - 1) {
                     let mid_x = (pts[seg][0] + pts[seg + 1][0]) * 0.5;
@@ -487,19 +488,22 @@ pub(crate) fn draw_reshape_curve_editor(
                     let hpos  = c2s(mid_x, mid_y);
                     let hid   = ui.id().with(("vrs_bias", node_id, seg));
                     let hr    = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), hid, egui::Sense::click_and_drag());
+                    let finger = bends.finger(ui, hr.id, hpos);
                     if hr.double_clicked() { biases[seg] = 0.0; bias_changed = true; }
-                    else if hr.dragged() { biases[seg] = (biases[seg] - hr.drag_delta().y / rect.height()).clamp(-2.0, 2.0); bias_changed = true; }
-                    painter.circle_filled(hpos, 3.5, Color32::from_rgb(255, 220, 50));
+                    else if hr.dragged() || finger.is_some() { biases[seg] = (biases[seg] - (hr.drag_delta().y + finger.unwrap_or(0.0)) / rect.height()).clamp(-2.0, 2.0); bias_changed = true; }
+                    painter.circle_filled(hpos, bends.dot_radius(3.5), Color32::from_rgb(255, 220, 50));
                 }
             }
 
             // Draggable points.
             let mut remove_idx: Option<usize> = None;
+            let mut point_down = false;
             for i in 0..pts.len() {
                 let [px, py] = pts[i];
                 let screen = c2s(px, py);
                 let pid = ui.id().with(("vrs_pt", node_id, i));
                 let r = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pid, egui::Sense::click_and_drag());
+                point_down |= r.is_pointer_button_down_on() || r.dragged();
                 if r.dragged() && !alt_held {
                     let dd = r.drag_delta();
                     let nx_raw = (px + dd.x / rect.width()).clamp(
@@ -512,7 +516,8 @@ pub(crate) fn draw_reshape_curve_editor(
                     pts[i] = [nx, sy];
                     pts_changed = true;
                 }
-                if r.secondary_clicked() && pts.len() > 2 && i != 0 && i != pts.len() - 1 {
+                if pts.len() > 2 && i != 0 && i != pts.len() - 1 { bends.removal_ring(ui, &r, screen); }
+                if r.secondary_clicked() && !bends.keeps_point(ui, &r) && pts.len() > 2 && i != 0 && i != pts.len() - 1 {
                     remove_idx = Some(i); pts_changed = true;
                 }
                 let col = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_gray(200) };
@@ -521,6 +526,7 @@ pub(crate) fn draw_reshape_curve_editor(
             }
             // Biases stay on their own segments (boundary has none; its all-zero
             // list is never written back).
+            bends.finish(ui, point_down);
             if let Some(idx) = remove_idx { curve_remove_point(&mut pts, &mut biases, idx); }
             if bg_resp.double_clicked() {
                 if let Some(pos) = bg_resp.interact_pointer_pos() {

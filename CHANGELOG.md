@@ -53,6 +53,31 @@ All notable changes to FlexInput are documented here. This project adheres to
   cards. East puts it down; South puts it down and opens it for editing. A quick press
   of South still opens the card.
 
+- **Wiring by touch.** Pins now take a touch well off their shape, and a wire let go
+  near a pin lands on the nearest one that accepts it. Hold a pin that has wires for a
+  second, until the ring around it fills, to pick them all up and move them; they stay
+  connected where they were until they land. Letting a wire go on empty space opens a
+  menu: **Cancel**, **Delete wires** (when moving existing wires) and **Add module**,
+  which connects every wire you're carrying to the new module.
+- **Easy mode scrolls by touch.** Drag a finger over the layout to scroll it. A finger
+  that lands on a list that can scroll, like a pinned Remapper, scrolls only that list,
+  even at its end, and a second finger elsewhere can scroll the layout at the
+  same time. Controls you can drag, like sliders, still take the drag.
+- **Hold a wire for its menu, by touch.** Hold a finger on a wire for a second, until the
+  ring fills, for the same menu a right click gives: delete it, or insert a module on it.
+  The nearest wire within reach gets thicker as soon as the finger lands, and stays
+  thick while its menu is open. Moving off pans the canvas as usual.
+- **Bend a curve with a second finger.** While a finger holds a point in a Response Curve,
+  Vector Response Curve, Two-Way Response Curve, Envelope or Vector Reshape graph, the
+  bend handles that used to need Alt appear, and another finger can drag them. The canvas
+  doesn't pinch-zoom meanwhile. Holding a point still for most of a second deletes it, as
+  before, unless another finger is down. A red ring fills around it first: move your
+  finger before it closes to keep the point.
+- **Bigger menus for touch.** Right-click-style menus and the File menu get finger-sized
+  rows when opened by touch, on Windows and Linux. A menu too long for the screen scrolls,
+  with a scroll bar that stays visible to show there's more. Dropdown lists keep their
+  size for now.
+
 ### Changed
 
 - **Curves and scopes keep track of a signal's source through more modules.** A
@@ -74,6 +99,31 @@ All notable changes to FlexInput are documented here. This project adheres to
   order.** A Knob on the Multiply's first pin no longer ends the search, so flick
   stick detection works there, and the overlay passes only the pins in use rather than
   the whole device.
+- **The Panic button now engages Panic mode.** It reads **OFF (Ctrl+~)** or **ON (Ctrl+~)**,
+  with your shortcut, and a click or tap toggles it. **Ctrl+click** re-binds the shortcut,
+  which is what a plain click used to do.
+- **The mouse wheel over a list in Easy mode scrolls only the list,** when it has somewhere
+  to scroll. It used to scroll the layout along with it.
+- **The wire menu's categories open on hover,** like every other menu's.
+- **Ctrl+drag moves wires only when they land.** Wires used to leave their pin as the
+  drag began, so giving up on it lost them. They now stay until they land somewhere, and
+  dropping them on empty space offers **Delete wires** in the same menu touch gets. The
+  menu for a wire dropped on empty space now starts with **Cancel**.
+
+### Fixed
+
+- **A touch on Windows no longer counts twice.** Windows also sends each touch as mouse
+  input, and turns a finger held still into a right click when it lifts, which on a pin
+  could delete its wires. A pen still works as before.
+- **Menus opened by touch stay open.** The canvas's Add module menu closed as soon as the
+  finger lifted, and letting a wire go on empty space showed nothing at all.
+- **Pinching over a module zooms and pans without moving the module.** A finger on a
+  module used to drag it along with the gesture. Two fingers now move the view wherever
+  they land on the canvas, on a module's frame or a pin too. A finger on a control in a
+  module, like a slider, keeps it, and the canvas stays put. No menu opens from a finger
+  resting during a pinch.
+- **A held pin no longer goes dead.** Keeping a finger on a pin for most of a second
+  before dragging stopped the wire from coming out at all.
 
 ## [0.16.6] - 2026-10-31
 

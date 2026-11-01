@@ -1040,7 +1040,7 @@ fn jsm_rows(
     }
     // Right-click the editor for the vocabulary. The list is the only place the
     // module tells you what it knows, so it goes where the typing happens.
-    resp.context_menu(|ui| {
+    crate::touch::context_menu(&resp, |ui| {
         if ui.button("Commands…").clicked() {
             let mut st = super::jsm_widgets::command_list_state(ui.ctx(), node_id);
             st.open = true;

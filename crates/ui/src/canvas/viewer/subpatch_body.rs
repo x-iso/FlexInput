@@ -578,7 +578,7 @@ pub(crate) fn show_subpatch_body(
         egui::Sense::click(),
     );
     let _ = secondary_down;
-    bg_resp.context_menu(|ui| {
+    crate::touch::context_menu(&bg_resp, |ui| {
         ui.menu_button("Add", |ui| {
             if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close(); }
             if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close(); }
@@ -830,7 +830,7 @@ pub(crate) fn show_subpatch_body(
                 egui::Id::new(("li_ctx", outer_id.0, idx)),
                 egui::Sense::click(),
             );
-            ctx_resp.context_menu(|ui| {
+            crate::touch::context_menu(&ctx_resp, |ui| {
                 layout_item_context_menu(
                     ui, idx, is_deco_idx, has_style_clip, n_selected,
                     &mut zaction, &mut delete_idx,
@@ -839,7 +839,7 @@ pub(crate) fn show_subpatch_body(
                 );
             });
         } else if let Some((_, resp)) = hit_responses.iter().find(|(i, _)| *i == idx) {
-            resp.clone().context_menu(|ui| {
+            crate::touch::context_menu(&resp, |ui| {
                 layout_item_context_menu(
                     ui, idx, is_deco_idx, has_style_clip, n_selected,
                     &mut zaction, &mut delete_idx,

@@ -1107,6 +1107,28 @@ pub(crate) fn render_net_whole_module(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A finger that came down on a pinned list that can scroll scrolls the list, at the
+/// finger's speed whatever the zoom, and nothing else: it stays the list's at either end.
+/// Returns the new offset.
+fn pinned_touch_scroll(
+    ui: &egui::Ui,
+    scroller: egui::Id,
+    container_rect: egui::Rect,
+    parent_to_global: egui::emath::TSTransform,
+    offset: f32,
+    scale: f32,
+    max_offset: f32,
+) -> f32 {
+    let dy = crate::touch::finger_scroll(
+        ui.ctx(), scroller, parent_to_global * container_rect, ui.layer_id(),
+        crate::touch::ScrollRank::Widget, max_offset > 0.0,
+    );
+    if dy == 0.0 {
+        return offset;
+    }
+    (offset - dy / (scale * parent_to_global.scaling)).clamp(0.0, max_offset)
+}
+
 pub(crate) fn render_remap_whole_module_impl<BodyFn, MapLenFn, DraftLenFn>(
     tag: &'static str,
     design_w: f32,
@@ -1186,10 +1208,19 @@ where
     // ── 4. Compute scroll offset (in body-space px, before scaling) ─────────
     let mut scroll_offset_body = if any_capture_change { 0.0 } else { prev_offset };
     if pointer_over && !is_layout_mode {
+        if prev_body_h > container_h / scale {
+            crate::canvas::wheel::keep_wheel_from_page(ui.ctx());
+        }
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel != 0.0 {
             scroll_offset_body -= wheel / scale;
         }
+    }
+    if !is_layout_mode {
+        scroll_offset_body = pinned_touch_scroll(
+            ui, state_key, container_rect, parent_to_global, scroll_offset_body, scale,
+            (prev_body_h - container_h / scale).max(0.0),
+        );
     }
     // Gamepad-nav scroll: the nav driver publishes a body-space scroll delta
     // (px) keyed by viewport and inner node id while the user is inside this
@@ -1712,10 +1743,19 @@ pub(crate) fn render_label_text_pinned_scroll(
 
     let mut scroll_offset_body = if changed { 0.0 } else { prev_offset };
     if pointer_over && !is_layout_mode {
+        if prev_body_h > container_h / scale {
+            crate::canvas::wheel::keep_wheel_from_page(ui.ctx());
+        }
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel != 0.0 {
             scroll_offset_body -= wheel / scale;
         }
+    }
+    if !is_layout_mode {
+        scroll_offset_body = pinned_touch_scroll(
+            ui, state_key, container_rect, parent_to_global, scroll_offset_body, scale,
+            (prev_body_h - container_h / scale).max(0.0),
+        );
     }
 
     // Freeze one scroll value for clip + transform + scrollbar, clamped against
@@ -2630,6 +2670,201 @@ mod pinnable_element_tests {
     }
 }
 
+/// The real pinned list, the way Easy mode hosts it: a page around it reading the same
+/// fingers and the same wheel. Remapper stands in for everything built on the same
+/// whole-module pin. JSM isn't: its boxes are the plain scroll areas tested last.
+#[cfg(test)]
+mod scroll_ownership_tests {
+    use super::*;
+    use crate::touch::tests::{finger_down, finger_move, finger_up, input, other_finger};
+    use crate::touch::{finger_scroll, ScrollRank};
+    use egui::{pos2, vec2, Event, TouchPhase};
 
+    const ON_LIST: egui::Pos2 = pos2(200.0, 100.0);
+    const OFF_LIST: egui::Pos2 = pos2(600.0, 600.0);
 
+    struct Rig {
+        ctx: egui::Context,
+        snarl: Snarl<NodeData>,
+        id: NodeId,
+        time: f64,
+        page_dy: f32,
+        list_offset: f32,
+    }
 
+    impl Rig {
+        fn new(cards: usize) -> Self {
+            let mut params = std::collections::HashMap::new();
+            let card = serde_json::json!({ "in": ["btn_south"], "out": ["btn_east"] });
+            params.insert("mappings".to_string(), Value::Array(vec![card; cards]));
+            let mut snarl = Snarl::new();
+            let id = snarl.insert_node(egui::Pos2::ZERO, NodeData {
+                module_id: "module.remapper".to_string(),
+                display_name: "Remapper".to_string(),
+                category: "AutoMap".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            });
+            let mut rig = Rig {
+                ctx: egui::Context::default(),
+                snarl,
+                id,
+                time: 0.0,
+                page_dy: 0.0,
+                list_offset: 0.0,
+            };
+            for _ in 0..5 {
+                rig.frame(vec![]);
+            }
+            rig
+        }
+
+        fn frame(&mut self, events: Vec<Event>) {
+            self.time += 1.0 / 30.0;
+            let mut raw = input(self.time, events);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 800.0));
+            raw.screen_rect = Some(screen);
+            let Rig { ctx, snarl, id, page_dy, list_offset, .. } = self;
+            let signals = std::collections::HashMap::new();
+            let panic = crate::app::PanicShortcut::default();
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *page_dy = finger_scroll(
+                        ui.ctx(), egui::Id::new("page"), screen, ui.layer_id(),
+                        ScrollRank::Page, true,
+                    );
+                    let key = remap_pin_state_id(ui, *id, "remapper");
+                    render_remapper_whole_module(
+                        *id, ui, snarl, vec2(400.0, 200.0), &signals, &panic, None, false,
+                    );
+                    *list_offset = ui.ctx().data(|d| d.get_temp::<RemapPinState>(key))
+                        .map_or(0.0, |state| state.0);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn a_finger_on_a_list_that_can_scroll_moves_only_the_list() {
+        let mut r = Rig::new(40);
+        r.frame(finger_down(ON_LIST));
+        let mut last = r.list_offset;
+        for step in 1..=6 {
+            r.frame(finger_move(ON_LIST - vec2(0.0, step as f32 * 15.0)));
+            assert_eq!(r.page_dy, 0.0, "step {step}");
+            assert!(r.list_offset >= last, "step {step}");
+            last = r.list_offset;
+            // A frame the finger doesn't move on must not hand it to the page.
+            r.frame(vec![]);
+            assert_eq!(r.page_dy, 0.0, "still, step {step}");
+        }
+        assert!(last > 10.0, "the list scrolled: {last}");
+    }
+
+    #[test]
+    fn a_list_at_its_end_keeps_the_finger() {
+        let mut r = Rig::new(40);
+        r.frame(finger_down(ON_LIST));
+        // Downwards: already at its top, with nowhere to go.
+        for step in 1..=4 {
+            r.frame(finger_move(ON_LIST + vec2(0.0, step as f32 * 15.0)));
+            assert_eq!(r.page_dy, 0.0);
+            assert_eq!(r.list_offset, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_second_finger_scrolls_the_page_around_the_list() {
+        let mut r = Rig::new(40);
+        r.frame(finger_down(ON_LIST));
+        r.frame(other_finger(TouchPhase::Start, OFF_LIST));
+        r.frame(finger_move(ON_LIST - vec2(0.0, 30.0)));
+        assert_eq!(r.page_dy, 0.0);
+        let offset = r.list_offset;
+        assert!(offset > 0.0);
+        r.frame(other_finger(TouchPhase::Move, OFF_LIST - vec2(0.0, 30.0)));
+        assert_eq!(r.page_dy, -30.0);
+        assert_eq!(r.list_offset, offset, "the list stays put");
+    }
+
+    #[test]
+    fn a_list_with_nothing_to_scroll_leaves_the_finger_to_the_page() {
+        let mut r = Rig::new(1);
+        r.frame(finger_down(ON_LIST));
+        r.frame(finger_move(ON_LIST - vec2(0.0, 30.0)));
+        assert_eq!(r.page_dy, -30.0);
+        assert_eq!(r.list_offset, 0.0);
+        r.frame(finger_up(ON_LIST - vec2(0.0, 30.0)));
+    }
+
+    /// A JSM box scrolls by itself, as egui's scroll areas do: it takes the drag, so the
+    /// page around it stays put. With nothing to scroll it takes nothing.
+    #[test]
+    fn a_jsm_scroll_box_keeps_its_finger_from_the_page() {
+        for (lines, box_scrolls) in [(100, true), (2, false)] {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 800.0));
+            let at = pos2(100.0, 60.0);
+            let (mut page_dy, mut offset) = (0.0_f32, 0.0_f32);
+            let mut frame = |t: f64, events: Vec<Event>| {
+                let mut raw = input(t, events);
+                raw.screen_rect = Some(screen);
+                let _ = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        page_dy = finger_scroll(
+                            ui.ctx(), egui::Id::new("page"), screen, ui.layer_id(),
+                            ScrollRank::Page, true,
+                        );
+                        let out = crate::canvas::wheel::scrolling_body(
+                            ui,
+                            egui::Id::new("jsm_box"),
+                            egui::ScrollArea::vertical().max_height(200.0).auto_shrink([false, false]),
+                            |ui| {
+                                for n in 0..lines {
+                                    ui.label(format!("line {n}"));
+                                }
+                            },
+                        );
+                        offset = out.state.offset.y;
+                    });
+                });
+                (page_dy, offset)
+            };
+            frame(0.0, vec![]);
+            frame(0.03, vec![]);
+            frame(0.06, finger_down(at));
+            frame(0.09, finger_move(at - vec2(0.0, 20.0)));
+            let (page, scrolled) = frame(0.12, finger_move(at - vec2(0.0, 50.0)));
+            if box_scrolls {
+                assert_eq!(page, 0.0);
+                assert!(scrolled > 0.0, "{scrolled}");
+            } else {
+                assert_eq!(page, -30.0);
+                assert_eq!(scrolled, 0.0);
+            }
+        }
+    }
+
+    /// The wheel goes the same way: the list alone, over a list that can scroll.
+    #[test]
+    fn the_wheel_over_a_list_is_the_lists_alone() {
+        let mut r = Rig::new(40);
+        let wheel_has = |r: &mut Rig, at: egui::Pos2| {
+            r.frame(vec![Event::PointerMoved(at)]);
+            r.frame(vec![]);
+            let ctx = r.ctx.clone();
+            let mut kept = false;
+            let raw = input(r.time + 1.0 / 30.0, vec![]);
+            let _ = ctx.run(raw, |ctx| kept = crate::canvas::wheel::widget_has_wheel(ctx));
+            kept
+        };
+        assert!(wheel_has(&mut r, ON_LIST));
+        let mut r = Rig::new(40);
+        assert!(!wheel_has(&mut r, OFF_LIST));
+        let mut r = Rig::new(1);
+        assert!(!wheel_has(&mut r, ON_LIST), "nothing to scroll: the page's");
+    }
+}

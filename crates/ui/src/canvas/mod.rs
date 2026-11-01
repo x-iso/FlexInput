@@ -1089,10 +1089,9 @@ pub enum PendingViewAction {
 pub struct Canvas {
     pub snarl: Snarl<NodeData>,
     style: SnarlStyle,
-    /// Pending wire right-click context menu: (from, to, screen position).
+    /// Open wire context menu (right click, or a finger held on the wire): (from, to,
+    /// screen position).
     wire_ctx_menu: Option<(OutPinId, InPinId, egui::Pos2)>,
-    /// True on the frame the wire menu was first opened; suppresses the outside-click close check.
-    wire_ctx_just_opened: bool,
     /// Active inline rename: (node id, edit buffer, popup position).
     rename_state: Option<(egui_snarl::NodeId, String, egui::Pos2)>,
     undo_stack: Vec<Snarl<NodeData>>,
@@ -1198,7 +1197,6 @@ impl Canvas {
             snarl: Snarl::new(),
             style,
             wire_ctx_menu: None,
-            wire_ctx_just_opened: false,
             rename_state: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1382,7 +1380,8 @@ impl Canvas {
         // "Ongoing" = the user is still mid-gesture: a button held down, an
         // active drag, or a focused text field. A click that changes a value
         // and releases on the same frame is NOT ongoing.
-        let interaction_ongoing = ctx.input(|i| i.pointer.any_down())
+        // (`any_touches`: a second finger can still be working after the pointer's lifts.)
+        let interaction_ongoing = ctx.input(|i| i.pointer.any_down() || i.any_touches())
             || ctx.is_using_pointer()
             || ctx.wants_keyboard_input();
         // "This-frame input" = any pointer/keyboard activity this frame,
@@ -1740,6 +1739,7 @@ impl Canvas {
         // would break undo, so the conditions are intentionally generous.
         let needs_snapshot = ui.ctx().input(|i| {
             i.pointer.any_down()
+                || crate::touch::fingers_working(i)
                 || i.pointer.any_released()
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
         });
@@ -1770,6 +1770,7 @@ impl Canvas {
             is_inner_canvas: self.is_inner,
             expose_module_request: None,
             pinned_inner_ids: self.pinned_inner_ids.clone(),
+            highlighted_wire: self.wire_ctx_menu.map(|(from, to, _)| (from, to)),
             group_request: false,
             push_undo_request: false,
             param_defaults,
@@ -1944,7 +1945,6 @@ impl Canvas {
 
         if let Some(pending) = viewer.pending_wire_menu {
             self.wire_ctx_menu = Some(pending);
-            self.wire_ctx_just_opened = true;
         }
 
         // ── Hot-swap: replace device node ─────────────────────────────────────
@@ -2046,37 +2046,47 @@ impl Canvas {
                 }
             }
 
-            let mut close = false;
+            let mut open = true;
             let mut delete = false;
             let mut insert_idx: Option<usize> = None;
 
-            let area_resp = egui::Area::new(egui::Id::new("wire_ctx_menu"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(pos)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(150.0);
-                        if ui.button("✖ Delete wire").clicked() {
-                            delete = true;
-                            close = true;
-                        }
-                        if !cats.is_empty() {
-                            ui.separator();
-                            ui.label(egui::RichText::new("Insert between…").small().weak());
-                            for (cat, indices) in &cats {
-                                ui.menu_button(*cat, |ui| {
-                                    for &i in indices {
-                                        if ui.button(descriptors[i].display_name).clicked() {
-                                            insert_idx = Some(i);
-                                            close = true;
-                                            ui.close();
-                                        }
+            egui::Popup::new(
+                egui::Id::new("wire_ctx_menu"),
+                ui.ctx().clone(),
+                egui::PopupAnchor::Position(pos),
+                ui.layer_id(),
+            )
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .style(crate::touch::menu_style_for(ui.ctx()))
+            .open_bool(&mut open)
+            .show(|ui| crate::touch::menu_scroll(ui, |ui| {
+                ui.set_min_width(150.0);
+                if crate::touch::is_active(ui.ctx()) && ui.button("Cancel").clicked() {
+                    ui.close();
+                }
+                if ui.button("✖ Delete wire").clicked() {
+                    delete = true;
+                    ui.close();
+                }
+                if !cats.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Insert between…").small().weak());
+                    for (cat, indices) in &cats {
+                        ui.menu_button(*cat, |ui| {
+                            let max_height = ui.ctx().content_rect().height() - 32.0;
+                            egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                                for &i in indices {
+                                    if ui.button(descriptors[i].display_name).clicked() {
+                                        insert_idx = Some(i);
+                                        ui.close();
                                     }
-                                });
-                            }
-                        }
-                    });
-                });
+                                }
+                            });
+                        });
+                    }
+                }
+            }));
 
             if delete {
                 self.push_undo();
@@ -2087,19 +2097,7 @@ impl Canvas {
                 insert_between(&mut self.snarl, &descriptors[i], out_id, in_id);
             }
 
-            // Close on click outside (skip the frame the menu first appeared).
-            if !self.wire_ctx_just_opened {
-                let ptr = ui.input(|i| i.pointer.latest_pos().unwrap_or_default());
-                let clicked = ui.input(|i| i.pointer.any_click());
-                if clicked && !area_resp.response.rect.contains(ptr) {
-                    close = true;
-                }
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    close = true;
-                }
-            }
-            self.wire_ctx_just_opened = false;
-            if close {
+            if !open {
                 self.wire_ctx_menu = None;
             }
         }
@@ -3585,6 +3583,170 @@ mod usb_audio_switch_tests {
         let n = canvas.snarl.get_node(node).unwrap();
         assert_eq!(n.outputs.len(), source.len());
         assert_eq!(canvas.snarl.wires().count(), 1);
+    }
+}
+
+/// A finger held on a wire, through the real canvas and its real menu.
+#[cfg(test)]
+mod wire_menu_tests {
+    use super::*;
+    use crate::touch::tests::{finger_down, finger_up, input};
+    use egui_snarl::ui::{NodeState, SnarlState};
+
+    struct Rig {
+        ctx: egui::Context,
+        canvas: Canvas,
+        descriptors: Vec<ModuleDescriptor>,
+        wire: (OutPinId, InPinId),
+        /// Halfway along the wire, on screen.
+        middle: egui::Pos2,
+        time: f64,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let desc = ModuleDescriptor {
+                id: "test.module",
+                display_name: "Test",
+                category: "Test",
+                inputs: vec![PinDescriptor::new("in", SignalType::Float)],
+                outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            };
+            let mut canvas = Canvas::new();
+            let a = canvas.snarl.insert_node(egui::pos2(100.0, 300.0), NodeData::from(&desc));
+            let b = canvas.snarl.insert_node(egui::pos2(700.0, 300.0), NodeData::from(&desc));
+            let wire = (OutPinId { node: a, output: 0 }, InPinId { node: b, input: 0 });
+            canvas.snarl.connect(wire.0, wire.1);
+            let mut rig = Rig {
+                ctx: egui::Context::default(),
+                canvas,
+                descriptors: vec![desc],
+                wire,
+                middle: egui::Pos2::ZERO,
+                time: 0.0,
+            };
+            rig.idle(5);
+            rig
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            self.time += 1.0 / 30.0;
+            let mut raw = input(self.time, events);
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0)));
+            let Rig { ctx, canvas, descriptors, wire, middle, .. } = self;
+            let (ids, signals) = (HashSet::new(), HashMap::new());
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = ui.available_rect_before_wrap();
+                    let id = ui.make_persistent_id(("flexinput_canvas", canvas.view_salt));
+                    canvas.show(
+                        descriptors, &ids, &signals, &signals,
+                        &crate::app::PanicShortcut::default(), &[], &HashMap::new(),
+                        DeviceParamDefaults::default(), ui, None, None,
+                    );
+                    let to_global = SnarlState::load(ui.ctx(), id, &canvas.snarl, rect, 0.2, 2.0).to_global();
+                    let style = ui.ctx().style();
+                    let node_rect = |node: NodeId| {
+                        let pos = canvas.snarl.get_node_info(node).unwrap().pos;
+                        NodeState::load(ui.ctx(), id.with(("snarl-node", node)), &style.spacing)
+                            .node_rect(pos, 1.0)
+                    };
+                    let (from, to) = (node_rect(wire.0.node), node_rect(wire.1.node));
+                    *middle = to_global * egui::pos2(
+                        (from.right() + to.left()) * 0.5,
+                        (from.center().y + to.center().y) * 0.5,
+                    );
+                });
+            });
+        }
+
+        fn idle(&mut self, frames: usize) {
+            for _ in 0..frames {
+                self.frame(vec![]);
+            }
+        }
+
+        fn tap(&mut self, at: egui::Pos2) {
+            self.frame(finger_down(at));
+            self.frame(finger_up(at));
+            self.idle(3);
+        }
+
+        /// Hold a finger on the wire until its menu opens, lift it, and say where it opened.
+        fn open_menu(&mut self) -> egui::Pos2 {
+            self.tap(egui::pos2(1150.0, 30.0));
+            let at = self.middle;
+            self.frame(finger_down(at));
+            self.idle(33);
+            self.frame(finger_up(at));
+            self.idle(3);
+            self.canvas.wire_ctx_menu.expect("the menu stays open once the finger is gone").2
+        }
+
+        fn wires(&self) -> usize {
+            self.canvas.snarl.wires().count()
+        }
+    }
+
+    // Rows are about 44 points apart in a menu for touch: Cancel, then Delete wire.
+    const CANCEL_ROW: egui::Vec2 = egui::vec2(40.0, 26.0);
+    const DELETE_ROW: egui::Vec2 = egui::vec2(40.0, 70.0);
+
+    #[test]
+    fn holding_a_wire_opens_its_menu_for_that_wire() {
+        let mut r = Rig::new();
+        r.open_menu();
+        let (from, to, _) = r.canvas.wire_ctx_menu.unwrap();
+        assert_eq!((from, to), r.wire);
+        assert_eq!(r.wires(), 1);
+    }
+
+    #[test]
+    fn tapping_away_closes_the_menu_and_keeps_the_wire() {
+        let mut r = Rig::new();
+        r.open_menu();
+        r.tap(egui::pos2(1150.0, 30.0));
+        assert!(r.canvas.wire_ctx_menu.is_none());
+        assert_eq!(r.wires(), 1);
+    }
+
+    #[test]
+    fn cancel_closes_the_menu_and_keeps_the_wire() {
+        let mut r = Rig::new();
+        let at = r.open_menu();
+        r.tap(at + CANCEL_ROW);
+        assert!(r.canvas.wire_ctx_menu.is_none());
+        assert_eq!(r.wires(), 1);
+    }
+
+    #[test]
+    fn delete_wire_deletes_it_with_an_undo() {
+        let mut r = Rig::new();
+        let at = r.open_menu();
+        assert!(!r.canvas.can_undo());
+        r.tap(at + DELETE_ROW);
+        assert!(r.canvas.wire_ctx_menu.is_none());
+        assert_eq!(r.wires(), 0);
+        assert!(r.canvas.can_undo());
+    }
+
+    /// The old menu took a tap inside a submenu's button for a tap outside it, and closed.
+    /// Here the category sits below Delete wire, the separator and the label.
+    #[test]
+    fn inserting_through_the_category_tree_works() {
+        let mut r = Rig::new();
+        let at = r.open_menu();
+        let category = at + egui::vec2(40.0, 140.0);
+        r.tap(category);
+        assert!(r.canvas.wire_ctx_menu.is_some(), "a category opens, the menu stays");
+
+        // A submenu opens to the right, its first row beside the category's.
+        let nodes = r.canvas.snarl.nodes_ids_data().count();
+        r.tap(category + egui::vec2(180.0, 0.0));
+        assert_eq!(r.canvas.snarl.nodes_ids_data().count(), nodes + 1, "the module went in");
+        assert!(r.canvas.wire_ctx_menu.is_none(), "picking one closes the menu");
+        assert_eq!(r.wires(), 2, "the wire now goes through the new module");
+        assert!(r.canvas.can_undo());
     }
 }
 

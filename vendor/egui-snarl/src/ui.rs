@@ -3,9 +3,9 @@
 use std::{collections::HashMap, hash::Hash};
 
 use egui::{
-    Align, Color32, CornerRadius, Frame, Id, LayerId, Layout, Margin, Modifiers, PointerButton,
-    Pos2, Rect, Scene, Sense, Shape, Stroke, StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo,
-    Vec2,
+    Align, Color32, CornerRadius, Frame, Id, LayerId, Layout, Margin, Modifiers,
+    PointerButton, Popup, PopupAnchor, PopupKind, Pos2, Rect, Scene, Sense, Shape, Stroke,
+    StrokeKind, Style, Ui, UiBuilder, UiKind, UiStackInfo, Vec2,
     collapsing_header::paint_default_icon,
     emath::{GuiRounding, TSTransform},
     epaint::Shadow,
@@ -22,18 +22,18 @@ mod background_pattern;
 mod pin;
 mod scale;
 mod state;
+pub mod touch;
 mod viewer;
 mod wire;
 
 use self::{
-    pin::AnyPin,
-    state::{NewWires, RowHeights},
+    state::{HoldOn, NewWires, RowHeights, WireHold, WireHoldStep},
     wire::{draw_wire, hit_wire, pick_wire_style},
 };
 
 pub use self::{
     background_pattern::{BackgroundPattern, Grid},
-    pin::{AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
+    pin::{AnyPin, AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
     state::{get_selected_nodes, NodeState, SnarlState},
     viewer::SnarlViewer,
     wire::{WireLayer, WireStyle},
@@ -990,9 +990,39 @@ where
     clamp_scale(&mut to_global, min_scale, max_scale, ui_rect);
 
     let mut snarl_resp = ui.response();
+    let view_before = to_global;
     Scene::new()
         .zoom_range(min_scale..=max_scale)
         .register_pan_and_zoom(&ui, &mut snarl_resp, &mut to_global);
+
+    // FLEXINPUT PATCH: what two fingers do depends on what they're on.
+    //
+    // A second finger makes a pinch of it over the canvas, a node's frame or a pin: those
+    // only drew the finger's attention by being in the way, so it stops holding them and
+    // moves the view instead. Over a widget in a node's body it doesn't: the finger on
+    // that is working it, and the other may be too, as on a curve's bend handles. Only a
+    // wire being dragged lets its finger keep steering it: that zooms but doesn't pan.
+    let (two_fingers, any_fingers, pointer_delta) =
+        ui.input(|i| (i.multi_touch().is_some(), i.any_touches(), i.pointer.delta()));
+    if two_fingers {
+        snarl_state.set_pinching(true);
+        snarl_state.stop_wire_hold();
+    } else if !any_fingers {
+        snarl_state.set_pinching(false);
+    }
+    let on_chrome = snarl_state.take_chrome_dragged();
+    let on_wire = |hold: WireHold| matches!(hold.on(), HoldOn::Wire(..));
+    let on_widget = touch::is_active(ui.ctx())
+        && !on_chrome
+        && !snarl_state.has_new_wires()
+        && ui.ctx().dragged_id().is_some_and(|id| id != snarl_resp.id);
+    if snarl_state.wire_hold().is_some_and(on_wire) || touch::pinch_blocked(ui.ctx()) || on_widget {
+        // The canvas also stays put under a finger resting on a wire, which wobbles.
+        to_global = view_before;
+    } else if two_fingers && on_chrome && !snarl_state.has_new_wires() {
+        // The Scene pans with its own drag, which this finger's isn't.
+        to_global.translation += pointer_delta;
+    }
 
     if snarl_resp.changed() {
         ui.ctx().request_repaint();
@@ -1116,6 +1146,63 @@ where
     let mut hovered_wire_disconnect = false;
     let mut wire_shapes = Vec::new();
 
+    // FLEXINPUT PATCH: a lost pin or a lifted finger can leave a hold behind.
+    if !ui.input(|i| i.pointer.primary_down()) {
+        snarl_state.stop_wire_hold();
+    }
+
+    // FLEXINPUT PATCH: a finger coming down on the canvas near a wire might stay for the
+    // wire's menu. That's the same menu as a right click on the wire, which touch has no
+    // other way to ask for.
+    let touch = touch::is_active(ui.ctx());
+    if touch
+        && !snarl_state.has_new_wires()
+        && snarl_state.wire_hold().is_none()
+        && snarl_resp.is_pointer_button_down_on()
+        && ui.input(|i| i.pointer.primary_pressed())
+        && let Some(pos) = latest_pos
+    {
+        let target = nearest_wire(
+            ui.ctx(),
+            snarl,
+            snarl_id,
+            &style,
+            pos,
+            TOUCH_WIRE_REACH / to_global.scaling,
+            wire_frame_size,
+            &input_info,
+            &output_info,
+        );
+        if let Some((out_pin, in_pin)) = target {
+            snarl_state.begin_wire_hold(HoldOn::Wire(out_pin, in_pin), ui.ctx());
+        }
+    }
+    let mut wire_held = None;
+    if let Some(hold) = snarl_state.wire_hold()
+        && let HoldOn::Wire(out_pin, in_pin) = hold.on()
+    {
+        match hold.step(ui.ctx()) {
+            WireHoldStep::Holding(progress) => {
+                wire_held = Some((hold.origin(), progress, out_pin));
+                ui.ctx().request_repaint();
+            }
+            WireHoldStep::Moved | WireHoldStep::Gone => snarl_state.stop_wire_hold(),
+            WireHoldStep::Lifted => {
+                snarl_state.stop_wire_hold();
+                if InPin::new(snarl, in_pin).remotes.contains(&out_pin) {
+                    let (from, to) = (OutPin::new(snarl, out_pin), InPin::new(snarl, in_pin));
+                    viewer.disconnect(&from, &to, snarl);
+                }
+            }
+        }
+    }
+
+    let wire_hold = snarl_state
+        .wire_hold()
+        .map(|hold| (hold.on(), ui.input(|i| hold.progress(i.time))));
+    let moved_from = snarl_state.moved_from();
+    let highlighted_wire = viewer.highlighted_wire();
+
     // Draw and interact with wires
     for wire in snarl.wires.iter() {
         let Some(from_r) = output_info.get(&wire.out_pin) else {
@@ -1160,12 +1247,38 @@ where
             }
         }
 
-        let color = mix_colors(from_r.wire_color, to_r.wire_color);
+        let mut color = mix_colors(from_r.wire_color, to_r.wire_color);
 
         let width_factor = from_r.wire_width_factor.max(to_r.wire_width_factor);
         let mut draw_width = wire_width * width_factor;
         if hovered_wire == Some(wire) {
             draw_width *= 1.5;
+        }
+
+        // FLEXINPUT PATCH: the wires a hold is about to pick up swell as it goes, under a
+        // finger that hides the pin. Once picked up they fade where they were, since
+        // they're still connected there until the move lands.
+        let on_pin = |pin: AnyPin| match pin {
+            AnyPin::Out(pin) => wire.out_pin == pin,
+            AnyPin::In(pin) => wire.in_pin == pin,
+        };
+        match wire_hold {
+            Some((HoldOn::Pin(pin), progress)) if on_pin(pin) => {
+                draw_width *= 1.0 + progress * 1.5;
+            }
+            // A held wire shows from the first moment which one the finger found.
+            Some((HoldOn::Wire(out_pin, in_pin), progress))
+                if (wire.out_pin, wire.in_pin) == (out_pin, in_pin) =>
+            {
+                draw_width *= 2.0 + progress * 1.5;
+            }
+            _ => {}
+        }
+        if highlighted_wire == Some((wire.out_pin, wire.in_pin)) {
+            draw_width *= 2.5;
+        }
+        if moved_from.is_some_and(on_pin) {
+            color = color.gamma_multiply(0.3);
         }
 
         draw_wire(
@@ -1247,7 +1360,33 @@ where
     // Wire end position will be overridden when link graph menu is opened.
     let mut wire_end_pos = latest_pos.unwrap_or_else(|| snarl_resp.rect.center());
 
+    // FLEXINPUT PATCH: a wire dragged by a finger. The pointer vanishes on the same frame
+    // the finger lifts, and a hold outlives egui's own drag, so neither the pin's drag
+    // nor the pointer's position can say where it ended: look at the release itself, and
+    // at `interact_pos`, which survives that frame. An OS-cancelled touch ends with no
+    // release at all, which counts as giving up on the wire.
+    if touch && let Some(new_wires) = snarl_state.new_wires().cloned() {
+        let (released, finger) = ui.input(|i| {
+            let finger = i.pointer.latest_pos().or_else(|| i.pointer.interact_pos());
+            (i.pointer.any_released(), finger.map(|pos| from_global * pos))
+        });
+        if released {
+            drag_released = true;
+        } else if latest_pos.is_none() {
+            let _ = snarl_state.take_new_wires();
+        }
+        let radius = TOUCH_SNAP_RADIUS / to_global.scaling;
+        let target = finger.and_then(|pos| {
+            nearest_pin(&new_wires, pos, radius, &input_info, &output_info, viewer, snarl)
+        });
+        pin_hovered = target.map(|(pin, _)| pin);
+        if let Some(end) = target.map(|(_, pos)| pos).or(finger) {
+            wire_end_pos = end;
+        }
+    }
+
     if drag_released {
+        let moved_from = snarl_state.moved_from();
         let new_wires = snarl_state.take_new_wires();
         if new_wires.is_some() {
             ui.ctx().request_repaint();
@@ -1260,6 +1399,14 @@ where
                         &InPin::new(snarl, in_pin),
                         snarl,
                     );
+                    // FLEXINPUT PATCH: a moved wire leaves its old pin, unless the viewer
+                    // refused it the new one.
+                    if let Some(AnyPin::Out(from)) = moved_from
+                        && from != out_pin
+                        && InPin::new(snarl, in_pin).remotes.contains(&out_pin)
+                    {
+                        snarl.disconnect(from, in_pin);
+                    }
                 }
             }
             (Some(NewWires::Out(out_pins)), Some(AnyPin::In(in_pin))) => {
@@ -1269,6 +1416,12 @@ where
                         &InPin::new(snarl, in_pin),
                         snarl,
                     );
+                    if let Some(AnyPin::In(from)) = moved_from
+                        && from != in_pin
+                        && InPin::new(snarl, in_pin).remotes.contains(&out_pin)
+                    {
+                        snarl.disconnect(out_pin, from);
+                    }
                 }
             }
             (Some(new_wires), None) if snarl_resp.hovered() => {
@@ -1282,44 +1435,70 @@ where
                     // Show context menu for the wire drop.
                     snarl_state.set_new_wires_menu(new_wires);
 
-                    // Force open context menu.
-                    snarl_resp.flags.insert(Flags::LONG_TOUCHED);
+                    // FLEXINPUT PATCH: a popup anchored to the pointer finds no pointer on
+                    // the frame a finger lifts, so this one remembers where the drop was.
+                    let at = ui.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()));
+                    let menu_id = snarl_id.with("dropped_wire_menu");
+                    ui.ctx().data_mut(|d| d.insert_temp(menu_id, at.unwrap_or(ui_rect.center())));
+                    Popup::open_id(ui.ctx(), menu_id);
                 }
             }
             _ => {}
         }
     }
 
-    if let Some(interact_pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-        if let Some(new_wires) = snarl_state.take_new_wires_menu() {
-            let pins = match &new_wires {
-                NewWires::In(x) => AnyPins::In(x),
-                NewWires::Out(x) => AnyPins::Out(x),
-            };
+    // FLEXINPUT PATCH: these menus used to show only while the pointer had a position, so a
+    // menu a finger opened went away the moment the finger lifted.
+    let moved_from = snarl_state.moved_from();
+    if let Some(new_wires) = snarl_state.take_new_wires_menu() {
+        let pins = match &new_wires {
+            NewWires::In(x) => AnyPins::In(x),
+            NewWires::Out(x) => AnyPins::Out(x),
+        };
 
-            if viewer.has_dropped_wire_menu(pins, snarl) {
-                snarl_resp.context_menu(|ui| {
-                    let pins = match &new_wires {
-                        NewWires::In(x) => AnyPins::In(x),
-                        NewWires::Out(x) => AnyPins::Out(x),
-                    };
+        if viewer.has_dropped_wire_menu(pins, snarl) {
+            let menu_id = snarl_id.with("dropped_wire_menu");
+            let at: Pos2 = ui.ctx().data(|d| d.get_temp(menu_id)).unwrap_or(ui_rect.center());
+            let menu = Popup::new(
+                menu_id,
+                ui.ctx().clone(),
+                PopupAnchor::Position(at),
+                ui.layer_id(),
+            )
+            .kind(PopupKind::Menu)
+            .layout(Layout::top_down_justified(Align::Min))
+            .style(touch::menu_style_for(ui.ctx()))
+            .open_memory(None)
+            .show(|ui| {
+                let pins = match &new_wires {
+                    NewWires::In(x) => AnyPins::In(x),
+                    NewWires::Out(x) => AnyPins::Out(x),
+                };
 
-                    let menu_pos = from_global * ui.cursor().min;
+                let menu_pos = from_global * ui.cursor().min;
 
-                    // Override wire end position when the wire-drop context menu is opened.
-                    wire_end_pos = menu_pos;
+                // Override wire end position when the wire-drop context menu is opened.
+                wire_end_pos = menu_pos;
 
-                    // The context menu is opened as *link* graph menu.
-                    viewer.show_dropped_wire_menu(menu_pos, ui, pins, snarl);
-
-                    // Even though menu could be closed in `show_dropped_wire_menu`,
-                    // we need to revert the new wires here, because menu state is inaccessible.
-                    // Next frame context menu won't be shown and wires will be removed.
-                    snarl_state.set_new_wires_menu(new_wires);
+                // The context menu is opened as *link* graph menu.
+                touch::menu_scroll(ui, |ui| {
+                    viewer.show_dropped_wire_menu(menu_pos, ui, pins, moved_from, snarl);
                 });
+            });
+
+            // Even though menu could be closed in `show_dropped_wire_menu`,
+            // we need to revert the new wires here, because menu state is inaccessible.
+            // Next frame context menu won't be shown and wires will be removed.
+            if menu.is_some() {
+                snarl_state.set_new_wires_menu(new_wires);
             }
-        } else if viewer.has_graph_menu(interact_pos, snarl) {
-            snarl_resp.context_menu(|ui| {
+        }
+    } else {
+        // (A finger held on a wire is after the wire's menu, though egui calls it a long
+        // touch on the canvas before the hold is up.)
+        let at = ui.input(|i| i.pointer.interact_pos()).unwrap_or_else(|| ui_rect.center());
+        if wire_held.is_none() && viewer.has_graph_menu(at, snarl) {
+            touch::context_menu(&snarl_resp, |ui| {
                 let menu_pos = from_global * ui.cursor().min;
 
                 viewer.show_graph_menu(menu_pos, ui, snarl);
@@ -1332,7 +1511,10 @@ where
         Some(NewWires::In(in_pins)) => {
             for &in_pin in in_pins {
                 let from_pos = wire_end_pos;
-                let to_r = &input_info[&in_pin];
+                // FLEXINPUT PATCH: picked-up wires can end on a pin that isn't drawn.
+                let Some(to_r) = input_info.get(&in_pin) else {
+                    continue;
+                };
 
                 draw_wire(
                     &ui,
@@ -1351,7 +1533,9 @@ where
         }
         Some(NewWires::Out(out_pins)) => {
             for &out_pin in out_pins {
-                let from_r = &output_info[&out_pin];
+                let Some(from_r) = output_info.get(&out_pin) else {
+                    continue;
+                };
                 let to_pos = wire_end_pos;
 
                 draw_wire(
@@ -1380,6 +1564,11 @@ where
         }
     }
 
+    if let Some((origin, progress, out_pin)) = wire_held {
+        let color = output_info.get(&out_pin).map_or(Color32::WHITE, |r| r.wire_color);
+        touch::paint_hold_ring(ui.painter(), from_global * origin, to_global.scaling, progress, color);
+    }
+
     ui.advance_cursor_after_rect(Rect::from_min_size(snarl_resp.rect.min, Vec2::ZERO));
 
     if let Some(node) = node_to_top
@@ -1390,6 +1579,7 @@ where
 
     if let Some((node, delta)) = node_moved
         && snarl.nodes.contains(node.0)
+        && !snarl_state.pinching()
     {
         ui.ctx().request_repaint();
         if snarl_state.selected_nodes().contains(&node) {
@@ -1406,6 +1596,125 @@ where
     snarl_state.store(snarl, ui.ctx());
 
     snarl_resp
+}
+
+// FLEXINPUT PATCH: touch targets, in points on screen whatever the zoom.
+
+/// How far from a pin's center a finger can land on it, sideways.
+const TOUCH_PIN_REACH: f32 = 22.0;
+
+/// The same reach's limit in graph space: zoomed far out, a pin mustn't reach over a
+/// neighboring node and take its touches.
+const TOUCH_PIN_REACH_MAX: f32 = 30.0;
+
+/// How far from a pin a wire dropped by a finger still lands on it.
+const TOUCH_SNAP_RADIUS: f32 = 36.0;
+
+/// How far from a wire a finger coming down still finds it.
+const TOUCH_WIRE_REACH: f32 = 28.0;
+
+/// Where a finger can land on the pin at `pin` in the row `row`. Most of it lies outward,
+/// away from the node (`outward` is -1 for the left, 1 for the right), because a pin takes
+/// touches from any widget in the node's body that it overlaps. It stays inside the row,
+/// so that neighboring pins never fight over a touch, unless the pin isn't in its row
+/// (an Auto-Map pin moved up to the node's header), where it has no neighbors.
+fn touch_pin_rect(pin: Rect, row: Rect, scale: f32, outward: f32) -> Rect {
+    let reach = (TOUCH_PIN_REACH / scale).min(TOUCH_PIN_REACH_MAX);
+    let c = pin.center();
+    let (top, bottom) = if row.y_range().contains(c.y) {
+        (row.top().min(pin.top()), row.bottom().max(pin.bottom()))
+    } else {
+        (c.y - reach * 0.5, c.y + reach * 0.5)
+    };
+    let (out_x, in_x) = (c.x + outward * reach, c.x - outward * reach * 0.4);
+    Rect::from_min_max(
+        pos2(out_x.min(in_x), (c.y - reach).max(top)),
+        pos2(out_x.max(in_x), (c.y + reach).min(bottom)),
+    )
+}
+
+/// The pin nearest `pos` that would take these wires, and where it is.
+fn nearest_pin<T, V>(
+    new_wires: &NewWires,
+    pos: Pos2,
+    radius: f32,
+    inputs: &HashMap<InPinId, PinResponse>,
+    outputs: &HashMap<OutPinId, PinResponse>,
+    viewer: &mut V,
+    snarl: &Snarl<T>,
+) -> Option<(AnyPin, Pos2)>
+where
+    V: SnarlViewer<T>,
+{
+    let mut best: Option<(AnyPin, Pos2)> = None;
+    let mut best_dist = radius;
+    let mut consider = |pin: AnyPin, at: Pos2, accepts: &mut dyn FnMut(&mut V) -> bool| {
+        let dist = at.distance(pos);
+        if dist <= best_dist && accepts(viewer) {
+            best = Some((pin, at));
+            best_dist = dist;
+        }
+    };
+    match new_wires {
+        NewWires::Out(out_pins) => {
+            for (&id, r) in inputs {
+                consider(AnyPin::In(id), r.pos, &mut |viewer| {
+                    let to = InPin::new(snarl, id);
+                    out_pins
+                        .iter()
+                        .any(|&out| viewer.can_connect(&OutPin::new(snarl, out), &to, snarl))
+                });
+            }
+        }
+        NewWires::In(in_pins) => {
+            for (&id, r) in outputs {
+                consider(AnyPin::Out(id), r.pos, &mut |viewer| {
+                    let from = OutPin::new(snarl, id);
+                    in_pins
+                        .iter()
+                        .any(|&to| viewer.can_connect(&from, &InPin::new(snarl, to), snarl))
+                });
+            }
+        }
+    }
+    best
+}
+
+/// The wire nearest `pos`, if one is within `reach`. Wires only answer whether a point is
+/// within some distance, so this asks at growing distances, which is plenty for a fingertip
+/// and only happens when one comes down.
+#[allow(clippy::too_many_arguments)]
+fn nearest_wire<T>(
+    ctx: &egui::Context,
+    snarl: &Snarl<T>,
+    snarl_id: Id,
+    style: &SnarlStyle,
+    pos: Pos2,
+    reach: f32,
+    frame_size: f32,
+    inputs: &HashMap<InPinId, PinResponse>,
+    outputs: &HashMap<OutPinId, PinResponse>,
+) -> Option<(OutPinId, InPinId)> {
+    const STEPS: usize = 7;
+    (1..=STEPS).find_map(|step| {
+        let threshold = reach * step as f32 / STEPS as f32;
+        snarl.wires.iter().find_map(|wire| {
+            let (from, to) = (outputs.get(&wire.out_pin)?, inputs.get(&wire.in_pin)?);
+            hit_wire(
+                ctx,
+                WireId::Connected { snarl_id, out_pin: wire.out_pin, in_pin: wire.in_pin },
+                frame_size,
+                style.get_upscale_wire_frame(),
+                style.get_downscale_wire_frame(),
+                from.pos,
+                to.pos,
+                pos,
+                threshold,
+                pick_wire_style(from.wire_style, to.wire_style),
+            )
+            .then_some((wire.out_pin, wire.in_pin))
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1445,6 +1754,9 @@ where
 
     let snarl_clip_rect = node_ui.clip_rect();
     inputs_ui.shrink_clip_rect(payload_clip_rect);
+
+    let touch = touch::is_active(node_ui.ctx());
+    let scale = snarl_state.to_global().scaling;
 
     let pin_layout = Layout::left_to_right(Align::Min);
     let mut new_heights = SmallVec::with_capacity(inputs.len());
@@ -1489,9 +1801,19 @@ where
             // Interact with pin shape.
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            // FLEXINPUT PATCH: a finger gets a bigger target than the pin it's for.
+            let hit_rect = if touch {
+                touch_pin_rect(pin_rect, outer_rect, scale, -1.0)
+            } else {
+                pin_rect
+            };
+            let r = pin_ui.interact(hit_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
+
+            if r.dragged() {
+                snarl_state.mark_chrome_dragged();
+            }
 
             if r.clicked_by(PointerButton::Secondary) {
                 if snarl_state.has_new_wires() {
@@ -1504,18 +1826,56 @@ where
                     }
                 }
             }
-            if r.drag_started_by(PointerButton::Primary) {
+
+            // FLEXINPUT PATCH: a finger on a wired pin could be dragging a new wire out or
+            // holding to pick up the ones there, and egui's drag can't tell: it starts
+            // on small wobbles, and egui ends it at a long touch, before the hold is up.
+            // So the hold decides, and ends with or without egui's drag.
+            let this_pin = AnyPin::In(in_pin.id);
+            if touch
+                && !modifiers.command
+                && !in_pin.remotes.is_empty()
+                && r.is_pointer_button_down_on()
+                && !snarl_state.has_new_wires()
+                && !snarl_state.pinching()
+            {
+                snarl_state.begin_wire_hold(HoldOn::Pin(this_pin), pin_ui.ctx());
+            }
+            let hold = snarl_state.wire_hold().filter(|hold| hold.on() == HoldOn::Pin(this_pin));
+
+            if r.drag_started_by(PointerButton::Primary) && hold.is_none() && !snarl_state.pinching() {
                 if modifiers.command {
                     snarl_state.start_new_wires_out(&in_pin.remotes);
                     if !modifiers.shift {
-                        snarl.drop_inputs(in_pin.id);
-                        if !snarl.nodes.contains(node.0) {
-                            // If removed
-                            return;
-                        }
+                        snarl_state.set_moved_from(this_pin);
                     }
                 } else {
                     snarl_state.start_new_wire_in(in_pin.id);
+                }
+            }
+
+            // A long touch ends egui's drag on an unwired pin too.
+            if touch && r.long_touched() && hold.is_none() && !snarl_state.has_new_wires() && !snarl_state.pinching() {
+                snarl_state.start_new_wire_in(in_pin.id);
+            }
+
+            let mut hold_progress = None;
+            if let Some(hold) = hold {
+                match hold.step(pin_ui.ctx()) {
+                    WireHoldStep::Holding(progress) => {
+                        hold_progress = Some(progress);
+                        pin_ui.ctx().request_repaint();
+                    }
+                    WireHoldStep::Moved => {
+                        snarl_state.stop_wire_hold();
+                        snarl_state.start_new_wire_in(in_pin.id);
+                    }
+                    WireHoldStep::Lifted => {
+                        snarl_state.stop_wire_hold();
+                        snarl_state.start_new_wires_out(&in_pin.remotes);
+                        snarl_state.set_moved_from(this_pin);
+                    }
+                    WireHoldStep::Gone => snarl_state.stop_wire_hold(),
                 }
             }
 
@@ -1523,7 +1883,7 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_in() {
@@ -1541,10 +1901,15 @@ where
             let wire_info =
                 snarl_pin.draw(style, pin_ui.style(), visual_pin_rect, pin_ui.painter());
 
+            if let Some(progress) = hold_progress {
+                let center = pin_rect.center();
+                touch::paint_hold_ring(pin_ui.painter(), center, scale, progress, wire_info.color);
+            }
+
             input_positions.insert(
                 in_pin.id,
                 PinResponse {
-                    pos: r.rect.center(),
+                    pos: pin_rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                     wire_width_factor: wire_info.width_factor,
@@ -1605,6 +1970,9 @@ where
     let snarl_clip_rect = node_ui.clip_rect();
     outputs_ui.shrink_clip_rect(payload_clip_rect);
 
+    let touch = touch::is_active(node_ui.ctx());
+    let scale = snarl_state.to_global().scaling;
+
     let pin_layout = Layout::right_to_left(Align::Min);
     let mut new_heights = SmallVec::with_capacity(outputs.len());
 
@@ -1655,9 +2023,19 @@ where
 
             pin_ui.set_clip_rect(snarl_clip_rect);
 
-            let r = pin_ui.interact(pin_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
+            // FLEXINPUT PATCH: see `draw_inputs`.
+            let hit_rect = if touch {
+                touch_pin_rect(pin_rect, outer_rect, scale, 1.0)
+            } else {
+                pin_rect
+            };
+            let r = pin_ui.interact(hit_rect, pin_ui.next_auto_id(), Sense::click_and_drag());
 
             pin_ui.skip_ahead_auto_ids(1);
+
+            if r.dragged() {
+                snarl_state.mark_chrome_dragged();
+            }
 
             if r.clicked_by(PointerButton::Secondary) {
                 if snarl_state.has_new_wires() {
@@ -1670,19 +2048,52 @@ where
                     }
                 }
             }
-            if r.drag_started_by(PointerButton::Primary) {
+
+            let this_pin = AnyPin::Out(out_pin.id);
+            if touch
+                && !modifiers.command
+                && !out_pin.remotes.is_empty()
+                && r.is_pointer_button_down_on()
+                && !snarl_state.has_new_wires()
+                && !snarl_state.pinching()
+            {
+                snarl_state.begin_wire_hold(HoldOn::Pin(this_pin), pin_ui.ctx());
+            }
+            let hold = snarl_state.wire_hold().filter(|hold| hold.on() == HoldOn::Pin(this_pin));
+
+            if r.drag_started_by(PointerButton::Primary) && hold.is_none() && !snarl_state.pinching() {
                 if modifiers.command {
                     snarl_state.start_new_wires_in(&out_pin.remotes);
 
                     if !modifiers.shift {
-                        snarl.drop_outputs(out_pin.id);
-                        if !snarl.nodes.contains(node.0) {
-                            // If removed
-                            return;
-                        }
+                        snarl_state.set_moved_from(this_pin);
                     }
                 } else {
                     snarl_state.start_new_wire_out(out_pin.id);
+                }
+            }
+
+            if touch && r.long_touched() && hold.is_none() && !snarl_state.has_new_wires() && !snarl_state.pinching() {
+                snarl_state.start_new_wire_out(out_pin.id);
+            }
+
+            let mut hold_progress = None;
+            if let Some(hold) = hold {
+                match hold.step(pin_ui.ctx()) {
+                    WireHoldStep::Holding(progress) => {
+                        hold_progress = Some(progress);
+                        pin_ui.ctx().request_repaint();
+                    }
+                    WireHoldStep::Moved => {
+                        snarl_state.stop_wire_hold();
+                        snarl_state.start_new_wire_out(out_pin.id);
+                    }
+                    WireHoldStep::Lifted => {
+                        snarl_state.stop_wire_hold();
+                        snarl_state.start_new_wires_in(&out_pin.remotes);
+                        snarl_state.set_moved_from(this_pin);
+                    }
+                    WireHoldStep::Gone => snarl_state.stop_wire_hold(),
                 }
             }
 
@@ -1690,7 +2101,7 @@ where
                 drag_released = true;
             }
 
-            let mut visual_pin_rect = r.rect;
+            let mut visual_pin_rect = pin_rect;
 
             if r.contains_pointer() {
                 if snarl_state.has_new_wires_out() {
@@ -1708,10 +2119,15 @@ where
             let wire_info =
                 snarl_pin.draw(style, pin_ui.style(), visual_pin_rect, pin_ui.painter());
 
+            if let Some(progress) = hold_progress {
+                let center = pin_rect.center();
+                touch::paint_hold_ring(pin_ui.painter(), center, scale, progress, wire_info.color);
+            }
+
             output_positions.insert(
                 out_pin.id,
                 PinResponse {
-                    pos: r.rect.center(),
+                    pos: pin_rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                     wire_width_factor: wire_info.width_factor,
@@ -1872,6 +2288,9 @@ where
     if !modifiers.shift && !modifiers.command && r.dragged_by(PointerButton::Primary) {
         node_moved = Some((node, r.drag_delta()));
     }
+    if r.dragged() {
+        snarl_state.mark_chrome_dragged();
+    }
 
     if r.clicked_by(PointerButton::Primary) || r.dragged_by(PointerButton::Primary) {
         if modifiers.shift {
@@ -1886,7 +2305,7 @@ where
     }
 
     if viewer.has_node_menu(&snarl.nodes[node.0].value) {
-        r.context_menu(|ui| {
+        touch::context_menu(&r, |ui| {
             viewer.show_node_menu(node, &inputs, &outputs, ui, snarl);
         });
     }

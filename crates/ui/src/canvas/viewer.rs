@@ -1,6 +1,6 @@
 use egui::Color32;
 use egui_snarl::{
-    ui::{AnyPins, NodeLayout, PinInfo, SnarlViewer},
+    ui::{AnyPin, AnyPins, NodeLayout, PinInfo, SnarlViewer},
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
 };
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType, automap as am_canon};
@@ -133,6 +133,8 @@ pub struct FlexViewer<'a> {
     /// Set by the `disconnect` override when the user right-clicks a wire.
     /// Canvas::show() reads this after snarl.show() and renders the context menu.
     pub pending_wire_menu: Option<(OutPinId, InPinId, egui::Pos2)>,
+    /// The wire whose context menu is open, drawn thicker so it's clear which it is.
+    pub highlighted_wire: Option<(OutPinId, InPinId)>,
     /// Set by show_node_menu when the user clicks "Rename…".
     pub rename_request: Option<NodeId>,
     /// Set by show_node_menu when the user picks "Replace with…".
@@ -1190,7 +1192,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     }
 
     fn disconnect(&mut self, from: &OutPin, to: &InPin, _snarl: &mut Snarl<NodeData>) {
-        // Intercept right-click-on-wire: show a context menu instead of disconnecting immediately.
+        // Intercept right-click-on-wire, or a finger held on it: show a context menu instead
+        // of disconnecting immediately.
         let pos = self.ctx.input(|i| i.pointer.latest_pos()).unwrap_or_default();
         self.pending_wire_menu = Some((from.id, to.id, pos));
     }
@@ -1406,26 +1409,64 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         pos: egui::Pos2,
         ui: &mut egui::Ui,
         src_pins: AnyPins,
+        moved_from: Option<AnyPin>,
         snarl: &mut Snarl<NodeData>,
     ) {
-        match src_pins {
-            AnyPins::Out(out_pins) => {
-                if let Some(&src) = out_pins.first() {
-                    let from_type = snarl[src.node].outputs[src.output].signal_type;
-                    ui.label("Connect to input of…");
-                    ui.separator();
-                    show_module_menu(pos, ui, snarl, self.descriptors, Some(WireDir::FromOutput { src, from_type }), self.is_inner_canvas);
-                }
-            }
-            AnyPins::In(in_pins) => {
-                if let Some(&dst) = in_pins.first() {
-                    let to_type = snarl[dst.node].inputs[dst.input].signal_type;
-                    ui.label("Connect to output of…");
-                    ui.separator();
-                    show_module_menu(pos, ui, snarl, self.descriptors, Some(WireDir::FromInput { dst, to_type }), self.is_inner_canvas);
-                }
+        if ui.button("Cancel").clicked() {
+            ui.close();
+        }
+        // Wires being moved are still connected where they came from, so doing nothing
+        // puts them back and deleting them takes this. A new wire has nothing to delete.
+        if let Some(from) = moved_from {
+            let n = match &src_pins {
+                AnyPins::Out(pins) => pins.len(),
+                AnyPins::In(pins) => pins.len(),
+            };
+            if ui.button(if n == 1 { "Delete wire" } else { "Delete wires" }).clicked() {
+                delete_moved_wires(snarl, &src_pins, from);
+                ui.close();
             }
         }
+        ui.separator();
+
+        let wire = match src_pins {
+            AnyPins::Out(srcs) => srcs.first().map(|&src| WireDir::FromOutput {
+                srcs,
+                from_type: snarl[src.node].outputs[src.output].signal_type,
+                moved_from: match moved_from { Some(AnyPin::In(pin)) => Some(pin), _ => None },
+            }),
+            AnyPins::In(dsts) => dsts.first().map(|&dst| WireDir::FromInput {
+                dsts,
+                to_type: snarl[dst.node].inputs[dst.input].signal_type,
+                moved_from: match moved_from { Some(AnyPin::Out(pin)) => Some(pin), _ => None },
+            }),
+        };
+        let Some(wire) = wire else { return };
+        let (descriptors, is_inner) = (self.descriptors, self.is_inner_canvas);
+        if crate::touch::is_active(ui.ctx()) {
+            // A level of its own, or the categories push the choices above off a small screen.
+            ui.menu_button("Add module", |ui| {
+                crate::touch::menu_scroll(ui, |ui| {
+                    show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
+                });
+            });
+        } else {
+            ui.label(match &wire {
+                WireDir::FromOutput { .. } => "Connect to input of…",
+                WireDir::FromInput { .. } => "Connect to output of…",
+            });
+            ui.separator();
+            show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
+        }
+    }
+
+    fn highlighted_wire(&mut self) -> Option<(OutPinId, InPinId)> {
+        self.highlighted_wire
+    }
+
+    fn can_connect(&mut self, from: &OutPin, to: &InPin, snarl: &Snarl<NodeData>) -> bool {
+        let from_type = snarl[from.id.node].outputs[from.id.output].signal_type;
+        snarl[to.id.node].inputs[to.id.input].signal_type.accepts(from_type)
     }
 
     // ── Node context menu ────────────────────────────────────────────────────
@@ -1488,11 +1529,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             use egui::containers::menu::{MenuConfig, SubMenuButton};
             use egui::PopupCloseBehavior;
             ui.separator();
-            let cfg = || MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
-            SubMenuButton::new("ON state…").config(cfg()).ui(ui, |ui| {
+            // `find`, so they keep this menu's style.
+            let cfg = MenuConfig::find(ui).close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+            SubMenuButton::new("ON state…").config(cfg.clone()).ui(ui, |ui| {
                 switch_state_submenu(ui, node, snarl, true);
             });
-            SubMenuButton::new("OFF state…").config(cfg()).ui(ui, |ui| {
+            SubMenuButton::new("OFF state…").config(cfg).ui(ui, |ui| {
                 switch_state_submenu(ui, node, snarl, false);
             });
         }

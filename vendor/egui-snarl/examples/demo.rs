@@ -458,6 +458,7 @@ impl SnarlViewer<DemoNode> for DemoViewer {
         pos: egui::Pos2,
         ui: &mut Ui,
         src_pins: AnyPins,
+        _moved_from: Option<egui_snarl::ui::AnyPin>,
         snarl: &mut Snarl<DemoNode>,
     ) {
         // In this demo, we create a context-aware node graph menu, and connect a wire

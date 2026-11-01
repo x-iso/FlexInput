@@ -164,7 +164,7 @@ pub(crate) fn show_tab_bar(
 
         // ── 1. Pinned File menu + Auto-switch cluster ──────────────────
         ui.add_space(8.0);
-        ui.menu_button("File", |ui| {
+        crate::touch::menu_button(ui, "File", |ui| {
             if ui.button("New").clicked()                       { new_tab = true; ui.close(); }
             if ui.button("Save Patch…").clicked()               { do_save  = true; ui.close(); }
             if ui.button("Load Patch…").clicked()               { do_load  = true; ui.close(); }
@@ -754,12 +754,9 @@ pub(crate) fn show_title_bar(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
 
-                // Shortcut button. While learning, label is "Press chord…".
-                let btn_text = if *panic_learning {
-                    "Press chord…".to_string()
-                } else {
-                    panic_shortcut.label()
-                };
+                // The button itself engages and releases, so it works by mouse and
+                // touch; Ctrl+click re-binds the shortcut it shows.
+                let btn_text = panic_button_text(*panic_active, *panic_learning, panic_shortcut);
                 let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
                 if *panic_active {
                     btn = btn.fill(egui::Color32::from_rgb(196, 43, 28))
@@ -769,20 +766,18 @@ pub(crate) fn show_title_bar(
                              .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
                 }
                 let resp = ui.add(btn).on_hover_text(
-                    if *panic_active {
-                        "Panic mode ENGAGED — virtual output is suppressed.\nPress the shortcut again to release."
-                    } else if *panic_learning {
+                    if *panic_learning {
                         "Press the new shortcut (modifier + key).\nClick again to cancel."
+                    } else if *panic_active {
+                        "Panic mode ENGAGED — virtual output is suppressed.\nClick or press the shortcut to release.\nCtrl+click to re-bind the shortcut."
                     } else {
-                        "Click to re-bind the shortcut.\nPress the shortcut anywhere on the system to toggle Panic mode."
+                        "Click or press the shortcut, anywhere on the system, to engage Panic mode.\nCtrl+click to re-bind the shortcut."
                     }
                 );
 
-                // Click toggles Learn mode (start re-binding, or cancel). To
-                // engage / disengage Panic mode, the user presses the shortcut
-                // — the title-bar button itself is purely a re-bind control.
                 if resp.clicked() {
-                    *panic_learning = !*panic_learning;
+                    let ctrl = ui.input(|i| i.modifiers.ctrl);
+                    panic_button_clicked(ctrl, panic_active, panic_learning);
                 }
 
                 // While in learn mode, watch every input event for the next chord.
@@ -1267,5 +1262,56 @@ pub(crate) fn render_mode_pill(
     if adv_resp.clicked()  { *do_set_mode = Some(settings::UiMode::Advanced); }
     if easy_resp.hovered() || adv_resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
+/// The panic button's face: the state, and what else toggles it.
+fn panic_button_text(active: bool, learning: bool, shortcut: &PanicShortcut) -> String {
+    if learning {
+        "Press chord…".to_string()
+    } else {
+        format!("{} ({})", if active { "ON" } else { "OFF" }, shortcut.label())
+    }
+}
+
+/// A click toggles Panic mode. Ctrl+click starts re-binding the shortcut instead, and any
+/// click while re-binding cancels it.
+fn panic_button_clicked(ctrl: bool, active: &mut bool, learning: &mut bool) {
+    if *learning {
+        *learning = false;
+    } else if ctrl {
+        *learning = true;
+    } else {
+        *active = !*active;
+    }
+}
+
+#[cfg(test)]
+mod panic_button_tests {
+    use super::*;
+
+    #[test]
+    fn the_face_shows_the_state_and_the_shortcut() {
+        let shortcut = PanicShortcut::default();
+        assert_eq!(panic_button_text(false, false, &shortcut), "OFF (Ctrl+~)");
+        assert_eq!(panic_button_text(true, false, &shortcut), "ON (Ctrl+~)");
+        assert_eq!(panic_button_text(true, true, &shortcut), "Press chord…");
+    }
+
+    #[test]
+    fn a_click_toggles_and_ctrl_click_re_binds() {
+        let (mut active, mut learning) = (false, false);
+        panic_button_clicked(false, &mut active, &mut learning);
+        assert_eq!((active, learning), (true, false));
+        panic_button_clicked(false, &mut active, &mut learning);
+        assert_eq!((active, learning), (false, false));
+
+        panic_button_clicked(true, &mut active, &mut learning);
+        assert_eq!((active, learning), (false, true), "Ctrl+click leaves Panic mode alone");
+        panic_button_clicked(false, &mut active, &mut learning);
+        assert_eq!((active, learning), (false, false), "any click cancels the re-bind");
+        panic_button_clicked(true, &mut active, &mut learning);
+        panic_button_clicked(true, &mut active, &mut learning);
+        assert_eq!((active, learning), (false, false));
     }
 }

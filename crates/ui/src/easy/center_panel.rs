@@ -1334,13 +1334,20 @@ fn render_subpatch_body(
         let pointer_over = ui.ctx().input(|i| {
             i.pointer.hover_pos().map(|p| panel_rect.contains(p)).unwrap_or(false)
         });
-        if pointer_over {
+        if pointer_over && !crate::canvas::wheel::widget_has_wheel(ui.ctx()) {
             let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if wheel != 0.0 {
                 scroll_y = (scroll_y - wheel).clamp(0.0, scroll_overflow);
             }
         }
     }
+    // Any finger that came down on the body scrolls it, unless it came down on a list
+    // inside that can scroll: that one is the list's.
+    let dy = crate::touch::finger_scroll(
+        ui.ctx(), scroll_id, panel_rect, body_area_layer(outer_id),
+        crate::touch::ScrollRank::Page, scroll_overflow > 0.0,
+    );
+    scroll_y = (scroll_y - dy).clamp(0.0, scroll_overflow);
 
     // Auto-scroll to keep the gamepad-nav selection (or the RS cursor) in view.
     if scroll_overflow > 0.0 {
@@ -1391,6 +1398,7 @@ fn render_subpatch_body(
     // value entered, toggle click) commits exactly one undo entry.
     let needs_snapshot = ui.ctx().input(|i| {
         i.pointer.any_down()
+            || crate::touch::fingers_working(i)
             || i.pointer.any_released()
             || i.pointer.any_pressed()
             || i.events.iter().any(|e| matches!(e,

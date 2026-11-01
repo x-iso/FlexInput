@@ -26,6 +26,7 @@ mod panic_hotkey;
 mod perf_bench;
 mod pin_hotkey;
 mod raw_learn;
+mod touch;
 mod widgets;
 pub mod process_list;
 mod settings;

@@ -3,7 +3,7 @@ use egui::{emath::TSTransform, Painter, Pos2, Rect, Style, Ui};
 use crate::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 
 use super::{
-    pin::{AnyPins, SnarlPin},
+    pin::{AnyPin, AnyPins, SnarlPin},
     BackgroundPattern, NodeLayout, SnarlStyle,
 };
 
@@ -254,15 +254,34 @@ pub trait SnarlViewer<T> {
     /// Show context menu for the snarl. This menu is opened when releasing a pin to empty
     /// space. It can be used to implement menu for adding new node, and directly
     /// connecting it to the released wire.
+    ///
+    /// FLEXINPUT PATCH: `moved_from` is the pin the wires were picked up from, when they
+    /// are existing wires being moved. They are still connected there, and stay so unless
+    /// this menu says otherwise.
     #[inline]
     fn show_dropped_wire_menu(
         &mut self,
         pos: Pos2,
         ui: &mut Ui,
         src_pins: AnyPins,
+        moved_from: Option<AnyPin>,
         snarl: &mut Snarl<T>,
     ) {
-        let _ = (pos, ui, src_pins, snarl);
+        let _ = (pos, ui, src_pins, moved_from, snarl);
+    }
+
+    /// FLEXINPUT PATCH: a wire to draw thicker, like the one a menu is open for.
+    #[inline]
+    fn highlighted_wire(&mut self) -> Option<(OutPinId, InPinId)> {
+        None
+    }
+
+    /// FLEXINPUT PATCH: would [`Self::connect`] accept this wire? A wire dropped by a
+    /// finger goes to the nearest pin that would have it, not just the nearest pin.
+    #[inline]
+    fn can_connect(&mut self, from: &OutPin, to: &InPin, snarl: &Snarl<T>) -> bool {
+        let _ = (from, to, snarl);
+        true
     }
 
     /// Checks if the node has something to show in context menu if right-clicked or long-touched on the node.
@@ -297,6 +316,9 @@ pub trait SnarlViewer<T> {
     }
 
     /// Asks the viewer to disconnect two pins.
+    ///
+    /// FLEXINPUT PATCH: also what a finger held on a wire for a second calls, as a right
+    /// click on the wire does.
     #[inline]
     fn disconnect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<T>) {
         snarl.disconnect(from.id, to.id);

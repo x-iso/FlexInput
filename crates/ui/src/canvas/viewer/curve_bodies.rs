@@ -266,7 +266,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
                     .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
                 let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
-                if alt_held && new_points.len() >= 2 {
+                let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
+                if (alt_held || bends.exposed()) && new_points.len() >= 2 {
                     while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
                     for seg in 0..(new_points.len() - 1) {
                         let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
@@ -279,26 +280,28 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         let hresp = ui.interact(
                             egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
                             hid, egui::Sense::click_and_drag());
+                        let finger = bends.finger(ui, hresp.id, hpos);
                         if hresp.double_clicked() {
                             new_biases[seg] = 0.0;
                             bias_changed = true;
-                        } else if hresp.dragged() {
-                            let dy = -hresp.drag_delta().y / rect.height() * y_range;
+                        } else if hresp.dragged() || finger.is_some() {
+                            let dy = -(hresp.drag_delta().y + finger.unwrap_or(0.0)) / rect.height() * y_range;
                             new_biases[seg] = (new_biases[seg] + dy).clamp(-2.0, 2.0);
                             bias_changed = true;
                         }
-                        let hcol = if hresp.hovered() || hresp.dragged() {
+                        let hcol = if hresp.hovered() || hresp.dragged() || finger.is_some() {
                             Color32::from_rgb(255, 220, 50)
                         } else {
                             Color32::from_rgb(180, 140, 20)
                         };
-                        painter.circle_filled(hpos, 4.0, hcol);
-                        painter.circle_stroke(hpos, 4.0,
+                        painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
+                        painter.circle_stroke(hpos, bends.dot_radius(4.0),
                             egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
                 let mut remove_idx: Option<usize> = None;
+                let mut point_down = false;
                 for i in 0..new_points.len() {
                     let [px, py] = new_points[i];
                     let screen   = c2s(px, py);
@@ -309,6 +312,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     let pt_resp  = ui.interact(
                         egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
                         pt_id, egui::Sense::click_and_drag());
+                    point_down |= pt_resp.is_pointer_button_down_on() || pt_resp.dragged();
 
                     let origin_id = ui.id().with(("crv_pt_origin_inline", node_id, i));
                     if pt_resp.drag_started() && !alt_held {
@@ -338,7 +342,8 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         new_points[i][1] = new_points[i][0].clamp(lo, 1.0);
                         pts_changed = true;
                     }
-                    if pt_resp.secondary_clicked() && new_points.len() > 2 {
+                    if new_points.len() > 2 { bends.removal_ring(ui, &pt_resp, screen); }
+                    if pt_resp.secondary_clicked() && !bends.keeps_point(ui, &pt_resp) && new_points.len() > 2 {
                         remove_idx = Some(i);
                         pts_changed = true;
                     }
@@ -365,6 +370,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     }
                 }
 
+                bends.finish(ui, point_down);
                 if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
@@ -455,7 +461,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 // we resync the local working buffers so the writeback block
                 // below doesn't clobber the change.
                 let mut menu_mutated = false;
-                bg_resp.context_menu(|ui| {
+                crate::touch::context_menu(&bg_resp, |ui| {
                     if curve_context_menu(ui, node_id, snarl, None) {
                         menu_mutated = true;
                     }
@@ -800,7 +806,8 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 }
 
                 let alt_held = ui.input(|i| i.modifiers.alt);
-                if alt_held && new_points.len() >= 2 {
+                let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
+                if (alt_held || bends.exposed()) && new_points.len() >= 2 {
                     while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
                     for seg in 0..(new_points.len() - 1) {
                         let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
@@ -813,24 +820,26 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         let hresp = ui.interact(
                             egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
                             hid, egui::Sense::click_and_drag());
+                        let finger = bends.finger(ui, hresp.id, hpos);
                         if hresp.double_clicked() {
                             new_biases[seg] = 0.0;
                             bias_changed = true;
-                        } else if hresp.dragged() {
-                            let dy = -hresp.drag_delta().y / rect.height() * y_range;
+                        } else if hresp.dragged() || finger.is_some() {
+                            let dy = -(hresp.drag_delta().y + finger.unwrap_or(0.0)) / rect.height() * y_range;
                             new_biases[seg] = (new_biases[seg] + dy).clamp(-2.0, 2.0);
                             bias_changed = true;
                         }
-                        let hcol = if hresp.hovered() || hresp.dragged() {
+                        let hcol = if hresp.hovered() || hresp.dragged() || finger.is_some() {
                             Color32::from_rgb(255, 220, 50)
                         } else { Color32::from_rgb(180, 140, 20) };
-                        painter.circle_filled(hpos, 4.0, hcol);
-                        painter.circle_stroke(hpos, 4.0,
+                        painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
+                        painter.circle_stroke(hpos, bends.dot_radius(4.0),
                             egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
                 let mut remove_idx: Option<usize> = None;
+                let mut point_down = false;
                 for i in 0..new_points.len() {
                     let [px, py] = new_points[i];
                     let screen   = c2s(px, py);
@@ -841,6 +850,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     let pt_resp  = ui.interact(
                         egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
                         pt_id, egui::Sense::click_and_drag());
+                    point_down |= pt_resp.is_pointer_button_down_on() || pt_resp.dragged();
 
                     let origin_id = ui.id().with(("vcrv_pt_origin_inline", node_id, i));
                     if pt_resp.drag_started() && !alt_held {
@@ -869,7 +879,8 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         new_points[i][1] = new_points[i][0].clamp(0.0, 1.0);
                         pts_changed = true;
                     }
-                    if pt_resp.secondary_clicked() && new_points.len() > 2 {
+                    if new_points.len() > 2 { bends.removal_ring(ui, &pt_resp, screen); }
+                    if pt_resp.secondary_clicked() && !bends.keeps_point(ui, &pt_resp) && new_points.len() > 2 {
                         remove_idx = Some(i);
                         pts_changed = true;
                     }
@@ -882,6 +893,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     }
                 }
 
+                bends.finish(ui, point_down);
                 if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
@@ -951,7 +963,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                 // Right-click on empty graph → save/load/copy/paste/reset
                 // (shared with the header buttons; uses .fxc format).
                 let mut menu_mutated = false;
-                bg_resp.context_menu(|ui| {
+                crate::touch::context_menu(&bg_resp, |ui| {
                     if curve_context_menu(ui, node_id, snarl, None) {
                         menu_mutated = true;
                     }
@@ -1361,7 +1373,8 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
                     .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
                 let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
-                if alt_held && new_edit_pts.len() >= 2 {
+                let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
+                if (alt_held || bends.exposed()) && new_edit_pts.len() >= 2 {
                     while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
                     for seg in 0..(new_edit_pts.len() - 1) {
                         let mid_x = (new_edit_pts[seg][0] + new_edit_pts[seg+1][0]) * 0.5;
@@ -1371,16 +1384,18 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         // hidden handle may catch clicks meant for whatever is drawn there.
                         if !rect.expand(8.0).contains(hpos) { continue; }
                         let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
+                        let finger = bends.finger(ui, hresp.id, hpos);
                         if hresp.double_clicked() { new_edit_biases[seg] = 0.0; *bias_changed_ref = true; }
-                        else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
-                        let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
-                        painter.circle_filled(hpos, 4.0, hcol);
-                        painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+                        else if hresp.dragged() || finger.is_some() { let dy = -(hresp.drag_delta().y + finger.unwrap_or(0.0)) / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
+                        let hcol = if hresp.hovered() || hresp.dragged() || finger.is_some() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
+                        painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
+                        painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
                     }
                 }
 
                 // Control point handles
                 let mut remove_idx: Option<usize> = None;
+                let mut point_down = false;
                 for i in 0..edit_pts_r.len() {
                     let [px, py] = edit_pts_r[i];
                     let screen   = c2s(px, py);
@@ -1389,6 +1404,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     if !rect.expand(8.0).contains(screen) { continue; }
                     let pt_id    = ui.id().with(("twpt", node_id, lane_ix, i as u32));
                     let pt_resp  = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
+                    point_down |= pt_resp.is_pointer_button_down_on() || pt_resp.dragged();
                     let oid      = ui.id().with(("twpt_orig", node_id, lane_ix, i as u32));
                     if pt_resp.drag_started() && !alt_held { ui.ctx().data_mut(|d| d.insert_temp(oid, [px, py, 0.0f32, 0.0f32])); }
                     if pt_resp.dragged() && !alt_held {
@@ -1411,7 +1427,8 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                         new_edit_pts[i][1] = new_edit_pts[i][0].clamp(lo, 1.0);
                         *pts_changed_ref = true;
                     }
-                    if pt_resp.secondary_clicked() && edit_pts_r.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); *pts_changed_ref = true; }
+                    if edit_pts_r.len() > if hyst_lane { 1 } else { 2 } { bends.removal_ring(ui, &pt_resp, screen); }
+                    if pt_resp.secondary_clicked() && !bends.keeps_point(ui, &pt_resp) && edit_pts_r.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); *pts_changed_ref = true; }
                     // Gamepad-nav selected-dot highlight (active lane only).
                     if nav_sel_dot == Some(i) {
                         let accent = ui.visuals().selection.stroke.color;
@@ -1438,6 +1455,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     }
                 }
 
+                bends.finish(ui, point_down);
                 if let Some(idx) = remove_idx { curve_remove_point(new_edit_pts, new_edit_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
@@ -1483,7 +1501,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 // curve into it without touching the Up lane.
                 let lane_name = if hyst_lane { "Hyst" } else if lane_up { "Up" } else { "Down" };
                 let mut menu_mutated = false;
-                bg_resp.context_menu(|ui| {
+                crate::touch::context_menu(&bg_resp, |ui| {
                     // Graph-only: only points/biases for the active lane are
                     // touched; range / grid / scale / lane toggle stay as-is.
                     if curve_context_menu(ui, node_id, snarl, Some(lane_name)) {
@@ -1731,7 +1749,7 @@ pub(crate) fn render_twoway_curve_only(
         .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()))
         .map(|s| match s { "dn" => "Down", "hy" => "Hyst", _ => "Up" })
         .unwrap_or("Up");
-    bg_for_menu.context_menu(|ui| {
+    crate::touch::context_menu(&bg_for_menu, |ui| {
         curve_context_menu(ui, inner_id, snarl, Some(lane_name));
     });
 }
@@ -1887,7 +1905,8 @@ pub(crate) fn paint_twoway_curve_graph(
 
     // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
     let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
-    if alt_held && new_edit_pts.len() >= 2 {
+    let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
+    if (alt_held || bends.exposed()) && new_edit_pts.len() >= 2 {
         while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
         for seg in 0..(new_edit_pts.len()-1) {
             let mid_x = (new_edit_pts[seg][0]+new_edit_pts[seg+1][0])*0.5;
@@ -1897,16 +1916,18 @@ pub(crate) fn paint_twoway_curve_graph(
             // hidden handle may catch clicks meant for whatever is drawn there.
             if !rect.expand(8.0).contains(hpos) { continue; }
             let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh_pin", node_id, lane_ix, seg as u32)), egui::Sense::click_and_drag());
+            let finger = bends.finger(ui, hresp.id, hpos);
             if hresp.double_clicked() { new_edit_biases[seg] = 0.0; bias_changed = true; }
-            else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); bias_changed = true; }
-            let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
-            painter.circle_filled(hpos, 4.0, hcol);
-            painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+            else if hresp.dragged() || finger.is_some() { let dy = -(hresp.drag_delta().y + finger.unwrap_or(0.0)) / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); bias_changed = true; }
+            let hcol = if hresp.hovered() || hresp.dragged() || finger.is_some() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
+            painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
+            painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
         }
     }
 
     // Control point handles
     let mut remove_idx: Option<usize> = None;
+    let mut point_down = false;
     for i in 0..edit_pts.len() {
         let [px, py] = edit_pts[i];
         let screen = c2s(px, py);
@@ -1915,6 +1936,7 @@ pub(crate) fn paint_twoway_curve_graph(
         if !rect.expand(8.0).contains(screen) { continue; }
         let pt_id  = ui.id().with(("twpt_pin", node_id, lane_ix, i as u32));
         let pt_resp = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
+        point_down |= pt_resp.is_pointer_button_down_on() || pt_resp.dragged();
         let oid = ui.id().with(("twpt_orig_pin", node_id, lane_ix, i as u32));
         if pt_resp.drag_started() && !alt_held { ui.ctx().data_mut(|d| d.insert_temp(oid, [px, py, 0.0f32, 0.0f32])); }
         if pt_resp.dragged() && !alt_held {
@@ -1937,7 +1959,8 @@ pub(crate) fn paint_twoway_curve_graph(
             new_edit_pts[i][1] = new_edit_pts[i][0].clamp(lo, 1.0);
             pts_changed = true;
         }
-        if pt_resp.secondary_clicked() && edit_pts.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); pts_changed = true; }
+        if edit_pts.len() > if hyst_lane { 1 } else { 2 } { bends.removal_ring(ui, &pt_resp, screen); }
+        if pt_resp.secondary_clicked() && !bends.keeps_point(ui, &pt_resp) && edit_pts.len() > if hyst_lane { 1 } else { 2 } { remove_idx = Some(i); pts_changed = true; }
         // Gamepad-nav selected-dot highlight (active lane).
         if nav_sel_dot == Some(i) {
             let accent = ui.visuals().selection.stroke.color;
@@ -1965,6 +1988,7 @@ pub(crate) fn paint_twoway_curve_graph(
     }
 
     // Remove (right-click) / add (double-click) — biases stay on their segments.
+    bends.finish(ui, point_down);
     if let Some(idx) = remove_idx { curve_remove_point(&mut new_edit_pts, &mut new_edit_biases, idx); }
     if bg_resp.double_clicked() {
         if let Some(pos) = bg_resp.interact_pointer_pos() {

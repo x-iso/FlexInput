@@ -358,7 +358,7 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                     }
 
                     // Right-click context menu.
-                    label.context_menu(|ui| {
+                    crate::touch::context_menu(&label, |ui| {
                         if ui.button("Rename").clicked() {
                             edit_state.editing = Some(i);
                             edit_state.buf = options[i].clone();

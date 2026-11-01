@@ -8,9 +8,79 @@ use smallvec::{SmallVec, ToSmallVec, smallvec};
 
 use crate::{InPinId, NodeId, OutPinId, Snarl};
 
-use super::{SnarlWidget, transform_matching_points};
+use super::{AnyPin, SnarlWidget, transform_matching_points};
 
 pub type RowHeights = SmallVec<[f32; 8]>;
+
+/// FLEXINPUT PATCH: how long a finger stays on a wired pin to pick its wires up, or on a
+/// wire to open its menu.
+const WIRE_HOLD_SECS: f64 = 1.0;
+
+/// FLEXINPUT PATCH: how far a held finger may wander (in points) and still be holding.
+/// egui's own click distance is smaller than a fingertip's wobble.
+const WIRE_HOLD_SLOP: f32 = 14.0;
+
+/// What a finger is resting on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldOn {
+    Pin(AnyPin),
+    Wire(OutPinId, InPinId),
+}
+
+/// FLEXINPUT PATCH: a finger resting on a wired pin or a wire, not yet decided between
+/// moving off (a new wire, or panning the canvas) and holding (picking up the pin's wires,
+/// or the wire's menu).
+#[derive(Clone, Copy)]
+pub(crate) struct WireHold {
+    on: HoldOn,
+    origin: Pos2,
+    since: f64,
+}
+
+/// What a [`WireHold`] came to.
+pub(crate) enum WireHoldStep {
+    /// Still deciding, this far (0..1) through the hold.
+    Holding(f32),
+    /// The finger moved off.
+    Moved,
+    /// The finger stayed the whole time.
+    Lifted,
+    /// The finger left without doing either.
+    Gone,
+}
+
+impl WireHold {
+    pub(crate) const fn on(&self) -> HoldOn {
+        self.on
+    }
+
+    /// Where the finger came down, on screen.
+    pub(crate) const fn origin(&self) -> Pos2 {
+        self.origin
+    }
+
+    /// How far through the hold this is at `time`, 0..1.
+    pub(crate) fn progress(&self, time: f64) -> f32 {
+        ((time - self.since) / WIRE_HOLD_SECS).clamp(0.0, 1.0) as f32
+    }
+
+    pub(crate) fn step(&self, cx: &Context) -> WireHoldStep {
+        cx.input(|i| {
+            let Some(pos) = i.pointer.latest_pos().filter(|_| i.pointer.primary_down()) else {
+                return WireHoldStep::Gone;
+            };
+            if (pos - self.origin).length() > WIRE_HOLD_SLOP {
+                return WireHoldStep::Moved;
+            }
+            let progress = self.progress(i.time);
+            if progress >= 1.0 {
+                WireHoldStep::Lifted
+            } else {
+                WireHoldStep::Holding(progress)
+            }
+        })
+    }
+}
 
 /// Node UI state.
 #[derive(Debug)]
@@ -165,6 +235,22 @@ pub struct SnarlState {
     /// Flag indicating that new wires are owned by the menu now.
     new_wires_menu: bool,
 
+    /// FLEXINPUT PATCH: the pin the new wires were picked up from, when they are existing
+    /// wires being moved. They stay connected there until the move lands, so giving up
+    /// on it needs no undoing.
+    moved_from: Option<AnyPin>,
+
+    /// FLEXINPUT PATCH: a finger resting on a pin.
+    wire_hold: Option<WireHold>,
+
+    /// FLEXINPUT PATCH: two fingers went down in this gesture, which makes it a pinch for
+    /// as long as any is left, so that lifting one doesn't turn the other into a node drag.
+    pinching: bool,
+
+    /// FLEXINPUT PATCH: the pointer's drag is on a node's frame or a pin, as of the last
+    /// time they drew: things a pinch can go ahead over.
+    chrome_dragged: bool,
+
     id: Id,
 
     /// Flag indicating that the graph state is dirty must be saved.
@@ -224,6 +310,10 @@ struct SnarlStateData {
     to_global: TSTransform,
     new_wires: Option<NewWires>,
     new_wires_menu: bool,
+    moved_from: Option<AnyPin>,
+    wire_hold: Option<WireHold>,
+    pinching: bool,
+    chrome_dragged: bool,
     rect_selection: Option<RectSelect>,
 }
 
@@ -268,6 +358,10 @@ impl SnarlState {
             to_global: data.to_global,
             new_wires: data.new_wires,
             new_wires_menu: data.new_wires_menu,
+            moved_from: data.moved_from,
+            wire_hold: data.wire_hold,
+            pinching: data.pinching,
+            chrome_dragged: data.chrome_dragged,
             id,
             dirty,
             rect_selection: data.rect_selection,
@@ -300,6 +394,10 @@ impl SnarlState {
             to_global,
             new_wires: None,
             new_wires_menu: false,
+            moved_from: None,
+            wire_hold: None,
+            pinching: false,
+            chrome_dragged: false,
             id,
             dirty: true,
             draw_order: Vec::new(),
@@ -317,6 +415,10 @@ impl SnarlState {
                 to_global: self.to_global,
                 new_wires: self.new_wires,
                 new_wires_menu: self.new_wires_menu,
+                moved_from: self.moved_from,
+                wire_hold: self.wire_hold,
+                pinching: self.pinching,
+                chrome_dragged: self.chrome_dragged,
                 rect_selection: self.rect_selection,
             };
             data.save(cx, self.id);
@@ -354,25 +456,84 @@ impl SnarlState {
     pub fn start_new_wire_in(&mut self, pin: InPinId) {
         self.new_wires = Some(NewWires::In(smallvec![pin]));
         self.new_wires_menu = false;
+        self.moved_from = None;
         self.dirty = true;
     }
 
     pub fn start_new_wire_out(&mut self, pin: OutPinId) {
         self.new_wires = Some(NewWires::Out(smallvec![pin]));
         self.new_wires_menu = false;
+        self.moved_from = None;
         self.dirty = true;
     }
 
     pub fn start_new_wires_in(&mut self, pins: &[InPinId]) {
         self.new_wires = Some(NewWires::In(pins.to_smallvec()));
         self.new_wires_menu = false;
+        self.moved_from = None;
         self.dirty = true;
     }
 
     pub fn start_new_wires_out(&mut self, pins: &[OutPinId]) {
         self.new_wires = Some(NewWires::Out(pins.to_smallvec()));
         self.new_wires_menu = false;
+        self.moved_from = None;
         self.dirty = true;
+    }
+
+    /// Mark the wires just started as existing wires, picked up from `pin`.
+    pub(crate) const fn set_moved_from(&mut self, pin: AnyPin) {
+        self.moved_from = Some(pin);
+        self.dirty = true;
+    }
+
+    /// The pin the current new wires are being moved away from, if they are.
+    pub(crate) fn moved_from(&self) -> Option<AnyPin> {
+        self.moved_from.filter(|_| self.new_wires.is_some())
+    }
+
+    /// Start a [`WireHold`], if the pointer went down this frame.
+    pub(crate) fn begin_wire_hold(&mut self, on: HoldOn, cx: &Context) {
+        let pressed = cx.input(|i| {
+            let origin = i.pointer.press_origin().filter(|_| i.pointer.primary_pressed());
+            origin.zip(i.pointer.press_start_time())
+        });
+        if let Some((origin, since)) = pressed {
+            self.wire_hold = Some(WireHold { on, origin, since });
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) const fn pinching(&self) -> bool {
+        self.pinching
+    }
+
+    pub(crate) const fn set_pinching(&mut self, pinching: bool) {
+        self.dirty |= self.pinching != pinching;
+        self.pinching = pinching;
+    }
+
+    pub(crate) const fn mark_chrome_dragged(&mut self) {
+        self.dirty |= !self.chrome_dragged;
+        self.chrome_dragged = true;
+    }
+
+    /// Was a node's frame or a pin being dragged when they last drew? Asks once a frame,
+    /// before they draw again.
+    pub(crate) const fn take_chrome_dragged(&mut self) -> bool {
+        let dragged = self.chrome_dragged;
+        self.dirty |= dragged;
+        self.chrome_dragged = false;
+        dragged
+    }
+
+    pub(crate) const fn wire_hold(&self) -> Option<WireHold> {
+        self.wire_hold
+    }
+
+    pub(crate) const fn stop_wire_hold(&mut self) {
+        self.dirty |= self.wire_hold.is_some();
+        self.wire_hold = None;
     }
 
     pub fn add_new_wire_in(&mut self, pin: InPinId) {

@@ -2,9 +2,13 @@
 
 use super::*;
 
-pub(crate) enum WireDir {
-    FromOutput { src: OutPinId, from_type: SignalType },
-    FromInput  { dst: InPinId,  to_type:   SignalType },
+/// The wires dropped on empty space that a new module will take. `moved_from` is the pin
+/// they were picked up from, if they're existing wires being moved: the ones that find a
+/// place on the module leave it. The type is the first wire's, which picks the modules to
+/// offer; each wire then finds its own pin.
+pub(crate) enum WireDir<'a> {
+    FromOutput { srcs: &'a [OutPinId], from_type: SignalType, moved_from: Option<InPinId> },
+    FromInput  { dsts: &'a [InPinId],  to_type:   SignalType, moved_from: Option<OutPinId> },
 }
 
 pub(crate) fn show_module_menu(
@@ -46,36 +50,82 @@ pub(crate) fn show_module_menu(
         }
 
         ui.menu_button(cat, |ui| {
-            for desc in cat_modules {
-                if ui.button(desc.display_name).clicked() {
-                    let node_id = snarl.insert_node(pos, NodeData::from(desc));
-                    match &wire {
-                        Some(WireDir::FromOutput { src, from_type }) => {
-                            if let Some((idx, _)) = desc
-                                .inputs
-                                .iter()
-                                .enumerate()
-                                .find(|(_, p)| p.signal_type.accepts(*from_type))
-                            {
-                                snarl.connect(*src, InPinId { node: node_id, input: idx });
-                            }
+            // Finger-sized rows can make a long category taller than the screen.
+            let max_height = ui.ctx().content_rect().height() - 32.0;
+            egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                for desc in cat_modules {
+                    if ui.button(desc.display_name).clicked() {
+                        let node_id = snarl.insert_node(pos, NodeData::from(desc));
+                        if let Some(wire) = &wire {
+                            connect_dropped_wires(snarl, wire, desc, node_id);
                         }
-                        Some(WireDir::FromInput { dst, to_type }) => {
-                            if let Some((idx, _)) = desc
-                                .outputs
-                                .iter()
-                                .enumerate()
-                                .find(|(_, p)| to_type.accepts(p.signal_type))
-                            {
-                                snarl.connect(OutPinId { node: node_id, output: idx }, *dst);
-                            }
-                        }
-                        None => {}
+                        ui.close();
                     }
-                    ui.close();
+                }
+            });
+        });
+    }
+}
+
+/// Delete the wires a move was carrying, which are still connected at `from`.
+pub(crate) fn delete_moved_wires(snarl: &mut Snarl<NodeData>, carried: &AnyPins, from: AnyPin) {
+    match (carried, from) {
+        (AnyPins::Out(srcs), AnyPin::In(from)) => {
+            for &src in *srcs {
+                snarl.disconnect(src, from);
+            }
+        }
+        (AnyPins::In(dsts), AnyPin::Out(from)) => {
+            for &dst in *dsts {
+                snarl.disconnect(from, dst);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Connect wires dropped on empty space to the new module just made for them. Each takes
+/// the first of its pins that accepts it; a wire none accepts stays where it was.
+fn connect_dropped_wires(
+    snarl: &mut Snarl<NodeData>,
+    wire: &WireDir,
+    desc: &ModuleDescriptor,
+    node_id: NodeId,
+) {
+    match wire {
+        WireDir::FromOutput { srcs, moved_from, .. } => {
+            for &src in *srcs {
+                let from_type = snarl[src.node].outputs[src.output].signal_type;
+                // An Auto-Map input takes one wire, so a second one looks further.
+                let found = desc.inputs.iter().enumerate().find(|&(input, p)| {
+                    p.signal_type.accepts(from_type)
+                        && (p.signal_type != SignalType::AutoMap
+                            || snarl.in_pin(InPinId { node: node_id, input }).remotes.is_empty())
+                });
+                if let Some((input, _)) = found {
+                    snarl.connect(src, InPinId { node: node_id, input });
+                    if let Some(from) = moved_from {
+                        snarl.disconnect(src, *from);
+                    }
                 }
             }
-        });
+        }
+        WireDir::FromInput { dsts, moved_from, .. } => {
+            for &dst in *dsts {
+                let to_type = snarl[dst.node].inputs[dst.input].signal_type;
+                let found = desc.outputs.iter().enumerate()
+                    .find(|(_, p)| to_type.accepts(p.signal_type));
+                if let Some((output, _)) = found {
+                    if to_type == SignalType::AutoMap {
+                        snarl.drop_inputs(dst);
+                    }
+                    snarl.connect(OutPinId { node: node_id, output }, dst);
+                    if let Some(from) = moved_from {
+                        snarl.disconnect(*from, dst);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -172,3 +222,138 @@ pub(crate) const MULTI_COLORS: [Color32; 12] = [
     Color32::from_rgb(40,  200, 160),  // 10 teal
     Color32::from_rgb(200, 200, 80),   // 11 olive
 ];
+
+#[cfg(test)]
+mod dropped_wire_tests {
+    use super::*;
+
+    fn desc(inputs: &[SignalType], outputs: &[SignalType]) -> ModuleDescriptor {
+        let pins = |types: &[SignalType]| {
+            types.iter().map(|&t| PinDescriptor::new("pin", t)).collect()
+        };
+        ModuleDescriptor {
+            id: "test.module",
+            display_name: "Test",
+            category: "Test",
+            inputs: pins(inputs),
+            outputs: pins(outputs),
+        }
+    }
+
+    fn add(snarl: &mut Snarl<NodeData>, desc: &ModuleDescriptor) -> NodeId {
+        snarl.insert_node(egui::Pos2::ZERO, NodeData::from(desc))
+    }
+
+    fn wires(snarl: &Snarl<NodeData>) -> Vec<(OutPinId, InPinId)> {
+        let mut wires: Vec<_> = snarl.wires().collect();
+        wires.sort_by_key(|(o, i)| (o.node.0, i.node.0));
+        wires
+    }
+
+    /// Every wire of a bundle moves to the new module, not just the first.
+    #[test]
+    fn a_moved_bundle_of_sources_all_lands_on_the_new_module() {
+        use SignalType::Float;
+        let mut snarl = Snarl::new();
+        let source = desc(&[], &[Float]);
+        let (s1, s2) = (add(&mut snarl, &source), add(&mut snarl, &source));
+        let old = add(&mut snarl, &desc(&[Float], &[]));
+        let (o1, o2) = (OutPinId { node: s1, output: 0 }, OutPinId { node: s2, output: 0 });
+        let from = InPinId { node: old, input: 0 };
+        snarl.connect(o1, from);
+        snarl.connect(o2, from);
+
+        let module = desc(&[Float], &[]);
+        let new = add(&mut snarl, &module);
+        let srcs = [o1, o2];
+        let wire = WireDir::FromOutput { srcs: &srcs, from_type: Float, moved_from: Some(from) };
+        connect_dropped_wires(&mut snarl, &wire, &module, new);
+
+        let to = InPinId { node: new, input: 0 };
+        assert_eq!(wires(&snarl), [(o1, to), (o2, to)]);
+    }
+
+    /// A new wire leaves what's already there alone.
+    #[test]
+    fn a_new_wire_moves_nothing() {
+        use SignalType::Float;
+        let mut snarl = Snarl::new();
+        let s = add(&mut snarl, &desc(&[], &[Float]));
+        let old = add(&mut snarl, &desc(&[Float], &[]));
+        let (src, kept) = (OutPinId { node: s, output: 0 }, InPinId { node: old, input: 0 });
+        snarl.connect(src, kept);
+
+        let module = desc(&[Float], &[]);
+        let new = add(&mut snarl, &module);
+        let srcs = [src];
+        let wire = WireDir::FromOutput { srcs: &srcs, from_type: Float, moved_from: None };
+        connect_dropped_wires(&mut snarl, &wire, &module, new);
+
+        assert_eq!(wires(&snarl), [(src, kept), (src, InPinId { node: new, input: 0 })]);
+    }
+
+    /// An Auto-Map input takes one wire. A bundle spreads over the ones a module has, and
+    /// what doesn't fit stays connected where it was rather than being lost.
+    #[test]
+    fn auto_map_inputs_take_one_wire_each() {
+        use SignalType::AutoMap;
+        let mut snarl = Snarl::new();
+        let source = desc(&[], &[AutoMap]);
+        let (s1, s2) = (add(&mut snarl, &source), add(&mut snarl, &source));
+        let old = add(&mut snarl, &desc(&[AutoMap], &[]));
+        let (o1, o2) = (OutPinId { node: s1, output: 0 }, OutPinId { node: s2, output: 0 });
+        let from = InPinId { node: old, input: 0 };
+        snarl.connect(o1, from);
+        snarl.connect(o2, from);
+
+        let module = desc(&[AutoMap], &[]);
+        let new = add(&mut snarl, &module);
+        let srcs = [o1, o2];
+        let wire = WireDir::FromOutput { srcs: &srcs, from_type: AutoMap, moved_from: Some(from) };
+        connect_dropped_wires(&mut snarl, &wire, &module, new);
+
+        assert_eq!(wires(&snarl), [(o1, InPinId { node: new, input: 0 }), (o2, from)]);
+    }
+
+    /// An outlet's wires move too: the new module drives everything the old pin did.
+    #[test]
+    fn a_moved_bundle_of_targets_all_lands_on_the_new_module() {
+        use SignalType::Float;
+        let mut snarl = Snarl::new();
+        let old = add(&mut snarl, &desc(&[], &[Float]));
+        let sink = desc(&[Float], &[]);
+        let (d1, d2) = (add(&mut snarl, &sink), add(&mut snarl, &sink));
+        let from = OutPinId { node: old, output: 0 };
+        let (i1, i2) = (InPinId { node: d1, input: 0 }, InPinId { node: d2, input: 0 });
+        snarl.connect(from, i1);
+        snarl.connect(from, i2);
+
+        let module = desc(&[], &[Float]);
+        let new = add(&mut snarl, &module);
+        let dsts = [i1, i2];
+        let wire = WireDir::FromInput { dsts: &dsts, to_type: Float, moved_from: Some(from) };
+        connect_dropped_wires(&mut snarl, &wire, &module, new);
+
+        let out = OutPinId { node: new, output: 0 };
+        assert_eq!(wires(&snarl), [(out, i1), (out, i2)]);
+    }
+
+    /// Deleting takes the wires being carried, and only those.
+    #[test]
+    fn delete_takes_only_the_carried_wires() {
+        use SignalType::Float;
+        let mut snarl = Snarl::new();
+        let source = desc(&[], &[Float]);
+        let (s1, s2) = (add(&mut snarl, &source), add(&mut snarl, &source));
+        let sink = add(&mut snarl, &desc(&[Float], &[]));
+        let (o1, o2) = (OutPinId { node: s1, output: 0 }, OutPinId { node: s2, output: 0 });
+        let pin = InPinId { node: sink, input: 0 };
+        snarl.connect(o1, pin);
+        snarl.connect(o2, pin);
+
+        let carried = [o1];
+        delete_moved_wires(&mut snarl, &AnyPins::Out(&carried), AnyPin::In(pin));
+
+        assert_eq!(wires(&snarl), [(o2, pin)]);
+    }
+}

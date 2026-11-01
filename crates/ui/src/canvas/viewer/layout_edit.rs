@@ -258,7 +258,7 @@ fn anchor_picker(ui: &mut egui::Ui, state: &mut LayoutStateMut<'_>, sel: &[usize
     let ex = if cur.x == AnchorAxis::Auto { dpx } else { cur.x };
     let ey = if cur.y == AnchorAxis::Auto { dpy } else { cur.y };
 
-    ui.menu_button(format!("⚓ {}", anchor_label(cur, dpx, dsx, dpy, dsy)), |ui| {
+    crate::touch::menu_button(ui, format!("⚓ {}", anchor_label(cur, dpx, dsx, dpy, dsy)), |ui| {
         ui.label(egui::RichText::new("Anchor to screen").small().weak());
 
         let mut sx = if cur.x == AnchorAxis::Auto { dsx } else { cur.stretch_x };

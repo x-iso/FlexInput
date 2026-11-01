@@ -243,7 +243,7 @@ pub(crate) fn show_overlay_body(
         if bg.clicked() {
             clicked_empty = true;
         }
-        bg.context_menu(|ui| {
+        crate::touch::context_menu(&bg, |ui| {
             ui.menu_button("Add", |ui| {
                 if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close(); }
                 if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close(); }
@@ -485,7 +485,7 @@ pub(crate) fn show_overlay_body(
                 let prev = multi_drag_delta.unwrap_or([0.0, 0.0]);
                 multi_drag_delta = Some([prev[0] + dd.x, prev[1] + dd.y]);
             }
-            resp.context_menu(|ui| {
+            crate::touch::context_menu(&resp, |ui| {
                 layout_item_context_menu(
                     ui, idx, is_deco_idx, has_style_clip, n_selected,
                     &mut zaction, &mut delete_idx,
@@ -591,7 +591,7 @@ pub(crate) fn show_overlay_body(
                     new_pos[target] = Some([tx, ty]);
                 }
             }
-            resp.context_menu(|ui| {
+            crate::touch::context_menu(&resp, |ui| {
                 layout_item_context_menu(
                     ui, idx, is_deco_idx, has_style_clip, n_selected,
                     &mut zaction, &mut delete_idx,

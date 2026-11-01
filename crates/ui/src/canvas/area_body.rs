@@ -1998,7 +1998,7 @@ fn area_field(
             ctx.data_mut(|d| d.insert_temp(ctx_id, (x, y, target)));
         }
     }
-    resp.context_menu(|ui| {
+    crate::touch::context_menu(&resp, |ui| {
         let Some((x, y, target)) = ui.ctx().data(|d| d.get_temp::<(f32, f32, Option<Value>)>(ctx_id)) else {
             return;
         };
@@ -2545,7 +2545,7 @@ fn overlay_controls(
 /// loading the whole module as a `.fxarea` file.
 fn presets_menu(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
     let mut changed = false;
-    ui.menu_button("Presets", |ui| {
+    crate::touch::menu_button(ui, "Presets", |ui| {
         let mut layout: Option<AreaLayout> = None;
         if ui.button("Circle: 4-way").clicked() { layout = Some(AreaLayout::circle_ways(4)); }
         if ui.button("Circle: 8-way").clicked() { layout = Some(AreaLayout::circle_ways(8)); }

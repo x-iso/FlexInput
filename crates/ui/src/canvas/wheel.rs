@@ -83,6 +83,24 @@ pub(crate) fn scrolling_body<R>(
     out
 }
 
+fn page_wheel_key(ctx: &Context) -> Id {
+    Id::new("fxi_widget_has_wheel").with(ctx.viewport_id())
+}
+
+/// The pointer is over a list inside a scrolling page (Easy mode's layout), and the list
+/// has somewhere to scroll: the wheel is the list's alone. The page reads this before the
+/// list draws, so it's good for the next frame too.
+pub(crate) fn keep_wheel_from_page(ctx: &Context) {
+    let (pass, key) = (ctx.cumulative_pass_nr(), page_wheel_key(ctx));
+    ctx.data_mut(|d| d.insert_temp(key, pass));
+}
+
+pub(crate) fn widget_has_wheel(ctx: &Context) -> bool {
+    let (pass, key) = (ctx.cumulative_pass_nr(), page_wheel_key(ctx));
+    ctx.data(|d| d.get_temp::<u64>(key))
+        .is_some_and(|kept| pass.saturating_sub(kept) <= 1)
+}
+
 /// The same body, drawn in two viewports (a node body and its pinned copy on the
 /// config overlay), is two claimants — `ctx.data` is shared across viewports, and
 /// pointer positions are not.
@@ -149,6 +167,19 @@ fn take_claimed_wheel(ctx: &Context, claimant: Id) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page reads this before the list draws, so it has to last a frame, and no more.
+    #[test]
+    fn a_list_keeps_the_wheel_from_the_page_for_one_frame() {
+        let ctx = Context::default();
+        let seen = std::cell::Cell::new(false);
+        let _ = ctx.run(Default::default(), |ctx| keep_wheel_from_page(ctx));
+        let _ = ctx.run(Default::default(), |ctx| seen.set(widget_has_wheel(ctx)));
+        assert!(seen.get());
+        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |ctx| seen.set(widget_has_wheel(ctx)));
+        assert!(!seen.get());
+    }
 
     const WHEEL: Vec2 = egui::vec2(0.0, -40.0);
     /// Where the pointer sits — inside the scroll area the test draws.

@@ -44,7 +44,8 @@ use windows_sys::Win32::UI::Input::Touch::{
 use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    GetMenu, GetMessageExtraInfo, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW,
+    PostMessageW,
     RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
@@ -1640,6 +1641,16 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::DefWindowProc(wparam);
         },
 
+        // FLEXINPUT PATCH: Windows follows every WM_TOUCH with mouse messages of its own,
+        // so a touch reached the app twice, and holding a finger still became a right
+        // click when it lifted. Touch already arrives through WM_TOUCH: drop the copies.
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+        | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP
+            if is_mouse_message_from_touch() =>
+        {
+            result = ProcResult::Value(0);
+        },
+
         WM_MOUSEMOVE => {
             use crate::event::WindowEvent::{CursorEntered, CursorLeft, CursorMoved};
 
@@ -2647,6 +2658,15 @@ enum PointerMoveKind {
     Leave,
     /// Pointer is inside the window or `GetClientRect` failed.
     None,
+}
+
+/// FLEXINPUT PATCH: is the mouse message being handled one Windows made up from a touch?
+/// Windows stamps those in the message's extra info; a pen sets the same signature with
+/// bit 7 clear, and stays a mouse here.
+fn is_mouse_message_from_touch() -> bool {
+    const SIGNATURE_MASK: u32 = 0xFFFF_FF80;
+    const TOUCH_SIGNATURE: u32 = 0xFF51_5780;
+    (unsafe { GetMessageExtraInfo() }) as u32 & SIGNATURE_MASK == TOUCH_SIGNATURE
 }
 
 fn get_pointer_move_kind(
