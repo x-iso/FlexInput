@@ -353,6 +353,7 @@ pub(crate) fn controller3d_live(
     tailoff: f32,
     highlight: [f32; 3],
     deadzone: [f32; 2],
+    capacitive_glow: f32,
 ) -> crate::model::ControllerLive {
     let mut live = crate::model::ControllerLive::default();
     live.highlight = highlight;
@@ -464,7 +465,7 @@ pub(crate) fn controller3d_live(
     glow("left_trigger", live.left_trigger);
     glow("right_trigger", live.right_trigger);
     // Sticks: movement lights the dome + rim; the CAP lights on an L3/R3
-    // click only (so a click reads distinctly from deflection).
+    // click (so a click reads distinctly from deflection).
     let lmag = live.left_stick.length().min(1.0);
     let rmag = live.right_stick.length().min(1.0);
     for p in ["left_stick", "left_ring"] {
@@ -474,12 +475,12 @@ pub(crate) fn controller3d_live(
         glow(p, rmag);
     }
     // A thumb resting on a capacitive cap (Misc 3 / 4, read only when the backend
-    // marks them capacitive) lights it dimly, below what a click does.
-    const CAP_TOUCH_GLOW: f32 = 0.3;
+    // marks them capacitive) lights it at the node's touch-sensor level, which a
+    // click still outshines.
     let capacitive = get(flexinput_core::automap::CAPACITIVE_MASK_PIN).map_or(0, |s| s.as_float() as u8);
     for (part, misc, press) in [("left_cap", 2, live.left_stick_press), ("right_cap", 3, live.right_stick_press)] {
         let touched = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
-        glow(part, press.max(if touched { CAP_TOUCH_GLOW } else { 0.0 }));
+        glow(part, press.max(if touched { capacitive_glow } else { 0.0 }));
     }
     // A pad click lights the whole pad surface — the touchpad, and a two-pad
     // controller's right pad (`touchpad2`), whose click SDL reports as Misc 2.
@@ -487,14 +488,24 @@ pub(crate) fn controller3d_live(
         let click = flexinput_core::touchzones::field_click_pins(field).iter().any(|p| b(p));
         glow(part, if click { 1.0 } else { 0.0 });
     }
-    // Grip sense (Steam Controller): a hand on a grip shows that grip's patch.
-    // The grips' capacitive pads arrive on Misc 5 / 6, read only when the
-    // backend marks those pins capacitive — on other pads they're buttons.
+    // Grip sense (Steam Controller): a hand on a grip shows that grip's patch,
+    // at the same level as a touched cap. The grips' capacitive pads arrive on
+    // Misc 5 / 6, read only when the backend marks those pins capacitive — on
+    // other pads they're buttons.
     for (part, misc) in [("left_gripsense", 4), ("right_gripsense", 5)] {
         let held = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
-        glow(part, if held { 1.0 } else { 0.0 });
+        glow(part, if held { capacitive_glow } else { 0.0 });
     }
     live
+}
+
+/// The node's Touch sensors level (`capacitive_glow`): how brightly a touched
+/// capacitive sensor (stick cap, grip) lights, 0 = not shown.
+pub(crate) fn c3d_capacitive_glow(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {
+    snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("capacitive_glow").and_then(|v| v.as_f64()))
+        .unwrap_or(0.3) as f32
 }
 
 /// The node's Motion cue amount (`motion_cue`, 0 = off).
@@ -590,6 +601,39 @@ pub(crate) fn c3d_motion_offset(
         let s = d.get_temp_mut_or_default::<C3dMotion>(key);
         s.step(a_world, dt, amount)
     })
+}
+
+#[cfg(test)]
+mod capacitive_glow_tests {
+    use super::*;
+    use flexinput_core::automap::{CAPACITIVE_MASK_PIN, MISC_PINS};
+
+    /// Both caps' and grips' sensors held; `(left_cap, left_gripsense)` glow.
+    fn glows(level: f32, mask: u8) -> (Option<f32>, Option<f32>) {
+        let dev = "sdl:generic:t".to_string();
+        let mut signals = std::collections::HashMap::new();
+        signals.insert((dev.clone(), CAPACITIVE_MASK_PIN.to_string()), Signal::Float(mask as f32));
+        for pin in [MISC_PINS[2], MISC_PINS[4]] {
+            signals.insert((dev.clone(), pin.to_string()), Signal::Bool(true));
+        }
+        let live = controller3d_live(
+            &signals, &[dev], &egui::Context::default(), 1, 0.25, [1.0; 3], [0.0; 2], level,
+        );
+        (live.glow.get("left_cap").copied(), live.glow.get("left_gripsense").copied())
+    }
+
+    #[test]
+    fn caps_and_grips_light_at_the_set_level() {
+        assert_eq!(glows(0.3, 0b11_1100), (Some(0.3), Some(0.3)));
+        assert_eq!(glows(0.8, 0b11_1100), (Some(0.8), Some(0.8)));
+        assert_eq!(glows(0.0, 0b11_1100), (None, None), "0 = not shown");
+    }
+
+    /// On a pad that doesn't mark them capacitive, Misc pins are buttons.
+    #[test]
+    fn misc_buttons_on_other_pads_are_not_sensors() {
+        assert_eq!(glows(0.3, 0), (None, None));
+    }
 }
 
 #[cfg(test)]
@@ -969,6 +1013,26 @@ pub(crate) fn show_controller3d_body(
             }
         });
 
+        // How brightly touched capacitive sensors light.
+        let mut touch_glow = c3d_capacitive_glow(snarl, node_id);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Touch sensors").small())
+                .on_hover_text(
+                    "How brightly a touched capacitive sensor lights, on pads
+                     that have them: the stick caps and grips of a Steam
+                     Controller. A stick click still lights its cap fully.
+                     0 = not shown.",
+                );
+            if ui
+                .add(egui::Slider::new(&mut touch_glow, 0.0..=1.0))
+                .changed()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("capacitive_glow".into(), serde_json::json!(touch_glow));
+                }
+            }
+        });
+
         // Motion cue: how far the model slides when the pad is moved.
         let mut motion = c3d_motion_amount(snarl, node_id);
         ui.horizontal(|ui| {
@@ -1012,6 +1076,7 @@ pub(crate) fn show_controller3d_body(
         let ctx = ui.ctx().clone();
         let mut live = controller3d_live(
             live_signals, &devs, &ctx, node_id.0, tailoff, accent, deadzone,
+            c3d_capacitive_glow(snarl, node_id),
         );
         live.offset = c3d_motion_offset(
             &ctx, node_id.0 as u64, live_signals, dev_id.as_deref(), wired_orientation,

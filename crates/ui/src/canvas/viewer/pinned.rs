@@ -258,6 +258,7 @@ pub(crate) fn render_pinned_element_impl(
             let ctx = ui.ctx().clone();
             let mut live = controller3d_live(
                 live_signals, &devs, &ctx, inner_id.0, tailoff, accent, deadzone,
+                c3d_capacitive_glow(inner_snarl, inner_id),
             );
             // Pinned copies live in a different host from the canvas node, so
             // the inner id alone can collide with it; the high bit keeps the two

@@ -13,6 +13,10 @@ All notable changes to FlexInput are documented here. This project adheres to
   far enough. It reads as a percentage, or in °/s or G when the input is a gyro or
   accelerometer. At 0, the default, every change counts as before. With Hysteresis
   on, a signal that keeps moving makes it fire in pulses rather than stay on.
+- **Touch sensors level on the 3D viewer.** A new **Touch sensors** slider sets how
+  brightly a touched capacitive sensor lights: the stick caps and grips of a Steam
+  Controller. Grips now start as dim as the caps. At 0 neither is shown; a stick click
+  still lights its cap fully.
 - **Sample and Hold module.** Holds any type of signal and outputs it as that same
   type. In **Sample** mode, each 0→1 on its Trigger pin samples the input, and the
   output holds that value until the next one. In **Hold** mode, the output follows the
