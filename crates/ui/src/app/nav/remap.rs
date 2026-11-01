@@ -515,7 +515,7 @@ impl FlexInputApp {
         if let Some(outer_id) = outer {
             if let Some(inner) = self.nav_selected_inner_node(outer_id) {
                 match self.gamepad_nav.edit_level {
-                    EditLevel::RemapScroll | EditLevel::RemapCard => {
+                    EditLevel::RemapScroll | EditLevel::RemapCard | EditLevel::RemapMove => {
                         self.nav_publish_remap_selection(ctx, outer_id, inner);
                     }
                     EditLevel::TzCards => {
@@ -643,6 +643,8 @@ impl FlexInputApp {
         let sel = new_cur;
 
         if sel < n_actions {
+            // A card's South press doesn't follow the focus up here.
+            self.gamepad_nav.card_south_hold = None;
             // An action button/dropdown is focused → South activates it.
             if nav.is_rising("btn_south") {
                 let action = actions[sel];
@@ -710,17 +712,26 @@ impl FlexInputApp {
             // A mapping card is focused.
             let card_idx = sel - n_actions;
             if nav.is_rising("btn_west") {
+                self.gamepad_nav.card_south_hold = None;
                 let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
                 if self.nav_remap_delete_card(outer_id, card_idx) {
                     self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
                 }
-            } else if nav.is_rising("btn_south") {
-                self.gamepad_nav.edit_level = EditLevel::RemapCard;
-                self.gamepad_nav.card_return_level = EditLevel::RemapScroll;
-                self.gamepad_nav.remap_card = card_idx;
-                self.gamepad_nav.card_field = 0;
-                self.gamepad_nav.edit_baseline = Some(Box::new(
-                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+            } else {
+                // South: a tap enters the card (on release), a hold picks it
+                // up to move it (RemapMove).
+                use crate::gamepad_nav::{card_south_step, CardSouth};
+                let held = nav.pressed.contains("btn_south");
+                let released = !held && self.gamepad_nav.prev_pressed.contains("btn_south");
+                let can_move = self.nav_remap_can_move(ctx, outer_id);
+                let (act, keep) = card_south_step(self.gamepad_nav.card_south_hold, card_idx,
+                    nav.is_rising("btn_south"), held, released, can_move, std::time::Instant::now());
+                self.gamepad_nav.card_south_hold = keep;
+                match act {
+                    CardSouth::Enter => self.nav_remap_enter_card(card_idx),
+                    CardSouth::PickUp => self.nav_remap_pick_up(card_idx),
+                    CardSouth::Wait => {}
+                }
             }
         }
 
@@ -1541,6 +1552,18 @@ impl FlexInputApp {
         self.open_special_picker(req, viewport);
     }
 
+    /// Whether the `RemapScroll` cursor is on a card (not the action row), so
+    /// a held South would pick it up.
+    pub(crate) fn nav_remap_scroll_on_card(&self) -> bool {
+        if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::RemapScroll {
+            return false;
+        }
+        let Some(outer) = self.nav_driving_outer_id() else { return false };
+        let Some(inner) = self.nav_selected_inner_node(outer) else { return false };
+        self.nav_remap_card_count(outer) > 0
+            && self.gamepad_nav.card_index >= self.nav_remap_action_items(outer, inner).len()
+    }
+
     /// What Select and Start do in the selected Remapper right now, for the
     /// legend: edit the focused card's input / output, or choose the draft's.
     /// `None` when they don't belong to it (not a Remapper).
@@ -1561,6 +1584,106 @@ impl FlexInputApp {
         Some(if on_card { ("Edit input", "Edit output") } else { ("Choose input", "Choose output") })
     }
 
+    /// Enter card `card_idx` to edit its fields (`RemapCard`), snapshotting for
+    /// one undo entry on the way out.
+    pub(crate) fn nav_remap_enter_card(&mut self, card_idx: usize) {
+        use crate::gamepad_nav::EditLevel;
+        self.gamepad_nav.edit_level = EditLevel::RemapCard;
+        self.gamepad_nav.card_return_level = EditLevel::RemapScroll;
+        self.gamepad_nav.remap_card = card_idx;
+        self.gamepad_nav.card_field = 0;
+        self.gamepad_nav.edit_baseline = Some(Box::new(
+            self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+    }
+
+    /// Whether the selected widget's cards can be reordered now: not while its
+    /// filter narrows the list, the rule the mouse's drag follows too.
+    pub(crate) fn nav_remap_can_move(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> bool {
+        let (Some(inner), Some((module_id, _))) =
+            (self.nav_selected_inner_node(outer_id), self.nav_selected_element(outer_id))
+        else {
+            return false;
+        };
+        let id = crate::canvas::viewer::mapping_filter_id(&module_id, inner.0, self.nav_lean_side(outer_id));
+        !crate::canvas::viewer::mapping_filter_narrows(ctx, id)
+    }
+
+    /// Pick card `card_idx` up to move it (`RemapMove`). The move is one undo
+    /// step, from here to where it's put down.
+    pub(crate) fn nav_remap_pick_up(&mut self, card_idx: usize) {
+        // A move left open (nav taken elsewhere mid-move) is closed first.
+        self.nav_remap_commit_move();
+        self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::RemapMove;
+        self.gamepad_nav.remap_card = card_idx;
+        self.gamepad_nav.card_move_baseline =
+            Some((self.active_tab, Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo())));
+    }
+
+    /// Commit a card move as one undo entry — only onto the tab it began on.
+    fn nav_remap_commit_move(&mut self) {
+        if let Some((tab, base)) = self.gamepad_nav.card_move_baseline.take() {
+            if tab == self.active_tab {
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(*base);
+            }
+        }
+    }
+
+    /// Drive a picked-up card (`RemapMove`): up / down move it one place
+    /// through the list (held, they repeat), South puts it down and enters it,
+    /// East puts it down. Nothing else acts while it's held up.
+    pub(crate) fn nav_drive_remap_move(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else {
+            self.nav_remap_commit_move();
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        };
+        let count = self.nav_remap_card_count(outer_id);
+        if count == 0 {
+            self.nav_remap_commit_move();
+            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            return;
+        }
+        if self.gamepad_nav.remap_card >= count {
+            self.gamepad_nav.remap_card = count - 1;
+        }
+        let idx = self.gamepad_nav.remap_card;
+        let put_down = nav.is_rising("btn_east") || nav.is_rising("btn_south");
+        if put_down {
+            self.nav_remap_commit_move();
+            // The list's cursor lands on the card where it now is.
+            self.gamepad_nav.card_index = self.nav_remap_action_items(outer_id, inner).len() + idx;
+            if nav.is_rising("btn_south") {
+                self.nav_remap_enter_card(idx);
+            } else {
+                self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            }
+        } else {
+            let dir = match step_dir {
+                Some(NavDir::Up) => -1,
+                Some(NavDir::Down) => 1,
+                _ => 0,
+            };
+            if dir != 0 {
+                let mut landed = None;
+                self.nav_remap_with_mappings(outer_id, |arr| {
+                    landed = crate::canvas::viewer::step_card(arr, idx, dir);
+                    landed.is_some()
+                });
+                if let Some(to) = landed {
+                    self.gamepad_nav.remap_card = to;
+                }
+            }
+        }
+        self.nav_publish_remap_selection(ctx, outer_id, inner);
+    }
+
     /// Publish the RemapScroll selection (action vs card) so the body glows the
     /// focused item. Action items glow their button rect (published by the body);
     /// cards glow via the existing card-rect publish.
@@ -1571,7 +1694,9 @@ impl FlexInputApp {
         let sel = self.gamepad_nav.card_index;
         let pass = ctx.cumulative_pass_nr();
         let scope = self.nav_remap_mappings_key(outer_id);
-        let entered = matches!(self.gamepad_nav.edit_level,
+        // A picked-up card glows as an entered one does, and says it's moving.
+        let moving = self.gamepad_nav.edit_level == crate::gamepad_nav::EditLevel::RemapMove;
+        let entered = moving || matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::RemapCard);
         // (selected_action_index or usize::MAX, card_index or usize::MAX, entered)
         let (act_sel, card_sel) = if entered {
@@ -1586,6 +1711,8 @@ impl FlexInputApp {
                 (pass, card_sel, entered));
             d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0, scope)),
                 (pass, act_sel));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card_moving", inner.0, scope)),
+                (pass, if moving { card_sel } else { usize::MAX }));
         });
         ctx.request_repaint();
     }

@@ -244,6 +244,11 @@ pub(crate) fn remapper_mapping_card_pixel(
         .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 1)
         .map(|(_, f)| f);
     let nav_this = nav_card_sel == Some(mapping_idx);
+    // Picked up by the pad to move (`RemapMove`): its grip lights as a drag's.
+    let nav_moving = ui.ctx()
+        .data(|d| d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_card_moving", node_id.0, nav_scope))))
+        .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 1)
+        .is_some_and(|(_, i)| i == mapping_idx);
     let mut nav_field_rects = [egui::Rect::NOTHING; 9];
 
     // Helper to paint a button background with idle + hover states. Matches
@@ -685,14 +690,25 @@ pub(crate) fn remapper_mapping_card_pixel(
                 ui.interact(grip, grip_id, egui::Sense::hover())
                     .on_hover_text("Clear the filter to reorder the cards")
             };
-            let live = reorder_enabled && (resp.hovered() || resp.dragged());
-            if live {
-                painter.rect_filled(grip.shrink(2.0 * s), 3.0, Color32::from_white_alpha(16));
+            let mouse_live = reorder_enabled && (resp.hovered() || resp.dragged());
+            if mouse_live {
                 ui.ctx().set_cursor_icon(if resp.dragged() {
                     egui::CursorIcon::Grabbing
                 } else {
                     egui::CursorIcon::Grab
                 });
+            }
+            let live = mouse_live || nav_moving;
+            if live {
+                painter.rect_filled(grip.shrink(2.0 * s), 3.0, Color32::from_white_alpha(16));
+            }
+            // Held up by the pad: which ways it goes.
+            if nav_moving {
+                let font = egui::FontId::proportional(8.0 * s);
+                painter.text(egui::pos2(grip.center().x, grip.top() + 7.0 * s), egui::Align2::CENTER_CENTER,
+                    "▲", font.clone(), accent);
+                painter.text(egui::pos2(grip.center().x, grip.bottom() - 7.0 * s), egui::Align2::CENTER_CENTER,
+                    "▼", font, accent);
             }
             let dot = if live {
                 Color32::from_gray(230)

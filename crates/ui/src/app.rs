@@ -3201,6 +3201,7 @@ impl FlexInputApp {
                 | crate::gamepad_nav::EditLevel::CurveDots
                 | crate::gamepad_nav::EditLevel::CurveDot
                 | crate::gamepad_nav::EditLevel::RemapScroll
+                | crate::gamepad_nav::EditLevel::RemapMove
                 | crate::gamepad_nav::EditLevel::TzCards
         );
         let pass = ctx.cumulative_pass_nr();
@@ -3213,6 +3214,7 @@ impl FlexInputApp {
         if matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::RemapScroll
             | crate::gamepad_nav::EditLevel::RemapCard
+            | crate::gamepad_nav::EditLevel::RemapMove
             | crate::gamepad_nav::EditLevel::TzCards)
         {
             self.nav_draw_remap_card_glow(ctx, outer_id);
@@ -3530,6 +3532,9 @@ impl FlexInputApp {
             }
             EditLevel::RemapCard => {
                 self.nav_drive_remap_card(ctx, outer_id, nav, dt, step_dir, rt_rising, mag);
+            }
+            EditLevel::RemapMove => {
+                self.nav_drive_remap_move(ctx, outer_id, nav, step_dir);
             }
             EditLevel::TzLines | EditLevel::TzGrab => {
                 self.nav_drive_touch_zones(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising, mag);

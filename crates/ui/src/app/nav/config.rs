@@ -345,7 +345,7 @@ impl FlexInputApp {
         use crate::gamepad_nav::EditLevel;
         if !matches!(
             self.gamepad_nav.edit_level,
-            EditLevel::RemapScroll | EditLevel::RemapCard | EditLevel::TzCards
+            EditLevel::RemapScroll | EditLevel::RemapCard | EditLevel::RemapMove | EditLevel::TzCards
         ) {
             return None;
         }

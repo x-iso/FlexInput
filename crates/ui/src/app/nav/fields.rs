@@ -2396,8 +2396,8 @@ impl crate::app::FlexInputApp {
     /// hold for Settings).
     ///
     /// Strictly contextual: only while a widget is ENTERED (edit level
-    /// `Editing`, or a Remapper's `RemapScroll` / `RemapCard`), and only for the
-    /// widgets listed here. Anywhere else the app's shortcuts keep working
+    /// `Editing`, a Remapper's `RemapScroll` / `RemapCard`, or any card picked
+    /// up to move — `RemapMove`), and only for the widgets listed here. Anywhere else the app's shortcuts keep working
     /// exactly as before. To give another widget Select or Start, add it here
     /// and handle the button in that widget's driver.
     pub(crate) fn nav_claimed_buttons(&self) -> &'static [&'static str] {
@@ -2412,6 +2412,8 @@ impl crate::app::FlexInputApp {
             EditLevel::RemapScroll | EditLevel::RemapCard if self.nav_selected_is_remapper(outer) => {
                 &["btn_back", "btn_start"]
             }
+            // Nothing else acts while a card is picked up to move (any card list).
+            EditLevel::RemapMove => &["btn_back", "btn_start"],
             _ => &[],
         }
     }

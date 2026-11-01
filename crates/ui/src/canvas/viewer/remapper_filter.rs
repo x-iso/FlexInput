@@ -213,6 +213,23 @@ pub(crate) fn mapping_filter_row(
     state
 }
 
+/// Where a mapping list's filter state lives, keyed as its body keys it: a
+/// Lean section's (`lean_side`), a Map Action's, or a Remapper's.
+pub(crate) fn mapping_filter_id(module_id: &str, inner_node_id: usize, lean_side: Option<&str>) -> egui::Id {
+    match (module_id, lean_side) {
+        (_, Some(side)) => egui::Id::new(("fxi_lean_filter", inner_node_id, side)),
+        ("module.map_action", None) => egui::Id::new(("fxi_mapact_filter", inner_node_id)),
+        _ => egui::Id::new(("fxi_remap_filter", inner_node_id)),
+    }
+}
+
+/// Whether a list's filter is narrowing it — anything but All. Cards don't
+/// reorder then (by mouse or pad): the list shown isn't the list's order.
+pub(crate) fn mapping_filter_narrows(ctx: &egui::Context, filter_id: egui::Id) -> bool {
+    ctx.data(|d| d.get_temp::<MapFilterState>(filter_id))
+        .is_some_and(|s| s.kind != MapFilterKind::All)
+}
+
 /// Gamepad-nav: cycle a Remapper/Map-Action node's mapping filter by `dir`
 /// (+1 forward, -1 back). Mirrors the chip click order All → Input → Stick,
 /// skipping Stick when no input group is currently latched (matches the UI's

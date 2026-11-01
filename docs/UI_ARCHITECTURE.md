@@ -401,6 +401,7 @@ pub enum EditLevel {
     CurveDot,     // moving the highlighted dot in X/Y; hold-North edits curvature
     RemapScroll,  // inside a remapper-family widget: move/reset/delete/Learn cards
     RemapCard,    // inside one entered card: left/right fields, up/down edits
+    RemapMove,    // a card picked up (hold South): up/down move it, South edits, East drops
     TzLines,      // inside a Touch Zones / Virtual Menu FIELD (see TzFocus below)
     TzGrab,       // a focused divider is grabbed and being nudged
     TzCards,      // inside the TZ/menu mapping CARDS widget (zone tab + Learn flow)
