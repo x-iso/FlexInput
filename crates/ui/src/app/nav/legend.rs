@@ -309,15 +309,7 @@ impl FlexInputApp {
                     (vec!["left_trigger", "right_trigger"], "Filter"),
                     (vec!["btn_east"], "Back"),
                 ];
-                // A Remapper's Select / Start: the picker on either side.
-                if let Some((input, output)) = self.nav_remap_picker_hints() {
-                    v.insert(2, (vec!["btn_back"], input));
-                    v.insert(3, (vec!["btn_start"], output));
-                }
-                // On a card, holding South picks it up to move.
-                if self.nav_remap_scroll_on_card() {
-                    v.insert(2, (vec!["btn_south"], "Hold: Move card"));
-                }
+                self.legend_card_list_extras(&mut v, 2);
                 v
             }
             EditLevel::RemapMove => vec![
@@ -333,10 +325,7 @@ impl FlexInputApp {
                     (vec!["btn_north"], "Reset card"),
                     (vec!["btn_east"], "Back"),
                 ];
-                if let Some((input, output)) = self.nav_remap_picker_hints() {
-                    v.insert(3, (vec!["btn_back"], input));
-                    v.insert(4, (vec!["btn_start"], output));
-                }
+                self.legend_card_list_extras(&mut v, 3);
                 v
             }
             EditLevel::TzLines if self.nav_driving_outer_id().is_some_and(|o| self.nav_is_area(o)) => {
@@ -423,6 +412,7 @@ impl FlexInputApp {
                     (vec!["btn_west"], "Delete card"),
                     (vec!["btn_lb", "btn_rb"], "Zone"),
                 ];
+                self.legend_card_list_extras(&mut v, 2);
                 // LT/RT cycles/nudges whichever value row is focused (tp_mode or
                 // mouse_speed); show the hint when either exists.
                 if has_analog { v.push((vec!["left_trigger", "right_trigger"], "Touchpad mode")); }
@@ -431,6 +421,25 @@ impl FlexInputApp {
                 v
             }
         }
+    }
+
+    /// A card list's own hints, inserted at `at`: holding South on a card to
+    /// pick it up, and Select / Start opening the picker on whichever sides its
+    /// cards have (`nav_card_picker_hints`).
+    fn legend_card_list_extras(&self, v: &mut Vec<(Vec<&'static str>, &'static str)>, at: usize) {
+        let (input, output) = self.nav_card_picker_hints();
+        let mut extra = Vec::new();
+        if self.nav_cards_on_card() {
+            extra.push((vec!["btn_south"], "Hold: Move card"));
+        }
+        if let Some(text) = input {
+            extra.push((vec!["btn_back"], text));
+        }
+        if let Some(text) = output {
+            extra.push((vec!["btn_start"], text));
+        }
+        let at = at.min(v.len());
+        v.splice(at..at, extra);
     }
 
     /// Resolve the active Easy sub-patch outer node id (the `subpatch` node in

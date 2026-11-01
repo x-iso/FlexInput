@@ -670,6 +670,22 @@ impl FlexInputApp {
         }).unwrap_or_default()
     }
 
+    /// The selected zone list's action row for its current capture phase, as
+    /// the body lays it out (`nav_tz_action_items`).
+    pub(crate) fn nav_tz_actions(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> Vec<&'static str> {
+        let phase = self.picker_target_param_str(&nav_path(outer), inner, "_tz_phase")
+            .unwrap_or_else(|| "idle".into());
+        self.nav_tz_actions_in(outer, inner, &phase)
+    }
+
+    fn nav_tz_actions_in(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str) -> Vec<&'static str> {
+        let has_analog = self.nav_tz_has_analog_card(outer, inner);
+        let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
+        let menu = self.nav_selected_module_id(outer).as_deref() == Some("module.menu");
+        let area = self.nav_is_area(outer);
+        Self::nav_tz_action_items(phase, has_analog, show_speed, menu, area)
+    }
+
     /// Publish the TzCards selection so the shared Remapper glow overlay rings the
     /// focused action button OR card. Card selection is published as the ABSOLUTE
     /// `zone_maps` index (what the card renderer tags each card with); action
@@ -677,11 +693,7 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_publish_selection(&self, ctx: &egui::Context,
         outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str)
     {
-        let has_analog = self.nav_tz_has_analog_card(outer, inner);
-        let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
-        let menu = self.nav_selected_module_id(outer).as_deref() == Some("module.menu");
-        let area = self.nav_is_area(outer);
-        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed, menu, area).len();
+        let n_actions = self.nav_tz_actions_in(outer, inner, phase).len();
         let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
         let sel = self.gamepad_nav.card_index;
         let entered = matches!(self.gamepad_nav.edit_level,
@@ -702,6 +714,36 @@ impl FlexInputApp {
                 (pass, act_sel));
         });
         ctx.request_repaint();
+    }
+
+    /// The zone's Choose…: the picker on its draft output. A menu or Area
+    /// Mapper zone (`menu`) binds to its selection / cell trigger (`trig`)
+    /// first, as the mouse's Choose does from idle; a Touch Zones zone is
+    /// already `captured` when this is offered.
+    pub(crate) fn nav_tz_choose_draft(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, menu: bool, trig: &str)
+    {
+        if menu {
+            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
+            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", trig);
+            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
+            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
+        }
+        // A menu's OWN output pins are excluded so a zone can't map to itself
+        // (mirrors the mouse menu path's `menu_excl`). Gamepad-navigable KB/M
+        // picker, routed over the game when the config overlay is up (see the
+        // central promotion in update()).
+        let exclude_pin_prefix = self.nav_menu_exclude(outer_id, inner);
+        self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
+            inner,
+            path: nav_path(outer_id),
+            draft_key: "_tz_draft_out".to_string(),
+            phase_key: None,
+            touch_zones: true,
+            exclude_pin_prefix,
+            ..Default::default()
+        }, None);
     }
 
     /// Drive the Touch Zones mapping CARDS widget (`TzCards`). Adapts the
@@ -792,6 +834,20 @@ impl FlexInputApp {
 
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
+        // Start (claimed here — `nav_claimed_buttons`): the picker on the
+        // focused card's outputs, or the draft's Choose from the action row
+        // when the phase offers one. A zone's trigger isn't picked, so Select
+        // stays the app's.
+        if let Some(stage) = self.nav_card_picker_press(outer_id, nav) {
+            if !on_actions {
+                self.nav_open_card_picker(outer_id, inner, Some(card_idxs[cur - n_actions]), stage);
+            } else if actions.contains(&"assign") {
+                self.nav_tz_choose_draft(outer_id, inner, menu, &trig);
+            }
+            self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
+            ctx.request_repaint();
+            return;
+        }
         // Mode / mouse-speed are VALUE items in the action row: focus them with
         // left/right like the buttons, then change with up/down (dpad or left
         // stick) — the same select-then-U/D pattern as the entered-card fields.
@@ -827,6 +883,8 @@ impl FlexInputApp {
         let sel = new_cur;
 
         if sel < n_actions {
+            // A card's South press doesn't follow the focus up here.
+            self.gamepad_nav.card_south_hold = None;
             // An action button is focused → South activates it (value items are
             // changed with up/down above, so South does nothing on them).
             if nav.is_rising("btn_south") {
@@ -861,39 +919,7 @@ impl FlexInputApp {
                         self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", false);
                         self.gamepad_nav.card_index = 0;
                     }
-                    "assign" => {
-                        // Menu idle→Choose commits the captured phase with the
-                        // menu-select trigger first (the mouse menu "Choose…"
-                        // flow), so picking outputs binds them to the zone's
-                        // selection. Touch Zones is already in `captured` here.
-                        if menu {
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
-                        }
-                        // Exclude the menu's OWN output pins so a zone can't map to
-                        // itself (mirrors the mouse menu path's `menu_excl`).
-                        let exclude_pin_prefix = if menu && !area {
-                            self.get_subpatch_param_str(outer_id, inner, "menu_id")
-                                .map(|id| format!("menu:{id}"))
-                        } else {
-                            None
-                        };
-                        // Gamepad-navigable KB/M picker (routed over the game when
-                        // the config overlay is up — see the central promotion in
-                        // update()).
-                        self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
-                            inner,
-                            path: nav_path(outer_id),
-                            draft_key: "_tz_draft_out".to_string(),
-                            phase_key: None,
-                            touch_zones: true,
-                            exclude_pin_prefix,
-                            ..Default::default()
-                        }, None);
-                    }
+                    "assign" => self.nav_tz_choose_draft(outer_id, inner, menu, &trig),
                     "midi" => {
                         // A menu zone picks its output straight from idle, as with
                         // Choose: bind to the zone's selection first.
@@ -929,21 +955,29 @@ impl FlexInputApp {
                 }
             }
         } else {
-            // A card is focused → West deletes, South ENTERS it for field editing
-            // (shared RemapCard driver, returning to TzCards on exit).
+            // A card is focused → West deletes; South, tapped, ENTERS it for
+            // field editing (shared RemapCard driver, returning to TzCards on
+            // exit) and, held, picks it up to move among its zone's cards
+            // (RemapMove) — the Remapper's list, exactly.
             let card_idx = card_idxs[sel - n_actions];
             if nav.is_rising("btn_west") {
+                self.gamepad_nav.card_south_hold = None;
                 let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
                 if self.nav_remap_delete_card(outer_id, card_idx) {
                     self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
                 }
-            } else if nav.is_rising("btn_south") {
-                self.gamepad_nav.edit_level = EditLevel::RemapCard;
-                self.gamepad_nav.card_return_level = EditLevel::TzCards;
-                self.gamepad_nav.remap_card = card_idx;
-                self.gamepad_nav.card_field = 0;
-                self.gamepad_nav.edit_baseline = Some(Box::new(
-                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+            } else {
+                use crate::gamepad_nav::{card_south_step, CardSouth};
+                let held = nav.pressed.contains("btn_south");
+                let released = !held && self.gamepad_nav.prev_pressed.contains("btn_south");
+                let (act, keep) = card_south_step(self.gamepad_nav.card_south_hold, card_idx,
+                    nav.is_rising("btn_south"), held, released, true, std::time::Instant::now());
+                self.gamepad_nav.card_south_hold = keep;
+                match act {
+                    CardSouth::Enter => self.nav_remap_enter_card(card_idx, EditLevel::TzCards),
+                    CardSouth::PickUp => self.nav_remap_pick_up(card_idx, EditLevel::TzCards),
+                    CardSouth::Wait => {}
+                }
             }
         }
 

@@ -256,12 +256,36 @@ pub(crate) fn reorder_array(arr: &mut Vec<Value>, from: usize, to: usize) {
 /// a picked-up card. Returns where it landed; `None` (nothing moved) past
 /// either end.
 pub(crate) fn step_card(arr: &mut [Value], from: usize, dir: i32) -> Option<usize> {
-    let to = if dir < 0 { from.checked_sub(1)? } else { from + 1 };
-    if from >= arr.len() || to >= arr.len() {
-        return None;
-    }
+    step_card_in_group(arr, from, dir, |_, _| true)
+}
+
+/// [`step_card`] within a list that shows only some of the array — a zone's
+/// cards out of `zone_maps`: the card trades places with the nearest card of
+/// its own group that way, and every other card keeps its slot (what the
+/// mouse's drag does to a zone's list, one place at a time).
+pub(crate) fn step_card_in_group(
+    arr: &mut [Value],
+    from: usize,
+    dir: i32,
+    same_group: impl Fn(&Value, &Value) -> bool,
+) -> Option<usize> {
+    let card = arr.get(from)?;
+    let to = if dir < 0 {
+        (0..from).rev().find(|&j| same_group(card, &arr[j]))?
+    } else {
+        (from + 1..arr.len()).find(|&j| same_group(card, &arr[j]))?
+    };
     arr.swap(from, to);
     Some(to)
+}
+
+/// Whether two `zone_maps` cards belong to the same zone (pad `f`, zone `z`).
+pub(crate) fn same_zone(a: &Value, b: &Value) -> bool {
+    let fz = |c: &Value| (
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0),
+        c.get("z").and_then(|v| v.as_u64()).unwrap_or(0),
+    );
+    fz(a) == fz(b)
 }
 
 #[cfg(test)]
@@ -349,6 +373,22 @@ mod mapping_list_tests {
         assert_eq!(step_card(&mut a, 1, 1), None);
         assert_eq!(step_card(&mut a, 5, -1), None);
         assert_eq!(ids(&a), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn a_zone_card_moves_among_its_own_zone_and_the_rest_stay_put() {
+        let card = |name: &str, z: u64| serde_json::json!({ "n": name, "f": 0, "z": z });
+        let mut a = vec![card("A1", 1), card("B1", 2), card("A2", 1), card("B2", 2), card("A3", 1)];
+        let names = |a: &[Value]| a.iter().map(|c| c["n"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        // A1 down: past B1 (another zone) to A2's slot.
+        assert_eq!(step_card_in_group(&mut a, 0, 1, same_zone), Some(2));
+        assert_eq!(names(&a), ["A2", "B1", "A1", "B2", "A3"]);
+        // And on down to the end of its zone; no further.
+        assert_eq!(step_card_in_group(&mut a, 2, 1, same_zone), Some(4));
+        assert_eq!(step_card_in_group(&mut a, 4, 1, same_zone), None);
+        assert_eq!(names(&a), ["A2", "B1", "A3", "B2", "A1"]);
+        // Zone 2's cards never moved.
+        assert_eq!((a[1]["n"].as_str(), a[3]["n"].as_str()), (Some("B1"), Some("B2")));
     }
 
     // ── input_group_of ────────────────────────────────────────────────────

@@ -1021,7 +1021,8 @@ pub struct ModuleDescriptor {
     first time a field is read, and the first structural edit persists `zone_tree{N}`,
     which is authoritative thereafter. Never deleted from a patch (kept as the migration
     source). See DEVELOPMENT_GUIDELINES.md → *"Touch Zones / Virtual Menu geometry"*.
-  - `zone_maps: Array<Mapping>` - Per-zone mapping cards (mapping mode; shared card
+  - `zone_maps: Array<Mapping>` - Per-zone mapping cards (edited and reordered like the
+    Remapper's — see *Editing a card* there — the out row only; mapping mode; shared card
     schema with Remapper, incl. per-card `curve`/`threshold`).
   - `zone_meta: Array<Object>` - Per-zone icon + name overrides (shared with Virtual
     Menu). Icons use the shared `icon_key` scheme, including dynamic `gp:<pin>` glyphs.
@@ -1087,20 +1088,33 @@ pub struct ModuleDescriptor {
     (`flexinput_engine::card_allows_analog_mode`); loading resets any other card to
     Normal. An Analog card passes that input's live value, from the first bit of
     movement.
-- **Editing a card:** a click on a card's in or out row opens the Choose picker on that
-  side of the card (West, or a click on the other caption, switches sides), editing its
-  `in` / `out` (and `out_gap` / `out_dur`) in place — live, one undo step per session.
-  When it closes the card is tidied as Add leaves a new one (`tidy_edited_card`: a
-  waiting gap dropped, Analog for a swipe output, Analog dropped without an analog
-  input). Cards reorder by the grip on their right edge. With a pad, inside the widget
-  (`RemapScroll` / `RemapCard`) Select opens the input side and Start the output side —
-  of the focused card, or of the draft from the action row; the Remapper claims both
-  from their app-wide shortcuts (`nav_claimed_buttons`) only there.
-- **Reordering with a pad:** hold South on a focused card (`CARD_MOVE_HOLD_MS`, 400 ms)
-  to pick it up (`RemapMove`); up / down move it one place at a time, South puts it
-  down and enters it, East puts it down. A quick press still enters the card, now on
-  release. One undo step per move; refused while a filter narrows the list, as the
-  mouse's drag is. Map Action and Lean card lists reorder the same way.
+- **Editing a card** (every mapping-card list works this way — Remapper, Map Action,
+  Lean, Touch Zones, Virtual Menu, Area Mapper): a click on a card's row opens the
+  Choose picker on the side of the mapping that row shows (`RowEdit`), editing the
+  card's `in` / `out` (and `out_gap` / `out_dur`) in place — live, one undo step per
+  session. A row whose side isn't picked isn't a button:
+
+  | Cards | Editable | Pad |
+  |---|---|---|
+  | Remapper | input and output (West switches) | Select / Start |
+  | Map Action | its one row, the input | Select |
+  | Lean | its one row, the outputs (the lean is the trigger) | Start |
+  | Touch Zones, Virtual Menu, Area Mapper | the out row (the zone is the trigger) | Start |
+
+  When the picker closes the card is tidied as Add leaves a new one
+  (`tidy_edited_card`: a waiting gap dropped; for a Remapper / Map Action card also
+  Analog for a swipe output and Analog dropped without an analog input). With a pad,
+  inside the list (`RemapScroll` / `TzCards` / `RemapCard`) Select and Start open the
+  sides the list's cards have — of the focused card, or of the draft from the action
+  row (a zone's only in the phases that offer Choose). The list claims just those
+  buttons from their app-wide shortcuts (`nav_claimed_buttons`), only there.
+- **Reordering:** cards move by the grip on their right edge (mouse), or — with a pad —
+  by holding South on a focused card (`CARD_MOVE_HOLD_MS`, 400 ms) to pick it up
+  (`RemapMove`): up / down move it one place at a time, South puts it down and enters
+  it, East puts it down. A quick press still enters the card, now on release. One undo
+  step per move; refused while a filter narrows the list, as the mouse's drag is. A
+  zone's card moves among its own zone's cards (`step_card_in_group`), the others
+  keeping their places.
 - **Presets:** the 💾 / 📂 icons in the body's top-right corner save the cards to a
   `.fxremap` file and load one, replacing them (see PATCH_FORMATS.md).
 

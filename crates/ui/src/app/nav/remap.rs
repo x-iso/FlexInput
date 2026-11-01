@@ -613,12 +613,12 @@ impl FlexInputApp {
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
 
-        // Select / Start (claimed for a Remapper — `nav_claimed_buttons`):
-        // the picker on the focused card's input / output, or on the draft's
-        // from the action row.
-        if let Some(stage) = self.nav_remap_picker_press(outer_id, nav) {
+        // Select / Start (claimed for the sides this list's cards have —
+        // `nav_claimed_buttons`): the picker on the focused card's input /
+        // output, or on the draft's from the action row.
+        if let Some(stage) = self.nav_card_picker_press(outer_id, nav) {
             let card = (!on_actions).then(|| cur - n_actions);
-            self.nav_open_remap_picker(outer_id, inner, card, stage);
+            self.nav_open_card_picker(outer_id, inner, card, stage);
             ctx.request_repaint();
             return;
         }
@@ -728,8 +728,8 @@ impl FlexInputApp {
                     nav.is_rising("btn_south"), held, released, can_move, std::time::Instant::now());
                 self.gamepad_nav.card_south_hold = keep;
                 match act {
-                    CardSouth::Enter => self.nav_remap_enter_card(card_idx),
-                    CardSouth::PickUp => self.nav_remap_pick_up(card_idx),
+                    CardSouth::Enter => self.nav_remap_enter_card(card_idx, EditLevel::RemapScroll),
+                    CardSouth::PickUp => self.nav_remap_pick_up(card_idx, EditLevel::RemapScroll),
                     CardSouth::Wait => {}
                 }
             }
@@ -1059,10 +1059,14 @@ impl FlexInputApp {
         let Some((cards_key, idx)) = self.gamepad_nav.kbm_picker_card.take() else { return };
         if let Some(inner) = self.gamepad_nav.kbm_picker_node {
             let path = self.gamepad_nav.kbm_picker_path.clone();
+            // The input rules are for a device input's card; a lean's or a
+            // zone's trigger is analog by nature.
+            let input_rules = self.picker_node(&path, inner)
+                .is_some_and(|n| matches!(n.module_id.as_str(), "module.remapper" | "module.map_action"));
             self.picker_write(&path, inner, &move |node| {
                 let Some(serde_json::Value::Array(cards)) = node.params.get_mut(&cards_key) else { return };
                 if let Some(serde_json::Value::Object(card)) = cards.get_mut(idx) {
-                    crate::canvas::viewer::tidy_edited_card(card);
+                    crate::canvas::viewer::tidy_edited_card(card, input_rules);
                 }
             });
         }
@@ -1091,6 +1095,19 @@ impl FlexInputApp {
         // A card edit still open (another row clicked while the picker is up)
         // ends here, tidied and committed, before this session replaces it.
         self.finish_picker_card_edit();
+        // A legacy Map Action card is a bare list of its inputs: make it the
+        // object every other card is, so the session can address its `in`. (Ahead of the
+        // undo snapshot: the same card in another form is no edit to undo.)
+        if let Some((cards_key, idx)) = req.card.clone() {
+            self.picker_write(&req.path, req.inner, &move |node| {
+                let Some(serde_json::Value::Array(cards)) = node.params.get_mut(&cards_key) else { return };
+                if let Some(slot) = cards.get_mut(idx) {
+                    if let Some(pins) = slot.as_array().cloned() {
+                        *slot = serde_json::json!({ "in": pins });
+                    }
+                }
+            });
+        }
         if req.card.is_some() {
             let covered = self.gamepad_nav.edit_level == crate::gamepad_nav::EditLevel::RemapCard
                 && self.gamepad_nav.edit_baseline.is_some();
@@ -1308,7 +1325,14 @@ impl FlexInputApp {
         if self.gamepad_nav.kbm_picker_phase_key.is_some() {
             return true; // Lean: the gesture itself is analog.
         }
-        let in_key = if self.gamepad_nav.kbm_picker_card.is_some() { "in" } else { "draft_input" };
+        let editing_card = self.gamepad_nav.kbm_picker_card.is_some();
+        // A Lean card's trigger is the lean, analog by nature.
+        if editing_card && self.picker_node(&self.gamepad_nav.kbm_picker_path, inner)
+            .is_some_and(|n| n.module_id == "processing.gyro_3dof")
+        {
+            return true;
+        }
+        let in_key = if editing_card { "in" } else { "draft_input" };
         self.picker_slot_pins(in_key).iter()
             .any(|p| flexinput_engine::pin_is_analog_input(p))
     }
@@ -1507,89 +1531,143 @@ impl FlexInputApp {
             .map(|a| a.len()).unwrap_or(0)
     }
 
+    /// Which sides of the selected card list's cards the picker can change:
+    /// `(input, output)`. A Remapper card both; a Map Action card its input (it
+    /// has no output); a Lean card and a zone's card (Touch Zones, Virtual Menu,
+    /// Area Mapper) their outputs — their trigger is the lean or the zone.
+    pub(crate) fn nav_card_picker_sides(&self, outer_id: egui_snarl::NodeId) -> (bool, bool) {
+        if self.nav_lean_side(outer_id).is_some() {
+            return (false, true);
+        }
+        match self.nav_selected_element(outer_id).as_ref().map(|(m, e)| (m.as_str(), e.as_str())) {
+            Some(("module.remapper", _)) => (true, true),
+            Some(("module.map_action", _)) => (true, false),
+            Some(("module.touch_zones" | "module.menu" | "module.area_mapper", "cards")) => (false, true),
+            _ => (false, false),
+        }
+    }
+
     /// The side Select (input) or Start (output) asks the picker for this
-    /// frame, in a Remapper being edited — the buttons it claims from the
-    /// app-wide shortcuts (`nav_claimed_buttons`).
-    pub(crate) fn nav_remap_picker_press(
+    /// frame, in a card list being edited — only a side its cards have. These
+    /// are the buttons it claims from the app-wide shortcuts
+    /// (`nav_claimed_buttons`).
+    pub(crate) fn nav_card_picker_press(
         &self,
         outer_id: egui_snarl::NodeId,
         nav: &crate::gamepad_nav::NavInput,
     ) -> Option<crate::kbm_picker::PickStage> {
         use crate::kbm_picker::PickStage;
-        if !self.nav_selected_is_remapper(outer_id) {
-            return None;
-        }
-        if nav.is_rising("btn_back") {
+        let (input, output) = self.nav_card_picker_sides(outer_id);
+        if input && nav.is_rising("btn_back") {
             Some(PickStage::Input)
-        } else if nav.is_rising("btn_start") {
+        } else if output && nav.is_rising("btn_start") {
             Some(PickStage::Output)
         } else {
             None
         }
     }
 
-    /// Open the Choose picker from the pad on a Remapper: on card `card`'s own
-    /// input or output (editing it in place), or on the draft's when `None`.
-    /// Over the game while the config overlay owns nav.
-    pub(crate) fn nav_open_remap_picker(
+    /// A Virtual Menu's own targets, kept off its cards (`menu:<id>`).
+    pub(crate) fn nav_menu_exclude(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> Option<String> {
+        (self.nav_selected_module_id(outer_id).as_deref() == Some("module.menu"))
+            .then(|| self.get_subpatch_param_str(outer_id, inner, "menu_id"))
+            .flatten()
+            .map(|id| format!("menu:{id}"))
+    }
+
+    /// Open the Choose picker from the pad on the selected card list: on card
+    /// `card`'s own side `stage` (editing it in place), or on the draft's when
+    /// `None`. (A zone's draft is the TzCards driver's: whether its Choose is
+    /// offered depends on the capture phase.) Over the game while the config
+    /// overlay owns nav.
+    pub(crate) fn nav_open_card_picker(
         &mut self,
         outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId,
         card: Option<usize>,
         stage: crate::kbm_picker::PickStage,
     ) {
-        use crate::canvas::viewer::SpecialPickerRequest;
+        use crate::canvas::viewer::SpecialPickerRequest as Req;
         let path = nav_path(outer_id);
-        let req = match card {
-            Some(i) => SpecialPickerRequest::remapper_card(inner, path, i, stage),
-            None => SpecialPickerRequest {
-                stage,
-                ..SpecialPickerRequest::remapper(inner, path, &self.nav_remap_phase(outer_id, inner))
-            },
+        let req = if let Some(side) = self.nav_lean_side(outer_id) {
+            match card {
+                Some(i) => Req::lean_card(inner, path, &format!("lean_{side}"), i),
+                None => Req {
+                    inner,
+                    path,
+                    draft_key: format!("_lean_{side}_draft"),
+                    phase_key: Some(format!("_lean_{side}_phase")),
+                    ..Default::default()
+                },
+            }
+        } else {
+            let module = self.nav_selected_element(outer_id).map(|(m, _)| m).unwrap_or_default();
+            match (module.as_str(), card) {
+                ("module.remapper", Some(i)) => Req::remapper_card(inner, path, i, stage),
+                ("module.remapper", None) => Req {
+                    stage,
+                    ..Req::remapper(inner, path, &self.nav_remap_phase(outer_id, inner))
+                },
+                ("module.map_action", Some(i)) => Req::map_action_card(inner, path, i),
+                ("module.map_action", None) => Req::map_action(inner, path),
+                ("module.touch_zones" | "module.menu" | "module.area_mapper", Some(i)) => {
+                    Req::zone_card(inner, path, i, self.nav_menu_exclude(outer_id, inner))
+                }
+                _ => return,
+            }
         };
         let viewport = self.gamepad_nav.config_nav_sel.is_some()
             .then(crate::config_overlay::picker_viewport_id);
         self.open_special_picker(req, viewport);
     }
 
-    /// Whether the `RemapScroll` cursor is on a card (not the action row), so
-    /// a held South would pick it up.
-    pub(crate) fn nav_remap_scroll_on_card(&self) -> bool {
-        if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::RemapScroll {
-            return false;
-        }
+    /// Whether the card-list cursor (`RemapScroll`, `TzCards`) is on a card,
+    /// not the action row — where Select / Start edit that card and a held
+    /// South picks it up.
+    pub(crate) fn nav_cards_on_card(&self) -> bool {
+        use crate::gamepad_nav::EditLevel;
         let Some(outer) = self.nav_driving_outer_id() else { return false };
         let Some(inner) = self.nav_selected_inner_node(outer) else { return false };
-        self.nav_remap_card_count(outer) > 0
-            && self.gamepad_nav.card_index >= self.nav_remap_action_items(outer, inner).len()
-    }
-
-    /// What Select and Start do in the selected Remapper right now, for the
-    /// legend: edit the focused card's input / output, or choose the draft's.
-    /// `None` when they don't belong to it (not a Remapper).
-    pub(crate) fn nav_remap_picker_hints(&self) -> Option<(&'static str, &'static str)> {
-        use crate::gamepad_nav::EditLevel;
-        let outer = self.nav_driving_outer_id()?;
-        if !self.nav_selected_is_remapper(outer) {
-            return None;
-        }
-        let inner = self.nav_selected_inner_node(outer)?;
-        let on_card = match self.gamepad_nav.edit_level {
-            EditLevel::RemapCard => true,
+        let at = self.gamepad_nav.card_index;
+        match self.gamepad_nav.edit_level {
             EditLevel::RemapScroll => {
-                self.gamepad_nav.card_index >= self.nav_remap_action_items(outer, inner).len()
+                self.nav_remap_card_count(outer) > 0 && at >= self.nav_remap_action_items(outer, inner).len()
             }
-            _ => return None,
-        };
-        Some(if on_card { ("Edit input", "Edit output") } else { ("Choose input", "Choose output") })
+            EditLevel::TzCards => {
+                !self.nav_tz_zone_card_indices(outer, inner).is_empty()
+                    && at >= self.nav_tz_actions(outer, inner).len()
+            }
+            _ => false,
+        }
     }
 
-    /// Enter card `card_idx` to edit its fields (`RemapCard`), snapshotting for
-    /// one undo entry on the way out.
-    pub(crate) fn nav_remap_enter_card(&mut self, card_idx: usize) {
+    /// What Select and Start do in the selected card list right now, for the
+    /// legend: each names what it opens — the focused card's side ("Edit …") or
+    /// the draft's ("Choose …") — or is `None` where it does nothing.
+    pub(crate) fn nav_card_picker_hints(&self) -> (Option<&'static str>, Option<&'static str>) {
         use crate::gamepad_nav::EditLevel;
-        self.gamepad_nav.edit_level = EditLevel::RemapCard;
-        self.gamepad_nav.card_return_level = EditLevel::RemapScroll;
+        let Some(outer) = self.nav_driving_outer_id() else { return (None, None) };
+        let (input, output) = self.nav_card_picker_sides(outer);
+        let level = self.gamepad_nav.edit_level;
+        let on_card = match level {
+            EditLevel::RemapCard => true,
+            EditLevel::RemapScroll | EditLevel::TzCards => self.nav_cards_on_card(),
+            _ => return (None, None),
+        };
+        // A zone's draft has a Choose only in the phases that offer one.
+        let draft_output = level != EditLevel::TzCards || self.nav_selected_inner_node(outer)
+            .is_some_and(|inner| self.nav_tz_actions(outer, inner).contains(&"assign"));
+        (
+            input.then_some(if on_card { "Edit input" } else { "Choose input" }),
+            (output && (on_card || draft_output)).then_some(if on_card { "Edit output" } else { "Choose output" }),
+        )
+    }
+
+    /// Enter card `card_idx` to edit its fields (`RemapCard`), returning to
+    /// `back` on exit, snapshotting for one undo entry on the way out.
+    pub(crate) fn nav_remap_enter_card(&mut self, card_idx: usize, back: crate::gamepad_nav::EditLevel) {
+        self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::RemapCard;
+        self.gamepad_nav.card_return_level = back;
         self.gamepad_nav.remap_card = card_idx;
         self.gamepad_nav.card_field = 0;
         self.gamepad_nav.edit_baseline = Some(Box::new(
@@ -1597,8 +1675,12 @@ impl FlexInputApp {
     }
 
     /// Whether the selected widget's cards can be reordered now: not while its
-    /// filter narrows the list, the rule the mouse's drag follows too.
+    /// filter narrows the list, the rule the mouse's drag follows too. A zone's
+    /// list has no filter (the zone is its tab).
     pub(crate) fn nav_remap_can_move(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> bool {
+        if self.nav_remap_mappings_key(outer_id) == "zone_maps" {
+            return true;
+        }
         let (Some(inner), Some((module_id, _))) =
             (self.nav_selected_inner_node(outer_id), self.nav_selected_element(outer_id))
         else {
@@ -1608,12 +1690,14 @@ impl FlexInputApp {
         !crate::canvas::viewer::mapping_filter_narrows(ctx, id)
     }
 
-    /// Pick card `card_idx` up to move it (`RemapMove`). The move is one undo
+    /// Pick card `card_idx` up to move it (`RemapMove`), returning to `back`
+    /// (`RemapScroll` / `TzCards`) when it's put down. The move is one undo
     /// step, from here to where it's put down.
-    pub(crate) fn nav_remap_pick_up(&mut self, card_idx: usize) {
+    pub(crate) fn nav_remap_pick_up(&mut self, card_idx: usize, back: crate::gamepad_nav::EditLevel) {
         // A move left open (nav taken elsewhere mid-move) is closed first.
         self.nav_remap_commit_move();
         self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::RemapMove;
+        self.gamepad_nav.card_return_level = back;
         self.gamepad_nav.remap_card = card_idx;
         self.gamepad_nav.card_move_baseline =
             Some((self.active_tab, Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo())));
@@ -1629,8 +1713,9 @@ impl FlexInputApp {
     }
 
     /// Drive a picked-up card (`RemapMove`): up / down move it one place
-    /// through the list (held, they repeat), South puts it down and enters it,
-    /// East puts it down. Nothing else acts while it's held up.
+    /// through the list (held, they repeat) — a zone's card among its own
+    /// zone's, the list it's shown in — South puts it down and enters it, East
+    /// puts it down. Nothing else acts while it's held up.
     pub(crate) fn nav_drive_remap_move(
         &mut self,
         ctx: &egui::Context,
@@ -1639,6 +1724,7 @@ impl FlexInputApp {
         step_dir: Option<crate::gamepad_nav::NavDir>,
     ) {
         use crate::gamepad_nav::{EditLevel, NavDir};
+        let back = self.gamepad_nav.card_return_level;
         let Some(inner) = self.nav_selected_inner_node(outer_id) else {
             self.nav_remap_commit_move();
             self.gamepad_nav.edit_level = EditLevel::Widget;
@@ -1647,22 +1733,28 @@ impl FlexInputApp {
         let count = self.nav_remap_card_count(outer_id);
         if count == 0 {
             self.nav_remap_commit_move();
-            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            self.gamepad_nav.edit_level = back;
             return;
         }
         if self.gamepad_nav.remap_card >= count {
             self.gamepad_nav.remap_card = count - 1;
         }
         let idx = self.gamepad_nav.remap_card;
+        let zone_list = self.nav_remap_mappings_key(outer_id) == "zone_maps";
         let put_down = nav.is_rising("btn_east") || nav.is_rising("btn_south");
         if put_down {
             self.nav_remap_commit_move();
             // The list's cursor lands on the card where it now is.
-            self.gamepad_nav.card_index = self.nav_remap_action_items(outer_id, inner).len() + idx;
-            if nav.is_rising("btn_south") {
-                self.nav_remap_enter_card(idx);
+            self.gamepad_nav.card_index = if back == EditLevel::TzCards {
+                let shown = self.nav_tz_zone_card_indices(outer_id, inner);
+                self.nav_tz_actions(outer_id, inner).len() + shown.iter().position(|&c| c == idx).unwrap_or(0)
             } else {
-                self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+                self.nav_remap_action_items(outer_id, inner).len() + idx
+            };
+            if nav.is_rising("btn_south") {
+                self.nav_remap_enter_card(idx, back);
+            } else {
+                self.gamepad_nav.edit_level = back;
             }
         } else {
             let dir = match step_dir {
@@ -1673,7 +1765,11 @@ impl FlexInputApp {
             if dir != 0 {
                 let mut landed = None;
                 self.nav_remap_with_mappings(outer_id, |arr| {
-                    landed = crate::canvas::viewer::step_card(arr, idx, dir);
+                    landed = if zone_list {
+                        crate::canvas::viewer::step_card_in_group(arr, idx, dir, crate::canvas::viewer::same_zone)
+                    } else {
+                        crate::canvas::viewer::step_card(arr, idx, dir)
+                    };
                     landed.is_some()
                 });
                 if let Some(to) = landed {
@@ -1778,10 +1874,12 @@ impl FlexInputApp {
             self.gamepad_nav.remap_card = count - 1;
         }
         let idx = self.gamepad_nav.remap_card;
-        // Select / Start: the picker on this card's input / output (Remapper).
-        // Back from it, the card is still entered, the field where it was.
-        if let Some(stage) = self.nav_remap_picker_press(outer_id, nav) {
-            self.nav_open_remap_picker(outer_id, inner, Some(idx), stage);
+        // Select / Start: the picker on this card's input / output, where it
+        // has that side (a zone's or a Lean card's output only, a Map Action's
+        // input only). Back from it, the card is still entered, the field
+        // where it was.
+        if let Some(stage) = self.nav_card_picker_press(outer_id, nav) {
+            self.nav_open_card_picker(outer_id, inner, Some(idx), stage);
             ctx.request_repaint();
             return;
         }

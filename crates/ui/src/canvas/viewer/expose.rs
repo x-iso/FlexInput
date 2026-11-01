@@ -188,6 +188,49 @@ impl SpecialPickerRequest {
         }
     }
 
+    /// Change one of a Map Action's existing cards: its input, the only side
+    /// it has.
+    pub fn map_action_card(inner: NodeId, path: Vec<usize>, card: usize) -> Self {
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: String::new(),
+            stage: crate::kbm_picker::PickStage::Input,
+            input_key: Some("in".to_string()),
+            card: Some(("mappings".to_string(), card)),
+            ..Default::default()
+        }
+    }
+
+    /// Change one of a Lean section's existing cards (`cards_key`:
+    /// `lean_left` / `lean_right`): its outputs — its trigger is the lean.
+    pub fn lean_card(inner: NodeId, path: Vec<usize>, cards_key: &str, card: usize) -> Self {
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: "out".to_string(),
+            stage: crate::kbm_picker::PickStage::Output,
+            card: Some((cards_key.to_string(), card)),
+            ..Default::default()
+        }
+    }
+
+    /// Change one of a Touch Zones / Virtual Menu / Area Mapper zone's existing
+    /// cards: its outputs — its trigger is the zone. `exclude_pin_prefix` keeps
+    /// a menu's own targets off its cards, as on its Choose.
+    pub fn zone_card(inner: NodeId, path: Vec<usize>, card: usize, exclude_pin_prefix: Option<String>) -> Self {
+        SpecialPickerRequest {
+            inner,
+            path,
+            draft_key: "out".to_string(),
+            stage: crate::kbm_picker::PickStage::Output,
+            touch_zones: true,
+            exclude_pin_prefix,
+            card: Some(("zone_maps".to_string(), card)),
+            ..Default::default()
+        }
+    }
+
     /// A Map Action's Choose: its input chord, the only side it has.
     pub fn map_action(inner: NodeId, path: Vec<usize>) -> Self {
         SpecialPickerRequest {

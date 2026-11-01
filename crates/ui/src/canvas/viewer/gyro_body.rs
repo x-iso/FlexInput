@@ -1079,14 +1079,23 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 egui::vec2(358.0_f32.min(ui.available_width()), 1.0),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
+                    // Its one row is its outputs (the lean is its trigger): a
+                    // click opens the picker on them.
+                    let picker_path = crate::canvas::viewer::subpatch_path(automap_parent);
+                    let row_edit = RowEdit::one_row(crate::kbm_picker::PickStage::Output,
+                        picker_card_edit_side(ui.ctx(), &picker_path, node_id, key, i));
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, skin, true, false,
                         reorder_enabled, drag_off, key, true,
-                        card_conf.as_ref(), None,
+                        card_conf.as_ref(), Some(row_edit),
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }
+                    if result.row_clicked.is_some() {
+                        request_special_picker(ui.ctx(),
+                            SpecialPickerRequest::lean_card(node_id, picker_path, key, i));
+                    }
                     // A MIDI chip. A Lean card draws its OUTPUTS in the card's one
                     // row (the one the renderer calls "in"), so the chip is an
                     // output's: its channel and levels.

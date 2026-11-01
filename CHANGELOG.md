@@ -10,14 +10,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **Remapper presets.** Two icons in the Remapper's top-right corner save its cards
   to a `.fxremap` file and load one back, replacing the cards it has. They sit in the
   module itself, so a pinned Remapper widget has them too.
-- **Edit a Remapper card's input or output.** Click a card's in or out row to open the
-  picker on that side, holding what the card has now; West switches to the other side.
-  With a pad, inside the Remapper widget, Select opens a card's input and Start its
-  output (from the action row, the new card being drafted). Cards now move by a grip
-  on their right edge.
-- **Reorder mapping cards with a pad.** Hold South on a Remapper, Map Action or Lean
-  card to pick it up, then move it with up and down. East puts it down; South puts it
-  down and opens it for editing. A quick press of South still opens the card.
+- **Edit a mapping card's input or output.** Click a card's row to open the picker on
+  that side, holding what the card has now. A Remapper card has both (West switches
+  sides); a Map Action card its input; a Lean, Touch Zones, Virtual Menu or Area Mapper
+  card its outputs, since the lean or the zone is its trigger. With a pad, inside the
+  list, Select opens a card's input and Start its outputs (from the action row, the new
+  card being drafted). Every card list's cards now move by a grip on their right edge.
+- **Reorder mapping cards with a pad.** Hold South on a card in any of those lists to
+  pick it up, then move it with up and down; a zone's card moves among that zone's
+  cards. East puts it down; South puts it down and opens it for editing. A quick press
+  of South still opens the card.
 - **Steam Controller (2026) haptics.** The pad's node now has inputs for all four
   actuators: each grip motor, with two carriers like a DualSense's haptics, so an
   Audio Stream Haptics patch drives it unchanged, and each trackpad, with an
