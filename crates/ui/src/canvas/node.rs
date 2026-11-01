@@ -23,10 +23,14 @@ pub struct NodeExtra {
     /// Most recent evaluated output per channel for nodes that capture outputs
     /// (e.g. twoway_response_curve blended output). Populated from last_outputs map.
     pub last_out: Vec<Option<Signal>>,
-    /// For a plain curve wired from a motion sensor (gyro / accel pins, or the
-    /// rates a 3DOF to 2D in Pointer mode hands on): which one. Traced from the
-    /// wiring each frame by `refresh_motion_units`.
+    /// For a plain curve or Has Changed wired from a motion sensor (gyro / accel
+    /// pins, or the rates a 3DOF to 2D in Pointer mode hands on): which one. Traced
+    /// from the wiring each frame by `refresh_motion_units`.
     pub(crate) motion_unit: Option<crate::canvas::viewer::MotionUnit>,
+    /// For such a curve: its output ends on a stick or trigger, so the graph's Out
+    /// axis reads as a share of that range rather than in the sensor's units.
+    /// Traced the same way.
+    pub(crate) curve_out_deflects: bool,
     /// For an Oscilloscope or Trigger Scope: what each input's wire carries
     /// (sensor and name), traced the same way, per input.
     pub(crate) scope_channels: Vec<crate::canvas::viewer::ScopeChannel>,

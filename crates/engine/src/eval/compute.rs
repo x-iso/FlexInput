@@ -1,7 +1,7 @@
 //! The per-node computation: `compute_node` dispatch, the `eval_pure`
 //! entry point, and the stateful generators and filters behind them
 //! (oscillator, envelope, delay, average, DC filter, response curve,
-//! change detector, logic delay, counter).
+//! change detector, logic delay, counter, sample and hold).
 
 use super::*;
 
@@ -329,7 +329,7 @@ pub(crate) fn compute_node(
             out
         }
         "logic.has_changed" => {
-            let out = compute_has_changed(inputs, state);
+            let out = compute_has_changed(inputs, state, &snap.params);
             state.last_signals = out.clone();
             out
         }
@@ -343,6 +343,7 @@ pub(crate) fn compute_node(
             state.last_signals = out.clone();
             out
         }
+        "module.sample_hold" => compute_sample_hold(inputs, state, &snap.params),
         "processing.gyro_3dof" => {
             let out = compute_gyro_3dof(inputs, state, &snap.params, dev_sigs, collector_sigs, dt);
             state.last_signals = out.clone();
@@ -1476,20 +1477,44 @@ pub(crate) fn twoway_live_inputs(inputs: &[Option<Signal>], state: Option<&NodeS
     out
 }
 
+/// Whether `c` has moved more than `band` away from `p`. A Bool has no small
+/// movements, and neither does a signal that changed type: those always count.
+fn moved_past(p: Signal, c: Signal, band: f32) -> bool {
+    match (p, c) {
+        (Signal::Float(a), Signal::Float(b)) => (b - a).abs() > band,
+        (Signal::Int(a), Signal::Int(b)) => (b as f32 - a as f32).abs() > band,
+        (Signal::Vec2(a), Signal::Vec2(b)) => a.distance(b) > band,
+        (Signal::Vec4(a), Signal::Vec4(b)) => a.distance(b) > band,
+        _ => p != c,
+    }
+}
+
+/// `prev_signals[0]` is the value it last reacted to: with a hysteresis band, the
+/// output stays quiet until the input leaves the band around that value, so noise
+/// inside it never fires and a slow drift fires once it has gone far enough. With
+/// no band that is simply the previous tick's value.
 pub(crate) fn compute_has_changed(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
+    params: &HashMap<String, Value>,
 ) -> Vec<Option<Signal>> {
     let cur = inputs.first().copied().flatten();
+    let band = params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 / 100.0;
     while state.prev_signals.len() < 1 { state.prev_signals.push(None); }
     let prev = state.prev_signals[0];
-    state.prev_signals[0] = cur;
+
+    let moved = match (prev, cur) {
+        (Some(p), Some(c)) if band > 0.0 => moved_past(p, c, band),
+        _ => prev != cur,
+    };
+    if moved {
+        state.prev_signals[0] = cur;
+    }
 
     let (changed, increased, decreased) = match (prev, cur) {
         (Some(p), Some(c)) => {
-            let ch = p != c;
             let (ps, cs) = (sig_scalar(p), sig_scalar(c));
-            (ch, cs > ps, cs < ps)
+            (moved, moved && cs > ps, moved && cs < ps)
         }
         (None, Some(_)) => (true, false, false),
         _ => (false, false, false),
@@ -1527,6 +1552,38 @@ pub(crate) fn compute_logic_delay(
         _            => { if input { *timer = 0.0; true } else { *timer += tick; *timer < threshold } }
     };
     vec![Some(Signal::Bool(output))]
+}
+
+/// Sample mode takes the input on the gate's rising edge. Hold mode tracks the
+/// input while the gate is low, so the last value taken is the one on the tick
+/// the gate went high.
+///
+///   prev_signals[0] = held value
+///   aux_f32[0]      = previous gate level (0/1)
+pub(crate) fn compute_sample_hold(
+    inputs: &[Option<Signal>],
+    state: &mut NodeState,
+    params: &HashMap<String, Value>,
+) -> Vec<Option<Signal>> {
+    let cur  = inputs.first().copied().flatten();
+    let gate = get_b(inputs, 1, false);
+    let hold = params.get("mode").and_then(|v| v.as_str()) == Some("hold");
+
+    while state.prev_signals.len() < 1 { state.prev_signals.push(None); }
+    while state.aux_f32.len() < 1 { state.aux_f32.push(0.0); }
+
+    let rising = gate && state.aux_f32[0] < 0.5;
+    state.aux_f32[0] = if gate { 1.0 } else { 0.0 };
+    if rising || (hold && !gate) {
+        state.prev_signals[0] = cur;
+    }
+
+    // The input's type decides the output's, including before the first sample
+    // (its rest value) and after a rewire to another type. An input with no
+    // signal emits nothing, like an unwired pin, so unwiring doesn't leave what's
+    // downstream stuck on the held value.
+    let held = state.prev_signals[0];
+    vec![cur.map(|c| held.and_then(|h| h.coerce_to(c.signal_type())).unwrap_or(c.zeroed()))]
 }
 
 pub(crate) fn compute_counter(

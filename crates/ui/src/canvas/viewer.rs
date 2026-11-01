@@ -1060,7 +1060,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             && desc.name == "Auto-Map";
         ui.spacing_mut().item_spacing.y = 0.0;
         if !is_relocated_automap {
-            let text = egui::RichText::new(&desc.name).small();
+            let name = if node.module_id == "module.sample_hold" && pin.id.input == 1 {
+                sample_hold_gate_label(node)
+            } else {
+                desc.name.as_str()
+            };
+            let text = egui::RichText::new(name).small();
             let text = match channel_label_color(&node.module_id, pin.id.input) {
                 Some(col) => text.color(col),
                 // A device inlet says what drives it: the Auto-Map bus's own
@@ -1239,6 +1244,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
+            "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl),
             "module.response_curve" => {
                 if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {
                     self.push_undo_request = true;
@@ -1277,6 +1283,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.label"    => show_label_body(node_id, ui, snarl),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
             "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl),
+            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl),
             "logic.delay"   => show_logic_delay_body(node_id, ui, snarl),
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
@@ -1553,13 +1560,13 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
         "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
         | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
         | "display.controller3d"
-        | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
+        | "module.delay" | "module.average" | "module.dc_filter" | "module.sample_hold" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
         | "module.automap_response_curve" | "module.automap_twoway_response_curve"
         | "module.area_mapper" | "module.stick_rotation"
         | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
         | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
         | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
-        | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
+        | "logic.greater_than" | "logic.less_than" | "logic.has_changed" | "logic.delay" | "logic.counter"
         | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
         | "processing.rws"
         | "module.automap_split" | "module.automap_collect"
@@ -1583,7 +1590,8 @@ mod body_gate_tests {
         for m in ["module.jsm", "module.remapper", "module.audio_stream_haptics",
                   "module.label", "module.touch_zones", "processing.rws",
                   "module.automap_response_curve", "module.automap_twoway_response_curve",
-                  "module.area_mapper", "module.stick_rotation"] {
+                  "module.area_mapper", "module.stick_rotation", "module.sample_hold",
+                  "logic.has_changed"] {
             assert!(module_has_body(m), "{m} draws a body");
         }
         assert!(!module_has_body("module.feedback_control"), "a pins-only module draws none");

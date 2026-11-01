@@ -682,6 +682,9 @@ bare header because the body gate was missed. In rough order:
   resolve.
 - **Gamepad nav** — `app/nav/fields.rs` if the module's controls should be
   reachable without a mouse.
+- **`curve_support.rs` `signal_path`** — if the module only shapes a signal on a
+  wire, list which inputs carry it. Anything missing from it ends the source trace,
+  so a curve or scope after the module stops reading in °/s or G.
 - **A body that scrolls** — show the scroll area through
   `canvas::wheel::scrolling_body` (`canvas/wheel.rs`). An ordinary `ScrollArea`
   is broken in a node body in two ways, both because the canvas is an

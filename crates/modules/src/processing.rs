@@ -7,6 +7,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<DelayModule>(),
         reg::<AverageModule>(),
         reg::<DcFilterModule>(),
+        reg::<SampleHoldModule>(),
         reg::<ResponseCurveModule>(),
         reg::<VecResponseCurveModule>(),
         reg::<VecReshapeModule>(),
@@ -102,6 +103,31 @@ impl Module for DcFilterModule {
             category: "Processing",
             inputs: vec![PinDescriptor::new("In", SignalType::Float)],
             outputs: vec![PinDescriptor::new("Out", SignalType::Float)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Sample and Hold ───────────────────────────────────────────────────────────
+
+/// Holds any signal, keeping its type.
+/// "sample" — each rising edge of the second input samples the first.
+/// "hold"   — the output follows the input, frozen while the second input is high.
+#[derive(Default)]
+pub struct SampleHoldModule;
+
+impl Module for SampleHoldModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.sample_hold",
+            display_name: "Sample and Hold",
+            category: "Processing",
+            inputs: vec![
+                PinDescriptor::new("In", SignalType::Any),
+                // Shown as "Gate" in Hold mode: see `sample_hold_gate_label`.
+                PinDescriptor::new("Trigger", SignalType::Bool),
+            ],
+            outputs: vec![PinDescriptor::new("Out", SignalType::Any)],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

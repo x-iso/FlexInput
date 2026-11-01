@@ -7901,3 +7901,191 @@ mod skip_display_tests {
         assert!(skipped.outputs.is_empty());
     }
 }
+
+#[cfg(test)]
+mod has_changed_tests {
+    use super::*;
+
+    /// One tick: [changed, increased, decreased].
+    fn tick(ns: &mut NodeState, params: &HashMap<String, Value>, s: Option<Signal>) -> [bool; 3] {
+        let out = compute_has_changed(&[s], ns, params);
+        [0, 1, 2].map(|i| out[i] == Some(Signal::Bool(true)))
+    }
+
+    fn band(pct: f64) -> HashMap<String, Value> {
+        [("hysteresis_pct".to_string(), serde_json::json!(pct))].into_iter().collect()
+    }
+
+    const QUIET: [bool; 3] = [false, false, false];
+    const UP: [bool; 3] = [true, true, false];
+    const DOWN: [bool; 3] = [true, false, true];
+    const MOVED: [bool; 3] = [true, false, false];
+
+    #[test]
+    fn with_no_band_every_change_counts() {
+        let f = |v| Some(Signal::Float(v));
+        for params in [HashMap::new(), band(0.0)] {
+            let mut ns = NodeState::default();
+            assert_eq!(tick(&mut ns, &params, f(0.5)), MOVED, "the first value is a change");
+            assert_eq!(tick(&mut ns, &params, f(0.5)), QUIET);
+            assert_eq!(tick(&mut ns, &params, f(0.5001)), UP);
+            assert_eq!(tick(&mut ns, &params, f(0.5)), DOWN);
+        }
+    }
+
+    #[test]
+    fn noise_inside_the_band_stays_quiet_and_leaving_it_fires_once() {
+        let f = |v| Some(Signal::Float(v));
+        let p = band(5.0); // ±0.05
+        let mut ns = NodeState::default();
+        assert_eq!(tick(&mut ns, &p, f(0.5)), MOVED);
+        for noise in [0.53, 0.47, 0.549, 0.451, 0.5] {
+            assert_eq!(tick(&mut ns, &p, f(noise)), QUIET, "{noise}");
+        }
+        assert_eq!(tick(&mut ns, &p, f(0.56)), UP);
+        // The band now sits around what it reacted to, not where it started.
+        assert_eq!(tick(&mut ns, &p, f(0.52)), QUIET);
+        assert_eq!(tick(&mut ns, &p, f(0.50)), DOWN);
+    }
+
+    #[test]
+    fn a_slow_drift_inside_the_band_adds_up() {
+        let p = band(5.0);
+        let mut ns = NodeState::default();
+        tick(&mut ns, &p, Some(Signal::Float(0.0)));
+        let fired: Vec<usize> = (1..=30)
+            .filter(|&i| tick(&mut ns, &p, Some(Signal::Float(i as f32 * 0.02))) == UP)
+            .collect();
+        assert_eq!(fired, [3, 6, 9, 12, 15, 18, 21, 24, 27, 30], "each time it clears the band");
+    }
+
+    #[test]
+    fn a_vector_moves_by_its_distance_in_any_direction() {
+        let v = |x, y| Some(Signal::Vec2(Vec2::new(x, y)));
+        let p = band(5.0);
+        let mut ns = NodeState::default();
+        tick(&mut ns, &p, v(0.5, 0.0));
+        assert_eq!(tick(&mut ns, &p, v(0.53, 0.03)), QUIET);
+        // Round the circle at one length: it moved, but got no longer or shorter.
+        assert_eq!(tick(&mut ns, &p, v(0.0, 0.5)), MOVED);
+    }
+
+    #[test]
+    fn a_band_never_hides_a_bool_a_new_type_or_a_lost_signal() {
+        let p = band(100.0);
+        let mut ns = NodeState::default();
+        let b = |v| Some(Signal::Bool(v));
+        tick(&mut ns, &p, b(false));
+        assert_eq!(tick(&mut ns, &p, b(true)), UP);
+        assert_eq!(tick(&mut ns, &p, b(false)), DOWN);
+        assert_eq!(tick(&mut ns, &p, Some(Signal::Float(0.0)))[0], true, "a new type is a change");
+
+        // Gone and back reads as a first value, as it does with no band.
+        assert_eq!(tick(&mut ns, &p, None), QUIET);
+        assert_eq!(tick(&mut ns, &p, Some(Signal::Float(0.0))), MOVED);
+    }
+}
+
+#[cfg(test)]
+mod sample_hold_tests {
+    use super::*;
+
+    fn bare_node() -> NodeSnap {
+        NodeSnap {
+            node_uid: 1,
+            module_id: "module.sample_hold".to_string(),
+            params: HashMap::new(),
+            n_outputs: 1,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn sample_hold(mode: &str) -> NodeSnap {
+        let mut n = bare_node();
+        n.params.insert("mode".to_string(), serde_json::json!(mode));
+        n
+    }
+
+    fn sh_tick(n: &NodeSnap, ns: &mut NodeState, input: Option<Signal>, gate: bool) -> Option<Signal> {
+        let inputs = [input, Some(Signal::Bool(gate))];
+        compute_node(n, &inputs, ns, &BusMap::default(), &BusMap::default(), 0.001)[0]
+    }
+
+    #[test]
+    fn sample_mode_takes_the_input_on_each_rising_edge_only() {
+        let n = sample_hold("sample");
+        let mut ns = NodeState::default();
+        let f = |v| Some(Signal::Float(v));
+
+        assert_eq!(sh_tick(&n, &mut ns, f(0.2), false), f(0.0), "nothing sampled yet");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.3), true), f(0.3), "rising edge samples");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.4), true), f(0.3), "still high: no new sample");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.5), false), f(0.3), "falling edge: no new sample");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.6), true), f(0.6), "next cycle samples again");
+    }
+
+    #[test]
+    fn hold_mode_follows_the_input_and_freezes_while_the_gate_is_high() {
+        let n = sample_hold("hold");
+        let mut ns = NodeState::default();
+        let f = |v| Some(Signal::Float(v));
+
+        assert_eq!(sh_tick(&n, &mut ns, f(0.2), false), f(0.2), "gate low: follows");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.3), true), f(0.3), "frozen where the gate flipped");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.4), true), f(0.3), "stays frozen");
+        assert_eq!(sh_tick(&n, &mut ns, f(0.5), false), f(0.5), "gate low: follows again");
+    }
+
+    #[test]
+    fn sample_hold_keeps_the_type_of_any_signal() {
+        for s in [
+            Signal::Bool(true),
+            Signal::Int(7),
+            Signal::Float(0.5),
+            Signal::Vec2(Vec2::new(0.5, -0.5)),
+            Signal::Vec4(glam::Vec4::new(0.1, 0.2, 0.3, 0.4)),
+        ] {
+            for mode in ["sample", "hold"] {
+                let n = sample_hold(mode);
+                let mut ns = NodeState::default();
+                sh_tick(&n, &mut ns, Some(s), true);
+                assert_eq!(sh_tick(&n, &mut ns, Some(s.zeroed()), true), Some(s), "{mode}");
+            }
+            let mut ns = NodeState::default();
+            assert_eq!(sh_tick(&sample_hold("sample"), &mut ns, Some(s), false), Some(s.zeroed()));
+        }
+    }
+
+    #[test]
+    fn sample_hold_edge_inputs() {
+        let n = sample_hold("sample");
+        let mut ns = NodeState::default();
+
+        // A mode-less node (fresh from the palette) is in Sample mode.
+        let mut fresh = NodeState::default();
+        assert_eq!(sh_tick(&bare_node(), &mut fresh, Some(Signal::Float(0.2)), false), Some(Signal::Float(0.0)));
+
+        // An analog gate crosses at 0.5, and an unwired one never fires.
+        let bus = BusMap::default();
+        let run = |ns: &mut NodeState, i: f32, g: Option<Signal>| {
+            compute_node(&n, &[Some(Signal::Float(i)), g], ns, &bus, &bus, 0.001)[0]
+        };
+        assert_eq!(run(&mut ns, 0.1, Some(Signal::Float(0.4))), Some(Signal::Float(0.0)));
+        assert_eq!(run(&mut ns, 0.2, Some(Signal::Float(0.6))), Some(Signal::Float(0.2)));
+        assert_eq!(run(&mut ns, 0.3, None), Some(Signal::Float(0.2)));
+
+        // No input emits nothing, and the held value is back when the input is.
+        assert_eq!(sh_tick(&n, &mut ns, None, false), None);
+        assert_eq!(sh_tick(&n, &mut ns, Some(Signal::Float(0.9)), false), Some(Signal::Float(0.2)));
+
+        // Rewired to another type mid-hold: the output takes the new type.
+        assert_eq!(sh_tick(&n, &mut ns, Some(Signal::Bool(false)), false), Some(Signal::Bool(false)));
+        let v = Signal::Vec2(Vec2::ONE);
+        assert_eq!(sh_tick(&n, &mut ns, Some(v), false), Some(v.zeroed()));
+    }
+}

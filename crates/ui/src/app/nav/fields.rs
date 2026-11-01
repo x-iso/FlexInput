@@ -273,6 +273,13 @@ impl FlexInputApp {
             if self.get_subpatch_param_bool(outer_id, inner, crate::canvas::viewer::RANGE_UNLINKED).unwrap_or(false) {
                 return;
             }
+            // Out reads as a share of a stick's range, so In has nothing to scale it by.
+            let canvas = &self.tabs[self.active_tab].canvas;
+            if nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
+                .is_some_and(|n| n.extra.curve_out_deflects)
+            {
+                return;
+            }
             let after = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(before);
             if after == before { return; }
             let Some(o) = self.get_subpatch_param_f32(outer_id, inner, other) else { return };
@@ -613,6 +620,8 @@ impl FlexInputApp {
             | ("module.average", "samples") | ("module.average", "spike_mad")
             | ("module.dc_filter", "window_ms") | ("module.dc_filter", "decay_ms")
             | ("logic.delay", "time") | ("logic.delay", "mode")
+            | ("logic.has_changed", "hysteresis")
+            | ("module.sample_hold", "mode")
             | ("generator.oscillator", "freq") | ("generator.oscillator", "phase")
             | ("generator.oscillator", "shape")
             | ("processing.gyro_3dof", "lean_threshold")
@@ -869,20 +878,20 @@ impl FlexInputApp {
         // An AutoMap curve on a motion sensor: its range row is the graph's
         // view of the sensor, in °/s or G (see `MotionUnit`).
         if elem == "range_row" {
-            let unit = self.nav_selected_inner_node(outer_id).and_then(|inner| {
+            let axes = self.nav_selected_inner_node(outer_id).and_then(|inner| {
                 let canvas = &self.tabs[self.active_tab].canvas;
-                nav_scope(&canvas.snarl, outer_id)
-                    .and_then(|sp| sp.get_node(inner))
-                    .and_then(crate::canvas::viewer::MotionUnit::of)
+                let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
+                Some(crate::canvas::viewer::MotionUnit::of(node)?.view_axes(node))
             });
-            if let Some(unit) = unit {
-                let (fs, d, sfx) = (unit.full_scale(), unit.default_extent(), unit.suffix());
-                let k = unit.view_keys();
+            if let Some([i, o]) = axes {
+                let row = |name: &str, a: crate::canvas::viewer::ViewAxis, end: usize, d: f32| {
+                    f!(format!("{name}{}", a.suffix), v(a.keys[end], -a.full_scale, a.full_scale, d, Fixed(a.step)))
+                };
                 return vec![
-                    f!(format!("In↓{sfx}"), v(k[0], -fs, fs, -d, Fixed(unit.step()))),
-                    f!(format!("In↑{sfx}"), v(k[1], -fs, fs, d, Fixed(unit.step()))),
-                    f!(format!("Out↓{sfx}"), v(k[2], -fs, fs, -d, Fixed(unit.step()))),
-                    f!(format!("Out↑{sfx}"), v(k[3], -fs, fs, d, Fixed(unit.step()))),
+                    row("In↓", i, 0, -i.extent),
+                    row("In↑", i, 1, i.extent),
+                    row("Out↓", o, 0, -o.extent),
+                    row("Out↑", o, 1, o.extent),
                 ];
             }
         }
@@ -913,6 +922,18 @@ impl FlexInputApp {
             ("module.dc_filter", "decay_ms")  => vec![f!("Decay ms", v("decay_ms",10.0,60_000.0,200.0,Decade))],
             ("logic.delay", "time")           => vec![f!("Time", v("time",0.0,60_000.0,100.0,Decade))],
             ("logic.delay", "mode")           => vec![f!("Mode", Enum{key:"mode",opts:&["delay_true","delay_false"]})],
+            ("module.sample_hold", "mode")    => vec![f!("Mode", Enum{key:"mode",opts:&["sample","hold"]})],
+            // Steps in the unit its field reads in (see `HysteresisField`).
+            ("logic.has_changed", "hysteresis") => {
+                let Some(field) = self.nav_selected_inner_node(outer_id).and_then(|inner| {
+                    let canvas = &self.tabs[self.active_tab].canvas;
+                    nav_scope(&canvas.snarl, outer_id)
+                        .and_then(|sp| sp.get_node(inner))
+                        .map(crate::canvas::viewer::HysteresisField::of)
+                }) else { return Vec::new() };
+                let step = FixedScaled { coarse: field.nav_step, factor: field.scale };
+                vec![f!(format!("Hysteresis {}", field.suffix.trim()), v("hysteresis_pct",0.0,100.0,0.0,step))]
+            }
             ("generator.oscillator", "freq")  => vec![f!("Freq", v("freq_param",0.01,200.0,1.0,Decade))],
             ("generator.oscillator", "phase") => vec![f!("Phase", v("phase_param",0.0,1.0,0.0,Linear))],
             ("generator.oscillator", "shape") => vec![f!("Shape", Enum{key:"shape",opts:&["sine","triangle","saw","square"]})],
@@ -2690,7 +2711,7 @@ mod jsm_tab_cycle_tests {
 }
 
 /// The Out end a curve's In range end is linked to, or the other way round:
-/// the plain ranges and both motion views' (see `MotionUnit::view_keys`).
+/// the plain ranges and both motion views' (see `MotionUnit::view_axes`).
 fn range_counterpart(key: &str) -> Option<&'static str> {
     const PAIRS: &[(&str, &str)] = &[
         ("in_min", "out_min"), ("in_max", "out_max"),

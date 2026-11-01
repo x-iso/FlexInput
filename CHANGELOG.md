@@ -7,6 +7,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **Has Changed can ignore small movements.** Its new **Hysteresis** setting keeps
+  it quiet until the input has moved that far from where it last reacted, so noise
+  and a shaky hand don't set it off, while a slow drift still does once it has gone
+  far enough. It reads as a percentage, or in °/s or G when the input is a gyro or
+  accelerometer. At 0, the default, every change counts as before. With Hysteresis
+  on, a signal that keeps moving makes it fire in pulses rather than stay on.
+- **Sample and Hold module.** Holds any type of signal and outputs it as that same
+  type. In **Sample** mode, each 0→1 on its Trigger pin samples the input, and the
+  output holds that value until the next one. In **Hold** mode, the output follows the
+  input and freezes for as long as its Gate pin is 1.
 - **Steam Controller clicks have a tone, a length and a softness.** Each trigger's
   click in the Calibration window now has a pitch, a length and a **soft** amount
   beside its strength. At 0% soft a click starts and stops dead; higher, more of it
@@ -26,6 +36,28 @@ All notable changes to FlexInput are documented here. This project adheres to
   pick it up, then move it with up and down; a zone's card moves among that zone's
   cards. East puts it down; South puts it down and opens it for editing. A quick press
   of South still opens the card.
+
+### Changed
+
+- **Curves and scopes keep track of a signal's source through more modules.** A
+  Response Curve or Oscilloscope fed by a gyro or accelerometer now reads in °/s or G
+  even if the signal went through Multiply, other math, Delay, Average, DC Filter,
+  Sample and Hold, Selector, Split or the Vec / Axis converters on the way. A scope's
+  legend names the source and what last shaped it, such as "Gyro X (roll) · Multiply".
+  As with a directly wired gyro, such a curve now works on the sensor's whole range,
+  and In / Out only zoom its graph. A curve that used In / Out to rescale a gyro after a
+  Multiply will respond differently, so set that scale on the Multiply instead. The
+  **Gyro Response Curve** in the General Purpose presets now reads in °/s and zooms to
+  ±500 °/s, and responds exactly as before.
+- **A gyro curve driving a stick reads its output in %.** When a Response Curve's input
+  is a gyro or accelerometer and its output ends on a stick or trigger, its In axis
+  stays in °/s or G while its Out axis shows that range in %. Out zooms on its own and
+  is no longer linked to In. A curve feeding RWS Aim or a gyro pin keeps the sensor's
+  units on both axes.
+- **RWS Aim and the config overlay find a stick behind a Multiply whatever its pin
+  order.** A Knob on the Multiply's first pin no longer ends the search, so flick
+  stick detection works there, and the overlay passes only the pins in use rather than
+  the whole device.
 
 ## [0.16.6] - 2026-10-31
 

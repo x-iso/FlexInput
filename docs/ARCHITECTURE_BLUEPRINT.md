@@ -170,7 +170,7 @@ Phase C architecture: modules can register custom publish hooks that override de
 | **Utility** | Constant, Switch, Knob, Selector, Dropdown, Text, SVG, Split, Sub-patch |
 | **Math** | Add, Subtract, Multiply, Divide, Clamp, Abs, Inverse, Min/Max, Quantize, Map Range |
 | **Logic** | AND, OR, NOT, XOR, Equal, NotEqual, GreaterThan, LessThan, Has Changed, Logic Delay, Counter |
-| **Processing** | Delay, Average, DC Filter, Response Curve, Vec Response Curve, Vec Reshaper, Two-way Response Curve, Gyro 3DOF |
+| **Processing** | Delay, Average, DC Filter, Sample and Hold, Response Curve, Vec Response Curve, Vec Reshaper, Two-way Response Curve, Gyro 3DOF |
 | **Display** | Readout, Oscilloscope, Trigger Scope, Vectorscope |
 | **Generator** | Oscillator, Envelope |
 | **AutoMap** | AutoMap Splitter, Collector, Fork, Selector, Combiner, Touch Zones, Remapper, Map Action, Feedback Control, Audio Stream Haptics |

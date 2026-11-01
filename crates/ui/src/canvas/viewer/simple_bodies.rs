@@ -1557,6 +1557,129 @@ pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     }
 }
 
+/// How Has Changed's hysteresis reads on its field. It is stored as a percentage
+/// of the bus (`hysteresis_pct`, as a Two-way Curve's is), and shown in °/s or G
+/// when the input is a motion sensor, whose noise floor is a tiny fraction of its
+/// range. Rewiring changes how the value reads, never what it does.
+pub(crate) struct HysteresisField {
+    /// Shown value per stored percent.
+    pub(crate) scale: f32,
+    pub(crate) suffix: &'static str,
+    speed: f64,
+    decimals: usize,
+    /// Gamepad step, in shown units.
+    pub(crate) nav_step: f32,
+}
+
+impl HysteresisField {
+    pub(crate) fn of(node: &NodeData) -> Self {
+        let (speed, decimals, nav_step) = match node.extra.motion_unit {
+            Some(MotionUnit::Gyro) => (0.1, 1, 1.0),
+            Some(MotionUnit::Accel) => (0.001, 3, 0.01),
+            None => (0.01, 2, 0.1),
+        };
+        let (scale, suffix) = match node.extra.motion_unit {
+            Some(unit) => (unit.full_scale() / 100.0, unit.suffix()),
+            None => (1.0, "%"),
+        };
+        Self { scale, suffix, speed, decimals, nav_step }
+    }
+
+    fn drag<'a>(&self, shown: &'a mut f32) -> egui::DragValue<'a> {
+        egui::DragValue::new(shown)
+            .speed(self.speed)
+            .range(0.0..=100.0 * self.scale)
+            .max_decimals(self.decimals)
+            .suffix(self.suffix)
+    }
+}
+
+fn has_changed_hysteresis(node_id: NodeId, snarl: &Snarl<NodeData>) -> Option<(HysteresisField, f32)> {
+    let node = snarl.get_node(node_id)?;
+    let field = HysteresisField::of(node);
+    let pct = node.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let shown = pct * field.scale;
+    Some((field, shown))
+}
+
+fn set_has_changed_hysteresis(node_id: NodeId, snarl: &mut Snarl<NodeData>, shown: f32, field: &HysteresisField) {
+    if let (Some(node), Some(n)) = (snarl.get_node_mut(node_id), Number::from_f64((shown / field.scale) as f64)) {
+        node.params.insert("hysteresis_pct".into(), Value::Number(n));
+    }
+}
+
+pub(crate) fn show_has_changed_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let Some((field, mut shown)) = has_changed_hysteresis(node_id, snarl) else { return };
+    let r = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Hysteresis").small())
+            .on_hover_text("Ignores movement smaller than this, like noise or a shaky hand. It reacts once \
+                            the input has moved this far from where it last reacted. 0 = every change counts.");
+        ui.add(field.drag(&mut shown)).changed()
+    });
+    register_exposable_element(ui, node_id, "hysteresis", r.response.rect);
+    if r.inner {
+        set_has_changed_hysteresis(node_id, snarl, shown, &field);
+    }
+}
+
+/// Has Changed's hysteresis row as a pinned widget: the value box takes the
+/// frame's spare width.
+pub(crate) fn render_has_changed_hysteresis(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let Some((field, mut shown)) = has_changed_hysteresis(inner_id, snarl) else { return };
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(140.0, 22.0));
+    let changed = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Hysteresis").weak());
+        let w = pin_flex_width(ui, container, 64.0);
+        let h = ui.spacing().interact_size.y;
+        let r = ui.add_sized([w, h], field.drag(&mut shown));
+        publish_nav_field_rects(ui, inner_id, &[r.rect]);
+        r.changed()
+    }).inner;
+    if changed {
+        set_has_changed_hysteresis(inner_id, snarl, shown, &field);
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
+/// What a Sample and Hold's second inlet does in the node's mode. Derived when
+/// drawn because the body, a pinned widget and the gamepad editor all write the mode.
+pub(crate) fn sample_hold_gate_label(node: &NodeData) -> &'static str {
+    if node.params.get("mode").and_then(|v| v.as_str()) == Some("hold") { "Gate" } else { "Trigger" }
+}
+
+/// The Sample / Hold switch, shared by the node body and its pinned widget.
+/// Returns the row's rect and whether the mode changed.
+pub(crate) fn sample_hold_mode_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, small: bool) -> (egui::Rect, bool) {
+    let mut mode = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "sample".to_string());
+    let mut changed = false;
+    let label = |s: &str| {
+        let t = egui::RichText::new(s);
+        if small { t.small() } else { t }
+    };
+    let r = ui.horizontal(|ui| {
+        changed |= ui.selectable_value(&mut mode, "sample".into(), label("Sample"))
+            .on_hover_text("Each 0→1 on Trigger samples In, and Out holds it until the next one")
+            .changed();
+        changed |= ui.selectable_value(&mut mode, "hold".into(), label("Hold"))
+            .on_hover_text("Out follows In, and freezes for as long as Gate is 1")
+            .changed();
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("mode".into(), Value::String(mode));
+        }
+    }
+    (r.response.rect, changed)
+}
+
+pub(crate) fn show_sample_hold_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (rect, _) = sample_hold_mode_row(node_id, ui, snarl, true);
+    register_exposable_element(ui, node_id, "mode", rect);
+}
+
 /// Inverse (module id `math.negate`): bipolar `-v` by default, or a unipolar
 /// mirror inside `0..max` when the checkbox is ticked. The max box is greyed
 /// out while unipolar is off since it has no effect there.

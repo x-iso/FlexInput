@@ -289,6 +289,8 @@ pub struct ModuleDescriptor {
   - Output 0: Bool (true if changed)
   - Output 1: Bool (true if increased)
   - Output 2: Bool (true if decreased)
+- **Parameters:**
+  - `hysteresis_pct: f64` - Size of the movement to ignore, as a percentage of the bus (default 0: every change counts). The outputs stay quiet until the input moves further than this from the value it last reacted to, which then becomes the new reference, so noise inside the band never fires and a slow drift fires once per band's width. A Vec2 or Vec4 moves by its distance. A Bool flip, a new signal type and a signal appearing always count. Shown in °/s or G when the input traces to a motion sensor
 
 #### Logic Delay
 - **ID:** `logic.delay`
@@ -348,6 +350,16 @@ pub struct ModuleDescriptor {
   - `window_ms: f64` - Estimation window (10 to 60,000 ms)
   - `decay_ms: f64` - Correction decay time (10 to 60,000 ms)
 
+#### Sample and Hold
+- **ID:** `module.sample_hold`
+- **Purpose:** Holds a signal of any type, on a trigger or for as long as a gate is high
+- **Inputs:**
+  - Input 0: In (Any)
+  - Input 1: Trigger / Gate (Bool). An unwired pin reads as 0
+- **Outputs:** Out (Any), the type of In. Its rest value until the first sample, and nothing while In carries no signal
+- **Parameters:**
+  - `mode: String` - "sample" (default): each rising edge samples In, and Out holds it until the next. "hold": Out follows In, frozen at its value on the rising edge while the gate is high
+
 #### Response Curve
 - **ID:** `module.response_curve`
 - **Purpose:** Applies a user-defined curve to signal with bias control
@@ -376,7 +388,19 @@ pub struct ModuleDescriptor {
   rates into something else) runs on the sensor's whole range and labels its graph in
   °/s or G; its In/Out fields then only choose what part of the sensor the graph shows
   (`gyro_view_*` / `accel_view_*`). Same for the Vec and Two-way curves, and for the
-  AutoMap curves' gyro / accel picks. To shape gyro aiming, curve the 3DOF to 2D's
+  AutoMap curves' gyro / accel picks. The trace carries on through modules that only
+  shape a signal (math, curves, Delay, Average, DC Filter, Sample and Hold, Selector,
+  Split and the Vec / Axis converters), reading the values as they arrive: a gyro times
+  2 reads in °/s, twice as large. Knobs, Constants and the like don't count as sources;
+  in a Multiply a signal with no unit is a gain on one that has one, and anywhere else
+  it mixes with it, so the curve keeps its ordinary ranges. A Selector counts every
+  branch rather than the selected one, so a curve doesn't change scale when it switches.
+  The output is traced the other way through the same modules: if it ends on a stick or
+  trigger, its Out axis reads in % (100% = a bus value of 1, `deflection_view_out_*`, the
+  whole range until set, not linked to In), unless it also reaches a gyro or accel pin or
+  RWS Aim's Rotation, which need the sensor's units. That only changes the labels, and it
+  reads the curve's own output, before any gain further along the wire.
+  To shape gyro aiming, curve the 3DOF to 2D's
   output rather than the raw gyro going into it: the module integrates and
   gravity-fuses the rates, which a curve in front of it would distort.
 
@@ -606,8 +630,10 @@ pub struct ModuleDescriptor {
 - **Inputs:** N channels (Float)
 - **Outputs:** None (display-only)
 - **Behavior:** Plots signal history over time window. Each channel reads in what its
-  wire carries, traced upstream each frame (`refresh_motion_units`): °/s for a gyro, G
-  for an accelerometer, the bus value otherwise. A gyro and an accelerometer on one
+  wire carries, traced upstream each frame (`refresh_motion_units`, through the same
+  modules as a Response Curve's motion sources): °/s for a gyro, G for an accelerometer,
+  the bus value otherwise. The legend names the source and the module that last shaped
+  it ("Gyro X (roll) · Multiply"). A gyro and an accelerometer on one
   scope read on two axes (left, right); with Auto each fits its own channels. Long
   windows draw each pixel column's min and max, so one-sample spikes keep their height.
   Hovering shows the time and every channel's value under the pointer.

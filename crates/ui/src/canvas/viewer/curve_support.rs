@@ -1314,44 +1314,75 @@ impl MotionUnit {
         }
     }
 
-    /// The shown-range param keys: [in ↓, in ↑, out ↓, out ↑].
-    pub(crate) fn view_keys(self) -> [&'static str; 4] {
-        match self {
-            Self::Gyro => ["gyro_view_in_min", "gyro_view_in_max", "gyro_view_out_min", "gyro_view_out_max"],
-            Self::Accel => ["accel_view_in_min", "accel_view_in_max", "accel_view_out_min", "accel_view_out_max"],
-        }
+    /// The graph's [In, Out] axes on `node`. Out reads in the sensor's units too,
+    /// unless the curve's output ends on a stick or trigger
+    /// (`extra.curve_out_deflects`), where it is a share of that range instead.
+    pub(crate) fn view_axes(self, node: &NodeData) -> [ViewAxis; 2] {
+        // How far the graph shows until set: what a hand-held turn or tilt mostly
+        // spans, not the sensor's whole range.
+        let (extent, step, decimals) = match self {
+            Self::Gyro => (500.0, 10.0, 0),
+            Self::Accel => (2.0, 0.05, 2),
+        };
+        let (input, output) = match self {
+            Self::Gyro => (["gyro_view_in_min", "gyro_view_in_max"], ["gyro_view_out_min", "gyro_view_out_max"]),
+            Self::Accel => (["accel_view_in_min", "accel_view_in_max"], ["accel_view_out_min", "accel_view_out_max"]),
+        };
+        let axis = |keys| ViewAxis { keys, full_scale: self.full_scale(), extent, step, suffix: self.suffix(), decimals };
+        [axis(input), if node.extra.curve_out_deflects { DEFLECTION_AXIS } else { axis(output) }]
     }
 
-    /// How far the graph shows until set: what a hand-held turn or tilt
-    /// mostly spans, not the sensor's whole range.
-    pub(crate) fn default_extent(self) -> f32 {
-        match self { Self::Gyro => 500.0, Self::Accel => 2.0 }
-    }
-
-    /// Step for dragging / nudging a shown-range value.
-    pub(crate) fn step(self) -> f32 {
-        match self { Self::Gyro => 10.0, Self::Accel => 0.05 }
-    }
-
-    /// The shown range [in ↓, in ↑, out ↓, out ↑], physical units.
+    /// The shown range [in ↓, in ↑, out ↓, out ↑], each in its axis's units.
     pub(crate) fn view(self, node: &NodeData) -> [f32; 4] {
-        let d = self.default_extent();
-        let defaults = [-d, d, -d, d];
-        let keys = self.view_keys();
-        std::array::from_fn(|i| {
-            node.params.get(keys[i]).and_then(|v| v.as_f64()).map_or(defaults[i], |v| v as f32)
-        })
+        let [input, output] = self.view_axes(node);
+        let end = |axis: ViewAxis, i: usize, default: f32| {
+            node.params.get(axis.keys[i]).and_then(|v| v.as_f64()).map_or(default, |v| v as f32)
+        };
+        [
+            end(input, 0, -input.extent), end(input, 1, input.extent),
+            end(output, 0, -output.extent), end(output, 1, output.extent),
+        ]
     }
 
     pub(crate) fn set_view(self, node: &mut NodeData, view: [f32; 4]) {
-        let fs = self.full_scale();
-        for (k, v) in self.view_keys().into_iter().zip(view) {
-            if let Some(n) = Number::from_f64(v.clamp(-fs, fs) as f64) {
-                node.params.insert(k.into(), Value::Number(n));
+        let [input, output] = self.view_axes(node);
+        for (axis, ends) in [(input, [view[0], view[1]]), (output, [view[2], view[3]])] {
+            for (k, v) in axis.keys.into_iter().zip(ends) {
+                if let Some(n) = Number::from_f64(v.clamp(-axis.full_scale, axis.full_scale) as f64) {
+                    node.params.insert(k.into(), Value::Number(n));
+                }
             }
         }
     }
 }
+
+/// One axis of a motion curve's graph: where its shown range is stored, and how
+/// its fields read. Each keeps its own keys, since a share of a stick's range and
+/// a rate in °/s aren't the same number.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ViewAxis {
+    /// The shown-range param keys: [↓, ↑], in `suffix` units.
+    pub(crate) keys: [&'static str; 2],
+    /// The value a bus 1.0 stands for.
+    pub(crate) full_scale: f32,
+    /// How far the graph shows until set.
+    pub(crate) extent: f32,
+    /// Step for dragging / nudging a shown-range value.
+    pub(crate) step: f32,
+    pub(crate) suffix: &'static str,
+    pub(crate) decimals: usize,
+}
+
+/// A motion curve's Out axis when it drives a stick or trigger: the whole of that
+/// range shows until set.
+const DEFLECTION_AXIS: ViewAxis = ViewAxis {
+    keys: ["deflection_view_out_min", "deflection_view_out_max"],
+    full_scale: 100.0,
+    extent: 100.0,
+    step: 1.0,
+    suffix: "%",
+    decimals: 0,
+};
 
 /// A curve module that takes its signal on a wire (not off an AutoMap bus).
 pub(crate) fn is_plain_curve(module_id: &str) -> bool {
@@ -1372,18 +1403,21 @@ pub(crate) struct ScopeChannel {
 /// read in °/s or G and zoom instead of rescale, like an AutoMap curve's pick.
 /// The trace follows a device's or Splitter's pin, a 3DOF to 2D's Out / X / Y
 /// in Pointer mode (still angular velocity, in the gyro's units — Steering
-/// integrates it into something else), curves in between (a motion curve hands
-/// on the same units), and sub-patch boundaries both ways. Every wired input
-/// must agree. Oscilloscopes and Trigger Scopes get the same trace per input
-/// (`extra.scope_channels`), each on its own. Runs once a frame, before
-/// the graph is built.
+/// integrates it into something else), the modules that only shape a signal
+/// (see [`signal_path`]; a gyro times a gain still reads in the gyro's units),
+/// and sub-patch boundaries both ways. Every wired input must agree.
+/// Such a curve's output is traced the other way too, to where it ends up
+/// (`extra.curve_out_deflects`, see [`curve_feeds_deflection`]). Oscilloscopes and
+/// Trigger Scopes get the same trace per input (`extra.scope_channels`), each on
+/// its own. Runs once a frame, before the graph is built.
 pub(crate) fn refresh_motion_units(snarl: &mut Snarl<NodeData>) {
     let mut found = Vec::new();
     let mut scopes = Vec::new();
     collect_motion_units(snarl, &mut Vec::new(), &mut Vec::new(), &mut found, &mut scopes);
-    for (path, unit) in found {
+    for (path, unit, deflects) in found {
         if let Some(n) = node_at_path_mut(snarl, &path) {
             n.extra.motion_unit = unit;
+            n.extra.curve_out_deflects = deflects;
         }
     }
     for (path, channels) in scopes {
@@ -1401,23 +1435,26 @@ fn collect_motion_units<'a>(
     snarl: &'a Snarl<NodeData>,
     path: &mut Vec<NodeId>,
     frames: &mut Frames<'a>,
-    out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>)>,
+    out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>, bool)>,
     scopes: &mut Vec<(Vec<NodeId>, Vec<ScopeChannel>)>,
 ) {
     for (id, n) in snarl.nodes_ids_data() {
         let node = &n.value;
-        if is_plain_curve(&node.module_id) {
+        if is_plain_curve(&node.module_id) || node.module_id == "logic.has_changed" {
+            let unit = curve_inputs_motion_unit(snarl, id, frames);
+            let deflects = unit.is_some() && is_plain_curve(&node.module_id)
+                && curve_feeds_deflection(snarl, id, frames);
             path.push(id);
-            out.push((path.clone(), curve_inputs_motion_unit(snarl, id, frames)));
+            out.push((path.clone(), unit, deflects));
             path.pop();
         }
         if matches!(node.module_id.as_str(), "display.oscilloscope" | "display.trigscope") {
             let channels = (0..node.inputs.len())
                 .map(|i| match snarl.in_pin(InPinId { node: id, input: i }).remotes.first() {
-                    Some(&src) => ScopeChannel {
-                        unit: source_motion_unit(snarl, src, frames, 0),
-                        name: source_name(snarl, src, frames),
-                    },
+                    Some(&src) => {
+                        let source = wire_source(snarl, src, frames);
+                        ScopeChannel { unit: source.unit, name: source.legend() }
+                    }
                     None => ScopeChannel::default(),
                 })
                 .collect();
@@ -1432,26 +1469,6 @@ fn collect_motion_units<'a>(
             frames.pop();
             path.pop();
         }
-    }
-}
-
-/// A short name for what an output pin carries, for a scope's legend: a
-/// device's or Splitter's pin by its own name ("Gyro X (roll)"), a sub-patch
-/// inlet by what feeds it outside, anything else by its node — plus the pin
-/// when the node has several.
-fn source_name(snarl: &Snarl<NodeData>, src: OutPinId, frames: &[(&Snarl<NodeData>, NodeId)]) -> String {
-    let Some(node) = snarl.get_node(src.node) else { return String::new() };
-    let pin = node.outputs.get(src.output).map(|p| p.name.as_str()).unwrap_or("");
-    match node.module_id.as_str() {
-        "device.source" | "module.automap_split" => pin.to_string(),
-        "subpatch.inlet" => frames.last()
-            .and_then(|&(outer, sp_id)| {
-                let up = *outer.in_pin(InPinId { node: sp_id, input: pin_index_of(node)? }).remotes.first()?;
-                Some(source_name(outer, up, &frames[..frames.len() - 1]))
-            })
-            .unwrap_or_else(|| node.display_name.clone()),
-        _ if node.outputs.len() > 1 => format!("{} · {pin}", node.display_name),
-        _ => node.display_name.clone(),
     }
 }
 
@@ -1470,7 +1487,7 @@ fn curve_inputs_motion_unit(snarl: &Snarl<NodeData>, id: NodeId, frames: &[(&Sna
     let mut unit = None;
     for i in 0..n_inputs {
         let Some(&src) = snarl.in_pin(InPinId { node: id, input: i }).remotes.first() else { continue };
-        let u = source_motion_unit(snarl, src, frames, 0)?;
+        let u = wire_source(snarl, src, frames).unit?;
         if unit.is_some_and(|prev| prev != u) {
             return None;
         }
@@ -1492,45 +1509,281 @@ fn pin_index_of(node: &NodeData) -> Option<usize> {
     node.params.get("pin_index").and_then(|v| v.as_u64()).map(|v| v as usize)
 }
 
-/// The sensor an output pin carries, following it upstream (see
-/// [`refresh_motion_units`]).
-fn source_motion_unit(
-    snarl: &Snarl<NodeData>,
-    src: OutPinId,
-    frames: &[(&Snarl<NodeData>, NodeId)],
-    depth: u32,
-) -> Option<MotionUnit> {
-    if depth > 16 {
-        return None;
+/// Which inputs of a module carry its signal to `output`, and whether those
+/// inputs act as gains on each other. `None` for a module whose output is a new
+/// signal of its own (a comparison, a Vec to Deflection's Angle): the trace stops
+/// there. Pins left out only set how the signal is shaped (a Clamp's limits, a
+/// Selector's select, a Sample and Hold's trigger).
+fn signal_path(module_id: &str, output: usize, n_inputs: usize) -> Option<(std::ops::Range<usize>, bool)> {
+    Some(match module_id {
+        // Channel by channel.
+        m if is_plain_curve(m) => (output..output + 1, false),
+        "module.delay" | "module.average" | "module.dc_filter" | "module.vec_reshape" => (output..output + 1, false),
+        "math.abs" | "math.negate" | "math.clamp" | "math.quantize" | "math.map_range" | "math.divide"
+        | "module.sample_hold" | "logic.delay" | "module.vec_to_axis" => (0..1, false),
+        "module.vec_to_deflection" if output == 0 => (0..1, false),
+        "module.split" => (1..2, false),
+        "module.selector" => (1..n_inputs, false),
+        "math.add" | "math.subtract" | "math.min_max" | "module.axis_to_vec" => (0..n_inputs, false),
+        "math.multiply" => (0..n_inputs, true),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SourceKind {
+    /// Nothing moves behind it: a Knob, a Constant, an unwired pin. It shapes a
+    /// signal it meets (an offset, a gain) but doesn't make it a different one.
+    Setting,
+    /// One signal, however it has been shaped on the way.
+    One,
+    /// Several different signals combined.
+    Mixed,
+}
+
+/// What an output pin carries, traced back to its source (see [`wire_source`]).
+struct TracedSource<'a> {
+    kind: SourceKind,
+    /// The sensor it reads in. Mixed signals keep one only if they all agree.
+    unit: Option<MotionUnit>,
+    /// The source pin's own name ("Gyro X (roll)"), or else its node's.
+    origin: std::borrow::Cow<'a, str>,
+    /// The module nearest the reader that shaped it, if any did.
+    via: Option<std::borrow::Cow<'a, str>>,
+}
+
+impl<'a> TracedSource<'a> {
+    fn new(kind: SourceKind, unit: Option<MotionUnit>, origin: std::borrow::Cow<'a, str>) -> Self {
+        Self { kind, unit, origin, via: None }
     }
-    let node = snarl.get_node(src.node)?;
+
+    /// A short name for a scope's legend: the source pin, then what last shaped
+    /// it, so a raw gyro and a scaled one on one scope can be told apart. Mixed
+    /// signals have no one source to name, so they go by the module that mixed them.
+    fn legend(self) -> String {
+        match (self.kind, self.via) {
+            (SourceKind::One, Some(via)) => format!("{} · {via}", self.origin),
+            (_, Some(via)) => via.into_owned(),
+            (_, None) => self.origin.into_owned(),
+        }
+    }
+
+    /// Two signals arriving at one module. With `gain`, a signal with no unit
+    /// scales one that has a unit rather than mixing with it: a gyro times a
+    /// trigger is still in °/s.
+    fn merge(self, other: Self, gain: bool) -> Self {
+        if gain && self.unit.is_some() != other.unit.is_some() {
+            return if self.unit.is_some() { self } else { other };
+        }
+        if self.kind == SourceKind::One && other.kind == SourceKind::One
+            && self.unit == other.unit && self.origin == other.origin
+        {
+            return self;
+        }
+        let unit = if self.unit == other.unit { self.unit } else { None };
+        Self::new(SourceKind::Mixed, unit, self.origin)
+    }
+}
+
+/// A node's name, plus the pin when it has several.
+fn node_label(node: &NodeData, output: usize) -> std::borrow::Cow<'_, str> {
+    match node.outputs.get(output) {
+        Some(pin) if node.outputs.len() > 1 => format!("{} · {}", node.display_name, pin.name).into(),
+        _ => node.display_name.as_str().into(),
+    }
+}
+
+/// What the output pin `src` carries, following it upstream (see
+/// [`refresh_motion_units`]).
+fn wire_source<'a>(
+    snarl: &'a Snarl<NodeData>,
+    src: OutPinId,
+    frames: &[(&'a Snarl<NodeData>, NodeId)],
+) -> TracedSource<'a> {
+    // Stops a feedback loop, and a chain of modules that each read the same
+    // signal twice, whose paths double at every step.
+    let mut steps = 256;
+    trace_source(snarl, src, frames, &mut steps)
+}
+
+fn trace_source<'a>(
+    snarl: &'a Snarl<NodeData>,
+    src: OutPinId,
+    frames: &[(&'a Snarl<NodeData>, NodeId)],
+    steps: &mut u32,
+) -> TracedSource<'a> {
+    use SourceKind::*;
+    let Some(node) = snarl.get_node(src.node) else {
+        return TracedSource::new(Setting, None, "".into());
+    };
+    let label = || node_label(node, src.output);
+    if *steps == 0 {
+        return TracedSource::new(Mixed, None, label());
+    }
+    *steps -= 1;
     match node.module_id.as_str() {
         "device.source" | "module.automap_split" => {
-            let pin = node.params.get("output_pin_ids")?.as_array()?.get(src.output)?.as_str()?;
-            MotionUnit::of_pin(pin)
+            let unit = node.params.get("output_pin_ids")
+                .and_then(|v| v.as_array()?.get(src.output)?.as_str())
+                .and_then(MotionUnit::of_pin);
+            let pin = node.outputs.get(src.output).map_or("", |p| p.name.as_str());
+            TracedSource::new(One, unit, pin.into())
         }
         // Out (Vec2), X, Y — not Lean, Lean!, Orientation or the bus.
-        "processing.gyro_3dof" => (src.output <= 2 && gyro_3dof_is_pointer(node)).then_some(MotionUnit::Gyro),
-        m if is_plain_curve(m) => {
-            let up = *snarl.in_pin(InPinId { node: src.node, input: src.output }).remotes.first()?;
-            source_motion_unit(snarl, up, frames, depth + 1)
+        "processing.gyro_3dof" => {
+            let unit = (src.output <= 2 && gyro_3dof_is_pointer(node)).then_some(MotionUnit::Gyro);
+            TracedSource::new(One, unit, label())
         }
-        "subpatch.inlet" => {
-            let (outer, sp_id) = *frames.last()?;
-            let up = *outer.in_pin(InPinId { node: sp_id, input: pin_index_of(node)? }).remotes.first()?;
-            source_motion_unit(outer, up, &frames[..frames.len() - 1], depth + 1)
+        "module.constant" | "module.knob" | "module.dropdown" | "module.switch" => {
+            TracedSource::new(Setting, None, label())
+        }
+        "subpatch.inlet" => frames.last()
+            .and_then(|&(outer, sp_id)| {
+                let up = *outer.in_pin(InPinId { node: sp_id, input: pin_index_of(node)? }).remotes.first()?;
+                Some(trace_source(outer, up, &frames[..frames.len() - 1], steps))
+            })
+            .unwrap_or_else(|| TracedSource::new(Setting, None, node.display_name.as_str().into())),
+        "subpatch" => {
+            let inner = node.subpatch.as_ref().and_then(|sp| {
+                let outlet = sp.snarl.nodes_ids_data()
+                    .find(|(_, n)| n.value.module_id == "subpatch.outlet" && pin_index_of(&n.value) == Some(src.output))
+                    .map(|(id, _)| id)?;
+                let up = *sp.snarl.in_pin(InPinId { node: outlet, input: 0 }).remotes.first()?;
+                let mut inner = frames.to_vec();
+                inner.push((snarl, src.node));
+                Some(trace_source(&sp.snarl, up, &inner, steps))
+            });
+            inner.unwrap_or_else(|| TracedSource::new(Setting, None, label()))
+        }
+        m => {
+            let Some((inputs, gain)) = signal_path(m, src.output, node.inputs.len()) else {
+                return TracedSource::new(One, None, label());
+            };
+            let mut merged: Option<TracedSource<'a>> = None;
+            for input in inputs {
+                let Some(&up) = snarl.in_pin(InPinId { node: src.node, input }).remotes.first() else { continue };
+                let source = trace_source(snarl, up, frames, steps);
+                if source.kind != Setting {
+                    merged = Some(match merged {
+                        Some(so_far) => so_far.merge(source, gain),
+                        None => source,
+                    });
+                }
+            }
+            match merged {
+                Some(mut source) => {
+                    source.via = Some(label());
+                    source
+                }
+                None => TracedSource::new(Setting, None, label()),
+            }
+        }
+    }
+}
+
+/// Whether a motion curve's output should read as a share of a stick's or
+/// trigger's range rather than in the sensor's units: it reaches one, through
+/// the same modules the source trace passes (see [`signal_path`]), and nothing it
+/// reaches needs those units (a gyro pin on a virtual pad, or RWS Aim, whose
+/// Rotation input is a rate). Whichever way a Split or Selector is set counts, so
+/// the graph doesn't change axes when it switches. Anything else on the wire, like a
+/// scope or the mouse, has no 0..1 range of its own and doesn't count either way.
+fn curve_feeds_deflection<'a>(
+    snarl: &'a Snarl<NodeData>,
+    id: NodeId,
+    frames: &[(&'a Snarl<NodeData>, NodeId)],
+) -> bool {
+    let Some(node) = snarl.get_node(id) else { return false };
+    let mut ends = CurveEnds::default();
+    let mut steps = 256;
+    for output in 0..node.outputs.len() {
+        follow_output(snarl, OutPinId { node: id, output }, frames, &mut steps, &mut ends);
+    }
+    ends.deflection && !ends.sensor
+}
+
+/// What a curve's output ends up driving (see [`curve_feeds_deflection`]).
+#[derive(Default)]
+struct CurveEnds {
+    deflection: bool,
+    sensor: bool,
+}
+
+impl CurveEnds {
+    fn note_pin(&mut self, pin: &str) {
+        self.deflection |= matches!(pin,
+            "left_stick" | "left_stick_x" | "left_stick_y"
+            | "right_stick" | "right_stick_x" | "right_stick_y"
+            | "left_trigger" | "right_trigger");
+        self.sensor |= MotionUnit::of_pin(pin).is_some();
+    }
+}
+
+fn follow_output<'a>(
+    snarl: &'a Snarl<NodeData>,
+    src: OutPinId,
+    frames: &[(&'a Snarl<NodeData>, NodeId)],
+    steps: &mut u32,
+    ends: &mut CurveEnds,
+) {
+    for &dst in &snarl.out_pin(src).remotes {
+        follow_input(snarl, dst, frames, steps, ends);
+    }
+}
+
+fn follow_input<'a>(
+    snarl: &'a Snarl<NodeData>,
+    dst: InPinId,
+    frames: &[(&'a Snarl<NodeData>, NodeId)],
+    steps: &mut u32,
+    ends: &mut CurveEnds,
+) {
+    let Some(node) = snarl.get_node(dst.node) else { return };
+    if *steps == 0 {
+        return;
+    }
+    *steps -= 1;
+    let pin_id = |key: &str, index: usize| {
+        node.params.get(key).and_then(|v| v.as_array()?.get(index)?.as_str())
+    };
+    match node.module_id.as_str() {
+        // Input 0 is the bus; the named pins start after it.
+        "module.automap_collect" => {
+            if let Some(pin) = dst.input.checked_sub(1).and_then(|i| pin_id("collect_input_pin_ids", i)) {
+                ends.note_pin(pin);
+            }
+        }
+        "device.sink" => {
+            if let Some(pin) = pin_id("input_pin_ids", dst.input) {
+                ends.note_pin(pin);
+            }
+        }
+        "processing.rws" => ends.sensor |= dst.input == 0,
+        "subpatch.outlet" => {
+            if let (Some(&(outer, sp_id)), Some(output)) = (frames.last(), pin_index_of(node)) {
+                follow_output(outer, OutPinId { node: sp_id, output }, &frames[..frames.len() - 1], steps, ends);
+            }
         }
         "subpatch" => {
-            let sp = node.subpatch.as_ref()?;
-            let outlet = sp.snarl.nodes_ids_data()
-                .find(|(_, n)| n.value.module_id == "subpatch.outlet" && pin_index_of(&n.value) == Some(src.output))
-                .map(|(id, _)| id)?;
-            let up = *sp.snarl.in_pin(InPinId { node: outlet, input: 0 }).remotes.first()?;
-            let mut inner = frames.to_vec();
-            inner.push((snarl, src.node));
-            source_motion_unit(&sp.snarl, up, &inner, depth + 1)
+            let Some(sp) = node.subpatch.as_ref() else { return };
+            let inlet = sp.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch.inlet" && pin_index_of(&n.value) == Some(dst.input))
+                .map(|(id, _)| id);
+            if let Some(inlet) = inlet {
+                let mut inner = frames.to_vec();
+                inner.push((snarl, dst.node));
+                follow_output(&sp.snarl, OutPinId { node: inlet, output: 0 }, &inner, steps, ends);
+            }
         }
-        _ => None,
+        m => {
+            for output in 0..node.outputs.len() {
+                let carries = signal_path(m, output, node.inputs.len())
+                    .is_some_and(|(inputs, _)| inputs.contains(&dst.input));
+                if carries {
+                    follow_output(snarl, OutPinId { node: dst.node, output }, frames, steps, ends);
+                }
+            }
+        }
     }
 }
 
@@ -1567,6 +1820,9 @@ pub(crate) struct CurveView {
     /// The ranges values are normalised by (bus units) — for the live dots.
     pub in_min: f32, pub in_max: f32, pub out_min: f32, pub out_max: f32,
     pub unit: Option<MotionUnit>,
+    /// What the Out axis reads in: `unit`, unless the output drives a stick or
+    /// trigger, when it reads as a plain share of its range.
+    out_unit: Option<MotionUnit>,
     absolute: bool,
     scale_t: f32,
 }
@@ -1577,8 +1833,10 @@ impl CurveView {
         let f = |k: &str, d: f64| node.params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
         let plain = Self::plain(absolute, scale_t, f("in_min", -1.0), f("in_max", 1.0), f("out_min", -1.0), f("out_max", 1.0));
         let Some(unit) = MotionUnit::of(node) else { return plain };
-        let fs = unit.full_scale();
-        let [il, ih, ol, oh] = unit.view(node).map(|v| (v / fs).clamp(-1.0, 1.0));
+        let [input, output] = unit.view_axes(node);
+        let [il, ih, ol, oh] = unit.view(node);
+        let (il, ih) = ((il / input.full_scale).clamp(-1.0, 1.0), (ih / input.full_scale).clamp(-1.0, 1.0));
+        let (ol, oh) = ((ol / output.full_scale).clamp(-1.0, 1.0), (oh / output.full_scale).clamp(-1.0, 1.0));
         // A value's graph coordinate: the Log/Exp scale, mirrored for a sign.
         let warp = |v: f32| v.signum() * curve_scale(v.abs(), scale_t);
         let full = if absolute { (0.0, 1.0) } else { (-1.0, 1.0) };
@@ -1591,7 +1849,9 @@ impl CurveView {
         Self {
             x_lo, x_hi, y_lo, y_hi,
             in_min: -1.0, in_max: 1.0, out_min: -1.0, out_max: 1.0,
-            unit: Some(unit), absolute, scale_t,
+            unit: Some(unit),
+            out_unit: (!node.extra.curve_out_deflects).then_some(unit),
+            absolute, scale_t,
         }
     }
 
@@ -1609,7 +1869,7 @@ impl CurveView {
         Self {
             x_lo: lo, x_hi: hi, y_lo: lo, y_hi: hi,
             in_min, in_max, out_min, out_max,
-            unit: None, absolute, scale_t,
+            unit: None, out_unit: None, absolute, scale_t,
         }
     }
 
@@ -1622,15 +1882,16 @@ impl CurveView {
     /// Labels for grid lines at graph coordinates `gs` on an axis ranging
     /// `lo..hi`: the sensor's units for a motion pick, else a percentage of a
     /// unit range, or plain values for a wider one. Abs reads only `hi`.
-    fn labels(&self, gs: &[f32], lo: f32, hi: f32) -> Vec<String> {
-        let (scale, suffix) = self.scale_suffix(lo, hi);
+    fn labels(&self, gs: &[f32], unit: Option<MotionUnit>, lo: f32, hi: f32) -> Vec<String> {
+        let (scale, suffix) = self.scale_suffix(unit, lo, hi);
         let values: Vec<f32> = gs.iter().map(|&g| self.real(g, scale)).collect();
         axis_labels(&values, suffix)
     }
 
-    /// What a graph unit is worth on an axis ranging `lo..hi`, and its suffix.
-    fn scale_suffix(&self, lo: f32, hi: f32) -> (f32, &'static str) {
-        match self.unit {
+    /// What a graph unit is worth on an axis ranging `lo..hi` that reads in
+    /// `unit`, and its suffix.
+    fn scale_suffix(&self, unit: Option<MotionUnit>, lo: f32, hi: f32) -> (f32, &'static str) {
+        match unit {
             Some(u) => (u.full_scale(), u.suffix()),
             None => {
                 let m = if self.absolute { hi.abs() } else { lo.abs().max(hi.abs()) };
@@ -1641,21 +1902,21 @@ impl CurveView {
 
     /// The input value at graph X `g`, for the cursor reading.
     pub(crate) fn value_in(&self, g: f32) -> String {
-        let (scale, suffix) = self.scale_suffix(self.in_min, self.in_max);
+        let (scale, suffix) = self.scale_suffix(self.unit, self.in_min, self.in_max);
         value_label(self.real(g, scale), suffix)
     }
 
     /// The output value at graph Y `g`, for a dot's label.
     pub(crate) fn value_out(&self, g: f32) -> String {
-        let (scale, suffix) = self.scale_suffix(self.out_min, self.out_max);
+        let (scale, suffix) = self.scale_suffix(self.out_unit, self.out_min, self.out_max);
         value_label(self.real(g, scale), suffix)
     }
 
     /// Labels for input grid lines at graph X positions `gs`.
-    pub(crate) fn labels_in(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.in_min, self.in_max) }
+    pub(crate) fn labels_in(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.unit, self.in_min, self.in_max) }
 
     /// Labels for output grid lines at graph Y positions `gs`.
-    pub(crate) fn labels_out(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.out_min, self.out_max) }
+    pub(crate) fn labels_out(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.out_unit, self.out_min, self.out_max) }
 }
 
 /// The In/Out fields of a motion pick: how much of the sensor the graph shows,
@@ -1671,29 +1932,40 @@ pub(crate) fn motion_view_range_fields(
 ) -> ([egui::Rect; 4], bool) {
     let mut view = snarl.get_node(node_id).map(|n| unit.view(n)).unwrap_or([0.0; 4]);
     let before = view;
-    let linked = snarl.get_node(node_id).map_or(true, range_linked);
+    let node = snarl.get_node(node_id);
+    let deflects = node.is_some_and(|n| n.extra.curve_out_deflects);
+    let axes = node.map(|n| unit.view_axes(n));
+    let Some(axes) = axes else { return ([egui::Rect::NOTHING; 4], false) };
+    // In and Out don't scale together when they measure different things: it
+    // would only clip Out at 100% and lose what it had been set to.
+    let linked = !deflects && node.map_or(true, range_linked);
     let mut link_clicked = false;
-    let fs = unit.full_scale();
-    let decimals = if unit == MotionUnit::Gyro { 0 } else { 2 };
     let mut rects = [egui::Rect::NOTHING; 4];
     let mut changed = false;
     let hover = format!(
         "How much of the sensor the graph shows ({} full scale). Only the view: \
          the curve always runs over the whole range, and nothing is rescaled.",
-        unit.format(fs),
+        unit.format(unit.full_scale()),
     );
+    let out_hover = if deflects {
+        "How much of the output the graph shows. It drives a stick or trigger, so it reads \
+         as a share of that range, where 100% is a bus value of 1. Only the view: nothing is rescaled."
+    } else {
+        hover.as_str()
+    };
     ui.horizontal(|ui| {
         for (i, (label, arrow)) in [("In", "↓"), ("", "↑"), ("Out", "↓"), ("", "↑")].into_iter().enumerate() {
-            if i == 2 { link_clicked = range_link_button(ui, linked); }
+            if i == 2 && !deflects { link_clicked = range_link_button(ui, linked); }
             if !label.is_empty() { ui.label(egui::RichText::new(label).small().weak()); }
             let is_min = i % 2 == 0;
+            let axis = axes[i / 2];
             let r = ui.add_enabled(!(absolute && is_min), egui::DragValue::new(&mut view[i])
-                .speed(unit.step())
-                .range(-fs..=fs)
+                .speed(axis.step)
+                .range(-axis.full_scale..=axis.full_scale)
                 .prefix(arrow)
-                .suffix(unit.suffix())
-                .max_decimals(decimals))
-                .on_hover_text(hover.as_str())
+                .suffix(axis.suffix)
+                .max_decimals(axis.decimals))
+                .on_hover_text(if i < 2 { hover.as_str() } else { out_hover })
                 .on_disabled_hover_text(ABS_MIN_HOVER);
             rects[i] = r.rect;
             changed |= r.changed();

@@ -929,54 +929,40 @@ fn config_consumed_pins(
     // pin group it actually consumes. Resolves a direct device.source / splitter
     // pin (via `output_pin_ids`), a gyro processor (the IMU group), and hops
     // through passthrough/processing nodes in between. Bounded to avoid cycles.
-    let resolve = |snarl: &Snarl<NodeData>| -> Option<Vec<String>> {
-        let mut cur = NodeId(inner_node_id);
-        for _ in 0..32 {
-            let node = snarl.get_node(cur)?;
-            // Which input to follow upstream. For signal-path GATES we must follow
-            // the ACTIVE DATA branch, not the first input (a Selector's input 0 is
-            // the select control, a Split's input 0 is the select and input 1 the
-            // data) — otherwise the walk chases the select's dropdown/switch and
-            // never reaches the physical source that's currently routed through.
-            let remote = match node.module_id.as_str() {
-                "module.selector" => {
-                    let act = super::config_route::selector_active_ins(snarl, cur);
-                    let idx = act.first().copied().unwrap_or(0) + 1; // skip the select input
-                    snarl.in_pin(InPinId { node: cur, input: idx }).remotes.first().copied()
-                }
-                "module.split" => {
-                    snarl.in_pin(InPinId { node: cur, input: 1 }).remotes.first().copied()
-                }
-                _ => (0..node.inputs.len()).find_map(|i| {
-                    snarl.in_pin(InPinId { node: cur, input: i }).remotes.first().copied()
-                }),
-            }?;
+    fn walk(
+        snarl: &Snarl<NodeData>,
+        cur: NodeId,
+        seen: &mut std::collections::HashSet<usize>,
+    ) -> Option<Vec<String>> {
+        if !seen.insert(cur.0) || seen.len() > 64 {
+            return None;
+        }
+        signal_inputs(snarl, cur).into_iter().find_map(|i| {
+            let remote = *snarl.in_pin(InPinId { node: cur, input: i }).remotes.first()?;
             let up = snarl.get_node(remote.node)?;
-            match up.module_id.as_str() {
-                // A gyro processor terminates the walk: it consumes exactly the
-                // IMU pins, so pass those and nothing else.
-                "processing.gyro_3dof" => {
-                    return Some(GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect());
-                }
-                _ => {
-                    // device.source / splitter (or anything storing pin ids):
-                    // a resolvable, non-passthrough pin ends the walk.
-                    if let Some(pid) = up.params.get("output_pin_ids")
-                        .and_then(|v| v.as_array())
-                        .and_then(|a| a.get(remote.output))
-                        .and_then(|v| v.as_str())
-                    {
-                        if pid != "automap_pass" && !pid.is_empty() {
-                            return Some(expand_pin_group(pid));
-                        }
-                    }
-                    // Passthrough / unresolved (an intermediate curve, a splitter's
-                    // bus output…): keep walking up toward the device.
-                    cur = remote.node;
+            // A gyro processor terminates the walk: it consumes exactly the IMU
+            // pins, so pass those and nothing else.
+            if up.module_id == "processing.gyro_3dof" {
+                return Some(GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect());
+            }
+            // device.source / splitter (or anything storing pin ids): a resolvable,
+            // non-passthrough pin ends the walk.
+            if let Some(pid) = up.params.get("output_pin_ids")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(remote.output))
+                .and_then(|v| v.as_str())
+            {
+                if pid != "automap_pass" && !pid.is_empty() {
+                    return Some(expand_pin_group(pid));
                 }
             }
-        }
-        None
+            // Passthrough / unresolved (an intermediate curve, a splitter's bus
+            // output…): keep walking up toward the device.
+            walk(snarl, remote.node, seen)
+        })
+    }
+    let resolve = |snarl: &Snarl<NodeData>| {
+        walk(snarl, NodeId(inner_node_id), &mut std::collections::HashSet::new())
     };
     match source_path {
         [] => resolve(tab_snarl),
@@ -985,6 +971,25 @@ fn config_consumed_pins(
             resolve(&inner.snarl)
         }
         _ => None,
+    }
+}
+
+/// The inputs to follow on a walk from a node toward its physical source, in
+/// order. For signal-path GATES that is the ACTIVE DATA branch, not the first
+/// input (a Selector's input 0 is the select control, a Split's input 0 is the
+/// select and input 1 the data) — otherwise the walk chases the select's
+/// dropdown/switch and never reaches the source that's currently routed through.
+/// Anything else offers every input, so a walk that dead-ends on one (a Multiply's
+/// Knob on `a`) can still find the source on the next.
+fn signal_inputs(snarl: &Snarl<NodeData>, id: NodeId) -> Vec<usize> {
+    let Some(node) = snarl.get_node(id) else { return Vec::new() };
+    match node.module_id.as_str() {
+        "module.selector" => {
+            let act = super::config_route::selector_active_ins(snarl, id);
+            vec![act.first().copied().unwrap_or(0) + 1] // skip the select input
+        }
+        "module.split" => vec![1],
+        _ => (0..node.inputs.len()).collect(),
     }
 }
 
@@ -1403,8 +1408,15 @@ fn trace_rws_flick_source(
     parents: Option<&AutomapParent<'_>>,
 ) -> Option<(String, String)> {
     const FLICK_INPUT: usize = 1;
-    let mut cur = snarl.in_pin(InPinId { node: node_id, input: FLICK_INPUT }).remotes.first().copied()?;
-    for _ in 0..32 {
+    fn walk(
+        snarl: &Snarl<NodeData>,
+        cur: OutPinId,
+        parents: Option<&AutomapParent<'_>>,
+        seen: &mut std::collections::HashSet<(usize, usize)>,
+    ) -> Option<(String, String)> {
+        if !seen.insert((cur.node.0, cur.output)) || seen.len() > 64 {
+            return None;
+        }
         let up = snarl.get_node(cur.node)?;
         // device.source / splitter store their output pin ids; a stick output ends
         // the walk.
@@ -1429,12 +1441,14 @@ fn trace_rws_flick_source(
                 }
             }
         }
-        // Otherwise keep walking up through the first connected input.
-        let next = (0..up.inputs.len())
-            .find_map(|i| snarl.in_pin(InPinId { node: cur.node, input: i }).remotes.first().copied())?;
-        cur = next;
+        // Otherwise keep walking up through its inputs.
+        signal_inputs(snarl, cur.node).into_iter().find_map(|i| {
+            let next = *snarl.in_pin(InPinId { node: cur.node, input: i }).remotes.first()?;
+            walk(snarl, next, parents, seen)
+        })
     }
-    None
+    let flick = *snarl.in_pin(InPinId { node: node_id, input: FLICK_INPUT }).remotes.first()?;
+    walk(snarl, flick, parents, &mut std::collections::HashSet::new())
 }
 
 pub(crate) fn build_processing_graph(
@@ -2665,6 +2679,354 @@ mod subpatch_bus_tests {
         s.get_node_mut(dof).unwrap().params.insert("family".into(), json!("steering"));
         refresh_motion_units(&mut s);
         assert_eq!(unit(&s, vec_curve), None);
+    }
+
+    /// A signal's source survives the modules that only shape it, in curves and
+    /// scope channels alike, and what's on the way decides how they combine.
+    #[test]
+    fn the_source_is_traced_through_modules_that_shape_a_signal() {
+        use crate::canvas::viewer::{refresh_motion_units, MotionUnit};
+        const F: SignalType = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[F, F, F, F]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["gyro_x", "gyro_y", "accel_z", "left_trigger"]));
+            for (o, name) in n.outputs.iter_mut().zip(["Gyro X", "Gyro Y", "Accel Z", "LT"]) {
+                o.name = name.into();
+            }
+            n
+        });
+        let knob = s.insert_node(p, node("module.knob", &[], &[F]));
+        // A module fed from `ins`, with an Oscilloscope channel and a curve on it.
+        let via = |s: &mut Snarl<NodeData>, module: &str, name: &str, ins: &[Option<(NodeId, usize)>]| {
+            let n = s.insert_node(p, {
+                let outs: &[SignalType] = if module == "module.vec_to_deflection" { &[F, F] } else { &[F] };
+                let mut n = node(module, &vec![F; ins.len()], outs);
+                n.display_name = name.into();
+                n
+            });
+            for (i, from) in ins.iter().enumerate() {
+                if let Some((from, o)) = *from {
+                    wire(s, from, o, n, i);
+                }
+            }
+            let curve = s.insert_node(p, node("module.response_curve", &[F], &[F]));
+            wire(s, n, 0, curve, 0);
+            let scope = s.insert_node(p, node("display.oscilloscope", &[F], &[]));
+            wire(s, n, 0, scope, 0);
+            (n, curve, scope)
+        };
+        let gyro = Some((pad, 0));
+        let gyro_y = Some((pad, 1));
+        let accel = Some((pad, 2));
+        let trigger = Some((pad, 3));
+        let knob = Some((knob, 0));
+
+        let (_, gain_first, _) = via(&mut s, "math.multiply", "Multiply", &[knob, gyro]);
+        let (_, gated, gated_scope) = via(&mut s, "math.multiply", "Multiply", &[trigger, gyro]);
+        let (_, bad_product, _) = via(&mut s, "math.multiply", "Multiply", &[gyro, accel]);
+        let (_, offset, _) = via(&mut s, "math.add", "Add", &[gyro, knob]);
+        let (_, stick_mix, mix_scope) = via(&mut s, "math.add", "Add", &[gyro, trigger]);
+        let (_, same_kind, kind_scope) = via(&mut s, "math.add", "Add", &[gyro, gyro_y]);
+        let (_, same_pin, _) = via(&mut s, "math.subtract", "Subtract", &[gyro, gyro]);
+        let (_, numerator, _) = via(&mut s, "math.divide", "Divide", &[gyro, trigger]);
+        let (_, denominator, _) = via(&mut s, "math.divide", "Divide", &[trigger, gyro]);
+        // In Sample and Hold's signal pin, not its trigger.
+        let (_, sampled, sampled_scope) = via(&mut s, "module.sample_hold", "Sample and Hold", &[gyro, trigger]);
+        let (_, by_trigger_only, _) = via(&mut s, "module.sample_hold", "Sample and Hold", &[trigger, gyro]);
+        // A Selector's select and a Split's select aren't its signal.
+        let (_, selected, _) = via(&mut s, "module.selector", "Selector", &[trigger, gyro, gyro_y]);
+        let (_, either, _) = via(&mut s, "module.selector", "Selector", &[knob, gyro, trigger]);
+        let (_, split, _) = via(&mut s, "module.split", "Split", &[trigger, gyro]);
+        let (_, compared, _) = via(&mut s, "logic.greater_than", "Greater Than", &[gyro, knob]);
+        let (_, nothing, knob_scope) = via(&mut s, "math.multiply", "Multiply", &[knob, knob]);
+
+        // A chain, ending on the module that shaped it last.
+        let (held, _, _) = via(&mut s, "module.sample_hold", "Sample and Hold", &[gyro, trigger]);
+        let (scaled, _, _) = via(&mut s, "math.multiply", "Gyro pass", &[Some((held, 0)), knob]);
+        let (_, chained, chained_scope) = via(&mut s, "module.average", "Average", &[Some((scaled, 0))]);
+        // A module's other output is its own signal.
+        let (deflect, _, _) = via(&mut s, "module.vec_to_deflection", "Vec to Deflection", &[gyro]);
+        let angle = s.insert_node(p, node("module.response_curve", &[F], &[F]));
+        wire(&mut s, deflect, 1, angle, 0);
+
+        refresh_motion_units(&mut s);
+        let unit = |id| MotionUnit::of(s.get_node(id).unwrap());
+        let gyro_unit = Some(MotionUnit::Gyro);
+        assert_eq!(unit(gain_first), gyro_unit, "the Knob on the first pin is only a gain");
+        assert_eq!(unit(gated), gyro_unit, "a trigger times a gyro still reads in °/s");
+        assert_eq!(unit(bad_product), None, "gyro times accel is neither");
+        assert_eq!(unit(offset), gyro_unit, "a Knob is an offset");
+        assert_eq!(unit(stick_mix), None, "adding a real signal with no unit mixes them");
+        assert_eq!(unit(same_kind), gyro_unit);
+        assert_eq!(unit(same_pin), gyro_unit);
+        assert_eq!(unit(numerator), gyro_unit);
+        assert_eq!(unit(denominator), None, "only the first pin of a Divide is its signal");
+        assert_eq!(unit(sampled), gyro_unit);
+        assert_eq!(unit(by_trigger_only), None, "the trigger isn't what it holds");
+        assert_eq!(unit(selected), gyro_unit, "every branch is a gyro");
+        assert_eq!(unit(either), None, "not every branch is a gyro");
+        assert_eq!(unit(split), gyro_unit);
+        assert_eq!(unit(compared), None, "a comparison is a new signal");
+        assert_eq!(unit(nothing), None);
+        assert_eq!(unit(chained), gyro_unit);
+        assert_eq!(unit(angle), None, "a Deflection's Angle isn't in °/s");
+
+        let legend = |id: NodeId| s.get_node(id).unwrap().extra.scope_channels[0].clone();
+        assert_eq!(legend(gated_scope).name, "Gyro X · Multiply");
+        assert_eq!(legend(gated_scope).unit, gyro_unit);
+        assert_eq!(legend(sampled_scope).name, "Gyro X · Sample and Hold");
+        assert_eq!(legend(chained_scope).name, "Gyro X · Average");
+        assert_eq!(legend(mix_scope).name, "Add", "no one source to name");
+        assert_eq!(legend(mix_scope).unit, None);
+        assert_eq!(legend(kind_scope).name, "Add");
+        assert_eq!(legend(kind_scope).unit, gyro_unit);
+        assert_eq!(legend(knob_scope).name, "Multiply");
+    }
+
+    /// The presets' gyro curves take the 3DOF through a gate (a Multiply, and in
+    /// one a filter branch of Selector and Split). They read in °/s, and the
+    /// engine runs them on the ranges they already had.
+    #[test]
+    fn the_presets_gyro_curves_keep_their_source_and_their_response() {
+        use crate::canvas::viewer::{refresh_motion_units, MotionUnit};
+        for name in ["General purpose preset", "General purpose preset with RWS"] {
+            let path = format!("{}/../../app/assets/sub-patches/{name}.fxsp", env!("CARGO_MANIFEST_DIR"));
+            let json = std::fs::read_to_string(&path).expect("the preset is there");
+            let file: crate::app::subpatch::SubPatchFile = serde_json::from_str(&json).expect("it parses");
+            let mut snarl = *file.sub_patch.snarl;
+            refresh_motion_units(&mut snarl);
+            let curve = snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.display_name == "Gyro Response Curve")
+                .map(|(id, _)| id)
+                .expect("the preset has its gyro curve");
+            let n = snarl.get_node(curve).unwrap();
+            assert_eq!(MotionUnit::of(n), Some(MotionUnit::Gyro), "{name}");
+            for (key, stored_default) in [("in_max", 1.0), ("out_max", 1.0)] {
+                let stored = n.params.get(key).and_then(|v| v.as_f64()).unwrap_or(stored_default);
+                assert_eq!(stored, 1.0, "{name}: {key} is what the whole sensor runs on anyway");
+            }
+            // Through a Split to the sticks; with RWS Aim, into its Rotation.
+            assert_eq!(n.extra.curve_out_deflects, name == "General purpose preset", "{name}");
+        }
+    }
+
+    /// A gyro curve's Out axis reads as a share of the range it drives, when what
+    /// it drives has one: In stays in °/s, and the engine sees no difference.
+    #[test]
+    fn a_curve_driving_a_stick_reads_its_output_as_a_share_of_it() {
+        use crate::canvas::viewer::{refresh_motion_units, CurveView, MotionUnit};
+        const F: SignalType = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[F]);
+            n.params.insert("output_pin_ids".into(), json!(["gyro_x"]));
+            n
+        });
+        let collect = s.insert_node(p, {
+            let mut n = node("module.automap_collect", &[SignalType::AutoMap, F, F, F, F], &[]);
+            n.params.insert("collect_input_pin_ids".into(), json!(["right_stick", "gyro_y", "mouse_move", "left_trigger"]));
+            n
+        });
+        let curve = |s: &mut Snarl<NodeData>| {
+            let c = s.insert_node(p, node("module.response_curve", &[F], &[F]));
+            wire(s, pad, 0, c, 0);
+            c
+        };
+        let deflects = |s: &Snarl<NodeData>, id| s.get_node(id).unwrap().extra.curve_out_deflects;
+
+        // Direct, and through a Multiply and a Split's data pin.
+        let to_stick = curve(&mut s);
+        wire(&mut s, to_stick, 0, collect, 1);
+        let through = curve(&mut s);
+        let mul = s.insert_node(p, node("math.multiply", &[F, F], &[F]));
+        wire(&mut s, through, 0, mul, 0);
+        let split = s.insert_node(p, node("module.split", &[F, F], &[F, F]));
+        wire(&mut s, mul, 0, split, 1);
+        wire(&mut s, split, 1, collect, 4);
+        // Into a sub-patch and out the other side, to a sink.
+        let across = curve(&mut s);
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let inlet = inner.insert_node(p, {
+            let mut n = node("subpatch.inlet", &[], &[F]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        let outlet = inner.insert_node(p, {
+            let mut n = node("subpatch.outlet", &[F], &[]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        wire(&mut inner, inlet, 0, outlet, 0);
+        let sp = s.insert_node(p, {
+            let mut n = node("subpatch", &[F], &[F]);
+            n.subpatch = Some(Box::new(crate::canvas::node::UiSubPatch { snarl: Box::new(inner), ..Default::default() }));
+            n
+        });
+        wire(&mut s, across, 0, sp, 0);
+        let sink = s.insert_node(p, {
+            let mut n = node("device.sink", &[SignalType::AutoMap, F], &[]);
+            n.params.insert("input_pin_ids".into(), json!(["", "left_stick"]));
+            n
+        });
+        wire(&mut s, sp, 0, sink, 1);
+
+        // These keep their units: a gyro pin, RWS's Rotation, and only a scope.
+        let to_gyro = curve(&mut s);
+        wire(&mut s, to_gyro, 0, collect, 2);
+        let to_rws = curve(&mut s);
+        let rws = s.insert_node(p, node("processing.rws", &[F, F], &[F]));
+        wire(&mut s, to_rws, 0, rws, 0);
+        let to_scope = curve(&mut s);
+        let scope = s.insert_node(p, node("display.oscilloscope", &[F], &[]));
+        wire(&mut s, to_scope, 0, scope, 0);
+        // The mouse isn't a 0..1 range, so it neither asks for % nor rules it out.
+        let to_mouse = curve(&mut s);
+        wire(&mut s, to_mouse, 0, collect, 3);
+        let mouse_and_stick = curve(&mut s);
+        wire(&mut s, mouse_and_stick, 0, collect, 3);
+        wire(&mut s, mouse_and_stick, 0, collect, 1);
+        // Something that needs °/s wins over a stick on the same wire.
+        let rws_and_stick = curve(&mut s);
+        wire(&mut s, rws_and_stick, 0, rws, 0);
+        wire(&mut s, rws_and_stick, 0, collect, 1);
+        // Driving a Split's select isn't carrying the signal.
+        let selects = curve(&mut s);
+        let gate = s.insert_node(p, node("module.split", &[F, F], &[F, F]));
+        wire(&mut s, selects, 0, gate, 0);
+        wire(&mut s, gate, 0, collect, 1);
+        // A stick on the output but no sensor on the input: not a motion curve.
+        let stick_in = s.insert_node(p, node("module.response_curve", &[F], &[F]));
+        wire(&mut s, stick_in, 0, collect, 1);
+
+        refresh_motion_units(&mut s);
+        for id in [to_stick, through, across, mouse_and_stick] {
+            assert!(deflects(&s, id), "node {}", id.0);
+            assert_eq!(MotionUnit::of(s.get_node(id).unwrap()), Some(MotionUnit::Gyro));
+        }
+        for id in [to_gyro, to_rws, to_scope, to_mouse, rws_and_stick, selects, stick_in] {
+            assert!(!deflects(&s, id), "node {}", id.0);
+        }
+
+        // In reads ±500 °/s until set, Out the stick's whole range in %.
+        let n = s.get_node(to_stick).unwrap();
+        let v = CurveView::of(n, true, 0.0);
+        assert!((v.x_hi - 0.25).abs() < 1e-6 && (v.y_hi - 1.0).abs() < 1e-6, "{v:?}");
+        assert_eq!(v.labels_in(&[0.25])[0], "500°/s");
+        assert_eq!(v.labels_out(&[0.5, 1.0]), ["50%", "100%"]);
+        assert_eq!(v.value_in(0.25), "500°/s");
+        assert_eq!(v.value_out(0.5), "50.0%");
+        let kept = CurveView::of(s.get_node(to_gyro).unwrap(), true, 0.0);
+        assert_eq!(kept.labels_out(&[0.25])[0], "500°/s");
+
+        // Out zooms on its own keys, leaving the °/s view it would come back to.
+        let n = s.get_node_mut(to_stick).unwrap();
+        n.params.insert("gyro_view_out_max".into(), json!(1000.0));
+        let unit = MotionUnit::Gyro;
+        unit.set_view(n, [-500.0, 500.0, -50.0, 150.0]);
+        assert_eq!(n.params.get("deflection_view_out_min").and_then(|v| v.as_f64()), Some(-50.0));
+        assert_eq!(n.params.get("deflection_view_out_max").and_then(|v| v.as_f64()), Some(100.0), "no further than all of it");
+        assert_eq!(n.params.get("gyro_view_out_max").and_then(|v| v.as_f64()), Some(1000.0));
+
+        // The label is all it changes: both still run on the whole sensor.
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        for id in [to_stick, to_gyro] {
+            let snap = graph.nodes.iter().find(|n| n.node_uid == id.0).unwrap();
+            for k in ["in_min", "out_min"] {
+                assert_eq!(snap.params.get(k).and_then(|v| v.as_f64()), Some(-1.0), "{k}");
+            }
+            for k in ["in_max", "out_max"] {
+                assert_eq!(snap.params.get(k).and_then(|v| v.as_f64()), Some(1.0), "{k}");
+            }
+        }
+    }
+
+    /// Has Changed's hysteresis reads in the units of what's on its wire, stored
+    /// the same either way. Knowing the sensor doesn't touch what the engine gets.
+    #[test]
+    fn has_changed_hysteresis_reads_in_its_inputs_units() {
+        use crate::canvas::viewer::{refresh_motion_units, HysteresisField, MotionUnit};
+        let f = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[f, f]);
+            n.params.insert("output_pin_ids".into(), json!(["gyro_x", "left_trigger"]));
+            n
+        });
+        let mul = s.insert_node(p, node("math.multiply", &[f, f], &[f]));
+        wire(&mut s, pad, 0, mul, 0);
+        let on_gyro = s.insert_node(p, node("logic.has_changed", &[SignalType::Any], &[f, f, f]));
+        wire(&mut s, mul, 0, on_gyro, 0);
+        let on_trigger = s.insert_node(p, node("logic.has_changed", &[SignalType::Any], &[f, f, f]));
+        wire(&mut s, pad, 1, on_trigger, 0);
+        s.get_node_mut(on_gyro).unwrap().params.insert("hysteresis_pct".into(), json!(0.25));
+        refresh_motion_units(&mut s);
+
+        let gyro = HysteresisField::of(s.get_node(on_gyro).unwrap());
+        assert_eq!((gyro.suffix, gyro.scale * 0.25), ("°/s", 5.0), "0.25% of ±2000 °/s");
+        let plain = HysteresisField::of(s.get_node(on_trigger).unwrap());
+        assert_eq!((plain.suffix, plain.scale), ("%", 1.0));
+
+        assert_eq!(MotionUnit::of(s.get_node(on_gyro).unwrap()), None, "not a curve");
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let snap = graph.nodes.iter().find(|n| n.node_uid == on_gyro.0).unwrap();
+        assert_eq!(snap.params.get("hysteresis_pct").and_then(|v| v.as_f64()), Some(0.25));
+    }
+
+    /// A feedback loop ends the trace instead of hanging the frame.
+    #[test]
+    fn a_trace_survives_a_feedback_loop() {
+        use crate::canvas::viewer::{refresh_motion_units, MotionUnit};
+        let f = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let a = s.insert_node(p, node("math.add", &[f, f], &[f]));
+        let b = s.insert_node(p, node("math.add", &[f, f], &[f]));
+        wire(&mut s, a, 0, b, 0);
+        wire(&mut s, a, 0, b, 1);
+        wire(&mut s, b, 0, a, 0);
+        wire(&mut s, b, 0, a, 1);
+        let curve = s.insert_node(p, node("module.response_curve", &[f], &[f]));
+        wire(&mut s, b, 0, curve, 0);
+        refresh_motion_units(&mut s);
+        assert_eq!(MotionUnit::of(s.get_node(curve).unwrap()), None);
+    }
+
+    /// A Knob on a Multiply's first pin doesn't hide the stick on its second, from
+    /// RWS's flick detection or from the config overlay's passthrough.
+    #[test]
+    fn a_walk_to_the_source_gets_past_a_gain_on_the_first_pin() {
+        let v = SignalType::Vec2;
+        let f = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, {
+            let mut n = node("device.source", &[], &[f, v]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["left_trigger", "right_stick"]));
+            n
+        });
+        let knob = s.insert_node(p, node("module.knob", &[], &[f]));
+        let mul = s.insert_node(p, node("math.multiply", &[f, v], &[v]));
+        wire(&mut s, knob, 0, mul, 0);
+        wire(&mut s, pad, 1, mul, 1);
+        let held = s.insert_node(p, node("module.sample_hold", &[v, f], &[v]));
+        wire(&mut s, mul, 0, held, 0);
+        wire(&mut s, pad, 0, held, 1);
+        let rws = s.insert_node(p, node("processing.rws", &[v, v], &[v, v]));
+        wire(&mut s, held, 0, rws, 1);
+
+        assert_eq!(
+            trace_rws_flick_source(&s, rws, None),
+            Some(("gilrs:pad:0".to_string(), "right_stick".to_string())),
+        );
+        let pins = config_consumed_pins(&s, &[], rws.0).expect("the pins it consumes");
+        assert!(pins.contains(&"right_stick".to_string()), "{pins:?}");
+        assert!(!pins.contains(&"left_trigger".to_string()), "{pins:?}");
     }
 
     /// Moving an AutoMap curve between a trigger and a stick changes which curve

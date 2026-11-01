@@ -697,6 +697,8 @@ pub(crate) fn render_pinned_element_impl(
         // Logic Delay — mode + time.
         ("logic.delay", "mode") => { render_logic_delay_mode(inner_id, ui, inner_snarl, container_size); return; }
         ("logic.delay", "time") => { render_logic_delay_time(inner_id, ui, inner_snarl, container_size); return; }
+        ("module.sample_hold", "mode") => { render_sample_hold_mode(inner_id, ui, inner_snarl, container_size); return; }
+        ("logic.has_changed", "hysteresis") => { render_has_changed_hysteresis(inner_id, ui, inner_snarl, container_size); return; }
         // Inverse — unipolar toggle + max box.
         ("math.negate", "unipolar") => { render_inverse_unipolar(inner_id, ui, inner_snarl, container_size); return; }
         // Quantize — grid factor + rounding mode.
@@ -2354,6 +2356,18 @@ pub(crate) fn render_logic_delay_time(inner_id: NodeId, ui: &mut egui::Ui, snarl
             node.params.insert("unit".into(), Value::String(unit));
             if let Some(n) = Number::from_f64(time as f64) { node.params.insert("time".into(), Value::Number(n)); }
         }
+    }
+}
+
+// ── Sample and Hold ───────────────────────────────────────────────────────────
+
+pub(crate) fn render_sample_hold_mode(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(110.0, 22.0));
+    let (rect, changed) = sample_hold_mode_row(inner_id, ui, snarl, false);
+    publish_nav_field_rects(ui, inner_id, &[rect]);
+    if changed {
+        mark_overlay_param_write(ui.ctx());
     }
 }
 
