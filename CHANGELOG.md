@@ -3,7 +3,7 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.16.6] - 2026-10-31
+## [0.16.7] - 2026-11-01
 
 ### Added
 
@@ -20,6 +20,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   pick it up, then move it with up and down; a zone's card moves among that zone's
   cards. East puts it down; South puts it down and opens it for editing. A quick press
   of South still opens the card.
+
+## [0.16.6] - 2026-10-31
+
+### Added
+
 - **Steam Controller (2026) haptics.** The pad's node now has inputs for all four
   actuators: each grip motor, with two carriers like a DualSense's haptics, so an
   Audio Stream Haptics patch drives it unchanged, and each trackpad, with an
