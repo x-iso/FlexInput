@@ -3255,8 +3255,8 @@ mod trigger_tests {
     /// Audio Stream Haptics node reading graph node 0's bus, with captured audio
     /// `audio` on both sides.
     fn asth_node(uid: usize, upstream_dev: &str, dest: &str, modulator: f32, audio: f32) -> NodeSnap {
-        flexinput_devices::loopback_manager::set_params_for_test(uid,
-            flexinput_devices::loopback_haptic::LoopbackParams {
+        flexinput_devices::loopback_params::set_params_for_test(uid,
+            flexinput_devices::loopback_params::LoopbackParams {
                 l_amp: audio, l_freq: 0.3, r_amp: audio, r_freq: 0.3,
             });
         let mut asth = empty_node(uid, "module.audio_stream_haptics");

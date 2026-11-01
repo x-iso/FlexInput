@@ -277,14 +277,12 @@ pub(crate) fn audio_stream_haptics_publish(
     republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
 
     // ── 2. Latest audio-derived haptics for this node. ────────────────────────
-    // (l_amp, l_freq, r_amp, r_freq) — zeros on non-Windows (no WASAPI loopback).
-    #[cfg(windows)]
+    // (l_amp, l_freq, r_amp, r_freq) — zeros where nothing captures (off
+    // Windows there is no WASAPI loopback), unless a test published some.
     let audio = {
-        let p = flexinput_devices::loopback_manager::latest_params(uid);
+        let p = flexinput_devices::loopback_params::latest_params(uid);
         (p.l_amp, p.l_freq, p.r_amp, p.r_freq)
     };
-    #[cfg(not(windows))]
-    let audio = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let (audio_l_amp, mut audio_l_freq, audio_r_amp, mut audio_r_freq) = audio;
 
     // ── 2b. Two-band engine (HF + LF carriers from the EQ-gained spectrum). ───
@@ -301,12 +299,11 @@ pub(crate) fn audio_stream_haptics_publish(
     let mut lf_frac = 1.0f32;
     let mut hf_frac = 0.0f32;
     let crossover_hz = snap.params.get("asth_crossover").and_then(|v| v.as_f64()).unwrap_or(250.0) as f32;
-    #[cfg(windows)]
     {
         // Flat unity EQ if none configured, so the two-band split still applies.
         let eq_pts = curve_points_from_params_keyed(&snap.params, "asth_eq_points")
             .unwrap_or_else(|| vec![[0.0, 0.5], [1.0, 0.5]]);
-        let spectrum = flexinput_devices::loopback_manager::latest_spectrum(uid);
+        let spectrum = flexinput_devices::loopback_params::latest_spectrum(uid);
         let xpos = crossover_hz_to_pos(crossover_hz);
         let lf = multiband_collapse_band(&spectrum, &eq_pts, 0.0, xpos);
         let hf = multiband_collapse_band(&spectrum, &eq_pts, xpos, 1.0);

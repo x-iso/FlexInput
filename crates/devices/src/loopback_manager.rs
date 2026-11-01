@@ -6,8 +6,8 @@
 //! [`LoopbackManager`] and calls [`LoopbackManager::reconcile`] once per wakeup
 //! with the current set of Audio Stream Haptics nodes; the manager opens /
 //! replaces / drops captures as targets change, and publishes each node's latest
-//! `(amp, freq)` into a process-global map the eval block reads via
-//! [`latest_params`].
+//! `(amp, freq)` and spectrum into the process-global maps of
+//! [`crate::loopback_params`], which the eval block reads via [`latest_params`].
 //!
 //! The reconcile API takes only primitives (`node uid` + [`LoopbackTarget`]), so
 //! this crate stays a dependency leaf — the engine extracts the target list from
@@ -19,8 +19,11 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use crate::loopback_haptic::{LoopbackHaptic, LoopbackParams, LoopbackTarget, ScopePoint};
+use crate::loopback_haptic::{LoopbackHaptic, LoopbackTarget, ScopePoint};
+use crate::loopback_params::{retain_params, retain_spectrum, set_params, set_spectrum};
 use crate::spectrum::N_BANDS;
+
+pub use crate::loopback_params::{latest_params, latest_spectrum, set_params_for_test};
 
 /// What a node wants to capture, in a form the engine can build without touching
 /// PIDs: a specific process by NAME (re-resolved to a live PID here), the
@@ -178,40 +181,6 @@ fn open(target: ResolvedTarget) -> Option<LoopbackHaptic> {
     }
 }
 
-// ── process-global published params (read by the eval block) ───────────────────
-
-static PARAMS: RwLock<Option<HashMap<usize, LoopbackParams>>> = RwLock::new(None);
-
-fn set_params(uid: usize, params: LoopbackParams) {
-    let mut guard = PARAMS.write().unwrap();
-    guard.get_or_insert_with(HashMap::new).insert(uid, params);
-}
-
-/// Publish captured params for a node as if its capture had produced them, so
-/// engine tests can drive Audio Stream Haptics without a WASAPI capture.
-#[doc(hidden)]
-pub fn set_params_for_test(uid: usize, params: LoopbackParams) {
-    set_params(uid, params);
-}
-
-fn retain_params(live: &std::collections::HashSet<usize>) {
-    let mut guard = PARAMS.write().unwrap();
-    if let Some(map) = guard.as_mut() {
-        map.retain(|uid, _| live.contains(uid));
-    }
-}
-
-/// Latest captured `(amp, freq)` for an Audio Stream Haptics node, or zeros if
-/// the node has no open capture this tick. Cheap read; safe from the eval thread.
-pub fn latest_params(uid: usize) -> LoopbackParams {
-    PARAMS
-        .read()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&uid).copied())
-        .unwrap_or_default()
-}
-
 // ── EF oscilloscope ring (read by the node body) ───────────────────────────────
 
 static SCOPE: RwLock<Option<HashMap<usize, Vec<ScopePoint>>>> = RwLock::new(None);
@@ -237,31 +206,4 @@ pub fn latest_scope(uid: usize) -> Vec<ScopePoint> {
         .as_ref()
         .and_then(|m| m.get(&uid).cloned())
         .unwrap_or_default()
-}
-
-// ── log-band audio spectrum (read by the spectrum view + multi-band engine) ─────
-
-static SPECTRUM: RwLock<Option<HashMap<usize, [f32; N_BANDS]>>> = RwLock::new(None);
-
-fn set_spectrum(uid: usize, bands: [f32; N_BANDS]) {
-    let mut guard = SPECTRUM.write().unwrap();
-    guard.get_or_insert_with(HashMap::new).insert(uid, bands);
-}
-
-fn retain_spectrum(live: &std::collections::HashSet<usize>) {
-    let mut guard = SPECTRUM.write().unwrap();
-    if let Some(map) = guard.as_mut() {
-        map.retain(|uid, _| live.contains(uid));
-    }
-}
-
-/// Latest log-band audio spectrum for an Audio Stream Haptics node, or all-zero if
-/// no capture is open. Cheap copy; read by the node's spectrum view and the engine.
-pub fn latest_spectrum(uid: usize) -> [f32; N_BANDS] {
-    SPECTRUM
-        .read()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&uid).copied())
-        .unwrap_or([0.0; N_BANDS])
 }

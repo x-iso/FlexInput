@@ -30,6 +30,8 @@ mod devnode;
 #[cfg(windows)]
 pub mod loopback_haptic;
 
+pub mod loopback_params;
+
 #[cfg(windows)]
 pub mod loopback_manager;
 

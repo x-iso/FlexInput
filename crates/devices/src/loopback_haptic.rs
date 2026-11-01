@@ -77,16 +77,7 @@ struct Shared {
     spectrum: Mutex<[f32; N_BANDS]>,
 }
 
-/// Per-side amplitude (0–1) and normalized carrier frequency (0–1) recovered
-/// from the captured audio. Frequency normalization matches the `*_freq` pin
-/// convention used elsewhere (0 = [`crate::haptic_pcm::FREQ_MIN_HZ`], 1 = MAX).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct LoopbackParams {
-    pub l_amp: f32,
-    pub l_freq: f32,
-    pub r_amp: f32,
-    pub r_freq: f32,
-}
+pub use crate::loopback_params::LoopbackParams;
 
 /// What audio to capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
