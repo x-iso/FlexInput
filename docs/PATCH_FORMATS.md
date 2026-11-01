@@ -10,6 +10,7 @@ FlexInput persists to JSON via serde. The on-disk formats are:
 | Sub-patch preset | `.fxsp` | `SubPatchFile` | `crates/ui/src/app/subpatch.rs` |
 | Response curve | `.fxc` | `CurveFile` | `crates/ui/src/canvas/viewer/curve_support.rs` |
 | Pad calibration | `.fxcal` | `CalFile` | `crates/ui/src/panels/calibration.rs` |
+| Remapper preset | `.fxremap` | JSON object | `crates/ui/src/canvas/viewer/remapper_presets.rs` |
 | Workspace autosave | `workspace.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
 | Crash recovery | `recovery.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
 | Settings | `settings.json` | `AppSettings` | `crates/ui/src/settings.rs` |
@@ -166,7 +167,8 @@ stick-click / menu ids on `device.source` `output_pin_ids` (`btn_lstick` → `bt
 `btn_rstick` → `btn_rs`, `btn_select` → `btn_back`, `btn_mode` → `btn_guide`). Add
 migrations here (never a version bump alone) when a param key or pin set changes.
 
-Three MIDI-era migrations run from `migrate_loaded_snarl`:
+Three MIDI-era migrations run from `migrate_loaded_snarl` (the two card ones through
+`migrate_mapping_cards`, which a Remapper preset load runs too):
 - `fold_note_companions_into_notes` rewrites a velocity or poly-aftertouch pin on any
   mapping card (Remapper, Map Action, Lean, Touch Zones, Virtual Menu) as the note it
   belongs to, dropping a duplicate of a note already on the card.
@@ -255,6 +257,26 @@ pad over another connection. A load replaces every key in `CAL_FILE_KEYS`, remov
 those the file lacks (they were at their defaults when it was saved), and ignores
 anything else in `settings`. A file with a higher `flexinput_calibration` than the app
 knows is refused.
+
+## Remapper Preset Format (`.fxremap`)
+
+Saved and loaded from the two icons in a Remapper's top-right corner (on the node and
+on a pinned whole-module widget alike).
+
+```json
+{
+  "flexinput_remapper": 1,
+  "mappings": [ { "in": ["btn_south"], "out": ["key_space"] } ]
+}
+```
+
+`mappings` is the node's card list exactly as a patch stores it (see the Remapper in
+MODULES_REFERENCE.md) — the only Remapper param the engine reads; the capture state
+(`ui_phase`, drafts) is not saved. A load replaces the node's `mappings` and runs
+`migrate_mapping_cards`, the card migrations `migrate_loaded_snarl` applies to a
+loaded patch, so a preset from an older build loads as that patch would. A file with a
+higher `flexinput_remapper` than the app knows, or without a `mappings` array, is
+refused with a message under the icons.
 
 ## Response Curve Format (`.fxc`)
 
@@ -376,6 +398,7 @@ Expected: the snarl serializes every node's full `inputs`/`outputs`/`params`. Li
   `crates/ui/src/canvas/node.rs`
 - `.fxc` / `CurveFile`: `crates/ui/src/canvas/viewer/curve_support.rs`
 - `.fxcal` / `CalFile`: `crates/ui/src/panels/calibration.rs`
+- `.fxremap`: `crates/ui/src/canvas/viewer/remapper_presets.rs`
 - `PersistedWorkspace` / `PersistedTab` / save/load: `crates/ui/src/settings.rs`
 - Workspace/recovery orchestration: `crates/ui/src/app/persistence.rs`
 - Snarl serialization: `vendor/egui-snarl/src/lib.rs`

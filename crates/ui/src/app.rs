@@ -2197,6 +2197,14 @@ impl eframe::App for FlexInputApp {
                 .collect()
         };
 
+        // Which card (and side) a picker session is editing, for its body to
+        // mark on whichever surface it's drawn. Every pass, ahead of the
+        // window freeze below: a main window kept from drawing must still take
+        // the mark down once the picker closes. A session whose card was
+        // deleted or moved under it ends first.
+        self.keep_picker_card_edit_on_its_card();
+        self.publish_picker_card_edit(ctx);
+
         let root_facts = window_facts(ctx, egui::ViewportId::ROOT)
             .without_hover(ctx, egui::ViewportId::ROOT);
         // A press keeps it drawing through to the pass that sees the release.

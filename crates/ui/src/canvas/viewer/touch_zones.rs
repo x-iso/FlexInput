@@ -3238,7 +3238,7 @@ pub(crate) fn render_touch_zone_cards(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin, skin,
                     true, false, reorder_enabled, drag_off, "zone_maps", card_analog,
-                    card_conf.as_ref(),
+                    card_conf.as_ref(), None,
                 );
                 if result.delete_clicked { remove = Some(i); }
                 if let Some((side_out, pin_idx)) = result.midi_chip_clicked {

@@ -1955,6 +1955,8 @@ impl crate::app::FlexInputApp {
         self.gamepad_nav.kbm_text = jsm_typing_seed(text, cur);
         self.gamepad_nav.kbm_text_caps = false;
         self.gamepad_nav.kbm_text_done = None;
+        // A card edit still open ends before the session moves to this node.
+        self.finish_picker_card_edit();
         self.gamepad_nav.kbm_picker_node = Some(inner);
         self.gamepad_nav.kbm_picker_path = Vec::new();
         self.gamepad_nav.kbm_picker_touch_zones = false;
@@ -2394,20 +2396,24 @@ impl crate::app::FlexInputApp {
     /// hold for Settings).
     ///
     /// Strictly contextual: only while a widget is ENTERED (edit level
-    /// `Editing`), and only for the widgets listed here. Anywhere else the app's
-    /// shortcuts keep working exactly as before. To give another widget Select or
-    /// Start, add it here and handle the button in that widget's driver.
+    /// `Editing`, or a Remapper's `RemapScroll` / `RemapCard`), and only for the
+    /// widgets listed here. Anywhere else the app's shortcuts keep working
+    /// exactly as before. To give another widget Select or Start, add it here
+    /// and handle the button in that widget's driver.
     pub(crate) fn nav_claimed_buttons(&self) -> &'static [&'static str] {
-        if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Editing {
-            return &[];
-        }
+        use crate::gamepad_nav::EditLevel;
         let Some(outer) = self.nav_driving_outer_id() else { return &[] };
-        if self.nav_is_jsm_editor(outer) {
+        match self.gamepad_nav.edit_level {
             // Select splits / joins a pair setting's faders in the Tune pane,
             // and steps a setting's value through its words in the text pane.
-            return &["btn_back"];
+            EditLevel::Editing if self.nav_is_jsm_editor(outer) => &["btn_back"],
+            // Select opens the picker on the focused card's input, Start on its
+            // output (the draft's, from the action row).
+            EditLevel::RemapScroll | EditLevel::RemapCard if self.nav_selected_is_remapper(outer) => {
+                &["btn_back", "btn_start"]
+            }
+            _ => &[],
         }
-        &[]
     }
 
     /// Does the widget being edited take this button for itself?

@@ -7,7 +7,9 @@ use super::*;
 // Cards are painter-driven and variable-height (chords wrap), and may live in a
 // transformed layer (the pinned whole-module widget). Reorder is implemented
 // against that reality:
-//   • The card body (below the header) is the drag handle (Sense in the card).
+//   • The card body (below the header) is the drag handle (Sense in the card) —
+//     or, on a card whose rows open the picker (the Remapper's), a grip on its
+//     right edge.
 //   • While a card is dragged, it visually lifts (paint offset) and the list
 //     opens an insertion gap at the drop target; other cards slide.
 //   • The target index is derived from the live pointer-Y compared against the
@@ -175,7 +177,7 @@ impl ReorderView {
     pub(crate) fn observe(&mut self, idx: usize, result: &MappingCardResult) {
         self.new_layout.push((idx, result.rect.center().y, result.rect.height()));
         if !self.enabled { return; }
-        let Some(resp) = result.body_drag.as_ref() else { return };
+        let Some(resp) = result.drag_handle.as_ref() else { return };
         if resp.drag_started() {
             self.drag = Some((idx, 0.0));
         } else if resp.dragged() {

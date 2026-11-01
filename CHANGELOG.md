@@ -7,6 +7,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **Remapper presets.** Two icons in the Remapper's top-right corner save its cards
+  to a `.fxremap` file and load one back, replacing the cards it has. They sit in the
+  module itself, so a pinned Remapper widget has them too.
+- **Edit a Remapper card's input or output.** Click a card's in or out row to open the
+  picker on that side, holding what the card has now; West switches to the other side.
+  With a pad, inside the Remapper widget, Select opens a card's input and Start its
+  output (from the action row, the new card being drafted). Cards now move by a grip
+  on their right edge.
 - **Steam Controller (2026) haptics.** The pad's node now has inputs for all four
   actuators: each grip motor, with two carriers like a DualSense's haptics, so an
   Audio Stream Haptics patch drives it unchanged, and each trackpad, with an

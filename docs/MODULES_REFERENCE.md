@@ -1087,6 +1087,17 @@ pub struct ModuleDescriptor {
     (`flexinput_engine::card_allows_analog_mode`); loading resets any other card to
     Normal. An Analog card passes that input's live value, from the first bit of
     movement.
+- **Editing a card:** a click on a card's in or out row opens the Choose picker on that
+  side of the card (West, or a click on the other caption, switches sides), editing its
+  `in` / `out` (and `out_gap` / `out_dur`) in place — live, one undo step per session.
+  When it closes the card is tidied as Add leaves a new one (`tidy_edited_card`: a
+  waiting gap dropped, Analog for a swipe output, Analog dropped without an analog
+  input). Cards reorder by the grip on their right edge. With a pad, inside the widget
+  (`RemapScroll` / `RemapCard`) Select opens the input side and Start the output side —
+  of the focused card, or of the draft from the action row; the Remapper claims both
+  from their app-wide shortcuts (`nav_claimed_buttons`) only there.
+- **Presets:** the 💾 / 📂 icons in the body's top-right corner save the cards to a
+  `.fxremap` file and load one, replacing them (see PATCH_FORMATS.md).
 
 #### Map Action
 - **ID:** `module.map_action`

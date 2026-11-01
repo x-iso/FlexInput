@@ -255,8 +255,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         }
         migrate_midi_automap_port(&mut node.value);
         clear_stuck_nav_arms(&mut node.value);
-        fold_note_companions_into_notes(&mut node.value);
-        drop_impossible_analog_modes(&mut node.value);
+        migrate_mapping_cards(&mut node.value);
         extend_feedback_control_inlets(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
@@ -337,6 +336,14 @@ fn clear_stuck_nav_arms(node: &mut NodeData) {
         node.params.insert(key, Value::Bool(false));
     }
     node.params.remove(crate::canvas::viewer::MIDI_PICK_OPEN);
+}
+
+/// The migrations a node's mapping cards get wherever the cards come from: a
+/// loaded patch, or a Remapper preset (`.fxremap`) saved by an older build.
+/// Add card-level migrations here so both paths pick them up. Idempotent.
+pub(crate) fn migrate_mapping_cards(node: &mut NodeData) {
+    fold_note_companions_into_notes(node);
+    drop_impossible_analog_modes(node);
 }
 
 /// A note's velocity and poly aftertouch are part of the note — its strike and

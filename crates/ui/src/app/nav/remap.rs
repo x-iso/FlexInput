@@ -613,6 +613,16 @@ impl FlexInputApp {
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
 
+        // Select / Start (claimed for a Remapper — `nav_claimed_buttons`):
+        // the picker on the focused card's input / output, or on the draft's
+        // from the action row.
+        if let Some(stage) = self.nav_remap_picker_press(outer_id, nav) {
+            let card = (!on_actions).then(|| cur - n_actions);
+            self.nav_open_remap_picker(outer_id, inner, card, stage);
+            ctx.request_repaint();
+            return;
+        }
+
         let new_cur = match step_dir {
             Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
             Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
@@ -928,15 +938,156 @@ impl FlexInputApp {
         });
     }
 
+    // ── Where a session's lists live ──────────────────────────────────────
+    // A Choose session fills drafts on its node — or, editing an existing
+    // card, that card's own fields. The keys have the same shape either way
+    // (`in` / `out` with `out_gap` / `out_dur` beside it, as a draft keeps
+    // `<draft>_gap` / `<draft>_dur`), so only the container differs.
+
+    /// What the open session keeps under `key`: a param of its node, or a
+    /// field of the card it is editing.
+    pub(crate) fn picker_slot_get(&self, key: &str) -> Option<serde_json::Value> {
+        let inner = self.gamepad_nav.kbm_picker_node?;
+        let node = self.picker_node(&self.gamepad_nav.kbm_picker_path, inner)?;
+        match &self.gamepad_nav.kbm_picker_card {
+            Some((cards_key, idx)) => node.params.get(cards_key)?.as_array()?.get(*idx)?.get(key).cloned(),
+            None => node.params.get(key).cloned(),
+        }
+    }
+
+    /// The pins of the session's list `key` (none for an empty key — a card
+    /// with no output to choose).
+    pub(crate) fn picker_slot_pins(&self, key: &str) -> Vec<String> {
+        if key.is_empty() {
+            return Vec::new();
+        }
+        self.picker_slot_get(key)
+            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()))
+            .unwrap_or_default()
+    }
+
+    /// Set (`Some`) or remove (`None`) values where the session keeps them,
+    /// on every live copy of its node.
+    pub(crate) fn picker_slot_set(&mut self, entries: Vec<(String, Option<serde_json::Value>)>) {
+        fn apply<M: FnMut(&str, Option<&serde_json::Value>)>(entries: &[(String, Option<serde_json::Value>)], mut put: M) {
+            for (k, v) in entries {
+                put(k, v.as_ref());
+            }
+        }
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return };
+        let path = self.gamepad_nav.kbm_picker_path.clone();
+        match self.gamepad_nav.kbm_picker_card.clone() {
+            Some((cards_key, idx)) => {
+                self.picker_write(&path, inner, &move |node| {
+                    let Some(serde_json::Value::Array(cards)) = node.params.get_mut(&cards_key) else { return };
+                    let Some(serde_json::Value::Object(card)) = cards.get_mut(idx) else { return };
+                    apply(&entries, |k, v| match v {
+                        Some(v) => { card.insert(k.to_string(), v.clone()); }
+                        None => { card.remove(k); }
+                    });
+                });
+                self.picker_card_remember();
+            }
+            None => self.picker_write(&path, inner, &move |node| {
+                apply(&entries, |k, v| match v {
+                    Some(v) => { node.params.insert(k.to_string(), v.clone()); }
+                    None => { node.params.remove(k); }
+                });
+            }),
+        }
+    }
+
+    /// Note the edited card's `in` / `out` as the session leaves them.
+    fn picker_card_remember(&mut self) {
+        self.gamepad_nav.kbm_picker_card_seen =
+            Some((self.picker_slot_get("in"), self.picker_slot_get("out")));
+    }
+
+    /// End a card-edit session whose card changed under it — deleted, dragged
+    /// elsewhere, replaced by a preset, undone — before it edits whichever
+    /// card now sits at its index. Whatever changed the card owns that
+    /// change's undo, so the session's baseline is dropped, not committed (an
+    /// undo committed over would also wipe the redo stack). Called once a frame.
+    pub(crate) fn keep_picker_card_edit_on_its_card(&mut self) {
+        if !self.gamepad_nav.kbm_picker_open || self.gamepad_nav.kbm_picker_card.is_none() {
+            return;
+        }
+        let now = (self.picker_slot_get("in"), self.picker_slot_get("out"));
+        if self.gamepad_nav.kbm_picker_card_seen.as_ref() != Some(&now) {
+            self.gamepad_nav.kbm_picker_card = None;
+            self.gamepad_nav.kbm_picker_undo = None;
+            self.close_kbm_picker();
+        }
+    }
+
+    /// The card the open session is editing, published for its body to mark
+    /// the row being changed. Called once a frame.
+    pub(crate) fn publish_picker_card_edit(&self, ctx: &egui::Context) {
+        let edit = match (&self.gamepad_nav.kbm_picker_card, self.gamepad_nav.kbm_picker_node) {
+            (Some((cards_key, card)), Some(inner)) if self.gamepad_nav.kbm_picker_open => {
+                Some(crate::canvas::viewer::PickerCardEdit {
+                    path: self.gamepad_nav.kbm_picker_path.clone(),
+                    inner: inner.0,
+                    cards_key: cards_key.clone(),
+                    card: *card,
+                    stage: self.gamepad_nav.kbm_picker_stage,
+                })
+            }
+            _ => None,
+        };
+        crate::canvas::viewer::set_picker_card_edit(ctx, edit);
+    }
+
+    /// End a card-edit session, if one is running: tidy the card the way Add
+    /// leaves a new one (see `tidy_edited_card`), and commit the whole session
+    /// as one undo entry. Called wherever the picker closes or another session
+    /// replaces it.
+    pub(crate) fn finish_picker_card_edit(&mut self) {
+        let undo = self.gamepad_nav.kbm_picker_undo.take();
+        self.gamepad_nav.kbm_picker_card_seen = None;
+        let Some((cards_key, idx)) = self.gamepad_nav.kbm_picker_card.take() else { return };
+        if let Some(inner) = self.gamepad_nav.kbm_picker_node {
+            let path = self.gamepad_nav.kbm_picker_path.clone();
+            self.picker_write(&path, inner, &move |node| {
+                let Some(serde_json::Value::Array(cards)) = node.params.get_mut(&cards_key) else { return };
+                if let Some(serde_json::Value::Object(card)) = cards.get_mut(idx) {
+                    crate::canvas::viewer::tidy_edited_card(card);
+                }
+            });
+        }
+        // Only onto the tab it was taken from: a baseline from another tab
+        // would swap that tab's whole patch in on undo.
+        if let Some((tab, base)) = undo {
+            if tab == self.active_tab {
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(*base);
+            }
+        }
+    }
+
     /// Open the shared Choose picker. `viewport` is the egui viewport the
     /// click came from (`None` = the main window) — the modal is drawn inside
     /// THAT viewport so it appears on the window the user is actually working in.
     ///
     /// A one-shot Learn the card had armed is dropped: choosing replaces it, and
     /// an armed capture holds gamepad nav, which the picker needs.
+    ///
+    /// A request naming a `card` edits that existing card in place; the whole
+    /// session is one undo step (or part of the entered card's, when it was
+    /// opened from inside one).
     pub(crate) fn open_special_picker(&mut self, req: crate::canvas::viewer::SpecialPickerRequest,
         viewport: Option<egui::ViewportId>)
     {
+        // A card edit still open (another row clicked while the picker is up)
+        // ends here, tidied and committed, before this session replaces it.
+        self.finish_picker_card_edit();
+        if req.card.is_some() {
+            let covered = self.gamepad_nav.edit_level == crate::gamepad_nav::EditLevel::RemapCard
+                && self.gamepad_nav.edit_baseline.is_some();
+            self.gamepad_nav.kbm_picker_undo = (!covered).then(|| {
+                (self.active_tab, Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()))
+            });
+        }
+        self.gamepad_nav.kbm_picker_card = req.card;
         if req.input_key.is_some() {
             self.picker_write(&req.path, req.inner, &|node| {
                 node.params.insert("_nav_capture_armed".into(), serde_json::Value::Bool(false));
@@ -963,6 +1114,9 @@ impl FlexInputApp {
         self.gamepad_nav.kbm_picker_inputs = req.inputs;
         self.gamepad_nav.kbm_picker_viewport = viewport;
         self.picker_select_tab(self.gamepad_nav.kbm_picker_tab);
+        if self.gamepad_nav.kbm_picker_card.is_some() {
+            self.picker_card_remember();
+        }
     }
 
     /// The open session's tabs, in order. Typing text only ever wants keys;
@@ -1054,24 +1208,34 @@ impl FlexInputApp {
     /// The chord the picker is filling, with its timing.
     pub(crate) fn picker_chord(&self) -> crate::kbm_picker::TimedChord {
         let key = self.picker_active_key();
-        let path = &self.gamepad_nav.kbm_picker_path;
-        let Some(node) = self.gamepad_nav.kbm_picker_node.and_then(|i| self.picker_node(path, i)) else {
-            return Default::default();
-        };
-        let pins = node.params.get(&key).and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
         let (gk, dk) = crate::kbm_picker::timing_keys(&key);
-        crate::kbm_picker::TimedChord::from_params(pins, node.params.get(&gk), node.params.get(&dk))
+        crate::kbm_picker::TimedChord::from_params(
+            self.picker_slot_pins(&key),
+            self.picker_slot_get(&gk).as_ref(),
+            self.picker_slot_get(&dk).as_ref(),
+        )
     }
 
     /// Write the chord the picker is filling back, timing and all (on every
     /// live copy of the node). An input emptied puts a Remapper or Map Action
     /// back to capturing, so a card can't be added with no input.
+    ///
+    /// Editing an existing card writes the card's own list instead, keeps its
+    /// timing only while there is some (as Add stores it) and moves no phase.
     pub(crate) fn picker_set_chord(&mut self, chord: &crate::kbm_picker::TimedChord) {
         let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
         let key = self.picker_active_key();
+        if self.gamepad_nav.kbm_picker_card.is_some() {
+            let (gk, dk) = crate::kbm_picker::timing_keys(&key);
+            let timed = chord.is_timed();
+            self.picker_slot_set(vec![
+                (key, Some(serde_json::json!(chord.pins))),
+                (gk, timed.then(|| chord.gaps_json())),
+                (dk, timed.then(|| chord.durs_json())),
+            ]);
+            return;
+        }
         self.picker_set_draft(&path, inner, &key, &chord.pins);
         let (gk, dk) = crate::kbm_picker::timing_keys(&key);
         let (gaps, durs) = (chord.gaps_json(), chord.durs_json());
@@ -1117,7 +1281,8 @@ impl FlexInputApp {
 
     /// Whether the picker's current target accepts analog-only outputs (swipe).
     /// Lean sections are always analog (the lean gesture is the input); Remapper
-    /// is analog only when its captured `draft_input` holds an analog source.
+    /// is analog only when its captured `draft_input` — or, editing a card,
+    /// that card's `in` — holds an analog source.
     pub(crate) fn picker_analog_input_ok(&self) -> bool {
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false; };
         if self.gamepad_nav.kbm_picker_touch_zones {
@@ -1132,7 +1297,8 @@ impl FlexInputApp {
         if self.gamepad_nav.kbm_picker_phase_key.is_some() {
             return true; // Lean: the gesture itself is analog.
         }
-        self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path.clone(), inner, "draft_input").iter()
+        let in_key = if self.gamepad_nav.kbm_picker_card.is_some() { "in" } else { "draft_input" };
+        self.picker_slot_pins(in_key).iter()
             .any(|p| flexinput_engine::pin_is_analog_input(p))
     }
 
@@ -1144,8 +1310,18 @@ impl FlexInputApp {
         if !crate::kbm_picker::stage_allows(stage, pin) { return; }
         let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
+        // Editing an existing card: the pick joins that card's own list, the
+        // same way it joins a draft — an input once, an output again only after
+        // a gap — and nothing about the node's capture phase moves.
+        let editing_card = self.gamepad_nav.kbm_picker_card.is_some();
         if stage == crate::kbm_picker::PickStage::Input {
-            if let Some(key) = self.gamepad_nav.kbm_picker_in_key.clone() {
+            if editing_card {
+                let mut ins = self.picker_slot_pins("in");
+                if !ins.iter().any(|p| p == pin) {
+                    ins.push(pin.to_string());
+                    self.picker_slot_set(vec![("in".to_string(), Some(serde_json::json!(ins)))]);
+                }
+            } else if let Some(key) = self.gamepad_nav.kbm_picker_in_key.clone() {
                 self.append_input_pin(&path, inner, &key, pin);
             }
             return;
@@ -1154,6 +1330,15 @@ impl FlexInputApp {
         let analog_only = matches!(pin,
             "touch_swipe_x" | "touch_swipe_y" | "scroll_x" | "scroll_y" | "left_stick" | "right_stick");
         if analog_only && !self.picker_analog_input_ok() { return; }
+        if editing_card {
+            let chord = self.picker_chord();
+            if chord.takes(pin) {
+                let mut out = chord.pins;
+                out.push(pin.to_string());
+                self.picker_slot_set(vec![("out".to_string(), Some(serde_json::json!(out)))]);
+            }
+            return;
+        }
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
         let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
         self.append_output_pin(&path, inner, &draft_key, phase_key.as_deref(), pin);
@@ -1311,6 +1496,71 @@ impl FlexInputApp {
             .map(|a| a.len()).unwrap_or(0)
     }
 
+    /// The side Select (input) or Start (output) asks the picker for this
+    /// frame, in a Remapper being edited — the buttons it claims from the
+    /// app-wide shortcuts (`nav_claimed_buttons`).
+    pub(crate) fn nav_remap_picker_press(
+        &self,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+    ) -> Option<crate::kbm_picker::PickStage> {
+        use crate::kbm_picker::PickStage;
+        if !self.nav_selected_is_remapper(outer_id) {
+            return None;
+        }
+        if nav.is_rising("btn_back") {
+            Some(PickStage::Input)
+        } else if nav.is_rising("btn_start") {
+            Some(PickStage::Output)
+        } else {
+            None
+        }
+    }
+
+    /// Open the Choose picker from the pad on a Remapper: on card `card`'s own
+    /// input or output (editing it in place), or on the draft's when `None`.
+    /// Over the game while the config overlay owns nav.
+    pub(crate) fn nav_open_remap_picker(
+        &mut self,
+        outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId,
+        card: Option<usize>,
+        stage: crate::kbm_picker::PickStage,
+    ) {
+        use crate::canvas::viewer::SpecialPickerRequest;
+        let path = nav_path(outer_id);
+        let req = match card {
+            Some(i) => SpecialPickerRequest::remapper_card(inner, path, i, stage),
+            None => SpecialPickerRequest {
+                stage,
+                ..SpecialPickerRequest::remapper(inner, path, &self.nav_remap_phase(outer_id, inner))
+            },
+        };
+        let viewport = self.gamepad_nav.config_nav_sel.is_some()
+            .then(crate::config_overlay::picker_viewport_id);
+        self.open_special_picker(req, viewport);
+    }
+
+    /// What Select and Start do in the selected Remapper right now, for the
+    /// legend: edit the focused card's input / output, or choose the draft's.
+    /// `None` when they don't belong to it (not a Remapper).
+    pub(crate) fn nav_remap_picker_hints(&self) -> Option<(&'static str, &'static str)> {
+        use crate::gamepad_nav::EditLevel;
+        let outer = self.nav_driving_outer_id()?;
+        if !self.nav_selected_is_remapper(outer) {
+            return None;
+        }
+        let inner = self.nav_selected_inner_node(outer)?;
+        let on_card = match self.gamepad_nav.edit_level {
+            EditLevel::RemapCard => true,
+            EditLevel::RemapScroll => {
+                self.gamepad_nav.card_index >= self.nav_remap_action_items(outer, inner).len()
+            }
+            _ => return None,
+        };
+        Some(if on_card { ("Edit input", "Edit output") } else { ("Choose input", "Choose output") })
+    }
+
     /// Publish the RemapScroll selection (action vs card) so the body glows the
     /// focused item. Action items glow their button rect (published by the body);
     /// cards glow via the existing card-rect publish.
@@ -1401,6 +1651,13 @@ impl FlexInputApp {
             self.gamepad_nav.remap_card = count - 1;
         }
         let idx = self.gamepad_nav.remap_card;
+        // Select / Start: the picker on this card's input / output (Remapper).
+        // Back from it, the card is still entered, the field where it was.
+        if let Some(stage) = self.nav_remap_picker_press(outer_id, nav) {
+            self.nav_open_remap_picker(outer_id, inner, Some(idx), stage);
+            ctx.request_repaint();
+            return;
+        }
         // North resets the entered card's press mode + params to default.
         if nav.is_rising("btn_north") {
             self.nav_remap_reset_card(outer_id, idx);
