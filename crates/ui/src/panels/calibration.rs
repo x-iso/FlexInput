@@ -17,6 +17,7 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke};
 use egui_snarl::NodeId;
+use flexinput_core::automap;
 use flexinput_core::Signal;
 use flexinput_devices::click_gate::{self, ClickGateConfig, ClickGateSettings, ClickPlot, ClickScope, JoltAnalyzer, PlotPoint};
 use flexinput_devices::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
@@ -678,9 +679,12 @@ const CAL_FILE_KEYS: &[&str] = &[
     "ltrig_digital_threshold", "rtrig_digital_threshold",
     "ltrig_effect_mode", "ltrig_effect_values", "rtrig_effect_mode", "rtrig_effect_values",
     "trig_click_on", "ltrig_click_gain_db", "rtrig_click_gain_db",
+    "ltrig_click_hz", "rtrig_click_hz", "ltrig_click_ms", "rtrig_click_ms",
+    "ltrig_click_soft", "rtrig_click_soft",
     "ltrig_click_offset", "rtrig_click_offset",
     "grip_touch", "grip_release",
     "pad_click_on", "pad_click_release", "pad_click_strong", "pad_click_gain_db",
+    "pad_click_tone", "pad_click_hz", "pad_click_ms", "pad_click_soft",
 ];
 /// The format's marker, and its version.
 const CAL_FILE_MARKER: &str = "flexinput_calibration";
@@ -1258,9 +1262,10 @@ fn grip_touch_section(
     if !section_header(ui, node_id, "Grip and Touch", false, false) {
         return;
     }
-    grip_sensors_group(ui, canvas, node_id, dev_id, live);
-    ui.add_space(10.0);
-    pad_click_group(ui, canvas, node_id, dev_id, live);
+    ui.columns(2, |cols| {
+        grip_sensors_group(&mut cols[0], canvas, node_id, dev_id, live);
+        pad_click_group(&mut cols[1], canvas, node_id, dev_id, live);
+    });
 }
 
 fn pad_click_group(
@@ -1276,34 +1281,93 @@ fn pad_click_group(
     let mut on = flag(canvas, "pad_click_on");
     let mut release = flag(canvas, "pad_click_release");
     let mut strong = flag(canvas, "pad_click_strong");
+    let mut tone = flag(canvas, "pad_click_tone");
     let mut gain = read_param_f32(canvas, node_id, "pad_click_gain_db", 0.0);
+    let mut hz = read_param_f32(canvas, node_id, "pad_click_hz", automap::PAD_CLICK_HZ);
+    let mut ms = read_param_f32(canvas, node_id, "pad_click_ms", automap::PAD_CLICK_MS);
+    let mut soft = read_param_f32(canvas, node_id, "pad_click_soft", 0.0);
     ui.label(egui::RichText::new("Trackpads").size(INSTRUCT_SIZE).strong());
     let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         changed |= ui.checkbox(&mut on, egui::RichText::new("Click feedback").size(INSTRUCT_SIZE))
             .on_hover_text("FlexInput plays a click on the trackpad as you press it. With Steam \
                 running and using the pad, Steam may play its own as well.")
             .changed();
-        if on {
-            changed |= ui.checkbox(&mut release, egui::RichText::new("On release too").size(INSTRUCT_SIZE)).changed();
-            changed |= ui.checkbox(&mut strong, egui::RichText::new("Strong").size(INSTRUCT_SIZE)).changed();
-            changed |= ui.add(egui::Slider::new(&mut gain, -18.0..=12.0)
-                .step_by(1.0).suffix(" dB").text("Strength")).changed();
-        }
         for (name, pin) in [("L", "btn_touchpad"), ("R", "btn_misc2")] {
             let held = read_float(live, dev_id, pin) > 0.5;
             ui.label(egui::RichText::new(name).size(INSTRUCT_SIZE).strong()
                 .color(if held { ORANGE } else { Color32::from_gray(80) }));
         }
     });
+    if on {
+        changed |= ui.checkbox(&mut release, egui::RichText::new("On release too").size(INSTRUCT_SIZE)).changed();
+        let shown = if tone { "Tone" } else if strong { "Strong click" } else { "Light click" };
+        egui::ComboBox::from_id_salt((node_id, "pad_click_style"))
+            .selected_text(egui::RichText::new(shown).size(INSTRUCT_SIZE))
+            .show_ui(ui, |ui| {
+                for (name, s, t) in [("Light click", false, false), ("Strong click", true, false), ("Tone", false, true)] {
+                    if ui.selectable_label(tone == t && (t || strong == s), name).clicked() {
+                        (strong, tone) = (s, t);
+                        changed = true;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Light and Strong are the pad's own built-in clicks. Tone plays the \
+                pitch, length and softness you set.");
+        ui.spacing_mut().slider_width = column_slider_width(ui);
+        changed |= ui.add(egui::Slider::new(&mut gain, -18.0..=12.0)
+            .step_by(1.0).suffix(" dB").text("Strength")).changed();
+        if tone {
+            changed |= click_tone_slider(ui, &mut hz, "Pitch");
+            changed |= click_length_slider(ui, &mut ms, "Length");
+            changed |= click_soft_slider(ui, &mut soft);
+        }
+    }
     if changed {
         if let Some(n) = canvas.snarl.get_node_mut(node_id) {
             n.params.insert("pad_click_on".into(), Value::Bool(on));
             n.params.insert("pad_click_release".into(), Value::Bool(release));
             n.params.insert("pad_click_strong".into(), Value::Bool(strong));
             n.params.insert("pad_click_gain_db".into(), serde_json::json!(gain));
+            n.params.insert("pad_click_tone".into(), Value::Bool(tone));
+            n.params.insert("pad_click_hz".into(), serde_json::json!(hz));
+            n.params.insert("pad_click_ms".into(), serde_json::json!(ms));
+            n.params.insert("pad_click_soft".into(), serde_json::json!(soft));
         }
     }
+}
+
+/// A slider's track in a Grip and Touch column, leaving room for its number and name.
+fn column_slider_width(ui: &egui::Ui) -> f32 {
+    (ui.available_width() - 150.0).max(60.0)
+}
+
+/// A click's pitch. True when it changed.
+pub(crate) fn click_tone_slider(ui: &mut egui::Ui, hz: &mut f32, name: &str) -> bool {
+    ui.add(egui::Slider::new(hz, 60.0..=600.0).logarithmic(true).step_by(1.0).suffix(" Hz").text(name))
+        .on_hover_text("The click's pitch. Lower feels like a thud, higher like a tick.")
+        .changed()
+}
+
+/// A click's length. True when it changed.
+pub(crate) fn click_length_slider(ui: &mut egui::Ui, ms: &mut f32, name: &str) -> bool {
+    ui.add(egui::Slider::new(ms, 4.0..=80.0).logarithmic(true).step_by(1.0).suffix(" ms").text(name))
+        .on_hover_text("The click's length: short feels crisp, long feels more like a pulse.")
+        .changed()
+}
+
+/// How much of a click fades in and out. True when it changed.
+pub(crate) fn click_soft_slider(ui: &mut egui::Ui, soft: &mut f32) -> bool {
+    let mut pct = *soft * 100.0;
+    let changed = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).step_by(5.0).suffix("% soft"))
+        .on_hover_text("Sharp to soft. At 0 the click starts and stops dead; higher, more of it \
+            fades in and out, until at 100% it swells and dies away.")
+        .changed();
+    if changed {
+        *soft = pct / 100.0;
+    }
+    changed
 }
 
 fn grip_sensors_group(
@@ -1321,6 +1385,7 @@ fn grip_sensors_group(
     instruct_line(ui, &[(false,
         "How far from each grip your fingers are detected. One setting covers both grips.")]);
     ui.add_space(6.0);
+    ui.spacing_mut().slider_width = column_slider_width(ui);
     let range_changed = ui.add(egui::Slider::new(&mut range, 25.0..=400.0).step_by(5.0).text("Sensor range"))
         .on_hover_text("Further reaches further from the grip.").changed();
     let hysteresis_changed = ui.add(egui::Slider::new(&mut hysteresis, 25.0..=100.0).step_by(1.0).text("Hysteresis"))
@@ -2396,7 +2461,6 @@ fn click_window_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_click_jolt", 
 
 /// A button's name on this pad: "ZR", not "RT (dig)", on the pads that print it.
 fn click_button_name(dev_id: &str, pin: &str) -> String {
-    use flexinput_core::automap;
     let slug = crate::canvas::remapper_icons::phys_pad_slug(dev_id)
         .map(|s| if s.starts_with("joycon2") { "switch_pro" } else { s });
     automap::family_label(pin, slug)
@@ -4046,6 +4110,12 @@ fn triggers_section(
     let rt_click = read_param_f32(canvas, node_id, "rtrig_click_offset", 0.0);
     let lt_gain = read_param_f32(canvas, node_id, "ltrig_click_gain_db", 0.0);
     let rt_gain = read_param_f32(canvas, node_id, "rtrig_click_gain_db", 0.0);
+    let lt_hz = read_param_f32(canvas, node_id, "ltrig_click_hz", automap::TRIGGER_CLICK_HZ);
+    let rt_hz = read_param_f32(canvas, node_id, "rtrig_click_hz", automap::TRIGGER_CLICK_HZ);
+    let lt_ms = read_param_f32(canvas, node_id, "ltrig_click_ms", automap::TRIGGER_CLICK_MS);
+    let rt_ms = read_param_f32(canvas, node_id, "rtrig_click_ms", automap::TRIGGER_CLICK_MS);
+    let lt_soft = read_param_f32(canvas, node_id, "ltrig_click_soft", 0.0);
+    let rt_soft = read_param_f32(canvas, node_id, "rtrig_click_soft", 0.0);
 
     // Step session: track min/max + tally top/bottom 1% for jitter-aware bounds.
     let sampling = ui.ctx().data_mut(|d| {
@@ -4188,10 +4258,10 @@ fn triggers_section(
             let wide = fx_l.is_some() || fx_r.is_some() || has_click;
             let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
             ui.add_space(pad);
-            let click = |offset: f32, gain_db: f32| has_click.then_some(TriggerClickEdit { on: click_on, offset, gain_db });
-            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, click(lt_click, lt_gain), lt_min, lt_max, lo, wide, fx_l.as_mut());
+            let click = |offset: f32, gain_db: f32, hz: f32, ms: f32, soft: f32| has_click.then_some(TriggerClickEdit { on: click_on, offset, gain_db, hz, ms, soft });
+            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, click(lt_click, lt_gain, lt_hz, lt_ms, lt_soft), lt_min, lt_max, lo, wide, fx_l.as_mut());
             ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, click(rt_click, rt_gain), rt_min, rt_max, lo, wide, fx_r.as_mut());
+            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, click(rt_click, rt_gain, rt_hz, rt_ms, rt_soft), rt_min, rt_max, lo, wide, fx_r.as_mut());
             if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
             if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
@@ -4204,8 +4274,24 @@ fn triggers_section(
                 if let Some(v) = new_r.click_gain { n.params.insert("rtrig_click_gain_db".into(), serde_json::json!(v)); }
                 if new_l.reset_threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
                 if new_r.reset_threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
-                if new_l.reset_click { n.params.insert("ltrig_click_offset".into(), serde_json::json!(0.0_f32)); }
-                if new_r.reset_click { n.params.insert("rtrig_click_offset".into(), serde_json::json!(0.0_f32)); }
+                if let Some(v) = new_l.click_hz { n.params.insert("ltrig_click_hz".into(), serde_json::json!(v)); }
+                if let Some(v) = new_r.click_hz { n.params.insert("rtrig_click_hz".into(), serde_json::json!(v)); }
+                if let Some(v) = new_l.click_ms { n.params.insert("ltrig_click_ms".into(), serde_json::json!(v)); }
+                if let Some(v) = new_r.click_ms { n.params.insert("rtrig_click_ms".into(), serde_json::json!(v)); }
+                if let Some(v) = new_l.click_soft { n.params.insert("ltrig_click_soft".into(), serde_json::json!(v)); }
+                if let Some(v) = new_r.click_soft { n.params.insert("rtrig_click_soft".into(), serde_json::json!(v)); }
+                if new_l.reset_click {
+                    n.params.insert("ltrig_click_offset".into(), serde_json::json!(0.0_f32));
+                    n.params.insert("ltrig_click_hz".into(), serde_json::json!(automap::TRIGGER_CLICK_HZ));
+                    n.params.insert("ltrig_click_ms".into(), serde_json::json!(automap::TRIGGER_CLICK_MS));
+                    n.params.insert("ltrig_click_soft".into(), serde_json::json!(0.0_f32));
+                }
+                if new_r.reset_click {
+                    n.params.insert("rtrig_click_offset".into(), serde_json::json!(0.0_f32));
+                    n.params.insert("rtrig_click_hz".into(), serde_json::json!(automap::TRIGGER_CLICK_HZ));
+                    n.params.insert("rtrig_click_ms".into(), serde_json::json!(automap::TRIGGER_CLICK_MS));
+                    n.params.insert("rtrig_click_soft".into(), serde_json::json!(0.0_f32));
+                }
                 if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
                 if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
@@ -4250,6 +4336,9 @@ struct TriggerWidgetEdit {
     /// Where the trigger click pin was dragged to, on the same scale as `threshold`.
     click: Option<f32>,
     click_gain: Option<f32>,
+    click_hz: Option<f32>,
+    click_ms: Option<f32>,
+    click_soft: Option<f32>,
     reset_threshold: bool,
     reset_click: bool,
     range_min: Option<f32>,
@@ -4265,6 +4354,9 @@ struct TriggerClickEdit {
     /// From the digital threshold, on the same scale.
     offset: f32,
     gain_db: f32,
+    hz: f32,
+    ms: f32,
+    soft: f32,
 }
 
 const DIGITAL_LABEL_COLOR: Color32 = Color32::from_rgb(240, 220, 60);
@@ -4303,13 +4395,24 @@ fn trigger_click_controls(
     out.reset_click = reset(ui);
     let mut gain = click.gain_db;
     // What's left of the row once the slider's own number has its room.
-    ui.spacing_mut().slider_width = (rect.width() - 52.0).max(32.0);
+    ui.spacing_mut().slider_width = (rect.width() - 66.0).max(32.0);
     let resp = ui.push_id(("trig_click_gain", label), |ui| {
         ui.add(egui::Slider::new(&mut gain, -18.0..=12.0).step_by(1.0).suffix(" dB"))
             .on_hover_text("How hard this trigger clicks.")
     }).inner;
     if resp.changed() {
         out.click_gain = Some(gain);
+    }
+    let (mut hz, mut ms) = (click.hz, click.ms);
+    if ui.push_id(("trig_click_hz", label), |ui| click_tone_slider(ui, &mut hz, "")).inner {
+        out.click_hz = Some(hz);
+    }
+    if ui.push_id(("trig_click_ms", label), |ui| click_length_slider(ui, &mut ms, "")).inner {
+        out.click_ms = Some(ms);
+    }
+    let mut soft = click.soft;
+    if ui.push_id(("trig_click_soft", label), |ui| click_soft_slider(ui, &mut soft)).inner {
+        out.click_soft = Some(soft);
     }
 }
 
@@ -4546,7 +4649,8 @@ fn trigger_widget(
     let r_out = arc_h * 0.5 - 10.0;
     let r_in  = r_out * 0.74;
     let right_margin = arc_h * 0.06 + 10.0;
-    let fx_h = fx_controls_h(ui);
+    // The click's controls run a little taller than an effect's.
+    let fx_h = fx_controls_h(ui) + if click.is_some() { FX_ROW_H + FX_ROW_GAP } else { 0.0 };
 
     // Width of the effect controls on the arc's left; `None` = square box.
     let side_w = wide.then(|| (lo.cell_w - arc_block(arc_h) - 8.0).max(0.0));

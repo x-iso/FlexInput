@@ -256,6 +256,24 @@ pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static s
 pub const PAD_CLICK_ON: u8 = 1;
 pub const PAD_CLICK_ON_RELEASE: u8 = 2;
 pub const PAD_CLICK_STRONG: u8 = 4;
+/// Play a tone of the set pitch and length, rather than the firmware's click.
+pub const PAD_CLICK_TONE: u8 = 8;
+
+// What a click plays until set otherwise: its pitch in Hz and its length in ms.
+// Shorter feels sharper, longer softer.
+pub const TRIGGER_CLICK_HZ: f32 = 170.0;
+pub const TRIGGER_CLICK_MS: f32 = 20.0;
+pub const PAD_CLICK_HZ: f32 = 200.0;
+pub const PAD_CLICK_MS: f32 = 12.0;
+
+/// A one-shot click pin, and the private pins that shape its next click: pitch in
+/// Hz, length in ms, softness 0..1. With none set, it plays the pad's plain click.
+pub const CLICK_TONE_PINS: [(&str, [&str; 3]); 4] = [
+    ("tp_l_click", ["tp_l_click_hz", "tp_l_click_ms", "tp_l_click_soft"]),
+    ("tp_r_click", ["tp_r_click_hz", "tp_r_click_ms", "tp_r_click_soft"]),
+    ("grip_l_click", ["grip_l_click_hz", "grip_l_click_ms", "grip_l_click_soft"]),
+    ("grip_r_click", ["grip_r_click_hz", "grip_r_click_ms", "grip_r_click_soft"]),
+];
 
 /// Read a device's capacitive mask back from a signal map (0 if not published).
 pub fn capacitive_mask_of<S: std::hash::BuildHasher>(

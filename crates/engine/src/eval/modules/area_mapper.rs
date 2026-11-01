@@ -76,8 +76,8 @@ pub const AREA_LAYER_KEYS: &[&str] = &[
     AREA_LAYER_RAMP_PARAM, AREA_LAYER_FULL_PARAM, AREA_LAYER_MID_PARAM,
     AREA_CELL_HAPTICS_PARAM,
 ];
-/// The loaded layer's cells that give a haptic as their border is crossed,
-/// `{ "<cell id>": strength 0..1 }`.
+/// The loaded layer's cells that give a haptic as their border is crossed, as
+/// `{ "<cell id>": CellHaptic }`.
 pub const AREA_CELL_HAPTICS_PARAM: &str = "area_cell_haptics";
 /// One press mode for every card (`area_press_*` then rule them all).
 pub const AREA_PRESS_LOCK_PARAM: &str = "area_press_lock";
@@ -107,6 +107,44 @@ pub const AREA_TRIG_LEAVE: &str = "area_leave";
 /// alike against the same sink sensitivity.
 const AREA_MOUSE_BASE: f32 = 0.03;
 
+/// A cell's click: how strong, 0..1, and optionally its own shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellHaptic {
+    pub strength: f32,
+    pub tone: Option<CellTone>,
+}
+
+/// What a cell's click plays: pitch in Hz, length in ms, softness 0..1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellTone {
+    pub hz: f32,
+    pub ms: f32,
+    pub soft: f32,
+}
+
+impl CellHaptic {
+    /// 0.16.6 stored a plain strength, which still reads as a click with no tone.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        if let Some(strength) = v.as_f64() {
+            return Some(Self { strength: strength as f32, tone: None });
+        }
+        let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
+        let tone = num("hz").map(|hz| CellTone {
+            hz,
+            ms: num("ms").unwrap_or(automap::PAD_CLICK_MS),
+            soft: num("soft").unwrap_or(0.0),
+        });
+        Some(Self { strength: num("s")?, tone })
+    }
+
+    pub fn to_value(self) -> Value {
+        match self.tone {
+            Some(t) => serde_json::json!({ "s": self.strength, "hz": t.hz, "ms": t.ms, "soft": t.soft }),
+            None => serde_json::json!({ "s": self.strength }),
+        }
+    }
+}
+
 /// The XY pairs an Area Mapper can read, in the header's order.
 pub const AREA_INPUTS: &[&str] = &["left_stick", "right_stick", "touch1", "touch2"];
 
@@ -120,8 +158,8 @@ pub fn area_layout_of(params: &HashMap<String, Value>) -> AreaLayout {
 pub struct AreaLayerSpec {
     pub layout: AreaLayout,
     pub touch_cells: HashSet<u32>,
-    /// Cell id → its border-cross haptic's strength.
-    pub haptics: HashMap<u32, f32>,
+    /// Cell id → its border-cross haptic.
+    pub haptics: HashMap<u32, CellHaptic>,
     pub analog: bool,
     pub analog_ms: f32,
     /// Mix by direction (else per key).
@@ -143,7 +181,7 @@ impl AreaLayerSpec {
                 .unwrap_or_default(),
             haptics: get(AREA_CELL_HAPTICS_PARAM).and_then(|v| v.as_object().cloned())
                 .map(|m| m.iter().filter_map(|(k, v)| {
-                    Some((k.parse().ok()?, v.as_f64()? as f32))
+                    Some((k.parse().ok()?, CellHaptic::from_value(v)?))
                 }).collect())
                 .unwrap_or_default(),
             analog: get(AREA_LAYER_ANALOG_PARAM).and_then(|v| v.as_bool()).unwrap_or(false),
@@ -615,11 +653,12 @@ pub(crate) fn eval_area_mapper_node(
     }
 
     // ── Border-cross haptics. State after the layers': each layer's crossing,
-    // then the pulse going out `[time left, strength, pad]`. A crossing takes the
-    // strength of the cell it enters, else of the one it leaves. The pad is fixed
-    // as it starts: it stops being "the one touched" if the finger lifts mid-pulse.
+    // then the pulse going out `[time left, strength, pad, hz, ms, soft]`. A crossing
+    // takes the haptic of the cell it enters, else of the one it leaves. The pad is
+    // fixed as it starts: it stops being "the one touched" if the finger lifts
+    // mid-pulse. No pitch = no tone of its own.
     {
-        let need = base + layers.len() * HAPTIC_LAYER_SLOTS + 3;
+        let need = base + layers.len() * HAPTIC_LAYER_SLOTS + 6;
         let pads: Vec<&str> = snap.params.get("_upstream_device_ids")
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect())
@@ -630,10 +669,12 @@ pub(crate) fn eval_area_mapper_node(
         let (crossings, pulse) = ns.aux_f32[base..need].split_at_mut(layers.len() * HAPTIC_LAYER_SLOTS);
         for ((spec, lay), st) in layers.iter().zip(&live).zip(crossings.chunks_mut(HAPTIC_LAYER_SLOTS)) {
             if let Some((from, to)) = area_border_crossed(lay.hard, st, dt) {
-                if let Some(s) = spec.haptics.get(&to).or_else(|| spec.haptics.get(&from)) {
+                if let Some(h) = spec.haptics.get(&to).or_else(|| spec.haptics.get(&from)) {
                     pulse[0] = HAPTIC_PULSE_SECS;
-                    pulse[1] = s.clamp(0.0, 1.0);
+                    pulse[1] = h.strength.clamp(0.0, 1.0);
                     pulse[2] = area_haptic_pad(&pads, input, dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
+                    let t = h.tone.map_or([0.0; 3], |t| [t.hz, t.ms, t.soft]);
+                    pulse[3..6].copy_from_slice(&t);
                 }
             }
         }
@@ -644,7 +685,17 @@ pub(crate) fn eval_area_mapper_node(
             if !pad.is_empty() {
                 let target = format!("{FEEDBACK_INJECT}{pad}");
                 let sig = Signal::Float(pulse[1]);
-                collector_sigs.merge_pin(&target, area_haptic_pin(input), sig, |cur| *cur = combine_signals(*cur, sig));
+                let click = area_haptic_pin(input);
+                collector_sigs.merge_pin(&target, click, sig, |cur| *cur = combine_signals(*cur, sig));
+                if pulse[3] > 0.0 {
+                    let tones = automap::CLICK_TONE_PINS.iter().find(|(c, _)| *c == click);
+                    if let Some((_, pins)) = tones {
+                        let key = format!("{FEEDBACK_CLICK_TONE}{pad}");
+                        for (pin, v) in pins.iter().zip(&pulse[3..6]) {
+                            collector_sigs.set_pin(&key, pin, Signal::Float(*v));
+                        }
+                    }
+                }
             }
         }
     }

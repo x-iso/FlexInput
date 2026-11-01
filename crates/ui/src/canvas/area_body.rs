@@ -45,7 +45,7 @@ use flexinput_core::Signal;
 use flexinput_engine::eval::{
     area_layout_of, area_touch_pin, AREA_ANALOG_MS_DEFAULT, AREA_INPUTS, AREA_INPUT_PARAM,
     AREA_LAYERS_PARAM, AREA_LAYER_ANALOG_PARAM, AREA_LAYER_COLOR_PARAM, AREA_LAYER_KEYS,
-    AREA_CELL_HAPTICS_PARAM, AREA_LAYER_LOADED_PARAM, AREA_LAYER_MS_PARAM, AREA_LAYER_STRIDE,
+    AREA_CELL_HAPTICS_PARAM, CellHaptic, CellTone, AREA_LAYER_LOADED_PARAM, AREA_LAYER_MS_PARAM, AREA_LAYER_STRIDE,
     AREA_LAYOUT_PARAM,
     AREA_ANALOG_HOLD_DEFAULT, AREA_LAYER_HOLD_PARAM, AREA_LAYER_MIX_PARAM, AREA_LAYER_PULSE_PARAM,
     AREA_ANALOG_FULL_DEFAULT, AREA_LAYER_FULL_PARAM, AREA_LAYER_MID_PARAM, AREA_LAYER_RAMP_PARAM,
@@ -2781,18 +2781,18 @@ fn border_settings(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
 // ── Selected cell ─────────────────────────────────────────────────────────────
 
 /// The selected cell's icon + name override.
-/// A cell's border-cross haptic: its strength, or `None` for none.
-fn cell_haptic(node: &NodeData, cell: u32) -> Option<f32> {
-    node.params.get(AREA_CELL_HAPTICS_PARAM)?.get(cell.to_string())?.as_f64().map(|v| v as f32)
+/// A cell's border-cross haptic, or `None` for none.
+fn cell_haptic(node: &NodeData, cell: u32) -> Option<CellHaptic> {
+    CellHaptic::from_value(node.params.get(AREA_CELL_HAPTICS_PARAM)?.get(cell.to_string())?)
 }
 
 /// Set the haptic of `cells`, on the loaded layer.
-fn set_cell_haptics(node: &mut NodeData, cells: &[u32], haptic: Option<f32>) {
+fn set_cell_haptics(node: &mut NodeData, cells: &[u32], haptic: Option<CellHaptic>) {
     let entry = node.params.entry(AREA_CELL_HAPTICS_PARAM.to_string()).or_insert_with(|| json!({}));
     let Some(map) = entry.as_object_mut() else { return };
     for cell in cells {
         match haptic {
-            Some(s) => { map.insert(cell.to_string(), json!(s)); }
+            Some(h) => { map.insert(cell.to_string(), h.to_value()); }
             None => { map.remove(&cell.to_string()); }
         }
     }
@@ -2805,7 +2805,14 @@ fn cell_haptic_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
     let cell = selected_cell(node, &layout);
     let current = cell_haptic(node, cell);
     let mut on = current.is_some();
-    let mut pct = current.unwrap_or(1.0) * 100.0;
+    let mut pct = current.map_or(1.0, |h| h.strength) * 100.0;
+    let mut tone = current.and_then(|h| h.tone);
+    let mut tone_on = tone.is_some();
+    let (default_hz, default_ms) = if area_input(node).starts_with("touch") {
+        (flexinput_core::automap::PAD_CLICK_HZ, flexinput_core::automap::PAD_CLICK_MS)
+    } else {
+        (flexinput_core::automap::TRIGGER_CLICK_HZ, flexinput_core::automap::TRIGGER_CLICK_MS)
+    };
     let (mut changed, mut all) = (false, false);
     ui.horizontal(|ui| {
         changed |= ui.checkbox(&mut on, egui::RichText::new("Haptic").small())
@@ -2821,7 +2828,26 @@ fn cell_haptic_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
             .on_hover_text("Give every cell in this layer this cell's haptic setting.")
             .clicked();
     });
-    let haptic = on.then_some(pct / 100.0);
+    if on {
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui.checkbox(&mut tone_on, egui::RichText::new("Tone").small())
+                .on_hover_text("Give this cell's click its own pitch, length and softness. Off, it \
+                    plays the pad's plain click. A pad without these actuators gets its short \
+                    rumble either way.")
+                .changed();
+            if tone_on {
+                let mut t = tone.unwrap_or(CellTone { hz: default_hz, ms: default_ms, soft: 0.0 });
+                ui.spacing_mut().slider_width = 64.0;
+                changed |= crate::panels::calibration::click_tone_slider(ui, &mut t.hz, "");
+                changed |= crate::panels::calibration::click_length_slider(ui, &mut t.ms, "");
+                changed |= crate::panels::calibration::click_soft_slider(ui, &mut t.soft);
+                tone = Some(t);
+            } else {
+                tone = None;
+            }
+        });
+    }
+    let haptic = on.then_some(CellHaptic { strength: pct / 100.0, tone });
     let Some(node) = snarl.get_node_mut(node_id) else { return false };
     if changed {
         set_cell_haptics(node, &[cell], haptic);
@@ -3003,11 +3029,13 @@ mod tests {
         let mut n = node();
         let ids = area_layout(&n).cell_ids();
         let (first, second) = (ids[0], ids[1]);
-        set_cell_haptics(&mut n, &[first], Some(0.5));
-        assert_eq!(cell_haptic(&n, first), Some(0.5));
+        let half = CellHaptic { strength: 0.5, tone: None };
+        let toned = CellHaptic { strength: 0.25, tone: Some(CellTone { hz: 300.0, ms: 40.0, soft: 0.5 }) };
+        set_cell_haptics(&mut n, &[first], Some(half));
+        assert_eq!(cell_haptic(&n, first), Some(half));
         assert_eq!(cell_haptic(&n, second), None);
-        set_cell_haptics(&mut n, &ids, Some(0.25));
-        assert!(ids.iter().all(|id| cell_haptic(&n, *id) == Some(0.25)));
+        set_cell_haptics(&mut n, &ids, Some(toned));
+        assert!(ids.iter().all(|id| cell_haptic(&n, *id) == Some(toned)));
         set_cell_haptics(&mut n, &[second], None);
         assert_eq!(cell_haptic(&n, second), None);
 
@@ -3018,7 +3046,7 @@ mod tests {
         n.params.insert("area_layer".into(), json!(0));
         area_sync(&mut n);
         assert_eq!(loaded_layer(&n), 0);
-        assert_eq!(cell_haptic(&n, first), Some(0.25), "and the first kept its own");
+        assert_eq!(cell_haptic(&n, first), Some(toned), "and the first kept its own");
     }
 
     /// The overlay shows by its mode and the live point: Off never, While

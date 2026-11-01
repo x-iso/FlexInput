@@ -11,8 +11,8 @@
 //!     an `hd_*` / `hd2_*` pair. Report 0x86 sets the stream up for both motors,
 //!     then 0x87 pushes each side's samples. 0x44 reports back how each buffer
 //!     is doing, and the sending rate leans on it.
-//!   * trackpads: tones (report 0x83). The stream has no target for the right
-//!     pad alone, and 0x87's id 5 writes the same samples to both.
+//!   * trackpads: tones (report 0x83), which need no pacing. A stream reaches
+//!     each pad alone as well (see [`PAD_STREAM`]), which a soft click uses.
 //!   * trackpad clicks: the firmware's click command (report 0x82).
 //!
 //! The trigger click is ours as well. The pad plays none of its own: the click
@@ -71,6 +71,12 @@ const STREAM_CHUNK: usize = 62;
 /// 0x87's target for each motor. Not the sides the tone report uses, and id 1
 /// is ignored, so the right motor can't be reached as "1".
 const PUSH_TARGET: [u8; 2] = [0, 4];
+/// Each trackpad's stream, `(0x86 target, 0x87 target)`. Set up alone, the right
+/// pad takes id 5, which otherwise writes both.
+const PAD_STREAM: [(u8, u8); 2] = [(3, 3), (4, 5)];
+/// Silence after a pad's burst before stopping its stream, in samples, in case the
+/// pad holds back the tail.
+const PAD_BURST_TAIL: u32 = 2 * STREAM_CHUNK as u32;
 
 // Stream status bits, per motor.
 const STATUS_OVERRUN: u8 = 0x01;
@@ -101,9 +107,12 @@ const TONE_MIN_GAP: Duration = Duration::from_millis(30);
 
 /// A one-shot click pin counts as up above this.
 const CLICK_PIN_MIN: f32 = 0.02;
-const CLICK_HZ: u16 = 170;
-const CLICK_MS: u16 = 20;
-const CLICK_SAMPLES: u32 = CLICK_MS as u32 * STREAM_RATE as u32 / 1000;
+/// A one-shot's tone report would take anything; these keep it something an
+/// actuator can play and a finger can feel.
+const CLICK_HZ_RANGE: (f32, f32) = (40.0, 1000.0);
+const CLICK_MS_RANGE: (f32, f32) = (1.0, 200.0);
+/// A trackpad's tone click lets go at half the strength it pressed with.
+const PAD_RELEASE_DB: i8 = -6;
 
 /// Setting 68: where the pad sets its click bit, in percent of travel. The bit
 /// sets about 5 above it and clears about 5 below, so 99 never sets.
@@ -164,13 +173,112 @@ fn amp_to_gain_db(amp: f32) -> i8 {
 
 // ── Trigger click ─────────────────────────────────────────────────────────────
 
+/// What a one-shot plays: a sine's pitch and length, and how much of it fades in
+/// and out. The firmware's tone starts and stops dead (its LFO settings shape nothing
+/// usable), so `soft` above 0 goes out as samples, and at 0 as the tone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClickShape {
+    hz: u16,
+    ms: u16,
+    soft: f32,
+}
+
+impl ClickShape {
+    fn new(hz: f32, ms: f32, soft: f32) -> Self {
+        Self {
+            hz: hz.clamp(CLICK_HZ_RANGE.0, CLICK_HZ_RANGE.1).round() as u16,
+            ms: ms.clamp(CLICK_MS_RANGE.0, CLICK_MS_RANGE.1).round() as u16,
+            soft: soft.clamp(0.0, 1.0),
+        }
+    }
+
+    fn trigger_default() -> Self {
+        use flexinput_core::automap::{TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS};
+        Self::new(TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS, 0.0)
+    }
+
+    fn played_as_samples(self) -> bool {
+        self.soft > 0.0
+    }
+
+    /// Its length in samples on the grip stream.
+    fn samples(self) -> u32 {
+        self.ms as u32 * STREAM_RATE as u32 / 1000
+    }
+}
+
+/// A one-shot's envelope at `t` through it (0..1): `soft` of it is the fade, half at
+/// each end on a raised cosine. 0 is a plain burst, 1 a smooth swell.
+fn click_envelope(t: f32, soft: f32) -> f32 {
+    let edge = t.min(1.0 - t).max(0.0);
+    let fade = soft * 0.5;
+    if edge >= fade {
+        1.0
+    } else {
+        0.5 - 0.5 * (edge / fade * std::f32::consts::PI).cos()
+    }
+}
+
+/// A one-shot in progress, in samples: on a grip's stream or a pad's own.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct ClickBurst {
+    at: u32,
+    total: u32,
+    level: f32,
+    hz: f32,
+    soft: f32,
+}
+
+impl ClickBurst {
+    fn new(shape: ClickShape, gain_db: i8) -> Self {
+        Self {
+            at: 0,
+            total: shape.samples(),
+            level: 10f32.powf(gain_db as f32 / 20.0).min(1.0),
+            hz: shape.hz as f32,
+            soft: shape.soft,
+        }
+    }
+
+    fn playing(&self) -> bool {
+        self.at < self.total
+    }
+
+    /// The next sample, or silence once it has ended.
+    fn next(&mut self) -> f32 {
+        if !self.playing() {
+            return 0.0;
+        }
+        let i = self.at as f32;
+        self.at += 1;
+        let env = click_envelope(i / self.total as f32, self.soft);
+        self.level * env * (i / STREAM_RATE * self.hz * std::f32::consts::TAU).sin()
+    }
+}
+
 /// Where each trigger clicks, on its raw 0–1 travel, as the engine sends it
 /// (`feedback::apply_trigger_click`). 0 = no click.
-#[derive(Default)]
 struct TriggerClick {
     position: [f32; 2],
     gain_db: [f32; 2],
+    hz: [f32; 2],
+    ms: [f32; 2],
+    soft: [f32; 2],
     past: [bool; 2],
+}
+
+impl Default for TriggerClick {
+    fn default() -> Self {
+        use flexinput_core::automap::{TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS};
+        Self {
+            position: [0.0; 2],
+            gain_db: [0.0; 2],
+            hz: [TRIGGER_CLICK_HZ; 2],
+            ms: [TRIGGER_CLICK_MS; 2],
+            soft: [0.0; 2],
+            past: [false; 2],
+        }
+    }
 }
 
 impl TriggerClick {
@@ -202,34 +310,104 @@ impl TriggerClick {
     }
 }
 
+// ── One-shot click pins ───────────────────────────────────────────────────────
+
+/// The `automap::CLICK_TONE_PINS`. A click is due as its pin rises, as strong as it
+/// rose to: a wired button reads 1, full strength. It goes out on the next poll, as
+/// the pins of one pass arrive in no particular order and its shape may be behind it.
+#[derive(Default)]
+struct ClickPins {
+    up: [bool; 4],
+    due: [Option<f32>; 4],
+    /// Each pin's `[hz, ms, soft]`; no pitch = the pad's plain click.
+    tone: [[f32; 3]; 4],
+}
+
+impl ClickPins {
+    /// Takes a pin of this family; false for any other.
+    fn set(&mut self, pin: &str, level: f32) -> bool {
+        use flexinput_core::automap::CLICK_TONE_PINS;
+        for (i, (click, tone)) in CLICK_TONE_PINS.iter().enumerate() {
+            if pin == *click {
+                let down = level > CLICK_PIN_MIN;
+                if down && !self.up[i] {
+                    self.due[i] = Some(level);
+                }
+                self.up[i] = down;
+                return true;
+            }
+            if let Some(field) = tone.iter().position(|p| *p == pin) {
+                self.tone[i][field] = level;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The clicks due now.
+    fn take_due(&mut self) -> Vec<Cmd> {
+        let mut out = Vec::new();
+        for i in 0..self.due.len() {
+            let Some(level) = self.due[i].take() else { continue };
+            let (side, grip) = (i % 2, i >= 2);
+            let gain_db = amp_to_gain_db(level);
+            let [hz, ms, soft] = self.tone[i];
+            let shape = (hz > 0.0).then(|| ClickShape::new(hz, ms, soft));
+            out.push(match (grip, shape) {
+                (true, shape) => Cmd::TriggerClick {
+                    side, gain_db, shape: shape.unwrap_or_else(ClickShape::trigger_default),
+                },
+                (false, Some(shape)) => Cmd::PadTone { side, gain_db, shape },
+                (false, None) => Cmd::PadClick { side, command: COMMAND_CLICK, gain_db },
+            });
+        }
+        out
+    }
+}
+
 // ── Pad click feedback ────────────────────────────────────────────────────────
 
 /// A click on each trackpad as it is pressed, and optionally released, set in the
 /// Calibration window. `mode` is the `automap::PAD_CLICK_*` bits, 0 = off.
-#[derive(Default)]
 struct PadClickFeedback {
     mode: u8,
     gain_db: f32,
+    hz: f32,
+    ms: f32,
+    soft: f32,
     held: [bool; 2],
 }
 
+impl Default for PadClickFeedback {
+    fn default() -> Self {
+        use flexinput_core::automap::{PAD_CLICK_HZ, PAD_CLICK_MS};
+        Self { mode: 0, gain_db: 0.0, hz: PAD_CLICK_HZ, ms: PAD_CLICK_MS, soft: 0.0, held: [false; 2] }
+    }
+}
+
 impl PadClickFeedback {
-    /// One poll's pad clicks: the command each side plays, if any. Keeps track
-    /// while off, so turning it on with a pad held doesn't click.
-    fn step(&mut self, down: [bool; 2]) -> [Option<u8>; 2] {
-        use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
-        let mut out = [None; 2];
+    /// One poll's pad clicks: what each side plays, if any. Keeps track while
+    /// off, so turning it on with a pad held doesn't click.
+    fn step(&mut self, down: [bool; 2]) -> [Option<Cmd>; 2] {
+        use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG, PAD_CLICK_TONE};
+        let gain_db = self.gain_db.clamp(GAIN_DB_MIN, 24.0).round() as i8;
+        let mut out = [None, None];
         for side in 0..2 {
             let was = std::mem::replace(&mut self.held[side], down[side]);
             if self.mode & PAD_CLICK_ON == 0 || was == down[side] {
                 continue;
             }
-            if down[side] {
-                let strong = self.mode & PAD_CLICK_STRONG != 0;
-                out[side] = Some(if strong { COMMAND_CLICK_STRONG } else { COMMAND_CLICK });
-            } else if self.mode & PAD_CLICK_ON_RELEASE != 0 {
-                out[side] = Some(COMMAND_CLICK);
+            if !down[side] && self.mode & PAD_CLICK_ON_RELEASE == 0 {
+                continue;
             }
+            out[side] = Some(if self.mode & PAD_CLICK_TONE != 0 {
+                let gain_db = if down[side] { gain_db } else { gain_db.saturating_add(PAD_RELEASE_DB) };
+                Cmd::PadTone { side, gain_db, shape: ClickShape::new(self.hz, self.ms, self.soft) }
+            } else {
+                let strong = down[side] && self.mode & PAD_CLICK_STRONG != 0;
+                let command = if strong { COMMAND_CLICK_STRONG } else { COMMAND_CLICK };
+                Cmd::PadClick { side, command, gain_db }
+            });
         }
         out
     }
@@ -237,11 +415,14 @@ impl PadClickFeedback {
 
 // ── Handle ────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, PartialEq)]
 enum Cmd {
     /// A trigger click on the side's grip motor.
-    TriggerClick { side: usize, gain_db: i8 },
+    TriggerClick { side: usize, gain_db: i8, shape: ClickShape },
     /// A firmware click on the side's trackpad.
     PadClick { side: usize, command: u8, gain_db: i8 },
+    /// A tone click on the side's trackpad.
+    PadTone { side: usize, gain_db: i8, shape: ClickShape },
     /// Keep the pad's click bit from setting, or let it again.
     HoldBit(bool),
     /// A grip sensor setting: its index in [`GRIP_SETTINGS`], and the value.
@@ -255,8 +436,7 @@ pub(crate) struct SteamHaptics {
     click: TriggerClick,
     pad_feedback: PadClickFeedback,
     bit_held: bool,
-    /// The one-shot click pins as last seen: pads, then grips.
-    click_pins: [bool; 4],
+    click_pins: ClickPins,
     grip_sent: [Option<i16>; GRIP_SETTINGS.len()],
 }
 
@@ -281,7 +461,7 @@ impl SteamHaptics {
             click: TriggerClick::default(),
             pad_feedback: PadClickFeedback::default(),
             bit_held: false,
-            click_pins: [false; 4],
+            click_pins: ClickPins::default(),
             grip_sent: Default::default(),
         })
     }
@@ -293,24 +473,10 @@ impl SteamHaptics {
             self.shared.targets[i].store(level.to_bits(), Ordering::Relaxed);
             return true;
         }
+        if self.click_pins.set(pin, level) {
+            return true;
+        }
         match pin {
-            // A click as the pin rises, as strong as it rose to: a wired button
-            // reads 1, full strength.
-            "tp_l_click" | "tp_r_click" | "grip_l_click" | "grip_r_click" => {
-                let grip = pin.starts_with("grip");
-                let side = usize::from(pin.contains("_r_"));
-                let held = &mut self.click_pins[side + if grip { 2 } else { 0 }];
-                let down = level > CLICK_PIN_MIN;
-                if down && !*held {
-                    let gain_db = amp_to_gain_db(level);
-                    let _ = self.cmds.send(if grip {
-                        Cmd::TriggerClick { side, gain_db }
-                    } else {
-                        Cmd::PadClick { side, command: COMMAND_CLICK, gain_db }
-                    });
-                }
-                *held = down;
-            }
             "trig_click_l" | "trig_click_r" => {
                 self.click.position[usize::from(pin == "trig_click_r")] = level.max(0.0);
                 let on = self.click.on();
@@ -322,8 +488,20 @@ impl SteamHaptics {
             "trig_click_gain_l" | "trig_click_gain_r" => {
                 self.click.gain_db[usize::from(pin == "trig_click_gain_r")] = level;
             }
+            "trig_click_hz_l" | "trig_click_hz_r" => {
+                self.click.hz[usize::from(pin == "trig_click_hz_r")] = level;
+            }
+            "trig_click_ms_l" | "trig_click_ms_r" => {
+                self.click.ms[usize::from(pin == "trig_click_ms_r")] = level;
+            }
             "pad_click_mode" => self.pad_feedback.mode = level as u8,
             "pad_click_gain" => self.pad_feedback.gain_db = level,
+            "pad_click_hz" => self.pad_feedback.hz = level,
+            "pad_click_ms" => self.pad_feedback.ms = level,
+            "pad_click_soft" => self.pad_feedback.soft = level,
+            "trig_click_soft_l" | "trig_click_soft_r" => {
+                self.click.soft[usize::from(pin == "trig_click_soft_r")] = level;
+            }
             _ => {
                 let Some(i) = GRIP_SETTINGS.iter().position(|s| s.0 == pin) else {
                     return false;
@@ -341,21 +519,21 @@ impl SteamHaptics {
 
     /// This poll's trigger travel (raw 0–1), left and right.
     pub(crate) fn poll_triggers(&mut self, left: f32, right: f32) {
+        for cmd in self.click_pins.take_due() {
+            let _ = self.cmds.send(cmd);
+        }
         let clicked = self.click.step([left, right]);
         for (side, _) in clicked.iter().enumerate().filter(|(_, c)| **c) {
             let gain_db = self.click.gain_db[side].clamp(GAIN_DB_MIN, 24.0).round() as i8;
-            let _ = self.cmds.send(Cmd::TriggerClick { side, gain_db });
+            let shape = ClickShape::new(self.click.hz[side], self.click.ms[side], self.click.soft[side]);
+            let _ = self.cmds.send(Cmd::TriggerClick { side, gain_db, shape });
         }
     }
 
     /// This poll's pad clicks, left and right.
     pub(crate) fn poll_pad_clicks(&mut self, left: bool, right: bool) {
-        let commands = self.pad_feedback.step([left, right]);
-        let gain_db = self.pad_feedback.gain_db.clamp(GAIN_DB_MIN, 24.0).round() as i8;
-        for (side, command) in commands.into_iter().enumerate() {
-            if let Some(command) = command {
-                let _ = self.cmds.send(Cmd::PadClick { side, command, gain_db });
-            }
+        for cmd in self.pad_feedback.step([left, right]).into_iter().flatten() {
+            let _ = self.cmds.send(cmd);
         }
     }
 }
@@ -413,12 +591,15 @@ fn streams_state(dev: &HidDevice) -> bool {
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
-/// What a click adds to a side's stream, when one is running: the tone report
-/// isn't known to play over a stream on the same motor.
-#[derive(Default, Clone, Copy)]
-struct StreamClick {
-    left: u32,
-    level: f32,
+/// A trackpad's burst, and how its stream is doing: from idle it sets up, sends in
+/// real time with a little silence after, and stops, the way it was proved on the pad.
+#[derive(Clone, Copy)]
+struct PadBurst {
+    burst: ClickBurst,
+    /// Samples sent since the burst began, silence included.
+    sent: u32,
+    owed: f32,
+    last: Instant,
 }
 
 /// Both grip motors' stream.
@@ -428,9 +609,11 @@ struct Stream {
     last_pump: Instant,
     owed: [f32; 2],
     low: [bool; 2],
-    /// Carrier 1 and 2 phase per side, plus the click's.
-    phase: [[f32; 3]; 2],
-    click: [StreamClick; 2],
+    /// Carrier 1 and 2 phase per side.
+    phase: [[f32; 2]; 2],
+    /// What a click adds to a side's stream: the tone report isn't known to play
+    /// over a stream on the same motor, and a soft one needs a stream anyway.
+    click: [ClickBurst; 2],
 }
 
 impl Stream {
@@ -442,7 +625,7 @@ impl Stream {
             last_pump: now,
             owed: [0.0; 2],
             low: [true; 2],
-            phase: [[0.0; 3]; 2],
+            phase: [[0.0; 2]; 2],
             click: Default::default(),
         }
     }
@@ -455,22 +638,15 @@ impl Stream {
         let steps = [
             carrier_hz(f1) / STREAM_RATE,
             carrier_hz(f2) / STREAM_RATE,
-            CLICK_HZ as f32 / STREAM_RATE,
         ];
         let mut out = [0u8; STREAM_CHUNK + 2];
         out[0] = REPORT_STREAM_PUSH;
         out[1] = PUSH_TARGET[side];
         let (phase, click) = (&mut self.phase[side], &mut self.click[side]);
         for s in &mut out[2..] {
-            let mut v = a1.clamp(0.0, 1.0) * (phase[0] * tau).sin()
-                + a2.clamp(0.0, 1.0) * (phase[1] * tau).sin();
-            if click.left > 0 {
-                v += click.level * (phase[2] * tau).sin();
-                click.left -= 1;
-                phase[2] = (phase[2] + steps[2]).fract();
-            } else {
-                phase[2] = 0.0;
-            }
+            let v = a1.clamp(0.0, 1.0) * (phase[0] * tau).sin()
+                + a2.clamp(0.0, 1.0) * (phase[1] * tau).sin()
+                + click.next();
             phase[0] = (phase[0] + steps[0]).fract();
             phase[1] = (phase[1] + steps[1]).fract();
             *s = pcm_s8(v);
@@ -495,6 +671,7 @@ struct Worker {
     shared: Arc<Shared>,
     stream: Stream,
     pads: [PadTone; 2],
+    pad_bursts: [Option<PadBurst>; 2],
     /// While holding the click bit: the threshold to put back.
     held_threshold: Option<i16>,
     logged_overrun: bool,
@@ -511,6 +688,7 @@ impl Worker {
             shared,
             stream: Stream::new(),
             pads: Default::default(),
+            pad_bursts: [None, None],
             held_threshold: None,
             logged_overrun: false,
             grip_pending: Default::default(),
@@ -531,11 +709,17 @@ impl Worker {
             }
             self.pump_stream();
             self.pump_pads();
+            self.pump_pad_bursts();
             if self.grip_changed.elapsed() >= GRIP_WRITE_DELAY {
                 self.write_grip_settings();
             }
         }
         self.write_grip_settings();
+        for side in 0..2 {
+            if self.pad_bursts[side].take().is_some() {
+                self.write(&[REPORT_STREAM_OP, STREAM_STOP, PAD_STREAM[side].0, 0]);
+            }
+        }
         self.write(&[REPORT_COMMAND, 2, COMMAND_STOP, 0]);
         if self.stream.running {
             self.write(&[REPORT_STREAM_OP, STREAM_STOP, STREAM_BOTH_GRIPS, 0]);
@@ -545,14 +729,20 @@ impl Worker {
 
     fn command(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::TriggerClick { side, gain_db } => {
-                if self.stream.running {
-                    let level = 10f32.powf(gain_db as f32 / 20.0).min(1.0);
-                    self.stream.click[side] = StreamClick { left: CLICK_SAMPLES, level };
+            Cmd::TriggerClick { side, gain_db, shape } => {
+                if self.stream.running || shape.played_as_samples() {
+                    self.stream.click[side] = ClickBurst::new(shape, gain_db);
                     self.stream.last_sound = Instant::now();
                 } else {
                     let grip = [SIDE_GRIP_L, SIDE_GRIP_R][side];
-                    self.tone(grip, gain_db, CLICK_HZ, CLICK_MS);
+                    self.tone(grip, gain_db, shape.hz, shape.ms);
+                }
+            }
+            Cmd::PadTone { side, gain_db, shape } => {
+                if shape.played_as_samples() {
+                    self.start_pad_burst(side, ClickBurst::new(shape, gain_db));
+                } else {
+                    self.tone(SIDE_PAD_L + side as u8, gain_db, shape.hz, shape.ms);
                 }
             }
             Cmd::PadClick { side, command, gain_db } => {
@@ -562,6 +752,47 @@ impl Worker {
             Cmd::Grip(i, value) => {
                 self.grip_pending[i] = Some(value);
                 self.grip_changed = Instant::now();
+            }
+        }
+    }
+
+    /// A pad's burst, from idle or over the one it is still playing.
+    fn start_pad_burst(&mut self, side: usize, burst: ClickBurst) {
+        let now = Instant::now();
+        let (owed, last) = match &self.pad_bursts[side] {
+            Some(p) => (p.owed, p.last),
+            None => {
+                self.write(&[REPORT_STREAM_OP, STREAM_START, PAD_STREAM[side].0, STREAM_FORMAT]);
+                // A chunk goes out at once rather than after a chunk's worth of wait.
+                (STREAM_CHUNK as f32, now)
+            }
+        };
+        self.pad_bursts[side] = Some(PadBurst { burst, sent: 0, owed, last });
+    }
+
+    fn pump_pad_bursts(&mut self) {
+        let now = Instant::now();
+        for side in 0..2 {
+            let Some(mut p) = self.pad_bursts[side] else { continue };
+            let dt = now.duration_since(p.last).as_secs_f32();
+            p.last = now;
+            p.owed = (p.owed + STREAM_RATE * dt).min(MAX_OWED);
+            while p.owed >= STREAM_CHUNK as f32 {
+                let mut report = [0u8; STREAM_CHUNK + 2];
+                report[0] = REPORT_STREAM_PUSH;
+                report[1] = PAD_STREAM[side].1;
+                for s in &mut report[2..] {
+                    *s = pcm_s8(p.burst.next());
+                }
+                self.write(&report);
+                p.owed -= STREAM_CHUNK as f32;
+                p.sent += STREAM_CHUNK as u32;
+            }
+            if p.sent >= p.burst.total + PAD_BURST_TAIL {
+                self.write(&[REPORT_STREAM_OP, STREAM_STOP, PAD_STREAM[side].0, 0]);
+                self.pad_bursts[side] = None;
+            } else {
+                self.pad_bursts[side] = Some(p);
             }
         }
     }
@@ -596,12 +827,12 @@ impl Worker {
         let shared = Arc::clone(&self.shared);
         let sounding = [HD, HD2].iter()
             .any(|&b| (0..2).any(|side| shared.carrier(b, side).0 > SILENCE));
-        let clicking = self.stream.click.iter().any(|c| c.left > 0);
+        let clicking = self.stream.click.iter().any(ClickBurst::playing);
         if sounding || clicking {
             self.stream.last_sound = now;
         }
         if !self.stream.running {
-            if !sounding {
+            if !sounding && !clicking {
                 return;
             }
             self.drain_status();
@@ -789,15 +1020,96 @@ mod tests {
     #[test]
     fn a_pad_clicks_on_press_and_only_on_release_when_asked() {
         use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
+        let firmware = |side, command| Some(Cmd::PadClick { side, command, gain_db: 0 });
         let mut fb = PadClickFeedback::default();
         assert_eq!(fb.step([true, false]), [None, None], "off, and it keeps track");
         fb.mode = PAD_CLICK_ON;
         assert_eq!(fb.step([true, false]), [None, None], "held since before it came on");
-        assert_eq!(fb.step([false, true]), [None, Some(COMMAND_CLICK)]);
+        assert_eq!(fb.step([false, true]), [None, firmware(1, COMMAND_CLICK)]);
         assert_eq!(fb.step([false, true]), [None, None], "once per press");
         fb.mode = PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_STRONG;
-        assert_eq!(fb.step([true, false]), [Some(COMMAND_CLICK_STRONG), Some(COMMAND_CLICK)],
+        assert_eq!(fb.step([true, false]), [firmware(0, COMMAND_CLICK_STRONG), firmware(1, COMMAND_CLICK)],
             "a press takes the strength, a release is always light");
+    }
+
+    #[test]
+    fn a_pad_set_to_tone_plays_its_pitch_and_length_and_lets_go_softer() {
+        use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_TONE};
+        let mut fb = PadClickFeedback::default();
+        fb.mode = PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_TONE;
+        (fb.gain_db, fb.hz, fb.ms) = (-3.0, 320.0, 8.0);
+        let shape = ClickShape { hz: 320, ms: 8, soft: 0.0 };
+        assert_eq!(fb.step([true, false]), [Some(Cmd::PadTone { side: 0, gain_db: -3, shape }), None]);
+        assert_eq!(fb.step([false, false]), [Some(Cmd::PadTone { side: 0, gain_db: -9, shape }), None]);
+    }
+
+    /// A click's shape counts whichever order a pass's pins arrive in, and without
+    /// one a click pin plays what it always did.
+    #[test]
+    fn a_click_pin_takes_its_shape_from_the_same_pass() {
+        let mut pins = ClickPins::default();
+        assert!(pins.set("tp_r_click", 0.5), "the click first");
+        assert!(pins.set("tp_r_click_hz", 300.0));
+        assert!(pins.set("tp_r_click_ms", 30.0));
+        assert!(pins.set("tp_r_click_soft", 0.5));
+        let shape = ClickShape { hz: 300, ms: 30, soft: 0.5 };
+        assert_eq!(pins.take_due(), [Cmd::PadTone { side: 1, gain_db: -6, shape }]);
+        assert_eq!(pins.take_due(), [], "once, for as long as it stays up");
+        assert!(pins.set("tp_r_click", 0.5));
+        assert_eq!(pins.take_due(), []);
+
+        // Dropped, all back to 0: the next is the plain click.
+        for pin in ["tp_r_click", "tp_r_click_hz", "tp_r_click_ms", "tp_r_click_soft"] {
+            assert!(pins.set(pin, 0.0));
+        }
+        assert!(pins.set("tp_r_click", 1.0));
+        assert_eq!(pins.take_due(), [Cmd::PadClick { side: 1, command: COMMAND_CLICK, gain_db: 0 }]);
+
+        assert!(pins.set("grip_l_click", 1.0));
+        assert_eq!(pins.take_due(),
+            [Cmd::TriggerClick { side: 0, gain_db: 0, shape: ClickShape::trigger_default() }]);
+        assert!(!pins.set("grip_touch", 100.0), "a setting, not one of these");
+    }
+
+    #[test]
+    fn a_click_shape_stays_something_an_actuator_can_play() {
+        assert_eq!(ClickShape::new(0.0, 0.0, -1.0), ClickShape { hz: 40, ms: 1, soft: 0.0 });
+        assert_eq!(ClickShape::new(9000.0, 9000.0, 2.0), ClickShape { hz: 1000, ms: 200, soft: 1.0 });
+        assert_eq!(ClickShape::new(170.4, 20.0, 0.0).samples(), 80);
+    }
+
+    /// Sharp holds from the first sample to the last; fully soft is silent at both
+    /// ends and full only at the middle; between, it fades that share and holds.
+    #[test]
+    fn softness_is_how_much_of_a_click_fades() {
+        for t in [0.0, 0.1, 0.5, 0.9, 0.999] {
+            assert_eq!(click_envelope(t, 0.0), 1.0, "sharp at {t}");
+        }
+        assert_eq!(click_envelope(0.0, 1.0), 0.0);
+        assert_eq!(click_envelope(1.0, 1.0), 0.0);
+        assert_eq!(click_envelope(0.5, 1.0), 1.0);
+        assert!((click_envelope(0.25, 1.0) - 0.5).abs() < 1e-5);
+        assert_eq!(click_envelope(0.5, 0.5), 1.0);
+        assert_eq!(click_envelope(0.3, 0.5), 1.0, "past its fade, it holds");
+        assert!(click_envelope(0.1, 0.5) < 1.0);
+    }
+
+    /// A burst plays its length at its level, then silence; a soft one starts from
+    /// nothing where a sharp one is at once at full swing.
+    #[test]
+    fn a_burst_plays_its_length_then_goes_quiet() {
+        let peak = |soft: f32, range: std::ops::Range<usize>| {
+            let mut b = ClickBurst::new(ClickShape { hz: 500, ms: 20, soft }, 0);
+            let all: Vec<f32> = (0..90).map(|_| b.next()).collect();
+            assert_eq!(b.at, b.total);
+            assert!(all[80..].iter().all(|s| *s == 0.0), "quiet after its 80 samples");
+            all[range].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        assert!(peak(0.0, 0..8) > 0.9, "sharp swings fully right away");
+        assert!(peak(1.0, 0..8) < 0.4, "soft eases in");
+        assert!(peak(1.0, 36..44) > 0.9, "and reaches full in the middle");
+        let quiet = ClickBurst::new(ClickShape { hz: 200, ms: 10, soft: 0.0 }, -6);
+        assert!((quiet.level - 0.5).abs() < 0.01);
     }
 
     #[test]
@@ -847,12 +1159,13 @@ mod tests {
     fn a_click_mixes_into_a_running_stream_for_its_length() {
         let shared = Shared::default();
         let mut stream = Stream::new();
-        stream.click[1] = StreamClick { left: CLICK_SAMPLES, level: 1.0 };
+        let samples = ClickShape::trigger_default().samples();
+        stream.click[1] = ClickBurst::new(ClickShape::trigger_default(), 0);
         let first = stream.chunk(1, &shared);
         assert!(first[2..].iter().any(|s| *s != 0));
-        assert_eq!(stream.click[1].left, CLICK_SAMPLES - STREAM_CHUNK as u32);
+        assert_eq!(stream.click[1].total - stream.click[1].at, samples - STREAM_CHUNK as u32);
         let _ = stream.chunk(1, &shared);
-        assert_eq!(stream.click[1].left, 0);
+        assert!(!stream.click[1].playing());
         assert!(stream.chunk(1, &shared)[2..].iter().all(|s| *s == 0), "and then stops");
     }
 }

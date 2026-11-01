@@ -3424,6 +3424,7 @@ mod trigger_tests {
             ("ltrig_min", 0.2), ("ltrig_max", 0.6),
             ("rtrig_digital_threshold", 0.5), ("rtrig_click_offset", -0.1),
             ("ltrig_click_gain_db", -6.0), ("rtrig_click_gain_db", 3.0),
+            ("ltrig_click_hz", 90.0), ("rtrig_click_ms", 45.0), ("ltrig_click_soft", 0.5),
         ] {
             pad.params.insert(key.into(), Value::from(v));
         }
@@ -3433,6 +3434,13 @@ mod trigger_tests {
         assert!((pad_value(&out, FB_DS, "trig_click_r") - 0.4).abs() < 1e-6, "full range, 0.5 - 0.1");
         assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_l"), -6.0);
         assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_r"), 3.0);
+        // Each its own, and the default where it has none.
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_hz_l"), 90.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_ms_r"), 45.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_soft_l"), 0.5);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_soft_r"), 0.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_hz_r"), flexinput_core::automap::TRIGGER_CLICK_HZ);
+        assert_eq!(pad_value(&out, FB_DS, "trig_click_ms_l"), flexinput_core::automap::TRIGGER_CLICK_MS);
     }
 
     // Click feedback goes out as one mode value, and only while it is on.
@@ -3448,6 +3456,27 @@ mod trigger_tests {
         let out = fb_tick(vec![pad], &BusMap::default());
         assert_eq!(pad_value(&out, FB_DS, "pad_click_mode"), (PAD_CLICK_ON | PAD_CLICK_STRONG) as f32);
         assert_eq!(pad_value(&out, FB_DS, "pad_click_gain"), -6.0);
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_hz"), flexinput_core::automap::PAD_CLICK_HZ);
+    }
+
+    // A click's shape reaches a pad that plays those clicks, and not one that
+    // answers them with a rumble.
+    #[test]
+    fn a_clicks_tone_only_reaches_a_pad_that_has_the_click() {
+        let dev = "gilrs:dualsense:0";
+        let mut collector = BusMap::default();
+        collector.set_pin(&format!("feedback_inject:{dev}"), &"tp_r_click", Signal::Float(0.5));
+        collector.set_pin(&format!("feedback_click_tone:{dev}"), &"tp_r_click_hz", Signal::Float(300.0));
+        let hz_with = |pins: Vec<&str>| {
+            let pad = fb_pad(1, FB_DS, &pins, Some(FB_VIRT));
+            let mut st = pad.sink_target.as_ref().unwrap().clone();
+            st.device_id = dev.to_string();
+            let mut out = BusMap::default();
+            crate::eval::apply_pad_feedback(&st, &collector, &mut out);
+            out.get_pin(&dev, &"tp_r_click_hz").map(|s| s.as_float())
+        };
+        assert_eq!(hz_with(FB_DS_PINS.iter().copied().chain(["tp_r_click"]).collect()), Some(300.0));
+        assert_eq!(hz_with(FB_DS_PINS.to_vec()), None);
     }
 
     // A trackpad pin wired into Feedback Control reaches a pad that has it.
@@ -6568,6 +6597,53 @@ mod area_mapper_tests {
         }
         assert!((35..=45).contains(&hits.len()), "one pulse, {} ticks", hits.len());
         assert!(hits.iter().all(|p| *p == STEAM), "{hits:?}");
+    }
+
+    /// A cell's saved haptic reads back, tone or none, and what 0.16.6 saved still
+    /// reads as a click at that strength.
+    #[test]
+    fn a_cells_haptic_keeps_its_tone_and_reads_the_old_form() {
+        assert_eq!(CellHaptic::from_value(&json!(0.5)), Some(CellHaptic { strength: 0.5, tone: None }));
+        let toned = CellHaptic { strength: 0.25, tone: Some(CellTone { hz: 300.0, ms: 40.0, soft: 0.5 }) };
+        assert_eq!(CellHaptic::from_value(&toned.to_value()), Some(toned));
+        let plain = CellHaptic { strength: 0.25, tone: None };
+        assert_eq!(CellHaptic::from_value(&plain.to_value()), Some(plain));
+        assert_eq!(CellHaptic::from_value(&json!("nonsense")), None);
+    }
+
+    /// A cell with a tone sends its shape along with the click's pulse, and one
+    /// without sends none.
+    #[test]
+    fn a_crossing_carries_the_cells_tone() {
+        let layout = AreaLayout::circle_ways(8);
+        let (to, other) = (
+            layout.locate_id(dir(90.0, 0.9).x, dir(90.0, 0.9).y),
+            layout.locate_id(dir(270.0, 0.9).x, dir(270.0, 0.9).y),
+        );
+        let toned = CellHaptic { strength: 0.5, tone: Some(CellTone { hz: 300.0, ms: 40.0, soft: 0.5 }) };
+        let plain = CellHaptic { strength: 0.5, tone: None };
+        let mut n = mapper(json!([]));
+        n.params.insert(AREA_CELL_HAPTICS_PARAM.into(), json!({
+            to.to_string(): toned.to_value(), other.to_string(): plain.to_value(),
+        }));
+        let key = format!("{FEEDBACK_CLICK_TONE}{PAD}");
+        let mut state = HashMap::new();
+        for _ in 0..30 { run(&n, &stick(dir(0.0, 0.9)), &mut state); }
+
+        let mut seen = None;
+        for _ in 0..30 {
+            let (c, _) = run(&n, &stick(dir(90.0, 0.9)), &mut state);
+            if let Some(hz) = c.get_pin(&key, &"grip_l_click_hz") {
+                seen = Some((hz.as_float(), c.get_pin(&key, &"grip_l_click_soft").map(|s| s.as_float())));
+            }
+        }
+        assert_eq!(seen, Some((300.0, Some(0.5))));
+
+        for _ in 0..60 { run(&n, &stick(dir(0.0, 0.9)), &mut state); }
+        for _ in 0..60 {
+            let (c, _) = run(&n, &stick(dir(270.0, 0.9)), &mut state);
+            assert!(c.get_pin(&key, &"grip_l_click_hz").is_none(), "no tone of its own");
+        }
     }
 
     /// Crossing into a cell with a haptic pulses the pad's pin at its strength, for

@@ -34,6 +34,9 @@ pub(crate) const FEEDBACK_GAME: &str = "feedback_game:";
 pub(crate) const FEEDBACK_NET: &str = "feedback_net:";
 pub(crate) const FEEDBACK_OVERRIDE: &str = "feedback_override:";
 pub(crate) const FEEDBACK_INJECT: &str = "feedback_inject:";
+/// The shape of a click going out on that device (`automap::CLICK_TONE_PINS`). No
+/// channel of its own to a pad that hasn't got those click pins.
+pub(crate) const FEEDBACK_CLICK_TONE: &str = "feedback_click_tone:";
 
 /// The channels a feedback-producing module or a Selector route can carry.
 pub(crate) const FEEDBACK_WRITE_CHANNELS: [&str; 3] = [FEEDBACK_NET, FEEDBACK_OVERRIDE, FEEDBACK_INJECT];
@@ -302,6 +305,17 @@ pub(crate) fn apply_pad_feedback(
             combine_into(sink_outputs, dev, dst, sig);
         }
     }
+
+    // What shapes those clicks, for a pad that plays them itself.
+    let tone_key = format!("{FEEDBACK_CLICK_TONE}{dev}");
+    for (click, tone) in automap::CLICK_TONE_PINS {
+        if !dst_pins.contains(&click) { continue; }
+        for pin in tone {
+            if let Some(&sig) = collector_sigs.get_pin(&tone_key, &pin) {
+                sink_outputs.set_pin(&dev, &pin, sig);
+            }
+        }
+    }
 }
 
 /// Where a Steam Controller's trigger click sits, set in the Calibration window:
@@ -319,17 +333,25 @@ pub(crate) fn apply_trigger_click(
         return;
     }
     let dev = st.device_id.as_str();
-    for (pin, min, max, threshold, offset, gain_pin, gain) in [
+    for (pin, min, max, threshold, offset, tone) in [
         ("trig_click_l", "ltrig_min", "ltrig_max", "ltrig_digital_threshold", "ltrig_click_offset",
-         "trig_click_gain_l", "ltrig_click_gain_db"),
+         [("trig_click_gain_l", "ltrig_click_gain_db", 0.0),
+          ("trig_click_hz_l", "ltrig_click_hz", automap::TRIGGER_CLICK_HZ),
+          ("trig_click_ms_l", "ltrig_click_ms", automap::TRIGGER_CLICK_MS),
+          ("trig_click_soft_l", "ltrig_click_soft", 0.0)]),
         ("trig_click_r", "rtrig_min", "rtrig_max", "rtrig_digital_threshold", "rtrig_click_offset",
-         "trig_click_gain_r", "rtrig_click_gain_db"),
+         [("trig_click_gain_r", "rtrig_click_gain_db", 0.0),
+          ("trig_click_hz_r", "rtrig_click_hz", automap::TRIGGER_CLICK_HZ),
+          ("trig_click_ms_r", "rtrig_click_ms", automap::TRIGGER_CLICK_MS),
+          ("trig_click_soft_r", "rtrig_click_soft", 0.0)]),
     ] {
         let at = num(threshold).unwrap_or(super::device_cal::TRIG_DIGITAL_THRESHOLD_DEFAULT)
             + num(offset).unwrap_or(0.0);
         let position = trigger_click_position(at, (num(min).unwrap_or(0.0), num(max).unwrap_or(1.0)));
         sink_outputs.set_pin(&dev, &pin, Signal::Float(position));
-        sink_outputs.set_pin(&dev, &gain_pin, Signal::Float(num(gain).unwrap_or(0.0)));
+        for (out, key, default) in tone {
+            sink_outputs.set_pin(&dev, &out, Signal::Float(num(key).unwrap_or(default)));
+        }
     }
 }
 
@@ -340,18 +362,24 @@ pub(crate) fn apply_pad_click(
     params: &HashMap<String, serde_json::Value>,
     sink_outputs: &mut BusMap,
 ) {
-    use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
+    use flexinput_core::automap::{
+        PAD_CLICK_HZ, PAD_CLICK_MS, PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG, PAD_CLICK_TONE,
+    };
     let flag = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     if !flag("pad_click_on") {
         return;
     }
     let mode = PAD_CLICK_ON
         | if flag("pad_click_release") { PAD_CLICK_ON_RELEASE } else { 0 }
-        | if flag("pad_click_strong") { PAD_CLICK_STRONG } else { 0 };
-    let gain = params.get("pad_click_gain_db").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        | if flag("pad_click_strong") { PAD_CLICK_STRONG } else { 0 }
+        | if flag("pad_click_tone") { PAD_CLICK_TONE } else { 0 };
+    let num = |key: &str, default: f32| params.get(key).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
     let dev = st.device_id.as_str();
     sink_outputs.set_pin(&dev, &"pad_click_mode", Signal::Float(mode as f32));
-    sink_outputs.set_pin(&dev, &"pad_click_gain", Signal::Float(gain));
+    sink_outputs.set_pin(&dev, &"pad_click_gain", Signal::Float(num("pad_click_gain_db", 0.0)));
+    sink_outputs.set_pin(&dev, &"pad_click_hz", Signal::Float(num("pad_click_hz", PAD_CLICK_HZ)));
+    sink_outputs.set_pin(&dev, &"pad_click_ms", Signal::Float(num("pad_click_ms", PAD_CLICK_MS)));
+    sink_outputs.set_pin(&dev, &"pad_click_soft", Signal::Float(num("pad_click_soft", 0.0)));
 }
 
 /// A Steam Controller's grip sensor settings (Calibration window), on pins no

@@ -7,6 +7,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **Steam Controller clicks have a tone, a length and a softness.** Each trigger's
+  click in the Calibration window now has a pitch, a length and a **soft** amount
+  beside its strength. At 0% soft a click starts and stops dead; higher, more of it
+  fades in and out. A trackpad's **Click feedback** gains **Tone** beside its Light
+  and Strong clicks, with the same three settings, and so does an Area Mapper cell's
+  **Haptic**. The Calibration window's Grip and Touch section is now in two columns.
 - **Remapper presets.** Two icons in the Remapper's top-right corner save its cards
   to a `.fxremap` file and load one back, replacing the cards it has. They sit in the
   module itself, so a pinned Remapper widget has them too.
