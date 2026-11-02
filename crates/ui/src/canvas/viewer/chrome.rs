@@ -51,8 +51,7 @@ pub(crate) fn show_module_menu(
 
         ui.menu_button(cat, |ui| {
             // Finger-sized rows can make a long category taller than the screen.
-            let max_height = ui.ctx().content_rect().height() - 32.0;
-            egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+            crate::touch::menu_list_scroll(ui, |ui| {
                 for desc in cat_modules {
                     if ui.button(desc.display_name).clicked() {
                         let node_id = snarl.insert_node(pos, NodeData::from(desc));

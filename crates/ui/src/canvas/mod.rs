@@ -1943,6 +1943,7 @@ impl Canvas {
             committed_this_frame = true;
         }
 
+        let wire_menu_opening = viewer.pending_wire_menu.is_some();
         if let Some(pending) = viewer.pending_wire_menu {
             self.wire_ctx_menu = Some(pending);
         }
@@ -2049,20 +2050,23 @@ impl Canvas {
             let mut open = true;
             let mut delete = false;
             let mut insert_idx: Option<usize> = None;
+            let (menu_id, for_touch) = egui_snarl::ui::touch::menu_opening(
+                ui.ctx(), egui::Id::new("wire_ctx_menu"), wire_menu_opening,
+            );
 
             egui::Popup::new(
-                egui::Id::new("wire_ctx_menu"),
+                menu_id,
                 ui.ctx().clone(),
                 egui::PopupAnchor::Position(pos),
                 ui.layer_id(),
             )
             .kind(egui::PopupKind::Menu)
             .layout(egui::Layout::top_down_justified(egui::Align::Min))
-            .style(crate::touch::menu_style_for(ui.ctx()))
+            .style(egui_snarl::ui::touch::menu_style_of(for_touch))
             .open_bool(&mut open)
-            .show(|ui| crate::touch::menu_scroll(ui, |ui| {
+            .show(|ui| crate::touch::menu_scroll(ui, for_touch, |ui| {
                 ui.set_min_width(150.0);
-                if crate::touch::is_active(ui.ctx()) && ui.button("Cancel").clicked() {
+                if for_touch && ui.button("Cancel").clicked() {
                     ui.close();
                 }
                 if ui.button("✖ Delete wire").clicked() {
@@ -2074,8 +2078,7 @@ impl Canvas {
                     ui.label(egui::RichText::new("Insert between…").small().weak());
                     for (cat, indices) in &cats {
                         ui.menu_button(*cat, |ui| {
-                            let max_height = ui.ctx().content_rect().height() - 32.0;
-                            egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                            crate::touch::menu_list_scroll(ui, |ui| {
                                 for &i in indices {
                                     if ui.button(descriptors[i].display_name).clicked() {
                                         insert_idx = Some(i);

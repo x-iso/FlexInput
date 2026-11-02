@@ -1446,7 +1446,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         if crate::touch::is_active(ui.ctx()) {
             // A level of its own, or the categories push the choices above off a small screen.
             ui.menu_button("Add module", |ui| {
-                crate::touch::menu_scroll(ui, |ui| {
+                crate::touch::menu_list_scroll(ui, |ui| {
                     show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
                 });
             });

@@ -6,7 +6,8 @@
 
 use egui::{
     Color32, Context, Event, Id, InnerResponse, Margin, Painter, Popup, Pos2, Response, ScrollArea,
-    Shape, Stroke, Style, Ui, Vec2, containers::menu, response::Flags, style::ScrollStyle, vec2,
+    Shape, Stroke, Style, TextWrapMode, Ui, Vec2, containers::menu, response::Flags,
+    style::ScrollStyle, vec2,
 };
 
 /// The radius of the ring that fills up while a finger holds something, big enough to show
@@ -89,12 +90,25 @@ pub fn menu_style(style: &mut Style) {
     spacing.menu_margin = Margin::same(8);
     spacing.icon_width *= 1.4;
     spacing.icon_width_inner *= 1.4;
-    // A bar that says there's more to scroll to. egui's default floats, and stays hidden
-    // until a pointer comes near, which a finger on a screen doesn't do.
+    // A bar that says there's more to scroll to. It floats over the rows' padding, as a
+    // solid one's room would come out of the rows, the menu having sized itself to them.
+    // egui's floating bar stays hidden until a pointer comes near, which a finger doesn't.
     spacing.scroll = ScrollStyle {
-        bar_width: 8.0,
+        floating: true,
+        bar_width: 6.0,
+        floating_width: 6.0,
+        floating_allocated_width: 0.0,
+        bar_inner_margin: 2.0,
+        dormant_background_opacity: 0.4,
+        active_background_opacity: 0.4,
+        interact_background_opacity: 0.7,
+        dormant_handle_opacity: 0.8,
+        active_handle_opacity: 0.8,
+        interact_handle_opacity: 1.0,
         ..ScrollStyle::solid()
     };
+    // Labels never wrap in a menu, which is as wide as its widest.
+    style.wrap_mode = Some(TextWrapMode::Extend);
     for font in style.text_styles.values_mut() {
         font.size *= 1.25;
     }
@@ -102,21 +116,59 @@ pub fn menu_style(style: &mut Style) {
 
 /// The style a menu opened now should use. A menu passes its style on to its submenus.
 pub fn menu_style_for(ctx: &Context) -> fn(&mut Style) {
-    if is_active(ctx) {
+    menu_style_of(is_active(ctx))
+}
+
+pub fn menu_style_of(for_touch: bool) -> fn(&mut Style) {
+    if for_touch {
         menu_style
     } else {
         menu::menu_style
     }
 }
 
+/// The id a menu should show under, and whether it's for a finger, both settled when it
+/// opens: `opening` says this is that frame, and `base` is the menu's own id.
+///
+/// egui remembers each menu's size for the next time it opens, and a scroll area can't grow
+/// past that, so a finger's menu used to come back in the box a mouse's left it, labels
+/// squeezed. Each kind of input gets a menu of its own. Settling it means a menu opened by
+/// one doesn't change size, or close, when the other touches it.
+pub fn menu_opening(ctx: &Context, base: Id, opening: bool) -> (Id, bool) {
+    let key = base.with("menu_for_touch");
+    // Every frame, not only this menu's opening one: `is_active` follows the input by
+    // looking at it, and the touch that opens a menu came down frames before it opens.
+    let active = is_active(ctx);
+    let for_touch = if opening {
+        ctx.data_mut(|d| d.insert_temp(key, active));
+        active
+    } else {
+        ctx.data(|d| d.get_temp(key)).unwrap_or(false)
+    };
+    (base.with(for_touch), for_touch)
+}
+
+/// Where the menu of [`context_menu`] on this response lives.
+pub fn context_menu_id(response: &Response) -> Id {
+    menu_opening(&response.ctx, Popup::default_response_id(response), false).0
+}
+
 /// A menu's contents: in a menu for a finger, whose rows take a lot of room, these scroll
 /// rather than running off the screen.
-pub fn menu_scroll<R>(ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> R {
-    if !is_active(ui.ctx()) {
-        return content(ui);
+pub fn menu_scroll<R>(ui: &mut Ui, for_touch: bool, content: impl FnOnce(&mut Ui) -> R) -> R {
+    if for_touch {
+        menu_list_scroll(ui, content)
+    } else {
+        content(ui)
     }
-    let max_height = ui.ctx().content_rect().height() - 32.0;
-    ScrollArea::vertical().max_height(max_height).show(ui, content).inner
+}
+
+/// A list in a menu that can be too long for any screen, for a mouse as well. It takes the
+/// whole height it might need even where the menu it's in remembers being shorter, and
+/// gives back what its rows don't use.
+pub fn menu_list_scroll<R>(ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> R {
+    let height = ui.ctx().content_rect().height() - 32.0;
+    ScrollArea::vertical().max_height(height).min_scrolled_height(height).show(ui, content).inner
 }
 
 /// [`Response::context_menu`], sized for the input that opened it. A finger resting while
@@ -126,11 +178,19 @@ pub fn context_menu<R>(
     response: &Response,
     content: impl FnOnce(&mut Ui) -> R,
 ) -> Option<InnerResponse<R>> {
-    let style = menu_style_for(&response.ctx);
+    let base = Popup::default_response_id(response);
+    let (id, for_touch) = menu_opening(&response.ctx, base, response.secondary_clicked());
+    let style = menu_style_of(for_touch);
+    let show = |response: &Response, content: _| {
+        Popup::context_menu(response)
+            .id(id)
+            .style(style)
+            .show(|ui| menu_scroll(ui, for_touch, content))
+    };
     if response.long_touched() && response.ctx.input(|i| i.multi_touch().is_some()) {
         let mut response = response.clone();
         response.flags.remove(Flags::LONG_TOUCHED);
-        return Popup::context_menu(&response).style(style).show(|ui| menu_scroll(ui, content));
+        return show(&response, content);
     }
-    Popup::context_menu(response).style(style).show(|ui| menu_scroll(ui, content))
+    show(response, content)
 }

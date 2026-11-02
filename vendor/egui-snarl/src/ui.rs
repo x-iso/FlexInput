@@ -1438,8 +1438,9 @@ where
                     // FLEXINPUT PATCH: a popup anchored to the pointer finds no pointer on
                     // the frame a finger lifts, so this one remembers where the drop was.
                     let at = ui.input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()));
-                    let menu_id = snarl_id.with("dropped_wire_menu");
-                    ui.ctx().data_mut(|d| d.insert_temp(menu_id, at.unwrap_or(ui_rect.center())));
+                    let base = snarl_id.with("dropped_wire_menu");
+                    let (menu_id, _) = touch::menu_opening(ui.ctx(), base, true);
+                    ui.ctx().data_mut(|d| d.insert_temp(base, at.unwrap_or(ui_rect.center())));
                     Popup::open_id(ui.ctx(), menu_id);
                 }
             }
@@ -1457,8 +1458,9 @@ where
         };
 
         if viewer.has_dropped_wire_menu(pins, snarl) {
-            let menu_id = snarl_id.with("dropped_wire_menu");
-            let at: Pos2 = ui.ctx().data(|d| d.get_temp(menu_id)).unwrap_or(ui_rect.center());
+            let base = snarl_id.with("dropped_wire_menu");
+            let (menu_id, for_touch) = touch::menu_opening(ui.ctx(), base, false);
+            let at: Pos2 = ui.ctx().data(|d| d.get_temp(base)).unwrap_or(ui_rect.center());
             let menu = Popup::new(
                 menu_id,
                 ui.ctx().clone(),
@@ -1467,7 +1469,7 @@ where
             )
             .kind(PopupKind::Menu)
             .layout(Layout::top_down_justified(Align::Min))
-            .style(touch::menu_style_for(ui.ctx()))
+            .style(touch::menu_style_of(for_touch))
             .open_memory(None)
             .show(|ui| {
                 let pins = match &new_wires {
@@ -1481,7 +1483,7 @@ where
                 wire_end_pos = menu_pos;
 
                 // The context menu is opened as *link* graph menu.
-                touch::menu_scroll(ui, |ui| {
+                touch::menu_scroll(ui, for_touch, |ui| {
                     viewer.show_dropped_wire_menu(menu_pos, ui, pins, moved_from, snarl);
                 });
             });

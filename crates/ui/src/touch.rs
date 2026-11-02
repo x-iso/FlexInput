@@ -3,7 +3,9 @@
 
 use egui::containers::menu::{MenuButton, MenuConfig};
 
-pub(crate) use egui_snarl::ui::touch::{context_menu, is_active, menu_scroll, menu_style_for};
+pub(crate) use egui_snarl::ui::touch::{
+    context_menu, is_active, menu_list_scroll, menu_scroll, menu_style_for,
+};
 
 /// [`egui::Ui::menu_button`] for a menu button outside a menu, sized for the input that
 /// opens it. Inside a menu, the plain one already inherits the menu's size.
@@ -1810,6 +1812,10 @@ pub(crate) mod tests {
     struct MenuRig {
         ctx: egui::Context,
         rows: usize,
+        /// Put the rows in a list that scrolls for a mouse as well, as Add module's are.
+        list: bool,
+        /// What the rows say, before their number.
+        label: &'static str,
         time: f64,
         /// Where the first row is on screen, while the menu is open.
         first_row: Option<egui::Rect>,
@@ -1821,32 +1827,83 @@ pub(crate) mod tests {
         const SCREEN: egui::Vec2 = egui::vec2(800.0, 400.0);
         const ANCHOR: Pos2 = pos2(100.0, 100.0);
 
-        fn opened(rows: usize) -> Self {
+        fn new(rows: usize, list: bool) -> Self {
             let mut r = Self {
                 ctx: egui::Context::default(),
                 rows,
+                list,
+                label: "Row",
                 time: 0.0,
                 first_row: None,
                 popup: None,
                 scroll_bar: false,
             };
             r.frame(vec![]);
-            r.frame(finger_down(Self::ANCHOR));
-            r.frame(vec![]);
-            r.time += 1.0;
-            r.frame(vec![]);
-            r.frame(finger_up(Self::ANCHOR));
-            r.frame(vec![]);
-            r.frame(vec![]);
-            assert!(r.first_row.is_some(), "the menu is open");
             r
+        }
+
+        fn opened(rows: usize) -> Self {
+            Self::opened_at(rows, Self::ANCHOR)
+        }
+
+        fn opened_at(rows: usize, at: Pos2) -> Self {
+            let mut r = Self::new(rows, false);
+            r.open_by_finger(at);
+            r
+        }
+
+        fn open_by_finger(&mut self, at: Pos2) {
+            self.frame(finger_down(at));
+            self.frame(vec![]);
+            self.time += 1.0;
+            self.frame(vec![]);
+            self.frame(finger_up(at));
+            self.frame(vec![]);
+            self.frame(vec![]);
+            assert!(self.first_row.is_some(), "the menu is open");
+        }
+
+        /// By right click, with the rows in a list that scrolls for a mouse too.
+        fn opened_by_mouse(rows: usize) -> Self {
+            let mut r = Self::new(rows, true);
+            r.open_by_mouse();
+            r
+        }
+
+        fn open_by_mouse(&mut self) {
+            let at = Self::ANCHOR;
+            self.frame(vec![Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                self.frame(vec![Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Secondary,
+                    pressed,
+                    modifiers: Default::default(),
+                }]);
+            }
+            self.frame(vec![]);
+            self.frame(vec![]);
+            assert!(self.first_row.is_some(), "the menu is open");
+        }
+
+        fn close(&mut self) {
+            self.frame(vec![Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]);
+            self.frame(vec![]);
+            self.frame(vec![]);
+            assert!(self.first_row.is_none(), "the menu is closed");
         }
 
         fn frame(&mut self, events: Vec<Event>) {
             self.time += 1.0 / 30.0;
             let mut raw = input(self.time, events);
             raw.screen_rect = Some(egui::Rect::from_min_size(Pos2::ZERO, Self::SCREEN));
-            let rows = self.rows;
+            let (rows, list, label) = (self.rows, self.list, self.label);
             let (mut first, mut popup) = (None, None);
             let out = self.ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1855,15 +1912,22 @@ pub(crate) mod tests {
                         egui::Id::new("bg"),
                         egui::Sense::click(),
                     );
-                    context_menu(&bg, |ui| {
+                    let mut add_rows = |ui: &mut egui::Ui| {
                         for n in 0..rows {
-                            let row = ui.button(format!("Row {n}")).rect;
+                            let row = ui.button(format!("{label} {n}")).rect;
                             if n == 0 {
                                 first = Some(row);
                             }
                         }
+                    };
+                    context_menu(&bg, |ui| {
+                        if list {
+                            menu_list_scroll(ui, |ui| add_rows(ui));
+                        } else {
+                            add_rows(ui);
+                        }
                     });
-                    popup = ctx.read_response(egui::Popup::default_response_id(&bg)).map(|r| r.rect);
+                    popup = ctx.read_response(egui_snarl::ui::touch::context_menu_id(&bg)).map(|r| r.rect);
                 });
             });
             self.first_row = first;
@@ -1893,6 +1957,132 @@ pub(crate) mod tests {
         assert!(popup.height() <= MenuRig::SCREEN.y, "{popup:?}");
         assert!(popup.top() >= 0.0 && popup.bottom() <= MenuRig::SCREEN.y, "{popup:?}");
         assert!(r.scroll_bar, "the strip shows with the finger gone");
+    }
+
+    /// The bar mustn't take its room out of the rows: the menu sizes itself to them, and
+    /// that squeezed "Reset" onto two lines.
+    #[test]
+    fn a_scrolling_touch_menu_keeps_its_rows_on_one_line() {
+        let single = MenuRig::opened(3).first_row.unwrap();
+        let scrolling = MenuRig::opened(30);
+        assert!(scrolling.scroll_bar);
+        let row = scrolling.first_row.unwrap();
+        assert_eq!(row.height(), single.height(), "the label wrapped");
+        assert!(row.width() >= single.width(), "{} < {}", row.width(), single.width());
+    }
+
+    /// A menu that fits on the screen shows it all, however little room is below where it
+    /// opened: it moves up rather than scrolling.
+    #[test]
+    fn a_touch_menu_that_fits_on_screen_shows_every_row() {
+        for at in [MenuRig::ANCHOR, pos2(100.0, 350.0)] {
+            let r = MenuRig::opened_at(6, at);
+            let popup = r.popup.expect("drawn");
+            assert!(!r.scroll_bar, "at {at:?}: scrolling with room to spare, {popup:?}");
+            let rows = 6.0 * r.first_row.unwrap().height();
+            assert!(popup.height() >= rows, "at {at:?}: {} < {rows}", popup.height());
+            assert!(popup.top() >= 0.0 && popup.bottom() <= MenuRig::SCREEN.y, "at {at:?}: {popup:?}");
+        }
+    }
+
+    /// A menu too long for the screen uses the screen, rather than a little of it.
+    #[test]
+    fn a_touch_menu_too_long_for_the_screen_fills_it() {
+        let popup = MenuRig::opened(30).popup.expect("drawn");
+        assert!(popup.height() >= MenuRig::SCREEN.y - 60.0, "{popup:?}");
+    }
+
+    /// Add module's lists scroll for a mouse too, and with room they show every row.
+    #[test]
+    fn a_mouse_menu_list_with_room_shows_every_row() {
+        let r = MenuRig::opened_by_mouse(8);
+        let popup = r.popup.expect("drawn");
+        let rows = 8.0 * r.first_row.unwrap().height();
+        assert!(popup.height() >= rows, "{} < {rows}", popup.height());
+    }
+
+    /// A menu last opened by mouse used to come back at the mouse's size, which a scroll
+    /// area can't grow out of: a small box to scroll around in, its labels squeezed.
+    #[test]
+    fn a_touch_menu_is_not_stuck_at_the_size_a_mouse_left_it() {
+        let mut r = MenuRig::new(6, false);
+        r.open_by_mouse();
+        r.close();
+        r.open_by_finger(MenuRig::ANCHOR);
+        let (row, popup) = (r.first_row.unwrap(), r.popup.expect("drawn"));
+        assert_eq!(row.height(), MenuRig::opened(3).first_row.unwrap().height(), "the label wrapped");
+        assert!(!r.scroll_bar, "scrolling with room to spare, {popup:?}");
+        assert!(popup.height() >= 6.0 * row.height(), "{popup:?}");
+    }
+
+    /// The same menu can come back with more in it, as a curve's does for another lane.
+    /// A longer list shows whole, though the menu remembers being shorter.
+    #[test]
+    fn a_menu_that_comes_back_longer_shows_every_row() {
+        let mut r = MenuRig::new(2, false);
+        r.open_by_finger(MenuRig::ANCHOR);
+        r.close();
+        r.rows = 6;
+        r.open_by_finger(MenuRig::ANCHOR);
+        let (row, popup) = (r.first_row.unwrap(), r.popup.expect("drawn"));
+        assert!(!r.scroll_bar, "{popup:?}");
+        assert!(popup.height() >= 6.0 * row.height(), "{popup:?}");
+    }
+
+    /// And longer labels stay on their line, though it remembers being narrower.
+    #[test]
+    fn a_menu_that_comes_back_wider_keeps_its_labels_on_one_line() {
+        let mut r = MenuRig::new(3, false);
+        r.open_by_finger(MenuRig::ANCHOR);
+        let height = r.first_row.unwrap().height();
+        r.close();
+        r.label = "A label a good deal longer than before";
+        r.open_by_finger(MenuRig::ANCHOR);
+        assert_eq!(r.first_row.unwrap().height(), height);
+    }
+
+    /// The bar lies over the rows' padding: they run as far across as with no bar at all.
+    #[test]
+    fn the_scroll_bar_takes_no_room_from_the_rows() {
+        let gap = |rows: usize| {
+            let r = MenuRig::opened(rows);
+            r.popup.expect("drawn").right() - r.first_row.unwrap().right()
+        };
+        let (scrolling, fitting) = (gap(30), gap(3));
+        assert!((scrolling - fitting).abs() < 1.0, "{scrolling} vs {fitting}");
+    }
+
+    /// A menu keeps the size it opened at, and stays open, when the other input reaches it:
+    /// a finger tapping a menu a mouse opened mustn't lose it on the way.
+    #[test]
+    fn a_menu_does_not_change_when_the_other_input_reaches_it() {
+        let mut r = MenuRig::new(6, false);
+        r.open_by_mouse();
+        let size = r.popup.expect("drawn").size();
+        // A second finger's Touch event marks touch as in use, without clicking anything.
+        r.frame(vec![Event::Touch {
+            device_id: TouchDeviceId(1),
+            id: TouchId(9),
+            phase: TouchPhase::Start,
+            pos: pos2(700.0, 380.0),
+            force: None,
+        }]);
+        r.frame(vec![]);
+        assert!(r.first_row.is_some(), "still open");
+        assert_eq!(r.popup.expect("drawn").size(), size);
+    }
+
+    /// And the other way, a mouse menu doesn't stay the size of the finger's.
+    #[test]
+    fn a_mouse_menu_is_not_stuck_at_the_size_a_finger_left_it() {
+        let mut r = MenuRig::new(6, false);
+        r.open_by_mouse();
+        let mouse_size = r.popup.expect("drawn").size();
+        r.close();
+        r.open_by_finger(MenuRig::ANCHOR);
+        r.close();
+        r.open_by_mouse();
+        assert_eq!(r.popup.expect("drawn").size(), mouse_size);
     }
 
     /// With everything in view there's nothing to say.
