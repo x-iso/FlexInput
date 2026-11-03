@@ -98,6 +98,12 @@ pub(crate) struct DeviceCal {
     /// Written by the Calibration window's yellow pin. Defaults to 0.5.
     ltrig_threshold: f32,
     rtrig_threshold: f32,
+    /// The band around its threshold a trigger's digital button holds steady
+    /// across (`trig_hysteresis`, Calibration window; the click goes by it too).
+    trig_hysteresis: f32,
+    /// How long, in seconds, a trigger stays under that band before its
+    /// digital button lets go (`trig_debounce_ms`; the click's too).
+    trig_debounce: f32,
     /// The right stick's own deadzone (`deadzone_r`, Calibration window), when
     /// it has one; `None` = the device's `deadzone` covers both sticks.
     rstick_dz: Option<f32>,
@@ -157,6 +163,8 @@ impl Default for DeviceCal {
             digital_triggers: false,
             ltrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
             rtrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
+            trig_hysteresis:  flexinput_core::automap::TRIGGER_HYSTERESIS,
+            trig_debounce:    flexinput_core::automap::trigger_debounce_secs(None),
             rstick_dz: None,
         }
     }
@@ -282,6 +290,10 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
         rtrig_threshold: params.get("rtrig_digital_threshold").and_then(|v| v.as_f64())
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
+        trig_hysteresis: params.get("trig_hysteresis").and_then(|v| v.as_f64())
+            .map(|v| v as f32).unwrap_or(flexinput_core::automap::TRIGGER_HYSTERESIS),
+        trig_debounce: flexinput_core::automap::trigger_debounce_secs(
+            params.get("trig_debounce_ms").and_then(|v| v.as_f64()).map(|v| v as f32)),
         rstick_dz: params.get("deadzone_r").and_then(|v| v.as_f64()).map(|v| v as f32),
     }
 }
@@ -395,7 +407,8 @@ pub struct DeviceParams {
     /// Per device id: stick deadzone, gyro multiplier, calibration.
     by_dev: HashMap<String, (f32, f32, DeviceCal)>,
     /// A device's accel deadzone keeps a baseline that every run of the
-    /// preprocessing moves, so that can't be skipped for a repeated input.
+    /// preprocessing moves, and a snapped digital trigger lets go on a clock,
+    /// so neither can be skipped for a repeated input.
     pub(crate) preprocessing_has_state: bool,
 }
 
@@ -411,7 +424,8 @@ pub(crate) fn device_params(graph: &ProcessingGraph) -> &DeviceParams {
             let cal = load_device_cal(&snap.params);
             by_dev.insert(dev_id.to_string(), (dz, gm, cal));
         }
-        let preprocessing_has_state = by_dev.values().any(|(_, _, cal)| cal.accel_dz > 0.0);
+        let preprocessing_has_state = by_dev.values()
+            .any(|(_, _, cal)| cal.accel_dz > 0.0 || cal.digital_triggers);
         DeviceParams { by_dev, preprocessing_has_state }
     })
 }
@@ -427,17 +441,24 @@ pub(crate) fn preprocess_dev_sigs<S: std::hash::BuildHasher>(
     dev_sigs: &HashMap<(String, String), Signal, S>,
 ) -> BusMap {
     let mut out = BusMap::default();
-    preprocess_dev_sigs_into(graph, dev_sigs, &mut out);
+    preprocess_dev_sigs_into(graph, dev_sigs, &mut out, &mut DigitalTriggers::default(), 0.0);
     out
 }
 
+/// Where each device's snapped digital triggers stand between ticks, left and
+/// right, for "Digital triggers" (see [`preprocess_dev_sigs_into`]).
+pub type DigitalTriggers = HashMap<String, [flexinput_core::automap::TriggerCrossing; 2]>;
+
 /// [`preprocess_dev_sigs`] into `out`, which must be empty: the tick hands in
 /// last tick's map, emptied by `recycle_keys`, so its table and key Strings are
-/// reused instead of rebuilt every tick.
+/// reused instead of rebuilt every tick. `snaps` carries the digital triggers
+/// from tick to tick, `dt` seconds apart.
 pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     graph: &ProcessingGraph,
     dev_sigs: &HashMap<(String, String), Signal, S>,
     out: &mut BusMap,
+    snaps: &mut DigitalTriggers,
+    dt: f32,
 ) {
     let params = &device_params(graph).by_dev;
     // Fallback for devices whose signals reach AutoMap consumers without a
@@ -568,13 +589,24 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
     IMU_SCRATCH.with(|s| *s.borrow_mut() = imu_override);
     for (dev_id, (_, _, cal)) in params {
         if !cal.digital_triggers { continue; }
-        for (analog_pin, dig_pin, thr) in [
-            ("left_trigger",  "btn_lt_dig", cal.ltrig_threshold),
-            ("right_trigger", "btn_rt_dig", cal.rtrig_threshold),
-        ] {
+        if !snaps.contains_key(dev_id) {
+            snaps.insert(dev_id.clone(), Default::default());
+        }
+        let Some(crossing) = snaps.get_mut(dev_id) else { continue };
+        for (side, (analog_pin, dig_pin, thr, range)) in [
+            ("left_trigger",  "btn_lt_dig", cal.ltrig_threshold, cal.ltrig_range),
+            ("right_trigger", "btn_rt_dig", cal.rtrig_threshold, cal.rtrig_range),
+        ].into_iter().enumerate() {
             let Some(Signal::Float(v)) = out.get_pin(dev_id, analog_pin).copied() else { continue };
-            // Guard against a threshold pinned at 0.0 firing on rest jitter.
-            let over = v >= thr.max(f32::EPSILON);
+            // Down at the threshold from rest, up once under the band around it
+            // for the debounce, so an unsteady pull at the point doesn't flicker
+            // it (`TriggerCrossing::step`). A threshold at rest fires on any
+            // movement off it. The band is a share of the full travel, so on
+            // this calibrated value it's as much wider as the range is narrower.
+            use flexinput_core::automap::{trigger_band_width, trigger_edges};
+            let edges = trigger_edges(thr, (0.0, 1.0), trigger_band_width(cal.trig_hysteresis, range));
+            crossing[side].step(&edges, v, dt, cal.trig_debounce);
+            let over = crossing[side].down();
             out.set_pin(dev_id, analog_pin, Signal::Float(if over { 1.0 } else { 0.0 }));
             out.set_pin(&dev_id, &dig_pin, Signal::Bool(over));
         }

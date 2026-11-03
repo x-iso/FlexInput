@@ -681,7 +681,11 @@ const CAL_FILE_KEYS: &[&str] = &[
     "trig_click_on", "ltrig_click_gain_db", "rtrig_click_gain_db",
     "ltrig_click_hz", "rtrig_click_hz", "ltrig_click_ms", "rtrig_click_ms",
     "ltrig_click_soft", "rtrig_click_soft",
-    "ltrig_click_offset", "rtrig_click_offset",
+    "ltrig_click_offset", "rtrig_click_offset", "trig_hysteresis", "trig_debounce_ms",
+    "ltrig_press_on", "rtrig_press_on",
+    "ltrig_release_on", "rtrig_release_on", "ltrig_release_gain_db", "rtrig_release_gain_db",
+    "ltrig_release_hz", "rtrig_release_hz", "ltrig_release_ms", "rtrig_release_ms",
+    "ltrig_release_soft", "rtrig_release_soft",
     "grip_touch", "grip_release",
     "pad_click_on", "pad_click_release", "pad_click_strong", "pad_click_gain_db",
     "pad_click_tone", "pad_click_hz", "pad_click_ms", "pad_click_soft",
@@ -924,7 +928,7 @@ pub fn show_windows(
         // as small as it can go and the user can grow it if needed.
         let min_w = (screen.width()  * 0.40).clamp(480.0, 700.0);
         let default_w = min_w;
-        let default_h = (screen.height() * 0.40).clamp(280.0, 460.0);
+        let default_h = (screen.height() * 0.75).max(CAL_MIN_H);
         // Opaque window frame — without an explicit fill the tab strip's
         // drop-shadow from underneath bleeds through the window content.
         let mut window_frame = egui::Frame::window(&ctx.style());
@@ -937,9 +941,11 @@ pub fn show_windows(
             .default_width(default_w)
             .default_height(default_h)
             .min_width(min_w)
-            // Width only: the sections lay out by width, and with height left to
-            // the contents the window shrinks when one collapses.
-            .resizable([true, false])
+            .min_height(CAL_MIN_H)
+            // Both ways, the body scrolling when its sections are taller than
+            // the window: a wide window draws them unscaled, so tallest.
+            .resizable(true)
+            .vscroll(true)
             .show(ctx, |ui| {
                 scaled_below_ref_width(ui, |ui| {
                     cal_file_status_line(ui, node_id);
@@ -981,6 +987,9 @@ pub fn show_windows(
 /// (instruction text a word a line, control rows breaking apart), so shrinking
 /// it whole reads better than squeezing it.
 const CAL_REF_W: f32 = 780.0;
+/// The window's shortest height: its title, the file buttons and a section's
+/// header with room to scroll under it.
+const CAL_MIN_H: f32 = 240.0;
 /// Smallest the body is scaled to, however narrow the window.
 const CAL_MIN_SCALE: f32 = 0.35;
 
@@ -1234,6 +1243,8 @@ fn draw_window_body(
     }
     if caps.triggers {
         triggers_section(ui, canvas, node_id, dev_id, live, lo);
+    } else if let Some(actuator) = trigger_click_actuator(canvas, node_id, dev_id) {
+        trigger_haptics_section(ui, canvas, node_id, dev_id, live, lo, actuator);
     }
     if crate::model::is_steam_controller(dev_id) {
         ui.separator();
@@ -1343,16 +1354,23 @@ fn column_slider_width(ui: &egui::Ui) -> f32 {
     (ui.available_width() - 150.0).max(60.0)
 }
 
+/// The pitches a click can take.
+const CLICK_HZ_RANGE: std::ops::RangeInclusive<f32> = 60.0..=600.0;
+
 /// A click's pitch. True when it changed.
 pub(crate) fn click_tone_slider(ui: &mut egui::Ui, hz: &mut f32, name: &str) -> bool {
-    ui.add(egui::Slider::new(hz, 60.0..=600.0).logarithmic(true).step_by(1.0).suffix(" Hz").text(name))
+    ui.add(egui::Slider::new(hz, CLICK_HZ_RANGE).logarithmic(true).step_by(1.0).suffix(" Hz").text(name))
         .on_hover_text("The click's pitch. Lower feels like a thud, higher like a tick.")
         .changed()
 }
 
+/// How long a click can be, and on rumble motors, which need longer to be felt.
+const CLICK_MS_RANGE: std::ops::RangeInclusive<f32> = 4.0..=80.0;
+const RUMBLE_CLICK_MS_RANGE: std::ops::RangeInclusive<f32> = 10.0..=150.0;
+
 /// A click's length. True when it changed.
 pub(crate) fn click_length_slider(ui: &mut egui::Ui, ms: &mut f32, name: &str) -> bool {
-    ui.add(egui::Slider::new(ms, 4.0..=80.0).logarithmic(true).step_by(1.0).suffix(" ms").text(name))
+    ui.add(egui::Slider::new(ms, CLICK_MS_RANGE).logarithmic(true).step_by(1.0).suffix(" ms").text(name))
         .on_hover_text("The click's length: short feels crisp, long feels more like a pulse.")
         .changed()
 }
@@ -4084,15 +4102,16 @@ fn triggers_section(
     let raw_l = read_float(live, dev_id, "left_trigger");
     let raw_r = read_float(live, dev_id, "right_trigger");
 
-    // Displayed bar = engine-equivalent normalisation.
+    // The arc shows raw travel, the range's ends on it as flags.
     let lt_min  = read_param_f32(canvas, node_id, "ltrig_min", 0.0);
     let lt_max  = read_param_f32(canvas, node_id, "ltrig_max", 1.0);
     let rt_min  = read_param_f32(canvas, node_id, "rtrig_min", 0.0);
     let rt_max  = read_param_f32(canvas, node_id, "rtrig_max", 1.0);
     let lt_thr  = read_param_f32(canvas, node_id, "ltrig_digital_threshold", TRIG_THRESHOLD_DEFAULT);
     let rt_thr  = read_param_f32(canvas, node_id, "rtrig_digital_threshold", TRIG_THRESHOLD_DEFAULT);
-    let l_norm  = normalise_trig(raw_l, lt_min, lt_max);
-    let r_norm  = normalise_trig(raw_r, rt_min, rt_max);
+    let hysteresis = read_param_f32(canvas, node_id, "trig_hysteresis", automap::TRIGGER_HYSTERESIS);
+    let debounce_ms = read_param_f32(canvas, node_id, "trig_debounce_ms", automap::TRIGGER_DEBOUNCE_MS)
+        .max(automap::TRIGGER_DEBOUNCE_MS);
 
     // A pad with adaptive triggers (a DualSense, natively) also gets each
     // trigger's default effect, beside its arc.
@@ -4101,21 +4120,13 @@ fn triggers_section(
         .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(pin)));
     let adaptive = [has_inlet("trigger_l_mode"), has_inlet("trigger_r_mode")];
 
-    // A Steam Controller's trigger click, placed relative to the yellow pin.
-    let has_click = crate::model::is_steam_controller(dev_id);
+    // The trigger click, placed relative to the yellow pin, on any pad with
+    // something to play it on.
+    let actuator = trigger_click_actuator(canvas, node_id, dev_id);
+    let has_click = actuator.is_some();
     let mut click_on = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("trig_click_on").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    let lt_click = read_param_f32(canvas, node_id, "ltrig_click_offset", 0.0);
-    let rt_click = read_param_f32(canvas, node_id, "rtrig_click_offset", 0.0);
-    let lt_gain = read_param_f32(canvas, node_id, "ltrig_click_gain_db", 0.0);
-    let rt_gain = read_param_f32(canvas, node_id, "rtrig_click_gain_db", 0.0);
-    let lt_hz = read_param_f32(canvas, node_id, "ltrig_click_hz", automap::TRIGGER_CLICK_HZ);
-    let rt_hz = read_param_f32(canvas, node_id, "rtrig_click_hz", automap::TRIGGER_CLICK_HZ);
-    let lt_ms = read_param_f32(canvas, node_id, "ltrig_click_ms", automap::TRIGGER_CLICK_MS);
-    let rt_ms = read_param_f32(canvas, node_id, "rtrig_click_ms", automap::TRIGGER_CLICK_MS);
-    let lt_soft = read_param_f32(canvas, node_id, "ltrig_click_soft", 0.0);
-    let rt_soft = read_param_f32(canvas, node_id, "rtrig_click_soft", 0.0);
 
     // Step session: track min/max + tally top/bottom 1% for jitter-aware bounds.
     let sampling = ui.ctx().data_mut(|d| {
@@ -4160,6 +4171,50 @@ fn triggers_section(
             ui.add_space(8.0);
             instruct_line(ui, &[(false,
                 "Drag the yellow pin to set the Digital output threshold for each trigger.")]);
+            // Only the source's "Digital triggers" puts the pad's digital button
+            // there (`device_cal`); without it the backend's own point stands.
+            let digital_on = canvas.snarl.get_node(node_id)
+                .and_then(|n| n.params.get("digital_triggers").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            if !digital_on {
+                ui.add_space(4.0);
+                instruct_line(ui, &[
+                    (false, "It takes effect with "),
+                    (true, "Digital triggers"),
+                    (false, " on in this pad's node. Until then its digital button presses where \
+                             the pad itself decides, which may not be the yellow pin."),
+                ]);
+            }
+            ui.add_space(6.0);
+            let mut pct = hysteresis * 100.0;
+            if ui.add(egui::Slider::new(&mut pct, 0.0..=20.0).step_by(1.0).suffix("%").text("Hysteresis"))
+                .on_hover_text("A band around the digital trigger's point and the click's, as a share \
+                    of the trigger's full travel, however narrow its range, shown faint on the arc. \
+                    A pull from rest presses at the \
+                    point. Once down, a trigger lets go under the band's bottom, and if it hasn't \
+                    gone back to rest, presses again only past its top, so an unsteady pull at the \
+                    point doesn't flicker it. Near either end the band shifts to stay its full \
+                    width inside the travel.")
+                .changed()
+            {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("trig_hysteresis".into(), serde_json::json!(pct / 100.0));
+                }
+            }
+            let mut ms = debounce_ms;
+            if ui.add(egui::Slider::new(&mut ms, automap::TRIGGER_DEBOUNCE_MS..=50.0).step_by(1.0).suffix(" ms")
+                    .text("Debounce"))
+                .on_hover_text("How long a trigger has to stay past an edge before it counts, for \
+                    the digital trigger and the click: under the band before it lets go, and, for a \
+                    point where the band reaches rest, off rest before it presses. A shorter dip or \
+                    blip is jitter. Wherever the band has room under the point, the press stays \
+                    instant.")
+                .changed()
+            {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("trig_debounce_ms".into(), serde_json::json!(ms));
+                }
+            }
             if adaptive.iter().any(|&a| a) {
                 ui.add_space(8.0);
                 instruct_line(ui, &[
@@ -4169,24 +4224,14 @@ fn triggers_section(
                              no game effects, no module."),
                 ]);
             }
-            if has_click {
+            if let Some(actuator) = actuator {
                 ui.add_space(8.0);
-                let toggled = ui.checkbox(&mut click_on,
-                    egui::RichText::new("Trigger click").size(INSTRUCT_SIZE))
-                    .on_hover_text("FlexInput plays a click on the grip motor as the trigger \
-                        passes the cyan pin. While this is on, the pad's own full-pull point \
-                        is out of reach, so Steam's click stays quiet, and so does anything \
-                        bound to Full Pull in Steam Input.")
-                    .changed();
-                if toggled {
-                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                        n.params.insert("trig_click_on".into(), Value::Bool(click_on));
-                    }
-                }
+                trigger_click_checkbox(ui, canvas, node_id, dev_id, actuator, &mut click_on);
                 if click_on {
                     ui.add_space(4.0);
                     instruct_line(ui, &[(false,
-                        "Drag the cyan pin to set where each trigger clicks. It moves along with the yellow pin.")]);
+                        "Drag the cyan pin to set where each trigger clicks. It moves along with the \
+                         yellow pin, and Release plays as the trigger comes back past it.")]);
                 }
             }
             ui.add_space(10.0);
@@ -4210,6 +4255,8 @@ fn triggers_section(
                                 snap.r_max_top_sum, snap.r_max_top_n,
                             );
                             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                                keep_trigger_points(&mut n.params, "l", (lt_min, lt_max), (l_min_c, l_max_c));
+                                keep_trigger_points(&mut n.params, "r", (rt_min, rt_max), (r_min_c, r_max_c));
                                 n.params.insert("ltrig_min".into(), serde_json::json!(l_min_c));
                                 n.params.insert("ltrig_max".into(), serde_json::json!(l_max_c));
                                 n.params.insert("rtrig_min".into(), serde_json::json!(r_min_c));
@@ -4226,6 +4273,8 @@ fn triggers_section(
                 }
                 if cal_button(ui, "Reset").clicked() {
                     if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        keep_trigger_points(&mut n.params, "l", (lt_min, lt_max), (0.0, 1.0));
+                        keep_trigger_points(&mut n.params, "r", (rt_min, rt_max), (0.0, 1.0));
                         n.params.insert("ltrig_min".into(), serde_json::json!(0.0_f32));
                         n.params.insert("ltrig_max".into(), serde_json::json!(1.0_f32));
                         n.params.insert("rtrig_min".into(), serde_json::json!(0.0_f32));
@@ -4258,40 +4307,24 @@ fn triggers_section(
             let wide = fx_l.is_some() || fx_r.is_some() || has_click;
             let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
             ui.add_space(pad);
-            let click = |offset: f32, gain_db: f32, hz: f32, ms: f32, soft: f32| has_click.then_some(TriggerClickEdit { on: click_on, offset, gain_db, hz, ms, soft });
-            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, click(lt_click, lt_gain, lt_hz, lt_ms, lt_soft), lt_min, lt_max, lo, wide, fx_l.as_mut());
+            let click = |side| actuator.map(|a| read_trigger_click(canvas, node_id, side, a, click_on));
+            let new_l = trigger_widget(ui, "L", raw_l, lt_thr, hysteresis, click("l"), lt_min, lt_max, lo, wide, fx_l.as_mut());
             ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, click(rt_click, rt_gain, rt_hz, rt_ms, rt_soft), rt_min, rt_max, lo, wide, fx_r.as_mut());
+            let new_r = trigger_widget(ui, "R", raw_r, rt_thr, hysteresis, click("r"), rt_min, rt_max, lo, wide, fx_r.as_mut());
             if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
             if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
+            if let Some(a) = actuator {
+                // A range flag moves both pins at once: the click's offset is from
+                // the digital point as it now stands.
+                write_trigger_click(canvas, node_id, "l", a, &new_l, new_l.threshold.unwrap_or(lt_thr));
+                write_trigger_click(canvas, node_id, "r", a, &new_r, new_r.threshold.unwrap_or(rt_thr));
+            }
             if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                 if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
                 if let Some(v) = new_l.range_max { n.params.insert("ltrig_max".into(), serde_json::json!(v)); }
-                if let Some(t) = new_l.click { n.params.insert("ltrig_click_offset".into(), serde_json::json!(t - lt_thr)); }
-                if let Some(t) = new_r.click { n.params.insert("rtrig_click_offset".into(), serde_json::json!(t - rt_thr)); }
-                if let Some(v) = new_l.click_gain { n.params.insert("ltrig_click_gain_db".into(), serde_json::json!(v)); }
-                if let Some(v) = new_r.click_gain { n.params.insert("rtrig_click_gain_db".into(), serde_json::json!(v)); }
                 if new_l.reset_threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
                 if new_r.reset_threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
-                if let Some(v) = new_l.click_hz { n.params.insert("ltrig_click_hz".into(), serde_json::json!(v)); }
-                if let Some(v) = new_r.click_hz { n.params.insert("rtrig_click_hz".into(), serde_json::json!(v)); }
-                if let Some(v) = new_l.click_ms { n.params.insert("ltrig_click_ms".into(), serde_json::json!(v)); }
-                if let Some(v) = new_r.click_ms { n.params.insert("rtrig_click_ms".into(), serde_json::json!(v)); }
-                if let Some(v) = new_l.click_soft { n.params.insert("ltrig_click_soft".into(), serde_json::json!(v)); }
-                if let Some(v) = new_r.click_soft { n.params.insert("rtrig_click_soft".into(), serde_json::json!(v)); }
-                if new_l.reset_click {
-                    n.params.insert("ltrig_click_offset".into(), serde_json::json!(0.0_f32));
-                    n.params.insert("ltrig_click_hz".into(), serde_json::json!(automap::TRIGGER_CLICK_HZ));
-                    n.params.insert("ltrig_click_ms".into(), serde_json::json!(automap::TRIGGER_CLICK_MS));
-                    n.params.insert("ltrig_click_soft".into(), serde_json::json!(0.0_f32));
-                }
-                if new_r.reset_click {
-                    n.params.insert("rtrig_click_offset".into(), serde_json::json!(0.0_f32));
-                    n.params.insert("rtrig_click_hz".into(), serde_json::json!(automap::TRIGGER_CLICK_HZ));
-                    n.params.insert("rtrig_click_ms".into(), serde_json::json!(automap::TRIGGER_CLICK_MS));
-                    n.params.insert("rtrig_click_soft".into(), serde_json::json!(0.0_f32));
-                }
                 if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
                 if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
                 if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
@@ -4300,9 +4333,96 @@ fn triggers_section(
     });
 }
 
-fn normalise_trig(v: f32, mn: f32, mx: f32) -> f32 {
-    if (mx - mn).abs() < 1e-4 { v.clamp(0.0, 1.0) }
-    else { ((v - mn) / (mx - mn)).clamp(0.0, 1.0) }
+/// Trigger clicks on a pad whose triggers this window doesn't calibrate: digital
+/// ones (a Switch Pro's ZL / ZR) click as they are pressed, and a pad known only
+/// through SDL clicks halfway, at the default digital point.
+fn trigger_haptics_section(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+    lo: Layout,
+    actuator: automap::ClickActuator,
+) {
+    let outputs = canvas.snarl.get_node(node_id).map(node_pin_ids).unwrap_or_default();
+    let sides: Vec<(&str, &str, [&str; 2])> = [("L", "l", ["left_trigger", "btn_lt_dig"]), ("R", "r", ["right_trigger", "btn_rt_dig"])]
+        .into_iter()
+        .filter(|(_, _, pins)| outputs.iter().any(|p| pins.contains(&p.as_str())))
+        .collect();
+    if sides.is_empty() || !section_header(ui, node_id, "Trigger Haptics", false, false) {
+        return;
+    }
+    let mut click_on = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("trig_click_on").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(lo.left_w);
+            instruct_line(ui, &[
+                (false, "Play a click as each trigger is "),
+                (true, "pressed"),
+                (false, " and, under Release, as it "),
+                (true, "lets go"),
+                (false, "."),
+            ]);
+            ui.add_space(8.0);
+            trigger_click_checkbox(ui, canvas, node_id, dev_id, actuator, &mut click_on);
+        });
+        if !click_on {
+            return;
+        }
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (i, (label, side, pins)) in sides.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(lo.scope_gap);
+                }
+                let click = read_trigger_click(canvas, node_id, side, actuator, click_on);
+                // Tabs, then the press's name, reset and four sliders.
+                let body_h = FX_ROW_H + FX_ROW_GAP + 2.0 + ui.text_style_height(&egui::TextStyle::Small)
+                    + FX_ROW_GAP + ui.spacing().interact_size.y + 4.0 * (FX_ROW_H + 2.0 * FX_ROW_GAP);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(lo.cell_w, body_h + 12.0), Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, 4.0, Color32::from_gray(15));
+                painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
+                    egui::epaint::StrokeKind::Inside);
+                // The trigger's name, lit while it is held.
+                let held = pins.iter().any(|p| read_float(live, dev_id, p) > 0.5);
+                painter.text(rect.right_top() + egui::vec2(-10.0, 6.0), egui::Align2::RIGHT_TOP, *label,
+                    egui::FontId::proportional(22.0), if held { ORANGE } else { Color32::from_gray(80) });
+                let body = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 6.0),
+                    egui::vec2((lo.cell_w - 48.0).max(FX_MIN_W), body_h));
+                let mut edit = TriggerWidgetEdit::default();
+                trigger_side_panel(ui, body, label, None, Some(click), false, &mut edit);
+                write_trigger_click(canvas, node_id, side, actuator, &edit, 0.0);
+            }
+        });
+    });
+}
+
+/// A point on a trigger's calibrated range (0–1 of `from`) carried onto the
+/// range `to`, keeping its raw distance from whichever end it sat nearer: that
+/// end takes it along as it moves, and the other pushes it only on reaching it.
+/// Where the range leaves it no room, it sits at the end.
+fn keep_trigger_point(t: f32, (mn0, mx0): (f32, f32), (mn1, mx1): (f32, f32)) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let span0 = mx0 - mn0;
+    let raw = if t <= 0.5 { mn1 + t * span0 } else { mx1 - (1.0 - t) * span0 };
+    ((raw - mn1) / (mx1 - mn1).max(1e-4)).clamp(0.0, 1.0)
+}
+
+/// A trigger's digital point and click point, as the device node holds them,
+/// kept where they sit on the pad as its range goes from `from` to `to` (see
+/// [`keep_trigger_point`]).
+fn keep_trigger_points(params: &mut HashMap<String, Value>, side: &str, from: (f32, f32), to: (f32, f32)) {
+    let (thr_key, off_key) = (format!("{side}trig_digital_threshold"), format!("{side}trig_click_offset"));
+    let get = |key: &str, default: f32| params.get(key).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
+    let t = get(&thr_key, TRIG_THRESHOLD_DEFAULT);
+    let click = (t + get(&off_key, 0.0)).clamp(0.0, 1.0);
+    let (t1, click1) = (keep_trigger_point(t, from, to), keep_trigger_point(click, from, to));
+    params.insert(thr_key, serde_json::json!(t1));
+    params.insert(off_key, serde_json::json!(click1 - t1));
 }
 
 /// Jitter-aware range debias + quantization.
@@ -4335,36 +4455,284 @@ struct TriggerWidgetEdit {
     threshold: Option<f32>,
     /// Where the trigger click pin was dragged to, on the same scale as `threshold`.
     click: Option<f32>,
-    click_gain: Option<f32>,
-    click_hz: Option<f32>,
-    click_ms: Option<f32>,
-    click_soft: Option<f32>,
+    /// The press's click, then the release's.
+    edges: [ClickEdgeEdit; 2],
+    press_on: Option<bool>,
+    release_on: Option<bool>,
     reset_threshold: bool,
-    reset_click: bool,
     range_min: Option<f32>,
     range_max: Option<f32>,
     /// The default effect's mode or a number changed (written back by the caller).
     effect_changed: bool,
 }
 
-/// One trigger's click, for the box its arc sits in.
+/// One edge of a trigger's click as the device node holds it (see
+/// `feedback::apply_trigger_click`, which reads the same keys and defaults).
 #[derive(Clone, Copy)]
-struct TriggerClickEdit {
-    on: bool,
-    /// From the digital threshold, on the same scale.
-    offset: f32,
+struct ClickEdge {
     gain_db: f32,
     hz: f32,
     ms: f32,
     soft: f32,
 }
 
+/// What changed in one edge this frame; `reset` puts its shape back.
+#[derive(Default)]
+struct ClickEdgeEdit {
+    gain_db: Option<f32>,
+    hz: Option<f32>,
+    ms: Option<f32>,
+    soft: Option<f32>,
+    reset: bool,
+}
+
+/// One trigger's click, for its box.
+#[derive(Clone, Copy)]
+struct TriggerClickEdit {
+    on: bool,
+    /// From the digital threshold, on the same scale.
+    offset: f32,
+    actuator: automap::ClickActuator,
+    press_on: bool,
+    press: ClickEdge,
+    release_on: bool,
+    release: ClickEdge,
+}
+
+impl TriggerClickEdit {
+    /// Whether this trigger plays anything: the click on, and its press or
+    /// release with it.
+    fn plays(&self) -> bool {
+        self.on && (self.press_on || self.release_on)
+    }
+}
+
+/// Which edge of a click, as its params name it: `{side}trig_{edge}_…`.
+const CLICK_EDGES: [&str; 2] = ["click", "release"];
+
+/// What plays this pad's trigger clicks, if it can play one at all. A Joy-Con 2
+/// declares HD pins its backend doesn't encode yet, so it gets none.
+fn trigger_click_actuator(canvas: &Canvas, node_id: NodeId, dev_id: &str) -> Option<automap::ClickActuator> {
+    if crate::canvas::remapper_icons::phys_pad_slug(dev_id).is_some_and(|s| s.starts_with("joycon2")) {
+        return None;
+    }
+    let pins = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("input_pin_ids").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    automap::click_actuator(pins.iter().filter_map(|v| v.as_str()))
+}
+
+fn read_trigger_click(canvas: &Canvas, node_id: NodeId, side: &str, actuator: automap::ClickActuator, on: bool) -> TriggerClickEdit {
+    let edge = |edge: &str| {
+        let num = |field: &str, default: f32| read_param_f32(canvas, node_id, &format!("{side}trig_{edge}_{field}"), default);
+        ClickEdge {
+            gain_db: num("gain_db", if edge == "release" { automap::TRIGGER_RELEASE_DB } else { 0.0 }),
+            hz: num("hz", automap::TRIGGER_CLICK_HZ),
+            ms: num("ms", actuator.default_ms()),
+            soft: num("soft", 0.0),
+        }
+    };
+    let flag = |key: &str, default: bool| canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get(&format!("{side}{key}")).and_then(|v| v.as_bool()))
+        .unwrap_or(default);
+    TriggerClickEdit {
+        on,
+        offset: read_param_f32(canvas, node_id, &format!("{side}trig_click_offset"), 0.0),
+        actuator,
+        press_on: flag("trig_press_on", true),
+        press: edge("click"),
+        release_on: flag("trig_release_on", false),
+        release: edge("release"),
+    }
+}
+
+/// Writes back what a trigger's box changed in its click. `threshold` is the
+/// yellow pin's before this frame, which the cyan pin's offset is from.
+fn write_trigger_click(
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    side: &str,
+    actuator: automap::ClickActuator,
+    edit: &TriggerWidgetEdit,
+    threshold: f32,
+) {
+    let Some(n) = canvas.snarl.get_node_mut(node_id) else { return };
+    let mut put = |key: String, v: Value| { n.params.insert(key, v); };
+    if let Some(t) = edit.click {
+        put(format!("{side}trig_click_offset"), serde_json::json!(t - threshold));
+    }
+    if let Some(on) = edit.press_on {
+        put(format!("{side}trig_press_on"), Value::Bool(on));
+    }
+    if let Some(on) = edit.release_on {
+        put(format!("{side}trig_release_on"), Value::Bool(on));
+    }
+    for (edge, e) in CLICK_EDGES.iter().zip(&edit.edges) {
+        let key = |field: &str| format!("{side}trig_{edge}_{field}");
+        for (field, v) in [("gain_db", e.gain_db), ("hz", e.hz), ("ms", e.ms), ("soft", e.soft)] {
+            if let Some(v) = v {
+                put(key(field), serde_json::json!(v));
+            }
+        }
+        if e.reset {
+            if *edge == "click" {
+                put(format!("{side}trig_click_offset"), serde_json::json!(0.0_f32));
+            }
+            put(key("hz"), serde_json::json!(automap::TRIGGER_CLICK_HZ));
+            put(key("ms"), serde_json::json!(actuator.default_ms()));
+            put(key("soft"), serde_json::json!(0.0_f32));
+        }
+    }
+}
+
+/// The checkbox that turns a pad's trigger clicks on, told what plays them.
+fn trigger_click_checkbox(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    actuator: automap::ClickActuator,
+    on: &mut bool,
+) {
+    use automap::ClickActuator;
+    let hover = match actuator {
+        ClickActuator::Own => "FlexInput plays a click on the grip motor as the trigger passes the \
+            cyan pin. While this is on, the pad's own full-pull point is out of reach, so Steam's \
+            click stays quiet, and so does anything bound to Full Pull in Steam Input.",
+        ClickActuator::Hd if crate::canvas::remapper_icons::phys_pad_slug(dev_id) == Some("dualsense") =>
+            "FlexInput plays a click on the haptics of the trigger's side, on top of the game's. \
+            Over Bluetooth a DualSense has no audio for them, so it plays on the rumble it \
+            emulates there, with no pitch.",
+        ClickActuator::Hd => "FlexInput plays a click on the haptics of the trigger's side, on top \
+            of the game's.",
+        ClickActuator::Switch => "FlexInput plays a click on the HD rumble of the trigger's side, on \
+            top of the game's, at a pitch from 82 to 1253 Hz. A click shorter than 35 ms isn't \
+            played reliably, so none is.",
+        ClickActuator::Rumble => "FlexInput plays a pulse on the rumble motor of the trigger's side, \
+            on top of the game's. A motor has no pitch, so only strength and length apply.",
+    };
+    let toggled = ui.checkbox(on, egui::RichText::new("Trigger click").size(INSTRUCT_SIZE))
+        .on_hover_text(hover)
+        .changed();
+    if toggled {
+        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+            n.params.insert("trig_click_on".into(), Value::Bool(*on));
+        }
+    }
+}
+
 const DIGITAL_LABEL_COLOR: Color32 = Color32::from_rgb(240, 220, 60);
 const HAPTICS_LABEL_COLOR: Color32 = Color32::from_rgb(90, 220, 230);
 
-/// A trigger's digital point and its click, inside `rect`, each named in its pin's
-/// colour: the box's counterpart of [`trigger_effect_controls`].
+/// A tab of the controls beside a trigger.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerTab {
+    Effect,
+    Press,
+    Release,
+}
+
+/// The controls beside a trigger, inside `rect`: its default adaptive effect and
+/// its click on press and on release, a tab each where there's more than one.
+/// `point` shows the yellow pin's name and reset, for a box with an arc.
+fn trigger_side_panel(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    effect: Option<&mut TriggerEffect>,
+    click: Option<TriggerClickEdit>,
+    point: bool,
+    out: &mut TriggerWidgetEdit,
+) {
+    let mut tabs = Vec::new();
+    if effect.is_some() {
+        tabs.push(TriggerTab::Effect);
+    }
+    if click.is_some_and(|c| c.on) {
+        tabs.extend([TriggerTab::Press, TriggerTab::Release]);
+    }
+    let tab_id = ui.id().with(("trig_tab", label));
+    let mut tab = ui.ctx().data(|d| d.get_temp::<TriggerTab>(tab_id))
+        .filter(|t| tabs.contains(t))
+        .or(tabs.first().copied())
+        .unwrap_or(TriggerTab::Press);
+    let mut body = rect;
+    if tabs.len() > 1 {
+        let row = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), FX_ROW_H));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        child.spacing_mut().item_spacing.x = 4.0;
+        for t in &tabs {
+            let name = match t {
+                TriggerTab::Effect => "Effect",
+                TriggerTab::Press => "Press",
+                TriggerTab::Release => "Release",
+            };
+            if child.selectable_label(tab == *t, egui::RichText::new(name).small()).clicked() {
+                tab = *t;
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(tab_id, tab));
+        body.min.y += FX_ROW_H + FX_ROW_GAP + 2.0;
+    }
+    match (tab, effect, click) {
+        (TriggerTab::Effect, Some(fx), _) => out.effect_changed = trigger_effect_controls(ui, body, label, fx),
+        (TriggerTab::Release, _, Some(c)) => trigger_release_controls(ui, body, label, c, out),
+        (_, _, Some(c)) => trigger_click_controls(ui, body, label, c, point, out),
+        (_, Some(fx), None) => out.effect_changed = trigger_effect_controls(ui, body, label, fx),
+        _ => {}
+    }
+}
+
+/// A trigger's digital point, where it has one, and its press click, inside
+/// `rect`, each named in its pin's colour.
 fn trigger_click_controls(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    click: TriggerClickEdit,
+    point: bool,
+    out: &mut TriggerWidgetEdit,
+) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.y = FX_ROW_GAP;
+    let reset = |ui: &mut egui::Ui| ui.add(egui::Button::new(egui::RichText::new("Reset").small())).clicked();
+
+    if point {
+        ui.label(egui::RichText::new("Digital trigger").small().color(DIGITAL_LABEL_COLOR));
+        out.reset_threshold = reset(ui);
+        ui.add_space(6.0);
+    }
+    if !click.on {
+        return;
+    }
+    let name = if !point || (click.offset * 100.0).round() == 0.0 {
+        "Haptics".to_string()
+    } else {
+        format!("Haptics {:+.0}%", click.offset * 100.0)
+    };
+    let mut on = click.press_on;
+    if ui.checkbox(&mut on, egui::RichText::new(name).small().color(HAPTICS_LABEL_COLOR))
+        .on_hover_text("Click as the trigger passes the point. Off, this trigger plays only its \
+            release, if that's on.")
+        .changed()
+    {
+        out.press_on = Some(on);
+    }
+    out.edges[0].reset = reset(ui);
+    ui.push_id((label, "press"), |ui| {
+        ui.add_enabled_ui(on, |ui| {
+            click_edge_faders(ui, rect.width(), click.actuator, click.press, &mut out.edges[0]);
+        });
+    });
+}
+
+/// A trigger's release click, inside `rect`.
+fn trigger_release_controls(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     label: &str,
@@ -4378,41 +4746,60 @@ fn trigger_click_controls(
     );
     let ui = &mut child;
     ui.spacing_mut().item_spacing.y = FX_ROW_GAP;
-    let reset = |ui: &mut egui::Ui| ui.add(egui::Button::new(egui::RichText::new("Reset").small())).clicked();
+    let mut on = click.release_on;
+    if ui.checkbox(&mut on, egui::RichText::new("On release").small().color(HAPTICS_LABEL_COLOR))
+        .on_hover_text("Also click as the trigger comes back past the point, with a feel of its own.")
+        .changed()
+    {
+        out.release_on = Some(on);
+    }
+    out.edges[1].reset = ui.add(egui::Button::new(egui::RichText::new("Reset").small())).clicked();
+    ui.push_id((label, "release"), |ui| {
+        ui.add_enabled_ui(on, |ui| {
+            click_edge_faders(ui, rect.width(), click.actuator, click.release, &mut out.edges[1]);
+        });
+    });
+}
 
-    ui.label(egui::RichText::new("Digital trigger").small().color(DIGITAL_LABEL_COLOR));
-    out.reset_threshold = reset(ui);
-    ui.add_space(6.0);
-    if !click.on {
-        return;
-    }
-    let name = if (click.offset * 100.0).round() == 0.0 {
-        "Haptics".to_string()
-    } else {
-        format!("Haptics {:+.0}%", click.offset * 100.0)
+/// One edge's strength and, where the pad can play them, its pitch and softness,
+/// and its length, as faders like the adaptive effect's numbers.
+fn click_edge_faders(
+    ui: &mut egui::Ui,
+    width: f32,
+    actuator: automap::ClickActuator,
+    edge: ClickEdge,
+    out: &mut ClickEdgeEdit,
+) {
+    use automap::ClickActuator;
+    // The Steam Controller's tone takes a boost; elsewhere 0 dB is the actuator's full.
+    let (gain_range, gain_hover) = match actuator {
+        ClickActuator::Own => (-18.0..=12.0, "How hard this trigger clicks."),
+        // A Switch Pro's quietest step is about −40 dB of its full.
+        ClickActuator::Switch => (-40.0..=0.0, "How hard this trigger clicks: 0 dB is the actuator's full strength."),
+        _ => (-24.0..=0.0, "How hard this trigger clicks: 0 dB is the actuator's full strength."),
     };
-    ui.label(egui::RichText::new(name).small().color(HAPTICS_LABEL_COLOR));
-    out.reset_click = reset(ui);
-    let mut gain = click.gain_db;
-    // What's left of the row once the slider's own number has its room.
-    ui.spacing_mut().slider_width = (rect.width() - 66.0).max(32.0);
-    let resp = ui.push_id(("trig_click_gain", label), |ui| {
-        ui.add(egui::Slider::new(&mut gain, -18.0..=12.0).step_by(1.0).suffix(" dB"))
-            .on_hover_text("How hard this trigger clicks.")
-    }).inner;
-    if resp.changed() {
-        out.click_gain = Some(gain);
+    out.gain_db = value_fader(ui, width, "Strength", edge.gain_db, gain_range, false, 1.0,
+        |v| format!("{v:.0} dB"), gain_hover);
+    // What the pad can play: a pitch, how short, and a fade.
+    let (pitches, lengths, fades) = match actuator {
+        ClickActuator::Own | ClickActuator::Hd => (Some(CLICK_HZ_RANGE), CLICK_MS_RANGE, true),
+        ClickActuator::Switch => {
+            let (lo, hi) = automap::SWITCH_HD_HZ;
+            (Some(lo..=hi), automap::SWITCH_CLICK_MIN_MS..=*RUMBLE_CLICK_MS_RANGE.end(), true)
+        }
+        ClickActuator::Rumble => (None, RUMBLE_CLICK_MS_RANGE, false),
+    };
+    if let Some(pitches) = pitches {
+        out.hz = value_fader(ui, width, "Pitch", edge.hz, pitches, true, 1.0,
+            |v| format!("{v:.0} Hz"), "The click's pitch. Lower feels like a thud, higher like a tick.");
     }
-    let (mut hz, mut ms) = (click.hz, click.ms);
-    if ui.push_id(("trig_click_hz", label), |ui| click_tone_slider(ui, &mut hz, "")).inner {
-        out.click_hz = Some(hz);
-    }
-    if ui.push_id(("trig_click_ms", label), |ui| click_length_slider(ui, &mut ms, "")).inner {
-        out.click_ms = Some(ms);
-    }
-    let mut soft = click.soft;
-    if ui.push_id(("trig_click_soft", label), |ui| click_soft_slider(ui, &mut soft)).inner {
-        out.click_soft = Some(soft);
+    out.ms = value_fader(ui, width, "Length", edge.ms, lengths, true, 1.0,
+        |v| format!("{v:.0} ms"), "The click's length: short feels crisp, long feels more like a pulse.");
+    if fades {
+        out.soft = value_fader(ui, width, "Soft", edge.soft, 0.0..=1.0, false, 0.05,
+            |v| format!("{:.0}%", v * 100.0),
+            "Sharp to soft. At 0 the click starts and stops dead; higher, more of it fades in \
+             and out, until at 100% it swells and dies away.");
     }
 }
 
@@ -4443,8 +4830,11 @@ const TRIG_EFFECT_MODES: [(&str, &str); 7] = [
 /// Height of one effect fader, and the gap under it.
 const FX_ROW_H: f32 = 18.0;
 const FX_ROW_GAP: f32 = 4.0;
-/// Narrowest the effect controls get beside the arc; a narrower cell shrinks the arc.
-const FX_MIN_W: f32 = 120.0;
+/// Narrowest the controls get beside the arc, just room for a fader's name and
+/// number; a narrower cell shrinks the arc.
+const FX_MIN_W: f32 = 96.0;
+/// Widest they get: the rest of the box goes to the arc.
+const FX_MAX_W: f32 = 150.0;
 /// Most numbers an effect takes (`MACHINE`): the controls reserve room for all
 /// of them, so the box keeps its size as the mode changes.
 const FX_MAX_ROWS: usize = 6;
@@ -4568,49 +4958,86 @@ fn effect_fader(
     prm: &flexinput_engine::eval::JsmEffectParam,
     value: u8,
 ) -> Option<u8> {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, FX_ROW_H), Sense::click_and_drag());
+    let (rect, resp, at) = fader_input(ui, width);
     let span = (prm.hi.saturating_sub(prm.lo)).max(1) as f32;
-    let mut out = None;
-    if resp.dragged() || resp.clicked() {
-        if let Some(p) = resp.interact_pointer_pos() {
-            let t = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            out = Some((prm.lo as f32 + t * span).round() as u8);
-        }
-    }
+    let out = at.map(|t| (prm.lo as f32 + t * span).round() as u8);
     let shown = out.unwrap_or(value).clamp(prm.lo, prm.hi);
-    let t = (shown - prm.lo) as f32 / span;
-    let active = resp.hovered() || resp.dragged();
+    let mut name = prm.name.to_string();
+    if let Some(first) = name.get_mut(0..1) { first.make_ascii_uppercase(); }
+    fader_paint(ui, rect, &resp, &name, (shown - prm.lo) as f32 / span, &shown.to_string());
+    resp.on_hover_text(format!("{} — {} to {}", prm.name, prm.lo, prm.hi));
+    out
+}
 
+/// A fader's room, and where along it (0..1) the pointer sets it while held.
+fn fader_input(ui: &mut egui::Ui, width: f32) -> (egui::Rect, egui::Response, Option<f32>) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, FX_ROW_H), Sense::click_and_drag());
+    let at = (resp.dragged() || resp.clicked())
+        .then(|| resp.interact_pointer_pos())
+        .flatten()
+        .map(|p| ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0));
+    (rect, resp, at)
+}
+
+/// A fader filled to `t` (0..1), its name on the left and its value on the right.
+fn fader_paint(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, name: &str, t: f32, value: &str) {
+    let active = resp.hovered() || resp.dragged();
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, Color32::from_gray(if active { 34 } else { 26 }));
     if t > 0.0 {
-        let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * t, rect.bottom()));
+        let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * t.min(1.0), rect.bottom()));
         painter.rect_filled(fill, 3.0, Color32::from_rgb(52, 92, 128));
     }
     painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(if active { 80 } else { 50 })),
         egui::epaint::StrokeKind::Inside);
     let font = egui::FontId::proportional(11.5);
-    let mut name = prm.name.to_string();
-    if let Some(first) = name.get_mut(0..1) { first.make_ascii_uppercase(); }
+    let dim = !ui.is_enabled();
     painter.text(egui::pos2(rect.left() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER,
-        name, font.clone(), Color32::from_gray(200));
+        name, font.clone(), Color32::from_gray(if dim { 110 } else { 200 }));
     painter.text(egui::pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER,
-        shown.to_string(), font, Color32::WHITE);
-    resp.on_hover_text(format!("{} — {} to {}", prm.name, prm.lo, prm.hi));
+        value, font, if dim { Color32::from_gray(130) } else { Color32::WHITE });
+}
+
+/// A number on a fader of the effect faders' kind: `log` spaces it by ratio,
+/// and it moves in `step`s. Returns the value while it is being set.
+#[allow(clippy::too_many_arguments)]
+fn value_fader(
+    ui: &mut egui::Ui,
+    width: f32,
+    name: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    log: bool,
+    step: f32,
+    unit: impl Fn(f32) -> String,
+    hover: &str,
+) -> Option<f32> {
+    let (lo, hi) = (*range.start(), *range.end());
+    let to_t = |v: f32| if log { (v / lo).ln() / (hi / lo).ln() } else { (v - lo) / (hi - lo) };
+    let from_t = |t: f32| if log { lo * (hi / lo).powf(t) } else { lo + t * (hi - lo) };
+    let (rect, resp, at) = fader_input(ui, width);
+    let out = at.map(|t| ((from_t(t) / step).round() * step).clamp(lo, hi));
+    let shown = out.unwrap_or(value).clamp(lo, hi);
+    fader_paint(ui, rect, &resp, name, to_t(shown).clamp(0.0, 1.0), &unit(shown));
+    resp.on_hover_text(hover);
     out
 }
 
-/// Trigger arc with live fill + draggable threshold pin (inner ring) +
-/// draggable range min/max pins (outer ring) + Atrig SVG silhouette, and — given
-/// `effect` — the trigger's default adaptive effect beside it.
+/// Trigger arc with an Atrig SVG silhouette, and — given `effect` or `click` —
+/// the controls beside it.
 ///
-/// Geometry: two concentric half-circles on the right side, cup opening
-/// leftward.
-///   * Inner radius `r_in`   — threshold pin (yellow).
-///   * Outer radius `r_out`  — range pins (green min, red max).
-/// Clicks within ±r_hit pixels of each ring are dispatched to that ring.
-/// `click` — the trigger click's position, a cyan pin between the two rings, so
-/// it stays grabbable sitting at the yellow pin's angle.
+/// One thick half-circle on the right, cup opening leftward, in the trigger's
+/// RAW travel from the top: what the pad reports, before its range applies.
+///   * Orange flags: the range's ends, the inner and outer deadzones. Travel
+///     outside them is thrown away, and its fill shows red.
+///   * Yellow pin, the digital point, and cyan pin, the click's: heads outside
+///     the track, the cyan one further out so both stay grabbable at one angle,
+///     each with a line of its colour across the track. Both sit on the range,
+///     so they move with the flags. The fill past each takes its colour, and
+///     past both it runs in two lanes.
+///   * The click's distance from the digital point, as a number inside the arc.
+/// A press takes the handle whose head is under it, else the one nearest along
+/// the arc, and keeps it for the whole drag.
 ///
 /// `wide` puts the arc on the right of a box spanning the whole vectorscope
 /// cell, the effect controls on its left (set for both triggers when either has
@@ -4620,8 +5047,9 @@ fn effect_fader(
 fn trigger_widget(
     ui: &mut egui::Ui,
     label: &str,
-    norm: f32,
+    raw: f32,
     threshold: f32,
+    hysteresis: f32,
     click: Option<TriggerClickEdit>,
     range_min: f32,
     range_max: f32,
@@ -4634,26 +5062,32 @@ fn trigger_widget(
     // pokes out left of its centre.
     let arc_block = |h: f32| {
         let r_out = h * 0.5 - 10.0;
-        h * 0.06 + 10.0 + r_out * (1.0 + 0.74 * 0.55) + 8.0
+        h * 0.06 + 10.0 + r_out * 1.45 + 8.0
     };
-    // The box is always one cell wide. Beside the effect controls the ARC gives
-    // way when the cell is narrow — never the box, which would push the window
-    // wider than the user dragged it.
+    // The click's controls, under their tabs, run a little taller than an effect's.
+    let fx_h = fx_controls_h(ui) + if click.is_some() { 2.0 * (FX_ROW_H + FX_ROW_GAP) } else { 0.0 };
+    // The box is always one cell wide. Beside the controls the arc takes what
+    // their column leaves, as tall as their rows make the box or the scopes'
+    // cell, whichever is taller; when the cell is narrow the ARC gives way, never
+    // the box, which would push the window wider than the user dragged it.
+    let panel_w = (lo.cell_w * 0.36).clamp(FX_MIN_W, FX_MAX_W);
     let arc_h = if wide {
         let (b, a) = (arc_block(0.0), arc_block(1.0) - arc_block(0.0));
-        lo.trig_h.min((lo.cell_w - 8.0 - FX_MIN_W - b) / a).max(48.0)
+        lo.trig_h.max(fx_h + 12.0).min((lo.cell_w - 12.0 - panel_w - b) / a).max(48.0)
     } else {
         lo.trig_h
     };
-    // Two concentric arcs: outer for range-clamp pins, inner for threshold.
+    // The pins' reach; the track inside it, thick enough to read the fill's
+    // zones; the silhouette inside that.
     let r_out = arc_h * 0.5 - 10.0;
-    let r_in  = r_out * 0.74;
+    let w = (r_out * 0.18).clamp(8.0, 14.0);
+    let r = r_out - 8.0 - w * 0.5;
+    let r_in = r - w * 0.5 - 4.0;
     let right_margin = arc_h * 0.06 + 10.0;
-    // The click's controls run a little taller than an effect's.
-    let fx_h = fx_controls_h(ui) + if click.is_some() { FX_ROW_H + FX_ROW_GAP } else { 0.0 };
 
-    // Width of the effect controls on the arc's left; `None` = square box.
-    let side_w = wide.then(|| (lo.cell_w - arc_block(arc_h) - 8.0).max(0.0));
+    // Width of the controls on the arc's left; `None` = square box. Room the
+    // arc can't use stays between the two.
+    let side_w = wide.then(|| (lo.cell_w - arc_block(arc_h) - 8.0).clamp(0.0, panel_w));
     let size = match side_w {
         None    => egui::vec2(lo.trig_w, arc_h),
         Some(_) => egui::vec2(lo.cell_w, arc_h.max(fx_h + 12.0)),
@@ -4677,142 +5111,145 @@ fn trigger_widget(
 
     let start = -std::f32::consts::FRAC_PI_2;
     let end   =  std::f32::consts::FRAC_PI_2;
+    let c = egui::pos2(cx, cy);
+    let angle = |t: f32| start + (end - start) * arc_place(t);
 
-    // Trigger silhouette — sized to fit inside the inner arc.
+    // Trigger silhouette — inside the track, a little left of its centre so the
+    // 10% mark fits on its right.
+    let sil_h = r_in * 1.15;
+    let sil = egui::Rect::from_center_size(
+        egui::pos2(cx - r_in * 0.1, cy + r_in * 0.05),
+        egui::vec2(sil_h * (69.0 / 82.0), sil_h),
+    );
     if let Some(tex) = load_atrig_texture(ui, (r_in * 2.0) as u32) {
-        let img_h = r_in * 1.30;
-        let img_w = img_h * (69.0 / 82.0);
-        let img_rect = egui::Rect::from_center_size(
-            egui::pos2(cx, cy + r_in * 0.05),
-            egui::vec2(img_w, img_h),
-        );
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let mut mesh = egui::epaint::Mesh::with_texture(tex.id());
-        mesh.add_rect_with_uv(img_rect, uv, Color32::WHITE);
+        mesh.add_rect_with_uv(sil, uv, Color32::WHITE);
         painter.add(egui::Shape::mesh(mesh));
     }
 
     // L/R glyph.
-    let glyph_size = (r_in * 0.78).clamp(22.0, 62.0);
+    let glyph_size = (r_in * 0.7).clamp(18.0, 56.0);
     painter.text(
-        egui::pos2(cx, cy + r_in * 0.05),
+        sil.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(glyph_size),
         Color32::from_gray(80),
     );
 
-    // Inner background arc.
-    arc_segment(painter, egui::pos2(cx, cy), r_in, start, end, 5.0, Color32::from_gray(50));
-    // Inner live fill (post-calibration) — blue.
-    let fill_end = start + (end - start) * norm.clamp(0.0, 1.0);
-    if fill_end > start {
-        arc_segment(painter, egui::pos2(cx, cy), r_in, start, fill_end, 5.0,
-            Color32::from_rgb(100, 180, 240));
+    // Each mark in raw travel. The digital and click points live on the range.
+    let mn = range_min.clamp(0.0, 1.0);
+    let mx = range_max.clamp(mn, 1.0);
+    let span = (mx - mn).max(1e-4);
+    let to_raw = |calibrated: f32| mn + calibrated.clamp(0.0, 1.0) * (mx - mn);
+    let digital = to_raw(threshold);
+    let on_click = click.filter(TriggerClickEdit::plays);
+    let haptic_point = on_click.map(|c| (threshold + c.offset).clamp(0.0, 1.0));
+    let haptic = haptic_point.map(to_raw);
+
+    // The track, discarded travel tinted red, each point's band faint in its
+    // colour, then the live fill over it.
+    arc_stroke(painter, c, r, angle(0.0), angle(mn), w, TRACK_DISCARDED);
+    arc_stroke(painter, c, r, angle(mn), angle(mx), w, Color32::from_gray(44));
+    arc_stroke(painter, c, r, angle(mx), angle(1.0), w, TRACK_DISCARDED);
+    let band = |point: f32, color: Color32| {
+        let (lo, hi) = automap::trigger_band(point, automap::trigger_band_width(hysteresis, (mn, mx)));
+        arc_stroke(painter, c, r, angle(to_raw(lo)), angle(to_raw(hi)), w, color.gamma_multiply(0.22));
+    };
+    band(threshold, DIGITAL_LABEL_COLOR);
+    if let Some(p) = haptic_point {
+        band(p, HAPTICS_LABEL_COLOR);
+    }
+    trigger_fill(painter, c, r, w, raw.clamp(0.0, 1.0), (mn, mx), digital, haptic, angle);
+
+    // Where the scale turns: half the arc is the first tenth of travel. The
+    // mark's number sits on a line to the track, between it and the silhouette;
+    // in the rare box too small for both, the line alone.
+    let mid = angle(ARC_MIDPOINT_TRAVEL);
+    let inner = r - w * 0.5;
+    let font = egui::FontId::proportional((r_in * 0.22).clamp(10.0, 12.0));
+    let galley = painter.layout_no_wrap(format!("{:.0}%", ARC_MIDPOINT_TRAVEL * 100.0), font, Color32::from_gray(140));
+    let at = polar(c, inner - 4.0, mid) - galley.size();
+    let from = if at.x >= sil.right() { at.x } else { inner + cx - 8.0 };
+    painter.line_segment([egui::pos2(from, cy), polar(c, inner, mid)], Stroke::new(1.0_f32, Color32::from_gray(110)));
+    if at.x >= sil.right() {
+        painter.galley(at, galley, Color32::from_gray(140));
     }
 
-    // Outer background arc — dim, full sweep.
-    arc_segment(painter, egui::pos2(cx, cy), r_out, start, end, 3.5,
-        Color32::from_gray(45));
-    // Outer active range — orange band between min and max pins.
-    let rmin_t = range_min.clamp(0.0, 1.0);
-    let rmax_t = range_max.clamp(rmin_t, 1.0);
-    let a_min = start + (end - start) * rmin_t;
-    let a_max = start + (end - start) * rmax_t;
-    if a_max > a_min {
-        arc_segment(painter, egui::pos2(cx, cy), r_out, a_min, a_max, 3.5,
-            Color32::from_rgb(220, 160, 40));
-    }
-
-    // Threshold pin on inner ring (yellow).
-    let thr_t = threshold.clamp(0.0, 1.0);
-    let thr_a = start + (end - start) * thr_t;
-    let thr_pin = polar(egui::pos2(cx, cy), r_in, thr_a);
-    painter.circle_filled(thr_pin, 5.0, Color32::from_rgb(240, 220, 60));
-    painter.circle_stroke(thr_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
-
-    // Trigger click pin, on a line of its own from the inner ring (cyan).
-    let click_pin = click.filter(|c| c.on).map(|c| {
-        let a = start + (end - start) * (threshold + c.offset).clamp(0.0, 1.0);
-        let pin = polar(egui::pos2(cx, cy), (r_in + r_out) * 0.5, a);
-        painter.line_segment([polar(egui::pos2(cx, cy), r_in, a), pin],
-            Stroke::new(1.5_f32, Color32::from_rgb(90, 220, 230)));
-        painter.circle_filled(pin, 4.0, Color32::from_rgb(90, 220, 230));
-        painter.circle_stroke(pin, 4.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
-        pin
-    });
-
-    // Range pins on outer ring.
-    let min_pin = polar(egui::pos2(cx, cy), r_out, a_min);
-    let max_pin = polar(egui::pos2(cx, cy), r_out, a_max);
-    painter.circle_filled(min_pin, 5.0, Color32::from_rgb(80, 200, 110));
-    painter.circle_stroke(min_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
-    painter.circle_filled(max_pin, 5.0, Color32::from_rgb(230, 90, 90));
-    painter.circle_stroke(max_pin, 5.0, Stroke::new(1.0_f32, Color32::from_gray(30)));
+    let flag_min = trigger_flag(painter, c, r, w, angle(mn), -1.0);
+    let flag_max = trigger_flag(painter, c, r, w, angle(mx), 1.0);
+    let digital_head = trigger_pin(painter, c, r, w, angle(digital), 5.0, DIGITAL_LABEL_COLOR);
+    let haptic_head = haptic.map(|h| trigger_pin(painter, c, r, w, angle(h), 13.0, HAPTICS_LABEL_COLOR));
 
     let mut out = TriggerWidgetEdit::default();
 
-    // Pointer routing: figure out which ring (inner/outer) the user is
-    // interacting with. We pick whichever ring's radius is CLOSER to the
-    // pointer's current distance from the arc center. Clicks at very
-    // different radii (silhouette area or far outside) snap to whichever
-    // is nearest, which feels natural.
     if resp.dragged() || resp.clicked() {
-        // Sticky-target: once a drag starts on a ring, keep editing that
-        // ring even if the pointer wanders into the other ring's
-        // capture zone mid-drag. Stash the target on drag start.
+        // The pointer's place along the arc, and the raw travel there. Left of
+        // the centre counts as the nearer end.
+        let pointer = resp.interact_pointer_pos().unwrap_or(c);
+        let (dx, dy) = (pointer.x - cx, pointer.y - cy);
+        let a = if dx < 0.0 { if dy < 0.0 { start } else { end } } else { dy.atan2(dx).clamp(start, end) };
+        let place = ((a - start) / (end - start)).clamp(0.0, 1.0);
+        let t = arc_travel(place);
+        // Sticky: the handle taken when the press began stays taken.
         let target_key = egui::Id::new(("trig_drag_target", label, resp.id));
+        // The range and both points as the press began: a flag carries the
+        // points from there, so dragging it back puts them back.
+        let snap_key = egui::Id::new(("trig_drag_snap", label, resp.id));
+        let click_point = click.map(|c| (threshold + c.offset).clamp(0.0, 1.0));
+        if resp.drag_started() || resp.clicked() {
+            ui.ctx().data_mut(|d| d.insert_temp(snap_key, (mn, mx, threshold, click_point)));
+        }
         let target_now = if resp.drag_started() || resp.clicked() {
-            let pos = resp.interact_pointer_pos().unwrap_or(egui::pos2(cx, cy));
-            let d = ((pos.x - cx).powi(2) + (pos.y - cy).powi(2)).sqrt();
-            // Decide based on which radius is closer.
-            let to_in = (d - r_in).abs();
-            let to_out = (d - r_out).abs();
-            // For the outer ring, decide which pin (min vs max) is closer
-            // in angle so a single click can grab the right handle.
-            let target: u8 = if click_pin.is_some_and(|p| p.distance(pos) <= 8.0) {
-                3 // trigger click
-            } else if to_in <= to_out {
-                0 // threshold
-            } else {
-                let dx = pos.x - cx;
-                let dy = pos.y - cy;
-                let a = if dx < 0.0 {
-                    if dy < 0.0 { start } else { end }
-                } else {
-                    dy.atan2(dx).clamp(start, end)
-                };
-                if (a - a_min).abs() <= (a - a_max).abs() { 1 } else { 2 }
-            };
+            // 0 digital point, 1 range start, 2 range end, 3 click — in this order
+            // of preference where two are as near.
+            let mut handles = vec![(0u8, digital_head, digital), (1, flag_min, mn), (2, flag_max, mx)];
+            if let (Some(head), Some(h)) = (haptic_head, haptic) {
+                handles.push((3, head, h));
+            }
+            let under = handles.iter()
+                .filter(|h| h.1.distance(pointer) <= 10.0)
+                .min_by(|x, y| x.1.distance(pointer).total_cmp(&y.1.distance(pointer)));
+            let along = |h: &(u8, Pos2, f32)| (arc_place(h.2) - place).abs();
+            let target = under
+                .or_else(|| handles.iter().min_by(|x, y| along(x).total_cmp(&along(y))))
+                .map_or(0, |h| h.0);
             ui.ctx().data_mut(|d| d.insert_temp(target_key, target));
             target
         } else {
             ui.ctx().data(|d| d.get_temp::<u8>(target_key)).unwrap_or(0)
         };
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let dx = pos.x - cx;
-            let dy = pos.y - cy;
-            let a = if dx < 0.0 {
-                if dy < 0.0 { start } else { end }
-            } else {
-                dy.atan2(dx).clamp(start, end)
-            };
-            let span = end - start;
-            let t = ((a - start) / span).clamp(0.0, 1.0);
-            match target_now {
-                0 => out.threshold = Some(t),
-                1 => out.range_min = Some(t.min(rmax_t - 0.01).max(0.0)),
-                2 => out.range_max = Some(t.max(rmin_t + 0.01).min(1.0)),
-                3 => out.click = Some(t),
-                _ => {}
+        // A range flag leaves the points where they sit on the pad, as far as it
+        // can (`keep_trigger_point`), instead of squeezing them along.
+        let move_range = |to: (f32, f32), out: &mut TriggerWidgetEdit| {
+            let snap = ui.ctx().data(|d| d.get_temp::<(f32, f32, f32, Option<f32>)>(snap_key));
+            if let Some((mn0, mx0, t0, click0)) = snap {
+                out.threshold = Some(keep_trigger_point(t0, (mn0, mx0), to));
+                out.click = click0.map(|c| keep_trigger_point(c, (mn0, mx0), to));
             }
+        };
+        match target_now {
+            0 => out.threshold = Some(((t - mn) / span).clamp(0.0, 1.0)),
+            1 => {
+                let to = t.min(mx - 0.01).max(0.0);
+                out.range_min = Some(to);
+                move_range((to, mx), &mut out);
+            }
+            2 => {
+                let to = t.max(mn + 0.01).min(1.0);
+                out.range_max = Some(to);
+                move_range((mn, to), &mut out);
+            }
+            // Within a few pixels of the yellow pin it lands exactly on it, so
+            // "the same spot" is the same point, not one a pixel's travel off.
+            3 if ((a - angle(digital)).abs() * r) < 5.0 => out.click = Some(threshold.clamp(0.0, 1.0)),
+            3 => out.click = Some(((t - mn) / span).clamp(0.0, 1.0)),
+            _ => {}
         }
     }
-    if let (Some(fx_rect), Some(fx)) = (fx_rect, effect) {
-        out.effect_changed = trigger_effect_controls(ui, fx_rect, label, fx);
-    }
-    if let (Some(fx_rect), Some(click)) = (fx_rect, click) {
-        trigger_click_controls(ui, fx_rect, label, click, &mut out);
+    if let Some(fx_rect) = fx_rect {
+        trigger_side_panel(ui, fx_rect, label, effect, click, true, &mut out);
     }
     out
 }
@@ -4821,16 +5258,103 @@ fn polar(c: Pos2, r: f32, a: f32) -> Pos2 {
     egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
 }
 
-fn arc_segment(painter: &egui::Painter, center: Pos2, radius: f32, a0: f32, a1: f32, stroke_w: f32, color: Color32) {
-    const N: usize = 72;
-    let span = a1 - a0;
-    let mut prev = polar(center, radius, a0);
-    for i in 1..=N {
-        let a = a0 + span * (i as f32 / N as f32);
-        let p = polar(center, radius, a);
-        painter.line_segment([prev, p], Stroke::new(stroke_w, color));
-        prev = p;
+/// The trigger track's colours: travel the range throws away, and the live fill
+/// before any pin and in that thrown-away travel.
+const TRACK_DISCARDED: Color32 = Color32::from_rgb(58, 32, 32);
+const FILL_LIVE: Color32 = Color32::from_rgb(80, 190, 110);
+const FILL_DISCARDED: Color32 = Color32::from_rgb(200, 80, 70);
+const FLAG_COLOR: Color32 = Color32::from_rgb(230, 140, 40);
+
+/// A stretch of arc from angle `a0` to `a1`, `w` thick, as one stroked line so it
+/// joins and edges cleanly however thick it is.
+fn arc_stroke(painter: &egui::Painter, center: Pos2, radius: f32, a0: f32, a1: f32, w: f32, color: Color32) {
+    if a1 <= a0 {
+        return;
     }
+    let n = ((a1 - a0) / 0.03).ceil().max(1.0) as usize;
+    let points = (0..=n).map(|i| polar(center, radius, a0 + (a1 - a0) * i as f32 / n as f32)).collect();
+    painter.add(egui::Shape::line(points, Stroke::new(w, color)));
+}
+
+/// The live fill to raw travel `raw`, each stretch coloured by its zone: red
+/// outside the range `(mn, mx)`, yellow past the digital point, cyan past the
+/// click's, the two side by side past both, green before either.
+#[allow(clippy::too_many_arguments)]
+fn trigger_fill(
+    painter: &egui::Painter,
+    center: Pos2,
+    r: f32,
+    w: f32,
+    raw: f32,
+    (mn, mx): (f32, f32),
+    digital: f32,
+    haptic: Option<f32>,
+    angle: impl Fn(f32) -> f32,
+) {
+    let mut cuts = vec![0.0, mn, mx, digital, raw];
+    cuts.extend(haptic);
+    cuts.retain(|&v| v <= raw);
+    cuts.sort_by(f32::total_cmp);
+    cuts.dedup();
+    for pair in cuts.windows(2) {
+        let (a0, a1) = (angle(pair[0]), angle(pair[1]));
+        let mid = (pair[0] + pair[1]) * 0.5;
+        let lane = |color| arc_stroke(painter, center, r, a0, a1, w, color);
+        if mid < mn || mid > mx {
+            lane(FILL_DISCARDED);
+            continue;
+        }
+        match (mid > digital, haptic.is_some_and(|h| mid > h)) {
+            (true, true) => {
+                arc_stroke(painter, center, r - w * 0.25, a0, a1, w * 0.5, DIGITAL_LABEL_COLOR);
+                arc_stroke(painter, center, r + w * 0.25, a0, a1, w * 0.5, HAPTICS_LABEL_COLOR);
+            }
+            (true, false) => lane(DIGITAL_LABEL_COLOR),
+            (false, true) => lane(HAPTICS_LABEL_COLOR),
+            (false, false) => lane(FILL_LIVE),
+        }
+    }
+}
+
+/// Where raw travel `t` (0..1) sits along the arc, 0..1: a log scale with the
+/// first [`ARC_MIDPOINT_TRAVEL`] of travel on the first half, where a light
+/// pull and the deadzones need the room.
+fn arc_place(t: f32) -> f32 {
+    (1.0 + ARC_SKEW * t.clamp(0.0, 1.0)).ln() / (1.0 + ARC_SKEW).ln()
+}
+
+/// The raw travel at place `p` along the arc: the inverse of [`arc_place`].
+fn arc_travel(p: f32) -> f32 {
+    ((1.0 + ARC_SKEW).powf(p.clamp(0.0, 1.0)) - 1.0) / ARC_SKEW
+}
+
+const ARC_MIDPOINT_TRAVEL: f32 = 0.1;
+/// The log scale's bend that puts [`ARC_MIDPOINT_TRAVEL`] halfway:
+/// (1 + 0.1·k)² = 1 + k.
+const ARC_SKEW: f32 = 80.0;
+
+/// A range end's flag at angle `a`: a pole across the track and in past it, its
+/// pennant pointing along the travel (`toward` +1) or back (−1), to the side
+/// that is thrown away. Inside, clear of the pins. Returns the pennant's
+/// centre, where it's grabbed.
+fn trigger_flag(painter: &egui::Painter, center: Pos2, r: f32, w: f32, a: f32, toward: f32) -> Pos2 {
+    let foot = polar(center, r + w * 0.5 + 1.0, a);
+    let tip = polar(center, r - w * 0.5 - 11.0, a);
+    painter.line_segment([foot, tip], Stroke::new(2.0_f32, FLAG_COLOR));
+    let low = polar(center, r - w * 0.5 - 4.0, a);
+    let along = egui::vec2(-a.sin(), a.cos()) * toward * 9.0;
+    painter.add(egui::Shape::convex_polygon(vec![tip, tip + along, low + along, low], FLAG_COLOR, Stroke::NONE));
+    egui::pos2((tip.x + low.x) * 0.5, (tip.y + low.y) * 0.5) + along * 0.5
+}
+
+/// A pin at angle `a`: a line of its colour across the track and out to its
+/// head, `reach` past the track's edge. Returns the head.
+fn trigger_pin(painter: &egui::Painter, center: Pos2, r: f32, w: f32, a: f32, reach: f32, color: Color32) -> Pos2 {
+    let head = polar(center, r + w * 0.5 + reach, a);
+    painter.line_segment([polar(center, r - w * 0.5, a), head], Stroke::new(2.0_f32, color));
+    painter.circle_filled(head, 4.5, color);
+    painter.circle_stroke(head, 4.5, Stroke::new(1.0_f32, Color32::from_gray(30)));
+    head
 }
 
 fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
@@ -4855,6 +5379,24 @@ fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
 mod unit_fmt_tests {
     use super::*;
 
+    /// A range end takes the points nearer it along, keeping their raw
+    /// distance from it, and pushes the far ones only on reaching them.
+    #[test]
+    fn a_range_end_carries_near_points_and_pushes_far_ones() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        let full = (0.0, 1.0);
+        // The start moves up 0.2: a point 0.3 in goes with it, one at 0.9
+        // stays where it is on the pad.
+        assert!(near(keep_trigger_point(0.3, full, (0.2, 1.0)), 0.3 / 0.8));
+        assert!(near(keep_trigger_point(0.9, full, (0.2, 1.0)), 0.7 / 0.8));
+        // Past a far point, the start pushes it along at the range's start.
+        assert_eq!(keep_trigger_point(0.6, full, (0.7, 1.0)), 0.0);
+        // The end comes down past a point nearer the start: it sits at the end.
+        assert_eq!(keep_trigger_point(0.3, full, (0.0, 0.25)), 1.0);
+        // Back where it began, the point is where it began.
+        assert!(near(keep_trigger_point(0.3, full, full), 0.3));
+    }
+
     /// Significant figures, not decimal places. The scope auto-zooms across
     /// several orders of magnitude, so a fixed precision is unreadable at one
     /// end or the other; this pins that every zoom depth keeps a usable
@@ -4878,6 +5420,18 @@ mod unit_fmt_tests {
     fn accel_uses_its_own_reference() {
         assert_eq!(fmt_g(1.0), "8.00 G");
         assert_eq!(fmt_g(0.125), "1.00 G");
+    }
+
+    /// The trigger arc's first half is the first tenth of travel, its ends the
+    /// ends, and a place on it reads back as the travel it shows.
+    #[test]
+    fn the_trigger_arc_gives_a_light_pull_half_its_length() {
+        assert_eq!(arc_place(0.0), 0.0);
+        assert!((arc_place(1.0) - 1.0).abs() < 1e-6);
+        assert!((arc_place(ARC_MIDPOINT_TRAVEL) - 0.5).abs() < 1e-6);
+        for t in [0.0, 0.02, 0.1, 0.37, 0.9, 1.0] {
+            assert!((arc_travel(arc_place(t)) - t).abs() < 1e-5, "{t}");
+        }
     }
 
     /// Negative values keep their sign and their precision bracket.

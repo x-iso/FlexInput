@@ -2118,6 +2118,55 @@ mod trigger_tests {
             Some(true), "above threshold must fire the digital button");
     }
 
+    // A snapped digital trigger goes down at its threshold from rest, comes up
+    // once under the band around it for the debounce, and short of rest goes
+    // down again only past the band's top; tick to tick, 10 ms apart.
+    #[test]
+    fn a_digital_trigger_lets_go_past_its_hysteresis_and_debounce() {
+        let dev_id = "gilrs:dualsense:hyst";
+        let run = |threshold: f32, steps: &[(f32, bool, &str)]| {
+            let mut src = empty_node(1, "device.source");
+            src.device_id = Some(dev_id.to_string());
+            src.params.insert("digital_triggers".into(), Value::Bool(true));
+            src.params.insert("ltrig_digital_threshold".into(), Value::from(threshold));
+            src.params.insert("trig_hysteresis".into(), Value::from(0.1));
+            let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
+            let mut state = HashMap::new();
+            let mut out = TickOutput::default();
+            for &(v, want, why) in steps {
+                let mut dev = BusMap::default();
+                dev.insert((dev_id.to_string(), "left_trigger".to_string()), Signal::Float(v));
+                eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&dev), 0.01, &mut out);
+                let down = out.dev_base.get_pin(dev_id, "btn_lt_dig").is_some_and(|s| s.as_bool());
+                assert_eq!(down, want, "threshold {threshold}, {v}: {why}");
+            }
+        };
+        // A 10% band: 0.45 to 0.55.
+        run(0.5, &[
+            (0.5, false, "on the threshold"),
+            (0.51, true, "just past it, from rest"),
+            (0.46, true, "held inside the band"),
+            (0.44, true, "under it, not for the debounce yet"),
+            (0.44, false, "let go once under it for the debounce"),
+            (0.52, false, "short of rest, the threshold doesn't press again"),
+            (0.56, true, "the band's top does"),
+        ]);
+        // At rest, with the band from rest to 0.1: no band under the point, so
+        // any movement presses once it has lasted the debounce, and a dip to
+        // rest shorter than that is jitter.
+        run(0.0, &[
+            (0.0, false, "at rest"),
+            (0.01, false, "off rest, not for the debounce yet"),
+            (0.0, false, "a blip is jitter"),
+            (0.01, false, "off rest again"),
+            (0.01, true, "for the debounce presses"),
+            (0.0, true, "a dip to rest"),
+            (0.01, true, "is jitter"),
+            (0.0, true, "back at rest"),
+            (0.0, false, "for the debounce lets go"),
+        ]);
+    }
+
     // "Ignore capacitive touch in Learn" is Learn's alone: a stick cap or grip
     // mapped to something keeps firing with the toggle on.
     #[test]
@@ -3414,24 +3463,44 @@ mod trigger_tests {
         assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trigger_l_mode".to_string())));
     }
 
+    /// A Steam Controller's haptic pins: it plays its own trigger clicks.
+    fn steam_pins() -> Vec<&'static str> {
+        FB_DS_PINS.iter().copied().chain(["tp_l_click", "grip_l_click", "grip_r_click"]).collect()
+    }
+
     // A trigger click sits at the digital threshold plus its offset, on the pad's
     // raw travel: the calibrated range maps back out, side by side.
     #[test]
     fn a_trigger_click_is_sent_as_raw_travel_from_the_threshold_and_offset() {
-        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let mut pad = fb_pad(1, FB_DS, &steam_pins(), Some(FB_VIRT));
         for (key, v) in [
             ("ltrig_digital_threshold", 0.5), ("ltrig_click_offset", 0.25),
             ("ltrig_min", 0.2), ("ltrig_max", 0.6),
             ("rtrig_digital_threshold", 0.5), ("rtrig_click_offset", -0.1),
             ("ltrig_click_gain_db", -6.0), ("rtrig_click_gain_db", 3.0),
             ("ltrig_click_hz", 90.0), ("rtrig_click_ms", 45.0), ("ltrig_click_soft", 0.5),
+            ("rtrig_release_gain_db", -12.0), ("rtrig_release_hz", 60.0),
         ] {
             pad.params.insert(key.into(), Value::from(v));
         }
         pad.params.insert("trig_click_on".into(), Value::Bool(true));
+        pad.params.insert("rtrig_release_on".into(), Value::Bool(true));
         let out = fb_tick(vec![pad], &BusMap::default());
-        assert!((pad_value(&out, FB_DS, "trig_click_l") - 0.5).abs() < 1e-6, "0.75 of 0.2..0.6");
-        assert!((pad_value(&out, FB_DS, "trig_click_r") - 0.4).abs() < 1e-6, "full range, 0.5 - 0.1");
+        // Each point and the band around it, 3% of the full travel whatever the
+        // range: 0.75 of 0.2..0.6 is 0.5, and the full range's 0.5 - 0.1 is 0.4.
+        // A pull from rest presses at the point, again past the top, lets go
+        // under the bottom for the debounce.
+        let at = |pin: &str, want: f32| (pad_value(&out, FB_DS, pin) - want).abs() < 1e-4;
+        assert!(at("trig_click_l", 0.5), "{}", pad_value(&out, FB_DS, "trig_click_l"));
+        assert!(at("trig_top_l", 0.515), "{}", pad_value(&out, FB_DS, "trig_top_l"));
+        assert!(at("trig_rearm_l", 0.485));
+        assert!(at("trig_rest_l", 0.2));
+        assert!(at("trig_click_r", 0.4));
+        assert!(at("trig_top_r", 0.415));
+        assert!(at("trig_rearm_r", 0.385));
+        assert!(at("trig_rest_r", 0.0));
+        assert!(at("trig_hold_l", 0.004) && at("trig_hold_r", 0.004));
+        assert!(at("trig_press_l", 1.0) && at("trig_press_r", 1.0));
         assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_l"), -6.0);
         assert_eq!(pad_value(&out, FB_DS, "trig_click_gain_r"), 3.0);
         // Each its own, and the default where it has none.
@@ -3441,6 +3510,104 @@ mod trigger_tests {
         assert_eq!(pad_value(&out, FB_DS, "trig_click_soft_r"), 0.0);
         assert_eq!(pad_value(&out, FB_DS, "trig_click_hz_r"), flexinput_core::automap::TRIGGER_CLICK_HZ);
         assert_eq!(pad_value(&out, FB_DS, "trig_click_ms_l"), flexinput_core::automap::TRIGGER_CLICK_MS);
+        // The release only where it is on.
+        assert_eq!(pad_value(&out, FB_DS, "trig_release_r"), 1.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_release_gain_r"), -12.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_release_hz_r"), 60.0);
+        assert_eq!(pad_value(&out, FB_DS, "trig_release_ms_r"), flexinput_core::automap::TRIGGER_CLICK_MS);
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_release_l".to_string())));
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_release_gain_l".to_string())));
+    }
+
+    /// Ticks one pad through `steps` of its `trigger`, 10 ms apart and keeping
+    /// its state: what `pin` reads after each.
+    fn click_run(pad: NodeSnap, trigger: &str, steps: &[Signal], pin: &str) -> Vec<f32> {
+        let dev = pad.sink_target.as_ref().unwrap().device_id.clone();
+        let graph = ProcessingGraph { nodes: vec![pad], ..Default::default() };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        steps.iter().map(|&v| {
+            let mut sigs = BusMap::default();
+            sigs.insert((dev.clone(), trigger.to_string()), v);
+            eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&sigs), 0.01, &mut out);
+            pad_value(&out, &dev, pin)
+        }).collect()
+    }
+
+    fn clicking(dev: &str, pins: &[&str], params: &[(&str, Value)]) -> NodeSnap {
+        let mut pad = fb_pad(1, dev, pins, None);
+        pad.params.insert("trig_click_on".into(), Value::Bool(true));
+        for (key, v) in params {
+            pad.params.insert(key.to_string(), v.clone());
+        }
+        pad
+    }
+
+    // On a pad with HD actuators the engine plays the click itself, on the
+    // trigger's side, for its length, at its pitch; once per pull.
+    #[test]
+    fn an_hd_pad_plays_a_trigger_click_on_its_own_side_for_its_length() {
+        let f = Signal::Float;
+        let steps = [f(0.0), f(0.6), f(0.7), f(0.8), f(0.9), f(0.0)];
+        let pad = || clicking(FB_DS, FB_DS_PINS, &[]);
+        assert_eq!(click_run(pad(), "left_trigger", &steps, "hd_l_amp"), [0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            "20 ms at full, from where it passes the threshold");
+        assert_eq!(click_run(pad(), "left_trigger", &steps, "hd_r_amp"), [0.0; 6], "not the other side");
+        let freq = click_run(pad(), "left_trigger", &steps, "hd_l_freq")[1];
+        let want = (flexinput_core::automap::TRIGGER_CLICK_HZ - 80.0) / 420.0;
+        assert!((freq - want).abs() < 1e-5, "{freq}");
+    }
+
+    // A release plays its own shape as the trigger comes back, once under the
+    // band for the debounce (a tick here), only when asked; and plays alone on
+    // a side with its press off.
+    #[test]
+    fn a_trigger_release_click_plays_on_the_way_back() {
+        let f = Signal::Float;
+        let steps = [f(0.0), f(0.9), f(0.9), f(0.9), f(0.1), f(0.1), f(0.1)];
+        let release = [
+            ("rtrig_release_on", Value::Bool(true)), ("rtrig_release_gain_db", Value::from(-20.0)),
+            ("rtrig_release_ms", Value::from(10.0)),
+        ];
+        let amp = click_run(clicking(FB_DS, FB_DS_PINS, &release), "right_trigger", &steps, "hd_r_amp");
+        assert_eq!(amp[..5], [0.0, 1.0, 1.0, 0.0, 0.0]);
+        assert!((amp[5] - 0.1).abs() < 1e-6, "-20 dB for 10 ms: {amp:?}");
+        assert_eq!(amp[6], 0.0);
+        let pad = clicking(FB_DS, FB_DS_PINS, &[("rtrig_release_gain_db", Value::from(-20.0))]);
+        assert_eq!(click_run(pad, "right_trigger", &steps, "hd_r_amp"), [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            "off unless asked");
+        let mut quiet_press = release.to_vec();
+        quiet_press.push(("rtrig_press_on", Value::Bool(false)));
+        let amp = click_run(clicking(FB_DS, FB_DS_PINS, &quiet_press), "right_trigger", &steps, "hd_r_amp");
+        assert_eq!(amp[..5], [0.0; 5], "no press click");
+        assert!((amp[5] - 0.1).abs() < 1e-6, "the release still: {amp:?}");
+    }
+
+    // A pad with motors only gets a longer pulse on the side's motor; a digital
+    // trigger clicks as it is pressed; a Switch Pro reads pitch on its own table.
+    #[test]
+    fn rumble_and_digital_pads_click_too() {
+        let (f, b) = (Signal::Float, Signal::Bool);
+        let xbox = clicking("gilrs:xinput:0", &["rumble_strong", "rumble_weak"], &[]);
+        assert_eq!(click_run(xbox, "right_trigger", &[f(0.0), f(1.0), f(1.0), f(1.0), f(1.0), f(1.0), f(1.0)], "rumble_weak"),
+            [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0], "50 ms");
+        let switch: Vec<&str> = FB_HD_PINS.iter().copied().chain(["hd_rumble_l", "hd_rumble_r"]).collect();
+        let pro = |params: &[(&str, Value)]| {
+            let mut all = vec![("ltrig_click_hz", Value::from(327.0))];
+            all.extend(params.iter().cloned());
+            clicking("gilrs:switch_pro:0", &switch, &all)
+        };
+        let held = [b(false), b(true), b(true), b(true), b(true), b(true)];
+        assert_eq!(click_run(pro(&[]), "btn_lt_dig", &held, "hd_l_amp"), [0.0, 1.0, 1.0, 1.0, 1.0, 0.0], "40 ms");
+        assert_eq!(click_run(pro(&[("ltrig_click_ms", Value::from(10.0))]), "btn_lt_dig", &held, "hd_l_amp"),
+            [0.0, 1.0, 1.0, 1.0, 1.0, 0.0], "never shorter than 35 ms, which a Switch Pro drops");
+        let freq = click_run(pro(&[]), "btn_lt_dig", &[b(false), b(true)], "hd_l_freq")[1];
+        assert!((freq - 64.0 / 126.0).abs() < 1e-5, "two octaves over 81.75 Hz, 64 of the table's 126 steps: {freq}");
+        let half = click_run(pro(&[("ltrig_click_gain_db", Value::from(-6.0))]), "btn_lt_dig", &[b(false), b(true)], "hd_l_amp")[1];
+        assert!((half - flexinput_core::automap::switch_hd_amp(10f32.powf(-6.0 / 20.0))).abs() < 1e-6,
+            "its strength by its own table: {half}");
+        let off = clicking("gilrs:xinput:0", &["rumble_strong", "rumble_weak"], &[("trig_click_on", Value::Bool(false))]);
+        assert_eq!(click_run(off, "left_trigger", &[f(0.0), f(1.0)], "rumble_strong"), [0.0, 0.0], "off");
     }
 
     // Click feedback goes out as one mode value, and only while it is on.
@@ -3506,13 +3673,19 @@ mod trigger_tests {
         assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "grip_release".to_string())));
     }
 
-    // Off means no pins at all, which is how the backend learns it went off.
+    // Off means no pins at all, which is how the backend learns it went off: the
+    // whole click, or a side with its press and release both off.
     #[test]
     fn a_trigger_click_that_is_off_sends_nothing() {
-        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let mut pad = fb_pad(1, FB_DS, &steam_pins(), Some(FB_VIRT));
         pad.params.insert("ltrig_click_offset".into(), Value::from(0.25));
+        let out = fb_tick(vec![pad.clone()], &BusMap::default());
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_click_l".to_string())));
+        pad.params.insert("trig_click_on".into(), Value::Bool(true));
+        pad.params.insert("ltrig_press_on".into(), Value::Bool(false));
         let out = fb_tick(vec![pad], &BusMap::default());
         assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_click_l".to_string())));
+        assert!(out.sink_outputs.contains_key(&(FB_DS.to_string(), "trig_click_r".to_string())));
     }
 
     // Any instruction from the game wins over the default — Off included: a game

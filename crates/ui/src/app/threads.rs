@@ -76,6 +76,18 @@ impl IoTimingAcc {
     }
 }
 
+/// The `hd_*_freq` a pad's HD rumble gets when something drives only its
+/// amplitude (a game's rumble, the ping): a Switch Pro its own default pitch on
+/// its own scale, any other pad 0.6 of its range.
+fn default_hd_freq(device_id: &str) -> f32 {
+    use flexinput_core::automap::{switch_hd_freq, SWITCH_RUMBLE_HZ};
+    if crate::canvas::remapper_icons::phys_pad_slug(device_id) == Some("switch_pro") {
+        switch_hd_freq(SWITCH_RUMBLE_HZ)
+    } else {
+        0.6
+    }
+}
+
 // ── Device I/O thread (polling-rate setting, default 500 Hz) ──────────────────
 
 pub(crate) fn spawn_io_thread(
@@ -729,8 +741,8 @@ pub(crate) fn spawn_io_thread(
                     // hd_*_amp pin (amplitude only) without a paired hd_*_freq, the
                     // Switch Pro stays silent (its voice-coil needs a frequency). If
                     // a side's amp is non-zero and no explicit freq was routed this
-                    // tick, inject ~320 Hz (0.6) so the rumble is audible — matching
-                    // what the manual ping pulse does.
+                    // tick, inject the pad's default pitch (`default_hd_freq`) so the
+                    // rumble is audible — matching what the manual ping pulse does.
                     for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
                         for &(device_id, pin_id, signal) in &phys_pins {
                             if pin_id != amp_pin { continue; }
@@ -740,8 +752,9 @@ pub(crate) fn spawn_io_thread(
                                 .map(|s| s.as_float() > 0.0)
                                 .unwrap_or(false);
                             if amp > 0.01 && !has_freq {
+                                let freq = default_hd_freq(device_id);
                                 for backend in &mut backends {
-                                    backend.send(device_id, freq_pin, Signal::Float(0.6));
+                                    backend.send(device_id, freq_pin, Signal::Float(freq));
                                 }
                             }
                         }
@@ -864,7 +877,7 @@ pub(crate) fn spawn_io_thread(
                                 //   hd_l_amp/hd_r_amp  → Switch Pro HD rumble (needs a
                                 //                        non-zero freq to be audible, so
                                 //                        we set ~320 Hz too)
-                                let freq = if active { Signal::Float(0.6) } else { Signal::Float(0.0) };
+                                let freq = Signal::Float(if active { default_hd_freq(dev_id) } else { 0.0 });
                                 for backend in &mut backends {
                                     backend.send(dev_id, "rumble_strong", amp);
                                     backend.send(dev_id, "rumble_weak", amp);

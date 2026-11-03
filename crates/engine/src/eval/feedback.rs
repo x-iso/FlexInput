@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flexinput_core::automap::{self, FeedbackGroup};
+use flexinput_core::automap::{self, ClickActuator, FeedbackGroup};
 use flexinput_core::{BusMap, PinMapExt, Signal};
 
 use crate::graph::{NodeSnap, SinkTarget};
@@ -318,41 +318,247 @@ pub(crate) fn apply_pad_feedback(
     }
 }
 
-/// Where a Steam Controller's trigger click sits, set in the Calibration window:
-/// the pad's digital threshold, moved by a per-trigger offset. Sent as raw trigger
-/// travel on pins no layout declares, every tick while it is on: the backend
-/// compares its own poll against them, and when they stop, zero-on-drop ends the
-/// click. Other pads ignore them.
-pub(crate) fn apply_trigger_click(
+/// What one edge of a trigger plays (Calibration window): strength in dB, where
+/// 0 is the actuator's full, pitch in Hz, length in ms, softness 0..1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeClick {
+    gain_db: f32,
+    hz: f32,
+    ms: f32,
+    soft: f32,
+}
+
+impl EdgeClick {
+    /// One edge from its four params (`[gain_db, hz, ms, soft]`), with the
+    /// defaults for that edge and what plays it.
+    fn read(params: &HashMap<String, serde_json::Value>, keys: [&str; 4], release: bool, actuator: ClickActuator) -> Self {
+        let num = |key: &str, default: f32| params.get(key).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
+        let gain = if release { automap::TRIGGER_RELEASE_DB } else { 0.0 };
+        Self {
+            gain_db: num(keys[0], gain),
+            hz: num(keys[1], automap::TRIGGER_CLICK_HZ),
+            ms: num(keys[2], actuator.default_ms()),
+            soft: num(keys[3], 0.0),
+        }
+    }
+
+    fn values(self) -> [f32; 4] {
+        [self.gain_db, self.hz, self.ms, self.soft]
+    }
+
+    /// How long it plays on `actuator`, which may not take it as short as set.
+    fn secs(self, actuator: ClickActuator) -> f32 {
+        self.ms.max(actuator.shortest_ms()).clamp(1.0, 200.0) / 1000.0
+    }
+}
+
+/// One trigger's click params on the device node, and the pins a pad that plays
+/// its own takes them on. Each `[gain_db, hz, ms, soft]` set is press, then
+/// release; the edge pins are the point and its band as raw travel
+/// (`automap::TriggerEdges`: press, again, release, rest) and the debounce.
+struct TriggerClickKeys {
+    threshold: &'static str,
+    offset: &'static str,
+    range: [&'static str; 2],
+    press_on: &'static str,
+    release_on: &'static str,
+    params: [[&'static str; 4]; 2],
+    edge_pins: [&'static str; 5],
+    press_pin: &'static str,
+    release_pin: &'static str,
+    pins: [[&'static str; 4]; 2],
+}
+
+const TRIGGER_CLICK_KEYS: [TriggerClickKeys; 2] = [
+    TriggerClickKeys {
+        threshold: "ltrig_digital_threshold",
+        offset: "ltrig_click_offset",
+        range: ["ltrig_min", "ltrig_max"],
+        press_on: "ltrig_press_on",
+        release_on: "ltrig_release_on",
+        params: [
+            ["ltrig_click_gain_db", "ltrig_click_hz", "ltrig_click_ms", "ltrig_click_soft"],
+            ["ltrig_release_gain_db", "ltrig_release_hz", "ltrig_release_ms", "ltrig_release_soft"],
+        ],
+        edge_pins: ["trig_click_l", "trig_top_l", "trig_rearm_l", "trig_rest_l", "trig_hold_l"],
+        press_pin: "trig_press_l",
+        release_pin: "trig_release_l",
+        pins: [
+            ["trig_click_gain_l", "trig_click_hz_l", "trig_click_ms_l", "trig_click_soft_l"],
+            ["trig_release_gain_l", "trig_release_hz_l", "trig_release_ms_l", "trig_release_soft_l"],
+        ],
+    },
+    TriggerClickKeys {
+        threshold: "rtrig_digital_threshold",
+        offset: "rtrig_click_offset",
+        range: ["rtrig_min", "rtrig_max"],
+        press_on: "rtrig_press_on",
+        release_on: "rtrig_release_on",
+        params: [
+            ["rtrig_click_gain_db", "rtrig_click_hz", "rtrig_click_ms", "rtrig_click_soft"],
+            ["rtrig_release_gain_db", "rtrig_release_hz", "rtrig_release_ms", "rtrig_release_soft"],
+        ],
+        edge_pins: ["trig_click_r", "trig_top_r", "trig_rearm_r", "trig_rest_r", "trig_hold_r"],
+        press_pin: "trig_press_r",
+        release_pin: "trig_release_r",
+        pins: [
+            ["trig_click_gain_r", "trig_click_hz_r", "trig_click_ms_r", "trig_click_soft_r"],
+            ["trig_release_gain_r", "trig_release_hz_r", "trig_release_ms_r", "trig_release_soft_r"],
+        ],
+    },
+];
+
+/// A pad's trigger clicks between ticks, where the engine plays them: where each
+/// trigger stands against its point, and the click each is playing and how far in.
+#[derive(Default)]
+pub struct TriggerClicks {
+    crossing: [automap::TriggerCrossing; 2],
+    playing: [Option<(EdgeClick, f32)>; 2],
+}
+
+/// A trigger click, set in the Calibration window: as each trigger passes the
+/// pad's digital threshold, moved by a per-trigger offset, and — where asked — as
+/// it comes back past it, each side's press and release on or off of their own.
+/// A digital trigger passes it as it is pressed.
+///
+/// A Steam Controller plays its own: the point goes out as raw trigger travel and
+/// what plays as numbers, on pins no layout declares, every tick while it is on.
+/// Its backend compares its own poll against them, and when they stop,
+/// zero-on-drop ends the click. On any other pad the engine watches the trigger
+/// and plays the click on the side's HD actuator, else its rumble motor, on top of
+/// whatever else drives it.
+pub(crate) fn apply_trigger_click<S: std::hash::BuildHasher>(
     st: &SinkTarget,
     params: &HashMap<String, serde_json::Value>,
+    dev_sigs: &HashMap<(String, String), Signal, S>,
+    clicks: &mut Option<Box<TriggerClicks>>,
+    dt: f32,
     sink_outputs: &mut BusMap,
 ) {
     let num = |key: &str| params.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
-    if !params.get("trig_click_on").and_then(|v| v.as_bool()).unwrap_or(false) {
+    let flag = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let actuator = flag("trig_click_on")
+        .then(|| automap::click_actuator(st.pin_ids.iter().map(String::as_str)))
+        .flatten();
+    let Some(actuator) = actuator else {
+        *clicks = None;
+        return;
+    };
+    let dev = st.device_id.as_str();
+    let hysteresis = num("trig_hysteresis").unwrap_or(automap::TRIGGER_HYSTERESIS);
+    let hold = automap::trigger_debounce_secs(num("trig_debounce_ms"));
+    for (side, keys) in TRIGGER_CLICK_KEYS.iter().enumerate() {
+        let press_on = params.get(keys.press_on).and_then(|v| v.as_bool()).unwrap_or(true);
+        let release = flag(keys.release_on).then(|| EdgeClick::read(params, keys.params[1], true, actuator));
+        if !press_on && release.is_none() {
+            if let Some(state) = clicks.as_mut() {
+                state.crossing[side] = Default::default();
+                state.playing[side] = None;
+            }
+            continue;
+        }
+        let point = num(keys.threshold).unwrap_or(super::device_cal::TRIG_DIGITAL_THRESHOLD_DEFAULT)
+            + num(keys.offset).unwrap_or(0.0);
+        let range = (num(keys.range[0]).unwrap_or(0.0), num(keys.range[1]).unwrap_or(1.0));
+        let edges = automap::trigger_edges(point, range, hysteresis);
+        let press = EdgeClick::read(params, keys.params[0], false, actuator);
+
+        if actuator == ClickActuator::Own {
+            let values = [edges.press, edges.again, edges.release, edges.rest, hold];
+            for (pin, v) in keys.edge_pins.iter().zip(values) {
+                sink_outputs.set_pin(&dev, pin, Signal::Float(v));
+            }
+            sink_outputs.set_pin(&dev, &keys.press_pin, Signal::Float(if press_on { 1.0 } else { 0.0 }));
+            for (pin, v) in keys.pins[0].iter().zip(press.values()) {
+                sink_outputs.set_pin(&dev, pin, Signal::Float(v));
+            }
+            if let Some(release) = release {
+                sink_outputs.set_pin(&dev, &keys.release_pin, Signal::Float(1.0));
+                for (pin, v) in keys.pins[1].iter().zip(release.values()) {
+                    sink_outputs.set_pin(&dev, pin, Signal::Float(v));
+                }
+            }
+            continue;
+        }
+
+        let state = clicks.get_or_insert_with(Default::default);
+        if let Some(travel) = trigger_travel(dev_sigs, dev, side) {
+            match state.crossing[side].step(&edges, travel, dt, hold) {
+                Some(true) => if press_on { state.playing[side] = Some((press, 0.0)) },
+                Some(false) => if let Some(release) = release { state.playing[side] = Some((release, 0.0)) },
+                None => {}
+            }
+        }
+        let Some((click, t)) = state.playing[side].as_mut() else { continue };
+        let secs = click.secs(actuator);
+        // Within a tenth of a millisecond is the end: ticks don't add up exactly.
+        if *t + 1e-4 >= secs {
+            state.playing[side] = None;
+            continue;
+        }
+        let level = 10f32.powf(click.gain_db.min(0.0) / 20.0)
+            * automap::click_envelope(*t / secs, click.soft);
+        // A Switch Pro's pin is felt strength on its own table, not a level.
+        let amp = if actuator == ClickActuator::Switch { automap::switch_hd_amp(level) } else { level };
+        play_trigger_click(st, side, amp, hd_freq_norm(actuator, click.hz), sink_outputs);
+        *t += dt;
+    }
+}
+
+/// A trigger's raw travel: the analog value, else the digital button as 0 or 1.
+/// `None` for a pad without that trigger.
+fn trigger_travel<S: std::hash::BuildHasher>(
+    dev_sigs: &HashMap<(String, String), Signal, S>,
+    dev: &str,
+    side: usize,
+) -> Option<f32> {
+    let [analog, digital] = [["left_trigger", "btn_lt_dig"], ["right_trigger", "btn_rt_dig"]][side];
+    dev_sigs.get_pin(&dev, &analog)
+        .or_else(|| dev_sigs.get_pin(&dev, &digital))
+        .map(|s| s.as_float())
+}
+
+/// One tick of a click at `level`, on the side's HD actuator at pitch `freq` (its
+/// `hd_*_freq` value; a pad with one actuator, a Joy-Con half, takes both sides
+/// on it), else on its rumble motor: left strong, right weak, the way the HD and
+/// rumble pins pair. It wins only where it is the stronger, so a heavy rumble
+/// isn't cut short by a click.
+fn play_trigger_click(st: &SinkTarget, side: usize, level: f32, freq_value: f32, sink_outputs: &mut BusMap) {
+    let has = |pin: &str| st.pin_ids.iter().any(|p| p == pin);
+    let dev = st.device_id.as_str();
+    let hd = [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")];
+    let actuator = if has(hd[side].0) {
+        Some(hd[side])
+    } else if has(hd[0].0) {
+        Some(hd[0])
+    } else {
+        None
+    };
+    let (amp, freq) = match actuator {
+        Some((amp, freq)) => (amp, Some(freq)),
+        None => (["rumble_strong", "rumble_weak"][side], None),
+    };
+    if !has(amp) {
         return;
     }
-    let dev = st.device_id.as_str();
-    for (pin, min, max, threshold, offset, tone) in [
-        ("trig_click_l", "ltrig_min", "ltrig_max", "ltrig_digital_threshold", "ltrig_click_offset",
-         [("trig_click_gain_l", "ltrig_click_gain_db", 0.0),
-          ("trig_click_hz_l", "ltrig_click_hz", automap::TRIGGER_CLICK_HZ),
-          ("trig_click_ms_l", "ltrig_click_ms", automap::TRIGGER_CLICK_MS),
-          ("trig_click_soft_l", "ltrig_click_soft", 0.0)]),
-        ("trig_click_r", "rtrig_min", "rtrig_max", "rtrig_digital_threshold", "rtrig_click_offset",
-         [("trig_click_gain_r", "rtrig_click_gain_db", 0.0),
-          ("trig_click_hz_r", "rtrig_click_hz", automap::TRIGGER_CLICK_HZ),
-          ("trig_click_ms_r", "rtrig_click_ms", automap::TRIGGER_CLICK_MS),
-          ("trig_click_soft_r", "rtrig_click_soft", 0.0)]),
-    ] {
-        let at = num(threshold).unwrap_or(super::device_cal::TRIG_DIGITAL_THRESHOLD_DEFAULT)
-            + num(offset).unwrap_or(0.0);
-        let position = trigger_click_position(at, (num(min).unwrap_or(0.0), num(max).unwrap_or(1.0)));
-        sink_outputs.set_pin(&dev, &pin, Signal::Float(position));
-        for (out, key, default) in tone {
-            sink_outputs.set_pin(&dev, &out, Signal::Float(num(key).unwrap_or(default)));
-        }
+    if sink_outputs.get_pin(&dev, &amp).is_some_and(|s| s.as_float() > level) {
+        return;
     }
+    sink_outputs.set_pin(&dev, &amp, Signal::Float(level));
+    if let Some(freq) = freq {
+        sink_outputs.set_pin(&dev, &freq, Signal::Float(freq_value));
+    }
+}
+
+/// A pitch as the pad's `hd_*_freq` value: a Switch Pro's on its own frequency
+/// table ([`automap::switch_hd_freq`]); every other HD pad reads it linearly over
+/// `haptic_pcm`'s range.
+fn hd_freq_norm(actuator: ClickActuator, hz: f32) -> f32 {
+    use flexinput_core::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
+    if actuator == ClickActuator::Switch {
+        return automap::switch_hd_freq(hz);
+    }
+    ((hz - FREQ_MIN_HZ) / (FREQ_MAX_HZ - FREQ_MIN_HZ)).clamp(0.0, 1.0)
 }
 
 /// A Steam Controller's click feedback on its trackpads (Calibration window), on
@@ -396,14 +602,6 @@ pub(crate) fn apply_grip_sensor(
             sink_outputs.set_pin(&st.device_id.as_str(), &pin, Signal::Float(v as f32));
         }
     }
-}
-
-/// A point on the calibrated trigger (0–1) as raw travel: the inverse of
-/// `device_cal::apply_trigger_range`. Never 0, which means no click.
-fn trigger_click_position(at: f32, (mn, mx): (f32, f32)) -> f32 {
-    let at = at.clamp(0.0, 1.0);
-    let raw = if (mx - mn).abs() < 1e-4 { at } else { mn + at * (mx - mn) };
-    raw.clamp(0.01, 1.0)
 }
 
 /// Device-node params holding a pad's default adaptive-trigger effect, left then

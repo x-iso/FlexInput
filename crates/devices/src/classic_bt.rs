@@ -49,7 +49,7 @@ use crate::gyro::{
     push_sony_reading, push_switch_pro_buttons, sony_bt_output, switch_pro_calib_from_spi,
     switch_pro_enable_vibration, switch_pro_spi_reply, switch_pro_spi_request,
     switch_rumble_report, xbox_bt_rumble, DualSenseState, HidReading, OutputState, SwitchProCalib,
-    SWITCH_PRO_CALIB_READS,
+    SwitchRumblePacer, SWITCH_PRO_CALIB_READS,
 };
 use crate::spike::SpikeFilter;
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
@@ -620,10 +620,13 @@ struct Link {
     vib_on: bool,
     vib_tries: u8,
     vib_next: Option<Instant>,
-    /// What output state (Switch Pro rumble, a Sony pad's whole output
-    /// report) the controller last received, and when.
+    /// What output state (a Sony pad's whole output report, an Xbox pad's
+    /// rumble) the controller last received, and when.
     rumble_sent: Option<OutputState>,
     rumble_at: Option<Instant>,
+    /// When a Switch Pro gets its rumble: no closer than `RUMBLE_MIN_GAP`, a
+    /// burst shorter than that held for the next write rather than lost.
+    switch_pacer: SwitchRumblePacer,
     family: Family,
     /// What it answered over SDP, when it has: on Linux, what its passthrough
     /// is created from.
@@ -1549,9 +1552,8 @@ fn run_inner(shared: &Arc<Shared>) {
         // ── Vibration on, then rumble ────────────────────────────────────
         //
         // Fire-and-forget like the SPI reads: the ack is picked out of the
-        // input stream below. Rumble goes out on change, on a one-second
-        // heartbeat, or continuously while amplitude modulation is running —
-        // the same policy as the HID path, from the same encoder.
+        // input stream below. Rumble goes out as `SwitchRumblePacer` lets it,
+        // from the same encoder as the HID path.
         let staged = shared.outputs.lock().map(|o| o.clone()).unwrap_or_default();
         for link in links.iter_mut() {
             if link.family != Family::SwitchPro || !link.reported {
@@ -1572,24 +1574,14 @@ fn run_inner(shared: &Arc<Shared>) {
                 });
             }
             let Some(out) = staged.get(&link.addr).copied() else { continue };
-            let since = link.rumble_at.map(|t| t.elapsed());
-            if since.is_some_and(|d| d < RUMBLE_MIN_GAP) {
-                continue;
-            }
-            let changed = link.rumble_sent != Some(out);
-            let heartbeat = since.is_none_or(|d| d >= RUMBLE_HEARTBEAT);
-            if !changed && !heartbeat {
-                continue;
-            }
+            let Some(send) = link.switch_pacer.next(Instant::now(), &out) else { continue };
             let counter = link.next_counter();
-            let (report, am) = switch_rumble_report(&out, counter);
+            let (report, am) = switch_rumble_report(&send, counter);
+            link.switch_pacer.modulated = am;
             let mut frame = Vec::with_capacity(65);
             frame.push(0xA2);
             frame.extend_from_slice(&report);
             let _ = r.with_dongle(|d| d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame));
-            // A modulated rumble differs every packet: never "unchanged".
-            link.rumble_sent = if am { None } else { Some(out) };
-            link.rumble_at = Some(Instant::now());
         }
 
         // ── Sony: full reports, then outputs ─────────────────────────────
@@ -1597,9 +1589,9 @@ fn run_inner(shared: &Arc<Shared>) {
         // ⭐ A DualShock 4 or DualSense on Bluetooth sends a short report with
         // no motion or touch until the host reads its calibration (feature
         // `0x05`), which is what switches it to the full one. Asked until the
-        // full reports arrive. Outputs follow the Switch Pro's policy: on
-        // change, on a heartbeat, never faster than the gap — a whole output
-        // report each time, as the HID path sends it.
+        // full reports arrive. Outputs go on change, on a heartbeat, never
+        // faster than the gap — a whole output report each time, as the HID
+        // path sends it.
         for link in links.iter_mut() {
             let Family::Sony { dualsense, .. } = link.family else { continue };
             if !link.full
@@ -2242,6 +2234,7 @@ fn bring_up(
         vib_next: None,
         rumble_sent: None,
         rumble_at: None,
+        switch_pacer: SwitchRumblePacer::new(RUMBLE_MIN_GAP),
     })
 }
 

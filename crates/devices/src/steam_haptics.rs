@@ -28,6 +28,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use flexinput_core::automap::{click_envelope, TriggerCrossing, TriggerEdges};
 use flexinput_core::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
 use hidapi::{HidApi, HidDevice};
 
@@ -207,18 +208,6 @@ impl ClickShape {
     }
 }
 
-/// A one-shot's envelope at `t` through it (0..1): `soft` of it is the fade, half at
-/// each end on a raised cosine. 0 is a plain burst, 1 a smooth swell.
-fn click_envelope(t: f32, soft: f32) -> f32 {
-    let edge = t.min(1.0 - t).max(0.0);
-    let fade = soft * 0.5;
-    if edge >= fade {
-        1.0
-    } else {
-        0.5 - 0.5 * (edge / fade * std::f32::consts::PI).cos()
-    }
-}
-
 /// A one-shot in progress, in samples: on a grip's stream or a pad's own.
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 struct ClickBurst {
@@ -256,57 +245,102 @@ impl ClickBurst {
     }
 }
 
-/// Where each trigger clicks, on its raw 0–1 travel, as the engine sends it
-/// (`feedback::apply_trigger_click`). 0 = no click.
+/// What one edge of a trigger plays: strength in dB, pitch, length, softness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeClick {
+    gain_db: f32,
+    hz: f32,
+    ms: f32,
+    soft: f32,
+}
+
+impl EdgeClick {
+    fn command(self, side: usize) -> Cmd {
+        Cmd::TriggerClick {
+            side,
+            gain_db: self.gain_db.clamp(GAIN_DB_MIN, 24.0).round() as i8,
+            shape: ClickShape::new(self.hz, self.ms, self.soft),
+        }
+    }
+}
+
+/// Where each trigger clicks and lets go again, on its raw 0–1 travel, and how
+/// long it stays under the band before it lets go, as the engine sends them
+/// (`feedback::apply_trigger_click`, from `automap::trigger_edges`), and what it
+/// plays on the way in and on the way back out, each where asked. A point at 0
+/// = no click.
 struct TriggerClick {
-    position: [f32; 2],
-    gain_db: [f32; 2],
-    hz: [f32; 2],
-    ms: [f32; 2],
-    soft: [f32; 2],
-    past: [bool; 2],
+    edges: [TriggerEdges; 2],
+    hold: [f32; 2],
+    press: [EdgeClick; 2],
+    press_on: [bool; 2],
+    release: [EdgeClick; 2],
+    release_on: [bool; 2],
+    crossing: [TriggerCrossing; 2],
 }
 
 impl Default for TriggerClick {
     fn default() -> Self {
-        use flexinput_core::automap::{TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS};
+        use flexinput_core::automap::{TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS, TRIGGER_RELEASE_DB};
+        let press = EdgeClick { gain_db: 0.0, hz: TRIGGER_CLICK_HZ, ms: TRIGGER_CLICK_MS, soft: 0.0 };
         Self {
-            position: [0.0; 2],
-            gain_db: [0.0; 2],
-            hz: [TRIGGER_CLICK_HZ; 2],
-            ms: [TRIGGER_CLICK_MS; 2],
-            soft: [0.0; 2],
-            past: [false; 2],
+            edges: Default::default(),
+            hold: [0.0; 2],
+            press: [press; 2],
+            press_on: [true; 2],
+            release: [EdgeClick { gain_db: TRIGGER_RELEASE_DB, ..press }; 2],
+            release_on: [false; 2],
+            crossing: Default::default(),
         }
     }
 }
 
 impl TriggerClick {
-    /// Travel back past the position needed before a trigger can click again, so
-    /// a finger resting on the point doesn't buzz.
-    const REARM: f32 = 0.03;
-
     fn on(&self) -> bool {
-        self.position.iter().any(|&p| p > 0.0)
+        self.edges.iter().any(|e| e.press > 0.0)
     }
 
-    /// One poll's trigger values: the sides that clicked.
-    fn step(&mut self, travel: [f32; 2]) -> [bool; 2] {
-        let mut clicked = [false; 2];
+    /// One poll's trigger values, `dt` seconds after the last: what each side
+    /// plays, if anything.
+    fn step(&mut self, travel: [f32; 2], dt: f32) -> [Option<Cmd>; 2] {
+        let mut out = [None, None];
         for side in 0..2 {
-            let at = self.position[side];
-            if at <= 0.0 {
-                self.past[side] = false;
-            } else if !self.past[side] {
-                if travel[side] >= at {
-                    self.past[side] = true;
-                    clicked[side] = true;
-                }
-            } else if travel[side] < at - Self::REARM {
-                self.past[side] = false;
-            }
+            out[side] = match self.crossing[side].step(&self.edges[side], travel[side], dt, self.hold[side]) {
+                Some(true) if self.press_on[side] => Some(self.press[side].command(side)),
+                Some(false) if self.release_on[side] => Some(self.release[side].command(side)),
+                _ => None,
+            };
         }
-        clicked
+        out
+    }
+
+    /// Takes a pin of this family; false for any other.
+    fn set(&mut self, pin: &str, level: f32) -> bool {
+        let Some((name, side)) = pin.strip_suffix("_l").map(|n| (n, 0))
+            .or_else(|| pin.strip_suffix("_r").map(|n| (n, 1)))
+        else {
+            return false;
+        };
+        let (edges, press, release) = (&mut self.edges[side], &mut self.press[side], &mut self.release[side]);
+        match name {
+            "trig_click" => edges.press = level.max(0.0),
+            "trig_top" => edges.again = level.max(0.0),
+            "trig_rearm" => edges.release = level.max(0.0),
+            "trig_rest" => edges.rest = level.max(0.0),
+            "trig_hold" => self.hold[side] = level.max(0.0),
+            "trig_press" => self.press_on[side] = level > 0.5,
+            "trig_click_gain" => press.gain_db = level,
+            "trig_click_hz" => press.hz = level,
+            "trig_click_ms" => press.ms = level,
+            "trig_click_soft" => press.soft = level,
+            "trig_release" => self.release_on[side] = level > 0.5,
+            "trig_release_gain" => release.gain_db = level,
+            "trig_release_hz" => release.hz = level,
+            "trig_release_ms" => release.ms = level,
+            "trig_release_soft" => release.soft = level,
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -434,6 +468,8 @@ pub(crate) struct SteamHaptics {
     shared: Arc<Shared>,
     cmds: Sender<Cmd>,
     click: TriggerClick,
+    /// When the triggers were last read, which the click's debounce counts from.
+    triggers_read: Option<Instant>,
     pad_feedback: PadClickFeedback,
     bit_held: bool,
     click_pins: ClickPins,
@@ -459,6 +495,7 @@ impl SteamHaptics {
             shared,
             cmds,
             click: TriggerClick::default(),
+            triggers_read: None,
             pad_feedback: PadClickFeedback::default(),
             bit_held: false,
             click_pins: ClickPins::default(),
@@ -476,32 +513,20 @@ impl SteamHaptics {
         if self.click_pins.set(pin, level) {
             return true;
         }
+        if self.click.set(pin, level) {
+            let on = self.click.on();
+            if on != self.bit_held {
+                self.bit_held = on;
+                let _ = self.cmds.send(Cmd::HoldBit(on));
+            }
+            return true;
+        }
         match pin {
-            "trig_click_l" | "trig_click_r" => {
-                self.click.position[usize::from(pin == "trig_click_r")] = level.max(0.0);
-                let on = self.click.on();
-                if on != self.bit_held {
-                    self.bit_held = on;
-                    let _ = self.cmds.send(Cmd::HoldBit(on));
-                }
-            }
-            "trig_click_gain_l" | "trig_click_gain_r" => {
-                self.click.gain_db[usize::from(pin == "trig_click_gain_r")] = level;
-            }
-            "trig_click_hz_l" | "trig_click_hz_r" => {
-                self.click.hz[usize::from(pin == "trig_click_hz_r")] = level;
-            }
-            "trig_click_ms_l" | "trig_click_ms_r" => {
-                self.click.ms[usize::from(pin == "trig_click_ms_r")] = level;
-            }
             "pad_click_mode" => self.pad_feedback.mode = level as u8,
             "pad_click_gain" => self.pad_feedback.gain_db = level,
             "pad_click_hz" => self.pad_feedback.hz = level,
             "pad_click_ms" => self.pad_feedback.ms = level,
             "pad_click_soft" => self.pad_feedback.soft = level,
-            "trig_click_soft_l" | "trig_click_soft_r" => {
-                self.click.soft[usize::from(pin == "trig_click_soft_r")] = level;
-            }
             _ => {
                 let Some(i) = GRIP_SETTINGS.iter().position(|s| s.0 == pin) else {
                     return false;
@@ -522,11 +547,10 @@ impl SteamHaptics {
         for cmd in self.click_pins.take_due() {
             let _ = self.cmds.send(cmd);
         }
-        let clicked = self.click.step([left, right]);
-        for (side, _) in clicked.iter().enumerate().filter(|(_, c)| **c) {
-            let gain_db = self.click.gain_db[side].clamp(GAIN_DB_MIN, 24.0).round() as i8;
-            let shape = ClickShape::new(self.click.hz[side], self.click.ms[side], self.click.soft[side]);
-            let _ = self.cmds.send(Cmd::TriggerClick { side, gain_db, shape });
+        let now = Instant::now();
+        let dt = self.triggers_read.replace(now).map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        for cmd in self.click.step([left, right], dt).into_iter().flatten() {
+            let _ = self.cmds.send(cmd);
         }
     }
 
@@ -981,28 +1005,76 @@ mod tests {
         assert!(!is_steam_controller(None, None));
     }
 
+    fn clicked(out: [Option<Cmd>; 2]) -> [bool; 2] {
+        out.map(|c| c.is_some())
+    }
+
+    const MS: f32 = 0.001;
+
+    /// A point at 0.5 with a band from 0.47 to 0.53.
+    fn edges() -> TriggerEdges {
+        TriggerEdges { press: 0.5, again: 0.53, release: 0.47, rest: 0.01 }
+    }
+
     #[test]
     fn a_trigger_clicks_once_per_pull_and_rearms_past_the_hysteresis() {
-        let mut click = TriggerClick { position: [0.5, 0.0], ..Default::default() };
-        assert_eq!(click.step([0.49, 0.9]), [false, false], "below it, and R has no click");
-        assert_eq!(click.step([0.5, 0.0]), [true, false], "reaching it clicks");
-        assert_eq!(click.step([0.9, 0.0]), [false, false], "no second click further in");
-        assert_eq!(click.step([0.48, 0.0]), [false, false], "still inside the hysteresis");
-        assert_eq!(click.step([0.5, 0.0]), [false, false], "so jitter here is silent");
-        assert_eq!(click.step([0.46, 0.0]), [false, false], "released");
-        assert_eq!(click.step([0.5, 0.0]), [true, false], "and the next pull clicks");
+        let mut click = TriggerClick { edges: [edges(), TriggerEdges::default()], ..Default::default() };
+        assert_eq!(clicked(click.step([0.49, 0.9], MS)), [false, false], "below it, and R has no click");
+        assert_eq!(click.step([0.5, 0.0], MS),
+            [Some(Cmd::TriggerClick { side: 0, gain_db: 0, shape: ClickShape::trigger_default() }), None],
+            "reaching it clicks");
+        assert_eq!(clicked(click.step([0.9, 0.0], MS)), [false, false], "no second click further in");
+        assert_eq!(clicked(click.step([0.48, 0.0], MS)), [false, false], "still inside the hysteresis");
+        assert_eq!(clicked(click.step([0.5, 0.0], MS)), [false, false], "so jitter here is silent");
+        assert_eq!(clicked(click.step([0.46, 0.0], MS)), [false, false], "released, with no release click");
+        assert_eq!(clicked(click.step([0.5, 0.0], MS)), [false, false], "short of rest, the point holds still");
+        assert_eq!(clicked(click.step([0.53, 0.0], MS)), [true, false], "the band's top clicks");
+        assert_eq!(clicked(click.step([0.0, 0.0], MS)), [false, false]);
+        assert_eq!(clicked(click.step([0.5, 0.0], MS)), [true, false], "and a pull from rest at the point");
+    }
+
+    // A release click plays its own shape as the trigger comes back past the
+    // point, once it has stayed under the band for the hold.
+    #[test]
+    fn a_release_click_plays_on_the_way_back_with_its_own_shape() {
+        let mut click = TriggerClick::default();
+        for (pin, v) in [("trig_click_r", 0.5), ("trig_top_r", 0.53), ("trig_rearm_r", 0.47), ("trig_rest_r", 0.01),
+                         ("trig_hold_r", 0.004), ("trig_release_r", 1.0), ("trig_release_gain_r", -9.0),
+                         ("trig_release_hz_r", 90.0), ("trig_release_ms_r", 40.0)] {
+            assert!(click.set(pin, v), "{pin}");
+        }
+        assert!(!click.set("hd_r_amp", 1.0), "not one of these");
+        assert_eq!(clicked(click.step([0.0, 0.9], MS)), [false, true]);
+        for _ in 0..4 {
+            assert_eq!(clicked(click.step([0.0, 0.1], MS)), [false, false], "under the band, not 4 ms yet");
+        }
+        assert_eq!(click.step([0.0, 0.1], MS),
+            [None, Some(Cmd::TriggerClick { side: 1, gain_db: -9, shape: ClickShape::new(90.0, 40.0, 0.0) })]);
+        click.set("trig_release_r", 0.0);
+        click.set("trig_hold_r", 0.0);
+        assert_eq!(clicked(click.step([0.0, 0.9], MS)), [false, true]);
+        assert_eq!(clicked(click.step([0.0, 0.1], MS)), [false, false], "release off again");
+    }
+
+    // Press off with release on: the trigger is still followed, and only lets go.
+    #[test]
+    fn a_side_with_press_off_plays_only_its_release() {
+        let mut click = TriggerClick { edges: [edges(); 2], release_on: [true; 2], ..Default::default() };
+        assert!(click.set("trig_press_l", 0.0));
+        assert_eq!(clicked(click.step([0.9, 0.9], MS)), [false, true]);
+        assert_eq!(clicked(click.step([0.0, 0.0], MS)), [true, true]);
     }
 
     #[test]
     fn turning_a_click_off_forgets_where_the_trigger_was() {
-        let mut click = TriggerClick { position: [0.5, 0.5], ..Default::default() };
+        let mut click = TriggerClick { edges: [edges(); 2], ..Default::default() };
         assert!(click.on());
-        assert_eq!(click.step([0.9, 0.9]), [true, true]);
-        click.position = [0.0, 0.5];
+        assert_eq!(clicked(click.step([0.9, 0.9], MS)), [true, true]);
+        click.edges[0] = TriggerEdges::default();
         assert!(click.on());
-        assert_eq!(click.step([0.9, 0.9]), [false, false]);
-        click.position = [0.5, 0.5];
-        assert_eq!(click.step([0.9, 0.9]), [true, false], "L starts afresh; R stayed armed-off");
+        assert_eq!(clicked(click.step([0.9, 0.9], MS)), [false, false]);
+        click.edges[0] = edges();
+        assert_eq!(clicked(click.step([0.9, 0.9], MS)), [true, false], "L starts afresh; R stayed down");
     }
 
     /// Each pin owned here reaches the slot `Shared::carrier` reads it from.

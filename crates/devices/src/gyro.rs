@@ -383,7 +383,8 @@ pub(crate) struct OutputState {
     mic_led:    u8,
     // HD Rumble carrier 1 (LF) — per-side amplitude + frequency (0–255 each, mapped at encode).
     // hd_l/r_amp:  0=silent, 255=max safe; perceptual power-law curve applied at encode.
-    // hd_l/r_freq: 0–255 mapped logarithmically over safe range 82–1253 Hz (indices 32–159).
+    // hd_l/r_freq: 0–255 over the Switch Pro's table, 82–1253 Hz (indices 32–158,
+    // an octave every 32); a DualSense reads it linearly over 80–500 Hz.
     // Device-agnostic: a Switch Pro packs this into its HD-rumble packet; a USB
     // DualSense synthesizes it as a PCM sine on the LRA.
     hd_l_amp:  u8,
@@ -2080,6 +2081,62 @@ fn build_ds4_bt_out(out: &OutputState) -> [u8; 78] {
     r
 }
 
+/// An unchanged rumble state is re-sent this often.
+const SWITCH_RUMBLE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// When a Switch Pro gets its rumble, and which, on a transport that writes no
+/// closer than `gap`: the strongest state asked for in between is kept, so a
+/// click shorter than the gap still plays (for the gap) instead of falling
+/// between two writes.
+pub(crate) struct SwitchRumblePacer {
+    gap: std::time::Duration,
+    sent: Option<OutputState>,
+    sent_at: Option<std::time::Instant>,
+    /// The strongest state asked for since the last write.
+    peak: Option<OutputState>,
+    /// The last write was amplitude-modulated, which changes every packet.
+    pub(crate) modulated: bool,
+}
+
+fn switch_rumble_level(o: &OutputState) -> u8 {
+    [o.rumble_strong, o.rumble_weak, o.hd_l_amp, o.hd_r_amp, o.hd2_l_amp, o.hd2_r_amp]
+        .into_iter().max().unwrap_or(0)
+}
+
+impl SwitchRumblePacer {
+    pub(crate) fn new(gap: std::time::Duration) -> Self {
+        Self { gap, sent: None, sent_at: None, peak: None, modulated: false }
+    }
+
+    /// The state to write now, if any, given the state asked for now: the
+    /// strongest since the last write where that was stronger than this and not
+    /// yet sent, else this one — when it changed, while it is modulated, or on
+    /// the heartbeat.
+    pub(crate) fn next(&mut self, now: std::time::Instant, out: &OutputState) -> Option<OutputState> {
+        if self.peak.is_none_or(|p| switch_rumble_level(out) > switch_rumble_level(&p)) {
+            self.peak = Some(*out);
+        }
+        let since = self.sent_at.map(|t| now.duration_since(t));
+        if since.is_some_and(|d| d < self.gap) {
+            return None;
+        }
+        let peak = self.peak.take().unwrap_or(*out);
+        let pick = if Some(peak) != self.sent && switch_rumble_level(&peak) > switch_rumble_level(out) {
+            peak
+        } else {
+            *out
+        };
+        let due = Some(pick) != self.sent || self.modulated
+            || since.is_none_or(|d| d >= SWITCH_RUMBLE_HEARTBEAT);
+        if !due {
+            return None;
+        }
+        self.sent = Some(pick);
+        self.sent_at = Some(now);
+        Some(pick)
+    }
+}
+
 /// The Switch Pro rumble-only report (`0x10`) for this output state, and
 /// whether amplitude modulation is active — in which case the packet changes
 /// every tick and must be re-sent continuously, not only on change.
@@ -2102,7 +2159,7 @@ pub(crate) fn switch_rumble_report(out: &OutputState, counter: u8) -> ([u8; 64],
         || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
     // Per side: carrier 1 (LF) + carrier 2 (HF). In legacy fallback
     // (no HD wiring) the classic rumble pins drive carrier 1 only at
-    // the firmware-default ~320 Hz, with carrier 2 silent.
+    // FlexInput's default pitch for the pad, with carrier 2 silent.
     let (l_lf_a, l_lf_f, l_hf_a, l_hf_f,
          r_lf_a, r_lf_f, r_hf_a, r_hf_f) = if hd_set {
         (
@@ -2112,12 +2169,12 @@ pub(crate) fn switch_rumble_report(out: &OutputState, counter: u8) -> ([u8; 64],
             out.hd2_r_amp as f32 / 255.0, out.hd2_r_freq as f32 / 255.0,
         )
     } else {
-        const DEFAULT_FREQ: f32 = 0.6;
+        let default_freq = flexinput_core::automap::switch_hd_freq(flexinput_core::automap::SWITCH_RUMBLE_HZ);
         let l = out.rumble_strong as f32 / 255.0;
         let r = out.rumble_weak as f32 / 255.0;
         (
-            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
-            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
+            l, if l > 0.0 { default_freq } else { 0.0 }, 0.0, 0.0,
+            r, if r > 0.0 { default_freq } else { 0.0 }, 0.0, 0.0,
         )
     };
     // HF "texture" = amplitude modulation of the LF carrier. Advance
@@ -2149,17 +2206,18 @@ fn build_switch_rumble_only(counter: u8, left: [u8; 4], right: [u8; 4]) -> [u8; 
 /// Encode amplitude + frequency into a 4-byte Switch Pro HD rumble packet.
 ///
 ///   amp  — vibration intensity 0.0–1.0 (0 = silent, 1 = max safe ~1003 units)
-///   freq — normalized 0.0–1.0 mapping to 41–1253 Hz
-///          (0.0=41 Hz, ~0.6=320 Hz default, 1.0=1253 Hz)
+///   freq — normalized 0.0–1.0 mapping to 82–1253 Hz
+///          (0.0=82 Hz, 0.5=320 Hz, 1.0=1253 Hz)
 ///
 /// The kernel uses one shared frequency table (joycon_rumble_frequencies[]) for
 /// both the HF field (bytes 0–1, u16 `high`) and the LF field (byte 2, u8 `low`).
-/// A single freq input drives both bands simultaneously, which is how the Switch
-/// OS and kernel driver work by default.
+/// A single freq input drives both bands simultaneously where both reach it,
+/// which is how the Switch OS and kernel driver work by default; above the LF
+/// band's top, the HF band alone.
 ///
 // joycon_rumble_frequencies[] from drivers/hid/hid-nintendo.c.
-// Each entry: (high: u16, low: u8) for the given Hz. 160 entries, 41 Hz (index 0)
-// → 1253 Hz (index 159). Index 96 = 320 Hz (firmware default). Module-level so both
+// Each entry: (high: u16, low: u8) for the given Hz. 159 entries, 41 Hz (index 0)
+// → 1253 Hz (index 158). Index 95 = 320 Hz (firmware default). Module-level so both
 // the single-carrier and dual-carrier encoders share the SAME validated table.
 #[rustfmt::skip]
 const SWITCH_FREQ_TABLE: &[(u16, u8)] = &[
@@ -2182,7 +2240,7 @@ const SWITCH_FREQ_TABLE: &[(u16, u8)] = &[
         (0xc400,0x51),(0xc800,0x52),(0xcc00,0x53),(0xd000,0x54),(0xd400,0x55),
         (0xd800,0x56),(0xdc00,0x57),(0xe000,0x58),(0xe400,0x59),(0xe800,0x5a),
         (0xec00,0x5b),(0xf000,0x5c),(0xf400,0x5d),(0xf800,0x5e),(0xfc00,0x5f),
-        // index 96 = 320 Hz
+        // index 95 = 320 Hz
         (0x0001,0x60),(0x0401,0x61),(0x0801,0x62),(0x0c01,0x63),(0x1001,0x64),
         (0x1401,0x65),(0x1801,0x66),(0x1c01,0x67),(0x2001,0x68),(0x2401,0x69),
         (0x2801,0x6a),(0x2c01,0x6b),(0x3001,0x6c),(0x3401,0x6d),(0x3801,0x6e),
@@ -2190,14 +2248,14 @@ const SWITCH_FREQ_TABLE: &[(u16, u8)] = &[
         (0x5001,0x74),(0x5401,0x75),(0x5801,0x76),(0x5c01,0x77),(0x6001,0x78),
         (0x6401,0x79),(0x6801,0x7a),(0x6c01,0x7b),(0x7001,0x7c),(0x7401,0x7d),
         (0x7801,0x7e),(0x7c01,0x7f),
-        // index 128 = 640 Hz, low = 0x00 for these (above LF range)
+        // index 127 = 640 Hz, low = 0x00 for these (above LF range)
         (0x8001,0x00),(0x8401,0x00),(0x8801,0x00),(0x8c01,0x00),(0x9001,0x00),
         (0x9401,0x00),(0x9801,0x00),(0x9c01,0x00),(0xa001,0x00),(0xa401,0x00),
         (0xa801,0x00),(0xac01,0x00),(0xb001,0x00),(0xb401,0x00),(0xb801,0x00),
         (0xbc01,0x00),(0xc001,0x00),(0xc401,0x00),(0xc801,0x00),(0xcc01,0x00),
         (0xd001,0x00),(0xd401,0x00),(0xd801,0x00),(0xdc01,0x00),(0xe001,0x00),
         (0xe401,0x00),(0xe801,0x00),(0xec01,0x00),(0xf001,0x00),(0xf401,0x00),
-        (0xf801,0x00),(0xfc01,0x00), // index 159 = 1253 Hz
+        (0xf801,0x00),(0xfc01,0x00), // index 158 = 1253 Hz
 ];
 // joycon_rumble_amplitudes[] safe range (0–1003 units) from drivers/hid/hid-nintendo.c.
 // (high: u8, low: u16) — added into frequency bytes per joycon_encode_rumble().
@@ -2234,11 +2292,17 @@ const SWITCH_AMP_TABLE: &[(u8, u16)] = &[
 /// the HF carrier's (fh, ah) for bytes 0/1 and the LF carrier's (fl, al) for bytes
 /// 2/3 — both via this same validated table.
 fn switch_carrier_fields(amp: f32, freq: f32) -> (u16, u8, u8, u16) {
-    // FREQ_TABLE valid indices 0–158. Safe range 32–127 (~82–626 Hz) — both HF and
-    // LF fields non-zero. The fh field is NOT linear (wraps at 95→96), so it's an
-    // opaque lookup key — never interpolate between entries.
-    const FREQ_LO: usize = 32;  // ~82 Hz
-    const FREQ_HI: usize = 127; // ~626 Hz
+    // FREQ_TABLE valid indices 0–158: step i plays 10·2^((i+65)/32) Hz. The pins
+    // span 32–158 (82–1253 Hz). Up to 126 (626 Hz, the LF field's last) the pitch
+    // plays on both bands; above, the LF field is 0, which a pad refuses — it
+    // ignores the packet and holds its last rumble — so there the pitch plays on
+    // the HF band alone, the LF band silent as in the neutral packet. The fh field
+    // is NOT linear (wraps at 94→95), so it's an opaque lookup key — never
+    // interpolate between entries.
+    const FREQ_LO: usize = 32;  // 82 Hz
+    const LF_TOP: usize = 126;  // 626 Hz
+    const FREQ_HI: usize = 158; // 1253 Hz
+    const LF_SILENT_FREQ: u8 = 0x40;
     let f_idx = ((FREQ_LO as f32 + freq.clamp(0.0, 1.0) * (FREQ_HI - FREQ_LO) as f32)
         .round() as usize)
         .clamp(FREQ_LO, FREQ_HI);
@@ -2254,6 +2318,9 @@ fn switch_carrier_fields(amp: f32, freq: f32) -> (u16, u8, u8, u16) {
             .min(SWITCH_AMP_TABLE.len() - 1)
     };
     let (ah, al) = SWITCH_AMP_TABLE[a_idx];
+    if f_idx > LF_TOP {
+        return (fh, LF_SILENT_FREQ, ah, SWITCH_AMP_TABLE[0].1);
+    }
     (fh, fl, ah, al)
 }
 
@@ -2268,16 +2335,6 @@ fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
         fl.wrapping_add(((al >> 8) & 0xFF) as u8),
         (al & 0xFF) as u8,
     ]
-}
-
-/// Map a band's 0..1 freq onto a FREQ_TABLE index window, returning the table's
-/// normalized 0..1 freq for [`switch_carrier_fields`]. Keeps both carriers inside
-/// the LRA's felt range (the actuators resonate ~150–200 Hz and roll off above
-/// ~300 Hz): LF → idx 32..=64 (~82–180 Hz), HF → idx 64..=96 (~180–320 Hz).
-fn band_freq_norm(freq01: f32, high_band: bool) -> f32 {
-    let (lo, hi) = if high_band { (64.0, 96.0) } else { (32.0, 64.0) };
-    let idx = lo + freq01.clamp(0.0, 1.0) * (hi - lo);
-    ((idx - 32.0) / (127.0 - 32.0)).clamp(0.0, 1.0)
 }
 
 /// AM mod-rate window (Hz) the HF "carrier" maps onto when used as an amplitude
@@ -2321,8 +2378,11 @@ fn switch_rumble_encode_am(
     let _ = mod_rate; // rate is applied by the caller when advancing mod_phase
     let amp = (lf_a * env).clamp(0.0, 1.0);
 
-    // Single felt carrier at the LF band frequency, amplitude-modulated.
-    let (fh, fl, ah, al) = switch_carrier_fields(amp, band_freq_norm(lf_freq, false));
+    // Single felt carrier at the pin's frequency over the table's whole range,
+    // as the pin promises (`automap::SWITCH_HD_HZ`), amplitude-modulated. It used
+    // to be squeezed into the bottom octave, 82–164 Hz, so nothing could play a
+    // pitch above that.
+    let (fh, fl, ah, al) = switch_carrier_fields(amp, lf_freq);
     [
         ((fh >> 8) & 0xFF) as u8,
         ((fh & 0xFF) as u8).wrapping_add(ah),
@@ -2503,12 +2563,23 @@ fn build_dualsense_usb_out(out: &OutputState, lightbar_setup: bool) -> [u8; 63] 
 /// Wraps the same 47-byte common struct as USB, prefixed with seq_tag + tag
 /// and signed with a CRC32 over the report contents (excluding the 4 CRC bytes).
 /// Without the CRC the firmware silently drops the packet.
+/// A DualSense on Bluetooth has no audio endpoint for its HD carriers, so they
+/// play on the rumble its firmware emulates on the same actuators instead of not
+/// at all: each side's loudest, left on the strong motor and right on the weak,
+/// the way the pins pair. A trigger click then still clicks, without a pitch.
+fn hd_on_motors(out: &OutputState) -> OutputState {
+    let mut o = *out;
+    o.rumble_strong = o.rumble_strong.max(o.hd_l_amp).max(o.hd2_l_amp);
+    o.rumble_weak = o.rumble_weak.max(o.hd_r_amp).max(o.hd2_r_amp);
+    o
+}
+
 fn build_dualsense_bt_out(out: &OutputState, seq: u8, lightbar_setup: bool) -> [u8; 78] {
     let mut r = [0u8; 78];
     r[0] = 0x31;                       // report id
     r[1] = (seq & 0x0F) << 4;          // seq_tag: high nibble = sequence, low nibble = 0
     r[2] = 0x10;                       // DS_OUTPUT_TAG
-    fill_dualsense_common(&mut r[3..50], out, lightbar_setup);
+    fill_dualsense_common(&mut r[3..50], &hd_on_motors(out), lightbar_setup);
     // bytes 50..73 = reserved (zero)
     let crc = dualsense_bt_crc32(&r[..74]);
     r[74..78].copy_from_slice(&crc.to_le_bytes());
@@ -2888,6 +2959,66 @@ mod tests {
         assert_eq!(bt[1], 0x50);              // seq high-nibble = 5, low = 0
         assert_eq!(bt[2], 0x10);              // DS_OUTPUT_TAG
         assert_eq!(bt.len(), 78);             // DS_OUTPUT_REPORT_BT_SIZE
+    }
+
+    // A click shorter than the gap still plays, then ends, and no two writes
+    // come closer than the gap.
+    #[test]
+    fn a_switch_pro_gets_a_short_click_whole_and_never_too_often() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let (mut idle, mut on) = (OutputState::default(), OutputState::default());
+        idle.stage("hd_l_freq", 128);
+        on.stage("hd_l_amp", 200);
+        let mut p = SwitchRumblePacer::new(std::time::Duration::from_millis(12));
+        assert!(p.next(at(0), &idle) == Some(idle), "first write");
+        assert!(p.next(at(3), &on).is_none(), "too soon");
+        assert!(p.next(at(6), &idle).is_none(), "the click is over, and still too soon");
+        assert!(p.next(at(12), &idle) == Some(on), "but it plays");
+        assert!(p.next(at(18), &idle).is_none());
+        assert!(p.next(at(24), &idle) == Some(idle), "and ends");
+        assert!(p.next(at(500), &idle).is_none(), "unchanged waits for the heartbeat");
+        assert!(p.next(at(1100), &idle) == Some(idle), "and gets it");
+    }
+
+    // The pins' frequency spans the whole table, as they say: the top of the old
+    // 82–164 Hz squeeze is a quarter of the way up now.
+    #[test]
+    fn a_switch_pro_plays_the_pitch_its_pin_asks_for() {
+        use flexinput_core::automap::switch_hd_freq;
+        let fields = |hz: f32| switch_carrier_fields(1.0, switch_hd_freq(hz));
+        assert_eq!(fields(163.5).0, SWITCH_FREQ_TABLE[64].0);
+        assert_eq!(fields(320.0).0, SWITCH_FREQ_TABLE[95].0);
+        assert_eq!(switch_carrier_fields(1.0, 1.0).0, SWITCH_FREQ_TABLE[158].0, "the table's top");
+    }
+
+    // Both bands play a pitch both reach. Above the LF band's top its field would
+    // be 0, which a pad refuses and holds its last rumble, so the HF band plays
+    // alone there, the LF band silent as in the neutral packet.
+    #[test]
+    fn a_switch_pro_pitch_above_the_low_band_plays_on_the_high_band_alone() {
+        use flexinput_core::automap::switch_hd_freq;
+        let pack = |hz: f32| switch_rumble_encode(1.0, switch_hd_freq(hz));
+        assert_eq!(pack(626.0)[2] & 0x7F, 0x7F, "the LF band's last pitch");
+        assert_eq!(pack(626.0)[3], SWITCH_AMP_TABLE[100].1 as u8, "at full strength");
+        for hz in [640.0, 900.0, 1253.0] {
+            let p = pack(hz);
+            assert_eq!((p[2], p[3]), (0x40, 0x40), "{hz}: LF silent");
+            assert_ne!(p[1] & 0xFE, 0, "{hz}: HF playing");
+        }
+    }
+
+    // Over Bluetooth the HD carriers land on the motors, the louder winning.
+    #[test]
+    fn a_bluetooth_dualsense_plays_hd_carriers_on_its_motors() {
+        let mut out = OutputState::default();
+        out.stage("hd_l_amp", 200);
+        out.stage("hd2_r_amp", 90);
+        out.stage("rumble_weak", 120);
+        let bt = build_dualsense_bt_out(&out, 0, false);
+        assert_eq!((bt[3 + 3], bt[3 + 2]), (200, 120), "strong, weak");
+        let usb = build_dualsense_usb_out(&out, false);
+        assert_eq!((usb[1 + 3], usb[1 + 2]), (0, 120), "USB plays them as audio");
     }
 
     #[test]

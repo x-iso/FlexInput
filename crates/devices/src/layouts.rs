@@ -372,7 +372,7 @@ fn joycon2_right_outputs() -> Vec<DevicePin> {
 fn joycon2_inputs() -> Vec<DevicePin> {
     vec![
         fl("hd_l_amp", "HD Rumble: Amplitude (perceptual 0–1)"),
-        fl("hd_l_freq", "HD Rumble: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        fl("hd_l_freq", "HD Rumble: Frequency (0=82Hz 0.5=320Hz 1=1253Hz)"),
         fl("hd2_l_amp", "HD Rumble: Amp (HF carrier)"),
         fl("hd2_l_freq", "HD Rumble: Freq (HF carrier)"),
         // player_led: bits 0–3 select which of the 4 LEDs light.
@@ -501,11 +501,12 @@ fn switch_pro_inputs() -> Vec<DevicePin> {
     vec![
         // Per-side amplitude + carrier frequency.
         // hd_l/r_amp:  0=silent → 1=max; perceptual power-law curve (more resolution at low amp).
-        // hd_l/r_freq: 0=82 Hz → 1=626 Hz; linear over safe dual-band range.
+        // hd_l/r_freq: 0=82 Hz → 1=1253 Hz along the pad's frequency table, an
+        // octave every 32 of its 126 steps (`automap::switch_hd_freq`).
         fl("hd_l_amp",  "HD Rumble L: Amplitude (perceptual 0–1)"),
-        fl("hd_l_freq", "HD Rumble L: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        fl("hd_l_freq", "HD Rumble L: Frequency (0=82Hz 0.5=320Hz 1=1253Hz)"),
         fl("hd_r_amp",  "HD Rumble R: Amplitude (perceptual 0–1)"),
-        fl("hd_r_freq", "HD Rumble R: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        fl("hd_r_freq", "HD Rumble R: Frequency (0=82Hz 0.5=320Hz 1=1253Hz)"),
         // Second simultaneous carrier (HF band). The Switch Pro packs carrier 1
         // (hd_*) + carrier 2 (hd2_*) into one dual-band HD-rumble packet.
         fl("hd2_l_amp",  "HD Rumble L: Amp (HF carrier)"),

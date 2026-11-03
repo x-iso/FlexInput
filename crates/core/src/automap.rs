@@ -265,6 +265,257 @@ pub const TRIGGER_CLICK_HZ: f32 = 170.0;
 pub const TRIGGER_CLICK_MS: f32 = 20.0;
 pub const PAD_CLICK_HZ: f32 = 200.0;
 pub const PAD_CLICK_MS: f32 = 12.0;
+/// A trigger's release click, until set otherwise, is this much softer than its press.
+pub const TRIGGER_RELEASE_DB: f32 = -6.0;
+/// What a trigger click lasts on a pad with rumble motors only, until set
+/// otherwise: a motor needs about that long to spin up enough to be felt.
+pub const TRIGGER_CLICK_RUMBLE_MS: f32 = 50.0;
+/// The pitches a Switch Pro's `hd_*_freq` pins span, 0 to 1: its frequency
+/// table (step `i` plays 10·2^((i+65)/32) Hz) from step 32 to its last, 158, an
+/// octave every 32 of those 126 steps. Above the low band's top, 626 Hz, the
+/// high band plays the pitch alone (`gyro.rs` `switch_carrier_fields`).
+pub const SWITCH_HD_HZ: (f32, f32) = (81.75, 1252.6);
+
+/// A pitch as a Switch Pro's `hd_*_freq` value.
+pub fn switch_hd_freq(hz: f32) -> f32 {
+    ((hz.max(1.0) / SWITCH_HD_HZ.0).log2() * 32.0 / 126.0).clamp(0.0, 1.0)
+}
+
+/// The pitch a Switch Pro's rumble plays when nothing gives it one (a game's
+/// classic rumble, the ping): near its actuator's resonance, where it is felt
+/// most.
+pub const SWITCH_RUMBLE_HZ: f32 = 123.0;
+
+/// The `hd_*_amp` value that plays `level` (0–1 of full strength, as a click's
+/// dB gives it) on a Switch Pro.
+///
+/// Its encoder reads the pin as felt strength, a 1.8 power curve onto
+/// Nintendo's 100-step amplitude table — and the table already runs on a log
+/// scale (dekuNukem's `rumble_data_table.md`, as SDL encodes it): steps 1–15
+/// about 19% apart from 0.8% of full, 16–32 an octave from 11.7%, 32–100 an
+/// octave every 32 from 23%. A plain level through both crowded every quieter
+/// click into the bottom few steps: −24 and −18 dB played alike, at 1%.
+pub fn switch_hd_amp(level: f32) -> f32 {
+    if level <= 0.0 {
+        return 0.0;
+    }
+    let a = level.min(1.0) * 65535.0;
+    let step = if a >= 15067.0 {
+        32.0 + 32.0 * (a / 15067.0).log2()
+    } else if a >= 7698.0 {
+        16.0 + 16.0 * (a / 7698.0).log2()
+    } else {
+        1.0 + 14.0 * (a / 514.0).ln() / (7372.0f32 / 514.0).ln()
+    };
+    let step = step.round().clamp(1.0, 100.0);
+    // The encoder's step is 1 + round(99 · pin^1.8). At least one byte's worth,
+    // so the pin doesn't round to silence on its way to the pad.
+    ((step - 1.0) / 99.0).powf(1.0 / 1.8).max(1.5 / 255.0)
+}
+
+/// The shortest click a Switch Pro plays reliably: at 30 ms and under, a TT
+/// Max dropped them.
+pub const SWITCH_CLICK_MIN_MS: f32 = 35.0;
+/// Its click's length until set otherwise.
+pub const TRIGGER_CLICK_SWITCH_MS: f32 = 40.0;
+
+/// What plays a pad's trigger clicks, by its haptic input pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClickActuator {
+    /// The pad plays them itself (a Steam Controller): the engine sends where
+    /// each trigger clicks and what it plays, and the backend watches its own poll.
+    Own,
+    /// HD actuators played as a waveform (a DualSense on USB): strength, pitch
+    /// and softness.
+    Hd,
+    /// A Switch Pro's HD rumble: as [`ClickActuator::Hd`], its pitch over
+    /// [`SWITCH_HD_HZ`] by its own scale ([`switch_hd_freq`]), its strength by
+    /// its own amplitude table ([`switch_hd_amp`]), and no shorter than
+    /// [`SWITCH_CLICK_MIN_MS`].
+    Switch,
+    /// Rumble motors: strength and length only.
+    Rumble,
+}
+
+impl ClickActuator {
+    /// A click's length until set otherwise.
+    pub fn default_ms(self) -> f32 {
+        match self {
+            ClickActuator::Rumble => TRIGGER_CLICK_RUMBLE_MS,
+            ClickActuator::Switch => TRIGGER_CLICK_SWITCH_MS,
+            ClickActuator::Own | ClickActuator::Hd => TRIGGER_CLICK_MS,
+        }
+    }
+
+    /// The shortest click it plays, whatever is set.
+    pub fn shortest_ms(self) -> f32 {
+        if self == ClickActuator::Switch { SWITCH_CLICK_MIN_MS } else { 1.0 }
+    }
+}
+
+pub fn click_actuator<'a>(pins: impl IntoIterator<Item = &'a str> + Clone) -> Option<ClickActuator> {
+    let has = |id: &str| pins.clone().into_iter().any(|p| p == id);
+    if has("grip_l_click") {
+        Some(ClickActuator::Own)
+    } else if has("hd_rumble_l") {
+        // The Switch Pro layout's legacy pin.
+        Some(ClickActuator::Switch)
+    } else if has("hd_l_amp") {
+        Some(ClickActuator::Hd)
+    } else if has("rumble_strong") || has("rumble_weak") {
+        Some(ClickActuator::Rumble)
+    } else {
+        None
+    }
+}
+
+/// A one-shot's envelope at `t` through it (0..1): `soft` of it is the fade, half at
+/// each end on a raised cosine. 0 is a plain burst, 1 a smooth swell.
+pub fn click_envelope(t: f32, soft: f32) -> f32 {
+    let edge = t.min(1.0 - t).max(0.0);
+    let fade = soft * 0.5;
+    if edge >= fade {
+        1.0
+    } else {
+        0.5 - 0.5 * (edge / fade * std::f32::consts::PI).cos()
+    }
+}
+
+/// How wide the band around a trigger's point is, as a share of its range, until
+/// set otherwise (Calibration window, `trig_hysteresis`): so a finger resting on
+/// the point, or an unsteady pull, doesn't flicker it.
+pub const TRIGGER_HYSTERESIS: f32 = 0.03;
+
+/// How long a trigger stays under its band before it lets go, and off rest
+/// before a point the band can't guard presses, in ms, until set otherwise
+/// (`trig_debounce_ms`), and the least it can be set to: shorter holds no
+/// jitter back. See [`TriggerCrossing::step`].
+pub const TRIGGER_DEBOUNCE_MS: f32 = 4.0;
+
+/// A trigger's set debounce (`trig_debounce_ms`, if set) in seconds, no shorter
+/// than [`TRIGGER_DEBOUNCE_MS`].
+pub fn trigger_debounce_secs(ms: Option<f32>) -> f32 {
+    ms.unwrap_or(TRIGGER_DEBOUNCE_MS).max(TRIGGER_DEBOUNCE_MS) / 1000.0
+}
+
+/// A trigger's hysteresis, set as a share of its full travel, as a share of its
+/// calibrated range `(mn, mx)`, which [`trigger_band`] takes: the band stays as
+/// wide on the pad however narrow the range. An uncalibrated range (`mn` ≈ `mx`)
+/// is the whole travel.
+pub fn trigger_band_width(hysteresis: f32, (mn, mx): (f32, f32)) -> f32 {
+    let span = mx - mn;
+    if span.abs() < 1e-4 { hysteresis } else { hysteresis / span.abs() }
+}
+
+/// The band around a trigger's point on the calibrated trigger (0–1), `(bottom,
+/// top)`: `hysteresis` wide (of the calibrated range: see
+/// [`trigger_band_width`]), centred on the point, and shifted inside the
+/// travel where it would run past either end — so near rest it reaches from
+/// rest up to its full width, and near full pull down from it.
+pub fn trigger_band(point: f32, hysteresis: f32) -> (f32, f32) {
+    let p = point.clamp(0.0, 1.0);
+    let h = hysteresis.clamp(0.0, 1.0);
+    let bottom = (p - h * 0.5).min(1.0 - h).max(0.0);
+    (bottom, (bottom + h).min(1.0))
+}
+
+/// A trigger's point and its band as the travel it is read on (from
+/// [`trigger_edges`]); see [`TriggerCrossing::step`].
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct TriggerEdges {
+    /// A pull from rest presses here: the point itself. 0 = no point.
+    pub press: f32,
+    /// Let go short of rest, it presses again only here: the band's top.
+    pub again: f32,
+    /// It lets go under here: the band's bottom.
+    pub release: f32,
+    /// Under here it is at rest.
+    pub rest: f32,
+}
+
+/// A point on the calibrated trigger (0–1 of the range `(mn, mx)`, as the
+/// digital threshold is) and its [`trigger_band`], as raw travel: just past
+/// the point and the band's top (full pull is its own edge), under the band's
+/// bottom, at rest. `hysteresis` is a share of the full travel. An
+/// uncalibrated range (`mn` ≈ `mx`) is the whole travel.
+pub fn trigger_edges(point: f32, (mn, mx): (f32, f32), hysteresis: f32) -> TriggerEdges {
+    // Less than any trigger's step: "just past" a point.
+    const NUDGE: f32 = 1e-5;
+    let width = trigger_band_width(hysteresis, (mn, mx));
+    let (mn, span) = if (mx - mn).abs() < 1e-4 { (0.0, 1.0) } else { (mn, mx - mn) };
+    // Full pull within rounding is full pull, or it would sit out of reach.
+    let past = |v: f32| if v >= 1.0 - 1e-6 { mn + span } else { mn + v * span + NUDGE };
+    let (bottom, top) = trigger_band(point, width);
+    let rest = mn + NUDGE;
+    TriggerEdges {
+        press: past(point.clamp(0.0, 1.0)),
+        again: past(top),
+        release: if bottom <= 0.0 { rest } else { mn + bottom * span },
+        rest,
+    }
+}
+
+/// Where a trigger stands against its point between reads.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct TriggerCrossing {
+    down: bool,
+    /// Let go short of rest: the next press waits for the band's top.
+    short: bool,
+    /// How long it has stayed past the edge it is waiting out: while down, the
+    /// band's bottom; while up, a point the band can't guard.
+    held: Option<f32>,
+}
+
+impl TriggerCrossing {
+    pub fn down(&self) -> bool {
+        self.down
+    }
+
+    /// One read of `travel`, `dt` seconds after the last, against `edges` (no
+    /// point forgets): `Some(true)` as it presses, `Some(false)` as it lets go.
+    /// A pull from rest presses at the point, even one at rest, which presses on
+    /// any movement off it. Once down, it lets go only after staying under the
+    /// band's bottom for `hold` seconds; let go short of rest, it presses again
+    /// only past the band's top, so jitter across the point is silent both ways.
+    /// Where the band reaches rest, nothing under the point guards it, so a
+    /// press waits `hold` too: a trigger barely off rest and back is jitter.
+    pub fn step(&mut self, edges: &TriggerEdges, travel: f32, dt: f32, hold: f32) -> Option<bool> {
+        if edges.press <= 0.0 {
+            *self = Self::default();
+            return None;
+        }
+        // Whether it has stayed past an edge for `hold`, from the first read there.
+        let waited = |held: &mut Option<f32>| {
+            let t = held.map_or(0.0, |t| t + dt);
+            *held = Some(t);
+            t + 1e-6 >= hold
+        };
+        if self.down {
+            if travel >= edges.release {
+                self.held = None;
+                return None;
+            }
+            if !waited(&mut self.held) {
+                return None;
+            }
+            *self = Self { down: false, short: travel >= edges.rest, held: None };
+            return Some(false);
+        }
+        if travel < edges.rest {
+            self.short = false;
+        }
+        if travel < if self.short { edges.again } else { edges.press } {
+            self.held = None;
+            return None;
+        }
+        let unguarded = !self.short && edges.release <= edges.rest;
+        if unguarded && !waited(&mut self.held) {
+            return None;
+        }
+        *self = Self { down: true, short: false, held: None };
+        Some(true)
+    }
+}
 
 /// A one-shot click pin, and the private pins that shape its next click: pitch in
 /// Hz, length in ms, softness 0..1. With none set, it plays the pad's plain click.
@@ -653,6 +904,176 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MS: f32 = 0.001;
+    const HOLD: f32 = TRIGGER_DEBOUNCE_MS * MS;
+
+    // A pull from rest presses at the point; jitter across it is silent both
+    // ways, the band's bottom lets go and, short of rest, only its top presses
+    // again.
+    #[test]
+    fn a_trigger_presses_at_its_point_and_jitter_across_its_band_is_silent() {
+        // A 10% band around the middle: 0.45 to 0.55.
+        let e = trigger_edges(0.5, (0.0, 1.0), 0.1);
+        let mut t = TriggerCrossing::default();
+        let mut step = |v: f32| t.step(&e, v, MS, 0.0);
+        assert_eq!(step(0.5), None, "on the point");
+        assert_eq!(step(0.501), Some(true), "just past it, from rest");
+        assert_eq!(step(0.9), None, "no second press further in");
+        assert_eq!(step(0.46), None, "back inside the band");
+        assert_eq!(step(0.52), None, "so jitter across the point is silent");
+        assert_eq!(step(0.44), Some(false), "past its bottom");
+        assert_eq!(step(0.52), None, "short of rest, the point doesn't press again");
+        assert_eq!(step(0.551), Some(true), "its top does");
+        assert_eq!(step(0.3), Some(false));
+        assert_eq!(step(0.0), None, "at rest");
+        assert_eq!(step(0.501), Some(true), "so the point presses again");
+    }
+
+    // Once down, it lets go only after staying under the band for the hold.
+    #[test]
+    fn a_trigger_lets_go_only_after_staying_under_its_band_for_the_hold() {
+        let e = trigger_edges(0.5, (0.0, 1.0), 0.1);
+        let mut t = TriggerCrossing::default();
+        let mut step = |v: f32| t.step(&e, v, MS, HOLD);
+        assert_eq!(step(0.6), Some(true), "the band guards this point: no wait");
+        for _ in 0..3 {
+            assert_eq!(step(0.4), None, "a dip shorter than the hold");
+        }
+        assert_eq!(step(0.6), None, "is jitter");
+        for _ in 0..4 {
+            assert_eq!(step(0.4), None);
+        }
+        assert_eq!(step(0.4), Some(false), "4 ms under lets go");
+    }
+
+    // A point at rest has no band under it: a press off rest waits the hold
+    // too, so a trigger blipping off rest and back, either way, stays quiet.
+    #[test]
+    fn a_point_at_rest_waits_the_hold_both_ways() {
+        let e = trigger_edges(0.0, (0.0, 1.0), 0.1);
+        let mut t = TriggerCrossing::default();
+        let mut step = |v: f32| t.step(&e, v, MS, HOLD);
+        for _ in 0..3 {
+            assert_eq!(step(0.001), None, "off rest, shorter than the hold");
+            assert_eq!(step(0.0), None, "and back: jitter");
+        }
+        for _ in 0..4 {
+            assert_eq!(step(0.001), None);
+        }
+        assert_eq!(step(0.002), Some(true), "4 ms off rest presses");
+        for _ in 0..3 {
+            assert_eq!(step(0.0), None, "a dip to rest shorter than the hold");
+        }
+        assert_eq!(step(0.001), None, "is jitter");
+        for _ in 0..4 {
+            assert_eq!(step(0.0), None);
+        }
+        assert_eq!(step(0.0), Some(false), "4 ms at rest lets go");
+    }
+
+    // A digital trigger jumps 0 → 1 → 0, and presses and lets go at any point.
+    #[test]
+    fn a_digital_trigger_presses_and_releases_at_any_point() {
+        for point in [0.0, 0.5, 1.0] {
+            let e = trigger_edges(point, (0.0, 1.0), TRIGGER_HYSTERESIS);
+            let mut t = TriggerCrossing::default();
+            for _ in 0..2 {
+                assert_eq!(t.step(&e, 1.0, MS, 0.0), Some(true), "{point}");
+                assert_eq!(t.step(&e, 0.0, MS, 0.0), Some(false), "{point}");
+            }
+        }
+    }
+
+    // A point at rest presses on any movement off it, whatever the band, and
+    // lets go only at rest, where the trigger sits at or under the range's start.
+    #[test]
+    fn a_point_at_rest_presses_on_any_movement_and_lets_go_at_rest() {
+        let e = trigger_edges(0.0, (0.06, 0.9), 0.1);
+        let mut t = TriggerCrossing::default();
+        for _ in 0..2 {
+            assert_eq!(t.step(&e, 0.055, MS, 0.0), None, "at rest");
+            assert_eq!(t.step(&e, 0.061, MS, 0.0), Some(true), "barely off it");
+            assert_eq!(t.step(&e, 0.0605, MS, 0.0), None, "barely-pressed jitter holds");
+            assert_eq!(t.step(&e, 0.06, MS, 0.0), Some(false), "back at rest");
+        }
+        assert_eq!(t.step(&TriggerEdges::default(), 0.9, MS, 0.0), None, "no point forgets");
+        assert!(!t.down());
+    }
+
+    // The band is the hysteresis wide wherever the point sits: centred, and
+    // shifted inside the travel near either end.
+    #[test]
+    fn a_trigger_band_keeps_its_width_inside_the_travel() {
+        let near = |(a, b): (f32, f32), (c, d): (f32, f32)| (a - c).abs() < 1e-6 && (b - d).abs() < 1e-6;
+        assert!(near(trigger_band(0.5, 0.1), (0.45, 0.55)));
+        assert!(near(trigger_band(0.98, 0.1), (0.9, 1.0)), "shifted down at full pull");
+        assert!(near(trigger_band(1.0, 0.1), (0.9, 1.0)));
+        assert!(near(trigger_band(0.02, 0.1), (0.0, 0.1)), "shifted up near rest");
+        assert!(near(trigger_band(0.0, 0.1), (0.0, 0.1)), "at rest");
+        assert!(near(trigger_band(0.5, 0.0), (0.5, 0.5)), "none");
+        // Raw edges: past the point and the top, at full pull, under the bottom;
+        // the band is 10% of the full travel, not of the 0.1..0.9 range.
+        let e = trigger_edges(0.5, (0.1, 0.9), 0.1);
+        assert!((e.press - 0.5).abs() < 1e-4 && e.press > 0.5);
+        assert!((e.again - 0.55).abs() < 1e-4 && e.again > 0.55);
+        assert!((e.release - 0.45).abs() < 1e-6);
+        assert!((trigger_band_width(0.1, (0.1, 0.9)) - 0.125).abs() < 1e-6);
+        assert_eq!(trigger_band_width(0.1, (0.5, 0.5)), 0.1, "uncalibrated");
+        assert_eq!(trigger_edges(0.98, (0.1, 0.9), 0.1).again, 0.9, "full pull");
+        assert_eq!(trigger_edges(0.02, (0.1, 0.9), 0.1).release, e.rest, "rest");
+    }
+
+    #[test]
+    fn a_pads_clicks_go_to_the_best_actuator_it_has() {
+        assert_eq!(click_actuator(["rumble_strong", "hd_l_amp", "grip_l_click"]), Some(ClickActuator::Own));
+        assert_eq!(click_actuator(["hd_l_amp", "hd_rumble_l"]), Some(ClickActuator::Switch));
+        assert_eq!(click_actuator(["rumble_strong", "hd_l_amp"]), Some(ClickActuator::Hd));
+        assert_eq!(click_actuator(["rumble_weak"]), Some(ClickActuator::Rumble));
+        assert_eq!(click_actuator(["lightbar_r"]), None);
+    }
+
+    // The table's ends, and an octave every 32 of its 126 steps.
+    #[test]
+    fn a_switch_pitch_lands_on_its_table() {
+        assert_eq!(switch_hd_freq(81.75), 0.0);
+        assert!((switch_hd_freq(163.5) - 32.0 / 126.0).abs() < 1e-5);
+        assert!((switch_hd_freq(1252.6) - 1.0).abs() < 1e-3);
+        assert_eq!(switch_hd_freq(5000.0), 1.0);
+        // The default pitch stays on the step it has played on: 51.
+        let step = 32.0 + switch_hd_freq(SWITCH_RUMBLE_HZ) * 126.0;
+        assert_eq!(step.round(), 51.0, "{step}");
+    }
+
+    /// The step the encoder lands on for a pin value (`gyro.rs`
+    /// `switch_carrier_fields`, after the pin's trip through a byte).
+    fn switch_step(pin: f32) -> u32 {
+        let pin = ((pin * 255.0) as u8) as f32 / 255.0;
+        if pin == 0.0 { 0 } else { 1 + (pin.powf(1.8) * 99.0).round() as u32 }
+    }
+
+    // A level lands on the table's step for it, so a click's dB is the pad's: a
+    // quarter of full strength near step 37, half near 68, full at 100, and the
+    // quietest still above silence.
+    #[test]
+    fn a_switch_strength_lands_on_its_table() {
+        assert_eq!(switch_hd_amp(0.0), 0.0);
+        assert_eq!(switch_step(switch_hd_amp(1.0)), 100);
+        assert!((66..=69).contains(&switch_step(switch_hd_amp(0.5))), "{}", switch_step(switch_hd_amp(0.5)));
+        assert!((35..=38).contains(&switch_step(switch_hd_amp(0.25))), "{}", switch_step(switch_hd_amp(0.25)));
+        assert_eq!(switch_step(switch_hd_amp(0.001)), 1);
+        // −24 and −18 dB no longer land on the same step.
+        let db = |d: f32| switch_step(switch_hd_amp(10f32.powf(d / 20.0)));
+        assert!(db(-24.0) + 5 < db(-18.0), "{} {}", db(-24.0), db(-18.0));
+    }
+
+    #[test]
+    fn a_click_envelope_fades_only_as_soft_as_asked() {
+        assert_eq!(click_envelope(0.0, 0.0), 1.0);
+        assert_eq!(click_envelope(0.5, 1.0), 1.0);
+        assert!(click_envelope(0.05, 1.0) < 0.1);
+        assert!(click_envelope(0.95, 0.5) < 0.5);
+    }
 
     /// Slots per SDL 3.4's mappings: Triton sticks+grips, Deck / HORI sticks,
     /// and nothing for pads whose Misc slots are real buttons.

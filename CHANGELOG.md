@@ -3,6 +3,89 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.8] - 2026-11-02
+
+### Added
+
+- **Trigger clicks on every pad.** The Calibration window's **Trigger click** is no
+  longer only for a Steam Controller: any pad with haptics or rumble can click as a
+  trigger passes its point. Analog triggers (Xbox, DualShock 4, DualSense) get the cyan
+  pin beside the yellow one. A pad with digital triggers, like a Switch Pro's ZL / ZR,
+  gets a **Trigger Haptics** section and clicks as each trigger is pressed, and so does
+  a pad FlexInput knows only through SDL (halfway down, if its triggers are analog).
+  HD haptics (a Switch Pro, a DualSense on USB) play the pitch and softness. A Switch
+  Pro's pitch reaches from 82 to 1253 Hz, its strength follows its own amplitude scale,
+  and its click lasts at least 35 ms, as shorter ones were dropped. Rumble motors play strength and length only,
+  50 ms by default so the motor can spin up. Everywhere but a Steam Controller, 0 dB is the
+  actuator's full strength, and the click plays on top of the game's rumble. A
+  Joy-Con 2 gets none yet, as FlexInput doesn't drive its rumble.
+- **Release clicks.** Each trigger's box now has **Press** and **Release** tabs. Tick
+  **On release** to click as the trigger comes back past the point, with its own
+  strength, pitch, length and softness; it starts 6 dB softer than the press. On a
+  DualSense the default adaptive-trigger effect moves to an **Effect** tab beside them.
+  A Steam Controller plays release clicks too. The press has a tick box of its own on
+  each side, so one trigger can click and the other not, or click only on release.
+- **Trigger hysteresis and debounce.** A **Hysteresis** slider under the trigger arcs
+  sets a band around the digital trigger's point and the click's, shown faint on the
+  arc in each pin's colour, as a share of the trigger's full travel, so a narrower
+  range doesn't narrow it. A pull from rest presses right at the point. Once down, a
+  trigger lets go under the band's bottom, and if it hasn't gone back to rest, presses
+  again only past its top, so an unsteady pull at either point doesn't flicker it. Near
+  either end the band shifts to stay its full width inside the travel. **Debounce**
+  (4 ms at least, by default) is how long a trigger stays under the band before it lets
+  go, so a dip shorter than that is jitter. Where the band reaches rest, nothing under
+  the point guards it, so there a press waits the debounce off rest too, and a trigger
+  barely pressed, blipping on and off rest, stays quiet; elsewhere the press is
+  instant. Both apply to the digital trigger (with **Digital triggers** on) and to the
+  click alike, 3% and 4 ms by default; the digital trigger had neither before. A click
+  point can now sit right at rest, pressing on any movement off it; it used to be kept
+  1% up the range.
+
+### Changed
+
+- **A clearer, larger trigger arc in the Calibration window.** It's one thick track
+  showing the trigger's raw travel, on a scale that gives the first 10% of travel
+  half the arc, where a light pull and the deadzones need the room. The range's ends
+  are orange flags on its inner side. The yellow digital pin and the cyan click pin
+  sit outside it, each with a line of its colour across it. The fill tells you where
+  the trigger is: red where the range throws travel away, green inside it, yellow
+  past the digital point, cyan past the click, and both side by side past the two.
+  The click's strength, pitch, length and softness are now faders like the adaptive
+  effect's numbers, in a narrower column that leaves the arc more room.
+- **The pins stay put when the range changes.** Moving a range flag, recalibrating or
+  resetting the range used to squeeze the yellow and cyan pins along with it. Now each
+  pin keeps its distance from the end it sits nearer: that end takes it along, and the
+  other end pushes it only once it reaches it.
+- **The Calibration window resizes both ways and scrolls.** It used to resize in
+  width only, its height following its sections, so a wide window ran off the
+  bottom of the screen. Now its height is yours to set too, down to a minimum, and
+  the body scrolls when the sections are taller than the window.
+- **A DualSense on Bluetooth plays HD haptics on its motors.** Bluetooth gives it no
+  audio for its HD actuators, so anything driving those pins (Audio Stream Haptics, a
+  game's haptics through a virtual DualSense, a trigger click) was silent there. It now
+  plays on the rumble the pad emulates on the same actuators, without the pitch.
+
+### Fixed
+
+- **A trigger click at the very bottom of its trigger clicks every pull.** Placed at
+  the start of the range, it never let go once the trigger had passed it, so it
+  clicked once at most: it now lets go as the trigger comes back to rest. Dragged
+  onto the yellow pin, the cyan pin now snaps to exactly the same point. The
+  Calibration window also says when the yellow pin doesn't decide the pad's digital
+  button: that takes **Digital triggers** on in the pad's node.
+- **A Switch Pro plays every pitch its HD rumble can.** Since Audio Stream Haptics
+  arrived, every frequency on its HD rumble pins was squeezed into 82–164 Hz, the
+  bottom octave. The pins now span the pad's whole frequency table, 82–1253 Hz (320 Hz
+  at 0.5). Up to 626 Hz the pitch plays on both of the pad's bands, as before. Above
+  that, where the low band stops, it plays on the high band alone. FlexInput used to
+  send an empty low band there, which the pad refused: at a frequency of 1 it held
+  whatever it was playing. Rumble that FlexInput gives a pitch itself, such as a
+  game's classic rumble or the ping, keeps the 123 Hz it has played at. Audio Stream
+  Haptics on a Switch Pro now spreads its pitches over the wider range too.
+- **A short rumble burst over the Bluetooth dongle is no longer lost.** The dongle
+  writes a Switch Pro's rumble no closer than 12 ms apart. A burst that started and
+  ended between two writes never went out at all; now it goes out on the next write.
+
 ## [0.16.7] - 2026-11-01
 
 ### Added

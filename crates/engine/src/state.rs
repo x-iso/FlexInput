@@ -38,6 +38,12 @@ pub struct NodeState {
     /// RWS Aim as a flick target: the flick pins cards held last tick, so a turn
     /// starts once per press.
     pub rws_turn_held: HashSet<String>,
+    /// Physical pad with its trigger click on (Calibration window), where the
+    /// engine plays it: each trigger's crossing and click. Created on first use.
+    pub trigger_clicks: Option<Box<crate::eval::TriggerClicks>>,
+    /// Snapped digital triggers (on the reserved carry entry only): where each
+    /// device's stand between ticks. See `device_cal::preprocess_dev_sigs_into`.
+    pub digital_triggers: Option<Box<crate::eval::DigitalTriggers>>,
     /// Device stick rebound filter (on the reserved carry entry only): every
     /// device's trackers and their clock. See `eval::filter_stick_rebound`.
     pub stick_rebound: Option<Box<crate::eval::StickReboundState>>,

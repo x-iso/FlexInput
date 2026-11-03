@@ -39,6 +39,7 @@ pub use curves::*;
 pub use device_cal::*;
 pub use modules::*;
 pub use trackpad::TrackpadState;
+pub use feedback::TriggerClicks;
 pub use combiner_motion::MotionCorrelator;
 pub(crate) use registry::*;
 // Every publisher is crate-internal — nothing outside the engine publishes
@@ -453,8 +454,12 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
     {
         puffin::profile_scope!("preprocess_dev_sigs");
         if !out.same_input || device_params(graph).preprocessing_has_state {
+            // A snapped digital trigger lets go past its hysteresis and debounce,
+            // so it carries where it stands from tick to tick.
+            let carry = state.entry(MACRO_CARRY_UID).or_default();
+            let snaps = carry.digital_triggers.get_or_insert_with(Default::default);
             out.dev_base.clear();
-            preprocess_dev_sigs_into(graph, dev_sigs, &mut out.dev_base);
+            preprocess_dev_sigs_into(graph, dev_sigs, &mut out.dev_base, snaps, dt);
         }
         dev_sigs_owned.clone_from(&out.dev_base);
     }
@@ -488,6 +493,9 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
     }
     // Set Neutral Forward, requested by a card last tick (one tick stale).
     apply_orient_neutral(state.entry(MACRO_CARRY_UID).or_default(), &mut dev_sigs_owned);
+    // Trigger clicks read the pad as it reports, the way a Steam Controller's
+    // backend does: a calibrated range or a menu's source block mustn't move them.
+    let raw_dev_sigs = dev_sigs;
     let dev_sigs = &dev_sigs_owned;
 
     // Destructure with `ref mut` so the rest of the function can keep
@@ -1264,7 +1272,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         let Some(ref st) = snap.sink_target else { continue; };
         if st.device_id.starts_with("virtual.") { continue; }
         apply_default_trigger_effects(st, &snap.params, &collector_sigs, sink_outputs);
-        apply_trigger_click(st, &snap.params, sink_outputs);
+        let clicks = &mut state.entry(snap.node_uid).or_default().trigger_clicks;
+        apply_trigger_click(st, &snap.params, raw_dev_sigs, clicks, dt, sink_outputs);
         apply_pad_click(st, &snap.params, sink_outputs);
         apply_grip_sensor(st, &snap.params, sink_outputs);
     }
