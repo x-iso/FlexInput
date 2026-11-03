@@ -248,6 +248,12 @@ pub(crate) fn spawn_io_thread(
             // (hotplug arrivals) that would only add log noise.
             const STALL_LOG_MS: u128 = 25;
             let stall_log = std::env::var("FLEXINPUT_IO_STALL_LOG").map_or(false, |v| v == "1");
+            // With the Steam Controller log on, a pass that held the loop up 100 ms
+            // or more goes there too, beside the pad's own lines: a pad that stops
+            // while it keeps sending is then FlexInput stalling or SDL, named.
+            const STEAM_LOG_STALL: Duration = Duration::from_millis(100);
+            let steam_log = flexinput_devices::steam_haptics::diag_on();
+            let mut last_pass: Option<(Instant, Duration)> = None;
             let io_started = Instant::now();
             let mut sect_marks: Vec<(&'static str, Duration)> = Vec::with_capacity(12);
             let mut backend_marks: Vec<Duration> = Vec::with_capacity(4);
@@ -271,6 +277,17 @@ pub(crate) fn spawn_io_thread(
                 puffin::GlobalProfiler::lock().new_frame();
                 puffin::profile_scope!("io_thread_iter");
                 let t0 = Instant::now();
+                // A gap with no busy pass to explain it: the wait overslept.
+                if steam_log {
+                    if let Some((at, busy)) = last_pass.replace((t0, Duration::ZERO)) {
+                        let gap = t0 - at;
+                        if gap >= STEAM_LOG_STALL && busy < STEAM_LOG_STALL {
+                            flexinput_devices::steam_haptics::diag_note(&format!(
+                                "I/O loop: next pass {} ms after the last, which was busy {:.1} ms",
+                                gap.as_millis(), busy.as_secs_f32() * 1e3));
+                        }
+                    }
+                }
                 sect_marks.clear();
                 backend_marks.clear();
                 let mut sect_t = t0;
@@ -891,6 +908,11 @@ pub(crate) fn spawn_io_thread(
                             for dev_id in expired { ping_until.remove(&dev_id); }
                         }
                     }
+                    // A backend on a thread of its own takes this pass's sends
+                    // over in one go.
+                    for backend in &mut backends {
+                        backend.end_output_pass();
+                    }
                 }
                 mark!("outputs_misc");
 
@@ -898,23 +920,29 @@ pub(crate) fn spawn_io_thread(
                 // Checked BEFORE the sleep so only busy time counts. Formats
                 // lazily: nothing allocates unless a stall actually happened.
                 let busy = t0.elapsed();
-                if stall_log && busy.as_millis() >= STALL_LOG_MS {
-                    let mut line = format!(
-                        "[io-stall] +{:.1}s busy {:.1}ms:",
-                        io_started.elapsed().as_secs_f32(),
-                        busy.as_secs_f32() * 1e3,
-                    );
+                let to_stderr = stall_log && busy.as_millis() >= STALL_LOG_MS;
+                let to_steam_log = steam_log && busy >= STEAM_LOG_STALL;
+                if let Some(pass) = last_pass.as_mut() {
+                    pass.1 = busy;
+                }
+                if to_stderr || to_steam_log {
+                    let mut line = format!("busy {:.1}ms:", busy.as_secs_f32() * 1e3);
                     for (name, d) in &sect_marks {
                         if d.as_micros() >= 500 {
                             line.push_str(&format!(" {}={:.1}ms", name, d.as_secs_f32() * 1e3));
                         }
                     }
-                    for (i, d) in backend_marks.iter().enumerate() {
+                    for (d, backend) in backend_marks.iter().zip(&backends) {
                         if d.as_micros() >= 500 {
-                            line.push_str(&format!(" backend{}={:.1}ms", i, d.as_secs_f32() * 1e3));
+                            line.push_str(&format!(" {}={:.1}ms", backend.name(), d.as_secs_f32() * 1e3));
                         }
                     }
-                    eprintln!("{line}");
+                    if to_stderr {
+                        eprintln!("[io-stall] +{:.1}s {line}", io_started.elapsed().as_secs_f32());
+                    }
+                    if to_steam_log {
+                        flexinput_devices::steam_haptics::diag_note(&format!("I/O loop stalled, {line}"));
+                    }
                 }
 
                 // Pace on absolute deadlines, not "interval minus this pass's

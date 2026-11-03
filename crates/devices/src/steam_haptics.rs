@@ -1,8 +1,8 @@
 //! Steam Controller (2026, "Triton") haptics, over a HID handle of our own.
 //!
-//! SDL's driver reads the pad and plays its rumble (report 0x80), but has no way
-//! to send the other haptic reports, so a worker thread opens the collection SDL
-//! reads and writes them itself. Windows and Linux both let the two share it.
+//! `steam_controller` reads the pad; a worker thread here opens the same
+//! collection on a handle of its own and writes every haptic report: the rumble
+//! (report 0x80, as SDL's driver sent it) and all the reports SDL had no way to.
 //!
 //! The pad has four actuators, and each is driven the way that was found to work
 //! on the hardware (2026-10-31, over the puck):
@@ -134,16 +134,26 @@ const GRIP_WRITE_DELAY: Duration = Duration::from_millis(150);
 // ── Targets ───────────────────────────────────────────────────────────────────
 
 /// The analog pins the worker reads, in the order of [`Shared::targets`].
-const TARGET_PINS: [&str; 12] = [
+const TARGET_PINS: [&str; 14] = [
     "hd_l_amp", "hd_l_freq", "hd_r_amp", "hd_r_freq",
     "hd2_l_amp", "hd2_l_freq", "hd2_r_amp", "hd2_r_freq",
     "tp_l_amp", "tp_l_freq", "tp_r_amp", "tp_r_freq",
+    "rumble_strong", "rumble_weak",
 ];
 
 /// Each side's offset into [`TARGET_PINS`] from carrier 1, carrier 2 and pad.
 const HD: usize = 0;
 const HD2: usize = 4;
 const TP: usize = 8;
+/// The two rumble levels, strong (left) then weak (right).
+const RUMBLE: usize = 12;
+
+/// The rumble report: `[0x80, type, intensity_le16, left speed_le16, left gain,
+/// right speed_le16, right gain]`, as SDL's driver sends it.
+const REPORT_RUMBLE: u8 = 0x80;
+/// The pad stops a rumble about 50 ms after the last report (SDL's driver),
+/// so a lasting one goes out again this often.
+const RUMBLE_RESEND: Duration = Duration::from_millis(40);
 
 #[derive(Default)]
 struct Shared {
@@ -463,7 +473,8 @@ enum Cmd {
     Grip(usize, i16),
 }
 
-/// One pad's haptics: lives on its `OpenPad`, and dropping it ends the worker.
+/// One pad's haptics: lives on its `steam_controller` pad, and dropping it ends
+/// the worker.
 pub(crate) struct SteamHaptics {
     shared: Arc<Shared>,
     cmds: Sender<Cmd>,
@@ -683,6 +694,181 @@ fn pcm_s8(v: f32) -> u8 {
     (v.clamp(-1.0, 1.0) * 127.0) as i8 as u8
 }
 
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+
+/// Input this long apart is a gap worth a line.
+const DIAG_INPUT_GAP: Duration = Duration::from_millis(100);
+/// A write this slow is worth a line.
+const DIAG_SLOW_WRITE: Duration = Duration::from_millis(20);
+/// The log stops growing here.
+const DIAG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+// The puck's report that the controller's radio link came up or went down
+// (SDL's `ID_TRITON_WIRELESS_STATUS` / `_X`), its first byte 1 = down, 2 = up.
+const REPORT_WIRELESS: [u8; 2] = [0x79, 0x46];
+// The controller's state reports.
+const REPORT_STATE: [u8; 3] = [0x42, 0x45, 0x47];
+
+/// Whether the diagnostic log was asked for.
+pub fn diag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLEXINPUT_STEAM_LOG").is_ok_and(|v| !v.is_empty()))
+}
+
+/// Where the diagnostic log goes: `FLEXINPUT_STEAM_LOG=on` for the logs
+/// folder's `steam-controller.log`, or a file path.
+fn diag_path() -> Option<std::path::PathBuf> {
+    let want = std::env::var("FLEXINPUT_STEAM_LOG").ok().filter(|v| !v.is_empty())?;
+    if want.eq_ignore_ascii_case("on") {
+        Some(flexinput_core::paths::log_dir()?.join("steam-controller.log"))
+    } else {
+        Some(std::path::PathBuf::from(want))
+    }
+}
+
+/// A line in the diagnostic log from outside any pad's worker (the I/O loop, the
+/// SDL backend), on the same clock, so a stall there lines up with what the pad
+/// was doing. Nothing without the log on.
+pub fn diag_note(text: &str) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    if !diag_on() {
+        return;
+    }
+    let file = FILE.get_or_init(|| {
+        let path = diag_path()?;
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(std::sync::Mutex::new)
+    });
+    if let Some(Ok(mut f)) = file.as_ref().map(|f| f.lock()) {
+        let _ = f.write_all(format!("{} {:>11} {text}\n", utc_clock(), "").as_bytes());
+    }
+}
+
+/// A heartbeat line this often, with how many reports the pad sent meanwhile.
+const DIAG_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// One setting operation in feature report 1: `op` on setting `id` with `value`.
+/// Waits on the pad's answer, which the puck can hold for seconds.
+fn feature(dev: &HidDevice, op: u8, id: u8, value: i16) -> bool {
+    let mut b = [0u8; 65];
+    let v = value.to_le_bytes();
+    b[..6].copy_from_slice(&[FEATURE_REPORT, op, 3, id, v[0], v[1]]);
+    dev.send_feature_report(&b).is_ok()
+}
+
+/// Sets setting `id` to `value` (see [`feature`]).
+pub(crate) fn set_setting(dev: &HidDevice, id: u8, value: i16) -> bool {
+    feature(dev, OP_SET_SETTING, id, value)
+}
+
+/// The time of day, UTC, for a log line someone will match against a clock.
+fn utc_clock() -> String {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let s = t.as_secs() % 86_400;
+    format!("{:02}:{:02}:{:02}.{:03}Z", s / 3600, s / 60 % 60, s % 60, t.subsec_millis())
+}
+
+/// Opt-in diagnostics, `FLEXINPUT_STEAM_LOG=on` (or a file path): the puck's
+/// radio link reports, gaps in the controller's input, slow or failed writes,
+/// and once a second while the grips stream, how the stream is doing. Enough to
+/// tell "the pad drops out while it plays haptics" apart: the radio going down,
+/// the pad going quiet on a live link, or neither (the gap is past this handle).
+struct Diag {
+    file: std::fs::File,
+    written: u64,
+    start: Instant,
+    last_input: Option<Instant>,
+    /// Since the last summary.
+    sent: [u32; 2],
+    low: u32,
+    enough: u32,
+    overruns: u32,
+    write_errors: u32,
+    slowest_write: Duration,
+    summary_at: Instant,
+    /// State reports since the last heartbeat.
+    reports: u32,
+    heartbeat_at: Instant,
+}
+
+impl Diag {
+    fn open() -> Option<Self> {
+        let path = diag_path()?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        let now = Instant::now();
+        let mut d = Self {
+            file, written: 0, start: now, last_input: None, sent: [0; 2], low: 0, enough: 0,
+            overruns: 0, write_errors: 0, slowest_write: Duration::ZERO, summary_at: now,
+            reports: 0, heartbeat_at: now,
+        };
+        d.line(format_args!("started: the pad is on (log {})", path.display()));
+        Some(d)
+    }
+
+    fn line(&mut self, what: std::fmt::Arguments) {
+        use std::io::Write;
+        if self.written >= DIAG_MAX_BYTES {
+            return;
+        }
+        let text = format!("{} {:>10.3}s {what}\n", utc_clock(), self.start.elapsed().as_secs_f32());
+        if self.file.write_all(text.as_bytes()).is_ok() {
+            self.written += text.len() as u64;
+        }
+    }
+
+    /// One report off the handle, as it is read.
+    fn report(&mut self, buf: &[u8], streaming: bool) {
+        let now = Instant::now();
+        if REPORT_WIRELESS.contains(&buf[0]) && buf.len() > 1 {
+            let state = match buf[1] { 1 => "DOWN", 2 => "up", _ => "?" };
+            self.line(format_args!("radio link {state} (report {:#04x} {:#04x}), streaming: {streaming}", buf[0], buf[1]));
+        }
+        if REPORT_STATE.contains(&buf[0]) {
+            if let Some(gap) = self.last_input.map(|t| now.duration_since(t)).filter(|g| *g >= DIAG_INPUT_GAP) {
+                self.line(format_args!("no input for {} ms, streaming: {streaming}", gap.as_millis()));
+            }
+            self.last_input = Some(now);
+            self.reports += 1;
+        }
+    }
+
+    fn write_done(&mut self, report: u8, took: Duration, ok: bool) {
+        if !ok {
+            self.write_errors += 1;
+        }
+        if took >= DIAG_SLOW_WRITE {
+            self.line(format_args!("write {report:#04x} took {} ms{}", took.as_millis(), if ok { "" } else { ", failed" }));
+        }
+        self.slowest_write = self.slowest_write.max(took);
+    }
+
+    /// The heartbeat, and the once-a-second line while the grips stream.
+    fn tick(&mut self, streaming: bool) {
+        let since = self.heartbeat_at.elapsed();
+        if since >= DIAG_HEARTBEAT {
+            let reports = self.reports;
+            self.line(format_args!("alive: the pad sent {reports} reports in {:.1} s", since.as_secs_f32()));
+            self.reports = 0;
+            self.heartbeat_at = Instant::now();
+        }
+        if self.summary_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        if streaming {
+            let (sent, low, enough, overruns, errors) = (self.sent, self.low, self.enough, self.overruns, self.write_errors);
+            let slowest = self.slowest_write.as_secs_f32() * 1000.0;
+            self.line(format_args!(
+                "stream: chunks L {} R {}, needs-more {low} enough {enough} overrun {overruns}, \
+                 write errors {errors}, slowest write {slowest:.1} ms",
+                sent[0], sent[1],
+            ));
+        }
+        self.sent = [0; 2];
+        (self.low, self.enough, self.overruns, self.write_errors) = (0, 0, 0, 0);
+        self.slowest_write = Duration::ZERO;
+        self.summary_at = Instant::now();
+    }
+}
+
 /// One trackpad's tone, as last sent.
 #[derive(Default, Clone, Copy)]
 struct PadTone {
@@ -702,6 +888,9 @@ struct Worker {
     /// Grip settings waiting to be written, and when the last one came in.
     grip_pending: [Option<i16>; GRIP_SETTINGS.len()],
     grip_changed: Instant,
+    /// The rumble speeds last sent, and when.
+    rumble: ([u16; 2], Option<Instant>),
+    diag: Option<Diag>,
 }
 
 impl Worker {
@@ -717,7 +906,25 @@ impl Worker {
             logged_overrun: false,
             grip_pending: Default::default(),
             grip_changed: Instant::now(),
+            rumble: ([0; 2], None),
+            diag: Diag::open(),
         }
+    }
+
+    /// The rumble motors from `rumble_strong` / `rumble_weak`: sent on a change,
+    /// and again every [`RUMBLE_RESEND`] while either runs.
+    fn pump_rumble(&mut self) {
+        let speed = |i: usize| (self.shared.get(RUMBLE + i).clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let want = [speed(0), speed(1)];
+        let (sent, at) = self.rumble;
+        let due = want != sent
+            || (want != [0, 0] && at.is_none_or(|t| t.elapsed() >= RUMBLE_RESEND));
+        if !due || (want == [0, 0] && at.is_none()) {
+            return;
+        }
+        let [l, r] = want.map(u16::to_le_bytes);
+        self.write(&[REPORT_RUMBLE, 0, 0, 0, l[0], l[1], 0, r[0], r[1], 0]);
+        self.rumble = (want, (want != [0, 0]).then(Instant::now));
     }
 
     fn run(mut self, cmds: mpsc::Receiver<Cmd>) {
@@ -731,9 +938,19 @@ impl Worker {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            // With diagnostics on, the input is watched while idle too, for a
+            // baseline; streaming reads it anyway.
+            if self.diag.is_some() && !self.stream.running {
+                self.drain_status();
+            }
+            let streaming = self.stream.running;
+            if let Some(d) = self.diag.as_mut() {
+                d.tick(streaming);
+            }
             self.pump_stream();
             self.pump_pads();
             self.pump_pad_bursts();
+            self.pump_rumble();
             if self.grip_changed.elapsed() >= GRIP_WRITE_DELAY {
                 self.write_grip_settings();
             }
@@ -749,6 +966,11 @@ impl Worker {
             self.write(&[REPORT_STREAM_OP, STREAM_STOP, STREAM_BOTH_GRIPS, 0]);
         }
         self.hold_bit(false);
+        // The pad is gone: it went off or out of reach (a new worker opens when
+        // it's back), or FlexInput is closing.
+        if let Some(d) = self.diag.as_mut() {
+            d.line(format_args!("stopped: the pad went away, or FlexInput is closing"));
+        }
     }
 
     fn command(&mut self, cmd: Cmd) {
@@ -862,6 +1084,9 @@ impl Worker {
             self.drain_status();
             self.write(&[REPORT_STREAM_OP, STREAM_START, STREAM_BOTH_GRIPS, STREAM_FORMAT]);
             self.stream.running = true;
+            if let Some(d) = self.diag.as_mut() {
+                d.line(format_args!("grip stream started"));
+            }
             self.stream.last_pump = now;
             self.stream.low = [true; 2];
             // A chunk goes out at once rather than after a chunk's worth of wait.
@@ -869,6 +1094,9 @@ impl Worker {
         } else if now.duration_since(self.stream.last_sound) >= STREAM_IDLE {
             self.write(&[REPORT_STREAM_OP, STREAM_STOP, STREAM_BOTH_GRIPS, 0]);
             self.stream.running = false;
+            if let Some(d) = self.diag.as_mut() {
+                d.line(format_args!("grip stream stopped, quiet"));
+            }
             return;
         }
         self.drain_status();
@@ -884,6 +1112,9 @@ impl Worker {
                 let chunk = self.stream.chunk(side, &shared);
                 self.write(&chunk);
                 self.stream.owed[side] -= STREAM_CHUNK as f32;
+                if let Some(d) = self.diag.as_mut() {
+                    d.sent[side] += 1;
+                }
             }
         }
     }
@@ -896,7 +1127,13 @@ impl Worker {
             if n == 0 {
                 return;
             }
-            if buf[0] != REPORT_STREAM_STATUS || n < 3 {
+            let streaming = self.stream.running;
+            if let Some(d) = self.diag.as_mut() {
+                d.report(&buf[..n], streaming);
+            }
+            // Statuses answer a stream's ops: only ours, while it runs. Before it
+            // starts they're stale, and while idle they may be Steam's.
+            if buf[0] != REPORT_STREAM_STATUS || n < 3 || !streaming {
                 continue;
             }
             let Some(side) = [0u8, 1].iter().position(|m| *m == buf[1]) else { continue };
@@ -914,10 +1151,18 @@ impl Worker {
             if status & STATUS_HAS_ENOUGH != 0 {
                 self.stream.low[side] = false;
             }
+            if let Some(d) = self.diag.as_mut() {
+                d.overruns += u32::from(status & STATUS_OVERRUN != 0);
+                d.low += u32::from(status & (STATUS_STOPPED | STATUS_NEEDS_MORE) != 0);
+                d.enough += u32::from(status & STATUS_HAS_ENOUGH != 0);
+            }
             if status & STATUS_ALREADY_RUNNING != 0 {
                 // Someone's stream, or one of ours from before a crash.
                 self.write(&[REPORT_STREAM_OP, STREAM_STOP, STREAM_BOTH_GRIPS, 0]);
                 self.stream.running = false;
+                if let Some(d) = self.diag.as_mut() {
+                    d.line(format_args!("grip stream refused: one was already running; stopped it"));
+                }
             }
         }
     }
@@ -951,7 +1196,12 @@ impl Worker {
     }
 
     fn write(&mut self, report: &[u8]) {
-        if let Err(e) = self.dev.write(report) {
+        let started = Instant::now();
+        let result = self.dev.write(report);
+        if let Some(d) = self.diag.as_mut() {
+            d.write_done(report[0], started.elapsed(), result.is_ok());
+        }
+        if let Err(e) = result {
             #[cfg(debug_assertions)]
             eprintln!("[steam-haptics] write {:#04x}: {e}", report[0]);
             let _ = e;
@@ -959,10 +1209,7 @@ impl Worker {
     }
 
     fn feature(&self, op: u8, id: u8, value: i16) -> bool {
-        let mut b = [0u8; 65];
-        let v = value.to_le_bytes();
-        b[..6].copy_from_slice(&[FEATURE_REPORT, op, 3, id, v[0], v[1]]);
-        self.dev.send_feature_report(&b).is_ok()
+        feature(&self.dev, op, id, value)
     }
 
     fn set_setting(&self, id: u8, value: i16) {

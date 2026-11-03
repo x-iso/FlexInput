@@ -734,7 +734,7 @@ impl FlexInputApp {
         #[cfg(target_os = "linux")]
         crate::kwin::keep_overlays_above();
         let descriptors = all_modules().into_iter().map(|r| r.descriptor).collect();
-        let backends    = init_backends();
+        let backends    = init_backends(flexinput_engine::raise_input_thread);
         let midi_backend = Arc::new(Mutex::new(Some(MidiBackend::new())));
         // Detect HidHide presence WITHOUT holding the control-device handle. A
         // persistently-held handle blocks the elevated helper from opening

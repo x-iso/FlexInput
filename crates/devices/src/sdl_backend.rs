@@ -4,7 +4,8 @@
 //! (Xbox/XInput, DualShock 4, DualSense, Switch Pro) — including their tuned
 //! gyro/touchpad/HD-haptic overrides. This backend fills the gap: it enumerates
 //! ONLY pads that [`ControllerKind::detect`] classifies as [`ControllerKind::Generic`]
-//! (Steam Controller, 8BitDo, arcade sticks, third-party pads), so no physical
+//! (8BitDo, arcade sticks, third-party pads; the Steam Controller (2026) is
+//! `steam_controller`'s, read off its own reports), so no physical
 //! device is ever surfaced by both backends. For those generic pads it relays
 //! everything SDL exposes — sticks, buttons, analog triggers, gyro/accel (SDL
 //! sensor API, requires the `hidapi` feature), the touchpad, and the extra
@@ -224,8 +225,6 @@ struct OpenPad {
     /// it is born and dropped with the connection — a reconnect gets a fresh
     /// window rather than judging new samples against pre-disconnect ones.
     spike: SpikeFilter,
-    /// A Steam Controller's haptics past SDL's rumble.
-    steam: Option<crate::steam_haptics::SteamHaptics>,
 }
 
 /// Revives a pad whose IMU stream went dead while the pad itself stayed open.
@@ -323,6 +322,9 @@ pub struct SdlBackend {
     /// `DeviceBackend::set_sdl_all_pads`). When set, `sync_open_pads` claims
     /// EVERY gamepad, not just the ones kind-detect calls `Generic`.
     sdl_all_pads: bool,
+    /// With the Steam Controller log on: SDL's count of HID devices coming and
+    /// going, as last read.
+    hid_changes: Option<u32>,
 }
 
 impl SdlBackend {
@@ -338,6 +340,7 @@ impl SdlBackend {
             raw_profiles: Arc::new(RawPadProfiles::new()),
             hid_opener: None,
             sdl_all_pads: false,
+            hid_changes: None,
         }
     }
 
@@ -366,6 +369,11 @@ impl SdlBackend {
     }
 
     fn try_init() -> Option<SdlState> {
+        // The Steam Controller (2026) is `steam_controller`'s. SDL's driver for
+        // it sends the pad a feature report every 3 s from inside its update,
+        // which the puck can hold for seconds; with it off SDL never opens the
+        // pad. Its other Steam pads stay off by SDL's default already.
+        sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", "0");
         let sdl = sdl3::init().ok()?;
         let gamepad_subsystem = sdl.gamepad().ok()?;
         let joystick_subsystem = sdl.joystick().ok()?;
@@ -493,6 +501,13 @@ impl SdlBackend {
                 rejected.insert(id);
                 continue;
             }
+            // A Steam Controller is `steam_controller`'s, read off its own
+            // reports: SDL is told to leave it alone (see `try_init`), and
+            // should it list one anyway, it isn't surfaced twice.
+            if crate::steam_haptics::is_steam_controller(vid, pid) {
+                rejected.insert(id);
+                continue;
+            }
 
             // Id carries the detected kind so the UI's skin/model/icon
             // resolution (which string-matches the id) picks the right one. The
@@ -545,9 +560,6 @@ impl SdlBackend {
                  conn={conn} gyro={has_gyro} accel={has_accel} touchpads={num_touchpads} \
                  serial={serial:?} path={path:?}"
             );
-            let steam = crate::steam_haptics::is_steam_controller(vid, pid)
-                .then(|| crate::steam_haptics::SteamHaptics::spawn(path, vid, pid))
-                .flatten();
 
             pads.insert(
                 id,
@@ -566,7 +578,6 @@ impl SdlBackend {
                     last_rumble: (0, 0),
                     led: LedOut::default(),
                     spike: SpikeFilter::new(),
-                    steam,
                 },
             );
         }
@@ -791,8 +802,12 @@ impl DeviceBackend for SdlBackend {
         if !self.ensure_init() {
             return Vec::new();
         }
+        let t = Instant::now();
         self.sync_open_pads();
+        note_slow("pad open/close sync", t);
+        let t = Instant::now();
         self.sync_raw_pads();
+        note_slow("raw pad sync", t);
 
         let mut result = Vec::new();
         let Some(state) = self.state.as_ref() else { return result };
@@ -851,7 +866,19 @@ impl DeviceBackend for SdlBackend {
         // ~2 s cadence, NOT per poll — hotplug scanning is too heavy for the hot
         // path and was part of the loop-throttling regression.
         if let Some(state) = self.state.as_ref() {
+            // SDL also looks for added and removed devices in here, after any
+            // device change on the system, which can take a while. With the log
+            // on, say when one came in, so a slow update right after it is that.
+            if crate::steam_haptics::diag_on() {
+                // SAFETY: SDL is initialized; this only reads a counter.
+                let changes = unsafe { sdl3::sys::hidapi::SDL_hid_device_change_count() };
+                if self.hid_changes.replace(changes).is_some_and(|was| was != changes) {
+                    crate::steam_haptics::diag_note("a HID device came or went: SDL looks for pads again");
+                }
+            }
+            let t = Instant::now();
             state.gamepad_subsystem.update();
+            note_slow("update", t);
         }
 
         let mut out = Vec::new();
@@ -867,13 +894,14 @@ impl DeviceBackend for SdlBackend {
         let now = Instant::now();
         for pad in state.pads.values_mut() {
             if let Some((r, g, b)) = pad.led.due(now) {
+                let t = Instant::now();
                 let _ = pad.gamepad.set_led(r, g, b);
+                note_slow("LED write", t);
             }
         }
         for (id, pad) in &mut state.pads {
             let dev = &pad.dev_id;
             let g = &pad.gamepad;
-            let steam = &mut pad.steam;
             let start_len = out.len();
             let presses = take_delivery(*id, &mut imu_samples);
 
@@ -896,9 +924,6 @@ impl DeviceBackend for SdlBackend {
             let rt = (g.axis(Axis::TriggerRight) as f32 / 32767.0).clamp(0.0, 1.0);
             out.push((dev.clone(), "left_trigger".into(), Signal::Float(lt)));
             out.push((dev.clone(), "right_trigger".into(), Signal::Float(rt)));
-            if let Some(steam) = steam.as_mut() {
-                steam.poll_triggers(lt, rt);
-            }
             // Digital trigger = past a small threshold (matches XInput's ~30/255).
             out.push((dev.clone(), "btn_lt_dig".into(), Signal::Bool(lt > 0.117)));
             out.push((dev.clone(), "btn_rt_dig".into(), Signal::Bool(rt > 0.117)));
@@ -992,9 +1017,6 @@ impl DeviceBackend for SdlBackend {
             // (`touchzones::field_click_pins`). Finger contact on either pad comes
             // from the touchpad API below as touch1_* / touch2_*.
             out.push((dev.clone(), "btn_touchpad".into(), Signal::Bool(b(Button::Touchpad))));
-            if let Some(steam) = steam.as_mut() {
-                steam.poll_pad_clicks(b(Button::Touchpad), b(Button::Misc2));
-            }
             if pad.capacitive_mask != 0 {
                 out.push((dev.clone(), flexinput_core::automap::CAPACITIVE_MASK_PIN.into(),
                           Signal::Float(pad.capacitive_mask as f32)));
@@ -1247,13 +1269,6 @@ impl DeviceBackend for SdlBackend {
         let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) else {
             return;
         };
-        if let Some(steam) = pad.steam.as_mut() {
-            // Not `byte`: the trigger click's position wants its full resolution,
-            // and its gain is in dB.
-            if steam.set(pin_id, signal.as_float()) {
-                return;
-            }
-        }
         // Which motor (if any) this pin drives. SDL exposes only two rumble
         // motors (low-freq "strong", high-freq "weak"), so every haptic pin a
         // pad's layout declares is collapsed onto those two:
@@ -1297,12 +1312,12 @@ impl DeviceBackend for SdlBackend {
 }
 
 /// SDL's gyro (rad/s, its frame) as the shared canonical frame and ±ref scale.
-fn sdl_gyro_normalized(d: [f32; 3]) -> [f32; 3] {
+pub(crate) fn sdl_gyro_normalized(d: [f32; 3]) -> [f32; 3] {
     sdl_gyro_to_canonical(d).map(|rad_s| (rad_s.to_degrees() / GYRO_REF_DPS).clamp(-1.0, 1.0))
 }
 
 /// SDL's accel (m/s², its frame) as the shared canonical frame and ±ref scale.
-fn sdl_accel_normalized(d: [f32; 3]) -> [f32; 3] {
+pub(crate) fn sdl_accel_normalized(d: [f32; 3]) -> [f32; 3] {
     const G: f32 = 9.806_65;
     sdl_accel_to_canonical(d).map(|ms2| ((ms2 / G) / ACCEL_REF_G).clamp(-1.0, 1.0))
 }
@@ -1504,12 +1519,21 @@ fn read_touchpad_fingers(id: JoystickId, touchpad: i32) -> Vec<Option<(f32, f32)
 /// Keeps only ASCII alphanumerics (lowercased) so the result can't contain a
 /// `:` — a serial like a Bluetooth MAC (`AA:BB:CC:…`) would otherwise break the
 /// `sdl:<slug>:<inst>` split that `phys_pad_slug` and the id parsers rely on.
-fn sanitize_inst(serial: &str) -> String {
+pub(crate) fn sanitize_inst(serial: &str) -> String {
     serial
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// With the Steam Controller log on, a line for an SDL call since `since` that
+/// held the I/O loop up 100 ms or more.
+fn note_slow(what: &str, since: Instant) {
+    let took = since.elapsed();
+    if took >= Duration::from_millis(100) && crate::steam_haptics::diag_on() {
+        crate::steam_haptics::diag_note(&format!("SDL's {what} took {} ms", took.as_millis()));
+    }
 }
 
 /// Cheap order-independent-ish hash of a signal slice, for change detection only

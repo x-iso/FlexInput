@@ -72,6 +72,19 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **The Steam Controller no longer drops out for seconds.** FlexInput now reads it
+  straight off its own reports instead of through SDL. SDL's driver sent the controller
+  a setting every 3 s from inside the update that reads every SDL pad, and waited for
+  the answer with no time limit; the puck sometimes held one for seconds, and the
+  controller, with every other pad, froze that long. The settings now go out from a
+  thread of their own, where a slow answer stops nothing. Wiring, calibration and
+  haptics carry over: same device, same pins, same values. FlexInput also turns the
+  controller's IMU back on whenever it stops, as it can after Steam Input takes the
+  pad and lets it go.
+- **A slow SDL update no longer freezes every other pad.** SDL now runs on a thread
+  of its own. It looks for pads again after any device change on the PC, at startup
+  most of all, and that could hold FlexInput's whole input loop for most of a second.
+  Now only the pads SDL reads wait, with their motion stopped meanwhile.
 - **A trigger click at the very bottom of its trigger clicks every pull.** Placed at
   the start of the range, it never let go once the trigger had passed it, so it
   clicked once at most: it now lets go as the trigger comes back to rest. Dragged

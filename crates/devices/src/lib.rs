@@ -11,6 +11,7 @@ pub mod layouts;
 #[cfg(target_os = "linux")]
 pub mod linux_hide;
 pub mod midi;
+pub mod own_thread;
 pub mod raw_hid;
 pub mod sdl_backend;
 pub mod spectrum;
@@ -21,6 +22,7 @@ pub mod spike_tune;
 #[cfg(feature = "joycon2")]
 pub mod joycon2_backend;
 
+pub mod steam_controller;
 pub mod steam_haptics;
 #[cfg(any(windows, target_os = "linux"))]
 mod dualsense_haptic;
@@ -75,6 +77,9 @@ pub trait DeviceBackend: Send {
     /// Route a signal to a physical output pin (e.g. MIDI CC send).
     /// Backends that don't support output can ignore this.
     fn send(&mut self, _device_id: &str, _pin_id: &str, _signal: Signal) {}
+    /// The I/O loop's output pass has sent everything it will: a backend that
+    /// gathers its sends hands them over here (see `own_thread::OwnThread`).
+    fn end_output_pass(&mut self) {}
     /// Drain accumulated raw-event counts per device id. Used by the I/O
     /// thread to compute live per-device polling rates. Default: empty
     /// (backends that don't track events are reported as 0 Hz).
@@ -123,17 +128,27 @@ pub trait DeviceBackend: Send {
     fn set_raw_pad_profiles(&mut self, _profiles: &std::sync::Arc<RawPadProfiles>) {}
 }
 
-pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
+/// Every backend, in the order the I/O loop polls them. `raise` lifts a thread
+/// a backend runs its input on as the I/O loop's own (Linux; see
+/// `own_thread::OwnThread::spawn`).
+pub fn init_backends(raise: fn(&str)) -> Vec<Box<dyn DeviceBackend>> {
     let mut backends: Vec<Box<dyn DeviceBackend>> = Vec::new();
     if let Some(b) = GilrsBackend::try_new() {
         backends.push(Box::new(b));
     }
     // SDL is a sibling source for pads gilrs/kind-detect classify as `Generic`
     // (Steam Controller, 8BitDo, third-party). It self-inits lazily on the first
-    // poll (on the device-io thread, per SDL's threading rule) and enumerates
+    // poll, on its own thread (every SDL call stays there), and enumerates
     // ONLY `Generic` pads, so it never double-surfaces a controller gilrs owns.
+    // Its own thread because SDL's update can block for seconds: a Steam
+    // Controller's puck may sit on the feature report SDL sends it every 3 s,
+    // and any device change on the system has SDL look for pads again.
     // Pushed AFTER gilrs so gilrs's tuned paths take precedence in iteration.
-    backends.push(Box::new(sdl_backend::SdlBackend::new()));
+    let sdl = sdl_backend::SdlBackend::new();
+    backends.push(Box::new(own_thread::OwnThread::spawn(sdl, "sdl:", raise)));
+    // The Steam Controller (2026), off its own HID reports: SDL leaves it be.
+    // Its ids keep SDL's `sdl:generic:` form, so saved patches still find it.
+    backends.push(Box::new(steam_controller::SteamControllerBackend::new()));
     // Joy-Con 2 over BLE. Cannot overlap with the two above: Windows binds no
     // driver to these controllers, so gilrs and SDL never see them and no
     // dedup is needed. Starts its own thread and enumerates nothing until a
