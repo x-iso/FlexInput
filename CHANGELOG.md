@@ -40,6 +40,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   click alike, 3% and 4 ms by default; the digital trigger had neither before. A click
   point can now sit right at rest, pressing on any movement off it; it used to be kept
   1% up the range.
+- **Audio Stream Haptics: Split L/R and Pure tones.** A new **Bands** row has two
+  options. **Split L/R** gives each side one band as its own tone, the low band on the
+  left and the high band on the right (**Swap** trades them), so a pad that plays one
+  pitch per side plays two. **Pure tones** stops the bands modulating each other, so
+  each plays clean, whatever **Balance** is set to.
 
 ### Changed
 

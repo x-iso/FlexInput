@@ -660,6 +660,7 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_amplitude")
             | ("module.audio_stream_haptics", "asth_balance")
             | ("module.audio_stream_haptics", "asth_swap_row")
+            | ("module.audio_stream_haptics", "asth_bands_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
             | ("module.area_mapper", "options") | ("module.area_mapper", "border")
@@ -1228,6 +1229,10 @@ impl FlexInputApp {
                 vec![f!("Balance", v("asth_freq_bias",-1.0,1.0,0.0,Linear))],
             ("module.audio_stream_haptics", "asth_swap_row") =>
                 vec![f!("Swap", Toggle{key:"asth_swap"})],
+            ("module.audio_stream_haptics", "asth_bands_row") => vec![
+                f!("Split L/R", Toggle{key:"asth_split"}),
+                f!("Pure tones", Toggle{key:"asth_pure"}),
+            ],
             ("module.audio_stream_haptics", "asth_rumble_mix") =>
                 vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
             // Selector mirrors counter's controls.

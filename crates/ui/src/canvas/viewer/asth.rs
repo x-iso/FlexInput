@@ -22,6 +22,10 @@ pub(crate) struct AsthParams {
     crossover: f32,
     /// Swap which band is the carrier vs the modulator (default: LF carrier, HF mod).
     swap: bool,
+    /// Each side plays one band as its own tone: LF left, HF right (Swap trades them).
+    split: bool,
+    /// No modulation between the bands: the carriers play clean.
+    pure: bool,
 }
 
 impl AsthParams {
@@ -155,7 +159,7 @@ pub(crate) fn asth_slider_and_box(
 /// to a stable `element_id` (so it can be pinned to a sub-patch body individually)
 /// and is rendered by the SAME code inline (in the node body) and when pinned.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum AsthRow { Mode, Volume, Release, Crossover, Amplitude, Balance, Swap, RumbleMix }
+pub(crate) enum AsthRow { Mode, Volume, Release, Crossover, Amplitude, Balance, Swap, Bands, RumbleMix }
 
 impl AsthRow {
     /// Stable element id used for pinning + the pinned-element dispatch.
@@ -168,15 +172,16 @@ impl AsthRow {
             AsthRow::Amplitude => "asth_amplitude",
             AsthRow::Balance   => "asth_balance",
             AsthRow::Swap      => "asth_swap_row",
+            AsthRow::Bands     => "asth_bands_row",
             AsthRow::RumbleMix => "asth_rumble_mix",
         }
     }
     /// Calibration rows drawn by the shared `asth_draw_row` slider renderer. The
     /// capture-mode block (`Mode`) is drawn separately by `asth_draw_mode_block` and
     /// is therefore NOT in this list — but it is still a recognized pinnable element.
-    const ALL: [AsthRow; 7] = [
+    const ALL: [AsthRow; 8] = [
         AsthRow::Volume, AsthRow::Release, AsthRow::Crossover, AsthRow::Amplitude,
-        AsthRow::Balance, AsthRow::Swap, AsthRow::RumbleMix,
+        AsthRow::Balance, AsthRow::Swap, AsthRow::Bands, AsthRow::RumbleMix,
     ];
     /// Recognize any pinnable ASTH element id (the calibration rows plus the mode block).
     pub(crate) fn from_element_id(id: &str) -> Option<AsthRow> {
@@ -256,12 +261,18 @@ pub(crate) fn asth_draw_row(
             crate::canvas::header_controls::curve_box(ui, &mut exp, 1.0);
             if (exp - a.curve).abs() > f32::EPSILON { a.curve = exp; changed = true; }
         }).response.rect,
-        AsthRow::Balance => asth_slider_row(ui, "Balance", label_w, body_w, scale, &mut changed, |ui, _w| {
-            ui.add(egui::Slider::new(&mut a.freq_bias, -1.0..=1.0).show_value(false))
-                .on_hover_text("◄ smooth low rumble · high-frequency texture ►. \
-                                The modulator band is rendered as a rapid amplitude \
-                                flutter on the felt carrier (the Switch LRA can't play a separate tone).")
-        }),
+        AsthRow::Balance => {
+            // Balance sets the modulation's depth, so there's nothing for it to do
+            // with Pure tones on.
+            let pure = a.pure;
+            asth_slider_row(ui, "Balance", label_w, body_w, scale, &mut changed, |ui, _w| {
+                ui.add_enabled(!pure, egui::Slider::new(&mut a.freq_bias, -1.0..=1.0).show_value(false))
+                    .on_hover_text("◄ smooth low rumble · high-frequency texture ►. \
+                                    The modulator band is rendered as a rapid amplitude \
+                                    flutter on the felt carrier (the Switch LRA can't play a separate tone).")
+                    .on_disabled_hover_text("Pure tones is on: the bands don't modulate each other.")
+            })
+        }
         AsthRow::Swap => ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(4.0 * scale);
@@ -272,8 +283,28 @@ pub(crate) fn asth_draw_row(
             );
             let r = ui.checkbox(&mut a.swap, "HF carrier / LF texture")
                 .on_hover_text("Default: LF is the felt carrier, HF flutters it. \
-                                Swap to make HF the carrier and LF the modulator.");
+                                Swap to make HF the carrier and LF the modulator. \
+                                With Split L/R on, it puts HF on the left and LF on the right.");
             if r.changed() { changed = true; }
+        }).response.rect,
+        AsthRow::Bands => ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(4.0 * scale);
+            ui.allocate_ui_with_layout(
+                egui::vec2(label_w, 18.0 * scale),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| { ui.label(egui::RichText::new("Bands").size(11.0 * scale)); },
+            );
+            changed |= ui.checkbox(&mut a.split, "Split L/R")
+                .on_hover_text("Each side plays one band as its own tone: LF on the left, \
+                                HF on the right. A pad that plays one pitch per side then \
+                                plays two at once.")
+                .changed();
+            ui.add_space(8.0 * scale);
+            changed |= ui.checkbox(&mut a.pure, "Pure tones")
+                .on_hover_text("The bands don't modulate each other: each carrier plays \
+                                clean, with no flutter from the other band.")
+                .changed();
         }).response.rect,
         AsthRow::RumbleMix => asth_slider_row(ui, "Rumble mix", label_w, body_w, scale, &mut changed, |ui, _w| {
             ui.add(egui::Slider::new(&mut a.modulator, 0.0..=1.0).show_value(false))
@@ -307,6 +338,8 @@ pub(crate) fn asth_row_min_w(row: AsthRow) -> f32 {
         AsthRow::Balance | AsthRow::RumbleMix => 110.0,
         // label cell + "HF carrier / LF texture" checkbox.
         AsthRow::Swap => 230.0,
+        // label cell + "Split L/R" and "Pure tones" checkboxes.
+        AsthRow::Bands => 250.0,
     }
 }
 
@@ -353,11 +386,14 @@ pub(crate) fn asth_params_from_node(snarl: &Snarl<NodeData>, node_id: NodeId) ->
             release: p.get("asth_release").and_then(|v| v.as_f64()).unwrap_or(30.0) as f32,
             crossover: p.get("asth_crossover").and_then(|v| v.as_f64()).unwrap_or(250.0) as f32,
             swap: p.get("asth_swap").and_then(|v| v.as_bool()).unwrap_or(false),
+            split: p.get("asth_split").and_then(|v| v.as_bool()).unwrap_or(false),
+            pure: p.get("asth_pure").and_then(|v| v.as_bool()).unwrap_or(false),
         }
     }).unwrap_or(AsthParams {
         mode: "system".into(), target_name: String::new(), include_tree: true,
         modulator: 1.0, volume: 1.0, freq_bias: 0.0, curve: 1.0,
         amp_min: 0.0, amp_max: 1.0, release: 30.0, crossover: 250.0, swap: false,
+        split: false, pure: false,
     })
 }
 
@@ -374,6 +410,8 @@ pub(crate) fn asth_write_params(snarl: &mut Snarl<NodeData>, node_id: NodeId, a:
         n.params.insert("asth_release".into(), serde_json::Value::from(a.release as f64));
         n.params.insert("asth_crossover".into(), serde_json::Value::from(a.crossover as f64));
         n.params.insert("asth_swap".into(), serde_json::Value::Bool(a.swap));
+        n.params.insert("asth_split".into(), serde_json::Value::Bool(a.split));
+        n.params.insert("asth_pure".into(), serde_json::Value::Bool(a.pure));
     }
 }
 
@@ -638,6 +676,8 @@ pub(crate) fn show_audio_stream_haptics_body(
             n.params.insert("asth_release".into(), serde_json::Value::from(a.release as f64));
             n.params.insert("asth_crossover".into(), serde_json::Value::from(a.crossover as f64));
             n.params.insert("asth_swap".into(), serde_json::Value::Bool(a.swap));
+            n.params.insert("asth_split".into(), serde_json::Value::Bool(a.split));
+            n.params.insert("asth_pure".into(), serde_json::Value::Bool(a.pure));
             let eq = serde_json::Value::Array(asth_eq_points.iter()
                 .map(|p| serde_json::json!([p[0], p[1]])).collect());
             n.params.insert("asth_eq_points".into(), eq);

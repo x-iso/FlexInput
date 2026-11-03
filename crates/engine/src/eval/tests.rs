@@ -3348,6 +3348,56 @@ mod trigger_tests {
         pad_value(&out, FB_PAD, "hd_l_amp")
     }
 
+    /// What an Audio Stream Haptics node with `params` writes to a Switch Pro, on
+    /// full audio: `[hd_l_amp, hd_r_amp, hd2_l_amp, hd2_r_amp]`.
+    fn asth_split_out(uid: usize, params: &[(&str, Value)]) -> [f32; 4] {
+        let pad = fb_pad(1, FB_PAD, FB_HD_PINS, None);
+        let mut asth = asth_node(uid, FB_PAD, FB_PAD, 1.0, 1.0);
+        for (k, v) in params {
+            asth.params.insert(k.to_string(), v.clone());
+        }
+        let out = fb_tick(vec![pad, asth], &BusMap::default());
+        ["hd_l_amp", "hd_r_amp", "hd2_l_amp", "hd2_r_amp"].map(|p| pad_value(&out, FB_PAD, p))
+    }
+
+    // Split L/R: each side plays one band as its own tone — with no high band in
+    // the audio, the left plays the low band at full and the right is quiet —
+    // and Swap trades the sides.
+    #[test]
+    fn asth_split_puts_one_band_on_each_side() {
+        let on = Value::Bool(true);
+        let plain = asth_split_out(9150, &[]);
+        assert!(plain[0] > 0.99 && plain[1] > 0.99, "both sides carry the low band: {plain:?}");
+        let split = asth_split_out(9151, &[("asth_split", on.clone())]);
+        assert!(split[0] > 0.99 && split[1] == 0.0, "{split:?}");
+        let swapped = asth_split_out(9152, &[("asth_split", on.clone()), ("asth_swap", on)]);
+        assert!(swapped[0] == 0.0 && swapped[1] > 0.99, "{swapped:?}");
+    }
+
+    // With both bands in the audio, Split plays both, the right the high band, and
+    // each flutters by the other; Pure tones leaves them clean.
+    #[cfg(windows)]
+    #[test]
+    fn asth_split_plays_both_bands_and_pure_tones_drops_the_flutter() {
+        let both = |uid: usize, params: &[(&str, Value)]| {
+            let mut bands = flexinput_devices::loopback_manager::latest_spectrum(usize::MAX);
+            let n = bands.len();
+            for (i, b) in bands.iter_mut().enumerate() {
+                if i < n / 5 || i > n * 4 / 5 { *b = 0.5; }
+            }
+            flexinput_devices::loopback_manager::set_spectrum_for_test(uid, bands);
+            let mut all = vec![("asth_split", Value::Bool(true)), ("asth_freq_bias", Value::from(1.0))];
+            all.extend(params.iter().cloned());
+            asth_split_out(uid, &all)
+        };
+        let textured = both(9153, &[]);
+        assert!(textured[0] > 0.0 && textured[1] > 0.0, "a tone each side: {textured:?}");
+        assert!(textured[2] > 0.0 && textured[3] > 0.0, "each fluttered by the other: {textured:?}");
+        let pure = both(9154, &[("asth_pure", Value::Bool(true))]);
+        assert!(pure[0] > 0.0 && pure[1] > 0.0, "{pure:?}");
+        assert_eq!((pure[2], pure[3]), (0.0, 0.0), "no flutter");
+    }
+
     // The module itself must see the game's rumble: at the gate end its OWN
     // output is audio × game rumble (pad shows only the module here).
     #[test]

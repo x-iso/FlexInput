@@ -448,8 +448,22 @@ pub(crate) fn audio_stream_haptics_publish(
     } else {
         band_balance.clamp(0.0, 1.0)    // HF end (+1) drives the HF modulator
     };
+    // Split (`asth_split`): each side plays ONE band as its own tone — LF on the
+    // left, HF on the right, Swap trading the sides — so a pad that plays one pitch
+    // per actuator still plays two. Both take the louder side's loudness, the
+    // stronger band at full and the other in proportion; each one's modulator is
+    // the other band.
+    let split = snap.params.get("asth_split").and_then(|v| v.as_bool()).unwrap_or(false);
     let (l_carrier_amp, l_carrier_freq, l_mod_ef, l_mod_freq,
-         r_carrier_amp, r_carrier_freq, r_mod_ef, r_mod_freq) = if swap {
+         r_carrier_amp, r_carrier_freq, r_mod_ef, r_mod_freq) = if split {
+        let loud = l_amp.max(r_amp);
+        let top = lf_frac.max(hf_frac);
+        let (lf_amp, hf_amp) = if top > 0.0 { (loud * lf_frac / top, loud * hf_frac / top) } else { (0.0, 0.0) };
+        let lf_side = (lf_amp, lf_carrier, hf_amp, hf_carrier);
+        let hf_side = (hf_amp, hf_carrier, lf_amp, lf_carrier);
+        let (l, r) = if swap { (hf_side, lf_side) } else { (lf_side, hf_side) };
+        (l.0, l.1, l.2, l.3, r.0, r.1, r.2, r.3)
+    } else if swap {
         (l_amp, hf_carrier, l_lf_ef, lf_carrier,
          r_amp, hf_carrier, r_lf_ef, lf_carrier)
     } else {
@@ -458,7 +472,10 @@ pub(crate) fn audio_stream_haptics_publish(
     };
     // Carrier amplitude = full felt loudness (Balance-independent). Modulation depth =
     // modulator-band EF scaled by how far Balance is toward the modulator end; gated
-    // so a silent carrier stays silent.
+    // so a silent carrier stays silent. Pure tones (`asth_pure`) leave the carriers
+    // unmodulated: no depth at all, whatever Balance says.
+    let pure = snap.params.get("asth_pure").and_then(|v| v.as_bool()).unwrap_or(false);
+    let toward_mod = if pure { 0.0 } else { toward_mod };
     let l_lf_amp = l_carrier_amp;
     let r_lf_amp = r_carrier_amp;
     let l_hf_amp = if l_carrier_amp > 0.0 { (l_mod_ef * toward_mod).clamp(0.0, 1.0) } else { 0.0 };

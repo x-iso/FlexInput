@@ -243,6 +243,12 @@ pub fn latest_scope(uid: usize) -> Vec<ScopePoint> {
 
 static SPECTRUM: RwLock<Option<HashMap<usize, [f32; N_BANDS]>>> = RwLock::new(None);
 
+/// Test hook: inject a node's audio spectrum without opening a capture.
+#[doc(hidden)]
+pub fn set_spectrum_for_test(uid: usize, bands: [f32; N_BANDS]) {
+    set_spectrum(uid, bands);
+}
+
 fn set_spectrum(uid: usize, bands: [f32; N_BANDS]) {
     let mut guard = SPECTRUM.write().unwrap();
     guard.get_or_insert_with(HashMap::new).insert(uid, bands);
