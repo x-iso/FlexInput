@@ -3,7 +3,7 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.16.8] - 2026-11-02
+## [0.16.8] - 2026-11-03
 
 ### Added
 
