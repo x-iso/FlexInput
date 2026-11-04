@@ -17,6 +17,10 @@ pub enum Skin {
     Xbox,
     Playstation,
     SwitchPro,
+    /// A Steam Controller: its own glyphs where it has buttons no other pad
+    /// has (grips, stick touch, the aux button, two trackpads), the Xbox ones
+    /// for the rest, as its face buttons are lettered the same.
+    Steam,
     Kbm,
 }
 
@@ -26,6 +30,7 @@ impl Skin {
             "xbox"        => Skin::Xbox,
             "playstation" => Skin::Playstation,
             "switchpro"   => Skin::SwitchPro,
+            "steam"       => Skin::Steam,
             "kbm"         => Skin::Kbm,
             _             => Skin::Auto,
         }
@@ -36,6 +41,7 @@ impl Skin {
             Skin::Xbox        => "xbox",
             Skin::Playstation => "playstation",
             Skin::SwitchPro   => "switchpro",
+            Skin::Steam       => "steam",
             Skin::Kbm         => "kbm",
         }
     }
@@ -45,6 +51,7 @@ impl Skin {
             Skin::Xbox        => "Xbox",
             Skin::Playstation => "PlayStation",
             Skin::SwitchPro   => "Switch Pro",
+            Skin::Steam       => "Steam Controller",
             Skin::Kbm         => "Keyboard",
         }
     }
@@ -72,6 +79,10 @@ pub fn phys_pad_slug(dev_id: &str) -> Option<&str> {
 }
 
 pub fn skin_from_device_id(dev_id: &str) -> Skin {
+    // Its id says only `sdl:generic:<serial>`; its USB ids say what it is.
+    if crate::model::is_steam_controller(dev_id) {
+        return Skin::Steam;
+    }
     let d = dev_id.to_ascii_lowercase();
     if d.contains("switch")               { return Skin::SwitchPro; }
     if d.contains("dualshock") || d.contains("dualsense") || d.contains("ds4")
@@ -204,6 +215,52 @@ const SW_RSTICK_L: &[u8] = a!("SwitchPro/switch_stick_r_left.svg");
 const SW_RSTICK_R: &[u8] = a!("SwitchPro/switch_stick_r_right.svg");
 const SW_LS:      &[u8] = a!("SwitchPro/switch_stick_l_press.svg");
 const SW_RS:      &[u8] = a!("SwitchPro/switch_stick_r_press.svg");
+
+// Steam Controller: what it has that no other pad does. Its two trackpads wear
+// the PS4 touchpad, a side's letter cut out of it (`extra_button_label`).
+const SC_GRIP_L:   &[u8] = a!("SC/controller_lg_gradient.svg");
+const SC_GRIP_R:   &[u8] = a!("SC/controller_rg_gradient.svg");
+const SC_CAP_L:    &[u8] = a!("SC/cap_sens_L.svg");
+const SC_CAP_R:    &[u8] = a!("SC/cap_sens_R.svg");
+const SC_AUX:      &[u8] = a!("SC/button_aux.svg");
+const SC_MENU:     &[u8] = a!("SC/sd_button_menu.svg");
+const SC_VIEW:     &[u8] = a!("SC/sd_button_view.svg");
+const SC_L4:       &[u8] = a!("SC/controller_button_l4.svg");
+const SC_L5:       &[u8] = a!("SC/controller_button_l5.svg");
+const SC_R4:       &[u8] = a!("SC/controller_button_r4.svg");
+const SC_R5:       &[u8] = a!("SC/controller_button_r5.svg");
+// The click is the pad with its press notch; a touch (and how hard it's
+// pressed), the pad's surface. Both keep a cut-out letter legible, as the
+// arrowed glyphs don't.
+const PS4_TP_CLICK:  &[u8] = a!("Playstation/playstation4_touchpad_press.svg");
+const PS4_TP_SURFACE: &[u8] = a!("Playstation/playstation4_touchpad.svg");
+const PS4_TP_LEFT:   &[u8] = a!("Playstation/playstation4_touchpad_press_left.svg");
+const PS4_TP_CENTER: &[u8] = a!("Playstation/playstation4_touchpad_press_center.svg");
+const PS4_TP_RIGHT:  &[u8] = a!("Playstation/playstation4_touchpad_press_right.svg");
+
+/// A Steam Controller's glyph for `pin_id`, where it has one of its own.
+fn steam_pin_svg(pin_id: &str) -> Option<&'static [u8]> {
+    Some(match pin_id {
+        "btn_misc1" => SC_AUX,
+        "btn_misc3" => SC_CAP_L,
+        "btn_misc4" => SC_CAP_R,
+        "btn_misc5" => SC_GRIP_L,
+        "btn_misc6" => SC_GRIP_R,
+        "btn_back" => SC_VIEW,
+        "btn_start" => SC_MENU,
+        // SDL's Triton mapping: the upper back buttons on the first paddle pair.
+        "btn_paddle_l1" => SC_L4,
+        "btn_paddle_r1" => SC_R4,
+        "btn_paddle_l2" => SC_L5,
+        "btn_paddle_r2" => SC_R5,
+        "btn_touchpad" | "btn_misc2" | "touchpad_any" => PS4_TP_CLICK,
+        "touch1_active" | "touch2_active" | "touch1_pressure" | "touch2_pressure" => PS4_TP_SURFACE,
+        "touch_left" | "touchpad_left" => PS4_TP_LEFT,
+        "touch_center" | "touchpad_center" => PS4_TP_CENTER,
+        "touch_right" | "touchpad_right" => PS4_TP_RIGHT,
+        _ => return None,
+    })
+}
 
 // KB/M — modifiers + special keys
 const KB_SHIFT:    &[u8] = a!("KBM/keyboard_shift.svg");
@@ -390,6 +447,7 @@ const DEV_XBOX:     &[u8] = a!("Xbox/controller_xboxone.svg");
 const DEV_PS4:      &[u8] = a!("Playstation/controller_playstation4.svg");
 const DEV_PS5:      &[u8] = a!("Playstation/controller_playstation5.svg");
 const DEV_SWITCH:   &[u8] = a!("SwitchPro/controller_switch_pro.svg");
+const DEV_STEAM:    &[u8] = a!("SC/sc2.svg");
 const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
 const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
 /// Combined keyboard + mouse glyph — used wherever Virtual Keyboard
@@ -440,9 +498,13 @@ const IMU_TILT_RIGHT:      &[u8] = a!("Motion/tilt-right.svg");
 pub const ADD_SVG:   &[u8] = a!("add.svg");
 pub const CLOSE_SVG: &[u8] = a!("close.svg");
 
-/// Resolve a device-card icon from a `ControllerKind`.
-pub fn device_card_svg(kind: flexinput_devices::ControllerKind) -> &'static [u8] {
+/// Resolve a device-card icon from a `ControllerKind`, and the USB ids that
+/// tell a Steam Controller from another Generic pad.
+pub fn device_card_svg(kind: flexinput_devices::ControllerKind, vid: Option<u16>, pid: Option<u16>) -> &'static [u8] {
     use flexinput_devices::ControllerKind as K;
+    if flexinput_devices::steam_haptics::is_steam_controller(vid, pid) {
+        return DEV_STEAM;
+    }
     match kind {
         K::XInput     => DEV_XBOX,
         K::DualShock4 => DEV_PS4,
@@ -495,6 +557,9 @@ pub enum NodeIconSpec {
 /// - `virtual.xinput:<inst>` / `virtual.ds4:<inst>` virtual gamepad
 /// - `virtual.keymouse[:<inst>]` virtual keyboard + mouse (pair)
 pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
+    if crate::model::is_steam_controller(dev_id) {
+        return Some(NodeIconSpec::Single(DEV_STEAM));
+    }
     if let Some(slug) = phys_pad_slug(dev_id) {
         return Some(NodeIconSpec::Single(match slug {
             "xinput"     => DEV_XBOX,
@@ -528,6 +593,11 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
 /// KBM-family pins (`key_*`, `mouse_*`, `scroll_*`) always resolve from the
 /// KBM folder regardless of the requested skin.
 pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
+    if skin == Skin::Steam {
+        if let Some(b) = steam_pin_svg(pin_id) {
+            return Some(b);
+        }
+    }
     // KBM pins are family-agnostic.
     match pin_id {
         // Modifiers + named special keys
@@ -634,6 +704,7 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "touch_center" | "touchpad_center" => return Some(PS_TP_CENTER),
         "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),
         "btn_touchpad" | "touchpad_any"    => return Some(PS_TP_CLICK),
+        "touch1_pressure" | "touch2_pressure" => return Some(PS4_TP_SURFACE),
         "btn_mute"                         => return Some(PS_MUTE),
         // Extra rear paddles (family-neutral generic glyph; left vs right by side).
         // Both paddle rows on a side share one glyph — the label overlay tells
@@ -669,9 +740,10 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "imu_tilt_right"      => return Some(IMU_TILT_RIGHT),
         _ => {}
     }
-    // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents.
+    // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents,
+    // and a Steam Controller's face is an Xbox one.
     let skin = match skin {
-        Skin::Auto | Skin::Kbm => Skin::Xbox,
+        Skin::Auto | Skin::Kbm | Skin::Steam => Skin::Xbox,
         s => s,
     };
     match (skin, pin_id) {
@@ -868,21 +940,22 @@ pub const GAMEPAD_INPUT_PINS: &[(&str, &str)] = &[
     ("btn_paddle_r1", "Right paddle"),
 ];
 
-/// Short on-icon label for an extra button (rear paddle), or `None` for pins
-/// that aren't extra buttons. Painted over the generic paddle glyph so the same
-/// left/right glyph can represent both paddle rows. Generic (device-agnostic)
-/// naming — SDL exposes no vendor-specific paddle names; a per-device VID/PID
-/// label table can override this later. Misc buttons return `None` (they have no
-/// glyph and render as their text display name).
-pub fn extra_button_label(pin_id: &str) -> Option<&'static str> {
-    match pin_id {
-        "btn_paddle_l1" => Some("PL1"),
-        "btn_paddle_r1" => Some("PR1"),
-        "btn_paddle_l2" => Some("PL2"),
-        "btn_paddle_r2" => Some("PR2"),
-        // The left pad's click wears the touchpad glyph, and needs telling from
-        // the right pad's on a pad that has both.
-        "btn_touchpad" if crate::model::connected_pad_pin_names(pin_id).is_some() => Some("L"),
+/// Short label cut out of a glyph that stands for more than one control under
+/// `skin`, or `None`. The generic paddle glyph serves both paddle rows on a side
+/// (SDL exposes no vendor names for them; a Steam Controller's own glyphs carry
+/// theirs); a Steam Controller's two trackpads share the touchpad's, and a
+/// touchpad's two touch points share the press glyph.
+pub fn extra_button_label(skin: Skin, pin_id: &str) -> Option<&'static str> {
+    match (skin, pin_id) {
+        (Skin::Steam, "btn_paddle_l1" | "btn_paddle_r1" | "btn_paddle_l2" | "btn_paddle_r2") => None,
+        (_, "btn_paddle_l1") => Some("PL1"),
+        (_, "btn_paddle_r1") => Some("PR1"),
+        (_, "btn_paddle_l2") => Some("PL2"),
+        (_, "btn_paddle_r2") => Some("PR2"),
+        (Skin::Steam, "btn_touchpad" | "touch1_active" | "touch1_pressure") => Some("L"),
+        (Skin::Steam, "btn_misc2" | "touch2_active" | "touch2_pressure") => Some("R"),
+        (_, "touch1_pressure") => Some("1"),
+        (_, "touch2_pressure") => Some("2"),
         _ => None,
     }
 }
@@ -890,6 +963,34 @@ pub fn extra_button_label(pin_id: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steam_controller_wears_its_own_glyphs() {
+        assert_eq!(pin_svg(Skin::Steam, "btn_misc5"), Some(SC_GRIP_L));
+        assert_eq!(pin_svg(Skin::Steam, "btn_misc4"), Some(SC_CAP_R));
+        assert_eq!(pin_svg(Skin::Steam, "btn_misc1"), Some(SC_AUX));
+        assert_eq!(pin_svg(Skin::Steam, "btn_back"), Some(SC_VIEW), "View is Select");
+        assert_eq!(pin_svg(Skin::Steam, "btn_start"), Some(SC_MENU), "Menu is Start");
+        assert_eq!(pin_svg(Skin::Steam, "btn_paddle_l2"), Some(SC_L5));
+        assert_eq!(pin_svg(Skin::Steam, "btn_misc2"), pin_svg(Skin::Steam, "btn_touchpad"), "two pads, one glyph");
+        assert_eq!(pin_svg(Skin::Steam, "btn_south"), pin_svg(Skin::Xbox, "btn_south"), "its face is an Xbox one");
+        assert_eq!(pin_svg(Skin::Xbox, "btn_misc5"), None, "another pad's Misc 5 is no grip");
+        assert_eq!(extra_button_label(Skin::Steam, "btn_touchpad"), Some("L"));
+        assert_eq!(extra_button_label(Skin::Steam, "touch2_pressure"), Some("R"));
+        assert_eq!(extra_button_label(Skin::Steam, "btn_paddle_l1"), None, "its own glyph says L4");
+        assert_eq!(extra_button_label(Skin::Xbox, "btn_paddle_l1"), Some("PL1"));
+        assert_eq!(Skin::from_str(Skin::Steam.as_str()), Skin::Steam);
+    }
+
+    /// A label is cut out of the glyph: where it is, the glyph is clear.
+    #[test]
+    fn a_label_is_cut_out_of_its_glyph() {
+        let svg = std::str::from_utf8(GEN_PADDLE_L).unwrap();
+        let solid = |img: &egui::ColorImage| img.pixels.iter().filter(|p| p.a() > 128).count();
+        let plain = crate::canvas::viewer::rasterize_svg_recolored(svg, 48, 48, "override", egui::Color32::TRANSPARENT).unwrap();
+        let cut = crate::canvas::viewer::rasterize_svg_cutout(svg, 48, 48, "PL1").unwrap();
+        assert!(solid(&cut) + 40 < solid(&plain), "{} vs {}", solid(&cut), solid(&plain));
+    }
 
     #[test]
     fn gp_pin_svg_native_fallback_and_coverage() {

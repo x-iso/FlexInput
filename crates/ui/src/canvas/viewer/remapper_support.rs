@@ -221,6 +221,45 @@ pub(crate) fn remapper_pressed_now(
     out
 }
 
+/// Whether `dev` has two touchpads of its own (a Steam Controller, which says so
+/// with `automap::TOUCH_PADS_PIN`), rather than one with two fingers on it.
+pub(crate) fn has_two_pads(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: Option<&str>,
+) -> bool {
+    dev.is_some_and(|d| live_signals.contains_key(&(d.to_string(), am_canon::TOUCH_PADS_PIN.to_string())))
+}
+
+/// Learn on a pad with two touchpads: each pad as a whole, its click, else its
+/// touch, onto `pressed`. (The right pad's click comes as `btn_misc2` with the
+/// other buttons already.) False, and nothing added, for a pad with one
+/// touchpad, which Learn reads by zone.
+pub(crate) fn learn_two_pads(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: Option<&str>,
+    pressed: &mut Vec<String>,
+) -> bool {
+    if !has_two_pads(live_signals, dev) {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    let on = |pin: &str| live_signals.get(&(dev.to_string(), pin.to_string())).is_some_and(|s| s.as_bool());
+    for (click, touch) in [("btn_touchpad", "touch1_active"), ("btn_misc2", "touch2_active")] {
+        let pin = if on(click) { click } else if on(touch) { touch } else { continue };
+        if !pressed.iter().any(|p| p == pin) {
+            pressed.push(pin.to_string());
+        }
+    }
+    true
+}
+
+/// The touch pins Learn treats as passing — a finger moves between them, and a
+/// click takes over from them: a touchpad's three zones, and a two-pad
+/// controller's pads touched.
+pub(crate) fn learn_touch_transient(p: &str) -> bool {
+    matches!(p, "touch_left" | "touch_center" | "touch_right" | "touch1_active" | "touch2_active")
+}
+
 /// A MIDI value has to MOVE to count as pressed, and this is how long it counts
 /// for afterwards. A knob left at two thirds is not a held button — without
 /// this, Learn would latch every resting fader on the controller at once.
@@ -478,32 +517,16 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
     }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
-        let tint = egui::Color32::TRANSPARENT;
-        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = crate::widgets::tex_cache::get(ui.ctx(), cache_key)
-            .or_else(|| {
-                let text = std::str::from_utf8(bytes).ok()?;
-                let img = rasterize_svg_recolored(text, size_px, size_px, "override", tint)?;
-                let handle = ui.ctx().load_texture(
-                    format!("remapper_icon_{:p}", bytes.as_ptr()),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                crate::widgets::tex_cache::put(ui.ctx(), cache_key, handle.clone());
-                Some(handle)
-            });
-        if let Some(tex) = tex {
+        // A glyph that stands for more than one control (the generic paddle,
+        // a Steam Controller's trackpads) has its label cut out of it.
+        let label = remapper_icons::extra_button_label(skin, pin_id);
+        if let Some(tex) = glyph_texture(ui.ctx(), bytes, label, size_px) {
             let mut resp = ui.add(egui::Image::new(&tex)
                 .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                 .tint(Color32::WHITE));
             // A motion glyph is clearer with its name to hand.
             if let Some(p) = imu {
                 resp = resp.on_hover_text(p.name);
-            }
-            // Overlay the extra-button label (e.g. "PL1") so one generic paddle
-            // glyph can stand for both paddle rows on a side.
-            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
-                paint_icon_label(ui, resp.rect, label);
             }
             return resp.rect;
         }
@@ -616,26 +639,6 @@ pub(crate) fn draft_timed_chord(node: Option<&NodeData>, draft_key: &str, pins: 
     )
 }
 
-/// Paint a short label centered over an icon rect (used for extra-button
-/// paddle glyphs). Draws a thin dark outline behind the text so it stays legible
-/// over the white glyph regardless of the underlying shape.
-pub(crate) fn paint_icon_label(ui: &egui::Ui, rect: egui::Rect, label: &str) {
-    let painter = ui.painter_at(rect);
-    let font = egui::FontId::proportional((rect.height() * 0.34).max(9.0));
-    let center = rect.center();
-    // Cheap outline: draw the text offset in dark, then the bright text on top.
-    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-        painter.text(
-            center + egui::vec2(dx, dy),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font.clone(),
-            Color32::from_black_alpha(200),
-        );
-    }
-    painter.text(center, egui::Align2::CENTER_CENTER, label, font, Color32::WHITE);
-}
-
 /// Paint a chord chip directly via the painter at `top_left`, sized
 /// `chip_h × chip_h`. Resolution order for the icon:
 ///   1. SVG for the *current* skin → render at full tint.
@@ -721,53 +724,30 @@ pub(crate) fn paint_chord_chip_tinted(
     // Probe current skin first; fall back to any other skin that has the
     // icon. `tinted` is true when we matched a non-current skin — the chip
     // is then dimmed to communicate that it isn't available on the device.
-    let mut found: Option<(&'static [u8], bool)> = None;
+    let mut found: Option<(&'static [u8], bool, Skin)> = None;
     if let Some(b) = remapper_icons::pin_svg(skin, pin_id) {
-        found = Some((b, false));
+        found = Some((b, false, skin));
     } else {
         for s in [Skin::Xbox, Skin::Playstation, Skin::SwitchPro, Skin::Kbm] {
             if s == skin { continue; }
             if let Some(b) = remapper_icons::pin_svg(s, pin_id) {
-                found = Some((b, true));
+                found = Some((b, true, s));
                 break;
             }
         }
     }
 
-    if let Some((bytes, dim)) = found {
+    if let Some((bytes, dim, from)) = found {
         let size_px = (chip_h * ctx.pixels_per_point()).round() as u32;
-        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = crate::widgets::tex_cache::get(&ctx, cache_key)
-            .or_else(|| {
-                let text = std::str::from_utf8(bytes).ok()?;
-                let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
-                let handle = ctx.load_texture(
-                    format!("remapper_icon_{:p}", bytes.as_ptr()),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                crate::widgets::tex_cache::put(&ctx, cache_key, handle.clone());
-                Some(handle)
-            });
-        if let Some(tex) = tex {
+        // A glyph that stands for more than one control has its label cut out.
+        let label = remapper_icons::extra_button_label(from, pin_id);
+        if let Some(tex) = glyph_texture(&ctx, bytes, label, size_px) {
             let rect = egui::Rect::from_min_size(top_left, egui::vec2(chip_h, chip_h));
             let tint = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) * tint }
                        else  { tint };
             painter.image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint);
-            // Extra-button label overlay (e.g. "PL1") — same outline-then-fill as
-            // paint_icon_label, inlined since we have a bare painter here.
-            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
-                let font = egui::FontId::proportional((chip_h * 0.34).max(9.0));
-                let c = rect.center();
-                let fg = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) } else { Color32::WHITE };
-                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                    painter.text(c + egui::vec2(dx, dy), egui::Align2::CENTER_CENTER,
-                        label, font.clone(), Color32::from_black_alpha(200));
-                }
-                painter.text(c, egui::Align2::CENTER_CENTER, label, font, fg);
-            }
             return chip_h;
         }
     }

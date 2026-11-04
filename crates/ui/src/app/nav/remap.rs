@@ -1217,6 +1217,15 @@ impl FlexInputApp {
             orient: chord,
             // A bound flick needs someone to turn it: an RWS Aim set to take them.
             flick: chord && self.flick_target_on_tab(),
+            // The side being chosen is a Steam Controller: its two trackpads.
+            steam: {
+                let (input, output) = self.gamepad_nav.kbm_picker_skins.get();
+                let side = match self.gamepad_nav.kbm_picker_stage {
+                    crate::kbm_picker::PickStage::Input => input,
+                    crate::kbm_picker::PickStage::Output => output,
+                };
+                side == crate::canvas::remapper_icons::Skin::Steam
+            },
         }
     }
 

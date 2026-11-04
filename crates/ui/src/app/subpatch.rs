@@ -82,6 +82,8 @@ pub(crate) fn kbm_pin_label(pin: &str) -> String {
         "touch_center" => "TP▣".into(),
         "touch_right" => "TP◨".into(),
         "btn_touchpad" => "TP Click".into(),
+        "touch1_pressure" => "TP1 Press".into(),
+        "touch2_pressure" => "TP2 Press".into(),
         "btn_mute" => "Mic".into(),
         "touch_swipe_x" => "Swipe↔".into(),
         "touch_swipe_y" => "Swipe↕".into(),
@@ -121,11 +123,14 @@ pub(crate) fn gp_pin_token(pin: &str) -> &'static str {
     }
 }
 
-/// Rasterize a KB/M pin's SVG icon to a cached texture (white, transparent bg).
+/// Rasterize a KB/M pin's SVG icon to a cached texture (white, transparent bg),
+/// its label cut out of it where its glyph stands for more than one control.
 pub(crate) fn kbm_cell_texture(ctx: &egui::Context, skin: crate::canvas::remapper_icons::Skin, pin: &str)
     -> Option<egui::TextureHandle>
 {
-    kbm_svg_texture(ctx, crate::canvas::remapper_icons::pin_svg(skin, pin)?)
+    use crate::canvas::remapper_icons as icons;
+    let size_px = (32.0 * ctx.pixels_per_point()).round() as u32;
+    crate::canvas::viewer::glyph_texture(ctx, icons::pin_svg(skin, pin)?, icons::extra_button_label(skin, pin), size_px)
 }
 
 /// The same, for SVG bytes the caller already chose — a character's glyph rather

@@ -318,6 +318,8 @@ pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static s
         "btn_misc4" => Some(("Cap sens R", "Cap R")),
         "btn_misc5" => Some(("Grip sens L", "Grip L")),
         "btn_misc6" => Some(("Grip sens R", "Grip R")),
+        "touch1_active" => Some(("Pad touch L", "Touch L")),
+        "touch2_active" => Some(("Pad touch R", "Touch R")),
         "touch1_pressure" => Some(("Pad press L", "Press L")),
         "touch2_pressure" => Some(("Pad press R", "Press R")),
         _ => None,

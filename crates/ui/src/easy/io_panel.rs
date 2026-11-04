@@ -544,7 +544,7 @@ fn input_card(
     // this card maps to. Only meaningful for pads that have rumble motors.
     let resp = ping_device_icon(
         &mut icon_ui,
-        remapper_icons::device_card_svg(d.kind),
+        remapper_icons::device_card_svg(d.kind, d.vid, d.pid),
         INPUT_CARD_ICON_H,
     );
     if resp.clicked() {
@@ -812,7 +812,7 @@ fn midi_input_card(
     let mut icon_ui = ui.new_child(egui::UiBuilder::new().max_rect(icon_rect));
     icon_ui.set_clip_rect(visible);
     crate::panels::device_icon::render_device_icon(
-        &mut icon_ui, remapper_icons::device_card_svg(d.kind), INPUT_CARD_ICON_H);
+        &mut icon_ui, remapper_icons::device_card_svg(d.kind, d.vid, d.pid), INPUT_CARD_ICON_H);
 
     let text_rect = egui::Rect::from_min_max(
         egui::pos2(icon_rect.right() + 8.0, card_rect.top() + (card_h - text_h) * 0.5),

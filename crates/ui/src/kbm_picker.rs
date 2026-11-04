@@ -178,6 +178,7 @@ pub enum PickStage {
 pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
     let input_only = flexinput_core::imu::is_imu_pin(pin)
         || CLICK_ZONES.contains(&pin)
+        || flexinput_core::automap::TOUCH_PRESSURE_PINS.contains(&pin)
         || pin == OPTICAL_CONTACT;
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
@@ -256,12 +257,15 @@ pub fn is_pad_cell(pin: &str) -> bool {
 }
 
 /// A few characters under a cell whose glyph it shares with another: the
-/// touchpad's touch and click zones are drawn alike.
-pub fn cell_caption(pin: &str) -> Option<&'static str> {
+/// touchpad's touch and click zones are drawn alike, and so are a Steam
+/// Controller's two pads (`steam`), told apart by the letter on them.
+pub fn cell_caption(pin: &str, steam: bool) -> Option<&'static str> {
     Some(match pin {
         "touch_left" | "touch_center" | "touch_right" => "touch",
         "touchpad_left" | "touchpad_center" | "touchpad_right" | "btn_touchpad" => "click",
         "touchpad_any" => "any",
+        "touch1_active" | "touch2_active" if steam => "touch",
+        "btn_misc2" if steam => "click",
         _ => return None,
     })
 }
@@ -300,6 +304,22 @@ pub const TOUCHPAD_LAYOUT: &[KbmCell] = &[
     ca("touch_swipe_x", TOUCHPAD_X + 2.0, TOUCHPAD_Y + 1.0),
     ca("touch_swipe_y", TOUCHPAD_X + 3.0, TOUCHPAD_Y + 1.0),
 ];
+
+/// A Steam Controller's two trackpads, each touched and clicked: left then
+/// right. A click reads as a button, or in the Analog press mode as how hard
+/// the pad is pressed, as a trigger does.
+pub const STEAM_TOUCHPADS: &[KbmCell] = &[
+    c("touch1_active", TOUCHPAD_X, TOUCHPAD_Y),
+    c("btn_touchpad", TOUCHPAD_X + 1.0, TOUCHPAD_Y),
+    c("touch2_active", TOUCHPAD_X + 2.0, TOUCHPAD_Y),
+    c("btn_misc2", TOUCHPAD_X + 3.0, TOUCHPAD_Y),
+];
+
+/// Is this one of the touchpad cluster's cells, on any pad? Drawn in the pad's
+/// dialect, like the gamepad's.
+pub fn is_touchpad_cell(pin: &str) -> bool {
+    TOUCHPAD_LAYOUT.iter().chain(STEAM_TOUCHPADS).any(|c| c.pin == pin) || CLICK_ZONES.contains(&pin)
+}
 
 /// Both sticks' directions, each as a plus — an input to remap, or a stick to
 /// push. Not on JSM's board: its stick directions are settings, not buttons.
@@ -350,6 +370,10 @@ pub struct PickerLayout {
     /// The bound flicks: a mapping card's outputs, on a tab with an RWS Aim set
     /// to take them.
     pub flick: bool,
+    /// The side being chosen is a Steam Controller: the touchpad cluster is its
+    /// two trackpads ([`STEAM_TOUCHPADS`]), and the right one's click, which the
+    /// bus calls Misc 2, sits there rather than with the Misc buttons.
+    pub steam: bool,
 }
 
 /// Where the flick cells sit. The mouse's is under the mouse cluster, wide enough
@@ -437,7 +461,7 @@ pub fn picker_cells(
     layout: PickerLayout,
     macros: &[crate::macro_icons::MacroDisplayEntry],
 ) -> Vec<PickerCell> {
-    let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient, flick } = layout;
+    let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient, flick, steam } = layout;
     let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
     if flick {
         use flexinput_core::flick::FlickVia;
@@ -446,7 +470,9 @@ pub fn picker_cells(
         let (x, y) = FLICK_STICK_AT;
         cells.push(flick_cell(FlickVia::Stick, x, y, 1.0));
     }
-    if !tz {
+    if !tz && steam {
+        cells.extend(STEAM_TOUCHPADS.iter().map(PickerCell::from));
+    } else if !tz {
         cells.extend(TOUCHPAD_LAYOUT.iter().map(PickerCell::from));
     } else {
         // The touchpad cluster is hidden in Touch-Zones mode (a touchpad can't
@@ -464,7 +490,9 @@ pub fn picker_cells(
         cells.push((&ca("scroll_x", TZ_OUT_X + 1.0, 3.0)).into());
     }
     if pad {
-        cells.extend(PAD_LAYOUT.iter().chain(STICK_CLICKS).map(PickerCell::from));
+        cells.extend(PAD_LAYOUT.iter().chain(STICK_CLICKS)
+            .filter(|c| !(steam && !tz && c.pin == "btn_misc2"))
+            .map(PickerCell::from));
     }
     if orient {
         cells.push((&c(flexinput_core::imu::ORIENT_NEUTRAL_PIN, ORIENT_X, ORIENT_Y)).into());
@@ -480,8 +508,9 @@ pub fn picker_cells(
         cells.extend(imu_cells().iter().map(PickerCell::from));
         cells.push((&c(OPTICAL_CONTACT, ACCEL_X, TILT_Y)).into());
         // The click zones go on the touchpad cluster's last row, which Touch
-        // Zones' variant hides — it has no input stage to need them.
-        if !tz {
+        // Zones' variant hides — it has no input stage to need them. A Steam
+        // Controller's pads are clicked each as a whole.
+        if !tz && !steam {
             for (i, pin) in CLICK_ZONES.into_iter().enumerate() {
                 cells.push((&c(pin, TOUCHPAD_X + i as f32, TOUCHPAD_Y + 2.0)).into());
             }
@@ -810,9 +839,9 @@ mod pad_cluster_tests {
         let overlaps = |a: &PickerCell, b: &PickerCell| {
             a.x < b.x + b.width && b.x < a.x + a.width && (a.y - b.y).abs() < 1.0
         };
-        // Every cluster at once, under both touchpad variants.
-        for tz in [false, true] {
-            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true, orient: true, flick: true }, &[]);
+        // Every cluster at once, under every touchpad variant.
+        for (tz, steam) in [(false, false), (true, false), (false, true)] {
+            let all = picker_cells(PickerLayout { tz, pad: true, sticks: true, whole_sticks: true, inputs: true, orient: true, flick: true, steam }, &[]);
             for (i, a) in all.iter().enumerate() {
                 for b in all.iter().skip(i + 1) {
                     assert!(!overlaps(a, b), "{} overlaps {} at ({}, {})", a.pin, b.pin, a.x, a.y);
@@ -945,10 +974,32 @@ mod stage_tests {
             assert!(!stage_allows(PickStage::Input, pin), "{pin} is only ever sent");
             assert!(stage_allows(PickStage::Output, pin), "{pin}");
         }
-        for pin in ["imu_gyro_yaw_right", "imu_tilt_roll", "touchpad_left", "touchpad_any", OPTICAL_CONTACT] {
+        for pin in ["imu_gyro_yaw_right", "imu_tilt_roll", "touchpad_left", "touchpad_any", OPTICAL_CONTACT, "touch2_pressure"] {
             assert!(stage_allows(PickStage::Input, pin), "{pin}");
             assert!(!stage_allows(PickStage::Output, pin), "{pin} is only ever read");
         }
+    }
+
+    /// A Steam Controller's board has its two pads, touched and clicked, in the
+    /// touchpad cluster — the right one's click out of the Misc row — and none of
+    /// a one-pad touchpad's zones; its press is no pick of its own, as a click in
+    /// the Analog press mode reads it.
+    #[test]
+    fn a_steam_controllers_board_has_its_two_pads() {
+        let layout = PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() };
+        let pins = |l: PickerLayout| picker_cells(l, &[]).into_iter().map(|c| (c.pin, c.y)).collect::<Vec<_>>();
+        let steam = pins(PickerLayout { steam: true, ..layout });
+        for p in ["touch1_active", "btn_touchpad", "touch2_active", "btn_misc2"] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y), "{p} in the touchpad cluster");
+        }
+        assert_eq!(steam.iter().filter(|(c, _)| c == "btn_misc2").count(), 1, "not with the Misc buttons too");
+        for p in ["touch_left", "touchpad_center", "touchpad_any", "btn_mute", "touch1_pressure"] {
+            assert!(!steam.iter().any(|(c, _)| c == p), "{p}");
+        }
+        let other = pins(layout);
+        assert!(other.iter().any(|(c, y)| c == "btn_misc2" && *y == PAD_Y + 6.0), "another pad's Misc 2 stays");
+        assert!(other.iter().any(|(c, _)| c == "touchpad_center"));
+        assert!(!other.iter().any(|(c, _)| c == "touch1_pressure"));
         for pin in ["btn_south", "left_trigger", "dpad_up", "left_stick_up", "left_stick", "touch_left", "btn_touchpad"] {
             assert!(stage_allows(PickStage::Input, pin), "{pin}");
             assert!(stage_allows(PickStage::Output, pin), "{pin}");

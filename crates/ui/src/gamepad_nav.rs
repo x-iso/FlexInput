@@ -593,6 +593,10 @@ pub struct GamepadNav {
     pub kbm_picker_prev_rt: bool,
     /// Touch Zones variant: hide the touchpad cluster + offer mouse-movement delta.
     pub kbm_picker_touch_zones: bool,
+    /// The open session's `(input, output)` glyph dialects, as the picker last
+    /// drew them (its target's body publishes them): the board's touchpad
+    /// cluster is a Steam Controller's two pads when the side chosen is one.
+    pub kbm_picker_skins: std::cell::Cell<(crate::canvas::remapper_icons::Skin, crate::canvas::remapper_icons::Skin)>,
     /// Pin-id prefix whose cells render disabled for this picker session
     /// (e.g. `menu:{id}` so a Virtual Menu can't target itself). `None` = all
     /// cells usable.
@@ -722,6 +726,8 @@ impl Default for GamepadNav {
             kbm_picker_list: None,
             kbm_picker_prev_rt: false,
             kbm_picker_touch_zones: false,
+            kbm_picker_skins: std::cell::Cell::new((
+                crate::canvas::remapper_icons::Skin::Xbox, crate::canvas::remapper_icons::Skin::Xbox)),
             kbm_picker_exclude: None,
             kbm_picker_viewport: None,
             press_mode_open: false,

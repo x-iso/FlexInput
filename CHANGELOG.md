@@ -67,9 +67,27 @@ All notable changes to FlexInput are documented here. This project adheres to
   has clicked), held at 1 past it. A Remapper or Map Action card on a trackpad click
   can take the **Analog** press mode, which passes that press on, so pressing a
   trackpad can pull a trigger gradually. On a pad without a press, a click there
-  drives full while held, as any button does. In Touch Zones an Analog card onto a
-  trigger takes the press of the finger in its zone, the pad's own trigger still
-  counting.
+  drives full while held, as any button does. A card on a trackpad click or press
+  also gets the **Response curve** with its threshold: with a threshold, a click
+  card fires where the press reaches it, click or not. A click reads both ways, as
+  a trigger does, so the press is no pick of its own; it's on the pad's node as
+  outputs, a saved node gaining them too. In Touch Zones a touch or click card on
+  a pad with a press gets the curve and threshold the same way, an Analog card onto
+  a trigger takes the press of the finger in its zone (from the threshold, the
+  pad's own trigger still counting), and in ports mode each pad has a **Press**
+  port beside its Click. Map Action rows get the same Response curve and
+  threshold, on any analog input. An Area Mapper on a trackpad has **By press**
+  on its cards: the press, through the card's curve, scales the card's analog
+  outputs, and with a threshold the cell fires only once pressed that hard.
+- **Steam Controller glyphs.** Its mappings show its own buttons: the grips, the
+  stick touches, the aux (···) button, View for Select and Menu for Start, its L4,
+  L5, R4 and R5 back buttons, and its two trackpads as touchpads marked L and R.
+  The rest keep the Xbox glyphs, as its face buttons are lettered the same. In the
+  input picker its touchpad section is its two pads, each touched and clicked (the
+  right pad's click no longer among the Misc buttons), without a one-pad
+  touchpad's zones, and Learn takes a pad's touch or click as that pad's. It also
+  has its own picture in the device lists and node headers, and **Steam Controller**
+  is a skin of its own in a mapping node's skin menu.
 - **Steam Controller trackpad calibration.** The Calibration window's **Grip and
   Touch** section is laid out like the sticks above it: each trackpad drawn as your
   thumb reaches it, with its trail and press, and its grip beside it. Holding the
@@ -88,6 +106,9 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Paddle labels cut out of their glyphs.** The label on a generic paddle glyph
+  (PL1, PR2…) is a hole in it now, as on the Steam Controller's own L4 and R5,
+  instead of white text with a dark outline. The input picker shows it too.
 - **Trigger calibration, buttons first.** In the Calibration window's trigger
   section, **Start** and **Reset** come right after the steps they go with, then the
   digital point, hysteresis and debounce. **Trigger click** goes under the trigger

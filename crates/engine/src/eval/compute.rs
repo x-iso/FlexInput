@@ -111,6 +111,7 @@ pub(crate) fn compute_node(
                     tz::Pin::Zone { comp: tz::ZoneComp::Active, .. } => Some(Signal::Bool(false)),
                     tz::Pin::Zone { .. } => Some(Signal::Float(0.0)),
                     tz::Pin::Click { .. } => Some(Signal::Bool(false)),
+                    tz::Pin::Press { .. } => Some(Signal::Float(0.0)),
                 }
             }).collect()
         }
@@ -192,6 +193,11 @@ pub(crate) fn compute_node(
                     tz::Pin::Click { field } => Some(Signal::Bool(
                         tz::field_click_pins(field).iter()
                             .any(|p| read(p).map(|s| s.as_bool()).unwrap_or(false)))),
+                    // The field's pad pressed, on a pad that reports it.
+                    tz::Pin::Press { field } => Some(Signal::Float(
+                        tz::field_press_pins(field, split).iter()
+                            .filter_map(|p| read(p).map(|s| s.as_float()))
+                            .fold(0.0_f32, f32::max).clamp(0.0, 1.0))),
                 }
             }).collect()
         }

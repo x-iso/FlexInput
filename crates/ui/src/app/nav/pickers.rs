@@ -486,6 +486,18 @@ impl FlexInputApp {
     pub(crate) fn kbm_picker_window(&self, ctx: &egui::Context) -> PickerInteraction {
         if !self.gamepad_nav.kbm_picker_open { return PickerInteraction::default(); }
         use crate::kbm_picker::{clamp_index, layout_extent, PickStage, PickerTab};
+        // The pad drawn in the dialect of the side being chosen: an input as
+        // the pad it comes from, an output as the device it goes to (both as
+        // the target's body publishes them), Xbox while there's neither. JSM
+        // writes the Xbox names (`X_A`), so its board stays Xbox. Noted first,
+        // for the board's layout, which the gamepad driver lays out too.
+        let side_skins = match (self.gamepad_nav.kbm_picker_use, self.gamepad_nav.kbm_picker_node) {
+            (crate::gamepad_nav::PickerUse::Chord, Some(n)) => {
+                crate::canvas::viewer::picker_skins(ctx, &self.gamepad_nav.kbm_picker_path, n)
+            }
+            _ => None,
+        }.unwrap_or((crate::canvas::remapper_icons::Skin::Xbox, crate::canvas::remapper_icons::Skin::Xbox));
+        self.gamepad_nav.kbm_picker_skins.set(side_skins);
         let macros = self.macro_display_entries();
         let layout = self.picker_layout();
         let tabs = self.picker_tabs();
@@ -553,16 +565,6 @@ impl FlexInputApp {
         // cluster is hidden and analog-output cells replace it (both handled by
         // `picker_cells`, which also keeps them navigable).
         let tz = self.gamepad_nav.kbm_picker_touch_zones;
-        // The pad drawn in the dialect of the side being chosen: an input as
-        // the pad it comes from, an output as the device it goes to (both as
-        // the target's body publishes them), Xbox while there's neither. JSM
-        // writes the Xbox names (`X_A`), so its board stays Xbox.
-        let side_skins = match (purpose, self.gamepad_nav.kbm_picker_node) {
-            (crate::gamepad_nav::PickerUse::Chord, Some(n)) => {
-                crate::canvas::viewer::picker_skins(ctx, &self.gamepad_nav.kbm_picker_path, n)
-            }
-            _ => None,
-        }.unwrap_or((crate::canvas::remapper_icons::Skin::Xbox, crate::canvas::remapper_icons::Skin::Xbox));
         let pad_skin = if stage == PickStage::Input { side_skins.0 } else { side_skins.1 };
 
         let title = match purpose {
@@ -976,8 +978,11 @@ impl FlexInputApp {
                         resp.on_hover_text(tip);
                         continue;
                     }
-                    // The gamepad cells in the side's dialect (`pad_skin`).
-                    let skin = if crate::kbm_picker::is_pad_cell(&cell.pin) {
+                    // The gamepad and touchpad cells in the side's dialect
+                    // (`pad_skin`): a Steam Controller's pads wear its glyphs.
+                    let skin = if crate::kbm_picker::is_pad_cell(&cell.pin)
+                        || crate::kbm_picker::is_touchpad_cell(&cell.pin)
+                    {
                         pad_skin
                     } else {
                         skin
@@ -1067,7 +1072,7 @@ impl FlexInputApp {
                             tint);
                         // A glyph shared with another cell (the touchpad's
                         // touch and click zones) gets its word under it.
-                        if let Some(word) = crate::kbm_picker::cell_caption(&cell.pin) {
+                        if let Some(word) = crate::kbm_picker::cell_caption(&cell.pin, layout.steam) {
                             let at = rect.center_bottom() - egui::vec2(0.0, 1.0);
                             let font = egui::FontId::proportional(UNIT * 0.26);
                             for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {

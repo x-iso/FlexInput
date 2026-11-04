@@ -709,6 +709,12 @@ pub(crate) fn eval_area_mapper_node(
         "turbo": snap.params.get(AREA_PRESS_TURBO_PARAM).and_then(|v| v.as_bool()).unwrap_or(false),
     });
 
+    // A trackpad's press, on a pad that reports one, for cards that go by it.
+    let pad_press: Option<f32> = touched
+        .then(|| bus(&format!("{input}_pressure"), collector_sigs))
+        .flatten()
+        .map(|s| s.as_float().clamp(0.0, 1.0));
+
     // ── Cards ──
     let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
     let mut button_on: HashMap<String, bool> = HashMap::new();
@@ -736,7 +742,19 @@ pub(crate) fn eval_area_mapper_node(
             _ => {
                 let raw = lay.digital.get(&z).copied().unwrap_or(false);
                 let share = lay.weights.iter().find(|c| c.id == z).map(|c| c.weight).unwrap_or(0.0);
-                (press.gate(raw, slots, dt), share)
+                // "By press" (`by_press`): the press, through the card's curve,
+                // scales its analog outputs, and with a threshold the cell fires
+                // only once pressed that hard.
+                let by_press = card.get("by_press").and_then(|v| v.as_bool()).unwrap_or(false);
+                match pad_press.filter(|_| by_press) {
+                    Some(p) => {
+                        let shape = MappingShape::from_card(card);
+                        let pressed = shape.shaped(p);
+                        let raw = raw && shape.threshold.is_none_or(|t| pressed >= t);
+                        (press.gate(raw, slots, dt), share * pressed)
+                    }
+                    None => (press.gate(raw, slots, dt), share),
+                }
             }
         };
         // The buttons and macros on: all while the cell holds, or those the

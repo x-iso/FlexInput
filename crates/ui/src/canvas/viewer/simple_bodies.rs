@@ -1437,6 +1437,88 @@ pub(crate) fn rasterize_svg_recolored(
     })
 }
 
+/// A glyph as [`rasterize_svg_recolored`] draws it untinted, with `label` cut out
+/// of its middle: a hole the background shows through, as on the Steam
+/// Controller's own L4 / R5 glyphs. The glyph stays whole if no font loads.
+pub(crate) fn rasterize_svg_cutout(svg_text: &str, w: u32, h: u32, label: &str) -> Option<egui::ColorImage> {
+    let mut img = rasterize_svg_recolored(svg_text, w, h, "override", egui::Color32::TRANSPARENT)?;
+    let Some((fonts, family)) = cutout_font() else { return Some(img) };
+    // Bigger the fewer letters, so a side's L or R reads at a chip's size.
+    let size = h as f32 * (0.95 / label.chars().count().max(1) as f32).min(0.46);
+    let baseline = h as f32 * 0.5 + size * 0.36;
+    let escaped: String = label.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let text = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><text x="{x}" y="{baseline}" text-anchor="middle" font-family="{family}" font-weight="700" font-size="{size}" fill="white">{escaped}</text></svg>"#,
+        x = w as f32 * 0.5,
+    );
+    let mut opt = usvg::Options::default();
+    opt.fontdb = std::sync::Arc::clone(fonts);
+    let Ok(tree) = usvg::Tree::from_str(&text, &opt) else { return Some(img) };
+    let Some(mut mask) = tiny_skia::Pixmap::new(w, h) else { return Some(img) };
+    resvg::render(&tree, tiny_skia::Transform::identity(), &mut mask.as_mut());
+    for (px, m) in img.pixels.iter_mut().zip(mask.pixels()) {
+        if m.alpha() > 0 {
+            *px = px.gamma_multiply(1.0 - m.alpha() as f32 / 255.0);
+        }
+    }
+    Some(img)
+}
+
+/// The font a cut-out label is set in: a bold system face where one is found,
+/// else egui's own, and its family name. Loaded once.
+fn cutout_font() -> Option<&'static (std::sync::Arc<usvg::fontdb::Database>, String)> {
+    static FONT: std::sync::OnceLock<Option<(std::sync::Arc<usvg::fontdb::Database>, String)>> =
+        std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        let mut db = usvg::fontdb::Database::new();
+        let windows = std::env::var("WINDIR").map(|d| std::path::PathBuf::from(d).join("Fonts"));
+        let mut bold: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(dir) = &windows {
+            bold.extend(["segoeuib.ttf", "arialbd.ttf"].map(|f| dir.join(f)));
+        }
+        bold.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+        ].map(std::path::PathBuf::from));
+        if !bold.iter().any(|p| db.load_font_file(p).is_ok()) {
+            let own = egui::FontDefinitions::default().font_data.get("Ubuntu-Light").map(|d| d.font.to_vec())?;
+            db.load_font_data(own);
+        }
+        let family = db.faces().next()?.families.first()?.0.clone();
+        Some((std::sync::Arc::new(db), family))
+    }).as_ref()
+}
+
+/// A pin glyph's texture, `label` cut out of it when it has one, at `size_px`.
+/// Cached by glyph, label and size.
+pub(crate) fn glyph_texture(
+    ctx: &egui::Context,
+    bytes: &'static [u8],
+    label: Option<&'static str>,
+    size_px: u32,
+) -> Option<egui::TextureHandle> {
+    let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, label, size_px));
+    if let Some(tex) = crate::widgets::tex_cache::get(ctx, cache_key) {
+        return Some(tex);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let img = match label {
+        Some(l) => rasterize_svg_cutout(text, size_px, size_px, l)?,
+        None => rasterize_svg_recolored(text, size_px, size_px, "override", egui::Color32::TRANSPARENT)?,
+    };
+    let handle = ctx.load_texture(
+        format!("remapper_icon_{:p}_{}", bytes.as_ptr(), label.unwrap_or("")),
+        img,
+        egui::TextureOptions::LINEAR,
+    );
+    crate::widgets::tex_cache::put(ctx, cache_key, handle.clone());
+    Some(handle)
+}
+
 pub(crate) fn show_counter_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let (mode, normalized, step_p, min_p, max_p) = snarl.get_node(node_id).map(|n| {
         let mode       = n.params.get("mode")      .and_then(|v| v.as_str()) .unwrap_or("loop").to_string();

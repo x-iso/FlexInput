@@ -92,6 +92,8 @@ pub(crate) fn eval_map_action_node(
                     (pins, PressParams::from_card(m))
                 };
                 if in_pins.is_empty() { continue; }
+                // The card's curve and threshold, as on a Remapper card.
+                let shape = MappingShape::from_card(m);
                 if press.is_analog() {
                     any_analog_present = true;
                     // Combo gate (same as Remapper): all non-cardinal pins
@@ -108,16 +110,17 @@ pub(crate) fn eval_map_action_node(
                         // trigger, a knob, a note — must be active, as a button
                         // must be held; each still sets the magnitude.
                         if analog_axis_for_cardinal(p).is_none() {
-                            if let Some(v) = analog_in_value(&upstream, p) {
+                            if let Some(v) = shape.in_value(&upstream, p) {
                                 if v == 0.0 { all_buttons_held = false; }
-                                if v.abs() > local_max { local_max = v.abs(); }
+                                let v = shape.shaped(v.abs());
+                                if v > local_max { local_max = v; }
                                 has_value = true;
                                 continue;
                             }
                         }
-                        if let Some(v) = analog_in_value(&upstream, p) {
+                        if let Some(v) = shape.in_value(&upstream, p) {
                             has_cardinal = true;
-                            let mag = v.abs();
+                            let mag = shape.shaped(v.abs());
                             if mag > 0.0 { any_cardinal_active = true; }
                             if mag > local_max { local_max = mag; }
                         } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
@@ -145,17 +148,17 @@ pub(crate) fn eval_map_action_node(
                 // simultaneously held — use the gesture-visited bitmap so
                 // half-circles and full sweeps complete the combo. Mirrors
                 // Remapper's digital path.
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns_map, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
+                // An input with a threshold counts once its shaped value
+                // reaches it — a trackpad click by its press — else when held.
+                let pin_on = |p: &str| shape.analog_gate(&upstream, p)
+                    .unwrap_or_else(|| read_upstream(p).map(|s| s.as_bool()).unwrap_or(false));
+                let raw_held = match (gesture_required_bits(&in_pins), shape.threshold) {
+                    (Some(required), None) => {
+                        let buttons_held = in_pins.iter().all(|p| gesture_pin_to_bit(p).is_some() || pin_on(p));
+                        let visited = gesture_state_get(ns_map, i);
+                        buttons_held && gesture_tick(required, visited, &upstream)
+                    }
+                    _ => in_pins.iter().all(|p| pin_on(p)),
                 };
                 let held = press.gate(raw_held, press_state_get(ns_map, i), dt);
                 if held { any_trigger = true; }

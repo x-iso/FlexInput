@@ -647,7 +647,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             .show_ui(ui, |ui| {
                                 // Skin governs only gamepad chip rendering; KBM has
                                 // no controller equivalent so it isn't offered here.
-                                for opt in [Skin::Auto, Skin::Xbox, Skin::Playstation, Skin::SwitchPro] {
+                                for opt in [Skin::Auto, Skin::Xbox, Skin::Playstation, Skin::SwitchPro, Skin::Steam] {
                                     if ui.selectable_label(current == opt,
                                         egui::RichText::new(opt.label()).small()).clicked()
                                     {

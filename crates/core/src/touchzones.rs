@@ -409,6 +409,9 @@ pub enum Pin {
     Zone { field: usize, idx: usize, comp: ZoneComp },
     /// Per-field touchpad click (whole pad is a button on DS4/DualSense/Steam).
     Click { field: usize },
+    /// Per-field press, on a pad that reports one (a Steam Controller's
+    /// trackpads, `automap::TOUCH_PRESSURE_PINS`): 0..1, 1 at the click.
+    Press { field: usize },
 }
 
 /// Port id for a zone component, e.g. `zone_pin_id(0, 2, ZoneComp::X) == "f0z2_x"`.
@@ -424,6 +427,25 @@ pub fn zone_pin_id(field: usize, idx: usize, comp: ZoneComp) -> String {
 /// Port id for a field's click, e.g. `click_pin_id(1) == "f1c"`.
 pub fn click_pin_id(field: usize) -> String {
     format!("f{field}c")
+}
+
+/// Port id for a field's press, e.g. `press_pin_id(1) == "f1p"`.
+pub fn press_pin_id(field: usize) -> String {
+    format!("f{field}p")
+}
+
+/// The device pins a field's press comes from: in split mode its own pad's; in
+/// one field, either finger's, the harder.
+pub fn field_press_pins(field: usize, split: bool) -> &'static [&'static str] {
+    use crate::automap::TOUCH_PRESSURE_PINS as P;
+    const BOTH: [&str; 2] = P;
+    const LEFT: [&str; 1] = [P[0]];
+    const RIGHT: [&str; 1] = [P[1]];
+    match (split, field) {
+        (false, _) => &BOTH,
+        (true, 0) => &LEFT,
+        (true, _) => &RIGHT,
+    }
 }
 
 /// Device pins that press a field's click — any one of them held counts.
@@ -452,6 +474,11 @@ pub fn parse_pin(id: &str) -> Option<Pin> {
     if let Some(fnum) = rest.strip_suffix('c') {
         let field: usize = fnum.parse().ok()?;
         return Some(Pin::Click { field });
+    }
+    // Press: "f{field}p"
+    if let Some(fnum) = rest.strip_suffix('p') {
+        let field: usize = fnum.parse().ok()?;
+        return Some(Pin::Press { field });
     }
     // Zone: "f{field}z{idx}_{comp}"
     let (fnum, zrest) = rest.split_once('z')?;
@@ -485,6 +512,15 @@ pub fn click_pin_label(field: usize, single: bool) -> String {
         "Click".to_string()
     } else {
         format!("{} ⊙", field_letter(field))
+    }
+}
+
+/// Human-readable press pin label, e.g. `"A press"` (or `"Press"` single).
+pub fn press_pin_label(field: usize, single: bool) -> String {
+    if single {
+        "Press".to_string()
+    } else {
+        format!("{} press", field_letter(field))
     }
 }
 
@@ -730,6 +766,7 @@ mod tests {
             }
             let cid = click_pin_id(field);
             assert_eq!(parse_pin(&cid), Some(Pin::Click { field }));
+            assert_eq!(parse_pin(&press_pin_id(field)), Some(Pin::Press { field }));
         }
         assert_eq!(parse_pin(PASS_PIN_ID), None);
         // Ensure zone vs click disambiguation is robust (zone id ends in _x/_y/_act,

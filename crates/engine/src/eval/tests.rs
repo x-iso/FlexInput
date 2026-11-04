@@ -558,6 +558,27 @@ mod trigger_tests {
         assert_eq!(run(&[("btn_touchpad", Signal::Bool(false))]), 0.0);
     }
 
+    // A trackpad click card with a threshold fires where the press reaches it,
+    // click or not; without one, at the click.
+    #[test]
+    fn remapper_pad_click_threshold_goes_by_its_press() {
+        let east = |card: serde_json::Value, press: f32, click: bool| {
+            let graph = curve_remap_graph(card);
+            let sigs: HashMap<(String, String), Signal> = [
+                ("btn_touchpad", Signal::Bool(click)), ("touch1_pressure", Signal::Float(press)),
+            ].into_iter().map(|(p, s)| (("gilrs:switch_pro:0".to_string(), p.to_string()), s)).collect();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+            sinkv(&out, "btn_east").is_some_and(|s| s.as_bool())
+        };
+        let with = serde_json::json!({ "in": ["btn_touchpad"], "out": ["btn_east"], "threshold": 0.5 });
+        assert!(!east(with.clone(), 0.4, false), "short of it");
+        assert!(east(with, 0.6, false), "past it, no click needed");
+        let without = serde_json::json!({ "in": ["btn_touchpad"], "out": ["btn_east"] });
+        assert!(!east(without.clone(), 0.9, false), "no threshold: the click");
+        assert!(east(without, 0.9, true));
+    }
+
     // A device's trackpads read through their deadzone and offset: the left
     // pad's frame moved right, off its grip side, the right pad's left; a pad
     // not touched is left as it is.
@@ -1766,6 +1787,37 @@ mod trigger_tests {
         assert_eq!(run(true, 0.6, 0.0), Some(0.6), "pressing short of the click");
         assert_eq!(run(true, 0.2, 0.5), Some(0.5), "the pad's own trigger past it");
         assert_eq!(run(false, 0.0, 0.3), None, "no finger: passes through");
+    }
+
+    // A touch card with a threshold, on a pad that reports its press, fires
+    // once the finger in its zone presses that hard, and an Analog card's
+    // trigger starts from it.
+    #[test]
+    fn touch_zones_threshold_goes_by_the_press() {
+        let snap = |card: serde_json::Value| {
+            let mut n = empty_node(1, "module.touch_zones");
+            n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+            n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+            n.params.insert("zone_maps".into(), serde_json::json!([card]));
+            n
+        };
+        let run = |snap: &NodeSnap, press: f32, pin: &str| {
+            let mut m = BusMap::default();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m.insert(("pad".into(), "touch1_pressure".into()), Signal::Float(press));
+            let mut c = BusMap::default();
+            eval_touch_zones_map_node(snap, 1, &m, &mut c, &mut HashMap::new(), 0.016);
+            c.get(&("touchmap:1".to_string(), pin.to_string())).copied()
+        };
+        let button = snap(serde_json::json!({"f":0,"z":0,"in":["tz_click"],"out":["btn_south"],"threshold":0.5}));
+        assert_eq!(run(&button, 0.4, "btn_south"), Some(Signal::Bool(false)), "short of it");
+        assert_eq!(run(&button, 0.6, "btn_south"), Some(Signal::Bool(true)), "no click needed");
+        let trigger = snap(serde_json::json!(
+            {"f":0,"z":0,"in":["tz_click"],"out":["right_trigger"],"mode":"analog","threshold":0.3}));
+        assert_eq!(run(&trigger, 0.2, "right_trigger"), None, "under the threshold: passes through");
+        assert_eq!(run(&trigger, 0.7, "right_trigger"), Some(Signal::Float(0.7)));
     }
 
     // Hold with an ANALOG origin zone: the analog output holds AND a button
@@ -6656,6 +6708,27 @@ mod midi_card_module_tests {
         let out = eval_map_action_node(&n, 1, &BusMap::default(), &BusMap::default(), &mut HashMap::new(), 0.016);
         assert_ne!(out.first().copied().flatten(), Some(Signal::Bool(true)));
     }
+
+    // A Map Action row on a trackpad click takes its threshold on the press,
+    // and in the Analog mode its curve shapes the press.
+    #[test]
+    fn a_map_action_row_goes_by_a_clicks_press() {
+        let run = |card: serde_json::Value, press: f32| {
+            let mut n = node(1, "module.map_action");
+            n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+            n.params.insert("mappings".into(), serde_json::json!([card]));
+            let mut dev = BusMap::default();
+            dev.insert(("pad".to_string(), "btn_touchpad".to_string()), Signal::Bool(false));
+            dev.insert(("pad".to_string(), "touch1_pressure".to_string()), Signal::Float(press));
+            eval_map_action_node(&n, 1, &dev, &BusMap::default(), &mut HashMap::new(), 0.016)
+        };
+        let gate = serde_json::json!({ "in": ["btn_touchpad"], "threshold": 0.5 });
+        assert_eq!(run(gate.clone(), 0.4).first().copied().flatten(), Some(Signal::Bool(false)));
+        assert_eq!(run(gate, 0.6).first().copied().flatten(), Some(Signal::Bool(true)), "no click needed");
+        let analog = serde_json::json!({ "in": ["btn_touchpad"], "mode": "analog", "curve": [[0.0, 0.0], [1.0, 0.5]] });
+        let v = run(analog, 0.8).get(1).copied().flatten().map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.4).abs() < 1e-3, "the press through the curve: {v}");
+    }
 }
 
 #[cfg(test)]
@@ -7148,6 +7221,35 @@ mod area_mapper_tests {
         let y = bus(&c, "right_stick_y").map(|s| s.as_float()).unwrap_or(0.0);
         assert!((y - 0.75).abs() < 1e-3, "{y}");
         assert_eq!(bus(&c, "right_stick"), Some(Signal::Vec2(Vec2::new(0.0, y))), "Vec2 kept in step");
+    }
+
+    /// A card by press, on a trackpad that reports one: its analog output
+    /// follows the press, and with a threshold its cell fires only once pressed
+    /// that hard.
+    #[test]
+    fn a_card_by_press_follows_the_trackpads_press() {
+        let mut n = mapper(json!([
+            { "z": 1, "out": ["right_trigger"], "by_press": true },
+            { "z": 1, "out": ["key_w"], "by_press": true, "threshold": 0.5 },
+        ]));
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+        let touch = |press: f32| {
+            let mut m = BusMap::default();
+            let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
+            // Up, well inside cell 1.
+            put("touch1_active", Signal::Bool(true));
+            put("touch1_x", Signal::Float(0.0));
+            put("touch1_y", Signal::Float(0.9));
+            put("touch1_pressure", Signal::Float(press));
+            m
+        };
+        let mut st = HashMap::new();
+        let (c, _) = run(&n, &touch(0.3), &mut st);
+        let rt = bus(&c, "right_trigger").map(|s| s.as_float()).unwrap_or(0.0);
+        assert!((rt - 0.3).abs() < 1e-3, "{rt}");
+        assert!(!on(&c, "key_w"), "short of its threshold");
+        let (c, _) = run(&n, &touch(0.7), &mut st);
+        assert!(on(&c, "key_w"));
     }
 
     /// Two keys across an Alternate PWM gradient take turns: never both on,

@@ -103,7 +103,9 @@ pub(crate) fn show_remapper_body(
     //                mask `_tp_zones`) so it survives across frames.
     // Per-zone override: touchpad_N firing forces touch_N false, so the
     // click-variant mapping takes over from a touch-only mapping cleanly.
-    {
+    // A pad with two touchpads is read a pad at a time instead.
+    let two_pads = has_two_pads(live_signals, upstream_dev_id.as_deref());
+    if !learn_two_pads(live_signals, upstream_dev_id.as_deref(), &mut pressed_now) {
         let prev_mask: u8 = snarl.get_node(node_id)
             .and_then(|n| n.params.get("_tp_zones"))
             .and_then(|v| v.as_u64()).unwrap_or(0) as u8;
@@ -185,14 +187,13 @@ pub(crate) fn show_remapper_body(
     let click_mode_before = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_tp_click_mode"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
-    let touch_click_now = upstream_dev_id.as_deref()
-        .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
-        .map(|s| s.as_bool()).unwrap_or(false);
+    // A touchpad clicked: on a two-pad controller, either.
+    let clicks: &[&str] = if two_pads { &["btn_touchpad", "btn_misc2"] } else { &["btn_touchpad"] };
+    let touch_click_now = upstream_dev_id.as_deref().is_some_and(|dev| clicks.iter().any(|c|
+        live_signals.get(&(dev.to_string(), c.to_string())).is_some_and(|s| s.as_bool())));
     let entering_click_mode = touch_click_now && !click_mode_before;
     if entering_click_mode {
-        new_draft_input.retain(|p|
-            p != "touch_left" && p != "touch_center" && p != "touch_right"
-        );
+        new_draft_input.retain(|p| !learn_touch_transient(p));
     }
     let click_mode = click_mode_before || touch_click_now;
     if click_mode != click_mode_before {
@@ -203,9 +204,7 @@ pub(crate) fn show_remapper_body(
     // While in click mode, drop touch_* from pressed_now so they don't
     // accumulate into the draft during the click+release tail.
     if click_mode {
-        pressed_now.retain(|p|
-            p != "touch_left" && p != "touch_center" && p != "touch_right"
-        );
+        pressed_now.retain(|p| !learn_touch_transient(p));
     }
 
     // Auto-enter capturing when a wire is connected and we were idle.
@@ -241,7 +240,7 @@ pub(crate) fn show_remapper_body(
     // unlike buttons/sticks which are held. Capture must reflect the
     // current touch zones, not the union across the swipe — otherwise
     // sweeping a finger across all three zones latches all three.
-    let is_transient = |p: &str| p == "touch_left" || p == "touch_center" || p == "touch_right";
+    let is_transient = learn_touch_transient;
     let mut reset_click_mode = false;
     match new_phase.as_str() {
         "capturing" => {
@@ -937,56 +936,61 @@ pub(crate) fn show_map_action_body(
     let mut new_phase = phase.clone();
     let mut new_draft_input = draft_input.clone();
 
-    // Touchpad zones & click accumulation (mirror remapper logic).
+    // Touchpad zones & click accumulation (mirror remapper logic). A pad with
+    // two touchpads is read a pad at a time instead.
     let mut reset_click_mode = false;
+    let two_pads = has_two_pads(live_signals, upstream_dev_id.as_deref());
     {
         let prev_mask: u8 = snarl.get_node(node_id)
             .and_then(|n| n.params.get("_tp_zones"))
             .and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        // Read btn_touchpad directly from live_signals
-        let touch_click_now = upstream_dev_id.as_deref()
-            .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
-            .map(|s| s.as_bool()).unwrap_or(false);
-        let mut click_mask = if touch_click_now { prev_mask } else { 0 };
-        let mut touch_mask: u8 = 0;
-        if let Some(dev) = upstream_dev_id.as_deref() {
-            let read_f = |pin: &str| -> Option<f32> {
-                live_signals.get(&(dev.to_string(), pin.to_string()))
-                    .map(|s| match s {
-                        Signal::Float(v) => *v,
-                        Signal::Vec2(v) => v.x,
-                        _ => 0.0,
-                    })
-            };
-            let read_b = |pin: &str| -> bool {
-                live_signals.get(&(dev.to_string(), pin.to_string()))
-                    .map(|s| s.as_bool()).unwrap_or(false)
-            };
-            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                if !read_b(apin) { continue; }
-                let x = match read_f(xpin) { Some(v) => v, None => continue };
-                let idx = if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 };
-                touch_mask |= 1u8 << idx;
-                if touch_click_now { click_mask |= 1u8 << idx; }
+        // Read the clicks directly from live_signals: on a two-pad controller,
+        // either pad's.
+        let clicks: &[&str] = if two_pads { &["btn_touchpad", "btn_misc2"] } else { &["btn_touchpad"] };
+        let touch_click_now = upstream_dev_id.as_deref().is_some_and(|dev| clicks.iter().any(|c|
+            live_signals.get(&(dev.to_string(), c.to_string())).is_some_and(|s| s.as_bool())));
+        if !learn_two_pads(live_signals, upstream_dev_id.as_deref(), &mut pressed_now) {
+            let mut click_mask = if touch_click_now { prev_mask } else { 0 };
+            let mut touch_mask: u8 = 0;
+            if let Some(dev) = upstream_dev_id.as_deref() {
+                let read_f = |pin: &str| -> Option<f32> {
+                    live_signals.get(&(dev.to_string(), pin.to_string()))
+                        .map(|s| match s {
+                            Signal::Float(v) => *v,
+                            Signal::Vec2(v) => v.x,
+                            _ => 0.0,
+                        })
+                };
+                let read_b = |pin: &str| -> bool {
+                    live_signals.get(&(dev.to_string(), pin.to_string()))
+                        .map(|s| s.as_bool()).unwrap_or(false)
+                };
+                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                    if !read_b(apin) { continue; }
+                    let x = match read_f(xpin) { Some(v) => v, None => continue };
+                    let idx = if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 };
+                    touch_mask |= 1u8 << idx;
+                    if touch_click_now { click_mask |= 1u8 << idx; }
+                }
             }
-        }
-        if click_mask != prev_mask {
-            if let Some(n) = snarl.get_node_mut(node_id) {
-                n.params.insert("_tp_zones".to_string(), Value::from(click_mask as u64));
+            if click_mask != prev_mask {
+                if let Some(n) = snarl.get_node_mut(node_id) {
+                    n.params.insert("_tp_zones".to_string(), Value::from(click_mask as u64));
+                }
             }
+            // Click suppresses touch-only — see derive in eval.rs.
+            let touch_mask = if touch_click_now { 0 } else { touch_mask };
+            let push = |pn: &mut Vec<String>, pin: &str| {
+                if !pn.iter().any(|p| p == pin) { pn.push(pin.to_string()); }
+            };
+            if click_mask & 1 != 0 { push(&mut pressed_now, "touchpad_left"); }
+            if click_mask & 2 != 0 { push(&mut pressed_now, "touchpad_center"); }
+            if click_mask & 4 != 0 { push(&mut pressed_now, "touchpad_right"); }
+            if touch_click_now && click_mask == 0 { push(&mut pressed_now, "btn_touchpad"); }
+            if touch_mask & 1 != 0 { push(&mut pressed_now, "touch_left"); }
+            if touch_mask & 2 != 0 { push(&mut pressed_now, "touch_center"); }
+            if touch_mask & 4 != 0 { push(&mut pressed_now, "touch_right"); }
         }
-        // Click suppresses touch-only — see derive in eval.rs.
-        let touch_mask = if touch_click_now { 0 } else { touch_mask };
-        let push = |pn: &mut Vec<String>, pin: &str| {
-            if !pn.iter().any(|p| p == pin) { pn.push(pin.to_string()); }
-        };
-        if click_mask & 1 != 0 { push(&mut pressed_now, "touchpad_left"); }
-        if click_mask & 2 != 0 { push(&mut pressed_now, "touchpad_center"); }
-        if click_mask & 4 != 0 { push(&mut pressed_now, "touchpad_right"); }
-        if touch_click_now && click_mask == 0 { push(&mut pressed_now, "btn_touchpad"); }
-        if touch_mask & 1 != 0 { push(&mut pressed_now, "touch_left"); }
-        if touch_mask & 2 != 0 { push(&mut pressed_now, "touch_center"); }
-        if touch_mask & 4 != 0 { push(&mut pressed_now, "touch_right"); }
 
         // Click-mode handling: if we just entered click mode, evict transient
         // touch_* pins from the draft so the click-variant mapping takes over.
@@ -995,7 +999,7 @@ pub(crate) fn show_map_action_body(
             .and_then(|v| v.as_bool()).unwrap_or(false);
         let entering_click_mode = touch_click_now && !click_mode_before;
         if entering_click_mode {
-            new_draft_input.retain(|p| p != "touch_left" && p != "touch_center" && p != "touch_right");
+            new_draft_input.retain(|p| !learn_touch_transient(p));
         }
         let click_mode = click_mode_before || touch_click_now;
         if click_mode != click_mode_before {
@@ -1006,7 +1010,7 @@ pub(crate) fn show_map_action_body(
         // While in click mode, drop touch_* from pressed_now so they don't
         // accumulate into the draft during the click+release tail.
         if click_mode {
-            pressed_now.retain(|p| p != "touch_left" && p != "touch_center" && p != "touch_right");
+            pressed_now.retain(|p| !learn_touch_transient(p));
         }
     }
 
@@ -1023,7 +1027,7 @@ pub(crate) fn show_map_action_body(
         set_arm_idle = Some(true);
     }
 
-    let is_transient = |p: &str| p == "touch_left" || p == "touch_center" || p == "touch_right";
+    let is_transient = learn_touch_transient;
     match new_phase.as_str() {
         "capturing" => {
             if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
@@ -1309,7 +1313,7 @@ pub(crate) fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin, skin,
-                                    card_analog, false, reorder_enabled, drag_off, "mappings", false,
+                                    card_analog, false, reorder_enabled, drag_off, "mappings", card_analog,
                                     None, // Map Action rows aren't bus writers (out_pins None)
                                     Some(row_edit),
                                 );
@@ -1333,6 +1337,23 @@ pub(crate) fn show_map_action_body(
                                     });
                                 }
                                 rv.observe(i, &result);
+                                // Its curve and threshold, as on a Remapper card.
+                                if card_analog {
+                                    let live = live_analog_in_mag(live_signals, &upstream_devs, &in_pins);
+                                    let live = match (live, live_imu_in_mag(
+                                        ui.ctx(), live_signals, &upstream_devs, &working))
+                                    {
+                                        (Some(a), Some(b)) => Some(a.max(b)),
+                                        (a, b) => a.or(b),
+                                    };
+                                    let live_note = live_note_readout(live_signals, &upstream_devs, &in_pins);
+                                    if mapping_card_curve_section(
+                                        ui, node_id, "mappings", i, &mut working,
+                                        true, live, live_note, None, None,
+                                    ) {
+                                        working_changed = true;
+                                    }
+                                }
                             },
                         );
                     });

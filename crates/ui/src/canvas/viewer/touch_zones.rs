@@ -1450,9 +1450,16 @@ fn live_analog_in_mag_one(
                 (Some(x), Some(y)) => Some(egui::vec2(x, y).length().min(1.0)),
                 _ => None,
             }
-        } else if matches!(p.as_str(), "left_trigger" | "right_trigger") {
+        } else if matches!(p.as_str(), "left_trigger" | "right_trigger")
+            || flexinput_core::automap::TOUCH_PRESSURE_PINS.contains(&p.as_str())
+        {
             live_signals.get(&(dev.to_string(), p.to_string()))
                 .map(|s| s.as_float().clamp(0.0, 1.0))
+        } else if let Some(press) = flexinput_core::automap::click_pressure_pin(p)
+            .and_then(|press| live_signals.get(&(dev.to_string(), press.to_string())))
+        {
+            // A trackpad click on a pad that reports its press: that press.
+            Some(press.as_float().clamp(0.0, 1.0))
         } else if let Some(mp) = flexinput_core::midi::parse_pin(p) {
             let get = |id: &str| live_signals.get(&(dev.to_string(), id.to_string())).copied();
             match mp.note_companions() {
@@ -2176,10 +2183,40 @@ pub(crate) fn render_touch_zones_pinned(
 /// passthrough) is always kept; changing a grid drops existing zone-port wiring
 /// for now (zone indices reshuffle row-major).
 pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
+    let Some((want_ids, want)) = touch_zone_port_plan(node_id, snarl) else { return };
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let cur_ids: Vec<String> = node.params.get("output_pin_ids").and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+        .unwrap_or_default();
+    if cur_ids == want_ids {
+        return;
+    }
+
+    let old_len = snarl.get_node(node_id).map_or(0, |n| n.outputs.len());
+    for i in 1..old_len {
+        snarl.drop_outputs(OutPinId { node: node_id, output: i });
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.outputs.truncate(1); // keep AutoMap passthrough at slot 0
+        for (label, ty) in &want {
+            node.outputs.push(PinDescriptor::new(label.clone(), *ty));
+        }
+        node.params.insert(
+            "output_pin_ids".to_string(),
+            Value::Array(want_ids.into_iter().map(Value::String).collect()),
+        );
+    }
+}
+
+/// The ports a Touch Zones node should have: their ids, slot 0's AutoMap
+/// passthrough first, and the (label, type) of each after it. `None` for no node.
+fn touch_zone_port_plan(node_id: NodeId, snarl: &Snarl<NodeData>) -> Option<(Vec<String>, Vec<(String, SignalType)>)> {
     use flexinput_core::touchzones as tz;
 
     // Build desired (id, label, type) triples from field_mode + per-field grids.
-    let Some(node) = snarl.get_node(node_id) else { return };
+    let node = snarl.get_node(node_id)?;
+    // A Press port per field once a pad that reports its press has been seen.
+    let press = node.params.get("pad_press").and_then(|v| v.as_bool()).unwrap_or(false);
     let split = node.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
     let single = !split;
     let n_fields = if split { 2 } else { 1 };
@@ -2205,30 +2242,13 @@ pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<Nod
         }
         want_ids.push(tz::click_pin_id(field));
         want.push((tz::click_pin_label(field, single), SignalType::Bool));
-    }
-    }
-
-    let cur_ids: Vec<String> = node.params.get("output_pin_ids").and_then(|v| v.as_array())
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        .unwrap_or_default();
-    if cur_ids == want_ids {
-        return;
-    }
-
-    let old_len = snarl.get_node(node_id).map_or(0, |n| n.outputs.len());
-    for i in 1..old_len {
-        snarl.drop_outputs(OutPinId { node: node_id, output: i });
-    }
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        node.outputs.truncate(1); // keep AutoMap passthrough at slot 0
-        for (label, ty) in &want {
-            node.outputs.push(PinDescriptor::new(label.clone(), *ty));
+        if press {
+            want_ids.push(tz::press_pin_id(field));
+            want.push((tz::press_pin_label(field, single), SignalType::Float));
         }
-        node.params.insert(
-            "output_pin_ids".to_string(),
-            Value::Array(want_ids.into_iter().map(Value::String).collect()),
-        );
     }
+    }
+    Some((want_ids, want))
 }
 
 /// Regenerate a Touch Zones / Virtual Menu node's typed zone ports (ports mode)
@@ -2247,13 +2267,17 @@ pub(crate) fn tz_regen_ports_preserving(node_id: NodeId, snarl: &mut Snarl<NodeD
             .unwrap_or_default()
     };
     let ids_before = read_ids(snarl);
+    let is_menu = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
+    // Nothing to do, as on most frames: no snapshot to take.
+    if !is_menu && touch_zone_port_plan(node_id, snarl).is_some_and(|(ids, _)| ids == ids_before) {
+        return;
+    }
     let mut snapshot: std::collections::HashMap<String, Vec<egui_snarl::InPinId>> =
         std::collections::HashMap::new();
     for (i, id) in ids_before.iter().enumerate() {
         let remotes = snarl.out_pin(OutPinId { node: node_id, output: i }).remotes.clone();
         if !remotes.is_empty() { snapshot.insert(id.clone(), remotes); }
     }
-    let is_menu = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
     if is_menu {
         crate::canvas::menu_body::regenerate_menu_ports(node_id, snarl);
     } else {
@@ -2295,6 +2319,32 @@ pub(crate) fn tz_mini_button(
     resp.clicked()
 }
 
+/// Whether the node's pad reports its press (`pad_press`): noted the first time
+/// it does, and kept from then on, so a pad unplugged takes neither its Press
+/// ports and their wires nor its cards' press settings with it.
+fn tz_note_pad_press(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> bool {
+    let noted = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("pad_press").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if noted {
+        return true;
+    }
+    let has = remapper_upstream_device_id(snarl, node_id, 0, automap_parent).is_some_and(|dev| {
+        live_signals.contains_key(&(dev, flexinput_core::automap::TOUCH_PRESSURE_PINS[0].to_string()))
+    });
+    if has {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("pad_press".to_string(), Value::Bool(true));
+        }
+    }
+    has
+}
+
 pub(crate) fn show_touch_zones_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2314,8 +2364,10 @@ pub(crate) fn show_touch_zones_body(
         }
     }
 
-    // Keep dynamic ports in sync with the grids (no-op when unchanged).
-    regenerate_touch_zone_ports(node_id, snarl);
+    tz_note_pad_press(snarl, node_id, live_signals, automap_parent);
+    // Keep dynamic ports in sync with the grids (no-op when unchanged), each
+    // port's wires kept by its id.
+    tz_regen_ports_preserving(node_id, snarl);
 
     let visuals = ui.visuals().clone();
     // Highlight colour: the `highlight_color` swatch (opaque, for editor
@@ -3179,6 +3231,32 @@ pub(crate) fn render_touch_zone_cards(
                 egui::Id::new(("tz_live_defl", node_id.0))))
             .and_then(|(_, mp)| mp.get(&(sel_f, sel_z)).copied())
     };
+    // On a pad that reports its press (`pad_press`, noted by the body), a touch or
+    // click card shapes that press and takes a threshold on it; the selected
+    // zone's press, while touched there, is its preview dot.
+    let pad_press = !implicit_trig && tz_note_pad_press(snarl, node_id, live_signals, automap_parent);
+    // An Area Mapper on a trackpad that reports its press: `Some(live press)`,
+    // the press `None` while it isn't touched.
+    let area_input = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("area_input").and_then(|v| v.as_str()).map(str::to_owned))
+        .filter(|i| area_mode && i.starts_with("touch"));
+    let area_press: Option<Option<f32>> = match area_input {
+        Some(input) if tz_note_pad_press(snarl, node_id, live_signals, automap_parent) => {
+            let dev = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
+            let read = |pin: String| dev.as_ref().and_then(|d| live_signals.get(&(d.clone(), pin)).map(|s| s.as_float()));
+            let touched = read(format!("{input}_active")).is_some_and(|a| a > 0.5);
+            Some(read(format!("{input}_pressure")).filter(|_| touched))
+        }
+        _ => None,
+    };
+    let live_press: Option<f32> = tz_live_defl.filter(|_| pad_press).and_then(|_| {
+        let split = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
+        let dev = remapper_upstream_device_id(snarl, node_id, 0, automap_parent)?;
+        flexinput_core::touchzones::field_press_pins(sel_f, split).iter()
+            .filter_map(|p| live_signals.get(&(dev.clone(), p.to_string())).map(|s| s.as_float()))
+            .reduce(f32::max)
+    });
     // Preview input for a card: swipe cards → 1-D directional value along the swipe
     // axis (engine ax=dfx, ay=−dfy; up→−dfy, down→dfy, left→−dfx, right→dfx),
     // clamped ≥0; analog cards → 2-D deflection magnitude.
@@ -3221,6 +3299,9 @@ pub(crate) fn render_touch_zone_cards(
         // An Area Mapper card has no analog mode of its own: its cell's share
         // drives analog outputs, shaped on the gradient border.
         let card_analog = !area_mode && out_pins.iter().any(|p| tz_out_pin_is_analog(p));
+        let is_swipe = in_pins.first().map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
+        let press_card = pad_press && !card_analog
+            && matches!(in_pins.first().map(String::as_str), Some("tz_click" | "tz_touch"));
         let nav_uid = if card_analog && !nav_curve_given {
             nav_curve_given = true;
             Some(node_id.0)
@@ -3242,7 +3323,7 @@ pub(crate) fn render_touch_zone_cards(
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin, skin,
-                    true, false, reorder_enabled, drag_off, "zone_maps", card_analog,
+                    true, false, reorder_enabled, drag_off, "zone_maps", card_analog || is_swipe || press_card,
                     card_conf.as_ref(), Some(row_edit),
                 );
                 if result.delete_clicked { remove = Some(i); }
@@ -3286,15 +3367,41 @@ pub(crate) fn render_touch_zone_cards(
                             ui.painter().rect_stroke(r.expand(2.0), 4.0,
                                 egui::Stroke::new(2.0_f32, accent), egui::StrokeKind::Outside);
                         }
+                        // On a trackpad that reports its press: the card can go
+                        // by it (`by_press`, the engine's Area Mapper cards).
+                        if area_press.is_some() && cur == "area_in" {
+                            let mut by_press = working.get("by_press").and_then(|v| v.as_bool()).unwrap_or(false);
+                            if ui.checkbox(&mut by_press, egui::RichText::new("By press").small())
+                                .on_hover_text("The finger's press scales this card's analog outputs, \
+                                    through its curve, and with a threshold the cell fires only once \
+                                    pressed that hard.")
+                                .changed()
+                            {
+                                working.insert("by_press".into(), Value::Bool(by_press));
+                            }
+                        }
                     });
+                    let by_press = working.get("by_press").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if let (Some(live), true, "area_in") = (area_press, by_press, cur.as_str()) {
+                        mapping_card_curve_section(
+                            ui, node_id, "zone_maps", i, &mut working,
+                            true, live, None, None, None,
+                        );
+                    }
                 }
                 // Response curve + threshold + Rel.-center, all INSIDE the card's
                 // opened body. Analog cards shape the zone's deflection (no
                 // threshold — the gate is touch presence). Swipe cards ALSO get the
                 // curve, WITH the activation threshold: it gates the swipe's
-                // directional magnitude into a hold (see the engine).
-                let is_swipe = in_pins.first().map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
-                if card_analog || is_swipe {
+                // directional magnitude into a hold (see the engine). A touch or
+                // click card on a pad with a press shapes that press, with a
+                // threshold where it fires.
+                if press_card {
+                    mapping_card_curve_section(
+                        ui, node_id, "zone_maps", i, &mut working,
+                        true, live_press, None, None, None,
+                    );
+                } else if card_analog || is_swipe {
                     let own = working.get("adaptive").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
                     if is_top_analog { driver_adaptive = own; }
                     // Rel.-center visibility/edit rules (mirror the engine): hidden in

@@ -362,6 +362,10 @@ pub(crate) fn eval_touch_zones_map_node(
         // no threshold it keeps the original one-shot flick detection.
         let swipe_threshold: Option<f32> =
             card.get("threshold").and_then(|v| v.as_f64()).map(|v| v as f32);
+        // On a pad that reports its press, a touch or click card with a
+        // threshold goes by the press instead: on once the finger in the zone
+        // presses that hard, through the card's curve.
+        let pressed_now = zone_press.get(&(field, zone)).copied().filter(|_| hit.is_some());
         let raw_held = match swipe_code {
             Some(code) => match swipe_threshold {
                 Some(thr) => {
@@ -371,9 +375,12 @@ pub(crate) fn eval_touch_zones_map_node(
                 }
                 None => swipes.iter().any(|&(f, z, d)| f == field && z == zone && d == code),
             },
-            None => match trigger {
-                "tz_click" => hit.is_some() && click(field),
-                _          => hit.is_some(), // tz_touch (default)
+            None => match (swipe_threshold, pressed_now) {
+                (Some(thr), Some(p)) => shape.shaped(p) >= thr,
+                _ => match trigger {
+                    "tz_click" => hit.is_some() && click(field),
+                    _          => hit.is_some(), // tz_touch (default)
+                },
             },
         };
 
@@ -428,14 +435,18 @@ pub(crate) fn eval_touch_zones_map_node(
                     }
                 }
                 // An analog trigger from an Analog card: the press of the finger
-                // in the zone, through the card's curve, on a pad that reports
-                // one; elsewhere full while the card holds, as a button does.
+                // in the zone, through the card's curve, from its threshold, on a
+                // pad that reports one; elsewhere full while the card holds, as a
+                // button does.
                 "left_trigger" | "right_trigger" if press.is_analog() => {
-                    let v = match zone_press.get(&(field, zone)) {
-                        Some(&pressed) if hit.is_some() => shape.shaped(pressed),
-                        _ if held => 1.0,
-                        _ => continue,
+                    let v = match pressed_now {
+                        Some(pressed) => shape.shaped(pressed),
+                        None if held => 1.0,
+                        None => continue,
                     };
+                    if swipe_threshold.is_some_and(|t| v < t) {
+                        continue;
+                    }
                     let e = triggers.entry(p.to_string()).or_insert(0.0);
                     *e = e.max(v);
                 }

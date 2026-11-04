@@ -414,7 +414,7 @@ fn device_card(
                 |ui| {
                     render_device_icon(
                         ui,
-                        remapper_icons::device_card_svg(device.kind),
+                        remapper_icons::device_card_svg(device.kind, device.vid, device.pid),
                         ICON_H,
                     );
                     ui.label(RichText::new(label).strong());

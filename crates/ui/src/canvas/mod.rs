@@ -790,11 +790,14 @@ mod migration_tests {
             id: "sdl:generic:a".to_string(),
             display_name: "Pad".to_string(),
             kind: flexinput_devices::ControllerKind::Generic,
-            outputs: vec![flexinput_devices::DevicePin {
-                id: "btn_misc5".to_string(),
-                display_name: "Grip sens L".to_string(),
-                signal_type: SignalType::Bool,
-            }],
+            outputs: vec![
+                flexinput_devices::DevicePin {
+                    id: "btn_misc5".to_string(),
+                    display_name: "Grip sens L".to_string(),
+                    signal_type: SignalType::Bool,
+                },
+                pin("touch1_pressure", SignalType::Float),
+            ],
             inputs: vec![pin("rumble_strong", SignalType::Float), pin("tp_l_click", SignalType::Bool)],
             instance_path: None,
             vid: None,
@@ -810,6 +813,8 @@ mod migration_tests {
         assert_eq!(n.inputs.len(), 2);
         assert_eq!(n.inputs[1].signal_type, SignalType::Bool);
         assert_eq!(n.outputs[0].name, "Grip sens L");
+        assert_eq!(n.params["output_pin_ids"], serde_json::json!(["btn_misc5", "touch1_pressure"]));
+        assert_eq!(n.outputs[1].signal_type, SignalType::Float);
         let o = snarl.get_node(other).unwrap();
         assert_eq!((o.inputs.len(), o.outputs[0].name.as_str()), (1, "Misc 5"));
         assert!(!sync_device_node_pins(&mut snarl, &device), "nothing left to do");
@@ -2843,9 +2848,11 @@ fn extend_feedback_control_inlets(node: &mut NodeData) {
 }
 
 /// A device.source's pins are frozen when the node is created, so a saved node
-/// doesn't have feedback inputs its pad gained since, or what its pad's outputs are
-/// called now. Add the inputs after the ones it has, so that its wires stay where
-/// they are, and rename the outputs in place. Recurses into sub-patches.
+/// doesn't have the pins its pad gained since (feedback inputs, a Steam
+/// Controller's trackpad press), or what its pad's outputs are called now. Add
+/// the new pins after the ones it has, so that its wires stay where they are, and
+/// rename the outputs in place. A MIDI port's or a raw pad's outputs are their
+/// own business and get no new ones. Recurses into sub-patches.
 /// True if anything changed.
 pub fn sync_device_node_pins(
     snarl: &mut Snarl<NodeData>,
@@ -2862,12 +2869,22 @@ pub fn sync_device_node_pins(
         {
             continue;
         }
-        if let Some(Value::Array(ids)) = node.params.get("output_pin_ids") {
+        if let Some(Value::Array(ids)) = node.params.get_mut("output_pin_ids") {
             for (id, out) in ids.iter().zip(node.outputs.iter_mut()) {
                 let pin = device.outputs.iter().find(|p| Some(p.id.as_str()) == id.as_str());
                 if let Some(pin) = pin.filter(|p| p.display_name != out.name) {
                     out.name = pin.display_name.clone();
                     changed = true;
+                }
+            }
+            let own_outputs = device.id.starts_with("midi_in:") || flexinput_core::raw_pad::is_raw_device_id(&device.id);
+            if !own_outputs && ids.len() == node.outputs.len() {
+                for pin in &device.outputs {
+                    if !ids.iter().any(|id| id.as_str() == Some(pin.id.as_str())) {
+                        ids.push(Value::String(pin.id.clone()));
+                        node.outputs.push(PinDescriptor::new(&pin.display_name, pin.signal_type));
+                        changed = true;
+                    }
                 }
             }
         }

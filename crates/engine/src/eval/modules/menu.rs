@@ -625,6 +625,8 @@ pub(crate) fn eval_menu_node(
             tz::Pin::Zone { idx, comp: tz::ZoneComp::Y, .. } =>
                 Some(Signal::Float(if hover == idx as i32 { hover_local.1 } else { 0.0 })),
             tz::Pin::Click { .. } => Some(Signal::Bool(pulse_on)),
+            // A menu has no press of its own.
+            tz::Pin::Press { .. } => Some(Signal::Float(0.0)),
         }
     }).collect();
     // TWO extra trailing slots beyond the real ports (invisible to the port
