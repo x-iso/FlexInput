@@ -15,7 +15,7 @@ straight at it instead — no copy, so it can't drift:
 | HIDMaestro | [`crates/hidmaestro/driver/LICENSE`](../crates/hidmaestro/driver/LICENSE) |
 | egui-snarl | [`vendor/egui-snarl/LICENSE-MIT`](../vendor/egui-snarl/LICENSE-MIT) |
 | btleplug | [`vendor/btleplug/LICENSE.md`](../vendor/btleplug/LICENSE.md) |
-| SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, upstream `master` as of 2026-10-27) is embedded by `crates/core/src/sdl_db.rs` |
+| SDL_GameControllerDB | [`vendor/SDL_GameControllerDB/LICENSE`](../vendor/SDL_GameControllerDB/LICENSE) — the database itself (`gamecontrollerdb.txt`, upstream `master` as of 2026-11-02) is embedded by `crates/core/src/sdl_db.rs` |
 | Steam Controller 3D model | [`app/assets/models/Steam Controller/license.txt`](../app/assets/models/Steam%20Controller/license.txt) — CC BY-NC-SA 4.0 (non-commercial), from `ceski-1/3d-controller-overlay` commit `587d1be`; the attribution chain is in `license_attribution.txt` beside it |
 
 ## Where each copy came from
