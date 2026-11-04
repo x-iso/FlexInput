@@ -71,6 +71,8 @@ pub(crate) fn eval_touch_zones_map_node(
     };
     let trees = [field_tree(0), field_tree(1)];
     let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+    // The press of the finger in each zone, on a pad that reports one.
+    let mut zone_press: HashMap<(usize, usize), f32> = HashMap::new();
     for finger in 0..2usize {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
@@ -90,6 +92,10 @@ pub(crate) fn eval_touch_zones_map_node(
             start_zone
         } else { idx };
         zone_hit.insert((field, eff), (lx, ly));
+        if let Some(p) = read(automap::TOUCH_PRESSURE_PINS[finger]) {
+            let e = zone_press.entry((field, eff)).or_insert(0.0);
+            *e = e.max(p.as_float().clamp(0.0, 1.0));
+        }
     }
     let click = |field: usize| -> bool {
         tz::field_click_pins(field).iter().any(|p| read(p).map(|s| s.as_bool()).unwrap_or(false))
@@ -115,6 +121,8 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut scroll_vx = 0.0f32;
     let mut scroll_vy = 0.0f32;
     let mut scroll_active = false;
+    // Analog triggers driven by Analog cards: the strongest press on each.
+    let mut triggers: HashMap<String, f32> = HashMap::new();
     // Mouse gain. The emitted value stacks with the SINK's own mouse_sensitivity
     // (like gyro / right-stick sources do), so a raw ±1 deflection would be wildly
     // hot at typical sink sensitivities. `TZ_MOUSE_BASE` attenuates a full-zone
@@ -419,6 +427,18 @@ pub(crate) fn eval_touch_zones_map_node(
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
+                // An analog trigger from an Analog card: the press of the finger
+                // in the zone, through the card's curve, on a pad that reports
+                // one; elsewhere full while the card holds, as a button does.
+                "left_trigger" | "right_trigger" if press.is_analog() => {
+                    let v = match zone_press.get(&(field, zone)) {
+                        Some(&pressed) if hit.is_some() => shape.shaped(pressed),
+                        _ if held => 1.0,
+                        _ => continue,
+                    };
+                    let e = triggers.entry(p.to_string()).or_insert(0.0);
+                    *e = e.max(v);
+                }
                 // A stick direction: pushed fully that way while the card holds.
                 // Sinks read a stick's axes, never its derived direction pins.
                 p if analog_axis_for_cardinal(p).is_some() => {
@@ -526,6 +546,12 @@ pub(crate) fn eval_touch_zones_map_node(
         }
     }
 
+    // Publish the pressed triggers, the pad's own trigger still counting. Not
+    // pressed, a trigger passes through from upstream.
+    for (pin, v) in &triggers {
+        let own = read(pin).map(|s| s.as_float()).unwrap_or(0.0);
+        collector_sigs.set_pin(&key, pin, Signal::Float(v.max(own).clamp(0.0, 1.0)));
+    }
     // Publish analog sticks (Vec2 authoritative + component floats). Only when a
     // finger is in the zone this frame; absent, the pin falls back to upstream so
     // the physical stick still passes through.

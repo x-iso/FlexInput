@@ -1040,6 +1040,24 @@ mod migration_tests {
     }
 }
 
+/// A tab's calibration of the pads taken off it, so picking one again brings its
+/// settings back: by device id, and by type for the same pad coming another way
+/// (a Steam Controller on its cable and on its dongle). Kept with the tab, in the
+/// workspace and a saved patch. See `panels::calibration::start_calibration`.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceMemory {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub by_id: std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub by_type: std::collections::BTreeMap<String, serde_json::Map<String, Value>>,
+}
+
+impl DeviceMemory {
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty() && self.by_type.is_empty()
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct UiPatch {
     pub version: u32,
@@ -1067,6 +1085,9 @@ pub struct UiPatch {
     /// and skipped when empty so pre-config `.fxp` files keep loading.
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
     pub config: OverlayLayout,
+    /// The calibration of pads taken off the patch (see [`DeviceMemory`]).
+    #[serde(default, skip_serializing_if = "DeviceMemory::is_empty")]
+    pub device_memory: DeviceMemory,
 }
 
 #[derive(Clone)]
@@ -1151,6 +1172,8 @@ pub struct Canvas {
     /// tab switches and sub-patch close→reopen. `pub(crate)` so `easy::layout`
     /// can key the measured-node-rect stash (`viewer::final_node_rect`).
     pub(crate) view_salt: u64,
+    /// The calibration of pads taken off this tab (see [`DeviceMemory`]).
+    pub device_memory: DeviceMemory,
 }
 
 impl Canvas {
@@ -1216,7 +1239,22 @@ impl Canvas {
             pending_view_action: None,
             spawn_glow: std::collections::HashMap::new(),
             view_salt: next_canvas_salt(),
+            device_memory: DeviceMemory::default(),
         }
+    }
+
+    /// Keep a pad's source node's calibration in this tab's memory as the node
+    /// goes, by id and by type. Any other node is left alone.
+    pub fn remember_device_source(&mut self, node: NodeId) {
+        let Some(n) = self.snarl.get_node(node) else { return };
+        if n.module_id != "device.source" {
+            return;
+        }
+        let Some(dev) = n.params.get("device_id").and_then(|v| v.as_str()) else { return };
+        let settings = crate::panels::calibration::calibration_of(&n.params);
+        let device_type = crate::panels::calibration::device_type(dev, &n.params);
+        self.device_memory.by_id.insert(dev.to_owned(), settings.clone());
+        self.device_memory.by_type.insert(device_type, settings);
     }
 
     /// Pin this canvas's snarl-id salt to a stable, caller-derived value so its
@@ -1601,6 +1639,7 @@ impl Canvas {
 
         for &node in selected {
             if self.snarl.get_node(node).is_some() {
+                self.remember_device_source(node);
                 self.snarl.remove_node(node);
             }
         }
@@ -1765,6 +1804,7 @@ impl Canvas {
             pending_wire_menu: None,
             rename_request: None,
             replace_request: None,
+            remove_request: None,
             edit_subpatch_request: None,
             save_subpatch_request: None,
             is_inner_canvas: self.is_inner,
@@ -1952,8 +1992,14 @@ impl Canvas {
         if let Some((node_id, dev_idx)) = viewer.replace_request {
             if let Some(new_device) = physical_devices.get(dev_idx) {
                 self.push_undo();
+                self.remember_device_source(node_id);
                 replace_device_node(&mut self.snarl, node_id, new_device);
             }
+        }
+        // ── Remove node (context menu): a pad's calibration is kept first ─────
+        if let Some(node_id) = viewer.remove_request {
+            self.remember_device_source(node_id);
+            self.snarl.remove_node(node_id);
         }
 
         // ── Rename popup ──────────────────────────────────────────────────────
@@ -2292,6 +2338,12 @@ impl Canvas {
         params.insert("input_pin_ids".to_string(), Value::Array(
             device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
         ));
+        // Its calibration: what this tab had for the pad, else its type's
+        // default, else stock.
+        let device_type = crate::panels::calibration::device_type_for(
+            &device.id, flexinput_devices::steam_haptics::is_steam_controller(device.vid, device.pid));
+        crate::panels::calibration::start_calibration(&mut params, &self.device_memory, &device.id, &device_type);
+        params.insert("device_type".to_string(), Value::String(device_type));
 
         // Count existing source nodes with the same base display name.
         let base = &device.display_name;
@@ -2562,6 +2614,7 @@ impl Canvas {
             easy_preset_path,
             overlay,
             config,
+            device_memory: self.device_memory.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(&path, json);
@@ -2659,6 +2712,7 @@ impl Canvas {
         let patch: UiPatch = serde_json::from_str(&json).ok()?;
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
+        canvas.device_memory = patch.device_memory;
         migrate_ds4_pin_ids(&mut canvas);
         migrate_loaded_snarl(&mut canvas.snarl);
         // Migrate the legacy device-id list the same way as the snarl, so the

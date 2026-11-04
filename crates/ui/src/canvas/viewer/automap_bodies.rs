@@ -112,6 +112,22 @@ pub(crate) const CAPACITIVE_HOVER: &str =
      Only Learn ignores them. To map one, choose it from the picker: it fires as \
      usual with this on.";
 
+/// "Ignore capacitive touch in Learn" until set otherwise: on. It only shows on,
+/// and only acts on, a pad with capacitive inputs (a Steam Controller above all),
+/// whose grips and stick caps would take every Learn otherwise.
+pub(crate) const TOUCH_MISC_DEFAULT: bool = true;
+
+/// Whether a device.source node's params have "Ignore capacitive touch in
+/// Learn" on (`suppress_touch_misc`), the default where unset.
+pub(crate) fn touch_misc_suppressed(params: &std::collections::HashMap<String, Value>) -> bool {
+    params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(TOUCH_MISC_DEFAULT)
+}
+
+/// A device.source on/off param's value where the node has none set.
+pub(crate) fn bool_param_default(key: &str) -> bool {
+    key == "suppress_touch_misc" && TOUCH_MISC_DEFAULT
+}
+
 /// Advanced-mode device.source body toggle hiding the capacitive stick-cap / grip
 /// pins from Learn. Stored on `suppress_touch_misc`; read by
 /// `devices_pool::collect_touch_misc_suppressed`.
@@ -120,10 +136,7 @@ pub(crate) fn touch_misc_header_toggle(
     snarl: &mut Snarl<NodeData>,
     node: NodeId,
 ) {
-    let mut checked = snarl.get_node(node)
-        .and_then(|n| n.params.get("suppress_touch_misc"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mut checked = snarl.get_node(node).is_some_and(|n| touch_misc_suppressed(&n.params));
 
     let resp = ui.checkbox(
         &mut checked,
@@ -147,6 +160,10 @@ pub(crate) const TOUCHPAD_ROUTE_HOVER: &str =
      • two fingers scroll smoothly\n\
      • tap = left click, two-finger tap = right click\n\
      • pressing the pad = left click (right click with two fingers down)\n\
+     On a Steam Controller each trackpad has a job of its own:\n\
+     • the right pad moves the pointer, and pressing it = left click\n\
+     • the left pad scrolls both ways, and pressing it = right click\n\
+     • pressing both = middle click (no tap clicks on these pads)\n\
      Adds to whatever else drives the mouse. Windows' own trackpad gestures \
      (three-finger swipes, pinch zoom) aren't available.";
 

@@ -333,7 +333,7 @@ impl EdgeClick {
     /// defaults for that edge and what plays it.
     fn read(params: &HashMap<String, serde_json::Value>, keys: [&str; 4], release: bool, actuator: ClickActuator) -> Self {
         let num = |key: &str, default: f32| params.get(key).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
-        let gain = if release { automap::TRIGGER_RELEASE_DB } else { 0.0 };
+        let gain = if release { automap::TRIGGER_RELEASE_DB } else { automap::TRIGGER_CLICK_DB };
         Self {
             gain_db: num(keys[0], gain),
             hz: num(keys[1], automap::TRIGGER_CLICK_HZ),
@@ -562,30 +562,68 @@ fn hd_freq_norm(actuator: ClickActuator, hz: f32) -> f32 {
 }
 
 /// A Steam Controller's click feedback on its trackpads (Calibration window), on
-/// pins no layout declares, every tick while it is on; zero-on-drop ends it.
+/// pins no layout declares, every tick while it is on (as it is until turned
+/// off); zero-on-drop ends it. Only a pad with the trackpads' own click pins.
 pub(crate) fn apply_pad_click(
     st: &SinkTarget,
     params: &HashMap<String, serde_json::Value>,
     sink_outputs: &mut BusMap,
 ) {
     use flexinput_core::automap::{
-        PAD_CLICK_HZ, PAD_CLICK_MS, PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG, PAD_CLICK_TONE,
+        PAD_CLICK_DB, PAD_CLICK_HZ, PAD_CLICK_MS, PAD_CLICK_ON, PAD_CLICK_ON_DEFAULT, PAD_CLICK_ON_RELEASE,
+        PAD_CLICK_PARAMS, PAD_CLICK_PINS, PAD_CLICK_RELEASE_DEFAULT, PAD_CLICK_SIDE_PARAMS, PAD_CLICK_STRONG,
+        PAD_CLICK_TONE,
     };
-    let flag = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
-    if !flag("pad_click_on") {
+    if !st.pin_ids.iter().any(|p| p == "tp_l_click") {
         return;
     }
-    let mode = PAD_CLICK_ON
-        | if flag("pad_click_release") { PAD_CLICK_ON_RELEASE } else { 0 }
-        | if flag("pad_click_strong") { PAD_CLICK_STRONG } else { 0 }
-        | if flag("pad_click_tone") { PAD_CLICK_TONE } else { 0 };
-    let num = |key: &str, default: f32| params.get(key).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
+    // Split per pad, a side's own setting where it has one, else the shared one.
+    let split = params.get("pad_click_split").and_then(|v| v.as_bool()).unwrap_or(false);
     let dev = st.device_id.as_str();
-    sink_outputs.set_pin(&dev, &"pad_click_mode", Signal::Float(mode as f32));
-    sink_outputs.set_pin(&dev, &"pad_click_gain", Signal::Float(num("pad_click_gain_db", 0.0)));
-    sink_outputs.set_pin(&dev, &"pad_click_hz", Signal::Float(num("pad_click_hz", PAD_CLICK_HZ)));
-    sink_outputs.set_pin(&dev, &"pad_click_ms", Signal::Float(num("pad_click_ms", PAD_CLICK_MS)));
-    sink_outputs.set_pin(&dev, &"pad_click_soft", Signal::Float(num("pad_click_soft", 0.0)));
+    if !split && !params.get(PAD_CLICK_PARAMS[0]).and_then(|v| v.as_bool()).unwrap_or(PAD_CLICK_ON_DEFAULT) {
+        return;
+    }
+    for (side, own) in PAD_CLICK_SIDE_PARAMS.iter().enumerate() {
+        let get = |k: usize| split.then(|| params.get(own[k])).flatten().or_else(|| params.get(PAD_CLICK_PARAMS[k]));
+        let flag = |k: usize, default: bool| get(k).and_then(|v| v.as_bool()).unwrap_or(default);
+        let num = |k: usize, default: f32| get(k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
+        let mode = if flag(0, PAD_CLICK_ON_DEFAULT) {
+            PAD_CLICK_ON
+                | if flag(1, PAD_CLICK_RELEASE_DEFAULT) { PAD_CLICK_ON_RELEASE } else { 0 }
+                | if flag(2, false) { PAD_CLICK_STRONG } else { 0 }
+                | if flag(3, false) { PAD_CLICK_TONE } else { 0 }
+        } else {
+            0
+        };
+        let [mode_pin, gain, hz, ms, soft] = PAD_CLICK_PINS[side];
+        sink_outputs.set_pin(&dev, &mode_pin, Signal::Float(mode as f32));
+        sink_outputs.set_pin(&dev, &gain, Signal::Float(num(4, PAD_CLICK_DB)));
+        sink_outputs.set_pin(&dev, &hz, Signal::Float(num(5, PAD_CLICK_HZ)));
+        sink_outputs.set_pin(&dev, &ms, Signal::Float(num(6, PAD_CLICK_MS)));
+        sink_outputs.set_pin(&dev, &soft, Signal::Float(num(7, 0.0)));
+    }
+}
+
+/// A Steam Controller's trackpad tracking (Calibration window): stabilisation,
+/// click force and click stabilisation, on pins of the params' names that no
+/// layout declares, every tick, stock values where unset; its backend applies
+/// them to each report. Only a pad with the trackpads' own click pins.
+pub(crate) fn apply_trackpad_tracking(
+    st: &SinkTarget,
+    params: &HashMap<String, serde_json::Value>,
+    sink_outputs: &mut BusMap,
+) {
+    if !st.pin_ids.iter().any(|p| p == "tp_l_click") {
+        return;
+    }
+    let dev = st.device_id.as_str();
+    for (key, stock) in automap::TRACKPAD_TRACKING {
+        // A pad's own click force, else the one both pads had before it.
+        let shared = key.strip_suffix("_l").or_else(|| key.strip_suffix("_r"));
+        let v = params.get(key).or_else(|| shared.and_then(|k| params.get(k)))
+            .and_then(|v| v.as_f64()).map_or(stock, |v| v as f32);
+        sink_outputs.set_pin(&dev, &key, Signal::Float(v));
+    }
 }
 
 /// A Steam Controller's grip sensor settings (Calibration window), on pins no

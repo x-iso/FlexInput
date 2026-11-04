@@ -25,7 +25,7 @@ impl FlexInputApp {
                     .and_then(|a| a.get(idx))
                     .and_then(|m| m.get("in").and_then(|v| v.as_array()))
                     .map(|a| a.iter().filter_map(|v| v.as_str())
-                        .any(flexinput_engine::pin_is_analog_input))
+                        .any(flexinput_engine::pin_allows_analog_mode))
                     .unwrap_or(false);
                 if analog { Some(true) } else { None }
             }

@@ -543,6 +543,19 @@ struct TriggerSession {
     seen: bool,
 }
 
+/// A trackpad edge trace: each pad's reach per direction, uncalibrated.
+#[derive(Clone)]
+struct TrackpadSession {
+    sampling: bool,
+    edges: [[f32; STICK_BUCKETS]; 2],
+}
+
+impl Default for TrackpadSession {
+    fn default() -> Self {
+        Self { sampling: false, edges: [[0.0; STICK_BUCKETS]; 2] }
+    }
+}
+
 #[derive(Clone)]
 struct WindowState {
     /// L/R fading dot trail for the stick vectorscopes (unit-circle coords).
@@ -551,6 +564,9 @@ struct WindowState {
     gyro: GyroSession,
     stick: StickSession,
     trig: TriggerSession,
+    tpad: TrackpadSession,
+    /// Each trackpad's recent points as drawn, `None` where the finger lifted.
+    tpad_trail: [VecDeque<Option<[f32; 2]>>; 2],
     orient: OrientSession,
     /// The spike check started with the gyro calibration.
     spikes: SpikeRun,
@@ -566,6 +582,8 @@ impl Default for WindowState {
             gyro: GyroSession::default(),
             stick: StickSession::default(),
             trig: TriggerSession::default(),
+            tpad: TrackpadSession::default(),
+            tpad_trail: Default::default(),
             orient: OrientSession::default(),
             spikes: SpikeRun::Idle,
             scope_win_ms: 1000.0,
@@ -688,7 +706,16 @@ const CAL_FILE_KEYS: &[&str] = &[
     "ltrig_release_soft", "rtrig_release_soft",
     "grip_touch", "grip_release",
     "pad_click_on", "pad_click_release", "pad_click_strong", "pad_click_gain_db",
-    "pad_click_tone", "pad_click_hz", "pad_click_ms", "pad_click_soft",
+    "pad_click_tone", "pad_click_hz", "pad_click_ms", "pad_click_soft", "pad_click_split",
+    "pad_click_on_l", "pad_click_release_l", "pad_click_strong_l", "pad_click_tone_l",
+    "pad_click_gain_db_l", "pad_click_hz_l", "pad_click_ms_l", "pad_click_soft_l",
+    "pad_click_on_r", "pad_click_release_r", "pad_click_strong_r", "pad_click_tone_r",
+    "pad_click_gain_db_r", "pad_click_hz_r", "pad_click_ms_r", "pad_click_soft_r",
+    "tp_stabilize", "tp_click_force", "tp_click_force_l", "tp_click_force_r", "tp_click_hold",
+    "tpad_l_radial", "tpad_r_radial", "tpads_calibrated",
+    "tpad_l_deadzone", "tpad_r_deadzone", "tpad_l_offset", "tpad_r_offset",
+    // The pad's own options, beside its card and node header.
+    "digital_triggers", "suppress_touch_misc",
 ];
 /// The format's marker, and its version.
 const CAL_FILE_MARKER: &str = "flexinput_calibration";
@@ -724,10 +751,111 @@ fn cal_file_event_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_file_event"
 fn cal_file_status_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_file_status", node)) }
 
 fn cal_file_contents(params: &HashMap<String, Value>, device: &str) -> Value {
-    let settings: serde_json::Map<String, Value> = CAL_FILE_KEYS.iter()
+    serde_json::json!({ CAL_FILE_MARKER: CAL_FILE_VERSION, "device": device, "settings": calibration_of(params) })
+}
+
+/// A node's calibration: those of [`CAL_FILE_KEYS`] it has set.
+pub(crate) fn calibration_of(params: &HashMap<String, Value>) -> serde_json::Map<String, Value> {
+    CAL_FILE_KEYS.iter()
         .filter_map(|k| params.get(*k).map(|v| (k.to_string(), v.clone())))
-        .collect();
-    serde_json::json!({ CAL_FILE_MARKER: CAL_FILE_VERSION, "device": device, "settings": settings })
+        .collect()
+}
+
+// ── Defaults, and a tab's memory ─────────────────────────────────────────────
+//
+// A pad added to a tab starts from what the tab had for it when it was last taken
+// off, by its id, else by its type (the same pad on its cable and on its dongle has
+// two ids); else from its type's default, set with Save as default; else stock.
+
+/// What a pad's calibration measured off that one pad. A default for every pad of
+/// its type would hand one unit's offsets and centres to another, so Save as
+/// default leaves these out.
+const CAL_MEASURED_KEYS: &[&str] = &[
+    "gyro_offset", "accel_offset", "gyro_calibrated", "gyro_noise_floor", "accel_noise_floor",
+    "orientation_baseline",
+    "lstick_center", "rstick_center", "lstick_radial", "rstick_radial", "lstick_scale",
+    "rstick_scale", "sticks_calibrated",
+    "ltrig_min", "ltrig_max", "rtrig_min", "rtrig_max", "triggers_calibrated",
+];
+
+/// The name a pad's type goes by, for its default and a tab's memory: its id's
+/// kind (`dualsense`, `switch_pro`, …), and a Steam Controller's own, whose id
+/// says only `generic`.
+pub(crate) fn device_type_for(dev_id: &str, steam_controller: bool) -> String {
+    if steam_controller {
+        return "steam_controller".into();
+    }
+    crate::canvas::remapper_icons::phys_pad_slug(dev_id).unwrap_or("pad").to_string()
+}
+
+/// A node's pad type: as noted when the node was made (`device_type`), else from
+/// its id, for a node made before that.
+pub(crate) fn device_type(dev_id: &str, params: &HashMap<String, Value>) -> String {
+    params.get("device_type").and_then(|v| v.as_str()).map(str::to_owned)
+        .unwrap_or_else(|| device_type_for(dev_id, crate::model::is_steam_controller(dev_id)))
+}
+
+/// Where each type's default lives: `calibration_defaults.json`, beside the
+/// settings.
+fn cal_defaults_path() -> Option<std::path::PathBuf> {
+    Some(flexinput_core::paths::app_data_dir()?.join("calibration_defaults.json"))
+}
+
+type CalDefaults = std::collections::BTreeMap<String, serde_json::Map<String, Value>>;
+
+/// Every type's default, read from its file once.
+fn cal_defaults() -> &'static RwLock<CalDefaults> {
+    static DEFAULTS: std::sync::OnceLock<RwLock<CalDefaults>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let read = cal_defaults_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|doc| doc.get("types").cloned())
+            .and_then(|types| serde_json::from_value(types).ok());
+        RwLock::new(read.unwrap_or_default())
+    })
+}
+
+/// A type's default, if one was saved.
+fn calibration_default(device_type: &str) -> Option<serde_json::Map<String, Value>> {
+    cal_defaults().read().ok()?.get(device_type).cloned()
+}
+
+/// Make a node's calibration, past what was measured off it, its type's default,
+/// and write every default to the file.
+fn save_calibration_default(device_type: &str, params: &HashMap<String, Value>) -> Result<(), String> {
+    let mut all = cal_defaults().write().map_err(|e| e.to_string())?;
+    all.insert(device_type.to_owned(), default_from(params));
+    let doc = serde_json::json!({ "flexinput_calibration_defaults": 1, "types": &*all });
+    let path = cal_defaults_path().ok_or("there's no settings folder")?;
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+/// A node's calibration as a default: all but what was measured off the pad.
+fn default_from(params: &HashMap<String, Value>) -> serde_json::Map<String, Value> {
+    let mut settings = calibration_of(params);
+    settings.retain(|k, _| !CAL_MEASURED_KEYS.contains(&k.as_str()));
+    settings
+}
+
+/// A new pad node's calibration (see the section's note): `memory` is its tab's.
+pub(crate) fn start_calibration(
+    params: &mut HashMap<String, Value>,
+    memory: &crate::canvas::DeviceMemory,
+    dev_id: &str,
+    device_type: &str,
+) {
+    let settings = memory.by_id.get(dev_id)
+        .or_else(|| memory.by_type.get(device_type))
+        .cloned()
+        .or_else(|| calibration_default(device_type));
+    let Some(settings) = settings else { return };
+    for key in CAL_FILE_KEYS {
+        if let Some(v) = settings.get(*key).filter(|v| !v.is_null()) {
+            params.insert(key.to_string(), v.clone());
+        }
+    }
 }
 
 fn cal_file_parse(text: &str) -> Result<CalFile, String> {
@@ -851,7 +979,15 @@ fn cal_file_status_line(ui: &mut egui::Ui, node_id: NodeId) {
     ui.label(if status.failed { text.color(ORANGE) } else { text.weak() });
 }
 
-/// Save and Load, in the window's title bar: (save clicked, load clicked).
+/// What the title bar's buttons were clicked for this frame.
+#[derive(Default)]
+struct CalFileClicks {
+    save: bool,
+    load: bool,
+    save_default: bool,
+}
+
+/// Save, Load and Save as default, in the window's title bar.
 ///
 /// egui has no place for them there, so they go on top once the window is done.
 /// Inside the window they would be under its title bar, whose double-click area
@@ -862,7 +998,7 @@ fn cal_file_buttons(
     window: &egui::Response,
     margin: egui::Margin,
     node_id: NodeId,
-) -> (bool, bool) {
+) -> CalFileClicks {
     let style = ctx.style();
     let height = ctx.fonts_mut(|f| f.row_height(&egui::TextStyle::Heading.resolve(&style)))
         .max(style.spacing.interact_size.y) + margin.sum().y;
@@ -885,11 +1021,17 @@ fn cal_file_buttons(
         .on_hover_text("Save this pad's calibration settings to a .fxcal file, to use them on\n\
                         another patch or PC, or when it connects another way.")
         .clicked();
+    let save_default = ui.small_button("Save as default")
+        .on_hover_text("Start every pad of this type you add from now on with these settings:\n\
+                        trigger points and clicks, hysteresis, deadzones, filters and the rest.\n\
+                        What this pad's own calibration measured (gyro and accel offsets, stick\n\
+                        centres, trigger ranges) stays with this pad, and isn't included.")
+        .clicked();
     let used = ui.min_rect();
     // Short of the strip's edges: those are the window's border and the title's rule.
     let cover = egui::Rect::from_x_y_ranges((used.left() - 6.0)..=used.right(), strip.shrink(2.0).y_range());
     ui.painter().set(backdrop, egui::epaint::RectShape::filled(cover, 0, style.visuals.window_fill));
-    (save, load)
+    CalFileClicks { save, load, save_default }
 }
 
 pub fn show_windows(
@@ -954,14 +1096,28 @@ pub fn show_windows(
                 });
             });
         if let Some(window) = window {
-            let (save, load) = cal_file_buttons(ctx, &window.response, window_frame.inner_margin, node_id);
-            if save {
+            let clicks = cal_file_buttons(ctx, &window.response, window_frame.inner_margin, node_id);
+            if clicks.save {
                 if let Some(n) = canvas.snarl.get_node(node_id) {
                     cal_file_save(ctx, node_id, display_name.clone(), cal_file_contents(&n.params, &display_name));
                 }
             }
-            if load {
+            if clicks.load {
                 cal_file_load(ctx, node_id);
+            }
+            if clicks.save_default {
+                if let Some(n) = canvas.snarl.get_node(node_id) {
+                    let saved = save_calibration_default(&device_type(&dev_id, &n.params), &n.params);
+                    let kind = display_name.rsplit_once(" #")
+                        .filter(|(_, n)| n.chars().all(|c| c.is_ascii_digit()))
+                        .map_or(display_name.as_str(), |(base, _)| base);
+                    let (text, failed) = match saved {
+                        Ok(()) => (format!("Saved as the default for every {kind} you add."), false),
+                        Err(e) => (format!("Couldn't save the default: {e}."), true),
+                    };
+                    ctx.data_mut(|d| d.insert_temp(cal_file_status_id(node_id),
+                        CalFileStatus { text, failed, at: Instant::now() }));
+                }
             }
         }
         click_jolt_window(ctx, canvas, node_id, &dev_id, &display_name);
@@ -1248,110 +1404,729 @@ fn draw_window_body(
     }
     if crate::model::is_steam_controller(dev_id) {
         ui.separator();
-        grip_touch_section(ui, canvas, node_id, dev_id, live);
+        grip_touch_section(ui, canvas, node_id, dev_id, live, lo);
     }
     ui.ctx().request_repaint();
 }
 
-// The pad's touch and release levels, and the defaults it and Steam use.
+// The grip sensors' touch and release levels, the defaults the pad and Steam
+// use, and the ranges it takes (settings 34 and 35).
 const GRIP_TOUCH_DEFAULT: f32 = 100.0;
 const GRIP_RELEASE_DEFAULT: f32 = 80.0;
-/// A lower level is a longer reach, so the sliders read it Steam's way round:
-/// more means more, and with Steam's numbers, so the two can be compared.
-const GRIP_RANGE_FLIP: f32 = 425.0;
-const GRIP_HYSTERESIS_FLIP: f32 = 125.0;
+const GRIP_TOUCH_RANGE: (f32, f32) = (25.0, 400.0);
+const GRIP_RELEASE_RANGE: (f32, f32) = (25.0, 100.0);
+/// The top of a grip strip, in those levels.
+const GRIP_SCALE: f32 = 425.0;
 
-/// A Steam Controller's grip sensors, as on Steam's page of that name, and the
-/// click its trackpads give.
+/// A Steam Controller's trackpads, left then right: their touch fields (x, y,
+/// contact), their clicks, and the grip beside each.
+const TPAD_FIELDS: [[&str; 3]; 2] = [
+    ["touch1_x", "touch1_y", "touch1_active"],
+    ["touch2_x", "touch2_y", "touch2_active"],
+];
+const TPAD_CLICK_PINS: [&str; 2] = ["btn_touchpad", "btn_misc2"];
+const GRIP_PINS: [&str; 2] = ["btn_misc5", "btn_misc6"];
+/// Directions a pad's edge trace needs before Stop & save keeps it.
+const TPAD_MIN_BUCKETS: usize = 48;
+/// How far out a touch has to be to count toward the edge trace.
+const TPAD_EDGE_MIN: f32 = 0.4;
+const TPAD_TRAIL_LEN: usize = 48;
+/// The pressure circle at the sensor's full scale, as a share of the pad's side.
+const PRESS_RING: f32 = 0.17;
+
+/// A Steam Controller's trackpads and grip sensors: each pad as the thumb
+/// reaches it, calibrated, with its grip's strip on its outer side; then the
+/// pads' tracking and click feedback.
 fn grip_touch_section(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
     node_id: NodeId,
     dev_id: &str,
     live: &LiveSignals,
+    lo: Layout,
 ) {
-    if !section_header(ui, node_id, "Grip and Touch", false, false) {
+    use flexinput_engine::eval::{TrackpadCal, TRACKPAD_DEADZONE_MAX, TRACKPAD_OFFSET_MAX};
+    let done = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("tpads_calibrated").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if !section_header(ui, node_id, "Grip and Touch", done, window_busy(ui, node_id, |s| s.tpad.sampling)) {
         return;
     }
-    ui.columns(2, |cols| {
-        grip_sensors_group(&mut cols[0], canvas, node_id, dev_id, live);
-        pad_click_group(&mut cols[1], canvas, node_id, dev_id, live);
+    let cals: [TrackpadCal; 2] = ["l", "r"].map(|side| canvas.snarl.get_node(node_id)
+        .map(|n| TrackpadCal::from_params(&n.params, side))
+        .unwrap_or_default());
+    // Each pad's finger as the reader hands it on, before calibration.
+    let raw: [Option<[f32; 2]>; 2] = std::array::from_fn(|i| {
+        let [px, py, pa] = TPAD_FIELDS[i];
+        (read_float(live, dev_id, pa) > 0.5).then(|| [read_float(live, dev_id, px), read_float(live, dev_id, py)])
+    });
+
+    // The trace and the trails, a frame at a time. While tracing the pads show
+    // the finger as it comes, otherwise as calibration puts it.
+    let (sampling, edges, trails) = ui.ctx().data_mut(|d| {
+        let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+        for i in 0..2 {
+            let shown = raw[i].map(|[x, y]| {
+                if st.tpad.sampling {
+                    push_tpad_edge(&mut st.tpad.edges[i], x, y);
+                    [x, y]
+                } else {
+                    cals[i].calibrated(x, y).to_array()
+                }
+            });
+            let trail = &mut st.tpad_trail[i];
+            if shown.is_some() || trail.back().is_some_and(Option::is_some) {
+                if trail.len() >= TPAD_TRAIL_LEN {
+                    trail.pop_front();
+                }
+                trail.push_back(shown);
+            }
+        }
+        (st.tpad.sampling, st.tpad.edges, st.tpad_trail.clone())
+    });
+    if sampling {
+        ui.ctx().request_repaint();
+    }
+
+    // What each pad's click and press go by: its own click force, else the one
+    // both pads had before they had their own.
+    let force: [f32; 2] = ["tp_click_force_l", "tp_click_force_r"].map(|key| {
+        let shared = read_param_f32(canvas, node_id, "tp_click_force", automap::TRACKPAD_CLICK_FORCE);
+        read_param_f32(canvas, node_id, key, shared)
+    });
+    let hold = read_param_f32(canvas, node_id, "tp_click_hold", automap::TRACKPAD_CLICK_HOLD);
+    let grip = (
+        read_param_f32(canvas, node_id, "grip_touch", GRIP_TOUCH_DEFAULT),
+        read_param_f32(canvas, node_id, "grip_release", GRIP_RELEASE_DEFAULT),
+    );
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(lo.left_w);
+            instruct_step(ui, 1, &[(false, "Click "), (true, "Start"), (false, ".")]);
+            instruct_step(ui, 2, &[
+                (false, "Holding the controller as you play, "),
+                (true, "trace each trackpad's edge"),
+                (false, " with your thumb, slowly, all the way round, a few times."),
+            ]);
+            instruct_step(ui, 3, &[(false, "Click "), (true, "Stop & save"), (false, ".")]);
+            ui.add_space(6.0);
+            instruct_line(ui, &[(false,
+                "What your thumb reaches then reads as the whole pad, corners and all. Past the \
+                 orange band a pad reads as its edge; Offset moves that frame away from the grip, \
+                 where a thumb slides off over the edge before it gets there.")]);
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                if cal_button(ui, if sampling { "Stop & save" } else { "Start" }).clicked() {
+                    if sampling {
+                        ui.ctx().data_mut(|d| {
+                            let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                            st.tpad.sampling = false;
+                        });
+                        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                            // A pad traced too little keeps what it had.
+                            let mut saved = false;
+                            for (side, e) in ["l", "r"].iter().zip(&edges) {
+                                if traced_buckets(e) >= TPAD_MIN_BUCKETS {
+                                    n.params.insert(format!("tpad_{side}_radial"),
+                                        serde_json::json!(derive_tpad_profile(e).to_vec()));
+                                    saved = true;
+                                }
+                            }
+                            if saved {
+                                n.params.insert("tpads_calibrated".into(), Value::Bool(true));
+                            }
+                        }
+                    } else {
+                        ui.ctx().data_mut(|d| {
+                            let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                            st.tpad = TrackpadSession { sampling: true, ..Default::default() };
+                        });
+                    }
+                }
+                if cal_button(ui, "Reset").clicked() {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.remove("tpad_l_radial");
+                        n.params.remove("tpad_r_radial");
+                        n.params.insert("tpads_calibrated".into(), Value::Bool(false));
+                    }
+                }
+            });
+            if sampling {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!(
+                    "Edge L {}/{}  R {}/{}",
+                    traced_buckets(&edges[0]), TPAD_MIN_BUCKETS, traced_buckets(&edges[1]), TPAD_MIN_BUCKETS,
+                )).size(INSTRUCT_SIZE).color(ORANGE));
+            }
+            ui.add_space(12.0);
+            instruct_line(ui, &[
+                (false, "On each "),
+                (true, "grip strip"),
+                (false, ", drag the yellow pin to set how near a hand has to come: lower reaches \
+                         further. The small mark under it is where the sensor lets go again. One \
+                         setting covers both grips."),
+            ]);
+            ui.add_space(4.0);
+            if cal_button(ui, "Reset grips").clicked() {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    // To the defaults rather than absent, or the pad would keep what it had.
+                    n.params.insert("grip_touch".into(), serde_json::json!(GRIP_TOUCH_DEFAULT));
+                    n.params.insert("grip_release".into(), serde_json::json!(GRIP_RELEASE_DEFAULT));
+                }
+            }
+        });
+        // The pads hug the window's right edge like the sticks above them, each
+        // with its own rows under it; then the rows both share.
+        ui.vertical(|ui| {
+            ui.set_width(lo.right_w);
+            let mut grip_edit = None;
+            let mut rows: Vec<(String, f32)> = Vec::new();
+            let label_w = ui.painter().layout_no_wrap("Outer deadzone".into(),
+                egui::FontId::proportional(INSTRUCT_SIZE), ORANGE).size().x;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = lo.scope_gap;
+                for (i, side) in ["l", "r"].into_iter().enumerate() {
+                    ui.vertical(|ui| {
+                        ui.set_width(lo.cell_w);
+                        let own_force = read_float(live, dev_id, automap::TOUCH_OWN_FORCE_PINS[i]);
+                        let click_at = if force[i] > 0.0 {
+                            Some(force[i])
+                        } else {
+                            (own_force > 0.0).then_some(own_force)
+                        };
+                        let trace = (0..STICK_BUCKETS).filter(|&b| edges[i][b] > 0.0).map(|b| {
+                            let a = b as f32 / STICK_BUCKETS as f32 * std::f32::consts::TAU;
+                            let p = [edges[i][b] * a.cos(), edges[i][b] * a.sin()];
+                            (b, if sampling { p } else { cals[i].calibrated(p[0], p[1]).to_array() })
+                        }).collect();
+                        let view = PadView {
+                            left: i == 0,
+                            label: if i == 0 { "L" } else { "R" },
+                            at: trails[i].back().copied().flatten(),
+                            trail: &trails[i],
+                            trace,
+                            frame: (!sampling).then_some(&cals[i]),
+                            pressure: read_float(live, dev_id, automap::TOUCH_RAW_PRESSURE_PINS[i]),
+                            click_at,
+                            hold_at: click_at.filter(|_| hold > 0.0).map(|f| f * hold),
+                            clicked: read_float(live, dev_id, TPAD_CLICK_PINS[i]) > 0.5,
+                            grip_on: read_float(live, dev_id, GRIP_PINS[i]) > 0.5,
+                            grip,
+                        };
+                        if let Some(g) = trackpad_cell(ui, &view, lo, egui::Id::new(("tpad_cell", node_id, i))) {
+                            grip_edit = Some(g);
+                        }
+                        ui.add_space(4.0);
+                        let row = |ui: &mut egui::Ui, name: &str, v: f32, max: f32, zero: Option<&str>, hover: &str| {
+                            pad_row(ui, lo.cell_w, label_w, name, v * 100.0, max * 100.0, zero, hover).map(|p| p / 100.0)
+                        };
+                        if let Some(v) = row(ui, "Outer deadzone", cals[i].deadzone, TRACKPAD_DEADZONE_MAX, None,
+                            "The band inside this pad's edge that reads as the edge itself, so a \
+                             thumb needn't reach the very side for a full push.")
+                        {
+                            rows.push((format!("tpad_{side}_deadzone"), v));
+                        }
+                        if let Some(v) = row(ui, "Offset", cals[i].shift.abs(), TRACKPAD_OFFSET_MAX, None,
+                            "Moves this pad's frame away from its grip by this much: the edge on \
+                             the grip side comes sooner, where a thumb would slide off over the \
+                             pad's edge before it got there, and the middle moves with it.")
+                        {
+                            rows.push((format!("tpad_{side}_offset"), v));
+                        }
+                        if let Some(v) = row(ui, "Click force", force[i], 1.0, Some("Own"),
+                            "How hard to press this trackpad for a click, on the scale of its \
+                             pressure circle; it lets go a little under it. At Own it clicks where \
+                             the pad itself does.")
+                        {
+                            rows.push((format!("tp_click_force_{side}"), v));
+                        }
+                    });
+                }
+            });
+            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                for (key, v) in rows {
+                    n.params.insert(key, serde_json::json!(v));
+                }
+                if let Some((touch, release)) = grip_edit {
+                    n.params.insert("grip_touch".into(), serde_json::json!(touch.round()));
+                    n.params.insert("grip_release".into(), serde_json::json!(release.round()));
+                }
+            }
+            ui.add_space(6.0);
+            pad_click_rows(ui, canvas, node_id, lo);
+            ui.add_space(2.0);
+            tracking_row(ui, canvas, node_id, lo.right_w);
+        });
     });
 }
 
-fn pad_click_group(
+/// One trackpad's cell, as [`trackpad_cell`] draws it.
+struct PadView<'a> {
+    /// The left pad, whose grip strip is on its left.
+    left: bool,
+    label: &'static str,
+    /// The finger, in the cell's space.
+    at: Option<[f32; 2]>,
+    trail: &'a VecDeque<Option<[f32; 2]>>,
+    /// The edge trace, by direction, in the cell's space.
+    trace: Vec<(usize, [f32; 2])>,
+    /// The calibration whose live frame (deadzone and offset) to show; none while
+    /// tracing, when the pad is shown as it comes.
+    frame: Option<&'a flexinput_engine::eval::TrackpadCal>,
+    /// The sensor's pressure, where the pad clicks on that scale, and where
+    /// click stabilisation starts.
+    pressure: f32,
+    click_at: Option<f32>,
+    hold_at: Option<f32>,
+    clicked: bool,
+    /// The grip sensor beside it: whether it senses a hand, and its touch and
+    /// release levels.
+    grip_on: bool,
+    grip: (f32, f32),
+}
+
+/// A trackpad as the thumb reaches it: the square pad, its live frame inside the
+/// outer deadzone (orange) and moved by the offset, crossed at the middle it
+/// reads; the finger and its trail, the edge trace, and around the finger its
+/// pressure against where it clicks; its grip's strip on the outer side. Returns
+/// the grip's new touch and release levels while one is dragged.
+fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Option<(f32, f32)> {
+    const STRIP_W: f32 = 12.0;
+    const MARGIN: f32 = 10.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(lo.cell_w, lo.cell_h), Sense::hover());
+    let strip_zone = STRIP_W + 2.0 * MARGIN;
+    let side = (rect.height() - 2.0 * MARGIN).min(rect.width() - strip_zone - MARGIN).max(40.0);
+    let (strip_x, pad_cx) = if v.left {
+        (rect.left() + MARGIN, (rect.left() + strip_zone + rect.right()) * 0.5)
+    } else {
+        (rect.right() - MARGIN - STRIP_W, (rect.left() + rect.right() - strip_zone) * 0.5)
+    };
+    let pad = egui::Rect::from_center_size(egui::pos2(pad_cx, rect.center().y), egui::vec2(side, side));
+    let strip = egui::Rect::from_min_max(egui::pos2(strip_x, rect.top() + MARGIN),
+        egui::pos2(strip_x + STRIP_W, rect.bottom() - MARGIN));
+    let half = side * 0.5;
+    let to_screen = |p: [f32; 2]| egui::pos2(pad.center().x + p[0] * half, pad.center().y - p[1] * half);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, Color32::from_gray(15));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)), egui::epaint::StrokeKind::Inside);
+
+    // The pad, the deadzone round its live frame, and the frame crossed at the
+    // middle it reads.
+    let round = |r: egui::Rect| r.width().min(r.height()) * 0.12;
+    let live = match v.frame {
+        Some(cal) => {
+            let [left, right, bottom, top] = cal.live();
+            painter.rect_filled(pad, round(pad), Color32::from_rgb(72, 52, 26));
+            let live = egui::Rect::from_min_max(to_screen([left, top]), to_screen([right, bottom]));
+            painter.rect_filled(live, round(live), Color32::from_gray(26));
+            live
+        }
+        None => {
+            painter.rect_filled(pad, round(pad), Color32::from_gray(26));
+            pad
+        }
+    };
+    let faint = Stroke::new(1.0_f32, Color32::from_gray(42));
+    painter.line_segment([egui::pos2(live.left(), live.center().y), egui::pos2(live.right(), live.center().y)], faint);
+    painter.line_segment([egui::pos2(live.center().x, live.top()), egui::pos2(live.center().x, live.bottom())], faint);
+    painter.rect_stroke(pad, round(pad), Stroke::new(1.0_f32, Color32::from_gray(80)), egui::epaint::StrokeKind::Inside);
+
+    // The edge trace, broken where a direction is untraced.
+    let green = Stroke::new(1.6_f32, Color32::from_rgb(80, 200, 100));
+    for pair in v.trace.windows(2) {
+        if pair[1].0 == pair[0].0 + 1 {
+            painter.line_segment([to_screen(pair[0].1), to_screen(pair[1].1)], green);
+        }
+    }
+    if let (Some(first), Some(last)) = (v.trace.first(), v.trace.last()) {
+        if first.0 == 0 && last.0 == STICK_BUCKETS - 1 {
+            painter.line_segment([to_screen(last.1), to_screen(first.1)], green);
+        }
+    }
+
+    // The finger's trail, fading, broken where it lifted.
+    let n = v.trail.len().max(1) as f32;
+    for (k, pair) in v.trail.iter().zip(v.trail.iter().skip(1)).enumerate() {
+        if let (Some(a), Some(b)) = pair {
+            let alpha = (30.0 + 170.0 * k as f32 / n) as u8;
+            painter.line_segment([to_screen(*a), to_screen(*b)],
+                Stroke::new(1.25_f32, Color32::from_rgba_unmultiplied(220, 80, 80, alpha)));
+        }
+    }
+
+    // The finger, and around it its pressure: the outer ring the sensor's full
+    // scale, the bright one where it clicks, the faint one where click
+    // stabilisation holds the pointer.
+    if let Some(p) = v.at {
+        let c = to_screen(p);
+        let full = side * PRESS_RING;
+        let radius = |f: f32| full * f.clamp(0.0, 1.0);
+        let colour = if v.clicked { ORANGE } else { FILL_LIVE };
+        painter.circle_stroke(c, full, Stroke::new(1.0_f32, Color32::from_gray(70)));
+        painter.circle_filled(c, radius(v.pressure), colour.gamma_multiply(0.3));
+        painter.circle_stroke(c, radius(v.pressure), Stroke::new(1.5_f32, colour));
+        if let Some(h) = v.hold_at {
+            painter.circle_stroke(c, radius(h), Stroke::new(1.0_f32, Color32::from_gray(130)));
+        }
+        if let Some(f) = v.click_at {
+            painter.circle_stroke(c, radius(f), Stroke::new(2.0_f32, Color32::from_gray(230)));
+        }
+        painter.circle_filled(c, 4.0, if v.clicked { ORANGE } else { Color32::from_rgb(220, 80, 80) });
+    }
+
+    // The pad's name in the corner away from its grip, lit while it clicks.
+    let (corner, align) = if v.left {
+        (rect.right_top() + egui::vec2(-8.0, 4.0), egui::Align2::RIGHT_TOP)
+    } else {
+        (rect.left_top() + egui::vec2(8.0, 4.0), egui::Align2::LEFT_TOP)
+    };
+    painter.text(corner, align, v.label, egui::FontId::proportional(20.0),
+        if v.clicked { ORANGE } else { Color32::from_gray(80) });
+    resp.on_hover_text("This trackpad as your thumb reaches it. The circle around your thumb is \
+        how hard it presses: the bright ring is where the pad clicks (with the pad's own click, \
+        learnt from your first click), the faint one where click stabilisation starts holding \
+        the pointer, the outer one the sensor's full scale.");
+
+    grip_strip(ui, strip, id.with("grip"), v.grip_on, v.grip, v.left)
+}
+
+/// A grip sensor's strip: lit while it senses a hand, with the pin where it does
+/// (its touch level) and a mark under it where it lets go (its release level),
+/// both draggable. The pad says only whether a hand is near, not how near, so
+/// the strip lights up to the pin. `pins_right`: the pins point right, toward
+/// the pad. Returns the new levels while one is dragged.
+fn grip_strip(ui: &egui::Ui, strip: egui::Rect, id: egui::Id, on: bool, (touch, release): (f32, f32), pins_right: bool) -> Option<(f32, f32)> {
+    let y_of = |level: f32| strip.bottom() - (level / GRIP_SCALE).clamp(0.0, 1.0) * strip.height();
+    let level_of = |y: f32| (strip.bottom() - y) / strip.height() * GRIP_SCALE;
+    let resp = ui.interact(strip.expand2(egui::vec2(10.0, 6.0)), id, Sense::click_and_drag());
+    let painter = ui.painter();
+    let r = strip.width() * 0.5;
+    let (touch_y, release_y) = (y_of(touch), y_of(release.min(touch)));
+    painter.rect_filled(strip, r, Color32::from_gray(32));
+    painter.rect_filled(egui::Rect::from_x_y_ranges(strip.x_range(), touch_y..=release_y), 2.0,
+        DIGITAL_LABEL_COLOR.gamma_multiply(0.22));
+    if on {
+        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(strip.left(), touch_y), strip.right_bottom()), r,
+            DIGITAL_LABEL_COLOR);
+    }
+    let (near, far, out) = if pins_right {
+        (strip.right(), strip.left(), 1.0)
+    } else {
+        (strip.left(), strip.right(), -1.0)
+    };
+    let release_head = egui::pos2(near + out * 6.0, release_y);
+    painter.line_segment([egui::pos2(far, release_y), release_head], Stroke::new(1.5_f32, DIGITAL_LABEL_COLOR.gamma_multiply(0.7)));
+    painter.circle_stroke(release_head, 3.0, Stroke::new(1.5_f32, DIGITAL_LABEL_COLOR.gamma_multiply(0.7)));
+    let touch_head = egui::pos2(near + out * 9.0, touch_y);
+    painter.line_segment([egui::pos2(far, touch_y), touch_head], Stroke::new(2.0_f32, DIGITAL_LABEL_COLOR));
+    painter.circle_filled(touch_head, 4.5, DIGITAL_LABEL_COLOR);
+    painter.circle_stroke(touch_head, 4.5, Stroke::new(1.0_f32, Color32::from_gray(30)));
+
+    let mut edit = None;
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            // Sticky: the mark nearer the press when it began stays taken.
+            let key = id.with("release");
+            let release_taken = if resp.drag_started() || resp.clicked() {
+                let taken = (p.y - release_y).abs() < (p.y - touch_y).abs();
+                ui.ctx().data_mut(|d| d.insert_temp(key, taken));
+                taken
+            } else {
+                ui.ctx().data(|d| d.get_temp::<bool>(key)).unwrap_or(false)
+            };
+            let level = level_of(p.y);
+            edit = Some(if release_taken {
+                (touch, level.clamp(GRIP_RELEASE_RANGE.0, GRIP_RELEASE_RANGE.1.min(touch)))
+            } else {
+                // The release mark goes down with the pin rather than sit over it.
+                let t = level.clamp(GRIP_TOUCH_RANGE.0, GRIP_TOUCH_RANGE.1);
+                (t, release.min(t).max(GRIP_RELEASE_RANGE.0))
+            });
+        }
+    }
+    resp.on_hover_text("This grip's sensor, lit while it senses a hand. Drag the yellow pin to set \
+        how near a hand has to come: lower reaches further. The small mark under it is where the \
+        sensor lets go again: the band between keeps a hand at the edge of its reach from \
+        flickering it. One setting covers both grips.");
+    edit
+}
+
+/// One of a trackpad's rows under its cell: a percentage, 0 shown as `zero`
+/// where it means something of its own; `label_w` keeps the sliders of a column
+/// lined up. Returns the new percentage when it changed.
+#[allow(clippy::too_many_arguments)]
+fn pad_row(
     ui: &mut egui::Ui,
-    canvas: &mut Canvas,
-    node_id: NodeId,
-    dev_id: &str,
-    live: &LiveSignals,
-) {
-    let flag = |canvas: &Canvas, key: &str| canvas.snarl.get_node(node_id)
-        .and_then(|n| n.params.get(key).and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let mut on = flag(canvas, "pad_click_on");
-    let mut release = flag(canvas, "pad_click_release");
-    let mut strong = flag(canvas, "pad_click_strong");
-    let mut tone = flag(canvas, "pad_click_tone");
-    let mut gain = read_param_f32(canvas, node_id, "pad_click_gain_db", 0.0);
-    let mut hz = read_param_f32(canvas, node_id, "pad_click_hz", automap::PAD_CLICK_HZ);
-    let mut ms = read_param_f32(canvas, node_id, "pad_click_ms", automap::PAD_CLICK_MS);
-    let mut soft = read_param_f32(canvas, node_id, "pad_click_soft", 0.0);
-    ui.label(egui::RichText::new("Trackpads").size(INSTRUCT_SIZE).strong());
-    let mut changed = false;
+    width: f32,
+    label_w: f32,
+    name: &str,
+    pct: f32,
+    max: f32,
+    zero: Option<&str>,
+    hover: &str,
+) -> Option<f32> {
+    let mut out = None;
     ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut on, egui::RichText::new("Click feedback").size(INSTRUCT_SIZE))
-            .on_hover_text("FlexInput plays a click on the trackpad as you press it. With Steam \
-                running and using the pad, Steam may play its own as well.")
-            .changed();
-        for (name, pin) in [("L", "btn_touchpad"), ("R", "btn_misc2")] {
-            let held = read_float(live, dev_id, pin) > 0.5;
-            ui.label(egui::RichText::new(name).size(INSTRUCT_SIZE).strong()
-                .color(if held { ORANGE } else { Color32::from_gray(80) }));
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let h = ui.spacing().interact_size.y;
+        let (rect, label) = ui.allocate_exact_size(egui::vec2(label_w, h), Sense::hover());
+        ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, name,
+            egui::FontId::proportional(INSTRUCT_SIZE), ORANGE);
+        label.on_hover_text(hover);
+        let dv_w = 52.0;
+        ui.spacing_mut().slider_width = (width - label_w - dv_w - 2.0 * 6.0).max(24.0);
+        let mut v = pct;
+        ui.add(egui::Slider::new(&mut v, 0.0..=max)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always))
+            .on_hover_text(hover);
+        let zero = zero.map(str::to_owned);
+        ui.add_sized([dv_w, h], egui::DragValue::new(&mut v)
+            .speed(0.5)
+            .range(0.0..=max)
+            .custom_formatter(move |v, _| match &zero {
+                Some(z) if v <= 0.0 => z.clone(),
+                _ => format!("{v:.0}%"),
+            })
+            .custom_parser(|s| s.trim().trim_end_matches('%').trim().parse().ok()));
+        if (v - pct).abs() > 1e-3 {
+            out = Some(v.clamp(0.0, max));
         }
     });
+    out
+}
+
+/// Records a touch at (`x`, `y`) toward a trackpad's edge trace: the farthest
+/// reached in its direction. A direction's bucket is centred on it, as
+/// `apply_stick_scale` reads a profile.
+fn push_tpad_edge(edges: &mut [f32; STICK_BUCKETS], x: f32, y: f32) {
+    let r = (x * x + y * y).sqrt();
+    if r < TPAD_EDGE_MIN {
+        return;
+    }
+    let turn = (y.atan2(x) / std::f32::consts::TAU + 1.0) % 1.0;
+    let b = (turn * STICK_BUCKETS as f32).round() as usize % STICK_BUCKETS;
+    edges[b] = edges[b].max(r);
+}
+
+fn traced_buckets(edges: &[f32; STICK_BUCKETS]) -> usize {
+    edges.iter().filter(|&&r| r > 0.0).count()
+}
+
+/// A trackpad's calibration profile from its edge trace: each direction's scale
+/// that takes the reach there to the square's edge. Untraced directions take
+/// their neighbours' reach.
+fn derive_tpad_profile(edges: &[f32; STICK_BUCKETS]) -> [f32; RADIAL_N] {
+    let have = edges.map(|r| r > 0.0);
+    let reach = fill_and_smooth_ring(*edges, have);
+    std::array::from_fn(|i| {
+        let a = i as f32 / RADIAL_N as f32 * std::f32::consts::TAU;
+        let to_edge = 1.0 / a.cos().abs().max(a.sin().abs());
+        if reach[i] > 0.1 { (to_edge / reach[i]).clamp(0.5, 2.5) } else { 1.0 }
+    })
+}
+
+/// The narrowest a slider's slot gets in the trackpads' wrapping rows, with its
+/// value and name; a row as wide as two takes two side by side.
+const PAD_SLOT_MIN_W: f32 = 200.0;
+/// The click style's box.
+const PAD_COMBO_W: f32 = 120.0;
+
+/// How wide each slider's slot is in a wrapping row `width` wide: half of it
+/// where two fit, else all of it.
+fn pad_slot_w(ui: &egui::Ui, width: f32) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    if width >= 2.0 * PAD_SLOT_MIN_W + gap { ((width - gap) * 0.5).floor() } else { width }
+}
+
+/// A control in a wrapping row, given exactly `w`: the row wraps by that, as it
+/// can't by a slider's or a box's own size, which takes whatever is left of the
+/// row and then runs past it.
+fn slot<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_width(w);
+        add(ui)
+    }).inner
+}
+
+/// The track a slider with its value and name gets in a slot `w` wide: the rest
+/// once the name and the widest value it shows (`widest`) are in, with room to
+/// spare, as a value can show wider than that while it's dragged.
+fn slot_slider_w(ui: &egui::Ui, w: f32, name: &str, widest: &str) -> f32 {
+    let text = |s: &str| ui.painter()
+        .layout_no_wrap(s.to_owned(), egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE).size().x;
+    let value = (text(widest) + 2.0 * ui.spacing().button_padding.x).max(ui.spacing().interact_size.x);
+    (w - text(name) - value - 2.0 * ui.spacing().item_spacing.x - 16.0).max(30.0)
+}
+
+/// The trackpads' tracking both pads share (`automap::TRACKPAD_TRACKING`, applied
+/// by the Steam Controller's reader to each report): stabilisation and click
+/// stabilisation, side by side where they fit.
+fn tracking_row(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, width: f32) {
+    let mut stabilize = read_param_f32(canvas, node_id, "tp_stabilize", automap::TRACKPAD_STABILIZE) * 100.0;
+    let mut hold = read_param_f32(canvas, node_id, "tp_click_hold", automap::TRACKPAD_CLICK_HOLD) * 100.0;
+    let mut changed: Vec<(&str, f32)> = Vec::new();
+    let w = pad_slot_w(ui, width);
+    ui.horizontal_wrapped(|ui| {
+        slot(ui, w, |ui| {
+            ui.spacing_mut().slider_width = slot_slider_w(ui, w, "Stabilisation", "100%");
+            if ui.add(egui::Slider::new(&mut stabilize, 0.0..=100.0).step_by(5.0).suffix("%").text("Stabilisation"))
+                .on_hover_text("Steadies both trackpads' tracking: a resting or slow finger stops \
+                    shaking, while a quick swipe still keeps up. Higher is steadier, and a slow move \
+                    trails a little more.")
+                .changed()
+            {
+                changed.push(("tp_stabilize", stabilize / 100.0));
+            }
+        });
+        slot(ui, w, |ui| {
+            ui.spacing_mut().slider_width = slot_slider_w(ui, w, "Click stabilisation", "100%");
+            if ui.add(egui::Slider::new(&mut hold, 0.0..=100.0).step_by(5.0)
+                    .custom_formatter(|v, _| if v <= 0.0 { "Off".into() } else { format!("{v:.0}%") })
+                    .text("Click stabilisation"))
+                .on_hover_text("Holds the pointer still while you press, from this share of the \
+                    pad's click force until a moment after you ease off, so pressing doesn't move \
+                    it. A move further than a press would roll the thumb lets go at once, so a firm \
+                    swipe or a drag still moves, and the pointer then catches up with your thumb. \
+                    At a pad's Own click force, its force is learnt from your first clicks.")
+                .changed()
+            {
+                changed.push(("tp_click_hold", hold / 100.0));
+            }
+        });
+    });
+    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+        for (key, v) in changed {
+            n.params.insert(key.into(), serde_json::json!(v));
+        }
+    }
+}
+
+/// The trackpads' click feedback: one set across both pads, or with Per pad,
+/// each pad's own under it (`automap::PAD_CLICK_PARAMS`).
+fn pad_click_rows(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, lo: Layout) {
+    let split = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("pad_click_split").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let mut per_pad = split;
+    let per_pad_box = |ui: &mut egui::Ui, per_pad: &mut bool| {
+        ui.checkbox(per_pad, egui::RichText::new("Per pad").size(INSTRUCT_SIZE))
+            .on_hover_text("Give each trackpad its own click feedback. Each starts from the \
+                shared settings, which come back when this is off.");
+    };
+    if split {
+        let spacing = ui.spacing().item_spacing.x;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = lo.scope_gap;
+            for side in 0..2 {
+                ui.vertical(|ui| {
+                    ui.set_width(lo.cell_w);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        pad_click_controls(ui, canvas, node_id, Some(side), lo.cell_w);
+                        if side == 1 {
+                            per_pad_box(ui, &mut per_pad);
+                        }
+                    });
+                });
+            }
+        });
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            pad_click_controls(ui, canvas, node_id, None, lo.right_w);
+            per_pad_box(ui, &mut per_pad);
+        });
+    }
+    if per_pad != split {
+        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+            n.params.insert("pad_click_split".into(), Value::Bool(per_pad));
+        }
+    }
+}
+
+/// One set of trackpad click feedback, inline, for a row that wraps at `width`:
+/// the shared settings, or `side`'s own (0 left, 1 right), which start from the
+/// shared.
+fn pad_click_controls(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, side: Option<usize>, width: f32) {
+    use automap::{PAD_CLICK_PARAMS, PAD_CLICK_SIDE_PARAMS};
+    let keys = side.map_or(PAD_CLICK_PARAMS, |s| PAD_CLICK_SIDE_PARAMS[s]);
+    let get = |canvas: &Canvas, k: usize| canvas.snarl.get_node(node_id).and_then(|n| {
+        n.params.get(keys[k]).or_else(|| n.params.get(PAD_CLICK_PARAMS[k])).cloned()
+    });
+    // The defaults are `feedback::apply_pad_click`'s.
+    let flag = |k: usize, default: bool| get(canvas, k).and_then(|v| v.as_bool()).unwrap_or(default);
+    let num = |k: usize, default: f32| get(canvas, k).and_then(|v| v.as_f64()).map_or(default, |v| v as f32);
+    let mut on = flag(0, automap::PAD_CLICK_ON_DEFAULT);
+    let mut release = flag(1, automap::PAD_CLICK_RELEASE_DEFAULT);
+    let mut strong = flag(2, false);
+    let mut tone = flag(3, false);
+    let mut gain = num(4, automap::PAD_CLICK_DB);
+    let mut hz = num(5, automap::PAD_CLICK_HZ);
+    let mut ms = num(6, automap::PAD_CLICK_MS);
+    let mut soft = num(7, 0.0);
+    let name = match side {
+        None => "Click feedback",
+        Some(0) => "L click feedback",
+        Some(_) => "R click feedback",
+    };
+    let mut changed = ui.checkbox(&mut on, egui::RichText::new(name).size(INSTRUCT_SIZE))
+        .on_hover_text("FlexInput plays a click on the trackpad as you press it. With Steam \
+            running and using the pad, Steam may play its own as well.")
+        .changed();
     if on {
-        changed |= ui.checkbox(&mut release, egui::RichText::new("On release too").size(INSTRUCT_SIZE)).changed();
+        changed |= ui.checkbox(&mut release, egui::RichText::new("Release").size(INSTRUCT_SIZE))
+            .on_hover_text("A softer click as you let go, too.")
+            .changed();
         let shown = if tone { "Tone" } else if strong { "Strong click" } else { "Light click" };
-        egui::ComboBox::from_id_salt((node_id, "pad_click_style"))
-            .selected_text(egui::RichText::new(shown).size(INSTRUCT_SIZE))
-            .show_ui(ui, |ui| {
-                for (name, s, t) in [("Light click", false, false), ("Strong click", true, false), ("Tone", false, true)] {
-                    if ui.selectable_label(tone == t && (t || strong == s), name).clicked() {
-                        (strong, tone) = (s, t);
-                        changed = true;
+        slot(ui, PAD_COMBO_W, |ui| {
+            egui::ComboBox::from_id_salt((node_id, "pad_click_style", side))
+                .width(PAD_COMBO_W - 8.0)
+                .selected_text(egui::RichText::new(shown).size(INSTRUCT_SIZE))
+                .show_ui(ui, |ui| {
+                    for (name, s, t) in [("Light click", false, false), ("Strong click", true, false), ("Tone", false, true)] {
+                        if ui.selectable_label(tone == t && (t || strong == s), name).clicked() {
+                            (strong, tone) = (s, t);
+                            changed = true;
+                        }
                     }
-                }
-            })
-            .response
-            .on_hover_text("Light and Strong are the pad's own built-in clicks. Tone plays the \
-                pitch, length and softness you set.");
-        ui.spacing_mut().slider_width = column_slider_width(ui);
-        changed |= ui.add(egui::Slider::new(&mut gain, -18.0..=12.0)
-            .step_by(1.0).suffix(" dB").text("Strength")).changed();
+                })
+                .response
+                .on_hover_text("Light and Strong are the pad's own built-in clicks. Tone plays the \
+                    pitch, length and softness you set.");
+        });
+        let w = pad_slot_w(ui, width);
+        changed |= slot(ui, w, |ui| {
+            ui.spacing_mut().slider_width = slot_slider_w(ui, w, "Strength", "-18.0 dB");
+            ui.add(egui::Slider::new(&mut gain, -18.0..=12.0).step_by(1.0).suffix(" dB").text("Strength")).changed()
+        });
         if tone {
-            changed |= click_tone_slider(ui, &mut hz, "Pitch");
-            changed |= click_length_slider(ui, &mut ms, "Length");
-            changed |= click_soft_slider(ui, &mut soft);
+            changed |= slot(ui, w, |ui| {
+                ui.spacing_mut().slider_width = slot_slider_w(ui, w, "Pitch", "600 Hz");
+                click_tone_slider(ui, &mut hz, "Pitch")
+            });
+            changed |= slot(ui, w, |ui| {
+                ui.spacing_mut().slider_width = slot_slider_w(ui, w, "Length", "80 ms");
+                click_length_slider(ui, &mut ms, "Length")
+            });
+            changed |= slot(ui, w, |ui| {
+                ui.spacing_mut().slider_width = slot_slider_w(ui, w, "", "100% soft");
+                click_soft_slider(ui, &mut soft)
+            });
         }
     }
     if changed {
         if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-            n.params.insert("pad_click_on".into(), Value::Bool(on));
-            n.params.insert("pad_click_release".into(), Value::Bool(release));
-            n.params.insert("pad_click_strong".into(), Value::Bool(strong));
-            n.params.insert("pad_click_gain_db".into(), serde_json::json!(gain));
-            n.params.insert("pad_click_tone".into(), Value::Bool(tone));
-            n.params.insert("pad_click_hz".into(), serde_json::json!(hz));
-            n.params.insert("pad_click_ms".into(), serde_json::json!(ms));
-            n.params.insert("pad_click_soft".into(), serde_json::json!(soft));
+            let values = [
+                Value::Bool(on), Value::Bool(release), Value::Bool(strong), Value::Bool(tone),
+                serde_json::json!(gain), serde_json::json!(hz), serde_json::json!(ms), serde_json::json!(soft),
+            ];
+            for (key, v) in keys.into_iter().zip(values) {
+                n.params.insert(key.into(), v);
+            }
         }
     }
-}
-
-/// A slider's track in a Grip and Touch column, leaving room for its number and name.
-fn column_slider_width(ui: &egui::Ui) -> f32 {
-    (ui.available_width() - 150.0).max(60.0)
 }
 
 /// The pitches a click can take.
@@ -1386,51 +2161,6 @@ pub(crate) fn click_soft_slider(ui: &mut egui::Ui, soft: &mut f32) -> bool {
         *soft = pct / 100.0;
     }
     changed
-}
-
-fn grip_sensors_group(
-    ui: &mut egui::Ui,
-    canvas: &mut Canvas,
-    node_id: NodeId,
-    dev_id: &str,
-    live: &LiveSignals,
-) {
-    let touch = read_param_f32(canvas, node_id, "grip_touch", GRIP_TOUCH_DEFAULT);
-    let release = read_param_f32(canvas, node_id, "grip_release", GRIP_RELEASE_DEFAULT);
-    let mut range = GRIP_RANGE_FLIP - touch;
-    let mut hysteresis = GRIP_HYSTERESIS_FLIP - release;
-    ui.label(egui::RichText::new("Grip sensors").size(INSTRUCT_SIZE).strong());
-    instruct_line(ui, &[(false,
-        "How far from each grip your fingers are detected. One setting covers both grips.")]);
-    ui.add_space(6.0);
-    ui.spacing_mut().slider_width = column_slider_width(ui);
-    let range_changed = ui.add(egui::Slider::new(&mut range, 25.0..=400.0).step_by(5.0).text("Sensor range"))
-        .on_hover_text("Further reaches further from the grip.").changed();
-    let hysteresis_changed = ui.add(egui::Slider::new(&mut hysteresis, 25.0..=100.0).step_by(1.0).text("Hysteresis"))
-        .on_hover_text("The extra movement needed to turn a sensor off once on. Raise it if a \
-            sensor flickers with your fingers near the edge of its range.").changed();
-    let mut reset = false;
-    ui.horizontal(|ui| {
-        reset = cal_button(ui, "Reset").clicked();
-        for (name, pin) in [("L", "btn_misc5"), ("R", "btn_misc6")] {
-            let held = read_float(live, dev_id, pin) > 0.5;
-            ui.label(egui::RichText::new(name).size(INSTRUCT_SIZE).strong()
-                .color(if held { ORANGE } else { Color32::from_gray(80) }));
-        }
-    });
-    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-        if range_changed {
-            n.params.insert("grip_touch".into(), serde_json::json!(GRIP_RANGE_FLIP - range));
-        }
-        if hysteresis_changed {
-            n.params.insert("grip_release".into(), serde_json::json!(GRIP_HYSTERESIS_FLIP - hysteresis));
-        }
-        // To the defaults rather than absent, or the pad would keep what it had.
-        if reset {
-            n.params.insert("grip_touch".into(), serde_json::json!(GRIP_TOUCH_DEFAULT));
-            n.params.insert("grip_release".into(), serde_json::json!(GRIP_RELEASE_DEFAULT));
-        }
-    }
 }
 
 /// How long a baseline capture averages the pose, in seconds — long enough to
@@ -3738,6 +4468,18 @@ fn derive_radial_profile(edges: &[f32; STICK_BUCKETS], center: [f32; 2]) -> [f32
         // so they reach the unit circle.
         if rc > radii[bin] { radii[bin] = rc; have[bin] = true; }
     }
+    let smooth = fill_and_smooth_ring(radii, have);
+    // Step 4: invert and clamp.
+    let mut scale = [1.0_f32; RADIAL_N];
+    for i in 0..RADIAL_N {
+        if smooth[i] > 0.1 { scale[i] = (1.0 / smooth[i]).clamp(0.5, 2.5); }
+    }
+    scale
+}
+
+/// Steps 2 and 3 of a radial profile: a ring of radii with the empty buckets
+/// filled from the nearest known either side, then lightly smoothed.
+fn fill_and_smooth_ring(radii: [f32; RADIAL_N], have: [bool; RADIAL_N]) -> [f32; RADIAL_N] {
     // Step 2: fill empty buckets via nearest-known interpolation around the ring.
     let mut filled: [f32; RADIAL_N] = radii;
     if have.iter().any(|h| *h) {
@@ -3763,12 +4505,7 @@ fn derive_radial_profile(edges: &[f32; STICK_BUCKETS], center: [f32; 2]) -> [f32
         let c = filled[(i + 1) % RADIAL_N];
         smooth[i] = 0.25 * a + 0.5 * b + 0.25 * c;
     }
-    // Step 4: invert and clamp.
-    let mut scale = [1.0_f32; RADIAL_N];
-    for i in 0..RADIAL_N {
-        if smooth[i] > 0.1 { scale[i] = (1.0 / smooth[i]).clamp(0.5, 2.5); }
-    }
-    scale
+    smooth
 }
 
 // ── Orientation-matrix solver ─────────────────────────────────────────────────
@@ -4082,7 +4819,7 @@ fn stick_scope(
 
 // ── Triggers section ─────────────────────────────────────────────────────────
 
-const TRIG_THRESHOLD_DEFAULT: f32 = 0.5;
+const TRIG_THRESHOLD_DEFAULT: f32 = automap::TRIGGER_DIGITAL_THRESHOLD;
 
 fn triggers_section(
     ui: &mut egui::Ui,
@@ -4157,9 +4894,36 @@ fn triggers_section(
 
     if sampling { ui.ctx().request_repaint(); }
 
+    // The trigger click's checkbox goes under the trigger arcs instead of under
+    // the text when that leaves the section shorter, by last frame's heights: the
+    // text column without it, the arcs without it, and its own.
+    let place_id = egui::Id::new(("trig_click_place", node_id));
+    let (text_h, arcs_h, click_h, was_under_arcs) =
+        ui.ctx().data(|d| d.get_temp::<(f32, f32, f32, bool)>(place_id)).unwrap_or_default();
+    let beside = (text_h + click_h).max(arcs_h);
+    let under = text_h.max(arcs_h + click_h);
+    // A few points either way before it moves, so it doesn't flick back and forth.
+    let under_arcs = if was_under_arcs { under <= beside + 4.0 } else { under + 4.0 < beside };
+    let click_part = |ui: &mut egui::Ui, canvas: &mut Canvas, click_on: &mut bool| {
+        let top = ui.min_rect().bottom();
+        if let Some(actuator) = actuator {
+            ui.add_space(8.0);
+            trigger_click_checkbox(ui, canvas, node_id, dev_id, actuator, click_on);
+            if *click_on {
+                ui.add_space(4.0);
+                instruct_line(ui, &[(false,
+                    "Drag the cyan pin to set where each trigger clicks. It moves along with the \
+                     yellow pin, and Release plays as the trigger comes back past it.")]);
+            }
+        }
+        ui.min_rect().bottom() - top
+    };
+    let (mut new_text_h, mut new_arcs_h, mut new_click_h) = (0.0, 0.0, 0.0);
+
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.set_width(lo.left_w);
+            let top = ui.min_rect().top();
             instruct_line(ui, &[
                 (true,  "Depress"),
                 (false, " and then "),
@@ -4169,72 +4933,6 @@ fn triggers_section(
                 (false, " to establish full working range."),
             ]);
             ui.add_space(8.0);
-            instruct_line(ui, &[(false,
-                "Drag the yellow pin to set the Digital output threshold for each trigger.")]);
-            // Only the source's "Digital triggers" puts the pad's digital button
-            // there (`device_cal`); without it the backend's own point stands.
-            let digital_on = canvas.snarl.get_node(node_id)
-                .and_then(|n| n.params.get("digital_triggers").and_then(|v| v.as_bool()))
-                .unwrap_or(false);
-            if !digital_on {
-                ui.add_space(4.0);
-                instruct_line(ui, &[
-                    (false, "It takes effect with "),
-                    (true, "Digital triggers"),
-                    (false, " on in this pad's node. Until then its digital button presses where \
-                             the pad itself decides, which may not be the yellow pin."),
-                ]);
-            }
-            ui.add_space(6.0);
-            let mut pct = hysteresis * 100.0;
-            if ui.add(egui::Slider::new(&mut pct, 0.0..=20.0).step_by(1.0).suffix("%").text("Hysteresis"))
-                .on_hover_text("A band around the digital trigger's point and the click's, as a share \
-                    of the trigger's full travel, however narrow its range, shown faint on the arc. \
-                    A pull from rest presses at the \
-                    point. Once down, a trigger lets go under the band's bottom, and if it hasn't \
-                    gone back to rest, presses again only past its top, so an unsteady pull at the \
-                    point doesn't flicker it. Near either end the band shifts to stay its full \
-                    width inside the travel.")
-                .changed()
-            {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("trig_hysteresis".into(), serde_json::json!(pct / 100.0));
-                }
-            }
-            let mut ms = debounce_ms;
-            if ui.add(egui::Slider::new(&mut ms, automap::TRIGGER_DEBOUNCE_MS..=50.0).step_by(1.0).suffix(" ms")
-                    .text("Debounce"))
-                .on_hover_text("How long a trigger has to stay past an edge before it counts, for \
-                    the digital trigger and the click: under the band before it lets go, and, for a \
-                    point where the band reaches rest, off rest before it presses. A shorter dip or \
-                    blip is jitter. Wherever the band has room under the point, the press stays \
-                    instant.")
-                .changed()
-            {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("trig_debounce_ms".into(), serde_json::json!(ms));
-                }
-            }
-            if adaptive.iter().any(|&a| a) {
-                ui.add_space(8.0);
-                instruct_line(ui, &[
-                    (false, "Pick each trigger's "),
-                    (true,  "default effect"),
-                    (false, ": it holds only while nothing else drives that trigger — \
-                             no game effects, no module."),
-                ]);
-            }
-            if let Some(actuator) = actuator {
-                ui.add_space(8.0);
-                trigger_click_checkbox(ui, canvas, node_id, dev_id, actuator, &mut click_on);
-                if click_on {
-                    ui.add_space(4.0);
-                    instruct_line(ui, &[(false,
-                        "Drag the cyan pin to set where each trigger clicks. It moves along with the \
-                         yellow pin, and Release plays as the trigger comes back past it.")]);
-                }
-            }
-            ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
                 if cal_button(ui, if sampling { "Stop & save" } else { "Start" }).clicked() {
                     if sampling {
@@ -4293,49 +4991,120 @@ fn triggers_section(
                     ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id)).map(|s| s.trig.r_max_obs).unwrap_or(0.0)),
                 )).size(INSTRUCT_SIZE).color(ORANGE));
             }
-        });
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let mut fx_l = adaptive[0].then(|| read_trigger_effect(canvas, node_id, "l"));
-            let mut fx_r = adaptive[1].then(|| read_trigger_effect(canvas, node_id, "r"));
-            // Each trigger widget sits under the matching vectorscope. With
-            // effect controls it spans the whole cell, the arc on its right and
-            // the controls in the room the half-circle leaves on its left;
-            // without, it is a square centered on the vectorscope's axis:
-            // [pad-left] [widget] [pad-right], so the cells remain `lo.cell_w`
-            // wide and line up with the vectorscopes above.
-            let wide = fx_l.is_some() || fx_r.is_some() || has_click;
-            let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
-            ui.add_space(pad);
-            let click = |side| actuator.map(|a| read_trigger_click(canvas, node_id, side, a, click_on));
-            let new_l = trigger_widget(ui, "L", raw_l, lt_thr, hysteresis, click("l"), lt_min, lt_max, lo, wide, fx_l.as_mut());
-            ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", raw_r, rt_thr, hysteresis, click("r"), rt_min, rt_max, lo, wide, fx_r.as_mut());
-            if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
-            if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
-            if let Some(a) = actuator {
-                // A range flag moves both pins at once: the click's offset is from
-                // the digital point as it now stands.
-                write_trigger_click(canvas, node_id, "l", a, &new_l, new_l.threshold.unwrap_or(lt_thr));
-                write_trigger_click(canvas, node_id, "r", a, &new_r, new_r.threshold.unwrap_or(rt_thr));
+            ui.add_space(10.0);
+            instruct_line(ui, &[(false,
+                "Drag the yellow pin to set the Digital output threshold for each trigger.")]);
+            // Only the source's "Digital triggers" puts the pad's digital button
+            // there (`device_cal`); without it the backend's own point stands.
+            let digital_on = canvas.snarl.get_node(node_id)
+                .and_then(|n| n.params.get("digital_triggers").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            if !digital_on {
+                ui.add_space(4.0);
+                instruct_line(ui, &[
+                    (false, "It takes effect with "),
+                    (true, "Digital triggers"),
+                    (false, " on in this pad's node. Until then its digital button presses where \
+                             the pad itself decides, which may not be the yellow pin."),
+                ]);
             }
-            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
-                if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
-                if let Some(v) = new_l.range_max { n.params.insert("ltrig_max".into(), serde_json::json!(v)); }
-                if new_l.reset_threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
-                if new_r.reset_threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
-                if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
-                if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
-                if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
+            ui.add_space(6.0);
+            let mut pct = hysteresis * 100.0;
+            if ui.add(egui::Slider::new(&mut pct, 0.0..=20.0).step_by(0.5).fixed_decimals(1).suffix("%")
+                    .text("Hysteresis"))
+                .on_hover_text("A band around the digital trigger's point and the click's, as a share \
+                    of the trigger's full travel, however narrow its range, shown faint on the arc. \
+                    A pull from rest presses at the \
+                    point. Once down, a trigger lets go under the band's bottom, and if it hasn't \
+                    gone back to rest, presses again only past its top, so an unsteady pull at the \
+                    point doesn't flicker it. Near either end the band shifts to stay its full \
+                    width inside the travel.")
+                .changed()
+            {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("trig_hysteresis".into(), serde_json::json!(pct / 100.0));
+                }
+            }
+            let mut ms = debounce_ms;
+            if ui.add(egui::Slider::new(&mut ms, automap::TRIGGER_DEBOUNCE_MS..=50.0).step_by(1.0).suffix(" ms")
+                    .text("Debounce"))
+                .on_hover_text("How long a trigger has to stay past an edge before it counts, for \
+                    the digital trigger and the click: under the band before it lets go, and, for a \
+                    point where the band reaches rest, off rest before it presses. A shorter dip or \
+                    blip is jitter. Wherever the band has room under the point, the press stays \
+                    instant.")
+                .changed()
+            {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("trig_debounce_ms".into(), serde_json::json!(ms));
+                }
+            }
+            if adaptive.iter().any(|&a| a) {
+                ui.add_space(8.0);
+                instruct_line(ui, &[
+                    (false, "Pick each trigger's "),
+                    (true,  "default effect"),
+                    (false, ": it holds only while nothing else drives that trigger — \
+                             no game effects, no module."),
+                ]);
+            }
+            new_text_h = ui.min_rect().bottom() - top;
+            if !under_arcs {
+                new_click_h = click_part(ui, canvas, &mut click_on);
+            }
+        });
+        ui.vertical(|ui| {
+            let top = ui.min_rect().top();
+            let arcs = ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let mut fx_l = adaptive[0].then(|| read_trigger_effect(canvas, node_id, "l"));
+                let mut fx_r = adaptive[1].then(|| read_trigger_effect(canvas, node_id, "r"));
+                // Each trigger widget sits under the matching vectorscope. With
+                // effect controls it spans the whole cell, the arc on its right and
+                // the controls in the room the half-circle leaves on its left;
+                // without, it is a square centered on the vectorscope's axis:
+                // [pad-left] [widget] [pad-right], so the cells remain `lo.cell_w`
+                // wide and line up with the vectorscopes above.
+                let wide = fx_l.is_some() || fx_r.is_some() || has_click;
+                let pad = if wide { 0.0 } else { ((lo.cell_w - lo.trig_w) * 0.5).max(0.0) };
+                ui.add_space(pad);
+                let click = |side| actuator.map(|a| read_trigger_click(canvas, node_id, side, a, click_on));
+                let new_l = trigger_widget(ui, "L", raw_l, lt_thr, hysteresis, click("l"), lt_min, lt_max, lo, wide, fx_l.as_mut());
+                ui.add_space(pad + lo.scope_gap + pad);
+                let new_r = trigger_widget(ui, "R", raw_r, rt_thr, hysteresis, click("r"), rt_min, rt_max, lo, wide, fx_r.as_mut());
+                if new_l.effect_changed { if let Some(fx) = &fx_l { write_trigger_effect(canvas, node_id, "l", fx); } }
+                if new_r.effect_changed { if let Some(fx) = &fx_r { write_trigger_effect(canvas, node_id, "r", fx); } }
+                if let Some(a) = actuator {
+                    // A range flag moves both pins at once: the click's offset is from
+                    // the digital point as it now stands.
+                    write_trigger_click(canvas, node_id, "l", a, &new_l, new_l.threshold.unwrap_or(lt_thr));
+                    write_trigger_click(canvas, node_id, "r", a, &new_r, new_r.threshold.unwrap_or(rt_thr));
+                }
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
+                    if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
+                    if let Some(v) = new_l.range_max { n.params.insert("ltrig_max".into(), serde_json::json!(v)); }
+                    if new_l.reset_threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
+                    if new_r.reset_threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(TRIG_THRESHOLD_DEFAULT)); }
+                    if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
+                    if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
+                    if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
+                }
+            });
+            new_arcs_h = ui.min_rect().bottom() - top;
+            if under_arcs {
+                // As wide as the arcs, its text wrapping there.
+                ui.set_max_width(arcs.response.rect.width());
+                new_click_h = click_part(ui, canvas, &mut click_on);
             }
         });
     });
+    ui.ctx().data_mut(|d| d.insert_temp(place_id, (new_text_h, new_arcs_h, new_click_h, under_arcs)));
 }
 
 /// Trigger clicks on a pad whose triggers this window doesn't calibrate: digital
 /// ones (a Switch Pro's ZL / ZR) click as they are pressed, and a pad known only
-/// through SDL clicks halfway, at the default digital point.
+/// through SDL clicks at the default digital point.
 fn trigger_haptics_section(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -4526,7 +5295,7 @@ fn read_trigger_click(canvas: &Canvas, node_id: NodeId, side: &str, actuator: au
     let edge = |edge: &str| {
         let num = |field: &str, default: f32| read_param_f32(canvas, node_id, &format!("{side}trig_{edge}_{field}"), default);
         ClickEdge {
-            gain_db: num("gain_db", if edge == "release" { automap::TRIGGER_RELEASE_DB } else { 0.0 }),
+            gain_db: num("gain_db", if edge == "release" { automap::TRIGGER_RELEASE_DB } else { automap::TRIGGER_CLICK_DB }),
             hz: num("hz", automap::TRIGGER_CLICK_HZ),
             ms: num("ms", actuator.default_ms()),
             soft: num("soft", 0.0),
@@ -5379,6 +6148,125 @@ fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
 mod unit_fmt_tests {
     use super::*;
 
+    fn params(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    // The trackpads' click feedback and tracking keep to their width, shared or
+    // per pad (each pad's in the column under it), at whatever width the window
+    // gives them.
+    #[test]
+    fn trackpad_rows_keep_to_their_columns() {
+        for (cell_w, split) in [180.0_f32, 260.0, 380.0].into_iter().flat_map(|w| [(w, true), (w, false)]) {
+            let ctx = egui::Context::default();
+            let mut canvas = Canvas::default();
+            let node = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), crate::canvas::NodeData {
+                module_id: "device.source".into(), display_name: "SC".into(), category: "".into(),
+                inputs: vec![], outputs: vec![],
+                params: params(&[("pad_click_split", Value::Bool(split)), ("pad_click_tone", Value::Bool(true))]),
+                subpatch: None, extra: Default::default(),
+            });
+            let lo = Layout {
+                left_w: 300.0, right_w: cell_w * 2.0 + 12.0, scope_gap: 12.0, cell_w, cell_h: cell_w,
+                gyro_h: 100.0, trig_w: cell_w * 0.72, trig_h: cell_w * 0.72,
+            };
+            let mut width = 0.0;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+            for _ in 0..2 {
+                let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let _ = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(lo.right_w);
+                            width = ui.scope(|ui| {
+                                pad_click_rows(ui, &mut canvas, node, lo);
+                                tracking_row(ui, &mut canvas, node, lo.right_w);
+                            }).response.rect.width();
+                        });
+                    });
+                });
+            }
+            assert!(width <= lo.right_w + 0.5, "cell {cell_w}, split {split}: {width} across {}", lo.right_w);
+        }
+    }
+
+    // Every trackpad click setting, shared and each pad's, goes with Save, Load
+    // and the default.
+    #[test]
+    fn every_trackpad_click_setting_is_saved() {
+        let side = automap::PAD_CLICK_SIDE_PARAMS.iter().flatten();
+        for key in automap::PAD_CLICK_PARAMS.iter().chain(side).chain(["pad_click_split"].iter()) {
+            assert!(CAL_FILE_KEYS.contains(key), "{key}");
+        }
+        for (key, _) in automap::TRACKPAD_TRACKING {
+            assert!(CAL_FILE_KEYS.contains(&key), "{key}");
+        }
+    }
+
+    // A trace that reaches the square's edge all round leaves a trackpad near
+    // enough as it is; one short of a corner stretches that way out to it.
+    #[test]
+    fn a_trackpad_trace_stretches_a_short_reach_out_to_the_edge() {
+        let mut edges = [0.0; STICK_BUCKETS];
+        for b in 0..STICK_BUCKETS {
+            let a = b as f32 / STICK_BUCKETS as f32 * std::f32::consts::TAU;
+            let to_edge = 1.0 / a.cos().abs().max(a.sin().abs());
+            push_tpad_edge(&mut edges, to_edge * a.cos(), to_edge * a.sin());
+        }
+        assert_eq!(traced_buckets(&edges), STICK_BUCKETS);
+        let full = derive_tpad_profile(&edges);
+        assert!(full.iter().all(|s| (s - 1.0).abs() < 0.05), "{full:?}");
+        // The top right corner reached only as far as the side's distance.
+        let corner = STICK_BUCKETS / 8;
+        edges[corner] = 1.0;
+        let short = derive_tpad_profile(&edges);
+        assert!(short[corner] > 1.15, "{}", short[corner]);
+        assert!((short[0] - full[0]).abs() < 1e-6, "the other directions keep theirs");
+        // Too near the middle to say where the edge is: no trace.
+        let mut none = [0.0; STICK_BUCKETS];
+        push_tpad_edge(&mut none, 0.2, 0.1);
+        assert_eq!(traced_buckets(&none), 0);
+    }
+
+    // A pad picked again starts from what its tab had for it: its own id first,
+    // then its type; nothing past the calibration's own keys.
+    #[test]
+    fn a_pad_picked_again_gets_its_tabs_calibration_back() {
+        let mut memory = crate::canvas::DeviceMemory::default();
+        let mine = params(&[("ltrig_digital_threshold", Value::from(0.3)), ("device_id", Value::from("x"))]);
+        let other = params(&[("ltrig_digital_threshold", Value::from(0.6))]);
+        memory.by_id.insert("sdl:generic:a".into(), calibration_of(&mine));
+        memory.by_type.insert("steam_controller".into(), calibration_of(&other));
+        assert!(!memory.by_id["sdl:generic:a"].contains_key("device_id"), "not a calibration key");
+
+        let mut fresh = params(&[("deadzone", Value::from(0.1))]);
+        start_calibration(&mut fresh, &memory, "sdl:generic:a", "steam_controller");
+        assert_eq!(fresh["ltrig_digital_threshold"], Value::from(0.3), "its own, by id");
+        assert_eq!(fresh["deadzone"], Value::from(0.1), "what the memory doesn't have stays");
+
+        let mut cabled = HashMap::new();
+        start_calibration(&mut cabled, &memory, "sdl:generic:b", "steam_controller");
+        assert_eq!(cabled["ltrig_digital_threshold"], Value::from(0.6), "its type's, by another id");
+    }
+
+    // A default keeps the preferences and leaves what was measured off the pad.
+    #[test]
+    fn a_default_leaves_out_what_was_measured_off_the_pad() {
+        let p = params(&[
+            ("trig_hysteresis", Value::from(0.02)),
+            ("ltrig_click_hz", Value::from(300.0)),
+            ("gyro_offset", serde_json::json!([0.1, 0.2, 0.3])),
+            ("lstick_center", serde_json::json!([0.01, 0.0])),
+            ("ltrig_min", Value::from(0.05)),
+        ]);
+        let d = default_from(&p);
+        assert!(d.contains_key("trig_hysteresis") && d.contains_key("ltrig_click_hz"));
+        for measured in ["gyro_offset", "lstick_center", "ltrig_min"] {
+            assert!(!d.contains_key(measured), "{measured}");
+        }
+        assert!(CAL_MEASURED_KEYS.iter().all(|k| CAL_FILE_KEYS.contains(k)), "only calibration keys");
+    }
+
     /// A range end takes the points nearer it along, keeping their raw
     /// distance from it, and pushes the far ones only on reaching them.
     #[test]
@@ -5598,7 +6486,7 @@ mod unit_fmt_tests {
         let window_rect = std::cell::Cell::new(egui::Rect::NOTHING);
         let frame = |events: Vec<egui::Event>, time: f64| {
             let raw = egui::RawInput { screen_rect: Some(screen), time: Some(time), events, ..Default::default() };
-            let mut got = (false, false);
+            let mut got = (false, false, false);
             let _ = ctx.run(raw, |ctx| {
                 let f = egui::Frame::window(&ctx.style());
                 let w = egui::Window::new(title).id(egui::Id::new("w")).frame(f)
@@ -5606,7 +6494,8 @@ mod unit_fmt_tests {
                     .show(ctx, |ui| { ui.set_min_width(500.0); ui.label("body"); })
                     .unwrap();
                 window_rect.set(w.response.rect);
-                got = cal_file_buttons(ctx, &w.response, f.inner_margin, node);
+                let c = cal_file_buttons(ctx, &w.response, f.inner_margin, node);
+                got = (c.save, c.load, c.save_default);
             });
             got
         };
@@ -5621,19 +6510,21 @@ mod unit_fmt_tests {
         assert!(width >= 500.0, "{width}");
         let load_at = egui::pos2(top.x + width - 55.0, top.y + 15.0);
         let save_at = egui::pos2(top.x + width - 100.0, top.y + 15.0);
-        let title_at = egui::pos2(top.x + width * 0.5, top.y + 15.0);
+        let default_at = egui::pos2(top.x + width - 165.0, top.y + 15.0);
+        let title_at = egui::pos2(top.x + 60.0, top.y + 15.0);
 
         let click_at = |at: egui::Pos2, t: f64| {
             let mut got = frame(vec![egui::Event::PointerMoved(at)], t);
+            let mut add = |r: (bool, bool, bool)| got = (got.0 || r.0, got.1 || r.1, got.2 || r.2);
             for (i, pressed) in [true, false].into_iter().enumerate() {
-                let r = frame(vec![click(at, pressed)], t + 0.05 * (i + 1) as f64);
-                got = (got.0 || r.0, got.1 || r.1);
+                add(frame(vec![click(at, pressed)], t + 0.05 * (i + 1) as f64));
             }
-            let r = frame(vec![], t + 0.2);
-            (got.0 || r.0, got.1 || r.1)
+            add(frame(vec![], t + 0.2));
+            got
         };
-        assert_eq!(click_at(load_at, 1.0), (false, true), "Load");
-        assert_eq!(click_at(save_at, 2.0), (true, false), "Save");
-        assert_eq!(click_at(title_at, 3.0), (false, false), "the title itself");
+        assert_eq!(click_at(load_at, 1.0), (false, true, false), "Load");
+        assert_eq!(click_at(save_at, 2.0), (true, false, false), "Save");
+        assert_eq!(click_at(default_at, 3.0), (false, false, true), "Save as default");
+        assert_eq!(click_at(title_at, 4.0), (false, false, false), "the title itself");
     }
 }

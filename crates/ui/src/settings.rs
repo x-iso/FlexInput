@@ -1061,6 +1061,9 @@ pub struct PersistedTab {
     /// so pre-config workspaces keep loading.
     #[serde(default)]
     pub config: crate::canvas::OverlayLayout,
+    /// The calibration of pads taken off the tab (`canvas::DeviceMemory`).
+    #[serde(default, skip_serializing_if = "crate::canvas::DeviceMemory::is_empty")]
+    pub device_memory: crate::canvas::DeviceMemory,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1131,6 +1134,7 @@ fn blank_tab_from_value(v: &serde_json::Value) -> PersistedTab {
         view_salt: 0,
         overlay: crate::canvas::OverlayLayout::default(),
         config: crate::canvas::OverlayLayout::default(),
+        device_memory: v.get("device_memory").cloned().and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default(),
     }
 }
 
@@ -1354,6 +1358,7 @@ mod workspace_resilience_tests {
             view_salt: 7,
             overlay: crate::canvas::OverlayLayout::default(),
             config: crate::canvas::OverlayLayout::default(),
+            device_memory: crate::canvas::DeviceMemory::default(),
         }
     }
 

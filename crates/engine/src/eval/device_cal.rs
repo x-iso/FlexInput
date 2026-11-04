@@ -107,11 +107,12 @@ pub(crate) struct DeviceCal {
     /// The right stick's own deadzone (`deadzone_r`, Calibration window), when
     /// it has one; `None` = the device's `deadzone` covers both sticks.
     rstick_dz: Option<f32>,
+    /// The trackpads' calibration, left then right, when either has any.
+    trackpads: Option<[TrackpadCal; 2]>,
 }
 
-/// Default digital-trigger threshold. Mirrors the Calibration UI's
-/// `TRIG_THRESHOLD_DEFAULT` so an uncalibrated pad snaps at the half pull.
-pub(crate) const TRIG_DIGITAL_THRESHOLD_DEFAULT: f32 = 0.5;
+/// Default digital-trigger threshold, the Calibration window's too.
+pub(crate) const TRIG_DIGITAL_THRESHOLD_DEFAULT: f32 = flexinput_core::automap::TRIGGER_DIGITAL_THRESHOLD;
 
 pub(crate) const IDENTITY_M3: [f32; 9] = [
     1.0, 0.0, 0.0,
@@ -166,6 +167,7 @@ impl Default for DeviceCal {
             trig_hysteresis:  flexinput_core::automap::TRIGGER_HYSTERESIS,
             trig_debounce:    flexinput_core::automap::trigger_debounce_secs(None),
             rstick_dz: None,
+            trackpads: None,
         }
     }
 }
@@ -295,6 +297,10 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
         trig_debounce: flexinput_core::automap::trigger_debounce_secs(
             params.get("trig_debounce_ms").and_then(|v| v.as_f64()).map(|v| v as f32)),
         rstick_dz: params.get("deadzone_r").and_then(|v| v.as_f64()).map(|v| v as f32),
+        trackpads: {
+            let pads = ["l", "r"].map(|side| TrackpadCal::from_params(params, side));
+            pads.iter().any(|p| !p.is_identity()).then_some(pads)
+        },
     }
 }
 
@@ -636,6 +642,156 @@ pub(crate) fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
             else { Signal::Vec2(v / len * (len - dz) / (1.0 - dz).max(f32::EPSILON)) }
         }
         other => other,
+    }
+}
+
+// ── Trackpads ────────────────────────────────────────────────────────────────
+//
+// Where a thumb reaches on a trackpad depends on how it lies on it: held as in
+// play, a corner or two is out of reach. The Calibration window traces each
+// pad's edge as the thumb reaches it, and `tpad_{l,r}_radial` scales each
+// direction so that reach lands on the pad's square edge. Then the outer
+// deadzone reads the band inside the edge as the edge itself, and the offset
+// moves that frame in from the pad's grip side, where a thumb moving that way
+// slides off over the edge before it gets there: the left pad's to the right,
+// the right pad's to the left.
+
+/// The touch field pins of a pad's two trackpads (a Steam Controller's): x, y,
+/// contact, left then right.
+const TRACKPAD_FIELDS: [[&str; 3]; 2] = [
+    ["touch1_x", "touch1_y", "touch1_active"],
+    ["touch2_x", "touch2_y", "touch2_active"],
+];
+
+/// One trackpad's calibration (`tpad_{side}_*` on its device.source): each
+/// direction's scale out to the square edge, the outer deadzone, and how far the
+/// live square is moved off the grip side (`+` right), each a share of the pad's
+/// half width.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackpadCal {
+    pub radial: [f32; STICK_RADIAL_BUCKETS],
+    pub deadzone: f32,
+    pub shift: f32,
+}
+
+impl Default for TrackpadCal {
+    fn default() -> Self {
+        Self { radial: [1.0; STICK_RADIAL_BUCKETS], deadzone: 0.0, shift: 0.0 }
+    }
+}
+
+/// How wide the outer deadzone can be, and how far the offset can go.
+pub const TRACKPAD_DEADZONE_MAX: f32 = 0.4;
+pub const TRACKPAD_OFFSET_MAX: f32 = 0.4;
+
+impl TrackpadCal {
+    /// A side's (`"l"` / `"r"`) calibration as a device.source's params hold it.
+    pub fn from_params(params: &HashMap<String, Value>, side: &str) -> Self {
+        let share = |key: &str, max: f32| params.get(&format!("tpad_{side}_{key}"))
+            .and_then(|v| v.as_f64()).map_or(0.0, |v| (v as f32).clamp(0.0, max));
+        let offset = share("offset", TRACKPAD_OFFSET_MAX);
+        Self {
+            radial: read_radial(params, &format!("tpad_{side}_radial")),
+            deadzone: share("deadzone", TRACKPAD_DEADZONE_MAX),
+            shift: if side == "r" { -offset } else { offset },
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A point on the pad (pad units, ±1, +y up) where calibration puts it,
+    /// still inside the pad.
+    pub fn calibrated(&self, x: f32, y: f32) -> Vec2 {
+        let (x, y) = apply_stick_scale(x, y, &self.radial);
+        Vec2::new(x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0))
+    }
+
+    /// The live square, inside the outer deadzone and moved by the offset: its
+    /// left, right, bottom and top on the calibrated pad. What lies past it reads
+    /// as the edge. Moved past the deadzone, it stops at the pad's far edge and
+    /// narrows from the grip side.
+    pub fn live(&self) -> [f32; 4] {
+        let reach = 1.0 - self.deadzone;
+        let left = (-reach + self.shift).max(-1.0);
+        let right = (reach + self.shift).min(1.0);
+        [left, right.max(left + 0.2), -reach, reach]
+    }
+
+    /// A calibrated point through the outer deadzone and the offset: the live
+    /// square's centre reads as the middle, its sides as the edges.
+    pub fn deadzoned(&self, p: Vec2) -> Vec2 {
+        let [left, right, bottom, top] = self.live();
+        let centre = Vec2::new((left + right) * 0.5, (bottom + top) * 0.5);
+        let half = Vec2::new((right - left) * 0.5, (top - bottom) * 0.5);
+        ((p - centre) / half).clamp(Vec2::splat(-1.0), Vec2::ONE)
+    }
+}
+
+/// Apply each device.source's trackpad calibration to its touch fields, once per
+/// tick: the calibrated point through the deadzone and offset.
+pub(crate) fn filter_trackpads(graph: &ProcessingGraph, sigs: &mut BusMap) {
+    for (dev, (_, _, cal)) in &device_params(graph).by_dev {
+        let Some(pads) = &cal.trackpads else { continue };
+        for (pad, [px, py, pa]) in pads.iter().zip(TRACKPAD_FIELDS) {
+            if !matches!(sigs.get_pin(dev, pa), Some(Signal::Bool(true))) {
+                continue;
+            }
+            let (Some(Signal::Float(x)), Some(Signal::Float(y))) =
+                (sigs.get_pin(dev, px).copied(), sigs.get_pin(dev, py).copied()) else { continue };
+            let q = pad.deadzoned(pad.calibrated(x, y));
+            sigs.set_pin(dev, px, Signal::Float(q.x));
+            sigs.set_pin(dev, py, Signal::Float(q.y));
+        }
+    }
+}
+
+#[cfg(test)]
+mod trackpad_tests {
+    use super::*;
+
+    fn pad(radial: f32, deadzone: f32, shift: f32) -> TrackpadCal {
+        TrackpadCal { radial: [radial; STICK_RADIAL_BUCKETS], deadzone, shift }
+    }
+
+    fn close(a: Vec2, b: Vec2) -> bool {
+        (a - b).length() < 1e-5
+    }
+
+    #[test]
+    fn calibration_scales_the_reach_out_to_the_edge_and_no_further() {
+        let p = pad(1.25, 0.0, 0.0);
+        assert!(close(p.calibrated(0.8, 0.0), Vec2::new(1.0, 0.0)));
+        assert!(close(p.calibrated(0.4, -0.4), Vec2::new(0.5, -0.5)));
+        assert_eq!(p.calibrated(0.9, 0.0), Vec2::new(1.0, 0.0), "clamped to the pad");
+    }
+
+    #[test]
+    fn the_outer_deadzone_reads_its_band_as_the_edge() {
+        let p = pad(1.0, 0.2, 0.0);
+        assert_eq!(p.live(), [-0.8, 0.8, -0.8, 0.8]);
+        assert!(close(p.deadzoned(Vec2::new(0.4, 0.0)), Vec2::new(0.5, 0.0)));
+        assert_eq!(p.deadzoned(Vec2::new(0.9, -0.95)), Vec2::new(1.0, -1.0));
+    }
+
+    // The left pad's offset moves its frame right, away from its grip: the edge
+    // comes sooner that way, the middle moves with it, up and down stay put.
+    #[test]
+    fn the_offset_moves_the_frame_off_the_grip_side() {
+        let mut params = HashMap::new();
+        params.insert("tpad_l_offset".to_string(), Value::from(0.1));
+        params.insert("tpad_l_deadzone".to_string(), Value::from(0.2));
+        params.insert("tpad_r_offset".to_string(), Value::from(0.1));
+        let (l, r) = (TrackpadCal::from_params(&params, "l"), TrackpadCal::from_params(&params, "r"));
+        assert!(close(Vec2::from_slice(&l.live()[..2]), Vec2::new(-0.7, 0.9)), "{:?}", l.live());
+        assert!(close(l.deadzoned(Vec2::new(0.1, 0.0)), Vec2::ZERO), "the middle moved right");
+        assert_eq!(l.deadzoned(Vec2::new(-0.75, 0.0)).x, -1.0, "the grip side's edge sooner");
+        assert!(close(l.deadzoned(Vec2::new(0.1, 0.4)), Vec2::new(0.0, 0.5)));
+        // With no deadzone to move into, the far side stays at the pad's edge.
+        assert!(close(Vec2::from_slice(&r.live()[..2]), Vec2::new(-1.0, 0.9)), "{:?}", r.live());
+        assert!(close(r.deadzoned(Vec2::new(-1.0, 0.0)), Vec2::new(-1.0, 0.0)));
+        assert!(close(r.deadzoned(Vec2::new(0.9, 0.0)), Vec2::new(1.0, 0.0)));
     }
 }
 

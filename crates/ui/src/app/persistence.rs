@@ -29,6 +29,7 @@ impl FlexInputApp {
                 view_salt: t.view_salt,
                 overlay,
                 config,
+                device_memory: t.canvas.device_memory.clone(),
             }
         }).collect();
         PersistedWorkspace {

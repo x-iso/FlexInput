@@ -536,6 +536,57 @@ mod trigger_tests {
         assert!((v.y - 0.3).abs() < 1e-4, "a 30% pull should push the stick 30%, got {}", v.y);
     }
 
+    // A trackpad click on an Analog card passes its press from the first touch,
+    // on a pad that reports one; on a pad that doesn't, it drives full while
+    // clicked, as any button there does.
+    #[test]
+    fn remapper_analog_pad_click_passes_its_press() {
+        let graph = curve_remap_graph(serde_json::json!({
+            "in": ["btn_touchpad"], "out": ["right_trigger"], "mode": "analog",
+        }));
+        let run = |pins: &[(&str, Signal)]| {
+            let sigs: HashMap<(String, String), Signal> = pins.iter()
+                .map(|(p, s)| (("gilrs:switch_pro:0".to_string(), p.to_string()), *s))
+                .collect();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &sigs, 0.016, &mut out);
+            sinkv(&out, "right_trigger").map(|s| s.as_float()).unwrap_or(0.0)
+        };
+        let v = run(&[("btn_touchpad", Signal::Bool(false)), ("touch1_pressure", Signal::Float(0.4))]);
+        assert!((v - 0.4).abs() < 1e-4, "pressing toward the click: {v}");
+        assert_eq!(run(&[("btn_touchpad", Signal::Bool(true))]), 1.0, "no press reported: full while clicked");
+        assert_eq!(run(&[("btn_touchpad", Signal::Bool(false))]), 0.0);
+    }
+
+    // A device's trackpads read through their deadzone and offset: the left
+    // pad's frame moved right, off its grip side, the right pad's left; a pad
+    // not touched is left as it is.
+    #[test]
+    fn trackpads_read_through_their_deadzone_and_offset() {
+        let dev = "sdl:generic:sc";
+        let mut src = source_node(1, dev, 0.0);
+        src.params.insert("tpad_l_offset".into(), Value::from(0.1));
+        src.params.insert("tpad_l_deadzone".into(), Value::from(0.2));
+        src.params.insert("tpad_r_offset".into(), Value::from(0.2));
+        src.params.insert("tpad_r_deadzone".into(), Value::from(0.2));
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
+        let mut sigs = BusMap::default();
+        for (field, x, on) in [("touch1", 0.1, true), ("touch2", -0.2, true)] {
+            sigs.set_pin(dev, &format!("{field}_x"), Signal::Float(x));
+            sigs.set_pin(dev, &format!("{field}_y"), Signal::Float(0.4));
+            sigs.set_pin(dev, &format!("{field}_active"), Signal::Bool(on));
+        }
+        filter_trackpads(&graph, &mut sigs);
+        let x = |field: &str| sigs.get_pin(dev, &format!("{field}_x")).map(|s| s.as_float()).unwrap_or(9.0);
+        assert!(x("touch1").abs() < 1e-5 && x("touch2").abs() < 1e-5, "each frame's middle: {} {}", x("touch1"), x("touch2"));
+        let y = sigs.get_pin(dev, "touch1_y").map(|s| s.as_float()).unwrap_or(9.0);
+        assert!((y - 0.5).abs() < 1e-5, "up and down through the deadzone alone: {y}");
+        sigs.set_pin(dev, "touch1_active", Signal::Bool(false));
+        sigs.set_pin(dev, "touch1_x", Signal::Float(0.3));
+        filter_trackpads(&graph, &mut sigs);
+        assert_eq!(sigs.get_pin(dev, "touch1_x"), Some(&Signal::Float(0.3)), "untouched: as it was");
+    }
+
     // Manual threshold on an analog→digital mapping: PLAIN HOLD above the
     // line (steady across ticks — no tap train), release the moment the
     // shaped value dips below.
@@ -1689,6 +1740,32 @@ mod trigger_tests {
             assert!(!getb(&c, "btn_south") && getb(&c, "btn_east"),
                 "no hold: crossing switches to the new zone");
         }
+    }
+
+    // A zone's Analog card onto a trigger takes the finger's press there, the
+    // pad's own trigger still counting; with no finger in it, the trigger passes.
+    #[test]
+    fn touch_zones_analog_trigger_follows_the_press() {
+        let mut snap = empty_node(1, "module.touch_zones");
+        snap.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        snap.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_click"],"out":["right_trigger"],"mode":"analog"},
+        ]));
+        let run = |active: bool, press: f32, own: f32| {
+            let mut m = BusMap::default();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(active));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.0));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m.insert(("pad".into(), "touch1_pressure".into()), Signal::Float(press));
+            m.insert(("pad".into(), "right_trigger".into()), Signal::Float(own));
+            let mut c = BusMap::default();
+            eval_touch_zones_map_node(&snap, 1, &m, &mut c, &mut HashMap::new(), 0.016);
+            c.get(&("touchmap:1".to_string(), "right_trigger".to_string())).map(|s| s.as_float())
+        };
+        assert_eq!(run(true, 0.6, 0.0), Some(0.6), "pressing short of the click");
+        assert_eq!(run(true, 0.2, 0.5), Some(0.5), "the pad's own trigger past it");
+        assert_eq!(run(false, 0.0, 0.3), None, "no finger: passes through");
     }
 
     // Hold with an ANALOG origin zone: the analog output holds AND a button
@@ -3536,18 +3613,18 @@ mod trigger_tests {
         pad.params.insert("trig_click_on".into(), Value::Bool(true));
         pad.params.insert("rtrig_release_on".into(), Value::Bool(true));
         let out = fb_tick(vec![pad], &BusMap::default());
-        // Each point and the band around it, 3% of the full travel whatever the
+        // Each point and the band around it, 2% of the full travel whatever the
         // range: 0.75 of 0.2..0.6 is 0.5, and the full range's 0.5 - 0.1 is 0.4.
         // A pull from rest presses at the point, again past the top, lets go
         // under the bottom for the debounce.
         let at = |pin: &str, want: f32| (pad_value(&out, FB_DS, pin) - want).abs() < 1e-4;
         assert!(at("trig_click_l", 0.5), "{}", pad_value(&out, FB_DS, "trig_click_l"));
-        assert!(at("trig_top_l", 0.515), "{}", pad_value(&out, FB_DS, "trig_top_l"));
-        assert!(at("trig_rearm_l", 0.485));
+        assert!(at("trig_top_l", 0.51), "{}", pad_value(&out, FB_DS, "trig_top_l"));
+        assert!(at("trig_rearm_l", 0.49));
         assert!(at("trig_rest_l", 0.2));
         assert!(at("trig_click_r", 0.4));
-        assert!(at("trig_top_r", 0.415));
-        assert!(at("trig_rearm_r", 0.385));
+        assert!(at("trig_top_r", 0.41));
+        assert!(at("trig_rearm_r", 0.39));
         assert!(at("trig_rest_r", 0.0));
         assert!(at("trig_hold_l", 0.004) && at("trig_hold_r", 0.004));
         assert!(at("trig_press_l", 1.0) && at("trig_press_r", 1.0));
@@ -3584,9 +3661,13 @@ mod trigger_tests {
         }).collect()
     }
 
+    /// A pad with its trigger clicks on, at full strength unless `params` say.
     fn clicking(dev: &str, pins: &[&str], params: &[(&str, Value)]) -> NodeSnap {
         let mut pad = fb_pad(1, dev, pins, None);
         pad.params.insert("trig_click_on".into(), Value::Bool(true));
+        for side in ["l", "r"] {
+            pad.params.insert(format!("{side}trig_click_gain_db"), Value::from(0.0));
+        }
         for (key, v) in params {
             pad.params.insert(key.to_string(), v.clone());
         }
@@ -3599,9 +3680,14 @@ mod trigger_tests {
     fn an_hd_pad_plays_a_trigger_click_on_its_own_side_for_its_length() {
         let f = Signal::Float;
         let steps = [f(0.0), f(0.6), f(0.7), f(0.8), f(0.9), f(0.0)];
-        let pad = || clicking(FB_DS, FB_DS_PINS, &[]);
+        let pad = || clicking(FB_DS, FB_DS_PINS, &[("ltrig_click_ms", Value::from(20.0))]);
         assert_eq!(click_run(pad(), "left_trigger", &steps, "hd_l_amp"), [0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
             "20 ms at full, from where it passes the threshold");
+        let mut stock = clicking(FB_DS, FB_DS_PINS, &[]);
+        stock.params.remove("ltrig_click_gain_db");
+        let amp = click_run(stock, "left_trigger", &steps, "hd_l_amp");
+        let full = 10f32.powf(flexinput_core::automap::TRIGGER_CLICK_DB / 20.0);
+        assert_eq!(amp, [0.0, full, 0.0, 0.0, 0.0, 0.0], "-5 dB for 5 ms by default: within the tick");
         assert_eq!(click_run(pad(), "left_trigger", &steps, "hd_r_amp"), [0.0; 6], "not the other side");
         let freq = click_run(pad(), "left_trigger", &steps, "hd_l_freq")[1];
         let want = (flexinput_core::automap::TRIGGER_CLICK_HZ - 80.0) / 420.0;
@@ -3614,16 +3700,18 @@ mod trigger_tests {
     #[test]
     fn a_trigger_release_click_plays_on_the_way_back() {
         let f = Signal::Float;
-        let steps = [f(0.0), f(0.9), f(0.9), f(0.9), f(0.1), f(0.1), f(0.1)];
+        let steps = [f(0.0), f(0.9), f(0.9), f(0.9), f(0.0), f(0.0), f(0.0)];
         let release = [
             ("rtrig_release_on", Value::Bool(true)), ("rtrig_release_gain_db", Value::from(-20.0)),
-            ("rtrig_release_ms", Value::from(10.0)),
+            ("rtrig_release_ms", Value::from(10.0)), ("rtrig_click_ms", Value::from(20.0)),
         ];
         let amp = click_run(clicking(FB_DS, FB_DS_PINS, &release), "right_trigger", &steps, "hd_r_amp");
         assert_eq!(amp[..5], [0.0, 1.0, 1.0, 0.0, 0.0]);
         assert!((amp[5] - 0.1).abs() < 1e-6, "-20 dB for 10 ms: {amp:?}");
         assert_eq!(amp[6], 0.0);
-        let pad = clicking(FB_DS, FB_DS_PINS, &[("rtrig_release_gain_db", Value::from(-20.0))]);
+        let pad = clicking(FB_DS, FB_DS_PINS, &[
+            ("rtrig_release_gain_db", Value::from(-20.0)), ("rtrig_click_ms", Value::from(20.0)),
+        ]);
         assert_eq!(click_run(pad, "right_trigger", &steps, "hd_r_amp"), [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             "off unless asked");
         let mut quiet_press = release.to_vec();
@@ -3660,20 +3748,56 @@ mod trigger_tests {
         assert_eq!(click_run(off, "left_trigger", &[f(0.0), f(1.0)], "rumble_strong"), [0.0, 0.0], "off");
     }
 
-    // Click feedback goes out as one mode value, and only while it is on.
+    // Click feedback goes out as each pad's mode value, while it is on: from the
+    // start, light, on release too, at -7 dB; and only to a pad with trackpad
+    // clicks. Split per pad, each side takes its own settings, else the shared.
     #[test]
     fn pad_click_feedback_reaches_the_pad_as_its_mode_bits() {
-        use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_STRONG};
-        let mut pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
-        pad.params.insert("pad_click_strong".into(), Value::Bool(true));
+        use flexinput_core::automap::{PAD_CLICK_DB, PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
+        let mode = |out: &TickOutput, side: &str| pad_value(out, FB_DS, &format!("pad_click_mode_{side}"));
+        let mut pad = fb_pad(1, FB_DS, &steam_pins(), Some(FB_VIRT));
         let out = fb_tick(vec![pad.clone()], &BusMap::default());
-        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "pad_click_mode".to_string())));
+        for side in ["l", "r"] {
+            assert_eq!(mode(&out, side), (PAD_CLICK_ON | PAD_CLICK_ON_RELEASE) as f32, "on by default");
+            assert_eq!(pad_value(&out, FB_DS, &format!("pad_click_gain_{side}")), PAD_CLICK_DB);
+        }
+        pad.params.insert("pad_click_on".into(), Value::Bool(false));
+        let out = fb_tick(vec![pad.clone()], &BusMap::default());
+        assert!(!out.sink_outputs.contains_key(&(FB_DS.to_string(), "pad_click_mode_l".to_string())), "off");
         pad.params.insert("pad_click_on".into(), Value::Bool(true));
+        pad.params.insert("pad_click_release".into(), Value::Bool(false));
+        pad.params.insert("pad_click_strong".into(), Value::Bool(true));
         pad.params.insert("pad_click_gain_db".into(), Value::from(-6.0));
+        let out = fb_tick(vec![pad.clone()], &BusMap::default());
+        assert_eq!(mode(&out, "r"), (PAD_CLICK_ON | PAD_CLICK_STRONG) as f32);
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_gain_r"), -6.0);
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_hz_l"), flexinput_core::automap::PAD_CLICK_HZ);
+        // A side's own settings count only split, and it falls back to the shared.
+        pad.params.insert("pad_click_on_r".into(), Value::Bool(false));
+        pad.params.insert("pad_click_gain_db_l".into(), Value::from(-12.0));
+        let out = fb_tick(vec![pad.clone()], &BusMap::default());
+        assert_eq!(mode(&out, "r"), (PAD_CLICK_ON | PAD_CLICK_STRONG) as f32, "not split");
+        pad.params.insert("pad_click_split".into(), Value::Bool(true));
         let out = fb_tick(vec![pad], &BusMap::default());
-        assert_eq!(pad_value(&out, FB_DS, "pad_click_mode"), (PAD_CLICK_ON | PAD_CLICK_STRONG) as f32);
-        assert_eq!(pad_value(&out, FB_DS, "pad_click_gain"), -6.0);
-        assert_eq!(pad_value(&out, FB_DS, "pad_click_hz"), flexinput_core::automap::PAD_CLICK_HZ);
+        assert_eq!((mode(&out, "l"), mode(&out, "r")), ((PAD_CLICK_ON | PAD_CLICK_STRONG) as f32, 0.0));
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_gain_l"), -12.0);
+        assert_eq!(pad_value(&out, FB_DS, "pad_click_gain_r"), -6.0, "the shared one");
+        let other = fb_tick(vec![fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT))], &BusMap::default());
+        assert!(!other.sink_outputs.contains_key(&(FB_DS.to_string(), "pad_click_mode_l".to_string())),
+            "a pad without trackpad clicks gets none");
+    }
+
+    // Each trackpad's click force reaches the pad on its own pin, and one saved
+    // for both pads at once still counts for a pad without its own.
+    #[test]
+    fn each_trackpads_click_force_reaches_the_pad() {
+        let mut pad = fb_pad(1, FB_DS, &steam_pins(), Some(FB_VIRT));
+        pad.params.insert("tp_click_force".into(), Value::from(0.4));
+        pad.params.insert("tp_click_force_r".into(), Value::from(0.6));
+        let out = fb_tick(vec![pad], &BusMap::default());
+        assert!((pad_value(&out, FB_DS, "tp_click_force_l") - 0.4).abs() < 1e-6);
+        assert!((pad_value(&out, FB_DS, "tp_click_force_r") - 0.6).abs() < 1e-6);
+        assert!((pad_value(&out, FB_DS, "tp_click_hold") - flexinput_core::automap::TRACKPAD_CLICK_HOLD).abs() < 1e-6);
     }
 
     // A click's shape reaches a pad that plays those clicks, and not one that
@@ -6885,7 +7009,7 @@ mod area_mapper_tests {
         let mut state = HashMap::new();
         let settle = 20; // ticks at DT, past the settling time
         let tick = |v: Vec2, state: &mut _| run(&n, &stick(v), state).0;
-        let mut quiet = |v: Vec2, state: &mut _, what: &str| {
+        let quiet = |v: Vec2, state: &mut _, what: &str| {
             for _ in 0..settle {
                 assert!(!tick(v, state).contains_key(&key), "{what}");
             }

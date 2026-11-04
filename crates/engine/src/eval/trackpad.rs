@@ -7,6 +7,12 @@
 //! `scroll_move_*` pins), a tap clicks (two-finger tap = right click), and
 //! the pad's click is a left click (right with two fingers down).
 //!
+//! A pad whose two touch fields are two trackpads (a Steam Controller,
+//! `automap::TOUCH_PADS_PIN`) splits the work between them instead: the right
+//! pad moves the pointer and its click is the left button, the left pad scrolls
+//! both ways and its click is the right button, and both clicked together are
+//! the middle button. No taps there: a thumb rests on those pads.
+//!
 //! Touch coordinates are the canonical pin range: [-1, 1] across the pad, +Y
 //! at the top (see the SDL / native DualSense backends).
 
@@ -28,12 +34,19 @@ const TAP_PULSE_S: f64 = 0.03;
 /// sink bus publishes one tick per wakeup, so a release sent for a single tick
 /// can be skipped and leave a button stuck down.
 const RELEASE_S: f64 = 0.1;
+/// On two pads, how long a pad's click waits for the other's, which together
+/// are the middle button. A click let go sooner plays as a pulse.
+const CHORD_S: f64 = 0.17;
 
 /// One tick of touchpad input.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TouchFrame {
     pub fingers: [Option<Vec2>; 2],
     pub click: bool,
+    /// The fields are two trackpads: `fingers[0]` and `click` the left one,
+    /// `fingers[1]` and `click2` the right.
+    pub split: bool,
+    pub click2: bool,
 }
 
 /// What the trackpad asks of the sink this tick.
@@ -45,11 +58,25 @@ pub(crate) struct TrackpadOut {
     pub scroll: Vec2,
     pub left: bool,
     pub right: bool,
+    pub middle: bool,
 }
 
 /// Which button a held pad click presses.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ClickButton { Left, Right }
+
+/// Two pads' clicks: each pad's own button, or the middle for both.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Chord {
+    #[default]
+    Up,
+    /// A pad clicked, waiting for the other: (the pad, seconds since).
+    Waiting(usize, f64),
+    /// A pad's own button, until that pad lets go.
+    One(usize),
+    /// Both: the middle button, until both let go.
+    Both,
+}
 
 /// Gesture state across ticks. Clocks are f64: they add `dt` for as long as a
 /// finger stays down.
@@ -68,6 +95,9 @@ pub struct TrackpadState {
     tap_left_s: f64,
     tap_right_s: f64,
     click: Option<ClickButton>,
+    /// On two pads: their clicks, and seconds left on each pad's click pulse.
+    chord: Chord,
+    pad_pulse_s: [f64; 2],
     /// Seconds since routing turned off (see `release`).
     off_s: f64,
 }
@@ -82,6 +112,8 @@ impl TrackpadState {
         self.session_clicked = true;
         self.tap_left_s = 0.0;
         self.tap_right_s = 0.0;
+        self.chord = Chord::Up;
+        self.pad_pulse_s = [0.0; 2];
         let out = self.step(&TouchFrame::default(), dt, true);
         self.off_s = off_s;
         Some(out)
@@ -92,6 +124,9 @@ impl TrackpadState {
     pub(crate) fn step(&mut self, f: &TouchFrame, dt: f32, natural: bool) -> TrackpadOut {
         self.off_s = 0.0;
         let dt = dt as f64;
+        if f.split {
+            return self.step_split(f, dt, natural);
+        }
         let count = f.fingers.iter().filter(|p| p.is_some()).count();
         let same_fingers = f.fingers.iter().zip(&self.prev).all(|(a, b)| a.is_some() == b.is_some());
         let mut out = TrackpadOut::default();
@@ -154,6 +189,47 @@ impl TrackpadState {
         self.tap_right_s = (self.tap_right_s - dt).max(0.0);
         out
     }
+
+    /// One tick on two pads (see the module's note): pad 0 the left, which
+    /// scrolls and whose click is the right button; pad 1 the right, which
+    /// points and whose click is the left button.
+    fn step_split(&mut self, f: &TouchFrame, dt: f64, natural: bool) -> TrackpadOut {
+        let mut out = TrackpadOut::default();
+        // Each pad moves only while its finger stays down: one landing is no motion.
+        if let (Some(now), Some(was)) = (f.fingers[0], self.prev[0]) {
+            let s = (now - was) * SCROLL_NOTCHES_PER_UNIT;
+            out.scroll = if natural { -s } else { s };
+        }
+        if let (Some(now), Some(was)) = (f.fingers[1], self.prev[1]) {
+            out.pointer = (now - was) * POINTER_PX_PER_UNIT;
+        }
+        self.prev = f.fingers;
+
+        let down = [f.click, f.click2];
+        self.chord = match self.chord {
+            _ if down == [true, true] && !matches!(self.chord, Chord::One(_)) => Chord::Both,
+            Chord::Up => match down.iter().position(|d| *d) {
+                Some(pad) => Chord::Waiting(pad, 0.0),
+                None => Chord::Up,
+            },
+            Chord::Waiting(pad, _) if !down[pad] => {
+                // Let go before the other came: still a click of its own.
+                self.pad_pulse_s[pad] = TAP_PULSE_S;
+                Chord::Up
+            }
+            Chord::Waiting(pad, s) if s + dt >= CHORD_S => Chord::One(pad),
+            Chord::Waiting(pad, s) => Chord::Waiting(pad, s + dt),
+            Chord::One(pad) if down[pad] => Chord::One(pad),
+            Chord::Both if down != [false, false] => Chord::Both,
+            _ => Chord::Up,
+        };
+        let button = |pad: usize| self.chord == Chord::One(pad) || self.pad_pulse_s[pad] > 0.0;
+        out.right = button(0);
+        out.left = button(1);
+        out.middle = self.chord == Chord::Both;
+        self.pad_pulse_s = self.pad_pulse_s.map(|s| (s - dt).max(0.0));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -163,10 +239,10 @@ mod tests {
     const DT: f32 = 0.001;
 
     fn one(x: f32, y: f32) -> TouchFrame {
-        TouchFrame { fingers: [Some(Vec2::new(x, y)), None], click: false }
+        TouchFrame { fingers: [Some(Vec2::new(x, y)), None], ..Default::default() }
     }
     fn two(x: f32, y: f32) -> TouchFrame {
-        TouchFrame { fingers: [Some(Vec2::new(x - 0.2, y)), Some(Vec2::new(x + 0.2, y))], click: false }
+        TouchFrame { fingers: [Some(Vec2::new(x - 0.2, y)), Some(Vec2::new(x + 0.2, y))], ..Default::default() }
     }
     fn none() -> TouchFrame { TouchFrame::default() }
 
@@ -261,6 +337,64 @@ mod tests {
         let mut st = TrackpadState::default();
         let o = st.step(&press(two(0.0, 0.0)), DT, true);
         assert!(o.right && !o.left, "two fingers down = right click");
+    }
+
+    /// Two pads: (left pad's finger, right pad's finger), and each pad's click.
+    fn pads(left: Option<(f32, f32)>, right: Option<(f32, f32)>, clicks: [bool; 2]) -> TouchFrame {
+        let at = |p: Option<(f32, f32)>| p.map(|(x, y)| Vec2::new(x, y));
+        TouchFrame { fingers: [at(left), at(right)], click: clicks[0], split: true, click2: clicks[1] }
+    }
+
+    /// On two pads the right one points and the left one scrolls, both at once,
+    /// and neither taps.
+    #[test]
+    fn two_pads_point_with_the_right_and_scroll_with_the_left() {
+        let mut st = TrackpadState::default();
+        let frames: Vec<_> = (0..=100)
+            .map(|i| pads(Some((0.0, i as f32 * 0.005)), Some((i as f32 * 0.005, 0.0)), [false; 2]))
+            .collect();
+        let (p, s, ..) = run(&mut st, &frames);
+        assert!((p.x - 0.5 * POINTER_PX_PER_UNIT).abs() < 1e-2 && p.y == 0.0, "{p}");
+        assert!((s.y + 0.5 * SCROLL_NOTCHES_PER_UNIT).abs() < 1e-3 && s.x == 0.0, "natural: {s}");
+        let mut st = TrackpadState::default();
+        let mut frames = vec![pads(Some((0.1, 0.1)), Some((0.1, 0.1)), [false; 2]); 50];
+        frames.extend([pads(None, None, [false; 2]); 5]);
+        let (_, _, l, r) = run(&mut st, &frames);
+        assert!(!l && !r, "no taps on two pads");
+    }
+
+    /// The right pad's click is the left button and the left pad's the right,
+    /// each once it hasn't been joined by the other; both are the middle.
+    #[test]
+    fn two_pads_click_left_right_and_both_middle() {
+        let held = |st: &mut TrackpadState, clicks: [bool; 2], ticks: usize| {
+            let mut last = TrackpadOut::default();
+            for _ in 0..ticks {
+                last = st.step(&pads(None, None, clicks), DT, true);
+            }
+            last
+        };
+        let mut st = TrackpadState::default();
+        let o = held(&mut st, [false, true], 150);
+        assert!(!o.left, "waits for the other pad, 170 ms");
+        let o = held(&mut st, [false, true], 30);
+        assert!(o.left && !o.right && !o.middle, "then the right pad's is the left button");
+        assert!(!held(&mut st, [false; 2], 1).left);
+
+        let mut st = TrackpadState::default();
+        held(&mut st, [true, false], 150);
+        let o = held(&mut st, [true, true], 1);
+        assert!(o.middle && !o.left && !o.right, "both within the wait: middle");
+        let o = held(&mut st, [true, false], 50);
+        assert!(o.middle, "until both let go");
+        assert!(!held(&mut st, [false; 2], 1).middle);
+
+        // A click let go before the wait is over still clicks, as a pulse.
+        let mut st = TrackpadState::default();
+        held(&mut st, [true, false], 20);
+        let o = held(&mut st, [false; 2], 1);
+        assert!(o.right && !o.left, "the left pad's click is the right button");
+        assert!(!held(&mut st, [false; 2], 100).right, "and the pulse ends");
     }
 
     /// Turning routing off mid-click releases the button for long enough to

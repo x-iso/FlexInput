@@ -38,9 +38,7 @@ pub(crate) fn collect_touch_misc_suppressed(
 ) {
     for (_, n) in snarl.nodes_ids_data() {
         let node = &n.value;
-        if node.module_id == "device.source"
-            && node.params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(false)
-        {
+        if node.module_id == "device.source" && crate::canvas::viewer::touch_misc_suppressed(&node.params) {
             if let Some(id) = node.params.get("device_id").and_then(|v| v.as_str()) {
                 out.insert(id.to_string());
             }

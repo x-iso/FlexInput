@@ -176,6 +176,8 @@ struct Report {
     sticks: [i16; 4],
     /// Each pad's x and y, left then right.
     pads: [[i16; 2]; 2],
+    /// Each pad's pressure, left then right: 32768 is SDL's 1.
+    pressure: [u16; 2],
     imu: Imu,
 }
 
@@ -193,6 +195,7 @@ fn parse(buf: &[u8]) -> Option<Input> {
     match id {
         REPORT_STATE | REPORT_STATE_BLE | REPORT_STATE_TIMESTAMP if d.len() >= STATE_LEN => {
             let i16_at = |o: usize| i16::from_le_bytes([d[o], d[o + 1]]);
+            let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
             // The timestamped report has the trackpads' own timestamp ahead of
             // them, and a 16-bit IMU timestamp in place of 32: the IMU itself
             // sits where it does in the other.
@@ -208,6 +211,7 @@ fn parse(buf: &[u8]) -> Option<Input> {
                 triggers: [i16_at(5), i16_at(7)],
                 sticks: [i16_at(9), i16_at(11), i16_at(13), i16_at(15)],
                 pads: [[i16_at(pad), i16_at(pad + 2)], [i16_at(pad + 6), i16_at(pad + 8)]],
+                pressure: [u16_at(pad + 4), u16_at(pad + 10)],
                 imu: Imu {
                     stamp,
                     accel: [i16_at(33), i16_at(35), i16_at(37)],
@@ -291,6 +295,206 @@ fn state_pins(out: &mut Vec<(String, String, Signal)>, dev: &str, report: &Repor
     }
 }
 
+// ── Trackpad tracking ─────────────────────────────────────────────────────────
+
+/// Stabilisation's filter: an adaptive low-pass (the 1€ filter) that smooths a
+/// slow or resting finger and opens up as it moves, so jitter goes while a swipe
+/// keeps up. Its cutoff at rest, in Hz, at the least and the most stabilisation.
+const STABILIZE_CUTOFF_HZ: (f32, f32) = (25.0, 1.0);
+/// How much the cutoff opens per pad unit a second of finger speed.
+const STABILIZE_BETA: f32 = 4.0;
+/// The speed estimate's own cutoff.
+const STABILIZE_SPEED_HZ: f32 = 1.0;
+/// A click of the set force lets go below this share of it.
+const CLICK_RELEASE: f32 = 0.85;
+/// Click stabilisation keeps the pointer held this long past the press easing
+/// off, while the finger settles.
+const CLICK_SETTLE: Duration = Duration::from_millis(80);
+/// How far, in pad units (1 = half the pad), a press may roll the finger and
+/// still be held: past it the move is meant, and the hold lets go, so a firm
+/// swipe or a click-drag moves.
+const HOLD_REACH: f32 = 0.15;
+/// The finger travel, in pad units, over which the gap a hold leaves between
+/// the point and the finger closes by e⁻¹: the point catches up as the finger
+/// moves on, and still reaches every edge.
+const CATCH_UP: f32 = 0.15;
+
+/// The 1€ filter over a 2-D position, in pad units.
+#[derive(Clone, Copy, Debug)]
+struct Stabilizer {
+    out: Vec2,
+    raw: Vec2,
+    speed: Vec2,
+}
+
+impl Stabilizer {
+    fn new(at: Vec2) -> Self {
+        Self { out: at, raw: at, speed: Vec2::ZERO }
+    }
+
+    fn step(&mut self, raw: Vec2, dt: f32, min_cutoff: f32) -> Vec2 {
+        let alpha = |cutoff: f32| {
+            let tau = 1.0 / (std::f32::consts::TAU * cutoff);
+            1.0 / (1.0 + tau / dt)
+        };
+        let speed = (raw - self.raw) / dt;
+        self.raw = raw;
+        self.speed += (speed - self.speed) * alpha(STABILIZE_SPEED_HZ);
+        self.out += (raw - self.out) * alpha(min_cutoff + STABILIZE_BETA * self.speed.length());
+        self.out
+    }
+}
+
+/// The trackpads' tracking settings, as the engine sends them
+/// (`automap::TRACKPAD_TRACKING`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrackingConfig {
+    stabilize: f32,
+    /// Each pad's, left then right.
+    click_force: [f32; 2],
+    click_hold: f32,
+}
+
+impl Default for TrackingConfig {
+    fn default() -> Self {
+        use flexinput_core::automap::{TRACKPAD_CLICK_FORCE, TRACKPAD_CLICK_HOLD, TRACKPAD_STABILIZE};
+        Self { stabilize: TRACKPAD_STABILIZE, click_force: [TRACKPAD_CLICK_FORCE; 2], click_hold: TRACKPAD_CLICK_HOLD }
+    }
+}
+
+impl TrackingConfig {
+    /// Takes a pin of these; false for any other.
+    fn set(&mut self, pin: &str, v: f32) -> bool {
+        let v = v.clamp(0.0, 1.0);
+        match pin {
+            "tp_stabilize" => self.stabilize = v,
+            "tp_click_force_l" => self.click_force[0] = v,
+            "tp_click_force_r" => self.click_force[1] = v,
+            "tp_click_hold" => self.click_hold = v,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// One trackpad between reports.
+#[derive(Clone, Copy, Debug, Default)]
+struct PadTrack {
+    filter: Option<Stabilizer>,
+    /// The position last handed on, in pad units.
+    out: Option<Vec2>,
+    /// What is handed on less the filtered finger, after a hold: the pointer
+    /// goes on from where the hold kept it, rather than jump, and closes the gap
+    /// as the finger moves on ([`CATCH_UP`]).
+    offset: Vec2,
+    /// Held here while the press builds, until `settle` after it eases; and
+    /// the finger when the hold began.
+    held: Option<Vec2>,
+    hold_from: Option<Vec2>,
+    settle: Option<Instant>,
+    /// The finger moved past [`HOLD_REACH`] in this press: no hold until it eases.
+    moved_on: bool,
+    /// The filtered finger last report.
+    last_smooth: Option<Vec2>,
+    /// Down by the set force.
+    clicked: bool,
+    /// The pressure the pad's own click was seen to set at, learnt from its
+    /// clicks, and whether its click was down last report.
+    own_force: Option<f32>,
+    own_down: bool,
+    last: Option<Instant>,
+}
+
+/// Both trackpads' tracking: what [`TrackingConfig`] makes of each report's
+/// pads, in place, before anything reads them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tracking {
+    config: TrackingConfig,
+    pads: [PadTrack; 2],
+}
+
+impl Tracking {
+    /// A pad's press: its pressure over the force it clicks at, the set one or
+    /// its own click's once seen (until then the sensor's whole scale), and 1
+    /// from there on.
+    fn press(&self, i: usize, pressure: f32) -> f32 {
+        let set = self.config.click_force[i];
+        let force = if set > 0.0 { Some(set) } else { self.pads[i].own_force };
+        (pressure / force.unwrap_or(1.0).max(0.01)).clamp(0.0, 1.0)
+    }
+
+    fn process(&mut self, r: &mut Report, now: Instant) {
+        const BITS: [(u32, u32); 2] = [(bit::LEFT_PAD_TOUCH, bit::LEFT_PAD_CLICK), (bit::RIGHT_PAD_TOUCH, bit::RIGHT_PAD_CLICK)];
+        let c = self.config;
+        for (i, (touch, click)) in BITS.into_iter().enumerate() {
+            let t = &mut self.pads[i];
+            let p = f32::from(r.pressure[i]) / 32768.0;
+            // The pad's own click: where it sets, learnt, so click stabilisation
+            // has a force to go by when no force is set.
+            let own = r.buttons & click != 0;
+            if own && !t.own_down {
+                t.own_force = Some(t.own_force.map_or(p, |f| f + (p - f) * 0.3));
+            }
+            t.own_down = own;
+            // A set force takes the click over from the pad's own.
+            let set_force = c.click_force[i];
+            let clicked = if set_force > 0.0 {
+                t.clicked = p >= if t.clicked { set_force * CLICK_RELEASE } else { set_force };
+                r.buttons = if t.clicked { r.buttons | click } else { r.buttons & !click };
+                t.clicked
+            } else {
+                own
+            };
+            if r.buttons & touch == 0 {
+                *t = PadTrack { own_force: t.own_force, own_down: t.own_down, ..Default::default() };
+                continue;
+            }
+            let raw = Vec2::new(f32::from(r.pads[i][0]), f32::from(r.pads[i][1])) / 32768.0;
+            let dt = t.last.map_or(0.004, |l| now.duration_since(l).as_secs_f32()).clamp(0.0005, 0.025);
+            t.last = Some(now);
+            let smooth = if c.stabilize > 0.0 {
+                let (least, most) = STABILIZE_CUTOFF_HZ;
+                let min_cutoff = least * (most / least).powf(c.stabilize);
+                t.filter.get_or_insert(Stabilizer::new(raw)).step(raw, dt, min_cutoff)
+            } else {
+                raw
+            };
+            // The gap a hold left, closing as the finger moves.
+            let moved = t.last_smooth.map_or(0.0, |l| (smooth - l).length());
+            t.last_smooth = Some(smooth);
+            t.offset *= (-moved / CATCH_UP).exp();
+            // Click stabilisation: still from the set share of the click's force,
+            // within reach of where the press began.
+            let force = if set_force > 0.0 { Some(set_force) } else { t.own_force };
+            let pressing = c.click_hold > 0.0 && (clicked || force.is_some_and(|f| p >= f * c.click_hold));
+            if !pressing {
+                t.moved_on = false;
+            }
+            if pressing && !t.moved_on {
+                t.settle = Some(now + CLICK_SETTLE);
+            }
+            if t.settle.is_some_and(|s| now < s)
+                && (smooth - *t.hold_from.get_or_insert(smooth)).length() > HOLD_REACH
+            {
+                t.moved_on = pressing;
+                t.settle = None;
+            }
+            let out = if t.settle.is_some_and(|s| now < s) {
+                *t.held.get_or_insert(t.out.unwrap_or(smooth + t.offset))
+            } else {
+                if let Some(h) = t.held.take() {
+                    t.offset = h - smooth;
+                }
+                t.hold_from = None;
+                smooth + t.offset
+            };
+            t.out = Some(out);
+            let raw_of = |v: f32| (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            r.pads[i] = [raw_of(out.x), raw_of(out.y)];
+        }
+    }
+}
+
 // ── Slots ─────────────────────────────────────────────────────────────────────
 
 /// One pad slot: a dongle has four, a wired pad one. Shared by the slot's reader
@@ -323,6 +527,8 @@ struct SlotState {
     imu_moved: Option<Instant>,
     /// State reports since the last poll.
     reports: u32,
+    /// The trackpads' tracking, applied to each report as it comes.
+    tracking: Tracking,
 }
 
 impl Slot {
@@ -344,7 +550,8 @@ impl Slot {
         let mut s = self.lock();
         match input {
             Input::Link(up) => s.connected = up,
-            Input::State(r) => {
+            Input::State(mut r) => {
+                s.tracking.process(&mut r, Instant::now());
                 s.connected = true;
                 s.held |= r.buttons;
                 s.reports += 1;
@@ -617,7 +824,7 @@ impl DeviceBackend for SteamControllerBackend {
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
         let mut out = Vec::new();
         for pad in &mut self.pads {
-            let (report, buttons, imu, reports) = {
+            let (report, buttons, imu, reports, own_force, pressure, press) = {
                 let mut s = pad.slot.lock();
                 if !s.connected {
                     continue;
@@ -625,7 +832,14 @@ impl DeviceBackend for SteamControllerBackend {
                 pad.samples.clear();
                 std::mem::swap(&mut pad.samples, &mut s.samples);
                 let buttons = std::mem::take(&mut s.held) | s.report.buttons;
-                (s.report, buttons, s.imu, std::mem::take(&mut s.reports))
+                let own_force = s.tracking.pads.map(|t| t.own_force);
+                // A pad untouched presses nothing, whatever its sensor says.
+                let pressure: [f32; 2] = std::array::from_fn(|i| {
+                    let touched = s.report.buttons & [bit::LEFT_PAD_TOUCH, bit::RIGHT_PAD_TOUCH][i] != 0;
+                    if touched { f32::from(s.report.pressure[i]) / 32768.0 } else { 0.0 }
+                });
+                let press = [0, 1].map(|i| s.tracking.press(i, pressure[i]));
+                (s.report, buttons, s.imu, std::mem::take(&mut s.reports), own_force, pressure, press)
             };
             let dev = pad.dev_id.as_str();
             if reports > 0 {
@@ -640,6 +854,18 @@ impl DeviceBackend for SteamControllerBackend {
             if pad.capacitive_mask != 0 {
                 out.push((dev.to_owned(), flexinput_core::automap::CAPACITIVE_MASK_PIN.into(),
                           Signal::Float(f32::from(pad.capacitive_mask))));
+            }
+            // Its touch fields are its two trackpads, not two fingers on one.
+            out.push((dev.to_owned(), flexinput_core::automap::TOUCH_PADS_PIN.into(), Signal::Float(2.0)));
+            // The trackpads' press; and their pressure and where their own click
+            // sets, for the Calibration window.
+            for i in 0..2 {
+                use flexinput_core::automap::{TOUCH_OWN_FORCE_PINS, TOUCH_PRESSURE_PINS, TOUCH_RAW_PRESSURE_PINS};
+                out.push((dev.to_owned(), TOUCH_PRESSURE_PINS[i].into(), Signal::Float(press[i])));
+                out.push((dev.to_owned(), TOUCH_RAW_PRESSURE_PINS[i].into(), Signal::Float(pressure[i])));
+                if let Some(f) = own_force[i] {
+                    out.push((dev.to_owned(), TOUCH_OWN_FORCE_PINS[i].into(), Signal::Float(f)));
+                }
             }
             // Each report since the last poll through the spike filter as one,
             // and the poll gets their mean, as the SDL path did.
@@ -663,6 +889,10 @@ impl DeviceBackend for SteamControllerBackend {
 
     fn send(&mut self, device_id: &str, pin_id: &str, signal: Signal) {
         let Some(pad) = self.pads.iter_mut().find(|p| p.dev_id == device_id) else { return };
+        // The trackpads' tracking, which the reader applies to each report.
+        if pin_id.starts_with("tp_") && pad.slot.lock().tracking.config.set(pin_id, signal.as_float()) {
+            return;
+        }
         if let Some(h) = pad.haptics.as_mut() {
             // Full resolution: a trigger click's position is raw travel, and its
             // gain is in dB.
@@ -790,6 +1020,108 @@ mod tests {
         let rad = 1000.0f32.to_radians();
         assert_eq!(n[..3], sdl_gyro_normalized([rad, 0.0, 0.0]));
         assert_eq!(n[3..], sdl_accel_normalized([0.0, 0.0, 9.806_65]));
+    }
+
+    /// A report with the left pad touched at `x` (pad units) and `pressure`.
+    fn touched(x: f32, pressure: f32, own_click: bool) -> Report {
+        let buttons = bit::LEFT_PAD_TOUCH | if own_click { bit::LEFT_PAD_CLICK } else { 0 };
+        Report {
+            buttons,
+            pads: [[(x * 32768.0) as i16, 0], [0, 0]],
+            pressure: [(pressure * 32768.0) as u16, 0],
+            ..Default::default()
+        }
+    }
+
+    /// Runs `reports` 4 ms apart: each one's left pad x and click bit after.
+    fn track(t: &mut Tracking, reports: &[Report]) -> Vec<(f32, bool)> {
+        let start = Instant::now();
+        reports.iter().enumerate().map(|(i, r)| {
+            let mut r = *r;
+            t.process(&mut r, start + Duration::from_millis(4 * i as u64));
+            (f32::from(r.pads[0][0]) / 32768.0, r.buttons & bit::LEFT_PAD_CLICK != 0)
+        }).collect()
+    }
+
+    // Stabilisation takes the jitter off a resting finger and keeps up with a swipe.
+    #[test]
+    fn stabilisation_steadies_a_resting_finger_and_follows_a_swipe() {
+        let mut t = Tracking { config: TrackingConfig { stabilize: 1.0, click_force: [0.0; 2], click_hold: 0.0 }, ..Default::default() };
+        let jitter: Vec<_> = (0..200).map(|i| touched(if i % 2 == 0 { 0.02 } else { -0.02 }, 0.1, false)).collect();
+        let out = track(&mut t, &jitter);
+        let spread = out[100..].iter().map(|(x, _)| x.abs()).fold(0.0f32, f32::max);
+        assert!(spread < 0.005, "±0.02 of jitter held to {spread}");
+        let mut t = Tracking { config: TrackingConfig { stabilize: 1.0, ..Default::default() }, ..Default::default() };
+        let swipe: Vec<_> = (0..60).map(|i| touched(-0.6 + i as f32 * 0.02, 0.1, false)).collect();
+        let (x, _) = *track(&mut t, &swipe).last().unwrap();
+        assert!((x - 0.58).abs() < 0.08, "a fast swipe keeps up: {x}");
+        let mut off = Tracking { config: TrackingConfig { stabilize: 0.0, click_hold: 0.0, ..Default::default() }, ..Default::default() };
+        assert!((track(&mut off, &[touched(0.3, 0.1, false)])[0].0 - 0.3).abs() < 1e-4, "off: as it comes");
+    }
+
+    // A set force takes the click from the pad's own, and lets go a little under.
+    #[test]
+    fn a_set_click_force_clicks_by_pressure() {
+        let mut t = Tracking { config: TrackingConfig { stabilize: 0.0, click_force: [0.5; 2], click_hold: 0.0 }, ..Default::default() };
+        let clicks: Vec<bool> = track(&mut t, &[
+            touched(0.0, 0.3, true), touched(0.0, 0.55, false), touched(0.0, 0.45, false), touched(0.0, 0.4, false),
+        ]).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(clicks, [false, true, true, false], "the pad's own bit is ignored; under 85% lets go");
+        // Unset, the pad's own click stands, and where it set is learnt.
+        let mut t = Tracking { config: TrackingConfig { click_force: [0.0; 2], ..Default::default() }, ..Default::default() };
+        let clicks: Vec<bool> = track(&mut t, &[touched(0.0, 0.7, true)]).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(clicks, [true]);
+        assert!(t.pads[0].own_force.is_some_and(|f| (f - 0.7).abs() < 1e-3), "{:?}", t.pads[0].own_force);
+    }
+
+    // The press is 1 at the click: the set force, else the pad's own once seen,
+    // else the sensor's whole scale.
+    #[test]
+    fn the_press_reaches_one_where_the_pad_clicks() {
+        let mut t = Tracking { config: TrackingConfig { click_force: [0.4, 0.0], ..Default::default() }, ..Default::default() };
+        assert!((t.press(0, 0.2) - 0.5).abs() < 1e-6);
+        assert_eq!(t.press(0, 0.6), 1.0, "past the click, held at 1");
+        assert!((t.press(1, 0.2) - 0.2).abs() < 1e-6, "the right pad's force is its own");
+        assert!(t.config.set("tp_click_force_r", 0.8));
+        assert!((t.press(1, 0.2) - 0.25).abs() < 1e-6);
+        t.config.click_force = [0.0; 2];
+        assert!((t.press(0, 0.2) - 0.2).abs() < 1e-6, "no click seen yet");
+        t.pads[0].own_force = Some(0.8);
+        assert!((t.press(0, 0.2) - 0.25).abs() < 1e-6);
+        assert!((t.press(1, 0.2) - 0.2).abs() < 1e-6, "each pad its own");
+    }
+
+    // Click stabilisation holds the pointer as the press builds, then goes on
+    // from there, without a jump, once it has eased off and settled.
+    #[test]
+    fn click_stabilisation_holds_the_pointer_through_a_press() {
+        let mut t = Tracking { config: TrackingConfig { stabilize: 0.0, click_force: [0.5; 2], click_hold: 0.6 }, ..Default::default() };
+        let mut reports = vec![touched(0.0, 0.1, false)];
+        // Pressing from 0.3 (60% of 0.5): the finger rolls 0.1 under the force.
+        reports.extend((0..10).map(|i| touched(i as f32 * 0.01, 0.6, false)));
+        // Eased off, still rolling, then 80 ms of settle and on.
+        reports.extend((0..40).map(|i| touched(0.1 + i as f32 * 0.001, 0.1, false)));
+        let out = track(&mut t, &reports);
+        assert!(out[1..11].iter().all(|(x, _)| x.abs() < 1e-4), "held at 0 through the press");
+        assert!(out[11..30].iter().all(|(x, _)| x.abs() < 1e-4), "and through the settle");
+        let (last, _) = out[49];
+        assert!(last > 0.0 && last < 0.06, "then on from there, not from 0.1: {last}");
+    }
+
+    // A move past the hold's reach is meant: a firm swipe moves, the gap the
+    // hold left closes as the finger goes on, and every edge is still reached.
+    #[test]
+    fn a_meant_move_breaks_the_hold_and_the_point_catches_up() {
+        let mut t = Tracking { config: TrackingConfig { stabilize: 0.0, click_force: [0.5; 2], click_hold: 0.6 }, ..Default::default() };
+        let mut reports = vec![touched(0.0, 0.1, false)];
+        // A firm press, then a swipe right while still pressing.
+        reports.extend((0..60).map(|i| touched(i as f32 * 0.02, 0.4, false)));
+        let out = track(&mut t, &reports);
+        assert!(out[1..6].iter().all(|(x, _)| x.abs() < 1e-4), "held while within reach");
+        let (x, _) = out[30];
+        assert!(x > 0.3, "the swipe moves the point: {x}");
+        let (x, _) = out[60];
+        assert!((x - 1.0).abs() < 0.03, "and it reaches the edge with the finger: {x}");
     }
 
     // Presses between polls are kept, the link reports turn the slot on and off,

@@ -1057,7 +1057,7 @@ fn digital_trigger_toggle(
         }
         resp.on_hover_text(
             "Make the analog triggers act digital: each snaps to a full pull once it \
-             crosses the digital threshold set in Calibration (default: half pull), \
+             crosses the digital threshold set in Calibration (default: 10% of the pull), \
              and 0 below it. The LT/RT digital buttons follow the same threshold. \
              Output stays analog-typed, so it still drives analog wires at full/zero.",
         );
@@ -1072,8 +1072,8 @@ fn touch_misc_toggle(
     params: &mut HashMap<String, Value>,
     enabled: bool,
 ) {
-    use crate::canvas::viewer::{CAPACITIVE_HOVER, CAPACITIVE_LABEL};
-    let mut checked = params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(false);
+    use crate::canvas::viewer::{touch_misc_suppressed, CAPACITIVE_HOVER, CAPACITIVE_LABEL};
+    let mut checked = touch_misc_suppressed(params);
     ui.add_space(2.0);
     ui.add_enabled_ui(enabled, |ui| {
         let resp = ui.checkbox(&mut checked, egui::RichText::new(CAPACITIVE_LABEL).size(11.0));
@@ -1147,6 +1147,7 @@ pub(crate) fn toggle_source(
 
     if let Some((id, _, _)) = active.iter().find(|(_, d, _)| d == &device.id) {
         if capacity > 1 {
+            canvas.remember_device_source(*id);
             canvas.snarl.remove_node(*id);
             super::layout::reposition_io_nodes(canvas);
         }
@@ -1156,6 +1157,8 @@ pub(crate) fn toggle_source(
     let held: Vec<(&str, usize)> = active.iter().map(|(_, d, p)| (d.as_str(), *p)).collect();
     let (evict, port) = place_new_source(&held, capacity, |d| connected.iter().any(|c| c.id == d));
     if let Some(i) = evict {
+        // Its calibration stays with the tab, for when it's picked again.
+        canvas.remember_device_source(active[i].0);
         canvas.snarl.remove_node(active[i].0);
     }
 

@@ -770,9 +770,10 @@ pub(crate) fn show_remapper_body(
                                 //
                                 // The same test gates the Analog press mode:
                                 // without an analog input there is no
-                                // magnitude to pass on.
+                                // magnitude to pass on. A trackpad click's is
+                                // its press.
                                 let card_analog = in_pins.iter()
-                                    .any(|p| flexinput_engine::pin_is_analog_input(p));
+                                    .any(|p| flexinput_engine::pin_allows_analog_mode(p));
                                 // The in / out rows open the picker on that
                                 // side of this card; the row it is changing
                                 // now is ringed.
@@ -1300,7 +1301,7 @@ pub(crate) fn show_map_action_body(
                             |ui| {
                                 // Analog press mode only with an analog input.
                                 let card_analog = in_pins.iter()
-                                    .any(|p| flexinput_engine::pin_is_analog_input(p));
+                                    .any(|p| flexinput_engine::pin_allows_analog_mode(p));
                                 // Its one row is its input: a click opens the
                                 // picker on it.
                                 let row_edit = RowEdit::one_row(crate::kbm_picker::PickStage::Input,

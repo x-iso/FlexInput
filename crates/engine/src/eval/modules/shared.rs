@@ -158,8 +158,12 @@ pub(crate) fn analog_in_value(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     if let Some(v) = whole_stick_value(upstream, pin_id) {
         return Some(v.length().min(1.0));
     }
-    if matches!(pin_id, "left_trigger" | "right_trigger") {
+    if matches!(pin_id, "left_trigger" | "right_trigger") || is_press_pin(pin_id) {
         return Some(upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0));
+    }
+    // A trackpad click on a pad that reports its press: that press.
+    if let Some(s) = flexinput_core::automap::click_pressure_pin(pin_id).and_then(|p| upstream.get(p)) {
+        return Some(sig_scalar(*s).clamp(0.0, 1.0));
     }
     if let Some(v) = note_value(upstream, pin_id) {
         return Some(v);
@@ -225,11 +229,25 @@ fn midi_analog_in(pin_id: &str) -> Option<flexinput_core::midi::MidiPin> {
 pub fn pin_is_analog_input(pin_id: &str) -> bool {
     analog_axis_for_cardinal(pin_id).is_some()
         || matches!(pin_id, "left_trigger" | "right_trigger")
+        || is_press_pin(pin_id)
         || midi_analog_in(pin_id).is_some()
         // A note is a gate AND a value (its aftertouch).
         || flexinput_core::midi::parse_pin(pin_id).is_some_and(|p| p.note_companions().is_some())
         || is_imu_pin(pin_id)
         || whole_stick_axes(pin_id).is_some()
+}
+
+/// A trackpad's press (`automap::TOUCH_PRESSURE_PINS`).
+fn is_press_pin(pin_id: &str) -> bool {
+    flexinput_core::automap::TOUCH_PRESSURE_PINS.contains(&pin_id)
+}
+
+/// Whether a card on this input may take the Analog press mode: an analog input,
+/// or a trackpad click, whose press is its analog side on a pad that reports one
+/// (elsewhere it drives full, as any button there does). Only the press mode:
+/// everywhere else a click stays the button it is.
+pub fn pin_allows_analog_mode(pin_id: &str) -> bool {
+    pin_is_analog_input(pin_id) || flexinput_core::automap::click_pressure_pin(pin_id).is_some()
 }
 
 /// A whole stick's axis pins, for `left_stick` / `right_stick`.
@@ -302,7 +320,7 @@ pub(crate) fn derive_imu_pins(upstream: &mut PinSigs, est: &mut ImuEstimator, dt
 /// Action's legacy bare pin list).
 pub fn card_allows_analog_mode(card: &Value) -> bool {
     let pins = card.get("in").and_then(|v| v.as_array()).or_else(|| card.as_array());
-    pins.is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(pin_is_analog_input))
+    pins.is_some_and(|a| a.iter().filter_map(|v| v.as_str()).any(pin_allows_analog_mode))
 }
 
 /// Synthetic Remapper/Lean OUTPUT pins that drive the virtual touchpad rather

@@ -236,6 +236,77 @@ pub const CAPACITIVE_MASK_PIN: &str = "__capacitive_misc";
 /// UI's live signals only, and like [`CAPACITIVE_MASK_PIN`] no real pin.
 pub const CAPACITIVE_LEARN_MUTE_PIN: &str = "__capacitive_learn_mute";
 
+/// Synthetic per-device signal from a pad whose two touch fields are two
+/// touchpads of their own (a Steam Controller: `touch1` the left, `touch2` the
+/// right), rather than two fingers on one; any value. Published by the backend,
+/// like [`CAPACITIVE_MASK_PIN`], and no real pin.
+pub const TOUCH_PADS_PIN: &str = "__touch_pads";
+
+/// A trackpad's press, left then right on a Steam Controller: 0 untouched, 1 at
+/// the force it clicks at (the set click force, else its own click's, once seen),
+/// and held there past it. Real pins, on the bus like a trigger.
+pub const TOUCH_PRESSURE_PINS: [&str; 2] = ["touch1_pressure", "touch2_pressure"];
+/// The same pads' pressure as the sensor gives it (0–1, SDL's scale), and the
+/// force their own click was seen to take, once it has clicked: for the
+/// Calibration window, like [`CAPACITIVE_MASK_PIN`] no real pins.
+pub const TOUCH_RAW_PRESSURE_PINS: [&str; 2] = ["__touch1_pressure", "__touch2_pressure"];
+pub const TOUCH_OWN_FORCE_PINS: [&str; 2] = ["__touch1_own_force", "__touch2_own_force"];
+
+/// The press pin that is a trackpad click's analog side, on a pad that has one:
+/// the left pad's click (and the zone clicks made of it) and the right's. A
+/// mapping in the Analog press mode reads the press through it.
+pub fn click_pressure_pin(pin: &str) -> Option<&'static str> {
+    match pin {
+        "btn_touchpad" | "touchpad_left" | "touchpad_center" | "touchpad_right" | "touchpad_any" => {
+            Some(TOUCH_PRESSURE_PINS[0])
+        }
+        "btn_touchpad2" | "btn_misc2" => Some(TOUCH_PRESSURE_PINS[1]),
+        _ => None,
+    }
+}
+
+/// A Steam Controller's trackpad tracking until set otherwise (Calibration
+/// window): stabilisation, 0 off to 1 the most (`tp_stabilize`); each pad's
+/// click force, 0 = the pad's own click (`tp_click_force_l` / `_r`, which fall
+/// back to the `tp_click_force` both had before); and click stabilisation,
+/// holding the pointer from this share of the click's force, 0 off
+/// (`tp_click_hold`). The backend takes them on pins of the same names.
+pub const TRACKPAD_STABILIZE: f32 = 0.5;
+pub const TRACKPAD_CLICK_FORCE: f32 = 0.0;
+pub const TRACKPAD_CLICK_HOLD: f32 = 0.6;
+/// Each of those settings: its param (and pin) and its stock value.
+pub const TRACKPAD_TRACKING: [(&str, f32); 4] = [
+    ("tp_stabilize", TRACKPAD_STABILIZE),
+    ("tp_click_force_l", TRACKPAD_CLICK_FORCE),
+    ("tp_click_force_r", TRACKPAD_CLICK_FORCE),
+    ("tp_click_hold", TRACKPAD_CLICK_HOLD),
+];
+
+/// A trackpad's click feedback settings (Calibration window) as device-node
+/// params: on, on release too, strong, tone, strength (dB), pitch, length and
+/// softness. With `pad_click_split` on, each pad has its own under the same name
+/// plus `_l` / `_r`, falling back to the shared one where it has none.
+pub const PAD_CLICK_PARAMS: [&str; 8] = [
+    "pad_click_on", "pad_click_release", "pad_click_strong", "pad_click_tone",
+    "pad_click_gain_db", "pad_click_hz", "pad_click_ms", "pad_click_soft",
+];
+pub const PAD_CLICK_SIDE_PARAMS: [[&str; 8]; 2] = [
+    [
+        "pad_click_on_l", "pad_click_release_l", "pad_click_strong_l", "pad_click_tone_l",
+        "pad_click_gain_db_l", "pad_click_hz_l", "pad_click_ms_l", "pad_click_soft_l",
+    ],
+    [
+        "pad_click_on_r", "pad_click_release_r", "pad_click_strong_r", "pad_click_tone_r",
+        "pad_click_gain_db_r", "pad_click_hz_r", "pad_click_ms_r", "pad_click_soft_r",
+    ],
+];
+/// What carries each pad's click feedback to the backend: the mode bits below,
+/// the strength in dB, pitch, length and softness, left then right.
+pub const PAD_CLICK_PINS: [[&str; 5]; 2] = [
+    ["pad_click_mode_l", "pad_click_gain_l", "pad_click_hz_l", "pad_click_ms_l", "pad_click_soft_l"],
+    ["pad_click_mode_r", "pad_click_gain_r", "pad_click_hz_r", "pad_click_ms_r", "pad_click_soft_r"],
+];
+
 /// What a Steam Controller's pad clicks and sensors are: `(full name, picker cell
 /// name)`. They have one name on the bus, as they mean other things on other pads.
 /// SDL's mapping puts the left pad's click on `touchpad`, the right's on `misc2`.
@@ -247,6 +318,8 @@ pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static s
         "btn_misc4" => Some(("Cap sens R", "Cap R")),
         "btn_misc5" => Some(("Grip sens L", "Grip L")),
         "btn_misc6" => Some(("Grip sens R", "Grip R")),
+        "touch1_pressure" => Some(("Pad press L", "Press L")),
+        "touch2_pressure" => Some(("Pad press R", "Press R")),
         _ => None,
     }
 }
@@ -261,12 +334,25 @@ pub const PAD_CLICK_TONE: u8 = 8;
 
 // What a click plays until set otherwise: its pitch in Hz and its length in ms.
 // Shorter feels sharper, longer softer.
-pub const TRIGGER_CLICK_HZ: f32 = 170.0;
-pub const TRIGGER_CLICK_MS: f32 = 20.0;
+/// A trigger click's pitch and length until set otherwise: high and short, which
+/// a hand holding the gyro still feels least in its aim.
+pub const TRIGGER_CLICK_HZ: f32 = 300.0;
+pub const TRIGGER_CLICK_MS: f32 = 5.0;
+/// Where a trigger's digital point sits until set otherwise, on the calibrated
+/// trigger: early in the pull, the arc's 10% mark.
+pub const TRIGGER_DIGITAL_THRESHOLD: f32 = 0.1;
 pub const PAD_CLICK_HZ: f32 = 200.0;
 pub const PAD_CLICK_MS: f32 = 12.0;
-/// A trigger's release click, until set otherwise, is this much softer than its press.
-pub const TRIGGER_RELEASE_DB: f32 = -6.0;
+/// A trackpad's click feedback until set otherwise: on, on release too, the pad's
+/// light click at this strength.
+pub const PAD_CLICK_ON_DEFAULT: bool = true;
+pub const PAD_CLICK_RELEASE_DEFAULT: bool = true;
+pub const PAD_CLICK_DB: f32 = -7.0;
+/// A trigger click's strength until set otherwise: under full, where it starts to
+/// shake the gyro's aim.
+pub const TRIGGER_CLICK_DB: f32 = -5.0;
+/// A trigger's release click, until set otherwise, is 6 dB softer than its press.
+pub const TRIGGER_RELEASE_DB: f32 = TRIGGER_CLICK_DB - 6.0;
 /// What a trigger click lasts on a pad with rumble motors only, until set
 /// otherwise: a motor needs about that long to spin up enough to be felt.
 pub const TRIGGER_CLICK_RUMBLE_MS: f32 = 50.0;
@@ -384,7 +470,7 @@ pub fn click_envelope(t: f32, soft: f32) -> f32 {
 /// How wide the band around a trigger's point is, as a share of its range, until
 /// set otherwise (Calibration window, `trig_hysteresis`): so a finger resting on
 /// the point, or an unsteady pull, doesn't flicker it.
-pub const TRIGGER_HYSTERESIS: f32 = 0.03;
+pub const TRIGGER_HYSTERESIS: f32 = 0.02;
 
 /// How long a trigger stays under its band before it lets go, and off rest
 /// before a point the band can't guard presses, in ms, until set otherwise
@@ -760,6 +846,10 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     // mouse_move. +Y scrolls up, +X scrolls right.
     AutoMapPin { id: "scroll_move_y", display_name: "Mouse: Scroll Y (move)", signal_type: SignalType::Float },
     AutoMapPin { id: "scroll_move_x", display_name: "Mouse: Scroll X (move)", signal_type: SignalType::Float },
+    // A trackpad's press (`TOUCH_PRESSURE_PINS`). Last, where a network peer on
+    // an older build reads the tail it doesn't know as extra.
+    AutoMapPin { id: "touch1_pressure", display_name: "Touch 1 Pressure", signal_type: SignalType::Float },
+    AutoMapPin { id: "touch2_pressure", display_name: "Touch 2 Pressure", signal_type: SignalType::Float },
 ];
 
 /// Whether `id` is one of [`ALL_PINS`]. A set lookup: the engine asks this per

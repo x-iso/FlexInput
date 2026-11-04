@@ -256,7 +256,8 @@ impl FlexInputApp {
             }
             LeftNavAction::ToggleParam { node, key } => {
                 let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
-                let cur = self.get_node_param_bool(node, &key).unwrap_or(false);
+                let cur = self.get_node_param_bool(node, &key)
+                    .unwrap_or_else(|| crate::canvas::viewer::bool_param_default(&key));
                 self.set_node_param_bool(node, &key, !cur);
                 self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
             }

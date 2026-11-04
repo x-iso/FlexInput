@@ -703,6 +703,7 @@ impl FlexInputApp {
                     let new_tabs: Vec<PatchTab> = ws.tabs.into_iter().map(|pt| {
                         let mut canvas = Canvas::new();
                         canvas.snarl = pt.snarl;
+                        canvas.device_memory = pt.device_memory;
                         crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
                         clear_canvas_capture_state(&mut canvas);
                         canvas.pending_view_action = on_load_view;

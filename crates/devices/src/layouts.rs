@@ -29,6 +29,9 @@ pub fn outputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>)
         pins.splice(at..at, dualsense_edge_extra_outputs());
     }
     if crate::steam_haptics::is_steam_controller(vid, pid) {
+        // Its trackpads' press, ahead of the Auto-Map port.
+        let at = pins.len().saturating_sub(1);
+        pins.splice(at..at, flexinput_core::automap::TOUCH_PRESSURE_PINS.map(|id| fl(id, id)));
         for pin in &mut pins {
             if let Some((name, _)) = flexinput_core::automap::steam_controller_pin_names(&pin.id) {
                 pin.display_name = name.to_string();

@@ -471,6 +471,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         let st = carry.stick_rebound.get_or_insert_with(Default::default);
         filter_stick_rebound(graph, &mut dev_sigs_owned, st, dt);
     }
+    // Calibrated trackpads: reach, outer deadzone and offset.
+    filter_trackpads(graph, &mut dev_sigs_owned);
     // Apply the Virtual Menu SOURCE-BLOCK (one tick stale): zero every pointer
     // pin an open menu asked to block last tick, so those analog inputs reach
     // ONLY the menu's navigation — not a mouse mapping, another module, or a
@@ -915,12 +917,17 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         if !resolve_sig(active)?.as_bool() { return None; }
                         Some(Vec2::new(resolve_sig(x)?.as_float(), resolve_sig(y)?.as_float()))
                     };
+                    let down = |pin: &str| resolve_sig(pin).is_some_and(|s| s.as_bool());
                     touch_frame = Some(trackpad::TouchFrame {
                         fingers: [
                             finger("touch1_active", "touch1_x", "touch1_y"),
                             finger("touch2_active", "touch2_x", "touch2_y"),
                         ],
-                        click: resolve_sig("btn_touchpad").is_some_and(|s| s.as_bool()),
+                        click: down("btn_touchpad"),
+                        // Two trackpads of their own (a Steam Controller): the
+                        // right one's click is SDL's Misc 2.
+                        split: resolve_sig(flexinput_core::automap::TOUCH_PADS_PIN).is_some(),
+                        click2: down("btn_misc2"),
                     });
                 }
                 if route_optical {
@@ -961,6 +968,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                 if o.scroll.x != 0.0 { put("scroll_move_x", Signal::Float(o.scroll.x)); }
                 put("mouse_left", Signal::Bool(o.left));
                 put("mouse_right", Signal::Bool(o.right));
+                put("mouse_middle", Signal::Bool(o.middle));
             }
             // Like the trackpad: ADDED to whatever else drives the pointer.
             // Mouse speed applies as it would to a wire; Sensor × on top.
@@ -1275,6 +1283,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         let clicks = &mut state.entry(snap.node_uid).or_default().trigger_clicks;
         apply_trigger_click(st, &snap.params, raw_dev_sigs, clicks, dt, sink_outputs);
         apply_pad_click(st, &snap.params, sink_outputs);
+        apply_trackpad_tracking(st, &snap.params, sink_outputs);
         apply_grip_sensor(st, &snap.params, sink_outputs);
     }
 

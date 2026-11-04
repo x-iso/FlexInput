@@ -1351,7 +1351,7 @@ impl FlexInputApp {
         }
         let in_key = if editing_card { "in" } else { "draft_input" };
         self.picker_slot_pins(in_key).iter()
-            .any(|p| flexinput_engine::pin_is_analog_input(p))
+            .any(|p| flexinput_engine::pin_allows_analog_mode(p))
     }
 
     /// Append one picked pin to the picker's draft chord (de-duped) and flip the

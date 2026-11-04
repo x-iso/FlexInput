@@ -32,6 +32,85 @@ All notable changes to FlexInput are documented here. This project adheres to
   so a gyro or right stick can aim while you tune. The slider shows the display's
   live status too, as a window over a borderless game can turn VRR off on some
   systems.
+- **Save as default in the Calibration window.** Beside **Save…** and **Load…**,
+  **Save as default** makes this pad's settings the start for every pad of its type
+  you add from then on: trigger points, clicks, hysteresis, deadzones, filters and the
+  rest. What the pad's own calibration measured off it (gyro and accel offsets, stick
+  centres, trigger ranges) stays with that pad and isn't part of the default. Each
+  type keeps its own: a DualSense, a Switch Pro and a Steam Controller each have one.
+  **Digital triggers → analog** and **Ignore capacitive touch in Learn** are part of a
+  pad's calibration now too, so Save, Load and the default carry them.
+- **A Steam Controller's two trackpads as a PC trackpad.** With the Virtual Keyboard
+  and Mouse's **Gamepad touchpad → trackpad** on, each of its trackpads has a job of
+  its own: the right one moves the pointer and pressing it is a left click, the left
+  one scrolls both ways and pressing it is a right click, and pressing both is a middle
+  click. Other pads work as before, with one touchpad and two-finger gestures.
+- **Steam Controller trackpad tracking.** The Calibration window's trackpad settings
+  apply to every trackpad report before anything reads it:
+  - **Stabilisation** (50% by default) steadies a resting or slowly moving finger, so
+    the pointer stops shaking, while a quick swipe still keeps up.
+  - **Click force**, for each pad, sets how hard to press it for a click, instead of
+    the pad's own click point; it lets go a little under it. **Own**, the pad's own
+    click, is the default.
+  - **Click stabilisation** (60% by default) holds the pointer still as you press,
+    from that share of the click's force until a moment after you ease off, so
+    pressing doesn't move it. A move further than a press rolls the thumb lets go
+    at once, so a firm swipe or a click-drag still moves. Afterwards the pointer goes
+    on from where it was held and catches up with your thumb as it moves, so every
+    edge stays in reach. At Own, a pad's click force is learnt from your first clicks.
+  - Each trackpad's picture shows how hard you press as a circle around your thumb,
+    with rings where it clicks and where the hold starts.
+  - **Click feedback** is one set for both pads, or with **Per pad** each pad's own.
+- **Steam Controller trackpad press.** Each trackpad's press is an analog input of its
+  own, **Pad press L** and **Pad press R** (`touch1_pressure`, `touch2_pressure`):
+  0 untouched, 1 at the click (the set click force, or the pad's own click once it
+  has clicked), held at 1 past it. A Remapper or Map Action card on a trackpad click
+  can take the **Analog** press mode, which passes that press on, so pressing a
+  trackpad can pull a trigger gradually. On a pad without a press, a click there
+  drives full while held, as any button does. In Touch Zones an Analog card onto a
+  trigger takes the press of the finger in its zone, the pad's own trigger still
+  counting.
+- **Steam Controller trackpad calibration.** The Calibration window's **Grip and
+  Touch** section is laid out like the sticks above it: each trackpad drawn as your
+  thumb reaches it, with its trail and press, and its grip beside it. Holding the
+  controller as you play, trace each pad's edge with your thumb: where it falls short
+  of a corner, that direction is stretched out to the edge, so the whole pad is in
+  reach. Under each pad, an **Outer deadzone** reads the band inside the edge as the
+  edge itself, and **Offset** moves that frame away from the pad's grip, the left
+  pad's to the right and the right pad's to the left: a thumb moving toward the grip
+  slides off over the pad's edge before it gets there, so that edge comes sooner, and
+  the pad's middle moves with it. Both apply wherever the trackpads are read: the
+  Virtual Keyboard and Mouse, Touch Zones, the Area Mapper and the rest.
+  The grip sensors are strips beside the pads, lit while they sense a hand, with the
+  sensor's reach and where it lets go as marks to drag (one setting covers both
+  grips, as on the pad). The pad reports only whether a grip senses a hand, not how
+  near, so the strips light up to the mark.
+
+### Changed
+
+- **Trigger calibration, buttons first.** In the Calibration window's trigger
+  section, **Start** and **Reset** come right after the steps they go with, then the
+  digital point, hysteresis and debounce. **Trigger click** goes under the trigger
+  arcs when that leaves the section shorter, as in a narrow window, else under the
+  rest.
+- **A pad taken off a tab keeps its calibration there.** Deselecting a pad, or
+  having another pad replace it, used to throw its calibration away, so picking it
+  again started over. The tab now keeps what each pad had, by the pad and by its type
+  (so a Steam Controller on its cable gets what it had on its dongle), and a pad
+  picked again starts from that, then from its type's default, then from stock. It's
+  saved with the tab, in the workspace and in a saved patch. Removing a pad's node in
+  the Advanced view keeps it too.
+- **New stock trigger settings.** The digital trigger's point now sits at 10% of the
+  pull, the arc's 10% mark, instead of halfway. A trigger click is 300 Hz for 5 ms
+  where the pad can play that (a Steam Controller, a DualSense's haptics), instead of
+  170 Hz for 20 ms, and at -5 dB instead of full: a high, short, softer click shakes the
+  gyro's aim least. Its release click starts 6 dB softer still. Hysteresis starts at 2%
+  instead of 3%, and its slider moves in 0.5% steps. A pad whose node never changed
+  these from stock takes the new values; one you've set keeps yours.
+- **Steam Controller stock settings.** Its trackpads' click feedback is on from the
+  start: the pad's light click, at -7 dB, on press and on release. **Ignore capacitive
+  touch in Learn** is on from the start too, so holding the controller, which touches
+  its grips and stick caps, can't take a Learn meant for a button.
 
 ## [0.16.8] - 2026-11-03
 

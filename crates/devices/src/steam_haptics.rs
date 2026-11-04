@@ -291,8 +291,8 @@ struct TriggerClick {
 
 impl Default for TriggerClick {
     fn default() -> Self {
-        use flexinput_core::automap::{TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS, TRIGGER_RELEASE_DB};
-        let press = EdgeClick { gain_db: 0.0, hz: TRIGGER_CLICK_HZ, ms: TRIGGER_CLICK_MS, soft: 0.0 };
+        use flexinput_core::automap::{TRIGGER_CLICK_DB, TRIGGER_CLICK_HZ, TRIGGER_CLICK_MS, TRIGGER_RELEASE_DB};
+        let press = EdgeClick { gain_db: TRIGGER_CLICK_DB, hz: TRIGGER_CLICK_HZ, ms: TRIGGER_CLICK_MS, soft: 0.0 };
         Self {
             edges: Default::default(),
             hold: [0.0; 2],
@@ -412,43 +412,70 @@ impl ClickPins {
 // ── Pad click feedback ────────────────────────────────────────────────────────
 
 /// A click on each trackpad as it is pressed, and optionally released, set in the
-/// Calibration window. `mode` is the `automap::PAD_CLICK_*` bits, 0 = off.
+/// Calibration window, each pad its own.
+#[derive(Default)]
 struct PadClickFeedback {
+    sides: [PadClickSide; 2],
+    held: [bool; 2],
+}
+
+/// One trackpad's click feedback. `mode` is the `automap::PAD_CLICK_*` bits,
+/// 0 = off.
+#[derive(Clone, Copy)]
+struct PadClickSide {
     mode: u8,
     gain_db: f32,
     hz: f32,
     ms: f32,
     soft: f32,
-    held: [bool; 2],
 }
 
-impl Default for PadClickFeedback {
+impl Default for PadClickSide {
     fn default() -> Self {
         use flexinput_core::automap::{PAD_CLICK_HZ, PAD_CLICK_MS};
-        Self { mode: 0, gain_db: 0.0, hz: PAD_CLICK_HZ, ms: PAD_CLICK_MS, soft: 0.0, held: [false; 2] }
+        Self { mode: 0, gain_db: 0.0, hz: PAD_CLICK_HZ, ms: PAD_CLICK_MS, soft: 0.0 }
     }
 }
 
 impl PadClickFeedback {
+    /// Takes a pad click pin (`automap::PAD_CLICK_PINS`); false for any other.
+    fn set(&mut self, pin: &str, level: f32) -> bool {
+        use flexinput_core::automap::PAD_CLICK_PINS;
+        let Some((side, field)) = PAD_CLICK_PINS.iter().enumerate()
+            .find_map(|(side, pins)| pins.iter().position(|p| *p == pin).map(|f| (side, f))) else {
+            return false;
+        };
+        let s = &mut self.sides[side];
+        match field {
+            0 => s.mode = level as u8,
+            1 => s.gain_db = level,
+            2 => s.hz = level,
+            3 => s.ms = level,
+            _ => s.soft = level,
+        }
+        true
+    }
+
     /// One poll's pad clicks: what each side plays, if any. Keeps track while
     /// off, so turning it on with a pad held doesn't click.
     fn step(&mut self, down: [bool; 2]) -> [Option<Cmd>; 2] {
         use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG, PAD_CLICK_TONE};
-        let gain_db = self.gain_db.clamp(GAIN_DB_MIN, 24.0).round() as i8;
         let mut out = [None, None];
         for side in 0..2 {
+            let s = self.sides[side];
+            let gain_db = s.gain_db.clamp(GAIN_DB_MIN, 24.0).round() as i8;
             let was = std::mem::replace(&mut self.held[side], down[side]);
-            if self.mode & PAD_CLICK_ON == 0 || was == down[side] {
+            if s.mode & PAD_CLICK_ON == 0 || was == down[side] {
                 continue;
             }
-            if !down[side] && self.mode & PAD_CLICK_ON_RELEASE == 0 {
+            if !down[side] && s.mode & PAD_CLICK_ON_RELEASE == 0 {
                 continue;
             }
-            out[side] = Some(if self.mode & PAD_CLICK_TONE != 0 {
+            out[side] = Some(if s.mode & PAD_CLICK_TONE != 0 {
                 let gain_db = if down[side] { gain_db } else { gain_db.saturating_add(PAD_RELEASE_DB) };
-                Cmd::PadTone { side, gain_db, shape: ClickShape::new(self.hz, self.ms, self.soft) }
+                Cmd::PadTone { side, gain_db, shape: ClickShape::new(s.hz, s.ms, s.soft) }
             } else {
-                let strong = down[side] && self.mode & PAD_CLICK_STRONG != 0;
+                let strong = down[side] && s.mode & PAD_CLICK_STRONG != 0;
                 let command = if strong { COMMAND_CLICK_STRONG } else { COMMAND_CLICK };
                 Cmd::PadClick { side, command, gain_db }
             });
@@ -532,22 +559,16 @@ impl SteamHaptics {
             }
             return true;
         }
-        match pin {
-            "pad_click_mode" => self.pad_feedback.mode = level as u8,
-            "pad_click_gain" => self.pad_feedback.gain_db = level,
-            "pad_click_hz" => self.pad_feedback.hz = level,
-            "pad_click_ms" => self.pad_feedback.ms = level,
-            "pad_click_soft" => self.pad_feedback.soft = level,
-            _ => {
-                let Some(i) = GRIP_SETTINGS.iter().position(|s| s.0 == pin) else {
-                    return false;
-                };
-                if let Some(value) = grip_value(i, level) {
-                    if self.grip_sent[i] != Some(value) {
-                        self.grip_sent[i] = Some(value);
-                        let _ = self.cmds.send(Cmd::Grip(i, value));
-                    }
-                }
+        if self.pad_feedback.set(pin, level) {
+            return true;
+        }
+        let Some(i) = GRIP_SETTINGS.iter().position(|s| s.0 == pin) else {
+            return false;
+        };
+        if let Some(value) = grip_value(i, level) {
+            if self.grip_sent[i] != Some(value) {
+                self.grip_sent[i] = Some(value);
+                let _ = self.cmds.send(Cmd::Grip(i, value));
             }
         }
         true
@@ -1268,8 +1289,8 @@ mod tests {
         let mut click = TriggerClick { edges: [edges(), TriggerEdges::default()], ..Default::default() };
         assert_eq!(clicked(click.step([0.49, 0.9], MS)), [false, false], "below it, and R has no click");
         assert_eq!(click.step([0.5, 0.0], MS),
-            [Some(Cmd::TriggerClick { side: 0, gain_db: 0, shape: ClickShape::trigger_default() }), None],
-            "reaching it clicks");
+            [Some(Cmd::TriggerClick { side: 0, gain_db: -5, shape: ClickShape::trigger_default() }), None],
+            "reaching it clicks, at the stock strength");
         assert_eq!(clicked(click.step([0.9, 0.0], MS)), [false, false], "no second click further in");
         assert_eq!(clicked(click.step([0.48, 0.0], MS)), [false, false], "still inside the hysteresis");
         assert_eq!(clicked(click.step([0.5, 0.0], MS)), [false, false], "so jitter here is silent");
@@ -1341,22 +1362,33 @@ mod tests {
         use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_STRONG};
         let firmware = |side, command| Some(Cmd::PadClick { side, command, gain_db: 0 });
         let mut fb = PadClickFeedback::default();
+        let mode = |fb: &mut PadClickFeedback, m: u8| {
+            assert!(fb.set("pad_click_mode_l", f32::from(m)) && fb.set("pad_click_mode_r", f32::from(m)));
+        };
         assert_eq!(fb.step([true, false]), [None, None], "off, and it keeps track");
-        fb.mode = PAD_CLICK_ON;
+        mode(&mut fb, PAD_CLICK_ON);
         assert_eq!(fb.step([true, false]), [None, None], "held since before it came on");
         assert_eq!(fb.step([false, true]), [None, firmware(1, COMMAND_CLICK)]);
         assert_eq!(fb.step([false, true]), [None, None], "once per press");
-        fb.mode = PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_STRONG;
+        mode(&mut fb, PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_STRONG);
         assert_eq!(fb.step([true, false]), [firmware(0, COMMAND_CLICK_STRONG), firmware(1, COMMAND_CLICK)],
             "a press takes the strength, a release is always light");
+        // Each pad its own: the right one off.
+        assert!(fb.set("pad_click_mode_r", 0.0));
+        assert_eq!(fb.step([false, true]), [firmware(0, COMMAND_CLICK), None]);
+        assert!(!fb.set("pad_click_mode", 1.0), "no shared pin");
     }
 
     #[test]
     fn a_pad_set_to_tone_plays_its_pitch_and_length_and_lets_go_softer() {
         use flexinput_core::automap::{PAD_CLICK_ON, PAD_CLICK_ON_RELEASE, PAD_CLICK_TONE};
         let mut fb = PadClickFeedback::default();
-        fb.mode = PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_TONE;
-        (fb.gain_db, fb.hz, fb.ms) = (-3.0, 320.0, 8.0);
+        for (pin, v) in [
+            ("pad_click_mode_l", f32::from(PAD_CLICK_ON | PAD_CLICK_ON_RELEASE | PAD_CLICK_TONE)),
+            ("pad_click_gain_l", -3.0), ("pad_click_hz_l", 320.0), ("pad_click_ms_l", 8.0),
+        ] {
+            assert!(fb.set(pin, v));
+        }
         let shape = ClickShape { hz: 320, ms: 8, soft: 0.0 };
         assert_eq!(fb.step([true, false]), [Some(Cmd::PadTone { side: 0, gain_db: -3, shape }), None]);
         assert_eq!(fb.step([false, false]), [Some(Cmd::PadTone { side: 0, gain_db: -9, shape }), None]);
@@ -1478,8 +1510,10 @@ mod tests {
     fn a_click_mixes_into_a_running_stream_for_its_length() {
         let shared = Shared::default();
         let mut stream = Stream::new();
-        let samples = ClickShape::trigger_default().samples();
-        stream.click[1] = ClickBurst::new(ClickShape::trigger_default(), 0);
+        // Longer than a chunk, so it spans two.
+        let shape = ClickShape::new(170.0, 20.0, 0.0);
+        let samples = shape.samples();
+        stream.click[1] = ClickBurst::new(shape, 0);
         let first = stream.chunk(1, &shared);
         assert!(first[2..].iter().any(|s| *s != 0));
         assert_eq!(stream.click[1].total - stream.click[1].at, samples - STREAM_CHUNK as u32);

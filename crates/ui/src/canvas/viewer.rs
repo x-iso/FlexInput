@@ -140,6 +140,9 @@ pub struct FlexViewer<'a> {
     /// Set by show_node_menu when the user picks "Replace with…".
     /// Carries (node id, index into physical_devices).
     pub replace_request: Option<(NodeId, usize)>,
+    /// Set by show_node_menu when the user clicks "Remove node": Canvas::show()
+    /// removes it, keeping a pad's calibration in the tab's memory first.
+    pub remove_request: Option<NodeId>,
     /// Set when the user clicks "Edit…" on a subpatch node.
     pub edit_subpatch_request: Option<NodeId>,
     /// Set when the user clicks "Save…" on a subpatch node on a TAB canvas: the
@@ -1584,7 +1587,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ui.close();
         }
         if ui.button("Remove node").clicked() {
-            snarl.remove_node(node);
+            self.remove_request = Some(node);
             ui.close();
         }
     }

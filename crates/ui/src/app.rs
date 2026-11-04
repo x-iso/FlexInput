@@ -880,6 +880,7 @@ impl FlexInputApp {
         let persisted_tab_to_patch = |pt: PersistedTab| -> PatchTab {
             let mut canvas = Canvas::new();
             canvas.snarl = pt.snarl;
+            canvas.device_memory = pt.device_memory;
             crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
             // Wipe any stale in-progress capture/learn state from saved
             // remapper-family nodes so a restored patch starts clean.
