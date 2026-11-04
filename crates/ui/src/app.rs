@@ -82,6 +82,7 @@ fn chord_watch_config_from(s: &AppSettings) -> ChordWatchConfig {
         overlay:    shortcut_spec_from(&s.overlay_chord, &s.overlay_chord_mode, s.overlay_chord_gap_ms),
         pin:        shortcut_spec_from(&s.pin_chord, &s.pin_chord_mode, s.pin_chord_gap_ms),
         config:     shortcut_spec_from(&s.config_overlay_chord, &s.config_overlay_chord_mode, s.config_overlay_chord_gap_ms),
+        phase:      shortcut_spec_from(&s.phase_overlay_chord, &s.phase_overlay_chord_mode, s.phase_overlay_chord_gap_ms),
     }
 }
 
@@ -585,6 +586,9 @@ pub struct FlexInputApp {
     /// Raised by the CONFIG-overlay hotkey listener thread; consumed once per
     /// frame to flip the config overlay's visible flag (M3).
     config_overlay_toggle_requested: Arc<AtomicBool>,
+    /// Raised by the gamepad-shortcut watcher; flips the phase tuner over the
+    /// game (`phase_overlay`).
+    phase_overlay_toggle_requested: Arc<AtomicBool>,
     /// Live snapshot of the config-overlay chord shared with its listener thread.
     config_overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
     /// True while the config-overlay shortcut button is in Learn mode in Settings.
@@ -801,6 +805,8 @@ impl FlexInputApp {
         // (the slider is now quantized to whole-ms periods).
         app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
         app_settings.output_hz = settings::snap_output_hz(app_settings.output_hz);
+        app_settings.output_sync_per_frame = settings::snap_output_sync_per_frame(app_settings.output_sync_per_frame);
+        app_settings.output_sync_phase = app_settings.output_sync_phase.clamp(0.0, settings::OUTPUT_SYNC_PHASE_MAX);
         // UI scale: snap a hand-edited value to a step, then apply it as egui's
         // zoom factor (pixels_per_point = zoom × OS scale, so fonts rasterize at
         // the scaled resolution and stay sharp). The window already exists at
@@ -1147,6 +1153,8 @@ impl FlexInputApp {
             Arc::clone(&edit_overlay_shortcut_shared),
             Arc::clone(&edit_overlay_toggle_requested),
         );
+        // The phase tuner has only its gamepad shortcut.
+        let phase_overlay_toggle_requested = Arc::new(AtomicBool::new(false));
         spawn_chord_watcher(
             Arc::clone(&config_chord_cfg),
             ShortcutToggles {
@@ -1155,6 +1163,7 @@ impl FlexInputApp {
                 overlay: Arc::clone(&overlay_toggle_requested),
                 pin: Arc::clone(&pin_toggle_requested),
                 config: Arc::clone(&config_overlay_toggle_requested),
+                phase: Arc::clone(&phase_overlay_toggle_requested),
             },
             Arc::clone(&nav_enabled_devices),
             Arc::clone(&proc_device_signals),
@@ -1300,6 +1309,7 @@ impl FlexInputApp {
             overlay_shortcut_shared,
             overlay_learning: false,
             config_overlay_toggle_requested,
+            phase_overlay_toggle_requested,
             config_overlay_shortcut_shared,
             config_overlay_learning: false,
             edit_overlay_toggle_requested,
@@ -1474,7 +1484,10 @@ impl eframe::App for FlexInputApp {
         self.refresh_active_tab_device_ids();
 
         // The engine's rate can follow the polling and output rates, so it's
-        // worked out here rather than where any one of them is edited.
+        // worked out here rather than where any one of them is edited. So is
+        // display-synced output, which the Settings window and the gamepad
+        // panel both edit.
+        flexinput_virtual::display_clock::set_sync(self.settings.output_sync());
         self.sample_rate_hz.store(self.settings.effective_sample_rate_hz(), Ordering::Relaxed);
 
         // ── Visibility / focus state ────────────────────────────────────
@@ -1623,6 +1636,15 @@ impl eframe::App for FlexInputApp {
                                 _ => true, // fully blocked
                             }
                         })
+                        .cloned()
+                        .collect()
+                } else if crate::phase_overlay::visible(ctx) {
+                    // The phase tuner takes only what it's driven with: the
+                    // game keeps the rest, so motion can be judged while tuning.
+                    self.last_signals
+                        .keys()
+                        .filter(|(dev, pin)| graph::is_physical_pad_id(dev)
+                            && crate::phase_overlay::NAV_PINS.contains(&pin.as_str()))
                         .cloned()
                         .collect()
                 } else {
@@ -1980,6 +2002,15 @@ impl eframe::App for FlexInputApp {
             let on = crate::config_overlay::config_overlay_visible(ctx);
             crate::config_overlay::set_config_overlay_visible(ctx, !on);
         }
+        // ── Phase tuner over the game (gamepad shortcut) ──────────────────
+        if self.phase_overlay_toggle_requested.swap(false, Ordering::Relaxed) {
+            let on = crate::phase_overlay::visible(ctx);
+            if on {
+                // Closed by its shortcut mid-adjustment: keep what it was set to.
+                self.settings_dirty = true;
+            }
+            crate::phase_overlay::set_visible(ctx, !on);
+        }
 
         // ── Info overlay EDIT-mode toggle (global hotkey) ─────────────────
         // Flip the overlay's edit-mode slot; entering edit also makes the
@@ -2265,6 +2296,11 @@ impl eframe::App for FlexInputApp {
             crate::gyro_cal_overlay::show(ctx, &mut self.tabs, self.active_tab, &self.last_signals,
                 &self.spike_filter_settings, fps);
         }
+        {
+            puffin::profile_scope!("show_phase_overlay");
+            let fps = self.overlay_fps();
+            crate::phase_overlay::show(ctx, &mut self.settings, &mut self.settings_dirty, &self.last_signals, fps);
+        }
 
         // ── Config overlay ────────────────────────────────────────────────────
         // A THIRD transparent viewport (M3): shortcut-summoned, interactive over
@@ -2507,6 +2543,10 @@ pub(crate) enum NavWidgetKind {
 pub(crate) enum GpSettingKey {
     PollingHz,
     OutputHz,
+    OutputSync,
+    OutputSyncPerFrame,
+    OutputSyncPhase,
+    OutputSyncFollowVrr,
     SampleRateHz,
     SampleRateMode,
     BgRepaintHz,
@@ -3789,6 +3829,7 @@ impl FlexInputApp {
             Some(ChordTarget::Overlay)       => self.settings.overlay_chord = Some(chord),
             Some(ChordTarget::Pin)           => self.settings.pin_chord = Some(chord),
             Some(ChordTarget::ConfigOverlay) => self.settings.config_overlay_chord = Some(chord),
+            Some(ChordTarget::PhaseOverlay)  => self.settings.phase_overlay_chord = Some(chord),
             None => {}
         }
         // A single-button shortcut can't be "on press" (it would fire the instant
@@ -3801,6 +3842,7 @@ impl FlexInputApp {
                 Some(ChordTarget::Overlay)       => Some(&mut self.settings.overlay_chord_mode),
                 Some(ChordTarget::Pin)           => Some(&mut self.settings.pin_chord_mode),
                 Some(ChordTarget::ConfigOverlay) => Some(&mut self.settings.config_overlay_chord_mode),
+                Some(ChordTarget::PhaseOverlay)  => Some(&mut self.settings.phase_overlay_chord_mode),
                 None => None,
             };
             if let Some(m) = mode {

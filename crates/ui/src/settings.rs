@@ -33,6 +33,18 @@ pub fn snap_output_hz(hz: u32) -> u32 {
     if hz == OUTPUT_HZ_SAME_AS_POLLING { hz } else { snap_polling_hz(hz) }
 }
 
+/// The reports-per-frame choices for display-synced output
+/// ([`AppSettings::output_display_sync`]).
+pub const OUTPUT_SYNC_PER_FRAME: [u32; 4] = [1, 2, 4, 8];
+
+/// The latest a frame's first report may sit, as a share of the frame.
+pub const OUTPUT_SYNC_PHASE_MAX: f32 = 0.95;
+
+/// A saved reports-per-frame made valid: the nearest choice.
+pub fn snap_output_sync_per_frame(n: u32) -> u32 {
+    *OUTPUT_SYNC_PER_FRAME.iter().min_by_key(|&&c| c.abs_diff(n)).unwrap_or(&4)
+}
+
 /// Snap an arbitrary Hz to the nearest exposed step in [`POLLING_HZ_STEPS`].
 /// Used to migrate older saved values to a valid step on load.
 pub fn snap_polling_hz(hz: u32) -> u32 {
@@ -107,6 +119,10 @@ pub enum SampleRateMode {
 
 fn default_polling_hz() -> u32 { POLLING_HZ_DEFAULT }
 fn default_sample_rate_hz() -> u32 { SAMPLE_RATE_HZ_DEFAULT }
+// Four a frame: a report crossing into the next frame moves a quarter of a
+// frame's motion, where at one it would move all of it.
+fn default_output_sync_per_frame() -> u32 { 4 }
+fn default_output_sync_phase() -> f32 { 0.5 }
 fn default_true() -> bool { true }
 fn default_deadzone() -> f32 { 0.1 }
 fn default_gyro_mult() -> f32 { 1.0 }
@@ -196,9 +212,26 @@ pub enum UiMode {
 }
 
 impl AppSettings {
-    /// The rate outputs actually go out at.
+    /// The rate outputs actually go out at. Synced to the display, the rate
+    /// that stands for: the reports a frame at the display's refresh rate (its
+    /// maximum, under VRR).
     pub fn effective_output_hz(&self) -> u32 {
+        if let Some(s) = self.output_sync() {
+            return flexinput_virtual::display_clock::output_hz(s.per_frame);
+        }
         if self.output_hz == OUTPUT_HZ_SAME_AS_POLLING { self.polling_hz } else { self.output_hz }
+    }
+
+    /// Display-synced output as the output threads take it; `None` while it's
+    /// off or the platform has no display clock.
+    pub fn output_sync(&self) -> Option<flexinput_virtual::display_clock::OutputSync> {
+        (self.output_display_sync && flexinput_virtual::display_clock::SUPPORTED).then(|| {
+            flexinput_virtual::display_clock::OutputSync {
+                per_frame: snap_output_sync_per_frame(self.output_sync_per_frame),
+                phase: self.output_sync_phase.clamp(0.0, OUTPUT_SYNC_PHASE_MAX),
+                follow_vrr: self.output_sync_follow_vrr,
+            }
+        })
     }
 
     /// The rate the engine actually ticks at.
@@ -245,6 +278,22 @@ pub struct AppSettings {
     /// [`POLLING_HZ_STEPS`], or [`OUTPUT_HZ_SAME_AS_POLLING`] (default).
     #[serde(default)]
     pub output_hz: u32,
+    /// Report on a grid locked to the display's frames instead of at
+    /// `output_hz`: `output_sync_per_frame` reports a frame, the first
+    /// `output_sync_phase` of a frame after the frame's vblank. See
+    /// `flexinput_virtual::display_clock`.
+    #[serde(default)]
+    pub output_display_sync: bool,
+    /// One of [`OUTPUT_SYNC_PER_FRAME`].
+    #[serde(default = "default_output_sync_per_frame")]
+    pub output_sync_per_frame: u32,
+    /// 0 ..= [`OUTPUT_SYNC_PHASE_MAX`].
+    #[serde(default = "default_output_sync_phase")]
+    pub output_sync_phase: f32,
+    /// Under VRR, follow the frames as they come. Off, report at the display's
+    /// maximum rate as if it were fixed.
+    #[serde(default = "default_true")]
+    pub output_sync_follow_vrr: bool,
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: u32,
     #[serde(default)]
@@ -479,6 +528,11 @@ pub struct AppSettings {
     /// None = unassigned. Default Home + D-pad Right.
     #[serde(default = "default_config_overlay_chord")]
     pub config_overlay_chord: Option<Vec<String>>,
+    /// Optional gamepad button combo that toggles the PHASE tuner over the game
+    /// (display-synced output's Phase in frame). Global, like the config
+    /// overlay's. None = unassigned (the default).
+    #[serde(default)]
+    pub phase_overlay_chord: Option<Vec<String>>,
     /// Press mode for each gamepad shortcut chord above (`"down"` = on press,
     /// `"long"` = hold for the gap, `"double"` = double-tap within the gap).
     /// Mirrors the remapper card press modes; see `gamepad_nav::chord_fire`.
@@ -492,6 +546,8 @@ pub struct AppSettings {
     pub pin_chord_mode: String,
     #[serde(default = "default_chord_mode")]
     pub config_overlay_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub phase_overlay_chord_mode: String,
     /// Time gap (ms) each shortcut chord's press mode reads: the hold duration
     /// for `long`, the max inter-tap gap for `double`. Ignored by `down`.
     #[serde(default = "default_chord_gap_ms")]
@@ -504,6 +560,8 @@ pub struct AppSettings {
     pub pin_chord_gap_ms: f32,
     #[serde(default = "default_chord_gap_ms")]
     pub config_overlay_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub phase_overlay_chord_gap_ms: f32,
     /// Whether the info overlay was visible on exit — restored on launch
     /// (mirrors `see_through_active`; the live state lives in a ctx temp
     /// slot that `update()` syncs back here).
@@ -785,6 +843,10 @@ impl Default for AppSettings {
             bt_key_dir: None,
             polling_hz: POLLING_HZ_DEFAULT,
             output_hz: OUTPUT_HZ_SAME_AS_POLLING,
+            output_display_sync: false,
+            output_sync_per_frame: default_output_sync_per_frame(),
+            output_sync_phase: default_output_sync_phase(),
+            output_sync_follow_vrr: true,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
             sample_rate_mode: SampleRateMode::Manual,
             keep_workspace: true,
@@ -832,16 +894,19 @@ impl Default for AppSettings {
             overlay_chord: default_overlay_chord(),
             pin_chord: default_pin_chord(),
             config_overlay_chord: default_config_overlay_chord(),
+            phase_overlay_chord: None,
             seethrough_chord_mode: default_chord_mode(),
             panic_chord_mode: default_chord_mode(),
             overlay_chord_mode: default_chord_mode(),
             pin_chord_mode: default_chord_mode(),
             config_overlay_chord_mode: default_chord_mode(),
+            phase_overlay_chord_mode: default_chord_mode(),
             seethrough_chord_gap_ms: default_chord_gap_ms(),
             panic_chord_gap_ms: default_chord_gap_ms(),
             overlay_chord_gap_ms: default_chord_gap_ms(),
             pin_chord_gap_ms: default_chord_gap_ms(),
             config_overlay_chord_gap_ms: default_chord_gap_ms(),
+            phase_overlay_chord_gap_ms: default_chord_gap_ms(),
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             edit_overlay_shortcut: default_edit_overlay_shortcut(),
@@ -1186,6 +1251,25 @@ mod sample_rate_tests {
     fn by_hand_is_the_default_and_leaves_a_saved_rate_alone() {
         assert_eq!(AppSettings::default().sample_rate_mode, SampleRateMode::Manual);
         assert_eq!(with(2000, 0, 500, SampleRateMode::Manual).effective_sample_rate_hz(), 500);
+    }
+
+    #[test]
+    fn display_sync_is_off_by_default_and_made_valid_when_on() {
+        assert!(AppSettings::default().output_sync().is_none());
+        assert_eq!(snap_output_sync_per_frame(0), 1);
+        assert_eq!(snap_output_sync_per_frame(5), 4);
+        assert_eq!(snap_output_sync_per_frame(100), 8);
+        if flexinput_virtual::display_clock::SUPPORTED {
+            let on = AppSettings {
+                output_display_sync: true,
+                output_sync_per_frame: 5,
+                output_sync_phase: 2.0,
+                ..AppSettings::default()
+            };
+            let sync = on.output_sync().unwrap();
+            assert_eq!(sync.per_frame, 4);
+            assert_eq!(sync.phase, OUTPUT_SYNC_PHASE_MAX);
+        }
     }
 
     #[test]

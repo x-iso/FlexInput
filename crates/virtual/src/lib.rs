@@ -1,5 +1,6 @@
 pub mod layouts;
 pub mod driver_availability;
+pub mod display_clock;
 
 use flexinput_core::{Signal, SignalType};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, Ordering};
@@ -77,11 +78,25 @@ pub(crate) fn output_hz() -> u32 {
 
 /// The SendInput mouse thread's rate: the output rate when the user picked one,
 /// else its own 1 kHz (finer than the default polling rate, for smooth slow aim
-/// — what it always ran at before the output rate was a setting).
+/// — what it always ran at before the output rate was a setting). Synced to the
+/// display, the rate that stands for (the thread then goes by the clock's grid).
 pub(crate) fn sendinput_mouse_hz() -> u32 {
+    if display_clock::sync().is_some() {
+        return output_hz();
+    }
     match OUTPUT_HZ_SETTING.load(Ordering::Relaxed) {
         0 => 1000,
         hz => hz,
+    }
+}
+
+/// The slowest rate the output may report at, for the virtual mouse's
+/// catch-up clamps. Synced to the display, a frame can take far longer than
+/// the display's fastest refresh.
+pub(crate) fn slowest_output_hz() -> f32 {
+    match display_clock::sync() {
+        Some(s) => s.per_frame as f32 * display_clock::SLOWEST_FRAME_HZ,
+        None => output_hz() as f32,
     }
 }
 

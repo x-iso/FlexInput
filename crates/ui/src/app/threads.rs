@@ -135,6 +135,7 @@ pub(crate) fn spawn_io_thread(
     engine_sync: Arc<flexinput_engine::EngineSync>,
 ) {
     use std::time::{Duration, Instant};
+    use flexinput_virtual::display_clock;
 
     std::thread::Builder::new()
         .name("device-io".into())
@@ -270,6 +271,12 @@ pub(crate) fn spawn_io_thread(
             // wait at the end of the loop.
             let mut next_poll = Instant::now();
             let mut next_output = next_poll;
+            // Display-synced output (flexinput_virtual::display_clock): when the
+            // last flush went out, how long a pass takes to get to the flush
+            // (it starts that much before the tick), and the exact wait for it.
+            let mut last_flush = next_poll;
+            let mut sync_work = Duration::from_micros(800);
+            let mut precise = display_clock::PreciseWait::default();
             let mut timings = IoTimingAcc::default();
             let mut click_gates = flexinput_devices::click_gate::ClickGates::default();
 
@@ -312,7 +319,16 @@ pub(crate) fn spawn_io_thread(
                 // between polls. Re-read each pass so live retunes apply.
                 let poll_hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
                 let out_setting = output_hz.load(Ordering::Relaxed);
-                let out_hz = if out_setting == 0 { poll_hz } else { out_setting.clamp(60, 4000) };
+                // Synced to the display, the flushes go on a grid locked to its
+                // frames instead, and the reports a frame at its refresh rate
+                // stand for the output rate: the fixed schedule they fall back
+                // to while the clock has no frames to go by.
+                let sync = display_clock::sync();
+                let out_hz = match sync {
+                    Some(s) => display_clock::output_hz(s.per_frame).clamp(30, 4000),
+                    None if out_setting == 0 => poll_hz,
+                    None => out_setting.clamp(60, 4000),
+                };
                 flexinput_virtual::set_output_rate(out_setting, out_hz);
                 let poll_interval = Duration::from_nanos(1_000_000_000 / poll_hz as u64);
                 let out_interval = Duration::from_nanos(1_000_000_000 / out_hz as u64);
@@ -321,11 +337,23 @@ pub(crate) fn spawn_io_thread(
                 // A deadline this close counts as due now, rather than costing a
                 // wake-up of its own a fraction of a period later.
                 let slack = interval / 4;
+                // On the grid the flush goes out exactly on its tick, so the
+                // pass starts `lead` early to have polled and run the engine by
+                // then (but after the last tick's flush). Looked up every pass:
+                // each frame moves the grid.
+                let tick = sync.and_then(|s| display_clock::next_tick(last_flush + out_interval / 2, s));
+                let lead = match tick {
+                    Some(t) => {
+                        next_output = t;
+                        (sync_work.mul_f32(1.5) + precise.margin()).min(out_interval.mul_f32(0.8))
+                    }
+                    None => Duration::ZERO,
+                };
                 let input_due = t0 + slack >= next_poll;
-                let output_due = t0 + slack >= next_output;
+                let output_due = t0 + slack + lead >= next_output;
                 if !input_due && !output_due {
                     // Woke early: wait out the rest.
-                    let wake = next_poll.min(next_output);
+                    let wake = next_poll.min(next_output.checked_sub(lead).unwrap_or(next_output));
                     let now = Instant::now();
                     if wake > now {
                         waiter.wait(wake - now);
@@ -578,6 +606,21 @@ pub(crate) fn spawn_io_thread(
                     flexinput_engine::drain_sink_bus_into(&sink_bus, &mut sink_outputs);
                 }
                 mark!("sink_bus");
+
+                // On the grid: out exactly on the tick. How long this pass took
+                // to get here sizes the next one's lead (an enumeration pass
+                // can't blow it up).
+                if output_due && tick.is_some() {
+                    let work = t0.elapsed().min(Duration::from_millis(2));
+                    sync_work = sync_work.mul_f32(0.875) + work.mul_f32(0.125);
+                    precise.until(next_output, |d| waiter.wait(d));
+                }
+                if output_due {
+                    last_flush = Instant::now();
+                }
+                if tick.is_some() {
+                    mark!("sync wait (idle)");
+                }
 
                 // ── Drive virtual & physical devices ──────────────────────────
                 // Shared pool holds ALL virtual devices across every open
@@ -970,7 +1013,15 @@ pub(crate) fn spawn_io_thread(
                         next_output = now;
                     }
                 }
-                let wake = next_poll.min(next_output);
+                // On the grid, wake `lead` before the next tick, and look again
+                // within a millisecond: a frame arriving meanwhile moves it.
+                let mut wake = next_poll.min(next_output);
+                if let Some(t) = sync.and_then(|s| display_clock::next_tick(last_flush + out_interval / 2, s)) {
+                    next_output = t;
+                    wake = next_poll
+                        .min(t.checked_sub(lead).unwrap_or(t))
+                        .min(now + Duration::from_millis(1));
+                }
                 if wake > now {
                     waiter.wait(wake - now);
                 }

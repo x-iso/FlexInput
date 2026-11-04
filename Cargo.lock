@@ -2108,6 +2108,7 @@ dependencies = [
  "glam",
  "libc",
  "vigem-client",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

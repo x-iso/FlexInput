@@ -19,6 +19,9 @@ const OUTPUT_RATE_OPTS: &[(f32, &str)] = &[
     (2000.0, "2000 Hz"),
 ];
 
+/// The reports-per-frame choices ([`settings::OUTPUT_SYNC_PER_FRAME`]).
+const OUTPUT_SYNC_OPTS: &[(f32, &str)] = &[(1.0, "1"), (2.0, "2"), (4.0, "4"), (8.0, "8")];
+
 /// The processing rate modes, in the order of [`settings::SampleRateMode`].
 const SAMPLE_RATE_MODE_OPTS: &[(f32, &str)] = &[
     (0.0, "Set by hand"), (1.0, "Same as output"), (2.0, "2x output"),
@@ -87,9 +90,32 @@ impl FlexInputApp {
             GpSettingRow { label: "Shortcut: Pin".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Pin }, suffix: "" },
         ];
-        // By hand only: the row goes while the rate follows the output.
+        // Display sync follows Output rate; its own rows only while it's on.
+        let mut at = 2;
+        if flexinput_virtual::display_clock::SUPPORTED {
+            let mut sync_rows = vec![GpSettingRow { label: "Sync output to the display".into(),
+                kind: Toggle { key: GpSettingKey::OutputSync }, suffix: "" }];
+            if self.settings.output_display_sync {
+                sync_rows.extend([
+                    GpSettingRow { label: "Reports per frame".into(),
+                        kind: Cycle { key: GpSettingKey::OutputSyncPerFrame, opts: OUTPUT_SYNC_OPTS }, suffix: "" },
+                    GpSettingRow { label: "Phase in frame".into(),
+                        kind: IntSlider { lo: 0.0, hi: settings::OUTPUT_SYNC_PHASE_MAX * 100.0, step: 5.0,
+                            key: GpSettingKey::OutputSyncPhase }, suffix: "%" },
+                    GpSettingRow { label: "Follow variable refresh (VRR)".into(),
+                        kind: Toggle { key: GpSettingKey::OutputSyncFollowVrr }, suffix: "" },
+                    GpSettingRow { label: "Shortcut: Tune phase over the game".into(),
+                        kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::PhaseOverlay }, suffix: "" },
+                ]);
+            }
+            let n = sync_rows.len();
+            rows.splice(at..at, sync_rows);
+            at += n;
+        }
+        // By hand only: the row goes while the rate follows the output. It
+        // sits under Processing rate, now at `at`.
         if self.settings.sample_rate_mode == settings::SampleRateMode::Manual {
-            rows.insert(3, GpSettingRow { label: "Processing sample rate".into(),
+            rows.insert(at + 1, GpSettingRow { label: "Processing sample rate".into(),
                 kind: IntSlider { lo: self.settings.sample_rate_floor_hz() as f32,
                     hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
                     key: GpSettingKey::SampleRateHz }, suffix: " Hz" });
@@ -103,6 +129,10 @@ impl FlexInputApp {
         match key {
             PollingHz => self.settings.polling_hz as f32,
             OutputHz => self.settings.output_hz as f32,
+            OutputSync => self.settings.output_display_sync as i32 as f32,
+            OutputSyncPerFrame => self.settings.output_sync_per_frame as f32,
+            OutputSyncPhase => (self.settings.output_sync_phase * 100.0).round(),
+            OutputSyncFollowVrr => self.settings.output_sync_follow_vrr as i32 as f32,
             SampleRateHz => self.settings.sample_rate_hz as f32,
             SampleRateMode => self.settings.sample_rate_mode as i32 as f32,
             BgRepaintHz => self.settings.bg_repaint_hz as f32,
@@ -139,6 +169,14 @@ impl FlexInputApp {
                 self.settings.output_hz = v;
                 self.output_hz.store(v, Ordering::Relaxed);
             }
+            OutputSync => self.settings.output_display_sync = val != 0.0,
+            OutputSyncPerFrame => {
+                self.settings.output_sync_per_frame = settings::snap_output_sync_per_frame(val.round() as u32);
+            }
+            OutputSyncPhase => {
+                self.settings.output_sync_phase = (val.round() / 100.0).clamp(0.0, settings::OUTPUT_SYNC_PHASE_MAX);
+            }
+            OutputSyncFollowVrr => self.settings.output_sync_follow_vrr = val != 0.0,
             SampleRateHz => {
                 let v = (val.round() as u32)
                     .clamp(self.settings.sample_rate_floor_hz(), settings::SAMPLE_RATE_HZ_MAX);
@@ -269,6 +307,7 @@ impl FlexInputApp {
                         ChordTarget::Overlay       => self.settings.overlay_chord = None,
                         ChordTarget::Pin           => self.settings.pin_chord = None,
                         ChordTarget::ConfigOverlay => self.settings.config_overlay_chord = None,
+                        ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord = None,
                     }
                     self.settings_dirty = true;
                 }
@@ -411,6 +450,7 @@ impl FlexInputApp {
                                     ChordTarget::Overlay => self.settings.overlay_chord.as_ref(),
                                     ChordTarget::Pin => self.settings.pin_chord.as_ref(),
                                     ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.as_ref(),
+                                    ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord.as_ref(),
                                 };
                                 match assigned {
                                     Some(c) if !c.is_empty() => { combo_icons = Some(c.clone()); String::new() }
@@ -532,5 +572,8 @@ mod tests {
         assert_eq!(OUTPUT_RATE_OPTS[0].0, settings::OUTPUT_HZ_SAME_AS_POLLING as f32);
         let output: Vec<f32> = OUTPUT_RATE_OPTS[1..].iter().map(|(v, _)| *v).collect();
         assert_eq!(output, steps);
+        let per_frame: Vec<f32> = settings::OUTPUT_SYNC_PER_FRAME.iter().map(|&n| n as f32).collect();
+        let opts: Vec<f32> = OUTPUT_SYNC_OPTS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(opts, per_frame);
     }
 }

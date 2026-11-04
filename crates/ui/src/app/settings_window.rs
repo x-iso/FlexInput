@@ -75,6 +75,7 @@ impl FlexInputApp {
             ChordTarget::Overlay       => self.settings.overlay_chord.clone(),
             ChordTarget::Pin           => self.settings.pin_chord.clone(),
             ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.clone(),
+            ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord.clone(),
         }.unwrap_or_default();
         let has_assigned = !combo_now.is_empty();
         // A single-button shortcut (a standalone Guide/Capture/Mic) may NOT use
@@ -106,6 +107,7 @@ impl FlexInputApp {
                     ChordTarget::Overlay       => self.settings.overlay_chord = None,
                     ChordTarget::Pin           => self.settings.pin_chord = None,
                     ChordTarget::ConfigOverlay => self.settings.config_overlay_chord = None,
+                    ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord = None,
                 }
                 if learning { self.gamepad_nav.chord_learn = None; }
                 changed = true;
@@ -120,6 +122,7 @@ impl FlexInputApp {
                 ChordTarget::Overlay       => self.settings.overlay_chord_mode.clone(),
                 ChordTarget::Pin           => self.settings.pin_chord_mode.clone(),
                 ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_mode.clone(),
+                ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_mode.clone(),
             };
             // Single-button shortcuts can't be "on press" — migrate a stored
             // "down" to "long" so the value shown (and persisted below) is valid.
@@ -148,6 +151,7 @@ impl FlexInputApp {
                 ChordTarget::Overlay       => s.overlay_chord_mode = m,
                 ChordTarget::Pin           => s.pin_chord_mode = m,
                 ChordTarget::ConfigOverlay => s.config_overlay_chord_mode = m,
+                ChordTarget::PhaseOverlay  => s.phase_overlay_chord_mode = m,
             };
             let prev_mode = match target {
                 ChordTarget::SeeThrough    => &self.settings.seethrough_chord_mode,
@@ -155,6 +159,7 @@ impl FlexInputApp {
                 ChordTarget::Overlay       => &self.settings.overlay_chord_mode,
                 ChordTarget::Pin           => &self.settings.pin_chord_mode,
                 ChordTarget::ConfigOverlay => &self.settings.config_overlay_chord_mode,
+                ChordTarget::PhaseOverlay  => &self.settings.phase_overlay_chord_mode,
             };
             if *prev_mode != mode_now {
                 apply_mode(&mut self.settings, mode_now.clone());
@@ -169,6 +174,7 @@ impl FlexInputApp {
                 ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms,
                 ChordTarget::Pin           => self.settings.pin_chord_gap_ms,
                 ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms,
+                ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_gap_ms,
             };
             ui.add_enabled_ui(gap_applies, |ui| {
                 let resp = ui.add(
@@ -183,6 +189,7 @@ impl FlexInputApp {
                         ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms = gap_ms,
                         ChordTarget::Pin           => self.settings.pin_chord_gap_ms = gap_ms,
                         ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms = gap_ms,
+                        ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_gap_ms = gap_ms,
                     }
                     changed = true;
                 }
@@ -1759,6 +1766,65 @@ impl FlexInputApp {
             });
     }
 
+    /// Display-synced output: reports on a grid locked to the display's frames
+    /// instead of at the output rate (see `flexinput_virtual::display_clock`).
+    fn settings_output_sync(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
+        use flexinput_virtual::display_clock;
+        let supported = display_clock::SUPPORTED;
+        ui.add_space(4.0);
+        let mut on = self.settings.output_display_sync && supported;
+        if ui.add_enabled(supported, egui::Checkbox::new(&mut on, "Sync to the display"))
+            .on_hover_text("Report on the display's frames instead of at a fixed rate: a few reports a frame, evenly spaced and locked to the frames, so each frame gets the same number. A game reads the mouse once a frame, and at a fixed rate the number of reports that land in each frame changes from frame to frame, so a mouse moved by a held stick or gyro judders, which only a very high output rate hides. Follows the display the foreground window is on; on Linux, which can't tell, the fastest display that's on.")
+            .on_disabled_hover_text("Windows and Linux only.")
+            .changed()
+        {
+            self.settings.output_display_sync = on;
+            *dirty = true;
+        }
+        if !on {
+            return;
+        }
+        ui.indent("output_sync", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Reports per frame")
+                    .on_hover_text("How many times the virtual devices report in each frame. More is more forgiving: if a report lands just past the moment the game reads its input, it moves a smaller share of the frame's motion to the next frame. The output rate is this many times the display's refresh rate.");
+                for n in settings::OUTPUT_SYNC_PER_FRAME {
+                    if ui.selectable_label(self.settings.output_sync_per_frame == n, n.to_string()).clicked() {
+                        self.settings.output_sync_per_frame = n;
+                        *dirty = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Phase in frame")
+                    .on_hover_text("Where in the frame the reports sit: the first this far into the frame after the display's refresh, the rest evenly after it. The game reads its input at a moment of its own in the frame; if motion still judders, move the reports away from it.");
+                let max = (settings::OUTPUT_SYNC_PHASE_MAX * 100.0).round() as i32;
+                let mut pct = (self.settings.output_sync_phase * 100.0).round() as i32;
+                if ui.add(egui::Slider::new(&mut pct, 0..=max).suffix("%")).changed() {
+                    self.settings.output_sync_phase = pct as f32 / 100.0;
+                    *dirty = true;
+                }
+            });
+            // Tuned by eye in the game: a slider over it, on a gamepad shortcut.
+            if self.gamepad_shortcut_row(ui, "Tune over the game", crate::gamepad_nav::ChordTarget::PhaseOverlay) {
+                *dirty = true;
+            }
+            ui.label(egui::RichText::new(
+                "Opens the phase over the game: left stick or D-pad moves it, East closes it. The game keeps everything else, so aim while you tune."
+            ).small().color(egui::Color32::from_gray(140)));
+            let mut follow = self.settings.output_sync_follow_vrr;
+            if ui.checkbox(&mut follow, "Follow variable refresh (VRR)")
+                .on_hover_text("With G-SYNC or FreeSync the display refreshes when the game shows a frame, so the reports follow the frames as they come. Off, they go out at the display's maximum rate as if it were fixed.")
+                .changed()
+            {
+                self.settings.output_sync_follow_vrr = follow;
+                *dirty = true;
+            }
+            ui.label(egui::RichText::new(crate::phase_overlay::sync_status(&self.settings))
+                .small().color(egui::Color32::from_gray(170)));
+        });
+    }
+
     fn settings_performance(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("Max polling rate")
@@ -1793,9 +1859,11 @@ impl FlexInputApp {
         ).small().color(egui::Color32::from_gray(140)));
 
         ui.add_space(8.0);
+        let synced = self.settings.output_sync().is_some();
         ui.horizontal(|ui| {
-            ui.label("Output rate")
-                .on_hover_text("How fast the virtual gamepads and the virtual mouse report to games, separately from the polling rate. Lower than polling saves work (or suits an old game that misbehaves with fast mice); higher gives virtual output finer steps than your controllers' own rate — mouse motion from a held gyro or stick moves in smaller, more frequent steps. Output can't change faster than the processing sample rate. \"Same as polling\" reports once per poll, as before, with the SendInput virtual mouse at its own 1000 Hz.");
+            ui.add_enabled(!synced, egui::Label::new("Output rate"))
+                .on_hover_text("How fast the virtual gamepads and the virtual mouse report to games, separately from the polling rate. Lower than polling saves work (or suits an old game that misbehaves with fast mice); higher gives virtual output finer steps than your controllers' own rate — mouse motion from a held gyro or stick moves in smaller, more frequent steps. Output can't change faster than the processing sample rate. \"Same as polling\" reports once per poll, as before, with the SendInput virtual mouse at its own 1000 Hz.")
+                .on_disabled_hover_text("Set by the display while output is synced to it.");
             // Position 0 = "Same as polling", then the polling steps low→high.
             let steps = settings::POLLING_HZ_STEPS.len();
             let mut pos = if self.settings.output_hz == settings::OUTPUT_HZ_SAME_AS_POLLING {
@@ -1810,7 +1878,7 @@ impl FlexInputApp {
                     settings::polling_hz_from_index(steps - pos.min(steps))
                 }
             };
-            let resp = ui.add(egui::Slider::new(&mut pos, 0..=steps as i64)
+            let resp = ui.add_enabled(!synced, egui::Slider::new(&mut pos, 0..=steps as i64)
                 .integer()
                 .custom_formatter(move |n, _| match hz_at(n as usize) {
                     settings::OUTPUT_HZ_SAME_AS_POLLING => "Same as polling".to_string(),
@@ -1825,6 +1893,7 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(
             "How fast the virtual gamepads and virtual mouse report to games."
         ).small().color(egui::Color32::from_gray(140)));
+        self.settings_output_sync(ui, dirty);
         if self.settings.effective_output_hz() > self.settings.effective_sample_rate_hz() {
             ui.label(egui::RichText::new(format!(
                 "Above the processing sample rate ({} Hz): outputs from the patch only change that often.",

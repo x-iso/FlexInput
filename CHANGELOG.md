@@ -3,6 +3,36 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.16.9] - 2026-11-04
+
+### Added
+
+- **Output synced to the display.** Settings → Performance → **Sync to the
+  display** reports on the display's frames instead of at a fixed output rate. A game
+  reads the mouse once a frame, and at a fixed rate the number of reports landing in
+  each frame changes from frame to frame, so a mouse moved by a held stick or gyro
+  judders; only a very high rate hid it. Synced, the virtual devices report a set
+  number of times a frame (**Reports per frame**: 1, 2, 4 or 8, 4 by default), evenly
+  spaced and locked to the frames, so every frame gets the same. **Phase in frame**
+  moves the reports within the frame, away from the moment the game reads its input.
+  With G-SYNC or FreeSync the display refreshes when the game shows a frame, and
+  **Follow variable refresh (VRR)** (on by default) follows the frames as they come;
+  off, it reports at the display's maximum rate as if it were fixed. Below the
+  display's range, where the driver shows each frame twice, the reports follow that;
+  the odd frame shown twice after a frame-rate change is skipped. On Windows it
+  follows the display the foreground window is on, in borderless and exclusive
+  fullscreen alike. Linux can't tell which window is in front, so there it follows the
+  fastest display that's on, by the kernel's own timing of each refresh. The readout
+  shows the display, its rate, and whether VRR is at work. Until the
+  display's frames arrive, and whenever they stop, output goes at the reports per
+  frame times the display's refresh rate. The gamepad settings panel has the same
+  rows. **Tune over the game** binds a gamepad shortcut that opens the phase as a
+  slider over the game, with a strip showing where in the frame the reports land: the
+  left stick or D-pad moves it and East closes it. The game keeps every other input,
+  so a gyro or right stick can aim while you tune. The slider shows the display's
+  live status too, as a window over a borderless game can turn VRR off on some
+  systems.
+
 ## [0.16.8] - 2026-11-03
 
 ### Added

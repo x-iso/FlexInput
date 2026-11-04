@@ -18,6 +18,15 @@ vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_
 enigo = "0.6"
 # The composite USB personas (a virtual DualSense with its audio interfaces).
 flexinput-usbip = { workspace = true }
+# The display clock (display_clock.rs): vblank events, and the display under
+# the foreground window. Already in the tree.
+windows-sys = { version = "0.61", features = [
+    "Wdk_Graphics_Direct3D",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # uinput / UHID: open, poll, ioctl. Already in the graph.

@@ -100,9 +100,11 @@ pub struct ChordWatchConfig {
     pub overlay: Option<ShortcutSpec>,
     pub pin: Option<ShortcutSpec>,
     pub config: Option<ShortcutSpec>,
+    /// The phase tuner over the game: from any pad, like the config overlay's.
+    pub phase: Option<ShortcutSpec>,
 }
 
-/// The five toggle flags the watcher raises; the UI loop consumes each once per
+/// The six toggle flags the watcher raises; the UI loop consumes each once per
 /// frame and applies the corresponding action. Shared (each is its own `Arc`)
 /// with the keyboard-hotkey listeners, which raise the same flags.
 #[derive(Clone)]
@@ -112,6 +114,7 @@ pub struct ShortcutToggles {
     pub overlay: Arc<AtomicBool>,
     pub pin: Arc<AtomicBool>,
     pub config: Arc<AtomicBool>,
+    pub phase: Arc<AtomicBool>,
 }
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
@@ -449,7 +452,7 @@ pub fn spawn_chord_watcher(
         .name("gamepad-shortcut-watcher".into())
         .spawn(move || {
             let started_at = Instant::now();
-            let mut watches: [TargetWatch; 5] = Default::default();
+            let mut watches: [TargetWatch; 6] = Default::default();
             let mut owned: Keys = Keys::new();
             let mut leaders = Leaders::default();
             let mut replay: Keys = Keys::new();
@@ -463,32 +466,34 @@ pub fn spawn_chord_watcher(
                 let snap = proc_device_signals.load_full();
 
                 // The four window shortcuts restrict to the nav-selected pads
-                // when nav-only is on; the config chord always fires from any.
+                // when nav-only is on; the config and phase chords always fire
+                // from any.
                 let nav_set = nav_devices.read().map(|s| s.clone()).unwrap_or_default();
                 let window_filter = if cfg.nav_only { Some(&nav_set) } else { None };
 
-                let targets: [Target; 5] = [
+                let targets: [Target; 6] = [
                     (&cfg.seethrough, window_filter),
                     (&cfg.panic, window_filter),
                     (&cfg.overlay, window_filter),
                     (&cfg.pin, window_filter),
                     (&cfg.config, None),
+                    (&cfg.phase, None),
                 ];
                 let flags = [&toggles.seethrough, &toggles.panic, &toggles.overlay,
-                    &toggles.pin, &toggles.config];
-                let combos: [Option<&[String]>; 5] = targets.map(|(s, _)|
+                    &toggles.pin, &toggles.config, &toggles.phase];
+                let combos: [Option<&[String]>; 6] = targets.map(|(s, _)|
                     s.as_ref().map(|s| s.combo.as_slice()).filter(|c| !c.is_empty()));
-                let held: [bool; 5] = std::array::from_fn(|i| combos[i]
+                let held: [bool; 6] = std::array::from_fn(|i| combos[i]
                     .map_or(false, |c| combo_held(&snap, c, targets[i].1)));
 
-                let mut fired = [false; 5];
+                let mut fired = [false; 6];
                 #[cfg(target_os = "linux")]
                 let pin_raised_before = watches[3].last_toggle;
-                for i in 0..5 {
+                for i in 0..targets.len() {
                     let mut superset_assigned = false;
                     let mut superset_held = false;
                     if let Some(small) = combos[i] {
-                        for j in (0..5).filter(|&j| j != i) {
+                        for j in (0..targets.len()).filter(|&j| j != i) {
                             if combos[j].map_or(false, |big| strict_superset(big, small)) {
                                 superset_assigned = true;
                                 superset_held |= held[j];

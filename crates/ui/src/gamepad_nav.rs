@@ -41,6 +41,8 @@ pub enum ChordTarget {
     Overlay,
     Pin,
     ConfigOverlay,
+    /// The phase tuner over the game (`phase_overlay`).
+    PhaseOverlay,
 }
 
 /// Per-shortcut edge/timing state carried between frames by `chord_fire`.

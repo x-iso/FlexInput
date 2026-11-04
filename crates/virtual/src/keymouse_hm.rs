@@ -502,7 +502,7 @@ impl VirtualDevice for VirtualKeyMouseHm {
         // ── Mouse ────────────────────────────────────────────────────────────
         // dt-scaled velocity → sub-pixel carry → int16 mickeys (same math as
         // the enigo thread, at flush cadence).
-        let max_dt = (4.0 / crate::output_hz() as f32).max(MAX_DT_FLOOR);
+        let max_dt = (4.0 / crate::slowest_output_hz()).max(MAX_DT_FLOOR);
         let dt = (now - self.last_emit).as_secs_f32().min(max_dt);
         self.last_emit = now;
 

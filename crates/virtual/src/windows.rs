@@ -1060,6 +1060,7 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     // lurch with scheduling jitter. dt-scaling keeps motion wall-clock-correct.
     let mut last_emit = Instant::now();
     let mut next_tick = Instant::now();
+    let mut precise = crate::display_clock::PreciseWait::default();
 
     loop {
         let t0 = Instant::now();
@@ -1078,8 +1079,10 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
         // big gap loses a sliver of distance (imperceptible for relative aim)
         // instead of lurching. carry_x/y stays sub-pixel as a result, so no
         // banked backlog can build up and discharge as a jump later.
-        // 4× the tick (4 ms at the default 1 kHz), never below 4 ms.
-        let max_dt = (4.0 / hz as f32).max(0.004);
+        // 4× the tick (4 ms at the default 1 kHz), never below 4 ms. Synced to
+        // the display, 4× the slowest frame's tick.
+        let slowest = if crate::display_clock::sync().is_some() { crate::slowest_output_hz() } else { hz as f32 };
+        let max_dt = (4.0 / slowest).max(0.004);
         let dt = (t0 - last_emit).as_secs_f32().min(max_dt);
         last_emit = t0;
 
@@ -1198,6 +1201,15 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             }
         }
 
+        // Synced to the display, the next tick is the clock's: exactly on it,
+        // at least half a tick after this one.
+        let grid = crate::display_clock::sync()
+            .and_then(|s| crate::display_clock::next_tick(t0 + tick / 2, s));
+        if let Some(t) = grid {
+            precise.until(t, std::thread::sleep);
+            next_tick = t;
+            continue;
+        }
         // Absolute-deadline pacing, as in the device-io loop: sleeping a fresh
         // `tick - busy` from each (always slightly late) wake held this "1 kHz"
         // thread to ~650–800 Hz. Carry the deadline; resync after a stall.

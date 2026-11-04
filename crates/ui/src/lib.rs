@@ -19,6 +19,7 @@ mod module_ui_info;
 mod menu_overlay;
 mod config_overlay;
 mod overlay;
+mod phase_overlay;
 mod panels;
 mod panic_hotkey;
 // Windows-only: times itself with GetProcessTimes and a Win32 sampler.
