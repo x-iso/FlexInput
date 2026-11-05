@@ -134,7 +134,7 @@ pub const LICENSES: &[License] = &[
         what: "Community controller mappings, bundled as data: the starting                layout for a controller SDL has no built-in mapping for.",
         spdx: "Zlib",
         url: "https://github.com/mdqinc/SDL_GameControllerDB",
-        note: Some("Upstream copy of 2026-10-27."),
+        note: Some("Upstream copy of 2026-11-02."),
         text: include_str!("../../../vendor/SDL_GameControllerDB/LICENSE"),
     },
     License {
