@@ -49,6 +49,34 @@ All notable changes to FlexInput are documented here. This project adheres to
   accepted and silently never run; such a build now yields a stand-in that keeps
   the node's identity and says what went wrong.
 
+- **FlexInput stopped hiding its own Audio & Haptics pad from games.** The HidHide
+  blacklist is built from a pad's USB vendor/product ids, and a persona answers to
+  exactly the ids of the pad it imitates — its HID node is indistinguishable from a
+  real Sony pad's, and because we fix the persona's USB serial, that node's instance
+  id is the same every session. So once one of ours fell inside a hide target, it was
+  masked from every game, every launch, forever, while FlexInput itself plugged it in,
+  enumerated it and streamed to it perfectly: the pad looked deployed in the app and
+  absent everywhere else, and toggling the checkbox read as the deploy having eaten
+  the device. The instance scan now refuses any node hanging off one of our own
+  composites, and the entry already sitting in a sticky keep list is released by the
+  next apply. Underneath it, the question "is this HID node ours?" now answers when
+  asked by PnP instance id and not only by the device interface path it was written
+  for; asked the wrong way it always said "not ours", which is how the entry got in.
+- **The census test that failed whenever our own personas were attached** now asks
+  the ownership question both ways — a node carrying a serial we minted must read as
+  ours, everything else must not — so it holds with personas deployed as well as
+  parked.
+
+### Added
+
+- **A persona probe for when a pad deploys but nobody can see it:**
+  `cargo run -p flexinput-virtual --example persona_probe -- virtual.usb.dualsense_edge`
+  attaches one persona on its own, says whether the host controller took it and why
+  not, and can hold it plugged in (`HOLD_SECS=30`) so Device Manager can be looked at
+  while it's there. A persona deploy never reaches HIDMaestro's helper log at all, and
+  stderr is lost when the app starts from a shortcut, so this is the only way to ask
+  the question directly.
+
 ## [0.17.0] - 2026-11-07
 
 ### Fixed

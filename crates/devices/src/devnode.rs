@@ -119,9 +119,18 @@ fn ancestors(instance_id: &str, levels: usize) -> Vec<String> {
 /// hang off, `USB\VID_054C&PID_xxxx\<serial>`, whose serial
 /// `flexinput_usbip::serial_for` made.
 pub fn is_own_composite_interface(path: &str) -> bool {
+    // A device interface path (hidapi's form) names a handle, not a node; the
+    // question is about the node, so resolve it first.
+    interface_instance_id(path).is_some_and(|id| is_own_composite_instance(&id))
+}
+
+/// The same question for a node named by its PnP **instance id** (`HID\VID_…\…`),
+/// which is how SetupAPI hands nodes out. Feeding an instance id to
+/// [`is_own_composite_interface`] finds nothing: the interface-property call it
+/// starts from only answers for interface paths.
+pub fn is_own_composite_instance(instance_id: &str) -> bool {
     // HID interface → USB interface (MI_03) → the composite USB device.
-    let Some(id) = interface_instance_id(path) else { return false };
-    ancestors(&id, 3)
+    ancestors(instance_id, 3)
         .iter()
         .any(|a| usb_device_serial(a).is_some_and(flexinput_usbip::is_own_serial))
 }
@@ -335,12 +344,28 @@ mod tests {
         assert_eq!(maker_of_token(""), HidMaestroMaker::OtherProgram);
     }
 
-    // A real HID device present on any Windows machine is never ours.
+    /// Which HID nodes on this machine are ours is decided by the composite they
+    /// hang off, so check it both ways against the serial hidapi reports: a node
+    /// whose device carries a serial we minted must read as ours, and every other
+    /// node — a real Sony pad, another program's device — must not. Both
+    /// directions matter, and the first one is not hypothetical: a persona this
+    /// misses is a pad FlexInput hides from games (see `hidhide`) and reads back
+    /// as somebody else's controller. Unlike a blanket "nothing present is ours",
+    /// this holds with our own personas deployed as well as without them.
     #[test]
-    fn present_hid_devices_are_not_own_composites() {
+    fn a_present_hid_node_is_ours_exactly_when_its_serial_is_ours() {
         let Ok(api) = hidapi::HidApi::new() else { return };
-        for d in api.device_list().take(16) {
-            assert!(!is_own_composite_interface(&d.path().to_string_lossy()));
+        let (mut ours, mut others) = (0usize, 0usize);
+        for d in api.device_list() {
+            let path = d.path().to_string_lossy().to_string();
+            if d.serial_number().is_some_and(flexinput_usbip::is_own_serial) {
+                ours += 1;
+                assert!(is_own_composite_interface(&path), "{path}: our serial, but not classified as ours");
+            } else {
+                others += 1;
+                assert!(!is_own_composite_interface(&path), "{path}: not our serial, but classified as ours");
+            }
         }
+        eprintln!("checked {ours} of our own HID nodes and {others} others");
     }
 }

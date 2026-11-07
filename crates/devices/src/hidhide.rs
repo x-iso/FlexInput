@@ -622,8 +622,14 @@ fn steam_controller_hides_node(id: &str, class: &str) -> bool {
 }
 
 /// Every real device node with this VID and PID, as `(instance id, setup class)`:
-/// no ViGEmBus or HIDMaestro ones.
+/// no ViGEmBus or HIDMaestro ones, and none of our own composite personas.
 fn matching_instances(vid: u16, pid: u16) -> Vec<(String, String)> {
+    matching_instances_with(vid, pid, true)
+}
+
+/// `matching_instances` with the own-persona exclusion switchable, so the test
+/// can tell "the filter removed it" from "nothing was there".
+fn matching_instances_with(vid: u16, pid: u16, exclude_own: bool) -> Vec<(String, String)> {
     #[cfg(windows)] {
         use win32::*;
         use std::mem;
@@ -699,6 +705,18 @@ fn matching_instances(vid: u16, pid: u16) -> Vec<(String, String)> {
                 let len = (id_size as usize).saturating_sub(1);
                 let s = String::from_utf16_lossy(&id_buf[..len]);
                 if is_virtual_instance_id(&s) { continue; } // virtual (ViGEmBus or HIDMaestro)
+                // Nor one of our own composite USB personas. To Windows those are
+                // indistinguishable from the Sony pad they imitate — the HID node
+                // carries no marker, only the composite above it has our serial —
+                // and their instance id is stable, because we fix the serial. So a
+                // persona that once landed in a hide target's (vid,pid) lands in it
+                // every session: HidHide then masks the pad FlexInput is producing,
+                // and the game is left with nothing where the virtual pad should be.
+                // That reads exactly like a deploy that never happened.
+                if exclude_own && crate::devnode::is_own_composite_instance(&s) {
+                    eprintln!("[hidhide] {vid:04X}:{pid:04X}: skipping our own persona {s}");
+                    continue;
+                }
 
                 let mut class_buf  = vec![0u8; 128];
                 let mut class_size = 0u32;
@@ -729,6 +747,38 @@ fn matching_instances(vid: u16, pid: u16) -> Vec<(String, String)> {
 #[cfg(test)]
 mod hide_target_tests {
     use super::*;
+
+    /// Our own composite USB personas must never come back as hide targets. To
+    /// Windows their HID node is indistinguishable from the Sony pad they
+    /// imitate, and because the persona's USB serial is fixed by its device id,
+    /// so is that node's instance id — so a persona that once fell inside a hide
+    /// target's (vid,pid) gets masked again every session, and the game is left
+    /// with nothing where FlexInput's own pad should be. Vacuous while no persona
+    /// is attached; run `cargo run -p flexinput-virtual --example persona_probe`
+    /// alongside it and it checks the real thing.
+    #[test]
+    #[cfg(windows)] // the instance-id walk is Windows' PnP
+    fn our_own_personas_are_never_hide_targets() {
+        for (vid, pid) in [(0x054C, 0x0CE6), (0x054C, 0x0DF2)] {
+            let seen: Vec<String> =
+                matching_instances_with(vid, pid, false).into_iter().map(|(id, _)| id).collect();
+            let ours: Vec<String> = seen
+                .iter()
+                .filter(|id| crate::devnode::is_own_composite_instance(id))
+                .cloned()
+                .collect();
+            let kept = matching_instances(vid, pid);
+            assert!(
+                kept.iter().all(|(id, _)| !crate::devnode::is_own_composite_instance(id)),
+                "{vid:04X}:{pid:04X} would hide our own persona: {ours:?}"
+            );
+            if ours.is_empty() {
+                eprintln!("{vid:04X}:{pid:04X}: no persona attached, nothing to exclude");
+            } else {
+                eprintln!("{vid:04X}:{pid:04X}: excluded {} of our own nodes: {ours:?}", ours.len());
+            }
+        }
+    }
 
     /// A puck's nodes as Windows lists them: the vendor collection of each pad slot
     /// and the puck's own go, the pointer and keyboard ones and the USB parents stay.
