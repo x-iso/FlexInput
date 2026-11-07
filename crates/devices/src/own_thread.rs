@@ -47,8 +47,8 @@ struct Shared {
     ready: Condvar,
 }
 
-/// A backend whose calls can block for seconds inside a library вЂ” SDL's update
-/// waits on a Steam Controller's puck for a feature report with no timeout вЂ”
+/// A backend whose calls can block for seconds inside a library — SDL's update
+/// waits on a Steam Controller's puck for a feature report with no timeout —
 /// on a thread of its own, so only its own pads wait, not the I/O loop and
 /// every other device with it.
 ///
