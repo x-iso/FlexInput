@@ -33,7 +33,7 @@ fn main() {
 
     // Before serving anything (see vhci::sweep_stale).
     vhci::sweep_stale(None);
-    let dev = EmulatedDevice::new(json, if edge { "probe.edge" } else { "probe.dualsense" }, 0)
+    let dev = EmulatedDevice::new(json, if edge { "probe.edge" } else { "probe.dualsense" })
         .expect("composite profile");
     println!("serving {} on {HOST}:{} as {}, serial {:?}", dev.descriptors().profile_id, dev.port(), dev.busid(), dev.descriptors().serial());
 

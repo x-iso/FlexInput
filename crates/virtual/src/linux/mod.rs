@@ -74,7 +74,7 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
         // reason kept on it; only an unreadable preset returns `None`, and even
         // that becomes a stand-in rather than a panic on the device-ops worker,
         // which would leave every later deploy unanswered.
-        let dev = crate::composite_device::CompositeDevice::create(&device_id, &display_name, json, instance as u8);
+        let dev = crate::composite_device::CompositeDevice::create(&device_id, &display_name, json);
         return Box::new(dev.unwrap_or_else(|| {
             crate::undeployed::stand_in(kind_id, &device_id, &display_name, "the persona's profile could not be read")
         }));

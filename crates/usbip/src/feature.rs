@@ -12,18 +12,54 @@
 
 /// The pairing MAC's fixed prefix: locally administered, then 'F' 'X'. Not
 /// HIDMaestro's 'H' 'M', so a composite never shares a MAC with a plain
-/// virtual pad of the same index.
-const MAC_PREFIX: [u8; 5] = [0x02, 0x46, 0x58, 0x00, 0x00];
+/// virtual pad.
+const MAC_PREFIX: [u8; 3] = [0x02, 0x46, 0x58];
 
-/// The answer to a feature GET_REPORT, or `None` to stall it. `index` makes
+/// The three bytes that tell one persona's pairing MAC from another's, taken
+/// from the tail of the USB serial it serves — that serial is already fixed
+/// per FlexInput device id, so the MAC is unique per pad and the same pad
+/// keeps it session after session. A serial we didn't mint (a passthrough
+/// serving a real pad's own) is folded instead.
+///
+/// It has to be per pad. Anything that keys a controller on its MAC sees two
+/// personas wearing one MAC as the same pad: Steam files a PlayStation
+/// controller under its MAC — the names of its per-controller calibration
+/// files say so — so both personas land in one record, and the pad that
+/// arrives second is the one missing from its controller list.
+pub fn mac_tail(serial: &str) -> [u8; 3] {
+    let hex = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'A'..=b'F' | b'a'..=b'f' => Some((c & 0x0F) + 9),
+        _ => None,
+    };
+    let b = serial.as_bytes();
+    if b.len() >= 6 && b[b.len() - 6..].iter().all(|c| hex(*c).is_some()) {
+        let t = &b[b.len() - 6..];
+        let byte = |i: usize| hex(t[i]).unwrap() * 16 + hex(t[i + 1]).unwrap();
+        [byte(0), byte(2), byte(4)]
+    } else {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for c in b {
+            h = (h ^ *c as u64).wrapping_mul(0x1000_0000_01b3);
+        }
+        [h as u8, (h >> 8) as u8, (h >> 16) as u8]
+    }
+}
+
+/// The answer to a feature GET_REPORT, or `None` to stall it. `mac_tail` makes
 /// the pairing MAC unique per controller.
-pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option<Vec<u8>> {
+pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, mac_tail: [u8; 3]) -> Option<Vec<u8>> {
     let w_length = w_length as usize;
     let with_id = |len: usize, body: &[u8]| {
         let mut p = vec![0u8; len];
         p[0] = report_id;
         p[1..1 + body.len()].copy_from_slice(body);
         p
+    };
+    // A pad's MAC as the pad writes it: our prefix, then the pad's own bytes.
+    let put_mac = |p: &mut [u8], at: usize| {
+        p[at..at + 3].copy_from_slice(&MAC_PREFIX);
+        p[at + 3..at + 6].copy_from_slice(&mac_tail);
     };
     match report_id {
         // Motion calibration. A DS4 orders its gyro pairs differently.
@@ -38,8 +74,9 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
         }
         // DualSense pairing info: the MAC at bytes 1..6.
         0x09 if w_length >= 20 => {
-            let mut p = with_id(20, &MAC_PREFIX);
-            p[6] = index;
+            // The MAC the pad reports: our prefix, then this pad's own three bytes.
+            let mut p = with_id(20, &[0u8; 19]);
+            put_mac(&mut p, 1);
             Some(p)
         }
         // Firmware info. The Edge is a different firmware line: Sony's updater
@@ -56,8 +93,8 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
         }
         // DS4 pairing info over USB, the DS4's 0x09.
         0x12 if w_length >= 16 => {
-            let mut p = with_id(16, &MAC_PREFIX);
-            p[6] = index;
+            let mut p = with_id(16, &[0u8; 15]);
+            put_mac(&mut p, 1);
             Some(p)
         }
         // Bluetooth patch info: on hardware this echoes the firmware line and
@@ -65,12 +102,7 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
         // parts that are ours and leave the signature region zero.
         0x22 if w_length >= 64 => {
             let mut p = PATCH_INFO.to_vec();
-            p[17] = MAC_PREFIX[0];
-            p[18] = MAC_PREFIX[1];
-            p[19] = MAC_PREFIX[2];
-            p[20] = MAC_PREFIX[3];
-            p[21] = MAC_PREFIX[4];
-            p[22] = index;
+            put_mac(&mut p, 17);
             Some(p)
         }
         // Two more reports a real pad answers with an otherwise empty body —
@@ -200,49 +232,60 @@ mod tests {
 
     #[test]
     fn calibration_is_the_captured_hardware_block() {
-        let ds = sony_feature(0x0CE6, 0x05, 41, 0).unwrap();
+        let ds = sony_feature(0x0CE6, 0x05, 41, [0, 0, 0]).unwrap();
         assert_eq!(ds.len(), 41);
         assert_eq!(ds[0], 0x05);
         // A real pad's block: small biases, then per-axis plus/minus full scale.
         assert_eq!(&ds[1..7], &[0xfa, 0xff, 0xf8, 0xff, 0xf8, 0xff], "biases");
         assert_eq!(&ds[7..11], &[0x8c, 0x22, 0x6a, 0xdd], "pitch plus then minus");
         assert_eq!(ds[35], 0x09, "the live byte after the block");
-        let ds4 = sony_feature(0x09CC, 0x05, 41, 0).unwrap();
+        let ds4 = sony_feature(0x09CC, 0x05, 41, [0, 0, 0]).unwrap();
         assert_eq!(&ds4[7..13], &[0x40, 0x1F, 0x40, 0x1F, 0x40, 0x1F], "all pluses first");
-        assert!(sony_feature(0x0CE6, 0x05, 40, 0).is_none(), "short buffer stalls");
+        assert!(sony_feature(0x0CE6, 0x05, 40, [0, 0, 0]).is_none(), "short buffer stalls");
     }
 
     #[test]
     fn the_reports_hardware_answers_are_never_stalled() {
         // A real pad answers these; only a fake pad refuses them.
-        let r81 = sony_feature(0x0CE6, 0x81, 64, 0).unwrap();
+        let r81 = sony_feature(0x0CE6, 0x81, 64, [0, 0, 0]).unwrap();
         assert_eq!(r81[0], 0x81);
         assert!(r81[1..].iter().all(|&b| b == 0), "empty body");
-        let r83 = sony_feature(0x0CE6, 0x83, 64, 0).unwrap();
+        let r83 = sony_feature(0x0CE6, 0x83, 64, [0, 0, 0]).unwrap();
         assert_eq!(r83[0], 0x83);
         assert_eq!(&r83[1..5], &[0xFF, 0xFF, 0xFF, 0xFF]);
         // 0x22 echoes the pairing MAC, per controller, like the real pad does.
-        let a = sony_feature(0x0CE6, 0x22, 64, 2).unwrap();
-        let b = sony_feature(0x0CE6, 0x22, 64, 3).unwrap();
+        let a = sony_feature(0x0CE6, 0x22, 64, [0, 0, 2]).unwrap();
+        let b = sony_feature(0x0CE6, 0x22, 64, [0, 0, 3]).unwrap();
         assert_eq!(a[0], 0x22);
-        assert_eq!(&a[17..22], &MAC_PREFIX);
-        assert_eq!(a[22], 2);
-        assert_eq!(b[22], 3);
+        assert_eq!(&a[17..20], &MAC_PREFIX);
+        assert_eq!(&a[20..23], &[0, 0, 2], "the pad's own three bytes");
         assert_ne!(&a[17..23], &b[17..23]);
     }
 
     #[test]
-    fn pairing_mac_is_per_controller() {
-        let a = sony_feature(0x0CE6, 0x09, 20, 0).unwrap();
-        let b = sony_feature(0x0CE6, 0x09, 20, 1).unwrap();
-        assert_eq!(&a[1..6], &MAC_PREFIX);
-        assert_ne!(a[6], b[6]);
+    fn two_personas_never_share_a_pairing_mac() {
+        // The workspace that broke: a DualSense persona and a DualSense Edge
+        // persona side by side, both instance 0, both answering to a Sony
+        // vid/pid. One MAC for two pads is one controller to anything that
+        // keys on the MAC, and Steam keys PlayStation controllers on it.
+        let ds = sony_feature(0x0CE6, 0x09, 20, mac_tail("FX0739CBE3F61A")).unwrap();
+        let edge = sony_feature(0x0DF2, 0x09, 20, mac_tail("FX08901952F9FA")).unwrap();
+        assert_eq!(&ds[1..4], &MAC_PREFIX, "still recognisably ours");
+        assert_eq!(&ds[4..7], &[0xE3, 0xF6, 0x1A], "the serial's own end");
+        assert_ne!(&ds[1..7], &edge[1..7], "one MAC per pad");
+        // Stable across sessions: Steam's calibration record follows the MAC,
+        // so a MAC that moved each launch would reset the pad's identity.
+        assert_eq!(mac_tail("FX0739CBE3F61A"), mac_tail("FX0739CBE3F61A"));
+        assert_ne!(mac_tail("virtual.usb.dualsense"), mac_tail("virtual.usb.dualsense_edge"));
+        // The DS4's own pairing report carries the same MAC.
+        let ds4 = sony_feature(0x09CC, 0x12, 16, mac_tail("FX0739CBE3F61A")).unwrap();
+        assert_eq!(&ds4[1..7], &ds[1..7]);
     }
 
     #[test]
     fn edge_firmware_info_names_its_own_line() {
-        let ds = sony_feature(0x0CE6, 0x20, 64, 0).unwrap();
-        let edge = sony_feature(0x0DF2, 0x20, 64, 0).unwrap();
+        let ds = sony_feature(0x0CE6, 0x20, 64, [0, 0, 0]).unwrap();
+        let edge = sony_feature(0x0DF2, 0x20, 64, [0, 0, 0]).unwrap();
         assert_eq!(&ds[22..24], &[0x04, 0x00]);
         assert_eq!(&edge[22..24], &[0x44, 0x00]);
         assert_eq!(&edge[44..46], &[0x17, 0x02]);
@@ -258,20 +301,20 @@ mod tests {
             0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x68, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
             0x77, 0x78, 0x79, 0x7a, 0x7b,
         ] {
-            let r = sony_feature(0x0DF2, id, 64, 0)
+            let r = sony_feature(0x0DF2, id, 64, [0, 0, 0])
                 .unwrap_or_else(|| panic!("the Edge stalled its own report {id:#04x}"));
             assert_eq!(r[0], id, "answered under its own id");
             assert_eq!(r.len(), 64, "the size its descriptor declares");
         }
-        assert!(sony_feature(0x0DF2, 0x60, 63, 0).is_none(), "short buffer stalls");
+        assert!(sony_feature(0x0DF2, 0x60, 63, [0, 0, 0]).is_none(), "short buffer stalls");
         assert!(
-            sony_feature(0x0CE6, 0x60, 64, 0).is_none(),
+            sony_feature(0x0CE6, 0x60, 64, [0, 0, 0]).is_none(),
             "a base DualSense declares none of these"
         );
     }
 
     #[test]
     fn unknown_reports_stall() {
-        assert!(sony_feature(0x0CE6, 0x7F, 64, 0).is_none());
+        assert!(sony_feature(0x0CE6, 0x7F, 64, [0, 0, 0]).is_none());
     }
 }

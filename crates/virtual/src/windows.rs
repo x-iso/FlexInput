@@ -92,11 +92,11 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     if let Some(profile_json) = usb_profile_json(kind_id) {
         // Composite USB persona: served from this process and attached through
         // usbip-win2 (installed via the helper on first use). The
-        // instance-qualified id fixes the device's USB serial, so each pad
-        // keeps its own identity across lives.
+        // instance-qualified id fixes the device's USB serial and with it its
+        // pairing MAC, so each pad keeps one identity across lives.
         let (device_id, display_name) = instance_label(kind_id, hm_display_name(kind_id), instance);
         if let Some(d) = crate::composite_device::CompositeDevice::create(
-            device_id.clone(), display_name.clone(), profile_json, instance as u8,
+            device_id.clone(), display_name.clone(), profile_json,
         ) {
             return Box::new(d);
         }

@@ -39,6 +39,16 @@ fn profile_for(kind: &str) -> &'static str {
 }
 
 fn main() {
+    // `--list` only asks the host controller what it has imported, so the app can
+    // be left running and its own personas inspected: the vhci list is the truth
+    // about what is plugged in, where Device Manager shows ghosts of previous
+    // sessions and HidHide changes what an application can see at all.
+    if std::env::args().nth(1).is_some_and(|a| a == "--list") {
+        println!("vhci available: {}", vhci::is_available());
+        show("now");
+        return;
+    }
+
     // Every kind on the command line is deployed and held at once: two personas
     // in one process is what a workspace with an audio pad and an audio Edge
     // asks for, and a deploy that only fails alongside its neighbour shows up
@@ -52,28 +62,30 @@ fn main() {
 
     let mut held: Vec<CompositeDevice> = Vec::new();
     for spec in &kinds {
-        // `kind@N` pins the instance index, which the app takes from the canvas
-        // node: two pads of different kinds at instance 0 is the common case, and
-        // a deploy that only fails when its neighbour shares the index shows up
-        // here.
-        let (kind, index) = match spec.split_once('@') {
-            Some((k, i)) => (k.to_string(), i.parse::<u8>().unwrap_or(0)),
-            None => (spec.clone(), 0),
-        };
+        // `kind@N` is the instance-qualified device id, spelled the way the app
+        // spells it. The id is what fixes a persona's serial and, through it,
+        // its pairing MAC — so it, not a numeric index, is what keeps two pads
+        // apart in the eyes of the host.
+        let kind = spec.split_once('@').map_or_else(|| spec.clone(), |(k, _)| k.to_string());
+        let id = spec.clone();
         let started = std::time::Instant::now();
-        let dev = CompositeDevice::create(&kind, &kind, profile_for(&kind), index);
+        let dev = CompositeDevice::create(&id, &id, profile_for(&kind));
         match dev {
             Some(dev) => {
                 println!(
-                    "{} after {:?}: connected={} deploy_error={:?}",
-                    kind,
+                    "{id} after {:?}: connected={} deploy_error={:?} serial={} mac={:02X?}",
                     started.elapsed(),
                     dev.is_connected(),
-                    dev.deploy_error()
+                    dev.deploy_error(),
+                    flexinput_usbip::serial_for(&id),
+                    // Two personas printing the same MAC is the bug: a host
+                    // that files a PlayStation pad by its MAC keeps one of them
+                    // and drops the other.
+                    flexinput_usbip::mac_tail(&flexinput_usbip::serial_for(&id)),
                 );
                 held.push(dev);
             }
-            None => println!("{kind}: no device at all after {:?}: the profile did not parse", started.elapsed()),
+            None => println!("{id}: no device at all after {:?}: the profile did not parse", started.elapsed()),
         }
         show(&format!("with {}", held.len()));
     }

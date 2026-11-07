@@ -118,8 +118,10 @@ pub(crate) struct DeviceInner {
     pub(crate) desc: DescriptorSet,
     pub(crate) busid: String,
     pub(crate) devid: u32,
-    /// Makes the pairing MAC unique per controller.
-    index: u8,
+    /// The three bytes that make this pad's pairing MAC its own, taken from
+    /// the serial it serves: two personas in one workspace must not answer
+    /// with one MAC, or the host folds them into one controller.
+    mac_tail: [u8; 3],
     slot: Arc<WireSlot>,
     hid: Mutex<HidState>,
     configuration: AtomicU8,
@@ -136,7 +138,8 @@ pub(crate) struct DeviceInner {
 }
 
 impl DeviceInner {
-    pub(crate) fn new(desc: DescriptorSet, busid: String, devid: u32, index: u8) -> Self {
+    pub(crate) fn new(desc: DescriptorSet, busid: String, devid: u32) -> Self {
+        let mac_tail = crate::feature::mac_tail(desc.serial().unwrap_or(""));
         let slot = Arc::new(WireSlot::default());
         let primary_in = desc
             .endpoints
@@ -149,7 +152,7 @@ impl DeviceInner {
             desc,
             busid,
             devid,
-            index,
+            mac_tail,
             slot,
             hid: Mutex::new(HidState::default()),
             configuration: AtomicU8::new(0),
@@ -168,7 +171,7 @@ impl DeviceInner {
         DeviceInner {
             forward: Some(forward),
             frame_queue: MAX_PASSTHROUGH_QUEUE,
-            ..Self::new(desc, busid, devid, 0)
+            ..Self::new(desc, busid, devid)
         }
     }
 
@@ -492,7 +495,7 @@ impl DeviceInner {
                 // GET_REPORT(Feature): the Sony interrogation.
                 0x03 => {
                     let stub = (self.desc.vid == 0x054C)
-                        .then(|| sony_feature(self.desc.pid, report_id, length, self.index))
+                        .then(|| sony_feature(self.desc.pid, report_id, length, self.mac_tail))
                         .flatten();
                     match stub {
                         Some(d) => self.reply(seq, &d, length),
@@ -536,7 +539,7 @@ pub(crate) mod tests {
 
     pub(crate) fn device(json: &str) -> (Arc<DeviceInner>, Arc<dyn Wire>, mpsc::Receiver<Vec<u8>>) {
         let desc = DescriptorSet::from_profile_json(json, "FX00000000000A").unwrap();
-        let dev = Arc::new(DeviceInner::new(desc, "1-1".into(), 0x1_0001, 3));
+        let dev = Arc::new(DeviceInner::new(desc, "1-1".into(), 0x1_0001));
         let (tx, rx) = mpsc::channel();
         let wire: Arc<dyn Wire> = Arc::new(Capture(Mutex::new(tx)));
         assert!(dev.claim(Arc::clone(&wire)));
@@ -637,7 +640,11 @@ pub(crate) mod tests {
         assert_eq!((status, actual), (0, 64));
         assert_eq!(&data[22..24], &[0x44, 0x00], "the Edge's firmware line");
         control(&dev, 2, [0xA1, 0x01, 0x09, 0x03, 3, 0, 20, 0], None); // pairing
-        assert_eq!(recv(&rx).4[6], 3, "MAC carries the controller index");
+        assert_eq!(
+            &recv(&rx).4[1..7],
+            &[0x02, 0x46, 0x58, 0x00, 0x00, 0x0A],
+            "the MAC carries this pad's own serial tail"
+        );
         control(&dev, 3, [0xA1, 0x01, 0x05, 0x03, 3, 0, 41, 0], None); // calibration
         assert_eq!(recv(&rx).3, 41);
     }

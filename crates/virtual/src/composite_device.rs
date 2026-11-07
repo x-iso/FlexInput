@@ -75,13 +75,12 @@ impl CompositeDevice {
         id: impl Into<String>,
         display_name: impl Into<String>,
         profile_json: &str,
-        index: u8,
     ) -> Option<Self> {
         let mut dev = Self::detached(id, display_name, profile_json)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match dev.connect(profile_json, index) {
+            match dev.connect(profile_json) {
                 Ok(()) => return Some(dev),
                 Err(e) if attempt < ATTACH_ATTEMPTS => {
                     eprintln!(
@@ -127,12 +126,12 @@ impl CompositeDevice {
         })
     }
 
-    fn connect(&mut self, profile_json: &str, index: u8) -> Result<(), String> {
+    fn connect(&mut self, profile_json: &str) -> Result<(), String> {
         ensure_host_controller()?;
         // Before the server exports anything, or the driver's re-attach loop
         // for a dead session's device could import this one first.
         flexinput_usbip::sweep_stale_once();
-        let usb = EmulatedDevice::new(profile_json, &self.id, index).map_err(|e| e.to_string())?;
+        let usb = EmulatedDevice::new(profile_json, &self.id).map_err(|e| e.to_string())?;
         let haptics = Arc::clone(&self.haptics);
         usb.set_pcm_sink(Some(Box::new(move |pcm: &[u8]| haptics.lock().unwrap().push_pcm(pcm))));
         // A neutral report waits for the host's first read.

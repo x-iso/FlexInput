@@ -67,15 +67,35 @@ All notable changes to FlexInput are documented here. This project adheres to
   ours, everything else must not — so it holds with personas deployed as well as
   parked.
 
+- **Two personas no longer answer with the same pairing MAC.** The last bytes of
+  a persona's MAC came from its *index*, and a workspace's DualSense persona and
+  DualSense Edge persona are both index 0 — so both pads reported
+  `02:46:58:00:00:00`, one identity between them. Steam files a PlayStation
+  controller under its MAC, which is what the names of its per-controller
+  calibration files say, and a pad arriving under a MAC it has already recorded
+  is the one that goes missing. So the pad was there and wasn't: the host
+  controller's list, the devnode tree and a plain HID app each showed the
+  persona attached, enumerating and streaming, while Steam's usable-controllers
+  list — and the games behind it — held one Sony pad where the workspace had
+  two, which of the pair surviving came down to arrival order. The MAC's tail
+  now comes from the persona's own USB serial, already fixed per device id:
+  unique per pad, and the same pad keeps the same MAC session after session,
+  which is what a host keying controllers by MAC wants. The index parameter
+  existed only to make that MAC unique, so it leaves the persona API with the
+  collision; the device id was always the identity.
+
 ### Added
 
 - **A persona probe for when a pad deploys but nobody can see it:**
   `cargo run -p flexinput-virtual --example persona_probe -- virtual.usb.dualsense_edge`
   attaches one persona on its own, says whether the host controller took it and why
   not, and can hold it plugged in (`HOLD_SECS=30`) so Device Manager can be looked at
-  while it's there. A persona deploy never reaches HIDMaestro's helper log at all, and
-  stderr is lost when the app starts from a shortcut, so this is the only way to ask
-  the question directly.
+  while it's there. Each persona prints the serial and pairing MAC it answers with,
+  since a pad sharing either is a pad a host may fold into its neighbour, and
+  `--list` asks only what the controller has imported, so a running app's own
+  personas can be inspected. A persona deploy never reaches HIDMaestro's helper log
+  at all, and stderr is lost when the app starts from a shortcut, so this is the
+  only way to ask the question directly.
 
 ## [0.17.0] - 2026-11-07
 

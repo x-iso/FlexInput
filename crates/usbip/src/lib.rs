@@ -45,6 +45,9 @@ use std::sync::Arc;
 pub use audio::PcmSink;
 pub use descriptors::{AudioStream, DescriptorError, DescriptorSet};
 pub use device::{OutputFrame, OutputKind};
+/// The three bytes that tell one persona's pairing MAC from another's, so a
+/// diagnostic can print the MAC a pad answers with: `02:46:58`, then these.
+pub use feature::mac_tail;
 #[cfg(any(windows, target_os = "linux"))]
 pub use passthrough::{HostRequest, Passthrough, PassthroughSpec, ReportKind};
 pub use server::{is_our_location, BASE_PORT, HOST, PORT_RANGE};
@@ -112,12 +115,13 @@ pub struct EmulatedDevice {
 
 impl EmulatedDevice {
     /// Build the device a composite profile describes and register it. `key`
-    /// is FlexInput's device id (it fixes the serial); `index` makes the
-    /// pairing MAC unique per controller.
-    pub fn new(profile_json: &str, key: &str, index: u8) -> Result<Self, Error> {
+    /// is FlexInput's device id: it fixes the USB serial and, through it, the
+    /// pairing MAC - the same pad keeps one identity across sessions, and two
+    /// pads in one workspace never answer with a shared MAC.
+    pub fn new(profile_json: &str, key: &str) -> Result<Self, Error> {
         let desc = DescriptorSet::from_profile_json(profile_json, &serial_for(key)).map_err(Error::Descriptor)?;
         let server = server::global().map_err(Error::Io)?;
-        let inner = server.register(|busid, devid| Arc::new(DeviceInner::new(desc, busid, devid, index)));
+        let inner = server.register(|busid, devid| Arc::new(DeviceInner::new(desc, busid, devid)));
         Ok(EmulatedDevice { inner, server })
     }
 
@@ -218,7 +222,7 @@ mod tests {
     // read input, write output.
     #[test]
     fn a_client_imports_enumerates_and_exchanges_reports() {
-        let dev = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.e2e", 0).unwrap();
+        let dev = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.e2e").unwrap();
         let mut s = import(&dev);
         for _ in 0..100 {
             if dev.is_connected() { break; }
@@ -274,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_second_import_is_refused_busy_and_dropping_disconnects() {
-        let dev = EmulatedDevice::new(profiles::DUALSENSE_EDGE_COMPOSITE_JSON, "test.busy", 1).unwrap();
+        let dev = EmulatedDevice::new(profiles::DUALSENSE_EDGE_COMPOSITE_JSON, "test.busy").unwrap();
         let mut first = import(&dev);
         let mut second = TcpStream::connect((HOST, dev.port())).unwrap();
         second.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -345,8 +349,8 @@ mod tests {
 
     #[test]
     fn devices_get_distinct_busids_on_one_server() {
-        let a = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.a", 0).unwrap();
-        let b = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.b", 1).unwrap();
+        let a = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.a").unwrap();
+        let b = EmulatedDevice::new(profiles::DUALSENSE_COMPOSITE_JSON, "test.b").unwrap();
         assert_ne!(a.busid(), b.busid());
         assert_eq!(a.port(), b.port());
         assert!(is_our_location(HOST, &a.port().to_string()));
