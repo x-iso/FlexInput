@@ -3,6 +3,48 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.17.0] - 2026-11-07
+
+### Fixed
+
+- **A virtual DualSense now carries the rest of its report.** A real pad writes
+  more into each one than sticks, buttons and motion: a rolling sequence byte, a
+  second 32-bit counter beside it, the IMU's own 3 MHz clock stamped twice a
+  report about 2 ms apart, a few vendor bytes that never change, and 8 bytes of
+  noise at the end. FlexInput left all of that at zero — the profiles declared
+  the sequence byte and the clock, and the encoder never looked at either. A
+  game reading the gyro straight was fine, which is why aiming worked and hid
+  the rest. What broke were the features that *integrate* motion, working out
+  how far the pad has turned since the last report rather than how fast it's
+  turning now: a report that never changes its counters reads as one frame
+  replayed forever. **Weapon Control** in Modern Warfare is how this surfaced,
+  and it now engages on a virtual pad as it does on hardware. Both counters
+  advance once per report; the clock comes from a real clock rather than a
+  per-report step, so a pad publishing at its own rate still tells the truth
+  about elapsed time; the noise tail moves as hardware's does; and the bytes
+  that are static on hardware stay static at what hardware holds. A DS4, or any
+  output whose profile declares none of this, is untouched.
+- **The persona with audio answers a game's questions about the pad the way a
+  pad does.** Its motion calibration was a synthesised identity table and its
+  firmware block came from a different pad; both come from a real wired
+  DualSense now, so a game scaling the gyro by what it reads lands on the same
+  degrees-per-second and g as hardware. The patch report carries the firmware
+  line and the pad's own MAC where the real one puts its own, instead of 64
+  zeros, and two reports real hardware answers with an otherwise empty body,
+  `0x81` and `0x83`, are answered rather than refused — nothing real refuses
+  them. The plain virtual pad path keeps HIDMaestro's own answers, unchanged.
+
+### Added
+
+- **A probe for what a pad actually puts on the wire.** `hm_report_record` sits
+  on every gamepad connected at once — a physical pad, FlexInput's virtual pads,
+  another emulator's — for a few seconds, then prints byte by byte which bytes
+  move, how far and how often: the counters, the clocks, the noise, the report
+  rate. It tells a virtual pad from a physical one by the MAC it answered with
+  at pairing. Running a real pad beside a virtual one is how the fix above was
+  found, and it's the shortest way to see why a game takes one pad and not the
+  other. `hm_feature_dump` labels each pad physical or virtual now too.
+
 ## [0.16.9] - 2026-11-04
 
 ### Added

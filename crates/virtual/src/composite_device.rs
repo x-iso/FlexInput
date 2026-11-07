@@ -21,6 +21,7 @@ use flexinput_hidmaestro::Profile;
 use flexinput_usbip::{vhci, EmulatedDevice, OutputKind};
 
 use crate::apply_pin;
+use crate::pad_clock::PadClock;
 use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 
@@ -38,6 +39,10 @@ pub struct CompositeDevice {
     vport: Option<i32>,
     rumble: (f32, f32),
     sony: SonyFeedback,
+    /// The vendor block's moving fields — sequence byte, 32-bit report counter,
+    /// 3 MHz clock stamps, noise tail — advanced once per published report, the
+    /// way a real pad's are. See [`PadClock`].
+    clock: PadClock,
     /// The haptic waveform the game streams (output channels 3/4), measured
     /// into per-side amplitude and frequency on the pacing thread.
     haptics: Arc<Mutex<HapticConverter>>,
@@ -65,8 +70,15 @@ impl CompositeDevice {
     /// The device, not yet served or attached.
     fn detached(id: impl Into<String>, display_name: impl Into<String>, profile_json: &str) -> Option<Self> {
         let profile = Profile::from_json(profile_json).ok()?;
+        let id: String = id.into();
+        // Seeded from the device id so two deployed personas don't stream the
+        // same noise tail.
+        let seed = id
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        let clock = PadClock::new(profile.extended.sequence_initial, seed);
         Some(CompositeDevice {
-            id: id.into(),
+            id,
             display_name: display_name.into(),
             report_buf: vec![0u8; profile.report.byte_size()],
             profile,
@@ -75,6 +87,7 @@ impl CompositeDevice {
             vport: None,
             rumble: (0.0, 0.0),
             sony: SonyFeedback::default(),
+            clock,
             haptics: Arc::new(Mutex::new(HapticConverter::new())),
         })
     }
@@ -88,7 +101,9 @@ impl CompositeDevice {
         let haptics = Arc::clone(&self.haptics);
         usb.set_pcm_sink(Some(Box::new(move |pcm: &[u8]| haptics.lock().unwrap().push_pcm(pcm))));
         // A neutral report waits for the host's first read.
-        encode_report_into(&self.profile, &self.pins.state(), &mut self.report_buf);
+        let mut state = self.pins.state();
+        self.clock.stamp(&mut state);
+        encode_report_into(&self.profile, &state, &mut self.report_buf);
         usb.submit_input(&self.report_buf);
         let vport = vhci::attach(flexinput_usbip::HOST, usb.port(), usb.busid()).map_err(|e| e.to_string())?;
         self.usb = Some(usb);
@@ -135,7 +150,9 @@ impl crate::VirtualDevice for CompositeDevice {
 
     fn flush(&mut self) {
         let Some(usb) = self.usb.as_ref() else { return };
-        encode_report_into(&self.profile, &self.pins.state(), &mut self.report_buf);
+        let mut state = self.pins.state();
+        self.clock.stamp(&mut state);
+        encode_report_into(&self.profile, &state, &mut self.report_buf);
         usb.submit_input(&self.report_buf);
     }
 

@@ -30,6 +30,8 @@ use flexinput_hidmaestro::Profile;
 // Bluetooth transport serves both with one loop.
 use flexinput_usbip::{HostRequest, ReportKind};
 
+use crate::pad_clock::PadClock;
+use crate::pad_clock::PadClock;
 use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 
@@ -220,6 +222,10 @@ pub struct UhidDevice {
     reader: Option<JoinHandle<()>>,
     rumble: (f32, f32),
     sony: SonyFeedback,
+    /// The vendor block's moving fields — sequence byte, 32-bit report counter,
+    /// 3 MHz clock stamps, noise tail — advanced once per published report, the
+    /// way a real pad's are. See [`PadClock`].
+    clock: PadClock,
 }
 
 impl UhidDevice {
@@ -270,6 +276,7 @@ impl UhidDevice {
 
     /// The device before its node exists: disconnected.
     fn unbuilt(id: String, display_name: String, profile: Profile) -> Self {
+        let clock = PadClock::new(profile.extended.sequence_initial, index as u64);
         UhidDevice {
             id,
             display_name,
@@ -282,6 +289,7 @@ impl UhidDevice {
             reader: None,
             rumble: (0.0, 0.0),
             sony: SonyFeedback::default(),
+            clock,
         }
     }
 
@@ -331,7 +339,8 @@ impl crate::VirtualDevice for UhidDevice {
 
     fn flush(&mut self) {
         let Some(node) = &self.node else { return };
-        let state = self.pins.state();
+        let mut state = self.pins.state();
+        self.clock.stamp(&mut state);
         // The encoder writes the report id at [0] when there is one, which is
         // the form UHID takes.
         encode_report_into(&self.profile, &state, &mut self.report_buf);

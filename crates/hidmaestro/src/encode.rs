@@ -89,6 +89,30 @@ pub struct GamepadState {
     /// "finger not touching" sentinel.
     pub touch1: TouchOut,
     pub touch2: TouchOut,
+    /// The DualSense input report's rolling sequence byte (report byte 7). A
+    /// real pad advances it with every report; consumers of the vendor motion
+    /// block (Sony's own stack, SDL, some games' motion features) use it to
+    /// order and rate samples. Devices own it: it increments once per
+    /// published report, NOT per state change, so an idle pad still streams
+    /// fresh frames. Ignored when the profile declares no sequence field.
+    pub sequence: u8,
+    /// The vendor block's free-running 32-bit report counter — a real DualSense
+    /// runs one at report bytes 12..15 that ticks once per report, independently
+    /// of the byte-7 sequence. Ignored unless the profile declares it.
+    pub report_counter: u32,
+    /// The IMU's sample clock, in ticks of a free-running 3 MHz counter, plus
+    /// the second stamp a real pad writes ~2 ms later (bytes 28..31 and
+    /// 49..52). Motion features that integrate read these to get a delta
+    /// between frames, so a stuck stamp makes every report look like a replay
+    /// of the previous one. Devices derive both from a monotonic clock, so they
+    /// advance even while the state is unchanged. Ignored unless the profile
+    /// declares them.
+    pub sensor_ticks: u32,
+    pub sensor_ticks2: u32,
+    /// The 8-byte tail of a real DualSense report (bytes 56..63), which the
+    /// hardware fills with uncorrelated values — a run of zeros is something no
+    /// real pad ever sends. Ignored unless the profile declares it.
+    pub vendor_noise: [u8; 8],
 }
 
 /// One touchpad finger for encoding into a virtual DS4/DualSense report.
@@ -398,6 +422,14 @@ pub fn gip_from_state(state: &GamepadState) -> [u8; 14] {
     g
 }
 
+/// Write the uint32-LE value `v` at byte `off` (RID-inclusive), if in bounds.
+fn write_u32_le(report: &mut [u8], off: usize, v: u32) {
+    if off + 3 < report.len() {
+        let b = v.to_le_bytes();
+        report[off..off + 4].copy_from_slice(&b);
+    }
+}
+
 /// Write the int16-LE little-endian value `v` at byte `off` (RID-inclusive
 /// offset into the on-wire report), if in bounds.
 fn write_i16_le(report: &mut [u8], off: usize, v: i16) {
@@ -441,6 +473,38 @@ fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
     }
     if let Some(o) = ext.accel_z {
         write_i16_le(report, o, to_i16(state.accel_z));
+    }
+
+    // Rolling sequence number: written last-ish so it carries the value the
+    // device advanced for THIS report. A constant byte 7 tells any consumer
+    // reading the vendor block that no new sample ever arrives.
+    if let Some(o) = ext.in_sequence {
+        if let Some(b) = report.get_mut(o) {
+            *b = state.sequence;
+        }
+    }
+
+    // The rest of the vendor block's "signs of life": a second, 32-bit report
+    // counter, the IMU's two sample-clock stamps, and the noise tail. A native
+    // title that integrates motion reads the stamps for its delta between
+    // frames, and nothing on a real pad ever holds these still at zero, so a
+    // report without them looks like a replayed frame no matter how the sticks
+    // and gyro move.
+    if let Some(o) = ext.in_counter32 {
+        write_u32_le(report, o, state.report_counter);
+    }
+    if let Some(o) = ext.in_ticks {
+        write_u32_le(report, o, state.sensor_ticks);
+    }
+    if let Some(o) = ext.in_ticks2 {
+        write_u32_le(report, o, state.sensor_ticks2);
+    }
+    if let Some(o) = ext.in_noise {
+        for i in 0..8 {
+            if let Some(b) = report.get_mut(o + i) {
+                *b = state.vendor_noise[i];
+            }
+        }
     }
 
     // Buttons outside the descriptor's Button page (the DualSense Edge's back
@@ -662,6 +726,15 @@ impl PinState {
             right_trigger: self.rt.clamp(0.0, 1.0),
             buttons: self.buttons,
             hat: Hat::from_dpad(self.dpad_up, self.dpad_down, self.dpad_left, self.dpad_right),
+            // The device owns the rolling sequence: it stamps it onto the
+            // snapshot per published report, so the snapshot itself starts at 0.
+            sequence: 0,
+            // Likewise the rest of the vendor block's moving fields: the device
+            // stamps them per published report (`PadClock`).
+            report_counter: 0,
+            sensor_ticks: 0,
+            sensor_ticks2: 0,
+            vendor_noise: [0; 8],
             // Exact inverse of the physical DS4/DualSense IMU decode
             // (flexinput_devices::gyro::build), so a virtual pad's wire report
             // matches what a real pad would emit in the same pose. The wire
@@ -1247,5 +1320,27 @@ mod tests {
         ps.set("left_stick_x", 1.0, true); // full right → X = 0xFF
         let rep = encode_report(&p, &ps.state());
         assert_eq!(rep[1], 255, "left_stick_x=+1 should drive X to max");
+    }
+
+    // The DualSense rolling sequence byte: a real pad advances it every
+    // report, and consumers of the vendor motion block (Sony's stack, SDL,
+    // and at least one game's motion feature) treat a constant one as "no
+    // fresh sample". The encoder carries the device's counter into byte 7.
+    #[test]
+    fn dualsense_sequence_rides_byte_7() {
+        let p = Profile::from_json(include_str!("../profiles/dualsense.json")).unwrap();
+        assert_eq!(p.extended.in_sequence, Some(7), "profile declares byte 7");
+        assert_eq!(p.extended.sequence_initial, 0, "profile's initial");
+        let mut st = GamepadState::neutral();
+        st.sequence = 0xC7;
+        assert_eq!(encode_report(&p, &st)[7], 0xC7, "byte 7 carries the counter");
+
+        // The Edge declares the same field in its own report layout.
+        let e = Profile::from_json(include_str!("../profiles/dualsense-edge.json")).unwrap();
+        assert_eq!(e.extended.in_sequence, Some(7), "Edge byte 7");
+
+        // DS4 declares no sequence field: byte 7 stays as the neutral encode.
+        let d = ds4();
+        assert_eq!(d.extended.in_sequence, None, "DS4 has no rolling field");
     }
 }

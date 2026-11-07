@@ -272,6 +272,9 @@ pub mod hidmaestro_device;
 mod sony_feedback;
 
 #[cfg(any(windows, target_os = "linux"))]
+mod pad_clock;
+
+#[cfg(any(windows, target_os = "linux"))]
 pub mod composite_device;
 
 #[cfg(any(windows, target_os = "linux"))]

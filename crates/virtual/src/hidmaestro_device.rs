@@ -20,6 +20,7 @@ use flexinput_core::Signal;
 use flexinput_hidmaestro::encode::{encode_report_into, gip_from_state, PinState};
 use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
+use crate::pad_clock::PadClock;
 use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 
@@ -111,6 +112,12 @@ pub struct HidMaestroDevice {
     /// The plain-HID (Sony) path's output-report decode: rumble peak/settle,
     /// lightbar, LEDs, adaptive triggers.
     sony: SonyFeedback,
+    /// The vendor block's moving fields — sequence byte, 32-bit report counter,
+    /// 3 MHz clock stamps, noise tail — advanced once per published report, the
+    /// way a real pad's are. The driver replays our last frame verbatim for its
+    /// idle repeats, so stamping per `flush()` is what makes the virtual pad
+    /// stream fresh samples. See [`PadClock`].
+    clock: PadClock,
 }
 
 impl HidMaestroDevice {
@@ -127,6 +134,7 @@ impl HidMaestroDevice {
         controller_index: u32,
     ) -> Option<Self> {
         let profile = Profile::from_json(profile_json).ok()?;
+        let clock = PadClock::new(profile.extended.sequence_initial, controller_index as u64);
         let report_buf = vec![0u8; profile.input_report_size];
         let input = InputSection::open(controller_index).ok();
         let output = OutputSection::open(controller_index).ok();
@@ -140,6 +148,7 @@ impl HidMaestroDevice {
             input,
             output,
             rumble: (0.0, 0.0),
+            clock,
             helper_instance_id: None,
             last_rumble_cmd: None,
             sony: SonyFeedback::default(),
@@ -179,7 +188,8 @@ impl HidMaestroDevice {
                 // is listening. Prime a neutral frame so the driver's first
                 // observed SeqNo transition is unambiguously ours.
                 if let Some(input) = dev.input.as_mut() {
-                    let state = dev.pins.state();
+                    let mut state = dev.pins.state();
+                    dev.clock.stamp(&mut state);
                     // Mirror flush(): for the XUSB companion send an empty HID
                     // Data[] (GIP is the sole source); otherwise encode the report.
                     let gip = dev
@@ -257,7 +267,8 @@ impl crate::VirtualDevice for HidMaestroDevice {
         let Some(input) = self.input.as_mut() else {
             return;
         };
-        let state = self.pins.state();
+        let mut state = self.pins.state();
+        self.clock.stamp(&mut state);
         // For XInput/Xbox360 pads the XUSB companion derives state SOLELY from the
         // GipData[14] region — and it ALSO reads the HID Data[] for its sibling
         // node. If we publish a populated HID report there too, the descriptor's

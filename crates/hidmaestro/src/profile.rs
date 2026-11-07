@@ -94,6 +94,9 @@ struct RawExtField {
     bits: Option<String>,
     /// A `button-mask`'s button names in bit order; "_" marks an unused bit.
     buttons: Option<Vec<String>>,
+    /// A `uint8-rolling` field's starting value (the DualSense's sequence
+    /// number; real pads power on at any value, ours starts where told).
+    initial: Option<u8>,
 }
 
 impl RawExtField {
@@ -180,6 +183,29 @@ pub struct ExtendedLayout {
     /// `(button bit, byte, bit)`, the byte RID-inclusive. The DualSense Edge's
     /// back and Fn buttons. Empty for every other profile.
     pub extra_buttons: Vec<(u32, usize, u8)>,
+    /// Input-report byte of the `uint8-rolling` sequence number (RID-inclusive),
+    /// the DualSense's byte 7. A real pad advances it every report; consumers
+    /// of the vendor motion block use it to order and rate the samples, so a
+    /// virtual pad that leaves it constant reads as one frozen frame replayed
+    /// forever. `None` when the profile declares no sequence field.
+    pub in_sequence: Option<usize>,
+    /// The sequence byte's starting value from the profile (`initial`, 0 when
+    /// unset); the device advances it once per published report.
+    pub sequence_initial: u8,
+    /// First byte of the vendor block's second, 32-bit report counter. A real
+    /// DualSense runs one at bytes 12..15 (`uint32-le`, `reportCounter`) that
+    /// ticks once per report, independently of the byte-7 sequence.
+    pub in_counter32: Option<usize>,
+    /// First byte of the IMU sample clock (`uint32-le`, `sensorTimestamp`): a
+    /// real pad's free-running 3 MHz counter, at bytes 28..31, plus a second
+    /// stamp written ~2 ms later at bytes 49..52 (`sensorTimestamp2`). Motion
+    /// features integrate over this, so a stuck stamp reads as one replayed
+    /// frame.
+    pub in_ticks: Option<usize>,
+    pub in_ticks2: Option<usize>,
+    /// First byte of the 8-byte report tail (`vendorNoise`) that real hardware
+    /// fills with uncorrelated values — never a run of zeros.
+    pub in_noise: Option<usize>,
 }
 
 impl ExtendedLayout {
@@ -198,6 +224,14 @@ impl ExtendedLayout {
                     "accelY" => out.accel_y = Some(byte),
                     "accelZ" => out.accel_z = Some(byte),
                     "batteryLevel" => out.battery_level = Some(byte),
+                    "sequenceNum" => {
+                        out.in_sequence = Some(byte);
+                        out.sequence_initial = f.initial.unwrap_or(0);
+                    }
+                    "reportCounter" => out.in_counter32 = Some(byte),
+                    "sensorTimestamp" => out.in_ticks = Some(byte),
+                    "sensorTimestamp2" => out.in_ticks2 = Some(byte),
+                    "vendorNoise" => out.in_noise = Some(byte),
                     _ => {}
                 }
                 if f.ty.as_deref() == Some("touchpad-finger") {
