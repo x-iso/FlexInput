@@ -70,14 +70,22 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
         return Box::new(uinput::Xbox360::create(device_id, display_name));
     }
     if let Some(json) = composite_profile_json(kind_id) {
-        // `None` only for an invalid bundled profile, a build bug.
+        // A persona the host controller refused comes back unattached with the
+        // reason kept on it; only an unreadable preset returns `None`, and even
+        // that becomes a stand-in rather than a panic on the device-ops worker,
+        // which would leave every later deploy unanswered.
         let dev = crate::composite_device::CompositeDevice::create(&device_id, &display_name, json, instance as u8);
-        return Box::new(dev.expect("bundled composite profile parses"));
+        return Box::new(dev.unwrap_or_else(|| {
+            crate::undeployed::stand_in(kind_id, &device_id, &display_name, "the persona's profile could not be read")
+        }));
     }
     if let Some(json) = sony_profile_json(kind_id) {
-        // `None` only for an invalid bundled profile, a build bug.
+        // `None` only for an invalid bundled profile, a build bug — same
+        // stand-in, same reason not to panic on the worker.
         let dev = uhid::UhidDevice::create(&device_id, &display_name, json, instance as u32);
-        return Box::new(dev.expect("bundled Sony profile parses"));
+        return Box::new(dev.unwrap_or_else(|| {
+            crate::undeployed::stand_in(kind_id, &device_id, &display_name, "the virtual node could not be created")
+        }));
     }
     if kind_id == "virtual.keymouse" {
         return match crate::keymouse_hm::VirtualKeyMouseHm::create() {

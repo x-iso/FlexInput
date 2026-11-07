@@ -96,10 +96,17 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
         // keeps its own identity across lives.
         let (device_id, display_name) = instance_label(kind_id, hm_display_name(kind_id), instance);
         if let Some(d) = crate::composite_device::CompositeDevice::create(
-            device_id, display_name, profile_json, instance as u8,
+            device_id.clone(), display_name.clone(), profile_json, instance as u8,
         ) {
             return Box::new(d);
         }
+        // Only an unreadable preset gets here — the persona itself reports a
+        // refused attach instead. Either way the caller keeps a device with the
+        // id it asked for: falling through to the kind table below would have
+        // hit its `panic!`, and this runs on the device-ops worker, so a panic
+        // would take the worker down and every deploy after it would silently
+        // go unanswered.
+        return Box::new(crate::undeployed::stand_in(kind_id, device_id, display_name, "the persona's profile could not be read"));
     }
     if let Some(profile_json) = hm_profile_json(kind_id) {
         // HIDMaestro device: the helper creates the node + sections (one UAC on
@@ -112,8 +119,8 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
         let (device_id, display_name) =
             instance_label(kind_id, hm_display_name(kind_id), instance);
         let dev = crate::hidmaestro_device::HidMaestroDevice::create(
-            device_id,
-            display_name,
+            device_id.clone(),
+            display_name.clone(),
             profile_json,
             instance as u32,
         );
@@ -122,6 +129,7 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
         if let Some(d) = dev {
             return Box::new(d);
         }
+        return Box::new(crate::undeployed::stand_in(kind_id, device_id, display_name, "the virtual node could not be created"));
     }
     match kind_id {
         "virtual.xinput"   => Box::new(VirtualXInput::new(instance)),

@@ -1,6 +1,7 @@
 pub mod layouts;
 pub mod driver_availability;
 pub mod display_clock;
+pub mod undeployed;
 
 use flexinput_core::{Signal, SignalType};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, Ordering};
@@ -234,6 +235,13 @@ pub trait VirtualDevice: Send {
     /// Returns false if the underlying system resource is unavailable
     /// (e.g. ViGEmBus not installed, enigo init failed).
     fn is_connected(&self) -> bool { true }
+    /// Why this device couldn't be deployed, for a device built but never
+    /// plugged in (a composite persona the host controller refused). `None`
+    /// for a device that is fine, and for one that simply hasn't been asked to
+    /// connect. The UI reports this instead of showing a pad that isn't there:
+    /// a persona that fails its attach and is parked in the pool counts as
+    /// "already deployed", so nothing retries and no reason is ever seen.
+    fn deploy_error(&self) -> Option<String> { None }
     /// Output pins this device exposes back into the graph (e.g. rumble from games).
     /// Empty by default — only devices with feedback signals implement this.
     fn source_pins(&self) -> &'static [SourcePin] { &[] }

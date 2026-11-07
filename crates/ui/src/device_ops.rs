@@ -157,7 +157,19 @@ fn worker_loop(
                     format!("Deploying {}…", friendly(&device_id)),
                 )));
                 let result = match build_device(&device_id) {
-                    Some(device) => DeviceOpResult::Created { device },
+                    // A device that came back but never made it onto the
+                    // system — a persona the host controller refused, after its
+                    // attach retries — is a failure, not a success: parking it
+                    // in the pool tells the per-frame reconcile the node is
+                    // satisfied, so nothing deploys, nothing retries, and the
+                    // user sees a pad in the graph that isn't in Windows.
+                    Some(device) => match device.deploy_error() {
+                        Some(error) => {
+                            eprintln!("[device-ops] deploy '{device_id}' failed: {error}");
+                            DeviceOpResult::Failed { device_id: device_id.clone(), error }
+                        }
+                        None => DeviceOpResult::Created { device },
+                    },
                     None => DeviceOpResult::Failed {
                         device_id: device_id.clone(),
                         error: format!("could not build device '{device_id}'"),

@@ -46,14 +46,31 @@ pub struct CompositeDevice {
     /// The haptic waveform the game streams (output channels 3/4), measured
     /// into per-side amplitude and frequency on the pacing thread.
     haptics: Arc<Mutex<HapticConverter>>,
+    /// Why the host controller refused this persona, once every attach attempt
+    /// has been spent. `None` while it's connected or never asked to connect.
+    deploy_error: Option<String>,
 }
+
+/// Attach attempts for one persona, and how long to sit between them. Switching
+/// a pad to its USB-audio variant plugs the persona in and unplugs the old pad
+/// a frame apart, and in that window the controller is busy unplugging and
+/// Windows is re-enumerating USB; the attach is one attempt with no background
+/// retry (see [`vhci`]), so a transient there used to leave a pad in the pool
+/// that was never actually there. Backoff grows per attempt: the teardown that
+/// is racing us takes a few hundred ms at worst.
+const ATTACH_ATTEMPTS: usize = 3;
+const ATTACH_BACKOFF_MS: u64 = 400;
 
 impl CompositeDevice {
     /// Build the persona `profile_json` describes and attach it, setting the
     /// host controller up first if it isn't (see [`ensure_host_controller`]).
     /// Blocking: call from the device-ops worker. `None` only for an invalid
-    /// bundled profile; a failed attach returns a disconnected device, with
-    /// the reason logged.
+    /// bundled profile. A persona the controller refuses is retried a few times
+    /// (see [`ATTACH_ATTEMPTS`]) and then returned unattached with the reason
+    /// kept in [`VirtualDevice::deploy_error`], so the caller can say so instead
+    /// of parking a pad that isn't there.
+    ///
+    /// [`VirtualDevice::deploy_error`]: crate::VirtualDevice::deploy_error
     pub fn create(
         id: impl Into<String>,
         display_name: impl Into<String>,
@@ -61,10 +78,27 @@ impl CompositeDevice {
         index: u8,
     ) -> Option<Self> {
         let mut dev = Self::detached(id, display_name, profile_json)?;
-        if let Err(e) = dev.connect(profile_json, index) {
-            eprintln!("[usbip] {} not attached: {e}", dev.id);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match dev.connect(profile_json, index) {
+                Ok(()) => return Some(dev),
+                Err(e) if attempt < ATTACH_ATTEMPTS => {
+                    eprintln!(
+                        "[usbip] {} attach attempt {attempt}/{ATTACH_ATTEMPTS} failed: {e}; retrying",
+                        dev.id
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        ATTACH_BACKOFF_MS * attempt as u64,
+                    ));
+                }
+                Err(e) => {
+                    eprintln!("[usbip] {} not attached after {attempt} attempts: {e}", dev.id);
+                    dev.deploy_error = Some(e);
+                    return Some(dev);
+                }
+            }
         }
-        Some(dev)
     }
 
     /// The device, not yet served or attached.
@@ -89,6 +123,7 @@ impl CompositeDevice {
             sony: SonyFeedback::default(),
             clock,
             haptics: Arc::new(Mutex::new(HapticConverter::new())),
+            deploy_error: None,
         })
     }
 
@@ -163,6 +198,10 @@ impl crate::VirtualDevice for CompositeDevice {
 
     fn is_connected(&self) -> bool {
         self.vport.is_some()
+    }
+
+    fn deploy_error(&self) -> Option<String> {
+        self.deploy_error.clone()
     }
 
     fn source_pins(&self) -> &'static [SourcePin] {

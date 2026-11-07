@@ -29,6 +29,26 @@ All notable changes to FlexInput are documented here. This project adheres to
   bytes stay unpinned there, because inventing an Edge's values would be no
   truer than zeros.
 
+- **Switching a pad to its Audio & Haptics variant deploys what replaces it.**
+  The checkbox used to be a trap: pick a virtual DualSense Edge, tick it, and the
+  Edge went away without the persona taking its place — nothing in Windows, and
+  nothing in the log beyond a line on stderr. A switch re-points one node, so the
+  same frame asked the deploy worker to build the persona and to unplug the pad
+  it replaces, in that order, and the persona's attach went first, while the old
+  pad was still plugged in and Windows was re-enumerating around it. The attach
+  is deliberately one attempt with no background retry, so losing that race ended
+  with a persona that had never attached sitting in the pool pretending to be
+  deployed: the per-frame reconcile counted the node as satisfied, so it never
+  retried, and the pad's own refusal was never shown anywhere. The teardown is
+  now queued ahead of the build, the attach is tried three times with a short
+  wait between tries, and a persona the controller still refuses reports the
+  reason instead of posing as a device — you get "deploying failed: …" rather
+  than a pad that isn't there. One hazard found on the way: a device build that
+  returned nothing fell through the kind table to a `panic!`, which ran on that
+  same deploy worker and took it down, after which every later deploy was
+  accepted and silently never run; such a build now yields a stand-in that keeps
+  the node's identity and says what went wrong.
+
 ## [0.17.0] - 2026-11-07
 
 ### Fixed
