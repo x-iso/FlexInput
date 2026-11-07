@@ -320,7 +320,7 @@ pub fn encode_report_into(profile: &Profile, state: &GamepadState, report: &mut 
     encode_extended(profile, state, report);
 
     // Fixed bytes the profile pins on every report, last so nothing above can
-    // clobber them (the DualSense Edge's active-profile byte).
+    // clobber them (the DualSense's static vendor bytes).
     for &(byte, value) in &profile.input_defaults {
         if let Some(b) = report.get_mut(byte) {
             *b = value;
@@ -1084,16 +1084,31 @@ mod tests {
         assert_eq!(encode_report(&p, &ps.state()), neutral);
     }
 
-    // The Edge's inputDefaults pin the active-profile byte (49) to 0x80 on every
-    // report, whatever else is pressed.
+    // The Edge carries the same vendor block as the base pad: rolling sequence, the
+    // report counter, both 3 MHz stamps and the noise tail. Nothing there is pinned
+    // any more — the byte 49 this profile used to hold at 0x80 is where a measured
+    // base pad stamps its clock's second half, and a field that never changes reads
+    // as one frame replayed.
     #[test]
-    fn edge_stamps_input_defaults() {
+    fn edge_carries_the_vendor_block_like_the_base_pad() {
         let p = edge();
         assert_eq!(p.report.byte_size(), 64, "Edge USB report 0x01 is 64 bytes");
-        let mut ps = PinState::new();
-        ps.set("btn_paddle_r1", 0.0, true);
-        let rep = encode_report(&p, &ps.state());
-        assert_eq!(&rep[49..53], &[0x80, 0, 0, 0]);
+        assert_eq!(p.extended.in_counter32, Some(12), "Edge byte 12");
+        assert_eq!(p.extended.in_ticks, Some(28), "Edge byte 28");
+        assert_eq!(p.extended.in_ticks2, Some(49), "Edge byte 49, no longer pinned");
+        assert_eq!(p.extended.in_noise, Some(56), "Edge byte 56");
+        let mut st = GamepadState::neutral();
+        st.sequence = 0x2a;
+        st.report_counter = 0xdead_beef;
+        st.sensor_ticks = 0x1234_5678;
+        st.sensor_ticks2 = 0x1235_ee78;
+        st.vendor_noise = [1, 2, 3, 4, 5, 6, 7, 8];
+        let rep = encode_report(&p, &st);
+        assert_eq!(rep[7], 0x2a, "sequence byte");
+        assert_eq!(&rep[12..16], &[0xef, 0xbe, 0xad, 0xde], "report counter");
+        assert_eq!(&rep[28..32], &[0x78, 0x56, 0x34, 0x12], "sensor clock");
+        assert_eq!(&rep[49..53], &[0x78, 0xee, 0x35, 0x12], "the second stamp, ~2 ms ahead");
+        assert_eq!(&rep[56..64], &[1, 2, 3, 4, 5, 6, 7, 8], "noise tail");
     }
 
     #[test]

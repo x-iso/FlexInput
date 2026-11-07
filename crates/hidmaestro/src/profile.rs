@@ -63,7 +63,9 @@ struct RawProfile {
     #[serde(rename = "ownContainer")]
     own_container: Option<bool>,
     /// Fixed on-wire bytes laid over every built input report (byte 0 is the
-    /// report ID). The DualSense Edge's active-profile byte lives here.
+    /// report ID), applied after every field so nothing can overwrite them. The
+    /// DualSense's static vendor bytes live here; the Edge used to pin byte 49,
+    /// which is a clock stamp, and no longer does.
     #[serde(rename = "inputDefaults")]
     input_defaults: Option<Vec<RawInputDefault>>,
 }

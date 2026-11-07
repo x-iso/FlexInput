@@ -78,6 +78,16 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
         // no hardware does.
         0x81 if w_length >= 64 => Some(with_id(64, &[0x00; 63])),
         0x83 if w_length >= 64 => Some(with_id(64, &[0xFF, 0xFF, 0xFF, 0xFF])),
+        // The Edge declares a feature block the base pad's report descriptor
+        // doesn't: 0x60-0x65, 0x68 and 0x70-0x7b, 64 bytes each, the profile and
+        // button-remapping tables a title with Edge support reads to find the
+        // paddles and the Fn buttons. A pad never stalls a report it declares, so
+        // they're answered. What an Edge puts in them isn't known, so each body is
+        // empty — the shape of a pad with no remapping stored — rather than
+        // invented, and the id is the one thing a reader checks first.
+        0x60..=0x65 | 0x68 | 0x70..=0x7b if pid == 0x0DF2 && w_length >= 64 => {
+            Some(with_id(64, &[0x00; 63]))
+        }
         0x02 if w_length >= 41 => Some(with_id(41, &CALIBRATION)),
         0x02 if w_length >= 37 => Some(with_id(37, &CALIBRATION)),
         0xA3 if w_length >= 49 => Some(DS4_FIRMWARE_INFO.to_vec()),
@@ -237,6 +247,27 @@ mod tests {
         assert_eq!(&edge[22..24], &[0x44, 0x00]);
         assert_eq!(&edge[44..46], &[0x17, 0x02]);
         assert_eq!(ds[0], 0x20);
+    }
+
+    #[test]
+    fn the_edge_answers_the_reports_only_it_declares() {
+        // Its report descriptor declares 0x60-0x65, 0x68 and 0x70-0x7b, 64 bytes
+        // each; the base pad declares none of them, and nothing stalls a report it
+        // declares itself.
+        for id in [
+            0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x68, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
+            0x77, 0x78, 0x79, 0x7a, 0x7b,
+        ] {
+            let r = sony_feature(0x0DF2, id, 64, 0)
+                .unwrap_or_else(|| panic!("the Edge stalled its own report {id:#04x}"));
+            assert_eq!(r[0], id, "answered under its own id");
+            assert_eq!(r.len(), 64, "the size its descriptor declares");
+        }
+        assert!(sony_feature(0x0DF2, 0x60, 63, 0).is_none(), "short buffer stalls");
+        assert!(
+            sony_feature(0x0CE6, 0x60, 64, 0).is_none(),
+            "a base DualSense declares none of these"
+        );
     }
 
     #[test]

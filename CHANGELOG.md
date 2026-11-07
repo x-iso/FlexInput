@@ -3,6 +3,32 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A virtual DualSense Edge carries the vendor block like a DualSense does.**
+  The 0.17.0 fix reached the base pad's profiles only; both Edge profiles still
+  held bytes 12–15 at zero, left the noise tail empty, and pinned 49–52 to a
+  constant 0x80 on the belief that it marks the pad's active profile. Nothing
+  that has actually read the pad treats that region as meaningful: Sony's own
+  Linux driver lays the report out with `reserved[4]` at 12–15, `reserved3[12]`
+  at 41–52 and `reserved4[8]` at 56–63, the Edge included, whose only
+  input-report difference from the base pad is the four back and Fn buttons in
+  byte 10 — while a measured wired base pad stamps its IMU clock's second half
+  at exactly 49–52, stepping 12000 ticks a report. A pinned field there is
+  worse than a zero: differenced, it reports one frame replayed forever, which
+  is the very thing that had refused the base pad. The pin is gone and the Edge
+  declares the same fields now, so **Weapon Control** engages on an Edge persona
+  as it does on hardware. And the reports an Edge declares that the base pad
+  doesn't — 0x60–0x65, 0x68 and 0x70–0x7B, the profile and remapping block — are
+  answered instead of stalled, since a pad never refuses a report it declares
+  itself; their real contents aren't known, so each body is empty, the shape of
+  a pad with no remapping stored. What's inherited from the base pad rather than
+  read off an Edge is said in the profiles too: the base pad's static vendor
+  bytes stay unpinned there, because inventing an Edge's values would be no
+  truer than zeros.
+
 ## [0.17.0] - 2026-11-07
 
 ### Fixed
