@@ -65,6 +65,11 @@ fn main() {
         if !is_ds4 && !is_ds {
             continue;
         }
+        // Accept FlexInput's own virtuals too: the HIDMaestro node carries
+        // 'hidmaestro' in its instance path (root-enumerated, no VID_ segment)
+        // and the composite USB/IP persona matches VID_054C normally.
+        let path_lower = info.path().to_string_lossy().to_lowercase();
+        let is_virtual = path_lower.contains("hidmaestro");
         // Only the gamepad usage page interface carries the feature reports we
         // want; on Windows a pad can also expose audio/other collections.
         // usage_page 0x01 (Generic Desktop) / usage 0x05 (Gamepad).
@@ -81,10 +86,12 @@ fn main() {
         // are root-enumerated, so their HID instance path is `HID\HIDCLASS\...`
         // (no VID_ segment), whereas a physical pad's path carries `VID_054C`.
         let path = info.path().to_string_lossy().to_string();
-        let origin = if path.to_uppercase().contains("VID_054C") {
+        let origin = if is_virtual {
+            "VIRTUAL (HIDMaestro)"
+        } else if path.to_uppercase().contains("VID_054C") {
             "PHYSICAL"
         } else {
-            "VIRTUAL (HIDMaestro?)"
+            "VIRTUAL (other)"
         };
         println!(
             "\n=== {kind} [{origin}]  VID:{:04X} PID:{:04X}  \"{product}\" ===",
