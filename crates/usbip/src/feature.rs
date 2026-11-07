@@ -1,11 +1,14 @@
 //! The Sony feature reports a composite persona answers over GET_REPORT.
 //!
 //! A game with native PlayStation support interrogates a DualSense before it
-//! will use it — firmware info, pairing info, then motion calibration — and
-//! refuses a pad that answers with zeros. These are byte for byte the replies
-//! HIDMaestro's UMDF driver (`driver.c`) and its usbip backend serve, so a
-//! composite persona reads the same as FlexInput's plain virtual pads.
-//! VID 0x054C only; every composite persona is USB, so no Bluetooth CRC.
+//! will use it — firmware info, pairing info, motion calibration — and refuses a
+//! pad that answers with zeros. These replies are captured from a real wired
+//! DualSense wherever one could be read, so the persona answers the way the
+//! hardware does; where a field is per-unit and can't be reproduced (the `0x22`
+//! signature, the pairing MAC itself) it is synthesised consistently instead.
+//! The plain UMDF2 pad path keeps HIDMaestro's own table, in
+//! `profiles/models/sony-dualsense.json`. VID 0x054C only; every composite
+//! persona is USB, so no Bluetooth CRC.
 
 /// The pairing MAC's fixed prefix: locally administered, then 'F' 'X'. Not
 /// HIDMaestro's 'H' 'M', so a composite never shares a MAC with a plain
@@ -26,7 +29,12 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
         // Motion calibration. A DS4 orders its gyro pairs differently.
         0x05 if w_length >= 41 => {
             let ds4 = matches!(pid, 0x05C4 | 0x09CC | 0x0BA0);
-            Some(with_id(41, if ds4 { &CALIBRATION_DS4 } else { &CALIBRATION }))
+            let mut p = with_id(41, if ds4 { &CALIBRATION_DS4 } else { &CALIBRATION_DUALSENSE });
+            if !ds4 {
+                // The one live byte that follows the calibration block.
+                p[35] = 0x09;
+            }
+            Some(p)
         }
         // DualSense pairing info: the MAC at bytes 1..6.
         0x09 if w_length >= 20 => {
@@ -52,14 +60,55 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, index: u8) -> Option
             p[6] = index;
             Some(p)
         }
-        // Bluetooth patch info: zero past the id is a pad carrying no patch.
-        0x22 if w_length >= 64 => Some(with_id(64, &[])),
+        // Bluetooth patch info: on hardware this echoes the firmware line and
+        // the pad's own MAC, then carries a per-unit signature. We serve the
+        // parts that are ours and leave the signature region zero.
+        0x22 if w_length >= 64 => {
+            let mut p = PATCH_INFO.to_vec();
+            p[17] = MAC_PREFIX[0];
+            p[18] = MAC_PREFIX[1];
+            p[19] = MAC_PREFIX[2];
+            p[20] = MAC_PREFIX[3];
+            p[21] = MAC_PREFIX[4];
+            p[22] = index;
+            Some(p)
+        }
+        // Two more reports a real pad answers with an otherwise empty body —
+        // byte 0x81 all zeros, 0x83 with four 0xFFs. Stalling them is something
+        // no hardware does.
+        0x81 if w_length >= 64 => Some(with_id(64, &[0x00; 63])),
+        0x83 if w_length >= 64 => Some(with_id(64, &[0xFF, 0xFF, 0xFF, 0xFF])),
         0x02 if w_length >= 41 => Some(with_id(41, &CALIBRATION)),
         0x02 if w_length >= 37 => Some(with_id(37, &CALIBRATION)),
         0xA3 if w_length >= 49 => Some(DS4_FIRMWARE_INFO.to_vec()),
         _ => None,
     }
 }
+
+/// A real unit's motion calibration for the DualSense `0x05`: small per-axis
+/// biases, then the plus/minus full-scale counts per axis, then the gyro speed
+/// range. Captured byte for byte from a wired pad's own `0x05` rather than
+/// synthesised as an identity table, so a consumer that scales the IMU by these
+/// numbers lands on the same degrees-per-second and g it would from hardware.
+const CALIBRATION_DUALSENSE: [u8; 34] = [
+    0xfa, 0xff, // gyro_pitch_bias    -6
+    0xf8, 0xff, // gyro_yaw_bias      -8
+    0xf8, 0xff, // gyro_roll_bias     -8
+    0x8c, 0x22, // gyro_pitch_plus   +8844
+    0x6a, 0xdd, // gyro_pitch_minus  -8854
+    0x88, 0x22, // gyro_yaw_plus     +8840
+    0x66, 0xdd, // gyro_yaw_minus    -8858
+    0xaf, 0x22, // gyro_roll_plus    +8879
+    0x46, 0xdd, // gyro_roll_minus   -8890
+    0x1c, 0x02, // gyro_speed_plus    +540
+    0x1c, 0x02, // gyro_speed_minus   +540
+    0xf9, 0x1f, // acc_x_plus        +8185
+    0xef, 0xdf, // acc_x_minus       -8209
+    0xc1, 0x1f, // acc_y_plus        +8129
+    0xe1, 0xdf, // acc_y_minus       -8223
+    0xfe, 0x1f, // acc_z_plus        +8190
+    0x06, 0xe0, // acc_z_minus       -8186
+];
 
 /// Identity calibration for the pad's nominal units (8192 per g, 16 per
 /// degree/second), written after the report id.
@@ -93,18 +142,34 @@ const CALIBRATION_DS4: [u8; 34] = [
     0x00, 0x20, 0x00, 0xE0, 0x00, 0x20, 0x00, 0xE0, 0x00, 0x20, 0x00, 0xE0,
 ];
 
+/// The `0x22` patch-info report, captured from a real wired pad. Its first
+/// fields echo the firmware line — type, hardware info, versions — and bytes
+/// 17..22 are the pad's own pairing MAC, which we fill with ours. Everything
+/// past byte 44 is a per-unit signature we can't reproduce, so it stays zero:
+/// a pad with no patch installed, which is the honest answer.
+const PATCH_INFO: [u8; 64] = [
+    0x22, 0x02, 0x00, 0x13, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, // 17..22: the MAC
+    0x00, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00, 0x18,
+    0x00, 0x00, 0x00, 0xa6, 0x0a, 0x11, 0xaa, 0x01,
+    0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 /// DualSense firmware info, captured from a real wired pad: build date
 /// "Jul  4 2025", time "10:10:32", then fwType 3, hwInfo 0x1310 and the
 /// firmware versions. Served verbatim — F1 22 validates it and abandons a pad
 /// that answers zeros, and which field it checks isn't known.
 const DS5_FIRMWARE_INFO: [u8; 64] = [
-    0x20, 0x4A, 0x75, 0x6C, 0x20, 0x20, 0x34, 0x20,
-    0x32, 0x30, 0x32, 0x35, 0x31, 0x30, 0x3A, 0x31,
-    0x30, 0x3A, 0x33, 0x32, 0x03, 0x00, 0x04, 0x00,
-    0x10, 0x13, 0x00, 0x00, 0x2A, 0x00, 0x10, 0x01,
-    0x01, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x30, 0x06, 0x00, 0x00,
-    0x3C, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x02, 0x00,
+    0x20, 0x4A, 0x75, 0x6E, 0x20, 0x32, 0x34, 0x20,
+    0x32, 0x30, 0x32, 0x34, 0x31, 0x31, 0x3A, 0x31,
+    0x36, 0x3A, 0x32, 0x31, 0x02, 0x00, 0x04, 0x00,
+    0x13, 0x03, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x01,
+    0x41, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x20, 0x05, 0x00, 0x00,
+    0x2A, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x02, 0x00,
     0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
@@ -124,14 +189,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn calibration_is_the_identity_for_both_orders() {
+    fn calibration_is_the_captured_hardware_block() {
         let ds = sony_feature(0x0CE6, 0x05, 41, 0).unwrap();
         assert_eq!(ds.len(), 41);
         assert_eq!(ds[0], 0x05);
-        assert_eq!(&ds[7..11], &[0x40, 0x1F, 0xC0, 0xE0], "pitch plus then minus");
+        // A real pad's block: small biases, then per-axis plus/minus full scale.
+        assert_eq!(&ds[1..7], &[0xfa, 0xff, 0xf8, 0xff, 0xf8, 0xff], "biases");
+        assert_eq!(&ds[7..11], &[0x8c, 0x22, 0x6a, 0xdd], "pitch plus then minus");
+        assert_eq!(ds[35], 0x09, "the live byte after the block");
         let ds4 = sony_feature(0x09CC, 0x05, 41, 0).unwrap();
         assert_eq!(&ds4[7..13], &[0x40, 0x1F, 0x40, 0x1F, 0x40, 0x1F], "all pluses first");
         assert!(sony_feature(0x0CE6, 0x05, 40, 0).is_none(), "short buffer stalls");
+    }
+
+    #[test]
+    fn the_reports_hardware_answers_are_never_stalled() {
+        // A real pad answers these; only a fake pad refuses them.
+        let r81 = sony_feature(0x0CE6, 0x81, 64, 0).unwrap();
+        assert_eq!(r81[0], 0x81);
+        assert!(r81[1..].iter().all(|&b| b == 0), "empty body");
+        let r83 = sony_feature(0x0CE6, 0x83, 64, 0).unwrap();
+        assert_eq!(r83[0], 0x83);
+        assert_eq!(&r83[1..5], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        // 0x22 echoes the pairing MAC, per controller, like the real pad does.
+        let a = sony_feature(0x0CE6, 0x22, 64, 2).unwrap();
+        let b = sony_feature(0x0CE6, 0x22, 64, 3).unwrap();
+        assert_eq!(a[0], 0x22);
+        assert_eq!(&a[17..22], &MAC_PREFIX);
+        assert_eq!(a[22], 2);
+        assert_eq!(b[22], 3);
+        assert_ne!(&a[17..23], &b[17..23]);
     }
 
     #[test]
