@@ -2434,6 +2434,13 @@ impl eframe::App for FlexInputApp {
         // the UI thread. `pending_device_ids` keeps the per-frame reconcile from
         // re-enqueueing a create that's still in flight; prune only fires for
         // devices actually present in the pool, so it can't double-send either.
+        //
+        // Prune goes FIRST, deliberately. Switching a pad to its USB audio
+        // variant (or back) re-points one node, so the old pad is unreferenced
+        // and the new id is needed in the same frame; the worker takes its queue
+        // in order, so tearing down before building keeps the two from being
+        // plugged in over each other. A persona attaching while the pad it
+        // replaces is still live was how an Edge switch ended with neither.
         {
             let needed: Vec<String> = self.tabs.iter()
                 .flat_map(|t| snarl_virtual_device_ids(&t.canvas.snarl))
@@ -2441,18 +2448,18 @@ impl eframe::App for FlexInputApp {
             // A failed id whose node was removed should be retryable on re-add:
             // drop it from the failed set once it's no longer referenced.
             self.failed_device_ids.retain(|id| needed.iter().any(|n| n == id));
+            prune_devices_async(
+                &self.shared_virtual_devices,
+                &mut self.pending_device_ids,
+                &self.device_ops.tx,
+                &self.tabs,
+            );
             reconcile_shared_devices(
                 &self.shared_virtual_devices,
                 &mut self.pending_device_ids,
                 &self.failed_device_ids,
                 &self.device_ops.tx,
                 &needed,
-            );
-            prune_devices_async(
-                &self.shared_virtual_devices,
-                &mut self.pending_device_ids,
-                &self.device_ops.tx,
-                &self.tabs,
             );
         }
         // Refresh the I/O thread's active-tab device id filter.

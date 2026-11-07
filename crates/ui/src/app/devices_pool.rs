@@ -189,6 +189,13 @@ pub(crate) fn take_unreferenced_devices(
 /// hand it to the worker for off-thread teardown (so `helper::destroy` doesn't
 /// block the UI). Also clears any matching in-flight `pending` create. No-op
 /// when nothing needs removing.
+///
+/// The per-frame caller runs this **before** `reconcile_shared_devices`, so
+/// switching a pad to its USB audio variant — one node, whose old id goes
+/// unreferenced and whose new id is needed in the same frame — queues the
+/// teardown ahead of the build. The worker takes its queue in order, and a
+/// persona attaching while the pad it replaces is still plugged in has ended
+/// with neither of them present.
 pub(crate) fn prune_devices_async(
     pool: &Mutex<Vec<Box<dyn VirtualDevice>>>,
     pending: &mut HashSet<String>,
