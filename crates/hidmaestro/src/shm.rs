@@ -3,7 +3,13 @@
 //! Layout is a verbatim transcription of
 //! `sdk/HIDMaestro.Core/Internal/SharedMemoryIO.cs` (`@main`, 2026-06-11), which
 //! the file's own header notes must match `driver/driver.h`. Rechecked against
-//! v2.0.1, the vendored driver: the input and output layouts are unchanged. v1.7.3
+//! v2.0.1 and again against v2.1.0, the vendored driver: the input and output
+//! layouts and the version contract are unchanged. 2.1.0 added the signal gate
+//! (`Global\HIDMaestroSignal<N>`, `SignalGate`), which this writer speaks: a
+//! frame skips its `SetEvent` while the driver's worker is busy and is handed
+//! over instead, and the companion's doorbell rings only while it holds a
+//! request. Its other rule for every writer, a SeqNo that never lands on 0, is
+//! `next_even_seq`. v1.7.3
 //! added the companion input doorbell (see `InputSection::write_frame`), and its
 //! producers reserve an output slot before publishing it, which the reader below
 //! already treats as "nothing new yet". v2.0.0 added the version section and the
@@ -96,8 +102,52 @@ const VERSION_LAYOUT: u32 = 1;
 /// The protocol FlexInput speaks, both ends of its range: 4, the version
 /// contract (v2.0.0). The v2.0 HID driver serves 4 and 5, the companion 4.
 const SDK_PROTOCOL: u32 = 4;
-/// The HIDMaestro release whose SDK FlexInput's half stands in for.
-pub(crate) const SDK_VERSION: [u16; 3] = [2, 0, 1];
+/// The HIDMaestro release whose SDK FlexInput's half stands in for: 2.1.0,
+/// whose writer protocol this is — the version contract, plus the signal gate
+/// ([`SignalGate`]) and `AckSignal` 0 (`orchestrator::write_instance_config`).
+/// The driver keys those two on the section and the registry value, not on this
+/// number, which it only reports.
+pub(crate) const SDK_VERSION: [u16; 3] = [2, 1, 0];
+
+// ── 2.1.0: the signal gate (hm_contract.h `HIDMAESTRO_SIGNAL`, upstream
+//    docs/design/signal-gate.md) ─────────────────────────────────────────────
+/// `Global\HIDMaestroSignal{i}`, 256 bytes, each counted word on a cache line of
+/// its own (two driver hosts write them).
+const SIGNAL_SIZE: usize = 256;
+const SIGNAL_OFFSET_LAYOUT: usize = 0;
+/// The HID driver's capabilities, set by its worker at each map and every 256
+/// frames, cleared at a recycle and as its device goes.
+const SIGNAL_OFFSET_DRIVER_CAPS: usize = 4;
+/// The XUSB companion's capabilities, set at its add.
+const SIGNAL_OFFSET_COMPANION_CAPS: usize = 8;
+/// HID workers inside a counted wait on the input event.
+const SIGNAL_OFFSET_INPUT_WAITERS: usize = 64;
+/// A frame handed to a worker instead of signalled: its even SeqNo once final,
+/// the SeqNo with its low bit set while provisional, or 0.
+const SIGNAL_OFFSET_INPUT_HANDOFF: usize = 68;
+/// WAIT_FOR_INPUT requests the companion holds (briefly −1 is possible).
+const SIGNAL_OFFSET_COMPANION_PARKED: usize = 128;
+const SIGNAL_LAYOUT: i32 = 1;
+/// In DriverCaps: the worker counts itself in InputWaiters and takes handoffs.
+const SIGNAL_CAP_INPUT_WAITERS: i32 = 1;
+/// In CompanionCaps: the companion counts its parked requests.
+const SIGNAL_CAP_COMPANION_PARKED: i32 = 1;
+
+fn signal_section_name(controller_index: u32) -> String {
+    format!(r"Global\HIDMaestroSignal{controller_index}")
+}
+
+/// The even SeqNo that ends a write begun with the odd `pending`. Never 0: from
+/// 2.1.0 the driver reads SeqNo 0 as a section no frame was written to, so at
+/// the wrap the number steps from 0xFFFFFFFF to 2, as HIDMaestro's own writer
+/// does (`SharedMemoryIO.NextEvenSeq`). A write left half done by a writer that
+/// died ends the same way, so an odd SeqNo found in a section resumes from here.
+fn next_even_seq(pending: u32) -> u32 {
+    match pending.wrapping_add(1) {
+        0 => 2,
+        n => n,
+    }
+}
 
 /// SDDL for the `Global\` sections + events shared between the elevated helper
 /// (which CREATES them) and the normally-launched, unelevated app (which OPENS
@@ -259,6 +309,42 @@ impl MappedSection {
             }
             Self::map_view(handle, size, /*zero=*/ true)
         }
+    }
+
+    /// [`create`](Self::create) that leaves a section which already exists as it
+    /// is, and says which it was: `(section, existed)`. A new one is zero, as
+    /// every pagefile-backed section starts.
+    fn create_or_open(name: &str, size: usize) -> Result<(Self, bool), ShmError> {
+        const ERROR_ALREADY_EXISTS: u32 = 183;
+        let wname = to_wide(name);
+        unsafe {
+            let (mut sa, sd) = build_security_attributes()?;
+            let handle = CreateFileMappingW(
+                INVALID_HANDLE_VALUE as *mut c_void,
+                &mut sa as *mut _ as *mut c_void,
+                PAGE_READWRITE,
+                0,
+                size as u32,
+                wname.as_ptr(),
+            );
+            let err = GetLastError();
+            LocalFree(sd);
+            if handle.is_null() {
+                return Err(ShmError::Mapping(err));
+            }
+            Ok((Self::map_view(handle, size, /*zero=*/ false)?, err == ERROR_ALREADY_EXISTS))
+        }
+    }
+
+    /// The aligned 32-bit word at `off`, as the atomic the drivers' interlocked
+    /// operations act on.
+    ///
+    /// # Safety
+    /// `off` must be 4-aligned and inside the view, which lives as long as `self`.
+    #[inline]
+    unsafe fn atomic_i32(&self, off: usize) -> &std::sync::atomic::AtomicI32 {
+        debug_assert!(off.is_multiple_of(4) && off + 4 <= self.size);
+        &*(self.view.add(off) as *const std::sync::atomic::AtomicI32)
     }
 
     /// Open an existing named section created by another process (e.g.
@@ -440,6 +526,148 @@ fn companion_event_name(controller_index: u32) -> String {
     format!(r"Global\HIDMaestroCompanionInputEvent{controller_index}")
 }
 
+/// 2.1.0's signal gate for one controller index (`Global\HIDMaestroSignal{i}`,
+/// upstream `docs/design/signal-gate.md`): which of a frame's wakeups anybody
+/// is waiting for.
+///
+/// Before it, every frame cost the writer a `SetEvent` on the driver's input
+/// event — a kernel call per frame per pad, at FlexInput's I/O rate — and every
+/// Xbox 360 frame a second on the companion's doorbell. With the gate a frame
+/// written while the driver's worker is still busy with the last one is handed
+/// over in `InputHandoff` instead, and the worker takes it before it waits
+/// again; the doorbell rings only while the companion holds a WAIT_FOR_INPUT.
+/// Each skip waits on a capability the driver announces, so on a driver
+/// without the gate — or a keyboard / mouse host, which doesn't count itself —
+/// every frame signals exactly as before.
+struct SignalGate {
+    section: MappedSection,
+}
+
+impl SignalGate {
+    /// Make the section, or take the one a driver host on the index still
+    /// holds. Never zeroed: a driver host may be counting in it right now, and
+    /// clearing a count would hide a waiter, so a found section's counts and
+    /// handoff stay as they are (a final SeqNo the last writer left there is a
+    /// read the worker still owes, which this writer's next frame replaces). One
+    /// of another layout is let go, and every frame signals.
+    fn create(controller_index: u32) -> Option<Self> {
+        let (section, existed) =
+            MappedSection::create_or_open(&signal_section_name(controller_index), SIGNAL_SIZE).ok()?;
+        // SAFETY: offset 0 of the 256-byte view just mapped.
+        let layout = unsafe { section.atomic_i32(SIGNAL_OFFSET_LAYOUT) };
+        if !existed {
+            layout.store(SIGNAL_LAYOUT, Ordering::Release);
+        } else if layout.load(Ordering::Acquire) != SIGNAL_LAYOUT {
+            return None;
+        }
+        Some(SignalGate { section })
+    }
+
+    /// The section the elevated helper made, from the unelevated writer.
+    fn open(controller_index: u32) -> Option<Self> {
+        let section = MappedSection::open(&signal_section_name(controller_index), SIGNAL_SIZE).ok()?;
+        // SAFETY: offset 0 of the 256-byte view just mapped.
+        let layout = unsafe { section.atomic_i32(SIGNAL_OFFSET_LAYOUT) }.load(Ordering::Acquire);
+        (layout == SIGNAL_LAYOUT).then_some(SignalGate { section })
+    }
+
+    #[inline]
+    fn word(&self, off: usize) -> &std::sync::atomic::AtomicI32 {
+        // SAFETY: every offset used is one of the SIGNAL_OFFSET_* words, all
+        // 4-aligned and inside the 256-byte view.
+        unsafe { self.section.atomic_i32(off) }
+    }
+
+    /// After a frame's even `seq` is stored: whether its input event and, for a
+    /// frame that has one, its companion doorbell still need a `SetEvent`. A
+    /// transcription of `SharedMemoryIO.WriteInputFrame` step 5:
+    ///
+    /// 1. Without the driver's capability, a full fence (the companion's count
+    ///    below needs it) and signal, as before.
+    /// 2. With it, a final SeqNo still in the handoff is a read the worker owes,
+    ///    which finds this frame too: one compare-exchange puts this frame's
+    ///    SeqNo in its place, and no `SetEvent`.
+    /// 3. Otherwise, a worker counted in `InputWaiters` is in (or on its way
+    ///    to, or just back from) its wait, so the frame is signalled, the
+    ///    handoff untouched — a fence first when the companion's count follows.
+    /// 4. With none counted, the provisional SeqNo (low bit set) goes in, a full
+    ///    fence; then, with the capability still set and the count still zero, a
+    ///    compare-exchange makes it final for the worker's next take and no
+    ///    `SetEvent` runs. Otherwise it is taken back and the frame signalled — as
+    ///    it is when either compare-exchange fails, which means the worker took
+    ///    and dropped the provisional SeqNo.
+    ///
+    /// The worker counts itself, then takes the handoff with an exchange of its
+    /// own; both sides' interlocked operations are full fences, so either the
+    /// take sees the provisional SeqNo or the recheck sees the count, and no
+    /// frame is left without a wakeup that reads the section after its store.
+    /// The companion rings only when its capability is clear or it holds a
+    /// request, after one of those full fences.
+    fn wakeups(&self, seq: u32, companion: bool) -> (bool, bool) {
+        let caps = self.word(SIGNAL_OFFSET_DRIVER_CAPS);
+        let waiters = self.word(SIGNAL_OFFSET_INPUT_WAITERS);
+        let handoff = self.word(SIGNAL_OFFSET_INPUT_HANDOFF);
+        let gated = |caps: i32| caps & SIGNAL_CAP_INPUT_WAITERS != 0;
+        let mut input = true;
+        if gated(caps.load(Ordering::Acquire)) {
+            // A SeqNo is never 0 (`next_even_seq`), so 0 in the handoff is none.
+            let fin = seq as i32;
+            let owed = handoff.load(Ordering::Acquire);
+            if owed != 0
+                && owed & 1 == 0
+                && handoff.compare_exchange(owed, fin, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            {
+                input = false;
+            } else if waiters.load(Ordering::Acquire) != 0 {
+                // This branch has no interlocked operation, and a load may pass
+                // the earlier SeqNo store: fence it before the companion's count.
+                if companion {
+                    fence(Ordering::SeqCst);
+                }
+            } else {
+                let provisional = fin | 1;
+                handoff.swap(provisional, Ordering::SeqCst);
+                let kept = gated(caps.load(Ordering::Acquire)) && waiters.load(Ordering::Acquire) == 0;
+                if kept {
+                    if handoff
+                        .compare_exchange(provisional, fin, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        input = false;
+                    }
+                } else {
+                    let _ = handoff.compare_exchange(provisional, 0, Ordering::SeqCst, Ordering::SeqCst);
+                }
+            }
+        } else {
+            fence(Ordering::SeqCst);
+        }
+        let ring = companion
+            && !(self.word(SIGNAL_OFFSET_COMPANION_CAPS).load(Ordering::Acquire) & SIGNAL_CAP_COMPANION_PARKED != 0
+                && self.word(SIGNAL_OFFSET_COMPANION_PARKED).load(Ordering::Acquire) == 0);
+        (input, ring)
+    }
+
+    /// The capability words as the drivers left them, for the helper's log.
+    fn caps(&self) -> (i32, i32) {
+        (
+            self.word(SIGNAL_OFFSET_DRIVER_CAPS).load(Ordering::Acquire),
+            self.word(SIGNAL_OFFSET_COMPANION_CAPS).load(Ordering::Acquire),
+        )
+    }
+
+    /// Clear both capability words, as the SDK's sweep does for a device it
+    /// removed while it keeps the index (`SharedMemoryIO.ForgetDriverLocked`): a
+    /// device made on the index next gets every signal until its own driver
+    /// host counts itself and says so again. A driver host that crashed never
+    /// cleared its own; clearing one that is still alive only costs signals
+    /// until it re-announces, within 256 frames.
+    fn forget_driver(&self) {
+        self.word(SIGNAL_OFFSET_DRIVER_CAPS).fetch_and(!SIGNAL_CAP_INPUT_WAITERS, Ordering::SeqCst);
+        self.word(SIGNAL_OFFSET_COMPANION_CAPS).fetch_and(!SIGNAL_CAP_COMPANION_PARKED, Ordering::SeqCst);
+    }
+}
+
 /// Writer for one controller's input section (`Global\HIDMaestroInput{i}`).
 ///
 /// Single-writer seqlock: the driver and XUSB companion are many readers that
@@ -456,6 +684,10 @@ pub struct InputSection {
     /// The v2.0 objects beside the section, held by the side that created it
     /// (the elevated helper). `None` when opened.
     driver_objects: Option<DriverObjects>,
+    /// 2.1.0's signal gate for this index ([`SignalGate`]). `None` where it
+    /// couldn't be made or opened — a helper before 2.1.0, a foreign layout —
+    /// and then every frame signals, as before.
+    signal: Option<SignalGate>,
     seq_no: u32,
 }
 
@@ -502,6 +734,11 @@ impl InputSection {
     pub fn create(controller_index: u32, identity_tag: u64) -> Result<Self, ShmError> {
         let i = controller_index;
         let section = MappedSection::create(&format!(r"Global\HIDMaestroInput{i}"), SHARED_INPUT_SIZE)?;
+        // 2.1.0: the signal gate. After the input section's zeroing, so a worker
+        // that maps a new gate finds no frame it could take for its last read,
+        // and before the input event, which the worker maps it with. Best
+        // effort: without it every frame signals.
+        let signal = SignalGate::create(i);
         // A second event rather than sharing the input event: the HID driver's
         // worker consumes that auto-reset event, and one auto-reset event can't
         // wake two waiters. Created here, by the elevated helper, for the same
@@ -535,8 +772,17 @@ impl InputSection {
                 _removed_event: removed_event,
                 version,
             }),
+            signal,
             seq_no: 0,
         })
+    }
+
+    /// The signal gate's capability words, `(driver, companion)`, as the drivers
+    /// set them — 1 each once its host counts itself — or `None` without a gate.
+    /// For the helper's log: a gate whose driver capability stays 0 signals
+    /// every frame.
+    pub fn signal_caps(&self) -> Option<(i32, i32)> {
+        self.signal.as_ref().map(SignalGate::caps)
     }
 
     /// The drivers' half of the version section, on the side that created it.
@@ -570,8 +816,13 @@ impl InputSection {
         let companion_event = EventHandle::open(&companion_event_name(controller_index)).ok();
         // Resume from whatever sequence the section currently holds so the driver
         // (which tracks last-seen SeqNo) sees our first write as a real change.
-        let seq_no = unsafe { section.read_u32(0) };
-        Ok(InputSection { section, event, companion_event, driver_objects: None, seq_no })
+        // An odd one is a write its writer never finished: count on from the
+        // even SeqNo that write would have ended on, or our own odd marker
+        // would read as a finished frame.
+        let left = unsafe { section.read_u32(0) };
+        let seq_no = if left & 1 == 1 { next_even_seq(left) } else { left };
+        let signal = SignalGate::open(controller_index);
+        Ok(InputSection { section, event, companion_event, driver_objects: None, signal, seq_no })
     }
 
     /// Publish one legacy input frame (Report-ID stripped `report`), optionally
@@ -615,16 +866,31 @@ impl InputSection {
             }
             self.section.write_u32(EXTENDED_SIZE_OFFSET, 0);
 
-            // 3. Mark write-complete (even SeqNo).
+            // 3. Mark write-complete (even SeqNo, never 0).
             fence(Ordering::Release);
-            self.seq_no = pending.wrapping_add(1);
+            self.seq_no = next_even_seq(pending);
             self.section.write_seqno_volatile(self.seq_no);
         }
-        // 4. Wake the driver's per-device worker (auto-reset event).
-        self.event.signal();
-        // 5. Ring the companion's doorbell. Only GIP frames feed the companion,
-        //    so plain-HID devices never pay for the extra syscall.
-        if gip.is_some() {
+        // 4. Wake the driver's per-device worker (auto-reset event) and ring the
+        //    companion's doorbell — each only where something waits for it (the
+        //    signal gate). Only GIP frames feed the companion, so plain-HID
+        //    devices never pay for the doorbell.
+        self.wake(gip.is_some());
+    }
+
+    /// The frame's wakeups, after its even SeqNo is stored: the input event and,
+    /// for a GIP frame, the companion's doorbell, less those the signal gate
+    /// says nobody waits for.
+    fn wake(&self, gip: bool) {
+        let companion = gip && self.companion_event.is_some();
+        let (input, ring) = match &self.signal {
+            Some(gate) => gate.wakeups(self.seq_no, companion),
+            None => (true, companion),
+        };
+        if input {
+            self.event.signal();
+        }
+        if ring {
             if let Some(ev) = &self.companion_event {
                 ev.signal();
             }
@@ -673,10 +939,25 @@ impl InputSection {
             self.section.write_u32(EXTENDED_SIZE_OFFSET, ext_len as u32);
 
             fence(Ordering::Release);
-            self.seq_no = pending.wrapping_add(1);
+            self.seq_no = next_even_seq(pending);
             self.section.write_seqno_volatile(self.seq_no);
         }
-        self.event.signal();
+        self.wake(false);
+    }
+}
+
+impl Drop for InputSection {
+    /// The creator (the elevated helper) lets go of a controller's sections when
+    /// its device goes: clear the gate's capability words as the SDK's sweep
+    /// does, so a device made on this index next signals every frame until its
+    /// own driver host announces itself. The writer that only opened the
+    /// sections leaves them alone — the device lives on without it.
+    fn drop(&mut self) {
+        if self.driver_objects.is_some() {
+            if let Some(gate) = &self.signal {
+                gate.forget_driver();
+            }
+        }
     }
 }
 
@@ -799,6 +1080,164 @@ impl OutputSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Arc;
+
+    /// A gate on a `Local\` section of its own (a `Global\` one needs the
+    /// elevated helper's privilege), its layout written as the creator writes it.
+    fn local_gate(tag: &str) -> SignalGate {
+        let name = format!(r"Local\FlexInputGateTest-{}-{tag}", std::process::id());
+        let (section, existed) = MappedSection::create_or_open(&name, SIGNAL_SIZE).unwrap();
+        assert!(!existed, "a fresh section");
+        let gate = SignalGate { section };
+        gate.word(SIGNAL_OFFSET_LAYOUT).store(SIGNAL_LAYOUT, Ordering::Release);
+        gate
+    }
+
+    /// Each branch of the gate, with the driver side's words set by hand.
+    #[test]
+    fn the_gate_skips_only_the_wakeups_nobody_waits_for() {
+        let g = local_gate("branches");
+        let handoff = || g.word(SIGNAL_OFFSET_INPUT_HANDOFF).load(Ordering::SeqCst);
+        // No driver capability (a driver before 2.1.0, a keyboard's host):
+        // every frame signals and rings, and the handoff is never touched.
+        assert_eq!(g.wakeups(2, true), (true, true));
+        assert_eq!(handoff(), 0);
+        // The worker announces itself and is busy (outside its counted wait):
+        // the frame is handed over, final, with no SetEvent.
+        g.word(SIGNAL_OFFSET_DRIVER_CAPS).store(SIGNAL_CAP_INPUT_WAITERS, Ordering::SeqCst);
+        assert_eq!(g.wakeups(4, false), (false, false));
+        assert_eq!(handoff(), 4, "final: the even SeqNo");
+        // Still not taken when the next frame comes: that take reads this frame
+        // too, so it replaces the owed SeqNo and again needs no SetEvent.
+        assert_eq!(g.wakeups(6, false).0, false);
+        assert_eq!(handoff(), 6);
+        // The worker takes it (an exchange with 0) and goes back into a
+        // counted wait: now a frame must signal, and leaves the handoff alone.
+        g.word(SIGNAL_OFFSET_INPUT_HANDOFF).swap(0, Ordering::SeqCst);
+        g.word(SIGNAL_OFFSET_INPUT_WAITERS).store(1, Ordering::SeqCst);
+        assert_eq!(g.wakeups(8, false).0, true);
+        assert_eq!(handoff(), 0);
+        // The companion: rung while its capability is clear or a request is
+        // parked, skipped when it counts none.
+        assert!(g.wakeups(10, true).1, "no companion capability: ring");
+        g.word(SIGNAL_OFFSET_COMPANION_CAPS).store(SIGNAL_CAP_COMPANION_PARKED, Ordering::SeqCst);
+        assert!(!g.wakeups(12, true).1, "nothing parked: no ring");
+        g.word(SIGNAL_OFFSET_COMPANION_PARKED).store(1, Ordering::SeqCst);
+        assert!(g.wakeups(14, true).1, "a WAIT_FOR_INPUT parked: ring");
+        g.word(SIGNAL_OFFSET_COMPANION_PARKED).store(-1, Ordering::SeqCst);
+        assert!(g.wakeups(16, true).1, "any count but zero rings");
+        assert!(!g.wakeups(18, false).1, "a frame without GIP bytes never rings");
+        // The sweep's forget: both capabilities go, every frame signals again.
+        g.word(SIGNAL_OFFSET_INPUT_WAITERS).store(0, Ordering::SeqCst);
+        g.forget_driver();
+        assert_eq!(g.caps(), (0, 0));
+        assert_eq!(g.wakeups(20, true), (true, true));
+    }
+
+    /// The gate against a worker that runs the driver's own protocol on another
+    /// thread (`SharedInputWorkerProc`, upstream signal-gate.md): count itself,
+    /// take the handoff, read at once on a final SeqNo, else wait on the event
+    /// (500 ms) and uncount. A lost wakeup leaves the worker on an old frame until
+    /// that timeout, so after every pause the worker must have read the writer's
+    /// last frame well inside it.
+    #[test]
+    fn no_frame_is_left_without_a_wakeup() {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+        }
+        struct Shared {
+            gate: SignalGate,
+            event: EventHandle,
+            seq: AtomicU32,
+            read: AtomicU32,
+            stop: AtomicBool,
+        }
+        // SAFETY (test): the section and event are process-global handles, and
+        // every word the threads share is an atomic.
+        unsafe impl Sync for Shared {}
+        let ev_name = format!(r"Local\FlexInputGateTestEvent-{}", std::process::id());
+        let shared = Arc::new(Shared {
+            gate: local_gate("race"),
+            event: EventHandle::create(&ev_name).unwrap(),
+            seq: AtomicU32::new(0),
+            read: AtomicU32::new(0),
+            stop: AtomicBool::new(false),
+        });
+        shared.gate.word(SIGNAL_OFFSET_DRIVER_CAPS).store(SIGNAL_CAP_INPUT_WAITERS, Ordering::SeqCst);
+
+        let w = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            let waiters = w.gate.word(SIGNAL_OFFSET_INPUT_WAITERS);
+            let handoff = w.gate.word(SIGNAL_OFFSET_INPUT_HANDOFF);
+            while !w.stop.load(Ordering::SeqCst) {
+                waiters.fetch_add(1, Ordering::SeqCst);
+                let took = handoff.swap(0, Ordering::SeqCst);
+                if took != 0 && took & 1 == 0 {
+                    waiters.fetch_sub(1, Ordering::SeqCst);
+                } else {
+                    // SAFETY: a live event handle.
+                    unsafe { WaitForSingleObject(w.event.0, 500) };
+                    waiters.fetch_sub(1, Ordering::SeqCst);
+                }
+                w.read.store(w.seq.load(Ordering::Acquire), Ordering::SeqCst);
+                // Busy with the frame for a moment, as a real worker is.
+                std::hint::spin_loop();
+            }
+        });
+
+        let mut seq = 0u32;
+        let mut rng = 0x9E37_79B9u32;
+        let mut skipped = 0usize;
+        for round in 0..150 {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            // A burst, then a pause: frames back to back, as an I/O tick writes.
+            for _ in 0..(rng % 40 + 1) {
+                seq = next_even_seq(seq.wrapping_add(1));
+                shared.seq.store(seq, Ordering::Release);
+                let (input, _) = shared.gate.wakeups(seq, false);
+                if input {
+                    shared.event.signal();
+                } else {
+                    skipped += 1;
+                }
+            }
+            let since = std::time::Instant::now();
+            while shared.read.load(Ordering::SeqCst) != seq {
+                assert!(
+                    since.elapsed() < std::time::Duration::from_millis(200),
+                    "round {round}: the worker never read frame {seq} (last read {})",
+                    shared.read.load(Ordering::SeqCst)
+                );
+                std::thread::yield_now();
+            }
+        }
+        shared.stop.store(true, Ordering::SeqCst);
+        shared.event.signal();
+        worker.join().unwrap();
+        assert!(skipped > 0, "a busy worker took frames with no SetEvent at all");
+    }
+
+    /// A frame's SeqNo is even and never 0, which the 2.1.0 driver reads as a
+    /// section with no frame in it: at the wrap it steps over 0 to 2.
+    #[test]
+    fn a_frames_seqno_steps_over_zero_at_the_wrap() {
+        assert_eq!(next_even_seq(1), 2, "a fresh section's first frame");
+        assert_eq!(next_even_seq(0xFFFF_FFFD), 0xFFFF_FFFE);
+        assert_eq!(next_even_seq(0xFFFF_FFFF), 2, "the wrap skips 0");
+        // A writer counting on from the section's SeqNo round the wrap.
+        let mut seq = 0xFFFF_FFFCu32;
+        for _ in 0..4 {
+            let pending = seq.wrapping_add(1);
+            assert_eq!(pending & 1, 1, "the in-progress mark is odd");
+            seq = next_even_seq(pending);
+            assert!(seq != 0 && seq & 1 == 0, "{seq:#x}");
+        }
+        assert_eq!(seq, 6);
+    }
 
     #[test]
     fn companion_doorbell_name_matches_the_driver() {

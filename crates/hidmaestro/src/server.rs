@@ -1022,6 +1022,12 @@ fn handle_create(
             // start failed. A companion protocol means it started under the
             // contract, which is also when it registers its XInput interface.
             let half = input.driver_half();
+            // 2.1.0's signal gate: the drivers set their capability once their
+            // hosts count themselves; a 0 here means every frame still signals.
+            let gate = match input.signal_caps() {
+                Some((driver, companion)) => format!(", signal gate driver {driver} companion {companion}"),
+                None => ", no signal gate".to_string(),
+            };
             claims::set_controller_instance(&token, &dev.instance_id);
             if let Ok(mut devs) = state.devices.lock() {
                 devs.insert(
@@ -1055,7 +1061,7 @@ fn handle_create(
                 };
                 diag_log(&format!(
                     "[helper] contract idx={index} token={token}: driver {major}.{minor}.{patch} protocol {} \
-                     config error {}{companion}",
+                     config error {}{companion}{gate}",
                     h.driver_protocol, h.driver_config_error
                 ));
             }

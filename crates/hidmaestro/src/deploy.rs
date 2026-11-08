@@ -37,7 +37,7 @@ use crate::install::{driver_state, inf_driver_version, installed_inf_names, publ
 use crate::orchestrator::registry;
 use crate::signing::{self, DriverPackage, Scope, SignError, Thumbprint};
 
-/// The vendored driver payload (HIDMaestro v2.0.1, unmodified), embedded at
+/// The vendored driver payload (HIDMaestro v2.1.0, unmodified), embedded at
 /// compile time so the helper can stage it regardless of cwd. The binaries ship
 /// unsigned; they're signed and catalogued on the target machine. Each INF's
 /// `DriverVer` is what [`installed_driver`] compares an install against, so a
@@ -739,8 +739,8 @@ mod tests {
         // installed_driver() treats an unreadable version as Indeterminate and
         // never upgrades, so the shipped INFs must always parse. Pinned to the
         // vendored release; update alongside the driver files.
-        assert_eq!(inf_driver_version(payload::HIDMAESTRO_INF).as_deref(), Some("2.0.0.2201"));
-        assert_eq!(inf_driver_version(payload::HIDMAESTRO_XUSB_INF).as_deref(), Some("2.0.0.2201"));
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_INF).as_deref(), Some("2.1.0.1716"));
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_XUSB_INF).as_deref(), Some("2.1.0.1716"));
     }
 
     #[test]
@@ -763,6 +763,8 @@ mod tests {
         assert!(v("1.4.7.48") < v("2.0.0.2201"));
         assert!(v("2.0.0.2201") < v("2.0.0.10000"), "numerically, not as text");
         assert!(v("2.0.1.0") > v("2.0.0.2201"));
+        // 2.1.0's build number is lower than 2.0.0's; the minor decides first.
+        assert!(v("2.1.0.1716") > v("2.0.0.2201"), "the 2.1.0 driver replaces 2.0's");
         assert_eq!(v("2.0"), [2, 0, 0, 0]);
         assert_eq!(version_parts("2.0.0.x"), None);
         assert_eq!(version_parts("1.2.3.4.5"), None);

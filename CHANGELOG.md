@@ -82,6 +82,26 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **The HIDMaestro driver is 2.1.0.** It is the first new driver build since
+  2.0.0, and the change is in how frames reach a game: the driver host now runs
+  at high priority, so a busy CPU no longer holds a virtual pad's reports back
+  for tens or hundreds of milliseconds (upstream measures a DualShock 4's worst
+  stall under load at 360 ms before and 1.4 ms after); reads waiting for a frame
+  are served from the frame just cached rather than the next one; frames can no
+  longer complete out of order; and the per-frame locks no longer cost system
+  calls. FlexInput writes its frames the 2.1.0 way too: a frame written while
+  the driver is still busy with the last one is handed over instead of costing
+  a kernel call (measured here, a pad's per-frame wakeup drops from 367 ns to
+  12 ns whenever the driver is busy, and stays as it was when the driver is
+  waiting), an Xbox 360 pad's XInput doorbell rings only while something is
+  waiting on it, and the driver no longer signals back every delivered frame,
+  which nothing in FlexInput waits for. A frame's sequence number also never
+  lands on 0, which the new driver reads as an empty section. The report
+  encoding itself — the vendor block's counters, clock and noise, the pinned
+  bytes, the personas' answers — is FlexInput's and stays exactly as it was.
+  The first start after updating reinstalls the driver once, which re-creates
+  the virtual pads; a newer driver another program installed is kept, and
+  PadForge's HIDMaestro 2.0.3 runs on this one.
 - **A Steam Controller read off its own reports calls its controls what they
   are.** The raw-HID reader copied SDL's names, and SDL's names are slot numbers:
   its driver sends the three-dot button as Misc 1, the right trackpad's click as

@@ -1603,6 +1603,13 @@ pub fn write_instance_config(
     let features = crate::answers::feature_answers(profile.vid, profile.pid, controller_index);
     let _ = write_binary(HKLM, &path, "FeatureAnswers", &features);
     let _ = write_binary(HKLM, &path, "CachedInputReportIds", &[]);
+    // 2.1.0, read under the contract: whether anything waits on the delivery
+    // acknowledgement's event (`Global\HIDMaestroInputAckEvent<N>`). Nothing in
+    // FlexInput does — its writers send the latest state, not every report — so
+    // 0 lets the driver skip that SetEvent on every delivered frame. It still
+    // stores DeliveredSeqNo. A writer that starts waiting on the ack (every
+    // report of a keyboard, say) must write 1 here.
+    let _ = write_dword(HKLM, &path, "AckSignal", 0);
     if let Some(ps) = profile.product_string.as_deref() {
         // Clean product string ("Wireless Controller") so games see a faithful
         // DualSense/DS4. We do NOT mark it: the input enumerator distinguishes our

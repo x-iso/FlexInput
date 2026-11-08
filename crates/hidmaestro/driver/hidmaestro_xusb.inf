@@ -24,7 +24,7 @@ Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 CatalogFile = hidmaestro_xusb.cat
-DriverVer   = 10/19/2026,2.0.0.2201
+DriverVer   = 10/26/2026,2.1.0.1716
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -111,6 +111,9 @@ UmdfFsContextUsePolicy      = CanUseFsContext2
 ; WAIT_FOR_INPUT pump + 8ms timer would otherwise serialize across
 ; every HIDMAESTRO instance in a single host.
 UmdfHostProcessSharing      = ProcessSharingDisabled
+; High priority for the reason hidmaestro.inf gives: the doorbell thread
+; and the 8 ms timer that complete WGI's WAIT_FOR_INPUT run in this host.
+UmdfHostPriority            = PriorityHigh
 
 [HMXInput_UmdfService]
 UmdfLibraryVersion = 2.15.0

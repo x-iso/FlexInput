@@ -9,7 +9,8 @@
 //!   companion registers no XInput interface at all.
 //!
 //! Both are compiled from HIDMaestro's own model files (`profiles/models`,
-//! vendored from v2.0.1, MIT) into the blobs the drivers parse at add:
+//! vendored from v2.0.1 and unchanged through v2.1.0, MIT) into the blobs the
+//! drivers parse at add:
 //! `driver.h`'s `HM_FEATURE_*` layout (the SDK's `FeatureStubTable.ToBlob`) and
 //! `companion.c`'s `HM_XUSB_ANSWERS_*` layout (`XusbAnswers.Build`). Only the
 //! parts of the model format the vendored models use are supported, and a model
