@@ -34,16 +34,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   swipe trigger draws — latched for the rest of that touch, so sweeping a thumb
   across the pad fires the direction it went rather than every one it passed
   through. Beside them `touch1_swipe_x` / `_y` and their field-2 siblings are the
-  same gesture read as HOW FAR: signed, a full pad's width being 1.0, zero the
-  moment the finger lifts — which is what a card takes in the Analog mode, half a
-  pad to one side driving one way and to the other driving back. A pad with two
-  trackpads of its own (a Steam Controller) gets a gesture per pad, since its two
-  fields ARE its two pads; a pad with one gets a gesture per finger. They are
-  chosen from the Choose picker rather than learned: Learn captures a held button,
-  and a swipe is a movement. The Steam Controller's board now carries both pads'
-  rows under its touched/clicked cells, each pad's two axes beside its four
-  arrows, and a swipe is an input only — the touchpad's analog swipe OUT stays
-  the other way round.
+  pad's own area made bipolar: how far off its centre the thumb sits, half the
+  way to one edge being +0.5 and half the way to the opposite edge −0.5, dead
+  centre asking for nothing, and following the thumb live rather than tallying
+  where it has walked — which is what a card takes in the Analog mode to aim a
+  cursor or a wheel, and what makes either half of the pad push its target the
+  other way. A pad with two trackpads of its own (a Steam Controller) gets a
+  gesture per pad, since its two fields ARE its two pads; a pad with one gets a
+  gesture per finger. They are chosen from the Choose picker rather than learned:
+  Learn captures a held button, and a swipe is a movement. The Steam Controller's
+  board now carries both pads' rows under its touched/clicked cells, each pad's
+  two axes beside its four arrows, and a swipe is an input only — the touchpad's
+  analog swipe OUT stays the other way round.
 - **Any mapping card can send an analog input at a pointer or a wheel.**
   `mouse_x` / `mouse_y` (a pointer velocity), `scroll_x` / `scroll_y` (the
   wheel's rate) and `trackpad_scroll_x` / `_y` (its smooth-scroll channel) are
@@ -57,16 +59,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   pad and a drag in a zone move the cursor alike, and the keymouse card's own
   sensitivity slider stays the single dial that tunes pointer speed; the wheel is
   capped at twice what one full deflection asks for, however many cards push it,
-  past which it stops being aimable. A swipe axis has no held state to gate a
-  card on, and unlike a stick or an IMU axis it rests at zero by itself — the
-  finger's own landing point is zero — so without a threshold a card on one
-  stands open and its value is the travel. That is what makes a swipe a pointer
-  rather than a button that engages halfway across the pad, and a threshold then
-  reads as the deliberate deadzone it is. A rate has no digital side, so a card
-  in Normal (or Short / Long / Double / Hold) that is held sends the rate ONE full
-  deflection asks for rather than a bare 1.0 — which for a pointer velocity is a
-  cursor off the screen — and the card's Analog mode is where how far the thumb
-  went starts to matter.
+  past which it stops being aimable. A pad's bipolar axis rests at its centre
+  rather than holding a button's state, so it is gated the way a stick's or an
+  IMU's axis is: by default a card counts from halfway out — half the way from
+  the pad's centre to its edge — and the card's own threshold moves that line
+  shallower or deeper. A rate has no digital side either, so a card in Normal (or
+  Short / Long / Double / Hold) that is held sends the rate ONE full deflection
+  asks for rather than a bare 1.0 — which for a pointer velocity is a cursor off
+  the screen — leaning the way its input does, since these pins are bipolar and a
+  pad pushed to the left has to move the cursor left. The card's Analog mode is
+  where how hard the pad is pushed starts to matter.
 - **A Steam Controller's swipes wear its own pad's shape, and say which pad.**
   The swipe glyphs came from the PS5 set, whose touchpad is a wide bar; this
   pad's are rounded squares, closer to the PS4's, which is the set its touched,

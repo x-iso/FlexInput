@@ -1037,11 +1037,10 @@ mod trigger_tests {
     // The same pin on a card in a DIGITAL press mode. A velocity has no digital
     // side: a held card has no magnitude to give it, and 1.0 of a velocity pin is
     // a cursor off the screen — so a held card sends the rate one full deflection
-    // asks for. And a finger that has not travelled holds nothing at all: the
-    // pin rests at zero by itself, which is what keeps the cursor still between
-    // swipes.
+    // asks for, and LEANS the way the thumb does. The pad's halfway mark is the
+    // line it counts from, so a thumb parked near the centre moves nothing.
     #[test]
-    fn a_digital_card_sends_a_pointer_rate_at_its_base_speed() {
+    fn a_digital_card_sends_a_pointer_rate_which_way_the_pad_leans() {
         let mut rig = RemapRig::new(serde_json::json!([
             { "in": ["touch1_swipe_x"], "out": ["mouse_x"] }
         ]));
@@ -1054,16 +1053,22 @@ mod trigger_tests {
                 ("touch1_active", Signal::Bool(true)),
             ]
         };
-        assert_eq!(got(&rig.tick_sigs(&touch(0.0))), Some(0.0),
-            "a finger sitting where it landed holds nothing");
+        assert_eq!(got(&rig.tick_sigs(&touch(0.0))), Some(0.0), "a thumb on the centre leans nowhere");
         let c = rig.tick_sigs(&touch(0.4));
+        assert_eq!(got(&c), Some(0.0), "half the way out is where it counts from, and 0.4 is short of that");
+        let c = rig.tick_sigs(&touch(0.6));
         assert!(got(&c).is_some_and(|v| (v - 0.03).abs() < 1e-5),
             "held sends the drift one full deflection asks for, not a full velocity: {c:?}");
-        let c = rig.tick_sigs(&touch(0.4));
-        assert!(got(&c).is_some_and(|v| (v - 0.03).abs() < 1e-5),
-            "and holds it for the rest of the touch, however far the thumb went");
+        let c = rig.tick_sigs(&touch(-0.75));
+        assert!(got(&c).is_some_and(|v| (v + 0.03).abs() < 1e-5),
+            "and it drifts the way the pad is pushed, not always right: {c:?}");
         let c = rig.tick_sigs(&[]);
         assert_eq!(got(&c), Some(0.0), "the cursor stops when the finger lifts");
+        // A threshold moves that line: the same lean past a shallower one drives.
+        rig.snap.params.get_mut("mappings").unwrap()[0]["threshold"] = serde_json::json!(0.3);
+        let c = rig.tick_sigs(&touch(0.35));
+        assert!(got(&c).is_some_and(|v| (v - 0.03).abs() < 1e-5),
+            "a card set to a shallower deadzone counts from there instead: {c:?}");
     }
 
     // ── Set Neutral Forward ──────────────────────────────────────────────────

@@ -289,8 +289,8 @@ pub fn cell_caption(pin: &str, steam: bool) -> Option<&'static str> {
         "touchpad_any" => "any",
         "touch1_active" | "touch2_active" if steam => "touch",
         "btn_touchpad2" if steam => "click",
-        // Each pad's own swipe — which way it went, and how far along each axis —
-        // told apart the same way its touch and click are.
+        // Each pad's own swipe — which way it went, and which way off its centre
+        // it is being pushed — told apart the same way its touch and click are.
         _ if steam && flexinput_core::touchzones::swipe_field(pin) == Some(0) => "pad L",
         _ if steam && flexinput_core::touchzones::swipe_field(pin) == Some(1) => "pad R",
         _ => return None,
@@ -334,19 +334,22 @@ pub const TOUCHPAD_LAYOUT: &[KbmCell] = &[
 
 /// A Steam Controller's two trackpads, each touched and clicked: left then
 /// right; and under them the swipe of each pad, four directions apiece, with the
-/// same gesture read as how far along each axis beside them. A click reads as a
-/// button, or in the Analog press mode as how hard the pad is pressed, as a
-/// trigger does. A swipe is the gesture a thumb makes on that pad: chosen here
-/// rather than learned, since Learn captures a held button and a swipe is a
-/// movement. The directions answer which way it went; the axes answer how far,
-/// which is what a card takes in the Analog mode.
+/// pad's own area made bipolar beside them — which way off its centre the thumb
+/// sits and how far. A click reads as a button, or in the Analog press mode as
+/// how hard the pad is pressed, as a trigger does. A swipe is the gesture a thumb
+/// makes on that pad: chosen here rather than learned, since Learn captures a
+/// held button and a swipe is a movement. The directions answer which way it
+/// went; the bipolar cells answer which way it is being pushed, which is what
+/// drives a cursor or a wheel — and, like a stick, they count from half the pad
+/// out unless the card is given a threshold.
 pub const STEAM_TOUCHPADS: &[KbmCell] = &[
     c("touch1_active", TOUCHPAD_X, TOUCHPAD_Y),
     c("btn_touchpad", TOUCHPAD_X + 1.0, TOUCHPAD_Y),
     c("touch2_active", TOUCHPAD_X + 2.0, TOUCHPAD_Y),
     c("btn_touchpad2", TOUCHPAD_X + 3.0, TOUCHPAD_Y),
     // The left pad's swipe, then the right's: what each pad does with a finger
-    // that travels — which way, then how far along each axis.
+    // that travels — which way it flicked, then which way off its centre it is
+    // being pushed and how far.
     c("touch1_swipe_up", TOUCHPAD_X, TOUCHPAD_Y + 1.0),
     c("touch1_swipe_down", TOUCHPAD_X + 1.0, TOUCHPAD_Y + 1.0),
     c("touch1_swipe_left", TOUCHPAD_X + 2.0, TOUCHPAD_Y + 1.0),
@@ -1079,7 +1082,7 @@ mod stage_tests {
         for p in flexinput_core::touchzones::SWIPE_PINS[1] {
             assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 2.0), "{p} on the right pad's row");
         }
-        // The same gesture read as how far, each pad's axes beside its arrows.
+        // The pad's area made bipolar, each pad's pair beside its arrows.
         for p in flexinput_core::touchzones::SWIPE_AXIS_PINS[0] {
             assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 1.0),
                 "{p} beside the left pad's directions");

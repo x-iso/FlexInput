@@ -766,6 +766,30 @@ pub(crate) fn eval_remapper_node(
                 }
             }
 
+            // Which way a held card leans on a rate pin. These pins are bipolar —
+            // a pad's axis points from its centre to either edge — so a card in a
+            // digital press mode still has to say WHICH way the cursor drifts: it
+            // has no magnitude to give, but the sign of its input is right there.
+            let mut rate_dir: HashMap<&'static str, f32> = HashMap::new();
+            for (idx, out_pins) in &digital_on {
+                let card = &mappings[*idx];
+                let shape = MappingShape::from_card(card);
+                let ins: Vec<&str> = card.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                for p in out_pins {
+                    let Some((rate, _, _)) = analog_rate_out(p) else { continue };
+                    let lean = ins.iter().find_map(|i| {
+                        // A stick's direction carries its sign in its name, not in
+                        // the magnitude, which is one-sided either way.
+                        let sign = analog_axis_for_cardinal(i).map(|(_, s)| s).unwrap_or(1.0);
+                        shape.in_value(&upstream, i)
+                            .filter(|v| *v != 0.0)
+                            .map(|v| if v * sign < 0.0 { -1.0 } else { 1.0 })
+                    }).unwrap_or(1.0);
+                    *rate_dir.entry(rate).or_insert(0.0) += lean;
+                }
+            }
             for out_pin in &digital_all_out_pins {
                 let sig_type = automap::ALL_PINS.iter()
                     .find(|p| p.id == out_pin.as_str())
@@ -781,10 +805,13 @@ pub(crate) fn eval_remapper_node(
                             // velocity pin is a cursor flying off the screen. A
                             // held digital card therefore sends the rate ONE full
                             // deflection asks for — the steady drift a Touch Zones
-                            // zone at its default sensitivity makes — and the
+                            // zone at its default sensitivity makes — LEANING THE
+                            // WAY its input does: these pins are bipolar, so a pad
+                            // pushed to the left has to move the cursor left. The
                             // card's Analog mode is where how far the thumb went
                             // starts to matter.
-                            Some((_, gain, _)) => Signal::Float(gain),
+                            Some((_, gain, _)) => Signal::Float(
+                                rate_dir.get(out_pin.as_str()).copied().unwrap_or(1.0) * gain),
                             None => Signal::Float(1.0),
                         },
                         SignalType::Vec2  => continue,

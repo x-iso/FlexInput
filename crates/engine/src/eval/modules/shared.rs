@@ -104,25 +104,17 @@ impl MappingShape {
         upstream: &PinSigs,
         pin: &str,
     ) -> Option<bool> {
-        if is_imu_pin(pin) || whole_stick_axes(pin).is_some() {
+        if is_imu_pin(pin) || whole_stick_axes(pin).is_some()
+            // A pad's swipe axis is a stick the same way: it has no held state to
+            // fall back to, it rests at its centre by itself (dead centre on the
+            // pad is zero), and it counts from halfway out — half the way from the
+            // pad's centre to its edge, which is what a threshold of 0.5 means
+            // here, so a thumb parked in the middle moves nothing and a card can
+            // be given a shallower or deeper deadzone by setting one.
+            || flexinput_core::touchzones::is_swipe_axis_pin(pin)
+        {
             let v = self.in_value(upstream, pin)?.abs();
             return Some(self.shaped(v) >= self.threshold.unwrap_or(ANALOG_DEFAULT_ON));
-        }
-        // A pad's swipe axis has no held state to fall back to either, but it
-        // rests at zero by itself — the finger's own landing point is zero — so
-        // without a threshold ANY travel drives it: the card stands open from the
-        // moment the thumb starts moving and its value is how far the thumb has
-        // gone, which is what makes a swipe a pointer rather than a button that
-        // engages halfway across the pad. Zero travel is NOT open: a finger
-        // sitting where it landed has swiped nothing, and a card that treated that
-        // as held would drive whatever it sends forever. A threshold is then a
-        // deliberate deadzone.
-        if flexinput_core::touchzones::is_swipe_axis_pin(pin) {
-            let v = self.in_value(upstream, pin)?.abs();
-            return Some(match self.threshold {
-                Some(t) => self.shaped(v) >= t,
-                None => v > 0.0,
-            });
         }
         // A note's threshold is on its VELOCITY — which strikes count — and is
         // compared as struck, not through the curve, which shapes the
@@ -184,9 +176,9 @@ pub(crate) fn analog_in_value(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     if let Some(v) = note_value(upstream, pin_id) {
         return Some(v);
     }
-    // A pad's own swipe, read as how far: signed like a pitch bend, a full pad's
-    // width either way the most it reads, so one card covers the whole pad and
-    // the far half of it pushes the target the other way.
+    // A pad's own swipe, read as its area made bipolar: signed like a pitch bend,
+    // one edge to +1 and the other to −1 with the centre at rest, so one card
+    // covers the whole pad and either half pushes the target its own way.
     if flexinput_core::touchzones::is_swipe_axis_pin(pin_id) {
         let v = upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0);
         return Some(v.clamp(-1.0, 1.0));
@@ -258,7 +250,7 @@ pub fn pin_is_analog_input(pin_id: &str) -> bool {
         || flexinput_core::midi::parse_pin(pin_id).is_some_and(|p| p.note_companions().is_some())
         || is_imu_pin(pin_id)
         || whole_stick_axes(pin_id).is_some()
-        // A pad's own swipe, read as how far its finger travelled.
+        // A pad's own swipe, read as which way off its centre it is being pushed.
         || flexinput_core::touchzones::is_swipe_axis_pin(pin_id)
 }
 

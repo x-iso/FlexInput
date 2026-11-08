@@ -484,7 +484,7 @@ pub const SWIPE_RIGHT: usize = 3;
 /// position pins. They are CHOSEN, not learned — Learn captures what is held,
 /// and a swipe is a gesture, so the picker is where a card gets one. A pad with
 /// two trackpads of its own (a Steam Controller) gets the gesture of each.
-/// [`SWIPE_AXIS_PINS`] is the same gesture read as how far, not which way.
+/// [`SWIPE_AXIS_PINS`] is the same gesture read as which way it leans.
 pub const SWIPE_PINS: [[&str; 4]; 2] = [
     ["touch1_swipe_up", "touch1_swipe_down", "touch1_swipe_left", "touch1_swipe_right"],
     ["touch2_swipe_up", "touch2_swipe_down", "touch2_swipe_left", "touch2_swipe_right"],
@@ -503,14 +503,18 @@ pub fn is_swipe_pin(pin: &str) -> bool {
     swipe_pin_of(pin).is_some()
 }
 
-/// A touch field's swipe along each axis, field 0 then field 1: how far its
-/// finger has travelled from where it landed, in the pad's own −1..1 units, cut
-/// off at a full pad's width, and zero the moment the finger lifts. The
-/// direction pins above answer "which way"; these answer "how far", and are what
-/// a card reads when a swipe is taken in the Analog mode — a thumb pushed
-/// further along the pad driving further along whatever it maps to.
+/// A touch field's swipe along each axis, field 0 then field 1: the pad's own
+/// area made bipolar — how far off its centre the finger sits, in the pad's −1..1
+/// units, so half the way to one edge is +0.5 and half the way to the opposite
+/// edge is −0.5, dead centre asks for nothing, and it follows the thumb live
+/// rather than tallying where it has walked. The direction pins above answer
+/// "which way did it flick"; these answer "which way is it leaning, and how far",
+/// and are what a card takes when a swipe drives a cursor or a wheel.
 ///
-/// Derived and chosen like the directions, never published by a backend.
+/// Derived and chosen like the directions, never published by a backend. Because
+/// these rest at the pad's centre rather than holding a state, a card on one
+/// counts from halfway out — half the way from the centre to an edge — unless it
+/// is given a threshold, the same default a stick's or an IMU's axis gets.
 pub const SWIPE_AXIS_PINS: [[&str; 2]; 2] = [
     ["touch1_swipe_x", "touch1_swipe_y"],
     ["touch2_swipe_x", "touch2_swipe_y"],

@@ -9,9 +9,10 @@
 //! Two readings of the same gesture. The direction, which latches for the rest
 //! of the touch: one swipe per finger down, the way the Touch Zones' swipe
 //! triggers do, so sweeping a thumb across the pad fires the direction it went
-//! rather than every one it passed through. And how far the finger has travelled
-//! along each axis, which follows the thumb and is what a card takes in the
-//! Analog mode.
+//! rather than every one it passed through. And the axis readings, which are the
+//! pad's own area turned bipolar: how far off its centre the thumb sits, either
+//! way, following it live — what a card takes in the Analog mode to drive a
+//! cursor or a wheel, exactly as a relative Touch Zones zone's deflection does.
 
 use glam::Vec2;
 
@@ -44,7 +45,7 @@ pub struct PadSwipes {
     fields: [SwipeFinger; 2],
 }
 
-/// Whether any card reads a swipe — the direction of one, or how far it went —
+/// Whether any card reads a swipe — a flick's direction, or the lean of the pad —
 /// and the tracking is worth doing at all.
 pub(crate) fn mappings_read_swipes(mappings: &[serde_json::Value]) -> bool {
     mappings.iter().any(|m| {
@@ -56,9 +57,9 @@ pub(crate) fn mappings_read_swipes(mappings: &[serde_json::Value]) -> bool {
 
 impl PadSwipes {
     /// One tick: read each field's finger and write its four direction pins and
-    /// its two axes into `upstream`, the direction latched for the touch. A
-    /// field whose contact pin the bus doesn't carry is not a touch field at all,
-    /// and writes nothing.
+    /// its two bipolar axes into `upstream`, the direction latched for the touch,
+    /// the axes the thumb's distance from the pad's centre. A field whose contact
+    /// pin the bus doesn't carry is not a touch field at all, and writes nothing.
     pub fn step(&mut self, upstream: &mut PinSigs) {
         const FINGERS: [(&str, &str, &str); 2] = [
             ("touch1_x", "touch1_y", "touch1_active"),
@@ -69,7 +70,7 @@ impl PadSwipes {
             let f = &mut self.fields[field];
             if !touched {
                 // Lifted — or never arrived. The next touch starts clean, and a
-                // card reading how far the swipe went reads nothing: no swipe.
+                // finger off the pad leans nothing: the pins go absent, not zero.
                 *f = SwipeFinger::default();
                 continue;
             }
@@ -83,11 +84,14 @@ impl PadSwipes {
             for (dir, pin) in tz::SWIPE_PINS[field].iter().enumerate() {
                 upstream.insert(pin, Signal::Bool(f.dir == dir as i8));
             }
-            // How far the finger has come, the other reading of the same
-            // gesture: it follows the thumb, and a full pad's travel is 1.0.
-            let gone = at - f.start;
-            upstream.insert(tz::SWIPE_AXIS_PINS[field][0], Signal::Float(gone.x.clamp(-1.0, 1.0)));
-            upstream.insert(tz::SWIPE_AXIS_PINS[field][1], Signal::Float(gone.y.clamp(-1.0, 1.0)));
+            // How far off the pad's CENTRE the thumb sits, the bipolar reading of
+            // the same gesture: −1..1 across the pad, so half the way to the right
+            // edge is +0.5 and half the way to the left edge is −0.5, dead centre
+            // asks for nothing, and the lean is whichever way it is from wherever
+            // the finger happened to land. A card on one of these is therefore a
+            // thumb resting on a stick, not a tally of how far it has walked.
+            upstream.insert(tz::SWIPE_AXIS_PINS[field][0], Signal::Float(at.x.clamp(-1.0, 1.0)));
+            upstream.insert(tz::SWIPE_AXIS_PINS[field][1], Signal::Float(at.y.clamp(-1.0, 1.0)));
         }
     }
 }
@@ -177,11 +181,12 @@ mod tests {
         assert!(!up.get("touch2_swipe_left").is_some_and(|s| s.as_bool()));
     }
 
-    /// The same gesture read as how far: it follows the thumb along each axis, a
-    /// full pad's width is the most it reads, and a finger that has not moved
-    /// yet — or has lifted — says nothing at all.
+    /// The same gesture read as an AREA: the pad's own surface made bipolar, so
+    /// half the way to one edge is +0.5 and half the way to the opposite edge is
+    /// −0.5, dead centre asks for nothing, and the lean is immediate — wherever
+    /// the finger landed, it is leaning there. A finger off the pad says nothing.
     #[test]
-    fn a_swipes_how_far_follows_the_thumb() {
+    fn a_pads_axes_are_its_area_from_the_centre() {
         let mut st = PadSwipes::default();
         let mut up = PinSigs::default();
         let touch = |up: &mut PinSigs, x: f32, y: f32| {
@@ -195,13 +200,17 @@ mod tests {
         ];
         touch(&mut up, 0.0, 0.0);
         st.step(&mut up);
-        assert_eq!(axes(&up), [Some(0.0), Some(0.0)], "a finger that arrived has not gone anywhere");
-        touch(&mut up, 0.4, -0.2);
+        assert_eq!(axes(&up), [Some(0.0), Some(0.0)], "a finger on the centre leans nowhere");
+        touch(&mut up, -0.8, 0.3);
         st.step(&mut up);
-        assert_eq!(axes(&up), [Some(0.4), Some(-0.2)], "it went right and down, that far");
-        touch(&mut up, -1.0, -0.2);
+        assert_eq!(axes(&up), [Some(-0.8), Some(0.3)],
+            "a finger that landed off centre is already leaning there");
+        touch(&mut up, 0.5, -0.5);
         st.step(&mut up);
-        assert_eq!(axes(&up), [Some(-1.0), Some(-0.2)], "a pad's width is the most it reads");
+        assert_eq!(axes(&up), [Some(0.5), Some(-0.5)], "half the way to an edge is 0.5 that way");
+        touch(&mut up, -1.6, 0.0);
+        st.step(&mut up);
+        assert_eq!(axes(&up), [Some(-1.0), Some(0.0)], "the far edge is the most it reads");
         let mut lifted = PinSigs::default();
         lifted.insert("touch1_active", Signal::Bool(false));
         st.step(&mut lifted);

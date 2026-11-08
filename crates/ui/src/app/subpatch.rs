@@ -89,7 +89,7 @@ pub(crate) fn kbm_pin_label(pin: &str) -> String {
         "touch2_swipe_down" => "Pad R Swipe↓".into(),
         "touch2_swipe_left" => "Pad R Swipe←".into(),
         "touch2_swipe_right" => "Pad R Swipe→".into(),
-        // The same gesture read as how far, which is what the Analog mode takes.
+        // The same gesture as the pad's area: which way off its centre, and how far.
         "touch1_swipe_x" => "Pad L Swipe↔".into(),
         "touch1_swipe_y" => "Pad L Swipe↕".into(),
         "touch2_swipe_x" => "Pad R Swipe↔".into(),
