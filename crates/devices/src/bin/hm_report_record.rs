@@ -15,9 +15,12 @@
 //! Default 6 s. Tilt ONE pad slowly and steadily while it runs; a good run
 //! also keeps the other pads still, so "quiet" streams stay quiet.
 //!
-//! Buffer layout assumed: buffer[0] is the report number the HID transport
-//! strips, and the profile's report byte N — the `extendedReport` byte index,
-//! e.g. stick X at 1, sequence at 7, gyro pitch at 16 — sits at buffer[N+1].
+//! Buffer layout: hidapi hands a numbered report over with its report id at
+//! buffer[0], so the profile's report byte N — the `extendedReport` byte index,
+//! which counts the id as byte 0: stick X at 1, sequence at 7, gyro pitch at 16 —
+//! sits at buffer[N]. A transport that adds a byte ahead of the id (a 65-byte
+//! read of a 64-byte report) shifts it to buffer[N+1]; `summarize` corrects for
+//! that.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,13 +119,13 @@ fn main() {
 }
 
 /// The per-device reader: one read per report, 150 ms timeout so the thread
-/// notices the stop. DualSense reports arrive as 65-byte buffers (0x01).
+/// notices the stop even on a pad that sends nothing. A wired DualSense's
+/// report 0x01 arrives as 64 bytes, report id included.
 fn record(dev: HidDevice, stop: Arc<AtomicBool>, tx: std::sync::mpsc::Sender<Frame>) {
-    let dev = dev;
     let start = Instant::now();
     let mut buf = vec![0u8; 128];
     while !stop.load(Ordering::Relaxed) {
-        match dev.read(&mut buf) {
+        match dev.read_timeout(&mut buf, 150) {
             Ok(n) if n > 0 => {
                 let _ = tx.send(Frame { t_ms: start.elapsed().as_millis(), buf: buf[..n].to_vec() });
             }
@@ -139,6 +142,13 @@ fn summarize(origin: &str, frames: &[Frame]) {
     println!("\n=== {origin}: {} frames ===", frames.len());
     if frames.is_empty() {
         println!("  silent (no reports while the device was open)");
+        return;
+    }
+    if frames.len() < 2 {
+        // One report says what the bytes are, never how they move.
+        let hex: String = frames[0].buf.iter().map(|b| format!("{b:02x} ")).collect();
+        println!("  a single report, too few to tell what moves:
+   {hex}");
         return;
     }
     let len = frames[0].buf.len();

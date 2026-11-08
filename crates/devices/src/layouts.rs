@@ -717,7 +717,8 @@ mod automap_vocabulary_tests {
                 ControllerKind::Generic, Some(0x045E), Some(0x0B12), SteamNaming::Raw)
             .into_iter().find(|p| p.id == "btn_touchpad").map(|p| p.display_name).as_deref(),
             Some("Touchpad Click"), "another pad's stays");
-        assert_eq!(name(SteamNaming::Sdl, "btn_misc3").as_deref(), Some("Cap sens L"), "another pad's stays");
+        assert_eq!(name(SteamNaming::Sdl, "btn_misc3").as_deref(), Some("Cap sens L"),
+            "read through SDL, this pad's Misc 3 is still named for its left cap");
     }
 
     /// Read off its own reports, the pad carries no Misc slots at all — every

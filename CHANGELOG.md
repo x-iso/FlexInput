@@ -3,8 +3,6 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
 ## [0.17.0] - 2026-11-07
 
 ### Added
@@ -139,17 +137,22 @@ All notable changes to FlexInput are documented here. This project adheres to
   pad does.** Its motion calibration was a synthesised identity table and its
   firmware block came from a different pad; both come from a real wired
   DualSense now, so a game scaling the gyro by what it reads lands on the same
-  degrees-per-second and g as hardware. The patch report carries the firmware
+  degrees-per-second and g as hardware. Its gyro biases are not that pad's,
+  which described its own sensor at rest and would have read as a still persona
+  turning half a degree a second: they are a count or two, never the all-zero no
+  real pad answers, and the persona adds every offset the table implies back
+  onto each report, accelerometer included — so a game that calibrates reads
+  exactly the motion FlexInput sends, and one that doesn't sees less than a real
+  sensor's noise. The patch report carries the firmware
   line and the pad's own MAC where the real one puts its own, instead of 64
   zeros, and two reports real hardware answers with an otherwise empty body,
   `0x81` and `0x83`, are answered rather than refused — nothing real refuses
   them. The plain virtual pad path keeps HIDMaestro's own answers, unchanged.
-
 - **A virtual DualSense Edge carries the vendor block like a DualSense does.**
   The vendor-block entry above reached the base pad's profiles only; both Edge
-  profiles still
-  held bytes 12–15 at zero, left the noise tail empty, and pinned 49–52 to a
-  constant 0x80 on the belief that it marks the pad's active profile. Nothing
+  profiles still held bytes 12–15 at zero, left the noise tail empty, and pinned
+  49–52 to a constant 0x80 on the belief that it marks the pad's active profile.
+  Nothing
   that has actually read the pad treats that region as meaningful: Sony's own
   Linux driver lays the report out with `reserved[4]` at 12–15, `reserved3[12]`
   at 41–52 and `reserved4[8]` at 56–63, the Edge included, whose only
@@ -167,7 +170,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   read off an Edge is said in the profiles too: the base pad's static vendor
   bytes stay unpinned there, because inventing an Edge's values would be no
   truer than zeros.
-
 - **Switching a pad to its Audio & Haptics variant deploys what replaces it.**
   The checkbox used to be a trap: pick a virtual DualSense Edge, tick it, and the
   Edge went away without the persona taking its place — nothing in Windows, and
@@ -182,12 +184,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   now queued ahead of the build, the attach is tried three times with a short
   wait between tries, and a persona the controller still refuses reports the
   reason instead of posing as a device — you get "deploying failed: …" rather
-  than a pad that isn't there. One hazard found on the way: a device build that
+  than a pad that isn't there. Only the attach is retried: a host controller
+  that can't be set up — its install failed or was declined — fails the same way
+  every time, so it says so at once instead of asking again. One hazard found
+  on the way: a device build that
   returned nothing fell through the kind table to a `panic!`, which ran on that
   same deploy worker and took it down, after which every later deploy was
   accepted and silently never run; such a build now yields a stand-in that keeps
   the node's identity and says what went wrong.
-
 - **FlexInput stopped hiding its own Audio & Haptics pad from games.** The HidHide
   blacklist is built from a pad's USB vendor/product ids, and a persona answers to
   exactly the ids of the pad it imitates — its HID node is indistinguishable from a
@@ -196,8 +200,8 @@ All notable changes to FlexInput are documented here. This project adheres to
   masked from every game, every launch, forever, while FlexInput itself plugged it in,
   enumerated it and streamed to it perfectly: the pad looked deployed in the app and
   absent everywhere else, and toggling the checkbox read as the deploy having eaten
-  the device. The instance scan now refuses any node hanging off one of our own
-  composites, and the entry already sitting in a sticky keep list is released by the
+  the device. The instance scan now refuses our own composites and any node hanging
+  off one, and the entry already sitting in a sticky keep list is released by the
   next apply. Underneath it, the question "is this HID node ours?" now answers when
   asked by PnP instance id and not only by the device interface path it was written
   for; asked the wrong way it always said "not ours", which is how the entry got in.
@@ -205,7 +209,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   the ownership question both ways — a node carrying a serial we minted must read as
   ours, everything else must not — so it holds with personas deployed as well as
   parked.
-
 - **Two personas no longer answer with the same pairing MAC.** The last bytes of
   a persona's MAC came from its *index*, and a workspace's DualSense persona and
   DualSense Edge persona are both index 0 — so both pads reported

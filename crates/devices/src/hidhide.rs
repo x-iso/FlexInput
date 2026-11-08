@@ -741,7 +741,7 @@ fn matching_instances_with(vid: u16, pid: u16, exclude_own: bool) -> Vec<(String
         unsafe { SetupDiDestroyDeviceInfoList(hdevinfo); }
         found
     }
-    #[cfg(not(windows))] { let _ = (vid, pid); Vec::new() }
+    #[cfg(not(windows))] { let _ = (vid, pid, exclude_own); Vec::new() }
 }
 
 #[cfg(test)]

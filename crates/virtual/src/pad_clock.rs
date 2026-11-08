@@ -43,6 +43,16 @@ pub struct PadClock {
 }
 
 impl PadClock {
+    /// [`PadClock::new`] seeded from the device's id (FNV-1a), so two deployed
+    /// pads never stream the same noise tail, and one pad streams the same kind
+    /// of tail every session.
+    pub fn for_device(sequence_initial: u8, device_id: &str) -> Self {
+        let seed = device_id
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        Self::new(sequence_initial, seed)
+    }
+
     /// Start from the profile's `sequence_initial`. `seed` only keeps two
     /// deployed personas' noise streams apart; it never affects the counters.
     pub fn new(sequence_initial: u8, seed: u64) -> Self {

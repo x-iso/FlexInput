@@ -129,10 +129,12 @@ pub fn is_own_composite_interface(path: &str) -> bool {
 /// [`is_own_composite_interface`] finds nothing: the interface-property call it
 /// starts from only answers for interface paths.
 pub fn is_own_composite_instance(instance_id: &str) -> bool {
-    // HID interface → USB interface (MI_03) → the composite USB device.
-    ancestors(instance_id, 3)
-        .iter()
-        .any(|a| usb_device_serial(a).is_some_and(flexinput_usbip::is_own_serial))
+    let ours = |id: &str| usb_device_serial(id).is_some_and(flexinput_usbip::is_own_serial);
+    // The composite USB device itself — which a hide-target search with no real
+    // pad present falls back to — or anything under it: HID interface → USB
+    // interface (MI_03) → the composite. Read off the id alone, so the node
+    // itself needs no PnP call.
+    ours(instance_id) || ancestors(instance_id, 3).iter().any(|a| ours(a))
 }
 
 /// The serial segment of a USB device's instance id (`USB\VID_…&PID_…\<serial>`),
@@ -324,6 +326,16 @@ mod tests {
         assert_eq!(usb_device_serial(r"USB\VID_054C&PID_0CE6&MI_03\7&1234&0&0003"), None);
         assert_eq!(usb_device_serial(r"HID\VID_054C&PID_0CE6&MI_03\8&abc&0&0000"), None);
         assert_eq!(usb_device_serial(r"ROOT\USB\0000"), None);
+    }
+
+    /// The composite USB device is ours on its own id, with no parent to walk —
+    /// which is the node a hide-target search falls back to when no real pad is
+    /// plugged in — while a real pad's composite, serial and all, is not.
+    #[test]
+    fn our_composite_usb_node_is_ours_by_its_own_id() {
+        let ours = format!(r"USB\VID_054C&PID_0CE6\{}", flexinput_usbip::serial_for("virtual.usb.dualsense"));
+        assert!(is_own_composite_instance(&ours), "{ours}");
+        assert!(!is_own_composite_instance(r"USB\VID_054C&PID_0CE6\5&2B8F1A3&0&4"), "a real pad's");
     }
 
     #[test]

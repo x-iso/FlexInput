@@ -31,7 +31,6 @@ use flexinput_hidmaestro::Profile;
 use flexinput_usbip::{HostRequest, ReportKind};
 
 use crate::pad_clock::PadClock;
-use crate::pad_clock::PadClock;
 use crate::sony_feedback::SonyFeedback;
 use crate::{layouts, SinkPin, SourcePin};
 
@@ -276,7 +275,9 @@ impl UhidDevice {
 
     /// The device before its node exists: disconnected.
     fn unbuilt(id: String, display_name: String, profile: Profile) -> Self {
-        let clock = PadClock::new(profile.extended.sequence_initial, index as u64);
+        // Seeded from the id, as the composite persona's is: two pads of a kind
+        // stream different noise tails.
+        let clock = PadClock::for_device(profile.extended.sequence_initial, &id);
         UhidDevice {
             id,
             display_name,

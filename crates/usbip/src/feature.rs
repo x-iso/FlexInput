@@ -64,7 +64,7 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, mac_tail: [u8; 3]) -
     match report_id {
         // Motion calibration. A DS4 orders its gyro pairs differently.
         0x05 if w_length >= 41 => {
-            let ds4 = matches!(pid, 0x05C4 | 0x09CC | 0x0BA0);
+            let ds4 = is_ds4(pid);
             let mut p = with_id(41, if ds4 { &CALIBRATION_DS4 } else { &CALIBRATION_DUALSENSE });
             if !ds4 {
                 // The one live byte that follows the calibration block.
@@ -129,13 +129,23 @@ pub fn sony_feature(pid: u16, report_id: u8, w_length: u16, mac_tail: [u8; 3]) -
 
 /// A real unit's motion calibration for the DualSense `0x05`: small per-axis
 /// biases, then the plus/minus full-scale counts per axis, then the gyro speed
-/// range. Captured byte for byte from a wired pad's own `0x05` rather than
-/// synthesised as an identity table, so a consumer that scales the IMU by these
-/// numbers lands on the same degrees-per-second and g it would from hardware.
+/// range. The full-scale counts and the speed range are captured byte for byte
+/// from a wired pad's own `0x05` rather than synthesised as an identity table,
+/// so a consumer that scales the IMU by these numbers lands on the same
+/// degrees-per-second and g it would from hardware.
+///
+/// The gyro biases are NOT that pad's. Its own were −6 / −8 / −8 counts, which
+/// describe its sensor at rest, not ours: SDL and hid-playstation subtract them,
+/// so a persona that is perfectly still would read as turning half a degree a
+/// second. A real pad never answers an all-zero bias, though, so these are
+/// micro biases of a count or two (≈0.1 °/s), and the persona adds every bias
+/// this table implies back onto what it encodes ([`imu_bias`]) — a consumer
+/// that calibrates lands exactly on the value FlexInput meant, and one that
+/// doesn't sees an offset smaller than a real sensor's noise.
 const CALIBRATION_DUALSENSE: [u8; 34] = [
-    0xfa, 0xff, // gyro_pitch_bias    -6
-    0xf8, 0xff, // gyro_yaw_bias      -8
-    0xf8, 0xff, // gyro_roll_bias     -8
+    0xff, 0xff, // gyro_pitch_bias    -1
+    0xfe, 0xff, // gyro_yaw_bias      -2
+    0xfe, 0xff, // gyro_roll_bias     -2
     0x8c, 0x22, // gyro_pitch_plus   +8844
     0x6a, 0xdd, // gyro_pitch_minus  -8854
     0x88, 0x22, // gyro_yaw_plus     +8840
@@ -173,6 +183,28 @@ const CALIBRATION: [u8; 34] = [
     0x00, 0x20, // acc_z_plus         +8192
     0x00, 0xE0, // acc_z_minus        -8192
 ];
+
+/// The IMU offsets a persona's motion calibration (`0x05`) implies, in raw
+/// counts: `[gyro pitch, yaw, roll, accel x, y, z]`. The gyro's are the table's
+/// bias fields; the accelerometer's are the midpoint of each axis's plus/minus
+/// pair, `plus − (plus − minus) / 2`, the way SDL and hid-playstation derive it.
+///
+/// A consumer that calibrates computes `raw − bias`, so the persona adds these
+/// to every report it encodes and that consumer reads exactly the motion
+/// FlexInput meant — which is also what a real pad does, whose raw counts at
+/// rest sit at its bias. Zero for an identity table.
+pub fn imu_bias(pid: u16) -> [i16; 6] {
+    let body: &[u8; 34] = if is_ds4(pid) { &CALIBRATION_DS4 } else { &CALIBRATION_DUALSENSE };
+    let at = |i: usize| i16::from_le_bytes([body[i], body[i + 1]]) as i32;
+    // Both orders keep the accelerometer pairs at the same offsets.
+    let mid = |plus: usize| (at(plus) - (at(plus) - at(plus + 2)) / 2) as i16;
+    [at(0) as i16, at(2) as i16, at(4) as i16, mid(22), mid(26), mid(30)]
+}
+
+/// The DualShock 4 PIDs, which order their calibration's gyro pairs their own way.
+fn is_ds4(pid: u16) -> bool {
+    matches!(pid, 0x05C4 | 0x09CC | 0x0BA0)
+}
 
 /// The same calibration in a DualShock 4's order: pitch+ yaw+ roll+, then the
 /// minuses.
@@ -235,13 +267,35 @@ mod tests {
         let ds = sony_feature(0x0CE6, 0x05, 41, [0, 0, 0]).unwrap();
         assert_eq!(ds.len(), 41);
         assert_eq!(ds[0], 0x05);
-        // A real pad's block: small biases, then per-axis plus/minus full scale.
-        assert_eq!(&ds[1..7], &[0xfa, 0xff, 0xf8, 0xff, 0xf8, 0xff], "biases");
+        // Micro biases — never all zero, as no real pad's are — then a real
+        // pad's per-axis plus/minus full scale.
+        assert_eq!(&ds[1..7], &[0xff, 0xff, 0xfe, 0xff, 0xfe, 0xff], "biases");
+        assert!(ds[1..7].iter().any(|&b| b != 0), "a real pad never answers a zero bias");
         assert_eq!(&ds[7..11], &[0x8c, 0x22, 0x6a, 0xdd], "pitch plus then minus");
         assert_eq!(ds[35], 0x09, "the live byte after the block");
         let ds4 = sony_feature(0x09CC, 0x05, 41, [0, 0, 0]).unwrap();
         assert_eq!(&ds4[7..13], &[0x40, 0x1F, 0x40, 0x1F, 0x40, 0x1F], "all pluses first");
         assert!(sony_feature(0x0CE6, 0x05, 40, [0, 0, 0]).is_none(), "short buffer stalls");
+    }
+
+    /// The offsets a consumer will subtract are exactly the ones the served
+    /// table implies — gyro from its bias fields, accelerometer from each
+    /// pair's midpoint as SDL and hid-playstation take it — so the persona can
+    /// add them back and a calibrating consumer reads FlexInput's own values.
+    #[test]
+    fn the_counter_bias_is_what_the_served_table_implies() {
+        let ds = sony_feature(0x0CE6, 0x05, 41, [0, 0, 0]).unwrap();
+        let at = |i: usize| i16::from_le_bytes([ds[i], ds[i + 1]]) as i32;
+        let bias = imu_bias(0x0CE6);
+        assert_eq!(&bias[..3], &[at(1) as i16, at(3) as i16, at(5) as i16], "gyro: the bias fields");
+        for (axis, plus) in [(3, 23), (4, 27), (5, 31)] {
+            let (p, m) = (at(plus), at(plus + 2));
+            assert_eq!(bias[axis] as i32, p - (p - m) / 2, "accel axis {axis}: SDL's midpoint");
+        }
+        assert_eq!(&bias[3..], &[-12, -47, 2], "the captured pad's accelerometer offsets");
+        assert!(bias[..3].iter().all(|b| b.abs() <= 2), "the gyro's are micro: {bias:?}");
+        assert_eq!(imu_bias(0x0DF2), bias, "the Edge serves the same table");
+        assert_eq!(imu_bias(0x09CC), [0; 6], "an identity table implies nothing");
     }
 
     #[test]

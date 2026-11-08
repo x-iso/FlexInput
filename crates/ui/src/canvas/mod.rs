@@ -174,24 +174,43 @@ fn rewrite_card_pins(card: &mut Value) -> bool {
     changed
 }
 
-/// Does anything in this node still name one of the Steam Controller's old Misc
-/// pins? A cheap pre-scan, so the walk below runs once rather than every frame.
-fn mentions_steam_misc(node: &NodeData) -> bool {
-    // A list of pin ids, or one pin id on its own (Map Action's legacy cards).
-    let ids = |v: Option<&Value>| match v {
+/// A list of pin ids, or one pin id on its own (Map Action's legacy cards), that
+/// names one of the Steam Controller's old Misc pins.
+fn ids_name_steam_misc(v: Option<&Value>) -> bool {
+    match v {
         Some(Value::Array(pins)) => pins.iter().any(|p|
             p.as_str().is_some_and(|s| migrate_steam_pad_pin(s).is_some())),
         Some(Value::String(s)) => migrate_steam_pad_pin(s).is_some(),
         _ => false,
-    };
-    let cards = |_module: &str, key: &str| node.params.get(key).and_then(|v| v.as_array()).is_some_and(|cards|
-        cards.iter().any(|c| match c {
-            Value::Object(m) => ["in", "out"].iter().any(|k| ids(m.get(*k))),
-            Value::Array(_) | Value::String(_) => ids(Some(c)),
-            _ => false,
-        }));
-    ids(node.params.get("output_pin_ids"))
-        || CARD_PARAMS.iter().any(|(m, k)| node.module_id == *m && cards(m, k))
+    }
+}
+
+/// Does this mapping node have a card still naming an old Misc pin? Which pad the
+/// card reads is on the wires, so only these nodes are worth walking upstream.
+fn cards_name_steam_misc(node: &NodeData) -> bool {
+    CARD_PARAMS.iter().any(|(m, key)| node.module_id == *m
+        && node.params.get(*key).and_then(|v| v.as_array()).is_some_and(|cards|
+            cards.iter().any(|c| match c {
+                Value::Object(m) => ["in", "out"].iter().any(|k| ids_name_steam_misc(m.get(*k))),
+                Value::Array(_) | Value::String(_) => ids_name_steam_misc(Some(c)),
+                _ => false,
+            })))
+}
+
+/// Is there anything in this snarl, or in any sub-patch inside it, that the
+/// migration for `device_id` could rewrite? Walks no wire, so it is cheap enough
+/// for the per-frame caller. A device node counts only if it IS this pad's —
+/// every other generic pad lists Misc 1–6 as ports of its own — and a card counts
+/// whichever pad it reads, which only the walk can tell.
+fn snarl_names_steam_misc(snarl: &Snarl<NodeData>, device_id: &str) -> bool {
+    snarl.nodes_ids_data().any(|(_, n)| {
+        let n = &n.value;
+        cards_name_steam_misc(n)
+            || (n.module_id == "device.source"
+                && n.params.get("device_id").and_then(|v| v.as_str()) == Some(device_id)
+                && ids_name_steam_misc(n.params.get("output_pin_ids")))
+            || n.subpatch.as_ref().is_some_and(|sp| snarl_names_steam_misc(&sp.snarl, device_id))
+    })
 }
 
 /// Rename one connected Steam Controller's old Misc pins through a patch: the
@@ -204,26 +223,33 @@ fn mentions_steam_misc(node: &NodeData) -> bool {
 /// this pad — true inside a sub-patch whose host is fed by it, where an inner
 /// inlet can't be resolved from the inner snarl alone. Idempotent: once
 /// rewritten, nothing matches.
+///
+/// Runs every frame while the pad is connected, so the walks are kept to the
+/// nodes that could change: a card node still naming a Misc pin, a sub-patch
+/// with something inside to rewrite. What stays after the first pass is only
+/// cards of OTHER pads that genuinely use their Misc buttons — one upstream walk
+/// each, the same walk their bodies make every frame anyway.
 pub fn migrate_steam_pad_pins(snarl: &mut Snarl<NodeData>, device_id: &str, fed_by: bool) -> bool {
-    if !snarl.nodes_ids_data().any(|(_, n)| mentions_steam_misc(&n.value)) {
+    if !snarl_names_steam_misc(snarl, device_id) {
         return false;
     }
+    let reads_this_pad = |snarl: &Snarl<NodeData>, id: NodeId| fed_by
+        || snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first()
+            .is_some_and(|src| crate::app::find_automap_device_ids_for_viewer(snarl, *src, None)
+                .iter().any(|d| d == device_id));
     // Which nodes to edit, found while the snarl can still be read.
     let cards: Vec<(NodeId, &'static str)> = snarl.nodes_ids_data()
+        .filter(|(_, n)| cards_name_steam_misc(&n.value))
         .filter_map(|(id, n)| {
             let key = CARD_PARAMS.iter().find(|(m, _)| &n.value.module_id == m).map(|(_, k)| *k)?;
-            let bound = fed_by || snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first()
-                .is_some_and(|src| crate::app::find_automap_device_ids_for_viewer(snarl, *src, None)
-                    .iter().any(|d| d == device_id));
-            bound.then_some((id, key))
+            reads_this_pad(snarl, id).then_some((id, key))
         })
         .collect();
     // Sub-patches: the host node's upstream decides what feeds them.
     let inner: Vec<(NodeId, bool)> = snarl.nodes_ids_data()
-        .filter(|(_, n)| n.value.subpatch.is_some())
-        .map(|(id, _)| (id, fed_by || snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first()
-            .is_some_and(|src| crate::app::find_automap_device_ids_for_viewer(snarl, *src, None)
-                .iter().any(|d| d == device_id))))
+        .filter(|(_, n)| n.value.subpatch.as_ref()
+            .is_some_and(|sp| snarl_names_steam_misc(&sp.snarl, device_id)))
+        .map(|(id, _)| (id, reads_this_pad(snarl, id)))
         .collect();
 
     let mut changed = false;
@@ -1059,10 +1085,33 @@ mod migration_tests {
         assert!(!migrate_steam_pad_pins(&mut snarl, "sdl:generic:triton", false), "once is enough");
         // A pad this patch doesn't read rewrites nothing.
         assert!(!migrate_steam_pad_pins(&mut snarl, "sdl:generic:nobody", false));
+
+        // A Misc pin named only inside a sub-patch is still found: the pre-scan
+        // looks inside, rather than stopping at the host node.
+        let mut outer: Snarl<NodeData> = Snarl::new();
+        let pad = outer.insert_node(egui::Pos2::ZERO, source("sdl:generic:triton", &["automap_out"]));
+        let mut deep_snarl: Snarl<NodeData> = Snarl::new();
+        let deep = deep_snarl.insert_node(egui::Pos2::ZERO,
+            card_node("module.remapper", "mappings", r#"[{"in":["btn_misc6"],"out":["key_b"]}]"#));
+        let mut deep_sp = UiSubPatch::default();
+        deep_sp.snarl = Box::new(deep_snarl);
+        let mut deep_host = card_node("subpatch", "mappings", "[]");
+        deep_host.params.remove("mappings");
+        deep_host.subpatch = Some(Box::new(deep_sp));
+        let deep_host_id = outer.insert_node(egui::pos2(10.0, 0.0), deep_host);
+        wire(pad, deep_host_id, &mut outer);
+        assert!(migrate_steam_pad_pins(&mut outer, "sdl:generic:triton", false), "found inside the sub-patch");
+        assert_eq!(cards(&outer.get_node(deep_host_id).unwrap().subpatch.as_ref().unwrap().snarl, deep),
+            serde_json::json!([{"in":["btn_grip_r"],"out":["key_b"]}]));
+        // Another generic pad's own Misc ports are nothing to rewrite, so a patch
+        // holding nothing else costs the per-frame caller no walk at all.
+        let mut others: Snarl<NodeData> = Snarl::new();
+        others.insert_node(egui::Pos2::ZERO,
+            source("sdl:generic:vader", &["btn_misc1", "btn_misc2", "automap_out"]));
+        assert!(!snarl_names_steam_misc(&others, "sdl:generic:triton"));
     }
 
-    /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
-    /// and the migration recurses into sub-patches.    /// A velocity or aftertouch pin saved on a card becomes the note it belongs
+    /// A velocity or aftertouch pin saved on a card becomes the note it belongs
     /// to — the note carries both now — without duplicating a note already there.
     #[test]
     fn loading_folds_a_notes_velocity_and_aftertouch_into_the_note() {

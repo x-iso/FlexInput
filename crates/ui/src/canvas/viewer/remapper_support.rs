@@ -229,7 +229,8 @@ pub(crate) const TWO_PAD_CLICKS: &[&str] = &["btn_touchpad", "btn_touchpad2", "b
 
 /// Whether `dev` has two touchpads of its own (a Steam Controller, which says so
 /// with `automap::TOUCH_PADS_PIN`), rather than one with two fingers on it.
-pub(crate) fn has_two_pads(    live_signals: &std::collections::HashMap<(String, String), Signal>,
+pub(crate) fn has_two_pads(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
     dev: Option<&str>,
 ) -> bool {
     dev.is_some_and(|d| live_signals.contains_key(&(d.to_string(), am_canon::TOUCH_PADS_PIN.to_string())))

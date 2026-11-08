@@ -48,6 +48,9 @@ pub use device::{OutputFrame, OutputKind};
 /// The three bytes that tell one persona's pairing MAC from another's, so a
 /// diagnostic can print the MAC a pad answers with: `02:46:58`, then these.
 pub use feature::mac_tail;
+/// The IMU offsets a persona's served motion calibration implies, which it adds
+/// back onto every report so a calibrating consumer reads the intended motion.
+pub use feature::imu_bias;
 #[cfg(any(windows, target_os = "linux"))]
 pub use passthrough::{HostRequest, Passthrough, PassthroughSpec, ReportKind};
 pub use server::{is_our_location, BASE_PORT, HOST, PORT_RANGE};

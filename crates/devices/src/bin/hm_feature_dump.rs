@@ -82,30 +82,36 @@ fn main() {
         found_any = true;
         let kind = if is_ds { "DualSense" } else { "DS4" };
         let product = info.product_string().unwrap_or("<no product string>");
-        // Distinguish a real pad from FlexInput's own virtual: HIDMaestro nodes
-        // are root-enumerated, so their HID instance path is `HID\HIDCLASS\...`
-        // (no VID_ segment), whereas a physical pad's path carries `VID_054C`.
         let path = info.path().to_string_lossy().to_string();
-        let origin = if is_virtual {
-            "VIRTUAL (HIDMaestro)"
-        } else if path.to_uppercase().contains("VID_054C") {
-            "PHYSICAL"
-        } else {
-            "VIRTUAL (other)"
+
+        let dev = match api.open_path(info.path()) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("\n=== {kind}  VID:{SONY_VID:04X} PID:{pid:04X}  \"{product}\" ===");
+                println!("    path: {path}");
+                println!("    open_path failed: {e}");
+                continue;
+            }
+        };
+
+        // Physical or virtual. The path can't always say: a plain HIDMaestro
+        // node is root-enumerated (`HID\HIDCLASS\…`, no VID_ segment), but a
+        // composite USB/IP persona is a USB device like any wired pad, its path
+        // carrying VID_054C&MI_03 too. So the pairing MAC decides first, as in
+        // hm_report_record: FlexInput's personas answer 02:46:58 ('F' 'X'),
+        // HIDMaestro-family virtual pads 02:48:4D ('H' 'M').
+        let origin = match pairing_mac_prefix(&dev, is_ds) {
+            Some([0x02, 0x46, 0x58]) => "VIRTUAL (FlexInput USB persona)",
+            Some([0x02, 0x48, 0x4D]) => "VIRTUAL (HIDMaestro)",
+            _ if is_virtual => "VIRTUAL (HIDMaestro)",
+            _ if path.to_uppercase().contains("VID_054C") => "PHYSICAL",
+            _ => "VIRTUAL (other)",
         };
         println!(
             "\n=== {kind} [{origin}]  VID:{:04X} PID:{:04X}  \"{product}\" ===",
             SONY_VID, pid
         );
         println!("    path: {path}");
-
-        let dev = match api.open_path(info.path()) {
-            Ok(d) => d,
-            Err(e) => {
-                println!("    open_path failed: {e}");
-                continue;
-            }
-        };
 
         let ids: Vec<u8> = if !id_filter.is_empty() {
             id_filter.clone()
@@ -132,6 +138,19 @@ fn main() {
 
 /// GET_FEATURE for one report id and hexdump the result. hidapi requires the
 /// first buffer byte to be the report id; the returned length includes it.
+/// The first three bytes of the pad's pairing MAC, read from its pairing
+/// report: `0x09` on a DualSense, `0x12` on a DS4 over USB. `None` when the pad
+/// doesn't answer.
+fn pairing_mac_prefix(dev: &HidDevice, is_dualsense: bool) -> Option<[u8; 3]> {
+    let (id, len) = if is_dualsense { (0x09u8, 20) } else { (0x12u8, 16) };
+    let mut buf = vec![0u8; len];
+    buf[0] = id;
+    match dev.get_feature_report(&mut buf) {
+        Ok(n) if n >= 4 => Some([buf[1], buf[2], buf[3]]),
+        _ => None,
+    }
+}
+
 fn dump_feature(dev: &HidDevice, report_id: u8) {
     // 64 is the max DualSense feature size; oversize is harmless (driver caps it).
     let mut buf = vec![0u8; 64];

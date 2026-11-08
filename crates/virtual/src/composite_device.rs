@@ -49,6 +49,20 @@ pub struct CompositeDevice {
     /// Why the host controller refused this persona, once every attach attempt
     /// has been spent. `None` while it's connected or never asked to connect.
     deploy_error: Option<String>,
+    /// The IMU offsets the persona's served motion calibration implies
+    /// (`flexinput_usbip::imu_bias`), added back onto every report it encodes.
+    /// See [`counter_bias`].
+    imu_bias: [i16; 6],
+}
+
+/// Why a connect failed, and whether another try could change it. Setting up —
+/// the host controller, the server, the descriptors — fails the same way every
+/// time, and on Windows a retry could put a second UAC prompt in front of the
+/// user; the attach itself can lose a race with a pad being unplugged, which is
+/// what the retries are for.
+enum ConnectError {
+    Setup(String),
+    Attach(String),
 }
 
 /// Attach attempts for one persona, and how long to sit between them. Switching
@@ -82,7 +96,7 @@ impl CompositeDevice {
             attempt += 1;
             match dev.connect(profile_json) {
                 Ok(()) => return Some(dev),
-                Err(e) if attempt < ATTACH_ATTEMPTS => {
+                Err(ConnectError::Attach(e)) if attempt < ATTACH_ATTEMPTS => {
                     eprintln!(
                         "[usbip] {} attach attempt {attempt}/{ATTACH_ATTEMPTS} failed: {e}; retrying",
                         dev.id
@@ -91,8 +105,14 @@ impl CompositeDevice {
                         ATTACH_BACKOFF_MS * attempt as u64,
                     ));
                 }
-                Err(e) => {
+                Err(ConnectError::Attach(e)) => {
                     eprintln!("[usbip] {} not attached after {attempt} attempts: {e}", dev.id);
+                    dev.deploy_error = Some(e);
+                    return Some(dev);
+                }
+                // Nothing a second try would change: say so at once.
+                Err(ConnectError::Setup(e)) => {
+                    eprintln!("[usbip] {} could not be set up: {e}", dev.id);
                     dev.deploy_error = Some(e);
                     return Some(dev);
                 }
@@ -106,10 +126,10 @@ impl CompositeDevice {
         let id: String = id.into();
         // Seeded from the device id so two deployed personas don't stream the
         // same noise tail.
-        let seed = id
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
-        let clock = PadClock::new(profile.extended.sequence_initial, seed);
+        let clock = PadClock::for_device(profile.extended.sequence_initial, &id);
+        // Every persona is a Sony pad, and the Sony feature answers are the only
+        // ones that serve a calibration.
+        let imu_bias = if profile.vid == 0x054C { flexinput_usbip::imu_bias(profile.pid) } else { [0; 6] };
         Some(CompositeDevice {
             id,
             display_name: display_name.into(),
@@ -123,26 +143,36 @@ impl CompositeDevice {
             clock,
             haptics: Arc::new(Mutex::new(HapticConverter::new())),
             deploy_error: None,
+            imu_bias,
         })
     }
 
-    fn connect(&mut self, profile_json: &str) -> Result<(), String> {
-        ensure_host_controller()?;
+    fn connect(&mut self, profile_json: &str) -> Result<(), ConnectError> {
+        ensure_host_controller().map_err(ConnectError::Setup)?;
         // Before the server exports anything, or the driver's re-attach loop
         // for a dead session's device could import this one first.
         flexinput_usbip::sweep_stale_once();
-        let usb = EmulatedDevice::new(profile_json, &self.id).map_err(|e| e.to_string())?;
+        let usb = EmulatedDevice::new(profile_json, &self.id).map_err(|e| ConnectError::Setup(e.to_string()))?;
         let haptics = Arc::clone(&self.haptics);
         usb.set_pcm_sink(Some(Box::new(move |pcm: &[u8]| haptics.lock().unwrap().push_pcm(pcm))));
         // A neutral report waits for the host's first read.
-        let mut state = self.pins.state();
-        self.clock.stamp(&mut state);
-        encode_report_into(&self.profile, &state, &mut self.report_buf);
+        self.encode();
         usb.submit_input(&self.report_buf);
-        let vport = vhci::attach(flexinput_usbip::HOST, usb.port(), usb.busid()).map_err(|e| e.to_string())?;
+        let vport = vhci::attach(flexinput_usbip::HOST, usb.port(), usb.busid())
+            .map_err(|e| ConnectError::Attach(e.to_string()))?;
         self.usb = Some(usb);
         self.vport = Some(vport);
         Ok(())
+    }
+
+    /// The next report for the host: the pins as they stand, the vendor block's
+    /// moving fields stamped for this report, and the calibration's offsets laid
+    /// back over the motion fields.
+    fn encode(&mut self) {
+        let mut state = self.pins.state();
+        self.clock.stamp(&mut state);
+        encode_report_into(&self.profile, &state, &mut self.report_buf);
+        counter_bias(&self.profile, &self.imu_bias, &mut self.report_buf);
     }
 
     /// The HID-side pins: the Edge adds its back and Fn buttons.
@@ -165,6 +195,24 @@ fn ensure_host_controller() -> Result<(), String> {
     Ok(())
 }
 
+/// Add the IMU offsets the persona's served calibration implies to the motion
+/// fields of an encoded report, `[gyro pitch, yaw, roll, accel x, y, z]` in raw
+/// counts. A consumer that calibrates — SDL, hid-playstation, a game reading
+/// `0x05` — computes `raw − bias`, so it reads exactly the motion the encoder
+/// meant; one that doesn't sees what a real pad at rest shows, its raw counts
+/// sitting at its bias. A field the profile doesn't declare is left alone.
+fn counter_bias(profile: &Profile, bias: &[i16; 6], report: &mut [u8]) {
+    let e = &profile.extended;
+    for (at, b) in [e.gyro_pitch, e.gyro_yaw, e.gyro_roll, e.accel_x, e.accel_y, e.accel_z]
+        .into_iter()
+        .zip(bias)
+    {
+        let Some(field) = at.and_then(|o| report.get_mut(o..o + 2)) else { continue };
+        let v = i16::from_le_bytes([field[0], field[1]]).saturating_add(*b);
+        field.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
 impl crate::VirtualDevice for CompositeDevice {
     fn id(&self) -> &str {
         &self.id
@@ -183,11 +231,13 @@ impl crate::VirtualDevice for CompositeDevice {
     }
 
     fn flush(&mut self) {
-        let Some(usb) = self.usb.as_ref() else { return };
-        let mut state = self.pins.state();
-        self.clock.stamp(&mut state);
-        encode_report_into(&self.profile, &state, &mut self.report_buf);
-        usb.submit_input(&self.report_buf);
+        if self.usb.is_none() {
+            return;
+        }
+        self.encode();
+        if let Some(usb) = &self.usb {
+            usb.submit_input(&self.report_buf);
+        }
     }
 
     fn reset_outputs(&mut self) {
@@ -269,6 +319,29 @@ mod tests {
         let ds = CompositeDevice::detached("virtual.usb.dualsense", "D", DUALSENSE_COMPOSITE_JSON).unwrap();
         assert!(edge.sink_pins().iter().any(|p| p.id == "btn_paddle_r1"));
         assert!(!ds.sink_pins().iter().any(|p| p.id == "btn_paddle_r1"));
+    }
+
+    /// The persona's motion fields carry the offsets its own calibration
+    /// advertises, so a consumer that subtracts them reads what the encoder
+    /// meant: at rest, exactly zero on the gyro.
+    #[test]
+    fn the_motion_fields_carry_the_served_calibrations_offsets() {
+        for (kind, json, pid) in [
+            ("virtual.usb.dualsense", DUALSENSE_COMPOSITE_JSON, 0x0CE6),
+            ("virtual.usb.dualsense_edge", DUALSENSE_EDGE_COMPOSITE_JSON, 0x0DF2),
+        ] {
+            let mut d = CompositeDevice::detached(kind, "D", json).unwrap();
+            let bias = flexinput_usbip::imu_bias(pid);
+            assert_eq!(d.imu_bias, bias, "{kind}");
+            d.encode();
+            let plain = flexinput_hidmaestro::encode::encode_report(&d.profile, &d.pins.state());
+            let i16_at = |r: &[u8], o: usize| i16::from_le_bytes([r[o], r[o + 1]]);
+            for (i, o) in [16usize, 18, 20, 22, 24, 26].into_iter().enumerate() {
+                let calibrated = i16_at(&d.report_buf, o) - bias[i];
+                assert_eq!(calibrated, i16_at(&plain, o), "{kind}: byte {o} less its bias is the encoder's value");
+            }
+            assert_eq!(&d.report_buf[16..18], &bias[0].to_le_bytes(), "{kind}: a still gyro reads its bias");
+        }
     }
 
     #[test]
