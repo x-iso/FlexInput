@@ -122,15 +122,9 @@ pub fn migrate_generic_button_pin(id: &str) -> Option<&'static str> {
 /// what SDL says they are, and `migrate_steam_pad_pins` only rewrites the parts
 /// of a patch that read that one device.
 pub fn migrate_steam_pad_pin(id: &str) -> Option<&'static str> {
-    Some(match id {
-        "btn_misc1" => "btn_capture",
-        "btn_misc2" => "btn_touchpad2",
-        "btn_misc3" => "btn_cap_l",
-        "btn_misc4" => "btn_cap_r",
-        "btn_misc5" => "btn_grip_l",
-        "btn_misc6" => "btn_grip_r",
-        _ => return None,
-    })
+    flexinput_core::automap::STEAM_MISC_ALIASES.iter()
+        .find(|(misc, _)| *misc == id)
+        .map(|(_, own)| *own)
 }
 
 /// The mapping cards of each module, by the param that holds them.

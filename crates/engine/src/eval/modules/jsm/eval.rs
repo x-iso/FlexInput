@@ -392,7 +392,7 @@ pub(crate) fn jsm_publish(
     );
 
     // What the config takes over from the pad.
-    let (claimed_digital, claimed_analog) = claimed_pins(&st.cfg, &res);
+    let (claimed_digital, claimed_analog) = claimed_pins(&st.cfg, &res, &upstream);
 
     if strict {
         for ap in automap::ALL_PINS {
@@ -1069,8 +1069,10 @@ fn button_down(
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     match btn.source() {
         BtnSource::Pin(pin) => b(pin),
-        // Whichever of the two this pad has; a pad never has both asserted.
-        BtnSource::Either(p, q) => b(p) || b(q),
+        // The pin this pad puts the button on: Capture where it has one.
+        BtnSource::Either(p, q) => b(super::names::either_pin(upstream, p, q)),
+        // The pin under either of its names; a pad only ever reports one.
+        BtnSource::Aliased(p, q) => b(p) || b(q),
         BtnSource::Trigger { .. }
         | BtnSource::TriggerFull { .. }
         | BtnSource::Stick { .. }
@@ -1200,8 +1202,13 @@ fn analog_reading(
 }
 
 /// The pins the config takes over, split the way the suppression pass wants
-/// them: buttons on one side, analog axes and triggers on the other.
-fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String>, HashSet<String>) {
+/// them: buttons on one side, analog axes and triggers on the other. `upstream`
+/// says which pins this pad reports, for a button that reads one or another.
+fn claimed_pins(
+    cfg: &Compiled,
+    res: &super::parse::Resolved,
+    upstream: &PinSigs,
+) -> (HashSet<String>, HashSet<String>) {
     let mut digital = HashSet::new();
     let mut analog = HashSet::new();
     let stick_pins = |stick: StickId| {
@@ -1249,9 +1256,14 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
             BtnSource::Pin(pin) => {
                 digital.insert(pin.to_string());
             }
-            // Both, because either could be the one this pad has — and claiming
-            // a pin the pad hasn't got costs nothing.
+            // Only the pin it reads on this pad: a Steam Controller's CAPTURE is
+            // its three-dot button, so its left pad click still passes through.
             BtnSource::Either(p, q) => {
+                digital.insert(super::names::either_pin(upstream, p, q).to_string());
+            }
+            // Both names: a pad only ever reports one, and claiming a pin the
+            // pad hasn't got costs nothing.
+            BtnSource::Aliased(p, q) => {
                 digital.insert(p.to_string());
                 digital.insert(q.to_string());
             }

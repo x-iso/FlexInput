@@ -5530,14 +5530,12 @@ fn the_forks_misc_buttons_are_our_misc_pins() {
     assert!(matches!(one("MISC7 = E").status, LineStatus::Error(_)));
 }
 
-/// The four fork names our bus has no pin for compile, never fire, and say so —
+/// The fork names our bus has no pin for compile, never fire, and say so —
 /// rather than being called errors or being guessed onto a pin that might be
 /// something else entirely.
 #[test]
 fn the_fork_names_we_have_no_pin_for_say_they_never_fire() {
     for (name, expect) in [
-        ("LTOUCH", "capacitive touch"),
-        ("RTOUCH", "capacitive touch"),
         ("LMINI", "mini shoulder"),
         ("RMINI", "mini shoulder"),
     ] {
@@ -5887,6 +5885,75 @@ fn angle_snap_reaches_the_gyro_output() {
         snapped.x.abs() >= plain.x.abs() * 0.99,
         "and the speed is kept, not lost: {snapped:?} against {plain:?}"
     );
+}
+
+/// A Steam Controller read off its own reports has no Misc slots: SDL's Misc 1…6
+/// are its three-dot button, its right pad's click, its stick caps and its grips,
+/// under the names the pad's reader gives them. `MISC1`…`MISC6` reach those
+/// controls by either name, so one config drives the pad whichever route reads it.
+#[test]
+fn misc_buttons_reach_a_steam_controllers_own_pins() {
+    for (n, (misc, own)) in flexinput_core::automap::STEAM_MISC_ALIASES.iter().enumerate() {
+        let line = format!("MISC{} = E", n + 1);
+        for pin in [*misc, *own] {
+            let out = run_node(&line, false, &[pin], 3);
+            assert!(
+                out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+                "{line} reads {pin}: {out:?}"
+            );
+        }
+    }
+    // The stick caps also answer to JSM's own names for a stick's touch.
+    for (line, pin) in [("LTOUCH = E", "btn_cap_l"), ("RTOUCH = E", "btn_cap_r")] {
+        assert_eq!(one(line).status, LineStatus::Ok, "{line}");
+        let out = run_node(line, false, &[pin], 3);
+        assert!(out.get("key_e").map(|s| s.as_bool()).unwrap_or(false), "{line} reads {pin}: {out:?}");
+        let other = run_node(line, false, &["btn_misc1"], 3);
+        assert!(!other.get("key_e").map(|s| s.as_bool()).unwrap_or(false), "{line} on another pin");
+    }
+}
+
+/// `CAPTURE` is the touchpad click on a PlayStation pad, which has no Capture
+/// button, and the Capture button on a pad that has one — even a pad that also
+/// has a touchpad click. A Steam Controller read off its own reports is that pad:
+/// its three-dot button is Capture and its left pad click is the touchpad button,
+/// and only the three-dot button is CAPTURE. Its pad click is not claimed either,
+/// so with a CAPTURE binding it still passes through.
+#[test]
+fn capture_is_the_capture_button_wherever_a_pad_has_one() {
+    let fired = |out: &PinSigs| out.get("key_e").map(|s| s.as_bool()).unwrap_or(false);
+    let t = |on: bool| Signal::Bool(on);
+    // A DualSense: no Capture pin at all, so the touchpad click is CAPTURE.
+    assert!(fired(&run_node_with("CAPTURE = E", false, &[("btn_touchpad", t(true))], 3)));
+    // A Switch Pro: Capture, no touchpad.
+    assert!(fired(&run_node_with("CAPTURE = E", false, &[("btn_capture", t(true))], 3)));
+    // A Steam Controller: both pins reported, every report.
+    let sc = |pad_click: bool, three_dot: bool| {
+        run_node_with("CAPTURE = E", false, &[("btn_touchpad", t(pad_click)), ("btn_capture", t(three_dot))], 3)
+    };
+    assert!(fired(&sc(false, true)), "the three-dot button is CAPTURE");
+    let out = sc(true, false);
+    assert!(!fired(&out), "the left pad click is not: {out:?}");
+    assert_eq!(out.get("btn_touchpad").map(|s| s.as_bool()), Some(true), "and it still passes through");
+    // On the DualSense the click IS CAPTURE, so the binding takes it over.
+    let ds = run_node_with("CAPTURE = E", false, &[("btn_touchpad", t(true))], 3);
+    assert_ne!(ds.get("btn_touchpad").map(|s| s.as_bool()), Some(true), "claimed on a PlayStation pad: {ds:?}");
+}
+
+/// An alias never takes a pin's name from the button that owns it: Learn on a
+/// Switch Pro's Capture still writes CAPTURE, and a Steam Controller's stick cap
+/// LTOUCH. Only a pin no name claims of its own goes by its Misc slot.
+#[test]
+fn a_misc_alias_names_only_what_nothing_else_names() {
+    let by_pin = super::catalogue::input_names_by_pin();
+    let name = |pin: &str| by_pin.get(pin).map(String::as_str);
+    assert_eq!(name("btn_capture"), Some("CAPTURE"));
+    assert_eq!(name("btn_cap_l"), Some("LTOUCH"));
+    assert_eq!(name("btn_cap_r"), Some("RTOUCH"));
+    assert_eq!(name("btn_misc1"), Some("MISC1"));
+    assert_eq!(name("btn_touchpad2"), Some("MISC2"));
+    assert_eq!(name("btn_grip_l"), Some("MISC5"));
+    assert_eq!(name("btn_grip_r"), Some("MISC6"));
 }
 
 /// Each `MISC` button is its own pin, not all of them the first one.

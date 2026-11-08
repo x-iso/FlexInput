@@ -197,12 +197,19 @@ pub fn fi_tag(name: &str) -> String {
 pub fn input_names_by_pin() -> std::collections::HashMap<String, String> {
     use super::names::BtnSource as S;
     let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // A Misc slot's alias for a pad's own pin names that pin only when no button
+    // claims it outright: `btn_capture` is CAPTURE, not MISC1.
+    let mut aliases: Vec<(&str, String)> = Vec::new();
     for b in Btn::ALL {
         let name = b.name();
         let pins: Vec<&str> = match b.source() {
             S::Pin(p) => vec![p],
             // One name, either pin — whichever this pad puts it on.
             S::Either(p, q) => vec![p, q],
+            S::Aliased(p, q) => {
+                aliases.push((q, name.clone()));
+                vec![p]
+            }
             // Both spellings of a trigger read the same line.
             S::Trigger { analog, digital } => vec![analog, digital],
             S::TriggerFull { analog } => vec![analog],
@@ -219,6 +226,9 @@ pub fn input_names_by_pin() -> std::collections::HashMap<String, String> {
                 out.insert(pin.to_string(), name.clone());
             }
         }
+    }
+    for (pin, name) in aliases {
+        out.entry(pin.to_string()).or_insert(name);
     }
     out
 }

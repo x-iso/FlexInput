@@ -72,6 +72,14 @@ pub(crate) fn macro_btn_pin(id: u32) -> String {
     flexinput_core::macros::macro_pin_id(&format!("{id:08x}"))
 }
 
+/// Which pin of a [`BtnSource::Either`] this pad reads the button from: `q`
+/// wherever the pad reports it at all (a released button still publishes its
+/// `false`), else `p`. A bus slot no backend wrote reads `None`, so "reports"
+/// means the pad has the button, not that it is held.
+pub fn either_pin<'a>(upstream: &flexinput_core::PinSigs, p: &'a str, q: &'a str) -> &'a str {
+    if upstream.get(q).is_some() { q } else { p }
+}
+
 /// Where a button reads from on the bus.
 pub enum BtnSource {
     /// A Bool pin.
@@ -85,7 +93,28 @@ pub enum BtnSource {
     /// Capture / Share button on every other kind. One name, two pieces of
     /// hardware — which is also what makes a config written on one pad work on
     /// the other.
+    ///
+    /// The second pin wins wherever the pad reports it at all
+    /// ([`either_pin`]): a PlayStation pad never reports a Capture button, so it
+    /// reads the touchpad click, but a pad with both — a Steam Controller off its
+    /// own reports, whose three-dot button is Capture and whose left pad click is
+    /// the touchpad button — reads Capture alone, as JSM's SDL layer does for
+    /// any non-PlayStation pad.
     Either(&'static str, &'static str),
+    /// A pin, or the name another reader gives the very same control.
+    ///
+    /// A Steam Controller's spare controls have two vocabularies
+    /// (`automap::STEAM_MISC_ALIASES`): read through SDL they come out as its
+    /// Misc slots, read off the pad's own reports as `btn_capture`,
+    /// `btn_touchpad2`, `btn_cap_l`… JSM's `MISC1`…`MISC6` are SDL's slots, so
+    /// each reads its Misc pin or the pad's own name for it, and a config reaches
+    /// the same control whichever route the pad came in by.
+    ///
+    /// Unlike [`BtnSource::Either`] the second pin is only an alias: it never
+    /// takes the name from a button that owns it (`btn_capture` stays `CAPTURE`,
+    /// `btn_cap_l` stays `LTOUCH`), and only a pin no JSM name claims of its own —
+    /// a grip, the right pad's click — is called by its Misc slot.
+    Aliased(&'static str, &'static str),
     /// An analog trigger, with the digital button some pads report instead.
     Trigger { analog: &'static str, digital: &'static str },
     /// Full pull of an analog trigger.
@@ -267,22 +296,23 @@ impl Btn {
             Mring => S::Motion { dir: Dir::Ring },
             LeanLeft => S::Lean { right: false }, LeanRight => S::Lean { right: true },
             Touch => S::Touch,
-            Misc(n) => S::Pin(match n {
-                1 => "btn_misc1",
-                2 => "btn_misc2",
-                3 => "btn_misc3",
-                4 => "btn_misc4",
-                5 => "btn_misc5",
-                _ => "btn_misc6",
-            }),
+            // SDL's Misc slots, and on a Steam Controller read off its own reports
+            // the controls SDL would have put there (see `BtnSource::Aliased`).
+            Misc(n) => {
+                let (misc, own) =
+                    flexinput_core::automap::STEAM_MISC_ALIASES[(n.clamp(1, 6) - 1) as usize];
+                S::Aliased(misc, own)
+            }
+            // A stick cap's capacitive sensor, where a pad's reader names it: a
+            // Steam Controller off its own reports. Through SDL the same sensors
+            // are Misc 3 / 4, which `MISC3` / `MISC4` read — not aliased here,
+            // because on most pads those slots are ordinary buttons.
+            LTouch => S::Pin("btn_cap_l"),
+            RTouch => S::Pin("btn_cap_r"),
             // The fork reads these off SDL3's extended button set. Nothing on our bus
             // carries them, and guessing at a paddle or a misc slot would be worse
             // than saying so: on one pad `LMINI` is a rail button, on another it is
             // something else entirely.
-            LTouch | RTouch => S::Absent(
-                "nothing on the bus reports capacitive touch on a stick — a pad that senses it \
-                 usually surfaces it as one of the MISC buttons instead",
-            ),
             LMini | RMini => S::Absent(
                 "the bus has no pin for a mini shoulder button; try LSL / LSR / RSL / RSR for a \
                  rail button, or a MISC one for whatever your pad calls it",

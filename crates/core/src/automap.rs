@@ -323,6 +323,21 @@ pub const PAD_CLICK_PINS: [[&str; 5]; 2] = [
     ["pad_click_mode_r", "pad_click_gain_r", "pad_click_hz_r", "pad_click_ms_r", "pad_click_soft_r"],
 ];
 
+/// A Steam Controller's spare controls under both of its vocabularies:
+/// `(SDL's Misc slot, the name the pad's own reader gives it)`, Misc 1 to 6 in
+/// order. SDL numbers them into its Misc slots; the raw-HID reader names each
+/// for what it is. Anything that has to reach the same control whichever route
+/// the pad came in by — a saved patch's migration, JSM's `MISC1`…`MISC6` — reads
+/// this one table.
+pub const STEAM_MISC_ALIASES: [(&str, &str); 6] = [
+    ("btn_misc1", "btn_capture"),
+    ("btn_misc2", "btn_touchpad2"),
+    ("btn_misc3", "btn_cap_l"),
+    ("btn_misc4", "btn_cap_r"),
+    ("btn_misc5", "btn_grip_l"),
+    ("btn_misc6", "btn_grip_r"),
+];
+
 /// What a Steam Controller's pad clicks and sensors are: `(full name, picker cell
 /// name)`. They have one name on the bus, as they mean other things on other pads.
 /// Read off its own reports the pad names them itself — the left pad's click on

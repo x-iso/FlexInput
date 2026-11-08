@@ -709,11 +709,15 @@ two numbers feel different. Neither smoother is "less" smoothing than the other 
 which is why the test for it asserts that the two *differ*, not that one lags more.
 
 **The fork's ten extra button names**: `MISC1`…`MISC6` are our `btn_misc1`…`6`, one
-for one. `LTOUCH`, `RTOUCH`, `LMINI` and `RMINI` have no pin on our bus, and rather
-than guess at a paddle or a misc slot — on one pad `LMINI` is a rail button, on
-another something else — they compile, never fire, and say why on the line. That
-needed a new `BtnSource::Absent(reason)`, which is the honest shape for "a name we
-know and cannot read".
+for one — and, through `BtnSource::Aliased`, the names a Steam Controller read off its
+own reports gives the same controls (`automap::STEAM_MISC_ALIASES`: Capture, the
+right pad's click, the stick caps, the grips), so a config reaches them whichever
+route reads the pad. An alias never takes a pin's JSM name from the button that owns
+it. `LTOUCH` / `RTOUCH` read those stick caps (`btn_cap_l` / `btn_cap_r`); `LMINI`
+and `RMINI` have no pin on our bus, and rather than guess at a paddle or a misc slot
+— on one pad `LMINI` is a rail button, on another something else — they compile,
+never fire, and say why on the line. That needed a new `BtnSource::Absent(reason)`,
+which is the honest shape for "a name we know and cannot read".
 
 ## Phase 9 — the survey it was built from
 

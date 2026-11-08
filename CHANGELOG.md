@@ -98,6 +98,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   its own. The icons, the legends, the Choose picker, Learn's capacitive-sensor
   mute, the calibration window and the 3D model answer to both namings, and the
   picker's Misc row for this pad is now its two stick caps and its two grips.
+  A JSM config reaches the same controls by either name: `MISC1`…`MISC6` read
+  SDL's Misc slot or the pad's own name for the same control, whichever route
+  the pad came in by, and `LTOUCH` / `RTOUCH`, which used to never fire, now read
+  the stick caps. The pad's own names never take a button's JSM name from it —
+  Learn on Capture still writes `CAPTURE` — so only the grips and the right
+  pad's click are named by their Misc slot. And `CAPTURE` itself is the
+  three-dot button alone: JSM's CAPTURE is the touchpad click only on a pad
+  with no Capture button of its own, a PlayStation pad, and a binding on it no
+  longer swallows the left pad's click either, which still passes through. The
+  Choose picker's JSM board greys that click on this pad rather than writing a
+  `CAPTURE` that would read a different button.
 - **Both trackpad clicks press a virtual DualSense's touchpad.** A DualSense
   report has ONE touchpad click, so a Steam Controller passed straight through
   onto one had nowhere to put its right pad's click: the button came from the

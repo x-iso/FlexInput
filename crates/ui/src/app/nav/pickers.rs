@@ -47,7 +47,7 @@ impl FlexInputApp {
         let cells = self.picker_tab_cells(self.picker_tab(), &self.macro_display_entries());
         let usable = self.picker_usable();
         let purpose = self.gamepad_nav.kbm_picker_use;
-        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
+        let vocab = self.jsm_vocab();
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let chord_purpose = purpose == crate::gamepad_nav::PickerUse::Chord;
         // Up past the board's top row goes into the chord list, on its last
@@ -201,6 +201,11 @@ impl FlexInputApp {
         }
     }
 
+    /// The JSM names this session can insert, for the board it shows.
+    pub(crate) fn jsm_vocab(&self) -> JsmVocab {
+        JsmVocab::for_board(self.gamepad_nav.kbm_slot, self.picker_layout().steam)
+    }
+
     /// Is a cell usable (focusable + mappable) for the open session? Not when
     /// it's an analog output on a discrete target (analog not OK), one of the
     /// target's own pins, something that can't sit on the side being chosen,
@@ -212,7 +217,7 @@ impl FlexInputApp {
         let stage = self.gamepad_nav.kbm_picker_stage;
         let purpose = self.gamepad_nav.kbm_picker_use;
         let chord = purpose == crate::gamepad_nav::PickerUse::Chord;
-        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
+        let vocab = self.jsm_vocab();
         // An analog-only cell needs an analog INPUT to drive it as an output;
         // as an input (a whole stick) it is itself the analog input.
         let choosing_input = chord && stage == crate::kbm_picker::PickStage::Input;
@@ -520,7 +525,7 @@ impl FlexInputApp {
         // What this session is for, and — when it is naming a key for a config —
         // the names JSM binds our pins by, so a key it can't name greys out.
         let purpose = self.gamepad_nav.kbm_picker_use;
-        let vocab = JsmVocab::of(self.gamepad_nav.kbm_slot);
+        let vocab = self.jsm_vocab();
         let usable = self.picker_usable();
 
         // The whole board — cells, gaps, captions, labels and the header's
@@ -1261,6 +1266,22 @@ impl JsmVocab {
         JsmVocab { slot, names }
     }
 
+    /// [`JsmVocab::of`] for the board being shown. On a Steam Controller's, the
+    /// left pad's click has no JSM name of its own: `CAPTURE` there is the
+    /// three-dot button, which the pad reports as Capture (the engine's
+    /// `either_pin`), so the click cell greys instead of writing a name that
+    /// would read a different button.
+    pub(crate) fn for_board(slot: crate::gamepad_nav::JsmSlot, steam: bool) -> JsmVocab {
+        let mut vocab = Self::of(slot);
+        if steam
+            && slot == crate::gamepad_nav::JsmSlot::Name
+            && vocab.names.get("btn_touchpad").is_some_and(|n| n == "CAPTURE")
+        {
+            vocab.names.remove("btn_touchpad");
+        }
+        vocab
+    }
+
     /// What inserting this cell writes into a config, if anything.
     ///
     /// Left of the `=`, a pad button goes in as the name JSM READS it as (`S`);
@@ -1336,6 +1357,19 @@ mod vocab_tests {
         assert_eq!(fi_insert(JsmSlot::Name, "Reload", true).as_deref(), Some("@Reload"));
         assert_eq!(fi_insert(JsmSlot::Name, "Menu — Show", false), None);
         assert_eq!(fi_insert(JsmSlot::Neither, "Reload", true), None);
+    }
+
+    /// On a Steam Controller's board the left pad's click is no `CAPTURE`: the
+    /// pad reports a Capture button of its own (the three-dot one), which is what
+    /// JSM's CAPTURE reads there. Its Capture cell still writes CAPTURE, and any
+    /// other board keeps the touchpad click as CAPTURE.
+    #[test]
+    fn a_steam_pads_click_is_not_capture() {
+        let steam = JsmVocab::for_board(JsmSlot::Name, true);
+        assert_eq!(steam.insert_for("btn_touchpad"), None, "the left pad click has no JSM name there");
+        assert_eq!(steam.insert_for("btn_capture").as_deref(), Some("CAPTURE"));
+        let other = JsmVocab::for_board(JsmSlot::Name, false);
+        assert_eq!(other.insert_for("btn_touchpad").as_deref(), Some("CAPTURE"), "a PlayStation pad's click");
     }
 
     /// Which side of the line the pick lands on decides what the board's keys
