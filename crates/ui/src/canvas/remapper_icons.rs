@@ -223,6 +223,9 @@ const SC_GRIP_R:   &[u8] = a!("SC/controller_rg_gradient.svg");
 const SC_CAP_L:    &[u8] = a!("SC/cap_sens_L.svg");
 const SC_CAP_R:    &[u8] = a!("SC/cap_sens_R.svg");
 const SC_AUX:      &[u8] = a!("SC/button_aux.svg");
+/// The pad's own home glyph, for the Guide button: the Xbox logo it fell back to
+/// is not what the pad has a button for.
+const SC_HOME:     &[u8] = a!("SC/controller_icon_outline.svg");
 const SC_MENU:     &[u8] = a!("SC/sd_button_menu.svg");
 const SC_VIEW:     &[u8] = a!("SC/sd_button_view.svg");
 const SC_L4:       &[u8] = a!("SC/controller_button_l4.svg");
@@ -237,23 +240,40 @@ const PS4_TP_SURFACE: &[u8] = a!("Playstation/playstation4_touchpad.svg");
 const PS4_TP_LEFT:   &[u8] = a!("Playstation/playstation4_touchpad_press_left.svg");
 const PS4_TP_CENTER: &[u8] = a!("Playstation/playstation4_touchpad_press_center.svg");
 const PS4_TP_RIGHT:  &[u8] = a!("Playstation/playstation4_touchpad_press_right.svg");
+// A Steam Controller's pads are rounded squares, like the PS4's touchpad and
+// nothing like PS5's wide bar, so its swipes — which way, and how far along each
+// axis — are drawn on that same surface.
+const PS4_SWIPE_UP:    &[u8] = a!("Playstation/playstation4_touchpad_swipe_up.svg");
+const PS4_SWIPE_DOWN:  &[u8] = a!("Playstation/playstation4_touchpad_swipe_down.svg");
+const PS4_SWIPE_LEFT:  &[u8] = a!("Playstation/playstation4_touchpad_swipe_left.svg");
+const PS4_SWIPE_RIGHT: &[u8] = a!("Playstation/playstation4_touchpad_swipe_right.svg");
+const PS4_SWIPE_H:     &[u8] = a!("Playstation/playstation4_touchpad_swipe_horizontal.svg");
+const PS4_SWIPE_V:     &[u8] = a!("Playstation/playstation4_touchpad_swipe_vertical.svg");
 
-/// A Steam Controller's glyph for `pin_id`, where it has one of its own.
+/// A Steam Controller's glyph for `pin_id`, where it has one of its own. Both
+/// namings: the controls the pad names itself (read off its own reports) and the
+/// Misc slots SDL hands out for them, which is what a pad read through SDL
+/// carries.
 fn steam_pin_svg(pin_id: &str) -> Option<&'static [u8]> {
     Some(match pin_id {
-        "btn_misc1" => SC_AUX,
-        "btn_misc3" => SC_CAP_L,
-        "btn_misc4" => SC_CAP_R,
-        "btn_misc5" => SC_GRIP_L,
-        "btn_misc6" => SC_GRIP_R,
+        // The three-dot button: Capture on the pad's own naming, Misc 1 on SDL's.
+        "btn_capture" | "btn_misc1" => SC_AUX,
+        "btn_cap_l" | "btn_misc3" => SC_CAP_L,
+        "btn_cap_r" | "btn_misc4" => SC_CAP_R,
+        "btn_grip_l" | "btn_misc5" => SC_GRIP_L,
+        "btn_grip_r" | "btn_misc6" => SC_GRIP_R,
         "btn_back" => SC_VIEW,
         "btn_start" => SC_MENU,
+        "btn_guide" => SC_HOME,
         // SDL's Triton mapping: the upper back buttons on the first paddle pair.
         "btn_paddle_l1" => SC_L4,
         "btn_paddle_r1" => SC_R4,
         "btn_paddle_l2" => SC_L5,
         "btn_paddle_r2" => SC_R5,
-        "btn_touchpad" | "btn_misc2" | "touchpad_any" => PS4_TP_CLICK,
+        "btn_touchpad" | "btn_touchpad2" | "btn_misc2" | "touchpad_any" => PS4_TP_CLICK,
+        // The analog swipe OUT too: a pad of this shape driving a mouse.
+        "touch_swipe_x" => PS4_SWIPE_H,
+        "touch_swipe_y" => PS4_SWIPE_V,
         "touch1_active" | "touch2_active" | "touch1_pressure" | "touch2_pressure" => PS4_TP_SURFACE,
         "touch_left" | "touchpad_left" => PS4_TP_LEFT,
         "touch_center" | "touchpad_center" => PS4_TP_CENTER,
@@ -700,6 +720,17 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "tz_swipe_down"  => return Some(PS_TP_SWIPE_DOWN),
         "tz_swipe_left"  => return Some(PS_TP_SWIPE_LEFT),
         "tz_swipe_right" => return Some(PS_TP_SWIPE_RIGHT),
+        // A pad's own swipe, per touch field: which way it went, and how far
+        // along each axis. These are the pins of a pad with trackpads of its own
+        // (a Steam Controller), so they wear the square-pad glyphs of the PS4 set,
+        // as its touch, click and press cells do — PS5's touchpad is a wide bar
+        // nothing like either.
+        "touch1_swipe_up" | "touch2_swipe_up"       => return Some(PS4_SWIPE_UP),
+        "touch1_swipe_down" | "touch2_swipe_down"   => return Some(PS4_SWIPE_DOWN),
+        "touch1_swipe_left" | "touch2_swipe_left"   => return Some(PS4_SWIPE_LEFT),
+        "touch1_swipe_right" | "touch2_swipe_right" => return Some(PS4_SWIPE_RIGHT),
+        "touch1_swipe_x" | "touch2_swipe_x"         => return Some(PS4_SWIPE_H),
+        "touch1_swipe_y" | "touch2_swipe_y"         => return Some(PS4_SWIPE_V),
         "touch_left"   | "touchpad_left"   => return Some(PS_TP_LEFT),
         "touch_center" | "touchpad_center" => return Some(PS_TP_CENTER),
         "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),
@@ -953,11 +984,44 @@ pub fn extra_button_label(skin: Skin, pin_id: &str) -> Option<&'static str> {
         (_, "btn_paddle_l2") => Some("PL2"),
         (_, "btn_paddle_r2") => Some("PR2"),
         (Skin::Steam, "btn_touchpad" | "touch1_active" | "touch1_pressure") => Some("L"),
-        (Skin::Steam, "btn_misc2" | "touch2_active" | "touch2_pressure") => Some("R"),
+        (Skin::Steam, "btn_touchpad2" | "btn_misc2" | "touch2_active" | "touch2_pressure") => Some("R"),
         (_, "touch1_pressure") => Some("1"),
         (_, "touch2_pressure") => Some("2"),
         _ => None,
     }
+}
+
+/// Which pad a swipe gesture belongs to, as a letter: a Steam Controller's two
+/// pads share the swipe glyphs just as they share its touch and click ones. Its
+/// click and touch glyphs take a label CUT OUT of them (see
+/// [`extra_button_label`]), but an arrowed swipe glyph has no clear space to cut
+/// into — the arrow shaft is where the letter would go — so the side is painted
+/// over it instead, by [`paint_pad_side_badge`].
+pub fn pin_pad_side(skin: Skin, pin_id: &str) -> Option<&'static str> {
+    let field = flexinput_core::touchzones::swipe_field(pin_id)?;
+    (skin == Skin::Steam).then(|| if field == 0 { "L" } else { "R" })
+}
+
+/// Paint a chip's pad-side badge in its top-left corner — a dark disc carrying
+/// `L` or `R`, as a Virtual Menu target's badge does — so a card naming one of a
+/// two-pad controller's swipes says WHICH pad, not just that a pad was swiped.
+/// No-op for any other pin, so every chip drawer can ask unconditionally. The
+/// top-left is free: the top-right takes a menu badge, the bottom-right a timed
+/// output's duration.
+pub fn paint_pad_side_badge(
+    painter: &egui::Painter,
+    icon: egui::Rect,
+    skin: Skin,
+    pin_id: &str,
+    tint: egui::Color32,
+) {
+    let Some(side) = pin_pad_side(skin, pin_id) else { return };
+    let r = (icon.width().min(icon.height()) * 0.23).clamp(5.0, 10.0);
+    let c = egui::pos2(icon.left() + r, icon.top() + r);
+    painter.circle(c, r, egui::Color32::from_black_alpha(225),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150)));
+    painter.text(c, egui::Align2::CENTER_CENTER, side,
+        egui::FontId::proportional(r * 1.3), tint);
 }
 
 #[cfg(test)]
@@ -969,13 +1033,36 @@ mod tests {
         assert_eq!(pin_svg(Skin::Steam, "btn_misc5"), Some(SC_GRIP_L));
         assert_eq!(pin_svg(Skin::Steam, "btn_misc4"), Some(SC_CAP_R));
         assert_eq!(pin_svg(Skin::Steam, "btn_misc1"), Some(SC_AUX));
+        // Read off its own reports the same controls answer to their own names,
+        // and wear the same glyphs.
+        assert_eq!(pin_svg(Skin::Steam, "btn_grip_l"), Some(SC_GRIP_L));
+        assert_eq!(pin_svg(Skin::Steam, "btn_cap_r"), Some(SC_CAP_R));
+        assert_eq!(pin_svg(Skin::Steam, "btn_capture"), Some(SC_AUX), "the three-dot button");
+        assert_eq!(pin_svg(Skin::Steam, "btn_touchpad2"), pin_svg(Skin::Steam, "btn_touchpad"),
+            "two pads, one glyph");
+        assert_eq!(pin_svg(Skin::Steam, "btn_guide"), Some(SC_HOME),
+            "its home button is no Xbox logo: the pad prints its own");
+        assert_ne!(pin_svg(Skin::Steam, "btn_guide"), pin_svg(Skin::Xbox, "btn_guide"));
         assert_eq!(pin_svg(Skin::Steam, "btn_back"), Some(SC_VIEW), "View is Select");
         assert_eq!(pin_svg(Skin::Steam, "btn_start"), Some(SC_MENU), "Menu is Start");
         assert_eq!(pin_svg(Skin::Steam, "btn_paddle_l2"), Some(SC_L5));
         assert_eq!(pin_svg(Skin::Steam, "btn_misc2"), pin_svg(Skin::Steam, "btn_touchpad"), "two pads, one glyph");
         assert_eq!(pin_svg(Skin::Steam, "btn_south"), pin_svg(Skin::Xbox, "btn_south"), "its face is an Xbox one");
+        // Its swipes are drawn on the square pad they happen on — the PS4's
+        // touchpad shape, not PS5's wide bar — and say which pad they happened
+        // on, since the arrow itself is the same either way.
+        assert_eq!(pin_svg(Skin::Steam, "touch1_swipe_left"), Some(PS4_SWIPE_LEFT));
+        assert_eq!(pin_svg(Skin::Steam, "touch2_swipe_y"), Some(PS4_SWIPE_V));
+        assert_eq!(pin_svg(Skin::Steam, "touch_swipe_x"), Some(PS4_SWIPE_H), "its swipe OUT wears it too");
+        assert_ne!(pin_svg(Skin::Steam, "touch1_swipe_up"), Some(PS_TP_SWIPE_UP), "no PS5 bar on this pad");
+        assert_eq!(pin_pad_side(Skin::Steam, "touch1_swipe_up"), Some("L"));
+        assert_eq!(pin_pad_side(Skin::Steam, "touch2_swipe_x"), Some("R"));
+        assert_eq!(pin_pad_side(Skin::Xbox, "touch1_swipe_up"), None, "no other pad has these pins");
+        assert_eq!(extra_button_label(Skin::Steam, "touch1_swipe_up"), None,
+            "an arrowed glyph keeps no room for a cut-out letter");
         assert_eq!(pin_svg(Skin::Xbox, "btn_misc5"), None, "another pad's Misc 5 is no grip");
         assert_eq!(extra_button_label(Skin::Steam, "btn_touchpad"), Some("L"));
+        assert_eq!(extra_button_label(Skin::Steam, "btn_touchpad2"), Some("R"));
         assert_eq!(extra_button_label(Skin::Steam, "touch2_pressure"), Some("R"));
         assert_eq!(extra_button_label(Skin::Steam, "btn_paddle_l1"), None, "its own glyph says L4");
         assert_eq!(extra_button_label(Skin::Xbox, "btn_paddle_l1"), Some("PL1"));
@@ -1009,7 +1096,7 @@ mod tests {
 
         // Every curated picker pin resolves under every family (no dead entries).
         for (pin, _) in GAMEPAD_INPUT_PINS {
-            for skin in [Skin::Xbox, Skin::Playstation, Skin::SwitchPro] {
+            for skin in [Skin::Xbox, Skin::Playstation, Skin::SwitchPro, Skin::Steam] {
                 assert!(gp_pin_svg(skin, pin).is_some(), "{pin} unresolved under {skin:?}");
             }
         }

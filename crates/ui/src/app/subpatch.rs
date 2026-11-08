@@ -73,6 +73,27 @@ pub(crate) fn kbm_pin_label(pin: &str) -> String {
         "btn_misc5" => "M5".into(),
         "btn_misc6" => "M6".into(),
         "btn_capture" => "Capt".into(),
+        // A pad's own names for what another pad reports as Misc slots.
+        "btn_touchpad2" => "TP2 Click".into(),
+        "btn_cap_l" => "Cap L".into(),
+        "btn_cap_r" => "Cap R".into(),
+        "btn_grip_l" => "Grip L".into(),
+        "btn_grip_r" => "Grip R".into(),
+        // The swipe of each touch field: the pad, or its first finger, then the
+        // second pad or finger.
+        "touch1_swipe_up" => "Pad L Swipe↑".into(),
+        "touch1_swipe_down" => "Pad L Swipe↓".into(),
+        "touch1_swipe_left" => "Pad L Swipe←".into(),
+        "touch1_swipe_right" => "Pad L Swipe→".into(),
+        "touch2_swipe_up" => "Pad R Swipe↑".into(),
+        "touch2_swipe_down" => "Pad R Swipe↓".into(),
+        "touch2_swipe_left" => "Pad R Swipe←".into(),
+        "touch2_swipe_right" => "Pad R Swipe→".into(),
+        // The same gesture read as how far, which is what the Analog mode takes.
+        "touch1_swipe_x" => "Pad L Swipe↔".into(),
+        "touch1_swipe_y" => "Pad L Swipe↕".into(),
+        "touch2_swipe_x" => "Pad R Swipe↔".into(),
+        "touch2_swipe_y" => "Pad R Swipe↕".into(),
         "key_backtick" => "`".into(),
         "key_arrowup" => "↑".into(),
         "key_arrowdown" => "↓".into(),

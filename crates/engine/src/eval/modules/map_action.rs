@@ -63,6 +63,11 @@ pub(crate) fn eval_map_action_node(
             upstream.insert("touch_left",      Signal::Bool(touch_only[0]));
             upstream.insert("touch_center",    Signal::Bool(touch_only[1]));
             upstream.insert("touch_right",     Signal::Bool(touch_only[2]));
+            // The pad's own swipe gestures, derived like Remapper's (see there).
+            if mappings_read_swipes(mappings) {
+                let ns = state.entry(uid).or_insert_with(NodeState::default);
+                ns.swipes.get_or_insert_with(Default::default).step(&mut upstream);
+            }
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 

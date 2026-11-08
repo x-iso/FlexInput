@@ -1695,6 +1695,12 @@ impl eframe::App for FlexInputApp {
             .filter(|d| flexinput_devices::steam_haptics::is_steam_controller(d.vid, d.pid))
         {
             for tab in &mut self.tabs {
+                // Read off its own reports the pad names its spare controls
+                // itself, so a patch saved against SDL's Misc slots is rewritten
+                // to those names first — before the ports below are retitled.
+                if crate::canvas::migrate_steam_pad_pins(&mut tab.canvas.snarl, &device.id, false) {
+                    tab.canvas.mutation_gen = tab.canvas.mutation_gen.wrapping_add(1);
+                }
                 if crate::canvas::sync_device_node_pins(&mut tab.canvas.snarl, device) {
                     tab.canvas.mutation_gen = tab.canvas.mutation_gen.wrapping_add(1);
                 }

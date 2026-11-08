@@ -435,7 +435,9 @@ pub(crate) fn controller3d_live(
         ("paddle_l2", "btn_paddle_l2"),
         ("paddle_r1", "btn_paddle_r1"),
         ("paddle_r2", "btn_paddle_r2"),
-        // SDL's Misc 1 (the Steam Controller's "…" quick-access button).
+        // The Steam Controller's "…" quick-access button: Capture read off its
+        // own reports, Misc 1 read through SDL.
+        ("misc1", "btn_capture"),
         ("misc1", "btn_misc1"),
     ];
     for (part, pin) in BUTTON_PART_PINS {
@@ -474,26 +476,37 @@ pub(crate) fn controller3d_live(
     for p in ["right_stick", "right_ring"] {
         glow(p, rmag);
     }
-    // A thumb resting on a capacitive cap (Misc 3 / 4, read only when the backend
-    // marks them capacitive) lights it at the node's touch-sensor level, which a
-    // click still outshines.
+    // A thumb resting on a capacitive cap lights it at the node's touch-sensor
+    // level, which a click still outshines. Each sensor answers under two names:
+    // SDL's Misc slot, and the pad's own, read off its own reports.
     let capacitive = get(flexinput_core::automap::CAPACITIVE_MASK_PIN).map_or(0, |s| s.as_float() as u8);
-    for (part, misc, press) in [("left_cap", 2, live.left_stick_press), ("right_cap", 3, live.right_stick_press)] {
-        let touched = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
+    let capacitive_pin = |pin: &str| {
+        flexinput_core::automap::CAPACITIVE_PINS.iter().position(|p| *p == pin)
+            .is_some_and(|bit| capacitive & (1 << bit) != 0) && b(pin)
+    };
+    for (part, caps, press) in [
+        ("left_cap", ["btn_misc3", "btn_cap_l"], live.left_stick_press),
+        ("right_cap", ["btn_misc4", "btn_cap_r"], live.right_stick_press),
+    ] {
+        let touched = caps.iter().any(|p| capacitive_pin(p));
         glow(part, press.max(if touched { capacitive_glow } else { 0.0 }));
     }
     // A pad click lights the whole pad surface — the touchpad, and a two-pad
-    // controller's right pad (`touchpad2`), whose click SDL reports as Misc 2.
+    // controller's right pad (`touchpad2`), whose click the pad names itself and
+    // SDL reports as Misc 2.
     for (part, field) in [("touchpad", 0), ("touchpad2", 1)] {
         let click = flexinput_core::touchzones::field_click_pins(field).iter().any(|p| b(p));
         glow(part, if click { 1.0 } else { 0.0 });
     }
     // Grip sense (Steam Controller): a hand on a grip shows that grip's patch,
-    // at the same level as a touched cap. The grips' capacitive pads arrive on
-    // Misc 5 / 6, read only when the backend marks those pins capacitive — on
-    // other pads they're buttons.
-    for (part, misc) in [("left_gripsense", 4), ("right_gripsense", 5)] {
-        let held = capacitive & (1 << misc) != 0 && b(flexinput_core::automap::MISC_PINS[misc]);
+    // at the same level as a touched cap. The grips' capacitive pads are marked
+    // capacitive by the pad's reader — Misc 5 / 6 through SDL, the pad's own
+    // names off its reports — and on other pads those slots are buttons.
+    for (part, grips) in [
+        ("left_gripsense", ["btn_misc5", "btn_grip_l"]),
+        ("right_gripsense", ["btn_misc6", "btn_grip_r"]),
+    ] {
+        let held = grips.iter().any(|p| capacitive_pin(p));
         glow(part, if held { capacitive_glow } else { 0.0 });
     }
     live
@@ -606,14 +619,14 @@ pub(crate) fn c3d_motion_offset(
 #[cfg(test)]
 mod capacitive_glow_tests {
     use super::*;
-    use flexinput_core::automap::{CAPACITIVE_MASK_PIN, MISC_PINS};
+    use flexinput_core::automap::{CAPACITIVE_MASK_PIN, MISC_PINS, STEAM_RAW_CAPACITIVE_MASK};
 
     /// Both caps' and grips' sensors held; `(left_cap, left_gripsense)` glow.
-    fn glows(level: f32, mask: u8) -> (Option<f32>, Option<f32>) {
+    fn glows(level: f32, mask: u8, left_cap: &str, left_grip: &str) -> (Option<f32>, Option<f32>) {
         let dev = "sdl:generic:t".to_string();
         let mut signals = std::collections::HashMap::new();
         signals.insert((dev.clone(), CAPACITIVE_MASK_PIN.to_string()), Signal::Float(mask as f32));
-        for pin in [MISC_PINS[2], MISC_PINS[4]] {
+        for pin in [left_cap, left_grip] {
             signals.insert((dev.clone(), pin.to_string()), Signal::Bool(true));
         }
         let live = controller3d_live(
@@ -624,15 +637,19 @@ mod capacitive_glow_tests {
 
     #[test]
     fn caps_and_grips_light_at_the_set_level() {
-        assert_eq!(glows(0.3, 0b11_1100), (Some(0.3), Some(0.3)));
-        assert_eq!(glows(0.8, 0b11_1100), (Some(0.8), Some(0.8)));
-        assert_eq!(glows(0.0, 0b11_1100), (None, None), "0 = not shown");
+        // SDL's Misc slots, marked capacitive.
+        assert_eq!(glows(0.3, 0b0000_1111, MISC_PINS[2], MISC_PINS[4]), (Some(0.3), Some(0.3)));
+        assert_eq!(glows(0.8, 0b0000_1111, MISC_PINS[2], MISC_PINS[4]), (Some(0.8), Some(0.8)));
+        assert_eq!(glows(0.0, 0b0000_1111, MISC_PINS[2], MISC_PINS[4]), (None, None), "0 = not shown");
+        // The same sensors as the pad's own reader names them.
+        assert_eq!(glows(0.3, STEAM_RAW_CAPACITIVE_MASK, "btn_cap_l", "btn_grip_l"),
+            (Some(0.3), Some(0.3)), "a Steam Controller read raw lights its caps and grips");
     }
 
     /// On a pad that doesn't mark them capacitive, Misc pins are buttons.
     #[test]
     fn misc_buttons_on_other_pads_are_not_sensors() {
-        assert_eq!(glows(0.3, 0), (None, None));
+        assert_eq!(glows(0.3, 0, MISC_PINS[2], MISC_PINS[4]), (None, None));
     }
 }
 

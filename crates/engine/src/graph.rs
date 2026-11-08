@@ -98,6 +98,11 @@ pub(crate) struct AutomapPair {
     pub wired: bool,
     /// `btn_lt_dig`→`left_trigger` or its twin: a lowest-priority fallback.
     pub digital_trigger_bridge: bool,
+    /// A second trackpad's click onto a pad with one touchpad button
+    /// (`automap::TOUCHPAD_CLICK_BRIDGE`): it JOINS whatever already drives the
+    /// destination rather than losing to it, because the pad has no other pin
+    /// for that click.
+    pub touchpad_click_bridge: bool,
 }
 
 /// A sink's AutoMap pairing and wiring, from [`SinkTarget::compiled`].
@@ -147,6 +152,8 @@ impl SinkTarget {
                         wired: directly_wired.contains(d),
                         digital_trigger_bridge: matches!((s, d),
                             ("btn_lt_dig", "left_trigger") | ("btn_rt_dig", "right_trigger")),
+                        touchpad_click_bridge:
+                            flexinput_core::automap::TOUCHPAD_CLICK_BRIDGE.contains(&(s, d)),
                         src: s.to_string(),
                         dst: d.to_string(),
                     }).collect()

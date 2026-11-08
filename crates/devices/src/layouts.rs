@@ -22,16 +22,57 @@ pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
 /// [`outputs_for`] for one pad, whose VID/PID can add pins its kind doesn't
 /// carry: a DualSense Edge's back and Fn buttons.
 pub fn outputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>) -> Vec<DevicePin> {
+    // The default naming is SDL's: whatever pad reaches this through gilrs or
+    // SDL gets its Misc slots, because that is what those paths report.
+    outputs_for_pad_named(kind, vid, pid, SteamNaming::Sdl)
+}
+
+/// Who is reading a Steam Controller's spare controls, and so what they are
+/// called on the bus: the raw-HID reader names each after what it is, while SDL
+/// hands the same out as its Misc slots. A pad's pins have to be named by
+/// whoever publishes them, so the layout follows the reader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SteamNaming {
+    /// `steam_controller`'s reader, off the pad's own reports.
+    Raw,
+    /// SDL's gamepad API, which keeps the Misc slots.
+    Sdl,
+}
+
+/// [`outputs_for_pad`] with the Steam Controller's naming chosen.
+pub fn outputs_for_pad_named(
+    kind: ControllerKind,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    naming: SteamNaming,
+) -> Vec<DevicePin> {
+    let steam = crate::steam_haptics::is_steam_controller(vid, pid);
     let mut pins = outputs_for(kind);
     if kind == ControllerKind::DualSense && crate::identification::is_dualsense_edge(vid, pid) {
         // Ahead of the Auto-Map port, which stays last.
         let at = pins.len().saturating_sub(1);
         pins.splice(at..at, dualsense_edge_extra_outputs());
     }
-    if crate::steam_haptics::is_steam_controller(vid, pid) {
+    if steam && naming == SteamNaming::Raw {
+        // Read off its own reports the pad has no Misc slots: it names the
+        // three-dot button, the right pad's click, the stick caps and the grips
+        // itself, and the SDL-era names are dropped rather than left to route
+        // to nothing.
+        pins.retain(|p| !flexinput_core::automap::MISC_PINS.contains(&p.id.as_str()));
+    }
+    if steam {
         // Its trackpads' press, ahead of the Auto-Map port.
         let at = pins.len().saturating_sub(1);
-        pins.splice(at..at, flexinput_core::automap::TOUCH_PRESSURE_PINS.map(|id| fl(id, id)));
+        let extra: Vec<DevicePin> = match naming {
+            SteamNaming::Raw => flexinput_core::automap::TOUCH_PRESSURE_PINS
+                .iter().map(|id| fl(id, id))
+                .chain(STEAM_RAW_EXTRA_OUTPUTS.iter().map(|(id, name)| bo(id, name)))
+                .collect(),
+            SteamNaming::Sdl => flexinput_core::automap::TOUCH_PRESSURE_PINS
+                .iter().map(|id| fl(id, id))
+                .collect(),
+        };
+        pins.splice(at..at, extra);
         for pin in &mut pins {
             if let Some((name, _)) = flexinput_core::automap::steam_controller_pin_names(&pin.id) {
                 pin.display_name = name.to_string();
@@ -40,6 +81,18 @@ pub fn outputs_for_pad(kind: ControllerKind, vid: Option<u16>, pid: Option<u16>)
     }
     pins
 }
+
+/// The controls a Steam Controller read off its own reports names itself, in the
+/// order the pad's node lists them: the three-dot button (the Capture of a Switch
+/// Pro), the right trackpad's click, the two stick caps and the two grips.
+const STEAM_RAW_EXTRA_OUTPUTS: [(&str, &str); 6] = [
+    ("btn_capture",   "Capture"),
+    ("btn_touchpad2", "Pad click R"),
+    ("btn_cap_l",     "Cap sens L"),
+    ("btn_cap_r",     "Cap sens R"),
+    ("btn_grip_l",    "Grip sens L"),
+    ("btn_grip_r",    "Grip sens R"),
+];
 
 /// The DualSense Edge's back buttons on the first paddle pair and its Fn
 /// buttons on the second, the order SDL reports them in.
@@ -641,14 +694,70 @@ mod automap_vocabulary_tests {
 
     #[test]
     fn a_steam_controllers_sensors_are_named_for_what_they_are() {
-        let name = |vid, pid, pin: &str| outputs_for_pad(ControllerKind::Generic, Some(vid), Some(pid))
+        let name = |naming: SteamNaming, pin: &str| outputs_for_pad_named(
+                ControllerKind::Generic, Some(0x28DE), Some(0x1304), naming)
             .into_iter().find(|p| p.id == pin).map(|p| p.display_name);
+        for (pin, want) in [("btn_touchpad", "Pad click L"), ("btn_touchpad2", "Pad click R"),
+                            ("btn_cap_l", "Cap sens L"), ("btn_cap_r", "Cap sens R"),
+                            ("btn_grip_l", "Grip sens L"), ("btn_grip_r", "Grip sens R")] {
+            assert_eq!(name(SteamNaming::Raw, pin).as_deref(), Some(want), "raw naming");
+        }
         for (pin, want) in [("btn_touchpad", "Pad click L"), ("btn_misc2", "Pad click R"),
                             ("btn_misc3", "Cap sens L"), ("btn_misc4", "Cap sens R"),
                             ("btn_misc5", "Grip sens L"), ("btn_misc6", "Grip sens R")] {
-            assert_eq!(name(0x28DE, 0x1304, pin).as_deref(), Some(want));
+            assert_eq!(name(SteamNaming::Sdl, pin).as_deref(), Some(want), "SDL naming");
         }
-        assert_eq!(name(0x045E, 0x0B12, "btn_touchpad").as_deref(), Some("Touchpad Click"), "another pad's stays");
-        assert_eq!(name(0x045E, 0x0B12, "btn_misc3").as_deref(), Some("Misc 3"), "another pad's stays");
+        assert_eq!(name(SteamNaming::Sdl, "btn_touchpad2"), None, "SDL's pad has no such pin");
+        assert_eq!(name(SteamNaming::Raw, "btn_misc3"), None, "nor does the raw one have Misc");
+        assert_eq!(outputs_for_pad(
+                ControllerKind::Generic, Some(0x045E), Some(0x0B12))
+            .into_iter().find(|p| p.id == "btn_misc3").map(|p| p.display_name).as_deref(),
+            Some("Misc 3"), "another pad's Misc pin keeps SDL's name");
+        assert_eq!(outputs_for_pad_named(
+                ControllerKind::Generic, Some(0x045E), Some(0x0B12), SteamNaming::Raw)
+            .into_iter().find(|p| p.id == "btn_touchpad").map(|p| p.display_name).as_deref(),
+            Some("Touchpad Click"), "another pad's stays");
+        assert_eq!(name(SteamNaming::Sdl, "btn_misc3").as_deref(), Some("Cap sens L"), "another pad's stays");
+    }
+
+    /// Read off its own reports, the pad carries no Misc slots at all — every
+    /// one of them is a pin named for the control it is — and the three-dot
+    /// button is Capture, so a mapping written for a Switch Pro's Capture runs
+    /// on it. A pad read through SDL keeps the Misc pins, which is what that
+    /// path reports.
+    #[test]
+    fn a_steam_controller_read_raw_names_its_own_controls() {
+        let ids = |naming: SteamNaming| -> Vec<String> {
+            outputs_for_pad_named(ControllerKind::Generic, Some(0x28DE), Some(0x1302), naming)
+                .into_iter().map(|p| p.id).collect()
+        };
+        let raw = ids(SteamNaming::Raw);
+        for pin in ["btn_capture", "btn_touchpad2", "btn_cap_l", "btn_cap_r", "btn_grip_l", "btn_grip_r"] {
+            assert!(raw.iter().any(|p| p == pin), "raw layout lacks {pin}");
+        }
+        for pin in flexinput_core::automap::MISC_PINS {
+            assert!(!raw.iter().any(|p| p == pin), "raw layout still declares {pin}");
+        }
+        // Its shared controls keep the positional names, so a patch wired for
+        // any other pad works: View is Start, Menu is Back, the left pad's click
+        // is the touchpad button.
+        for pin in ["btn_start", "btn_back", "btn_guide", "btn_touchpad",
+                    "btn_paddle_l1", "btn_paddle_r2", "left_trigger", "touch2_x"] {
+            assert!(raw.iter().any(|p| p == pin), "raw layout lacks {pin}");
+        }
+        // Every one of them reaches the AutoMap bus, or it could never be mapped.
+        let bus: std::collections::HashSet<&str> =
+            flexinput_core::automap::ALL_PINS.iter().map(|p| p.id).collect();
+        for pin in &raw {
+            assert!(!pin.starts_with("btn_") || bus.contains(pin.as_str()), "{pin} is off the bus");
+        }
+        // The Auto-Map port stays last.
+        assert_eq!(raw.last().map(String::as_str), Some("automap_out"));
+        // SDL's route keeps its vocabulary.
+        let sdl = ids(SteamNaming::Sdl);
+        for pin in flexinput_core::automap::MISC_PINS {
+            assert!(sdl.iter().any(|p| p == pin), "SDL layout lacks {pin}");
+        }
+        assert!(!sdl.iter().any(|p| p == "btn_touchpad2"), "and no pin SDL never reports");
     }
 }

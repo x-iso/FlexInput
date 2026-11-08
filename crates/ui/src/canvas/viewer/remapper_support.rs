@@ -221,19 +221,24 @@ pub(crate) fn remapper_pressed_now(
     out
 }
 
+/// Every pin that presses a click on a controller with two trackpads: the left
+/// pad's, and the right's under the name its reader gives it — the pad's own
+/// `btn_touchpad2` off its raw reports, SDL's `btn_misc2` through SDL. Mirrors
+/// `touchzones::field_click_pins` for both fields.
+pub(crate) const TWO_PAD_CLICKS: &[&str] = &["btn_touchpad", "btn_touchpad2", "btn_misc2"];
+
 /// Whether `dev` has two touchpads of its own (a Steam Controller, which says so
 /// with `automap::TOUCH_PADS_PIN`), rather than one with two fingers on it.
-pub(crate) fn has_two_pads(
-    live_signals: &std::collections::HashMap<(String, String), Signal>,
+pub(crate) fn has_two_pads(    live_signals: &std::collections::HashMap<(String, String), Signal>,
     dev: Option<&str>,
 ) -> bool {
     dev.is_some_and(|d| live_signals.contains_key(&(d.to_string(), am_canon::TOUCH_PADS_PIN.to_string())))
 }
 
 /// Learn on a pad with two touchpads: each pad as a whole, its click, else its
-/// touch, onto `pressed`. (The right pad's click comes as `btn_misc2` with the
-/// other buttons already.) False, and nothing added, for a pad with one
-/// touchpad, which Learn reads by zone.
+/// touch, onto `pressed`. (The right pad's click comes with the other buttons
+/// already, under the pad's own name or — read through SDL — as Misc 2.) False,
+/// and nothing added, for a pad with one touchpad, which Learn reads by zone.
 pub(crate) fn learn_two_pads(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     dev: Option<&str>,
@@ -244,8 +249,14 @@ pub(crate) fn learn_two_pads(
     }
     let Some(dev) = dev else { return false };
     let on = |pin: &str| live_signals.get(&(dev.to_string(), pin.to_string())).is_some_and(|s| s.as_bool());
-    for (click, touch) in [("btn_touchpad", "touch1_active"), ("btn_misc2", "touch2_active")] {
-        let pin = if on(click) { click } else if on(touch) { touch } else { continue };
+    for (field, touch) in [(0, "touch1_active"), (1, "touch2_active")] {
+        let click = flexinput_core::touchzones::field_click_pins(field)
+            .iter().find(|p| on(p));
+        let pin = match click {
+            Some(p) => *p,
+            None if on(touch) => touch,
+            None => continue,
+        };
         if !pressed.iter().any(|p| p == pin) {
             pressed.push(pin.to_string());
         }
@@ -528,6 +539,13 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
             if let Some(p) = imu {
                 resp = resp.on_hover_text(p.name);
             }
+            // A swipe of one of a two-pad controller's pads wears which pad it
+            // was, and says it in full on hover: the glyph alone is the same
+            // arrow either way.
+            if flexinput_core::touchzones::swipe_field(pin_id).is_some() {
+                resp = resp.on_hover_text(remapper_pin_display(pin_id));
+            }
+            remapper_icons::paint_pad_side_badge(ui.painter(), resp.rect, skin, pin_id, Color32::WHITE);
             return resp.rect;
         }
     }
@@ -748,6 +766,7 @@ pub(crate) fn paint_chord_chip_tinted(
             painter.image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint);
+            remapper_icons::paint_pad_side_badge(painter, rect, from, pin_id, tint);
             return chip_h;
         }
     }
@@ -1035,6 +1054,25 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
         "touch_right"       => return "Touchpad Right (Touch)".into(),
         "touch_swipe_x"     => return "Touchpad Swipe ↔".into(),
         "touch_swipe_y"     => return "Touchpad Swipe ↕".into(),
+        // A pad's own swipe gesture, per touch field: which way it went, or how
+        // far along an axis. On a pad with two trackpads of its own the fields
+        // are its pads, and it is named for them by `connected_pad_pin_names`,
+        // above.
+        _ if flexinput_core::touchzones::swipe_field(pin_id).is_some() => {
+            use flexinput_core::touchzones as tz;
+            let field = tz::swipe_field(pin_id).unwrap_or(0);
+            let way = match tz::swipe_pin_of(pin_id) {
+                Some((_, tz::SWIPE_UP)) => "↑",
+                Some((_, tz::SWIPE_DOWN)) => "↓",
+                Some((_, tz::SWIPE_LEFT)) => "←",
+                Some((_, _)) => "→",
+                None => match tz::swipe_axis_pin_of(pin_id) {
+                    Some((_, 0)) => "↔",
+                    _ => "↕",
+                },
+            };
+            return format!("Touch {} Swipe {way}", field + 1);
+        }
         // Virtual Menu card trigger tokens (the zone's selection / highlight).
         "menu_sel"          => return "Select".into(),
         "menu_hover"        => return "Hover".into(),
@@ -1153,6 +1191,24 @@ mod learn_mute_tests {
         seen.sort();
         assert_eq!(seen, ["btn_misc1", "btn_south"]);
         assert_eq!(live.get(&k("btn_misc5")).map(|s| s.as_bool()), Some(true), "the pin itself stays live");
+    }
+
+    /// The same mute over the names a Steam Controller read off its own reports
+    /// uses: its stick caps and grips are skipped, its Capture (the three-dot
+    /// button) is a button and counts.
+    #[test]
+    fn learn_skips_the_raw_pads_own_sensors_too() {
+        let dev = "sdl:generic:triton";
+        let k = |pin: &str| (dev.to_string(), pin.to_string());
+        let mut live = std::collections::HashMap::new();
+        for pin in ["btn_cap_l", "btn_grip_r", "btn_capture", "btn_south"] {
+            live.insert(k(pin), Signal::Bool(true));
+        }
+        live.insert(k(am_canon::CAPACITIVE_LEARN_MUTE_PIN),
+            Signal::Float(am_canon::STEAM_RAW_CAPACITIVE_MASK as f32));
+        let mut seen = remapper_pressed_now(&live, dev);
+        seen.sort();
+        assert_eq!(seen, ["btn_capture", "btn_south"]);
     }
 }
 

@@ -181,14 +181,30 @@ pub struct AutoMapPin {
 
 use crate::SignalType;
 
-/// The Misc pins, in bit order for [`capacitive_misc_mask`] (bit n = `MISC_PINS[n]`).
+/// The Misc pins, in the order SDL hands its spare button slots out.
 pub const MISC_PINS: [&str; 6] = [
     "btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
 ];
 
+/// The capacitive sensors a backend can mark with [`capacitive_misc_mask`], in
+/// bit order (bit n = `CAPACITIVE_PINS[n]`). The first four are those sensors
+/// where SDL puts them — on its Misc slots — and the last four are the same
+/// sensors as the raw Steam Controller reader names them: a pad's pins are
+/// named by whoever reads it, and a Steam Controller read off its own reports
+/// has no Misc slots at all.
+pub const CAPACITIVE_PINS: [&str; 8] = [
+    "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
+    "btn_cap_l", "btn_cap_r", "btn_grip_l", "btn_grip_r",
+];
+
+/// The sensors the raw Steam Controller reader publishes: stick caps and grips,
+/// under their own names.
+pub const STEAM_RAW_CAPACITIVE_MASK: u8 = 0b1111_0000;
+
 /// Which of a pad's Misc pins are CAPACITIVE touch sensors (stick caps, grips)
-/// rather than switches, as a bitmask over [`MISC_PINS`]. 0 for every pad
-/// without them.
+/// rather than switches, as a bitmask over [`CAPACITIVE_PINS`]. 0 for every pad
+/// without them. The raw Steam Controller reader publishes
+/// [`STEAM_RAW_CAPACITIVE_MASK`] for the same sensors instead.
 ///
 /// These are what the device.source "Ignore capacitive touch in Learn" toggle
 /// (`suppress_touch_misc` param) hides from Learn. They assert just from holding
@@ -208,8 +224,8 @@ pub const MISC_PINS: [&str; 6] = [
 /// Trackpads are deliberately NOT here: finger contact is how a pad is meant to
 /// be used, and the pad CLICK (Misc 2 on a Steam Controller / Deck) is a switch.
 pub fn capacitive_misc_mask(vid: u16, pid: u16) -> u8 {
-    const STICKS: u8 = 0b00_1100; // misc3, misc4
-    const GRIPS: u8 = 0b11_0000;  // misc5, misc6
+    const STICKS: u8 = 0b0000_0011; // misc3, misc4
+    const GRIPS: u8 = 0b0000_1100;  // misc5, misc6
     match (vid, pid) {
         (0x28DE, 0x1302..=0x1305) => STICKS | GRIPS,
         (0x28DE, 0x1205) => STICKS,
@@ -220,7 +236,7 @@ pub fn capacitive_misc_mask(vid: u16, pid: u16) -> u8 {
 
 /// The pins a [`capacitive_misc_mask`] names.
 pub fn capacitive_pins(mask: u8) -> impl Iterator<Item = &'static str> {
-    MISC_PINS.iter().enumerate().filter(move |(i, _)| mask & (1 << i) != 0).map(|(_, p)| *p)
+    CAPACITIVE_PINS.iter().enumerate().filter(move |(i, _)| mask & (1 << i) != 0).map(|(_, p)| *p)
 }
 
 /// Synthetic per-device signal carrying that device's [`capacitive_misc_mask`]
@@ -309,19 +325,34 @@ pub const PAD_CLICK_PINS: [[&str; 5]; 2] = [
 
 /// What a Steam Controller's pad clicks and sensors are: `(full name, picker cell
 /// name)`. They have one name on the bus, as they mean other things on other pads.
-/// SDL's mapping puts the left pad's click on `touchpad`, the right's on `misc2`.
+/// Read off its own reports the pad names them itself — the left pad's click on
+/// `touchpad`, the right's on `touchpad2`, the sensors by what they sense. Read
+/// through SDL it has no names of its own, and its slots come out as Misc.
 pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static str)> {
     match pin {
         "btn_touchpad" => Some(("Pad click L", "Pad L")),
-        "btn_misc2" => Some(("Pad click R", "Pad R")),
-        "btn_misc3" => Some(("Cap sens L", "Cap L")),
-        "btn_misc4" => Some(("Cap sens R", "Cap R")),
-        "btn_misc5" => Some(("Grip sens L", "Grip L")),
-        "btn_misc6" => Some(("Grip sens R", "Grip R")),
+        "btn_touchpad2" | "btn_misc2" => Some(("Pad click R", "Pad R")),
+        "btn_cap_l" | "btn_misc3" => Some(("Cap sens L", "Cap L")),
+        "btn_cap_r" | "btn_misc4" => Some(("Cap sens R", "Cap R")),
+        "btn_grip_l" | "btn_misc5" => Some(("Grip sens L", "Grip L")),
+        "btn_grip_r" | "btn_misc6" => Some(("Grip sens R", "Grip R")),
         "touch1_active" => Some(("Pad touch L", "Touch L")),
         "touch2_active" => Some(("Pad touch R", "Touch R")),
         "touch1_pressure" => Some(("Pad press L", "Press L")),
         "touch2_pressure" => Some(("Pad press R", "Press R")),
+        // Each pad's own swipe, in the picker's short form for its cell.
+        "touch1_swipe_up" => Some(("Pad L swipe up", "Swipe L↑")),
+        "touch1_swipe_down" => Some(("Pad L swipe down", "Swipe L↓")),
+        "touch1_swipe_left" => Some(("Pad L swipe left", "Swipe L←")),
+        "touch1_swipe_right" => Some(("Pad L swipe right", "Swipe L→")),
+        "touch2_swipe_up" => Some(("Pad R swipe up", "Swipe R↑")),
+        "touch2_swipe_down" => Some(("Pad R swipe down", "Swipe R↓")),
+        "touch2_swipe_left" => Some(("Pad R swipe left", "Swipe R←")),
+        "touch2_swipe_right" => Some(("Pad R swipe right", "Swipe R→")),
+        "touch1_swipe_x" => Some(("Pad L swipe ↔", "Swipe L↔")),
+        "touch1_swipe_y" => Some(("Pad L swipe ↕", "Swipe L↕")),
+        "touch2_swipe_x" => Some(("Pad R swipe ↔", "Swipe R↔")),
+        "touch2_swipe_y" => Some(("Pad R swipe ↕", "Swipe R↕")),
         _ => None,
     }
 }
@@ -719,6 +750,12 @@ pub const FEEDBACK_OUTLET_PINS: &[AutoMapPin] = &[
 /// Canonical list of all gamepad signals that AutoMap covers.
 /// Used by AutoMap Splitter/Collector UIs and for signal resolution.
 /// Order: bundled vectors first, then individual axes, then buttons.
+///
+/// ⭐ **Append-only.** A network peer sends these slots by position and decodes
+/// the common prefix between its build and its peer's (see the layout hash in
+/// `crates/net/src/frame.rs`), so a new pin goes at the tail and a mid-list
+/// insertion is a wire-format break that only shows up as a warning between two
+/// builds.
 pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "left_stick",    display_name: "Left Stick",           signal_type: SignalType::Vec2 },
     AutoMapPin { id: "right_stick",   display_name: "Right Stick",          signal_type: SignalType::Vec2 },
@@ -848,10 +885,20 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     // mouse_move. +Y scrolls up, +X scrolls right.
     AutoMapPin { id: "scroll_move_y", display_name: "Mouse: Scroll Y (move)", signal_type: SignalType::Float },
     AutoMapPin { id: "scroll_move_x", display_name: "Mouse: Scroll X (move)", signal_type: SignalType::Float },
-    // A trackpad's press (`TOUCH_PRESSURE_PINS`). Last, where a network peer on
-    // an older build reads the tail it doesn't know as extra.
+    // A trackpad's press (`TOUCH_PRESSURE_PINS`).
     AutoMapPin { id: "touch1_pressure", display_name: "Touch 1 Pressure", signal_type: SignalType::Float },
     AutoMapPin { id: "touch2_pressure", display_name: "Touch 2 Pressure", signal_type: SignalType::Float },
+    // ── A pad's own names, read off its own reports ──────────────────────────
+    // The Steam Controller's raw-HID reader names its spare controls after what
+    // they are; SDL, reading the same pad, hands them out as Misc slots. Both
+    // names are in the bus, so whichever route reads the pad has its pins, and
+    // only that pad's layout declares the dedicated ones. Appended at the tail:
+    // the net layout is append-only (see `crates/net/src/frame.rs`).
+    AutoMapPin { id: "btn_touchpad2", display_name: "Touchpad 2 Click",   signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_cap_l",     display_name: "Cap Sense L",        signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_cap_r",     display_name: "Cap Sense R",        signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_grip_l",    display_name: "Grip Sense L",       signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_grip_r",    display_name: "Grip Sense R",       signal_type: SignalType::Bool },
 ];
 
 /// Whether `id` is one of [`ALL_PINS`]. A set lookup: the engine asks this per
@@ -890,7 +937,11 @@ pub fn known_pins() -> &'static KnownPins {
     static KNOWN: std::sync::OnceLock<KnownPins> = std::sync::OnceLock::new();
     KNOWN.get_or_init(|| {
         let mut names: Vec<&'static str> = ALL_PINS.iter().map(|p| p.id).collect();
-        for &p in DERIVED_PINS.iter().chain(crate::imu::IMU_PINS.iter().map(|p| &p.id)) {
+        for &p in DERIVED_PINS.iter()
+            .chain(crate::imu::IMU_PINS.iter().map(|p| &p.id))
+            .chain(crate::touchzones::SWIPE_PINS.iter().flatten())
+            .chain(crate::touchzones::SWIPE_AXIS_PINS.iter().flatten())
+        {
             if !names.contains(&p) {
                 names.push(p);
             }
@@ -940,6 +991,15 @@ pub fn family_label(pin_id: &str, family_slug: Option<&str>) -> Option<&'static 
     })
 }
 
+/// A second trackpad's click, bridged onto a destination with ONE touchpad
+/// button. A DualSense / DS4 report has a single touchpad click, so a two-pad
+/// controller passed straight through onto one presses it from either pad — as
+/// a real touchpad is clicked wherever the finger happens to be. Both sources
+/// reach the destination and the engine combines them, which for a button is an
+/// OR; unlike a semantic group, the direct match never owns the destination
+/// alone.
+pub const TOUCHPAD_CLICK_BRIDGE: &[(&str, &str)] = &[("btn_touchpad2", "btn_touchpad")];
+
 /// Given lists of source and destination pin IDs, returns `(src_id, dst_id)` pairs
 /// for every auto-mappable signal. A single source pin can map to multiple destination
 /// pins when a semantic group bridges digital ↔ analog (e.g. `btn_lt_dig` fires both
@@ -987,6 +1047,23 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
         let has_analog_dst = dst_pins.contains(&analog);
         if has_dig_src && has_analog_dst && !result.iter().any(|&(s, d)| s == dig && d == analog) {
             result.push((dig, analog));
+        }
+    }
+
+    // Pass 4: a second pad's click onto a one-touchpad destination (see
+    // [`TOUCHPAD_CLICK_BRIDGE`]). Not a fallback: a pad with two trackpads means
+    // BOTH of them when it is passed through onto a pad with one touchpad, so
+    // the pair is emitted beside the direct match and the engine ORs the two
+    // into the one button.
+    for &(second, single) in TOUCHPAD_CLICK_BRIDGE {
+        if src_pins.contains(&second)
+            && dst_pins.contains(&single)
+            // A destination that has its own second click pin is a two-pad one:
+            // the direct match already keeps the two apart.
+            && !dst_pins.contains(&second)
+            && !result.iter().any(|&(s, d)| s == second && d == single)
+        {
+            result.push((second, single));
         }
     }
 
@@ -1174,12 +1251,38 @@ mod tests {
         let pins = |vid, pid| capacitive_pins(capacitive_misc_mask(vid, pid)).collect::<Vec<_>>();
         let sticks_grips = ["btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6"];
         for pid in 0x1302..=0x1305 {
-            assert_eq!(pins(0x28DE, pid), sticks_grips, "Steam Controller {pid:04X}");
+            assert_eq!(pins(0x28DE, pid), sticks_grips, "Steam Controller {pid:04X}, read through SDL");
         }
         assert_eq!(pins(0x28DE, 0x1205), ["btn_misc3", "btn_misc4"], "Steam Deck");
         assert_eq!(pins(0x0F0D, 0x01AB), ["btn_misc3", "btn_misc4"], "HORI (USB)");
         assert_eq!(pins(0x0F0D, 0x0196), ["btn_misc3", "btn_misc4"], "HORI (BT)");
         assert!(pins(0x2DC8, 0x6012).is_empty(), "other pads mute nothing");
+        // Read off its own reports the same pad names those sensors itself, and
+        // marks them under those names: a mute that skipped `btn_misc5` would
+        // leave its grip hijacking Learn.
+        assert_eq!(
+            capacitive_pins(STEAM_RAW_CAPACITIVE_MASK).collect::<Vec<_>>(),
+            ["btn_cap_l", "btn_cap_r", "btn_grip_l", "btn_grip_r"],
+        );
+    }
+
+    /// A pad with two trackpads, passed through onto one with a single touchpad
+    /// button: the second pad's click joins the first's, and its touch point is
+    /// the sink's second finger.
+    #[test]
+    fn a_second_pad_click_joins_the_first_on_a_one_touchpad_sink() {
+        let src = ["btn_touchpad", "btn_touchpad2", "touch1_x", "touch2_x"];
+        let dst = ["btn_touchpad", "touch1_x", "touch1_active", "touch2_x", "touch2_active"];
+        let m = resolve_mapping(&src, &dst);
+        assert!(m.contains(&("btn_touchpad", "btn_touchpad")), "the left pad keeps its own name");
+        assert!(m.contains(&("btn_touchpad2", "btn_touchpad")), "and the right's joins it");
+        assert!(m.contains(&("touch2_x", "touch2_x")), "the second pad is the second touch point");
+        // A sink that HAS two click pins — a pad passed to a pad — gets no bridge.
+        let dst2 = ["btn_touchpad", "btn_touchpad2"];
+        assert_eq!(
+            resolve_mapping(&["btn_touchpad", "btn_touchpad2"], &dst2),
+            vec![("btn_touchpad", "btn_touchpad"), ("btn_touchpad2", "btn_touchpad2")],
+        );
     }
 
     // An override can only take over a kind of feedback it can name: every

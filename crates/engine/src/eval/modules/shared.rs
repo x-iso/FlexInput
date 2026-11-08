@@ -95,10 +95,10 @@ impl MappingShape {
 
     /// Threshold verdict for one analog input pin. `None` means this card has
     /// no threshold, or the pin carries no analog value — the caller then falls
-    /// back to the pin's plain held state. An IMU input or a whole stick
-    /// always has a verdict: neither has a held state to fall back to, so
-    /// without a threshold it counts from [`ANALOG_DEFAULT_ON`] — either way
-    /// along a two-sided IMU axis, any way for a stick.
+    /// back to the pin's plain held state. An IMU input, a whole stick or a
+    /// pad's swipe axis always has a verdict: none has a held state to fall back
+    /// to, so without a threshold it counts from [`ANALOG_DEFAULT_ON`] — either
+    /// way along a two-sided axis, any way for a stick.
     pub(crate) fn analog_gate(
         &self,
         upstream: &PinSigs,
@@ -107,6 +107,22 @@ impl MappingShape {
         if is_imu_pin(pin) || whole_stick_axes(pin).is_some() {
             let v = self.in_value(upstream, pin)?.abs();
             return Some(self.shaped(v) >= self.threshold.unwrap_or(ANALOG_DEFAULT_ON));
+        }
+        // A pad's swipe axis has no held state to fall back to either, but it
+        // rests at zero by itself — the finger's own landing point is zero — so
+        // without a threshold ANY travel drives it: the card stands open from the
+        // moment the thumb starts moving and its value is how far the thumb has
+        // gone, which is what makes a swipe a pointer rather than a button that
+        // engages halfway across the pad. Zero travel is NOT open: a finger
+        // sitting where it landed has swiped nothing, and a card that treated that
+        // as held would drive whatever it sends forever. A threshold is then a
+        // deliberate deadzone.
+        if flexinput_core::touchzones::is_swipe_axis_pin(pin) {
+            let v = self.in_value(upstream, pin)?.abs();
+            return Some(match self.threshold {
+                Some(t) => self.shaped(v) >= t,
+                None => v > 0.0,
+            });
         }
         // A note's threshold is on its VELOCITY — which strikes count — and is
         // compared as struck, not through the curve, which shapes the
@@ -167,6 +183,13 @@ pub(crate) fn analog_in_value(upstream: &PinSigs, pin_id: &str) -> Option<f32> {
     }
     if let Some(v) = note_value(upstream, pin_id) {
         return Some(v);
+    }
+    // A pad's own swipe, read as how far: signed like a pitch bend, a full pad's
+    // width either way the most it reads, so one card covers the whole pad and
+    // the far half of it pushes the target the other way.
+    if flexinput_core::touchzones::is_swipe_axis_pin(pin_id) {
+        let v = upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        return Some(v.clamp(-1.0, 1.0));
     }
     if let Some(pin) = midi_analog_in(pin_id) {
         let v = upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0);
@@ -235,6 +258,8 @@ pub fn pin_is_analog_input(pin_id: &str) -> bool {
         || flexinput_core::midi::parse_pin(pin_id).is_some_and(|p| p.note_companions().is_some())
         || is_imu_pin(pin_id)
         || whole_stick_axes(pin_id).is_some()
+        // A pad's own swipe, read as how far its finger travelled.
+        || flexinput_core::touchzones::is_swipe_axis_pin(pin_id)
 }
 
 /// A trackpad's press (`automap::TOUCH_PRESSURE_PINS`).
@@ -249,6 +274,40 @@ fn is_press_pin(pin_id: &str) -> bool {
 pub fn pin_allows_analog_mode(pin_id: &str) -> bool {
     pin_is_analog_input(pin_id) || flexinput_core::automap::click_pressure_pin(pin_id).is_some()
 }
+
+/// What one analog input drives as a RATE: a pointer's velocity or the wheel's,
+/// which is what "swipe the trackpad → move the mouse / scroll" is. (The touchpad
+/// swipe OUTPUTS — [`TouchOutKind`] — are the other direction: moving a finger on
+/// a virtual pad.) Returns the canonical pin to write, the gain the input's
+/// signed value carries, and the most that pin is allowed to ask for in total.
+///
+/// The gains match what a Touch Zones' relative zone emits at its default speed,
+/// so a swipe and a zone push a cursor or a wheel the same way and the keymouse
+/// device card's own mouse sensitivity is the one place that tunes it. Scroll is
+/// capped, because a swipe axis reaches 1.0 at a pad's full width and several
+/// cards on one pin would otherwise send the wheel off at a speed nobody can aim
+/// with.
+pub(crate) fn analog_rate_out(pin: &str) -> Option<(&'static str, f32, f32)> {
+    Some(match pin {
+        "mouse_x" => ("mouse_x", MOUSE_RATE_BASE, f32::MAX),
+        "mouse_y" => ("mouse_y", MOUSE_RATE_BASE, f32::MAX),
+        "scroll_x" => ("scroll_x", 1.0, SCROLL_RATE_MAX),
+        "scroll_y" => ("scroll_y", 1.0, SCROLL_RATE_MAX),
+        "trackpad_scroll_x" => ("trackpad_scroll_x", 1.0, SCROLL_RATE_MAX),
+        "trackpad_scroll_y" => ("trackpad_scroll_y", 1.0, SCROLL_RATE_MAX),
+        _ => return None,
+    })
+}
+
+/// The pointer velocity a full deflection asks for at a Touch Zones' default
+/// speed — the number a relative zone and a swipe card agree on, before the
+/// keymouse card's own sensitivity multiplies it.
+pub(crate) const MOUSE_RATE_BASE: f32 = 0.03;
+
+/// The most a scroll-rate pin takes from the cards driving it: one zone or swipe
+/// at full deflection is 1.0, and twice that is a page flying past — the wheel
+/// stops being aimable long before the sink's own ceiling.
+pub(crate) const SCROLL_RATE_MAX: f32 = 2.0;
 
 /// A whole stick's axis pins, for `left_stick` / `right_stick`.
 pub(crate) fn whole_stick_axes(pin: &str) -> Option<(&'static str, &'static str)> {

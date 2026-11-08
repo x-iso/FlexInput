@@ -110,6 +110,158 @@ pub fn migrate_generic_button_pin(id: &str) -> Option<&'static str> {
     })
 }
 
+/// Map a Steam Controller's SDL-era pin id to the name the pad's own reader
+/// publishes, or `None` when the id needs no rewrite.
+///
+/// The pad used to be read through SDL, which numbers a pad's spare controls
+/// into Misc slots; read off its own HID reports it names them after what they
+/// are (see `devices::layouts::SteamNaming`). A card left naming `btn_misc1`
+/// would sit on a pin that pad no longer reports, fire never, and say nothing.
+///
+/// This belongs to a Steam Controller ALONE: on every other pad those slots are
+/// what SDL says they are, and `migrate_steam_pad_pins` only rewrites the parts
+/// of a patch that read that one device.
+pub fn migrate_steam_pad_pin(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "btn_misc1" => "btn_capture",
+        "btn_misc2" => "btn_touchpad2",
+        "btn_misc3" => "btn_cap_l",
+        "btn_misc4" => "btn_cap_r",
+        "btn_misc5" => "btn_grip_l",
+        "btn_misc6" => "btn_grip_r",
+        _ => return None,
+    })
+}
+
+/// The mapping cards of each module, by the param that holds them.
+const CARD_PARAMS: &[(&str, &str)] = &[
+    ("module.remapper", "mappings"),
+    ("module.map_action", "mappings"),
+    ("module.lean", "mappings"),
+    ("module.touch_zones", "zone_maps"),
+];
+
+/// Rewrite one card's pin names — the object form's `in` / `out` lists, and Map
+/// Action's legacy bare list of inputs.
+fn rewrite_card_pins(card: &mut Value) -> bool {
+    let mut changed = false;
+    let mut list = |v: &mut Value| match v {
+        Value::Array(pins) => for p in pins {
+            if let Some(new) = p.as_str().and_then(migrate_steam_pad_pin) {
+                *p = Value::String(new.to_string());
+                changed = true;
+            }
+        },
+        Value::String(s) => {
+            if let Some(new) = migrate_steam_pad_pin(s) {
+                *s = new.to_string();
+                changed = true;
+            }
+        }
+        _ => {}
+    };
+    match card {
+        Value::Object(m) => {
+            for key in ["in", "out"] {
+                if let Some(v) = m.get_mut(key) { list(v); }
+            }
+        }
+        Value::Array(_) => list(card),
+        // A legacy Map Action list: each element of `mappings` IS a pin.
+        Value::String(_) => list(card),
+        _ => {}
+    }
+    changed
+}
+
+/// Does anything in this node still name one of the Steam Controller's old Misc
+/// pins? A cheap pre-scan, so the walk below runs once rather than every frame.
+fn mentions_steam_misc(node: &NodeData) -> bool {
+    // A list of pin ids, or one pin id on its own (Map Action's legacy cards).
+    let ids = |v: Option<&Value>| match v {
+        Some(Value::Array(pins)) => pins.iter().any(|p|
+            p.as_str().is_some_and(|s| migrate_steam_pad_pin(s).is_some())),
+        Some(Value::String(s)) => migrate_steam_pad_pin(s).is_some(),
+        _ => false,
+    };
+    let cards = |_module: &str, key: &str| node.params.get(key).and_then(|v| v.as_array()).is_some_and(|cards|
+        cards.iter().any(|c| match c {
+            Value::Object(m) => ["in", "out"].iter().any(|k| ids(m.get(*k))),
+            Value::Array(_) | Value::String(_) => ids(Some(c)),
+            _ => false,
+        }));
+    ids(node.params.get("output_pin_ids"))
+        || CARD_PARAMS.iter().any(|(m, k)| node.module_id == *m && cards(m, k))
+}
+
+/// Rename one connected Steam Controller's old Misc pins through a patch: the
+/// ports of the node that shows the pad, and the cards of every mapping node
+/// that reads THAT pad.
+///
+/// Which node reads which device is on the wires, not in a param, so the nodes
+/// are found with the same upstream walk the bodies and the glow use, and only
+/// then edited. `fed_by` says the snarl's AutoMap input is known to come from
+/// this pad — true inside a sub-patch whose host is fed by it, where an inner
+/// inlet can't be resolved from the inner snarl alone. Idempotent: once
+/// rewritten, nothing matches.
+pub fn migrate_steam_pad_pins(snarl: &mut Snarl<NodeData>, device_id: &str, fed_by: bool) -> bool {
+    if !snarl.nodes_ids_data().any(|(_, n)| mentions_steam_misc(&n.value)) {
+        return false;
+    }
+    // Which nodes to edit, found while the snarl can still be read.
+    let cards: Vec<(NodeId, &'static str)> = snarl.nodes_ids_data()
+        .filter_map(|(id, n)| {
+            let key = CARD_PARAMS.iter().find(|(m, _)| &n.value.module_id == m).map(|(_, k)| *k)?;
+            let bound = fed_by || snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first()
+                .is_some_and(|src| crate::app::find_automap_device_ids_for_viewer(snarl, *src, None)
+                    .iter().any(|d| d == device_id));
+            bound.then_some((id, key))
+        })
+        .collect();
+    // Sub-patches: the host node's upstream decides what feeds them.
+    let inner: Vec<(NodeId, bool)> = snarl.nodes_ids_data()
+        .filter(|(_, n)| n.value.subpatch.is_some())
+        .map(|(id, _)| (id, fed_by || snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first()
+            .is_some_and(|src| crate::app::find_automap_device_ids_for_viewer(snarl, *src, None)
+                .iter().any(|d| d == device_id))))
+        .collect();
+
+    let mut changed = false;
+    for (id, key) in cards {
+        let Some(node) = snarl.get_node_mut(id) else { continue };
+        if let Some(Value::Array(cards)) = node.params.get_mut(key) {
+            for card in cards {
+                changed |= rewrite_card_pins(card);
+            }
+        }
+    }
+    for (id, fed) in inner {
+        let Some(node) = snarl.get_node_mut(id) else { continue };
+        if let Some(sp) = node.subpatch.as_mut() {
+            changed |= migrate_steam_pad_pins(&mut sp.snarl, device_id, fed);
+        }
+    }
+    for (_, node) in snarl.nodes_ids_data_mut() {
+        let node = &mut node.value;
+        if node.module_id != "device.source"
+            || node.params.get("device_id").and_then(|v| v.as_str()) != Some(device_id)
+        {
+            continue;
+        }
+        // Ports are addressed by slot, so renaming one in place keeps every wire
+        // on it; `sync_device_node_pins` retitles it from the device below.
+        if let Some(Value::Array(ids)) = node.params.get_mut("output_pin_ids") {
+            for id in ids {
+                if let Some(new) = id.as_str().and_then(migrate_steam_pad_pin) {
+                    *id = Value::String(new.to_string());
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// Bring a loaded `Snarl` up to date with the current module descriptors for
 /// pin-layout changes that can't be expressed through `#[serde(default)]`, and
 /// migrate legacy ViGEm device ids to their HIDMaestro equivalents.
@@ -820,9 +972,97 @@ mod migration_tests {
         assert!(!sync_device_node_pins(&mut snarl, &device), "nothing left to do");
     }
 
+    /// A Steam Controller's saved patch follows the pad from SDL's Misc slots to
+    /// the names its own reader uses: the ports of its node and the cards of the
+    /// nodes that read THAT pad — including inside a sub-patch the pad feeds —
+    /// while another pad's Misc buttons, which are genuinely its own, are left
+    /// exactly where they were.
+    #[test]
+    fn a_steam_pads_saved_misc_pins_follow_the_pad() {
+        let source = |dev: &str, pins: &[&str]| {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(dev));
+            params.insert("input_pin_ids".to_string(), serde_json::json!([]));
+            params.insert("output_pin_ids".to_string(),
+                serde_json::json!(pins.iter().map(|p| Value::from(*p)).collect::<Vec<_>>()));
+            NodeData {
+                module_id: "device.source".to_string(),
+                display_name: "Pad".to_string(),
+                category: "Device".to_string(),
+                inputs: vec![PinDescriptor::new("Feedback", SignalType::AutoMap)],
+                outputs: pins.iter().map(|p| PinDescriptor::new(*p, SignalType::Bool)).collect(),
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        };
+        let card_node = |module: &str, key: &str, cards: &str| {
+            let mut params = HashMap::new();
+            params.insert(key.to_string(), serde_json::from_str(cards).unwrap());
+            NodeData {
+                module_id: module.to_string(),
+                display_name: "Map".to_string(),
+                category: "Mapping".to_string(),
+                inputs: vec![PinDescriptor::new("In", SignalType::AutoMap)],
+                outputs: vec![PinDescriptor::new("Out", SignalType::Bool)],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let steam = snarl.insert_node(egui::Pos2::ZERO,
+            source("sdl:generic:triton", &["btn_misc1", "btn_misc5", "automap_out"]));
+        let other = snarl.insert_node(egui::pos2(10.0, 0.0),
+            source("sdl:generic:vader", &["btn_misc1", "automap_out"]));
+        let r_steam = snarl.insert_node(egui::pos2(0.0, 10.0),
+            card_node("module.remapper", "mappings",
+                r#"[{"in":["btn_misc1","btn_misc5"],"out":["btn_south"]}]"#));
+        // Map Action's legacy form: a bare list of its inputs.
+        let m_steam = snarl.insert_node(egui::pos2(5.0, 10.0),
+            card_node("module.map_action", "mappings", r#"["btn_misc2"]"#));
+        let r_other = snarl.insert_node(egui::pos2(10.0, 10.0),
+            card_node("module.remapper", "mappings", r#"[{"in":["btn_misc1"],"out":["btn_south"]}]"#));
+        // A sub-patch the Steam pad feeds: its cards can only be attributed to
+        // the pad from outside, where the inlet's wire is.
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let r_inner = inner.insert_node(egui::Pos2::ZERO,
+            card_node("module.remapper", "mappings", r#"[{"in":["btn_misc3"],"out":["key_a"]}]"#));
+        let mut sp = UiSubPatch::default();
+        sp.snarl = Box::new(inner);
+        let mut host = card_node("subpatch", "mappings", "[]");
+        host.params.remove("mappings");
+        host.subpatch = Some(Box::new(sp));
+        let host_id = snarl.insert_node(egui::pos2(20.0, 10.0), host);
+        let wire = |s: NodeId, d: NodeId, snarl: &mut Snarl<NodeData>|
+            snarl.connect(OutPinId { node: s, output: 0 }, InPinId { node: d, input: 0 });
+        wire(steam, r_steam, &mut snarl);
+        wire(steam, m_steam, &mut snarl);
+        wire(other, r_other, &mut snarl);
+        wire(steam, host_id, &mut snarl);
+
+        assert!(migrate_steam_pad_pins(&mut snarl, "sdl:generic:triton", false));
+        let cards = |snarl: &Snarl<NodeData>, id| snarl.get_node(id).unwrap().params["mappings"].clone();
+        assert_eq!(cards(&snarl, r_steam),
+            serde_json::json!([{"in":["btn_capture","btn_grip_l"],"out":["btn_south"]}]),
+            "the three-dot button is Capture and the grip is a grip");
+        assert_eq!(cards(&snarl, m_steam), serde_json::json!(["btn_touchpad2"]), "the legacy form too");
+        assert_eq!(cards(&snarl, r_other),
+            serde_json::json!([{"in":["btn_misc1"],"out":["btn_south"]}]),
+            "another pad's Misc button is its own");
+        assert_eq!(cards(&snarl.get_node(host_id).unwrap().subpatch.as_ref().unwrap().snarl, r_inner),
+            serde_json::json!([{"in":["btn_cap_l"],"out":["key_a"]}]), "and inside a sub-patch it reads");
+        assert_eq!(snarl.get_node(steam).unwrap().params["output_pin_ids"],
+            serde_json::json!(["btn_capture", "btn_grip_l", "automap_out"]), "ports rename in place");
+        assert_eq!(snarl.get_node(other).unwrap().params["output_pin_ids"],
+            serde_json::json!(["btn_misc1", "automap_out"]));
+        assert!(!migrate_steam_pad_pins(&mut snarl, "sdl:generic:triton", false), "once is enough");
+        // A pad this patch doesn't read rewrites nothing.
+        assert!(!migrate_steam_pad_pins(&mut snarl, "sdl:generic:nobody", false));
+    }
+
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
-    /// and the migration recurses into sub-patches.
-    /// A velocity or aftertouch pin saved on a card becomes the note it belongs
+    /// and the migration recurses into sub-patches.    /// A velocity or aftertouch pin saved on a card becomes the note it belongs
     /// to — the note carries both now — without duplicating a note already there.
     #[test]
     fn loading_folds_a_notes_velocity_and_aftertouch_into_the_note() {

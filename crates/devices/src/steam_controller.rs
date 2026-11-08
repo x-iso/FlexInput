@@ -8,12 +8,16 @@
 //! waits as long as the puck takes, while the reader goes on. SDL is told to leave
 //! the pad alone (`sdl_backend`'s `try_init`).
 //!
-//! What comes out is what SDL made of the same reports: the same pins, scales and
-//! frame, its button mapping and its trigger arithmetic, under the id SDL gave the
-//! pad, `sdl:generic:<USB serial>`, so a saved patch and calibration carry over.
-//! Where SDL's C casts wrap (a stick at full down, a trigger under zero), the
-//! values here clamp. Report layouts and bits are SDL's
+//! What comes out is what SDL made of the same reports: its scales and frame, its
+//! button mapping (menu buttons aside) and its trigger arithmetic, under the id
+//! SDL gave the pad, `sdl:generic:<USB serial>`, so a saved patch and calibration
+//! carry over. Where SDL's C casts wrap (a stick at full down, a trigger under
+//! zero), the values here clamp. Report layouts and bits are SDL's
 //! (`SDL_hidapi_steam_triton.c`, `steam/controller_structs.h`).
+//!
+//! The one thing not taken from SDL is what the spare controls are CALLED: they
+//! come out under names of their own (`BUTTON_PINS`), since SDL's Misc slots are
+//! an artefact of how SDL numbers the buttons of a pad it reads.
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,10 +111,14 @@ mod bit {
     pub const LEFT_GRIP_TOUCH: u32 = 0x2000_0000;
 }
 
-/// Each button pin and its bit, as SDL mapped them: its driver sends Menu as
-/// Back and View as Start, and its Triton gamepad mapping puts the Steam (QAM)
-/// button, the right pad's click and the stick and grip touches on Misc1–6, the
-/// back buttons on the paddles, and the left pad's click on the touchpad button.
+/// Each button pin and its bit. The menu buttons keep SDL's pairing — its driver
+/// sends View as Start and Menu as Back — and so does the left pad's click, which
+/// is the touchpad button on every pad. The rest of the pad's controls are named
+/// for what they are: SDL put them on its Misc slots, a vocabulary that only fits
+/// a pad read through SDL and whose slots mean other things on other pads. So
+/// here the three-dot button is Capture, the way a Switch Pro names its own; the
+/// right trackpad's click is the second touchpad button; and the stick caps and
+/// the grips are named after what they sense.
 const BUTTON_PINS: [(&str, u32); 26] = [
     ("btn_south", bit::A),
     ("btn_east", bit::B),
@@ -131,12 +139,12 @@ const BUTTON_PINS: [(&str, u32); 26] = [
     ("btn_paddle_r1", bit::R4),
     ("btn_paddle_l2", bit::L5),
     ("btn_paddle_r2", bit::R5),
-    ("btn_misc1", bit::QAM),
-    ("btn_misc2", bit::RIGHT_PAD_CLICK),
-    ("btn_misc3", bit::LEFT_STICK_TOUCH),
-    ("btn_misc4", bit::RIGHT_STICK_TOUCH),
-    ("btn_misc5", bit::LEFT_GRIP_TOUCH),
-    ("btn_misc6", bit::RIGHT_GRIP_TOUCH),
+    ("btn_capture", bit::QAM),
+    ("btn_touchpad2", bit::RIGHT_PAD_CLICK),
+    ("btn_cap_l", bit::LEFT_STICK_TOUCH),
+    ("btn_cap_r", bit::RIGHT_STICK_TOUCH),
+    ("btn_grip_l", bit::LEFT_GRIP_TOUCH),
+    ("btn_grip_r", bit::RIGHT_GRIP_TOUCH),
     ("btn_touchpad", bit::LEFT_PAD_CLICK),
 ];
 
@@ -783,7 +791,9 @@ impl SteamControllerBackend {
                 dev_id,
                 haptics,
                 spike: SpikeFilter::new(),
-                capacitive_mask: flexinput_core::automap::capacitive_misc_mask(VALVE, slot.pid),
+                // The pad's own names for its stick caps and grips: the same
+                // sensors SDL marks on its Misc slots.
+                capacitive_mask: flexinput_core::automap::STEAM_RAW_CAPACITIVE_MASK,
                 samples: Vec::new(),
                 slot,
             });
@@ -811,7 +821,8 @@ impl DeviceBackend for SteamControllerBackend {
                     id: p.dev_id.clone(),
                     display_name: "Steam Controller".into(),
                     kind: ControllerKind::Generic,
-                    outputs: layouts::outputs_for_pad(ControllerKind::Generic, vid, pid),
+                    outputs: layouts::outputs_for_pad_named(
+                        ControllerKind::Generic, vid, pid, layouts::SteamNaming::Raw),
                     inputs: layouts::inputs_for_pad(ControllerKind::Generic, vid, pid),
                     instance_path: None,
                     vid,
@@ -986,16 +997,21 @@ mod tests {
         out.iter().find(|(_, p, _)| p == name).map(|(_, _, s)| *s)
     }
 
-    // SDL's mapping: Misc1–6 and the paddles, the left pad's click on the
-    // touchpad button, Menu as Back.
+    // SDL's pairing of the menu buttons and the left pad's click on the touchpad
+    // button, and the pad's own names for everything SDL put on a Misc slot.
     #[test]
-    fn buttons_land_on_sdls_pins() {
+    fn buttons_land_on_their_own_pins() {
         let out = pins(&Report::default(), bit::QAM | bit::RIGHT_PAD_CLICK | bit::L4 | bit::R5 | bit::LEFT_PAD_CLICK
-            | bit::MENU | bit::RIGHT_GRIP_TOUCH | bit::DPAD_UP | bit::DPAD_RIGHT);
-        for (name, want) in [("btn_misc1", true), ("btn_misc2", true), ("btn_paddle_l1", true), ("btn_paddle_r2", true),
-                             ("btn_paddle_r1", false), ("btn_touchpad", true), ("btn_back", true), ("btn_start", false),
-                             ("btn_misc6", true), ("btn_misc5", false), ("dpad_up", true)] {
+            | bit::MENU | bit::RIGHT_GRIP_TOUCH | bit::DPAD_UP | bit::DPAD_RIGHT | bit::LEFT_STICK_TOUCH);
+        for (name, want) in [("btn_capture", true), ("btn_touchpad2", true), ("btn_paddle_l1", true),
+                             ("btn_paddle_r2", true), ("btn_paddle_r1", false), ("btn_touchpad", true),
+                             ("btn_back", true), ("btn_start", false), ("btn_grip_r", true),
+                             ("btn_cap_l", true), ("btn_grip_l", false), ("dpad_up", true)] {
             assert_eq!(pin(&out, name), Some(Signal::Bool(want)), "{name}");
+        }
+        // No Misc slots: the pad names these controls itself.
+        for name in ["btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6"] {
+            assert_eq!(pin(&out, name), None, "{name}");
         }
         let half = std::f32::consts::FRAC_1_SQRT_2;
         assert_eq!(pin(&out, "dpad"), Some(Signal::Vec2(Vec2::new(half, half))));

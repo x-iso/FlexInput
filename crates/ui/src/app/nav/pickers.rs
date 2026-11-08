@@ -670,7 +670,7 @@ impl FlexInputApp {
                         // Picks as the cards draw them: the key's or button's
                         // glyph, the pad's in this side's dialect.
                         let side_pad = if side == Some(PickStage::Input) { side_skins.0 } else { side_skins.1 };
-                        let pin_skin = |pin: &str| if crate::kbm_picker::is_pad_cell(pin) {
+                        let pin_skin = |pin: &str| if crate::kbm_picker::is_pad_dialect_cell(pin) {
                             side_pad
                         } else {
                             crate::canvas::remapper_icons::Skin::Kbm
@@ -980,9 +980,7 @@ impl FlexInputApp {
                     }
                     // The gamepad and touchpad cells in the side's dialect
                     // (`pad_skin`): a Steam Controller's pads wear its glyphs.
-                    let skin = if crate::kbm_picker::is_pad_cell(&cell.pin)
-                        || crate::kbm_picker::is_touchpad_cell(&cell.pin)
-                    {
+                    let skin = if crate::kbm_picker::is_pad_dialect_cell(&cell.pin) {
                         pad_skin
                     } else {
                         skin

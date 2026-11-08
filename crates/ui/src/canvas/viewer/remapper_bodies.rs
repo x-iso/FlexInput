@@ -187,8 +187,9 @@ pub(crate) fn show_remapper_body(
     let click_mode_before = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_tp_click_mode"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
-    // A touchpad clicked: on a two-pad controller, either.
-    let clicks: &[&str] = if two_pads { &["btn_touchpad", "btn_misc2"] } else { &["btn_touchpad"] };
+    // A touchpad clicked: on a two-pad controller, either — the second pad's
+    // click under its own name, or as SDL's Misc 2 for a pad read through SDL.
+    let clicks: &[&str] = if two_pads { TWO_PAD_CLICKS } else { &["btn_touchpad"] };
     let touch_click_now = upstream_dev_id.as_deref().is_some_and(|dev| clicks.iter().any(|c|
         live_signals.get(&(dev.to_string(), c.to_string())).is_some_and(|s| s.as_bool())));
     let entering_click_mode = touch_click_now && !click_mode_before;
@@ -946,7 +947,7 @@ pub(crate) fn show_map_action_body(
             .and_then(|v| v.as_u64()).unwrap_or(0) as u8;
         // Read the clicks directly from live_signals: on a two-pad controller,
         // either pad's.
-        let clicks: &[&str] = if two_pads { &["btn_touchpad", "btn_misc2"] } else { &["btn_touchpad"] };
+        let clicks: &[&str] = if two_pads { TWO_PAD_CLICKS } else { &["btn_touchpad"] };
         let touch_click_now = upstream_dev_id.as_deref().is_some_and(|dev| clicks.iter().any(|c|
             live_signals.get(&(dev.to_string(), c.to_string())).is_some_and(|s| s.as_bool())));
         if !learn_two_pads(live_signals, upstream_dev_id.as_deref(), &mut pressed_now) {

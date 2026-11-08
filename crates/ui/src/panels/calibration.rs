@@ -1424,8 +1424,11 @@ const TPAD_FIELDS: [[&str; 3]; 2] = [
     ["touch1_x", "touch1_y", "touch1_active"],
     ["touch2_x", "touch2_y", "touch2_active"],
 ];
-const TPAD_CLICK_PINS: [&str; 2] = ["btn_touchpad", "btn_misc2"];
-const GRIP_PINS: [&str; 2] = ["btn_misc5", "btn_misc6"];
+/// A Steam Controller's pad clicks and grips, as its own reader names them: this
+/// window only opens for the pad read off its own reports, which has no SDL Misc
+/// slots to read.
+const TPAD_CLICK_PINS: [&str; 2] = ["btn_touchpad", "btn_touchpad2"];
+const GRIP_PINS: [&str; 2] = ["btn_grip_l", "btn_grip_r"];
 /// Directions a pad's edge trace needs before Stop & save keeps it.
 const TPAD_MIN_BUCKETS: usize = 48;
 /// How far out a touch has to be to count toward the edge trace.

@@ -118,6 +118,16 @@ pub(crate) fn eval_remapper_node(
             upstream.insert("touch_left",      Signal::Bool(touch_only[0]));
             upstream.insert("touch_center",    Signal::Bool(touch_only[1]));
             upstream.insert("touch_right",     Signal::Bool(touch_only[2]));
+            // The pad's OWN swipe gestures (`touch1_swipe_*` / `touch2_swipe_*`),
+            // for a card that reads the direction a finger travelled. Nothing
+            // publishes a gesture on the bus, so it is worked out here, and the
+            // picker offers it rather than Learn: a swipe is a movement, not a
+            // button held. On a pad with two trackpads of its own (a Steam
+            // Controller) the two fields are its two pads, so each has its own.
+            if mappings_read_swipes(&mappings) {
+                let ns = state.entry(uid).or_insert_with(NodeState::default);
+                ns.swipes.get_or_insert_with(Default::default).step(&mut upstream);
+            }
 
             // Cards that decide after the press ("in order", Sequence, Short /
             // Long / Double) run first, against the RAW inputs. Their hold-back
@@ -401,6 +411,10 @@ pub(crate) fn eval_remapper_node(
             // Accumulate cardinal-axis writes additively; track button-output
             // emissions per output-pin for turbo / sustain handling.
             let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
+            // Pointer velocities and wheel rates an analog card drives — the
+            // swipe-to-mouse and swipe-to-scroll case — summed per pin like the
+            // axes above, then capped where a cap keeps the wheel aimable.
+            let mut analog_rate_acc: HashMap<&'static str, f32> = HashMap::new();
             // MIDI value pins an analog card drives, summed like the axes above
             // so two cards can push one controller.
             let mut midi_analog_acc: HashMap<String, f32> = HashMap::new();
@@ -474,6 +488,15 @@ pub(crate) fn eval_remapper_node(
                         // triggers like Switch Pro).
                         let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
                         *entry += mag_from_input.max(0.0);
+                    } else if let Some((rate_pin, gain, _)) = analog_rate_out(out_p) {
+                        // A pointer velocity or a wheel rate: the input's signed
+                        // value at the rate base, which is what a Touch Zones'
+                        // relative zone emits at its default speed — so a swipe
+                        // across a pad and a zone drag move the cursor alike, and
+                        // the keymouse card's own sensitivity stays the one dial
+                        // that tunes pointer speed. A stick direction or trigger
+                        // driving the same pin gets the same treatment.
+                        *analog_rate_acc.entry(rate_pin).or_insert(0.0) += mag_from_input * gain;
                     } else if flexinput_core::midi::parse_pin(out_p)
                         .is_some_and(|p| p.note_companions().is_some())
                     {
@@ -627,6 +650,13 @@ pub(crate) fn eval_remapper_node(
                 let clamped = v.clamp(-1.0, 1.0);
                 collector_sigs.set_pin(&key, &(*axis_pin), Signal::Float(clamped));
             }
+            // Commit the rates: a pointer velocity or a wheel rate per pin, summed
+            // across every card driving it and capped where a cap matters, so two
+            // cards on one wheel can't add up to a scroll the user can't aim.
+            for (pin, v) in &analog_rate_acc {
+                let max = analog_rate_out(pin).map(|(_, _, m)| m).unwrap_or(f32::MAX);
+                collector_sigs.set_pin(&key, &(*pin), Signal::Float(v.clamp(-max, max)));
+            }
             // Update bundled Vec2 pins so downstream sinks that read the
             // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
             // values too. Without this, the sink's Vec2-vs-axis conflict
@@ -744,7 +774,19 @@ pub(crate) fn eval_remapper_node(
                 let on = digital_asserted.contains(out_pin);
                 if on {
                     let sig = match sig_type {
-                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Float => match analog_rate_out(out_pin) {
+                            // A pointer velocity or a wheel rate has no digital
+                            // side: a card in Normal (or Short / Long / Double /
+                            // Hold) has no magnitude to give it, and 1.0 of a
+                            // velocity pin is a cursor flying off the screen. A
+                            // held digital card therefore sends the rate ONE full
+                            // deflection asks for — the steady drift a Touch Zones
+                            // zone at its default sensitivity makes — and the
+                            // card's Analog mode is where how far the thumb went
+                            // starts to matter.
+                            Some((_, gain, _)) => Signal::Float(gain),
+                            None => Signal::Float(1.0),
+                        },
                         SignalType::Vec2  => continue,
                         SignalType::Int   => Signal::Int(1),
                         _                 => Signal::Bool(true),
@@ -757,6 +799,7 @@ pub(crate) fn eval_remapper_node(
                     // mapping), don't overwrite with zero.
                     if analog_button_out.contains(out_pin)
                         || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
+                        || analog_rate_acc.iter().any(|(rp, _)| *rp == out_pin.as_str())
                     {
                         continue;
                     }
@@ -795,6 +838,11 @@ pub(crate) fn eval_remapper_node(
                             // MIDI note is a gate and does belong here.
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
+                                // A pointer velocity or wheel rate is an axis too:
+                                // the rate accumulator above owns the pin, and a
+                                // binary on/off release would stamp its live value
+                                // back to zero.
+                                && analog_rate_out(s).is_none()
                                 && midi_analog_out(s).is_none()
                                 // Nor a note: the note pass above plays it.
                                 && !flexinput_core::midi::is_midi_pin(s)

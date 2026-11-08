@@ -466,6 +466,76 @@ pub fn field_click_pins(field: usize) -> &'static [&'static str] {
     }
 }
 
+/// The swipe directions, in the order [`SWIPE_PINS`] lists them.
+pub const SWIPE_DIRS: [&str; 4] = ["up", "down", "left", "right"];
+/// Indexes into [`SWIPE_DIRS`] and into a row of [`SWIPE_PINS`].
+pub const SWIPE_UP: usize = 0;
+pub const SWIPE_DOWN: usize = 1;
+pub const SWIPE_LEFT: usize = 2;
+pub const SWIPE_RIGHT: usize = 3;
+
+/// A touch field's swipe pins, field 0 (the pad, or the first finger on a pad
+/// with one) then field 1 (a two-pad controller's second pad, else the second
+/// finger): the direction its finger travelled, once it travelled far enough,
+/// held for the rest of that touch.
+///
+/// These are DERIVED, like the touch zones, and read by a mapping card rather
+/// than published by a backend: the engine works them out of the field's
+/// position pins. They are CHOSEN, not learned — Learn captures what is held,
+/// and a swipe is a gesture, so the picker is where a card gets one. A pad with
+/// two trackpads of its own (a Steam Controller) gets the gesture of each.
+/// [`SWIPE_AXIS_PINS`] is the same gesture read as how far, not which way.
+pub const SWIPE_PINS: [[&str; 4]; 2] = [
+    ["touch1_swipe_up", "touch1_swipe_down", "touch1_swipe_left", "touch1_swipe_right"],
+    ["touch2_swipe_up", "touch2_swipe_down", "touch2_swipe_left", "touch2_swipe_right"],
+];
+
+/// The `(field, direction)` a swipe pin names, or `None` for any other pin.
+/// `direction` indexes [`SWIPE_DIRS`].
+pub fn swipe_pin_of(pin: &str) -> Option<(usize, usize)> {
+    SWIPE_PINS.iter().enumerate().find_map(|(field, dirs)| {
+        dirs.iter().position(|d| *d == pin).map(|dir| (field, dir))
+    })
+}
+
+/// Whether `pin` is one of [`SWIPE_PINS`].
+pub fn is_swipe_pin(pin: &str) -> bool {
+    swipe_pin_of(pin).is_some()
+}
+
+/// A touch field's swipe along each axis, field 0 then field 1: how far its
+/// finger has travelled from where it landed, in the pad's own −1..1 units, cut
+/// off at a full pad's width, and zero the moment the finger lifts. The
+/// direction pins above answer "which way"; these answer "how far", and are what
+/// a card reads when a swipe is taken in the Analog mode — a thumb pushed
+/// further along the pad driving further along whatever it maps to.
+///
+/// Derived and chosen like the directions, never published by a backend.
+pub const SWIPE_AXIS_PINS: [[&str; 2]; 2] = [
+    ["touch1_swipe_x", "touch1_swipe_y"],
+    ["touch2_swipe_x", "touch2_swipe_y"],
+];
+
+/// The `(field, axis)` an analog swipe pin names — axis 0 is the pad's
+/// horizontal, 1 its vertical — or `None` for any other pin.
+pub fn swipe_axis_pin_of(pin: &str) -> Option<(usize, usize)> {
+    SWIPE_AXIS_PINS.iter().enumerate().find_map(|(field, axes)| {
+        axes.iter().position(|p| *p == pin).map(|axis| (field, axis))
+    })
+}
+
+/// Whether `pin` is one of [`SWIPE_AXIS_PINS`].
+pub fn is_swipe_axis_pin(pin: &str) -> bool {
+    swipe_axis_pin_of(pin).is_some()
+}
+
+/// Which touch field a swipe pin belongs to — a direction of one, or how far
+/// along an axis — or `None` for any other pin.
+pub fn swipe_field(pin: &str) -> Option<usize> {
+    swipe_pin_of(pin).map(|(field, _)| field)
+        .or_else(|| swipe_axis_pin_of(pin).map(|(field, _)| field))
+}
+
 /// Parse a dynamic port id into a [`Pin`]. Returns `None` for the passthrough
 /// sentinel or any unrecognized id.
 pub fn parse_pin(id: &str) -> Option<Pin> {

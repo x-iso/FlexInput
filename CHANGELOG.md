@@ -7,6 +7,113 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [0.17.0] - 2026-11-07
 
+### Added
+
+- **A probe for what a pad actually puts on the wire.** `hm_report_record` sits
+  on every gamepad connected at once — a physical pad, FlexInput's virtual pads,
+  another emulator's — for a few seconds, then prints byte by byte which bytes
+  move, how far and how often: the counters, the clocks, the noise, the report
+  rate. It tells a virtual pad from a physical one by the MAC it answered with
+  at pairing. Running a real pad beside a virtual one is how the fix above was
+  found, and it's the shortest way to see why a game takes one pad and not the
+  other. `hm_feature_dump` labels each pad physical or virtual now too.
+- **A persona probe for when a pad deploys but nobody can see it:**
+  `cargo run -p flexinput-virtual --example persona_probe -- virtual.usb.dualsense_edge`
+  attaches one persona on its own, says whether the host controller took it and why
+  not, and can hold it plugged in (`HOLD_SECS=30`) so Device Manager can be looked at
+  while it's there. Each persona prints the serial and pairing MAC it answers with,
+  since a pad sharing either is a pad a host may fold into its neighbour, and
+  `--list` asks only what the controller has imported, so a running app's own
+  personas can be inspected. A persona deploy never reaches HIDMaestro's helper log
+  at all, and stderr is lost when the app starts from a shortcut, so this is the
+  only way to ask the question directly.
+- **Each trackpad's swipe is something a mapping can read.** `touch1_swipe_up`,
+  `touch2_swipe_left` and the rest of the eight are derived inside a Remapper /
+  Map Action node from the touch field's position pins: the direction a finger
+  travelled, once it travelled 0.18 of the pad — the same line a Touch Zones
+  swipe trigger draws — latched for the rest of that touch, so sweeping a thumb
+  across the pad fires the direction it went rather than every one it passed
+  through. Beside them `touch1_swipe_x` / `_y` and their field-2 siblings are the
+  same gesture read as HOW FAR: signed, a full pad's width being 1.0, zero the
+  moment the finger lifts — which is what a card takes in the Analog mode, half a
+  pad to one side driving one way and to the other driving back. A pad with two
+  trackpads of its own (a Steam Controller) gets a gesture per pad, since its two
+  fields ARE its two pads; a pad with one gets a gesture per finger. They are
+  chosen from the Choose picker rather than learned: Learn captures a held button,
+  and a swipe is a movement. The Steam Controller's board now carries both pads'
+  rows under its touched/clicked cells, each pad's two axes beside its four
+  arrows, and a swipe is an input only — the touchpad's analog swipe OUT stays
+  the other way round.
+- **Any mapping card can send an analog input at a pointer or a wheel.**
+  `mouse_x` / `mouse_y` (a pointer velocity), `scroll_x` / `scroll_y` (the
+  wheel's rate) and `trackpad_scroll_x` / `_y` (its smooth-scroll channel) are
+  outputs an Analog-mode card drives, and the picker's rate OUT column — those
+  cells, marked analog-only so they grey out until the card has an analog input
+  to take a magnitude from — now sits right of the mouse cluster on EVERY board
+  instead of only Touch Zones' variant. A card's single input has no second axis
+  to fill, so the XY `mouse` pin stays a zone's: a zone has a deflection in both
+  directions. The velocity a full deflection asks for is the number a Touch Zones
+  relative zone already emits at its default sensitivity, so a swipe across a
+  pad and a drag in a zone move the cursor alike, and the keymouse card's own
+  sensitivity slider stays the single dial that tunes pointer speed; the wheel is
+  capped at twice what one full deflection asks for, however many cards push it,
+  past which it stops being aimable. A swipe axis has no held state to gate a
+  card on, and unlike a stick or an IMU axis it rests at zero by itself — the
+  finger's own landing point is zero — so without a threshold a card on one
+  stands open and its value is the travel. That is what makes a swipe a pointer
+  rather than a button that engages halfway across the pad, and a threshold then
+  reads as the deliberate deadzone it is. A rate has no digital side, so a card
+  in Normal (or Short / Long / Double / Hold) that is held sends the rate ONE full
+  deflection asks for rather than a bare 1.0 — which for a pointer velocity is a
+  cursor off the screen — and the card's Analog mode is where how far the thumb
+  went starts to matter.
+- **A Steam Controller's swipes wear its own pad's shape, and say which pad.**
+  The swipe glyphs came from the PS5 set, whose touchpad is a wide bar; this
+  pad's are rounded squares, closer to the PS4's, which is the set its touched,
+  clicked and pressed cells already wear — so its swipes do too, its OUT
+  included. And since one arrow glyph means either pad, every chip naming one
+  wears an `L` / `R` badge in its corner, the way a Virtual Menu target wears its
+  eye or its check — on the card, in a body's chord row, and in the picker's
+  header preview of what's picked so far. That last one needed the picker asked
+  the same question in both places, which it hadn't: the board drew a touchpad
+  cluster cell in the pad's dialect while the header drew it in the keyboard's,
+  so the pick lost its art and its letter the moment it was made. The board
+  captions its cells "pad L" / "pad R", and a swipe chip's hover says it in full.
+
+### Changed
+
+- **A Steam Controller read off its own reports calls its controls what they
+  are.** The raw-HID reader copied SDL's names, and SDL's names are slot numbers:
+  its driver sends the three-dot button as Misc 1, the right trackpad's click as
+  Misc 2, the stick caps and the grips as Misc 3–6, because that is where SDL
+  happens to put the controls of a pad it reads. The pad has no Misc slots, and
+  on every other pad those slots mean something else entirely, so the buttons
+  now come out as Capture, Touchpad 2 Click, Cap Sense L/R and Grip Sense L/R —
+  which also means a mapping written for a Switch Pro's Capture button works on
+  the three-dot button, which is what it is beside. A pad read *through* SDL
+  keeps the Misc names, because that is what SDL reports, and the layout a pad
+  gets follows whoever reads it (`layouts::SteamNaming`). Patches saved against
+  the old names are rewritten — the ports of the pad's node and the cards of the
+  nodes that read that pad, and no other pad's Misc buttons, which are genuinely
+  its own. The icons, the legends, the Choose picker, Learn's capacitive-sensor
+  mute, the calibration window and the 3D model answer to both namings, and the
+  picker's Misc row for this pad is now its two stick caps and its two grips.
+- **Both trackpad clicks press a virtual DualSense's touchpad.** A DualSense
+  report has ONE touchpad click, so a Steam Controller passed straight through
+  onto one had nowhere to put its right pad's click: the button came from the
+  left pad alone, and clicking the right pad did nothing while its finger moved
+  the pad's second touch point. A pad's second click now bridges onto a
+  destination that has one click pin, and the engine combines the two rather
+  than letting the first writer win — which for a button is an OR, and is how a
+  real touchpad is clicked wherever on it the finger sits. A destination with two
+  click pins gets no bridge, so a pad passed to a pad keeps its pads apart.
+- **A Steam Controller's home button wears its own glyph.** The Steam icon set
+  had glyphs for the buttons the pad has that nobody else does and let the rest
+  fall through to Xbox's, on the reasoning that its face buttons are lettered the
+  same. Guide was in that leftover group, so its icon — in a legend, in the icon
+  picker — was the Xbox logo for a pad that prints the Steam logo on the button.
+  It now comes from the pad's own `controller_icon_outline.svg`.
+
 ### Fixed
 
 - **A virtual DualSense now carries the rest of its report.** A real pad writes
@@ -113,27 +220,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   which is what a host keying controllers by MAC wants. The index parameter
   existed only to make that MAC unique, so it leaves the persona API with the
   collision; the device id was always the identity.
-
-### Added
-
-- **A probe for what a pad actually puts on the wire.** `hm_report_record` sits
-  on every gamepad connected at once — a physical pad, FlexInput's virtual pads,
-  another emulator's — for a few seconds, then prints byte by byte which bytes
-  move, how far and how often: the counters, the clocks, the noise, the report
-  rate. It tells a virtual pad from a physical one by the MAC it answered with
-  at pairing. Running a real pad beside a virtual one is how the fix above was
-  found, and it's the shortest way to see why a game takes one pad and not the
-  other. `hm_feature_dump` labels each pad physical or virtual now too.
-- **A persona probe for when a pad deploys but nobody can see it:**
-  `cargo run -p flexinput-virtual --example persona_probe -- virtual.usb.dualsense_edge`
-  attaches one persona on its own, says whether the host controller took it and why
-  not, and can hold it plugged in (`HOLD_SECS=30`) so Device Manager can be looked at
-  while it's there. Each persona prints the serial and pairing MAC it answers with,
-  since a pad sharing either is a pad a host may fold into its neighbour, and
-  `--list` asks only what the controller has imported, so a running app's own
-  personas can be inspected. A persona deploy never reaches HIDMaestro's helper log
-  at all, and stderr is lost when the app starts from a shortcut, so this is the
-  only way to ask the question directly.
 
 ## [0.16.9] - 2026-11-04
 

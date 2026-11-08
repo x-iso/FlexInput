@@ -945,8 +945,128 @@ mod trigger_tests {
         }
     }
 
-    // ── Set Neutral Forward ──────────────────────────────────────────────────
+    // A card on the pad's OWN swipe: the direction a finger travelled, per touch
+    // field — the two fields of a two-trackpad pad are its two pads.
+    #[test]
+    fn a_swipe_card_fires_for_the_pad_that_was_swiped() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["touch1_swipe_left"],  "out": ["btn_east"] },
+            { "in": ["touch2_swipe_down"],  "out": ["btn_west"] },
+        ]));
+        let touch = |x1: f32, y1: f32, x2: f32, y2: f32| -> Vec<(&str, Signal)> {
+            vec![
+                ("touch1_x", Signal::Float(x1)), ("touch1_y", Signal::Float(y1)),
+                ("touch1_active", Signal::Bool(true)),
+                ("touch2_x", Signal::Float(x2)), ("touch2_y", Signal::Float(y2)),
+                ("touch2_active", Signal::Bool(true)),
+            ]
+        };
+        let c = rig.tick_sigs(&touch(0.0, 0.0, 0.0, 0.0));
+        assert!(!on(&c, "btn_east") && !on(&c, "btn_west"), "fingers that have only just landed");
+        let c = rig.tick_sigs(&touch(-0.5, 0.0, 0.0, -0.5));
+        assert!(on(&c, "btn_east"), "the left pad went left");
+        assert!(on(&c, "btn_west"), "the right pad went down");
+        let c = rig.tick_sigs(&touch(-0.5, 0.0, 0.0, -0.5));
+        assert!(on(&c, "btn_east") && on(&c, "btn_west"), "held for the rest of the touch");
+        let c = rig.tick_sigs(&[]);
+        assert!(!on(&c, "btn_east") && !on(&c, "btn_west"), "and gone when the fingers lift");
+        let c = rig.tick_sigs(&touch(0.0, 0.0, 0.5, 0.0));
+        assert!(on(&c, "btn_east") == false, "a new touch has to swipe again: the left pad sat still");
+        assert!(!on(&c, "btn_west"), "and the right pad's swipe the other way is no swipe down");
+    }
 
+    // The same gesture read as HOW FAR: a card in the Analog mode takes a pad's
+    // swipe axis as a signed value, a full pad's width being the most it reads.
+    #[test]
+    fn a_swipes_how_far_drives_an_axis() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["touch1_swipe_x"], "out": ["left_stick_right"], "mode": "analog" }
+        ]));
+        let axis = |c: &BusMap| c
+            .get(&("remap:1".to_string(), "left_stick_x".to_string()))
+            .map_or(0.0, |s| s.as_float());
+        let touch = |x: f32| -> Vec<(&str, Signal)> {
+            vec![
+                ("touch1_x", Signal::Float(x)), ("touch1_y", Signal::Float(0.0)),
+                ("touch1_active", Signal::Bool(true)),
+            ]
+        };
+        assert_eq!(axis(&rig.tick_sigs(&touch(0.0))), 0.0, "a finger that has only landed pushes nothing");
+        let c = rig.tick_sigs(&touch(0.6));
+        assert!((axis(&c) - 0.6).abs() < 1e-4, "over half a pad right, that far right: {c:?}");
+        let c = rig.tick_sigs(&touch(-0.75));
+        assert!((axis(&c) + 0.75).abs() < 1e-4, "the far half of the pad pushes it the other way: {c:?}");
+        let c = rig.tick_sigs(&[]);
+        assert_eq!(axis(&c), 0.0, "and it centers when the finger lifts");
+    }
+
+    // …and sent at a POINTER or a WHEEL: the pin carries a rate for the sink to
+    // integrate, at the same base a Touch Zones' relative zone emits at its
+    // default speed; a wheel several cards push is capped where it stops being
+    // aimable.
+    #[test]
+    fn an_analog_card_drives_a_pointer_and_a_wheel_rate() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["touch1_swipe_x"], "out": ["mouse_x"],          "mode": "analog" },
+            { "in": ["touch1_swipe_y"], "out": ["trackpad_scroll_x"], "mode": "analog" },
+            { "in": ["touch1_swipe_x"], "out": ["scroll_y"],          "mode": "analog" },
+            { "in": ["touch2_swipe_x"], "out": ["scroll_y"],          "mode": "analog" },
+            { "in": ["touch2_swipe_y"], "out": ["scroll_y"],          "mode": "analog" },
+        ]));
+        let got = |c: &BusMap, p: &str| {
+            c.get(&("remap:1".to_string(), p.to_string())).map(|s| s.as_float())
+        };
+        let touch = |x1: f32, y1: f32, x2: f32, y2: f32| -> Vec<(&str, Signal)> {
+            vec![
+                ("touch1_x", Signal::Float(x1)), ("touch1_y", Signal::Float(y1)),
+                ("touch1_active", Signal::Bool(true)),
+                ("touch2_x", Signal::Float(x2)), ("touch2_y", Signal::Float(y2)),
+                ("touch2_active", Signal::Bool(true)),
+            ]
+        };
+        let c = rig.tick_sigs(&touch(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(got(&c, "mouse_x"), None, "a finger that has only landed asks nothing of the cursor");
+        let c = rig.tick_sigs(&touch(1.0, 0.5, 1.0, 1.0));
+        assert!(got(&c, "mouse_x").is_some_and(|v| (v - 0.03).abs() < 1e-5),
+            "a full pad's swipe asks for what a zone at its default speed asks for: {c:?}");
+        assert!(got(&c, "trackpad_scroll_x").is_some_and(|v| (v - 0.5).abs() < 1e-5),
+            "the smooth-scroll channel takes the other axis");
+        assert_eq!(got(&c, "scroll_y"), Some(2.0), "three cards on one wheel add up, and stop where the wheel stops being aimable");
+    }
+
+    // The same pin on a card in a DIGITAL press mode. A velocity has no digital
+    // side: a held card has no magnitude to give it, and 1.0 of a velocity pin is
+    // a cursor off the screen — so a held card sends the rate one full deflection
+    // asks for. And a finger that has not travelled holds nothing at all: the
+    // pin rests at zero by itself, which is what keeps the cursor still between
+    // swipes.
+    #[test]
+    fn a_digital_card_sends_a_pointer_rate_at_its_base_speed() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["touch1_swipe_x"], "out": ["mouse_x"] }
+        ]));
+        let got = |c: &BusMap| {
+            c.get(&("remap:1".to_string(), "mouse_x".to_string())).map(|s| s.as_float())
+        };
+        let touch = |x: f32| -> Vec<(&str, Signal)> {
+            vec![
+                ("touch1_x", Signal::Float(x)), ("touch1_y", Signal::Float(0.0)),
+                ("touch1_active", Signal::Bool(true)),
+            ]
+        };
+        assert_eq!(got(&rig.tick_sigs(&touch(0.0))), Some(0.0),
+            "a finger sitting where it landed holds nothing");
+        let c = rig.tick_sigs(&touch(0.4));
+        assert!(got(&c).is_some_and(|v| (v - 0.03).abs() < 1e-5),
+            "held sends the drift one full deflection asks for, not a full velocity: {c:?}");
+        let c = rig.tick_sigs(&touch(0.4));
+        assert!(got(&c).is_some_and(|v| (v - 0.03).abs() < 1e-5),
+            "and holds it for the rest of the touch, however far the thumb went");
+        let c = rig.tick_sigs(&[]);
+        assert_eq!(got(&c), Some(0.0), "the cursor stops when the finger lifts");
+    }
+
+    // ── Set Neutral Forward ──────────────────────────────────────────────────
     fn neutral_req(c: &BusMap, dev: &str) -> bool {
         c.get(&(format!("{ORIENT_NEUTRAL_PREFIX}{dev}"), flexinput_core::imu::ORIENT_NEUTRAL_PIN.to_string()))
             .is_some_and(|s| s.as_bool())
@@ -1995,6 +2115,69 @@ mod trigger_tests {
         c.clear();
         eval_touch_zones_map_node(&n, 1, &input(false, true), &mut c, &mut state, 0.016);
         assert!(getb(&c, "btn_east"), "the right pad's click (Misc2) fires Pad B's click mapping");
+    }
+
+    /// A pad with two trackpads of its own — a Steam Controller, read off its
+    /// own reports — auto-mapped straight onto a virtual DualSense. The report
+    /// has ONE touchpad button, so either pad's click presses it: the right
+    /// pad's click has no pin there to land on, and a real touchpad is clicked
+    /// wherever on it the finger sits. The two touch points stay separate, so
+    /// the second pad is the sink's second finger.
+    #[test]
+    fn both_pad_clicks_press_one_virtual_touchpad() {
+        let dev = "sdl:generic:triton";
+        let sink_dev = "virtual.hm.dualsense:0";
+        // The sink's own pin set: one touchpad button, two touch points.
+        let dst: Vec<String> = ["btn_touchpad", "btn_start", "btn_guide",
+            "touch1_x", "touch1_y", "touch1_active",
+            "touch2_x", "touch2_y", "touch2_active", "automap_in"]
+            .into_iter().map(str::to_string).collect();
+        // The pad's: two clicks, two pads' worth of touch, no Misc slots.
+        let src: Vec<String> = ["btn_touchpad", "btn_touchpad2", "btn_capture", "btn_start",
+            "touch1_x", "touch1_y", "touch1_active",
+            "touch2_x", "touch2_y", "touch2_active"]
+            .into_iter().map(str::to_string).collect();
+        let mut sink = empty_node(3, "device.sink");
+        sink.sink_target = Some(SinkTarget {
+            device_id: sink_dev.to_string(),
+            pin_ids: dst.clone(),
+            multi_sources: vec![Vec::new(); dst.len()],
+            automap_source: Some((dev.to_string(), src)),
+            automap_fallback_dev: None,
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+            compiled: Default::default(),
+        });
+        let graph = ProcessingGraph { nodes: vec![sink], ..Default::default() };
+        let click = |left: bool, right: bool| {
+            let mut s = HashMap::new();
+            s.insert((dev.to_string(), "btn_touchpad".to_string()), Signal::Bool(left));
+            s.insert((dev.to_string(), "btn_touchpad2".to_string()), Signal::Bool(right));
+            s.insert((dev.to_string(), "touch2_active".to_string()), Signal::Bool(right));
+            s.insert((dev.to_string(), "touch2_x".to_string()), Signal::Float(0.4));
+            s.insert((dev.to_string(), "touch2_y".to_string()), Signal::Float(-0.2));
+            s
+        };
+        let run = |left: bool, right: bool| {
+            let mut state = HashMap::new();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut state, &click(left, right), 0.016, &mut out);
+            out
+        };
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&(sink_dev.to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        assert!(getb(&run(true, false), "btn_touchpad"), "the left pad clicks the touchpad");
+        assert!(getb(&run(false, true), "btn_touchpad"), "and so does the right one");
+        assert!(getb(&run(true, true), "btn_touchpad"), "and both together");
+        assert!(!getb(&run(false, false), "btn_touchpad"), "and neither lets it go");
+        let out = run(false, true);
+        assert_eq!(out.sink_outputs.get(&(sink_dev.to_string(), "touch2_x".to_string())),
+            Some(&Signal::Float(0.4)), "the right pad is the sink's second touch point");
+        assert_eq!(out.sink_outputs.get(&(sink_dev.to_string(), "touch2_y".to_string())),
+            Some(&Signal::Float(-0.2)));
+        assert!(!getb(&out, "touch1_active"), "and the left pad's finger is not faked");
     }
 
     // Analog swipe drives a finger coordinate continuously (absolute position).

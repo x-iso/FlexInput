@@ -1360,7 +1360,7 @@ impl FlexInputApp {
 
     fn settings_controllers(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         if ui.checkbox(&mut self.settings.sdl_all_pads, "Route all pads through SDL")
-            .on_hover_text("Diagnostic: read EVERY controller through SDL instead of the native gilrs/HID paths. Lets a pad with a native parser be compared against SDL, and surfaces SDL-only devices. Changes device IDs, so re-wire after toggling. Off = normal native handling.")
+            .on_hover_text("Diagnostic: read EVERY controller through SDL instead of the native gilrs/HID paths. Lets a pad with a native parser be compared against SDL, and surfaces SDL-only devices. Changes device IDs, so re-wire after toggling. Off = normal native handling. A Steam Controller keeps its own reader either way — SDL's driver for it stalls the pad — and that reader names its controls; only a pad read through SDL is named by SDL's Misc slots.")
             .changed()
         {
             self.sdl_all_pads.store(self.settings.sdl_all_pads, Ordering::Relaxed);

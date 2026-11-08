@@ -56,7 +56,7 @@ const fn ca(pin: &'static str, x: f32, y: f32) -> KbmCell {
 // right of it, the mouse cluster further right again.
 const NAV_X: f32 = 15.5; // Insert/Home/PgUp column start
 const MOUSE_X: f32 = 19.5; // mouse cluster column start
-const TZ_OUT_X: f32 = 23.5; // Touch Zones' analog outputs (right of the mouse cluster)
+const ANALOG_OUT_X: f32 = 23.5; // the analog rate OUT column, right of the mouse cluster
 
 /// The full keyboard + mouse layout as absolutely-positioned cells. Pin ids
 /// match `remapper_icons::pin_svg` so every cell resolves to an SVG icon.
@@ -132,6 +132,22 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     c("media_volume_up", MOUSE_X + 6.0, 0.0),
 ];
 
+/// The analog rate OUT column, right of the mouse cluster, on every board: one
+/// analog input driving a POINTER VELOCITY or a WHEEL RATE — what a trackpad
+/// swipe becomes when it aims a cursor or scrolls a page, and a stick direction
+/// or a trigger likewise. Marked analog-only, so they grey out on a card with no
+/// analog input to take the magnitude from; the pin itself is a rate, so the
+/// card takes the Analog mode and its value is how far and which way.
+///
+/// Touch Zones' variant adds the `mouse` XY cell as well: a zone has a
+/// two-dimensional deflection to put in a Vec2, a card's single input does not —
+/// that one gets its two axes as the two cells above.
+const RATE_OUT_CELLS: &[KbmCell] = &[
+    ca("mouse_x", ANALOG_OUT_X, 1.0), ca("mouse_y", ANALOG_OUT_X + 1.0, 1.0),
+    ca("scroll_y", ANALOG_OUT_X, 2.0), ca("scroll_x", ANALOG_OUT_X + 1.0, 2.0),
+    ca("trackpad_scroll_y", ANALOG_OUT_X, 3.0), ca("trackpad_scroll_x", ANALOG_OUT_X + 1.0, 3.0),
+];
+
 /// An owned picker cell — the static [`KBM_LAYOUT`] plus the current patch's
 /// dynamic macro ports resolve into these. `macro_meta` carries the port's
 /// display entry only for macro cells (their pin ids aren't in the KBM icon
@@ -179,6 +195,10 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
     let input_only = flexinput_core::imu::is_imu_pin(pin)
         || CLICK_ZONES.contains(&pin)
         || flexinput_core::automap::TOUCH_PRESSURE_PINS.contains(&pin)
+        // A pad's own swipe: a gesture its thumb makes, never something a patch
+        // drives. (The touchpad's analog swipe OUT is the other way round.)
+        || flexinput_core::touchzones::is_swipe_pin(pin)
+        || flexinput_core::touchzones::is_swipe_axis_pin(pin)
         || pin == OPTICAL_CONTACT;
     let output_only = pin.starts_with("key_")
         || flexinput_core::media::is_media_pin(pin)
@@ -187,7 +207,9 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
         || pin == flexinput_core::imu::GYRO_CAL_PIN
         || pin.starts_with("mouse")
         || pin.starts_with("scroll_")
-        || matches!(pin, "touch_swipe_x" | "touch_swipe_y")
+        || matches!(pin, "touch_swipe_x" | "touch_swipe_y"
+            // The smooth-scroll channel: a rate sent, never a state read.
+            | "trackpad_scroll_x" | "trackpad_scroll_y")
         || flexinput_core::macros::parse_macro_pin(pin).is_some()
         || flexinput_core::menu::parse_target_pin(pin).is_some();
     match stage {
@@ -253,7 +275,8 @@ pub fn pad_caption_at() -> (f32, f32) {
 /// names are the `X_` family — a board that shows a ✕ while writing `X_A`
 /// reads as a mistake.
 pub fn is_pad_cell(pin: &str) -> bool {
-    PAD_LAYOUT.iter().chain(STICK_CLICKS).chain(STICK_LAYOUT).chain(WHOLE_STICKS).any(|c| c.pin == pin)
+    PAD_LAYOUT.iter().chain(STICK_CLICKS).chain(STICK_LAYOUT).chain(WHOLE_STICKS)
+        .chain(STEAM_PAD_LAYOUT).any(|c| c.pin == pin)
 }
 
 /// A few characters under a cell whose glyph it shares with another: the
@@ -265,7 +288,11 @@ pub fn cell_caption(pin: &str, steam: bool) -> Option<&'static str> {
         "touchpad_left" | "touchpad_center" | "touchpad_right" | "btn_touchpad" => "click",
         "touchpad_any" => "any",
         "touch1_active" | "touch2_active" if steam => "touch",
-        "btn_misc2" if steam => "click",
+        "btn_touchpad2" if steam => "click",
+        // Each pad's own swipe — which way it went, and how far along each axis —
+        // told apart the same way its touch and click are.
+        _ if steam && flexinput_core::touchzones::swipe_field(pin) == Some(0) => "pad L",
+        _ if steam && flexinput_core::touchzones::swipe_field(pin) == Some(1) => "pad R",
         _ => return None,
     })
 }
@@ -306,19 +333,63 @@ pub const TOUCHPAD_LAYOUT: &[KbmCell] = &[
 ];
 
 /// A Steam Controller's two trackpads, each touched and clicked: left then
-/// right. A click reads as a button, or in the Analog press mode as how hard
-/// the pad is pressed, as a trigger does.
+/// right; and under them the swipe of each pad, four directions apiece, with the
+/// same gesture read as how far along each axis beside them. A click reads as a
+/// button, or in the Analog press mode as how hard the pad is pressed, as a
+/// trigger does. A swipe is the gesture a thumb makes on that pad: chosen here
+/// rather than learned, since Learn captures a held button and a swipe is a
+/// movement. The directions answer which way it went; the axes answer how far,
+/// which is what a card takes in the Analog mode.
 pub const STEAM_TOUCHPADS: &[KbmCell] = &[
     c("touch1_active", TOUCHPAD_X, TOUCHPAD_Y),
     c("btn_touchpad", TOUCHPAD_X + 1.0, TOUCHPAD_Y),
     c("touch2_active", TOUCHPAD_X + 2.0, TOUCHPAD_Y),
-    c("btn_misc2", TOUCHPAD_X + 3.0, TOUCHPAD_Y),
+    c("btn_touchpad2", TOUCHPAD_X + 3.0, TOUCHPAD_Y),
+    // The left pad's swipe, then the right's: what each pad does with a finger
+    // that travels — which way, then how far along each axis.
+    c("touch1_swipe_up", TOUCHPAD_X, TOUCHPAD_Y + 1.0),
+    c("touch1_swipe_down", TOUCHPAD_X + 1.0, TOUCHPAD_Y + 1.0),
+    c("touch1_swipe_left", TOUCHPAD_X + 2.0, TOUCHPAD_Y + 1.0),
+    c("touch1_swipe_right", TOUCHPAD_X + 3.0, TOUCHPAD_Y + 1.0),
+    c("touch1_swipe_x", TOUCHPAD_X + 4.0, TOUCHPAD_Y + 1.0),
+    c("touch1_swipe_y", TOUCHPAD_X + 5.0, TOUCHPAD_Y + 1.0),
+    c("touch2_swipe_up", TOUCHPAD_X, TOUCHPAD_Y + 2.0),
+    c("touch2_swipe_down", TOUCHPAD_X + 1.0, TOUCHPAD_Y + 2.0),
+    c("touch2_swipe_left", TOUCHPAD_X + 2.0, TOUCHPAD_Y + 2.0),
+    c("touch2_swipe_right", TOUCHPAD_X + 3.0, TOUCHPAD_Y + 2.0),
+    c("touch2_swipe_x", TOUCHPAD_X + 4.0, TOUCHPAD_Y + 2.0),
+    c("touch2_swipe_y", TOUCHPAD_X + 5.0, TOUCHPAD_Y + 2.0),
+    // The analog swipe OUT, as on every other board: driving a virtual pad's
+    // finger, which is how a pad gets turned into a mouse.
+    ca("touch_swipe_x", TOUCHPAD_X, TOUCHPAD_Y + 3.0),
+    ca("touch_swipe_y", TOUCHPAD_X + 1.0, TOUCHPAD_Y + 3.0),
+];
+
+/// A Steam Controller's own controls, in the cells its Misc slots take on every
+/// other pad's board: the two stick caps and the two grips. Its Capture — the
+/// three-dot button — is the Capture cell the row already has, and its two pad
+/// clicks sit with its pads (`STEAM_TOUCHPADS`), where the pad has them.
+pub const STEAM_PAD_LAYOUT: &[KbmCell] = &[
+    c("btn_cap_l", PAD_X + 1.0, PAD_Y + 6.0),
+    c("btn_cap_r", PAD_X + 2.0, PAD_Y + 6.0),
+    c("btn_grip_l", PAD_X + 3.0, PAD_Y + 6.0),
+    c("btn_grip_r", PAD_X + 4.0, PAD_Y + 6.0),
 ];
 
 /// Is this one of the touchpad cluster's cells, on any pad? Drawn in the pad's
 /// dialect, like the gamepad's.
 pub fn is_touchpad_cell(pin: &str) -> bool {
     TOUCHPAD_LAYOUT.iter().chain(STEAM_TOUCHPADS).any(|c| c.pin == pin) || CLICK_ZONES.contains(&pin)
+}
+
+/// Every cell drawn in the PAD's dialect rather than the keyboard's: the
+/// gamepad cluster, the touchpad cluster and the sticks. The board and a pick's
+/// chip in the picker's preview bar both ask this one question, so a cell never
+/// wears the pad's glyphs in one place and the keyboard's in the other — which
+/// is how a Steam Controller's swipes lost, in the preview bar alone, both their
+/// square-pad art and the letter saying which pad was swiped.
+pub fn is_pad_dialect_cell(pin: &str) -> bool {
+    is_pad_cell(pin) || is_touchpad_cell(pin)
 }
 
 /// Both sticks' directions, each as a plus — an input to remap, or a stick to
@@ -405,7 +476,8 @@ pub fn cluster_captions(layout: PickerLayout) -> Vec<(&'static str, f32, f32)> {
         v.push(("STICKS", STICKS_X, STICKS_Y - 0.42));
     }
     if !layout.tz {
-        v.push(("TOUCHPAD", TOUCHPAD_X, TOUCHPAD_Y - 0.42));
+        // A Steam Controller has two of these, each with its own gestures.
+        v.push((if layout.steam { "TRACKPADS" } else { "TOUCHPAD" }, TOUCHPAD_X, TOUCHPAD_Y - 0.42));
     }
     if layout.orient {
         v.push(("ORIENTATION", ORIENT_X, ORIENT_Y - 0.42));
@@ -463,6 +535,10 @@ pub fn picker_cells(
 ) -> Vec<PickerCell> {
     let PickerLayout { tz, pad, sticks, whole_sticks, inputs, orient, flick, steam } = layout;
     let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
+    // The rate OUT column sits on every board: a trackpad swipe, a stick
+    // direction or a trigger aims a cursor and turns a wheel from an ordinary
+    // mapping card, not only from a Touch Zones one.
+    cells.extend(RATE_OUT_CELLS.iter().map(PickerCell::from));
     if flick {
         use flexinput_core::flick::FlickVia;
         let (x, y, w) = FLICK_MOUSE_AT;
@@ -476,23 +552,25 @@ pub fn picker_cells(
         cells.extend(TOUCHPAD_LAYOUT.iter().map(PickerCell::from));
     } else {
         // The touchpad cluster is hidden in Touch-Zones mode (a touchpad can't
-        // remap to itself); analog mouse outputs go right of the mouse instead:
-        // mouse-delta and variable-speed scroll (touch position → rate). The
-        // whole sticks it can drive are with the sticks, on the gamepad tab.
-        // Marked analog-only so they are greyed for targets where analog
-        // output makes no sense (a Virtual Menu zone triggers a DISCRETE
+        // remap to itself); the rate OUT column is already there from
+        // [`RATE_OUT_CELLS`], and a zone adds the whole two-dimensional
+        // deflection as one XY move, which a card's single input has no second
+        // axis to fill. Marked analog-only so they grey out for targets where
+        // analog output makes no sense (a Virtual Menu zone triggers a DISCRETE
         // selection); a touch/touchpad zone keeps them enabled
         // (`picker_analog_input_ok` returns true for non-menu touch zones).
-        cells.push((&ca("mouse_x", TZ_OUT_X, 1.0)).into());
-        cells.push((&ca("mouse_y", TZ_OUT_X + 1.0, 1.0)).into());
-        cells.push((&ca("mouse", TZ_OUT_X, 2.0)).into());
-        cells.push((&ca("scroll_y", TZ_OUT_X, 3.0)).into());
-        cells.push((&ca("scroll_x", TZ_OUT_X + 1.0, 3.0)).into());
+        cells.push((&ca("mouse", ANALOG_OUT_X + 2.0, 1.0)).into());
     }
     if pad {
         cells.extend(PAD_LAYOUT.iter().chain(STICK_CLICKS)
-            .filter(|c| !(steam && !tz && c.pin == "btn_misc2"))
+            // A Steam Controller read off its own reports has no Misc slots at
+            // all: its pad click sits with its pads, and its sensors are named
+            // below for what they are.
+            .filter(|c| !(steam && !tz && flexinput_core::automap::MISC_PINS.contains(&c.pin)))
             .map(PickerCell::from));
+        if steam && !tz {
+            cells.extend(STEAM_PAD_LAYOUT.iter().map(PickerCell::from));
+        }
     }
     if orient {
         cells.push((&c(flexinput_core::imu::ORIENT_NEUTRAL_PIN, ORIENT_X, ORIENT_Y)).into());
@@ -980,31 +1058,130 @@ mod stage_tests {
         }
     }
 
-    /// A Steam Controller's board has its two pads, touched and clicked, in the
-    /// touchpad cluster — the right one's click out of the Misc row — and none of
-    /// a one-pad touchpad's zones; its press is no pick of its own, as a click in
+    /// A Steam Controller's board has its two pads, touched and clicked, and the
+    /// swipe of each, in the trackpad cluster; its stick caps and grips by their
+    /// own names, where another pad shows Misc slots; its three-dot button as
+    /// Capture; the analog swipe out it can still drive a mouse with; and none of
+    /// a one-pad touchpad's zones. Its press is no pick of its own, as a click in
     /// the Analog press mode reads it.
     #[test]
     fn a_steam_controllers_board_has_its_two_pads() {
         let layout = PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() };
         let pins = |l: PickerLayout| picker_cells(l, &[]).into_iter().map(|c| (c.pin, c.y)).collect::<Vec<_>>();
         let steam = pins(PickerLayout { steam: true, ..layout });
-        for p in ["touch1_active", "btn_touchpad", "touch2_active", "btn_misc2"] {
-            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y), "{p} in the touchpad cluster");
+        for p in ["touch1_active", "btn_touchpad", "touch2_active", "btn_touchpad2"] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y), "{p} in the trackpad cluster");
         }
-        assert_eq!(steam.iter().filter(|(c, _)| c == "btn_misc2").count(), 1, "not with the Misc buttons too");
+        // Each pad's own swipe, in a row of its own under the pads.
+        for p in flexinput_core::touchzones::SWIPE_PINS[0] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 1.0), "{p} on the left pad's row");
+        }
+        for p in flexinput_core::touchzones::SWIPE_PINS[1] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 2.0), "{p} on the right pad's row");
+        }
+        // The same gesture read as how far, each pad's axes beside its arrows.
+        for p in flexinput_core::touchzones::SWIPE_AXIS_PINS[0] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 1.0),
+                "{p} beside the left pad's directions");
+        }
+        for p in flexinput_core::touchzones::SWIPE_AXIS_PINS[1] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 2.0),
+                "{p} beside the right pad's");
+        }
+        // The analog swipe OUT, which a trackpad driving a mouse needs, stays.
+        for p in ["touch_swipe_x", "touch_swipe_y"] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == TOUCHPAD_Y + 3.0),
+                "{p} still turns a pad into movement");
+        }
+        // Its sensors, named for what they are, in the cells another pad's Misc
+        // slots take — and no Misc slots at all.
+        for p in ["btn_cap_l", "btn_cap_r", "btn_grip_l", "btn_grip_r"] {
+            assert!(steam.iter().any(|(c, y)| c == p && *y == PAD_Y + 6.0), "{p} where the Misc slots sit");
+        }
+        assert!(steam.iter().any(|(c, y)| c == "btn_capture" && *y == PAD_Y + 6.0),
+            "its three-dot button is the Capture a Switch Pro has");
+        for p in flexinput_core::automap::MISC_PINS {
+            assert!(!steam.iter().any(|(c, _)| c == p), "{p} is not on a pad that names its own controls");
+        }
         for p in ["touch_left", "touchpad_center", "touchpad_any", "btn_mute", "touch1_pressure"] {
             assert!(!steam.iter().any(|(c, _)| c == p), "{p}");
         }
         let other = pins(layout);
         assert!(other.iter().any(|(c, y)| c == "btn_misc2" && *y == PAD_Y + 6.0), "another pad's Misc 2 stays");
+        assert!(other.iter().any(|(c, _)| c == "btn_misc1"), "and its Misc 1");
+        for p in ["btn_touchpad2", "btn_cap_l", "btn_grip_r"] {
+            assert!(!other.iter().any(|(c, _)| c == p), "{p} is this pad's, not every pad's");
+        }
+        for p in flexinput_core::touchzones::SWIPE_PINS.iter().flatten()
+            .chain(flexinput_core::touchzones::SWIPE_AXIS_PINS.iter().flatten())
+        {
+            assert!(!other.iter().any(|(c, _)| c == p), "{p} fits a pad with touch fields, not every pad");
+        }
         assert!(other.iter().any(|(c, _)| c == "touchpad_center"));
         assert!(!other.iter().any(|(c, _)| c == "touch1_pressure"));
         for pin in ["btn_south", "left_trigger", "dpad_up", "left_stick_up", "left_stick", "touch_left", "btn_touchpad"] {
             assert!(stage_allows(PickStage::Input, pin), "{pin}");
             assert!(stage_allows(PickStage::Output, pin), "{pin}");
         }
+        // A swipe is read, never driven: the touchpad's analog swipe OUT is the
+        // other way round, and both are on the board. A swipe axis is read in the
+        // Analog mode, so it takes both its card's readings like a stick does.
+        for pin in ["touch1_swipe_up", "touch2_swipe_left", "touch1_swipe_right",
+            "touch1_swipe_x", "touch2_swipe_y"] {
+            assert!(stage_allows(PickStage::Input, pin), "{pin}");
+            assert!(!stage_allows(PickStage::Output, pin), "{pin} is a gesture, not a target");
+        }
+        for pin in ["touch1_swipe_x", "touch1_swipe_y", "touch2_swipe_x", "touch2_swipe_y"] {
+            assert!(flexinput_engine::pin_allows_analog_mode(pin), "{pin} reads how far");
+        }
+        assert!(!stage_allows(PickStage::Input, "touch_swipe_x"), "the swipe OUT is not an input");
         assert!(!stage_allows(PickStage::Input, "macro:1f3a9c2b"), "a macro port is a target");
+    }
+
+    /// The analog rate OUT column — a pointer velocity, a wheel rate — sits on
+    /// EVERY board, not only Touch Zones': a swipe, a stick direction or a
+    /// trigger aims a cursor and turns a wheel from an ordinary mapping card.
+    /// They are sent, never read, and grey out (analog-only) on a card with no
+    /// analog input. Only a zone also sends the pair as one XY move.
+    #[test]
+    fn an_analog_input_can_be_sent_at_a_pointer_or_a_wheel() {
+        let base = PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() };
+        let cell = |l: PickerLayout, p: &str| {
+            picker_cells(l, &[]).into_iter().find(|c| c.pin == p)
+        };
+        for p in ["mouse_x", "mouse_y", "scroll_x", "scroll_y",
+            "trackpad_scroll_x", "trackpad_scroll_y"] {
+            assert!(cell(base, p).is_some_and(|c| c.analog_only), "{p} on an ordinary board");
+            assert!(cell(PickerLayout { tz: true, ..base }, p).is_some(), "{p} on Touch Zones' board");
+            assert!(cell(PickerLayout { steam: true, ..base }, p).is_some(),
+                "{p} on a Steam Controller's board");
+            assert!(!stage_allows(PickStage::Input, p), "{p} is a rate sent, not a state read");
+            assert!(stage_allows(PickStage::Output, p), "{p}");
+        }
+        assert!(cell(PickerLayout { tz: true, ..base }, "mouse").is_some(),
+            "a zone's two-dimensional deflection fills the XY move");
+        assert!(cell(base, "mouse").is_none(),
+            "an ordinary card's single input takes the two axes instead");
+    }
+
+    /// The picker draws a cell in the pad's dialect on its board AND in the
+    /// preview bar above it, from one question: a Steam Controller's swipe cells
+    /// carry the letter saying which pad was swiped, and their square-pad art,
+    /// only in that dialect — so a bar that asked a narrower question than the
+    /// board showed the pick without either.
+    #[test]
+    fn a_pads_cell_is_drawn_in_its_dialect_wherever_it_shows() {
+        for p in flexinput_core::touchzones::SWIPE_PINS.iter().flatten()
+            .chain(flexinput_core::touchzones::SWIPE_AXIS_PINS.iter().flatten())
+        {
+            assert!(is_touchpad_cell(p), "{p} is a touchpad cluster cell");
+            assert!(is_pad_dialect_cell(p), "{p} wears the pad's dialect");
+        }
+        for p in ["btn_touchpad", "btn_touchpad2", "touch1_active", "btn_cap_l", "left_stick"] {
+            assert!(is_pad_dialect_cell(p), "{p}");
+        }
+        assert!(!is_pad_dialect_cell("key_a"), "the keyboard keeps its own glyphs");
+        assert!(!is_pad_dialect_cell("mouse_x"), "and so does the mouse");
     }
 
     /// Every IMU cell wears its glyph.

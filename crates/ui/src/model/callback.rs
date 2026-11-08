@@ -2149,14 +2149,20 @@ mod model_choice_tests {
         assert!(is_steam_controller(id));
         assert!(crate::panels::calibration::caps_for(id).triggers);
         assert!(!crate::panels::calibration::caps_for("sdl:generic:other").triggers);
-        // Its sensors go by their own names, for as long as it is connected.
+        // Its sensors go by their own names, for as long as it is connected:
+        // both the names its own reader publishes and the Misc slots SDL gives.
+        assert_eq!(connected_pad_pin_names("btn_grip_l"), Some(("Grip sens L", "Grip L")));
+        assert_eq!(connected_pad_pin_names("btn_cap_r"), Some(("Cap sens R", "Cap R")));
+        assert_eq!(connected_pad_pin_names("btn_touchpad2"), Some(("Pad click R", "Pad R")));
         assert_eq!(connected_pad_pin_names("btn_misc5"), Some(("Grip sens L", "Grip L")));
         assert_eq!(connected_pad_pin_names("btn_misc2"), Some(("Pad click R", "Pad R")));
         assert_eq!(connected_pad_pin_names("btn_misc1"), None);
+        assert_eq!(connected_pad_pin_names("btn_capture"), None, "Capture needs no other name");
         note_device_models([]);
         assert_eq!(model_for_device(id), "Xbox One");
         assert!(!is_steam_controller(id));
         assert_eq!(connected_pad_pin_names("btn_misc5"), None);
+        assert_eq!(connected_pad_pin_names("btn_grip_l"), None);
     }
 
     /// The bundled Steam Controller loads under this viewer's part names, with

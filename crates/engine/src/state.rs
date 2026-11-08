@@ -25,6 +25,10 @@ pub struct NodeState {
     /// Virtual KB/M sink with "Route gamepad touchpad" on: the trackpad's
     /// gesture state. Created on first use, dropped when the toggle goes off.
     pub trackpad: Option<Box<crate::eval::TrackpadState>>,
+    /// A Remapper / Map Action card reading the pad's own swipe gesture
+    /// (`touch1_swipe_*` / `touch2_swipe_*`): where each finger landed and the
+    /// direction it went. Created when such a card first runs.
+    pub swipes: Option<Box<crate::eval::PadSwipes>>,
     /// AutoMap Combiner with its Motion section on CORRELATE: each lower
     /// port's learned mounting rotation. Created on first use, dropped on SORT.
     pub combiner_motion: Option<Box<crate::eval::MotionCorrelator>>,

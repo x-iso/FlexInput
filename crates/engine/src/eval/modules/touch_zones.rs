@@ -125,11 +125,13 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut triggers: HashMap<String, f32> = HashMap::new();
     // Mouse gain. The emitted value stacks with the SINK's own mouse_sensitivity
     // (like gyro / right-stick sources do), so a raw ±1 deflection would be wildly
-    // hot at typical sink sensitivities. `TZ_MOUSE_BASE` attenuates a full-zone
+    // hot at typical sink sensitivities. `MOUSE_RATE_BASE` attenuates a full-zone
     // deflection to a firm-but-controlled velocity comparable to gyro/RS at the
     // same sink sensitivity; the per-node `mouse_speed` multiplier (default 1.0)
-    // tunes it from there.
-    const TZ_MOUSE_BASE: f32 = 0.03;
+    // tunes it from there. It is the same number a mapping card driving `mouse_x`
+    // on its own uses (see `analog_rate_out`), so a zone and a swipe move the
+    // cursor alike.
+    const TZ_MOUSE_BASE: f32 = MOUSE_RATE_BASE;
     // Legacy node-global speed, kept only as the migration fallback for patches
     // saved before the multiplier became per-zone.
     let node_mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).map(|v| v as f32);

@@ -27,6 +27,7 @@ mod feedback;
 mod midi_bus;
 mod modules;
 mod registry;
+mod swipe;
 mod trackpad;
 #[cfg(test)]
 mod tests;
@@ -38,10 +39,12 @@ pub use config::*;
 pub use curves::*;
 pub use device_cal::*;
 pub use modules::*;
+pub use swipe::PadSwipes;
 pub use trackpad::TrackpadState;
 pub use feedback::TriggerClicks;
 pub use combiner_motion::MotionCorrelator;
 pub(crate) use registry::*;
+pub(crate) use swipe::mappings_read_swipes;
 // Every publisher is crate-internal — nothing outside the engine publishes
 // into the bus — so this one glob is narrowed rather than `pub`.
 pub(crate) use publish::*;
@@ -843,6 +846,11 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                     (dev_sigs.view(src_dev), dev_sigs.view(""))
                 };
                 let sink_bus = sink_outputs.bus_id(&st.device_id);
+                // A two-pad controller onto a one-touchpad sink: its second pad's
+                // click joins the first's on the one button. Held back to a pass
+                // of its own so it merges with whatever the direct pair already
+                // wrote, whichever order the source lists its pins in.
+                let mut click_bridges: Vec<(&str, &str)> = Vec::new();
                 for p in &compiled.pairs {
                     if p.wired { continue; }
                     if p.digital_trigger_bridge {
@@ -853,6 +861,10 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         if st.digital_trigger_bridge {
                             deferred_digital_triggers.push((&p.src, &p.dst));
                         }
+                        continue;
+                    }
+                    if p.touchpad_click_bridge {
+                        click_bridges.push((&p.src, &p.dst));
                         continue;
                     }
                     let sig = match p.src_ix {
@@ -871,6 +883,18 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                             }
                             None => sink_outputs.set_pin_if_absent(&st.device_id, &p.dst, scale_for_sink(&p.dst, sig)),
                         }
+                    }
+                }
+                // A second trackpad's click, ORed onto the sink's one touchpad
+                // button (see `automap::TOUCHPAD_CLICK_BRIDGE`): the destination
+                // has no pin for it of its own, and a real touchpad is clicked
+                // wherever on it the finger sits — so either pad's click presses
+                // the button, as a Steam Controller's own two pads do.
+                for (mapped_src, mapped_dst) in click_bridges {
+                    if let Some(sig) = resolve_sig(mapped_src) {
+                        let v = scale_for_sink(mapped_dst, sig);
+                        sink_outputs.merge_pin(&st.device_id, mapped_dst, v,
+                            |slot| *slot = combine_signals(*slot, v));
                     }
                 }
                 // Second pass: digital-trigger fallback. Writes the analog trigger
@@ -925,9 +949,11 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         ],
                         click: down("btn_touchpad"),
                         // Two trackpads of their own (a Steam Controller): the
-                        // right one's click is SDL's Misc 2.
+                        // right one's click, under the pad's own name when it is
+                        // read off its own reports and under SDL's Misc 2 when it
+                        // is read through SDL.
                         split: resolve_sig(flexinput_core::automap::TOUCH_PADS_PIN).is_some(),
-                        click2: down("btn_misc2"),
+                        click2: down("btn_touchpad2") || down("btn_misc2"),
                     });
                 }
                 if route_optical {

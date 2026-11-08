@@ -371,7 +371,10 @@ pub(crate) fn menu_suppressed_pin_set(node: &NodeData) -> std::collections::Hash
         let which = node.params.get("ptr_touch_which").and_then(|v| v.as_str())
             .unwrap_or(if legacy == "touch2" { "touch2" } else { "touch1" });
         if which == "touch2" {
-            ex.extend(["touch2_x", "touch2_y", "touch2_active", "btn_touchpad"]);
+            // On a pad with two trackpads the second field is the second PAD,
+            // and its click is named with it (SDL's Misc 2 being the older name).
+            ex.extend(["touch2_x", "touch2_y", "touch2_active",
+                "btn_touchpad", "btn_touchpad2", "btn_misc2"]);
         } else {
             ex.extend(["touch1_x", "touch1_y", "touch1_active", "btn_touchpad"]);
         }
