@@ -289,9 +289,17 @@ pub(crate) fn show_subpatch_editors(
     // Open new editors requested this frame by the canvas viewer.
     let pending = app.tabs[active].canvas.pending_edit_subpatch.take();
     if let Some(node_id) = pending {
+        // The editor is a window of its own, which a pinned main window covers.
+        crate::main_pin::release();
         let already_open = app.sub_patch_editors.iter()
             .any(|e| e.tab_idx == active && e.node_id == node_id);
-        if !already_open {
+        if already_open {
+            // Asked for again: bring it up rather than leave it under us.
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0)),
+                egui::ViewportCommand::Focus,
+            );
+        } else {
             let inner_snarl = app.tabs[active].canvas.snarl
                 .get_node(node_id)
                 .and_then(|n| n.subpatch.as_ref())
@@ -832,9 +840,15 @@ pub(crate) fn show_subpatch_editors(
 
     // Open any nested editors collected during rendering.
     for (parent_idx, child_node_id) in pending_nested {
+        crate::main_pin::release();
         let already_open = app.sub_patch_editors.iter()
             .any(|e| e.tab_idx == active && e.node_id == child_node_id && e.parent_editor_idx == Some(parent_idx));
-        if !already_open {
+        if already_open {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of(("subpatch_editor", active, child_node_id.0)),
+                egui::ViewportCommand::Focus,
+            );
+        } else {
             let inner_snarl = app.sub_patch_editors[parent_idx].canvas.snarl
                 .get_node(child_node_id)
                 .and_then(|n| n.subpatch.as_ref())

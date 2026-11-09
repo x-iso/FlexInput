@@ -767,6 +767,7 @@ pub(crate) fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
             map.insert(g.key().to_string(), v);
         }
     }
+    crate::main_pin::release();
     std::thread::spawn(move || {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("FlexInput Colours", &["fxcol"])
@@ -788,6 +789,7 @@ pub(crate) fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
 /// be swallowed by a pinned instance or vice versa.
 pub(crate) fn controller3d_scheme_load_async(ctx: &egui::Context, chan: &'static str, uid: usize) {
     let ctx = ctx.clone();
+    crate::main_pin::release();
     std::thread::spawn(move || {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("FlexInput Colours", &["fxcol"])

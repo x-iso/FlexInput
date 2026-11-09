@@ -15,6 +15,7 @@ mod licenses;
 mod guide_watcher;
 mod gyro_cal_overlay;
 mod macro_icons;
+mod main_pin;
 mod module_ui_info;
 mod menu_overlay;
 mod config_overlay;

@@ -1531,6 +1531,7 @@ impl eframe::App for FlexInputApp {
                 }
             }
         }
+        crate::main_pin::note_main_window(_frame);
         #[cfg(not(windows))]
         log_display_scale(ctx, _frame);
 
@@ -1562,23 +1563,15 @@ impl eframe::App for FlexInputApp {
         // re-applied here. We piggy-back on `last_fg_exe.is_empty()` —
         // true exactly once at startup — to avoid storing a separate
         // "first frame" flag.
-        if self.settings.pin_active && self.last_fg_exe.is_empty()
-            && self.pin_prev_foreground_hwnd.is_none()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                egui::WindowLevel::AlwaysOnTop,
-            ));
-            // Plasma on Wayland ignores the level; KWin pins it instead. Once:
-            // nothing fills `last_fg_exe` on Linux (or with auto-switch off), so
-            // this block runs every frame there.
-            #[cfg(target_os = "linux")]
-            {
-                static RESTORED: AtomicBool = AtomicBool::new(false);
-                if !RESTORED.swap(true, Ordering::Relaxed) {
-                    crate::kwin::pin_main_window(true);
-                }
-            }
-        }
+        //
+        // Decided here, sent at the end of the pass: nothing fills
+        // `last_fg_exe` on Linux (or with auto-switch off), so it repeats
+        // every pass there — which is what makes it stick on X11, where the
+        // first pass's request reaches a window not mapped yet and is ignored.
+        // But each send re-raises us, so it must not go out in the pass that
+        // opened a window and released the pin (`main_pin::release`).
+        let restore_pin = self.settings.pin_active && self.last_fg_exe.is_empty()
+            && self.pin_prev_foreground_hwnd.is_none();
 
         // Read the latest device signals written by the I/O thread (polling rate).
         // `load_full()` returns the current `Arc<HashMap>` — a refcount
@@ -1996,9 +1989,18 @@ impl eframe::App for FlexInputApp {
         // effect immediately. We also handle the optional focus flip-flop
         // (capture HWND on pin-on, restore on pin-off) here, on the UI
         // thread, where the Win32 calls are safe to make.
+        // A window the pin would cover opened (a file dialog, a sub-patch
+        // editor, a link's browser): `main_pin::release` already took us out
+        // of the topmost band; settle the setting, and winit's level where it
+        // keeps one. Before the toggle, so a pin pressed while a dialog was up
+        // still lands.
+        if let Some(owed) = crate::main_pin::take_released() {
+            self.unpin_quietly(ctx, owed == crate::main_pin::Released::TellWinit);
+        }
         if self.pin_toggle_requested.swap(false, Ordering::Relaxed) {
             self.toggle_pin(ctx);
         }
+        crate::main_pin::publish(self.settings.pin_active);
 
         // ── Overlay visibility toggle (global hotkey) ─────────────────────
         // The keyboard listener thread raises the flag; flip the ctx slot
@@ -2276,6 +2278,26 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("show_subpatch_editors");
             show_subpatch_editors(self, ctx, &live_device_ids);
+        }
+        // A link clicked this pass opens the browser once the pass ends, which
+        // a pinned main window would cover.
+        if ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_)))) {
+            crate::main_pin::release();
+        }
+        // The startup pin restore decided at the top of the pass, unless the
+        // pass unpinned (toggle, Alt+Tab, or a window opened).
+        if restore_pin && crate::main_pin::pinned() && self.settings.pin_active {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            // Plasma on Wayland ignores the level; KWin pins it instead, once.
+            #[cfg(target_os = "linux")]
+            {
+                static RESTORED: AtomicBool = AtomicBool::new(false);
+                if !RESTORED.swap(true, Ordering::Relaxed) {
+                    crate::kwin::pin_main_window(true);
+                }
+            }
         }
 
         // ── Info overlay ──────────────────────────────────────────────────────
@@ -3627,20 +3649,8 @@ impl FlexInputApp {
     fn enter_alt_tab(&mut self, _dev_id: &str, ctx: &egui::Context) {
         // Alt-tabbing away from a pinned FlexInput is self-defeating: it
         // would stay always-on-top over whatever window the user switches
-        // to. Un-pin as part of entering the switcher. We don't run the full
-        // `toggle_pin` foreground-yield here — Alt+Tab itself decides the new
-        // foreground — we just clear the always-on-top level and topmost band.
-        if self.settings.pin_active {
-            self.settings.pin_active = false;
-            self.settings_dirty = true;
-            ctx.send_viewport_cmd(
-                egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-            if let Some(hwnd) = self.self_hwnd {
-                crate::process_list::drop_topmost(hwnd);
-            }
-            #[cfg(target_os = "linux")]
-            crate::kwin::pin_main_window(false);
-        }
+        // to. Un-pin as part of entering the switcher.
+        self.unpin_quietly(ctx, true);
         #[cfg(any(windows, target_os = "linux"))]
         {
             // Linux: the tapper watches Select itself, through the same signals
@@ -4396,6 +4406,28 @@ impl FlexInputApp {
             // hwnd 0 sentinel = no specific target; yield to whatever's below.
             self.pin_pending_yield = Some((yield_to.unwrap_or(0), 5));
         }
+    }
+
+    /// Unpin without `toggle_pin`'s foreground handoff or re-minimize, for
+    /// when something else decides the foreground: Alt+Tab, or a window we
+    /// opened that the pin would cover (see `main_pin`). Clears the level and
+    /// the topmost band; nothing while unpinned. `tell_winit` false skips the
+    /// level command, for when `main_pin` already dropped it on X11.
+    fn unpin_quietly(&mut self, ctx: &egui::Context, tell_winit: bool) {
+        if !self.settings.pin_active {
+            return;
+        }
+        self.settings.pin_active = false;
+        self.settings_dirty = true;
+        self.pin_restore_minimized = false;
+        if tell_winit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        }
+        if let Some(hwnd) = self.self_hwnd {
+            crate::process_list::drop_topmost(hwnd);
+        }
+        #[cfg(target_os = "linux")]
+        crate::kwin::pin_main_window(false);
     }
 
     /// Toggle our pseudo-maximize state. Avoids the WS_POPUP overshoot

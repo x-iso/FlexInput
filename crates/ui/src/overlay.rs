@@ -78,12 +78,16 @@ fn edit_id() -> egui::Id { egui::Id::new(OVERLAY_EDIT_KEY) }
 /// covering the dialog). Dropping the OS topmost bit directly, synchronously,
 /// before the blocking call is the reliable fix; we restore it after. No-op
 /// off Windows or when the overlay window isn't present.
+///
+/// The pinned main window covers the dialog the same way, so this also drops
+/// that pin, for good rather than for the dialog's span ([`crate::main_pin`]).
 #[cfg(windows)]
 pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     };
+    crate::main_pin::release();
     let title: Vec<u16> = OVERLAY_WINDOW_TITLE
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -104,6 +108,7 @@ pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
 
 #[cfg(not(windows))]
 pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
+    crate::main_pin::release();
     f()
 }
 

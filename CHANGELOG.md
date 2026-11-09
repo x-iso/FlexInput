@@ -82,6 +82,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Opening another window unpins the main window.** A pinned (always-on-top)
+  FlexInput covered every window it opened, so a file or folder dialog, a
+  sub-patch editor, an Explorer window or a link's browser came up behind it,
+  out of reach. Opening any of them now turns the pin off, the way entering the
+  Alt+Tab switcher already did; pin again when you want it back. Opening a
+  sub-patch editor that's already open also brings it to the front, where
+  before it stayed wherever it was. On Linux this holds on Plasma, on X11
+  desktops and on GNOME alike: the pin is dropped before the window opens, so
+  even a file dialog, which holds FlexInput up until it closes, comes up on top.
 - **A Steam Controller's finger dots show how hard they press.** In the 3D and
   2D controller viewers each trackpad's dot is as opaque as the finger presses,
   over the sensor's whole range rather than up to the click (the pad's own

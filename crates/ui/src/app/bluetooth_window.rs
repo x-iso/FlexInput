@@ -697,6 +697,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                 const OPEN: &str = "explorer";
                 #[cfg(not(windows))]
                 const OPEN: &str = "xdg-open";
+                crate::main_pin::release();
                 let _ = std::process::Command::new(OPEN).arg(dir).spawn();
             }
         }

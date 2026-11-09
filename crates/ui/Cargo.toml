@@ -103,6 +103,9 @@ wayland-client = "0.31"
 # The overlays' input regions (`overlay::set_input_rects`), from the vendored
 # copy eframe already uses, with the features eframe already turns on.
 egui-winit     = { version = "0.33", default-features = false, features = ["wayland"] }
+# Unpinning the main window on X11 the moment a dialog opens (main_pin.rs), on a
+# connection of its own. Already in the tree under winit.
+x11rb          = "0.13"
 # Whether the kernel's USB/IP host controller is set up, for the first-use
 # setup of a pad's USB audio variant (already a transitive dep via
 # flexinput-virtual).
