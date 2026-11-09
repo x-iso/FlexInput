@@ -29,6 +29,8 @@ This directory contains comprehensive reference documentation for the FlexInput 
 | Document | Description | Key Topics |
 |----------|-------------|------------|
 | [UI_ARCHITECTURE.md](./UI_ARCHITECTURE.md) | egui-based UI system | Canvas, overlays, Easy/Advanced modes, gamepad nav, settings |
+| [MODULE_UI_GUIDELINES.md](./MODULE_UI_GUIDELINES.md) | How module bodies and the canvas are laid out | Layout grid, wire routing, the body kit, converting a body |
+| [MODULE_UI_ITERATION.md](./MODULE_UI_ITERATION.md) | Brief for proposing a module body's layout | What may and may not change, building blocks, sizes, pitfalls, what to hand back, prompt template |
 
 ### Device Handling
 

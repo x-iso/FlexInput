@@ -1377,6 +1377,16 @@ impl eframe::App for FlexInputApp {
         self.sync_jsm_macro_ports(ctx);
         crate::macro_icons::publish_registry(
             std::sync::Arc::new(self.macro_display_entries()));
+        // The layout grid: take what the zoom toolbar's grid menu changed last
+        // frame, then publish the settings for it and the grid for every canvas.
+        if let Some(edited) = crate::canvas::canvas_grid_settings(ctx) {
+            if edited != self.settings.canvas_grid {
+                self.settings.canvas_grid = edited;
+                self.settings_dirty = true;
+            }
+        }
+        crate::canvas::set_canvas_grid_settings(ctx, self.settings.canvas_grid);
+        crate::canvas::set_canvas_grid(ctx, self.settings.canvas_grid.layout());
 
         // ── GPU-recovery persist safety net ──────────────────────────────
         // On a GPU-loss relaunch the helper's persistence was forced ON so the

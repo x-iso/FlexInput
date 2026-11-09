@@ -116,8 +116,9 @@ pub(crate) fn signal_intensity(sig: &Signal) -> f32 {
 }
 
 /// Read prior glow intensity for this pin (memory-cached), lerp toward `target`
-/// at a fixed rate, store back, and return the smoothed value. Smoothing
-/// prevents the polling-rate raw signal from strobing the visual.
+/// at a fixed rate, store back, and return the smoothed value as shown (see
+/// [`shown_glow`]). Smoothing prevents the polling-rate raw signal from strobing
+/// the visual.
 pub(crate) fn pin_glow_smoothed(ctx: &egui::Context, node: egui_snarl::NodeId, pin_idx: usize, is_input: bool, target: f32) -> f32 {
     let key = egui::Id::new(("pin_glow", node.0, pin_idx, is_input));
     let prev = ctx.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
@@ -126,7 +127,125 @@ pub(crate) fn pin_glow_smoothed(ctx: &egui::Context, node: egui_snarl::NodeId, p
     let rate = if target > prev { 30.0 } else { 6.0 };
     let smoothed = prev + (target - prev) * (1.0 - (-rate * dt).exp());
     ctx.data_mut(|d| d.insert_temp(key, smoothed));
-    smoothed
+    shown_glow(smoothed)
+}
+
+// ── Glow settings (the canvas's Wires menu) ──────────────────────────────────
+
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+static GLOW_MIN: AtomicU32 = AtomicU32::new(0); // 0.0
+static GLOW_MAX: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+static AUTOMAP_RULE: AtomicU8 = AtomicU8::new(2); // Live
+
+/// Takes the Wires menu's glow settings for this frame: the range activity glow
+/// is shown in, and what lights an Auto-Map bus.
+pub(crate) fn set_glow_settings(min: f32, max: f32, rule: crate::settings::AutomapGlow) {
+    let min = min.clamp(0.0, 1.0);
+    let max = max.clamp(0.0, 1.0).max(min);
+    GLOW_MIN.store(min.to_bits(), Ordering::Relaxed);
+    GLOW_MAX.store(max.to_bits(), Ordering::Relaxed);
+    let rule = match rule {
+        crate::settings::AutomapGlow::Any => 0,
+        crate::settings::AutomapGlow::Changes => 1,
+        crate::settings::AutomapGlow::Live => 2,
+    };
+    AUTOMAP_RULE.store(rule, Ordering::Relaxed);
+}
+
+fn automap_rule() -> crate::settings::AutomapGlow {
+    match AUTOMAP_RULE.load(Ordering::Relaxed) {
+        0 => crate::settings::AutomapGlow::Any,
+        1 => crate::settings::AutomapGlow::Changes,
+        _ => crate::settings::AutomapGlow::Live,
+    }
+}
+
+/// A pin's glow as drawn, from its activity (0 to 1): no activity stays dark;
+/// any activity glows at least the range's floor and at most its ceiling.
+fn shown_glow(activity: f32) -> f32 {
+    let (lo, hi) = (f32::from_bits(GLOW_MIN.load(Ordering::Relaxed)), f32::from_bits(GLOW_MAX.load(Ordering::Relaxed)));
+    if activity <= 0.004 {
+        0.0
+    } else {
+        lo + activity.min(1.0) * (hi - lo).max(0.0)
+    }
+}
+
+/// Where each live reading rests, for the "changes from rest" Auto-Map rule.
+#[derive(Default)]
+struct Baselines {
+    values: std::collections::HashMap<(String, String), [f32; 4]>,
+}
+
+static BASELINES: std::sync::LazyLock<std::sync::Mutex<Baselines>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Baselines::default()));
+static BASELINE_PASS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn components(sig: &Signal) -> [f32; 4] {
+    match *sig {
+        Signal::Float(f) => [f, 0.0, 0.0, 0.0],
+        Signal::Bool(b) => [if b { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        Signal::Int(i) => [i as f32, 0.0, 0.0, 0.0],
+        Signal::Vec2(v) => [v.x, v.y, 0.0, 0.0],
+        Signal::Vec4(v) => [v.x, v.y, v.z, v.w],
+    }
+}
+
+/// Moves where each live reading rests toward where it is, once a frame, for the
+/// "changes from rest" Auto-Map rule: quickly while it's near (drift, settling),
+/// slowly while it's far, so a stick held over or a button held down counts as
+/// activity for a good while, and a pad set down on its side settles back dark.
+pub(crate) fn update_glow_baselines(
+    ctx: &egui::Context,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+) {
+    if automap_rule() != crate::settings::AutomapGlow::Changes {
+        return;
+    }
+    let pass = ctx.cumulative_pass_nr();
+    if BASELINE_PASS.swap(pass, Ordering::Relaxed) == pass {
+        return;
+    }
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+    let Ok(mut b) = BASELINES.lock() else { return };
+    for (key, sig) in live_signals {
+        let v = components(sig);
+        let rest = b.values.entry(key.clone()).or_insert(v);
+        let off = (0..4).map(|i| (v[i] - rest[i]).abs()).fold(0.0_f32, f32::max);
+        let tau = if off < 0.15 { 1.0 } else { 8.0 };
+        let k = 1.0 - (-dt / tau).exp();
+        for i in 0..4 {
+            rest[i] += (v[i] - rest[i]) * k;
+        }
+    }
+}
+
+/// How far a reading is from where it rests (0 to 1).
+fn deviation(dev_id: &str, pin_id: &str, sig: &Signal) -> f32 {
+    let Ok(b) = BASELINES.lock() else { return 0.0 };
+    let Some(rest) = b.values.get(&(dev_id.to_string(), pin_id.to_string())) else { return 0.0 };
+    let v = components(sig);
+    (0..4).map(|i| (v[i] - rest[i]).abs()).fold(0.0_f32, f32::max).min(1.0)
+}
+
+/// Whether a reading means nothing right now (for the "only live input"
+/// Auto-Map rule): a touch's position and pressure while there's no touch.
+fn idle_reading(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev_id: &str,
+    pin_id: &str,
+) -> bool {
+    let Some((n, field)) = pin_id.strip_prefix("touch").and_then(|rest| rest.split_once('_')) else {
+        return false;
+    };
+    if !matches!(field, "x" | "y" | "pressure") {
+        return false;
+    }
+    !matches!(
+        live_signals.get(&(dev_id.to_string(), format!("touch{n}_active"))),
+        Some(Signal::Bool(true))
+    )
 }
 
 /// Parent-snarl frame for AutoMap glow chain-walking. When the inner editor's
@@ -155,33 +274,29 @@ pub(crate) fn resolve_automap_glow_output(
             let dev_id = node.params.get("device_id").and_then(|v| v.as_str())?;
             let pin_ids = node.params.get("output_pin_ids")
                 .and_then(|v| v.as_array())?;
+            let rule = automap_rule();
             let mut max_i = 0.0_f32;
             for pid in pin_ids.iter().filter_map(|v| v.as_str()) {
                 // Battery is a steady-state status readout (always ~full on
                 // virtuals, a slowly-changing level on physicals), not input
                 // activity — pooling it would pin the whole AutoMap bus glow on
-                // permanently. Its own pin glow is suppressed too (output_pin_glow).
+                // permanently, whatever the rule. Its own pin glow is suppressed
+                // too (output_pin_glow).
                 if pid == "battery" {
                     continue;
                 }
-                // Exclude raw touch X/Y axes from AutoMap bus glow unless the
-                // corresponding Touch Active flag is present and true. These
-                // axes are only meaningful when Touch Active is asserted;
-                // individual touch X/Y pins and their wires remain unaffected.
-                if pid == "touch1_x" || pid == "touch1_y" {
-                    match live_signals.get(&(dev_id.to_string(), "touch1_active".to_string())) {
-                        Some(Signal::Bool(b)) if *b => {}
-                        _ => continue,
-                    }
-                }
-                if pid == "touch2_x" || pid == "touch2_y" {
-                    match live_signals.get(&(dev_id.to_string(), "touch2_active".to_string())) {
-                        Some(Signal::Bool(b)) if *b => {}
-                        _ => continue,
-                    }
+                // "Only live input": a touch's position and pressure count only
+                // while there's a touch (the pad holds the last ones after a lift).
+                // Individual touch pins and their wires are unaffected.
+                if rule == crate::settings::AutomapGlow::Live && idle_reading(live_signals, dev_id, pid) {
+                    continue;
                 }
                 if let Some(sig) = live_signals.get(&(dev_id.to_string(), pid.to_string())) {
-                    max_i = max_i.max(signal_intensity(sig));
+                    let i = match rule {
+                        crate::settings::AutomapGlow::Changes => deviation(dev_id, pid, sig),
+                        _ => signal_intensity(sig),
+                    };
+                    max_i = max_i.max(i);
                 }
             }
             Some(max_i)
@@ -588,6 +703,53 @@ pub(crate) fn automap_label_abs_y_key(node: egui_snarl::NodeId) -> egui::Id {
 /// by `show_input` this frame, stashed for next-frame delta calculation.
 pub(crate) fn automap_pin_row_y_key(node: egui_snarl::NodeId) -> egui::Id {
     egui::Id::new(("device_sink_automap_pin_row_y", node.0))
+}
+
+#[cfg(test)]
+mod glow_settings_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn the_glow_range_lifts_faint_activity_and_caps_full_activity() {
+        set_glow_settings(0.2, 0.8, crate::settings::AutomapGlow::Live);
+        assert_eq!(shown_glow(0.0), 0.0, "no activity stays dark");
+        assert!((shown_glow(0.01) - 0.206).abs() < 1e-3);
+        assert!((shown_glow(1.0) - 0.8).abs() < 1e-6);
+        assert!((shown_glow(5.0) - 0.8).abs() < 1e-6, "past full is full");
+        set_glow_settings(0.0, 1.0, crate::settings::AutomapGlow::Live);
+    }
+
+    #[test]
+    fn a_touch_position_is_idle_without_a_touch() {
+        let dev = "sdl:dualsense:0";
+        let mut live: HashMap<(String, String), Signal> = HashMap::new();
+        live.insert((dev.into(), "touch1_x".into()), Signal::Float(0.7));
+        assert!(idle_reading(&live, dev, "touch1_x"));
+        assert!(idle_reading(&live, dev, "touch1_pressure"));
+        live.insert((dev.into(), "touch1_active".into()), Signal::Bool(true));
+        assert!(!idle_reading(&live, dev, "touch1_x"));
+        // The second touch has its own flag.
+        assert!(idle_reading(&live, dev, "touch2_y"));
+        // Not a touch's position: never idle.
+        for pid in ["btn_touchpad", "touch_left", "touch1_active", "stick_lx"] {
+            assert!(!idle_reading(&live, dev, pid), "{pid}");
+        }
+    }
+
+    #[test]
+    fn a_reading_resting_away_from_zero_counts_only_while_it_moves() {
+        let key = ("test:baseline".to_string(), "accel_z".to_string());
+        {
+            let mut b = BASELINES.lock().unwrap();
+            b.values.insert(key.clone(), [1.0, 0.0, 0.0, 0.0]);
+        }
+        // Resting at 1 g: no deviation, though the value isn't zero.
+        assert!(deviation(&key.0, &key.1, &Signal::Float(1.0)) < 1e-6);
+        // Moving: counts.
+        assert!((deviation(&key.0, &key.1, &Signal::Float(1.4)) - 0.4).abs() < 1e-5);
+        BASELINES.lock().unwrap().values.remove(&key);
+    }
 }
 
 #[cfg(test)]

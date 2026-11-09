@@ -43,6 +43,9 @@ pub(crate) use jsm_widgets::knob_name_of as jsm_knob_name_of;
 // The pad drives the command list by asking it to move, not by index: see
 // `CommandList`.
 pub(crate) use jsm_widgets::{command_list_state, set_command_list_state};
+mod kit;
+mod kit_bodies;
+pub(crate) use kit_bodies::*;
 mod layout_edit;
 mod midi;
 mod net;
@@ -183,6 +186,10 @@ pub struct FlexViewer<'a> {
     /// layout can position nodes against the sub-patch's REAL rendered size
     /// instead of guessed constants.
     pub view_salt: u64,
+    /// The id the canvas shows its snarl with, which keys each node's state.
+    pub snarl_id: egui::Id,
+    /// Left plus right margin of a node's frame around its contents.
+    pub node_margin_x: f32,
 }
 
 /// egui temp-data key for this canvas's measured node rects, in CANVAS space.
@@ -1204,6 +1211,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
     // ── Node bodies ──────────────────────────────────────────────────────────
 
+    fn node_resizable(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
+        snarl.get_node(node).is_some_and(|n| kit::uses_kit(&n.module_id))
+    }
+
+    fn resize_node(&mut self, node: NodeId, frame_width: f32, snarl: &mut Snarl<NodeData>) {
+        if let (Some(n), Some(w)) = (snarl.get_node_mut(node), Number::from_f64(frame_width.round() as f64)) {
+            if n.params.get(kit::WIDTH_PARAM) != Some(&Value::Number(w.clone())) {
+                n.params.insert(kit::WIDTH_PARAM.into(), Value::Number(w));
+            }
+        }
+    }
+
     fn has_body(&mut self, node: &NodeData) -> bool {
         let dev_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
         let is_midi_source = node.module_id == "device.source" && dev_id.starts_with("midi_in:");
@@ -1242,6 +1261,25 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             return;
         }
 
+        // Kit bodies are handed their width (see `kit::body_width`).
+        let kit_w = if kit::uses_kit(&module_id) {
+            // The frame's width as the node is laid out this frame: the same size the
+            // body's available width comes from (the frame last drawn is a frame
+            // behind it, and correcting against that overshoots every other frame).
+            let frame_w = snarl.get_node_info(node_id).map(|info| {
+                let id = self.snarl_id.with(("snarl-node", node_id));
+                let state = egui_snarl::ui::NodeState::load(ui.ctx(), id, &ui.style().spacing);
+                state.node_rect(info.pos, 1.0).width() + self.node_margin_x
+            });
+            let avail = ui.available_width();
+            snarl.get_node(node_id).map_or(kit::MIN_W, |n| {
+                let block = crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block);
+                kit::body_width(n, avail, frame_w, kit_min_width(&module_id), block)
+            })
+        } else {
+            0.0
+        };
+
         match module_id.as_str() {
             "device.sink"          => show_sink_body(node_id, inputs, ui, snarl),
             "module.constant"      => show_constant_body(node_id, ui, snarl),
@@ -1253,9 +1291,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
             "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "processing.rws"   => show_rws_body(node_id, ui, snarl),
-            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
-            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
-            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
+            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, kit_w),
+            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, kit_w),
+            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, kit_w),
             "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl),
             "module.response_curve" => {
                 if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {
@@ -1285,19 +1323,19 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.min_max" => {
                 show_math_variadic_body(node_id, inputs, ui, snarl);
             }
-            "math.negate" => show_inverse_body(node_id, ui, snarl),
-            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl),
-            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl),
+            "math.negate" => show_inverse_body(node_id, ui, snarl, kit_w),
+            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl, kit_w),
+            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w),
             "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
             "module.split"    => show_split_body(node_id, outputs, ui, snarl),
             "module.dropdown" => show_dropdown_body(node_id, ui, snarl),
             "module.macro"    => show_macro_body(node_id, outputs, ui, snarl),
             "module.label"    => show_label_body(node_id, ui, snarl),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
-            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl),
-            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl),
-            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl),
-            "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl),
+            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, kit_w),
+            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w),
+            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w),
+            "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
             "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl),
             "processing.gyro_3dof"  => show_gyro_3dof_body(

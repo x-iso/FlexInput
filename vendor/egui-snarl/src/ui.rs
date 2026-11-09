@@ -19,6 +19,8 @@ use smallvec::SmallVec;
 use crate::{InPin, InPinId, Node, NodeId, OutPin, OutPinId, Snarl, ui::wire::WireId};
 
 mod background_pattern;
+mod grid;
+pub mod route;
 mod pin;
 mod scale;
 mod state;
@@ -27,12 +29,14 @@ mod viewer;
 mod wire;
 
 use self::{
+    grid::{GridDrag, GridMemory},
     state::{HoldOn, NewWires, RowHeights, WireHold, WireHoldStep},
     wire::{draw_wire, hit_wire, pick_wire_style},
 };
 
 pub use self::{
     background_pattern::{BackgroundPattern, Grid},
+    grid::{GridLayout, GridStyle, RouteSet, WireRouting, wire_route},
     pin::{AnyPin, AnyPins, PinInfo, PinShape, PinWireInfo, SnarlPin},
     state::{get_selected_nodes, NodeState, SnarlState},
     viewer::SnarlViewer,
@@ -558,6 +562,24 @@ pub struct SnarlStyle {
     )]
     pub wire_smoothness: Option<f32>,
 
+    /// FLEXINPUT PATCH: how much the wires of the hovered or selected nodes stand out
+    /// (0 to 1): they get a little thicker and the rest of the graph dims. Off when
+    /// `None` or 0.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
+    pub wire_focus: Option<f32>,
+
+    /// FLEXINPUT PATCH: the layout grid. See [`GridLayout`].
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
+    pub grid: Option<GridLayout>,
+
     #[doc(hidden)]
     #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
     #[cfg_attr(feature = "serde", serde(skip_serializing, default))]
@@ -692,6 +714,11 @@ impl SnarlStyle {
         self.crisp_magnified_text.unwrap_or(false)
     }
 
+    /// FLEXINPUT PATCH: the layout grid, when it's on.
+    const fn get_grid(&self) -> Option<GridLayout> {
+        self.grid
+    }
+
     fn get_wire_smoothness(&self) -> f32 {
         self.wire_smoothness.unwrap_or(1.0)
     }
@@ -781,6 +808,8 @@ impl SnarlStyle {
             select_style: None,
             crisp_magnified_text: None,
             wire_smoothness: None,
+            grid: None,
+            wire_focus: None,
 
             _non_exhaustive: (),
         }
@@ -800,6 +829,8 @@ struct DrawNodeResponse {
     drag_released: bool,
     pin_hovered: Option<AnyPin>,
     final_rect: Rect,
+    /// FLEXINPUT PATCH: from the frame's top-left corner to the node's position.
+    frame_offset: Vec2,
 }
 
 struct DrawPinsResponse {
@@ -957,6 +988,9 @@ where
     content_rect.max.y = content_rect.max.y.max(content_rect.min.y);
 
     let snarl_layer_id = LayerId::new(ui.layer_id().order, snarl_id);
+    // FLEXINPUT PATCH: the layer the graph is shown in. The graph draws in a sublayer
+    // of it, which isn't what egui finds under the pointer: this is.
+    let host_layer = ui.layer_id();
 
     ui.ctx().set_sublayer(ui.layer_id(), snarl_layer_id);
 
@@ -1058,6 +1092,13 @@ where
         snarl,
     );
 
+    // FLEXINPUT PATCH: the layout grid's lines.
+    let grid_cfg = style.get_grid();
+    if let Some(grid) = grid_cfg.filter(|g| g.show) {
+        let color = ui.visuals().text_color();
+        grid::draw_grid(&grid, ui.painter(), &viewport, to_global.scaling, color);
+    }
+
     let mut node_moved = None;
     let mut node_to_top = None;
 
@@ -1103,6 +1144,8 @@ where
 
     let mut nodes_bb = Rect::NOTHING;
     let mut node_rects = Vec::new();
+    // FLEXINPUT PATCH: each node's frame offset, for snapping it while it's dragged.
+    let mut frame_offsets: HashMap<NodeId, Vec2> = HashMap::new();
 
     for node_idx in draw_order {
         if !snarl.nodes.contains(node_idx.0) {
@@ -1136,15 +1179,36 @@ where
             drag_released |= response.drag_released;
 
             nodes_bb = nodes_bb.union(response.final_rect);
-            if rect_selection_ended.is_some() {
-                node_rects.push((node_idx, response.final_rect));
-            }
+            // FLEXINPUT PATCH: the grid's routes and pushes need every node's rect.
+            node_rects.push((node_idx, response.final_rect));
+            frame_offsets.insert(node_idx, response.frame_offset);
         }
     }
 
     let mut hovered_wire = None;
     let mut hovered_wire_disconnect = false;
     let mut wire_shapes = Vec::new();
+
+    // FLEXINPUT PATCH: connected wires routed along the grid's lines, around the nodes.
+    let pin_size = style.get_pin_size(ui.style()).max(0.0);
+    let routes = grid_cfg.filter(|g| g.wires != WireRouting::Direct).map(|grid| {
+        let pin_reach = match style.get_pin_placement() {
+            PinPlacement::Outside { margin } => margin + pin_size + 1.0,
+            PinPlacement::Edge => pin_size * 0.5 + 1.0,
+            PinPlacement::Inside => 1.0,
+        };
+        let ends: Vec<grid::WireEnds> = snarl
+            .wires
+            .iter()
+            .filter_map(|w| {
+                let from = output_info.get(&w.out_pin)?;
+                let to = input_info.get(&w.in_pin)?;
+                let factor = from.wire_width_factor.max(to.wire_width_factor);
+                Some((w.out_pin, w.in_pin, from.pos, to.pos, wire_width * routed_factor(factor)))
+            })
+            .collect();
+        grid::routes(ui.ctx(), snarl_id, &grid, pin_reach, &node_rects, &ends)
+    });
 
     // FLEXINPUT PATCH: a lost pin or a lifted finger can leave a hold behind.
     if !ui.input(|i| i.pointer.primary_down()) {
@@ -1172,6 +1236,7 @@ where
             wire_frame_size,
             &input_info,
             &output_info,
+            routes.as_deref(),
         );
         if let Some((out_pin, in_pin)) = target {
             snarl_state.begin_wire_hold(HoldOn::Wire(out_pin, in_pin), ui.ctx());
@@ -1203,6 +1268,10 @@ where
     let moved_from = snarl_state.moved_from();
     let highlighted_wire = viewer.highlighted_wire();
 
+    // FLEXINPUT PATCH: the wires of the hovered or selected nodes stand out.
+    let focus = wire_focus(&ui, snarl, snarl_id, &snarl_state, &node_rects, style.wire_focus, host_layer);
+    let focused = |node: NodeId| focus.nodes.contains(&node);
+
     // Draw and interact with wires
     for wire in snarl.wires.iter() {
         let Some(from_r) = output_info.get(&wire.out_pin) else {
@@ -1218,22 +1287,28 @@ where
             // And not hovering over item above.
 
             if let Some(latest_pos) = latest_pos {
-                let wire_hit = hit_wire(
-                    ui.ctx(),
-                    WireId::Connected {
-                        snarl_id,
-                        out_pin: wire.out_pin,
-                        in_pin: wire.in_pin,
-                    },
-                    wire_frame_size,
-                    style.get_upscale_wire_frame(),
-                    style.get_downscale_wire_frame(),
-                    from_r.pos,
-                    to_r.pos,
-                    latest_pos,
-                    wire_width.max(2.0),
-                    pick_wire_style(from_r.wire_style, to_r.wire_style),
-                );
+                let routed = routes.as_ref().and_then(|r| r.paths.get(&(wire.out_pin, wire.in_pin)));
+                let wire_hit = if let Some(path) = routed {
+                    let reach = wire_width * routed_factor(from_r.wire_width_factor.max(to_r.wire_width_factor));
+                    route::distance_sq(path, latest_pos) < (reach * 0.5 + 1.5).max(3.0).powi(2)
+                } else {
+                    hit_wire(
+                        ui.ctx(),
+                        WireId::Connected {
+                            snarl_id,
+                            out_pin: wire.out_pin,
+                            in_pin: wire.in_pin,
+                        },
+                        wire_frame_size,
+                        style.get_upscale_wire_frame(),
+                        style.get_downscale_wire_frame(),
+                        from_r.pos,
+                        to_r.pos,
+                        latest_pos,
+                        wire_width.max(2.0),
+                        pick_wire_style(from_r.wire_style, to_r.wire_style),
+                    )
+                };
 
                 if wire_hit {
                     hovered_wire = Some(wire);
@@ -1277,8 +1352,26 @@ where
         if highlighted_wire == Some((wire.out_pin, wire.in_pin)) {
             draw_width *= 2.5;
         }
+        if focus.amount > 0.0 {
+            if focused(wire.out_pin.node) || focused(wire.in_pin.node) {
+                draw_width *= 1.0 + FOCUS_THICKEN * focus.amount;
+                color = color.lerp_to_gamma(Color32::WHITE, FOCUS_BRIGHTEN * focus.amount);
+            } else {
+                color = color.gamma_multiply((1.0 - FOCUS_DIM * focus.amount).max(FOCUS_DIM_FLOOR));
+            }
+        }
         if moved_from.is_some_and(on_pin) {
             color = color.gamma_multiply(0.3);
+        }
+
+        if let Some(path) = routes.as_ref().and_then(|r| r.drawn.get(&(wire.out_pin, wire.in_pin))) {
+            // Thicker than a curve: a routed wire runs along grid lines and beside other
+            // wires, and has to stand out from both. (A wire that's already thick, an
+            // Auto-Map bundle, keeps its own width.)
+            let routed = draw_width / width_factor.max(0.01) * routed_factor(width_factor);
+            let shade = ui.visuals().extreme_bg_color;
+            draw_routed_wire(&ui, &mut wire_shapes, path, Stroke::new(routed, color), shade);
+            continue;
         }
 
         draw_wire(
@@ -1308,7 +1401,7 @@ where
     }
 
     if let Some(select_rect) = rect_selection_ended {
-        let select_nodes = node_rects.into_iter().filter_map(|(id, rect)| {
+        let select_nodes = node_rects.iter().copied().filter_map(|(id, rect)| {
             let select = if style.get_select_rect_contained() {
                 select_rect.contains_rect(rect)
             } else {
@@ -1557,6 +1650,16 @@ where
         }
     }
 
+    // FLEXINPUT PATCH: the nodes neither in focus nor wired to it dim with the wires.
+    if focus.amount > 0.0 {
+        let shade = ui.visuals().extreme_bg_color.gamma_multiply(FOCUS_SHADE * focus.amount);
+        for &(node, rect) in &node_rects {
+            if !focus.nodes.contains(&node) && !focus.neighbors.contains(&node) {
+                ui.painter().rect_filled(rect, CornerRadius::same(6), shade);
+            }
+        }
+    }
+
     match wire_shape_idx {
         None => {
             ui.painter().add(Shape::Vec(wire_shapes));
@@ -1579,20 +1682,138 @@ where
         snarl_state.node_to_top(node);
     }
 
+    // FLEXINPUT PATCH: on the grid, dragged nodes snap as they go (Alt drags freely):
+    // each frame's snap starts from where the drag alone would have put them.
+    let snap_cfg = grid_cfg.filter(|g| g.snap);
+
+    // FLEXINPUT PATCH: nodes the user just placed settle on the grid where they were put,
+    // once they've been drawn at their size (see `Snarl::insert_node_placed`), and push
+    // whatever they landed on out of their way.
+    let mut placed: Vec<NodeId> = Vec::new();
+    if let Some(grid) = snap_cfg {
+        let nodes = &snarl.nodes;
+        snarl.placing.retain_mut(|(n, wait)| {
+            if !nodes.contains(n.0) {
+                return false;
+            }
+            if *wait > 0 {
+                *wait -= 1;
+                return true;
+            }
+            placed.push(*n);
+            false
+        });
+        let first = node_rects.iter().find(|(n, _)| placed.contains(n)).map(|&(_, r)| r);
+        if let Some(first) = first {
+            // The whole group moves alike, so a pasted group keeps its shape.
+            let by = grid.snap_offset(first);
+            let moves: Vec<(NodeId, Vec2)> = placed.iter().map(|&n| (n, by)).collect();
+            apply_pushes(snarl, &moves, ui.ctx());
+            if grid.push {
+                let moved: Vec<(NodeId, Rect)> = node_rects
+                    .iter()
+                    .map(|&(n, r)| (n, if placed.contains(&n) { r.translate(by) } else { r }))
+                    .collect();
+                apply_pushes(snarl, &grid::push_apart(&grid, &moved, &placed), ui.ctx());
+            }
+        }
+    } else {
+        snarl.placing.clear();
+    }
+    let mut grid_dragging = false;
     if let Some((node, delta)) = node_moved
         && snarl.nodes.contains(node.0)
         && !snarl_state.pinching()
     {
         ui.ctx().request_repaint();
-        if snarl_state.selected_nodes().contains(&node) {
-            for node in snarl_state.selected_nodes() {
+        let moving: Vec<NodeId> = if snarl_state.selected_nodes().contains(&node) {
+            snarl_state.selected_nodes().to_vec()
+        } else {
+            vec![node]
+        };
+        if let Some(grid) = snap_cfg {
+            grid_dragging = true;
+            let same = |d: &GridDrag| {
+                d.origins.len() == moving.len() && d.origins.iter().all(|(n, _)| moving.contains(n))
+            };
+            let mut drag = GridDrag::load(ui.ctx(), snarl_id).filter(same).unwrap_or_else(|| GridDrag {
+                origins: moving
+                    .iter()
+                    .filter(|n| snarl.nodes.contains(n.0))
+                    .map(|&n| (n, snarl.nodes[n.0].pos))
+                    .collect(),
+                moved: Vec2::ZERO,
+            });
+            drag.moved += delta;
+            for &(n, origin) in &drag.origins {
+                if !snarl.nodes.contains(n.0) {
+                    continue;
+                }
+                let free = origin + drag.moved;
+                let offset = frame_offsets.get(&n).copied().unwrap_or(Vec2::ZERO);
+                snarl.nodes[n.0].pos = if modifiers.alt { free } else { grid.snap_pos(free, offset) };
+            }
+            drag.store(ui.ctx(), snarl_id);
+        } else {
+            for node in moving {
                 let node = &mut snarl.nodes[node.0];
                 node.pos += delta;
             }
-        } else {
-            let node = &mut snarl.nodes[node.0];
-            node.pos += delta;
         }
+    }
+
+    // FLEXINPUT PATCH: a node dropped onto others, or grown into them by the user,
+    // pushes them out of its way.
+    let mut dropped: Option<Vec<NodeId>> = None;
+    if !grid_dragging && let Some(drag) = GridDrag::load(ui.ctx(), snarl_id) {
+        GridDrag::clear(ui.ctx(), snarl_id);
+        let movers: Vec<NodeId> = drag.origins.iter().map(|&(n, _)| n).collect();
+        if let Some(grid) = grid_cfg.filter(|g| g.push) {
+            apply_pushes(snarl, &grid::push_apart(&grid, &node_rects, &movers), ui.ctx());
+        }
+        dropped = Some(movers);
+    }
+    if let Some(grid) = grid_cfg.filter(|g| g.push) {
+        let mut memory = GridMemory::load(ui.ctx(), snarl_id);
+        let (pressed, down, now) =
+            ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.time));
+        if pressed && let Some(pos) = latest_pos {
+            memory.note_press(pos, now);
+        } else if down {
+            memory.note_held(now);
+        }
+        let grown = memory.grown(&node_rects, now);
+        if !grown.is_empty() && !grid_dragging {
+            apply_pushes(snarl, &grid::push_apart(&grid, &node_rects, &grown), ui.ctx());
+            memory.settle(&grown);
+        }
+        if let Some(movers) = &dropped {
+            memory.settle(movers);
+        }
+        // A wire or two the user just connected (not a patch's worth arriving at once).
+        let wires = snarl.wires.iter().count();
+        let before = memory.wire_count();
+        if memory.wire_added(wires) && wires - before <= 4 && memory.pressed_lately(now) {
+            memory.settle(&[]);
+        }
+
+        // FLEXINPUT PATCH: after any of those, wires that ran out of room in a gap get
+        // it: the modules beside it move apart, a round at a time as the wires reroute
+        // into the wider gap. Not in the frame the change lands, whose routes predate it.
+        if !grid_dragging
+            && dropped.is_none()
+            && grown.is_empty()
+            && let Some(routes) = routes.as_ref()
+            && let Some(movers) = memory.settle_round()
+        {
+            let moves = grid::spread_crowded(&grid, &node_rects, &routes.crowding, &movers);
+            if moves.is_empty() {
+                memory.settled();
+            } else {
+                apply_pushes(snarl, &moves, ui.ctx());
+            }
+        }
+        memory.store(ui.ctx(), snarl_id);
     }
 
     snarl_state.store(snarl, ui.ctx());
@@ -1682,6 +1903,184 @@ where
     best
 }
 
+/// FLEXINPUT PATCH: the grip on a resizable node's bottom-right corner. Dragging it
+/// asks the viewer for a frame that wide: whole blocks on the grid (Alt for any width),
+/// counted from the frame's actual width when the drag began.
+#[allow(clippy::too_many_arguments)]
+fn width_grip<T, V>(
+    ui: &mut Ui,
+    node: NodeId,
+    node_id: Id,
+    frame: Rect,
+    narrowest: f32,
+    grid: Option<GridLayout>,
+    modifiers: Modifiers,
+    snarl_state: &mut SnarlState,
+    viewer: &mut V,
+    snarl: &mut Snarl<T>,
+) where
+    V: SnarlViewer<T>,
+{
+    const GRIP: f32 = 12.0;
+    let rect = Rect::from_min_max(frame.max - vec2(GRIP, GRIP), frame.max);
+    let resp = ui
+        .interact(rect, node_id.with("width_grip"), Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let key = node_id.with("width_grip_from");
+    if resp.drag_started() {
+        ui.ctx().data_mut(|d| d.insert_temp(key, (frame.width(), 0.0_f32)));
+    }
+    if resp.dragged() {
+        snarl_state.mark_chrome_dragged();
+        let (from, moved) = ui
+            .ctx()
+            .data(|d| d.get_temp::<(f32, f32)>(key))
+            .unwrap_or((frame.width(), 0.0));
+        let moved = moved + resp.drag_delta().x;
+        ui.ctx().data_mut(|d| d.insert_temp(key, (from, moved)));
+        let free = (from + moved).max(narrowest).max(ui.spacing().interact_size.x);
+        let width = match grid {
+            Some(g) if !modifiers.alt => ((free / g.block).round() * g.block).max(g.snap_len(narrowest)),
+            _ => free,
+        };
+        viewer.resize_node(node, width, snarl);
+        ui.ctx().request_repaint();
+    }
+    if resp.drag_stopped() {
+        ui.ctx().data_mut(|d| d.remove::<(f32, f32)>(key));
+    }
+
+    // Three short diagonal strokes in the corner, brighter under the pointer.
+    let visuals = ui.visuals();
+    let color = if resp.hovered() || resp.dragged() {
+        visuals.widgets.hovered.fg_stroke.color
+    } else {
+        visuals.weak_text_color().gamma_multiply(0.6)
+    };
+    let stroke = Stroke::new(1.0_f32, color);
+    let corner = frame.max - vec2(3.0, 3.0);
+    for k in 1..=3 {
+        let d = k as f32 * 3.0;
+        ui.painter().line_segment([corner - vec2(d, 0.0), corner - vec2(0.0, d)], stroke);
+    }
+}
+
+/// FLEXINPUT PATCH: at full strength, the wires of the nodes in focus are drawn this
+/// much thicker than usual, and lightened this far toward white…
+const FOCUS_THICKEN: f32 = 0.9;
+const FOCUS_BRIGHTEN: f32 = 0.2;
+/// …the other wires fade this much (but never below the floor, so they can still be
+/// made out)…
+const FOCUS_DIM: f32 = 1.17;
+const FOCUS_DIM_FLOOR: f32 = 0.06;
+/// …and the nodes neither in focus nor wired to it are shaded over this much.
+const FOCUS_SHADE: f32 = 0.8;
+
+/// FLEXINPUT PATCH: which nodes' wires stand out this frame, the nodes at their other
+/// ends, and how far along the fade in or out the emphasis is (times its strength).
+struct WireFocus {
+    nodes: Vec<NodeId>,
+    neighbors: Vec<NodeId>,
+    amount: f32,
+}
+
+/// FLEXINPUT PATCH: the nodes in focus: the selected ones and the one under the pointer
+/// (the topmost, and only when nothing else, a menu or a window, is over it). The
+/// emphasis fades in and out, and keeps the last focus while it fades out.
+fn wire_focus<T>(
+    ui: &Ui,
+    snarl: &Snarl<T>,
+    snarl_id: Id,
+    snarl_state: &SnarlState,
+    node_rects: &[(NodeId, Rect)],
+    strength: Option<f32>,
+    host_layer: LayerId,
+) -> WireFocus {
+    let strength = strength.unwrap_or(0.0).clamp(0.0, 1.0);
+    let none = WireFocus { nodes: Vec::new(), neighbors: Vec::new(), amount: 0.0 };
+    if strength <= 0.0 {
+        return none;
+    }
+    let mut nodes: Vec<NodeId> = snarl_state.selected_nodes().to_vec();
+    // Under the pointer, with nothing (a menu, a window) over the graph there.
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let to_global = snarl_state.to_global();
+    let over_graph = pointer.is_some_and(|p| ui.ctx().layer_id_at(p) == Some(host_layer));
+    let hovered = pointer
+        .filter(|_| over_graph)
+        .and_then(|p| node_rects.iter().rev().find(|(_, r)| (to_global * *r).contains(p)));
+    if let Some(&(hovered, _)) = hovered
+        && !nodes.contains(&hovered)
+    {
+        nodes.push(hovered);
+    }
+    let id = snarl_id.with("flexinput_wire_focus");
+    let fade = ui.ctx().animate_bool_with_time(id, !nodes.is_empty(), 0.15);
+    if nodes.is_empty() {
+        nodes = ui.ctx().data(|d| d.get_temp::<Vec<NodeId>>(id)).unwrap_or_default();
+    } else {
+        let kept = nodes.clone();
+        ui.ctx().data_mut(|d| d.insert_temp(id, kept));
+    }
+    if fade <= 0.0 || nodes.is_empty() {
+        return none;
+    }
+    let mut neighbors = Vec::new();
+    for wire in snarl.wires.iter() {
+        let (a, b) = (wire.out_pin.node, wire.in_pin.node);
+        if nodes.contains(&a) && !neighbors.contains(&b) {
+            neighbors.push(b);
+        }
+        if nodes.contains(&b) && !neighbors.contains(&a) {
+            neighbors.push(a);
+        }
+    }
+    WireFocus { nodes, neighbors, amount: strength * fade }
+}
+
+/// FLEXINPUT PATCH: how many times the style's wire width a routed wire is drawn, at
+/// least.
+const ROUTED_WIRE_WIDTH: f32 = 2.2;
+
+/// FLEXINPUT PATCH: a routed wire's width factor, for a pin's `factor`.
+fn routed_factor(factor: f32) -> f32 {
+    factor.max(ROUTED_WIRE_WIDTH)
+}
+
+/// FLEXINPUT PATCH: how far each side of a routed wire its dark underlay reaches: where
+/// wires cross, the one on top cuts a dark edge into the one below. Less than half the
+/// clear space between lanes, so wires side by side don't shade each other.
+const WIRE_SHADE: f32 = 1.3;
+
+/// FLEXINPUT PATCH: moves pushed nodes by how far they were pushed.
+fn apply_pushes<T>(snarl: &mut Snarl<T>, pushes: &[(NodeId, Vec2)], cx: &egui::Context) {
+    for &(node, by) in pushes {
+        if let Some(n) = snarl.nodes.get_mut(node.0) {
+            n.pos += by;
+        }
+    }
+    if !pushes.is_empty() {
+        cx.request_repaint();
+    }
+}
+
+/// FLEXINPUT PATCH: draws a routed wire along its (already rounded) path, over a dark
+/// underlay `shade` that sets it off from wires it crosses.
+fn draw_routed_wire(ui: &Ui, shapes: &mut Vec<Shape>, path: &[Pos2], mut stroke: Stroke, shade: Color32) {
+    if path.len() < 2 || !ui.is_visible() {
+        return;
+    }
+    if stroke.width < 1.0 {
+        stroke.color = stroke.color.gamma_multiply(stroke.width);
+        stroke.width = 1.0;
+    }
+    if ui.is_rect_visible(Rect::from_points(path).expand(stroke.width + WIRE_SHADE)) {
+        let under = Stroke::new(stroke.width + 2.0 * WIRE_SHADE, shade.gamma_multiply(0.85));
+        shapes.push(Shape::line(path.to_vec(), under));
+        shapes.push(Shape::line(path.to_vec(), stroke));
+    }
+}
+
 /// The wire nearest `pos`, if one is within `reach`. Wires only answer whether a point is
 /// within some distance, so this asks at growing distances, which is plenty for a fingertip
 /// and only happens when one comes down.
@@ -1696,12 +2095,18 @@ fn nearest_wire<T>(
     frame_size: f32,
     inputs: &HashMap<InPinId, PinResponse>,
     outputs: &HashMap<OutPinId, PinResponse>,
+    routes: Option<&RouteSet>,
 ) -> Option<(OutPinId, InPinId)> {
     const STEPS: usize = 7;
     (1..=STEPS).find_map(|step| {
         let threshold = reach * step as f32 / STEPS as f32;
         snarl.wires.iter().find_map(|wire| {
             let (from, to) = (outputs.get(&wire.out_pin)?, inputs.get(&wire.in_pin)?);
+            // FLEXINPUT PATCH: a routed wire is where its route is.
+            if let Some(path) = routes.and_then(|r| r.paths.get(&(wire.out_pin, wire.in_pin))) {
+                return (route::distance_sq(path, pos) < threshold * threshold)
+                    .then_some((wire.out_pin, wire.in_pin));
+            }
             hit_wire(
                 ctx,
                 WireId::Connected { snarl_id, out_pin: wire.out_pin, in_pin: wire.in_pin },
@@ -2232,7 +2637,7 @@ where
 
     let mut node_state = NodeState::load(ui.ctx(), node_id, ui.spacing());
 
-    let node_rect = node_state.node_rect(node_pos, openness);
+    let mut node_rect = node_state.node_rect(node_pos, openness);
 
     let mut node_to_top = None;
     let mut node_moved = None;
@@ -2255,8 +2660,21 @@ where
         snarl,
     );
 
+    // FLEXINPUT PATCH: on the layout grid the frame is a whole number of blocks: the
+    // node's size is rounded up (see the end of this function), and a collapsed node,
+    // whose height is its header's, is rounded up here.
+    let frame_margin = node_frame.total_margin();
+    let margins = frame_margin.sum();
+    let grid_snap = style.get_grid().filter(|g| g.snap);
+    if let Some(g) = grid_snap
+        && !open
+        && openness <= 0.0
+    {
+        node_rect.max.y = node_rect.min.y + g.snap_len(node_rect.height() + margins.y) - margins.y;
+    }
+
     // Rect for node + frame margin.
-    let node_frame_rect = node_rect + node_frame.total_margin();
+    let node_frame_rect = node_rect + frame_margin;
 
     if snarl_state.selected_nodes().contains(&node) {
         let select_style = style.get_select_style(ui.style());
@@ -2338,6 +2756,9 @@ where
     );
 
     let mut new_pins_size = Vec2::ZERO;
+    // FLEXINPUT PATCH: how wide the header's contents are, which the width grip can't
+    // make the node narrower than.
+    let mut header_w = 0.0_f32;
 
     let r = node_frame.show(node_ui, |ui| {
         if viewer.has_node_style(node, &inputs, &outputs, snarl) {
@@ -2869,15 +3290,25 @@ where
 
         ui.expand_to_include_rect(header_rect);
         let header_size = header_rect.size();
+        header_w = header_size.x;
         node_state.set_header_height(header_size.y);
 
-        node_state.set_size(vec2(
+        let mut size = vec2(
             f32::max(header_size.x, new_pins_size.x),
             header_size.y
                 + header_frame.total_margin().bottom
                 + ui.spacing().item_spacing.y
                 + new_pins_size.y,
-        ));
+        );
+        // FLEXINPUT PATCH: see the top of this function.
+        if let Some(g) = grid_snap {
+            size = g.snap_inner_size(size, margins);
+        }
+        node_state.set_size(size);
+        if grid_snap.is_some() {
+            // The frame fills the node's rect, not just what's in it.
+            ui.expand_to_include_rect(node_rect);
+        }
     });
 
     if !snarl.nodes.contains(node.0) {
@@ -2889,6 +3320,12 @@ where
 
     viewer.final_node_rect(node, r.response.rect, ui, snarl);
 
+    // FLEXINPUT PATCH: the width grip, over everything else in the node.
+    if viewer.node_resizable(node, snarl) {
+        let narrowest = header_w + margins.x;
+        width_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl);
+    }
+
     node_state.store(ui.ctx());
     Some(DrawNodeResponse {
         node_moved,
@@ -2896,6 +3333,7 @@ where
         drag_released,
         pin_hovered,
         final_rect: r.response.rect,
+        frame_offset: frame_margin.left_top(),
     })
 }
 

@@ -1444,6 +1444,9 @@ pub struct Canvas {
     /// Updated each frame from the snarl view transform. Used to spawn
     /// new device nodes at the center of the current viewport.
     last_view_center_canvas: Option<egui::Pos2>,
+    /// Where the pointer was over the canvas last frame, in canvas space:
+    /// where a paste lands.
+    last_pointer_canvas: Option<egui::Pos2>,
     /// One-shot view action to apply on the next render. Set by app.rs
     /// after loading a patch when the `on_patch_load` setting is not Off.
     /// Consumed during `draw_zoom_controls` (which already has the
@@ -1524,6 +1527,7 @@ impl Canvas {
             is_inner: false,
             pinned_inner_ids: std::collections::HashSet::new(),
             last_view_center_canvas: None,
+            last_pointer_canvas: None,
             pending_view_action: None,
             spawn_glow: std::collections::HashMap::new(),
             view_salt: next_canvas_salt(),
@@ -1871,9 +1875,16 @@ impl Canvas {
     fn paste(&mut self) {
         let clipboard = match self.clipboard.clone() { Some(c) => c, None => return };
         self.push_undo();
-        let offset = egui::vec2(40.0, 40.0);
+        // At the pointer when it's over the canvas (the group's top-left corner
+        // there), else just down and right of where it was copied from.
+        let top_left = clipboard.nodes.iter().map(|(pos, _)| *pos)
+            .reduce(|a, b| egui::pos2(a.x.min(b.x), a.y.min(b.y)));
+        let offset = match (self.last_pointer_canvas, top_left) {
+            (Some(at), Some(top_left)) => at - top_left,
+            _ => egui::vec2(40.0, 40.0),
+        };
         let new_ids: Vec<NodeId> = clipboard.nodes.iter()
-            .map(|(pos, data)| self.snarl.insert_node(*pos + offset, data.clone()))
+            .map(|(pos, data)| self.snarl.insert_node_placed(*pos + offset, data.clone()))
             .collect();
         for (from_idx, from_pin, to_idx, to_pin) in clipboard.internal_wires {
             // Bounds-check node indices first.
@@ -2050,6 +2061,17 @@ impl Canvas {
             }
         }
 
+        // The layout grid, as the settings have it this frame (see `CANVAS_GRID_KEY`).
+        self.style.grid = canvas_grid(ui.ctx());
+        // How much the hovered or selected module's wires stand out.
+        self.style.wire_focus = canvas_grid_settings(ui.ctx()).map(|g| g.focus);
+        // The activity glow's range and Auto-Map rule (the Wires menu), and where
+        // each reading rests for the "changes from rest" rule.
+        if let Some(g) = canvas_grid_settings(ui.ctx()) {
+            viewer::set_glow_settings(g.glow_min, g.glow_max, g.automap_glow);
+        }
+        viewer::update_glow_baselines(ui.ctx(), live_signals);
+
         // ── Pre-show snapshot for viewer-driven mutations ─────────────────────
         // Only clone the snarl when this frame could plausibly mutate it.
         // Snarl's built-in `show()` mutates on pointer drag (node move),
@@ -2080,6 +2102,9 @@ impl Canvas {
             self.snarl.wires().count(),
         );
 
+        // The snarl id `show` derives from this salt; the viewer reads node sizes by it.
+        let id_salt = ("flexinput_canvas", self.view_salt);
+        let snarl_id = ui.make_persistent_id(id_salt);
         let mut viewer = FlexViewer {
             descriptors,
             ctx: ctx.clone(),
@@ -2106,13 +2131,13 @@ impl Canvas {
             automap_parent,
             ping_requests,
             view_salt: self.view_salt,
+            snarl_id,
+            node_margin_x: self.style.node_frame.map_or(0.0, |f| f.total_margin().sum().x),
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
         // (zoom / pan) from the zoom-control overlay below. The salt is
         // per-canvas (`view_salt`) so each tab / sub-patch keeps its own
         // pan/zoom instead of sharing one transform via a constant id.
-        let id_salt = ("flexinput_canvas", self.view_salt);
-        let snarl_id = ui.make_persistent_id(id_salt);
         let snarl_rect = ui.available_rect_before_wrap();
         // A node body that asked for the wheel (a text editor with a scroll
         // area) gets it: the Scene inside `show` pans by the scroll delta it
@@ -2133,6 +2158,9 @@ impl Canvas {
             let center = snarl_rect.center();
             let canvas_center = (center - t.translation) / t.scaling;
             self.last_view_center_canvas = Some(egui::pos2(canvas_center.x, canvas_center.y));
+            self.last_pointer_canvas = ui.ctx().pointer_hover_pos()
+                .filter(|p| snarl_rect.contains(*p))
+                .map(|p| egui::pos2((p.x - t.translation.x) / t.scaling, (p.y - t.translation.y) / t.scaling));
         }
 
         // ── Edge auto-scroll while dragging a wire ──────────────────────────
@@ -2577,6 +2605,12 @@ impl Canvas {
         calibrate_request
     }
 
+    /// From a node frame's top-left corner to the node's position: the frame's
+    /// margin, which grid snapping needs to put the frame on the grid.
+    pub(crate) fn node_frame_offset(&self) -> egui::Vec2 {
+        self.style.node_frame.map_or(egui::Vec2::ZERO, |f| f.total_margin().left_top())
+    }
+
     /// Return a sensible canvas-space spawn position for a new node:
     /// the center of the current viewport if known, else a fallback.
     /// Populated each frame from the snarl show; if `show` hasn't been
@@ -2674,6 +2708,7 @@ impl Canvas {
         } else {
             self.snarl.insert_node(pos, node)
         };
+        self.snarl.place_node(new_id);
         self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 
@@ -2744,6 +2779,7 @@ impl Canvas {
         } else {
             self.snarl.insert_node(pos, node)
         };
+        self.snarl.place_node(new_id);
         self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 
@@ -2839,6 +2875,7 @@ impl Canvas {
         } else {
             self.snarl.insert_node(pos, node)
         };
+        self.snarl.place_node(new_id);
         self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 }
@@ -3384,6 +3421,36 @@ fn draw_spawn_glow(
 /// `false` means the very first frame after launch matches the persisted
 /// setting once the app writes it back.
 pub const SEE_THROUGH_DATA_KEY: &str = "flexinput::see_through_active";
+
+/// egui temp-data slot holding the layout grid every canvas uses this frame
+/// (`Option<egui_snarl::ui::GridLayout>`), written from the settings each frame.
+pub const CANVAS_GRID_KEY: &str = "flexinput::canvas_grid";
+
+/// Publishes the layout grid for this frame's canvases.
+pub fn set_canvas_grid(ctx: &egui::Context, grid: Option<egui_snarl::ui::GridLayout>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(CANVAS_GRID_KEY), grid));
+}
+
+/// egui temp-data slot holding the grid's settings (`settings::CanvasGrid`).
+/// The app publishes them each frame, the zoom toolbar's grid menu edits them
+/// in place, and the app saves the edits it finds there.
+pub const CANVAS_GRID_SETTINGS_KEY: &str = "flexinput::canvas_grid_settings";
+
+/// Publishes the grid's settings for the zoom toolbar's grid menu.
+pub fn set_canvas_grid_settings(ctx: &egui::Context, settings: crate::settings::CanvasGrid) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(CANVAS_GRID_SETTINGS_KEY), settings));
+}
+
+/// The grid's settings as last published or edited.
+pub fn canvas_grid_settings(ctx: &egui::Context) -> Option<crate::settings::CanvasGrid> {
+    ctx.data(|d| d.get_temp::<crate::settings::CanvasGrid>(egui::Id::new(CANVAS_GRID_SETTINGS_KEY)))
+}
+
+/// The layout grid canvases use this frame; none until the settings publish one.
+pub fn canvas_grid(ctx: &egui::Context) -> Option<egui_snarl::ui::GridLayout> {
+    ctx.data(|d| d.get_temp::<Option<egui_snarl::ui::GridLayout>>(egui::Id::new(CANVAS_GRID_KEY)))
+        .flatten()
+}
 pub const SEE_THROUGH_ALPHA_KEY: &str = "flexinput::see_through_alpha";
 
 /// Lower-right overlay with canvas zoom controls.
@@ -3406,9 +3473,9 @@ fn draw_zoom_controls(
     let pct = (cur_scale * 100.0).round() as i32;
 
     // Pre-measure the strip so we can compute a bottom-right placement.
-    // Layout: [eye] [sep] [-] [zoom%] [+] [fit] ≈ 24 + 8 + 24 + 48 + 24 + 24 + paddings
+    // Layout: [grid] [-] [zoom%] [+] [fit] ≈ 24 + 24 + 48 + 24 + 24 + paddings
     let margin = 10.0_f32;
-    let est_w  = 196.0_f32;
+    let est_w  = 224.0_f32;
     let est_h  = 36.0_f32;
     let anchor = egui::pos2(
         snarl_rect.right()  - est_w - margin,
@@ -3443,6 +3510,9 @@ fn draw_zoom_controls(
                 // (See-through eye toggle relocated to the title bar so it
                 // works from both Easy and Advanced mode — see
                 // `app::render_eye_toggle`.)
+
+                grid_menu(ui);
+                wires_menu(ui);
 
                 clicked_minus = ui.add(egui::Button::new(
                     egui::RichText::new("−").monospace())
@@ -3504,6 +3574,173 @@ fn draw_zoom_controls(
     }
 
     state.store(snarl, ui.ctx());
+}
+
+/// The zoom toolbar's grid menu: the layout grid's settings, edited in their
+/// ctx slot (the app saves them from there).
+fn grid_menu(ui: &mut egui::Ui) {
+    let Some(mut grid) = canvas_grid_settings(ui.ctx()) else { return };
+    let before = grid;
+    const GRID_SVG: &[u8] = include_bytes!("../../../../app/assets/grid.svg");
+    let button = toolbar_icon_button(ui, GRID_SVG, "#");
+    let resp = egui::containers::menu::MenuButton::from_button(button)
+        .ui(ui, |ui| {
+            use egui_snarl::ui::GridStyle;
+            ui.set_min_width(200.0);
+            ui.checkbox(&mut grid.show, "Show the grid");
+            ui.add_enabled_ui(grid.show, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.selectable_value(&mut grid.style, GridStyle::Lines, "Lines");
+                    ui.selectable_value(&mut grid.style, GridStyle::Dashed, "Dashed");
+                    ui.selectable_value(&mut grid.style, GridStyle::Crosses, "Crosses");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new("Brighter every").small().weak());
+                    for (n, text) in [(0, "Off"), (2, "2"), (4, "4"), (8, "8")] {
+                        ui.selectable_value(&mut grid.accent_every, n, text);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new("Brightness").small().weak());
+                    ui.add(
+                        egui::Slider::new(&mut grid.brightness, 0.25..=4.0)
+                            .logarithmic(true)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .on_hover_text("How bright the grid is drawn. Low-contrast themes need it brighter.");
+                });
+            });
+            ui.separator();
+            ui.checkbox(&mut grid.snap, "Snap modules to the grid").on_hover_text(concat!(
+                "Modules sit with their edges in the middle of a block and are whole blocks in ",
+                "size, so there's always a block between two. Hold Alt while dragging to place ",
+                "one freely.",
+            ));
+            ui.add_enabled_ui(grid.snap, |ui| {
+                ui.checkbox(&mut grid.push, "Push modules out of the way").on_hover_text(concat!(
+                    "A module dropped onto others, or grown into them, moves them aside. So does ",
+                    "one added on top of them.",
+                ));
+            });
+        })
+        .0;
+    resp.on_hover_text("Layout grid");
+    if grid != before {
+        set_canvas_grid_settings(ui.ctx(), grid);
+    }
+}
+
+/// The zoom toolbar's wires menu: how wires are drawn and lit, in the same
+/// settings slot as the grid menu.
+fn wires_menu(ui: &mut egui::Ui) {
+    let Some(mut grid) = canvas_grid_settings(ui.ctx()) else { return };
+    let before = grid;
+    const WIRES_SVG: &[u8] = include_bytes!("../../../../app/assets/wires.svg");
+    let button = toolbar_icon_button(ui, WIRES_SVG, "~");
+    let small = |text: &str| egui::RichText::new(text).small().weak();
+    let resp = egui::containers::menu::MenuButton::from_button(button)
+        .ui(ui, |ui| {
+            use crate::settings::AutomapGlow;
+            use egui_snarl::ui::WireRouting;
+            ui.set_min_width(240.0);
+
+            ui.label(small("Route"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut grid.wires, WireRouting::Direct, "Direct")
+                    .on_hover_text("A plain curve from pin to pin, over whatever's in between.");
+                ui.selectable_value(&mut grid.wires, WireRouting::Around, "Around").on_hover_text(concat!(
+                    "The shortest way round the modules in the way, straight wherever nothing is: ",
+                    "a flowing curve. Wires going round a module together go round it side by side.",
+                ));
+                ui.selectable_value(&mut grid.wires, WireRouting::Grid, "Along the grid").on_hover_text(concat!(
+                    "Along the grid's lines through the gaps, side by side where they share one, ",
+                    "like traces on a circuit board.",
+                ));
+            });
+            if grid.wires == WireRouting::Around {
+                ui.horizontal(|ui| {
+                    ui.label(small("Clearance"));
+                    ui.add(egui::Slider::new(&mut grid.clearance, 0.0..=48.0).suffix(" pt").max_decimals(0))
+                        .on_hover_text("How wide a berth wires give the modules they go round.");
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label(small("Highlight"));
+                ui.add(egui::Slider::new(&mut grid.focus, 0.0..=1.0).custom_formatter(|v, _| {
+                    if v <= 0.0 { "Off".into() } else { format!("{:.0}%", v * 100.0) }
+                }))
+                .on_hover_text(concat!(
+                    "How much a hovered or selected module's wires stand out: they thicken a ",
+                    "little and the rest of the patch dims.",
+                ));
+            });
+
+            ui.separator();
+            ui.label(small("Activity glow"));
+            ui.horizontal(|ui| {
+                crate::widgets::range_slider(ui, &mut grid.glow_min, &mut grid.glow_max, 0.0..=1.0, 150.0)
+                    .on_hover_text(concat!(
+                        "How strongly pins and wires light up with activity: the least any activity ",
+                        "glows (left handle) to the most full activity does (right handle). Both at ",
+                        "the left turns the glow off.",
+                    ));
+                ui.label(egui::RichText::new(format!(
+                    "{:.0}–{:.0}%",
+                    grid.glow_min * 100.0,
+                    grid.glow_max * 100.0
+                ))
+                .small()
+                .monospace());
+            });
+            ui.label(small("An Auto-Map bus glows for"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut grid.automap_glow, AutomapGlow::Any, "Any value")
+                    .on_hover_text("Any reading of the device away from zero.");
+                ui.selectable_value(&mut grid.automap_glow, AutomapGlow::Changes, "Movement").on_hover_text(concat!(
+                    "Readings moving away from where they rest: a pad lying still (its ",
+                    "accelerometer reading gravity) or a value left somewhere stops glowing once ",
+                    "it settles. Something held over keeps glowing for a good while.",
+                ));
+                ui.selectable_value(&mut grid.automap_glow, AutomapGlow::Live, "Live input").on_hover_text(concat!(
+                    "Only readings that mean something right now: a touchpad's position and ",
+                    "pressure count only while there's a touch.",
+                ));
+            });
+        })
+        .0;
+    resp.on_hover_text("Wires");
+    if grid != before {
+        set_canvas_grid_settings(ui.ctx(), grid);
+    }
+}
+
+/// A zoom-toolbar button showing an SVG icon (drawn white, tinted like the other
+/// buttons' text), rasterized once per pixel density; `fallback` text if the SVG
+/// doesn't render.
+fn toolbar_icon_button(ui: &egui::Ui, svg: &'static [u8], fallback: &str) -> egui::Button<'static> {
+    let px = (16.0 * ui.ctx().pixels_per_point()).round() as u32;
+    let key = egui::Id::new(("toolbar_icon", svg.as_ptr() as usize, px));
+    let tex = crate::widgets::tex_cache::get(ui.ctx(), key).or_else(|| {
+        let text = std::str::from_utf8(svg).ok()?;
+        let img = crate::canvas::viewer::rasterize_svg_recolored(
+            text, px, px, "override", egui::Color32::TRANSPARENT,
+        )?;
+        let handle = ui.ctx().load_texture(format!("toolbar_icon_{:p}", svg.as_ptr()), img, egui::TextureOptions::LINEAR);
+        crate::widgets::tex_cache::put(ui.ctx(), key, handle.clone());
+        Some(handle)
+    });
+    match tex {
+        Some(tex) => egui::Button::image(
+            egui::Image::new(&tex)
+                .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                .tint(ui.visuals().widgets.inactive.fg_stroke.color),
+        ),
+        None => egui::Button::new(egui::RichText::new(fallback.to_owned()).monospace()),
+    }
+    .min_size(egui::vec2(24.0, 22.0))
 }
 
 /// Apply a new zoom level while keeping `pivot` (screen-space point) fixed.
@@ -3942,6 +4179,9 @@ mod usb_audio_switch_tests {
         assert_eq!(canvas.snarl.wires().count(), 1);
     }
 }
+
+#[cfg(test)]
+mod grid_tests;
 
 /// A finger held on a wire, through the real canvas and its real menu.
 #[cfg(test)]
@@ -4389,7 +4629,7 @@ fn insert_between(
         .map(|p| p.signal_type);
 
     snarl.disconnect(out_id, in_id);
-    let new_id = snarl.insert_node(insert_pos, NodeData::from(desc));
+    let new_id = snarl.insert_node_placed(insert_pos, NodeData::from(desc));
 
     if let Some(idx) = desc.inputs.iter().position(|p| out_type.map_or(true, |t| p.signal_type.accepts(t))) {
         snarl.connect(out_id, InPinId { node: new_id, input: idx });

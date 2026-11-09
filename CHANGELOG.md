@@ -3,6 +3,43 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **A layout grid on the canvas.** Modules snap to a grid of blocks as they're
+  dragged (Alt drags freely), with their edges in the middle of a block and their
+  size in whole blocks, so there's always a block's gap between two. A module
+  dropped onto others, or grown into them, pushes them aside; so does one added
+  from the menu, pasted (at the pointer) or inserted on a wire, which stays where
+  it was put. The grid is drawn as faint crosses on the block corners (or lines,
+  or dashed lines), a little brighter every 8 blocks, with a brightness slider
+  for low-contrast themes. The I/O nodes Easy mode places around its sub-patch
+  sit on the grid too.
+- **Wires that go around modules.** By default a wire is a plain curve where its
+  way is clear and takes the shortest way round any module in its way, with a
+  berth you set; wires going round a module together go round it side by side.
+  Or, along the grid: wires run along the grid's lines like traces on a circuit
+  board, each in its own lane with clear space between where they share a gap,
+  ordered so they cross as little as they can, eased into an S where pins nearly
+  line up; a gap with more wires than fit widens, moving the modules beside it
+  apart. Or plain curves straight over everything, as before. A dark edge shows
+  which wire crosses over which.
+- **A module's wires stand out.** Hovering or selecting a module thickens its
+  wires a little and dims the rest of the patch, except the modules its wires
+  lead to.
+- **A wires menu** on the zoom toolbar, beside the grid menu: how wires are
+  routed, how much a module's wires stand out (0 turns it off), the range the
+  activity glow is shown in, and what makes an Auto-Map bus glow: any reading,
+  only readings moving from where they rest (a pad lying still goes dark), or
+  only live input (a touchpad's position only while it's touched).
+- **One layout for module bodies.** Delay, Average, DC Filter, Inverse,
+  Quantize, Logic Delay, Counter, Has Changed, Greater / Less Than and Vec to
+  Deflection are rebuilt on a shared body kit (label column, one flexible
+  control per row, value boxes on a shared right edge) and get a width grip on
+  their corner. The rules are in `docs/MODULE_UI_GUIDELINES.md`; the other
+  modules follow.
+
 ## [0.17.1] - 2026-11-10
 
 ### Added

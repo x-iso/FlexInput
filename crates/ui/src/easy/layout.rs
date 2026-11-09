@@ -62,6 +62,15 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
     let meas_w = |id: NodeId, fb: f32| measured.get(&id.0).map(|r| r[2]).filter(|w| *w > 1.0).unwrap_or(fb);
     let meas_h = |id: NodeId, fb: f32| measured.get(&id.0).map(|r| r[3]).filter(|h| *h > 1.0).unwrap_or(fb);
 
+    // On the layout grid (seen when the tab is opened in Advanced mode) the
+    // columns keep a block from the sub-patch and from each other, and the
+    // sub-patch itself sits on the grid: the measured frames are whole blocks
+    // then, so every I/O node lands on the grid too, with a block line down
+    // each gap for the wires.
+    let grid = ctx.and_then(crate::canvas::canvas_grid).filter(|g| g.snap);
+    let (edge_gap, stack_gap) = grid.map_or((EDGE_GAP, STACK_GAP), |g| (g.block, g.block));
+    let frame_offset = canvas.node_frame_offset();
+
     let snarl = &mut canvas.snarl;
 
     // Locate the sub-patch. Prefer its REAL measured width (covers all chrome +
@@ -85,7 +94,21 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
         }
     }
     let (subpatch_pos, sp_w) = match subpatch {
-        Some((id, pos)) => (pos, meas_w(id, sp_bbox_w)),
+        Some((id, pos)) => {
+            let pos = match grid {
+                Some(g) => {
+                    let snapped = g.snap_pos(pos, frame_offset);
+                    if let Some(info) = snarl.get_node_info_mut(id) {
+                        if info.pos.distance(snapped) > 0.5 {
+                            info.pos = snapped;
+                        }
+                    }
+                    snapped
+                }
+                None => pos,
+            };
+            (pos, meas_w(id, sp_bbox_w))
+        }
         None => (egui::pos2(0.0, 0.0), FALLBACK_SUBPATCH_W),
     };
 
@@ -114,7 +137,7 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
     let sinks: Vec<NodeId> = gamepad_sinks.into_iter().chain(keymouse_sinks).collect();
 
     // Sinks column: left edge EDGE_GAP px right of the sub-patch's right edge.
-    let sink_x = subpatch_pos.x + sp_w + EDGE_GAP;
+    let sink_x = subpatch_pos.x + sp_w + edge_gap;
 
     // Stack a column downward from the sub-patch top: first node top-aligned with
     // the sub-patch, each subsequent node STACK_GAP below the PREVIOUS node's
@@ -128,7 +151,7 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
         for &id in ids {
             let w = meas_w(id, fb_w);
             let h = meas_h(id, fb_h);
-            let x = if right_aligned { subpatch_pos.x - EDGE_GAP - w } else { sink_x };
+            let x = if right_aligned { subpatch_pos.x - edge_gap - w } else { sink_x };
             let target = egui::pos2(x, y);
             if let Some(info) = snarl.get_node_info_mut(id) {
                 // Only write when it actually moves — the per-frame Easy reflow
@@ -138,7 +161,7 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
                     info.pos = target;
                 }
             }
-            y += h + STACK_GAP;
+            y += h + stack_gap;
         }
     };
     place_column(snarl, &sources, true, FALLBACK_DEVICE_W, FALLBACK_DEVICE_H);

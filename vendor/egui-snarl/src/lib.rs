@@ -210,6 +210,10 @@ pub struct Snarl<T> {
     // #[cfg_attr(feature = "serde", serde(with = "serde_nodes"))]
     nodes: Slab<Node<T>>,
     wires: Wires,
+    /// FLEXINPUT PATCH: nodes to settle on the layout grid once they've been drawn and
+    /// measured, with how many more frames to wait. See [`Snarl::insert_node_placed`].
+    #[cfg_attr(feature = "serde", serde(skip))]
+    placing: Vec<(NodeId, u8)>,
 }
 
 impl<T> Snarl<T> {
@@ -226,6 +230,7 @@ impl<T> Snarl<T> {
         Snarl {
             nodes: Slab::new(),
             wires: Wires::new(),
+            placing: Vec::new(),
         }
     }
 
@@ -247,6 +252,25 @@ impl<T> Snarl<T> {
         });
 
         NodeId(idx)
+    }
+
+    /// FLEXINPUT PATCH: adds a node the user is placing, as [`Self::insert_node`] does.
+    /// On the layout grid it then snaps to the grid, and moves to the nearest spot clear
+    /// of other nodes if it landed on one.
+    pub fn insert_node_placed(&mut self, pos: egui::Pos2, node: T) -> NodeId {
+        let id = self.insert_node(pos, node);
+        self.place_node(id);
+        id
+    }
+
+    /// FLEXINPUT PATCH: settles a node on the layout grid, as for
+    /// [`Self::insert_node_placed`]. Nodes marked in the same frame move together, so a
+    /// pasted group keeps its shape.
+    pub fn place_node(&mut self, id: NodeId) {
+        if self.nodes.contains(id.0) && !self.placing.iter().any(|&(n, _)| n == id) {
+            // A node's first frame measures it; the second has it at its size.
+            self.placing.push((id, 2));
+        }
     }
 
     /// Adds a node to the Snarl in collapsed state.

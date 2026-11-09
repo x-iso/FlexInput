@@ -54,7 +54,7 @@ pub(crate) fn show_module_menu(
             crate::touch::menu_list_scroll(ui, |ui| {
                 for desc in cat_modules {
                     if ui.button(desc.display_name).clicked() {
-                        let node_id = snarl.insert_node(pos, NodeData::from(desc));
+                        let node_id = snarl.insert_node_placed(pos, NodeData::from(desc));
                         if let Some(wire) = &wire {
                             connect_dropped_wires(snarl, wire, desc, node_id);
                         }

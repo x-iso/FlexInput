@@ -1043,6 +1043,7 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(
             "Behavior when a .fxp is loaded into a tab. 'Off' preserves the current view."
         ).small().color(egui::Color32::from_gray(140)));
+
     }
 
     fn settings_gamepad_nav(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {

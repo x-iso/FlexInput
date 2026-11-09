@@ -39,6 +39,62 @@ pub(crate) fn slider_track_double_clicked(ui: &egui::Ui, slider_resp: &egui::Res
 
 /// Fixed-width label cell used to align the leading column across the
 /// Deadzone / Gyro × / Mouse × slider rows in a device-node header.
+/// A slider with two handles, picking a range `lo..=hi` within `bounds`, `width`
+/// wide. A drag moves whichever handle is nearer where it starts (the higher one
+/// when they sit together and the drag starts to their right), and neither handle
+/// passes the other. The span between them is drawn in the selection colour.
+pub(crate) fn range_slider(
+    ui: &mut egui::Ui,
+    lo: &mut f32,
+    hi: &mut f32,
+    bounds: std::ops::RangeInclusive<f32>,
+    width: f32,
+) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click_and_drag());
+    let knob = h * 0.35;
+    let rail = rect.shrink2(egui::vec2(knob, 0.0));
+    let (b0, b1) = (*bounds.start(), *bounds.end());
+    let x_of = |v: f32| egui::remap_clamp(v, b0..=b1, rail.left()..=rail.right());
+    let v_of = |x: f32| egui::remap_clamp(x, rail.left()..=rail.right(), b0..=b1);
+
+    let which = resp.id.with("range_handle");
+    if resp.drag_started() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let (dl, dh) = ((p.x - x_of(*lo)).abs(), (p.x - x_of(*hi)).abs());
+            let upper = dh < dl || (dh == dl && p.x > x_of(*hi));
+            ui.ctx().data_mut(|d| d.insert_temp(which, upper));
+        }
+    }
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let v = v_of(p.x);
+            let upper = ui.ctx().data(|d| d.get_temp::<bool>(which)).unwrap_or(false);
+            let before = (*lo, *hi);
+            if upper {
+                *hi = v.max(*lo);
+            } else {
+                *lo = v.min(*hi);
+            }
+            if (*lo, *hi) != before {
+                resp.mark_changed();
+            }
+        }
+    }
+
+    let visuals = ui.style().interact(&resp);
+    let painter = ui.painter();
+    let y = rect.center().y;
+    let rail_stroke = egui::Stroke::new(4.0_f32, ui.visuals().widgets.inactive.bg_fill);
+    painter.line_segment([egui::pos2(rail.left(), y), egui::pos2(rail.right(), y)], rail_stroke);
+    let span = egui::Stroke::new(4.0_f32, ui.visuals().selection.bg_fill);
+    painter.line_segment([egui::pos2(x_of(*lo), y), egui::pos2(x_of(*hi), y)], span);
+    for v in [*lo, *hi] {
+        painter.circle(egui::pos2(x_of(v), y), knob, visuals.bg_fill, visuals.fg_stroke);
+    }
+    resp
+}
+
 pub(crate) fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
     let (cell, _) = ui.allocate_exact_size(
         egui::vec2(cell_w, 18.0),

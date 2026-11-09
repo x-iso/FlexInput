@@ -479,6 +479,10 @@ pub struct AppSettings {
     /// What to do with the camera when a patch is loaded into a tab.
     #[serde(default)]
     pub on_patch_load: OnPatchLoad,
+    /// The canvas's layout grid: snapping modules to blocks, routing wires
+    /// through the gaps between them.
+    #[serde(default)]
+    pub canvas_grid: CanvasGrid,
     /// Profiler toggle. When true the app spawns a `puffin_http` server on
     /// 127.0.0.1:8585 and flips `puffin::set_scopes_on(true)` so the macros
     /// scattered through the hot paths actually emit events. Connect from
@@ -802,6 +806,100 @@ pub enum OnPatchLoad {
     ZoomToFit,
 }
 
+/// The canvas's layout grid. Modules sit on a grid of square blocks with their
+/// edges on block centers, so there's always at least a block's gap between
+/// two, and wires run along the block lines down the middle of those gaps.
+/// Edited from the canvas's zoom toolbar.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CanvasGrid {
+    /// Draw the grid on the canvas.
+    pub show: bool,
+    /// How it's drawn: lines, dashed lines, or crosses on the block corners.
+    pub style: egui_snarl::ui::GridStyle,
+    /// Every this many blocks a line is a little brighter (0: none).
+    pub accent_every: u32,
+    /// How bright the grid is drawn, times its usual faintness (1 is usual);
+    /// low-contrast themes need it brighter to see it at all.
+    pub brightness: f32,
+    /// Snap modules to the grid as they're dragged (Alt drags freely), and
+    /// size them in whole blocks.
+    pub snap: bool,
+    /// Push modules out of the way of one dropped onto them or grown into them.
+    pub push: bool,
+    /// How wires are drawn: straight over the modules, around them, or along
+    /// the grid's lines. (A new field, not the old `route_wires` flag, so a
+    /// settings file from before still loads: the flag is ignored.)
+    pub wires: egui_snarl::ui::WireRouting,
+    /// How much the wires of the hovered or selected module stand out (0 to 1):
+    /// they thicken a little and the rest of the patch dims. 0 is off.
+    pub focus: f32,
+    /// How far wires going around modules keep from them, in canvas points.
+    pub clearance: f32,
+    /// The range activity glow is shown in (0 to 1): the least any activity
+    /// glows, and the most full activity does.
+    pub glow_min: f32,
+    pub glow_max: f32,
+    /// What makes an Auto-Map bus glow.
+    pub automap_glow: AutomapGlow,
+}
+
+/// What makes an Auto-Map bus (and its wires) glow: which of the source
+/// device's readings count as activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AutomapGlow {
+    /// Any reading away from zero.
+    Any,
+    /// Readings moving away from where they rest: an accelerometer reading
+    /// gravity, or a value parked somewhere, stops counting once it settles.
+    Changes,
+    /// Only readings that mean something right now: a touch position counts
+    /// only while there's a touch.
+    #[default]
+    Live,
+}
+
+impl Default for CanvasGrid {
+    fn default() -> Self {
+        Self {
+            show: true,
+            style: egui_snarl::ui::GridStyle::Crosses,
+            accent_every: 8,
+            brightness: 1.0,
+            snap: true,
+            push: true,
+            wires: egui_snarl::ui::WireRouting::Around,
+            focus: 0.5,
+            clearance: 12.0,
+            glow_min: 0.0,
+            glow_max: 1.0,
+            automap_glow: AutomapGlow::Live,
+        }
+    }
+}
+
+impl CanvasGrid {
+    /// The one block size modules are laid out in, in canvas points: modules
+    /// are designed in multiples of it, so it isn't a setting.
+    pub const BLOCK: f32 = 56.0;
+
+    /// The snarl style's grid for these settings, `None` when it does nothing.
+    pub fn layout(self) -> Option<egui_snarl::ui::GridLayout> {
+        let routed = self.wires != egui_snarl::ui::WireRouting::Direct;
+        (self.show || self.snap || routed).then(|| egui_snarl::ui::GridLayout {
+            block: Self::BLOCK,
+            show: self.show,
+            style: self.style,
+            accent_every: self.accent_every,
+            brightness: self.brightness.clamp(0.0, 8.0),
+            snap: self.snap,
+            push: self.push && self.snap,
+            wires: self.wires,
+            clearance: self.clearance.max(0.0),
+        })
+    }
+}
+
 /// Repaint rate (Hz) applied ONLY while the window is unfocused or
 /// minimized. The focused window always paints at vsync — the user is
 /// actively tweaking and visual smoothness matters there. Background
@@ -885,6 +983,7 @@ impl Default for AppSettings {
             raw_pad_profiles: HashMap::new(),
             renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
+            canvas_grid: CanvasGrid::default(),
             profiler_enabled: false,
             ui_mode: UiMode::Easy,
             user_presets_folder: None,

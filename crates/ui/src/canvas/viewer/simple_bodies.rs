@@ -1519,125 +1519,7 @@ pub(crate) fn glyph_texture(
     Some(handle)
 }
 
-pub(crate) fn show_counter_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (mode, normalized, step_p, min_p, max_p) = snarl.get_node(node_id).map(|n| {
-        let mode       = n.params.get("mode")      .and_then(|v| v.as_str()) .unwrap_or("loop").to_string();
-        let normalized = n.params.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
-        let step_p     = n.params.get("step_param").and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
-        let min_p      = n.params.get("min_param") .and_then(|v| v.as_f64()).unwrap_or(0.0)  as f32;
-        let max_p      = n.params.get("max_param") .and_then(|v| v.as_f64()).unwrap_or(10.0) as f32;
-        (mode, normalized, step_p, min_p, max_p)
-    }).unwrap_or_default();
 
-    let step_wired  = inputs.get(3).map(|p| !p.remotes.is_empty()).unwrap_or(false);
-    let min_wired   = inputs.get(4).map(|p| !p.remotes.is_empty()).unwrap_or(false);
-    let max_wired   = inputs.get(5).map(|p| !p.remotes.is_empty()).unwrap_or(false);
-
-    let mut mode       = mode;
-    let mut normalized = normalized;
-    let mut step_p     = step_p;
-    let mut min_p      = min_p;
-    let mut max_p      = max_p;
-    let mut changed    = false;
-
-    let mut mode_rect:    Option<egui::Rect> = None;
-    let mut range_rect:   Option<egui::Rect> = None;
-    let mut step_rect:    Option<egui::Rect> = None;
-    let mut minmax_rect:  Option<egui::Rect> = None;
-    ui.vertical(|ui| {
-        // Row 1: counting mode
-        let r = ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut mode, "loop".into(),      egui::RichText::new("Loop").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "limit".into(),     egui::RichText::new("Limit").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "bounce".into(),    egui::RichText::new("Bounce").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "unlimited".into(), egui::RichText::new("Unlimited").small()).changed();
-        });
-        mode_rect = Some(r.response.rect);
-
-        // Row 2: output range + reset button
-        let r = ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut normalized, false, egui::RichText::new("Raw").small()).changed();
-            changed |= ui.selectable_value(&mut normalized, true,  egui::RichText::new("0..1").small()).changed();
-            if ui.small_button("↺").on_hover_text("Reset counter").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    while node.extra.aux_f32.len() < 2 { node.extra.aux_f32.push(0.0); }
-                    node.extra.aux_f32[0] = 0.0;
-                    node.extra.aux_f32[1] = 1.0;
-                    node.extra.aux_f32_dirty = true;
-                }
-            }
-        });
-        range_rect = Some(r.response.rect);
-
-        // Row 3: Step
-        let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Step").small().weak());
-            changed |= ui.add_enabled(!step_wired, egui::DragValue::new(&mut step_p).speed(0.1).range(0.001..=10000.0)).changed();
-        });
-        step_rect = Some(r.response.rect);
-
-        // Row 4: Min / Max
-        let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Min").small().weak());
-            changed |= ui.add_enabled(!min_wired, egui::DragValue::new(&mut min_p).speed(0.1)).changed();
-            ui.label(egui::RichText::new("Max").small().weak());
-            let max_active = !max_wired && mode != "unlimited";
-            changed |= ui.add_enabled(max_active, egui::DragValue::new(&mut max_p).speed(0.1)).changed();
-        });
-        minmax_rect = Some(r.response.rect);
-    });
-    if let Some(r) = mode_rect   { register_exposable_element(ui, node_id, "mode",       r); }
-    if let Some(r) = range_rect  { register_exposable_element(ui, node_id, "range_mode", r); }
-    if let Some(r) = step_rect   { register_exposable_element(ui, node_id, "step",       r); }
-    if let Some(r) = minmax_rect { register_exposable_element(ui, node_id, "min_max",    r); }
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("mode".into(),       Value::String(mode));
-            node.params.insert("normalized".into(), Value::Bool(normalized));
-            if let Some(n) = Number::from_f64(step_p as f64) { node.params.insert("step_param".into(), Value::Number(n)); }
-            if let Some(n) = Number::from_f64(min_p  as f64) { node.params.insert("min_param".into(),  Value::Number(n)); }
-            if let Some(n) = Number::from_f64(max_p  as f64) { node.params.insert("max_param".into(),  Value::Number(n)); }
-        }
-    }
-}
-
-pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (mode, time, unit) = snarl.get_node(node_id).map(|n| {
-        let mode = n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("delay_false").to_string();
-        let time = n.params.get("time").and_then(|v| v.as_f64()).unwrap_or(100.0);
-        let unit = n.params.get("unit").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
-        (mode, time, unit)
-    }).unwrap_or_default();
-
-    let mut mode = mode;
-    let mut time = time as f32;
-    let mut unit = unit;
-    let mut changed = false;
-
-    let r1 = ui.horizontal(|ui| {
-        changed |= ui.selectable_value(&mut mode, "delay_true".into(),  egui::RichText::new("Delay ON").small()).changed();
-        changed |= ui.selectable_value(&mut mode, "delay_false".into(), egui::RichText::new("Delay OFF").small()).changed();
-    });
-    let r2 = ui.horizontal(|ui| {
-        let limit = if unit == "ms" { 60_000.0 } else { 10_000.0 };
-        changed |= ui.add(egui::DragValue::new(&mut time).speed(1.0).range(0.0..=limit)).changed();
-        changed |= ui.selectable_value(&mut unit, "ms".into(),      egui::RichText::new("ms").small()).changed();
-        changed |= ui.selectable_value(&mut unit, "samples".into(), egui::RichText::new("frames").small()).changed();
-    });
-    register_exposable_element(ui, node_id, "mode", r1.response.rect);
-    register_exposable_element(ui, node_id, "time", r2.response.rect);
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("mode".into(), Value::String(mode));
-            node.params.insert("unit".into(), Value::String(unit));
-            if let Some(n) = Number::from_f64(time as f64) {
-                node.params.insert("time".into(), Value::Number(n));
-            }
-        }
-    }
-}
 
 /// How Has Changed's hysteresis reads on its field. It is stored as a percentage
 /// of the bus (`hysteresis_pct`, as a Two-way Curve's is), and shown in °/s or G
@@ -1667,7 +1549,7 @@ impl HysteresisField {
         Self { scale, suffix, speed, decimals, nav_step }
     }
 
-    fn drag<'a>(&self, shown: &'a mut f32) -> egui::DragValue<'a> {
+    pub(crate) fn drag<'a>(&self, shown: &'a mut f32) -> egui::DragValue<'a> {
         egui::DragValue::new(shown)
             .speed(self.speed)
             .range(0.0..=100.0 * self.scale)
@@ -1676,7 +1558,7 @@ impl HysteresisField {
     }
 }
 
-fn has_changed_hysteresis(node_id: NodeId, snarl: &Snarl<NodeData>) -> Option<(HysteresisField, f32)> {
+pub(crate) fn has_changed_hysteresis(node_id: NodeId, snarl: &Snarl<NodeData>) -> Option<(HysteresisField, f32)> {
     let node = snarl.get_node(node_id)?;
     let field = HysteresisField::of(node);
     let pct = node.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -1684,25 +1566,12 @@ fn has_changed_hysteresis(node_id: NodeId, snarl: &Snarl<NodeData>) -> Option<(H
     Some((field, shown))
 }
 
-fn set_has_changed_hysteresis(node_id: NodeId, snarl: &mut Snarl<NodeData>, shown: f32, field: &HysteresisField) {
+pub(crate) fn set_has_changed_hysteresis(node_id: NodeId, snarl: &mut Snarl<NodeData>, shown: f32, field: &HysteresisField) {
     if let (Some(node), Some(n)) = (snarl.get_node_mut(node_id), Number::from_f64((shown / field.scale) as f64)) {
         node.params.insert("hysteresis_pct".into(), Value::Number(n));
     }
 }
 
-pub(crate) fn show_has_changed_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let Some((field, mut shown)) = has_changed_hysteresis(node_id, snarl) else { return };
-    let r = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Hysteresis").small())
-            .on_hover_text("Ignores movement smaller than this, like noise or a shaky hand. It reacts once \
-                            the input has moved this far from where it last reacted. 0 = every change counts.");
-        ui.add(field.drag(&mut shown)).changed()
-    });
-    register_exposable_element(ui, node_id, "hysteresis", r.response.rect);
-    if r.inner {
-        set_has_changed_hysteresis(node_id, snarl, shown, &field);
-    }
-}
 
 /// Has Changed's hysteresis row as a pinned widget: the value box takes the
 /// frame's spare width.
@@ -1762,137 +1631,9 @@ pub(crate) fn show_sample_hold_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     register_exposable_element(ui, node_id, "mode", rect);
 }
 
-/// Inverse (module id `math.negate`): bipolar `-v` by default, or a unipolar
-/// mirror inside `0..max` when the checkbox is ticked. The max box is greyed
-/// out while unipolar is off since it has no effect there.
-pub(crate) fn show_inverse_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (unipolar, max) = snarl.get_node(node_id).map(|n| {
-        let unipolar = n.params.get("unipolar").and_then(|v| v.as_bool()).unwrap_or(false);
-        let max = n.params.get("unipolar_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-        (unipolar, max)
-    }).unwrap_or((false, 1.0));
 
-    let mut unipolar = unipolar;
-    let mut max = max;
-    let mut changed = false;
 
-    let r = ui.vertical(|ui| {
-        changed |= ui
-            .checkbox(&mut unipolar, egui::RichText::new("Unipolar").small())
-            .on_hover_text("Mirror the signal inside 0..max instead of flipping its sign")
-            .changed();
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(unipolar, |ui| {
-                ui.label(egui::RichText::new("max").small());
-                changed |= ui
-                    .add(egui::DragValue::new(&mut max).speed(0.01).range(0.0..=1000.0))
-                    .on_hover_text("Input value that maps to 0; also the output at input 0")
-                    .changed();
-            });
-        });
-    });
-    register_exposable_element(ui, node_id, "unipolar", r.response.rect);
 
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("unipolar".into(), Value::Bool(unipolar));
-            if let Some(n) = Number::from_f64(max as f64) {
-                node.params.insert("unipolar_max".into(), Value::Number(n));
-            }
-        }
-    }
-}
-
-/// Quantize (`math.quantize`): grid factor + rounding mode. The factor box is
-/// greyed out while the Factor pin is wired, since the wire wins.
-pub(crate) fn show_quantize_body(
-    node_id: NodeId,
-    inputs: &[InPin],
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
-) {
-    let (factor, mode) = snarl.get_node(node_id).map(|n| {
-        let f = n.params.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-        let m = n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("round").to_string();
-        (f, m)
-    }).unwrap_or((1.0, "round".to_string()));
-
-    let factor_wired = inputs.get(1).map(|p| !p.remotes.is_empty()).unwrap_or(false);
-
-    let mut factor = factor;
-    let mut mode = mode;
-    let mut changed = false;
-
-    let r1 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("factor").small());
-        ui.add_enabled_ui(!factor_wired, |ui| {
-            changed |= ui
-                .add(egui::DragValue::new(&mut factor).speed(0.05).range(0.0..=10_000.0))
-                .on_hover_text("Steps per unit: 1 = integers, 2 = halves, 4 = quarters")
-                .changed();
-        });
-        if factor_wired {
-            ui.label(egui::RichText::new("(wired)").small().weak());
-        }
-    });
-    let r2 = ui.horizontal(|ui| {
-        changed |= ui.selectable_value(&mut mode, "round".into(), egui::RichText::new("Round").small()).changed();
-        changed |= ui.selectable_value(&mut mode, "floor".into(), egui::RichText::new("Floor").small()).changed();
-        changed |= ui.selectable_value(&mut mode, "ceil".into(),  egui::RichText::new("Ceil").small()).changed();
-        changed |= ui.selectable_value(&mut mode, "trunc".into(), egui::RichText::new("Trunc").small()).changed();
-    });
-    register_exposable_element(ui, node_id, "factor", r1.response.rect);
-    register_exposable_element(ui, node_id, "mode",   r2.response.rect);
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("mode".into(), Value::String(mode));
-            if let Some(n) = Number::from_f64(factor as f64) {
-                node.params.insert("factor".into(), Value::Number(n));
-            }
-        }
-    }
-}
-
-/// Vec to Deflection (`module.vec_to_deflection`): pick the Angle output's unit.
-pub(crate) fn show_vec_to_deflection_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let degrees = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("degrees").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let mut degrees = degrees;
-    let mut changed = false;
-
-    let r = ui.horizontal(|ui| {
-        changed |= ui
-            .selectable_value(&mut degrees, false, egui::RichText::new("0..1").small())
-            .on_hover_text("Angle as a fraction of a full turn, wrapping to 0 at 1")
-            .changed();
-        changed |= ui
-            .selectable_value(&mut degrees, true, egui::RichText::new("0..360°").small())
-            .on_hover_text("Angle in degrees, wrapping to 0 at 360")
-            .changed();
-    });
-    register_exposable_element(ui, node_id, "angle_unit", r.response.rect);
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("degrees".into(), Value::Bool(degrees));
-        }
-    }
-}
-
-pub(crate) fn show_or_equal_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let or_equal = snarl
-        .get_node(node_id)
-        .and_then(|n| n.params.get("or_equal").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let mut v = or_equal;
-    if ui.checkbox(&mut v, egui::RichText::new("or equal").small()).changed() {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("or_equal".to_string(), Value::Bool(v));
-        }
-    }
-}
 
 pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let (value, bipolar) = snarl.get_node(node_id).map(|n| {
@@ -2223,139 +1964,5 @@ pub(crate) fn clear_unused_inputs(
 
 // ── Processing module body renderers ──────────────────────────────────────────
 
-pub(crate) fn show_delay_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let delay_ms = snarl
-        .get_node(node_id)
-        .and_then(|n| n.params.get("delay_ms").and_then(|v| v.as_f64()))
-        .unwrap_or(100.0) as f32;
-    let mut v = delay_ms;
-    let r = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("ms").small());
-        if ui
-            .add(egui::DragValue::new(&mut v).speed(1.0).range(0.0..=60_000.0))
-            .changed()
-        {
-            if let (Some(node), Some(n)) = (
-                snarl.get_node_mut(node_id),
-                Number::from_f64(v as f64),
-            ) {
-                node.params.insert("delay_ms".into(), Value::Number(n));
-            }
-        }
-    });
-    register_exposable_element(ui, node_id, "ms", r.response.rect);
-    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Ch").small().weak());
-        if ui.small_button("+").on_hover_text("Add channel").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len() + 1;
-                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
-                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
-            }
-        }
-        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-        }
-    });
-}
 
-pub(crate) fn show_average_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (window_ms, spike_mad) = snarl
-        .get_node(node_id)
-        .map(|n| {
-            let ms = flexinput_engine::eval::average_window_ms(&n.params) as f32;
-            let sm = n.params.get("spike_mad").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-            (ms, sm)
-        })
-        .unwrap_or((5.0, 0.0));
 
-    let mut ms = window_ms;
-    let mut sm = spike_mad;
-    let mut changed = false;
-
-    let r1 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Window ms").small());
-        changed |= ui.add(egui::DragValue::new(&mut ms).speed(0.5).range(0.5..=5_000.0).max_decimals(1)).changed();
-    });
-    let r2 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Spike MAD").small())
-            .on_hover_text("Outlier threshold in median absolute deviations. 0 = off. Try 3.0 to start.");
-        changed |= ui.add(egui::DragValue::new(&mut sm).speed(0.1).range(0.0..=20.0).max_decimals(1)).changed();
-    });
-    register_exposable_element(ui, node_id, "samples",   r1.response.rect);
-    register_exposable_element(ui, node_id, "spike_mad", r2.response.rect);
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            if let Some(n) = Number::from_f64(ms as f64) { node.params.insert("window_ms".into(), Value::Number(n)); }
-            if let Some(n) = Number::from_f64(sm as f64) { node.params.insert("spike_mad".into(), Value::Number(n)); }
-        }
-    }
-
-    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Ch").small().weak());
-        if ui.small_button("+").on_hover_text("Add channel").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len() + 1;
-                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
-                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
-            }
-        }
-        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-        }
-    });
-}
-
-pub(crate) fn show_dc_filter_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (window_ms, decay_ms) = snarl
-        .get_node(node_id)
-        .map(|n| {
-            let w = n.params.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
-            let d = n.params.get("decay_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-            (w, d)
-        })
-        .unwrap_or((500.0, 200.0));
-
-    let mut w = window_ms;
-    let mut d = decay_ms;
-    let mut changed = false;
-
-    let r1 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Window ms").small());
-        changed |= ui.add(egui::DragValue::new(&mut w).speed(10.0).range(10.0..=60_000.0)).changed();
-    });
-    let r2 = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Decay ms").small());
-        changed |= ui.add(egui::DragValue::new(&mut d).speed(10.0).range(10.0..=60_000.0)).changed();
-    });
-    register_exposable_element(ui, node_id, "window_ms", r1.response.rect);
-    register_exposable_element(ui, node_id, "decay_ms",  r2.response.rect);
-
-    if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            if let Some(n) = Number::from_f64(w as f64) { node.params.insert("window_ms".into(), Value::Number(n)); }
-            if let Some(n) = Number::from_f64(d as f64) { node.params.insert("decay_ms".into(),  Value::Number(n)); }
-        }
-    }
-
-    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Ch").small().weak());
-        if ui.small_button("+").on_hover_text("Add channel").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len() + 1;
-                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
-                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
-            }
-        }
-        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-        }
-    });
-}
