@@ -805,19 +805,7 @@ pub(crate) fn mapping_curve_editor(
         if nav_focused || nav_sel_dot.is_some() || nav_curve_field.is_some() {
             let extra = if nav_curve_field == Some(6) { 32.0 } else { 0.0 };
             let target = egui::Rect::from_min_max(rect.min, rect.max + egui::vec2(0.0, extra));
-            let clip = ui.clip_rect();
-            let mut need = 0.0f32;
-            if target.top() < clip.top() + 4.0 {
-                need = target.top() - (clip.top() + 4.0);
-            } else if target.bottom() > clip.bottom() - 4.0 {
-                need = target.bottom() - (clip.bottom() - 4.0);
-            }
-            if need.abs() > 1.0 {
-                let vp = ui.ctx().viewport_id();
-                ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_remap_scroll", vp, uid)), (pass, need)));
-                request_repaint_throttled(ui.ctx());
-            }
+            nav_scroll_into_view(ui, uid, target, 1.0);
         }
     }
 

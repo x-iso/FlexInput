@@ -694,7 +694,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 // shared drawer is viewport-agnostic; run here so the ring appears
                 // over the overlay, not behind it in the main window).
                 if let Some((outer, inner, scope)) = &remap_glow {
-                    crate::app::draw_remap_card_glow(ui.ctx(), *outer, *inner, scope, ui.layer_id());
+                    crate::app::draw_remap_card_glow(
+                        ui.ctx(), *outer, *inner, scope, ui.layer_id(), ui.ctx().content_rect());
                 }
 
                 // Value-field bloom ring (knob / min-max / range rows). nav draws

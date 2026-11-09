@@ -55,6 +55,9 @@ use fonts::setup_fonts;
 use main_window::{paint_window_veil, window_facts, UiPassAcc, WindowFreeze, WindowStep, WAKE_PASSES};
 pub(crate) use graph::*;
 pub(crate) use nav::draw_remap_card_glow;
+pub(crate) use nav::{draw_requested_card_glow, draw_requested_field_hud, nav_card_focus_rect, nav_field_focus_rect};
+#[cfg(test)]
+pub(crate) use nav::request_card_glow;
 pub(crate) use nav::draw_config_field_glow;
 pub(crate) use subpatch::*;
 pub(crate) use threads::*;
@@ -3076,8 +3079,8 @@ impl FlexInputApp {
 
         // ── Virtual KB/M picker (modal: captures dpad/LS/South/North/East) ────
         if self.gamepad_nav.kbm_picker_open {
-            let step_dir = self.picker_step_dir(&nav, dt);
-            self.drive_kbm_picker(step_dir, &nav);
+            let step = self.picker_step(&nav, dt);
+            self.drive_kbm_picker(step, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
             return;
@@ -3262,16 +3265,16 @@ impl FlexInputApp {
         ctx.data_mut(|d| {
             d.insert_temp(egui::Id::new(("gp_nav_glow", outer_id.0)), (pass, editing))
         });
-        // Draw the mapping-card glow at top level (NOT inside the remapper
-        // body's child layer — that deadlocks epaint). Uses global rects the
-        // body published last frame.
+        // The mapping-card glow: the body paints it once it has rendered, from
+        // the rects it publishes this pass (NOT inside the remapper body's child
+        // layer — that deadlocks epaint).
         if matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::RemapScroll
             | crate::gamepad_nav::EditLevel::RemapCard
             | crate::gamepad_nav::EditLevel::RemapMove
             | crate::gamepad_nav::EditLevel::TzCards)
         {
-            self.nav_draw_remap_card_glow(ctx, outer_id);
+            self.nav_request_remap_card_glow(ctx, outer_id);
         }
     }
 
@@ -3310,14 +3313,21 @@ impl FlexInputApp {
         } else {
             0.5
         };
-        let stick = gn::stick_dir_past(nav.lstick, engage);
         let mag = nav.lstick.length();
-        if let Some(sd) = stick {
+        let rate = 6.0 + ((mag - 0.5) / 0.5).clamp(0.0, 1.0) * 12.0;
+        // Across the widgets the walk is 8-way: they're laid out in two
+        // dimensions, and a diagonal is the way to one that sits off both axes.
+        // Inside one (a list, a row of fields) it stays the four directions.
+        let mut step: Option<gn::NavStep> = None;
+        if self.gamepad_nav.edit_level == EditLevel::Widget {
+            let dpad = self.gamepad_nav.dpad_step(nav);
+            let stick = self.gamepad_nav.stick_repeat(nav.lstick, engage, rate, dt);
+            step = dpad.or(stick);
+        } else if let Some(sd) = gn::stick_dir_past(nav.lstick, engage) {
             if self.gamepad_nav.repeat_dir != Some(sd) {
                 self.gamepad_nav.repeat_dir = Some(sd);
                 self.gamepad_nav.repeat_accum = 1.0; // immediate first step
             }
-            let rate = 6.0 + ((mag - 0.5) / 0.5).clamp(0.0, 1.0) * 12.0;
             self.gamepad_nav.repeat_accum += dt * rate;
             if self.gamepad_nav.repeat_accum >= 1.0 {
                 self.gamepad_nav.repeat_accum -= 1.0;
@@ -3333,13 +3343,13 @@ impl FlexInputApp {
         match self.gamepad_nav.edit_level {
             EditLevel::Widget => {
                 // Move selection spatially.
-                if let Some(dir) = step_dir {
+                if let Some(step) = step {
                     // Seamless cross LEFT into the Devices panel: when already at
                     // the left-most sub-patch widget (a real selection with no
                     // left neighbour) and the panel is visible, hand focus to the
                     // panel instead of staying put. Consumes this frame; the panel
                     // takes over next frame.
-                    if matches!(dir, NavDir::Left) && !self.easy_left_panel_collapsed {
+                    if step == gn::NavStep::LEFT && !self.easy_left_panel_collapsed {
                         let at_left_edge = {
                             let canvas = &self.tabs[self.active_tab].canvas;
                             canvas.snarl.get_node(outer_id)
@@ -3383,12 +3393,16 @@ impl FlexInputApp {
                             .map(|i| Self::sp_item_is_editable(sp, i))
                             .collect();
                         let is_editable = |i: usize| editable.get(i).copied().unwrap_or(false);
-                        if let Some(next) = gn::nearest_in_dir(&sp.items, sp.selected_item, dir, &is_editable) {
+                        // Keeping to the lane it came down or across in: down onto a
+                        // wide widget from its right goes on down from the right.
+                        if let Some(next) = gn::walk_items(&sp.items, sp.selected_item, step, &is_editable,
+                            &mut self.gamepad_nav.easy_lane, outer_id.0 as u64)
+                        {
                             sp.selected_item = Some(next);
                             sp.selected_items = vec![next];
                         } else if sp.selected_item.is_none() {
                             // Seed selection at the first navigable item.
-                            if let Some(seed) = gn::nearest_in_dir(&sp.items, None, dir, &is_editable) {
+                            if let Some(seed) = gn::nearest_item_toward(&sp.items, None, step, &is_editable) {
                                 sp.selected_item = Some(seed);
                                 sp.selected_items = vec![seed];
                             }

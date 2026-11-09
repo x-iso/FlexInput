@@ -5,13 +5,16 @@ use super::*;
 
 impl FlexInputApp {
 
+    /// `step` walks the board 8-way (`picker_step`): its pad cluster is a
+    /// diamond and a plus, laid out the way the pad is.
     pub(crate) fn drive_kbm_picker(
         &mut self,
-        step_dir: Option<crate::gamepad_nav::NavDir>,
+        step: Option<crate::gamepad_nav::NavStep>,
         nav: &crate::gamepad_nav::NavInput,
     ) {
-        use crate::gamepad_nav::NavDir;
-        use crate::kbm_picker::{clamp_index, nearest_in_dir};
+        use crate::kbm_picker::{clamp_index, nearest_cell_toward};
+        // The chord list is a row: it takes the four directions only.
+        let step_dir = step.and_then(|s| s.cardinal());
 
         // RT's press edge: it inserts a gap.
         let rt_down = nav.rt > 0.5;
@@ -52,10 +55,10 @@ impl FlexInputApp {
         let chord_purpose = purpose == crate::gamepad_nav::PickerUse::Chord;
         // Up past the board's top row goes into the chord list, on its last
         // element — or on "+ Gap" when the list has nothing yet — when there's
-        // one to go to.
-        if chord_purpose && matches!(step_dir, Some(NavDir::Up))
-            && (cells.is_empty() || nearest_in_dir(&cells, idx, 0.0, -1.0, &usable) == idx)
-        {
+        // one to go to. Up-left and up-right with nothing that way too.
+        let up_past_top = step.is_some_and(|s| chord_purpose && s.y < 0
+            && (cells.is_empty() || nearest_cell_toward(&cells, idx, s, &usable) == idx));
+        if up_past_top {
             let n = self.picker_chord().elems(self.picker_side_timed()).len();
             if self.picker_list_stops() > 0 {
                 self.gamepad_nav.kbm_picker_list = Some(n.saturating_sub(1));
@@ -68,14 +71,11 @@ impl FlexInputApp {
             self.picker_edit_chord(crate::kbm_picker::ChordEdit::InsertGap(None));
             return;
         }
-        if !cells.is_empty() {
-            idx = match step_dir {
-                Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
-                Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0, &usable),
-                Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0, &usable),
-                Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0, &usable),
-                None => idx,
-            };
+        if let (false, Some(s)) = (cells.is_empty(), step) {
+            // Keeping to the lane it came down or across in (per tab).
+            let tab = self.picker_tab() as u64;
+            idx = crate::kbm_picker::walk_cells(&cells, idx, s, &usable,
+                &mut self.gamepad_nav.picker_lane, tab);
         }
         self.gamepad_nav.kbm_picker_idx = idx;
         // The focused cell — none on an empty tab (Macros, before there are any).
@@ -384,12 +384,27 @@ impl FlexInputApp {
     /// and control hints. Input is handled in `drive_kbm_picker`; this is
     /// display-only. Rendered top-level (not in a sublayer), so painting here is
     /// safe.
-    /// Resolve the picker's spatial-nav step this frame: D-pad = one discrete
-    /// step per press; left stick = continuous auto-repeat whose rate rises with
-    /// deflection (so a big push scrolls fast, a small one steps slowly). Uses
-    /// the shared `stick_dir` for direction so up/down match every other nav
-    /// (no Y inversion). Shared by the main-window picker loop and the config
-    /// overlay's (which owns nav while summoned).
+    /// Resolve the picker's spatial-nav step this frame, 8-way: D-pad = one
+    /// discrete step per press (two directions pressed together = the diagonal
+    /// between them); left stick = its 8-way direction (`stick_step`), on
+    /// continuous auto-repeat whose rate rises with deflection (so a big push
+    /// scrolls fast, a small one steps slowly). Shared by the main-window picker
+    /// loop and the config overlay's (which owns nav while summoned).
+    pub(crate) fn picker_step(
+        &mut self,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+    ) -> Option<crate::gamepad_nav::NavStep> {
+        if let Some(s) = self.gamepad_nav.dpad_step(nav) {
+            self.gamepad_nav.repeat_dir = None;
+            return Some(s);
+        }
+        let rate = 5.0 + ((nav.lstick.length() - 0.5) / 0.5).clamp(0.0, 1.0) * 13.0; // ~5..18 cells/s
+        self.gamepad_nav.stick_repeat(nav.lstick, 0.5, rate, dt)
+    }
+
+    /// [`Self::picker_step`] in the four directions, for the pickers that are
+    /// lists (the MIDI modal, the press-mode list).
     pub(crate) fn picker_step_dir(
         &mut self,
         nav: &crate::gamepad_nav::NavInput,

@@ -690,46 +690,51 @@ pub fn clamp_index(cells: &[PickerCell], idx: usize) -> usize {
     idx.min(cells.len().saturating_sub(1))
 }
 
-/// Center point of a cell in grid units (for spatial navigation + hit-testing).
-fn cell_center(cell: &PickerCell) -> (f32, f32) {
-    (cell.x + cell.width * 0.5, cell.y + 0.5)
+/// A cell's rect in grid units: one row tall.
+fn cell_rect(cell: &PickerCell) -> eframe::egui::Rect {
+    use eframe::egui;
+    egui::Rect::from_min_size(egui::pos2(cell.x, cell.y), egui::vec2(cell.width, 1.0))
 }
 
-/// Find the nearest cell to `from` in the pressed direction (`dx`, `dy` are the
-/// unit direction: e.g. right = (1, 0), up = (0, -1)). Returns the current index
-/// if no cell lies in that direction. Scores by primary-axis distance plus a
-/// cross-axis penalty so navigation favors the same row/column.
-pub fn nearest_in_dir(
+/// The cell a pad `step` from `from` lands on, by the rules every gamepad walk
+/// over a layout follows (`gamepad_nav::nearest_rect_toward`): the same row or
+/// column first, then within 60° of the step — and diagonals, so X to Y in the
+/// pad's diamond is one step up-right. Returns `from` when no cell lies that way.
+pub fn nearest_cell_toward(
     cells: &[PickerCell],
     from: usize,
-    dx: f32,
-    dy: f32,
+    step: crate::gamepad_nav::NavStep,
     usable: impl Fn(&PickerCell) -> bool,
 ) -> usize {
+    walk_cells(cells, from, step, usable, &mut None, 0)
+}
+
+/// [`nearest_cell_toward`] as a walk, keeping to `lane` (`gamepad_nav::NavLane`,
+/// scoped by `scope`, the tab) and moving it on: up from the space bar goes
+/// back to the key it was come down from, not to the one over its middle.
+pub fn walk_cells(
+    cells: &[PickerCell],
+    from: usize,
+    step: crate::gamepad_nav::NavStep,
+    usable: impl Fn(&PickerCell) -> bool,
+    lane: &mut Option<crate::gamepad_nav::NavLane>,
+    scope: u64,
+) -> usize {
     let from = clamp_index(cells, from);
-    let (cx, cy) = cell_center(&cells[from]);
-    let mut best = from;
-    let mut best_score = f32::INFINITY;
-    for (i, cell) in cells.iter().enumerate() {
-        // Skip the current cell and any DISABLED cell (analog output on a
+    let Some(here) = cells.get(from) else { return from; };
+    crate::gamepad_nav::step_in_lane(
+        lane,
+        scope,
+        (from, cell_rect(here)),
+        // Never the current cell or a DISABLED one (an analog output on a
         // discrete target, or a self-target), so focus can't land on — and
         // therefore can't map — a greyed cell.
-        if i == from || !usable(cell) { continue; }
-        let (ox, oy) = cell_center(cell);
-        let vx = ox - cx;
-        let vy = oy - cy;
-        // Project onto the pressed direction; reject anything not ahead of us.
-        let primary = vx * dx + vy * dy;
-        if primary <= 0.05 { continue; }
-        // Cross-axis offset (perpendicular distance).
-        let cross = (vx * dy - vy * dx).abs();
-        let score = primary + cross * 2.5;
-        if score < best_score {
-            best_score = score;
-            best = i;
-        }
-    }
-    best
+        cells.iter().enumerate()
+            .filter(|&(i, c)| i != from && usable(c))
+            .map(|(i, c)| (i, cell_rect(c))),
+        step,
+    )
+    .unwrap_or(from)
 }
 
 // ── typing, rather than binding ───────────────────────────────────────────────
@@ -1652,5 +1657,75 @@ mod timed_chord_tests {
         assert_eq!(c.gaps[1], 1.0, "nor does typing 0");
         c.delete(ChordElem::Gap(1));
         assert!(!c.is_timed());
+    }
+}
+
+/// Walking the board with the pad: the gamepad cluster's diamond and plus.
+#[cfg(test)]
+mod board_walk_tests {
+    use super::*;
+    use crate::gamepad_nav::NavStep;
+
+    fn pad() -> Vec<PickerCell> {
+        PAD_LAYOUT.iter().map(PickerCell::from).collect()
+    }
+
+    fn from(cells: &[PickerCell], pin: &str, step: NavStep) -> String {
+        let at = cells.iter().position(|c| c.pin == pin).unwrap();
+        cells[nearest_cell_toward(cells, at, step, |_| true)].pin.clone()
+    }
+
+    /// The reported bug: X to Y meant going round by something in line with
+    /// Y. A diagonal goes straight there, round the whole diamond.
+    #[test]
+    fn the_face_buttons_walk_round_their_diamond_diagonally() {
+        let c = pad();
+        let (ur, ul, dr, dl) = (NavStep { x: 1, y: -1 }, NavStep { x: -1, y: -1 },
+            NavStep { x: 1, y: 1 }, NavStep { x: -1, y: 1 });
+        assert_eq!(from(&c, "btn_west", ur), "btn_north");
+        assert_eq!(from(&c, "btn_north", dr), "btn_east");
+        assert_eq!(from(&c, "btn_east", dl), "btn_south");
+        assert_eq!(from(&c, "btn_south", ul), "btn_west");
+        // The D-pad's plus likewise.
+        assert_eq!(from(&c, "dpad_left", ur), "dpad_up");
+        assert_eq!(from(&c, "dpad_down", ur), "dpad_right");
+    }
+
+    /// Straight steps stay in their row or column, as they did.
+    #[test]
+    fn straight_steps_keep_to_the_row_or_column() {
+        let c = pad();
+        assert_eq!(from(&c, "btn_south", NavStep::UP), "btn_north", "through the diamond, not to X beside");
+        assert_eq!(from(&c, "btn_west", NavStep::RIGHT), "btn_east");
+        assert_eq!(from(&c, "btn_west", NavStep::UP), "btn_start");
+        assert_eq!(from(&c, "dpad_up", NavStep::DOWN), "dpad_down");
+        assert_eq!(from(&c, "left_trigger", NavStep::DOWN), "btn_lb");
+        // Nothing that way: it stays.
+        assert_eq!(from(&c, "right_trigger", NavStep::RIGHT), "right_trigger");
+    }
+}
+
+/// The keyboard walked with the pad keeps to the lane it came down.
+#[cfg(test)]
+mod lane_walk_tests {
+    use super::*;
+    use crate::gamepad_nav::NavStep;
+
+    /// The reported bug: up from the space bar always went to B, over its
+    /// middle, wherever it had been come down to from.
+    #[test]
+    fn up_from_the_space_bar_goes_back_to_the_key_it_was_come_down_from() {
+        let cells: Vec<PickerCell> = KBM_LAYOUT.iter().map(PickerCell::from).collect();
+        let at = |pin: &str| cells.iter().position(|c| c.pin == pin).unwrap();
+        for key in ["key_c", "key_v", "key_n", "key_m"] {
+            let mut lane = None;
+            let space = walk_cells(&cells, at(key), NavStep::DOWN, |_| true, &mut lane, 0);
+            assert_eq!(cells[space].pin, "key_space", "down from {key}");
+            let back = walk_cells(&cells, space, NavStep::UP, |_| true, &mut lane, 0);
+            assert_eq!(cells[back].pin, key, "back up from the space bar");
+        }
+        // Come to some other way, it's the key over its middle, as before.
+        let back = walk_cells(&cells, at("key_space"), NavStep::UP, |_| true, &mut None, 0);
+        assert_eq!(cells[back].pin, "key_b");
     }
 }

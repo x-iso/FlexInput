@@ -890,20 +890,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         // Auto-scroll: if the selected card is outside the visible band, request
         // a body-space scroll so it comes into view. This only touches data,
         // never graphics, so it's deadlock-safe.
-        let clip = ui.clip_rect();
-        let mut need = 0.0f32;
-        if card_rect.top() < clip.top() + 4.0 {
-            need = card_rect.top() - (clip.top() + 4.0);
-        } else if card_rect.bottom() > clip.bottom() - 4.0 {
-            need = card_rect.bottom() - (clip.bottom() - 4.0);
-        }
-        if need.abs() > 1.0 {
-            let body_delta = need / s.max(0.01);
-            ui.ctx().data_mut(|d| d.insert_temp(
-                egui::Id::new(("gp_nav_remap_scroll", vp, node_id.0)),
-                (pass, body_delta)));
-            request_repaint_throttled(ui.ctx());
-        }
+        nav_scroll_into_view(ui, node_id.0, card_rect, s);
     }
 
     // ── Output-conflict badge ──────────────────────────────────────────────

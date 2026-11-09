@@ -147,6 +147,36 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A widget taller than the Easy body no longer flickers under gamepad nav.**
+  Selecting one scrolled the body up and down every frame, trying to show its
+  top and its bottom at once. Now the body shows the widget's top and moves on
+  only as the focus inside it — a Remapper card, its Learn button, a field —
+  goes past the edge, the top going out of view to make room. A card taller
+  than its pinned list no longer flickers the list the same way, and the list
+  scrolls to its own edges rather than to wherever the body happens to cut it.
+  The highlights inside the body — a card's ring, the Learn / Special / Add
+  ring, a field's ring and its label — are cut off at the body's edge like the
+  widget under them, where they used to hang over the preset bar and the I/O
+  panel once scrolled out of view, and they keep up with a scroll instead of
+  trailing it by a frame.
+- **Gamepad nav goes where the stick points.** Moving between the Easy body's
+  widgets weighed their centres, so a wide widget straight below — a Touch Zones
+  pad under two curves — lost to a narrower one further down whose centre lined
+  up better, and was skipped. Now the next widget is the nearest one whose edges
+  line up with this one's that way, and something off to the side counts only
+  within 60° of where you pushed. A walk keeps to the lane it came in on, the
+  way a text cursor keeps its column: down onto a wide widget from its right
+  side, the next step down goes on from the right rather than from its middle,
+  and back up returns the way it came. The stick and the D-pad also go
+  diagonally (a diagonal push, or two D-pad directions pressed within 60 ms of
+  each other — a straight press waits that long for the second before it
+  moves, and steps at once if let go of first): down-right is the widget
+  that's both right and below. The Choose picker walks its board the same way,
+  so X to Y on its pad is one push up-right instead of a detour by way of
+  something in line with Y, and up from the space bar goes back to the key you
+  came down from instead of to B over its middle; so does the config overlay.
+  Arriving on the topmost widget scrolls the body all the way up, showing the
+  titles over it, as long as the widget still fits whole under them.
 - **A virtual DualSense now carries the rest of its report.** A real pad writes
   more into each one than sticks, buttons and motion: a rolling sequence byte, a
   second 32-bit counter beside it, the IMU's own 3 MHz clock stamped twice a

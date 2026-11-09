@@ -4,6 +4,86 @@
 
 use super::*;
 
+/// The field-focus HUD nav asked for on an Easy body this pass: which field of
+/// which element, and the label its pill shows.
+#[derive(Clone)]
+struct FieldHudReq {
+    pass: u64,
+    inner: usize,
+    element: String,
+    idx: usize,
+    label: String,
+}
+
+fn field_hud_req_id(outer: egui_snarl::NodeId) -> egui::Id {
+    egui::Id::new(("gp_nav_field_hud_req", outer.0))
+}
+
+/// This pass's HUD request for the Easy body of `outer`, with the focused field's
+/// global rect as its renderer last published it, and the pass it did (when the
+/// renderer publishes field rects at all).
+fn field_hud_req(ctx: &egui::Context, outer: egui_snarl::NodeId) -> Option<(FieldHudReq, Option<(u64, egui::Rect)>)> {
+    let pass = ctx.cumulative_pass_nr();
+    let req = ctx.data(|d| d.get_temp::<FieldHudReq>(field_hud_req_id(outer)))
+        .filter(|r| r.pass == pass)?;
+    let field = ctx.data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(
+            egui::Id::new(("gp_nav_field_rects", req.inner, req.element.clone()))))
+        .and_then(|(p, frs)| frs.get(req.idx).map(|r| (p, *r)))
+        .filter(|(_, r)| r.is_finite() && FlexInputApp::nav_ring_is_worth_drawing(r));
+    Some((req, field))
+}
+
+/// The focused field's global rect on the Easy body of `outer`, for the body to
+/// keep in view. Read after the body has rendered this pass; a rect its renderer
+/// has stopped publishing is no guide to where the field is now.
+pub(crate) fn nav_field_focus_rect(ctx: &egui::Context, outer: egui_snarl::NodeId) -> Option<egui::Rect> {
+    let pass = ctx.cumulative_pass_nr();
+    field_hud_req(ctx, outer)
+        .and_then(|(_, field)| field)
+        .filter(|(p, _)| pass.saturating_sub(*p) <= 2)
+        .map(|(_, r)| r)
+}
+
+/// Paint the field-focus HUD nav asked for (`nav_publish_field_hud`) on the Easy
+/// body of `outer`, after the body has rendered: a ring on the focused field and
+/// a pill naming it above `item` (the selected widget's rect), both inside `view`
+/// (the part of the screen the body shows). With the widget's top scrolled out
+/// of view the pill stays at the top of the view, over the widget, rather than
+/// out over the preset bar. `host` is the body's layer: a window over it covers
+/// the HUD too.
+pub(crate) fn draw_requested_field_hud(
+    ctx: &egui::Context,
+    outer: egui_snarl::NodeId,
+    item: egui::Rect,
+    host: egui::LayerId,
+    view: egui::Rect,
+) {
+    let Some((req, field)) = field_hud_req(ctx, outer) else { return; };
+    let view = view.intersect(ctx.content_rect());
+    let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
+    // Which sub-control is targeted (the pill names it; the ring points at it).
+    // Pill only when the renderer hasn't published per-control rects.
+    if let Some((_, fr)) = field {
+        FlexInputApp::paint_field_glow_ring(ctx, fr, accent, host, view);
+    }
+    if !item.intersect(view).is_positive() {
+        return;
+    }
+    let painter = crate::widgets::nav_highlight_painter(
+        ctx, egui::Id::new(("gp_nav_field_hud", outer.0)), host, view);
+    let font = egui::FontId::proportional(12.0);
+    let galley = painter.layout_no_wrap(req.label.clone(), font.clone(), egui::Color32::WHITE);
+    let pad = egui::vec2(6.0, 3.0);
+    let size = galley.size() + pad * 2.0;
+    // Just above the widget, as far as the view allows.
+    let bottom = (item.top() - 6.0 + pad.y).max(view.top() + size.y + 2.0);
+    let bg = egui::Rect::from_center_size(
+        egui::pos2(item.center().x, bottom - size.y * 0.5), size);
+    painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230));
+    painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
+    painter.text(bg.center(), egui::Align2::CENTER_CENTER, req.label, font, egui::Color32::WHITE);
+}
+
 impl FlexInputApp {
 
     /// Unified multi-field editor. Left/right move the focused field; up/down +
@@ -377,22 +457,26 @@ impl FlexInputApp {
     }
 
     /// Outward-bloom ring on a focused sub-control's rect, drawn on the given
-    /// context's Foreground layer. Shared by `nav_publish_field_hud` (main window)
-    /// and the config overlay (`config_draw_field_glow`) so the value-field glow
-    /// shows in BOTH viewports — the overlay is a separate window, so nav's own
-    /// root-viewport draw never reaches it. No-op on a degenerate rect. `host` is
-    /// the layer the field's body renders in.
+    /// context's Foreground layer and kept inside `clip`. Shared by the Easy body
+    /// (`draw_requested_field_hud`) and the config overlay
+    /// (`config_draw_field_glow`) so the value-field glow shows in BOTH viewports
+    /// — the overlay is a separate window, so nav's own root-viewport draw never
+    /// reaches it. No-op on a degenerate rect. `host` is the layer the field's
+    /// body renders in.
     pub(crate) fn paint_field_glow_ring(ctx: &egui::Context, fr: egui::Rect, accent: egui::Color32,
-        host: egui::LayerId)
+        host: egui::LayerId, clip: egui::Rect)
     {
         if !fr.is_finite() || fr.width() <= 0.5 { return; }
-        let p = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
-            egui::Order::Foreground, egui::Id::new("gp_nav_field_glow"), host));
+        let p = crate::widgets::nav_highlight_painter(
+            ctx, egui::Id::new("gp_nav_field_glow"), host, clip);
         crate::widgets::paint_nav_bloom(&p, fr, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
     }
 
-    /// Publish the multi-field focus HUD (pass-stamped) for the renderer overlay
-    /// + a foreground text label so the user sees the focused field.
+    /// Ask for the multi-field focus HUD on the Easy body: a ring on the focused
+    /// field and a label pill naming it and its value. The body paints both once
+    /// it has rendered (`draw_requested_field_hud`), from the rects it publishes
+    /// this pass: painted here, before the body, they sat a frame behind every
+    /// scroll and over whatever the body had scrolled them under.
     pub(crate) fn nav_publish_field_hud(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, fields: &[NavFieldDef], idx: usize, fine: bool)
     {
@@ -431,37 +515,6 @@ impl FlexInputApp {
             // run, or how far the sweep already running has got.
             NavField::JsmCalibrate => self.nav_jsm_cal_summary(outer_id),
         };
-        // Find the item's screen rect (published by render_subpatch_body) to
-        // anchor the HUD just above it.
-        let rects: Option<(u64, Vec<(usize, egui::Rect)>)> =
-            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0))));
-        let sel = {
-            let canvas = &self.tabs[self.active_tab].canvas;
-            canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.selected_item)
-        };
-        let rect = rects.and_then(|(_, rs)| sel.and_then(|s| rs.iter().find(|(i,_)| *i == s).map(|(_,r)| *r)));
-        let Some(rect) = rect else { return; };
-        let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-        // Both ride the Easy body: a window over it covers them too.
-        let host = crate::easy::center_panel::body_area_layer(outer_id);
-
-        // Per-field inner glow: if the row renderer published per-control rects
-        // this frame, draw an outward bloom ring on the focused field's rect so
-        // the user sees WHICH sub-control is targeted (the HUD pill names it; the
-        // ring points at it). Falls back silently to pill-only when a renderer
-        // hasn't been instrumented.
-        let element = self.nav_selected_element(outer_id)
-            .map(|(_, e)| e).unwrap_or_default();
-        let field_rects: Option<(u64, Vec<egui::Rect>)> =
-            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, element))));
-        if let Some((_, frs)) = field_rects {
-            if let Some(fr) = frs.get(idx).filter(|r| Self::nav_ring_is_worth_drawing(r)) {
-                Self::paint_field_glow_ring(ctx, *fr, accent, host);
-            }
-        }
-        let painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
-            egui::Order::Foreground, egui::Id::new(("gp_nav_field_hud", outer_id.0)), host));
         let n = fields.len();
         let label = if n > 1 {
             format!("[{}/{}] {} = {}{}", idx + 1, n, def.label, val_str,
@@ -469,18 +522,12 @@ impl FlexInputApp {
         } else {
             format!("{} = {}{}", def.label, val_str, if fine { "  (fine)" } else { "" })
         };
-        let pos = egui::pos2(rect.center().x, rect.top() - 6.0);
-        // Background pill for legibility.
-        let galley = painter.layout_no_wrap(label.clone(),
-            egui::FontId::proportional(12.0), egui::Color32::WHITE);
-        let pad = egui::vec2(6.0, 3.0);
-        let bg = egui::Rect::from_center_size(
-            egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
-            galley.size() + pad * 2.0);
-        painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230));
-        painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
-        painter.text(egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
-            egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+        // The field's rects are keyed by (inner, element): a single inner node
+        // exposes several element rows, each rendered separately.
+        let element = self.nav_selected_element(outer_id)
+            .map(|(_, e)| e).unwrap_or_default();
+        let req = FieldHudReq { pass: ctx.cumulative_pass_nr(), inner: inner.0, element, idx, label };
+        ctx.data_mut(|d| d.insert_temp(field_hud_req_id(outer_id), req));
     }
 
     /// Read/write a String param on an inner sub-patch node.
@@ -2724,4 +2771,54 @@ fn range_counterpart(key: &str) -> Option<&'static str> {
         ("accel_view_in_min", "accel_view_out_min"), ("accel_view_in_max", "accel_view_out_max"),
     ];
     PAIRS.iter().find_map(|&(a, b)| if key == a { Some(b) } else if key == b { Some(a) } else { None })
+}
+
+#[cfg(test)]
+mod field_hud_tests {
+    use super::*;
+
+    /// The pill names the focused field just above its widget — and when the
+    /// widget's top has scrolled out of the body, it stays at the top of the body
+    /// rather than out over the preset bar. Nothing of it, or the field's ring,
+    /// paints outside the body.
+    #[test]
+    fn the_field_hud_stays_inside_the_body() {
+        let ctx = egui::Context::default();
+        let outer = egui_snarl::NodeId(3);
+        let view = egui::Rect::from_min_max(egui::pos2(100.0, 150.0), egui::pos2(500.0, 450.0));
+        for (item_top, field_top) in [(300.0, 320.0), (60.0, 140.0)] {
+            let item = egui::Rect::from_min_size(egui::pos2(150.0, item_top), egui::vec2(200.0, 400.0));
+            let field = egui::Rect::from_min_size(egui::pos2(160.0, field_top), egui::vec2(80.0, 20.0));
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                let pass = ctx.cumulative_pass_nr();
+                ctx.data_mut(|d| {
+                    d.insert_temp(field_hud_req_id(outer), FieldHudReq {
+                        pass, inner: 7, element: "value".into(), idx: 0, label: "Gain = 1.000".into(),
+                    });
+                    d.insert_temp(egui::Id::new(("gp_nav_field_rects", 7_usize, "value".to_string())),
+                        (pass, vec![field]));
+                });
+                draw_requested_field_hud(ctx, outer, item, egui::LayerId::background(), view);
+            });
+            let painted: Vec<egui::Rect> = out.shapes.iter()
+                .map(|s| s.shape.visual_bounding_rect().intersect(s.clip_rect))
+                .filter(|r| r.is_positive())
+                .collect();
+            let pill_fill = egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230);
+            let pill = out.shapes.iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == pill_fill => Some(r.rect),
+                    _ => None,
+                })
+                .expect("the pill painted");
+            for r in &painted {
+                assert!(view.expand(0.5).contains_rect(*r), "item at {item_top}: {r:?} outside the body {view:?}");
+            }
+            if item_top > view.top() {
+                assert!(pill.bottom() <= item.top(), "the pill isn't above its widget: {pill:?}");
+            } else {
+                assert!(pill.top() >= view.top(), "the pill left the body: {pill:?}");
+            }
+        }
+    }
 }

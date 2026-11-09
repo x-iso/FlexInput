@@ -1386,13 +1386,24 @@ where
         // would over-transform and collapse the clip to an empty rect.
         //
         // `local_xform` is built once here from `render_scroll` and is the
-        // exact transform installed on the layer further down — deriving the
-        // clip from anything else is what let content and clip drift apart.
+        // exact transform installed on the layer — deriving the clip from
+        // anything else is what let content and clip drift apart.
         let parent_clip_local = ui.clip_rect();
         let local_translation = container_rect.min.to_vec2()
             - egui::vec2(0.0, render_scroll * scale);
         let local_xform = egui::emath::TSTransform::new(local_translation, scale);
         let inv_local = local_xform.inverse();
+        // Installed BEFORE the body renders, so the global rects its cards publish
+        // for gamepad nav (glow, auto-scroll) are where they paint THIS frame. Put
+        // in afterwards, the body read last frame's transform: while the Easy body
+        // scrolled, every highlight trailed its card by a frame.
+        ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
+        ui.ctx().set_sublayer(ui.layer_id(), body_layer);
+        // The list's own visible band, for a focused card to scroll into
+        // (`nav_scroll_into_view`). Not the clip: that is also cut by whatever
+        // hosts the pin, and the host scrolls itself (the Easy body does).
+        let band_pass = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(nav_band_id(body_layer), (band_pass, visible_band)));
         let parent_clip_body = egui::Rect::from_min_max(
             inv_local * parent_clip_local.min,
             inv_local * parent_clip_local.max,
@@ -1488,9 +1499,6 @@ where
             };
             painter.rect_filled(thumb_rect, 2.0 / scale, thumb_col);
         }
-        // Install the SAME `local_xform` the clip was derived from.
-        ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
-        ui.ctx().set_sublayer(ui.layer_id(), body_layer);
 
         // Settled offset for the next frame (scrollbar drag + real-height clamp).
         scroll_offset_body = new_scroll;

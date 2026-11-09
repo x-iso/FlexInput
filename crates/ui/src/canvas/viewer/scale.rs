@@ -144,6 +144,39 @@ pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rec
         egui::Id::new(("gp_nav_field_rects", inner_id.0, element)), (pass, rects)));
 }
 
+/// Ctx-data slot of the visible band a whole-module pin shows of its list, keyed
+/// by the pin's own layer (`(pass, band)` in that layer's coordinates).
+pub(crate) fn nav_band_id(layer: egui::LayerId) -> egui::Id {
+    egui::Id::new(("fxi_pin_nav_band", layer))
+}
+
+/// Ask the whole-module pin around this list to scroll `target` (in this ui's
+/// coordinates) into the band it shows, the way gamepad nav keeps a focused card,
+/// action or curve in view. `uid` names the scroll channel the pin listens on
+/// (`gp_nav_remap_scroll`); the request is in list pixels, divided by `per_px`.
+///
+/// The band is the pin's own, not this ui's clip rect, which is also cut by the
+/// pin's host: an Easy body scrolled to show half the pin. Chasing that cut made
+/// the list scroll for what the host scrolls into view itself. Outside a pin
+/// (nothing published for this layer) the clip rect stands in. The move never
+/// asks for both ends of a target taller than the band (`nav_reveal_delta`):
+/// that flickered between them.
+pub(crate) fn nav_scroll_into_view(ui: &egui::Ui, uid: usize, target: egui::Rect, per_px: f32) {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let band = ui.ctx().data(|d| d.get_temp::<(u64, egui::Rect)>(nav_band_id(ui.layer_id())))
+        .filter(|(p, _)| *p == pass)
+        .map_or_else(|| ui.clip_rect(), |(_, band)| band);
+    let need = crate::widgets::nav_reveal_delta(
+        target.top(), target.bottom(), band.top(), band.bottom(), 4.0);
+    if need.abs() > 1.0 {
+        let vp = ui.ctx().viewport_id();
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_remap_scroll", vp, uid)),
+            (pass, need / per_px.max(0.01))));
+        request_repaint_throttled(ui.ctx());
+    }
+}
+
 /// Publish the remapper-family action buttons' GLOBAL rects (Learn, Special,
 /// Add) so the nav driver can glow the focused one. NOTHING rects are omitted.
 /// Order matches `nav_remap_action_items`: Learn, Special, Add — entries with a
@@ -174,7 +207,6 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
     let vp = ui.ctx().viewport_id();
     let action_sel: Option<(u64, usize)> = ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(("gp_nav_remap_action", node_id.0, scope))));
-    let clip = ui.clip_rect();
 
     ui.ctx().data_mut(|d| d.insert_temp(
         egui::Id::new(("gp_nav_action_rects", vp, node_id.0, scope)), (pass, rects)));
@@ -189,18 +221,10 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
         .filter(|i| *i != usize::MAX);
     if let Some(ai) = act_sel {
         if let Some(r) = local.get(ai) {
-            let mut need = 0.0f32;
-            if r.top() < clip.top() + 4.0 { need = r.top() - (clip.top() + 4.0); }
-            else if r.bottom() > clip.bottom() - 4.0 { need = r.bottom() - (clip.bottom() - 4.0); }
-            if need.abs() > 1.0 {
-                // Scroll-into-view temp stays UNscoped (keyed by node id): the
-                // two consumers read it unscoped, and lean left/right action
-                // rows live in separate scroll bodies so cross-talk is harmless.
-                ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_remap_scroll", vp, node_id.0)),
-                    (pass, need)));
-                request_repaint_throttled(ui.ctx());
-            }
+            // The scroll request stays UNscoped (keyed by node id): the two
+            // consumers read it unscoped, and lean left/right action rows live
+            // in separate scroll bodies so cross-talk is harmless.
+            nav_scroll_into_view(ui, node_id.0, *r, 1.0);
         }
     }
 }

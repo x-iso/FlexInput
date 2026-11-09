@@ -30,15 +30,15 @@ impl FlexInputApp {
         nav: &crate::gamepad_nav::NavInput,
         dt: f32,
     ) {
-        use crate::gamepad_nav::{self as gn, EditLevel, NavDir};
+        use crate::gamepad_nav::{self as gn, EditLevel};
 
         // The Choose picker (opened from a pinned Remapper/TZ body) is modal
         // and renders in its own over-the-game viewport — drive IT, not the pin
         // nav, while it's open. run_gamepad_nav early-returns into here when the
         // overlay is visible, so this is the only place it can be driven.
         if self.gamepad_nav.kbm_picker_open {
-            let step_dir = self.picker_step_dir(nav, dt);
-            self.drive_kbm_picker(step_dir, nav);
+            let step = self.picker_step(nav, dt);
+            self.drive_kbm_picker(step, nav);
             return;
         }
         // The other modals a pad can open from a pinned body. Until these were
@@ -251,35 +251,40 @@ impl FlexInputApp {
             }
         }
 
-        // Directional focus move (d-pad edges, else left-stick step on engage).
-        let mut dir: Option<NavDir> = None;
-        if nav.is_rising("dpad_up") {
-            dir = Some(NavDir::Up);
-        } else if nav.is_rising("dpad_down") {
-            dir = Some(NavDir::Down);
-        } else if nav.is_rising("dpad_left") {
-            dir = Some(NavDir::Left);
-        } else if nav.is_rising("dpad_right") {
-            dir = Some(NavDir::Right);
-        }
-        if dir.is_none() {
-            match gn::stick_dir(nav.lstick) {
-                Some(d) => {
-                    if self.gamepad_nav.repeat_dir != Some(d) {
-                        self.gamepad_nav.repeat_dir = Some(d);
-                        dir = Some(d);
+        // Directional focus move, 8-way like the Easy body's (d-pad edges, else
+        // a left-stick step each time it's pushed to a new direction).
+        let mut step = self.gamepad_nav.dpad_step(nav);
+        if step.is_none() {
+            let held = self.gamepad_nav.repeat_step.filter(|_| self.gamepad_nav.repeat_dir.is_some());
+            match gn::stick_step(nav.lstick, 0.5, held) {
+                Some(s) => {
+                    if held != Some(s) {
+                        step = Some(s);
                     }
+                    self.gamepad_nav.repeat_step = Some(s);
+                    self.gamepad_nav.repeat_dir = gn::stick_dir(nav.lstick);
                 }
-                None => self.gamepad_nav.repeat_dir = None,
+                None => {
+                    self.gamepad_nav.repeat_step = None;
+                    self.gamepad_nav.repeat_dir = None;
+                }
             }
         }
-        if let Some(dir) = dir {
+        if let Some(step) = step {
             let cur_pos = self
                 .gamepad_nav
                 .config_index
                 .and_then(|item| targets.iter().position(|(idx, _)| *idx == item));
             let rects: Vec<egui::Rect> = targets.iter().map(|(_, r)| *r).collect();
-            if let Some(next_pos) = nearest_rect_in_dir(&rects, cur_pos, dir) {
+            let next_pos = match cur_pos {
+                // Keeping to its lane, as the Easy body's walk does.
+                Some(cur) => gn::step_in_lane(
+                    &mut self.gamepad_nav.config_lane, 0, (cur, rects[cur]),
+                    rects.iter().copied().enumerate().filter(|&(i, _)| i != cur), step,
+                ),
+                None => nearest_rect_in_dir(&rects, None, step),
+            };
+            if let Some(next_pos) = next_pos {
                 self.gamepad_nav.config_index = Some(targets[next_pos].0);
             }
             ctx.request_repaint();
@@ -494,18 +499,17 @@ pub(crate) fn draw_config_field_glow(
         .filter(|r| FlexInputApp::nav_ring_is_worth_drawing(r))
     {
         let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent, host);
+        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent, host, ctx.content_rect());
     }
 }
 
-/// Nearest rect in a direction from the current one (top-left-most when none).
-/// A bare-rect mirror of `gamepad_nav::nearest_target_rect_in_dir`.
+/// The rect a step from the current one lands on (top-left-most when none), by
+/// the rules of every walk over a layout (`gamepad_nav::nearest_rect_toward`).
 fn nearest_rect_in_dir(
     rects: &[egui::Rect],
     cur: Option<usize>,
-    dir: crate::gamepad_nav::NavDir,
+    step: crate::gamepad_nav::NavStep,
 ) -> Option<usize> {
-    use crate::gamepad_nav::NavDir;
     if rects.is_empty() {
         return None;
     }
@@ -524,27 +528,9 @@ fn nearest_rect_in_dir(
                 .map(|(i, _)| i);
         }
     };
-    let c = rects[cur].center();
-    let mut best: Option<(usize, f32)> = None;
-    for (i, r) in rects.iter().enumerate() {
-        if i == cur {
-            continue;
-        }
-        let o = r.center();
-        let (dx, dy) = (o.x - c.x, o.y - c.y);
-        let (primary, cross) = match dir {
-            NavDir::Right => (dx, dy),
-            NavDir::Left => (-dx, dy),
-            NavDir::Down => (dy, dx),
-            NavDir::Up => (-dy, dx),
-        };
-        if primary <= 0.0 {
-            continue;
-        }
-        let score = primary + 2.0 * cross.abs();
-        if best.map(|(_, s)| score < s).unwrap_or(true) {
-            best = Some((i, score));
-        }
-    }
-    best.map(|(i, _)| i)
+    crate::gamepad_nav::nearest_rect_toward(
+        rects[cur],
+        rects.iter().copied().enumerate().filter(|&(i, _)| i != cur),
+        step,
+    )
 }

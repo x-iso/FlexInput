@@ -272,6 +272,40 @@ pub(crate) fn nav_highlight_painter(
         .with_clip_rect(clip)
 }
 
+/// How far a gamepad-nav auto-scroll moves a view (`view_top..view_bot`) to show
+/// `top..bot`, as a change to the scroll offset (positive scrolls down).
+///
+/// Something that fits is brought fully into view with `margin` around it, the
+/// margin shrinking to what the view has room for. Something TALLER than the view
+/// can never be shown whole, and asking for both edges is what flickered: the
+/// top rule scrolled up, the bottom rule scrolled back down, every frame. Such a
+/// target only moves the view while the view sticks out past one of its ends: its
+/// top comes to the view's top (or its bottom to the view's bottom), and once the
+/// view lies inside it nothing moves. The answer for the view it leads to is
+/// always 0, so repeating it can't oscillate.
+pub(crate) fn nav_reveal_delta(top: f32, bot: f32, view_top: f32, view_bot: f32, margin: f32) -> f32 {
+    let (h, view_h) = (bot - top, view_bot - view_top);
+    if !(h.is_finite() && view_h.is_finite()) || view_h <= 0.0 {
+        return 0.0;
+    }
+    if h <= view_h {
+        let m = margin.min((view_h - h) * 0.5).max(0.0);
+        if top - m < view_top {
+            top - m - view_top
+        } else if bot + m > view_bot {
+            bot + m - view_bot
+        } else {
+            0.0
+        }
+    } else if top - margin > view_top {
+        top - margin - view_top
+    } else if bot + margin < view_bot {
+        bot + margin - view_bot
+    } else {
+        0.0
+    }
+}
+
 /// The layer a post-hoc nav highlight (a glow, a focus HUD, a tip) paints on,
 /// for a widget that lives on `host`. It stays a free `order` layer, so it is
 /// always above the widget and its own sublayers, but at the end of the pass
@@ -514,5 +548,56 @@ mod tests {
             assert_eq!(glow.len(), 1);
             assert_eq!(glow[0].clip_rect, ctx.content_rect());
         }
+    }
+
+    /// Apply the auto-scroll the way a view does, frame after frame: the offset
+    /// it settles on, and whether it ever moved back the way it came.
+    fn settle(top: f32, bot: f32, view_h: f32, mut offset: f32) -> (f32, bool) {
+        let mut last_sign = 0.0_f32;
+        for _ in 0..20 {
+            let d = nav_reveal_delta(top, bot, offset, offset + view_h, 24.0);
+            if d == 0.0 {
+                return (offset, false);
+            }
+            if last_sign != 0.0 && d.signum() != last_sign {
+                return (offset, true);
+            }
+            last_sign = d.signum();
+            offset += d;
+        }
+        (offset, true)
+    }
+
+    /// The reported bug: a widget taller than the Easy body flickered up and
+    /// down, the top rule and the bottom rule undoing each other every frame.
+    #[test]
+    fn a_target_taller_than_the_view_settles_without_flicker() {
+        // 500 tall in a 300 view, from above it, inside it and below it.
+        for start in [0.0, 150.0, 250.0, 400.0, 700.0] {
+            let (offset, flicker) = settle(200.0, 700.0, 300.0, start);
+            assert!(!flicker, "from {start}: moved back and forth");
+            let view = (offset, offset + 300.0);
+            // The view ends up inside the widget (with the margin at an edge).
+            assert!(view.0 >= 200.0 - 24.0 && view.1 <= 700.0 + 24.0, "from {start}: {view:?}");
+        }
+        // A view already inside it stays where it is: only content going past
+        // the edge moves it.
+        assert_eq!(settle(200.0, 700.0, 300.0, 300.0), (300.0, false));
+        // Coming down to it shows its top; coming up to it, its bottom.
+        assert_eq!(settle(200.0, 700.0, 300.0, 0.0).0, 176.0);
+        assert_eq!(settle(200.0, 700.0, 300.0, 700.0).0, 424.0);
+    }
+
+    #[test]
+    fn a_target_that_fits_is_shown_whole() {
+        // Below the view, above it, already in it.
+        assert_eq!(settle(400.0, 450.0, 300.0, 0.0).0, 450.0 + 24.0 - 300.0);
+        assert_eq!(settle(10.0, 60.0, 300.0, 100.0).0, 10.0 - 24.0);
+        assert_eq!(settle(100.0, 150.0, 300.0, 50.0), (50.0, false));
+        // Too tall for the margin but not for the view: the margin gives way,
+        // never the target.
+        let (offset, flicker) = settle(100.0, 390.0, 300.0, 0.0);
+        assert!(!flicker);
+        assert!(offset <= 100.0 && offset + 300.0 >= 390.0, "{offset}");
     }
 }

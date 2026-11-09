@@ -360,6 +360,17 @@ pub struct GamepadNav {
     /// Left-stick directional auto-repeat accumulator (in "steps").
     pub repeat_accum: f32,
     pub repeat_dir: Option<NavDir>,
+    /// The 8-way direction the stick is held in where it walks a layout (the
+    /// Easy body's widgets, the Choose picker's board) — see `stick_repeat`.
+    pub repeat_step: Option<NavStep>,
+    /// A straight D-pad press held back for [`DPAD_DIAGONAL_GRACE`], in case
+    /// the direction beside it follows (`GamepadNav::dpad_step`).
+    pub dpad_pending: Option<(NavStep, std::time::Instant)>,
+    /// The lane each 2D walk keeps to ([`NavLane`]): the Easy body's widgets,
+    /// the Choose picker's board, the config overlay's pins.
+    pub easy_lane: Option<NavLane>,
+    pub picker_lane: Option<NavLane>,
+    pub config_lane: Option<NavLane>,
     /// The left stick has walked a field list and hasn't been back to neutral
     /// since. While set, that stick edits nothing: a thumb scrolling down a
     /// column of faders is never perfectly straight, and its sideways slop would
@@ -649,6 +660,79 @@ pub struct GamepadNav {
     pub key_tapper: Option<flexinput_virtual::UiKeyTapper>,
 }
 
+impl GamepadNav {
+    /// The step the D-pad asks for this frame where it walks a layout, 8-way.
+    /// Two directions pressed together are the diagonal between them, and
+    /// "together" is within [`DPAD_DIAGONAL_GRACE`]: a straight press waits that
+    /// long for the direction beside it, and steps straight once it hasn't come
+    /// (or at once when the press is let go of first, a quick tap). A direction
+    /// pressed while another has been held past the wait is a step of its own.
+    pub fn dpad_step(&mut self, nav: &NavInput) -> Option<NavStep> {
+        self.dpad_step_at(nav, std::time::Instant::now())
+    }
+
+    pub fn dpad_step_at(&mut self, nav: &NavInput, now: std::time::Instant) -> Option<NavStep> {
+        let r = |pin| nav.is_rising(pin) as i8;
+        let (rx, ry) = (r("dpad_right") - r("dpad_left"), r("dpad_down") - r("dpad_up"));
+        if let Some((s, since)) = self.dpad_pending.take() {
+            let waited = now.saturating_duration_since(since);
+            if waited < DPAD_PENDING_STALE {
+                // The direction beside it arrived: the diagonal.
+                let joined = NavStep {
+                    x: if s.x == 0 { rx } else { s.x },
+                    y: if s.y == 0 { ry } else { s.y },
+                };
+                if joined.is_diagonal() {
+                    return Some(joined);
+                }
+                if waited < DPAD_DIAGONAL_GRACE && nav.pressed.contains(dpad_pin(s)) {
+                    self.dpad_pending = Some((s, since));
+                    return None;
+                }
+                return Some(s);
+            }
+        }
+        if rx == 0 && ry == 0 {
+            return None;
+        }
+        let s = NavStep { x: rx, y: ry };
+        if s.is_diagonal() {
+            return Some(s);
+        }
+        self.dpad_pending = Some((s, now));
+        None
+    }
+
+    /// The step a stick walking a layout takes this frame: its 8-way direction
+    /// at once when it's pushed (or turned to a new one), then again at `rate`
+    /// steps a second while it's held there. `None` when no step is due.
+    ///
+    /// Shares the accumulator with the 4-way walks, and keeps `repeat_dir` set
+    /// while held: the hand-offs elsewhere in nav clear it to make the next
+    /// direction step at once, and this honours that too.
+    pub fn stick_repeat(&mut self, stick: egui::Vec2, engage: f32, rate: f32, dt: f32) -> Option<NavStep> {
+        let held = self.repeat_step.filter(|_| self.repeat_dir.is_some());
+        let Some(step) = stick_step(stick, engage, held) else {
+            self.repeat_step = None;
+            self.repeat_dir = None;
+            self.repeat_accum = 0.0;
+            return None;
+        };
+        if held != Some(step) {
+            self.repeat_step = Some(step);
+            self.repeat_accum = 1.0;
+        }
+        self.repeat_dir = stick_dir_past(stick, engage);
+        self.repeat_accum += dt * rate;
+        if self.repeat_accum >= 1.0 {
+            self.repeat_accum -= 1.0;
+            Some(step)
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for GamepadNav {
     fn default() -> Self {
         Self {
@@ -656,6 +740,11 @@ impl Default for GamepadNav {
             prev_pressed: HashSet::new(),
             repeat_accum: 0.0,
             repeat_dir: None,
+            repeat_step: None,
+            dpad_pending: None,
+            easy_lane: None,
+            picker_lane: None,
+            config_lane: None,
             stick_walk_latch: false,
             edit_level: EditLevel::Widget,
             active_dev: None,
@@ -944,20 +1033,35 @@ fn item_center(item: &LayoutItem) -> egui::Vec2 {
     egui::vec2(p[0] + s[0] * 0.5, p[1] + s[1] * 0.5)
 }
 
-/// Spatial neighbour-finding: from `cur`, pick the nearest item in screen
-/// direction `dir` using body-local centres. Returns the top-left-most item
-/// when there is no current selection. `None` when no candidate lies in the
-/// pressed direction.
+/// [`nearest_item_toward`] in one of the four directions.
+pub fn nearest_in_dir(
+    items: &[LayoutItem],
+    cur: Option<usize>,
+    dir: NavDir,
+    editable: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    nearest_item_toward(items, cur, dir.into(), editable)
+}
+
+fn item_rect(item: &LayoutItem) -> egui::Rect {
+    let (p, s) = item.bbox();
+    egui::Rect::from_min_size(egui::pos2(p[0], p[1]), egui::vec2(s[0], s[1]))
+}
+
+/// Spatial neighbour-finding: from `cur`, the widget a `step` lands on, by the
+/// items' body-local rects ([`nearest_rect_toward`]). Returns the top-left-most
+/// item when there is no current selection. `None` when no candidate lies that
+/// way.
 ///
 /// `editable(i)` gates whether Module item `i` is a gamepad-editable widget
 /// (vs a purely visual pin like a scope/vector/oscilloscope display or 3D
 /// viewer) — visual pins are pinnable for feedback but must never intercept
 /// directional focus. Callers resolve editability against the sub-patch's inner
 /// snarl (see `FlexInputApp::sp_item_is_editable`).
-pub fn nearest_in_dir(
+pub fn nearest_item_toward(
     items: &[LayoutItem],
     cur: Option<usize>,
-    dir: NavDir,
+    step: NavStep,
     editable: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     // Only editable Module items are "navigable widgets"; decorations and
@@ -983,34 +1087,38 @@ pub fn nearest_in_dir(
         }
     };
 
-    let c = item_center(&items[cur]);
-    let mut best: Option<(usize, f32)> = None;
+    nearest_rect_toward(
+        item_rect(&items[cur]),
+        items.iter().enumerate()
+            .filter(|&(i, _)| i != cur && navigable(i))
+            .map(|(i, item)| (i, item_rect(item))),
+        step,
+    )
+}
 
-    for (i, item) in items.iter().enumerate() {
-        if i == cur || !navigable(i) {
-            continue;
-        }
-        let o = item_center(item);
-        let dx = o.x - c.x;
-        let dy = o.y - c.y;
-        // primary = distance along the pressed axis (must be positive);
-        // cross = lateral offset (penalised so straight-ahead wins).
-        let (primary, cross) = match dir {
-            NavDir::Right => (dx, dy),
-            NavDir::Left => (-dx, dy),
-            NavDir::Down => (dy, dx),
-            NavDir::Up => (-dy, dx),
-        };
-        if primary <= 0.0 {
-            continue;
-        }
-        let score = primary + 2.0 * cross.abs();
-        if best.map(|(_, s)| score < s).unwrap_or(true) {
-            best = Some((i, score));
-        }
-    }
-
-    best.map(|(i, _)| i)
+/// [`nearest_item_toward`] as a walk: keeping to `lane` ([`NavLane`], scoped by
+/// `scope`, the sub-patch) and moving it on.
+pub fn walk_items(
+    items: &[LayoutItem],
+    cur: Option<usize>,
+    step: NavStep,
+    editable: impl Fn(usize) -> bool,
+    lane: &mut Option<NavLane>,
+    scope: u64,
+) -> Option<usize> {
+    let Some(cur) = cur.filter(|&i| i < items.len()) else {
+        return nearest_item_toward(items, None, step, editable);
+    };
+    let navigable = |i: usize| matches!(items.get(i), Some(LayoutItem::Module(_))) && editable(i);
+    step_in_lane(
+        lane,
+        scope,
+        (cur, item_rect(&items[cur])),
+        items.iter().enumerate()
+            .filter(|&(i, _)| i != cur && navigable(i))
+            .map(|(i, item)| (i, item_rect(item))),
+        step,
+    )
 }
 
 /// Spatial neighbour-finding for the left I/O panel: from `cur` (an index into
@@ -1110,6 +1218,267 @@ pub fn stick_dir_past(v: egui::Vec2, engage: f32) -> Option<NavDir> {
         // Screen Y grows downward; gamepad up-stick is +y in our convention.
         Some(if v.y >= 0.0 { NavDir::Up } else { NavDir::Down })
     }
+}
+
+/// A step across a layout, 8-way: the four directions and the diagonals
+/// between them. Screen space: `x` right, `y` down, each -1, 0 or 1 (never both
+/// 0). What moves a selection over widgets laid out in two dimensions: a pad's
+/// face buttons sit in a diamond, and without the diagonals X to Y meant going
+/// round by way of something in line with Y.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NavStep {
+    pub x: i8,
+    pub y: i8,
+}
+
+impl NavStep {
+    pub const UP: NavStep = NavStep { x: 0, y: -1 };
+    pub const DOWN: NavStep = NavStep { x: 0, y: 1 };
+    pub const LEFT: NavStep = NavStep { x: -1, y: 0 };
+    pub const RIGHT: NavStep = NavStep { x: 1, y: 0 };
+
+    /// The direction it goes in, as a unit vector.
+    pub fn vec(self) -> egui::Vec2 {
+        egui::vec2(self.x as f32, self.y as f32).normalized()
+    }
+
+    pub fn is_diagonal(self) -> bool {
+        self.x != 0 && self.y != 0
+    }
+
+    /// The step as one of the four directions, for what is laid out in a line
+    /// (a list, a row of fields). `None` for a diagonal.
+    pub fn cardinal(self) -> Option<NavDir> {
+        match (self.x, self.y) {
+            (0, y) if y < 0 => Some(NavDir::Up),
+            (0, _) => Some(NavDir::Down),
+            (x, 0) if x < 0 => Some(NavDir::Left),
+            (_, 0) => Some(NavDir::Right),
+            _ => None,
+        }
+    }
+}
+
+impl From<NavDir> for NavStep {
+    fn from(d: NavDir) -> Self {
+        match d {
+            NavDir::Up => NavStep::UP,
+            NavDir::Down => NavStep::DOWN,
+            NavDir::Left => NavStep::LEFT,
+            NavDir::Right => NavStep::RIGHT,
+        }
+    }
+}
+
+/// Half the arc a stick direction owns, in degrees: a direction wider than a
+/// diagonal (25 + 20 = 45 per side of each axis), so a push meant straight up
+/// stays up through 25° of slop and a diagonal has to be meant.
+const STICK_CARDINAL_HALF_ARC: f32 = 25.0;
+const STICK_DIAGONAL_HALF_ARC: f32 = 20.0;
+/// How far past its arc the stick may drift before a held direction gives way
+/// to the next, so a thumb resting on a boundary doesn't flip between the two
+/// (each flip steps at once).
+const STICK_HOLD_SLACK: f32 = 8.0;
+
+/// The 8-way step a stick deflection asks for once past `engage`: whichever of
+/// the eight directions' arcs it points into. `held` is the step it asked for
+/// last frame, kept until the stick has gone [`STICK_HOLD_SLACK`] past its arc.
+pub fn stick_step(v: egui::Vec2, engage: f32, held: Option<NavStep>) -> Option<NavStep> {
+    if v.length() < engage {
+        return None;
+    }
+    // Screen angle, degrees, 0 = right, 90 = down (stick up is +y; the screen's down).
+    let angle = (-v.y).atan2(v.x).to_degrees();
+    let off = |s: NavStep| {
+        let a = (s.y as f32).atan2(s.x as f32).to_degrees();
+        let d = (angle - a).rem_euclid(360.0);
+        d.min(360.0 - d)
+    };
+    let half = |s: NavStep| if s.is_diagonal() { STICK_DIAGONAL_HALF_ARC } else { STICK_CARDINAL_HALF_ARC };
+    if let Some(h) = held.filter(|&h| off(h) <= half(h) + STICK_HOLD_SLACK) {
+        return Some(h);
+    }
+    const ALL: [NavStep; 8] = [
+        NavStep { x: 1, y: 0 }, NavStep { x: 1, y: 1 }, NavStep { x: 0, y: 1 }, NavStep { x: -1, y: 1 },
+        NavStep { x: -1, y: 0 }, NavStep { x: -1, y: -1 }, NavStep { x: 0, y: -1 }, NavStep { x: 1, y: -1 },
+    ];
+    // The arcs tile the circle, so one always owns the angle.
+    ALL.into_iter().find(|&s| off(s) <= half(s))
+}
+
+/// How long a straight D-pad press waits for the direction beside it before it
+/// steps: a mushy D-pad lands a diagonal's two switches a few tens of
+/// milliseconds apart, and stepping on the first sent the walk the wrong way.
+pub const DPAD_DIAGONAL_GRACE: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// A held-back straight D-pad press older than this was never asked about
+/// again (nav went inside a widget, say): it's dropped, not stepped late.
+const DPAD_PENDING_STALE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn dpad_pin(s: NavStep) -> &'static str {
+    match (s.x, s.y) {
+        (_, y) if y < 0 => "dpad_up",
+        (_, y) if y > 0 => "dpad_down",
+        (x, _) if x < 0 => "dpad_left",
+        _ => "dpad_right",
+    }
+}
+
+/// The line a walk over a layout keeps to across its steps, the way a text
+/// cursor keeps its column through a short line: the column it went down, the
+/// row it went across. Down onto a wide widget from its right, the next step
+/// down goes on from the right, not from its middle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NavLane {
+    /// The layout it belongs to (a sub-patch, a picker tab, the config overlay).
+    pub scope: u64,
+    /// The target it was last on: one selected some other way starts afresh
+    /// from its own middle.
+    pub at: usize,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// One step of a walk over a layout from `from` (an id and its rect) toward
+/// `step`, keeping to `lane` ([`NavLane`]) and moving it on to where it lands.
+/// `None`, and the lane as it was, when nothing lies that way.
+pub fn step_in_lane(
+    lane: &mut Option<NavLane>,
+    scope: u64,
+    from: (usize, egui::Rect),
+    cands: impl IntoIterator<Item = (usize, egui::Rect)>,
+    step: NavStep,
+) -> Option<usize> {
+    let here = lane
+        .filter(|l| l.scope == scope && l.at == from.0)
+        .map_or(from.1.center(), |l| egui::pos2(l.x, l.y));
+    let cands: Vec<(usize, egui::Rect)> = cands.into_iter().collect();
+    let next = nearest_rect_in_lane(from.1, here, cands.iter().copied(), step)?;
+    let c = cands.iter().find(|(i, _)| *i == next).map_or(here, |(_, r)| r.center());
+    *lane = Some(match (step.x, step.y) {
+        // Down or up keeps the column; across keeps the row; a diagonal starts
+        // a lane of its own.
+        (0, _) => NavLane { scope, at: next, x: here.x, y: c.y },
+        (_, 0) => NavLane { scope, at: next, x: c.x, y: here.y },
+        _ => NavLane { scope, at: next, x: c.x, y: c.y },
+    });
+    Some(next)
+}
+
+/// Where a step from `from` lands among `cands` (an index and a screen rect
+/// each), or `None` when nothing lies that way.
+///
+/// Rect edges, not centres: a wide widget straight below is the next thing
+/// down even when its centre is off to one side, and scoring centres is what
+/// skipped a Touch Zones pad for the narrower widget under it.
+///
+/// Up, down, left and right:
+/// - A candidate lies that way when it reaches further along the step than
+///   `from` does and starts past where `from` starts.
+/// - One in line — its rect overlapping `from`'s across the step — always beats
+///   one beside it: up from A in a pad's diamond is Y, not X next to it. Beside
+///   it, only within 60° of the step; further round is another direction, which
+///   the 8-way step can ask for.
+/// - Among those, nearest edge to edge along the step, then nearest across it
+///   (`13·gap² + offset²`, the weighting Android's focus search uses).
+///
+/// A diagonal is both of its directions at once: the candidate's centre lies
+/// that way on both axes (down-right: right of `from`'s and below it), so
+/// what's straight below a wide row isn't its down-right. Nearest edge to edge,
+/// then nearest the 45° line.
+pub fn nearest_rect_toward(
+    from: egui::Rect,
+    cands: impl IntoIterator<Item = (usize, egui::Rect)>,
+    step: NavStep,
+) -> Option<usize> {
+    nearest_rect_in_lane(from, from.center(), cands, step)
+}
+
+/// [`nearest_rect_toward`] keeping to a lane through `from` at `lane` (see
+/// [`NavLane`]): across a straight step, "nearest" is nearest the lane — kept
+/// within `from` — not `from`'s middle, and the distance is to a candidate's
+/// edge, so whatever the lane runs through is nearest of all.
+pub fn nearest_rect_in_lane(
+    from: egui::Rect,
+    lane: egui::Pos2,
+    cands: impl IntoIterator<Item = (usize, egui::Rect)>,
+    step: NavStep,
+) -> Option<usize> {
+    if step.is_diagonal() {
+        return nearest_rect_diagonal(from, cands, step);
+    }
+    let d = step.vec();
+    let across = egui::vec2(-d.y, d.x);
+    // A rect's extent along a unit axis: (start, centre, end).
+    let span = |r: egui::Rect, a: egui::Vec2| {
+        let c = r.center().to_vec2().dot(a);
+        let h = 0.5 * (r.width() * a.x.abs() + r.height() * a.y.abs());
+        (c - h, c, c + h)
+    };
+    let (f0, fc, f1) = span(from, d);
+    let (q0, qc, q1) = span(from, across);
+    let at = lane.to_vec2().dot(across).clamp(q0.min(q1), q0.max(q1));
+    let mut in_line: Option<(usize, f32)> = None;
+    let mut beside: Option<(usize, f32)> = None;
+    for (i, r) in cands {
+        if !r.is_finite() {
+            continue;
+        }
+        let (a0, ac, a1) = span(r, d);
+        // Rounding slack, scaled to the rects: a picker cell is 1 unit, a widget 100s.
+        let eps = 1e-3 * ((f1 - f0) + (a1 - a0)).max(1e-3);
+        if !(a1 > f1 + eps && a0 > f0 + eps) {
+            continue;
+        }
+        let (b0, bc, b1) = span(r, across);
+        // Touching edges are beside, not in line: a grid's cells all touch.
+        let tol = 0.02 * ((q1 - q0) + (b1 - b0));
+        let lined_up = b1 > q0 + tol && b0 < q1 - tol;
+        if !lined_up && (bc - qc).abs() > (ac - fc).max(0.0) * 3f32.sqrt() {
+            continue;
+        }
+        let gap = (a0 - f1).max(0.0);
+        // From the lane to the candidate's near edge across (0 when the lane
+        // runs through it); its centre only breaks a tie.
+        let to_edge = (b0 - at).max(at - b1).max(0.0);
+        let score = 13.0 * gap * gap + to_edge * to_edge + 1e-3 * (bc - at).powi(2);
+        let slot = if lined_up { &mut in_line } else { &mut beside };
+        if slot.map_or(true, |(_, s)| score < s) {
+            *slot = Some((i, score));
+        }
+    }
+    in_line.or(beside).map(|(i, _)| i)
+}
+
+/// [`nearest_rect_toward`] for a diagonal `step`.
+fn nearest_rect_diagonal(
+    from: egui::Rect,
+    cands: impl IntoIterator<Item = (usize, egui::Rect)>,
+    step: NavStep,
+) -> Option<usize> {
+    let (sx, sy) = (step.x as f32, step.y as f32);
+    let c = from.center();
+    let mut best: Option<(usize, f32)> = None;
+    for (i, r) in cands {
+        if !r.is_finite() {
+            continue;
+        }
+        // Centre to centre, positive toward the step on each axis.
+        let o = r.center();
+        let (dx, dy) = ((o.x - c.x) * sx, (o.y - c.y) * sy);
+        if dx <= 0.01 * (from.width() + r.width()) || dy <= 0.01 * (from.height() + r.height()) {
+            continue;
+        }
+        // Edge to edge on each axis, 0 where they overlap.
+        let gx = if sx > 0.0 { r.left() - from.right() } else { from.left() - r.right() }.max(0.0);
+        let gy = if sy > 0.0 { r.top() - from.bottom() } else { from.top() - r.bottom() }.max(0.0);
+        let off = (dx - dy).abs() * std::f32::consts::FRAC_1_SQRT_2;
+        let score = 13.0 * (gx * gx + gy * gy) + off * off;
+        if best.map_or(true, |(_, s)| score < s) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 // ── the nav switch, reachable from outside Easy mode ─────────────────────────
@@ -1461,5 +1830,179 @@ mod card_south_tests {
         assert_eq!((act, keep), (CardSouth::Wait, None));
         let (act, _) = card_south_step(stale, 1, false, false, true, true, later);
         assert_eq!(act, CardSouth::Wait);
+    }
+}
+
+/// Spatial walks over a layout: which rect a step lands on, and which step a
+/// stick or a D-pad asks for.
+#[cfg(test)]
+mod spatial_walk_tests {
+    use super::*;
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+    }
+
+    /// The reported layout (a user's "Untitled 13"): two curves with their
+    /// rows, a Touch Zones pad under both, its cards and a third curve under
+    /// that, a Remapper down the right.
+    fn untitled_13() -> Vec<(usize, egui::Rect)> {
+        vec![
+            (4, r(8.0, 260.0, 488.0, 192.0)),   // Touch Zones pad
+            (5, r(8.0, 460.0, 236.0, 240.0)),   // its cards
+            (6, r(8.0, 28.0, 240.0, 152.0)),    // curve
+            (8, r(8.0, 184.0, 240.0, 18.0)),    // its scale row
+            (9, r(8.0, 204.0, 240.0, 18.0)),    // its range row
+            (10, r(256.0, 28.0, 240.0, 152.0)), // curve
+            (11, r(256.0, 184.0, 240.0, 18.0)),
+            (12, r(256.0, 204.0, 240.0, 18.0)),
+            (15, r(512.0, 28.0, 232.0, 676.0)), // Remapper
+            (20, r(256.0, 480.0, 240.0, 180.0)), // curve
+            (21, r(256.0, 664.0, 240.0, 18.0)),
+            (22, r(256.0, 684.0, 240.0, 18.0)),
+        ]
+    }
+
+    fn walk(layout: &[(usize, egui::Rect)], from: usize, step: NavStep) -> Option<usize> {
+        let here = layout.iter().find(|(i, _)| *i == from).unwrap().1;
+        nearest_rect_toward(here, layout.iter().copied().filter(|(i, _)| *i != from), step)
+    }
+
+    /// The reported bug: down from either curve's last row skipped the Touch
+    /// Zones pad (wide, its centre far off to one side) for the widget under it.
+    #[test]
+    fn down_from_a_curve_reaches_the_touch_zones_pad_under_it() {
+        let l = untitled_13();
+        assert_eq!(walk(&l, 9, NavStep::DOWN), Some(4));
+        assert_eq!(walk(&l, 12, NavStep::DOWN), Some(4));
+        // And on down: the cards on the left, the curve on the right.
+        assert_eq!(walk(&l, 4, NavStep::DOWN), Some(5));
+        assert_eq!(walk(&l, 4, NavStep { x: 1, y: 1 }), Some(20));
+        // Back up from the pad: a row above it, not the curve two rows up.
+        assert!(matches!(walk(&l, 4, NavStep::UP), Some(9) | Some(12)));
+        // Across: the pad to the Remapper beside it, and back.
+        assert_eq!(walk(&l, 4, NavStep::RIGHT), Some(15));
+        assert_eq!(walk(&l, 15, NavStep::LEFT), Some(4));
+        // Nothing left of the pad (that's where nav hands over to the panel).
+        assert_eq!(walk(&l, 4, NavStep::LEFT), None);
+        // A diagonal is right AND down: from a curve, the next column's row,
+        // not the curve's own row straight below it.
+        assert_eq!(walk(&l, 6, NavStep { x: 1, y: 1 }), Some(11));
+        assert_eq!(walk(&l, 6, NavStep { x: -1, y: 1 }), None, "nothing left of the left column");
+        assert_eq!(walk(&l, 15, NavStep { x: -1, y: 1 }), Some(20));
+    }
+
+    /// Off to the side only within 60° of the step: further round is another
+    /// direction, which a diagonal asks for.
+    #[test]
+    fn nothing_far_off_the_step_is_taken_for_it() {
+        let l = vec![(0, r(0.0, 0.0, 100.0, 50.0)), (1, r(300.0, 60.0, 100.0, 50.0))];
+        assert_eq!(walk(&l, 0, NavStep::DOWN), None, "80° off down");
+        assert_eq!(walk(&l, 0, NavStep::RIGHT), Some(1), "beside, but within 60°");
+        assert_eq!(walk(&l, 0, NavStep { x: 1, y: 1 }), Some(1));
+    }
+
+    #[test]
+    fn the_stick_asks_for_the_direction_it_points_in() {
+        let at = |deg: f32| {
+            let a = deg.to_radians();
+            // Stick y is up: 90° here is straight up.
+            stick_step(egui::vec2(a.cos(), a.sin()), 0.5, None)
+        };
+        assert_eq!(at(90.0), Some(NavStep::UP));
+        assert_eq!(at(110.0), Some(NavStep::UP), "20° of slop stays up");
+        assert_eq!(at(45.0), Some(NavStep { x: 1, y: -1 }), "up-right");
+        assert_eq!(at(-45.0), Some(NavStep { x: 1, y: 1 }), "down-right");
+        assert_eq!(at(180.0), Some(NavStep::LEFT));
+        assert_eq!(stick_step(egui::vec2(0.3, 0.0), 0.5, None), None, "not past engage");
+        // Held up, it stays up a little past its arc; let go of, it's the diagonal.
+        let past = |held| {
+            let a = 61.0_f32.to_radians();
+            stick_step(egui::vec2(a.cos(), a.sin()), 0.5, held)
+        };
+        assert_eq!(past(Some(NavStep::UP)), Some(NavStep::UP));
+        assert_eq!(past(None), Some(NavStep { x: 1, y: -1 }));
+    }
+
+    fn dpad(rising: &[&str], held: &[&str]) -> NavInput {
+        NavInput {
+            pressed: rising.iter().chain(held).map(|s| s.to_string()).collect(),
+            rising: rising.iter().map(|s| s.to_string()).collect(),
+            lstick: egui::Vec2::ZERO,
+            rstick: egui::Vec2::ZERO,
+            lt: 0.0,
+            rt: 0.0,
+            gyro_pitch: 0.0,
+            gyro_yaw: 0.0,
+        }
+    }
+
+    /// A mushy D-pad lands a diagonal's two switches tens of milliseconds
+    /// apart: a straight press waits for the one beside it.
+    #[test]
+    fn the_dpad_waits_for_a_diagonal_before_it_steps_straight() {
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        let t0 = std::time::Instant::now();
+        let ur = NavStep { x: 1, y: -1 };
+
+        // Right lands 40 ms after up: one step, up-right.
+        let mut g = GamepadNav::default();
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_up"], &[]), t0), None, "held back");
+        assert_eq!(g.dpad_step_at(&dpad(&[], &["dpad_up"]), t0 + ms(20)), None);
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_right"], &["dpad_up"]), t0 + ms(40)), Some(ur));
+        assert_eq!(g.dpad_step_at(&dpad(&[], &["dpad_up", "dpad_right"]), t0 + ms(60)), None, "once");
+
+        // Nothing joins it: up, once the wait is over.
+        let mut g = GamepadNav::default();
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_up"], &[]), t0), None);
+        assert_eq!(g.dpad_step_at(&dpad(&[], &["dpad_up"]), t0 + ms(30)), None);
+        assert_eq!(g.dpad_step_at(&dpad(&[], &["dpad_up"]), t0 + ms(65)), Some(NavStep::UP));
+        // A direction pressed while up has long been held is a step of its own.
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_right"], &["dpad_up"]), t0 + ms(300)), None);
+        assert_eq!(g.dpad_step_at(&dpad(&[], &["dpad_up", "dpad_right"]), t0 + ms(370)), Some(NavStep::RIGHT));
+
+        // A quick tap steps as it's let go of, without waiting out the rest.
+        let mut g = GamepadNav::default();
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_down"], &[]), t0), None);
+        assert_eq!(g.dpad_step_at(&dpad(&[], &[]), t0 + ms(25)), Some(NavStep::DOWN));
+
+        // Two at once go diagonally at once.
+        let mut g = GamepadNav::default();
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_down", "dpad_left"], &[]), t0), Some(NavStep { x: -1, y: 1 }));
+
+        // One held back and never asked about again isn't stepped late.
+        let mut g = GamepadNav::default();
+        assert_eq!(g.dpad_step_at(&dpad(&["dpad_up"], &[]), t0), None);
+        assert_eq!(g.dpad_step_at(&dpad(&[], &[]), t0 + ms(400)), None);
+    }
+
+    /// The reported bug: down onto the wide Touch Zones pad from the right-hand
+    /// curve, the next step down went to the cards on the left. It keeps to the
+    /// lane it came down: the curve under the right of the pad, and back up.
+    #[test]
+    fn a_walk_keeps_to_the_lane_it_came_down() {
+        let l = untitled_13();
+        let rect = |i: usize| l.iter().find(|(j, _)| *j == i).unwrap().1;
+        let mut lane = None;
+        let mut at = 12; // the right-hand curve's range row
+        let go = |lane: &mut Option<NavLane>, at: &mut usize, step: NavStep| {
+            let next = step_in_lane(lane, 1, (*at, rect(*at)),
+                l.iter().copied().filter(|(i, _)| i != at), step);
+            *at = next.expect("a step");
+            *at
+        };
+        assert_eq!(go(&mut lane, &mut at, NavStep::DOWN), 4, "onto the pad");
+        assert_eq!(go(&mut lane, &mut at, NavStep::DOWN), 20, "on down the right, not to the cards");
+        assert_eq!(go(&mut lane, &mut at, NavStep::UP), 4);
+        assert_eq!(go(&mut lane, &mut at, NavStep::UP), 12, "back up the right");
+        // From the left-hand curve it's the left all the way.
+        let (mut lane, mut at) = (None, 9);
+        assert_eq!(go(&mut lane, &mut at, NavStep::DOWN), 4);
+        assert_eq!(go(&mut lane, &mut at, NavStep::DOWN), 5);
+        // A lane for one widget is no lane for another: selected some other way,
+        // the pad walks from its middle again.
+        let mut stale = Some(NavLane { scope: 1, at: 12, x: 400.0, y: 213.0 });
+        let mut pad = 4;
+        assert_eq!(go(&mut stale, &mut pad, NavStep::DOWN), 5, "from the pad's middle: the cards");
     }
 }

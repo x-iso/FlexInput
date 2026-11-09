@@ -7,26 +7,34 @@ use super::*;
 /// Paint the mapping-card selection glow from the pass-stamped rect channels the
 /// remapper/TZ body published this frame. Viewport-agnostic: it reads only ctx
 /// temps and paints on whichever `ctx`'s foreground layer you hand it — the main
-/// window (via [`FlexInputApp::nav_draw_remap_card_glow`]) or the config-overlay
+/// window's Easy body (via [`draw_requested_card_glow`]) or the config-overlay
 /// viewport. `inner` is the mapping node; `scope` its mappings key
 /// (`"mappings"` / `"zone_maps"` / `"lean_*"`); `host` the layer the body renders
-/// in, so what covers the body covers the glow too.
+/// in, so what covers the body covers the glow too. `view` is the part of the
+/// screen the body shows (the Easy body's panel): nothing paints outside it, so a
+/// card scrolled out of the body takes its glow with it instead of leaving it
+/// over the preset bar or the I/O panel.
+///
+/// Call it AFTER the body has rendered this pass: the rects are the ones it just
+/// published, so the ring sits on the card even while the body scrolls.
 pub(crate) fn draw_remap_card_glow(
     ctx: &egui::Context,
     outer_id: egui_snarl::NodeId,
     inner: egui_snarl::NodeId,
     scope: &str,
     host: egui::LayerId,
+    view: egui::Rect,
 ) {
     let cur_pass = ctx.cumulative_pass_nr();
     // The rect channels are per viewport: this one's copy of the body.
     let vp = ctx.viewport_id();
     let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-    // The action-button glow uses the full-screen painter (the action row sits at
-    // the top of the body and never scrolls); the card glow below re-clips to the
+    // The action-button glow is clipped to the view (the action row scrolls out
+    // with the body like any other row); the card glow below also re-clips to the
     // card-list viewport so a card scrolled partly out is cropped at its edge.
+    let view = view.intersect(ctx.content_rect());
     let painter = crate::widgets::nav_highlight_painter(
-        ctx, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0)), host, ctx.content_rect());
+        ctx, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0)), host, view);
     let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
         crate::widgets::paint_nav_bloom(&painter, rect, accent, round, peak, max_grow, 6, 2.0, 1.0, 2.0);
     };
@@ -54,11 +62,13 @@ pub(crate) fn draw_remap_card_glow(
                     whole = whole.union(sect);
                 }
             }
-            let clipped = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+            let list_view = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
                     egui::Id::new(("gp_nav_remap_viewport", vp, inner.0, scope))))
                 .filter(|(p, r)| cur_pass.saturating_sub(*p) <= 2 && r.is_finite())
-                .map(|(_, vp)| painter.with_clip_rect(vp));
+                .map(|(_, r)| r.intersect(view));
+            let clipped = list_view.map(|r| painter.with_clip_rect(r));
             let cp = clipped.as_ref().unwrap_or(&painter);
+            let shown = list_view.unwrap_or(view);
             let ring_c = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
                 crate::widgets::paint_nav_bloom(cp, rect, accent, round, peak, max_grow, 6, 2.0, 1.0, 2.0);
             };
@@ -66,11 +76,14 @@ pub(crate) fn draw_remap_card_glow(
             if entered {
                 if let Some(fr) = field { ring_c(fr, 4.0, 160.0, 6.0); }
             }
-            // What the focused option does, as its hover tooltip says it.
+            // What the focused option does, as its hover tooltip says it — while
+            // that option is on screen. A tooltip isn't clipped, so one for a
+            // field scrolled out of view would hang over whatever is there.
             let tip = ctx.data(|d| d.get_temp::<(u64, String)>(
                     egui::Id::new(("gp_nav_remap_card_tip", vp, inner.0, scope))))
                 .filter(|(p, t)| cur_pass.saturating_sub(*p) <= 2 && !t.is_empty())
                 .map(|(_, t)| t);
+            let field = field.filter(|fr| fr.intersect(shown).is_positive());
             if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
                 let tp = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
                     egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0)), host));
@@ -109,17 +122,101 @@ pub(crate) fn draw_remap_card_glow(
     }
 }
 
+/// Ctx-data slot of this pass's mapping-card glow request for the Easy body of
+/// `outer`: `(pass, inner node, mappings key)`.
+fn card_glow_req_id(outer: egui_snarl::NodeId) -> egui::Id {
+    egui::Id::new(("gp_nav_card_glow_req", outer.0))
+}
+
+/// Ask for the glow on the card list of `inner` (`scope` its mappings key) on the
+/// Easy body of `outer`, this pass.
+pub(crate) fn request_card_glow(
+    ctx: &egui::Context,
+    outer: egui_snarl::NodeId,
+    inner: egui_snarl::NodeId,
+    scope: &'static str,
+) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(card_glow_req_id(outer), (pass, inner.0, scope)));
+}
+
+/// The mapping-card glow nav asked for on the Easy body of `outer` this pass.
+fn card_glow_req(ctx: &egui::Context, outer: egui_snarl::NodeId) -> Option<(egui_snarl::NodeId, &'static str)> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<(u64, usize, &'static str)>(card_glow_req_id(outer)))
+        .filter(|(p, _, _)| *p == pass)
+        .map(|(_, inner, scope)| (egui_snarl::NodeId(inner), scope))
+}
+
+/// Paint the mapping-card glow nav asked for (`nav_request_remap_card_glow`) on
+/// the Easy body of `outer`, from the rects the body published THIS pass. The
+/// body calls it after rendering, clipped to the `view` it shows.
+pub(crate) fn draw_requested_card_glow(
+    ctx: &egui::Context,
+    outer: egui_snarl::NodeId,
+    host: egui::LayerId,
+    view: egui::Rect,
+) {
+    if let Some((inner, scope)) = card_glow_req(ctx, outer) {
+        draw_remap_card_glow(ctx, outer, inner, scope, host, view);
+    }
+}
+
+/// Where the focus is inside a card list the Easy body of `outer` shows, in
+/// global coordinates, for the body to keep in view: the focused action button,
+/// else the entered card's focused field, else the selected card (with the curve
+/// section under it while one of its fields is the focus). Read after the body
+/// has rendered this pass; `None` when nav isn't in a card list.
+pub(crate) fn nav_card_focus_rect(ctx: &egui::Context, outer: egui_snarl::NodeId) -> Option<egui::Rect> {
+    let (inner, scope) = card_glow_req(ctx, outer)?;
+    let pass = ctx.cumulative_pass_nr();
+    let vp = ctx.viewport_id();
+    let fresh = |p: u64| pass.saturating_sub(p) <= 2;
+    let action = ctx.data(|d|
+        d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0, scope))))
+        .filter(|(p, _)| crate::widgets::nav_pass_matches(ctx, *p))
+        .map(|(_, i)| i)
+        .filter(|i| *i != usize::MAX);
+    if let Some(ai) = action {
+        return ctx.data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(
+                egui::Id::new(("gp_nav_action_rects", vp, inner.0, scope))))
+            .filter(|(p, _)| fresh(*p))
+            .and_then(|(_, rects)| rects.get(ai).copied());
+    }
+    let (p, card, field, entered) = ctx.data(|d|
+        d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
+            egui::Id::new(("gp_nav_remap_card_rects", vp, inner.0, scope))))?;
+    if !fresh(p) || !card.is_finite() {
+        return None;
+    }
+    if entered {
+        if let Some(fr) = field {
+            return Some(fr);
+        }
+        // A focused field the card doesn't own a rect for lives in the curve
+        // section under it.
+        let section = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+                egui::Id::new(("gp_nav_card_section_rect", vp, inner.0, scope))))
+            .filter(|(sp, r)| fresh(*sp) && r.is_finite() && (r.top() - card.bottom()).abs() < 6.0)
+            .map(|(_, r)| r);
+        if let Some(sect) = section {
+            return Some(card.union(sect));
+        }
+    }
+    Some(card)
+}
+
 impl FlexInputApp {
 
-    /// Draw the mapping-card selection glow at top level using the GLOBAL rects
-    /// the remapper body published last frame (`gp_nav_remap_card_rects`). Must
-    /// run outside the body's child layer — painting from inside it deadlocks
-    /// epaint's graphics lock.
-    pub(crate) fn nav_draw_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+    /// Ask for the mapping-card selection glow on the Easy body this pass. The
+    /// body paints it after it renders (`draw_requested_card_glow`), from the
+    /// rects it publishes as it goes: painted here, before the body, the ring sat
+    /// where the card was LAST frame, a frame behind every scroll. Painting from
+    /// inside the body's child layer instead deadlocks epaint's graphics lock.
+    pub(crate) fn nav_request_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let scope = self.nav_remap_mappings_key(outer_id);
-        let host = crate::easy::center_panel::body_area_layer(outer_id);
-        draw_remap_card_glow(ctx, outer_id, inner, scope, host);
+        request_card_glow(ctx, outer_id, inner, scope);
     }
 
     /// Mappings array key for the selected remapper-family node. Remapper /

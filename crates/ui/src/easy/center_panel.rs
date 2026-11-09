@@ -1281,6 +1281,13 @@ pub(crate) fn body_area_layer(outer_id: NodeId) -> egui::LayerId {
     )
 }
 
+/// Ctx-data slot of the gamepad-nav focus inside the selected widget of the Easy
+/// body of `outer_id`: `(pass, item index, body-local rect)`, written after the
+/// body renders for the next pass's auto-scroll.
+fn nav_focus_id(outer_id: NodeId) -> egui::Id {
+    egui::Id::new(("easy_nav_focus", outer_id.0))
+}
+
 fn render_subpatch_body(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -1349,29 +1356,55 @@ fn render_subpatch_body(
     );
     scroll_y = (scroll_y - dy).clamp(0.0, scroll_overflow);
 
-    // Auto-scroll to keep the gamepad-nav selection (or the RS cursor) in view.
+    // Auto-scroll to keep the gamepad-nav focus (or the RS cursor) in view.
+    let cur_pass = ui.ctx().cumulative_pass_nr();
+    let focus_id = nav_focus_id(outer_id);
+    let selected = canvas.snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.selected_item);
+    let prev_sel_id = egui::Id::new(("easy_nav_prev_sel", outer_id.0));
+    let newly_selected = ui.ctx().data(|d| d.get_temp::<Option<usize>>(prev_sel_id)) != Some(selected);
+    ui.ctx().data_mut(|d| d.insert_temp(prev_sel_id, selected));
     if scroll_overflow > 0.0 {
         let margin = 24.0_f32;
-        // Selected item span in screen-Y (post-scale, pre-scroll offset).
         let nav_owns: bool = {
             let stamp: Option<u64> = ui.ctx().data(|d|
                 d.get_temp(egui::Id::new("gp_nav_owns_selection")));
-            stamp == Some(ui.ctx().cumulative_pass_nr())
+            stamp == Some(cur_pass)
         };
         if nav_owns {
-            if let Some((top, bot)) = canvas.snarl.get_node(outer_id)
+            // What to keep in view, in screen-Y post-scale, pre-scroll offset —
+            // the space whose visible window is [scroll_y, scroll_y + panel_h].
+            // Inside the selected widget it's the focus there (a card, a field),
+            // stored body-local by last pass's render; else the widget itself.
+            // Either way `nav_reveal_delta` never asks for both ends of something
+            // taller than the panel: fitting a widget that can't fit is what made
+            // it flicker up and down. A tall widget scrolls only as the focus in
+            // it goes past an edge, its top going out of view.
+            let focus = ui.ctx().data(|d| d.get_temp::<(u64, usize, egui::Rect)>(focus_id))
+                .filter(|(p, idx, _)| cur_pass.saturating_sub(*p) <= 1 && Some(*idx) == selected)
+                .map(|(_, _, r)| (r.top() * scale, r.bottom() * scale));
+            let item = canvas.snarl.get_node(outer_id)
                 .and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.selected_item.and_then(|i| sp.items.get(i)))
-                .map(|item| { let (p, s) = item.bbox(); (p[1] * scale, (p[1] + s[1]) * scale) })
-            {
-                // Desired visible window in the same (pre-offset) space is
-                // [scroll_y, scroll_y + panel_h]. Nudge to include the item.
-                if top - margin < scroll_y {
-                    scroll_y = (top - margin).max(0.0);
-                } else if bot + margin > scroll_y + panel_h {
-                    scroll_y = (bot + margin - panel_h).min(scroll_overflow);
+                .and_then(|sp| selected.and_then(|i| sp.items.get(i)))
+                .map(|item| { let (p, s) = item.bbox(); (p[1] * scale, (p[1] + s[1]) * scale) });
+            // Arriving on a widget with nothing above it shows the top of the
+            // layout — the titles over it — so long as the widget still fits
+            // whole under them. Once, on arrival: the wheel stays free after.
+            if let (true, None, Some((_, bot))) = (newly_selected, focus, item) {
+                let topmost = canvas.snarl.get_node(outer_id)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .is_some_and(|sp| crate::gamepad_nav::nearest_item_toward(
+                        &sp.items, selected, crate::gamepad_nav::NavStep::UP,
+                        |i| crate::app::FlexInputApp::sp_item_is_editable(sp, i),
+                    ).is_none());
+                if topmost && bot + margin <= panel_h {
+                    scroll_y = 0.0;
                 }
-                scroll_y = scroll_y.clamp(0.0, scroll_overflow);
+            }
+            if let Some((top, bot)) = focus.or(item) {
+                let d = crate::widgets::nav_reveal_delta(top, bot, scroll_y, scroll_y + panel_h, margin);
+                scroll_y = (scroll_y + d).clamp(0.0, scroll_overflow);
             }
         }
         // Keep the RS cursor in view too (when visible).
@@ -1407,6 +1440,14 @@ fn render_subpatch_body(
     let pre_snapshot = if needs_snapshot { Some(canvas.undo_clone()) } else { None };
 
     let area_layer = body_area_layer(outer_id);
+    // Body layer transform: scale + translate so body-local coords map to
+    // (panel_rect.min + body_pos*scale - (0, scroll_y)). Fixed for the pass
+    // (a scrollbar drag below lands next pass); the nav focus published while
+    // the body renders maps back to body-local through it.
+    let xform = egui::emath::TSTransform::new(
+        panel_rect.min.to_vec2() - egui::vec2(0.0, scroll_y),
+        scale,
+    );
     egui::Area::new(area_layer.id)
         .order(area_layer.order)
         .movable(false)
@@ -1416,17 +1457,12 @@ fn render_subpatch_body(
         .show(ui.ctx(), |ui| {
             ui.set_clip_rect(panel_rect);
 
-            // Dedicated body layer: scale + translate so body-local
-            // coords map to (panel_rect.min + body_pos*scale - (0, scroll_y)).
+            // Dedicated body layer, transformed by `xform`.
             let body_layer = egui::LayerId::new(
                 egui::Order::Middle,
                 egui::Id::new(("easy_body_scale_layer", outer_id.0)),
             );
             ui.ctx().set_sublayer(ui.layer_id(), body_layer);
-            let xform = egui::emath::TSTransform::new(
-                panel_rect.min.to_vec2() - egui::vec2(0.0, scroll_y),
-                scale,
-            );
             ui.ctx().set_transform_layer(body_layer, xform);
 
             // Child UI is on body_layer; its max_rect & clip_rect are
@@ -1509,10 +1545,8 @@ fn render_subpatch_body(
         if let Some(sp) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref()) {
             for (i, item) in sp.items.iter().enumerate() {
                 let (lp, ls) = item.bbox();
-                let min = panel_rect.min
-                    + egui::vec2(lp[0] * scale, lp[1] * scale - scroll_y);
-                let size = egui::vec2(ls[0].max(1.0) * scale, ls[1].max(1.0) * scale);
-                rects.push((i, egui::Rect::from_min_size(min, size)));
+                rects.push((i, xform * egui::Rect::from_min_size(
+                    egui::pos2(lp[0], lp[1]), egui::vec2(ls[0].max(1.0), ls[1].max(1.0)))));
             }
         }
         let pass = ui.ctx().cumulative_pass_nr();
@@ -1525,62 +1559,81 @@ fn render_subpatch_body(
     // The nav driver (run earlier this frame) stamps a temp value keyed by
     // outer_id with (pass_nr, is_editing) when a nav device is active. Draw a
     // steady glowing outline around the selected item, mapping its body-local
-    // bbox through the same transform the body layer uses:
-    //   screen = panel_rect.min + body_pos*scale - (0, scroll_y)
+    // bbox through the transform the body rendered with (`xform`: the scroll
+    // a scrollbar drag set above only lands next pass).
+    let selected_rect = canvas.snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| selected.and_then(|i| sp.items.get(i)))
+        .map(|item| {
+            let (lp, ls) = item.bbox();
+            xform * egui::Rect::from_min_size(
+                egui::pos2(lp[0], lp[1]), egui::vec2(ls[0].max(1.0), ls[1].max(1.0)))
+        });
     let glow: Option<(u64, bool)> =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_glow", outer_id.0))));
     if let Some((pass, editing)) = glow {
-        if pass == ui.ctx().cumulative_pass_nr() {
-            let sel = canvas.snarl.get_node(outer_id)
-                .and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.selected_item.map(|i| (i, sp)));
-            if let Some((sel_idx, sp)) = sel {
-                if let Some(item) = sp.items.get(sel_idx) {
-                    let (lp, ls) = item.bbox();
-                    let min = panel_rect.min
-                        + egui::vec2(lp[0] * scale, lp[1] * scale - scroll_y);
-                    let size = egui::vec2(ls[0].max(1.0) * scale, ls[1].max(1.0) * scale);
-                    let rect = egui::Rect::from_min_size(min, size);
-                    let accent = ui.visuals().selection.stroke.color;
-                    let [r, g, b, _] = accent.to_array();
-                    let base_round = 6.0_f32;
+        if let (true, Some(rect)) = (pass == cur_pass, selected_rect) {
+            let accent = ui.visuals().selection.stroke.color;
+            let [r, g, b, _] = accent.to_array();
+            let base_round = 6.0_f32;
 
-                    // Edge ring + OUTWARD bloom only — never fills the widget
-                    // interior, so the control underneath stays fully visible
-                    // while editing. Bloom = concentric outside-strokes with
-                    // falling alpha (a true outward gradient).
-                    let painter = crate::widgets::nav_highlight_painter(
-                        ui.ctx(),
-                        egui::Id::new(("gp_nav_glow_top", outer_id.0)),
-                        area_layer,
-                        panel_rect,
-                    );
-                    let rings = 7;
-                    let max_grow = if editing { 9.0 } else { 6.0 };
-                    let peak = if editing { 150.0 } else { 90.0 };
-                    for i in 0..rings {
-                        let t = (i as f32 + 1.0) / rings as f32;
-                        let grow = t * max_grow;
-                        let a = (peak * (1.0 - t)).round() as u8;
-                        if a == 0 { continue; }
-                        painter.rect_stroke(
-                            rect.expand(grow), base_round + grow,
-                            egui::Stroke::new(2.0_f32,
-                                egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-                    painter.rect_stroke(
-                        rect.expand(1.0),
-                        base_round,
-                        egui::Stroke::new(if editing { 2.0 } else { 1.25_f32 },
-                            accent.gamma_multiply(if editing { 1.0 } else { 0.75 })),
-                        egui::StrokeKind::Outside,
-                    );
-                }
+            // Edge ring + OUTWARD bloom only — never fills the widget
+            // interior, so the control underneath stays fully visible
+            // while editing. Bloom = concentric outside-strokes with
+            // falling alpha (a true outward gradient).
+            let painter = crate::widgets::nav_highlight_painter(
+                ui.ctx(),
+                egui::Id::new(("gp_nav_glow_top", outer_id.0)),
+                area_layer,
+                panel_rect,
+            );
+            let rings = 7;
+            let max_grow = if editing { 9.0 } else { 6.0 };
+            let peak = if editing { 150.0 } else { 90.0 };
+            for i in 0..rings {
+                let t = (i as f32 + 1.0) / rings as f32;
+                let grow = t * max_grow;
+                let a = (peak * (1.0 - t)).round() as u8;
+                if a == 0 { continue; }
+                painter.rect_stroke(
+                    rect.expand(grow), base_round + grow,
+                    egui::Stroke::new(2.0_f32,
+                        egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                    egui::StrokeKind::Outside,
+                );
             }
+            painter.rect_stroke(
+                rect.expand(1.0),
+                base_round,
+                egui::Stroke::new(if editing { 2.0 } else { 1.25_f32 },
+                    accent.gamma_multiply(if editing { 1.0 } else { 0.75 })),
+                egui::StrokeKind::Outside,
+            );
         }
     }
+
+    // The highlights inside the selected widget nav asked for this pass — the
+    // mapping-card glow, the field ring and its label pill — paint now too, from
+    // the rects the body just published, clipped to the panel like the ring
+    // above. Painted by nav before the body, they trailed every scroll by a
+    // frame and hung over the preset bar and the I/O panel once their card or
+    // field had scrolled out of the panel.
+    crate::app::draw_requested_card_glow(ui.ctx(), outer_id, area_layer, panel_rect);
+    if let Some(item) = selected_rect {
+        crate::app::draw_requested_field_hud(ui.ctx(), outer_id, item, area_layer, panel_rect);
+    }
+
+    // Where the focus inside the selected widget is, body-local, for next pass's
+    // auto-scroll. Published in global coordinates by this pass's render, so
+    // this pass's transform maps it back.
+    let focus = crate::app::nav_card_focus_rect(ui.ctx(), outer_id)
+        .or_else(|| crate::app::nav_field_focus_rect(ui.ctx(), outer_id))
+        .map(|g| xform.inverse() * g)
+        .filter(|r| r.is_finite());
+    ui.ctx().data_mut(|d| match (focus, selected) {
+        (Some(r), Some(idx)) => d.insert_temp(focus_id, (cur_pass, idx, r)),
+        _ => d.remove::<(u64, usize, egui::Rect)>(focus_id),
+    });
 
     // Capture any pinned-widget value edit made this frame into undo/redo
     // (commit-on-settle, coalesced to one entry per gesture). Only runs when we
@@ -1832,4 +1885,253 @@ fn hash_subpatch(sp: &UiSubPatch) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// The Easy body as gamepad nav drives it, headless: a pinned Remapper taller
+/// than the panel, selected, and the highlights nav asks for.
+#[cfg(test)]
+mod nav_scroll_tests {
+    use super::*;
+    use egui::pos2;
+
+    const SCREEN: egui::Rect = egui::Rect { min: pos2(0.0, 0.0), max: pos2(800.0, 700.0) };
+    /// The body's panel: preset bar above it, I/O panel to its left.
+    const PANEL: egui::Rect = egui::Rect { min: pos2(100.0, 150.0), max: pos2(500.0, 450.0) };
+    /// The pin's top in the body, and the body's width (its widest item + PAD).
+    const PIN_TOP: f32 = 120.0;
+    const BODY_W: f32 = 380.0 + 16.0;
+
+    struct Rig {
+        ctx: egui::Context,
+        canvas: Canvas,
+        outer: NodeId,
+        t: f64,
+    }
+
+    /// What nav sets up for the body in a pass, besides owning the selection.
+    #[derive(Clone, Copy)]
+    enum Nav {
+        /// The selected widget itself (`EditLevel::Widget`).
+        Widget,
+        /// In its card list, card `n` selected (`EditLevel::RemapScroll`).
+        Card(usize),
+        /// In its card list, on its first action button (Learn).
+        Action,
+    }
+
+    /// One pass's result: the body's scroll, the focus nav keeps in view (global),
+    /// and everything painted.
+    struct Pass {
+        scroll: f32,
+        focus: Option<egui::Rect>,
+        shapes: Vec<egui::epaint::ClippedShape>,
+    }
+
+    impl Rig {
+        /// A short decoration on top, then a Remapper with `cards` cards whose pin
+        /// is `pin_h` tall: taller than the 300 px panel. The Remapper is selected.
+        fn new(cards: usize, pin_h: f32) -> Self {
+            Self::with_pins(cards, &[(PIN_TOP, pin_h)], 1)
+        }
+
+        /// A short decoration on top (a title), then a pin of the one Remapper
+        /// per `(top, height)`, 380 wide; item `selected` selected (the
+        /// decoration is item 0).
+        fn with_pins(cards: usize, pins: &[(f32, f32)], selected: usize) -> Self {
+            let mut items = vec![serde_json::json!(
+                { "Deco": { "Rect": { "pos": [0.0, 0.0], "size": [380.0, 40.0],
+                    "fill": [40, 40, 40, 255], "stroke": [0, 0, 0, 0],
+                    "stroke_px": 0.0, "corner_radius": 0.0 } } })];
+            items.extend(pins.iter().map(|&(top, h)| serde_json::json!(
+                { "Module": { "inner_node_id": 0, "element_id": "whole_module",
+                    "pos": [0.0, top], "size": [380.0, h] } })));
+            let mut sp: UiSubPatch = serde_json::from_value(serde_json::json!({
+                "display_name": "Body", "pins_in": [], "pins_out": [], "items": items,
+            })).expect("sub-patch json");
+            let card = serde_json::json!({ "in": ["btn_south"], "out": ["btn_east"] });
+            let mut params = HashMap::new();
+            params.insert("mappings".to_string(), serde_json::Value::Array(vec![card; cards]));
+            let inner = sp.snarl.insert_node(pos2(0.0, 0.0), NodeData {
+                module_id: "module.remapper".into(), display_name: "Remapper".into(),
+                category: "AutoMap".into(), inputs: vec![], outputs: vec![], params,
+                subpatch: None, extra: Default::default(),
+            });
+            assert_eq!(inner.0, 0);
+            sp.selected_item = Some(selected);
+            let mut canvas = Canvas::default();
+            let outer = canvas.snarl.insert_node(pos2(0.0, 0.0), NodeData {
+                module_id: "subpatch".into(), display_name: String::new(), category: String::new(),
+                inputs: vec![], outputs: vec![], params: Default::default(),
+                subpatch: Some(Box::new(sp)), extra: Default::default(),
+            });
+            Rig { ctx: egui::Context::default(), canvas, outer, t: 0.0 }
+        }
+
+        /// Nav moves the selection to item `i`.
+        fn select(&mut self, i: usize) {
+            let sp = self.canvas.snarl.get_node_mut(self.outer)
+                .and_then(|n| n.subpatch.as_mut()).expect("sub-patch");
+            sp.selected_item = Some(i);
+            sp.selected_items = vec![i];
+        }
+
+        fn scroll_id(&self) -> egui::Id {
+            egui::Id::new(("easy_subpatch_body_scroll", self.outer.0))
+        }
+
+        /// One pass, with nav published the way its driver does before the body.
+        fn pass(&mut self, nav: Nav) -> Pass {
+            self.t += 1.0 / 60.0;
+            let raw = egui::RawInput { screen_rect: Some(SCREEN), time: Some(self.t), ..Default::default() };
+            let scroll_id = self.scroll_id();
+            let Rig { ctx, canvas, outer, .. } = self;
+            let outer = *outer;
+            let inner = NodeId(0);
+            let mut focus = None;
+            let out = ctx.run(raw, |ctx| {
+                let pass = ctx.cumulative_pass_nr();
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("gp_nav_owns_selection"), pass);
+                    d.insert_temp(egui::Id::new(("gp_nav_glow", outer.0)), (pass, !matches!(nav, Nav::Widget)));
+                    let action = match nav {
+                        Nav::Card(n) => {
+                            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, "mappings")), (pass, n, false));
+                            usize::MAX
+                        }
+                        Nav::Action => 0,
+                        Nav::Widget => usize::MAX,
+                    };
+                    d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0, "mappings")), (pass, action));
+                });
+                if !matches!(nav, Nav::Widget) {
+                    crate::app::request_card_glow(ctx, outer, inner, "mappings");
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(PANEL), |ui| {
+                        render_subpatch_body(
+                            ui, canvas, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
+                            &HashMap::new(), &PanicShortcut::default(), &HashMap::new(), None,
+                        );
+                    });
+                });
+                focus = crate::app::nav_card_focus_rect(ctx, outer);
+            });
+            let scroll = ctx.data(|d| d.get_temp::<f32>(scroll_id)).unwrap_or(0.0);
+            Pass { scroll, focus, shapes: out.shapes }
+        }
+
+        /// Run `n` passes; the scroll each ended on.
+        fn run(&mut self, nav: Nav, n: usize) -> Vec<f32> {
+            (0..n).map(|_| self.pass(nav).scroll).collect()
+        }
+    }
+
+    fn scale() -> f32 {
+        PANEL.width() / BODY_W
+    }
+
+    /// The scroll moved one way and then held still: no back-and-forth.
+    fn assert_settles(scrolls: &[f32], what: &str) {
+        let tail = &scrolls[scrolls.len() - 8..];
+        assert!(tail.iter().all(|s| (s - tail[0]).abs() < 0.5), "{what}: still moving {scrolls:?}");
+        let steps: Vec<f32> = scrolls.windows(2).map(|w| w[1] - w[0]).filter(|d| d.abs() > 0.5).collect();
+        assert!(steps.windows(2).all(|w| w[0].signum() == w[1].signum()),
+            "{what}: moved back and forth {scrolls:?}");
+    }
+
+    /// The reported bug: selecting a widget taller than the body made the body
+    /// flicker up and down, every frame. It comes to rest showing the widget's top.
+    #[test]
+    fn a_widget_taller_than_the_body_settles_on_its_top() {
+        let mut r = Rig::new(12, 700.0);
+        let scrolls = r.run(Nav::Widget, 30);
+        assert_settles(&scrolls, "selecting the widget");
+        let top = PIN_TOP * scale() - 24.0;
+        assert!((scrolls[29] - top).abs() < 1.0, "came to rest at {} not the widget's top {top}", scrolls[29]);
+    }
+
+    /// Inside it, the body scrolls only as the focused card goes past the panel's
+    /// edge, the widget's top going out of view for it, and every card comes to
+    /// rest in the panel.
+    #[test]
+    fn the_body_follows_the_focused_card_and_lets_the_top_go() {
+        let mut r = Rig::new(12, 700.0);
+        let rest = *r.run(Nav::Widget, 20).last().unwrap();
+        // The first card is in view already: entering the list moves nothing.
+        let scrolls = r.run(Nav::Card(0), 15);
+        assert!(scrolls.iter().all(|s| (s - rest).abs() < 0.5), "the first card moved the body: {scrolls:?}");
+        // Down the list, a card at a time.
+        for n in 1..12 {
+            let scrolls = r.run(Nav::Card(n), 15);
+            assert_settles(&scrolls, &format!("card {n}"));
+            let card = r.pass(Nav::Card(n)).focus.expect("the focused card's rect");
+            assert!(PANEL.expand(1.0).contains_rect(card), "card {n} at {card:?}, outside the panel {PANEL:?}");
+        }
+        assert!(r.pass(Nav::Card(11)).scroll > PIN_TOP * scale(), "the widget's top is still in view");
+        // And back up to the action row at its top.
+        let scrolls = r.run(Nav::Action, 15);
+        assert_settles(&scrolls, "back to Learn");
+        let learn = r.pass(Nav::Action).focus.expect("the Learn button's rect");
+        assert!(PANEL.expand(1.0).contains_rect(learn), "Learn at {learn:?}, outside the panel");
+    }
+
+    /// Going up onto the top widget scrolls the body all the way up, showing
+    /// the title over it — unless the widget wouldn't fit whole under it, when
+    /// it is the widget's own top that shows.
+    #[test]
+    fn up_onto_the_top_widget_shows_the_top_of_the_layout() {
+        // A short top widget, a second one far below it.
+        let mut r = Rig::with_pins(3, &[(60.0, 100.0), (400.0, 100.0)], 2);
+        let below = *r.run(Nav::Widget, 10).last().unwrap();
+        assert!(below > 60.0 * scale(), "the lower widget is scrolled to: {below}");
+        r.select(1);
+        let scrolls = r.run(Nav::Widget, 10);
+        assert_settles(&scrolls, "up onto the top widget");
+        assert_eq!(scrolls[9], 0.0, "the layout's top isn't in view");
+        // The wheel is free once it's there: nav doesn't pull it back up.
+        let scroll_id = r.scroll_id();
+        r.ctx.data_mut(|d| d.insert_temp(scroll_id, 30.0_f32));
+        assert_eq!(r.pass(Nav::Widget).scroll, 30.0, "the top widget is still in view");
+
+        // A top widget too tall to fit whole under the title: it is the widget
+        // that shows, whole, not the title.
+        let mut r = Rig::with_pins(3, &[(60.0, 260.0), (400.0, 100.0)], 2);
+        r.run(Nav::Widget, 10);
+        r.select(1);
+        let scrolls = r.run(Nav::Widget, 10);
+        assert_settles(&scrolls, "up onto a tall top widget");
+        let (rest, top, bot) = (scrolls[9], 60.0 * scale(), 320.0 * scale());
+        assert!(rest > 0.0 && rest <= top && rest + PANEL.height() >= bot,
+            "came to rest at {rest}, not showing the widget ({top}..{bot}) whole");
+    }
+
+    /// Nothing the body or nav paints for it lands outside the panel: not the
+    /// cards, not their glow, not the glow of an action row scrolled out of view.
+    #[test]
+    fn nothing_paints_outside_the_panel() {
+        // At the last card: the list and the body both scrolled down.
+        let mut r = Rig::new(12, 700.0);
+        r.run(Nav::Card(11), 30);
+        let last_card = r.pass(Nav::Card(11));
+        // On Learn while it sits on screen just above the panel, over the preset
+        // bar: a body held 40 px past the widget's top, as a pass in which nav
+        // has only just asked for it (no focus yet for the auto-scroll to chase).
+        let mut r = Rig::new(12, 700.0);
+        r.run(Nav::Widget, 10);
+        let scroll_id = r.scroll_id();
+        r.ctx.data_mut(|d| d.insert_temp(scroll_id, PIN_TOP * scale() + 40.0));
+        let learn = r.pass(Nav::Action);
+        let above = learn.focus.expect("Learn's rect");
+        assert!(above.bottom() < PANEL.top() && above.top() > SCREEN.top(),
+            "Learn at {above:?} isn't on screen above the panel");
+        for (what, p) in [("at the last card", &last_card), ("on Learn out of view", &learn)] {
+            for s in &p.shapes {
+                let vis = s.shape.visual_bounding_rect().intersect(s.clip_rect);
+                // The central panel's own fill spans the screen.
+                if !vis.is_positive() || vis.width() >= SCREEN.width() - 1.0 { continue; }
+                assert!(PANEL.expand(1.0).contains_rect(vis),
+                    "{what}: a shape paints at {vis:?}, outside the panel {PANEL:?}");
+            }
+        }
+    }
 }
