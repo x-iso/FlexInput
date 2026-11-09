@@ -651,10 +651,15 @@ pub(crate) fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
 // play, a corner or two is out of reach. The Calibration window traces each
 // pad's edge as the thumb reaches it, and `tpad_{l,r}_radial` scales each
 // direction so that reach lands on the pad's square edge. Then the outer
-// deadzone reads the band inside the edge as the edge itself, and the offset
-// moves that frame in from the pad's grip side, where a thumb moving that way
-// slides off over the edge before it gets there: the left pad's to the right,
-// the right pad's to the left.
+// deadzone is a band inside the edge where a touch doesn't count, so a thumb
+// resting against the side, or the hand round it, touches nothing; the offset
+// moves the live square in from the pad's grip side, where a thumb gets close
+// first: the left pad's to the right, the right pad's to the left. The square
+// reads as the whole pad.
+//
+// A touch counts from when it is inside the square, or the pad clicks, until it
+// lifts: one that started inside and slides out into the band goes on, at the
+// square's edge, rather than let go in the middle of a swipe.
 
 /// The touch field pins of a pad's two trackpads (a Steam Controller's): x, y,
 /// contact, left then right.
@@ -662,6 +667,9 @@ const TRACKPAD_FIELDS: [[&str; 3]; 2] = [
     ["touch1_x", "touch1_y", "touch1_active"],
     ["touch2_x", "touch2_y", "touch2_active"],
 ];
+/// Each pad's click: the left's, then the right's as the pad's own reader and
+/// SDL name it.
+const TRACKPAD_CLICKS: [&[&str]; 2] = [&["btn_touchpad"], &["btn_touchpad2", "btn_misc2"]];
 
 /// One trackpad's calibration (`tpad_{side}_*` on its device.source): each
 /// direction's scale out to the square edge, the outer deadzone, and how far the
@@ -709,14 +717,22 @@ impl TrackpadCal {
     }
 
     /// The live square, inside the outer deadzone and moved by the offset: its
-    /// left, right, bottom and top on the calibrated pad. What lies past it reads
-    /// as the edge. Moved past the deadzone, it stops at the pad's far edge and
-    /// narrows from the grip side.
+    /// left, right, bottom and top on the calibrated pad. A touch past it doesn't
+    /// count until it comes inside. Moved past the deadzone, it stops at the
+    /// pad's far edge and narrows from the grip side.
     pub fn live(&self) -> [f32; 4] {
         let reach = 1.0 - self.deadzone;
         let left = (-reach + self.shift).max(-1.0);
         let right = (reach + self.shift).min(1.0);
         [left, right.max(left + 0.2), -reach, reach]
+    }
+
+    /// Whether a touch at the calibrated point `p` counts: one that already did
+    /// (`counted`, until it lifts), one inside the live square, and one the pad
+    /// clicks under.
+    pub fn touch_counts(&self, p: Vec2, counted: bool, clicked: bool) -> bool {
+        let [left, right, bottom, top] = self.live();
+        counted || clicked || (left..=right).contains(&p.x) && (bottom..=top).contains(&p.y)
     }
 
     /// A calibrated point through the outer deadzone and the offset: the live
@@ -729,18 +745,43 @@ impl TrackpadCal {
     }
 }
 
+/// Whether each device's trackpads' touches count yet, left then right (see
+/// [`TrackpadCal::touch_counts`]). Kept on the reserved carry entry's state.
+#[derive(Default)]
+pub struct TrackpadTouches {
+    counted: HashMap<String, [bool; 2]>,
+}
+
 /// Apply each device.source's trackpad calibration to its touch fields, once per
-/// tick: the calibrated point through the deadzone and offset.
-pub(crate) fn filter_trackpads(graph: &ProcessingGraph, sigs: &mut BusMap) {
+/// tick: a touch in the outer deadzone that doesn't count reads as no touch and
+/// presses nothing, and one that does as the calibrated point through the
+/// deadzone and offset.
+pub(crate) fn filter_trackpads(graph: &ProcessingGraph, sigs: &mut BusMap, st: &mut TrackpadTouches) {
     for (dev, (_, _, cal)) in &device_params(graph).by_dev {
         let Some(pads) = &cal.trackpads else { continue };
-        for (pad, [px, py, pa]) in pads.iter().zip(TRACKPAD_FIELDS) {
+        if !st.counted.contains_key(dev) {
+            st.counted.insert(dev.clone(), [false; 2]);
+        }
+        let Some(counted) = st.counted.get_mut(dev) else { continue };
+        for (i, (pad, [px, py, pa])) in pads.iter().zip(TRACKPAD_FIELDS).enumerate() {
             if !matches!(sigs.get_pin(dev, pa), Some(Signal::Bool(true))) {
+                counted[i] = false;
                 continue;
             }
             let (Some(Signal::Float(x)), Some(Signal::Float(y))) =
                 (sigs.get_pin(dev, px).copied(), sigs.get_pin(dev, py).copied()) else { continue };
-            let q = pad.deadzoned(pad.calibrated(x, y));
+            let p = pad.calibrated(x, y);
+            let clicked = TRACKPAD_CLICKS[i].iter().any(|c| matches!(sigs.get_pin(dev, c), Some(Signal::Bool(true))));
+            counted[i] = pad.touch_counts(p, counted[i], clicked);
+            if !counted[i] {
+                sigs.set_pin(dev, pa, Signal::Bool(false));
+                let press = flexinput_core::automap::TOUCH_PRESSURE_PINS[i];
+                if sigs.get_pin(dev, press).is_some() {
+                    sigs.set_pin(dev, press, Signal::Float(0.0));
+                }
+                continue;
+            }
+            let q = pad.deadzoned(p);
             sigs.set_pin(dev, px, Signal::Float(q.x));
             sigs.set_pin(dev, py, Signal::Float(q.y));
         }

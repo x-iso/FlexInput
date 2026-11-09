@@ -51,6 +51,9 @@ pub struct NodeState {
     /// Device stick rebound filter (on the reserved carry entry only): every
     /// device's trackers and their clock. See `eval::filter_stick_rebound`.
     pub stick_rebound: Option<Box<crate::eval::StickReboundState>>,
+    /// Calibrated trackpads (on the reserved carry entry only): whether each
+    /// device's touches count yet. See `eval::filter_trackpads`.
+    pub trackpad_touches: Option<Box<crate::eval::TrackpadTouches>>,
     /// Per-channel ring buffers of (timestamp, value) pairs for the delay module.
     pub delay_bufs: Vec<VecDeque<(Instant, f32)>>,
     /// Per-channel sample ring buffers for the moving-average module (float inputs).

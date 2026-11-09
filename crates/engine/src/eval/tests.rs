@@ -597,15 +597,54 @@ mod trigger_tests {
             sigs.set_pin(dev, &format!("{field}_y"), Signal::Float(0.4));
             sigs.set_pin(dev, &format!("{field}_active"), Signal::Bool(on));
         }
-        filter_trackpads(&graph, &mut sigs);
+        let mut st = TrackpadTouches::default();
+        filter_trackpads(&graph, &mut sigs, &mut st);
         let x = |field: &str| sigs.get_pin(dev, &format!("{field}_x")).map(|s| s.as_float()).unwrap_or(9.0);
         assert!(x("touch1").abs() < 1e-5 && x("touch2").abs() < 1e-5, "each frame's middle: {} {}", x("touch1"), x("touch2"));
         let y = sigs.get_pin(dev, "touch1_y").map(|s| s.as_float()).unwrap_or(9.0);
         assert!((y - 0.5).abs() < 1e-5, "up and down through the deadzone alone: {y}");
         sigs.set_pin(dev, "touch1_active", Signal::Bool(false));
         sigs.set_pin(dev, "touch1_x", Signal::Float(0.3));
-        filter_trackpads(&graph, &mut sigs);
+        filter_trackpads(&graph, &mut sigs, &mut st);
         assert_eq!(sigs.get_pin(dev, "touch1_x"), Some(&Signal::Float(0.3)), "untouched: as it was");
+    }
+
+    // A thumb landing in a pad's outer deadzone touches nothing and presses
+    // nothing, until it comes inside the live square or the pad clicks; from
+    // there it counts, out over the band at the edge, until it lifts.
+    #[test]
+    fn a_touch_in_the_outer_deadzone_counts_only_once_inside() {
+        let dev = "sdl:generic:sc";
+        let mut src = source_node(1, dev, 0.0);
+        src.params.insert("tpad_l_deadzone".into(), Value::from(0.2));
+        src.params.insert("tpad_l_offset".into(), Value::from(0.1));
+        let graph = ProcessingGraph { nodes: vec![src], ..Default::default() };
+        let mut st = TrackpadTouches::default();
+        // The left pad's live square is [-0.7, 0.9] across: its grip side's band is wider.
+        let mut tick = |x: f32, on: bool, click: bool| {
+            let mut sigs = BusMap::default();
+            sigs.set_pin(dev, "touch1_x", Signal::Float(x));
+            sigs.set_pin(dev, "touch1_y", Signal::Float(0.0));
+            sigs.set_pin(dev, "touch1_active", Signal::Bool(on));
+            sigs.set_pin(dev, "touch1_pressure", Signal::Float(0.3));
+            sigs.set_pin(dev, "btn_touchpad", Signal::Bool(click));
+            filter_trackpads(&graph, &mut sigs, &mut st);
+            let pin = |p: &str| sigs.get_pin(dev, p).copied();
+            (pin("touch1_active") == Some(Signal::Bool(true)),
+             pin("touch1_x").map(|s| s.as_float()).unwrap_or(9.0),
+             pin("touch1_pressure").map(|s| s.as_float()).unwrap_or(9.0))
+        };
+        let (on, _, press) = tick(-0.8, true, false);
+        assert!(!on && press == 0.0, "landed on the grip side's band: no touch, no press");
+        assert!(!tick(-0.75, true, false).0, "still in the band");
+        let (on, x, press) = tick(-0.6, true, false);
+        assert!(on && x > -1.0 && press == 0.3, "inside: it counts from here ({x})");
+        let (on, x, _) = tick(-0.95, true, false);
+        assert!(on && x == -1.0, "slid back out: it goes on, at the edge");
+        assert!(!tick(-0.95, false, false).0, "lifted");
+        assert!(!tick(0.95, true, false).0, "the far side's band, a fresh touch");
+        assert!(tick(0.95, true, true).0, "clicked there: it counts");
+        assert!(tick(0.95, true, false).0, "and goes on after the click");
     }
 
     // Manual threshold on an analog→digital mapping: PLAIN HOLD above the

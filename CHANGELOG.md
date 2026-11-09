@@ -161,6 +161,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A trackpad's outer deadzone is dead.** On a Steam Controller the band
+  inside each trackpad's edge read as the edge itself, so a thumb resting against
+  the side, or the hand round it, still touched the pad and pushed it all the way
+  out. Now a touch landing in the band doesn't count: no touch, no press, nothing
+  for Touch Zones, the Area Mapper, swipes or a click's analog side to see, until
+  the thumb comes inside the live square. A touch that started inside goes on out
+  over the band, held at the edge, so a swipe isn't cut off halfway, and a click
+  counts anywhere. **Offset** widens the band on the pad's grip side, where a thumb
+  gets close first. The Calibration window shows a touch that doesn't count as a
+  grey ring, out of the trail.
 - **A widget taller than the Easy body no longer flickers under gamepad nav.**
   Selecting one scrolled the body up and down every frame, trying to show its
   top and its bottom at once. Now the body shows the widget's top and moves on

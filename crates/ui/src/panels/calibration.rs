@@ -567,6 +567,9 @@ struct WindowState {
     tpad: TrackpadSession,
     /// Each trackpad's recent points as drawn, `None` where the finger lifted.
     tpad_trail: [VecDeque<Option<[f32; 2]>>; 2],
+    /// Whether each trackpad's touch counts yet, as the engine has it
+    /// (`TrackpadCal::touch_counts`).
+    tpad_counted: [bool; 2],
     orient: OrientSession,
     /// The spike check started with the gyro calibration.
     spikes: SpikeRun,
@@ -584,6 +587,7 @@ impl Default for WindowState {
             trig: TriggerSession::default(),
             tpad: TrackpadSession::default(),
             tpad_trail: Default::default(),
+            tpad_counted: [false; 2],
             orient: OrientSession::default(),
             spikes: SpikeRun::Idle,
             scope_win_ms: 1000.0,
@@ -1465,11 +1469,14 @@ fn grip_touch_section(
     });
 
     // The trace and the trails, a frame at a time. While tracing the pads show
-    // the finger as it comes, otherwise as calibration puts it.
+    // the finger as it comes, otherwise as calibration puts it; a touch the
+    // outer deadzone keeps from counting stays out of the trail.
+    let mut strays: [Option<[f32; 2]>; 2] = [None; 2];
     let (sampling, edges, trails) = ui.ctx().data_mut(|d| {
         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
         for i in 0..2 {
-            let shown = raw[i].map(|[x, y]| {
+            let clicked = read_float(live, dev_id, TPAD_CLICK_PINS[i]) > 0.5;
+            let mut shown = raw[i].map(|[x, y]| {
                 if st.tpad.sampling {
                     push_tpad_edge(&mut st.tpad.edges[i], x, y);
                     [x, y]
@@ -1477,6 +1484,11 @@ fn grip_touch_section(
                     cals[i].calibrated(x, y).to_array()
                 }
             });
+            st.tpad_counted[i] = shown.is_some_and(|p| st.tpad.sampling
+                || cals[i].touch_counts(glam::Vec2::from_array(p), st.tpad_counted[i], clicked));
+            if !st.tpad_counted[i] {
+                strays[i] = shown.take();
+            }
             let trail = &mut st.tpad_trail[i];
             if shown.is_some() || trail.back().is_some_and(Option::is_some) {
                 if trail.len() >= TPAD_TRAIL_LEN {
@@ -1515,9 +1527,9 @@ fn grip_touch_section(
             instruct_step(ui, 3, &[(false, "Click "), (true, "Stop & save"), (false, ".")]);
             ui.add_space(6.0);
             instruct_line(ui, &[(false,
-                "What your thumb reaches then reads as the whole pad, corners and all. Past the \
-                 orange band a pad reads as its edge; Offset moves that frame away from the grip, \
-                 where a thumb slides off over the edge before it gets there.")]);
+                "What your thumb reaches then reads as the whole pad, corners and all. A touch \
+                 landing in the orange band doesn't count until it comes inside; Offset widens \
+                 the band on the grip side, where a thumb gets close to the pad first.")]);
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
                 if cal_button(ui, if sampling { "Stop & save" } else { "Start" }).clicked() {
@@ -1607,6 +1619,7 @@ fn grip_touch_section(
                             left: i == 0,
                             label: if i == 0 { "L" } else { "R" },
                             at: trails[i].back().copied().flatten(),
+                            stray: strays[i],
                             trail: &trails[i],
                             trace,
                             frame: (!sampling).then_some(&cals[i]),
@@ -1625,15 +1638,17 @@ fn grip_touch_section(
                             pad_row(ui, lo.cell_w, label_w, name, v * 100.0, max * 100.0, zero, hover).map(|p| p / 100.0)
                         };
                         if let Some(v) = row(ui, "Outer deadzone", cals[i].deadzone, TRACKPAD_DEADZONE_MAX, None,
-                            "The band inside this pad's edge that reads as the edge itself, so a \
-                             thumb needn't reach the very side for a full push.")
+                            "The band inside this pad's edge where a touch doesn't count, so a \
+                             thumb resting against the side touches nothing. One that started \
+                             inside goes on out there, at the edge, and a click counts anywhere. \
+                             The square inside reads as the whole pad.")
                         {
                             rows.push((format!("tpad_{side}_deadzone"), v));
                         }
                         if let Some(v) = row(ui, "Offset", cals[i].shift.abs(), TRACKPAD_OFFSET_MAX, None,
-                            "Moves this pad's frame away from its grip by this much: the edge on \
-                             the grip side comes sooner, where a thumb would slide off over the \
-                             pad's edge before it got there, and the middle moves with it.")
+                            "Moves this pad's live square away from its grip by this much: the \
+                             band widens on the grip side, where a thumb gets close to the pad \
+                             first, and the middle moves with it.")
                         {
                             rows.push((format!("tpad_{side}_offset"), v));
                         }
@@ -1671,6 +1686,8 @@ struct PadView<'a> {
     label: &'static str,
     /// The finger, in the cell's space.
     at: Option<[f32; 2]>,
+    /// A finger the outer deadzone keeps from counting, where it is.
+    stray: Option<[f32; 2]>,
     trail: &'a VecDeque<Option<[f32; 2]>>,
     /// The edge trace, by direction, in the cell's space.
     trace: Vec<(usize, [f32; 2])>,
@@ -1777,6 +1794,10 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
         }
         painter.circle_filled(c, 4.0, if v.clicked { ORANGE } else { Color32::from_rgb(220, 80, 80) });
     }
+    // A thumb in the band that doesn't count: where it is, and nothing more.
+    if let Some(p) = v.stray {
+        painter.circle_stroke(to_screen(p), 5.0, Stroke::new(1.5_f32, Color32::from_gray(140)));
+    }
 
     // The pad's name in the corner away from its grip, lit while it clicks.
     let (corner, align) = if v.left {
@@ -1789,7 +1810,8 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
     resp.on_hover_text("This trackpad as your thumb reaches it. The circle around your thumb is \
         how hard it presses: the bright ring is where the pad clicks (with the pad's own click, \
         learnt from your first click), the faint one where click stabilisation starts holding \
-        the pointer, the outer one the sensor's full scale.");
+        the pointer, the outer one the sensor's full scale. A grey ring is a touch in the orange \
+        band that doesn't count.");
 
     grip_strip(ui, strip, id.with("grip"), v.grip_on, v.grip, v.left)
 }

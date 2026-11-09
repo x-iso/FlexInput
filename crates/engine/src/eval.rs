@@ -475,7 +475,11 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         filter_stick_rebound(graph, &mut dev_sigs_owned, st, dt);
     }
     // Calibrated trackpads: reach, outer deadzone and offset.
-    filter_trackpads(graph, &mut dev_sigs_owned);
+    {
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        let st = carry.trackpad_touches.get_or_insert_with(Default::default);
+        filter_trackpads(graph, &mut dev_sigs_owned, st);
+    }
     // Apply the Virtual Menu SOURCE-BLOCK (one tick stale): zero every pointer
     // pin an open menu asked to block last tick, so those analog inputs reach
     // ONLY the menu's navigation — not a mouse mapping, another module, or a
