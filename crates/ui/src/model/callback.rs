@@ -64,6 +64,21 @@ pub(crate) fn is_grip_sense(part: &str) -> bool {
     part.ends_with("gripsense")
 }
 
+/// A finger dot's opacity for how hard it presses (`pressure`, 0..1 over the
+/// sensor's range): the pressure itself, floored so a touch too light to
+/// register any still shows where the finger is, and solid only at the
+/// sensor's full scale. Solid without a pressure reading. The pad's own click
+/// highlight is half strength ([`PAD_CLICK_GLOW`]), so the dot, drawn over it,
+/// reads at any pressure.
+pub(crate) fn touch_dot_alpha(pressure: Option<f32>) -> f32 {
+    const MIN: f32 = 0.2;
+    pressure.map_or(1.0, |p| MIN + (1.0 - MIN) * p.clamp(0.0, 1.0))
+}
+
+/// How brightly a clicked touchpad lights: half, so the finger dot on it is
+/// never lost in the pad's highlight.
+pub(crate) const PAD_CLICK_GLOW: f32 = 0.5;
+
 /// Live input state that animates the model: touch dots, stick tilt, trigger
 /// pull and button presses. Built each frame from the resolved device's live
 /// signals (see `controller3d_live` in the viewer).
@@ -72,6 +87,12 @@ pub struct ControllerLive {
     /// Normalized `[0,1]` touch positions (x = left→right, y = top→bottom);
     /// `None` = that finger is up.
     pub touch: [Option<glam::Vec2>; 2],
+    /// How hard each finger presses its pad, `0..1` over the sensor's whole
+    /// range (not relative to where the pad clicks: the pad's own highlight
+    /// shows the click), on a pad that senses it (the Steam Controller's): the
+    /// dot's opacity follows it ([`touch_dot_alpha`]). `None` = no pressure
+    /// sensed, a solid dot.
+    pub touch_pressure: [Option<f32>; 2],
     /// Stick deflections, each component `-1..1`.
     pub left_stick: glam::Vec2,
     pub right_stick: glam::Vec2,
@@ -100,9 +121,18 @@ pub struct ControllerLive {
     /// model radii along the renderer's world axes (see `c3d_motion_offset`).
     /// Zero = in place.
     pub offset: glam::Vec3,
+    /// The viewer's X-ray setting: an active input shows through the shell
+    /// once less than this share of its facing surface is in view, 0 = never.
+    /// `None` = the stock [`GHOST_VIS_LOW`].
+    pub xray_visible: Option<f32>,
 }
 
 impl ControllerLive {
+    /// The share of a part's facing surface below which it x-rays.
+    fn xray_low(&self) -> f32 {
+        self.xray_visible.unwrap_or(GHOST_VIS_LOW).clamp(0.0, 1.0)
+    }
+
     /// Extra model-space transform for a part given its rest transform, or
     /// identity when the part isn't animated. Rotations pivot about the part's
     /// own placement so sticks/triggers hinge in place. Touch points are handled
@@ -685,10 +715,28 @@ pub struct MeshRenderState {
 /// covers a nearer highlighted input (z-order among highlighted objects).
 /// `translucent` are the parts whose material alpha < 1, excluded from the
 /// opaque pass and drawn far→near with blending (depth-tested, no writes).
+/// `dots` are the touched finger dots, drawn last of all with blending: a
+/// dot is see-through by its press, so it composites over its pad, over any
+/// ghost, and once only (a second draw would thicken it).
+#[derive(Default)]
 struct XrayOrder {
     ghosts: Vec<usize>,
     restore: Vec<usize>,
     translucent: Vec<usize>,
+    dots: Vec<usize>,
+}
+
+impl XrayOrder {
+    /// Which parts the opaque pass skips: the translucent ones and the dots.
+    fn drawn_late(&self, n: usize) -> Vec<bool> {
+        let mut v = vec![false; n];
+        for &i in self.translucent.iter().chain(&self.dots) {
+            if let Some(s) = v.get_mut(i) {
+                *s = true;
+            }
+        }
+        v
+    }
 }
 
 /// Offscreen target for the widget matte: when composite alpha < 1 the
@@ -726,16 +774,23 @@ struct PerInstance {
 /// Ghost-gate threshold on the measured `visible / total` sample ratio. The
 /// X-ray ghost gating with hysteresis (kills the strobe when a part sits at the
 /// edge of occlusion): an active part ENTERS x-ray only once its smoothed
-/// visibility falls below LOW, and LEAVES it once back above HIGH.
+/// visibility falls below LOW, and LEAVES it once back above LOW + BAND.
 ///
 /// The measured fraction counts only CAMERA-FACING surface samples, so a fully
 /// unobstructed part reads ≈ 1.0 and the numbers mean what the spec says
-/// literally: ghost below ~5% of the part's facing surface visible, un-ghost
-/// once back over ~12%. (The older occlusion-query measure counted front and
-/// back faces alike and so topped out near 0.5, which is why its thresholds
-/// looked half this size.)
-const GHOST_VIS_LOW: f32 = 0.05;
-const GHOST_VIS_HIGH: f32 = 0.12;
+/// literally: by default ghost below half the part's facing surface visible,
+/// un-ghost once back over ~57%. (The older occlusion-query measure counted
+/// front and back faces alike and so topped out near 0.5.)
+///
+/// LOW is the viewer's X-ray setting (`xray_visible`, [`ControllerLive::xray_visible`]);
+/// this is its stock value. It was 5%, which a part that only peeks out past
+/// the shell — a Steam Controller's lower back buttons — never got under, so
+/// pressed it read as barely lit at a small size; half was found to read
+/// better. Higher is safe: a ghost draws only where the part is covered, so
+/// ghosting a part that is mostly in view adds nothing over its visible
+/// surface. 0 turns x-ray off.
+pub(crate) const GHOST_VIS_LOW: f32 = 0.5;
+const GHOST_VIS_BAND: f32 = 0.07;
 
 /// Consecutive readbacks that must agree before a part's ghost state flips.
 ///
@@ -767,8 +822,15 @@ const VIS_MIN_SAMPLES: u32 = 8;
 ///
 /// `ghosted` is the latched state the renderer reads; `streak` counts how many
 /// consecutive readbacks have disagreed with it. Hysteresis picks the bar
-/// (harder to leave x-ray than to enter it) and the streak supplies the delay.
-fn update_ghost_latch(frac: Option<f32>, ghosted: &mut bool, streak: &mut u8) {
+/// (harder to leave x-ray than to enter it: in under `low`, out over
+/// `low + GHOST_VIS_BAND`) and the streak supplies the delay. `low` 0 never
+/// ghosts, and lets go of anything ghosted.
+fn update_ghost_latch(frac: Option<f32>, low: f32, ghosted: &mut bool, streak: &mut u8) {
+    if low <= 0.0 {
+        *ghosted = false;
+        *streak = 0;
+        return;
+    }
     // No usable measurement: hold. Treating absence as "visible" would invert
     // the verdict at the exact moment a part is least visible.
     let Some(frac) = frac else {
@@ -776,9 +838,9 @@ fn update_ghost_latch(frac: Option<f32>, ghosted: &mut bool, streak: &mut u8) {
         return;
     };
     let want = if *ghosted {
-        frac < GHOST_VIS_HIGH
+        frac < low + GHOST_VIS_BAND
     } else {
-        frac < GHOST_VIS_LOW
+        frac < low
     };
     if want == *ghosted {
         *streak = 0; // agreement resets the run
@@ -1136,6 +1198,8 @@ impl CallbackTrait for MeshRenderState {
         // Parts with a translucent material (scheme alpha < 1): excluded from
         // the opaque pass and re-drawn sorted far→near with blending.
         let mut translucent: Vec<(usize, f32)> = Vec::new();
+        // Touched finger dots: drawn last, blended (see `XrayOrder::dots`).
+        let mut dots: Vec<usize> = Vec::new();
         // Per-part model matrices, in draw order — handed to the visibility
         // measurement below so it tests the pose that was actually rendered.
         let mut part_model: Vec<Mat4> = Vec::with_capacity(gpu_parts.len());
@@ -1174,7 +1238,8 @@ impl CallbackTrait for MeshRenderState {
                             * Mat4::from_translation(Vec3::new(dx, 0.0, dz))
                             * Mat4::from_translation(-rest)
                             * part_tf;
-                        (m, hl4, hl4, 0.6)
+                        let a = touch_dot_alpha(self.live.touch_pressure[k]);
+                        (m, [hl[0], hl[1], hl[2], a], hl4, 0.6)
                     }
                     // Hidden: collapse to a zero-area point (draws nothing).
                     _ => (Mat4::from_scale(Vec3::splat(0.0)), [0.0; 4], [0.0; 4], 0.0),
@@ -1240,11 +1305,12 @@ impl CallbackTrait for MeshRenderState {
             // that are meaningfully visible keep only the normal highlight.
             let xg = match touch_slot {
                 // Touch dots aren't in the glow map (it's keyed by button/stick
-                // pins) — an active finger counts as fully highlighted, so a
-                // dot on an away-facing touchpad ghosts like any other input.
+                // pins) — an active finger counts as highlighted at its dot's
+                // opacity, so a dot on an away-facing touchpad ghosts like any
+                // other input.
                 Some(k) => {
                     if self.live.touch[k].is_some() {
-                        1.0
+                        base_color[3]
                     } else {
                         0.0
                     }
@@ -1254,7 +1320,12 @@ impl CallbackTrait for MeshRenderState {
                     .unwrap_or(0.0),
             };
             let ghosted = xg > 0.02 && ghost_hidden.get(i).copied().unwrap_or(false);
-            if xg > 0.02 {
+            if touch_slot.is_some() {
+                // A dot is drawn after the ghosts anyway, so it needs no restore.
+                if xg > 0.02 {
+                    dots.push(i);
+                }
+            } else if xg > 0.02 {
                 restore.push(i);
             }
             let dist = part
@@ -1287,17 +1358,12 @@ impl CallbackTrait for MeshRenderState {
         // Painter's order for the ghost + translucent passes: far → near.
         ghosts.sort_by(|a, b| b.1.total_cmp(&a.1));
         translucent.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let trans_order: Vec<usize> = translucent.into_iter().map(|(i, _)| i).collect();
-        let is_trans: Vec<bool> = {
-            let mut v = vec![false; gpu_parts.len()];
-            for &i in &trans_order {
-                if let Some(s) = v.get_mut(i) {
-                    *s = true;
-                }
-            }
-            v
+        let order = XrayOrder {
+            ghosts: ghosts.into_iter().map(|(i, _)| i).collect(),
+            restore,
+            translucent: translucent.into_iter().map(|(i, _)| i).collect(),
+            dots,
         };
-        let ghost_order: Vec<usize> = ghosts.into_iter().map(|(i, _)| i).collect();
 
         // ── Widget matte (composite alpha) ─────────────────────────────────
         // Render the whole controller into an offscreen texture now; `paint`
@@ -1419,37 +1485,7 @@ impl CallbackTrait for MeshRenderState {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                pass.set_pipeline(&pipeline.pipeline);
-                for (i, gpu_part) in gpu_parts.iter().enumerate() {
-                    if is_trans.get(i).copied().unwrap_or(false) {
-                        continue; // drawn blended below
-                    }
-                    gpu_part.draw(&mut pass);
-                }
-                if !trans_order.is_empty() {
-                    // Translucent materials: far → near over the opaque depth.
-                    pass.set_pipeline(&pipeline.translucent);
-                    for &i in &trans_order {
-                        if let Some(gp) = gpu_parts.get(i) {
-                            gp.draw(&mut pass);
-                        }
-                    }
-                }
-                if !ghost_order.is_empty() {
-                    pass.set_pipeline(&pipeline.xray);
-                    for &i in &ghost_order {
-                        if let Some(gp) = gpu_parts.get(i) {
-                            gp.draw_xray(&mut pass);
-                        }
-                    }
-                    // Highlighted visible surfaces reclaim their pixels.
-                    pass.set_pipeline(&pipeline.restore);
-                    for &i in &restore {
-                        if let Some(gp) = gpu_parts.get(i) {
-                            gp.draw(&mut pass);
-                        }
-                    }
-                }
+                draw_model(&mut pass, &pipeline, gpu_parts, &order);
             }
         }
         // ── Visibility measurement (depth prepass + CPU sample test) ───────
@@ -1545,7 +1581,7 @@ impl CallbackTrait for MeshRenderState {
                                 if let Some(f) = m {
                                     fr[i] = f;
                                 }
-                                update_ghost_latch(m, &mut gh[i], &mut st[i]);
+                                update_ghost_latch(m, self.live.xray_low(), &mut gh[i], &mut st[i]);
                             }
                         }
                         vm.staging.unmap();
@@ -1643,14 +1679,7 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        per_instance(callback_resources).frame.insert(self.instance, (
-            MatteActive(use_matte),
-            XrayOrder {
-                ghosts: ghost_order,
-                restore,
-                translucent: trans_order,
-            },
-        ));
+        per_instance(callback_resources).frame.insert(self.instance, (MatteActive(use_matte), order));
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
     }
@@ -1694,55 +1723,52 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        let xo = frame.map(|(_, xo)| xo);
-        let is_trans: Vec<bool> = {
-            let mut v = vec![false; gpu_parts.len()];
-            if let Some(xo) = xo {
-                for &i in &xo.translucent {
-                    if let Some(s) = v.get_mut(i) {
-                        *s = true;
-                    }
-                }
-            }
-            v
-        };
-        render_pass.set_pipeline(&pipeline.pipeline);
-        for (i, gpu_part) in gpu_parts.iter().enumerate() {
-            if is_trans.get(i).copied().unwrap_or(false) {
-                continue; // drawn blended below
-            }
-            gpu_part.draw(render_pass);
-        }
+        // No draw lists yet (no `prepare` this frame): every part, opaque.
+        let none = XrayOrder::default();
+        let order = frame.map_or(&none, |(_, xo)| xo);
+        draw_model(render_pass, &pipeline, gpu_parts, order);
+    }
+}
 
-        if let Some(xo) = xo {
-            // Translucent materials: far → near over the opaque depth.
-            if !xo.translucent.is_empty() {
-                render_pass.set_pipeline(&pipeline.translucent);
-                for &i in &xo.translucent {
-                    if let Some(gp) = gpu_parts.get(i) {
-                        gp.draw(render_pass);
-                    }
-                }
-            }
-            // X-ray pass: re-draw active off-view parts where they are OCCLUDED
-            // (depth Greater) as accent ghosts, far → near. Then the highlighted
-            // VISIBLE parts re-draw their front surfaces (LessEqual + bias), so a
-            // ghost pierces the inert shell but never covers a nearer highlighted
-            // input.
-            if !xo.ghosts.is_empty() {
-                render_pass.set_pipeline(&pipeline.xray);
-                for &i in &xo.ghosts {
-                    if let Some(gp) = gpu_parts.get(i) {
-                        gp.draw_xray(render_pass);
-                    }
-                }
-                render_pass.set_pipeline(&pipeline.restore);
-                for &i in &xo.restore {
-                    if let Some(gp) = gpu_parts.get(i) {
-                        gp.draw(render_pass);
-                    }
-                }
-            }
+/// Record the model's draws into `pass`, in the order [`XrayOrder`] lays out.
+/// The opaque parts first; then the translucent materials, far → near over
+/// the opaque depth. Then the x-ray pass re-draws active off-view parts where
+/// they are OCCLUDED (depth Greater) as accent ghosts, far → near, and the
+/// highlighted VISIBLE parts re-draw their front surfaces (LessEqual + bias),
+/// so a ghost pierces the inert shell but never covers a nearer highlighted
+/// input. The finger dots go last, blended over their pads and any ghost; the
+/// depth test still hides a dot on an away-facing pad, which shows as its
+/// ghost alone.
+fn draw_model(pass: &mut wgpu::RenderPass<'_>, pipeline: &ControllerPipeline, parts: &[PartBuffers], order: &XrayOrder) {
+    fn each<'a>(parts: &'a [PartBuffers], list: &'a [usize]) -> impl Iterator<Item = &'a PartBuffers> + 'a {
+        list.iter().filter_map(move |&i| parts.get(i))
+    }
+    pass.set_pipeline(&pipeline.pipeline);
+    for (part, late) in parts.iter().zip(order.drawn_late(parts.len())) {
+        if !late {
+            part.draw(pass);
+        }
+    }
+    if !order.translucent.is_empty() {
+        pass.set_pipeline(&pipeline.translucent);
+        for part in each(parts, &order.translucent) {
+            part.draw(pass);
+        }
+    }
+    if !order.ghosts.is_empty() {
+        pass.set_pipeline(&pipeline.xray);
+        for part in each(parts, &order.ghosts) {
+            part.draw_xray(pass);
+        }
+        pass.set_pipeline(&pipeline.restore);
+        for part in each(parts, &order.restore) {
+            part.draw(pass);
+        }
+    }
+    if !order.dots.is_empty() {
+        pass.set_pipeline(&pipeline.translucent);
+        for part in each(parts, &order.dots) {
+            part.draw(pass);
         }
     }
 }
@@ -1918,7 +1944,7 @@ mod vis_tests {
     fn an_object_never_measured_is_not_ghosted() {
         let (mut ghosted, mut streak) = (false, 0u8);
         for _ in 0..50 {
-            update_ghost_latch(None, &mut ghosted, &mut streak);
+            update_ghost_latch(None, GHOST_VIS_LOW, &mut ghosted, &mut streak);
         }
         assert!(!ghosted, "no measurement must leave the model rendering normally");
     }
@@ -1992,7 +2018,7 @@ mod vis_tests {
     fn readbacks_to_flip(from_ghosted: bool, frac: f32) -> u32 {
         let (mut ghosted, mut streak) = (from_ghosted, 0u8);
         for n in 1..100 {
-            update_ghost_latch(Some(frac), &mut ghosted, &mut streak);
+            update_ghost_latch(Some(frac), GHOST_VIS_LOW, &mut ghosted, &mut streak);
             if ghosted != from_ghosted {
                 return n;
             }
@@ -2020,8 +2046,9 @@ mod vis_tests {
     #[test]
     fn a_reading_in_the_band_never_flips_a_visible_part() {
         let (mut ghosted, mut streak) = (false, 0u8);
-        for frac in [1.0, 0.08, 1.0, 0.06, 0.11, 1.0] {
-            update_ghost_latch(Some(frac), &mut ghosted, &mut streak);
+        let band = |t: f32| GHOST_VIS_LOW + GHOST_VIS_BAND * t;
+        for frac in [1.0, band(0.4), 1.0, band(0.1), band(0.9), 1.0] {
+            update_ghost_latch(Some(frac), GHOST_VIS_LOW, &mut ghosted, &mut streak);
             assert!(!ghosted, "only a reading under LOW may engage x-ray");
         }
     }
@@ -2030,11 +2057,11 @@ mod vis_tests {
     /// occlusion holds whatever state it is in instead of strobing.
     #[test]
     fn ghost_latch_holds_inside_the_hysteresis_band() {
-        let mid = (GHOST_VIS_LOW + GHOST_VIS_HIGH) * 0.5;
+        let mid = GHOST_VIS_LOW + GHOST_VIS_BAND * 0.5;
         for start in [false, true] {
             let (mut ghosted, mut streak) = (start, 0u8);
             for _ in 0..20 {
-                update_ghost_latch(Some(mid), &mut ghosted, &mut streak);
+                update_ghost_latch(Some(mid), GHOST_VIS_LOW, &mut ghosted, &mut streak);
             }
             assert_eq!(ghosted, start, "edge-of-occlusion part must hold its state");
         }
@@ -2091,7 +2118,7 @@ mod vis_tests {
             let f = object_visibility_fractions(
                 std::slice::from_ref(&part), &[0], &pose, &depth,
             );
-            update_ghost_latch(f[0], &mut ghosted, &mut streak);
+            update_ghost_latch(f[0], GHOST_VIS_LOW, &mut ghosted, &mut streak);
             if prev.is_some_and(|p| p != ghosted) {
                 flips += 1;
             }
@@ -2116,6 +2143,54 @@ mod vis_tests {
             let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
             assert_eq!(f[0], Some(1.0), "self-occlusion at {deg}° — depth epsilon too tight");
         }
+    }
+}
+
+#[cfg(test)]
+mod touch_dot_tests {
+    use super::*;
+
+    /// A dot is as opaque as its finger presses, never vanishing on a touch too
+    /// light to sense; without a pressure reading it is solid.
+    #[test]
+    fn a_dot_shows_its_pressure_as_opacity() {
+        assert_eq!(touch_dot_alpha(None), 1.0, "no pressure sensed: solid");
+        assert_eq!(touch_dot_alpha(Some(1.0)), 1.0, "at the sensor's full scale: solid");
+        let light = touch_dot_alpha(Some(0.0));
+        assert!(light > 0.0 && light < 0.5, "a touch without pressure still shows: {light}");
+        assert!(touch_dot_alpha(Some(0.5)) > light && touch_dot_alpha(Some(0.5)) < 1.0);
+        assert_eq!(touch_dot_alpha(Some(2.0)), 1.0);
+        assert_eq!(touch_dot_alpha(Some(-1.0)), light);
+    }
+
+    /// The dots leave the opaque pass with the translucent parts, to be drawn
+    /// once, last.
+    #[test]
+    fn dots_are_drawn_late() {
+        let order = XrayOrder { translucent: vec![1], dots: vec![3], restore: vec![2], ..Default::default() };
+        assert_eq!(order.drawn_late(5), vec![false, true, false, true, false]);
+    }
+
+    /// The X-ray setting moves where a part starts showing through: a back
+    /// button peeking out at 8% stays solid at the old 5% and x-rays at the
+    /// stock half, and 0 lets go of a ghosted part.
+    #[test]
+    fn xray_threshold_is_the_setting() {
+        let latch = |low: f32, start: bool, frac: f32| {
+            let (mut ghosted, mut streak) = (start, 0u8);
+            for _ in 0..4 {
+                update_ghost_latch(Some(frac), low, &mut ghosted, &mut streak);
+            }
+            ghosted
+        };
+        assert!(!latch(0.05, false, 0.08), "at 5%: peeking out reads as in view");
+        assert!(latch(GHOST_VIS_LOW, false, 0.08), "stock: it shows through");
+        assert!(latch(0.3, true, 0.3 + GHOST_VIS_BAND * 0.5), "and holds inside the band");
+        assert!(!latch(0.3, true, 0.3 + GHOST_VIS_BAND * 1.5), "leaving above it");
+        assert!(!latch(0.0, true, 0.0), "0 = x-ray off, even fully hidden");
+        let live = ControllerLive::default();
+        assert_eq!(live.xray_low(), 0.5, "unset = stock: half");
+        assert!(!latch(GHOST_VIS_LOW, false, 1.0), "a part in full view never ghosts");
     }
 }
 

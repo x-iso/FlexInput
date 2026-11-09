@@ -294,6 +294,12 @@ pub struct IvStyleOverride {
     /// model-opacity see-through. `None` = fully opaque.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub c3d_composite: Option<f32>,
+    /// 3D controller viewer only — per-pin X-ray setting: the share of a
+    /// pressed input's facing surface left in view below which it shows
+    /// through the shell (0..1, 0 = never). `None` = use the module's
+    /// `xray_visible` param.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_xray: Option<f32>,
     /// 3D controller viewer only — this pin's model colour overrides, keyed
     /// like the node's `materials` param (`"body"` → `[r, g, b]`). Groups
     /// missing from the map fall back to the module's shared scheme;

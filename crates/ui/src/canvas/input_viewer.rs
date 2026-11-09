@@ -168,6 +168,7 @@ impl IvStyle {
             c3d_alpha: None,
             c3d_fade: None,
             c3d_composite: None,
+            c3d_xray: None,
             c3d_materials: None,
             c3d_model: None,
         }
@@ -448,11 +449,17 @@ fn paint_touchpad_strip(
     let readb = |pin: &str| -> bool {
         live_signals.get(&(dev.to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
     };
-    for (px, py, pa) in [("touch1_x", "touch1_y", "touch1_active"), ("touch2_x", "touch2_y", "touch2_active")] {
+    // A pad that senses pressure shows each finger's pressure (the sensor's
+    // own scale) as its dot's opacity, as the 3D viewer does.
+    let pressure = flexinput_core::automap::TOUCH_RAW_PRESSURE_PINS;
+    for (k, (px, py, pa)) in [("touch1_x", "touch1_y", "touch1_active"), ("touch2_x", "touch2_y", "touch2_active")]
+        .into_iter().enumerate()
+    {
         if !readb(pa) { continue; }
         let (ux, uy) = flexinput_core::touchzones::pad_point_to_unit(readf(px), readf(py));
         let dot = egui::pos2(r.left() + ux * r.width(), r.top() + uy * r.height());
-        painter.circle_filled(dot, 3.5 * s, accent);
+        let press = live_signals.get(&(dev.to_string(), pressure[k].to_string())).map(|s| s.as_float());
+        painter.circle_filled(dot, 3.5 * s, accent.gamma_multiply(crate::model::callback::touch_dot_alpha(press)));
     }
 }
 

@@ -82,6 +82,20 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **A Steam Controller's finger dots show how hard they press.** In the 3D and
+  2D controller viewers each trackpad's dot is as opaque as the finger presses,
+  over the sensor's whole range rather than up to the click (the pad's own
+  highlight already shows the click), never fading out entirely on a touch too
+  light to register. A clicked trackpad now lights at half strength, with the
+  dot drawn over it, so the dot no longer disappears into the pad's highlight.
+  That goes for every touchpad, a DualSense's too; pads that sense no pressure
+  keep solid dots.
+- **The 3D viewer's X-ray point is a setting, and half by default.** "X-ray
+  under" sets how little of a pressed input has to be in view before it shows
+  through the shell: 50% now, where it was a fixed 5%; 0 turns X-ray off.
+  Inputs that only peek out past the shell, like a Steam Controller's lower
+  back buttons, never got under 5% and read as barely lit at a small size. A
+  pinned copy can set its own in its style strip.
 - **The HIDMaestro driver is 2.1.0.** It is the first new driver build since
   2.0.0, and the change is in how frames reach a game: the driver host now runs
   at high priority, so a busy CPU no longer holds a virtual pad's reports back

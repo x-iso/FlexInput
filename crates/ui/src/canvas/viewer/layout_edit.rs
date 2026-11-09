@@ -1037,6 +1037,7 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
         c3d_alpha: None,
         c3d_fade: None,
         c3d_composite: None,
+        c3d_xray: None,
         c3d_materials: None,
         c3d_model: None,
     });
@@ -1085,6 +1086,10 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
             if ui.add(egui::Slider::new(&mut comp, 0.05..=1.0))
                 .on_hover_text("Widget composite alpha: fades the whole rendered controller as a 2D image (overlay), without the see-through look.")
                 .changed() { ov.c3d_composite = Some(comp); }
+            ui.label(egui::RichText::new("x-ray").small().weak());
+            if let Some(v) = crate::canvas::viewer::c3d_xray_slider(ui, ov.c3d_xray) {
+                ov.c3d_xray = Some(v);
+            }
         });
 
         // Material colours + model — this PIN's own override (the module and

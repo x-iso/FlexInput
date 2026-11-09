@@ -268,6 +268,9 @@ pub(crate) fn render_pinned_element_impl(
                 &ctx, instance, live_signals, dev_id.as_deref(), wired_orientation,
                 c3d_motion_amount(inner_snarl, inner_id),
             );
+            // This pin's own X-ray setting, else the module's.
+            live.xray_visible = iv_style_override.as_ref().and_then(|o| o.c3d_xray)
+                .or_else(|| c3d_xray_visible(inner_snarl, inner_id));
             render_controller3d_core(
                 ui, instance, rect, &resolved, orientation, bg, outline,
                 outline_w, scheme, alpha, cam_pitch, live, composite,

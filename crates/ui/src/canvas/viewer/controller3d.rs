@@ -365,7 +365,11 @@ pub(crate) fn controller3d_live(
     let b = |pin: &str| get(pin).map(|s| s.as_bool()).unwrap_or(false);
     let has = |pin: &str| get(pin).is_some();
 
-    // Touch dots (normalized, y already flipped by pad_point_to_unit).
+    // Touch dots (normalized, y already flipped by pad_point_to_unit), and how
+    // hard each presses on a pad that senses it (a Steam Controller's: each
+    // touch field is its own pad, with its own pressure). The sensor's own
+    // scale, not the press pin, which tops out at the click the pad's
+    // highlight already shows.
     for (k, (px, py, pa)) in [
         ("touch1_x", "touch1_y", "touch1_active"),
         ("touch2_x", "touch2_y", "touch2_active"),
@@ -376,6 +380,7 @@ pub(crate) fn controller3d_live(
         if b(pa) {
             let (ux, uy) = flexinput_core::touchzones::pad_point_to_unit(f(px), f(py));
             live.touch[k] = Some(glam::Vec2::new(ux, uy));
+            live.touch_pressure[k] = get(flexinput_core::automap::TOUCH_RAW_PRESSURE_PINS[k]).map(|s| s.as_float());
         }
     }
 
@@ -493,10 +498,11 @@ pub(crate) fn controller3d_live(
     }
     // A pad click lights the whole pad surface — the touchpad, and a two-pad
     // controller's right pad (`touchpad2`), whose click the pad names itself and
-    // SDL reports as Misc 2.
+    // SDL reports as Misc 2. At half strength, so the finger dot on it, drawn
+    // over it, still shows.
     for (part, field) in [("touchpad", 0), ("touchpad2", 1)] {
         let click = flexinput_core::touchzones::field_click_pins(field).iter().any(|p| b(p));
-        glow(part, if click { 1.0 } else { 0.0 });
+        glow(part, if click { crate::model::callback::PAD_CLICK_GLOW } else { 0.0 });
     }
     // Grip sense (Steam Controller): a hand on a grip shows that grip's patch,
     // at the same level as a touched cap. The grips' capacitive pads are marked
@@ -519,6 +525,31 @@ pub(crate) fn c3d_capacitive_glow(snarl: &Snarl<NodeData>, node_id: NodeId) -> f
         .get_node(node_id)
         .and_then(|n| n.params.get("capacitive_glow").and_then(|v| v.as_f64()))
         .unwrap_or(0.3) as f32
+}
+
+/// The node's X-ray setting (`xray_visible`): the share of an active input's
+/// facing surface left in view below which it shows through the shell, 0 =
+/// never. `None` = unset, the renderer's stock value.
+pub(crate) fn c3d_xray_visible(snarl: &Snarl<NodeData>, node_id: NodeId) -> Option<f32> {
+    snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("xray_visible").and_then(|v| v.as_f64()))
+        .map(|v| v as f32)
+}
+
+/// The X-ray setting's slider, in percent of the facing surface. Returns the
+/// new share when moved.
+pub(crate) fn c3d_xray_slider(ui: &mut egui::Ui, visible: Option<f32>) -> Option<f32> {
+    let mut pct = visible.unwrap_or(crate::model::callback::GHOST_VIS_LOW) * 100.0;
+    ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").fixed_decimals(0))
+        .on_hover_text(
+            "When a pressed input shows through the shell: once less than this\n\
+             much of it is in view. Raise it for inputs that only peek out past\n\
+             the shell, like a pad's back buttons, which at a small size read as\n\
+             barely lit. 0 = never.",
+        )
+        .changed()
+        .then_some(pct / 100.0)
 }
 
 /// The node's Motion cue amount (`motion_cue`, 0 = off).
@@ -650,6 +681,22 @@ mod capacitive_glow_tests {
     #[test]
     fn misc_buttons_on_other_pads_are_not_sensors() {
         assert_eq!(glows(0.3, 0, MISC_PINS[2], MISC_PINS[4]), (None, None));
+    }
+
+    /// The dot follows the sensor's own scale, not the press that tops out at
+    /// the click: a pad clicking at 40% of the sensor's range still has a dot
+    /// with room to grow past the click.
+    #[test]
+    fn a_dot_keeps_growing_past_the_click() {
+        use flexinput_core::automap::{TOUCH_PRESSURE_PINS, TOUCH_RAW_PRESSURE_PINS};
+        let dev = "steam:test:0".to_string();
+        let mut signals = std::collections::HashMap::new();
+        signals.insert((dev.clone(), "touch1_active".to_string()), Signal::Bool(true));
+        signals.insert((dev.clone(), TOUCH_PRESSURE_PINS[0].to_string()), Signal::Float(1.0));
+        signals.insert((dev.clone(), TOUCH_RAW_PRESSURE_PINS[0].to_string()), Signal::Float(0.4));
+        let live = controller3d_live(&signals, &[dev], &egui::Context::default(), 1, 0.25, [1.0; 3], [0.0; 2], 0.3);
+        assert_eq!(live.touch_pressure, [Some(0.4), None]);
+        assert!(crate::model::callback::touch_dot_alpha(live.touch_pressure[0]) < 1.0);
     }
 }
 
@@ -1071,6 +1118,17 @@ pub(crate) fn show_controller3d_body(
             }
         });
 
+        // X-ray: how hidden a pressed input must be to show through the shell.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("X-ray under").small())
+                .on_hover_text("A pressed input shows through the shell once less than this much of it is in view.");
+            if let Some(v) = c3d_xray_slider(ui, c3d_xray_visible(snarl, node_id)) {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("xray_visible".into(), serde_json::json!(v));
+                }
+            }
+        });
+
         // Resizable rectangular viewport (persisted like the scopes).
         let size_id = egui::Id::new(("c3d_size", node_id));
         let mut size = ui
@@ -1099,6 +1157,7 @@ pub(crate) fn show_controller3d_body(
             &ctx, node_id.0 as u64, live_signals, dev_id.as_deref(), wired_orientation,
             c3d_motion_amount(snarl, node_id),
         );
+        live.xray_visible = c3d_xray_visible(snarl, node_id);
         render_controller3d_core(
             ui, node_id.0 as u64, rect, &resolved, orientation, bg, outline, outline_w, scheme,
             alpha, cam_pitch, live, 1.0,
