@@ -10,6 +10,17 @@ pub enum ControllerKind {
     JoyCon2L,
     /// Joy-Con 2, right half.
     JoyCon2R,
+    /// The original Joy-Con, left half. Read through SDL, which knows the
+    /// pad; FlexInput has no reader of its own for it (see
+    /// [`ControllerKind::read_by_sdl`]).
+    JoyConL,
+    /// The original Joy-Con, right half.
+    JoyConR,
+    /// Both original Joy-Cons as one pad: the virtual controller joycond
+    /// (Linux) makes of a pair. Read through SDL. It carries no motion —
+    /// joycond forwards none — and while it exists joycond keeps both halves
+    /// to itself.
+    JoyConPair,
     Generic,
     MidiIn,
     MidiOut,
@@ -37,6 +48,20 @@ impl ControllerKind {
                 // firmware update. Note R has the LOWER id.
                 (0x057E, 0x2066) | (0x057E, 0x2070) => return Self::JoyCon2R,
                 (0x057E, 0x2067) | (0x057E, 0x2071) => return Self::JoyCon2L,
+                // The original Joy-Con. Before the catch-all too: read as a
+                // Switch Pro it got the Pro's button map, which is not its
+                // report, and worked not at all. An NES or Famicom controller
+                // reuses these ids; SDL's own type tells those apart
+                // (`sdl_backend` demotes them to Generic).
+                (0x057E, 0x2006) => return Self::JoyConL,
+                (0x057E, 0x2007) => return Self::JoyConR,
+                // joycond's combined pad (Linux, BUS_VIRTUAL). SDL uses the
+                // same id for a pair it merges itself, which FlexInput turns off.
+                (0x057E, 0x2008) => return Self::JoyConPair,
+                // The USB charging grip: one id for both halves, so it says
+                // nothing of which half this is. SDL names each half itself;
+                // where it can't, the pad stays a Generic one SDL still reads.
+                (0x057E, 0x200E) => return Self::Generic,
                 // Any other Nintendo VID — catch BT paths where PID may differ
                 // or gilrs reports a variant PID not in the list above.
                 (0x057E, _) => return Self::SwitchPro,
@@ -82,6 +107,9 @@ impl ControllerKind {
             Self::SwitchPro  => "switch_pro",
             Self::JoyCon2L   => "joycon2_l",
             Self::JoyCon2R   => "joycon2_r",
+            Self::JoyConL    => "joycon_l",
+            Self::JoyConR    => "joycon_r",
+            Self::JoyConPair => "joycon_pair",
             Self::Generic    => "generic",
             Self::MidiIn     => "midi_in",
             Self::MidiOut    => "midi_out",
@@ -102,6 +130,9 @@ impl ControllerKind {
             // speaks, so the name says that and no more.
             Self::JoyCon2L   => "Switch 2 Controller (L)",
             Self::JoyCon2R   => "Switch 2 Controller (R)",
+            Self::JoyConL    => "Joy-Con (L)",
+            Self::JoyConR    => "Joy-Con (R)",
+            Self::JoyConPair => "Joy-Con pair",
             Self::Generic    => "Generic Gamepad",
             Self::MidiIn     => "MIDI Input Port",
             Self::MidiOut    => "MIDI Output Port",
@@ -114,6 +145,14 @@ impl ControllerKind {
         matches!(self, Self::JoyCon2L | Self::JoyCon2R)
     }
 
+    /// Whether SDL reads this kind of pad even with "Route pads through SDL"
+    /// off: the ones no native path reads — every Generic pad, and the
+    /// original Joy-Con, which gilrs mistook for a Switch Pro and SDL's
+    /// Switch driver reads in full (SL/SR included), alone or as joycond's pair.
+    pub fn read_by_sdl(self) -> bool {
+        matches!(self, Self::Generic | Self::JoyConL | Self::JoyConR | Self::JoyConPair)
+    }
+
     /// Whether this controller exposes pressure-sensitive analog triggers
     /// (LT/RT as a 0..1 axis). Switch Pro's ZL/ZR are digital-only buttons, so
     /// it returns false — the UI forces the digital-trigger override ON for it.
@@ -122,6 +161,13 @@ impl ControllerKind {
     pub fn has_analog_triggers(self) -> bool {
         matches!(self, Self::XInput | Self::DualShock4 | Self::DualSense | Self::Generic)
     }
+}
+
+/// Whether `vid`/`pid` is an original Joy-Con: either half, the USB charging
+/// grip that carries both, or joycond's pair. SDL reads these, so gilrs leaves
+/// them be.
+pub fn is_joycon(vid: Option<u16>, pid: Option<u16>) -> bool {
+    vid == Some(0x057E) && matches!(pid, Some(0x2006 | 0x2007 | 0x2008 | 0x200E))
 }
 
 /// Whether `vid`/`pid` is a DualSense Edge. It classifies as

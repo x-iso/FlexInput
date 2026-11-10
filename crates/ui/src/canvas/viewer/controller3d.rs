@@ -72,11 +72,9 @@ pub(crate) fn controller3d_physical_devices(
 /// the device that has that stick — the left from the first device that isn't
 /// a right Joy-Con, the right from the first that isn't a left one.
 pub(crate) fn controller3d_devices_and_deadzone(traced: Vec<(String, [f32; 2])>) -> (Vec<String>, [f32; 2]) {
-    fn slug(d: &str) -> Option<&str> {
-        crate::canvas::remapper_icons::phys_pad_slug(d)
-    }
-    let left = traced.iter().find(|(d, _)| slug(d) != Some("joycon2_r")).map(|(_, z)| z[0]);
-    let right = traced.iter().find(|(d, _)| slug(d) != Some("joycon2_l")).map(|(_, z)| z[1]);
+    use crate::canvas::remapper_icons::{joycon_half, JoyConHalf};
+    let left = traced.iter().find(|(d, _)| joycon_half(d) != Some(JoyConHalf::Right)).map(|(_, z)| z[0]);
+    let right = traced.iter().find(|(d, _)| joycon_half(d) != Some(JoyConHalf::Left)).map(|(_, z)| z[1]);
     let dz = [left.unwrap_or(0.1), right.unwrap_or(0.1)];
     (traced.into_iter().map(|(d, _)| d).collect(), dz)
 }

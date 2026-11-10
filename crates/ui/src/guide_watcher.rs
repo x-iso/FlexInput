@@ -160,7 +160,15 @@ type SignalMap = HashMap<(String, String), Signal>;
 fn chord_group(dev: &str) -> &str {
     // Only SPLIT controllers group. A classic pad is one device and one
     // controller, so it must not share a group with anything.
-    if dev.starts_with("jc2:") { "jc2" } else { dev }
+    if dev.starts_with("jc2:") {
+        return "jc2";
+    }
+    // The original Joy-Con's halves too (`sdl:joycon_l:…`), apart from any
+    // Joy-Con 2: those are someone else's grip.
+    if matches!(crate::canvas::remapper_icons::phys_pad_slug(dev), Some("joycon_l" | "joycon_r")) {
+        return "joycon";
+    }
+    dev
 }
 
 /// True when one physical controller holds every button in `combo`.
@@ -563,6 +571,22 @@ mod chord_tests {
             ("jc2:joycon2_l:ccdd", "btn_back", true),
         ]);
         assert!(combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// The same for the original Joy-Con, read through SDL — but not with a
+    /// Joy-Con 2 half, which is another grip.
+    #[test]
+    fn a_chord_across_original_joycon_halves_fires() {
+        let s = snap(&[
+            ("sdl:joycon_r:98b6e9a1b2c4", "btn_guide", true),
+            ("sdl:joycon_l:98b6e9a1b2c3", "btn_back", true),
+        ]);
+        assert!(combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+        let mixed = snap(&[
+            ("sdl:joycon_r:98b6e9a1b2c4", "btn_guide", true),
+            ("jc2:joycon2_l:ccdd", "btn_back", true),
+        ]);
+        assert!(!combo_held(&mixed, &combo(&["btn_guide", "btn_back"]), None));
     }
 
     /// …and it still must not fire from one half alone.

@@ -222,9 +222,16 @@ struct OpenPad {
     /// a DualSense-through-SDL reads `sdl:dualsense:N`, not `sdl:generic:N`.
     dev_id: String,
     /// Detected controller kind — drives the pin layout, icon, 3D model and the
-    /// kind-gated device UI (calibration, card options). `Generic` unless the
-    /// global-SDL switch is on and SDL opened a pad a native parser would own.
+    /// kind-gated device UI (calibration, card options). A `read_by_sdl` kind
+    /// unless the global-SDL switch is on and SDL opened a pad a native parser
+    /// would own.
     kind: ControllerKind,
+    /// For half of a pad (a Joy-Con), the only pins it publishes: what its
+    /// layout declares. SDL reports every gamepad control on every pad, so a
+    /// left half would carry an idle right stick and face buttons — merged with
+    /// its other half they'd count as a port carrying those pins (a Combiner's
+    /// port default, MULT/ADD). The Joy-Con 2 halves publish only their own.
+    own_pins: Option<HashSet<String>>,
     /// Whether this pad reports a gyroscope/accelerometer (checked once at open;
     /// sensors were enabled then too). Gates the per-poll sensor reads.
     has_gyro: bool,
@@ -396,9 +403,26 @@ impl SdlBackend {
         // which the puck can hold for seconds; with it off SDL never opens the
         // pad. Its other Steam pads stay off by SDL's default already.
         sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", "0");
+        // Original Joy-Cons: one device per half, as the Joy-Con 2 halves are
+        // (SDL would merge a pair into one pad), each read upright — its own
+        // stick, buttons and SL/SR as they're printed — rather than turned
+        // sideways as a mini-pad. Both must be set before SDL opens any.
+        sdl3::hint::set("SDL_JOYSTICK_HIDAPI_COMBINE_JOY_CONS", "0");
+        sdl3::hint::set("SDL_JOYSTICK_HIDAPI_VERTICAL_JOY_CONS", "1");
         let sdl = sdl3::init().ok()?;
         let gamepad_subsystem = sdl.gamepad().ok()?;
         let joystick_subsystem = sdl.joystick().ok()?;
+        // Before any pad is opened, so the first open already uses them.
+        #[cfg(target_os = "linux")]
+        for mapping in LINUX_JOYCON_MAPPINGS {
+            match gamepad_subsystem.add_mapping(mapping) {
+                Ok(status) => eprintln!(
+                    "[sdl] Joy-Con mapping {status:?}: {}",
+                    mapping.split(',').nth(1).unwrap_or("?")
+                ),
+                Err(e) => eprintln!("[sdl] Joy-Con mapping refused: {e}"),
+            }
+        }
         // Do NOT create an EventPump / pump the SDL event queue. This backend
         // lives on the real-time device-io loop (up to 4 kHz); pumping the whole
         // SDL event system there is expensive (it drives window messages + full
@@ -474,7 +498,8 @@ impl SdlBackend {
             };
             // Dedup gate: if this pad is a kind gilrs already owns (Xbox / DS4 /
             // DualSense / Switch Pro), skip it so it isn't surfaced twice. Only
-            // `Generic` pads belong to SDL. REMEMBER the verdict: the probe
+            // the kinds `read_by_sdl` names (Generic pads, original Joy-Cons)
+            // belong to SDL. REMEMBER the verdict: the probe
             // above costs an SDL_OpenGamepad (device I/O, ~140 ms on a cold BT
             // pad), and re-probing the same id every 2 s enumerate was a
             // periodic io-thread stall.
@@ -485,7 +510,7 @@ impl SdlBackend {
             let vid = gamepad.vendor_id();
             let pid = gamepad.product_id();
             let name = gamepad.name().unwrap_or_default();
-            let kind = ControllerKind::detect(&name, vid, pid);
+            let kind = joycon_by_sdl_type(ControllerKind::detect(&name, vid, pid), gamepad.real_type(), &name);
 
             // Never surface FlexInput's OWN HIDMaestro virtual XInput companion
             // (vid 045E / pid 02FF, or a "HIDMaestro"-named pad) through SDL —
@@ -518,7 +543,7 @@ impl SdlBackend {
                 rejected.insert(id);
                 continue;
             }
-            if !sdl_all && kind != ControllerKind::Generic {
+            if !sdl_all && !kind.read_by_sdl() {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
                 continue;
@@ -589,6 +614,8 @@ impl SdlBackend {
                     gamepad,
                     dev_id,
                     kind,
+                    own_pins: matches!(kind, ControllerKind::JoyConL | ControllerKind::JoyConR)
+                        .then(|| layouts::outputs_for(kind).into_iter().map(|p| p.id).collect()),
                     has_gyro,
                     has_accel,
                     imu_watch: ImuWatchdog::new(Instant::now()),
@@ -674,8 +701,10 @@ impl SdlBackend {
             // calls ANY Microsoft VID that, and a real XInput pad is always an
             // SDL gamepad — an unmapped 045E joystick is something like a
             // SideWinder.
+            // An original Joy-Con has no native parser either, so an unmapped
+            // one (SDL's Switch driver didn't take it) is Learned like any pad.
             let kind = ControllerKind::detect(&name, vid, pid);
-            if !matches!(kind, ControllerKind::Generic | ControllerKind::XInput) {
+            if !kind.read_by_sdl() && kind != ControllerKind::XInput {
                 self.raw_rejected.insert(id);
                 continue;
             }
@@ -1031,6 +1060,23 @@ impl DeviceBackend for SdlBackend {
                 ControllerKind::SwitchPro => {
                     out.push((dev.clone(), "btn_capture".into(), Signal::Bool(b(Button::Misc1))));
                 }
+                // The rail buttons, on the pins the Joy-Con 2 halves (and JSM's
+                // LSL/LSR/RSL/RSR) give them: SL first, then SR, on both
+                // halves. SDL orders the right half's the other way round — its
+                // first right paddle is SR.
+                ControllerKind::JoyConL | ControllerKind::JoyConR | ControllerKind::JoyConPair => {
+                    let left = pad.kind != ControllerKind::JoyConR;
+                    let right = pad.kind != ControllerKind::JoyConL;
+                    if left {
+                        out.push((dev.clone(), "btn_capture".into(), Signal::Bool(b(Button::Misc1))));
+                        out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(b(Button::LeftPaddle1))));
+                        out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(b(Button::LeftPaddle2))));
+                    }
+                    if right {
+                        out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(b(Button::RightPaddle2))));
+                        out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(b(Button::RightPaddle1))));
+                    }
+                }
                 ControllerKind::Generic => {
                     // Rear paddles + misc buttons live only on the generic layout;
                     // SDL returns false for absent buttons, harmless to emit.
@@ -1160,6 +1206,10 @@ impl DeviceBackend for SdlBackend {
                     "touch1_x", "touch1_y", "touch1_active");
                 emit_finger(&mut out, fingers.get(1).copied().flatten(),
                     "touch2_x", "touch2_y", "touch2_active");
+            }
+
+            if let Some(own) = &pad.own_pins {
+                keep_own_pins(&mut out, start_len, own);
             }
 
             // Change-detection for the live Hz approximation: hash this pad's
@@ -1591,6 +1641,76 @@ fn note_slow(what: &str, since: Instant) {
     }
 }
 
+/// An original Joy-Con as SDL's own type says it is. Its product id is shared
+/// with the NES and Famicom controllers for Switch Online, which SDL's Switch
+/// driver names as what they are — those are Generic pads, read whole, not a
+/// half with most of its pins missing. A pair is a pair whatever id it came
+/// under: older joycond gave its combined pad the left half's id, under SDL's
+/// "(L/R)" name. Any other kind is left as it was.
+fn joycon_by_sdl_type(kind: ControllerKind, real: sdl3::gamepad::GamepadType, name: &str) -> ControllerKind {
+    use sdl3::gamepad::GamepadType as T;
+    match kind {
+        ControllerKind::JoyConL | ControllerKind::JoyConR | ControllerKind::JoyConPair => match real {
+            T::NintendoSwitchJoyconPair => ControllerKind::JoyConPair,
+            _ if name.contains("(L/R)") || name.contains("Combined") => ControllerKind::JoyConPair,
+            T::NintendoSwitchJoyconLeft => ControllerKind::JoyConL,
+            T::NintendoSwitchJoyconRight => ControllerKind::JoyConR,
+            _ => ControllerKind::Generic,
+        },
+        other => other,
+    }
+}
+
+/// SDL mappings for original Joy-Cons read through evdev on Linux — when SDL's
+/// own Switch driver can't open the pad's hidraw node, and for joycond's pair.
+/// Each replaces SDL's built-in entry for the same id (the log says "Updated"):
+///
+/// - **A half from `hid-nintendo`**: SDL's entry reads it sideways, as a
+///   mini-pad (the d-pad as face buttons, the stick turned), where its own
+///   driver is told to read it upright (`SDL_JOYSTICK_HIDAPI_VERTICAL_JOY_CONS`).
+///   These read it upright too, with the rail buttons on the same paddles that
+///   driver uses (left: SL, SR; right: SR, SL) and Capture on Misc1.
+/// - **joycond's pair** (`057E:2008`, a virtual device): SDL's entry leaves out
+///   Capture (`BTN_Z`) and the four rail buttons joycond forwards as
+///   `BTN_TRIGGER_HAPPY1`–`4` (left SL, left SR, right SL, right SR).
+///
+/// Button numbers are SDL's for evdev: the pad's key codes in ascending order
+/// from `BTN_JOYSTICK`. The codes are `hid-nintendo`'s — left: `BTN_Z` capture,
+/// `BTN_TL`/`BTN_TL2` L/ZL, `BTN_TR`/`BTN_TR2` SL/SR, `BTN_SELECT`,
+/// `BTN_THUMBL`, `BTN_DPAD_*`; right: `BTN_SOUTH`/`EAST`/`NORTH`/`WEST` B/A/X/Y,
+/// `BTN_TL`/`BTN_TL2` SL/SR, `BTN_TR`/`BTN_TR2` R/ZR, `BTN_START`, `BTN_MODE`,
+/// `BTN_THUMBR`. SDL's own sideways entries number them the same way.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_JOYCON_MAPPINGS: [&str; 3] = [
+    "050067007e0500000620000001800000,Nintendo Switch Joy-Con (L),crc:0067,\
+     back:b5,dpdown:b8,dpleft:b9,dpright:b10,dpup:b7,leftshoulder:b1,leftstick:b6,\
+     lefttrigger:b3,leftx:a0,lefty:a1,misc1:b0,paddle2:b2,paddle4:b4,\
+     hint:!SDL_GAMECONTROLLER_USE_BUTTON_LABELS:=1,",
+    "05006ea07e0500000720000001800000,Nintendo Switch Joy-Con (R),crc:a06e,\
+     a:b0,b:b1,guide:b9,paddle1:b6,paddle3:b4,rightshoulder:b5,rightstick:b10,\
+     righttrigger:b7,rightx:a0,righty:a1,start:b8,x:b3,y:b2,\
+     hint:!SDL_GAMECONTROLLER_USE_BUTTON_LABELS:=1,",
+    "060000007e0500000820000000000000,Nintendo Switch Joy-Con (L/R),\
+     a:b0,b:b1,back:b9,dpdown:b15,dpleft:b16,dpright:b17,dpup:b14,guide:b11,\
+     leftshoulder:b5,leftstick:b12,lefttrigger:b7,leftx:a0,lefty:a1,misc1:b4,\
+     paddle1:b21,paddle2:b18,paddle3:b20,paddle4:b19,rightshoulder:b6,\
+     rightstick:b13,righttrigger:b8,rightx:a2,righty:a3,start:b10,x:b3,y:b2,\
+     hint:!SDL_GAMECONTROLLER_USE_BUTTON_LABELS:=1,",
+];
+
+/// Drops, from `out[start..]`, every pin outside `own`, keeping the order of
+/// the rest. In place: this runs every poll.
+fn keep_own_pins(out: &mut Vec<(String, String, Signal)>, start: usize, own: &HashSet<String>) {
+    let mut kept = start;
+    for i in start..out.len() {
+        if own.contains(out[i].1.as_str()) {
+            out.swap(kept, i);
+            kept += 1;
+        }
+    }
+    out.truncate(kept);
+}
+
 /// Cheap order-independent-ish hash of a signal slice, for change detection only
 /// (not correctness-critical). Quantizes floats so tiny jitter doesn't count as
 /// a change every poll.
@@ -1621,6 +1741,118 @@ mod tests {
         assert_eq!(sdl_accel_to_canonical([1.0, 2.0, 3.0]), [-3.0, -1.0, 2.0]);
         // A pad at rest reads +1 g up SDL Y → canonical +Z (vertical, flat).
         assert_eq!(sdl_accel_to_canonical([0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
+    }
+
+    /// A Joy-Con's product id is shared with the NES / Famicom controllers;
+    /// only SDL's type keeps the half. Nothing else is touched.
+    #[test]
+    fn a_joycon_is_whatever_sdls_type_says() {
+        use sdl3::gamepad::GamepadType as T;
+        use ControllerKind as K;
+        let half = "Nintendo Switch Joy-Con (L)";
+        assert_eq!(joycon_by_sdl_type(K::JoyConL, T::NintendoSwitchJoyconLeft, half), K::JoyConL);
+        assert_eq!(joycon_by_sdl_type(K::JoyConR, T::NintendoSwitchJoyconRight, half), K::JoyConR);
+        // An NES controller (R) carries the right half's id; SDL calls it Standard.
+        assert_eq!(joycon_by_sdl_type(K::JoyConR, T::Standard, "Nintendo NES Controller (R)"), K::Generic);
+        assert_eq!(joycon_by_sdl_type(K::JoyConL, T::Unknown, half), K::Generic);
+        // SDL's type picks the half, whichever id it came under.
+        assert_eq!(joycon_by_sdl_type(K::JoyConL, T::NintendoSwitchJoyconRight, half), K::JoyConR);
+        // joycond's pair, and the older joycond that gave it the left half's id.
+        assert_eq!(joycon_by_sdl_type(K::JoyConPair, T::NintendoSwitchJoyconPair, "Nintendo Switch Joy-Con (L/R)"), K::JoyConPair);
+        assert_eq!(joycon_by_sdl_type(K::JoyConL, T::NintendoSwitchJoyconLeft, "Nintendo Switch Joy-Con (L/R)"), K::JoyConPair);
+        for k in [K::SwitchPro, K::JoyCon2L, K::DualSense, K::Generic] {
+            assert_eq!(joycon_by_sdl_type(k, T::NintendoSwitchJoyconLeft, half), k, "{k:?}");
+        }
+    }
+
+    /// Each Linux Joy-Con mapping numbers a control as SDL's evdev driver does
+    /// — the pad's key codes in ascending order — from `hid-nintendo`'s and
+    /// joycond's codes, and puts it where the upright HIDAPI driver does: rail
+    /// buttons on LEFT_PADDLE1/2 = left SL/SR (`paddle2`/`paddle4`) and
+    /// RIGHT_PADDLE1/2 = right SR/SL (`paddle1`/`paddle3`), Capture on Misc1.
+    #[test]
+    fn linux_joycon_mappings_number_hid_nintendos_codes() {
+        const SOUTH: u16 = 0x130; const EAST: u16 = 0x131; const NORTH: u16 = 0x133;
+        const WEST: u16 = 0x134; const Z: u16 = 0x135; const TL: u16 = 0x136;
+        const TR: u16 = 0x137; const TL2: u16 = 0x138; const TR2: u16 = 0x139;
+        const SELECT: u16 = 0x13a; const START: u16 = 0x13b; const MODE: u16 = 0x13c;
+        const THUMBL: u16 = 0x13d; const THUMBR: u16 = 0x13e;
+        const UP: u16 = 0x220; const DOWN: u16 = 0x221; const LEFT: u16 = 0x222; const RIGHT: u16 = 0x223;
+        const HAPPY: [u16; 4] = [0x2c0, 0x2c1, 0x2c2, 0x2c3];
+        fn check(mapping: &str, codes: &[u16], want: &[(&str, u16)]) {
+            let mut sorted = codes.to_vec();
+            sorted.sort_unstable();
+            for (control, code) in want {
+                let index = sorted.iter().position(|c| c == code).expect("code is the pad's");
+                let field = mapping.split(',').find_map(|f| f.strip_prefix(&format!("{control}:")));
+                assert_eq!(field, Some(format!("b{index}").as_str()), "{control} in {mapping}");
+            }
+        }
+        // hid-nintendo, left half: SL/SR are BTN_TR/BTN_TR2.
+        let left = [TL, TL2, SELECT, THUMBL, UP, DOWN, LEFT, RIGHT, Z, TR, TR2];
+        check(LINUX_JOYCON_MAPPINGS[0], &left, &[
+            ("leftshoulder", TL), ("lefttrigger", TL2), ("back", SELECT), ("leftstick", THUMBL),
+            ("dpup", UP), ("dpdown", DOWN), ("dpleft", LEFT), ("dpright", RIGHT), ("misc1", Z),
+            ("paddle2", TR), ("paddle4", TR2),
+        ]);
+        // Right half: B/A/X/Y positional, SL/SR are BTN_TL/BTN_TL2.
+        let right = [EAST, SOUTH, NORTH, WEST, TR, TR2, START, THUMBR, MODE, TL, TL2];
+        check(LINUX_JOYCON_MAPPINGS[1], &right, &[
+            ("a", SOUTH), ("b", EAST), ("x", WEST), ("y", NORTH), ("rightshoulder", TR),
+            ("righttrigger", TR2), ("start", START), ("rightstick", THUMBR), ("guide", MODE),
+            ("paddle3", TL), ("paddle1", TL2),
+        ]);
+        // joycond's pair: both halves' codes, the rail buttons on HAPPY1–4
+        // (left SL, left SR, right SL, right SR).
+        let pair = [SOUTH, EAST, NORTH, WEST, Z, TL, TR, TL2, TR2, SELECT, START, MODE,
+                    THUMBL, THUMBR, UP, DOWN, LEFT, RIGHT, HAPPY[0], HAPPY[1], HAPPY[2], HAPPY[3]];
+        check(LINUX_JOYCON_MAPPINGS[2], &pair, &[
+            ("a", SOUTH), ("b", EAST), ("x", WEST), ("y", NORTH), ("misc1", Z),
+            ("leftshoulder", TL), ("rightshoulder", TR), ("lefttrigger", TL2), ("righttrigger", TR2),
+            ("back", SELECT), ("start", START), ("guide", MODE), ("leftstick", THUMBL),
+            ("rightstick", THUMBR), ("dpup", UP), ("dpdown", DOWN), ("dpleft", LEFT),
+            ("dpright", RIGHT), ("paddle2", HAPPY[0]), ("paddle4", HAPPY[1]),
+            ("paddle3", HAPPY[2]), ("paddle1", HAPPY[3]),
+        ]);
+    }
+
+    /// SDL takes each Linux Joy-Con mapping whole: the stored copy keeps the
+    /// rail buttons and Capture, so no element was dropped as unreadable.
+    #[test]
+    #[ignore = "starts SDL; run alone with --ignored"]
+    fn sdl_accepts_the_linux_joycon_mappings() {
+        use sdl3::sys::gamepad::SDL_GetGamepadMappingForGUID;
+        use sdl3::sys::guid::SDL_StringToGUID;
+        let state = SdlBackend::try_init().expect("SDL starts");
+        for mapping in LINUX_JOYCON_MAPPINGS {
+            state.gamepad_subsystem.add_mapping(mapping).expect("SDL takes the mapping");
+            let guid = std::ffi::CString::new(&mapping[..32]).unwrap();
+            // SAFETY: SDL is up; the returned string is SDL's, freed below.
+            let stored = unsafe {
+                let p = SDL_GetGamepadMappingForGUID(SDL_StringToGUID(guid.as_ptr()));
+                assert!(!p.is_null(), "no mapping stored for {}", &mapping[..32]);
+                let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+                sdl3::sys::stdinc::SDL_free(p.cast());
+                s
+            };
+            for field in mapping.split(',').filter(|f| f.starts_with("paddle") || f.starts_with("misc1")) {
+                assert!(stored.split(',').any(|f| f == field), "{field} lost from {stored}");
+            }
+        }
+    }
+
+    /// Only the pad's own slice is filtered, in order; earlier pads' pins stay
+    /// whatever they are.
+    #[test]
+    fn keep_own_pins_filters_only_this_pads_tail() {
+        let sig = |d: &str, p: &str| (d.to_string(), p.to_string(), Signal::Bool(true));
+        let mut out = vec![sig("a", "btn_south"), sig("l", "right_stick_x"), sig("l", "btn_lb"),
+                           sig("l", "btn_south"), sig("l", "btn_paddle_l1"), sig("l", "gyro_x")];
+        let own: HashSet<String> = layouts::outputs_for(ControllerKind::JoyConL)
+            .into_iter().map(|p| p.id).collect();
+        keep_own_pins(&mut out, 1, &own);
+        let pins: Vec<(&str, &str)> = out.iter().map(|(d, p, _)| (d.as_str(), p.as_str())).collect();
+        assert_eq!(pins, [("a", "btn_south"), ("l", "btn_lb"), ("l", "btn_paddle_l1"), ("l", "gyro_x")]);
     }
 
     /// A serial with colons (e.g. a Bluetooth MAC) must not survive into the id

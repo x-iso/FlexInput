@@ -1486,9 +1486,10 @@ pub(crate) fn build_processing_graph_rec(
         if node.module_id != "device.source" { continue; }
         let Some(dev_id) = node.params.get("device_id").and_then(|v| v.as_str()) else { continue; };
         let opted_in = node.params.get("digital_triggers").and_then(|v| v.as_bool()).unwrap_or(false);
-        // Both backends: an SDL-surfaced Switch Pro is digital-only too.
-        let digital_only =
-            crate::canvas::remapper_icons::phys_pad_slug(dev_id) == Some("switch_pro");
+        // Both backends: an SDL-surfaced Switch Pro is digital-only too, and
+        // so is an original Joy-Con.
+        let digital_only = crate::canvas::remapper_icons::phys_pad_slug(dev_id)
+            .is_some_and(crate::canvas::remapper_icons::slug_has_digital_triggers);
         if opted_in || digital_only {
             digital_trigger_devs.insert(dev_id.to_string());
         }

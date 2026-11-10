@@ -223,7 +223,8 @@ impl FlexInputApp {
                 && !matches!(d.kind, CK::MidiIn | CK::MidiOut))
             .map(|d| match d.kind {
                 CK::DualShock4 | CK::DualSense => Skin::Playstation,
-                CK::SwitchPro => Skin::SwitchPro,
+                CK::SwitchPro | CK::JoyConL | CK::JoyConR | CK::JoyConPair
+                | CK::JoyCon2L | CK::JoyCon2R => Skin::SwitchPro,
                 _ => Skin::Xbox,
             })
             .unwrap_or(Skin::Xbox)

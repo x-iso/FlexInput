@@ -15,6 +15,9 @@ fn all_supported_kinds_have_automap_out_pin() {
         ControllerKind::DualShock4,
         ControllerKind::DualSense,
         ControllerKind::SwitchPro,
+        ControllerKind::JoyConL,
+        ControllerKind::JoyConR,
+        ControllerKind::JoyConPair,
         ControllerKind::Generic,
     ] {
         let outputs = layouts::outputs_for(kind);
@@ -48,6 +51,9 @@ fn feedback_inlet_union_covers_all_input_families() {
         ControllerKind::DualShock4,
         ControllerKind::DualSense,
         ControllerKind::SwitchPro,
+        ControllerKind::JoyConL,
+        ControllerKind::JoyConR,
+        ControllerKind::JoyConPair,
         ControllerKind::Generic,
     ] {
         for pin in layouts::inputs_for(kind) {
@@ -194,10 +200,11 @@ fn generic_outputs_do_not_panic() {
 // Verify that the sensor output side (buttons/axes) is not accidentally empty.
 
 // ── SDL backend dedup + extended Generic pins ──────────────────────────────────
-// The SDL backend enumerates ONLY pads that `ControllerKind::detect` classifies
-// as `Generic`; every kind gilrs owns must therefore detect as non-`Generic` so
-// SDL drops it and no controller is surfaced twice. These are the exact VID/PIDs
-// the SDL open path runs `detect` on. Pure — no SDL device needed.
+// The SDL backend enumerates ONLY pads whose `ControllerKind::detect` kind is
+// `read_by_sdl` (Generic, original Joy-Con); every kind gilrs owns must therefore
+// detect as something else so SDL drops it and no controller is surfaced twice.
+// These are the exact VID/PIDs the SDL open path runs `detect` on. Pure — no SDL
+// device needed.
 
 #[test]
 fn sdl_dedup_gilrs_owned_pads_detect_non_generic() {
@@ -213,13 +220,46 @@ fn sdl_dedup_gilrs_owned_pads_detect_non_generic() {
     ];
     for (vid, pid, label) in owned {
         let kind = ControllerKind::detect("", Some(*vid), Some(*pid));
-        assert_ne!(
-            kind,
-            ControllerKind::Generic,
-            "{label} ({vid:04X}:{pid:04X}) must NOT detect as Generic, or the SDL \
-             backend would surface it as a duplicate of the gilrs/raw-HID device",
+        assert!(
+            !kind.read_by_sdl(),
+            "{label} ({vid:04X}:{pid:04X}) must NOT detect as a kind SDL reads, or \
+             the SDL backend would surface it as a duplicate of the gilrs/raw-HID \
+             device (got {kind:?})",
         );
+        assert!(!flexinput_devices::identification::is_joycon(Some(*vid), Some(*pid)),
+            "{label}: gilrs would skip it");
     }
+}
+
+/// An original Joy-Con has no native reader, and read as a Switch Pro it
+/// didn't work: SDL takes both halves (and the charging grip) by default, each
+/// half under its own kind, and gilrs leaves them all alone.
+#[test]
+fn sdl_reads_original_joycons_by_default() {
+    use flexinput_devices::identification::is_joycon;
+    // Bluetooth on Windows names either half "Wireless Gamepad": the ids decide.
+    for (pid, want) in [(0x2006, ControllerKind::JoyConL), (0x2007, ControllerKind::JoyConR)] {
+        for name in ["", "Wireless Gamepad", "Nintendo Switch Joy-Con (L)"] {
+            assert_eq!(ControllerKind::detect(name, Some(0x057E), Some(pid)), want, "{pid:04X} {name:?}");
+        }
+        assert!(!want.has_analog_triggers(), "{pid:04X}: ZL/ZR are buttons");
+    }
+    // joycond's pair (Linux) is its own pad, with no analog triggers either.
+    let pair = ControllerKind::detect("Nintendo Switch Combined Joy-Cons", Some(0x057E), Some(0x2008));
+    assert_eq!(pair, ControllerKind::JoyConPair);
+    assert!(!pair.has_analog_triggers());
+    // The charging grip's one id names no half: SDL names each itself.
+    for pid in [0x2006, 0x2007, 0x2008, 0x200E] {
+        let kind = ControllerKind::detect("", Some(0x057E), Some(pid));
+        assert!(kind.read_by_sdl(), "{pid:04X} → {kind:?}");
+        assert!(is_joycon(Some(0x057E), Some(pid)), "{pid:04X}: gilrs must skip it");
+    }
+    // A Joy-Con 2 is the BLE backend's, never SDL's by default.
+    for pid in [0x2066, 0x2067] {
+        assert!(!ControllerKind::detect("", Some(0x057E), Some(pid)).read_by_sdl());
+        assert!(!is_joycon(Some(0x057E), Some(pid)));
+    }
+    assert!(!is_joycon(Some(0x054C), Some(0x2006)), "another vendor's product id");
 }
 
 #[test]

@@ -22,6 +22,33 @@ All notable changes to FlexInput are documented here. This project adheres to
   should keep playing, so the pad falls silent soon after FlexInput stops. When
   SDL can't rumble a raw pad, the log now says so once.
 
+### Fixed
+
+- **Original Joy-Cons work without "Route pads through SDL", SL and SR
+  included.** FlexInput took a first-generation Joy-Con for a Switch Pro
+  Controller and read it with the Pro's button layout, so it barely worked
+  unless every pad was routed through SDL — and there, a pair merged into one
+  pad and SL/SR were missing. Each half now appears as its own **Joy-Con (L)**
+  or **Joy-Con (R)**, read through SDL by default: stick, buttons, Capture or
+  Home, motion and rumble, with SL and SR on the same pins as a Joy-Con 2's,
+  so they map like any button (and a JSM config's `LSL`/`LSR`/`RSL`/`RSR`
+  reach them). The two halves combine the way a Joy-Con 2 pair does. A patch
+  wired to the old merged pad needs its halves picked again. NES and Famicom
+  controllers for Switch Online, which share the Joy-Con's ids, are read as
+  generic pads.
+- **On Linux, joycond's combined Joy-Cons are a Joy-Con pair, with Capture and
+  SL/SR.** The pad joycond makes of two halves was read as a Switch Pro
+  Controller and lost its Capture button and all four rail buttons. It now
+  shows as **Joy-Con pair** with every button, SL and SR named by side. It has
+  no motion: joycond forwards none, and while the halves are combined it keeps
+  them to itself. For gyro, use the halves on their own and combine them in
+  FlexInput. A single Joy-Con that SDL reads through the kernel's driver is
+  now read upright, as on Windows, rather than sideways.
+- **Joy-Cons wear Nintendo glyphs.** Joy-Con 2 halves showed Xbox button
+  glyphs and an Xbox icon on their node. Both generations now show the Switch
+  glyphs and labels, their own half's silhouette as the device icon, and SL/SR
+  glyphs on the rail buttons with a small L or R saying which half.
+
 ## [0.17.0] - 2026-11-07
 
 ### Added

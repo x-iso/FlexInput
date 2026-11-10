@@ -78,10 +78,38 @@ pub fn phys_pad_slug(dev_id: &str) -> Option<&str> {
         .and_then(|rest| rest.split(':').next())
 }
 
+/// One half of a Joy-Con pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoyConHalf {
+    Left,
+    Right,
+}
+
+/// Which Joy-Con half a pad is, of either generation (`joycon_l`, read through
+/// SDL, or `joycon2_l`), or `None` for a whole pad.
+pub fn joycon_half(dev_id: &str) -> Option<JoyConHalf> {
+    match phys_pad_slug(dev_id)? {
+        "joycon_l" | "joycon2_l" => Some(JoyConHalf::Left),
+        "joycon_r" | "joycon2_r" => Some(JoyConHalf::Right),
+        _ => None,
+    }
+}
+
+/// Whether a pad's ZL/ZR (or LT/RT) are buttons with no travel, by its pad
+/// slug — so the digital-trigger bridge is always on for it.
+pub fn slug_has_digital_triggers(slug: &str) -> bool {
+    matches!(slug, "switch_pro" | "joycon_l" | "joycon_r" | "joycon_pair")
+}
+
 pub fn skin_from_device_id(dev_id: &str) -> Skin {
     // Its id says only `sdl:generic:<serial>`; its USB ids say what it is.
     if crate::model::is_steam_controller(dev_id) {
         return Skin::Steam;
+    }
+    // A Joy-Con's id (`jc2:joycon2_l:…`, `sdl:joycon_l:…`, `sdl:joycon_pair:…`)
+    // names no "switch", so it wore Xbox glyphs.
+    if joycon_half(dev_id).is_some() || phys_pad_slug(dev_id) == Some("joycon_pair") {
+        return Skin::SwitchPro;
     }
     let d = dev_id.to_ascii_lowercase();
     if d.contains("switch")               { return Skin::SwitchPro; }
@@ -194,6 +222,10 @@ const SW_PLUS:    &[u8] = a!("SwitchPro/switch_button_plus.svg");
 const SW_MINUS:   &[u8] = a!("SwitchPro/switch_button_minus.svg");
 const SW_HOME:    &[u8] = a!("SwitchPro/switchpro_button_home.svg");
 const SW_SYNC:    &[u8] = a!("SwitchPro/switch_button_sync.svg");
+// A Joy-Con's rail buttons. Both halves have an SL and an SR, so a chip also
+// carries which half (`pin_pad_side`).
+const SW_SL:      &[u8] = a!("SwitchPro/switch_button_sl.svg");
+const SW_SR:      &[u8] = a!("SwitchPro/switch_button_sr.svg");
 const SW_DPAD_U:  &[u8] = a!("SwitchPro/switch_dpad_up.svg");
 const SW_DPAD_D:  &[u8] = a!("SwitchPro/switch_dpad_down.svg");
 const SW_DPAD_L:  &[u8] = a!("SwitchPro/switch_dpad_left.svg");
@@ -467,6 +499,11 @@ const DEV_XBOX:     &[u8] = a!("Xbox/controller_xboxone.svg");
 const DEV_PS4:      &[u8] = a!("Playstation/controller_playstation4.svg");
 const DEV_PS5:      &[u8] = a!("Playstation/controller_playstation5.svg");
 const DEV_SWITCH:   &[u8] = a!("SwitchPro/controller_switch_pro.svg");
+// One Joy-Con, either generation, and a pair as one pad (the console with both
+// attached).
+const DEV_JOYCON_L:    &[u8] = a!("SwitchPro/switch_joycon_left.svg");
+const DEV_JOYCON_R:    &[u8] = a!("SwitchPro/switch_joycon_right.svg");
+const DEV_JOYCON_PAIR: &[u8] = a!("SwitchPro/controller_switch.svg");
 const DEV_STEAM:    &[u8] = a!("SC/sc2.svg");
 const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
 const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
@@ -530,12 +567,11 @@ pub fn device_card_svg(kind: flexinput_devices::ControllerKind, vid: Option<u16>
         K::DualShock4 => DEV_PS4,
         K::DualSense  => DEV_PS5,
         K::SwitchPro  => DEV_SWITCH,
-        // Joy-Con 2 halves borrow the Switch Pro glyph for now. The
-        // `controller_switch_joycon_up/down.svg` assets are NOT per-side art —
-        // they are rail attach/detach direction glyphs (a body with an up or
-        // down arrow) — so using them here would be misleading. Dedicated
-        // left/right Joy-Con art is a follow-up.
-        K::JoyCon2L | K::JoyCon2R => DEV_SWITCH,
+        // ❗ Not `controller_switch_joycon_up/down.svg`: those are rail
+        // attach/detach glyphs (a body with an arrow), not a side's art.
+        K::JoyCon2L | K::JoyConL => DEV_JOYCON_L,
+        K::JoyCon2R | K::JoyConR => DEV_JOYCON_R,
+        K::JoyConPair => DEV_JOYCON_PAIR,
         K::Generic    => DEV_XBOX,
         K::MidiIn     => DEV_MIDI_IN,
         K::MidiOut    => DEV_MIDI_OUT,
@@ -581,12 +617,15 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
         return Some(NodeIconSpec::Single(DEV_STEAM));
     }
     if let Some(slug) = phys_pad_slug(dev_id) {
-        return Some(NodeIconSpec::Single(match slug {
-            "xinput"     => DEV_XBOX,
-            "ds4"        => DEV_PS4,
-            "dualsense"  => DEV_PS5,
-            "switch_pro" => DEV_SWITCH,
-            _            => DEV_XBOX,
+        return Some(NodeIconSpec::Single(match (slug, joycon_half(dev_id)) {
+            (_, Some(JoyConHalf::Left))  => DEV_JOYCON_L,
+            (_, Some(JoyConHalf::Right)) => DEV_JOYCON_R,
+            ("joycon_pair", _) => DEV_JOYCON_PAIR,
+            ("xinput", _)     => DEV_XBOX,
+            ("ds4", _)        => DEV_PS4,
+            ("dualsense", _)  => DEV_PS5,
+            ("switch_pro", _) => DEV_SWITCH,
+            _                 => DEV_XBOX,
         }));
     }
     if dev_id.starts_with("midi_in")  { return Some(NodeIconSpec::Single(DEV_MIDI_IN));  }
@@ -616,6 +655,15 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
     if skin == Skin::Steam {
         if let Some(b) = steam_pin_svg(pin_id) {
             return Some(b);
+        }
+    }
+    // On a Nintendo pad the paddle pins are a Joy-Con's rail buttons (SL first,
+    // then SR, on either half); no other Nintendo pad has paddles.
+    if skin == Skin::SwitchPro {
+        match pin_id {
+            "btn_paddle_l1" | "btn_paddle_r1" => return Some(SW_SL),
+            "btn_paddle_l2" | "btn_paddle_r2" => return Some(SW_SR),
+            _ => {}
         }
     }
     // KBM pins are family-agnostic.
@@ -978,7 +1026,8 @@ pub const GAMEPAD_INPUT_PINS: &[(&str, &str)] = &[
 /// touchpad's two touch points share the press glyph.
 pub fn extra_button_label(skin: Skin, pin_id: &str) -> Option<&'static str> {
     match (skin, pin_id) {
-        (Skin::Steam, "btn_paddle_l1" | "btn_paddle_r1" | "btn_paddle_l2" | "btn_paddle_r2") => None,
+        // Their own glyphs say L4/R5 and SL/SR already.
+        (Skin::Steam | Skin::SwitchPro, "btn_paddle_l1" | "btn_paddle_r1" | "btn_paddle_l2" | "btn_paddle_r2") => None,
         (_, "btn_paddle_l1") => Some("PL1"),
         (_, "btn_paddle_r1") => Some("PR1"),
         (_, "btn_paddle_l2") => Some("PL2"),
@@ -997,7 +1046,17 @@ pub fn extra_button_label(skin: Skin, pin_id: &str) -> Option<&'static str> {
 /// [`extra_button_label`]), but an arrowed swipe glyph has no clear space to cut
 /// into — the arrow shaft is where the letter would go — so the side is painted
 /// over it instead, by [`paint_pad_side_badge`].
+///
+/// Likewise which Joy-Con a rail button is on: both halves have an SL and an
+/// SR, and the lettering fills the glyph.
 pub fn pin_pad_side(skin: Skin, pin_id: &str) -> Option<&'static str> {
+    if skin == Skin::SwitchPro {
+        match pin_id {
+            "btn_paddle_l1" | "btn_paddle_l2" => return Some("L"),
+            "btn_paddle_r1" | "btn_paddle_r2" => return Some("R"),
+            _ => {}
+        }
+    }
     let field = flexinput_core::touchzones::swipe_field(pin_id)?;
     (skin == Skin::Steam).then(|| if field == 0 { "L" } else { "R" })
 }
@@ -1115,6 +1174,7 @@ mod prefix_tests {
         ("gilrs:xinput:0", "xinput"),
         ("gilrs:switch_pro:1", "switch_pro"),
         ("sdl:generic:2", "generic"),
+        ("sdl:joycon_r:98b6e9a1b2c3", "joycon_r"),
         ("jc2:joycon2_l:da2d160f0169", "joycon2_l"),
         ("btc:switch_pro:da2d160f0169", "switch_pro"),
     ];
@@ -1159,5 +1219,54 @@ mod prefix_tests {
         for id in ["vgamepad:xbox360:v0", "midi_in:0", "nonsense"] {
             assert_eq!(phys_pad_slug(id), None, "{id} resolved to a pad slug");
         }
+    }
+
+    /// Either generation's halves are halves, wear the Switch glyphs and their
+    /// own side's silhouette; joycond's pair is one Nintendo pad. ZL/ZR bridge
+    /// like a Switch Pro's on the original ones.
+    #[test]
+    fn joycons_are_switch_halves_of_either_generation() {
+        let icon = |id: &str| match device_node_icon_for_id(id) {
+            Some(NodeIconSpec::Single(svg)) => svg,
+            None => panic!("{id} has no icon"),
+        };
+        for (id, half, svg) in [("sdl:joycon_l:aa", JoyConHalf::Left, DEV_JOYCON_L),
+                                ("sdl:joycon_r:bb", JoyConHalf::Right, DEV_JOYCON_R),
+                                ("jc2:joycon2_l:cc", JoyConHalf::Left, DEV_JOYCON_L),
+                                ("jc2:joycon2_r:dd", JoyConHalf::Right, DEV_JOYCON_R)] {
+            assert_eq!(joycon_half(id), Some(half), "{id}");
+            assert_eq!(skin_from_device_id(id), Skin::SwitchPro, "{id}");
+            assert!(icon(id) == svg, "{id} wears its side's silhouette");
+        }
+        assert_eq!(joycon_half("gilrs:switch_pro:0"), None);
+        assert_eq!(joycon_half("sdl:joycon_pair:i0"), None, "a pair is a whole pad");
+        assert_eq!(skin_from_device_id("sdl:joycon_pair:i0"), Skin::SwitchPro);
+        assert!(icon("sdl:joycon_pair:i0") == DEV_JOYCON_PAIR);
+        assert!(icon("gilrs:switch_pro:0") == DEV_SWITCH);
+        use flexinput_devices::ControllerKind as K;
+        assert!(device_card_svg(K::JoyCon2L, None, None) == DEV_JOYCON_L);
+        assert!(device_card_svg(K::JoyConR, None, None) == DEV_JOYCON_R);
+        assert!(device_card_svg(K::JoyConPair, None, None) == DEV_JOYCON_PAIR);
+        for slug in ["switch_pro", "joycon_l", "joycon_r", "joycon_pair"] {
+            assert!(slug_has_digital_triggers(slug), "{slug}");
+        }
+        assert!(!slug_has_digital_triggers("dualsense"));
+    }
+
+    /// Under the Switch skin the paddle pins are SL/SR, with which half in the
+    /// corner badge rather than cut into the lettering; elsewhere they stay the
+    /// generic paddle with its PL1… label.
+    #[test]
+    fn a_joycons_rail_buttons_are_sl_and_sr() {
+        for (pin, svg, side) in [("btn_paddle_l1", SW_SL, "L"), ("btn_paddle_l2", SW_SR, "L"),
+                                 ("btn_paddle_r1", SW_SL, "R"), ("btn_paddle_r2", SW_SR, "R")] {
+            assert_eq!(pin_svg(Skin::SwitchPro, pin), Some(svg), "{pin}");
+            assert_eq!(pin_pad_side(Skin::SwitchPro, pin), Some(side), "{pin}");
+            assert_eq!(extra_button_label(Skin::SwitchPro, pin), None, "{pin}: SL/SR is on the glyph");
+            assert_eq!(pin_svg(Skin::Xbox, pin), pin_svg(Skin::Playstation, pin), "{pin}");
+            assert_ne!(pin_svg(Skin::Xbox, pin), Some(svg), "{pin}");
+            assert_eq!(pin_pad_side(Skin::Xbox, pin), None, "{pin}");
+        }
+        assert_eq!(pin_pad_side(Skin::SwitchPro, "btn_south"), None);
     }
 }

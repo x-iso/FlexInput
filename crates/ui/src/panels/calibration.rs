@@ -128,6 +128,12 @@ pub fn caps_for(dev_id: &str) -> CalCaps {
             // firmware fuses orientation itself, so it also gets a baseline.
             "joycon2_l"  => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: false, triggers: false, orientation: true },
             "joycon2_r"  => CalCaps { gyro: true,  sticks: true,  left_stick: false, right_stick: true, triggers: false, orientation: true },
+            // The original Joy-Con, through SDL: the same halves, but no
+            // orientation of its own.
+            "joycon_l"   => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: false, triggers: false, orientation: false },
+            "joycon_r"   => CalCaps { gyro: true,  sticks: true,  left_stick: false, right_stick: true, triggers: false, orientation: false },
+            // joycond's pair (Linux): both sticks, but joycond forwards no motion.
+            "joycon_pair" => CalCaps { gyro: false, sticks: true, left_stick: true, right_stick: true, triggers: false, orientation: false },
             // Anything else: conservative sticks-only. A Steam Controller lands
             // here too (`sdl:generic:<serial>`), and only its USB ids say that its
             // triggers are analog.
@@ -3235,7 +3241,7 @@ fn click_window_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_click_jolt", 
 /// A button's name on this pad: "ZR", not "RT (dig)", on the pads that print it.
 fn click_button_name(dev_id: &str, pin: &str) -> String {
     let slug = crate::canvas::remapper_icons::phys_pad_slug(dev_id)
-        .map(|s| if s.starts_with("joycon2") { "switch_pro" } else { s });
+        .map(|s| if s.starts_with("joycon") { "switch_pro" } else { s });
     automap::family_label(pin, slug)
         .or_else(|| automap::ALL_PINS.iter().find(|p| p.id == pin).map(|p| p.display_name))
         .unwrap_or(pin)

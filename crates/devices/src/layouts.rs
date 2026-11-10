@@ -10,6 +10,9 @@ pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
         ControllerKind::SwitchPro  => switch_pro_outputs(),
         ControllerKind::JoyCon2L   => joycon2_left_outputs(),
         ControllerKind::JoyCon2R   => joycon2_right_outputs(),
+        ControllerKind::JoyConL    => joycon_left_outputs(),
+        ControllerKind::JoyConR    => joycon_right_outputs(),
+        ControllerKind::JoyConPair => joycon_pair_outputs(),
         ControllerKind::Generic    => generic_outputs(),
         // MIDI devices build their own pin lists; layouts not used.
         ControllerKind::MidiIn | ControllerKind::MidiOut => return vec![],
@@ -353,7 +356,15 @@ fn joycon2_optical_outputs() -> Vec<DevicePin> {
 }
 
 fn joycon2_left_outputs() -> Vec<DevicePin> {
-    let mut pins = vec![
+    let mut pins = joycon_left_controls();
+    pins.extend(joycon2_shared_outputs());
+    pins
+}
+
+/// One left half's controls, either generation: the Joy-Con 2 adds sensors
+/// after these, not buttons.
+fn joycon_left_controls() -> Vec<DevicePin> {
+    vec![
         f2("left_stick", "Stick", SignalType::Vec2),
         f2("dpad", "D-Pad", SignalType::Vec2),
         fl("left_stick_x", "Stick X"),
@@ -390,12 +401,18 @@ fn joycon2_left_outputs() -> Vec<DevicePin> {
         bo("dpad_down", "D-Pad Down"),
         bo("dpad_left", "D-Pad Left"),
         bo("dpad_right", "D-Pad Right"),
-    ];
+    ]
+}
+
+fn joycon2_right_outputs() -> Vec<DevicePin> {
+    let mut pins = joycon_right_controls(true);
     pins.extend(joycon2_shared_outputs());
     pins
 }
 
-fn joycon2_right_outputs() -> Vec<DevicePin> {
+/// One right half's controls. `gamechat` adds the Switch 2's C button, in the
+/// place the Joy-Con 2 has always listed it.
+fn joycon_right_controls(gamechat: bool) -> Vec<DevicePin> {
     let mut pins = vec![
         f2("right_stick", "Stick", SignalType::Vec2),
         fl("right_stick_x", "Stick X"),
@@ -409,14 +426,53 @@ fn joycon2_right_outputs() -> Vec<DevicePin> {
         bo("btn_rs", "Stick Click"),
         bo("btn_start", "Plus"),
         bo("btn_guide", "Home"),
+    ];
+    if gamechat {
         // New on Switch 2: the GameChat button.
-        bo("btn_c", "C (GameChat)"),
+        pins.push(bo("btn_c", "C (GameChat)"));
+    }
+    pins.extend(vec![
         // The rail buttons — see the left half for why these carry paddle ids.
         // This half's two become R1/R2.
         bo("btn_paddle_r1", "SL"),
         bo("btn_paddle_r2", "SR"),
-    ];
-    pins.extend(joycon2_shared_outputs());
+    ]);
+    pins
+}
+
+// ── Joy-Con (original) ────────────────────────────────────────────────────────
+//
+// Read through SDL, one device per half (SDL is told not to combine them, see
+// `sdl_backend::try_init`), so these match the Joy-Con 2 halves above pin for
+// pin: what a patch maps on one generation works on the other. SDL has no
+// battery level or fused orientation for them, so only the IMU follows.
+
+fn joycon_left_outputs() -> Vec<DevicePin> {
+    let mut pins = joycon_left_controls();
+    pins.extend(imu_pins());
+    pins
+}
+
+fn joycon_right_outputs() -> Vec<DevicePin> {
+    let mut pins = joycon_right_controls(false);
+    pins.extend(imu_pins());
+    pins
+}
+
+/// joycond's pair (Linux): both halves as one pad — a Switch Pro's controls
+/// plus the four rail buttons, on the same pins the halves use. joycond
+/// forwards no motion, so there are no IMU pins to offer.
+fn joycon_pair_outputs() -> Vec<DevicePin> {
+    let mut pins: Vec<DevicePin> = switch_pro_outputs()
+        .into_iter()
+        .filter(|p| !imu_pins().iter().any(|imu| imu.id == p.id))
+        .collect();
+    pins.extend([
+        bo("btn_paddle_l1", "SL (left)"),
+        bo("btn_paddle_l2", "SR (left)"),
+        bo("btn_paddle_r1", "SL (right)"),
+        bo("btn_paddle_r2", "SR (right)"),
+    ]);
     pins
 }
 
@@ -630,6 +686,9 @@ mod automap_vocabulary_tests {
         let kinds = [
             ControllerKind::JoyCon2L,
             ControllerKind::JoyCon2R,
+            ControllerKind::JoyConL,
+            ControllerKind::JoyConR,
+            ControllerKind::JoyConPair,
             ControllerKind::SwitchPro,
             ControllerKind::DualSense,
             ControllerKind::DualShock4,
@@ -652,6 +711,65 @@ mod automap_vocabulary_tests {
             "these buttons can never be mapped — they are published but absent \
              from ALL_PINS: {orphans:?}",
         );
+    }
+
+    /// An original Joy-Con half carries the Joy-Con 2 half's controls pin for
+    /// pin, in the same order, so a patch mapped on one generation runs on the
+    /// other; it lacks only what SDL can't give it (C, fused orientation,
+    /// battery, the mouse sensor). SL and SR are on the paddle pins, on the bus.
+    #[test]
+    fn original_joycon_halves_match_joycon2_without_its_extras() {
+        let ids = |kind| outputs_for(kind).into_iter().map(|p| p.id).collect::<Vec<_>>();
+        let jc2_only = ["btn_c", "orientation", "battery", "charging", "optical_motion",
+                        "optical_x", "optical_y", "optical_contact", "optical_distance"];
+        for (jc1, jc2) in [(ControllerKind::JoyConL, ControllerKind::JoyCon2L),
+                           (ControllerKind::JoyConR, ControllerKind::JoyCon2R)] {
+            let want: Vec<String> = ids(jc2).into_iter()
+                .filter(|p| !jc2_only.contains(&p.as_str()))
+                .collect();
+            assert_eq!(ids(jc1), want, "{jc1:?}");
+        }
+        let bus: std::collections::HashSet<&str> =
+            flexinput_core::automap::ALL_PINS.iter().map(|p| p.id).collect();
+        for (kind, sl, sr) in [(ControllerKind::JoyConL, "btn_paddle_l1", "btn_paddle_l2"),
+                               (ControllerKind::JoyConR, "btn_paddle_r1", "btn_paddle_r2")] {
+            let pins = outputs_for(kind);
+            let name = |id: &str| pins.iter().find(|p| p.id == id).map(|p| p.display_name.as_str());
+            assert_eq!(name(sl), Some("SL"), "{kind:?}");
+            assert_eq!(name(sr), Some("SR"), "{kind:?}");
+            assert!(bus.contains(sl) && bus.contains(sr));
+        }
+    }
+
+    /// joycond's pair carries both halves' controls on the same pins, no
+    /// motion (joycond forwards none), and its four rail buttons named by side.
+    #[test]
+    fn a_joycond_pair_is_both_halves_without_motion() {
+        let pair: Vec<String> = outputs_for(ControllerKind::JoyConPair).into_iter().map(|p| p.id).collect();
+        for half in [ControllerKind::JoyConL, ControllerKind::JoyConR] {
+            for pin in outputs_for(half) {
+                let motion = imu_pins().iter().any(|p| p.id == pin.id);
+                assert_eq!(pair.contains(&pin.id), !motion, "{half:?} {}", pin.id);
+            }
+        }
+        let names: Vec<String> = outputs_for(ControllerKind::JoyConPair).into_iter()
+            .filter(|p| p.id.starts_with("btn_paddle_")).map(|p| p.display_name).collect();
+        assert_eq!(names, ["SL (left)", "SR (left)", "SL (right)", "SR (right)"]);
+        assert_eq!(pair.last().map(String::as_str), Some("automap_out"));
+    }
+
+    /// Saved patches address a device's pins by position, so sharing the
+    /// half layouts must not move a Joy-Con 2 pin: C stays between Home and
+    /// SL, the sensors stay after SR.
+    #[test]
+    fn joycon2_right_half_keeps_its_pin_order() {
+        let ids: Vec<String> = outputs_for(ControllerKind::JoyCon2R).into_iter().map(|p| p.id).collect();
+        let at = |id: &str| ids.iter().position(|p| p == id).unwrap_or_else(|| panic!("no {id}"));
+        assert_eq!(at("btn_c"), at("btn_guide") + 1);
+        assert_eq!(at("btn_paddle_r1"), at("btn_c") + 1);
+        assert_eq!(at("gyro_x"), at("btn_paddle_r2") + 1);
+        assert_eq!(ids.first().map(String::as_str), Some("right_stick"));
+        assert_eq!(ids.last().map(String::as_str), Some("automap_out"));
     }
 
     // Only an Edge gains the back/Fn pins, ahead of the Auto-Map port.

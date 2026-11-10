@@ -667,6 +667,12 @@ impl DeviceBackend for GilrsBackend {
         let mut result = Vec::new();
 
         for (i, (_id, pad)) in self.gilrs.gamepads().enumerate() {
+            // An original Joy-Con is SDL's: read here it got the Switch Pro's
+            // maps and didn't work. `i` is taken first, so skipping it leaves
+            // every other pad's disposition where it was.
+            if crate::identification::is_joycon(pad.vendor_id(), pad.product_id()) {
+                continue;
+            }
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
             let (dev_id, _inst, is_virt) = match disp.get(i) {
                 Some(PadDisposition::Keep { is_virt }) => {
@@ -839,6 +845,10 @@ impl DeviceBackend for GilrsBackend {
         {
         puffin::profile_scope!("gilrs_gamepads_walk");
         for (i, (gilrs_id, pad)) in self.gilrs.gamepads().enumerate() {
+            // SDL reads an original Joy-Con — skipped as in enumerate().
+            if crate::identification::is_joycon(pad.vendor_id(), pad.product_id()) {
+                continue;
+            }
             // Keep/virtual decided up front (path-based for PS, name/PID for our
             // HIDMaestro virtual) so IDs stay in sync with enumerate().
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());

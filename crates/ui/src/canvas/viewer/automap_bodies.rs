@@ -19,7 +19,7 @@ pub(crate) fn slug_has_analog_triggers(dev_id: &str) -> bool {
     // phys_pad_slug handles both gilrs: and sdl: — so an SDL-surfaced Switch Pro
     // is correctly treated as digital-only (forced ON), not analog-capable.
     let slug = crate::canvas::remapper_icons::phys_pad_slug(dev_id).unwrap_or("");
-    slug != "switch_pro"
+    !crate::canvas::remapper_icons::slug_has_digital_triggers(slug)
 }
 
 /// Advanced-mode device.source body toggle for the digital-trigger override.
@@ -350,7 +350,8 @@ pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool,
         return match slug {
             "xinput"                          => (true, false, true),
             "ds4" | "dualsense" | "switch_pro"
-            | "joycon2_l" | "joycon2_r"       => (true, true,  true),
+            | "joycon2_l" | "joycon2_r"
+            | "joycon_l" | "joycon_r"         => (true, true,  true),
             _                                 => (true, false, true),
         };
     }
@@ -368,7 +369,10 @@ pub(crate) fn family_slug_from_device_id(dev_id: &str) -> Option<&'static str> {
         return match slug {
             "dualsense"  => Some("dualsense"),
             "ds4"        => Some("ds4"),
-            "switch_pro" => Some("switch_pro"),
+            // A Joy-Con of either generation prints the Switch Pro's labels
+            // (B/A/Y/X, ZL/ZR, +/−/Home) on its buttons.
+            "switch_pro" | "joycon_l" | "joycon_r" | "joycon_pair"
+            | "joycon2_l" | "joycon2_r" => Some("switch_pro"),
             "xinput"     => Some("xinput"),
             _            => None,
         };
@@ -1044,12 +1048,14 @@ pub(crate) fn combiner_inputs_info(
         let (offered, label) = match traced {
             // Physical device.source: pin set is whatever its output_pin_ids declares.
             Some(TracedInput::Device { dev_id, pins }) => {
-                // Joy-Con halves by their pad slug: they have no glyph family,
-                // so `family_slug_from_device_id` (a glyph lookup) knows nothing
-                // of them.
+                // Joy-Cons by their pad slug: their glyph family
+                // (`family_slug_from_device_id`) would call them a Switch Pro.
                 let label = match crate::canvas::remapper_icons::phys_pad_slug(&dev_id) {
                     Some("joycon2_l") => "Joy-Con 2 (L)".to_string(),
                     Some("joycon2_r") => "Joy-Con 2 (R)".to_string(),
+                    Some("joycon_l") => "Joy-Con (L)".to_string(),
+                    Some("joycon_r") => "Joy-Con (R)".to_string(),
+                    Some("joycon_pair") => "Joy-Con pair".to_string(),
                     _ => match family_slug_from_device_id(&dev_id) {
                         Some("dualsense")  => "DualSense".to_string(),
                         Some("ds4")        => "DualShock 4".to_string(),
