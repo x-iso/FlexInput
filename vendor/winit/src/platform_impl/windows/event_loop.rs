@@ -1275,13 +1275,13 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_PAINT => {
-            userdata.window_state_lock().redraw_requested =
-                userdata.event_loop_runner.should_buffer();
+            let busy = userdata.event_loop_runner.should_buffer();
+            userdata.window_state_lock().redraw_requested = false;
 
             // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
             // window outside the normal flow of the event loop. This way mark event as handled
             // and request a normal redraw with `RedrawWindow`.
-            if !userdata.event_loop_runner.should_buffer() {
+            if !busy {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
                     event: WindowEvent::RedrawRequested,
@@ -1293,7 +1293,14 @@ unsafe fn public_window_callback_inner(
             // user asked for redraw during `RedrawRequested` event handling and request it again
             // after marking `WM_PAINT` as handled.
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
-            if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
+            let again = std::mem::take(&mut userdata.window_state_lock().redraw_requested);
+            if busy {
+                // FLEXINPUT PATCH: upstream asked again right here, which inside a handler's
+                // modal loop (rfd's dialogs run in FlexInput's update()) became a WM_PAINT
+                // per drained queue for as long as the dialog stayed open, and hid its
+                // overwrite prompt. Owe it to after the handler; see `defer_redraw`.
+                userdata.event_loop_runner.defer_redraw(window);
+            } else if again {
                 unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
             }
         },

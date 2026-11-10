@@ -145,6 +145,12 @@ gilrs-core = { path = "vendor/gilrs-core" }
 # See the FLEXINPUT PATCH comments in vendor/winit/src/platform_impl/linux/
 # wayland/ (window/shell.rs, window/mod.rs, window/state.rs, state.rs) and
 # vendor/winit/src/platform/wayland.rs.
+# On Windows it also holds back a redraw a window is owed while a handler is
+# busy (rfd's file dialogs run inside update()) until the handler returns:
+# upstream asked again at once, which kept the thread's queue from ever going
+# idle, so a dialog's "replace existing file?" prompt never appeared. See the
+# FLEXINPUT PATCH comments in vendor/winit/src/platform_impl/windows/
+# event_loop.rs (WM_PAINT) and event_loop/runner.rs (defer_redraw).
 winit = { path = "vendor/winit" }
 
 # ── Debug-build performance ─────────────────────────────────────────────────

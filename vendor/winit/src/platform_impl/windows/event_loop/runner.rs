@@ -7,6 +7,7 @@ use std::time::Instant;
 use std::{mem, panic};
 
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_INTERNALPAINT};
 
 use crate::dpi::PhysicalSize;
 use crate::event::{Event, InnerSizeWriter, StartCause, WindowEvent};
@@ -58,6 +59,9 @@ pub(crate) enum RunnerState {
 enum BufferedEvent<T: 'static> {
     Event(Event<T>),
     ScaleFactorChanged(WindowId, f64, PhysicalSize<u32>),
+    /// FLEXINPUT PATCH: a redraw owed to a window that was handed a `WM_PAINT`
+    /// while the handler was busy; see [`EventLoopRunner::defer_redraw`].
+    Redraw(HWND),
 }
 
 impl<T> EventLoopRunner<T> {
@@ -162,6 +166,22 @@ impl<T> EventLoopRunner<T> {
         let should_buffer = handler.is_none();
         self.event_handler.set(handler);
         should_buffer
+    }
+
+    /// FLEXINPUT PATCH: ask for `hwnd`'s redraw again once the busy handler
+    /// has returned, instead of now. A `WM_PAINT` arrives while the handler is
+    /// busy when the handler runs a modal loop of its own (a file dialog, a
+    /// message box). Asking for a redraw from inside that loop hands the window
+    /// another `WM_PAINT` the moment the queue drains, every time, so the
+    /// thread's queue never goes idle until the dialog closes. Windows shows a
+    /// dialog only once its thread's queue has gone idle, so any prompt the
+    /// dialog opens (the "replace existing file?" one) stays invisible while it
+    /// disables the dialog, and `WM_TIMER` never arrives either.
+    pub(crate) fn defer_redraw(&self, hwnd: HWND) {
+        let mut buffer = self.event_buffer.borrow_mut();
+        if !buffer.iter().any(|e| matches!(e, BufferedEvent::Redraw(h) if *h == hwnd)) {
+            buffer.push_back(BufferedEvent::Redraw(hwnd));
+        }
     }
 }
 
@@ -376,6 +396,9 @@ impl<T> BufferedEvent<T> {
     pub fn dispatch_event(self, dispatch: impl FnOnce(Event<T>)) {
         match self {
             Self::Event(event) => dispatch(event),
+            Self::Redraw(hwnd) => unsafe {
+                RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INTERNALPAINT);
+            },
             Self::ScaleFactorChanged(window_id, scale_factor, new_inner_size) => {
                 let user_new_inner_size = Arc::new(Mutex::new(new_inner_size));
                 dispatch(Event::WindowEvent {

@@ -24,6 +24,17 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Saving over an existing file no longer freezes the save dialog.** Picking
+  an existing patch or workspace and pressing Save could leave the dialog
+  stuck: Windows' "replace it?" prompt opened but never appeared, so the dialog
+  sat disabled behind a question nobody could see. Windows shows a new dialog
+  only once the app has gone quiet, and if any FlexInput window needed a
+  repaint while a dialog was up (another window due a frame at the moment Save
+  was pressed was enough), the app asked to repaint it again every time Windows
+  had nothing else to do, until the dialog closed. That repaint now waits until
+  the dialog has closed, so the prompt shows, and the app no longer burns CPU
+  while a dialog is open. The same applied to every file dialog and
+  confirmation box FlexInput opens.
 - **Original Joy-Cons work without "Route pads through SDL", SL and SR
   included.** FlexInput took a first-generation Joy-Con for a Switch Pro
   Controller and read it with the Pro's button layout, so it barely worked
