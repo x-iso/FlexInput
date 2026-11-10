@@ -363,6 +363,64 @@ impl ImuMap {
     }
 }
 
+/// One force-feedback channel of a pad that speaks the USB force-feedback
+/// protocol (HID PID): a constant force of this sign. A rumble pad with no
+/// force axes has nothing to push, so the sign is all that tells its motors
+/// apart — on a Saitek P2600, positive spins the heavy one, negative the
+/// light one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RumbleChannel {
+    Positive,
+    Negative,
+}
+
+/// What the user felt while the rumble test played one channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Felt {
+    Heavy,
+    Light,
+    Both,
+    Nothing,
+}
+
+/// Which channel drives each rumble motor, as the rumble test found it. Both
+/// motors on one channel is a pad with one motor (or one that mixes them): it
+/// plays the stronger of the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RumbleMap {
+    /// `rumble_strong`: the heavy, low-frequency motor.
+    pub strong: RumbleChannel,
+    /// `rumble_weak`: the light, high-frequency motor.
+    pub weak: RumbleChannel,
+}
+
+impl RumbleMap {
+    /// The map the rumble test's answers imply: the channel felt as heavy
+    /// drives the strong motor, the one felt as light the weak motor, a
+    /// channel felt as both stands in for whichever is missing, and a pad
+    /// with only one working motor plays both from it. `None` when nothing
+    /// was felt at all.
+    pub fn from_test(answers: &[(RumbleChannel, Felt)]) -> Option<Self> {
+        let felt = |want: Felt| answers.iter().find(|(_, f)| *f == want).map(|(c, _)| *c);
+        let strong = felt(Felt::Heavy).or(felt(Felt::Both));
+        let weak = felt(Felt::Light).or(felt(Felt::Both));
+        match (strong, weak) {
+            (Some(strong), Some(weak)) => Some(RumbleMap { strong, weak }),
+            (Some(c), None) | (None, Some(c)) => Some(RumbleMap { strong: c, weak: c }),
+            (None, None) => None,
+        }
+    }
+
+    /// How hard `channel` plays (0..1) for this frame's motor strengths: the
+    /// stronger of the motors it drives, 0 when it drives none.
+    pub fn level(&self, channel: RumbleChannel, strong: f32, weak: f32) -> f32 {
+        let s = if self.strong == channel { strong } else { 0.0 };
+        let w = if self.weak == channel { weak } else { 0.0 };
+        s.max(w).clamp(0.0, 1.0)
+    }
+}
+
 /// A raw pad's learned layout.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RawPadProfile {
@@ -375,6 +433,10 @@ pub struct RawPadProfile {
     pub gyro: Option<ImuMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accel: Option<ImuMap>,
+    /// Rumble through the pad's USB force-feedback interface, once the
+    /// rumble test has found which channel drives which motor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rumble: Option<RumbleMap>,
     /// Started from the community controller database (`sdl_db`) rather
     /// than from nothing. Kept even once every entry is forgotten, so the
     /// database isn't offered again for a pad the user cleared on purpose.
@@ -390,7 +452,7 @@ const ACCEL_PINS: [&str; 3] = ["accel_x", "accel_y", "accel_z"];
 
 impl RawPadProfile {
     pub fn is_empty(&self) -> bool {
-        self.binds.is_empty() && self.gyro.is_none() && self.accel.is_none()
+        self.binds.is_empty() && self.gyro.is_none() && self.accel.is_none() && self.rumble.is_none()
     }
 
     /// Add `bind`, replacing whatever it supersedes: any bind driving the same
@@ -1175,8 +1237,46 @@ mod tests {
             bias: [0.0; 3],
             matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
         }));
+        p.rumble = Some(RumbleMap { strong: RumbleChannel::Positive, weak: RumbleChannel::Negative });
         let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains(r#""rumble":{"strong":"positive","weak":"negative"}"#), "{json}");
         assert_eq!(serde_json::from_str::<RawPadProfile>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn the_rumble_test_answers_become_a_motor_map() {
+        use Felt::*;
+        use RumbleChannel::*;
+        let map = |a: &[(RumbleChannel, Felt)]| RumbleMap::from_test(a);
+        // The Saitek P2600: + is the heavy motor, − the light one.
+        assert_eq!(map(&[(Positive, Heavy), (Negative, Light)]), Some(RumbleMap { strong: Positive, weak: Negative }));
+        assert_eq!(map(&[(Positive, Light), (Negative, Heavy)]), Some(RumbleMap { strong: Negative, weak: Positive }));
+        // One motor, whichever sign: both motors play on the channel that works.
+        assert_eq!(map(&[(Positive, Heavy), (Negative, Nothing)]), Some(RumbleMap { strong: Positive, weak: Positive }));
+        assert_eq!(map(&[(Positive, Nothing), (Negative, Light)]), Some(RumbleMap { strong: Negative, weak: Negative }));
+        // A channel felt as both fills in for the motor nothing else drives.
+        assert_eq!(map(&[(Positive, Heavy), (Negative, Both)]), Some(RumbleMap { strong: Positive, weak: Negative }));
+        assert_eq!(map(&[(Positive, Nothing), (Negative, Nothing)]), None);
+        assert_eq!(map(&[]), None);
+    }
+
+    #[test]
+    fn a_channel_driving_both_motors_plays_the_stronger() {
+        let one = RumbleMap { strong: RumbleChannel::Positive, weak: RumbleChannel::Positive };
+        assert_eq!(one.level(RumbleChannel::Positive, 0.2, 0.7), 0.7);
+        assert_eq!(one.level(RumbleChannel::Negative, 0.2, 0.7), 0.0);
+        let two = RumbleMap { strong: RumbleChannel::Positive, weak: RumbleChannel::Negative };
+        assert_eq!(two.level(RumbleChannel::Positive, 0.2, 0.7), 0.2);
+        assert_eq!(two.level(RumbleChannel::Negative, 0.2, 0.7), 0.7);
+    }
+
+    #[test]
+    fn a_profile_with_only_rumble_learned_is_not_empty() {
+        let p = RawPadProfile {
+            rumble: Some(RumbleMap { strong: RumbleChannel::Positive, weak: RumbleChannel::Positive }),
+            ..Default::default()
+        };
+        assert!(!p.is_empty(), "an emptied-out profile is dropped from settings");
     }
 
     #[test]

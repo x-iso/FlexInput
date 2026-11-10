@@ -434,9 +434,17 @@ pub(crate) struct Opened {
     dev: hidapi::HidDevice,
     numbered: bool,
     info: RawHidInfo,
+    /// A USB force-feedback (PID) rumble interface, with a handle of its own
+    /// for the rumble worker's writes (`hid_pid`).
+    pid: Option<(crate::hid_pid::PidLayout, hidapi::HidDevice)>,
 }
 
 impl Opened {
+    /// The PID rumble interface, for the pad to start its worker with.
+    pub fn take_pid(&mut self) -> Option<(crate::hid_pid::PidLayout, hidapi::HidDevice)> {
+        self.pid.take()
+    }
+
     /// Hand the tier to the pad it was opened for, publishing its catalog.
     pub fn into_tier(self, dev_id: &str) -> HidTier {
         let pins = self.info.fields.iter().map(|(s, _, _)| (*s, s.pin_id())).collect();
@@ -460,7 +468,7 @@ impl Opened {
     }
 }
 
-fn open(api: &hidapi::HidApi, path: &CString) -> Result<Opened, String> {
+fn open(api: &hidapi::HidApi, path: &CString, dev_id: &str) -> Result<Opened, String> {
     // A pad FlexInput hides from games opens through its private node.
     #[cfg(target_os = "linux")]
     let path = &crate::linux_hide::reachable(path);
@@ -469,7 +477,23 @@ fn open(api: &hidapi::HidApi, path: &CString) -> Result<Opened, String> {
     let n = dev.get_report_descriptor(&mut desc).map_err(|e| format!("no report descriptor: {e}"))?;
     let (fields, numbered) = parse_input_fields(&desc[..n]);
     dev.set_blocking_mode(false).map_err(|e| format!("can't read without blocking: {e}"))?;
-    Ok(Opened { dev, numbered, info: classify(&fields) })
+    let pid = match crate::hid_pid::parse(&desc[..n]) {
+        Some(layout) if layout.force_axes => {
+            eprintln!("[pid] {dev_id}: force feedback with force axes (a wheel or joystick) — left alone");
+            None
+        }
+        // Writes block for a USB interval each, so they get a handle of
+        // their own rather than sharing the tier's non-blocking reads.
+        Some(layout) => match api.open_path(path) {
+            Ok(w) => Some((layout, w)),
+            Err(e) => {
+                eprintln!("[pid] {dev_id}: force-feedback interface found but couldn't be opened for writing ({e})");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(Opened { dev, numbered, info: classify(&fields), pid })
 }
 
 /// A worker that opens HID tiers off the I/O thread: `HidApi::new` walks every
@@ -495,7 +519,8 @@ impl Opener {
                     }
                 };
                 while let Ok((dev_id, path)) = jrx.recv() {
-                    if dtx.send((dev_id, open(&api, &path))).is_err() {
+                    let opened = open(&api, &path, &dev_id);
+                    if dtx.send((dev_id, opened)).is_err() {
                         break;
                     }
                 }

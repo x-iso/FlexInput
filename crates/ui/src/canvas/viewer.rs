@@ -51,6 +51,7 @@ mod pad_hints;
 mod pins;
 mod raw_motion;
 mod raw_pad;
+mod raw_rumble;
 mod pinned;
 mod remapper_bodies;
 mod remapper_card;

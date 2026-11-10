@@ -3,6 +3,25 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.17.1] - 2026-11-10
+
+### Added
+
+- **Rumble for old force-feedback pads, without their driver.** Some older
+  DirectInput pads — a Saitek P2600 Rumble Force Pad, for one — drive their
+  motors through the USB force-feedback protocol (HID PID), and Windows often
+  registers no effects for them, so DirectInput (and SDL with it) reports no
+  rumble at all. FlexInput now reads that interface from the pad's own report
+  descriptor and plays it directly. A raw pad's node shows **Rumble test**
+  when it finds one: it plays each force-feedback channel in turn, you say
+  whether the heavy motor, the light one, both or nothing answered, and from
+  then on rumble sent to the pad plays through it — on the P2600 both motors,
+  each on its own. Only rumble pads are driven: a wheel or joystick whose
+  effects have force axes is left alone, since a constant force there pushes
+  the stick. Each effect runs two seconds at a time and is restarted while it
+  should keep playing, so the pad falls silent soon after FlexInput stops. When
+  SDL can't rumble a raw pad, the log now says so once.
+
 ## [0.17.0] - 2026-11-07
 
 ### Added

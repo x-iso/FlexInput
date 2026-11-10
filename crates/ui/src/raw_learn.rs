@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use flexinput_core::raw_pad::{ImuMap, RawBind, RawPadProfile, RawPadProfiles, RawSrc};
+use flexinput_core::raw_pad::{ImuMap, RawBind, RawPadProfile, RawPadProfiles, RawSrc, RumbleMap};
 
 /// An edit made on a raw pad's node.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +20,9 @@ pub enum RawEdit {
     RemovePin(String),
     /// Motion setup's result; a `None` leaves that sensor as it was.
     SetMotion { gyro: Option<ImuMap>, accel: Option<ImuMap> },
+    /// The rumble test's result; `None` forgets it (rumble goes back to
+    /// whatever SDL can do).
+    SetRumble(Option<RumbleMap>),
 }
 
 struct Snapshot {
@@ -116,6 +119,10 @@ pub fn apply_edits(profiles: &mut RawPadProfiles, edits: Vec<(String, String, Ra
                 changed |= gyro.is_some() || accel.is_some();
                 p.set_motion(gyro, accel);
             }
+            RawEdit::SetRumble(map) => {
+                changed |= p.rumble != map;
+                p.rumble = map;
+            }
         }
     }
     // An emptied layout that came from the controller database stays (as an
@@ -152,6 +159,19 @@ mod tests {
             ("k".into(), String::new(), RawEdit::RemovePin("btn_south".into())),
             ("k".into(), String::new(), RawEdit::RemovePin("btn_east".into())),
         ]);
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn a_rumble_test_result_is_stored_and_forgetting_it_drops_a_profile_with_nothing_else() {
+        use flexinput_core::raw_pad::RumbleChannel;
+        let map = RumbleMap { strong: RumbleChannel::Positive, weak: RumbleChannel::Negative };
+        let mut profiles = RawPadProfiles::new();
+        assert!(apply_edits(&mut profiles, vec![("k".into(), "P2600".into(), RawEdit::SetRumble(Some(map)))]));
+        assert_eq!(profiles["k"].rumble, Some(map));
+        assert!(!apply_edits(&mut profiles, vec![("k".into(), String::new(), RawEdit::SetRumble(Some(map)))]),
+            "the same result again changes nothing");
+        assert!(apply_edits(&mut profiles, vec![("k".into(), String::new(), RawEdit::SetRumble(None))]));
         assert!(profiles.is_empty());
     }
 

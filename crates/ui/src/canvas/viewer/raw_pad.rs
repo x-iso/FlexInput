@@ -316,6 +316,9 @@ pub(crate) fn show_raw_pad_header_controls(
                 add_missing_ports(n, &next);
             }
         }
+        if !in_motion_setup {
+            super::raw_rumble::show_rumble_section(ui, node_id, &dev_id, &key, &dev_name, &profile);
+        }
         return;
     }
     request_repaint_throttled(ui.ctx());

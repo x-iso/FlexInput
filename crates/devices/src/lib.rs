@@ -6,6 +6,7 @@ pub mod gyro;
 // its old path here.
 pub use flexinput_core::haptic_pcm;
 pub mod hidhide;
+pub mod hid_pid;
 pub mod identification;
 pub mod layouts;
 #[cfg(target_os = "linux")]

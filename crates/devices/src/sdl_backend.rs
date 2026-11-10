@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec2;
 
-use flexinput_core::raw_pad::{self, RawLayout, RawPadProfiles, RawReading};
+use flexinput_core::raw_pad::{self, RawLayout, RawPadProfiles, RawReading, RumbleChannel, RumbleMap};
 use flexinput_core::{Signal, SignalType};
 
 use crate::gyro::{ImuAverage, LED_MIN_GAP};
@@ -158,6 +158,14 @@ struct RawPad {
     hats: Vec<Vec2>,
     /// Last-sent rumble (strong, weak), as for `OpenPad`.
     last_rumble: (u8, u8),
+    /// The pad's USB force-feedback rumble (`hid_pid`), when its descriptor
+    /// declares one. Outlives HID-tier reopens.
+    ff_rumble: Option<crate::hid_pid::PidRumble>,
+    /// Which force-feedback channel drives which motor, once the rumble test
+    /// has run. Until then (or without `pid`) rumble goes through SDL.
+    rumble_map: Option<RumbleMap>,
+    /// SDL refused to rumble this pad, and the log has said so once.
+    rumble_refused: bool,
     /// The pad's HID tier (`raw_hid`): the fields SDL doesn't read. `None`
     /// while it opens, or when the pad has no HID path or wouldn't open.
     hid: Option<crate::raw_hid::HidTier>,
@@ -171,6 +179,20 @@ struct RawPad {
 
 fn compile_layout(profiles: &RawPadProfiles, key: &str) -> RawLayout {
     profiles.get(key).map(|p| p.compile()).unwrap_or_default()
+}
+
+impl RawPad {
+    /// Hand this pad's rumble to its force-feedback worker, when it has one
+    /// and the rumble test has mapped it. False: SDL's turn.
+    fn pid_rumble(&self) -> bool {
+        let (Some(pid), Some(map)) = (&self.ff_rumble, self.rumble_map) else { return false };
+        let (strong, weak) = (self.last_rumble.0 as f32 / 255.0, self.last_rumble.1 as f32 / 255.0);
+        pid.drive([
+            map.level(RumbleChannel::Positive, strong, weak),
+            map.level(RumbleChannel::Negative, strong, weak),
+        ]);
+        true
+    }
 }
 
 /// SDL's hat bits → (+x right, +y up).
@@ -688,6 +710,7 @@ impl SdlBackend {
             let name = if name.is_empty() { "Unknown controller".to_string() } else { name };
             let profile_key = raw_pad::profile_key(vid, pid, &name);
             let layout = compile_layout(&self.raw_profiles, &profile_key);
+            let rumble_map = self.raw_profiles.get(&profile_key).and_then(|p| p.rumble);
             // The id-based GUID query, not `Joystick::guid`: that one panics on
             // a zero GUID, and a panic here would take the whole I/O loop down.
             eprintln!(
@@ -736,6 +759,9 @@ impl SdlBackend {
                     buttons: Vec::with_capacity(cap(n_buttons)),
                     hats: Vec::with_capacity(cap(n_hats)),
                     last_rumble: (0, 0),
+                    ff_rumble: None,
+                    rumble_map,
+                    rumble_refused: false,
                     hid: None,
                     hid_requested: hid_path.as_ref().map(|_| Instant::now()),
                     hid_path,
@@ -777,6 +803,18 @@ impl DeviceBackend for SdlBackend {
         if let Some(state) = self.state.as_mut() {
             for pad in state.raw_pads.values_mut() {
                 pad.layout = compile_layout(&self.raw_profiles, &pad.profile_key);
+                let map = self.raw_profiles.get(&pad.profile_key).and_then(|p| p.rumble);
+                if map != pad.rumble_map {
+                    // A forgotten map silences the motors it drove; a new
+                    // one picks up the rumble already playing.
+                    if map.is_none() {
+                        if let Some(pid) = &pad.ff_rumble {
+                            pid.drive([0.0, 0.0]);
+                        }
+                    }
+                    pad.rumble_map = map;
+                    pad.pid_rumble();
+                }
             }
         }
     }
@@ -1139,7 +1177,15 @@ impl DeviceBackend for SdlBackend {
                     continue; // gone before its HID tier opened
                 };
                 match opened {
-                    Ok(o) => {
+                    Ok(mut o) => {
+                        // Rumble outlives a reopened tier: the first open
+                        // starts it, later ones drop their spare handle.
+                        if let Some((layout, w)) = o.take_pid() {
+                            if pad.ff_rumble.is_none() {
+                                pad.ff_rumble = crate::hid_pid::PidRumble::spawn(&dev_id, layout, w);
+                                pad.pid_rumble();
+                            }
+                        }
                         let tier = o.into_tier(&dev_id);
                         if let Some(info) = crate::raw_hid::hid_info(&dev_id) {
                             eprintln!(
@@ -1248,8 +1294,10 @@ impl DeviceBackend for SdlBackend {
         // Find the pad by device id.
         let Some(state) = self.state.as_mut() else { return };
         if raw_pad::is_raw_device_id(device_id) {
-            // A raw joystick has nothing but rumble, where its driver offers
-            // force feedback at all (SDL's DirectInput driver plays it).
+            // A raw joystick has nothing but rumble: through its USB
+            // force-feedback interface once the rumble test has mapped it,
+            // else wherever its driver offers force feedback at all (SDL's
+            // DirectInput driver plays it).
             let Some(pad) = state.raw_pads.values_mut().find(|p| p.dev_id == device_id) else {
                 return;
             };
@@ -1258,12 +1306,19 @@ impl DeviceBackend for SdlBackend {
                 "rumble_weak" => pad.last_rumble.1 = byte,
                 _ => return,
             }
+            if pad.pid_rumble() {
+                return;
+            }
             let (strong, weak) = pad.last_rumble;
-            let _ = pad.joystick.set_rumble(
+            let played = pad.joystick.set_rumble(
                 (strong as u16).saturating_mul(257),
                 (weak as u16).saturating_mul(257),
                 1000,
             );
+            if !played && !pad.rumble_refused {
+                eprintln!("[sdl] {device_id}: no rumble through SDL ({})", sdl3::get_error());
+                pad.rumble_refused = true;
+            }
             return;
         }
         let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) else {
