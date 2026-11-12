@@ -140,6 +140,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **The Counter's settings are cells, not a column of labelled rows.** Its four settings were
+  a mode strip, an "Output" row, a "Step" row and a "Range" row with two captioned boxes: 336
+  points across, most of that the words "Output", "Step" and "Range" sitting beside the things
+  they named. The cells are the module now - the mode two per row so the words stay whole, the
+  output pair with its reset at the end of the row, the range and the step as pills - and it
+  comes to 252 wide by 168 tall: a block and a half narrower, a block taller, which on a canvas
+  where wires run between modules is the trade worth making. With it the body-kit's labelled
+  rows are gone from the app entirely; what's left of the kit is the option strip and the width
+  and height a grip can set.
 - **Delay, Average and DC Filter are pills now.** Each one was a label, a slider rail and a
   value box per setting, with a "Channels" row across the body on top: 252 points of module to
   hold one or two numbers, of which most was the words beside them. The settings are pills you

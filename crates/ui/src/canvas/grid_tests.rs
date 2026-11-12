@@ -1760,6 +1760,53 @@ fn the_per_channel_filters_are_pills_with_their_channels_in_the_header() {
 }
 
 #[test]
+fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
+    // Counter had a mode strip, an "Output" row, "Step", and a "Range" row with two captioned
+    // boxes: 335 points across, most of it the words "Output", "Step" and "Range". Its cells
+    // are its own now, two across and centred on the module, so the frame's width is the cells
+    // and its six pins - and every cell still has to sit inside the frame it's given.
+    let (mut rig, ids) = Rig::real("logic.counter", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    assert!(
+        f.width() <= 9.0 * B,
+        "the counter is still as wide as its label rows were: {f:?}",
+    );
+    for what in ["counter_mode_0", "counter_mode_1", "counter_out", "step_pill"] {
+        let r = rig.traced_rect(node, what).unwrap_or(egui::Rect::NOTHING);
+        assert!(
+            r.is_positive() && f.contains_rect(r.shrink(-0.5)),
+            "the counter's {what} {r:?} isn't inside {f:?}",
+        );
+        assert!(
+            (r.center().x - f.center().x).abs() < 1.0,
+            "the counter's {what} {r:?} isn't on the module's centre line ({f:?})",
+        );
+    }
+    // The range is two cells across, so it's the pair that sits on the centre line.
+    let (r_min, r_max) = (
+        rig.traced_rect(node, "min_pill").unwrap_or(egui::Rect::NOTHING),
+        rig.traced_rect(node, "max_pill").unwrap_or(egui::Rect::NOTHING),
+    );
+    let pair = r_min.union(r_max);
+    assert!(
+        r_min.is_positive() && r_max.is_positive() && f.contains_rect(pair.shrink(-0.5)),
+        "the counter's range cells {r_min:?} {r_max:?} aren't inside {f:?}",
+    );
+    assert!(
+        (pair.center().x - f.center().x).abs() < 1.0,
+        "the counter's range {pair:?} isn't on the module's centre line ({f:?})",
+    );
+    // The cells are two across, so the two mode rows and the range row line up in columns.
+    let (m0, m1) = (rig.traced(node, "counter_mode_0"), rig.traced(node, "counter_mode_1"));
+    assert!(
+        (m0.left() - m1.left()).abs() < 0.5 && (m0.width() - m1.width()).abs() < 0.5,
+        "the mode rows aren't the same width: {m0:?} {m1:?}",
+    );
+}
+
+#[test]
 fn a_long_port_list_still_lands_on_the_grid_and_stays_readable() {
     // Nine ports is the case where a column of strips runs out of the module: the frame has to
     // keep growing a block per port, the empty band under the last strip has to stay the same

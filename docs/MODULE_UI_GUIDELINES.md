@@ -365,13 +365,15 @@ rect is what `register_exposable_element` takes.
 | `k.section(ui, title)` | Caption and hairline |
 | `k.note(ui, text)` | Small weak text, wrapped to the body |
 
-`k.slider` and the in-body `k.stepper` are gone. A label cell plus a rail plus a value box
-costs 174 points of body for one number, and Delay, Average and DC Filter each carried two of
-those rows and a "Channels" row on top — 252 points of module for settings a pill says in seven
-characters. Their settings are pills now, and a channel (always a matched In/Out pair) is
-added from the header, so the row builders they used have no caller left. Putting a stepper in
-a body row is how a module ends up wide for a number that belongs at the top anyway: a count
-of something the module *has pins for* goes in the header, beside the name.
+`k.slider` and the in-body `k.stepper` are gone, and after the Counter moved to cells so is
+`kit::body` and the row builders themselves: no body lays out a label cell, a control and a
+value box any more. What survives of the kit is `kit::strip` (a row of equal option cells,
+which is what the Counter's mode and output are), the width/height params a grip writes, and
+the floor arithmetic. The pattern a body of settings follows now is the Counter's: **a stack of
+cells, two across, centred on the module's middle line**, in a box reserved at a constant size —
+and if the words won't fit across, they go two per row rather than the module going wider
+("Loop Limit Bounce Unlimited" in one strip is 184 points of words; two rows of two costs a
+block of height the module's six pin rows already make free).
 
 ## Converting a body
 

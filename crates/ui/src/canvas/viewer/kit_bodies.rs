@@ -53,7 +53,10 @@ pub(crate) fn kit_width_param() -> &'static str {
 /// allocates nothing at all, so its width is its pins' business like the other marks.
 pub(crate) fn kit_min_width(module_id: &str) -> f32 {
     match module_id {
-        "logic.counter" => 240.0,
+        // The cells two across: two 72-point cells and the gap between. The old floor was
+        // 240 because a row was a label cell, a control and a value box, and the labels
+        // ("Output", "Step", "Range") were most of it.
+        "logic.counter" => 148.0,
         _ => kit::MIN_W,
     }
 }
@@ -612,71 +615,197 @@ pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     register_exposable_element(ui, node_id, "time", r_time.union(r_unit));
 }
 
-/// Counter (`logic.counter`): counts steps between limits.
-pub(crate) fn show_counter_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, w: f32) {
+/// Counter (`logic.counter`): counts steps between limits. Its four settings used to be four
+/// labelled rows - a mode strip, an "Output" row, "Step", and a "Range" row with two captioned
+/// boxes - 335 points of module for a strip of words and three numbers, most of it the words
+/// "Output", "Step" and "Range" beside them. It is a stack of cells now: the mode as two rows of
+/// two so the words stay whole, the output pair with the reset at the end of its row, then the
+/// range and the step as pills. The ids the pinned fields and the nav look the controls up by
+/// are unchanged, and so are the params.
+pub(crate) fn show_counter_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    w: f32,
+    view_salt: u64,
+) {
+    use super::simple_bodies::PILL_H;
     let mut mode = param_str(snarl, node_id, "mode", "loop");
     let mut normalized = param_bool(snarl, node_id, "normalized", false);
     let mut step = param_f32(snarl, node_id, "step_param", 1.0);
     let mut min = param_f32(snarl, node_id, "min_param", 0.0);
     let mut max = param_f32(snarl, node_id, "max_param", 10.0);
     let (step_wired, min_wired, max_wired) = (wired(inputs, 3), wired(inputs, 4), wired(inputs, 5));
-    kit::body(ui, w, |ui, k| {
-        let (c1, r1) = k.choice(ui, None, &mut mode, &[
-            ("loop".to_string(), "Loop", "Past the max, start again at the min"),
-            ("limit".to_string(), "Limit", "Stop at the min and max"),
-            ("bounce".to_string(), "Bounce", "Turn around at the min and max"),
-            ("unlimited".to_string(), "Unlimited", "Count on past the max"),
-        ]);
-        let mut reset = false;
-        let (c2, r2) = k.row(ui, "Output", |ui, rest| {
-            let h = ui.spacing().interact_size.y;
-            let changed = kit::strip(ui, rest - kit::GAP - h, &mut normalized, &[
-                (false, "Raw", "The count itself"),
-                (true, "0..1", "The count across min..max as 0..1"),
-            ]);
-            ui.add_space(kit::GAP);
-            reset = ui
-                .add(egui::Button::new("↺").min_size(egui::vec2(h, h)))
-                .on_hover_text("Reset the count")
-                .clicked();
-            changed
-        });
-        let (c3, r3) = ui
-            .add_enabled_ui(!step_wired, |ui| {
-                k.value(ui, "Step", &mut step, |v| egui::DragValue::new(v).speed(0.1).range(0.001..=10_000.0))
-            })
-            .inner;
-        let (c4, r4) = k.pair(
-            ui,
-            "Range",
-            ("Min", &mut min, !min_wired),
-            ("Max", &mut max, !max_wired && mode != "unlimited"),
-            |v| egui::DragValue::new(v).speed(0.1),
+    // Cells two across, sized from the width the body was given rather than from what any of
+    // them happens to say: the grip can still take this module wider, and the cells use it.
+    const MIN_CELL: f32 = 72.0;
+    const ROW: f32 = 4.0;
+    const ROWS: usize = 5;
+    let cell_w = ((w - ROW) * 0.5).max(MIN_CELL);
+    let col_w = 2.0 * cell_w + ROW;
+    let group_h = ROWS as f32 * PILL_H + (ROWS as f32 - 1.0) * ROW;
+    ui.allocate_exact_size(egui::vec2(col_w, group_h), egui::Sense::hover());
+    let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
+        Some(r) => r,
+        None => return,
+    };
+    let column = ui.max_rect();
+    let cx = inner.center().x;
+    let top = kit::group_top(column, group_h);
+    let left = cx - col_w * 0.5;
+    let row_top = |row: usize| top + row as f32 * (PILL_H + ROW);
+    let mut changed = false;
+    // The mode: four options, two per row. In one strip of four the words need 184 points,
+    // which is a block more module than this asks for; split over two rows it costs height the
+    // module's six input pins already give it for free.
+    const MODES: [(&str, &str, &str); 4] = [
+        ("loop", "Loop", "Past the max, start again at the min"),
+        ("limit", "Limit", "Stop at the min and max"),
+        ("bounce", "Bounce", "Turn around at the min and max"),
+        ("unlimited", "Unlimited", "Count on past the max"),
+    ];
+    let mut mode_area: Option<egui::Rect> = None;
+    for row in 0..2 {
+        let rect = egui::Rect::from_min_size(egui::pos2(left, row_top(row)), egui::vec2(col_w, PILL_H));
+        let opts: Vec<(String, &str, &str)> =
+            MODES[row * 2..row * 2 + 2].iter().map(|(v, t, h)| (v.to_string(), *t, *h)).collect();
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("counter_mode", row)),
         );
-        register_exposable_element(ui, node_id, "mode", r1);
-        register_exposable_element(ui, node_id, "range_mode", r2);
-        register_exposable_element(ui, node_id, "step", r3);
-        register_exposable_element(ui, node_id, "min_max", r4);
-
-        if reset {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                while node.extra.aux_f32.len() < 2 {
-                    node.extra.aux_f32.push(0.0);
-                }
-                node.extra.aux_f32[0] = 0.0;
-                node.extra.aux_f32[1] = 1.0;
-                node.extra.aux_f32_dirty = true;
-            }
-        }
-        if c1 || c2 || c3 || c4 {
-            set_value(snarl, node_id, "mode", Value::String(mode.clone()));
-            set_value(snarl, node_id, "normalized", Value::Bool(normalized));
-            set_f32(snarl, node_id, "step_param", step);
-            set_f32(snarl, node_id, "min_param", min);
-            set_f32(snarl, node_id, "max_param", max);
-        }
+        changed |= kit::strip(&mut child, col_w, &mut mode, &opts);
+        drop(child);
+        simple_bodies::trace_rect(ui, node_id, &format!("counter_mode_{row}"), rect);
+        mode_area = Some(mode_area.map_or(rect, |a: egui::Rect| a.union(rect)));
+    }
+    if let Some(r) = mode_area {
+        register_exposable_element(ui, node_id, "mode", r);
+    }
+    // The output: the count itself, or the count across min..max as 0..1. "Output" was the row's
+    // label; the two cells say it, and the reset button sits at the end of the row rather than
+    // taking a row of its own.
+    let out_y = row_top(2);
+    let out_rect = egui::Rect::from_min_size(
+        egui::pos2(left, out_y),
+        egui::vec2(col_w - PILL_H - ROW, PILL_H),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(out_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt("counter_out"),
+    );
+    changed |= kit::strip(&mut child, out_rect.width(), &mut normalized, &[
+        (false, "Raw", "The count itself"),
+        (true, "0..1", "The count across min..max as 0..1"),
+    ]);
+    drop(child);
+    let reset_rect = egui::Rect::from_min_size(
+        egui::pos2(cx + col_w * 0.5 - PILL_H, out_y),
+        egui::vec2(PILL_H, PILL_H),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(reset_rect)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown))
+            .id_salt("counter_reset"),
+    );
+    let reset = child.add(egui::Button::new("↺")).on_hover_text("Reset the count").clicked();
+    drop(child);
+    simple_bodies::trace_rect(ui, node_id, "counter_out", out_rect.union(reset_rect));
+    register_exposable_element(ui, node_id, "range_mode", out_rect.union(reset_rect));
+    // A value that arrives down a wire shows what the wire says, and a drag would be a lie, so
+    // the pill doesn't take one. `max` is out of use in the Unlimited mode.
+    let wired_value = |idx: usize| -> Option<String> {
+        snarl
+            .get_node(node_id)
+            .and_then(|n| n.extra.last_signals.get(idx).copied().flatten())
+            .and_then(|s| match s {
+                flexinput_core::Signal::Float(v) => Some(trim_num(v)),
+                _ => None,
+            })
+    };
+    let max_off = mode == "unlimited";
+    let shown_min = if min_wired { wired_value(4).unwrap_or_else(|| trim_num(min)) } else { trim_num(min) };
+    let shown_max = if max_wired { wired_value(5).unwrap_or_else(|| trim_num(max)) } else { trim_num(max) };
+    let shown_step = if step_wired { wired_value(3).unwrap_or_else(|| trim_num(step)) } else { trim_num(step) };
+    let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, -1e6..=1e6);
+    let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, -1e6..=1e6);
+    let (r_step, t_step) = pill_at(ui, node_id, "step", egui::pos2(left, row_top(4)), col_w, "step", &shown_step, 0.001..=10_000.0);
+    let r_min = r_min.on_hover_text("The bottom of the count: it stops, loops or turns here, depending on the mode.");
+    let r_max = r_max.on_hover_text(if max_off {
+        "The top of the count - not used while the mode is Unlimited."
+    } else {
+        "The top of the count: it stops, loops or turns here, depending on the mode."
     });
+    let r_step = r_step.on_hover_text("How much one step adds to the count.");
+    if !min_wired {
+        if let Some(v) = t_min {
+            min = v as f32;
+            changed = true;
+        } else if r_min.dragged() {
+            min = (min + r_min.drag_delta().x * 0.1).clamp(-1e6, 1e6);
+            changed = true;
+        }
+    }
+    if !max_wired && !max_off {
+        if let Some(v) = t_max {
+            max = v as f32;
+            changed = true;
+        } else if r_max.dragged() {
+            max = (max + r_max.drag_delta().x * 0.1).clamp(-1e6, 1e6);
+            changed = true;
+        }
+    }
+    if !step_wired {
+        if let Some(v) = t_step {
+            step = v as f32;
+            changed = true;
+        } else if r_step.dragged() {
+            step = (step + r_step.drag_delta().x * 0.05).clamp(0.001, 10_000.0);
+            changed = true;
+        }
+    }
+    register_exposable_element(
+        ui,
+        node_id,
+        "min_max",
+        egui::Rect::from_min_size(egui::pos2(left, row_top(3)), egui::vec2(col_w, PILL_H)),
+    );
+    register_exposable_element(
+        ui,
+        node_id,
+        "step",
+        egui::Rect::from_min_size(egui::pos2(left, row_top(4)), egui::vec2(col_w, PILL_H)),
+    );
+    if reset {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            while node.extra.aux_f32.len() < 2 {
+                node.extra.aux_f32.push(0.0);
+            }
+            node.extra.aux_f32[0] = 0.0;
+            node.extra.aux_f32[1] = 1.0;
+            node.extra.aux_f32_dirty = true;
+        }
+    }
+    if changed {
+        set_value(snarl, node_id, "mode", Value::String(mode.clone()));
+        set_value(snarl, node_id, "normalized", Value::Bool(normalized));
+        set_f32(snarl, node_id, "step_param", step);
+        set_f32(snarl, node_id, "min_param", min);
+        set_f32(snarl, node_id, "max_param", max);
+    }
 }
+
+/// A number without the zeros that don't say anything: a step of one is `1`, not `1.00`.
+fn trim_num(v: f32) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 
 /// Has Changed (`logic.has_changed`): how far the input has to move to count. The one
 /// setting is painted across the module — a pill centred on it, allocating a token box so

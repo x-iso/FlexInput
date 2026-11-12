@@ -26,7 +26,6 @@ pub(crate) const VALUE_W: f32 = 50.0;
 /// Space between the cells of a row.
 pub(crate) const GAP: f32 = 4.0;
 /// Space between rows.
-pub(crate) const ROW_GAP: f32 = 4.0;
 /// Space above a section caption.
 #[allow(dead_code)] // As `Kit::section`.
 pub(crate) const SECTION_GAP: f32 = 6.0;
@@ -261,50 +260,8 @@ pub(crate) fn group_top(column: egui::Rect, h: f32) -> f32 {
     column.center().y - h * 0.5
 }
 
-/// A body of rows `w` wide.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Kit {
-    pub(crate) w: f32,
-}
-
-/// Lays out a kit body `w` wide; `add` draws its rows.
-///
-/// The rows go in a child of `ui`, and `ui` is told the body takes exactly
-/// `w`, whatever the rows drew: a value or an option too long for its cell
-/// can't make the node measure wider, and so can't tip it over a block and
-/// back every other frame.
-pub(crate) fn body<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui, Kit) -> R) -> R {
-    let origin = ui.cursor().min;
-    let mut rows = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt("kit_body")
-            .max_rect(egui::Rect::from_min_size(origin, egui::vec2(w, 1.0e5)))
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    rows.spacing_mut().item_spacing.y = ROW_GAP;
-    let r = add(&mut rows, Kit { w });
-    let h = rows.min_rect().height();
-    ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    r
-}
-
 fn row_h(ui: &egui::Ui) -> f32 {
     ui.spacing().interact_size.y
-}
-
-/// A label cell: small, weak, left-aligned, clipped to the cell.
-fn label_cell(ui: &mut egui::Ui, text: &str, w: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, row_h(ui)), egui::Sense::hover());
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    let color = if ui.is_enabled() {
-        ui.visuals().weak_text_color()
-    } else {
-        ui.visuals().weak_text_color().gamma_multiply(0.5)
-    };
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
-    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
-    ui.painter().with_clip_rect(rect).galley(pos, galley, color);
-    resp
 }
 
 /// The options as a strip of equal cells `w` wide, for a row's flexible part.
@@ -335,123 +292,6 @@ pub(crate) fn strip<T: PartialEq + Clone>(
         }
     }
     changed
-}
-
-impl Kit {
-    /// What's left of the row for its control after the label cell.
-    pub(crate) fn rest(self) -> f32 {
-        self.w - LABEL_W - GAP
-    }
-
-    /// A row: the label cell, then `add` lays out the rest, given its width.
-    pub(crate) fn row<R>(
-        self,
-        ui: &mut egui::Ui,
-        label: &str,
-        add: impl FnOnce(&mut egui::Ui, f32) -> R,
-    ) -> (R, egui::Rect) {
-        let r = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            label_cell(ui, label, LABEL_W);
-            ui.add_space(GAP);
-            add(ui, self.rest())
-        });
-        (r.inner, r.response.rect)
-    }
-
-    /// A row with no label cell: `add` gets the whole width.
-    pub(crate) fn full_row<R>(self, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui, f32) -> R) -> (R, egui::Rect) {
-        let r = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            add(ui, self.w)
-        });
-        (r.inner, r.response.rect)
-    }
-
-    /// A value box `VALUE_W` wide at the right edge of what's left of the row,
-    /// after `before` points of other cells.
-    fn value_box(ui: &mut egui::Ui, rest: f32, before: f32, drag: egui::DragValue<'_>) -> egui::Response {
-        ui.add_space((rest - before - VALUE_W).max(0.0));
-        ui.add_sized([VALUE_W, row_h(ui)], drag)
-    }
-
-    /// Label and the value's box on the right edge, for values with no useful
-    /// range to slide across.
-    pub(crate) fn value(
-        self,
-        ui: &mut egui::Ui,
-        label: &str,
-        value: &mut f32,
-        drag: impl FnOnce(&mut f32) -> egui::DragValue<'_>,
-    ) -> (bool, egui::Rect) {
-        self.row(ui, label, |ui, rest| Self::value_box(ui, rest, 0.0, drag(value)).changed())
-    }
-
-    /// Label, then two value boxes sharing the row, each with its own small
-    /// caption (Min / Max and the like).
-    pub(crate) fn pair(
-        self,
-        ui: &mut egui::Ui,
-        label: &str,
-        a: (&str, &mut f32, bool),
-        b: (&str, &mut f32, bool),
-        drag: impl Fn(&mut f32) -> egui::DragValue<'_>,
-    ) -> (bool, egui::Rect) {
-        self.row(ui, label, |ui, rest| {
-            let half = (rest - GAP) * 0.5;
-            let mut changed = false;
-            for (i, (caption, v, enabled)) in [a, b].into_iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(GAP);
-                }
-                let cap_w = (half - VALUE_W - GAP).max(0.0);
-                ui.add_enabled_ui(enabled, |ui| {
-                    label_cell(ui, caption, cap_w);
-                    ui.add_space(GAP);
-                    changed |= ui.add_sized([VALUE_W, row_h(ui)], drag(v)).changed();
-                });
-            }
-            changed
-        })
-    }
-
-    /// Label, then the options as a strip of equal cells across the row. Each
-    /// option is (value, text, hover text — empty for none).
-    pub(crate) fn choice<T: PartialEq + Clone>(
-        self,
-        ui: &mut egui::Ui,
-        label: Option<&str>,
-        value: &mut T,
-        options: &[(T, &str, &str)],
-    ) -> (bool, egui::Rect) {
-        match label {
-            Some(label) => self.row(ui, label, |ui, w| strip(ui, w, value, options)),
-            None => self.full_row(ui, |ui, w| strip(ui, w, value, options)),
-        }
-    }
-
-    /// A section caption: small text followed by a hairline to the right edge.
-    #[allow(dead_code)] // For bodies with more than one group of rows; none moved over yet.
-    pub(crate) fn section(self, ui: &mut egui::Ui, title: &str) {
-        ui.add_space(SECTION_GAP - ROW_GAP);
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        let color = ui.visuals().weak_text_color();
-        let galley = ui.painter().layout_no_wrap(title.to_owned(), font, color);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(self.w, galley.size().y), egui::Sense::hover());
-        let y = rect.center().y;
-        ui.painter().galley(egui::pos2(rect.left(), rect.top()), galley.clone(), color);
-        let x0 = rect.left() + galley.size().x + GAP;
-        if x0 < rect.right() {
-            let line = ui.visuals().widgets.noninteractive.bg_stroke;
-            ui.painter().line_segment([egui::pos2(x0, y), egui::pos2(rect.right(), y)], line);
-        }
-    }
-
-    /// A short note under a row: small, weak, wrapped to the body's width.
-    #[allow(dead_code)] // As `section`.
-    pub(crate) fn note(self, ui: &mut egui::Ui, text: &str) {
-        ui.add(egui::Label::new(egui::RichText::new(text).small().weak()).wrap());
-    }
 }
 
 // ── The header's stepper ──────────────────────────────────────────────────────
