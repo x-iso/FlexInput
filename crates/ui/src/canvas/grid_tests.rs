@@ -1728,8 +1728,11 @@ fn the_per_channel_filters_are_pills_with_their_channels_in_the_header() {
             whole_blocks(f.width()) && whole_blocks(f.height()),
             "{module}: {f:?} off the grid",
         );
+        // Six blocks, not five: "DC Filter" spelled out in the header - which is what the
+        // module is called, so it stays - is the widest thing in the row, and at a 28-point
+        // step the next room is a whole block up.
         assert!(
-            f.width() <= 5.0 * B,
+            f.width() <= 6.0 * B,
             "{module}: {f:?} is still as wide as the label rows it used to be",
         );
         assert!(
@@ -1807,45 +1810,46 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
 }
 
 #[test]
-fn the_automap_port_lists_hold_their_width_and_line_the_names_up() {
-    // The Auto-Map splitter and collector list the ports they've taken off a bus, with a `×`
-    // to drop each one. The list used to lead with the button and set its own floor at 170
-    // points, so the names started at a column of buttons and a long learned name pushed the
-    // module out past 280. The rows are one constant width now, the name first, the `×` at the
-    // right edge like the port strips, and a name that doesn't fit is cut with the whole of it
-    // on hover.
-    for (module, pin_key, param_key, salt, extra) in [
-        ("module.automap_split", "outputs", "output_pin_ids", "am_split", true),
-        ("module.automap_collect", "inputs", "collect_input_pin_ids", "am_collect", false),
+fn the_automap_port_lists_show_their_names_in_full_and_can_be_reordered() {
+    // The Auto-Map splitter and collector list the ports they've taken off a bus. Those names
+    // are the whole reason the module is on the canvas - which port feeds what, at a glance -
+    // so they are never abbreviated the way a small module's `in_2` is, and a long learned name
+    // makes the module wide instead. What the rows do share with the port strips is the shape:
+    // handle, name, `×` at the right edge, all one width. And the handle moves a port, taking
+    // its wire and its entry in the parallel id list with it, because the engine reads these
+    // pins by position.
+    for (module, side, param_key, salt) in [
+        ("module.automap_split", "outputs", "output_pin_ids", "am_split"),
+        ("module.automap_collect", "inputs", "collect_input_pin_ids", "am_collect"),
     ] {
-        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0)]);
-        let node = ids[0];
+        assert!(
+            !crate::canvas::viewer::kit::pin_abbreviates(module),
+            "{module}: its pin labels are being shortened - they're what the module is read by",
+        );
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0), egui::pos2(900.0, 300.0)]);
+        let (node, other) = (ids[0], ids[1]);
         if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
-            let long = "Left Stick Horizontal, learned from the raw pad";
-            for name in [long, "Right Stick"] {
-                if pin_key == "outputs" {
+            for name in ["Left Stick", "Right Stick"] {
+                if side == "outputs" {
                     n.outputs.push(PinDescriptor::new(name, SignalType::Any));
                 } else {
                     n.inputs.push(PinDescriptor::new(name, SignalType::Any));
                 }
             }
-            let ids_param: Vec<String> = if extra {
-                // The splitter's first output is the passthrough the list doesn't show.
+            // The splitter's first output is the Auto-Map passthrough, which isn't in the list.
+            let ids_param: Vec<String> = if side == "outputs" {
                 vec!["automap_pass".into(), "left_stick".into(), "right_stick".into()]
             } else {
                 vec!["left_stick".into(), "right_stick".into()]
             };
-            n.params.insert(param_key.into(), serde_json::Value::Array(
-                ids_param.into_iter().map(serde_json::Value::String).collect(),
-            ));
+            n.params.insert(
+                param_key.into(),
+                serde_json::Value::Array(ids_param.into_iter().map(serde_json::Value::String).collect()),
+            );
         }
         rig.idle(8);
         let f = rig.frame_rect(node);
         assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "{module}: {f:?} off the grid");
-        assert!(
-            f.width() <= 9.0 * B,
-            "{module}: {f:?} is wider than the module it lists names for",
-        );
         let rows: Vec<egui::Rect> = (0..2)
             .map(|i| rig.traced_rect(node, &format!("{salt}_row_{i}")).unwrap_or(egui::Rect::NOTHING))
             .collect();
@@ -1860,11 +1864,66 @@ fn the_automap_port_lists_hold_their_width_and_line_the_names_up() {
                 rows[0],
             );
         }
-        // A long name doesn't make the row - or the module - any wider than the list's floor.
-        assert!(
-            rows[0].width() < f.width(),
-            "{module}: the list {rows:?} fills the whole frame {f:?}, so a name is holding it",
+        // A wire on the first listed port, so the move can be checked to carry it.
+        let listed = 1usize; // index 0 is the bus / passthrough pin, never in the list
+        if side == "outputs" {
+            rig.canvas.snarl.connect(
+                egui_snarl::OutPinId { node, output: listed },
+                egui_snarl::InPinId { node: other, input: 0 },
+            );
+        } else {
+            rig.canvas.snarl.connect(
+                egui_snarl::OutPinId { node: other, output: 0 },
+                egui_snarl::InPinId { node, input: listed },
+            );
+        }
+        rig.idle(4);
+        let names = |rig: &Rig| -> Vec<String> {
+            rig.canvas
+                .snarl
+                .get_node(node)
+                .map(|n| {
+                    let all: &[PinDescriptor] = if side == "outputs" { &n.outputs } else { &n.inputs };
+                    all.iter().skip(1).map(|p| p.name.clone()).collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(&rig), ["Left Stick", "Right Stick"], "{module}: the ports as listed");
+        // Drag row 0's handle down onto row 1: the port moves, and so does its wire.
+        let handle = egui::pos2(rows[0].left() + 4.0, rows[0].center().y);
+        rig.drag(handle, egui::vec2(0.0, rows[1].center().y - rows[0].center().y));
+        rig.idle(6);
+        assert_eq!(
+            names(&rig),
+            ["Right Stick", "Left Stick"],
+            "{module}: the handle didn't move the port (rows {rows:?} frame {f:?}, dragged from {:?}",
+            egui::pos2(rows[0].left() + 9.0, rows[0].center().y),
         );
+        let ids_param: Vec<String> = rig
+            .canvas
+            .snarl
+            .get_node(node)
+            .and_then(|n| n.params.get(param_key).and_then(|v| v.as_array().cloned()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect();
+        let moved = if side == "outputs" { &ids_param[2] } else { &ids_param[1] };
+        assert_eq!(moved, "left_stick", "{module}: the id list didn't follow the port: {ids_param:?}");
+        let wired = if side == "outputs" {
+            rig.canvas
+                .snarl
+                .out_pin(egui_snarl::OutPinId { node, output: 2 })
+                .remotes
+                .len()
+        } else {
+            rig.canvas
+                .snarl
+                .in_pin(egui_snarl::InPinId { node, input: 2 })
+                .remotes
+                .len()
+        };
+        assert_eq!(wired, 1, "{module}: the wire didn't move with the port");
     }
 }
 

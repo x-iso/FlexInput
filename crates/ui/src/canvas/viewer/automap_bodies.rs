@@ -574,10 +574,21 @@ pub(crate) fn automap_curve_pin_picker(
     true
 }
 
-/// One row of an Auto-Map port list: the port's name on the left, cut short rather than
-/// widening the module, and the `×` at the row's right edge - where the port strips put it, so
-/// the names line up down the list instead of staggering behind a column of buttons. Returns
-/// true when the row was asked to be removed.
+/// One row of an Auto-Map port list: a drag handle, the port's name, and the `×` at the row's
+/// right edge where the port strips keep theirs, so the names line up down the list instead of
+/// staggering behind a column of buttons.
+///
+/// The handle drags the port to another row. These lists are ordered and the engine reads the
+/// pins by position, so a move takes the wire with it (`move_automap_port`). The name is never
+/// abbreviated here, unlike a small module's `in_2`: telling "Left Stick" from "Right Stick" at
+/// a glance is the whole point of the module. What is cut short is only what won't fit the
+/// row's width, and the whole name stays on hover.
+///
+/// The handle is dragged the way the port strips drag theirs - an interaction on the handle's
+/// own rect, not a drag-and-drop payload - and what it hands back is where the pointer was let
+/// go. The caller turns that into a target row once every row has been laid out, because the
+/// row the pointer is over is below this one and has no rect yet. Returns whether the `×` was
+/// pressed and the release position, if the drag ended here.
 fn automap_port_row(
     ui: &mut egui::Ui,
     node_id: NodeId,
@@ -585,35 +596,99 @@ fn automap_port_row(
     list_w: f32,
     name: &str,
     index: usize,
-) -> bool {
+) -> (bool, Option<egui::Pos2>, egui::Rect) {
     const LIST_PAD: f32 = 4.0;
     let row_h = ui.spacing().interact_size.y;
-    let (row, _) = ui.allocate_exact_size(egui::vec2(list_w, row_h), egui::Sense::hover());
-    // Traced so a test can hold the rows to the list's width and see where the buttons are.
-    super::simple_bodies::trace_rect(ui, node_id, &format!("{salt}_row_{index}"), row);
     let btn = row_h + 4.0;
-    ui.interact(row, ui.id().with((salt, node_id, index)), egui::Sense::hover())
+    let handle_w = row_h;
+    let mut remove = false;
+    let mut released: Option<egui::Pos2> = None;
+    let row = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let (handle_rect, _) =
+            ui.allocate_exact_size(egui::vec2(handle_w, row_h), egui::Sense::hover());
+        let glyph = ui.painter().layout_no_wrap(
+            "⠿".to_owned(),
+            egui::TextStyle::Small.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
+        let size = glyph.size();
+        ui.painter().galley(
+            egui::pos2(
+                handle_rect.center().x - size.x * 0.5,
+                handle_rect.center().y - size.y * 0.5,
+            ),
+            glyph,
+            ui.visuals().weak_text_color(),
+        );
+        let grabbed = ui.interact(
+            handle_rect,
+            ui.id().with((salt, "handle", node_id, index)),
+            egui::Sense::drag(),
+        );
+        if grabbed.drag_stopped() {
+            released = grabbed.interact_pointer_pos();
+        }
+        grabbed
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Drag to move this port");
+        ui.add_space(LIST_PAD);
+        let name_w = (list_w - handle_w - btn - 2.0 * LIST_PAD).max(20.0);
+        ui.add_sized(
+            [name_w, row_h],
+            egui::Label::new(egui::RichText::new(name).small()).truncate(),
+        )
         .on_hover_text(name);
-    let mut label_child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(
-                row.min,
-                egui::pos2(row.right() - btn - LIST_PAD, row.bottom()),
-            ))
-            .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id_salt((salt, "label", node_id, index)),
-    );
-    label_child.add(egui::Label::new(egui::RichText::new(name).small()).truncate());
-    drop(label_child);
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(egui::pos2(row.right() - btn, row.top()), row.max))
-            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown))
-            .id_salt((salt, "remove", node_id, index)),
-    );
-    let clicked = child.small_button("×").clicked();
-    drop(child);
-    clicked
+        ui.add_space(LIST_PAD);
+        remove = ui.small_button("×").clicked();
+    });
+    // Traced so a test can hold the rows to one width and find the handle and the `×`.
+    super::simple_bodies::trace_rect(ui, node_id, &format!("{salt}_row_{index}"), row.response.rect);
+    (remove, released, row.response.rect)
+}
+
+
+/// Move one port of an Auto-Map list to another row, taking its wires with it and permuting
+/// the id list kept beside the pins. The splitter's ids run alongside all its outputs (the
+/// passthrough first); the collector's alongside its inputs past the bus pin, hence `offset`.
+fn move_automap_port<S: PinSide>(
+    node_id: NodeId,
+    from: usize,
+    to: usize,
+    pins: &[S::Pin],
+    ids_key: &str,
+    offset: usize,
+    snarl: &mut Snarl<NodeData>,
+) {
+    if from == to || from >= pins.len() || to >= pins.len() {
+        return;
+    }
+    // The id list first: read it as it was, then hand the pins over and write it back moved.
+    let old: Vec<Value> = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get(ids_key).and_then(|v| v.as_array().cloned()))
+        .unwrap_or_default();
+    crate::canvas::viewer::pins::move_dynamic_pin::<S>(node_id, from, to, pins, snarl);
+    if old.is_empty() {
+        return;
+    }
+    // The same permutation over the ids. The list's row `i` is pin `i + offset` - the splitter
+    // keeps its Auto-Map passthrough at output 0 and the collector its bus pin at input 0, and
+    // neither is a row - so the id indices are the pin indices less that offset.
+    let (a, b) = (from.saturating_sub(offset), to.saturating_sub(offset));
+    if a < old.len() && b < old.len() {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let mut order: Vec<usize> = (lo..=hi).collect();
+        let moved = order.remove(a - lo);
+        order.insert(b - lo, moved);
+        let mut next = old.clone();
+        for (k, &old_idx) in order.iter().enumerate() {
+            next[lo + k] = old[old_idx].clone();
+        }
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert(ids_key.into(), Value::Array(next));
+        }
+    }
 }
 
 pub(crate) fn show_automap_split_body(
@@ -643,24 +718,36 @@ pub(crate) fn show_automap_split_body(
     // The list's width is this constant, not the longest pin name on show: a splitter pointed
     // at a pad with long learned names was 263 points wide, wider than most of the modules it
     // feeds. A name that doesn't fit is cut with an ellipsis and the whole of it is on hover -
-    // the same deal the port strips make.
-    const LIST_W: f32 = 132.0;
+    // The list's width. The names in it are never abbreviated - telling one learned port from
+    // another is the module's whole job - so the row is wide enough to read them, and only what
+    // still won't fit is cut with the whole name on hover.
+    const LIST_W: f32 = 170.0;
     ui.vertical(|ui| {
         ui.set_min_width(LIST_W);
 
-        // Existing individual outputs, the name first and the `×` at the row's right edge -
-        // which is where the strips put it too, so the names line up down the list instead of
-        // staggering behind a column of buttons.
+        // Each port: a handle to move it, its name, and the `×` at the row's right edge where
+        // the port strips keep theirs.
         let mut to_remove: Option<usize> = None;
+        let mut rows: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut released: Option<(usize, egui::Pos2)> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
             let neutral = bus_pin_neutral_label(pin_id);
             let display = splitter_pin_label(pin_id, &neutral, family_ref);
-            if automap_port_row(ui, node_id, "am_split", LIST_W, &display, i) {
-                to_remove = Some(i + 1);
-            }
+            let (remove, where_dropped, rect) = automap_port_row(ui, node_id, "am_split", LIST_W, &display, i);
+            if remove { to_remove = Some(i + 1); }
+            if let Some(p) = where_dropped { released = Some((i, p)); }
+            rows.push((i, rect));
         }
         if let Some(rm_idx) = to_remove {
             remove_automap_split_output(node_id, rm_idx, outputs, snarl);
+        }
+        // Which row the handle was let go over - worked out now that every row has a rect -
+        // and the pins the list shows start one past the Auto-Map passthrough.
+        if let Some((from, p)) = released {
+            let to = rows.iter().find(|(_, r)| r.contains(p)).map(|(i, _)| *i).unwrap_or(from);
+            if to != from {
+                move_automap_port::<Outputs>(node_id, from + 1, to + 1, outputs, "output_pin_ids", 0, snarl);
+            }
         }
 
         ui.add_space(4.0);
@@ -772,25 +859,36 @@ pub(crate) fn show_automap_collect_body(
 
     let family_ref = collector_downstream_family(snarl, node_id);
 
-    // Same list as the splitter's: a constant width, names cut short, the `×` at the right.
-    const LIST_W: f32 = 132.0;
+    // Same list as the splitter's: a handle per port, its full name, the `×` at the right.
+    const LIST_W: f32 = 170.0;
     ui.vertical(|ui| {
         ui.set_min_width(LIST_W);
 
-        // Existing individual inputs, with their remove button at the row's right edge.
+        // Existing individual inputs.
         let mut to_remove: Option<usize> = None;
+        let mut rows: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut released: Option<(usize, egui::Pos2)> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
             // Resolve display name: canonical list, then MIDI, otherwise the raw
             // key name (learned keys use their egui Key Debug name as both id
             // and display).
             let neutral = bus_pin_neutral_label(pin_id);
             let display = splitter_pin_label(pin_id, &neutral, family_ref);
-            if automap_port_row(ui, node_id, "am_collect", LIST_W, &display, i) {
-                to_remove = Some(i + 1);
-            }
+            let (remove, where_dropped, rect) = automap_port_row(ui, node_id, "am_collect", LIST_W, &display, i);
+            if remove { to_remove = Some(i + 1); }
+            if let Some(p) = where_dropped { released = Some((i, p)); }
+            rows.push((i, rect));
         }
         if let Some(rm_idx) = to_remove {
             remove_automap_collect_input(node_id, rm_idx, inputs, snarl);
+        }
+        // Input 0 is the Auto-Map bus pin, which isn't in the list: the pins it shows and the
+        // id list beside them both run one behind it.
+        if let Some((from, p)) = released {
+            let to = rows.iter().find(|(_, r)| r.contains(p)).map(|(i, _)| *i).unwrap_or(from);
+            if to != from {
+                move_automap_port::<Inputs>(node_id, from + 1, to + 1, inputs, "collect_input_pin_ids", 1, snarl);
+            }
         }
 
         ui.add_space(4.0);

@@ -156,10 +156,6 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
             | "module.delay"
             | "module.average"
             | "module.dc_filter"
-            // Their pins are named for what came off the bus ("Left Stick", a learned key),
-            // and a name written out in full is the one thing that holds these two past 280.
-            | "module.automap_split"
-            | "module.automap_collect"
     )
 }
 
@@ -542,9 +538,6 @@ pub(crate) const MARKS: &[(&str, &str, &str)] = &[
     // block their pins don't need.
     ("module.vec_to_deflection", "Vec to Deflection", "∠"),
     ("logic.has_changed", "Has Changed", "Δ"),
-    // Two letters: this module's header also carries the `− +` for its channels, and "DC
-    // Filter" beside it is the one thing that would make it a block wider than its siblings.
-    ("module.dc_filter", "DC Filter", "DC"),
 ];
 
 /// The mark a node's header shows, or none: a module known by a symbol, still under

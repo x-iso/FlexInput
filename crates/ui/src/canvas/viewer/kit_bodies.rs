@@ -61,12 +61,19 @@ pub(crate) fn kit_min_width(module_id: &str) -> f32 {
     }
 }
 
+/// The line a setting's word sits on above its pill: `Small`, which is what draws it.
+const CAP_H: f32 = 14.0;
+
 /// The pill group the small bodies share: a **constant box** reserved in the flow, and the
 /// middle of it. Reserving a constant - not what the text happens to measure - is what keeps
 /// a body from feeding its own width back into the frame, and it is the only way a module
 /// gets to be narrower than a stack of label rows: the labels were the width, not the
 /// controls. The pills are painted against the module's centre line rather than the column's,
 /// because the pin columns are different widths (`In` one letter, `Out` three).
+///
+/// `captioned` gives every row a line of its own above the pill — the setting's word, which
+/// is what the three-letter cell inside a pill used to stand in for. That read as a puzzle
+/// (`win`/`spk`/`dec`) for a module that has the room to say Window, Spikes and Decay.
 ///
 /// Returns nothing on the module's first frame, before the canvas has a frame to centre on;
 /// the box is still reserved, so the size is right as soon as the controls are drawn.
@@ -76,19 +83,38 @@ fn pill_group(
     view_salt: u64,
     pill_w: f32,
     rows: usize,
+    captioned: bool,
 ) -> Option<(f32, f32)> {
     use super::simple_bodies::PILL_H;
     const ROW: f32 = 4.0;
+    let row_h = if captioned { CAP_H + PILL_H } else { PILL_H };
     // At least two rows of height whatever the module actually has, so one setting doesn't
     // make a module shallower than its neighbours: the body floor that a coarse grid used to
     // supply has to be asked for by name.
-    let h = (rows as f32 * PILL_H + (rows.saturating_sub(1)) as f32 * ROW).max(48.0);
+    let h = (rows as f32 * row_h + (rows.saturating_sub(1)) as f32 * ROW).max(48.0);
     ui.allocate_exact_size(egui::vec2(pill_w, h), egui::Sense::hover());
     let inner = super::module_icons::module_inner(ui, view_salt, node_id)?;
     let column = ui.max_rect();
     // Traced so a test can hold the pills to the module's centre, not just to its size.
     simple_bodies::trace_rect(ui, node_id, "body_column", column);
-    Some((inner.center().x, kit::group_top(column, h)))
+    // Centred in the frame, not at the top of the body column: a single pill under a header
+    // and a pin row sits low if it follows the column's middle, which is where its *rows*
+    // start rather than where the frame's room is.
+    Some((inner.center().x, inner.center().y - h * 0.5))
+}
+
+/// The word above a pill, painted in the row's caption line. Painted rather than allocated,
+/// so a longer setting name can't widen the module: the box was reserved at a constant.
+fn caption_at(ui: &mut egui::Ui, left: egui::Pos2, w: f32, title: &str) {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), font, ui.visuals().weak_text_color());
+    ui.painter().galley(
+        egui::pos2(left.x + (w - galley.size().x) * 0.5, left.y),
+        galley,
+        ui.visuals().weak_text_color(),
+    );
 }
 
 /// One value pill at `left`, painted rather than allocated (the rect is given, so nothing it
@@ -135,7 +161,7 @@ pub(crate) fn show_delay_body(
     use super::simple_bodies::PILL_H;
     let ms = param_f32(snarl, node_id, "delay_ms", 100.0);
     const PILL_W: f32 = 56.0;
-    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 1) else { return };
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 1, false) else { return };
     let (resp, typed) = pill_at(
         ui,
         node_id,
@@ -173,10 +199,11 @@ pub(crate) fn show_average_body(
         .get_node(node_id)
         .map_or(5.0, |n| flexinput_engine::eval::average_window_ms(&n.params) as f32);
     let mad = param_f32(snarl, node_id, "spike_mad", 0.0);
-    const PILL_W: f32 = 72.0;
-    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2) else { return };
-    let left = egui::pos2(cx - PILL_W * 0.5, top);
-    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "win", &ms_text(ms), 0.5..=5_000.0);
+    const PILL_W: f32 = 76.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
+    let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
+    caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
+    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "", &ms_text(ms), 0.5..=5_000.0);
     let r1 = r1.on_hover_text(
         "How much of the recent signal the average runs over.\nDrag to change it, double-click to type.",
     );
@@ -185,9 +212,10 @@ pub(crate) fn show_average_body(
     } else if r1.dragged() {
         set_f32(snarl, node_id, "window_ms", (ms + r1.drag_delta().x * 5.0).clamp(0.5, 5_000.0));
     }
-    let left2 = egui::pos2(left.x, left.y + PILL_H + 4.0);
+    let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
+    caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Spikes");
     let shown2 = if mad > 0.0 { format!("{mad:.1}") } else { "off".into() };
-    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "spk", &shown2, 0.0..=20.0);
+    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "", &shown2, 0.0..=20.0);
     let r2 = r2.on_hover_text(
         "Outlier threshold in median absolute deviations: a reading further from the middle than this is dropped.\n0 = off. Try 3.0 to start.",
     );
@@ -214,10 +242,11 @@ pub(crate) fn show_dc_filter_body(
     use super::simple_bodies::PILL_H;
     let window = param_f32(snarl, node_id, "window_ms", 500.0);
     let decay = param_f32(snarl, node_id, "decay_ms", 200.0);
-    const PILL_W: f32 = 72.0;
-    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2) else { return };
-    let left = egui::pos2(cx - PILL_W * 0.5, top);
-    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "win", &ms_text(window), 10.0..=60_000.0);
+    const PILL_W: f32 = 76.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
+    let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
+    caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
+    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "", &ms_text(window), 10.0..=60_000.0);
     let r1 = r1.on_hover_text(
         "How slowly a change has to move to count as offset rather than signal.\nDrag to change it, double-click to type.",
     );
@@ -226,8 +255,9 @@ pub(crate) fn show_dc_filter_body(
     } else if r1.dragged() {
         set_f32(snarl, node_id, "window_ms", (window + r1.drag_delta().x * 25.0).clamp(10.0, 60_000.0));
     }
-    let left2 = egui::pos2(left.x, left.y + PILL_H + 4.0);
-    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "dec", &ms_text(decay), 10.0..=60_000.0);
+    let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
+    caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Decay");
+    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "", &ms_text(decay), 10.0..=60_000.0);
     let r2 = r2.on_hover_text(
         "How quickly the filter settles after a real change goes through it.",
     );
