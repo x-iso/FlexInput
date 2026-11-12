@@ -441,6 +441,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **The grid stays when you zoom out.** Past the point where 28-point blocks crowd together it
   draws those same lines every second, fourth, eighth block, at a floor of brightness, so a
   zoomed-out patch still says how big a module is. It used to fade to nothing by about 50%.
+- **An Envelope spends the width it is given on its length.** The number saying how long one
+  pass takes sat in a box that never grew while the `ms | s | Hz` buttons beside it did. It is
+  a pill like every other setting now - the rest of its row, dragging and taking typing - and
+  the unit buttons went down to the three two-letter words they are. A row's share of a band
+  is now what it asks for rather than an equal split, so the row carrying a strip and a number
+  is not left shorter than the row carrying two grid numbers.
+- **An Envelope's curve says what its points are.** Each point paints its level beside the
+  dot, the way the Response Curve's points do, and hovering one gives the level and where
+  along the envelope's length it falls, in the unit the module is timed in. Until now the
+  graph was the only place any of that was written, and it wrote none of it.
 
 ### Fixed
 

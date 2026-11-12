@@ -3018,3 +3018,56 @@ fn the_envelope_follows_the_frame_it_is_given() {
         "generator.envelope: the graph {squat_graph:?} vanished in {squat_frame:?}",
     );
 }
+
+#[test]
+fn the_envelope_spends_the_width_it_is_given_on_its_length() {
+    // A wide Envelope used to hand its extra width to the unit buttons and the mode words,
+    // leaving the length - the one number being read off it - in the same small box it wears
+    // at its default size. The pill takes the row's remainder, so width goes where it is read.
+    let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    let pill_at = |rig: &mut Rig, w: f32| -> (egui::Rect, egui::Rect) {
+        rig.canvas
+            .snarl
+            .get_node_mut(node)
+            .unwrap()
+            .params
+            .insert(kit_width_param().into(), serde_json::json!(w));
+        rig.idle(6);
+        rig.ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("module_ctrl_rect", node.0, "env_time_pill")),
+                Xysr([0.0; 4]),
+            )
+        });
+        rig.idle(3);
+        (
+            rig.frame_rect(node),
+            rig.traced_rect(node, "env_time_pill").unwrap_or(egui::Rect::NOTHING),
+        )
+    };
+    let (frame, small) = pill_at(&mut rig, 10.0 * B);
+    // What the pill promises: it runs to the end of its row, so whatever width the module was
+    // given lands on the number being read rather than on the two-letter unit buttons beside
+    // it, and it is the wider half of the row. Where the row itself ends up between band
+    // wrapping is the layout's business, not the pill's.
+    // How much of the band a row gets moves with the wrapping, so the floor held here is the
+    // one that does not: the number is the wider half of the row it sits in.
+    for (w, least) in [(10.0 * B, 40.0), (14.0 * B, 40.0)] {
+        let (frame, pill) = pill_at(&mut rig, w);
+        let cell = rig.traced_rect(node, "env_time").unwrap_or(egui::Rect::NOTHING);
+        assert!(pill.is_positive(), "no length pill drawn in {frame:?}");
+        assert!(
+            (pill.right() - (cell.right() - 4.0)).abs() < 1.0,
+            "the length pill {pill:?} stops short of its row {cell:?}",
+        );
+        assert!(
+            pill.width() > least,
+            "the length pill has too little of its row in {frame:?}: {pill:?}",
+        );
+        assert!(
+            frame.contains_rect(pill.expand(0.5)),
+            "the length pill {pill:?} left {frame:?}",
+        );
+    }
+}

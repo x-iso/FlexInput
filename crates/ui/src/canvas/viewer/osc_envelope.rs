@@ -281,6 +281,38 @@ pub(crate) fn envelope_init_params(node: &mut crate::canvas::NodeData) {
 }
 
 /// Core envelope graph painter — curve editing + sustain line + playhead + live trail.
+/// The envelope's length as it is written in the pill: no false precision in ms, two places
+/// in seconds, and hertz counted the way a repeating envelope is thought about.
+fn envelope_time_text(v: f32, timebase: &str) -> String {
+    match timebase {
+        "s" => {
+            if v.abs() >= 10.0 {
+                format!("{v:.1} s")
+            } else {
+                format!("{v:.3} s")
+            }
+        }
+        "hz" => format!("{v:.1} Hz"),
+        _ => {
+            if v.abs() >= 10.0 {
+                format!("{} ms", v.round() as i64)
+            } else {
+                format!("{v:.1} ms")
+            }
+        }
+    }
+}
+/// What an envelope point is: its level, and where along the envelope's length it sits, in the
+/// unit the module is timed in. The graph gives no numbers of its own at a size this small.
+fn envelope_point_help(x: f32, y: f32, period_ms: f32) -> String {
+    let t = x * period_ms;
+    let when = if period_ms >= 1000.0 {
+        format!("{:.2} s", t / 1000.0)
+    } else {
+        format!("{:.0} ms", t)
+    };
+    format!("{:.2} level at {when}", y)
+}
 pub(crate) fn paint_envelope_curve_graph(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -528,6 +560,14 @@ pub(crate) fn paint_envelope_curve_graph(
         let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
+        // The point's level beside the dot, and on hover where in the envelope's length it
+        // falls - the reading the Response Curve's dots give. The number goes with the graph's
+        // own labels, or whenever the dot is under the pointer; the time is always available,
+        // because the graph is the only place any of it is written.
+        if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
+            super::curve_support::paint_point_value(&painter, rect, screen, format!("{:.2}", py));
+        }
+        pt_resp.on_hover_text(envelope_point_help(px, py, period_ms));
 
         // Gamepad-nav dot highlight — mirror the response curve painter so the
         // user sees which ADSR point is selected (works in sub-patch AND config
@@ -872,16 +912,25 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
         let last = (first + per_band).min(group_min.len());
         let n = last - first;
         let sep_total = if n > 1 { (n as f32 - 1.0) * (SEP_W + GAP) } else { 0.0 };
-        let each = ((band.width() - sep_total) / n as f32).max(48.0);
+        // Shared in proportion to what each row needs, not equally: the row with the unit
+        // buttons and a length in it asks for more than the row of two grid numbers, and an
+        // equal split left the first with less than it asked and the others with slack they
+        // spend on nothing.
+        let wants: Vec<f32> = (first..last).map(|gi| group_min[gi]).collect();
+        let want_sum: f32 = wants.iter().sum::<f32>().max(1.0);
+        let avail = (band.width() - sep_total).max(0.0);
         let mut x = band.left();
         for (slot, gi) in (first..last).enumerate() {
+            let each = (avail * wants[slot] / want_sum).max(48.0);
             let cell = egui::Rect::from_min_size(egui::pos2(x, band.top()), egui::vec2(each, band_h));
             match gi {
                 // The time the envelope takes, and the unit it's counted in: a length in ms or
                 // seconds, or how often it repeats in hertz. Switching unit keeps the length the
                 // same rather than the number.
                 0 => {
-                    let strip_w = 3.0 * 30.0 + 2.0 * 4.0;
+                    // Three two-letter units. At 30 a cell the strip was the wider half of
+                    // the row, counting a length of up to seven digits into the other half.
+                    let strip_w = 3.0 * 24.0 + 2.0 * 4.0;
                     let strip = egui::Rect::from_min_size(cell.min, egui::vec2(strip_w, band_h));
                     let old_tb = timebase.clone();
                     {
@@ -916,11 +965,6 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         };
                         changed = true;
                     }
-                    let (lo, hi, spd) = match timebase.as_str() {
-                        "s" => (0.001f32, 2000.0, 0.001),
-                        "hz" => (0.001, 2000.0, 0.001),
-                        _ => (0.001, 2000.0, 1.0),
-                    };
                     let value = egui::Rect::from_min_max(
                         egui::pos2(strip.right() + 4.0, cell.top()),
                         cell.max,
@@ -940,20 +984,50 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             Some(Signal::Float(f)) => Some(*f),
                             _ => None,
                         });
-                    let mut shown = if time_wired { live_time.unwrap_or(time_mul) } else { time_mul };
-                    let resp = child.add_enabled(
-                        !time_wired,
-                        egui::DragValue::new(&mut shown).speed(spd).range(lo..=hi).max_decimals(3),
+                    // The number, not the unit strip, is what a widened Envelope should spend
+                    // its width on: it is the value being read, and at the old fixed box a
+                    // five-second envelope and a five-millisecond one showed the same number of
+                    // digits in the same space. It is a pill like every other setting, so it
+                    // drags and takes typing.
+                    let shown = envelope_time_text(time_mul, &timebase);
+                    let band = egui::Rect::from_center_size(cell.center(), egui::vec2(super::simple_bodies::PILL_H, super::simple_bodies::PILL_H));
+                    let pill = egui::Rect::from_min_max(
+                        egui::pos2(strip.right() + 4.0, band.top()),
+                        egui::pos2(cell.right() - 4.0, band.bottom()),
                     );
-                    if !time_wired {
-                        time_mul = shown;
-                        changed |= resp.changed();
-                    }
-                    resp.on_hover_text(if time_wired {
-                        "The Time pin is driving this - unplug it to set the length here."
+                    trace_rect(ui, node_id, "env_time_pill", pill);
+                    if time_wired {
+                        if let Some(f) = live_time {
+                            time_mul = f;
+                        }
+                        super::simple_bodies::setting_pill(&mut child, "env_time", pill, "", &envelope_time_text(time_mul, &timebase), 0.0);
                     } else {
-                        "How long the pass takes, in the unit chosen beside it."
-                    });
+                        // The step a drag takes, and the clamp: milliseconds count whole, the
+                        // other two bases are small numbers either side of 1.
+                        let (lo, hi, spd) = match timebase.as_str() {
+                            "s" => (0.001f32, 2000.0, 0.001),
+                            "hz" => (0.001, 2000.0, 0.001),
+                            _ => (0.001, 2000.0, 1.0),
+                        };
+                        let (resp, typed) = super::simple_bodies::value_pill_number(
+                            &mut child,
+                            node_id,
+                            "env_time",
+                            pill,
+                            "",
+                            &shown,
+                            0.0,
+                            lo as f64..=hi as f64,
+                        );
+                        if let Some(v) = typed {
+                            time_mul = v as f32;
+                            changed = true;
+                        } else if resp.dragged() {
+                            time_mul = (time_mul + resp.drag_delta().x * spd).clamp(lo, hi);
+                            changed = true;
+                        }
+                        resp.on_hover_text("How long the pass takes, in the unit chosen beside it. Drag to change, double-click to type.");
+                    }
                     exposable.push(("time_row", cell));
                     trace_rect(ui, node_id, "env_time", cell);
                 }
