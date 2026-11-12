@@ -658,6 +658,16 @@ pub(crate) fn dropdown_write_selected(node: &mut NodeData, idx: usize) {
 /// Per-node editing state held in egui memory: which row is being renamed and
 /// the in-progress text buffer for it. Cleared when editing ends (Enter,
 /// Escape, focus loss, or row delete).
+/// A reorder drag in progress on the option list: which row's handle the finger is holding,
+/// where the option it grabbed stands now, and the leftover pixels of its travel.
+#[derive(Clone, Copy, Default)]
+struct OptionDrag {
+    held: usize,
+    current: usize,
+    acc: f32,
+    active: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DropdownEditState {
     editing: Option<usize>,
@@ -680,235 +690,278 @@ pub(crate) fn dropdown_set_edit_state(ctx: &egui::Context, node_id: NodeId, st: 
     ));
 }
 
-pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, view_salt: u64) {
     // Snapshot params up-front.
     let mut options = snarl.get_node(node_id).map(dropdown_read_options).unwrap_or_default();
     let selected = snarl.get_node(node_id).map(|n| dropdown_read_selected(n, options.len())).unwrap_or(0);
-    let box_width = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("box_width").and_then(|v| v.as_f64()))
-        .map(|v| v as f32).unwrap_or(140.0).clamp(80.0, 600.0);
 
     let mut new_selected = selected;
     let mut options_changed = false;
     let mut selected_changed = false;
 
-    ui.vertical(|ui| {
-        ui.set_min_width(box_width.max(140.0));
+    // The list column, and the reading above it, at constants - not a `box_width` param the
+    // user could dial to 600 and not the frame the module was handed. A row is a handle, the
+    // option's text cut at the column's edge with the whole of it on hover, and the `×` at the
+    // right where every other list puts its remove button; the `+` that adds an option sits in
+    // that same column, at the end of the list.
+    // 120 rather than the 140 the old `box_width` default gave it: an option's name is cut at
+    // the column's edge and reads whole on hover and in the popup, so the column is sized to
+    // the module's two blocks, not to the longest name someone might type.
+    const LIST_W: f32 = 120.0;
+    const ROW: f32 = 4.0;
+    const HANDLE_W: f32 = 18.0;
+    const BTN_W: f32 = 24.0;
+    const READ_W: f32 = LIST_W;
+    let name_w = (LIST_W - HANDLE_W - BTN_W - 2.0 * ROW).max(40.0);
+    // The reading, one row per option, and the `+` row.
+    let rows = options.len() + 2;
+    let list_h = rows as f32 * PILL_H + (rows as f32 - 1.0) * ROW;
 
-        // ── ComboBox (pinnable) ──────────────────────────────────────────
-        let mut combo_rect = egui::Rect::NOTHING;
-        egui::Resize::default()
-            .id_salt(("dropdown_combo", node_id))
-            .default_size([box_width, 22.0])
-            .min_size([80.0, 22.0])
-            .max_size([600.0, 22.0])
-            .resizable([true, false])
-            .show(ui, |ui| {
-                let current = options.get(selected).cloned().unwrap_or_default();
-                let avail = ui.available_width();
-                let inner = ui.allocate_ui([avail, 22.0].into(), |ui| {
-                    egui::ComboBox::from_id_salt(("dropdown_combo_sel", node_id.0))
-                        .selected_text(if current.is_empty() { "—".to_string() } else { current })
-                        .width(avail)
-                        .show_ui(ui, |ui| {
-                            for (i, opt) in options.iter().enumerate() {
-                                let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
-                                if ui.selectable_label(i == selected, label).clicked() {
-                                    new_selected = i;
-                                    selected_changed = true;
-                                }
-                            }
-                        });
-                });
-                combo_rect = inner.response.rect;
-            });
-        // Persist the new width if the user resized horizontally.
-        let new_w = combo_rect.width().clamp(80.0, 600.0);
-        if (new_w - box_width).abs() > 0.5 {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("box_width".to_string(), Value::from(new_w as f64));
-            }
-        }
-        register_exposable_element(ui, node_id, "selection", combo_rect);
+    // Reserved once, so none of the text in it can reach back into the frame's width.
+    ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
+    let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
+        Some(r) => r,
+        None => return,
+    };
+    let cx = inner.center().x;
+    let top = kit::group_top(ui.max_rect(), list_h);
+    let row_top = |row: usize| top + row as f32 * (PILL_H + ROW);
+    let row_rect = |row: usize| {
+        egui::Rect::from_min_size(egui::pos2(cx - LIST_W * 0.5, row_top(row)), egui::vec2(LIST_W, PILL_H))
+    };
 
-        ui.add_space(4.0);
-
-        // ── Editor list ─────────────────────────────────────────────────
-        let mut to_remove: Option<usize> = None;
-        let mut to_move: Option<(usize, isize)> = None;
-        let mut edit_state = dropdown_edit_state(ui.ctx(), node_id);
-        let alt = ui.input(|i| i.modifiers.alt);
-
-        for i in 0..options.len() {
-            let mut row_remove = false;
-            let mut row_move: isize = 0;
-            let mut commit_edit: Option<String> = None;
-            let mut cancel_edit = false;
-
-            ui.horizontal(|ui| {
-                // Drag handle. Drag vertically beyond half a row → reorder.
-                let handle = ui.add(egui::Label::new(
-                    egui::RichText::new("≡").monospace()
-                ).sense(egui::Sense::click_and_drag()));
-                if handle.dragged() {
-                    let dy = handle.drag_delta().y;
-                    // Accumulate drag in egui memory so a slow drag still
-                    // crosses the threshold instead of stalling on per-frame
-                    // sub-pixel deltas.
-                    let key = egui::Id::new(("fxi_dropdown_drag", node_id.0, i));
-                    let acc: f32 = ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0) + dy;
-                    let row_h = 22.0_f32;
-                    let steps = (acc / row_h).trunc() as isize;
-                    if steps != 0 {
-                        row_move = steps;
-                        ui.ctx().data_mut(|d| d.insert_temp(key, acc - steps as f32 * row_h));
-                    } else {
-                        ui.ctx().data_mut(|d| d.insert_temp(key, acc));
-                    }
-                } else {
-                    let key = egui::Id::new(("fxi_dropdown_drag", node_id.0, i));
-                    ui.ctx().data_mut(|d| d.remove_temp::<f32>(key));
-                }
-
-                if ui.small_button("×").clicked() {
-                    row_remove = true;
-                }
-
-                let is_editing = edit_state.editing == Some(i);
-                if is_editing {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut edit_state.buf)
-                            .desired_width(ui.available_width().max(60.0))
-                    );
-                    if edit_state.request_focus {
-                        resp.request_focus();
-                        edit_state.request_focus = false;
-                    }
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let esc   = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                    if esc {
-                        cancel_edit = true;
-                    } else if enter || resp.lost_focus() {
-                        commit_edit = Some(edit_state.buf.clone());
-                    }
-                } else {
-                    let label_text = if options[i].is_empty() {
-                        format!("(empty {i})")
-                    } else {
-                        options[i].clone()
-                    };
-                    let label = ui.add(egui::Label::new(label_text)
-                        .sense(egui::Sense::click()));
-
-                    // Double-click OR Alt-click → enter edit mode.
-                    if label.double_clicked() || (alt && label.clicked()) {
-                        edit_state.editing = Some(i);
-                        edit_state.buf = options[i].clone();
-                        edit_state.request_focus = true;
-                    }
-
-                    // Single click (no Alt) → select this entry.
-                    if label.clicked() && !alt && !label.double_clicked() {
+    // ── The reading (pinnable): what the module is outputting right now ──
+    let reading = row_rect(0);
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(reading)
+                .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight))
+                .id_salt(("dropdown_combo", node_id)),
+        );
+        let current = options.get(selected).cloned().unwrap_or_default();
+        egui::ComboBox::from_id_salt(("dropdown_combo_sel", node_id.0))
+            .selected_text(if current.is_empty() { "—".to_string() } else { current })
+            .width(READ_W)
+            .show_ui(&mut child, |ui| {
+                for (i, opt) in options.iter().enumerate() {
+                    let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
+                    if ui.selectable_label(i == selected, label).clicked() {
                         new_selected = i;
                         selected_changed = true;
                     }
-
-                    // Right-click context menu.
-                    crate::touch::context_menu(&label, |ui| {
-                        if ui.button("Rename").clicked() {
-                            edit_state.editing = Some(i);
-                            edit_state.buf = options[i].clone();
-                            edit_state.request_focus = true;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
-                            row_move = -1;
-                            ui.close();
-                        }
-                        if ui.add_enabled(i + 1 < options.len(),
-                            egui::Button::new("Move down")).clicked()
-                        {
-                            row_move = 1;
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button("Delete").clicked() {
-                            row_remove = true;
-                            ui.close();
-                        }
-                    });
                 }
             });
+        register_exposable_element(ui, node_id, "selection", reading);
+        drop(child);
+    }
 
-            if let Some(new_text) = commit_edit {
-                options[i] = new_text;
-                options_changed = true;
+    let mut to_remove: Option<usize> = None;
+    let mut to_move: Option<(usize, isize)> = None;
+    let mut edit_state = dropdown_edit_state(ui.ctx(), node_id);
+    let alt = ui.input(|i| i.modifiers.alt);
+    let drag_key = egui::Id::new(("fxi_dropdown_drag", node_id.0));
+    let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
+    let mut drag_seen = false;
+
+    for i in 0..options.len() {
+        let mut row_remove = false;
+        let mut row_move: isize = 0;
+        let mut row_from = i;
+        let mut commit_edit: Option<String> = None;
+        let mut cancel_edit = false;
+        let row = row_rect(i + 1);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("dropdown_row", node_id, i)),
+        );
+        child.spacing_mut().item_spacing.x = 0.0;
+        // Drag handle: the same grab the port strips and the Auto-Map lists give. Dragging
+        // past half a row moves the option, and the selection follows the option, not the slot.
+        let handle = child.add_sized(
+            [HANDLE_W, PILL_H],
+            egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
+        );
+        if handle.dragged() {
+            drag_seen = true;
+            if !drag.active || drag.held != i {
+                drag = OptionDrag { held: i, current: i, acc: 0.0, active: true };
+            }
+            // Accumulate in egui memory so a slow drag still crosses the threshold instead of
+            // stalling on per-frame sub-pixel deltas.
+            drag.acc += handle.drag_delta().y;
+            let steps = (drag.acc / (PILL_H + ROW)).trunc() as isize;
+            if steps != 0 {
+                // Counted from where the option stands now, which is no longer the row the
+                // finger grabbed it on once it has been moved: the row ids are fixed, so a
+                // second step measured from that row would bounce it back where it started.
+                row_from = drag.current;
+                row_move = steps;
+                let target = (drag.current as isize + steps).clamp(0, options.len() as isize - 1) as usize;
+                drag.current = target;
+                drag.acc -= steps as f32 * (PILL_H + ROW);
+            }
+        }
+        handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+        child.add_space(ROW);
+        let is_editing = edit_state.editing == Some(i);
+        if is_editing {
+            let resp = child.add_sized(
+                [name_w, PILL_H],
+                egui::TextEdit::singleline(&mut edit_state.buf),
+            );
+            if edit_state.request_focus {
+                resp.request_focus();
+                edit_state.request_focus = false;
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if esc {
+                cancel_edit = true;
+            } else if enter || resp.lost_focus() {
+                commit_edit = Some(edit_state.buf.clone());
+            }
+        } else {
+            let label_text = if options[i].is_empty() {
+                format!("(empty {i})")
+            } else {
+                options[i].clone()
+            };
+            let label = child.add_sized(
+                [name_w, PILL_H],
+                egui::Label::new(egui::RichText::new(label_text).small())
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            );
+            label.clone().on_hover_text(&options[i]);
+
+            // Double-click OR Alt-click → enter edit mode.
+            if label.double_clicked() || (alt && label.clicked()) {
+                edit_state.editing = Some(i);
+                edit_state.buf = options[i].clone();
+                edit_state.request_focus = true;
+            }
+            // Single click (no Alt) → select this entry.
+            if label.clicked() && !alt && !label.double_clicked() {
+                new_selected = i;
+                selected_changed = true;
+            }
+            // Right-click context menu.
+            crate::touch::context_menu(&label, |ui| {
+                if ui.button("Rename").clicked() {
+                    edit_state.editing = Some(i);
+                    edit_state.buf = options[i].clone();
+                    edit_state.request_focus = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
+                    row_move = -1;
+                    ui.close();
+                }
+                if ui.add_enabled(i + 1 < options.len(), egui::Button::new("Move down")).clicked() {
+                    row_move = 1;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Delete").clicked() {
+                    row_remove = true;
+                    ui.close();
+                }
+            });
+        }
+        child.add_space(ROW);
+        if child.small_button("×").clicked() {
+            row_remove = true;
+        }
+        drop(child);
+        trace_rect(ui, node_id, &format!("dropdown_row_{i}"), row);
+
+        if let Some(new_text) = commit_edit {
+            options[i] = new_text;
+            options_changed = true;
+            edit_state.editing = None;
+            edit_state.buf.clear();
+        }
+        if cancel_edit {
+            edit_state.editing = None;
+            edit_state.buf.clear();
+        }
+        if row_remove { to_remove = Some(i); }
+        if row_move != 0 { to_move = Some((row_from, row_move)); }
+    }
+
+    // The `+` that adds an option, in the same column as the `×`es, at the end of the list.
+    {
+        let add = row_rect(options.len() + 1);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(add)
+                .layout(egui::Layout::right_to_left(egui::Align::Center))
+                .id_salt(("dropdown_add", node_id)),
+        );
+        if child.small_button("+").clicked() {
+            let next_n = options.len() + 1;
+            options.push(format!("Option {next_n}"));
+            options_changed = true;
+        }
+        drop(child);
+        trace_rect(ui, node_id, "dropdown_add", add);
+    }
+
+    // ── Apply mutations ─────────────────────────────────────────────────
+    if let Some((i, dir)) = to_move {
+        let target = (i as isize + dir).clamp(0, options.len() as isize - 1) as usize;
+        if target != i {
+            options.swap(i, target);
+            options_changed = true;
+            // Keep selection pointing at the same logical entry.
+            if new_selected == i {
+                new_selected = target;
+                selected_changed = true;
+            } else if new_selected == target {
+                new_selected = i;
+                selected_changed = true;
+            }
+        }
+    }
+
+    if let Some(rm) = to_remove {
+        if rm < options.len() {
+            options.remove(rm);
+            options_changed = true;
+            // Stop editing if the deleted row was the active editor.
+            if edit_state.editing == Some(rm) {
                 edit_state.editing = None;
                 edit_state.buf.clear();
+            } else if let Some(e) = edit_state.editing {
+                if e > rm { edit_state.editing = Some(e - 1); }
             }
-            if cancel_edit {
-                edit_state.editing = None;
-                edit_state.buf.clear();
-            }
-            if row_remove { to_remove = Some(i); }
-            if row_move != 0 { to_move = Some((i, row_move)); }
-        }
-
-        // ── Add button ──────────────────────────────────────────────────
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(18.0);
-            if ui.small_button("+").clicked() {
-                let next_n = options.len() + 1;
-                options.push(format!("Option {next_n}"));
-                options_changed = true;
-            }
-        });
-
-        // ── Apply mutations ─────────────────────────────────────────────
-        if let Some((i, dir)) = to_move {
-            let target = (i as isize + dir).clamp(0, options.len() as isize - 1) as usize;
-            if target != i {
-                options.swap(i, target);
-                options_changed = true;
-                // Keep selection pointing at the same logical entry.
-                if new_selected == i {
-                    new_selected = target;
-                    selected_changed = true;
-                } else if new_selected == target {
-                    new_selected = i;
-                    selected_changed = true;
-                }
+            // Selection clamp: shift down if a row before the selection
+            // was deleted, otherwise clamp to the new last index.
+            if options.is_empty() {
+                new_selected = 0;
+            } else if rm < new_selected {
+                new_selected = new_selected.saturating_sub(1);
+                selected_changed = true;
+            } else if new_selected >= options.len() {
+                new_selected = options.len() - 1;
+                selected_changed = true;
             }
         }
-        if let Some(rm) = to_remove {
-            if rm < options.len() {
-                options.remove(rm);
-                options_changed = true;
-                // Stop editing if the deleted row was the active editor.
-                if edit_state.editing == Some(rm) {
-                    edit_state.editing = None;
-                    edit_state.buf.clear();
-                } else if let Some(e) = edit_state.editing {
-                    if e > rm { edit_state.editing = Some(e - 1); }
-                }
-                // Selection clamp: shift down if a row before the selection
-                // was deleted, otherwise clamp to the new last index.
-                if options.is_empty() {
-                    new_selected = 0;
-                } else if rm < new_selected {
-                    new_selected = new_selected.saturating_sub(1);
-                    selected_changed = true;
-                } else if new_selected >= options.len() {
-                    new_selected = options.len() - 1;
-                    selected_changed = true;
-                }
-            }
-        }
+    }
 
-        dropdown_set_edit_state(ui.ctx(), node_id, edit_state);
-    });
+    // Let go, or delete a row while holding one, and the drag is over: the next press starts a
+    // fresh one at whatever row it lands on.
+    if drag_seen && drag.active && to_remove.is_none() {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_key, drag));
+    } else {
+        ui.ctx().data_mut(|d| d.remove_temp::<OptionDrag>(drag_key));
+    }
+
+    dropdown_set_edit_state(ui.ctx(), node_id, edit_state);
 
     if options_changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -921,6 +974,7 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         }
     }
 }
+
 
 /// Renderer used when the dropdown's ComboBox is pinned into a sub-patch
 /// layout. Fills the full container (both axes) so the user can resize the

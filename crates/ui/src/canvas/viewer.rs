@@ -1721,7 +1721,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, self.view_salt),
             "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
             "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
-            "module.dropdown" => show_dropdown_body(node_id, ui, snarl),
+            "module.dropdown" => show_dropdown_body(node_id, ui, snarl, self.view_salt),
             "module.macro"    => show_macro_body(node_id, outputs, ui, snarl),
             "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
             "module.svg"      => show_svg_body(node_id, ui, snarl),

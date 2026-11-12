@@ -1818,6 +1818,88 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
 }
 
 #[test]
+fn the_dropdown_is_a_column_of_its_options_under_its_reading() {
+    // The menu module sized itself from a `box_width` parameter the user could dial to 600,
+    // its rows led with their own `×`, and its handle was a monospace `≡` nothing else in the
+    // app uses. It wears the list idiom now: one constant column centred on the module, the
+    // current option as the reading at the top, then a row per option - handle, the name cut at
+    // the column's edge with the whole of it on hover, the `×` at the right - and the `+` that
+    // adds one in that same column. Reordering moves the option and keeps the selection on it,
+    // because the engine outputs whatever sits at the selected index.
+    let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(
+            "options".into(),
+            serde_json::Value::Array(
+                ["Alpha", "Beta", "Gamma"].into_iter().map(|s| serde_json::Value::String(s.to_string())).collect(),
+            ),
+        );
+        n.params.insert("selected_index".into(), serde_json::Value::from(0_u64));
+    }
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "module.dropdown: {f:?} off the grid");
+    assert!(
+        f.width() <= 7.0 * B,
+        "module.dropdown: {f:?} is wider than its column asks for - a parameter is driving it again",
+    );
+    let rows: Vec<egui::Rect> = (0..3)
+        .map(|i| rig.traced_rect(node, &format!("dropdown_row_{i}")).unwrap_or(egui::Rect::NOTHING))
+        .collect();
+    for (i, r) in rows.iter().enumerate() {
+        assert!(
+            r.is_positive() && f.contains_rect(r.expand(1.0)),
+            "module.dropdown: option row {i} {r:?} isn't inside {f:?}",
+        );
+        assert!(
+            (r.width() - rows[0].width()).abs() < 0.5,
+            "module.dropdown: option row {i} {r:?} is a different width from row 0 {:?}",
+            rows[0],
+        );
+        if i > 0 {
+            let pitch = rows[i].top() - rows[i - 1].top();
+            assert!(
+                (pitch - rows[1].top() + rows[0].top()).abs() < 0.5 && pitch > 20.0,
+                "module.dropdown: option rows aren't one pitch apart: {rows:?}",
+            );
+        }
+    }
+    let add = rig.traced_rect(node, "dropdown_add").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        add.is_positive() && f.contains_rect(add.expand(1.0)) && add.top() > rows[2].bottom(),
+        "module.dropdown: the `+` row {add:?} isn't at the end of the list inside {f:?}",
+    );
+    assert!(
+        (add.width() - rows[0].width()).abs() < 0.5,
+        "module.dropdown: the `+` row {add:?} isn't the list's width {:?}",
+        rows[0],
+    );
+    // Drag the first option's handle down two rows.
+    let handle = egui::pos2(rows[0].left() + 6.0, rows[0].center().y);
+    let two = 2.0 * (rows[1].top() - rows[0].top());
+    rig.drag(handle, egui::vec2(0.0, two));
+    rig.idle(6);
+    let opts: Vec<String> = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("options").and_then(|v| v.as_array().cloned()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(opts, ["Beta", "Gamma", "Alpha"], "module.dropdown: the handle didn't move the option");
+    let sel = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("selected_index").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+    assert_eq!(sel, 2, "module.dropdown: the selection stayed on the slot instead of the option");
+}
+
+#[test]
 fn the_automap_port_lists_show_their_names_in_full_and_can_be_reordered() {
     // The Auto-Map splitter and collector list the ports they've taken off a bus. Those names
     // are the whole reason the module is on the canvas - which port feeds what, at a glance -
