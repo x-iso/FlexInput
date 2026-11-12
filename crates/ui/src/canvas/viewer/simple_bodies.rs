@@ -837,7 +837,10 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
             // Accumulate in egui memory so a slow drag still crosses the threshold instead of
             // stalling on per-frame sub-pixel deltas.
             drag.acc += handle.drag_delta().y;
-            let steps = (drag.acc / (PILL_H + ROW)).trunc() as isize;
+            // Round rather than truncate: the comment promises a move once the drag has
+            // crossed half a row, and a truncated quotient only moves after a whole one -
+            // which also loses the last fraction of a sub-pixel-per-step pointer move.
+            let steps = (drag.acc / (PILL_H + ROW)).round() as isize;
             if steps != 0 {
                 // Counted from where the option stands now, which is no longer the row the
                 // finger grabbed it on once it has been moved: the row ids are fixed, so a
@@ -2249,7 +2252,7 @@ pub(crate) fn show_svg_body_sized(
 /// param, the node's dynamic output pins, and `output_pin_ids` together so
 /// the three can never drift. Removal drops the port's wires and shifts the
 /// ones above down a slot (same surgery as the AutoMap Splitter).
-pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, view_salt: u64) {
     use flexinput_core::macros as mac;
 
     let Some(node) = snarl.get_node(node_id) else { return };
@@ -2270,64 +2273,136 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     }
 
     let mut remove_idx: Option<usize> = None;
+    let mut moved: Option<(usize, isize)> = None;
 
-    // The snarl body ui lays out HORIZONTALLY by default — without this
-    // wrapper every port row lands side by side on one line.
-    ui.vertical(|ui| {
-    ui.set_min_width(230.0);
+    // The rows are a list like every other list on the canvas: a handle to move the port, the
+    // icon, the name, the signal type as a dropdown that shows a letter and lists the names, and
+    // the `×` at the right edge. The column is a constant - the module was 308 points wide
+    // because each row measured itself out as an icon button, a 96-point field, a 58-point
+    // dropdown and a button labelled "+ Add output".
+    const LIST_W: f32 = 156.0;
+    const ROW: f32 = 4.0;
+    const HANDLE_W: f32 = 18.0;
+    const ICON_W: f32 = 24.0;
+    const TYPE_W: f32 = 22.0;
+    const RM_W: f32 = 22.0;
+    const NAME_W: f32 = LIST_W - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW;
+    let row_h = ui.spacing().interact_size.y.max(PILL_H);
+    let list_h = ports.len() as f32 * row_h;
+    ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
+    let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
+        Some(r) => r,
+        None => return,
+    };
+    let cx = inner.center().x;
+    let top = kit::group_top(ui.max_rect(), list_h);
+    let row_rect = |i: usize| {
+        egui::Rect::from_min_size(
+            egui::pos2(cx - LIST_W * 0.5, top + i as f32 * row_h),
+            egui::vec2(LIST_W, row_h),
+        )
+    };
+    let drag_key = egui::Id::new(("fxi_macro_drag", node_id.0));
+    let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
+    let mut drag_seen = false;
 
+    let n_ports = ports.len();
     for (i, port) in ports.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            // Icon button + picker (shared with the Virtual Menu module): the
-            // custom-SVG loader, category dropdown, name search, and the
-            // embedded-set grid all live in `icon_picker_button`.
-            if let Some((k, svg)) = crate::canvas::menu_body::icon_picker_button(
-                ui,
-                egui::Id::new((node_id, "macro_icon_grid", i)),
-                &port.icon,
-                &port.icon_svg,
-            ) {
-                port.icon = k;
-                port.icon_svg = svg;
-                changed = true;
+        let row = row_rect(i);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("macro_row", node_id, i)),
+        );
+        child.spacing_mut().item_spacing.x = 0.0;
+        // The handle: dragging a port past half a row moves it, counted from where the port
+        // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
+        // it back. The pins and their wires move with it further down.
+        let handle = child.add_sized(
+            [HANDLE_W, row_h],
+            egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
+        );
+        if handle.dragged() {
+            drag_seen = true;
+            if !drag.active || drag.held != i {
+                drag = OptionDrag { held: i, current: i, acc: 0.0, active: true };
             }
-
-            let name_resp = ui.add(
-                egui::TextEdit::singleline(&mut port.name).desired_width(96.0));
-            if name_resp.changed() { changed = true; }
-
-            egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
-                .selected_text(port.signal_type.display_name())
-                .width(58.0)
-                .show_ui(ui, |ui| {
-                    for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
-                        if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
-                            && port.signal_type != ty
-                        {
-                            port.signal_type = ty;
-                            changed = true;
-                        }
+            drag.acc += handle.drag_delta().y;
+            let steps = (drag.acc / row_h).round() as isize;
+            if steps != 0 {
+                moved = Some((drag.current, steps));
+                let target = (drag.current as isize + steps).clamp(0, n_ports as isize - 1) as usize;
+                drag.current = target;
+                drag.acc -= steps as f32 * row_h;
+            }
+        }
+        handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+        child.add_space(ROW);
+        // Icon button + picker (shared with the Virtual Menu module): the
+        // custom-SVG loader, category dropdown, name search, and the
+        // embedded-set grid all live in `icon_picker_button`.
+        if let Some((k, svg)) = crate::canvas::menu_body::icon_picker_button(
+            &mut child,
+            egui::Id::new((node_id, "macro_icon_grid", i)),
+            &port.icon,
+            &port.icon_svg,
+        ) {
+            port.icon = k;
+            port.icon_svg = svg;
+            changed = true;
+        }
+        child.add_space(ROW);
+        let name_resp = child.add(
+            egui::TextEdit::singleline(&mut port.name).desired_width(NAME_W),
+        );
+        if name_resp.changed() {
+            changed = true;
+        }
+        name_resp.on_hover_text(&port.name);
+        child.add_space(ROW);
+        // The signal type: one letter in the row, the names in the popup. The word in the row
+        // was the third of four things making every port row wider than the port it names.
+        let short = macro_type_short(port.signal_type);
+        egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
+            .selected_text(egui::RichText::new(short).small())
+            .show_ui(&mut child, |ui| {
+                for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
+                    if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
+                        && port.signal_type != ty
+                    {
+                        port.signal_type = ty;
+                        changed = true;
                     }
-                });
-
-            if ui.small_button("✕").on_hover_text("Remove port (drops its wires)").clicked() {
-                remove_idx = Some(i);
-            }
-        });
+                }
+            });
+        child.add_space(ROW);
+        if child.small_button("×").on_hover_text("Remove port (drops its wires)").clicked() {
+            remove_idx = Some(i);
+        }
+        drop(child);
+        trace_rect(ui, node_id, &format!("macro_row_{i}"), row);
     }
 
-    ui.add_space(2.0);
-    if ui.small_button("+ Add output").clicked() {
-        ports.push(mac::MacroPortDef {
-            id: mac::new_port_id(),
-            name: format!("Macro {}", ports.len() + 1),
-            icon: String::new(),
-            icon_svg: String::new(),
-            signal_type: SignalType::Bool,
-        });
-        changed = true;
+    if drag_seen && drag.active && moved.is_none() && remove_idx.is_none() {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_key, drag));
+    } else {
+        ui.ctx().data_mut(|d| d.remove_temp::<OptionDrag>(drag_key));
     }
-    }); // end ui.vertical
+
+    if let Some((from, dir)) = moved {
+        let to = (from as isize + dir).clamp(0, ports.len() as isize - 1) as usize;
+        if to != from {
+            // The order of these rows is the order of the node's output pins, and the engine
+            // reads them by position: the port moves, its wires go with it, and the `ports`
+            // list below is permuted the same way so the pins, the ids and the wires stay in
+            // step.
+            super::pins::move_dynamic_pin::<super::pins::Outputs>(node_id, from, to, outputs, snarl);
+            let port = ports.remove(from);
+            ports.insert(to, port);
+            changed = true;
+        }
+    }
 
     if let Some(rm) = remove_idx {
         // Drop the removed port's wires and reconnect the ones above one slot
@@ -2351,19 +2426,59 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     }
 
     if changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
-            node.params.insert(
-                "output_pin_ids".to_string(),
-                Value::Array(ports.iter().map(|p| Value::String(mac::macro_pin_id(&p.id))).collect()),
-            );
-            node.outputs = ports
-                .iter()
-                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
-                .collect();
-        }
+        write_macro_ports(snarl, node_id, &ports);
     }
 }
+
+/// The letter a port's type shows in the row. The popup lists the words.
+fn macro_type_short(ty: SignalType) -> &'static str {
+    match ty {
+        SignalType::Bool => "B",
+        SignalType::Float => "F",
+        SignalType::Vec2 => "V",
+        _ => "*",
+    }
+}
+
+/// Write a Macro Output's port list back: the `macro_ports` param, the `output_pin_ids` the
+/// layout keeps beside the pins, and the pins themselves, from one list so the three can't
+/// drift. Callers change `ports` and call this - the body, and the header's `+`.
+pub(crate) fn write_macro_ports(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    ports: &[flexinput_core::macros::MacroPortDef],
+) {
+    use flexinput_core::macros as mac;
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(ports));
+        node.params.insert(
+            "output_pin_ids".to_string(),
+            Value::Array(ports.iter().map(|p| Value::String(mac::macro_pin_id(&p.id))).collect()),
+        );
+        node.outputs = ports
+            .iter()
+            .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+            .collect();
+    }
+}
+
+/// The Macro Output's `+`, from the header: one more port, named for how many there are.
+pub(crate) fn add_macro_port(snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+    use flexinput_core::macros as mac;
+    let mut ports = snarl
+        .get_node(node_id)
+        .map(|n| mac::ports_from_params(&n.params))
+        .unwrap_or_default();
+    ports.push(mac::MacroPortDef {
+        id: mac::new_port_id(),
+        name: format!("Macro {}", ports.len() + 1),
+        icon: String::new(),
+        icon_svg: String::new(),
+        signal_type: SignalType::Bool,
+    });
+    write_macro_ports(snarl, node_id, &ports);
+}
+
 
 /// Rasterize an SVG to a rect of `(w, h)` and recolor the resulting pixmap
 /// according to `mode`:

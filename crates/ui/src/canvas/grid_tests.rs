@@ -2071,6 +2071,107 @@ fn the_oscillator_is_a_shape_a_wave_and_two_numbers() {
     assert_eq!(shape_now, "saw", "generator.oscillator: the shape strip's third cell isn't the saw wave");
 }
 #[test]
+fn the_macro_lists_its_ports_like_every_other_list() {
+    // A Macro Output's rows used to measure themselves out as an icon button, a 96-point name
+    // field, a 58-point type dropdown, a `✕`, and a button named "+ Add output" under them: 308
+    // points of module for a port. It's the list idiom now - handle, icon, name, the type as one
+    // letter with the names in the popup, and the `×` at the right edge - and the `+` is in the
+    // header with the other lists'. A moved port takes its wires with it, because its row order
+    // is the node's output-pin order.
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0), egui::pos2(900.0, 300.0)]);
+    let (node, other) = (ids[0], ids[1]);
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        use flexinput_core::macros as mac;
+        let mk = |id: &str, name: &str, ty: flexinput_core::SignalType| mac::MacroPortDef {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: ty,
+        };
+        n.params.insert(
+            mac::MACRO_PORTS_PARAM.to_string(),
+            mac::ports_to_value(&[
+                mk("aa11bb22", "Left", flexinput_core::SignalType::Bool),
+                mk("cc33dd44", "Right", flexinput_core::SignalType::Float),
+            ]),
+        );
+        n.outputs = vec![
+            PinDescriptor::new("Left", flexinput_core::SignalType::Bool),
+            PinDescriptor::new("Right", flexinput_core::SignalType::Float),
+        ];
+        n.params.insert(
+            "output_pin_ids".into(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("macro:aa11bb22".into()),
+                serde_json::Value::String("macro:cc33dd44".into()),
+            ]),
+        );
+    }
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "module.macro: {f:?} off the grid");
+    assert!(f.width() <= 8.0 * B, "module.macro: {f:?} is still as wide as its editor rows were");
+    let rows: Vec<egui::Rect> = (0..2)
+        .map(|i| rig.traced_rect(node, &format!("macro_row_{i}")).unwrap_or(egui::Rect::NOTHING))
+        .collect();
+    for (i, r) in rows.iter().enumerate() {
+        assert!(
+            r.is_positive() && f.contains_rect(r.shrink(-0.5)),
+            "module.macro: port row {i} {r:?} isn't inside {f:?}",
+        );
+        assert!(
+            (r.width() - rows[0].width()).abs() < 0.5,
+            "module.macro: port row {i} {r:?} is a different width from row 0 {:?}",
+            rows[0],
+        );
+    }
+    let add = rig.traced_rect(node, "header_add").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        add.is_positive() && f.contains_rect(add.expand(1.0)) && add.top() < f.top() + 2.0 * B,
+        "module.macro: the header `+` {add:?} isn't at the top of {f:?}",
+    );
+    // A wire on the first port, so the move can be checked to carry it.
+    rig.canvas.snarl.connect(
+        egui_snarl::OutPinId { node, output: 0 },
+        egui_snarl::InPinId { node: other, input: 0 },
+    );
+    rig.idle(4);
+    let names = |r: &Rig| -> Vec<String> {
+        r.canvas
+            .snarl
+            .get_node(node)
+            .map(|n| n.outputs.iter().map(|d| d.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(names(&rig), ["Left", "Right"], "module.macro: the ports as listed");
+    let handle = egui::pos2(rows[0].left() + 6.0, rows[0].center().y);
+    rig.drag(handle, egui::vec2(0.0, rows[1].center().y - rows[0].center().y));
+    rig.idle(6);
+    assert_eq!(names(&rig), ["Right", "Left"], "module.macro: the handle didn't move the port");
+    let wired = rig
+        .canvas
+        .snarl
+        .out_pin(egui_snarl::OutPinId { node, output: 1 })
+        .remotes
+        .len();
+    assert_eq!(wired, 1, "module.macro: the wire didn't move with the port");
+    let ids_param: Vec<String> = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array().cloned()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        ids_param,
+        ["macro:cc33dd44", "macro:aa11bb22"],
+        "module.macro: the port ids didn't follow the port",
+    );
+}
+#[test]
 fn the_automap_port_lists_show_their_names_in_full_and_can_be_reordered() {
     // The Auto-Map splitter and collector list the ports they've taken off a bus. Those names
     // are the whole reason the module is on the canvas - which port feeds what, at a glance -

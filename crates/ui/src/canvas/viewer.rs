@@ -362,6 +362,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // in the header with the other list controls: at the end of the list it read as one
         // more option, and it made the list's last row a button rather than a port.
         let option_add = snarl.get_node(node).map_or(false, |n| n.module_id == "module.dropdown");
+        // The Macro Output's ports are its output pins, listed in its body; its `+` belongs in
+        // the header with the other lists' too, where a button named "+ Add output" was one of
+        // the things holding every row wide.
+        let macro_add = snarl.get_node(node).map_or(false, |n| n.module_id == "module.macro");
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -464,7 +468,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let reserved = if is_knob && !knob_collapsed {
                         // The Uni/Bi switch that will sit at the header's right edge.
                         crate::canvas::viewer::kit_bodies::KNOB_TOGGLE.x + ui.spacing().item_spacing.x
-                    } else if channel_count.is_some() || option_add {
+                    } else if channel_count.is_some() || option_add || macro_add {
                         // The `− n +` or the `+` that will sit at the header's right edge. It
                         // is also reserved in the flow after the name, but the name is painted
                         // rather than laid out, so this is where its room comes off the name.
@@ -612,20 +616,25 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     }
                 }
 
-                if option_add {
+                if option_add || macro_add {
                     let h = kit::stepper_h(ui);
                     let (row, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
                     let right = ui.max_rect().right();
-                    if kit::header_plus_button(ui, "Add an option", row, right) {
-                        if let Some(n) = snarl.get_node_mut(node) {
-                            let mut opts: Vec<Value> = n
-                                .params
-                                .get("options")
-                                .and_then(|v| v.as_array().cloned())
-                                .unwrap_or_default();
-                            let next = opts.len() + 1;
-                            opts.push(Value::String(format!("Option {next}")));
-                            n.params.insert("options".into(), Value::Array(opts));
+                    let hover = if option_add { "Add an option" } else { "Add an output" };
+                    if kit::header_plus_button(ui, hover, row, right) {
+                        if option_add {
+                            if let Some(n) = snarl.get_node_mut(node) {
+                                let mut opts: Vec<Value> = n
+                                    .params
+                                    .get("options")
+                                    .and_then(|v| v.as_array().cloned())
+                                    .unwrap_or_default();
+                                let next = opts.len() + 1;
+                                opts.push(Value::String(format!("Option {next}")));
+                                n.params.insert("options".into(), Value::Array(opts));
+                            }
+                        } else {
+                            simple_bodies::add_macro_port(snarl, node);
                         }
                     }
                     simple_bodies::trace_rect(
@@ -1780,7 +1789,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
             "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
             "module.dropdown" => show_dropdown_body(node_id, ui, snarl, self.view_salt),
-            "module.macro"    => show_macro_body(node_id, outputs, ui, snarl),
+            "module.macro"    => show_macro_body(node_id, outputs, ui, snarl, self.view_salt),
             "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
             "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, self.view_salt),
