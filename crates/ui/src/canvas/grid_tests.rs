@@ -1674,6 +1674,48 @@ fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
 }
 
 #[test]
+fn a_long_port_list_still_lands_on_the_grid_and_stays_readable() {
+    // Nine ports is the case where a column of strips runs out of the module: the frame has to
+    // keep growing a block per port, the empty band under the last strip has to stay the same
+    // size it is at three ports, and each strip still has to leave room for its handle, its
+    // `x` and a name - a strip that shrinks to a pixel is worse than one that makes the module
+    // wider.
+    let (mut rig, ids) = Rig::real("module.selector", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    let mut left = std::collections::BTreeMap::new();
+    for ports in 3..=9usize {
+        while rig.inputs(node) < ports + 1 {
+            rig.set_inputs(node, rig.inputs(node) + 1);
+        }
+        rig.idle(6);
+        let f = rig.frame_rect(node);
+        let (a, b) = (rig.traced(node, "strip_0"), rig.traced(node, "strip_1"));
+        let last = rig.traced(node, &format!("strip_{}", ports - 1));
+        let pitch = b.top() - a.top();
+        assert!(
+            (pitch - B).abs() < 0.5,
+            "{ports} ports: a row of {pitch:.1} isn't one block ({B})",
+        );
+        assert!(
+            last.bottom() <= f.bottom() + 0.5,
+            "{ports} ports: the last strip {last:?} hangs below the frame {f:?}",
+        );
+        // Handle, the `x`, a name with something in it, and the air between them.
+        assert!(
+            a.width() >= 70.0,
+            "{ports} ports: a strip {a:?} is too narrow to hold its name (frame {f:?})",
+        );
+        left.insert(ports, f.bottom() - last.bottom());
+    }
+    let vals: Vec<f32> = left.values().copied().collect();
+    let spread = vals.iter().fold(0.0f32, |m, v| m.max((v - vals[0]).abs()));
+    assert!(
+        spread < 1.5,
+        "the space under the last strip changes with the port count: {left:?}",
+    );
+}
+
+#[test]
 fn a_switch_at_any_step_of_the_finer_grid_keeps_its_button_inside() {
     // The other body that reflows with the frame. Its button is the whole control, so a size
     // where the button no longer fits is a module that stopped working, not one that merely
