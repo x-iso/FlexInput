@@ -1598,7 +1598,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     // ── Node bodies ──────────────────────────────────────────────────────────
 
     fn node_resizable(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
-        snarl.get_node(node).is_some_and(|n| kit::uses_kit(&n.module_id) || kit::stretchy(&n.module_id))
+        snarl.get_node(node).is_some_and(|n| {
+            !kit::fixed_size(&n.module_id)
+                && (kit::uses_kit(&n.module_id) || kit::stretchy(&n.module_id))
+        })
     }
 
     /// What the header actually holds, for the nodes that put a control against its right
@@ -1680,7 +1683,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             let avail = ui.available_width();
             snarl.get_node(node_id).map_or(kit::MIN_W, |n| {
                 let block = crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block);
-                let (w, floor) = kit::body_width(n, avail, frame_size.map(|s| s.0), kit_min_width(&module_id), block, None);
+                // A fixed-size module takes the width its cells ask for and no other: no grip
+                // to set ui_w, and no ratchet on the width it was handed.
+                let (w, floor) = if kit::fixed_size(&module_id) {
+                    let mine = kit_min_width(&module_id);
+                    (mine, mine)
+                } else {
+                    kit::body_width(n, avail, frame_size.map(|s| s.0), kit_min_width(&module_id), block, None)
+                };
                 self.size_floors.insert(node_id.0, floor);
                 w
             })

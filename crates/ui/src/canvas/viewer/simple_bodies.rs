@@ -2334,11 +2334,11 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     // the `×` at the right edge. The column is a constant - the module was 308 points wide
     // because each row measured itself out as an icon button, a 96-point field, a 58-point
     // dropdown and a button labelled "+ Add output".
-    const LIST_W: f32 = 156.0;
+    const LIST_W: f32 = 180.0;
     const ROW: f32 = 4.0;
     const HANDLE_W: f32 = 18.0;
     const ICON_W: f32 = 24.0;
-    const TYPE_W: f32 = 22.0;
+    const TYPE_W: f32 = 46.0;
     const RM_W: f32 = 22.0;
 
     let row_h = ui.spacing().interact_size.y.max(PILL_H);
@@ -2423,14 +2423,15 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         }
         name_resp.on_hover_text(&port.name);
         child.add_space(ROW);
-        // The signal type: one letter in the row, the names in the popup. The word in the row
-        // was the third of four things making every port row wider than the port it names.
-        let short = macro_type_short(port.signal_type);
+        // The signal type, spelled out. An abbreviation there saves 24 points by making you
+        // open a menu to read what the row could already have said, on the one module whose
+        // ports are its pins - so the module pays a block of width instead.
+
         // `.width` because a ComboBox takes `Spacing::combo_width` - 150 points - as its minimum
         // otherwise, whatever the one letter in it is: the button reached past the row and under
         // the output labels. The popup is not held to that width; its entries size it.
         egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
-            .selected_text(egui::RichText::new(short).small())
+            .selected_text(egui::RichText::new(port.signal_type.display_name()).small())
             .width(TYPE_W)
             .show_ui(&mut child, |ui| {
                 for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
@@ -2496,15 +2497,6 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     }
 }
 
-/// The letter a port's type shows in the row. The popup lists the words.
-fn macro_type_short(ty: SignalType) -> &'static str {
-    match ty {
-        SignalType::Bool => "B",
-        SignalType::Float => "F",
-        SignalType::Vec2 => "V",
-        _ => "*",
-    }
-}
 
 /// Write a Macro Output's port list back: the `macro_ports` param, the `output_pin_ids` the
 /// layout keeps beside the pins, and the pins themselves, from one list so the three can't
@@ -3150,14 +3142,14 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
             draw_knob_rotary(&painter, rect, t, bipolar, active);
             // A dial keeps its reading in its middle - and its indicator stops short of the
             // middle, so the two don't cross.
-            // The middle reading has to sit inside the dial without reaching the indicator that
-            // stops short of the middle. The smallest face has neither, and draws no number at
-            // all: the face and where it points are the value.
+            // Only when the number is not going under the face - a dial with a line to spare
+            // says its value once, below. Otherwise it has to sit inside the dial without
+            // reaching the indicator that stops short of the middle, and the smallest face            // has room for neither: there the face and where it points are the value.
             // The number spans most of a small dial rather than not appearing at all: a
             // three-block knob has a 33-point face and a 27-point reading, and the value being
             // legible matters more here than the margin around the arc. Below that - the two-
             // block minimum - it genuinely doesn't fit, and the face's pointer is the value.
-            if galley.size().x <= rect.width() * 0.85 {
+            if !number_under && galley.size().x <= rect.width() * 0.85 {
                 let at = egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
                 trace_rect(ui, node_id, "knob_number", egui::Rect::from_min_size(at, galley.size()));
                 text_painter.galley(at, galley.clone(), text_col);

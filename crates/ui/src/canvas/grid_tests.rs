@@ -342,20 +342,26 @@ fn kit_modules_settle_on_one_width() {
 }
 
 #[test]
-fn a_kit_module_takes_the_width_its_grip_asks_for() {
-    let (mut rig, ids) = Rig::with("logic.counter", &[egui::pos2(100.0, 300.0)]);
-    let before = rig.frame_rect(ids[0]).width();
-    let wider = before + 3.0 * MAJOR;
-    rig.canvas.snarl.get_node_mut(ids[0]).unwrap().params
-        .insert(kit_width_param().into(), serde_json::json!(wider));
+fn the_counter_has_no_grip_and_keeps_the_size_its_cells_ask_for() {
+    // The Counter is the last body built from the old kit rows, and the only one that ever
+    // had a corner grip. The cells want one size; a grip let the same module stand at four,
+    // with the difference all air. So the grip is gone, and a width written into the patch by
+    // an older build is ignored.
+    let (mut rig, ids) = Rig::real("logic.counter", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
     rig.idle(6);
-    assert_eq!(rig.frame_rect(ids[0]).width(), wider);
-    // Narrower than its rows allow: it stops at the narrowest.
-    rig.canvas.snarl.get_node_mut(ids[0]).unwrap().params
-        .insert(kit_width_param().into(), serde_json::json!(B));
+    let at = rig.frame_rect(node);
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params
+            .insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(420.0));
+        n.params.insert("ui_h".into(), serde_json::json!(420.0));
+    }
     rig.idle(6);
-    // It goes back to the narrowest it can be, which is where it started.
-    assert_eq!(rig.frame_rect(ids[0]).width(), before);
+    let sized = rig.frame_rect(node);
+    assert!(
+        (sized.width() - at.width()).abs() < 1.0 && (sized.height() - at.height()).abs() < 1.0,
+        "the Counter took a size it has no grip to be given: {at:?} -> {sized:?}",
+    );
 }
 
 fn kit_width_param() -> &'static str {
@@ -2288,7 +2294,10 @@ fn the_macro_lists_its_ports_like_every_other_list() {
     rig.idle(8);
     let f = rig.frame_rect(node);
     assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "module.macro: {f:?} off the grid");
-    assert!(f.width() <= 8.0 * B, "module.macro: {f:?} is still as wide as its editor rows were");
+    // Nine blocks: the editor row spells the signal type out (Bool, Float, ...) rather than
+    // abbreviating it, which the module pays a block for, and the list runs the width the body
+    // has instead of being centred on the frame with dead margin beside it.
+    assert!(f.width() <= 9.0 * B, "module.macro: {f:?} is wider than its list rows ask for");
     let rows: Vec<egui::Rect> = (0..2)
         .map(|i| rig.traced_rect(node, &format!("macro_row_{i}")).unwrap_or(egui::Rect::NOTHING))
         .collect();
@@ -2756,9 +2765,8 @@ fn a_title_does_not_hold_a_module_wide() {
         "the same module at the same settings came out different widths: {widths:?}",
     );
     // A module the user *can* widen - one with a corner grip - still takes the width it's
-    // asked for, name or no name. The Counter is the one that still lays its settings out in
-    // kit rows; the per-channel filters are pills now and size themselves.
-    let (mut rig, ids) = Rig::real("logic.counter", &[egui::pos2(100.0, 300.0)]);
+    // asked for, name or no name.
+    let (mut rig, ids) = Rig::real("module.label", &[egui::pos2(100.0, 300.0)]);
     if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
         n.display_name = "Wait until the signal has settled before letting go".to_string();
     }

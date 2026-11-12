@@ -43,6 +43,14 @@ pub(crate) const HEIGHT_PARAM: &str = "ui_h";
 /// surface that fills whatever frame it's given — a Text module's field, an Envelope's
 /// graph — rather than a stack of rows wanting a wider label column. Same grip, same block
 /// snapping, and the height is theirs to use as well as the width.
+/// Modules whose body is a fixed grid of cells: the corner grip is taken away, because
+/// stretching them adds nothing the cells needed - a Counter at 336 points is the same six
+/// cells with more air between them - and a module that can be any size is a module that
+/// shows up at four sizes in one patch. What they get is the width their content asks for.
+pub(crate) fn fixed_size(module_id: &str) -> bool {
+    matches!(module_id, "logic.counter")
+}
+
 pub(crate) fn stretchy(module_id: &str) -> bool {
     matches!(
         module_id,
