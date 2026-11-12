@@ -121,9 +121,14 @@ creep wider, stick, or flicker. It is handed its width instead.
 - `FlexViewer::show_body` computes `kit_w` with `kit::body_width` for every
   module in `kit::uses_kit`, and passes it to the body.
 - The body always fills its node. The node is as wide as the user dragged it
-  (the node's `ui_w` param), or as it already is, but never narrower than the
-  narrowest frame the rows fit in, rounded up to whole blocks. Asking for less
-  gets that frame, filled, not a body squeezed inside a frame that can't shrink.
+  (the node's `ui_w` param) or, if nobody has dragged it, as wide as the
+  narrowest frame its content fits in — never as wide as the frame it happens
+  to be standing in. That last was a ratchet: the body reports back the width
+  it is given, so a module born into a default frame keeps it, and the Counter
+  came out 252 points wide for a strip of words and three numbers because
+  252-ish is what an untouched node starts with. Asking for less than the
+  content needs gets the content's frame, filled, not a body squeezed inside a
+  frame that can't shrink.
 - The grip itself stops at the header's width and at that narrowest frame.
 - The body reports exactly that width to the node whatever its rows draw, so a
   value or option too long for its cell can't tip the node over a block and back
@@ -350,48 +355,52 @@ walks the node out a block.
 
 ## The kit
 
-`kit::body(ui, w, |ui, k| …)` lays out a body `w` wide with the row spacing set;
-`k` is a `Kit`. Every row method returns `(changed or response, row rect)`; the
-rect is what `register_exposable_element` takes.
+The labelled-row kit is retired. No body lays out a label cell, a control and a value box any
+more — `kit::body`, `k.row`, `k.full_row`, `k.value`, `k.pair`, `k.choice`, `k.section`,
+`k.note`, `k.slider` and the in-body `k.stepper` are all gone, and the words they put beside the
+controls were most of the width of the modules that used them. What survives is `kit::strip` (a
+row of equal option cells — the Counter's mode and output wear it), `kit::header_stepper` (the
+`− n +` that adds a matched In/Out pair to the per-channel filters), the width and height a
+grip writes, and the floor arithmetic.
 
-| Call | Draws |
-| ---- | ----- |
-| `k.row(ui, label, \|ui, rest\| …)` | Label cell, then your own content in the `rest` of the width |
-| `k.full_row(ui, \|ui, w\| …)` | A row with no label cell |
-| `k.value(ui, label, &mut v, \|v\| DragValue…)` | Label, value box on the right edge |
-| `k.pair(ui, label, (caption, &mut a, enabled), (caption, &mut b, enabled), \|v\| DragValue…)` | Label, two captioned value boxes (Min / Max) |
-| `k.choice(ui, Some(label) or None, &mut value, &[(value, text, hover)])` | Label, option strip |
-| `kit::strip(ui, width, &mut value, options)` | The option strip alone, for inside `k.row` |
-| `k.section(ui, title)` | Caption and hairline |
-| `k.note(ui, text)` | Small weak text, wrapped to the body |
+The pattern a body of settings follows now is **a box reserved at a constant size, with the
+controls placed inside it**: the Counter's stack of cells two across, or a group of pills each
+with its word above it (`kit_bodies::pill_group` with `caption_at` — Delay, Average and DC
+Filter read Window, Spikes and Decay over their boxes rather than `win`, `spk` and `dec` inside
+them, which asked the reader to expand an abbreviation the module had room not to need). Two
+rules come with it:
 
-`k.slider` and the in-body `k.stepper` are gone, and after the Counter moved to cells so is
-`kit::body` and the row builders themselves: no body lays out a label cell, a control and a
-value box any more. What survives of the kit is `kit::strip` (a row of equal option cells,
-which is what the Counter's mode and output are), the width/height params a grip writes, and
-the floor arithmetic. The pattern a body of settings follows now is the Counter's: **a stack of
-cells, two across, centred on the module's middle line**, in a box reserved at a constant size —
-and if the words won't fit across, they go two per row rather than the module going wider
-("Loop Limit Bounce Unlimited" in one strip is 184 points of words; two rows of two costs a
-block of height the module's six pin rows already make free).
+- If the words won't fit across, they go two per row rather than the module going wider
+  ("Loop Limit Bounce Unlimited" in one strip is 184 points of words; two rows of two costs a
+  block of height the module's six pin rows already make free).
+- A caption is painted, never allocated. The box was reserved at a constant, and a longer word
+  must not be able to widen the module that reserved it.
 
 ## Converting a body
 
-1. Write the new body in `crates/ui/src/canvas/viewer/kit_bodies.rs`, taking an
-   extra `w: f32`, built from `kit::body` and the row methods.
-2. Add the module id to `kit::uses_kit`.
-3. If its rows need more than `MIN_W` (a strip of four options does), add it to
-   `kit_min_width`.
-4. Pass `kit_w` at its arm of the `show_body` dispatch in `viewer.rs`.
+1. Write the new body in `crates/ui/src/canvas/viewer/kit_bodies.rs`: **reserve a box at a
+   constant** (`ui.allocate_exact_size`) and place the controls inside it against
+   `module_icons::module_inner`, which is the module's middle, not the body column's.
+2. If it's a body that should fill a frame the user widened, take the width it is handed
+   (`kit_w`) as something to stretch into, never as the demand —
+   `((w - gap) * 0.5).max(FLOOR)` — and write that floor into `kit_min_width`, which is what
+   an untouched module starts at.
+3. Add the module to `kit::uses_kit` only if it's built from `kit::strip` cells; other bodies
+   keep their own arm of the `show_body` dispatch in `viewer.rs`.
+4. If the body is a list the user can reorder, the move carries the pin, its wires and any
+   id list kept parallel to the pins (`pins::move_dynamic_pin`, `move_automap_port`); where
+   the engine reads the list by index, keep the selection on the item rather than the slot.
 5. Keep **every** `register_exposable_element(ui, node_id, element_id, rect)`
    call with the **same element ids**: pinned widgets, and their own renderers in
    `pinned.rs`, look elements up by id.
 6. Delete the old body.
 
-Converted to rows and a width grip so far: Delay, Average, DC Filter, Counter. Rebuilt in
-the same house style but with painted controls and **no grip**, because their bodies
-allocate nothing for a wider frame to stretch into: Inverse, Quantize, Logic Delay, Has
-Changed, Vec to Deflection, Switch, Sample and Hold, Greater / Less Than.
+Bodies that fill a frame the grip widened: Counter (its cells stretch from a 56-point floor)
+and the port lists — Selector, Split, the Auto-Map splitter and collector, the Dropdown menu.
+Rebuilt in the same house style but with painted controls and **no width to fill**, because
+their bodies allocate nothing a wider frame could stretch into: Delay, Average, DC Filter,
+Inverse, Quantize, Logic Delay, Has Changed, Vec to Deflection, Switch, Sample and Hold,
+Greater / Less Than.
 
 **Constant has no grip and no width param.** Its whole body is one number, and the box is
 as wide as the digits it holds — `30` tall, monospace 12, 8 of air each side — with a
@@ -442,11 +451,15 @@ wide as the box and the pair reads as one object, not two controls that happen t
 - The box's width is measured against the text as displayed — trailing zeros trimmed — so a
   whole number doesn't pay for a dot and two zeros it never shows. `9999.99` is the floor
   the box is built around, and it still fits 112 points.
-- **Centred horizontally on the module, vertically in the body column.** The module's
-  centre includes its header, so a pair centred on it hangs high: the empty space all ends
-  up below the controls, and it reads as uncentred even though the arithmetic is symmetric.
-  The body column — what's under the header — is the box to centre a stack inside; the pin
-  labels are what the module's width has to be measured against, not its height.
+- **Centred horizontally on the module; vertically, on whatever the controls are.** The
+  module's centre includes its header, and the body column's centre is where its *rows*
+  start, so the two answer different questions. A stack that fills the column — the
+  Counter's cells, a run of port strips — centres in the column (`kit::group_top`): centred
+  on the module it hangs high with all the empty space below it. A short group of pills in
+  a tall column does the opposite — the column is as tall as the pin rows next to it, so its
+  middle is low — and centres on the module's middle line instead
+  (`module_icons::module_inner`). Neither centres horizontally on the column: its middle is
+  offset by the pin labels, and `in` is one letter while `out` is three.
 - The Knob will want the same control with a different meaning — steps that divide its 0-1
   scale (whole, halves, thirds, quarters) rather than decimal places — so it doesn't simply
   inherit this one.
@@ -522,6 +535,12 @@ The pin labels are usually the widest thing in a small module — "increased", "
   tail. The full name goes in the hover text of the label.
 - Only modules small enough for a block to matter take the short forms
   (`kit::pin_abbreviates`). A Remapper or a JSM has room and keeps its labels spelled out.
+- **Never on a port you choose by its name.** An Auto-Map splitter's or collector's pins, and
+  a device module's, are labelled with what the user learned or plugged in — "Left Stick",
+  "Channel Pressure · ch 2" — and reading which port feeds what is the whole reason the module
+  is on the canvas. Those names are shown in full and the module pays the width; shortening one
+  to fit a block trades the module's purpose for its size. A module's own fixed words
+  (`increase`, `deflection`) carry no information the user is scanning for, so those do shorten.
 - A module whose body says what comes out may hide its output labels entirely
   (`kit::pin_hides_outputs` — Knob today). The socket stays; the label doesn't.
 - The header does the same job with names: `kit::MARKS` gives a module a symbol in place of

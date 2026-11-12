@@ -143,27 +143,46 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **The Auto-Map splitter and collector list their ports the way the port strips do.** Each
   row used to lead with its `×`, so the names started behind a column of buttons and staggered;
   the list also set its own floor at 170 points and asked its dropdown for 150 more. The name
-  comes first now, cut short at the row's edge with the whole of it on hover, the `×` sits at
-  the right edge like every other list's, and adding one is a `+` whose dropdown can be as wide
-  as it likes because it's a popup. Their pins abbreviate on the canvas like the small modules'
-  ("Left Stick Horizontal…" shows as "Left", full name on hover), which is what these two were
-  really being wide for: 280 points down to 224.
+  comes first now, cut only at the row's edge with the whole of it on hover, the `×` sits at the
+  right edge like every other list's, and adding one is a `+` whose dropdown can be as wide as
+  it likes because it's a popup. Each row carries a drag handle, and a port moved to another row
+  takes its wire and its entry in the layout's id list with it, because the engine reads these
+  pins by position. Their names are never shortened the way a small module's `in_2` is - which
+  port feeds what is the thing these modules are read for, as with a device module's pins - so a
+  long learned name makes the module wide instead.
 - **The Counter's settings are cells, not a column of labelled rows.** Its four settings were
   a mode strip, an "Output" row, a "Step" row and a "Range" row with two captioned boxes: 336
   points across, most of that the words "Output", "Step" and "Range" sitting beside the things
   they named. The cells are the module now - the mode two per row so the words stay whole, the
   output pair with its reset at the end of the row, the range and the step as pills - and it
-  comes to 252 wide by 168 tall: a block and a half narrower, a block taller, which on a canvas
-  where wires run between modules is the trade worth making. With it the body-kit's labelled
-  rows are gone from the app entirely; what's left of the kit is the option strip and the width
-  and height a grip can set.
+  comes to 196 wide by 168 tall: two blocks narrower than the labelled rows, and a third
+  narrower than the first cut of this redesign, which was still being held open by the width it
+  happened to be handed at birth rather than the one its cells ask for. Its six pin words are
+  drawn short on the canvas like the other small modules' (`inc`, `dec`, `rst`, `step`, `min`,
+  `max`): they're fixed by the module and the same on every patch. With it the body-kit's
+  labelled rows are gone from the app entirely; what's left of the kit is the option strip and
+  the width and height a grip can set.
 - **Delay, Average and DC Filter are pills now.** Each one was a label, a slider rail and a
   value box per setting, with a "Channels" row across the body on top: 252 points of module to
   hold one or two numbers, of which most was the words beside them. The settings are pills you
-  drag across or double-click to type into (`100 ms`, `win 5 ms`, `spk 3.0`), centred on the
-  module, and a channel - always an In and its matching Out - is added from the header's `− +`
-  the way the variadic operations add a pin. All three sit at 140 by 112 points, and DC Filter
-  wears "DC" in its header so its name isn't the fourth thing deciding the width.
+  drag across or double-click to type into, each with its word written above it - Window, Spikes,
+  Decay - rather than three letters inside it (`win`, `spk`, `dec`), the group centred on the
+  module both ways, and a channel - always an In and its matching Out - is added from the
+  header's `− +` the way the variadic operations add a pin. Delay and Average sit at 140 by 112;
+  DC Filter at 168 by 112, because "DC Filter" spelled out in its header - it keeps its name -
+  is the widest thing in it, and at a 28-point step the room after 140 is a whole block up.
+- **The Dropdown menu is a column of its options under its reading.** It sized itself from a
+  `box_width` parameter the user could dial up to 600 points, wrapped its reading in a resize
+  frame, led every row with its own `×`, and drew its handle as a monospace `≡` that nothing
+  else in the app uses. One constant column centred on the module decides its width now: the
+  current option as the reading on top, then a row per option - handle, the option's text cut at
+  the column's edge with the whole of it on hover, the `×` at the right edge - and the `+` that
+  adds one in that same column, so the two columns of buttons line up down the module. 196 by
+  140. A patch that had set `box_width` keeps the parameter, which no longer moves anything, and
+  a dropdown pinned into a sub-patch layout still fills its container. Dragging a handle two
+  rows used to bounce the option back where it started, because the second step was counted from
+  the row the finger was on rather than from the option; the selection now follows the option,
+  not the slot, since the engine outputs whatever sits at the selected index.
 - **Dragging a Combiner's row now shows where it will land.** The row under the finger dims
   as if lifted out of the list, and a line is drawn along the edge of the row it would
   displace. The port strips move their neighbours out of the way as you drag, but these rows
