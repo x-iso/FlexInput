@@ -612,6 +612,21 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   order (`remap_offsets`) so the strips carry on from exactly where the preview left them.
   The frames have to keep coming while that settles — `request_repaint` while any offset is
   still more than half a point from its target.
+  A Combiner's rows can't do that: they are live widgets with a socket beside each, and
+  moving one mid-frame would move the socket and the pins' column with it. Its preview is
+  the minimum that still answers the question a drag asks — which of three near-identical
+  rows will this land on: the row under the finger is dimmed as lifted (egui paints the
+  moving copy at the cursor), and a line is drawn where the gap will open. Which row is
+  being dragged comes from the drop zones' hover payload; between zones egui says nothing,
+  so the last one seen is kept while the button is held (`combiner_drag_key`) or the mark
+  flickers in the three-point gaps.
+- **Anything stored by port number follows the port, not the slot.** The Combiner keeps a
+  port's default merge policy (`combiner_port_default`, keyed by port index) and a pin's
+  pinned port (`combiner_pin_port`, whose *value* is a port index). The engine reads ports by
+  position — the lowest offering a pin wins — so a reorder that permutes only the pins hands
+  a device's policy to whichever device lands in its slot and repoints a pinned pin at
+  whatever took its place. `combiner_move_input` permutes both; a new index-keyed setting has
+  to be added there too, and the test for it drags a row and checks the settings came with it.
 - **A module that draws its rows in the flow — the Combiner — has to be told the height.**
   Its rows contain dropdowns, so their height is the style's, not a constant: `kit::strip_pitch`
   returns `interact_size.y + 2 * COMBINER_PAD_V` and the body uses the same expression for the

@@ -1176,6 +1176,12 @@ pub(crate) fn combiner_move_input(
     }
 }
 
+/// Which row a Combiner's live drag came from, kept between frames so the row's "lifted"
+/// mark doesn't flicker in the gaps between drop zones.
+fn combiner_drag_key(node: NodeId) -> egui::Id {
+    egui::Id::new(("fxi_combiner_drag", node.0))
+}
+
 pub(crate) fn show_automap_combiner_body(
     node_id: NodeId,
     inputs: &[InPin],
@@ -1218,6 +1224,20 @@ pub(crate) fn show_automap_combiner_body(
         // The strip fill, so a port row reads as one object the handle, the `×` and the
         // dropdowns sit on - the same fill the Selector's and Split's strips wear.
         let strip_fill = ui.visuals().widgets.inactive.weak_bg_fill;
+        // Where the row being dragged would land, if there is one: recorded while the rows
+        // are laid out, drawn once they're all down so nothing paints over it.
+        let mut slot: Option<egui::Rect> = None;
+        let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(n);
+        // Which row the drag in flight came from. egui reports the payload on whatever drop
+        // zone the pointer is over, so between rows it says nothing and the mark would
+        // flicker; the last one seen is kept while the button is still held.
+        let mut drag_from = ui
+            .ctx()
+            .data(|d| d.get_temp::<Option<usize>>(combiner_drag_key(node_id)))
+            .flatten();
+        if !ui.input(|i| i.pointer.any_down()) {
+            drag_from = None;
+        }
 
         // Every row the same width, sized by the longest port name and device label in the
         // list: strips ending at ragged widths read as several controls rather than one
@@ -1275,11 +1295,10 @@ pub(crate) fn show_automap_combiner_body(
                 ui.set_min_width(row_min_w - 2.0 * pad);
                 ui.horizontal(|ui| {
                     let handle_id = egui::Id::new(("automap_combiner_handle", node_id, i));
-                    ui.dnd_drag_source(handle_id, i, |ui| {
+                    let src = ui.dnd_drag_source(handle_id, i, |ui| {
                         ui.label(egui::RichText::new("⠿").weak().small());
-                    })
-                    .response
-                    .on_hover_cursor(egui::CursorIcon::Grab);
+                    });
+                    src.response.on_hover_cursor(egui::CursorIcon::Grab);
                     if n > 2 {
                         if ui.small_button("×").clicked() { to_remove = Some(i); }
                     } else {
@@ -1320,10 +1339,46 @@ pub(crate) fn show_automap_combiner_body(
             });
             // Traced so a test can hold the rows to one width.
             super::simple_bodies::trace_rect(ui, node_id, &format!("combiner_row_{i}"), zone.response.rect);
+            row_rects.push(zone.response.rect);
+            // Where this row would take the one being dragged: the drop lands on the row
+            // under the pointer, so the line goes below it - the gap the moved row pushes the
+            // rest down into.
+            if let Some(from) = zone.response.dnd_hover_payload::<usize>().map(|p| *p) {
+                drag_from = Some(from);
+                if from != i {
+                    slot = Some(zone.response.rect);
+                }
+            }
             if let Some(dragged_idx) = dropped {
                 let from = *dragged_idx;
                 if from != i { to_move = Some((from, i)); }
             }
+        }
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(combiner_drag_key(node_id), drag_from));
+        // The row under the finger reads as lifted out of the list: egui paints the moving
+        // copy at the cursor, so this is the hole it left behind.
+        if let Some(from) = drag_from {
+            if let Some(r) = row_rects.get(from).copied() {
+                super::simple_bodies::trace_rect(ui, node_id, "combiner_lifted", r);
+                ui.painter()
+                    .rect_filled(r.shrink(1.0), 4.0, strip_fill.gamma_multiply(0.4));
+            }
+        }
+        if let Some(r) = slot {
+            // Where the dragged row would land. The strips' preview slides the rows out of
+            // the way as you drag; this list is live widgets, and moving them mid-frame would
+            // move the sockets beside them, so it says where the gap will open instead.
+            let accent = ui.visuals().selection.bg_fill;
+            let y = r.bottom() + 2.0;
+            super::simple_bodies::trace_rect(
+                ui,
+                node_id,
+                "combiner_slot",
+                egui::Rect::from_min_max(egui::pos2(r.left(), y), egui::pos2(r.right(), y + 2.0)),
+            );
+            ui.painter()
+                .hline(r.left()..=r.right(), y, egui::Stroke::new(2.0_f32, accent));
         }
         if let Some(rm) = to_remove {
             remove_input_pin(node_id, rm, inputs, snarl);

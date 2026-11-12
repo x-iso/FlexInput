@@ -1500,6 +1500,53 @@ fn a_title_is_left_out_when_it_doesnt_fit_and_comes_back_when_it_does() {
 }
 
 #[test]
+fn dragging_a_combiner_row_shows_where_it_will_land() {
+    // The port strips slide their neighbours out of the way as you drag one. The Combiner's
+    // rows are live widgets with a socket beside each one, so they can't be moved mid-frame;
+    // what they do instead is mark the row under the finger as lifted and draw the line where
+    // the gap will open. Without that, a drag gives no sign of which of three near-identical
+    // rows it will land on.
+    let (mut rig, ids) = Rig::real("module.automap_combiner", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    for what in ["combiner_slot", "combiner_lifted"] {
+        rig.ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("module_ctrl_rect", node.0, what)),
+                Xysr([0.0; 4]),
+            )
+        });
+    }
+    let (row0, row1) = (rig.traced(node, "combiner_row_0"), rig.traced(node, "combiner_row_1"));
+    let grab = egui::pos2(row0.left() + 8.0, row0.center().y);
+    let button = |pos: egui::Pos2, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    let start = rig.to_global * grab;
+    let end = rig.to_global * egui::pos2(grab.x, row1.center().y);
+    rig.frame(vec![egui::Event::PointerMoved(start)]);
+    rig.frame(vec![button(start, true)]);
+    for s in 1..=8 {
+        rig.frame(vec![egui::Event::PointerMoved(start + (end - start) * (s as f32 / 8.0))]);
+    }
+    let lifted = rig.traced_rect(node, "combiner_lifted").unwrap_or(egui::Rect::NOTHING);
+    let slot = rig.traced_rect(node, "combiner_slot").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        lifted.is_positive() && lifted.center().y < row1.center().y,
+        "the row being dragged isn't marked: {lifted:?} / slot {slot:?} (rows {row0:?} {row1:?})"
+    );
+    assert!(
+        slot.is_positive() && (slot.top() - row1.bottom()).abs() < 6.0,
+        "no line showing where the row lands: {slot:?} (over {row1:?})"
+    );
+    rig.frame(vec![button(end, false)]);
+    rig.idle(4);
+}
+
+#[test]
 fn a_combiner_row_move_takes_its_settings_with_it() {
     // The Combiner's rows are ports and the engine reads them by position - the lowest port
     // that offers a pin wins - so two of its settings are stored by port number: the port's

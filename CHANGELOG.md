@@ -139,6 +139,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Dragging a Combiner's row now shows where it will land.** The row under the finger dims
+  as if lifted out of the list, and a line is drawn along the edge of the row it would
+  displace. The port strips move their neighbours out of the way as you drag, but these rows
+  are live widgets with a socket beside each, so moving one mid-drag would drag the patch's
+  wiring around with it; the mark and the line answer the question without touching either.
 - **The grid's block is 28 points instead of 56, and the modules are the same size.** The
   finer step is for the port lists: a strip row - a 25-point strip and the pin column's
   3-point spacing - is now exactly one block, so a Selector's rows land on the grid at every
