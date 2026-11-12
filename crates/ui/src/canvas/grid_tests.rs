@@ -2553,15 +2553,21 @@ fn a_switch_at_any_step_of_the_finer_grid_keeps_its_button_inside() {
 }
 
 #[test]
-fn the_grid_default_keeps_the_old_visual_density() {
-    // The block halved for finer snapping; the brighter line is what keeps the canvas reading
-    // as it did - sitting where the old block used to be, so the new lines look like its
-    // subdivisions rather than a second grid laid over the first.
+fn the_grid_ships_without_a_brighter_line_and_offers_odd_ones() {
+    // The brighter line used to be the old 56-point grid showing through a 28-point one. It
+    // is not needed to keep the canvas readable, and an even step puts the bright lines
+    // through a module four blocks across rather than around it - so nothing is brighter by
+    // default, and the choices are odd: five blocks is one either side of a 4x4 module.
     let g = crate::settings::CanvasGrid::default();
-    assert_eq!(
-        crate::settings::CanvasGrid::BLOCK * g.accent_every as f32,
-        56.0,
-        "the brighter line moved off the 56-point major",
+    assert_eq!(g.accent_every, 0, "the grid ships with a brighter line: {g:?}");
+    let choices = crate::settings::CanvasGrid::ACCENT_CHOICES;
+    assert_eq!(choices.first().copied(), Some(0), "the menu doesn't offer no highlight at all: {choices:?}");
+    for &n in choices.iter().filter(|n| **n > 0) {
+        assert_eq!(n % 2, 1, "a brighter line every {n} blocks cuts through a 4-block module");
+    }
+    assert!(
+        choices.contains(&5),
+        "the menu lost the step that brackets a 4x4 module: {choices:?}",
     );
 }
 

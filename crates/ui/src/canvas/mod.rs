@@ -3601,7 +3601,8 @@ fn grid_menu(ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     ui.add_space(18.0);
                     ui.label(egui::RichText::new("Brighter every").small().weak());
-                    for (n, text) in [(0, "Off"), (2, "2"), (4, "4"), (8, "8")] {
+                    for &n in crate::settings::CanvasGrid::ACCENT_CHOICES {
+                        let text = if n == 0 { "Off".to_string() } else { n.to_string() };
                         ui.selectable_value(&mut grid.accent_every, n, text);
                     }
                 });

@@ -864,7 +864,7 @@ impl Default for CanvasGrid {
         Self {
             show: true,
             style: egui_snarl::ui::GridStyle::Crosses,
-            accent_every: 2,
+            accent_every: 0,
             brightness: 1.0,
             snap: true,
             push: true,
@@ -879,6 +879,12 @@ impl Default for CanvasGrid {
 }
 
 impl CanvasGrid {
+    /// The spacings the grid menu offers for the brighter line: 0 for none, which is
+    /// what ships, and odd numbers of blocks above it. An even step puts the bright lines
+    /// through a module four blocks across; an odd one puts them either side of it, which is
+    /// what makes the grid read as the thing the modules sit on.
+    pub(crate) const ACCENT_CHOICES: &[u32] = &[0, 3, 5, 7, 9];
+
     /// The one block size modules are laid out in, in canvas points: modules
     /// are designed in multiples of it, so it isn't a setting.
     ///
@@ -889,9 +895,9 @@ impl CanvasGrid {
     /// block alternated between 26 and 55 depending on whether the port count was odd. It
     /// buys granularity, not size: the floors and defaults that were stated in old blocks are
     /// now stated in twice as many of these, so a module that started two blocks square still
-    /// starts 112 points square. The default grid keeps the old look the same way: a brighter
-    /// line every two, so the 56-point grid is still what stands out and the 28-point lines
-    /// read as its subdivisions.
+    /// starts 112 points square. Nothing is brighter by default; where a patch wants a
+    /// brighter line, the choices are odd numbers of blocks, so it brackets a four-block
+    /// module rather than cutting through it.
     pub const BLOCK: f32 = 28.0;
 
     /// The snarl style's grid for these settings, `None` when it does nothing.

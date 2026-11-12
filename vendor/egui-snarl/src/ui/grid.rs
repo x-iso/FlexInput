@@ -126,24 +126,43 @@ impl GridLayout {
 }
 
 /// Draws the grid across `viewport` in its style, a screen pixel thin and faint enough to
-/// stay behind the wires, with every `accent_every`th line a little brighter. Fades out
-/// as zooming out packs the blocks too close together to be any help.
+/// stay behind the wires, with every `accent_every`th line a little brighter. Zooming out
+/// past the point where blocks are tellable apart steps it to every second, fourth, eighth
+/// block rather than dropping out.
 pub fn draw_grid(grid: &GridLayout, painter: &Painter, viewport: &Rect, scale: f32, color: Color32) {
     let b = grid.block.max(1.0);
-    let on_screen = b * scale;
     // Crosses, a pair of strokes per block corner, go sooner than lines.
     let fade_from = if grid.style == GridStyle::Crosses { 14.0 } else { 8.0 };
-    let fade = ((on_screen - fade_from) / 16.0).clamp(0.0, 1.0);
+    // Zooming out used to drop the grid entirely once the blocks crowded. It doesn't: past the
+    // point where blocks are too close to tell apart, the same lines are drawn every second,
+    // fourth, eighth block instead, and they stay at a floor of brightness rather than fading
+    // to nothing. A canvas with no grid at all loses the one thing the grid is for at that
+    // zoom - saying how big a module is - and the stepped grid still says it.
+    let mut step = 1i64;
+    while b * scale * (step as f32) < fade_from && step < 128 {
+        step *= 2;
+    }
+    let unit = b * step as f32;
+    let fade = if step == 1 {
+        ((b * scale - fade_from) / 16.0).clamp(0.0, 1.0)
+    } else {
+        // The stepped grid is a ruler, not a texture: dim, but there.
+        ((unit * scale - fade_from) / 16.0).clamp(0.3, 1.0)
+    };
     if fade <= 0.0 {
         return;
     }
-    let (x0, x1) = ((viewport.min.x / b).floor() as i64, (viewport.max.x / b).ceil() as i64);
-    let (y0, y1) = ((viewport.min.y / b).floor() as i64, (viewport.max.y / b).ceil() as i64);
+    let (x0, x1) = ((viewport.min.x / unit).floor() as i64, (viewport.max.x / unit).ceil() as i64);
+    let (y0, y1) = ((viewport.min.y / unit).floor() as i64, (viewport.max.y / unit).ceil() as i64);
     if x1 - x0 > 1000 || y1 - y0 > 1000 {
         return;
     }
     let px = 1.0 / scale.max(0.01);
-    let accent = |k: i64| grid.accent_every > 1 && k.rem_euclid(i64::from(grid.accent_every)) == 0;
+    // The accent counts blocks, not drawn lines: a stepped grid still brightens the same
+    // positions it would have at full zoom.
+    let accent = |k: i64| {
+        grid.accent_every > 1 && (k * step).rem_euclid(i64::from(grid.accent_every)) == 0
+    };
     let bright = grid.brightness.max(0.0);
     let minor = Stroke::new(px, color.gamma_multiply((0.045 * bright).min(1.0) * fade));
     let major = Stroke::new(px, color.gamma_multiply((0.11 * bright).min(1.0) * fade));
@@ -159,22 +178,22 @@ pub fn draw_grid(grid: &GridLayout, painter: &Painter, viewport: &Rect, scale: f
                 }
             };
             for x in x0..=x1 {
-                let xf = x as f32 * b;
+                let xf = x as f32 * unit;
                 line(pos2(xf, viewport.min.y), pos2(xf, viewport.max.y), stroke(x));
             }
             for y in y0..=y1 {
-                let yf = y as f32 * b;
+                let yf = y as f32 * unit;
                 line(pos2(viewport.min.x, yf), pos2(viewport.max.x, yf), stroke(y));
             }
         }
         GridStyle::Crosses => {
             // Crosses are seen more than lines, so they take a little more of the color.
-            let arm = (4.0 * px).min(b * 0.2);
+            let arm = (4.0 * px).min(unit * 0.2);
             for x in x0..=x1 {
                 for y in y0..=y1 {
                     let s = if accent(x) && accent(y) { major } else { minor };
                     let s = Stroke::new(s.width, s.color.gamma_multiply(2.0));
-                    let c = pos2(x as f32 * b, y as f32 * b);
+                    let c = pos2(x as f32 * unit, y as f32 * unit);
                     painter.line_segment([c - vec2(arm, 0.0), c + vec2(arm, 0.0)], s);
                     painter.line_segment([c - vec2(0.0, arm), c + vec2(0.0, arm)], s);
                 }
@@ -182,6 +201,7 @@ pub fn draw_grid(grid: &GridLayout, painter: &Painter, viewport: &Rect, scale: f
         }
     }
 }
+
 
 /// A snapped drag in progress: where the dragged nodes started and how far the pointer
 /// has gone since, so each frame's snap starts from the unsnapped spot.
