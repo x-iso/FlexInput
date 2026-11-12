@@ -665,6 +665,9 @@ struct OptionDrag {
     held: usize,
     current: usize,
     acc: f32,
+    /// How far the finger has gone since the row was picked up, unstepped: what the
+    /// row under it follows, so the move is visible while it is happening.
+    lift: f32,
     active: bool,
 }
 
@@ -813,7 +816,31 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
     let alt = ui.input(|i| i.modifiers.alt);
     let drag_key = egui::Id::new(("fxi_dropdown_drag", node_id.0));
     let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
-    let mut drag_seen = false;
+
+    // A row that is picked up follows the finger, and the rows the gap has travelled
+    // through step a pitch aside: the language the port strips use, so a row you grab
+    // behaves like a pin you grab. The lifts read the state as it stood coming into this
+    // frame, which is what makes the slide continuous instead of a jump at each crossing.
+    let pitch = PILL_H + ROW;
+    let lifts: Vec<f32> = if drag.active {
+        (0..options.len())
+            .map(|i| {
+                if i == drag.held {
+                    let lo = -(pitch * drag.held as f32);
+                    let hi = pitch * (options.len() as f32 - 1.0 - drag.held as f32);
+                    drag.lift.clamp(lo, hi)
+                } else if drag.held < drag.current && i > drag.held && i <= drag.current {
+                    -pitch
+                } else if drag.held > drag.current && i < drag.held && i >= drag.current {
+                    pitch
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    } else {
+        vec![0.0; options.len()]
+    };
 
     for i in 0..options.len() {
         let mut row_remove = false;
@@ -821,7 +848,7 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         let mut row_from = i;
         let mut commit_edit: Option<String> = None;
         let mut cancel_edit = false;
-        let row = row_rect(i + 1);
+        let row = row_rect(i + 1).translate(egui::vec2(0.0, lifts[i]));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(row)
@@ -838,36 +865,26 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
             child.painter().rect_filled(row, 4.0, egui::ecolor::tint_color_towards(bg, super::pins::CHOICE_GREEN));
             trace_rect(ui, node_id, "dropdown_effective", row);
         }
-        // Drag handle: the same grab the port strips and the Auto-Map lists give. Dragging
-        // past half a row moves the option, and the selection follows the option, not the slot.
+        // The dots say that a row can be picked up. They are a grab in their own right, and
+        // so is the option's name beside them - that is where a finger lands, and making it
+        // the only place a drag could start is what made a reorder feel like it fought the
+        // list's own selection.
         let handle = child.add_sized(
             [HANDLE_W, PILL_H],
             egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
         );
-        if handle.dragged() {
-            drag_seen = true;
-            if !drag.active || drag.held != i {
-                drag = OptionDrag { held: i, current: i, acc: 0.0, active: true };
-            }
-            // Accumulate in egui memory so a slow drag still crosses the threshold instead of
-            // stalling on per-frame sub-pixel deltas.
-            drag.acc += handle.drag_delta().y;
-            // Round rather than truncate: the comment promises a move once the drag has
-            // crossed half a row, and a truncated quotient only moves after a whole one -
-            // which also loses the last fraction of a sub-pixel-per-step pointer move.
-            let steps = (drag.acc / (PILL_H + ROW)).round() as isize;
-            if steps != 0 {
-                // Counted from where the option stands now, which is no longer the row the
-                // finger grabbed it on once it has been moved: the row ids are fixed, so a
-                // second step measured from that row would bounce it back where it started.
-                row_from = drag.current;
-                row_move = steps;
-                let target = (drag.current as isize + steps).clamp(0, options.len() as isize - 1) as usize;
-                drag.current = target;
-                drag.acc -= steps as f32 * (PILL_H + ROW);
-            }
+        handle.clone().on_hover_cursor(egui::CursorIcon::Grab);
+        handle.clone().on_hover_text("Drag to reorder");
+        if drag.active && drag.held == i {
+            // The row travelling under the finger sits above the ones it has passed. Painted
+            // before the row's own parts, so it is a floor rather than a cover.
+            let lifted = egui::ecolor::tint_color_towards(
+                ui.visuals().widgets.inactive.weak_bg_fill,
+                ui.visuals().strong_text_color(),
+            );
+            child.painter().rect_filled(row, 4.0, lifted);
         }
-        handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+        let mut name: Option<egui::Response> = None;
         child.add_space(ROW);
         let is_editing = edit_state.editing == Some(i);
         if is_editing {
@@ -899,18 +916,23 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                 } else {
                     ui.visuals().text_color()
                 }))
-                    .truncate()
-                    .sense(egui::Sense::click()),
+                .truncate()
+                .sense(egui::Sense::click_and_drag()),
             );
-            label.clone().on_hover_text(&options[i]);
+            name = Some(label.clone());
+            label.clone().on_hover_cursor(egui::CursorIcon::Grab);
+            label.clone().on_hover_text(format!(
+                "{} - click to choose, drag to reorder, double-click to rename",
+                options[i],
+            ));
 
-            // Double-click OR Alt-click → enter edit mode.
+            // Double-click OR Alt-click -> enter edit mode.
             if label.double_clicked() || (alt && label.clicked()) {
                 edit_state.editing = Some(i);
                 edit_state.buf = options[i].clone();
                 edit_state.request_focus = true;
             }
-            // Single click (no Alt) → choose this entry, undoing the shift pin's step so the
+            // Single click (no Alt) -> choose this entry, undoing the shift pin's step so the
             // option clicked is the option that comes out.
             if label.clicked() && !alt && !label.double_clicked() {
                 new_selected = wrap(i as i64 - shift);
@@ -939,6 +961,46 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                     ui.close();
                 }
             });
+        }
+        // The grab: the handle or the option's name, since a finger lands on the word rather
+        // than on the column of dots beside it. A click stays a click - egui stops reporting
+        // one once the pointer has travelled - which is what stops a reorder from also
+        // choosing the option it moved.
+        let grabbed = handle.dragged() || name.as_ref().is_some_and(|n| n.dragged());
+        if grabbed {
+            if !drag.active || drag.held != i {
+                drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
+            }
+            // The distance comes from the pointer rather than from the widget: a frame in
+            // which something else claims the pointer would otherwise drop what has been
+            // carried so far, and a drag then lands wherever the last live frame left it.
+            let raw = ui.input(|i| i.pointer.delta()).y;
+            let d = if grabbed {
+                name
+                    .as_ref()
+                    .filter(|n| n.dragged())
+                    .map_or_else(|| handle.drag_delta().y, |n| n.drag_delta().y)
+            } else {
+                raw
+            };
+            // Accumulate in egui memory so a slow drag still crosses the threshold instead of
+            // stalling on per-frame sub-pixel deltas, and keep the unstepped distance so the
+            // row follows the finger.
+            drag.acc += d;
+            drag.lift += d;
+            // Round rather than truncate: a move is promised once the drag has crossed half
+            // a row, and a truncated quotient only moves after a whole one.
+            let steps = (drag.acc / pitch).round() as isize;
+            if steps != 0 {
+                // Counted from where the option stands now, which is no longer the row the
+                // finger grabbed it on once it has been moved: the row ids are fixed, so a
+                // second step measured from that row would bounce it back where it started.
+                row_from = drag.current;
+                row_move = steps;
+                let target = (drag.current as isize + steps).clamp(0, options.len() as isize - 1) as usize;
+                drag.current = target;
+                drag.acc -= steps as f32 * pitch;
+            }
         }
         child.add_space(ROW);
         if child.small_button("×").clicked() {
@@ -1004,9 +1066,12 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         }
     }
 
-    // Let go, or delete a row while holding one, and the drag is over: the next press starts a
+    // A drag is over when the finger leaves, not when a frame happens to report the row as
+    // no longer dragged: egui hands the pointer to whatever is under it, and dropping the
+    // state then loses the distance already carried, which is what made a reorder feel like
+    // it had a mind of its own.
     // fresh one at whatever row it lands on.
-    if drag_seen && drag.active && to_remove.is_none() {
+    if drag.active && ui.input(|i| i.pointer.any_down()) {
         ui.ctx().data_mut(|d| d.insert_temp(drag_key, drag));
     } else {
         ui.ctx().data_mut(|d| d.remove_temp::<OptionDrag>(drag_key));
@@ -2373,8 +2438,31 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     let mut drag_seen = false;
 
     let n_ports = ports.len();
+    // A port picked up follows the finger, and the ports the gap has travelled through step
+    // a row aside: the language the Split and Selector strips use, so a port you grab
+    // behaves like a pin you grab. The lifts read the drag as it stood coming into this
+    // frame, which is what makes the slide continuous rather than a jump at each crossing.
+    let lifts: Vec<f32> = if drag.active {
+        (0..ports.len())
+            .map(|i| {
+                if i == drag.held {
+                    let lo = -(row_h * drag.held as f32);
+                    let hi = row_h * (ports.len() as f32 - 1.0 - drag.held as f32);
+                    drag.lift.clamp(lo, hi)
+                } else if drag.held < drag.current && i > drag.held && i <= drag.current {
+                    -row_h
+                } else if drag.held > drag.current && i < drag.held && i >= drag.current {
+                    row_h
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    } else {
+        vec![0.0; ports.len()]
+    };
     for (i, port) in ports.iter_mut().enumerate() {
-        let row = row_rect(i);
+        let row = row_rect(i).translate(egui::vec2(0.0, lifts[i]));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(row)
@@ -2385,6 +2473,17 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         // The handle: dragging a port past half a row moves it, counted from where the port
         // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
         // it back. The pins and their wires move with it further down.
+        if drag.active && drag.held == i {
+            // The port travelling under the finger sits above the ones it has passed, so the
+            // gap opening in the list is visible where it is rather than only at the end.
+            let lifted = egui::ecolor::tint_color_towards(
+                ui.visuals().widgets.inactive.weak_bg_fill,
+                ui.visuals().strong_text_color(),
+            );
+            child.painter().rect_filled(row, 4.0, lifted);
+        }
+        // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
+        // it back. The pins and their wires move with it further down.
         let handle = child.add_sized(
             [HANDLE_W, row_h],
             egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
@@ -2392,9 +2491,11 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         if handle.dragged() {
             drag_seen = true;
             if !drag.active || drag.held != i {
-                drag = OptionDrag { held: i, current: i, acc: 0.0, active: true };
+                drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
             }
-            drag.acc += handle.drag_delta().y;
+            let d = handle.drag_delta().y;
+            drag.acc += d;
+            drag.lift += d;
             let steps = (drag.acc / row_h).round() as isize;
             if steps != 0 {
                 moved = Some((drag.current, steps));

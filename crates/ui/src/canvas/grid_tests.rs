@@ -3046,7 +3046,7 @@ fn the_envelope_spends_the_width_it_is_given_on_its_length() {
             rig.traced_rect(node, "env_time_pill").unwrap_or(egui::Rect::NOTHING),
         )
     };
-    let (frame, small) = pill_at(&mut rig, 10.0 * B);
+    let _ = pill_at(&mut rig, 10.0 * B);
     // What the pill promises: it runs to the end of its row, so whatever width the module was
     // given lands on the number being read rather than on the two-letter unit buttons beside
     // it, and it is the wider half of the row. Where the row itself ends up between band
@@ -3071,4 +3071,43 @@ fn the_envelope_spends_the_width_it_is_given_on_its_length() {
             "the length pill {pill:?} left {frame:?}",
         );
     }
+}
+
+#[test]
+fn a_dropdown_row_can_be_reordered_from_its_name_not_only_the_dots() {
+    // The dots at the row's end were the only place a reorder could start, so a finger that
+    // landed on the word - where a finger lands - moved nothing and read as the list ignoring
+    // it, while the same gesture near the dots did the move. The name is a grab too, and a
+    // drag along it is not also a click: an option it passes is not chosen on the way.
+    let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    let row = |rig: &Rig, i: usize| -> egui::Rect {
+        rig.traced_rect(node, &format!("dropdown_row_{i}")).unwrap_or(egui::Rect::NOTHING)
+    };
+    let (top, second) = (row(&rig, 0), row(&rig, 1));
+    assert!(top.is_positive() && second.is_positive(), "the list drew no rows: {top:?} {second:?}");
+    let pitch = second.top() - top.top();
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(
+            "options".into(),
+            serde_json::json!(["Alpha", "Beta", "Gamma"]),
+        );
+    }
+    rig.idle(4);
+    rig.drag(top.center(), egui::vec2(0.0, 2.0 * pitch));
+    let options: Vec<String> = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("options").and_then(|v| v.as_array().cloned()))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        &options[..],
+        &["Beta".to_string(), "Gamma".to_string(), "Alpha".to_string()],
+        "the drag did not land the grabbed option where it was dragged to: {options:?}",
+    );
 }

@@ -451,6 +451,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   dot, the way the Response Curve's points do, and hovering one gives the level and where
   along the envelope's length it falls, in the unit the module is timed in. Until now the
   graph was the only place any of that was written, and it wrote none of it.
+- **Reordering a Dropdown menu or a Macro Output fought the list.** The dots at a row's end
+  were the only place a drag could start, so the same gesture on the word beside them - where a
+  finger actually lands - did nothing at all. The row being dragged now comes with the finger
+  and the rows it passes step aside a row, the way the Split and Selector strips do; the
+  distance travelled is carried while the button is down rather than only while egui still
+  reports that row as dragged, which is what made a long drag land somewhere other than where
+  it was picked up; and a drag is never also a click, so passing an option no longer chooses it.
 
 ### Fixed
 
