@@ -157,8 +157,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   fit between those: a long number in a Constant now costs a 140-point width instead of
   jumping to 168, and a sixth input on an Add takes a fifth block rather than a third. The
   grid looks the same as it did - the brighter line now falls on every second block, where
-  the old block used to be, so the 28-point lines read as subdivisions of it (a patch saved
-  with the old setting keeps its "brighter every 8"; the canvas grid menu changes it).
+  the old block used to be, so the 28-point lines read as subdivisions of it. A setting saved
+  before this keeps its number, which now counts the smaller blocks - "brighter every 8"
+  brightens twice as many lines as it used to; the canvas grid menu sets it again.)
 - **Six modules came down to two blocks square: Switch, Knob, Inverse, Logic Delay, Has
   Changed and Vec to Deflection.** They were two, three, five and six blocks wide, and in
   every case the extra was a label rather than a control: rows that spelled out "Delay",
