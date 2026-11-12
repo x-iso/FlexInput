@@ -189,6 +189,13 @@ module and change it.
   asserts, along with inputs filling those four blocks up to five and the sixth taking a
   fifth block (140: at the old grid there was nothing between 112 and 168 to land on),
   then handing it back.
+- **A count of pins a module *has* goes in the header, not in a body row.** The per-channel
+  filters — Delay, Average, DC Filter — take a matched In/Out pair per channel, and the `− n +`
+  for them is drawn in the header by the same `kit::header_stepper` (`kit::channel_range` says
+  which modules and what range). It used to be a "Channels" row across the body, which made the
+  body wide enough for a label, a count and two buttons so that the module's *settings* rows
+  could be wider still: the count of channels was the reason a Delay with one number in it was
+  252 points across.
 - **A mark body has to say its height.** Bodies that paint a symbol and a couple of pills
   — the operations, gates, Switch, Sample and Hold, Inverse, Has Changed, Quantize, Vec to
   Deflection (`kit::mark_body`) — reserve nothing of their own, so their height came from
@@ -351,14 +358,20 @@ rect is what `register_exposable_element` takes.
 | ---- | ----- |
 | `k.row(ui, label, \|ui, rest\| …)` | Label cell, then your own content in the `rest` of the width |
 | `k.full_row(ui, \|ui, w\| …)` | A row with no label cell |
-| `k.slider(ui, label, &mut v, range, log, \|v\| DragValue…)` | Label, slider rail, value box |
 | `k.value(ui, label, &mut v, \|v\| DragValue…)` | Label, value box on the right edge |
 | `k.pair(ui, label, (caption, &mut a, enabled), (caption, &mut b, enabled), \|v\| DragValue…)` | Label, two captioned value boxes (Min / Max) |
 | `k.choice(ui, Some(label) or None, &mut value, &[(value, text, hover)])` | Label, option strip |
 | `kit::strip(ui, width, &mut value, options)` | The option strip alone, for inside `k.row` |
-| `k.stepper(ui, label, count, range, (minus_hover, plus_hover))` | Label, `− n +`; returns `Some(-1)` / `Some(1)` |
 | `k.section(ui, title)` | Caption and hairline |
 | `k.note(ui, text)` | Small weak text, wrapped to the body |
+
+`k.slider` and the in-body `k.stepper` are gone. A label cell plus a rail plus a value box
+costs 174 points of body for one number, and Delay, Average and DC Filter each carried two of
+those rows and a "Channels" row on top — 252 points of module for settings a pill says in seven
+characters. Their settings are pills now, and a channel (always a matched In/Out pair) is
+added from the header, so the row builders they used have no caller left. Putting a stepper in
+a body row is how a module ends up wide for a number that belongs at the top anyway: a count
+of something the module *has pins for* goes in the header, beside the name.
 
 ## Converting a body
 

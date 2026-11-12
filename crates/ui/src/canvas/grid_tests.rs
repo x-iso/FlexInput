@@ -343,7 +343,7 @@ fn kit_modules_settle_on_one_width() {
 
 #[test]
 fn a_kit_module_takes_the_width_its_grip_asks_for() {
-    let (mut rig, ids) = Rig::with("module.delay", &[egui::pos2(100.0, 300.0)]);
+    let (mut rig, ids) = Rig::with("logic.counter", &[egui::pos2(100.0, 300.0)]);
     let before = rig.frame_rect(ids[0]).width();
     let wider = before + 3.0 * MAJOR;
     rig.canvas.snarl.get_node_mut(ids[0]).unwrap().params
@@ -1674,6 +1674,92 @@ fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
 }
 
 #[test]
+#[ignore]
+fn measure_every_module_size() {
+    // A census, not a claim: what each module's body actually asks for (`no-snap`) next to
+    // the size the grid gives it, and its pin count. The gap between the two is what a body
+    // redesign is buying, so this says which bodies are still too big for what they hold.
+    let mut rows: Vec<(f32, String, f32, f32, f32, f32, usize, usize)> = Vec::new();
+    for r in flexinput_modules::all_modules() {
+        let desc = r.descriptor;
+        let (mut rig, ids) = Rig::build(desc.clone(), &[egui::pos2(100.0, 300.0)]);
+        rig.idle(10);
+        let f = rig.frame_rect(ids[0]);
+        let (mut rig2, ids2) = Rig::build(desc, &[egui::pos2(100.0, 300.0)]);
+        rig2.grid.snap = false;
+        rig2.idle(10);
+        let c = rig2.frame_rect(ids2[0]);
+        let n = rig.canvas.snarl.get_node(ids[0]).unwrap();
+        rows.push((
+            c.width() * c.height(),
+            n.module_id.clone(),
+            c.width(),
+            c.height(),
+            f.width(),
+            f.height(),
+            n.inputs.len(),
+            n.outputs.len(),
+        ));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("{:<32} {:>10} {:>10} {:>8}", "module", "content", "grid", "in/out");
+    for r in &rows {
+        println!("{:<32} {:>4.0}x{:<4.0} {:>4.0}x{:<4.0}  {:>2}/{}", r.1, r.2, r.3, r.4, r.5, r.6, r.7);
+    }
+    println!("{} modules, total content area {:.0}", rows.len(), rows.iter().map(|r| r.0).sum::<f32>());
+}
+
+#[test]
+fn the_per_channel_filters_are_pills_with_their_channels_in_the_header() {
+    // Delay, Average and DC Filter were a label, a slider rail and a value box per setting,
+    // plus a "Channels" row: 252 points of module to hold one or two numbers. The settings are
+    // pills now, centred on the module, and a channel - always a matched In/Out pair - is
+    // added from the header the way the variadic operations' pins are.
+    for (module, salts) in [
+        ("module.delay", ["delay_ms"].as_slice()),
+        ("module.average", ["samples", "spike_mad"].as_slice()),
+        ("module.dc_filter", ["window_ms", "decay_ms"].as_slice()),
+    ] {
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        rig.idle(8);
+        let f = rig.frame_rect(node);
+        assert!(
+            whole_blocks(f.width()) && whole_blocks(f.height()),
+            "{module}: {f:?} off the grid",
+        );
+        assert!(
+            f.width() <= 5.0 * B,
+            "{module}: {f:?} is still as wide as the label rows it used to be",
+        );
+        assert!(
+            f.height() >= 4.0 * B,
+            "{module}: {f:?} is shallower than the other small modules",
+        );
+        for s in salts {
+            let r = rig.traced(node, &format!("{s}_pill"));
+            assert!(
+                r.is_positive() && f.contains_rect(r.shrink(-0.5)),
+                "{module}: the {s} pill {r:?} isn't inside {f:?}",
+            );
+            assert!(
+                (r.center().x - f.center().x).abs() < 1.0,
+                "{module}: the {s} pill {r:?} isn't on the module's centre line ({f:?})",
+            );
+        }
+        let before = rig.frame_rect(node);
+        let h = rig.ctx.style().spacing.interact_size.y;
+        rig.click(egui::pos2(before.right() - 6.0 - h * 0.5, before.top() + 4.0 + h * 0.5));
+        rig.idle(6);
+        let n = rig.canvas.snarl.get_node(node).unwrap();
+        assert_eq!(n.inputs.len(), 2, "{module}: the header's + didn't add a channel");
+        assert_eq!(n.outputs.len(), 2, "{module}: the channel's output pin is missing");
+        assert_eq!(n.inputs[1].name, "In 2", "{module}: the new channel isn't named like its neighbour");
+        assert_eq!(n.outputs[1].name, "Out 2", "{module}: the new output isn't named like its neighbour");
+    }
+}
+
+#[test]
 fn a_long_port_list_still_lands_on_the_grid_and_stays_readable() {
     // Nine ports is the case where a column of strips runs out of the module: the frame has to
     // keep growing a block per port, the empty band under the last strip has to stay the same
@@ -1938,8 +2024,9 @@ fn a_title_does_not_hold_a_module_wide() {
     let group = rig.traced(node, "delay_group");
     assert!(f.contains_rect(group.expand(-1.0)), "the controls {group:?} don't fit {f:?}");
     // A module the user *can* widen - one with a corner grip - still takes the width it's
-    // asked for, name or no name.
-    let (mut rig, ids) = Rig::real("module.delay", &[egui::pos2(100.0, 300.0)]);
+    // asked for, name or no name. The Counter is the one that still lays its settings out in
+    // kit rows; the per-channel filters are pills now and size themselves.
+    let (mut rig, ids) = Rig::real("logic.counter", &[egui::pos2(100.0, 300.0)]);
     if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
         n.display_name = "Wait until the signal has settled before letting go".to_string();
     }

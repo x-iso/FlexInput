@@ -97,14 +97,24 @@ pub(crate) fn mark_body(module_id: &str) -> bool {
 /// A module whose body allocates nothing — Quantize, Inverse, Logic Delay, Has Changed,
 /// Sample and Hold, Vec to Deflection: a mark and pills painted across the frame — isn't in
 /// it: there is no row layout to give room, so a grip would drag a handle that does nothing.
+/// The modules whose body is a stack of labelled kit rows, and so needs a width the rows
+/// can lay out in: they take the corner grip and a floor the rows work out. The per-channel
+/// filters used to be here; their rows were two sliders and a channel count, and the labels
+/// on them were the whole reason a Delay was 252 points wide for one number. They are pills
+/// now, sized by a constant box like the other small bodies, so they size themselves.
 pub(crate) fn uses_kit(module_id: &str) -> bool {
-    matches!(
-        module_id,
-        "module.delay"
-            | "module.average"
-            | "module.dc_filter"
-            | "logic.counter"
-    )
+    matches!(module_id, "logic.counter")
+}
+
+/// The modules whose channels are their content: a matched In/Out pin pair each, added and
+/// dropped by the `− +` at the right of their header (see `show_header`) rather than a row
+/// across the body. The range is what `channels_row` allowed when the stepper lived in the
+/// body; the names it gives the pins are unchanged, since a patch stores them.
+pub(crate) fn channel_range(module_id: &str) -> Option<std::ops::RangeInclusive<usize>> {
+    match module_id {
+        "module.delay" | "module.average" | "module.dc_filter" => Some(1..=64),
+        _ => None,
+    }
 }
 
 /// The modules small enough that a block of width matters. Their pins are drawn in short
@@ -144,6 +154,9 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
             | "module.vec_to_axis"
             | "module.axis_to_vec"
             | "module.vec_to_deflection"
+            | "module.delay"
+            | "module.average"
+            | "module.dc_filter"
     )
 }
 
@@ -152,7 +165,10 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
 /// in or out, so the number is everything the label adds. The kit's common words have
 /// fixed short forms; anything else longer than four letters loses its tail.
 pub(crate) fn pin_short(name: &str) -> (String, bool) {
-    if let Some((base, index)) = name.split_once('_') {
+    // A numbered generic pin, in either of the two ways the app writes it: `in_2` from the
+    // steppers, `In 2` from the per-channel filters that add a matched pair. The column it
+    // sits in already says in or out, so the number is everything the label adds.
+    if let Some((base, index)) = name.split_once(['_', ' ']) {
         let digits = !index.is_empty() && index.chars().all(|c| c.is_ascii_digit());
         if digits && matches!(base, "in" | "out") {
             return (index.to_string(), true);
@@ -359,30 +375,6 @@ impl Kit {
         ui.add_sized([VALUE_W, row_h(ui)], drag)
     }
 
-    /// Label, a slider rail across the row, and the value's box on the right
-    /// edge. `drag` builds the box's `DragValue` (speed, range, suffix…).
-    /// `log` spaces the rail logarithmically, for times and other values whose
-    /// small settings matter as much as their large ones.
-    pub(crate) fn slider(
-        self,
-        ui: &mut egui::Ui,
-        label: &str,
-        value: &mut f32,
-        range: RangeInclusive<f32>,
-        log: bool,
-        drag: impl FnOnce(&mut f32) -> egui::DragValue<'_>,
-    ) -> (bool, egui::Rect) {
-        self.row(ui, label, |ui, rest| {
-            let rail = (rest - GAP - VALUE_W).max(MIN_FLEX);
-            ui.spacing_mut().slider_width = rail;
-            let slider = egui::Slider::new(value, range).show_value(false).logarithmic(log);
-            let mut changed = ui.add(slider).changed();
-            ui.add_space(GAP);
-            changed |= ui.add_sized([VALUE_W, row_h(ui)], drag(value)).changed();
-            changed
-        })
-    }
-
     /// Label and the value's box on the right edge, for values with no useful
     /// range to slide across.
     pub(crate) fn value(
@@ -436,42 +428,6 @@ impl Kit {
             Some(label) => self.row(ui, label, |ui, w| strip(ui, w, value, options)),
             None => self.full_row(ui, |ui, w| strip(ui, w, value, options)),
         }
-    }
-
-    /// Label, then − count + at the right edge. Returns the step taken.
-    pub(crate) fn stepper(
-        self,
-        ui: &mut egui::Ui,
-        label: &str,
-        count: usize,
-        range: RangeInclusive<usize>,
-        hover: (&str, &str),
-    ) -> (Option<isize>, egui::Rect) {
-        self.row(ui, label, |ui, rest| {
-            let h = row_h(ui);
-            let count_w = (VALUE_W - 2.0 * (h + GAP)).max(h);
-            ui.add_space((rest - (2.0 * (h + GAP) + count_w)).max(0.0));
-            let mut step = None;
-            let minus = ui.add_enabled(count > *range.start(), egui::Button::new("−").min_size(egui::vec2(h, h)));
-            if minus.on_hover_text(hover.0).clicked() {
-                step = Some(-1);
-            }
-            ui.add_space(GAP);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(count_w, h), egui::Sense::hover());
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                count.to_string(),
-                egui::TextStyle::Body.resolve(ui.style()),
-                ui.visuals().text_color(),
-            );
-            ui.add_space(GAP);
-            let plus = ui.add_enabled(count < *range.end(), egui::Button::new("+").min_size(egui::vec2(h, h)));
-            if plus.on_hover_text(hover.1).clicked() {
-                step = Some(1);
-            }
-            step
-        })
     }
 
     /// A section caption: small text followed by a hairline to the right edge.
@@ -742,6 +698,9 @@ pub(crate) const MARKS: &[(&str, &str, &str)] = &[
     // block their pins don't need.
     ("module.vec_to_deflection", "Vec to Deflection", "∠"),
     ("logic.has_changed", "Has Changed", "Δ"),
+    // Two letters: this module's header also carries the `− +` for its channels, and "DC
+    // Filter" beside it is the one thing that would make it a block wider than its siblings.
+    ("module.dc_filter", "DC Filter", "DC"),
 ];
 
 /// The mark a node's header shows, or none: a module known by a symbol, still under

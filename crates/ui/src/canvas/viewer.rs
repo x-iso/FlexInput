@@ -242,7 +242,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         &mut self,
         node: NodeId,
         inputs: &[egui_snarl::InPin],
-        _outputs: &[egui_snarl::OutPin],
+        outputs: &[egui_snarl::OutPin],
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
@@ -351,6 +351,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // `+` at the header's right edge. Dropping one is the `×` on its own strip.
         let port_noun = snarl.get_node(node).and_then(|n| kit::header_plus(&n.module_id));
         let port_module = snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
+        // A per-channel filter (Delay, Average, DC Filter): its channels are a matched
+        // In/Out pair each, and the `− +` for them sits in this header rather than in a row
+        // across the body - a "Channels" row with a stepper in it was costing these modules
+        // 174 points of width to hold one number.
+        let channel_count = snarl
+            .get_node(node)
+            .and_then(|n| kit::channel_range(&n.module_id).map(|range| (n.inputs.len(), range)));
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -525,6 +532,41 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         }
                         Some(-1) if n > fewest => {
                             remove_input_pin(node, n - 1, inputs, snarl);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // The channels of a per-channel filter: same stepper, same place, one step
+                // adds or drops the pair of pins together so the two columns never fall out
+                // of step. The names are the ones the body's stepper used to give them,
+                // because a saved patch holds them.
+                if let Some((n, range)) = channel_count {
+                    let (fewest, most) = (*range.start(), *range.end());
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(kit::stepper_w(ui), kit::stepper_h(ui)),
+                        egui::Sense::hover(),
+                    );
+                    let right = ui.max_rect().right();
+                    let step = kit::header_stepper(
+                        ui,
+                        n,
+                        fewest..=most,
+                        ("Remove the last channel", "Add a channel"),
+                        row,
+                        right,
+                    );
+                    match step {
+                        Some(1) => {
+                            if let Some(node) = snarl.get_node_mut(node) {
+                                let next = node.inputs.len() + 1;
+                                node.inputs.push(PinDescriptor::new(format!("In {next}"), SignalType::Float));
+                                node.outputs.push(PinDescriptor::new(format!("Out {next}"), SignalType::Float));
+                            }
+                        }
+                        Some(-1) if n > fewest => {
+                            remove_input_pin(node, n - 1, inputs, snarl);
+                            remove_output_pin(node, n - 1, outputs, snarl);
                         }
                         _ => {}
                     }
@@ -960,7 +1002,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             if is_midi_in {
                 // Its width (next frame) right-aligns the Auto-Map label above,
                 // which otherwise only knows the body's width.
-                let w = ui.scope(|ui| show_midi_in_header_controls(node, _outputs, ui, snarl))
+                let w = ui.scope(|ui| show_midi_in_header_controls(node, outputs, ui, snarl))
                     .response.rect.width();
                 ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
             }
@@ -1224,7 +1266,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // MIDI In's message controls. Its width joins the rows' for the
             // Auto-Map label's alignment.
             if is_device_source && is_raw_pad_node("device.source", dev_id_str) {
-                let w = ui.scope(|ui| show_raw_pad_header_controls(node, _outputs, ui, snarl, self.live_signals))
+                let w = ui.scope(|ui| show_raw_pad_header_controls(node, outputs, ui, snarl, self.live_signals))
                     .response.rect.width();
                 let w = rows_w.map_or(w, |r| r.max(w));
                 ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
@@ -1645,9 +1687,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
             "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "processing.rws"   => show_rws_body(node_id, ui, snarl),
-            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, kit_w),
-            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, kit_w),
-            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, kit_w),
+            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
+            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
+            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
             "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl, self.view_salt),
             "module.response_curve" => {
                 if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {

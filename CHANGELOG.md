@@ -140,6 +140,13 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Delay, Average and DC Filter are pills now.** Each one was a label, a slider rail and a
+  value box per setting, with a "Channels" row across the body on top: 252 points of module to
+  hold one or two numbers, of which most was the words beside them. The settings are pills you
+  drag across or double-click to type into (`100 ms`, `win 5 ms`, `spk 3.0`), centred on the
+  module, and a channel - always an In and its matching Out - is added from the header's `− +`
+  the way the variadic operations add a pin. All three sit at 140 by 112 points, and DC Filter
+  wears "DC" in its header so its name isn't the fourth thing deciding the width.
 - **Dragging a Combiner's row now shows where it will land.** The row under the finger dims
   as if lifted out of the list, and a line is drawn along the edge of the row it would
   displace. The port strips move their neighbours out of the way as you drag, but these rows

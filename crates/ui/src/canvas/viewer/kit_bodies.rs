@@ -2,7 +2,7 @@
 //! onto the shared layout. Each keeps the pinnable element ids (and rects) it
 //! had, so pins made before keep working.
 
-use super::kit::{self, Kit};
+use super::kit;
 use super::*;
 
 fn param_f32(snarl: &Snarl<NodeData>, node_id: NodeId, key: &str, default: f32) -> f32 {
@@ -58,115 +58,183 @@ pub(crate) fn kit_min_width(module_id: &str) -> f32 {
     }
 }
 
-/// The Channels row the per-channel filters share: − count + adds or drops an
-/// In/Out pin pair at the end.
-fn channels_row(
+/// The pill group the small bodies share: a **constant box** reserved in the flow, and the
+/// middle of it. Reserving a constant - not what the text happens to measure - is what keeps
+/// a body from feeding its own width back into the frame, and it is the only way a module
+/// gets to be narrower than a stack of label rows: the labels were the width, not the
+/// controls. The pills are painted against the module's centre line rather than the column's,
+/// because the pin columns are different widths (`In` one letter, `Out` three).
+///
+/// Returns nothing on the module's first frame, before the canvas has a frame to centre on;
+/// the box is still reserved, so the size is right as soon as the controls are drawn.
+fn pill_group(
     ui: &mut egui::Ui,
-    k: Kit,
     node_id: NodeId,
-    inputs: &[InPin],
-    outputs: &[OutPin],
-    snarl: &mut Snarl<NodeData>,
-) {
-    let n = snarl.get_node(node_id).map_or(1, |n| n.inputs.len()).max(1);
-    let (step, _) = k.stepper(ui, "Channels", n, 1..=64, ("Remove the last channel", "Add a channel"));
-    match step {
-        Some(1) => {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len() + 1;
-                node.inputs.push(PinDescriptor::new(format!("In {next}"), SignalType::Float));
-                node.outputs.push(PinDescriptor::new(format!("Out {next}"), SignalType::Float));
-            }
-        }
-        Some(-1) if n > 1 => {
-            remove_input_pin(node_id, n - 1, inputs, snarl);
-            remove_output_pin(node_id, n - 1, outputs, snarl);
-        }
-        _ => {}
+    view_salt: u64,
+    pill_w: f32,
+    rows: usize,
+) -> Option<(f32, f32)> {
+    use super::simple_bodies::PILL_H;
+    const ROW: f32 = 4.0;
+    // At least two rows of height whatever the module actually has, so one setting doesn't
+    // make a module shallower than its neighbours: the body floor that a coarse grid used to
+    // supply has to be asked for by name.
+    let h = (rows as f32 * PILL_H + (rows.saturating_sub(1)) as f32 * ROW).max(48.0);
+    ui.allocate_exact_size(egui::vec2(pill_w, h), egui::Sense::hover());
+    let inner = super::module_icons::module_inner(ui, view_salt, node_id)?;
+    let column = ui.max_rect();
+    // Traced so a test can hold the pills to the module's centre, not just to its size.
+    simple_bodies::trace_rect(ui, node_id, "body_column", column);
+    Some((inner.center().x, kit::group_top(column, h)))
+}
+
+/// One value pill at `left`, painted rather than allocated (the rect is given, so nothing it
+/// measures folds back into the body's size). Traced under `{salt}_pill` so a test can hold
+/// the placement, and returns the response plus a number the user typed into it.
+fn pill_at(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    salt: &str,
+    left: egui::Pos2,
+    w: f32,
+    label: &str,
+    shown: &str,
+    range: std::ops::RangeInclusive<f64>,
+) -> (egui::Response, Option<f64>) {
+    use super::simple_bodies::{value_pill_number, PILL_H};
+    let rect = egui::Rect::from_min_size(left, egui::vec2(w, PILL_H));
+    let label_w = if label.is_empty() { 0.0 } else { 26.0 };
+    simple_bodies::trace_rect(ui, node_id, &format!("{salt}_pill"), rect);
+    value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range)
+}
+
+/// Milliseconds written compactly: a delay of a second is `1000 ms`, a window of five
+/// milliseconds is `5 ms`, and nothing pretends at precision below that.
+fn ms_text(v: f32) -> String {
+    if v.abs() >= 10.0 {
+        format!("{} ms", v.round() as i64)
+    } else {
+        format!("{v:.1} ms")
     }
 }
 
-/// Delay (`module.delay`): every channel delayed by the same time.
+/// Delay (`module.delay`): every channel delayed by the same time. It used to be a "Delay"
+/// label, a slider and a "Channels" row - 252 points of module for one number - and its
+/// channels are added from the header now, like the variadic operations' pins.
 pub(crate) fn show_delay_body(
     node_id: NodeId,
-    inputs: &[InPin],
-    outputs: &[OutPin],
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
-    w: f32,
+    view_salt: u64,
 ) {
-    let mut ms = param_f32(snarl, node_id, "delay_ms", 100.0);
-    kit::body(ui, w, |ui, k| {
-        let (changed, rect) = k.slider(ui, "Delay", &mut ms, 0.0..=60_000.0, true, |v| {
-            egui::DragValue::new(v).speed(1.0).range(0.0..=60_000.0).max_decimals(0).suffix(" ms")
-        });
-        register_exposable_element(ui, node_id, "ms", rect);
-        if changed {
-            set_f32(snarl, node_id, "delay_ms", ms);
-        }
-        channels_row(ui, k, node_id, inputs, outputs, snarl);
-    });
+    use super::simple_bodies::PILL_H;
+    let ms = param_f32(snarl, node_id, "delay_ms", 100.0);
+    const PILL_W: f32 = 56.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 1) else { return };
+    let (resp, typed) = pill_at(
+        ui,
+        node_id,
+        "delay_ms",
+        egui::pos2(cx - PILL_W * 0.5, top),
+        PILL_W,
+        "",
+        &ms_text(ms),
+        0.0..=60_000.0,
+    );
+    let resp = resp.on_hover_text(
+        "How long every channel is delayed by.\nDrag across the pill to change it, double-click to type.",
+    );
+    if let Some(v) = typed {
+        set_f32(snarl, node_id, "delay_ms", v as f32);
+    } else if resp.dragged() {
+        set_f32(snarl, node_id, "delay_ms", (ms + resp.drag_delta().x * 25.0).clamp(0.0, 60_000.0));
+    }
+    register_exposable_element(ui, node_id, "ms", egui::Rect::from_min_size(egui::pos2(cx - PILL_W * 0.5, top), egui::vec2(PILL_W, PILL_H)));
 }
 
-/// Average (`module.average`): a moving average over a time window, with
-/// outliers dropped past a spike threshold.
+/// Average (`module.average`): a moving average over a time window, with outliers dropped
+/// past a spike threshold. Two pills, the window and the threshold in median absolute
+/// deviations; the channels come from the header.
 pub(crate) fn show_average_body(
     node_id: NodeId,
-    inputs: &[InPin],
-    outputs: &[OutPin],
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
-    w: f32,
+    view_salt: u64,
 ) {
-    let mut ms = snarl
+    use super::simple_bodies::PILL_H;
+    let ms = snarl
         .get_node(node_id)
         .map_or(5.0, |n| flexinput_engine::eval::average_window_ms(&n.params) as f32);
-    let mut mad = param_f32(snarl, node_id, "spike_mad", 0.0);
-    kit::body(ui, w, |ui, k| {
-        let (c1, r1) = k.slider(ui, "Window", &mut ms, 0.5..=5_000.0, true, |v| {
-            egui::DragValue::new(v).speed(0.5).range(0.5..=5_000.0).max_decimals(1).suffix(" ms")
-        });
-        let (c2, r2) = k.slider(ui, "Spikes", &mut mad, 0.0..=20.0, false, |v| {
-            egui::DragValue::new(v).speed(0.1).range(0.0..=20.0).max_decimals(1)
-        });
-        ui.interact(r2, ui.id().with(("avg_mad_hint", node_id)), egui::Sense::hover()).on_hover_text(
-            "Outlier threshold in median absolute deviations. 0 = off. Try 3.0 to start.",
-        );
-        register_exposable_element(ui, node_id, "samples", r1);
-        register_exposable_element(ui, node_id, "spike_mad", r2);
-        if c1 || c2 {
-            set_f32(snarl, node_id, "window_ms", ms);
-            set_f32(snarl, node_id, "spike_mad", mad);
-        }
-        channels_row(ui, k, node_id, inputs, outputs, snarl);
-    });
+    let mad = param_f32(snarl, node_id, "spike_mad", 0.0);
+    const PILL_W: f32 = 72.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2) else { return };
+    let left = egui::pos2(cx - PILL_W * 0.5, top);
+    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "win", &ms_text(ms), 0.5..=5_000.0);
+    let r1 = r1.on_hover_text(
+        "How much of the recent signal the average runs over.\nDrag to change it, double-click to type.",
+    );
+    if let Some(v) = t1 {
+        set_f32(snarl, node_id, "window_ms", v as f32);
+    } else if r1.dragged() {
+        set_f32(snarl, node_id, "window_ms", (ms + r1.drag_delta().x * 5.0).clamp(0.5, 5_000.0));
+    }
+    let left2 = egui::pos2(left.x, left.y + PILL_H + 4.0);
+    let shown2 = if mad > 0.0 { format!("{mad:.1}") } else { "off".into() };
+    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "spk", &shown2, 0.0..=20.0);
+    let r2 = r2.on_hover_text(
+        "Outlier threshold in median absolute deviations: a reading further from the middle than this is dropped.\n0 = off. Try 3.0 to start.",
+    );
+    if let Some(v) = t2 {
+        set_f32(snarl, node_id, "spike_mad", v as f32);
+    } else if r2.dragged() {
+        set_f32(snarl, node_id, "spike_mad", (mad + r2.drag_delta().x * 0.05).clamp(0.0, 20.0));
+    }
+    register_exposable_element(ui, node_id, "samples", egui::Rect::from_min_size(left, egui::vec2(PILL_W, PILL_H)));
+    register_exposable_element(ui, node_id, "spike_mad", egui::Rect::from_min_size(left2, egui::vec2(PILL_W, PILL_H)));
 }
 
-/// DC Filter (`module.dc_filter`): removes a slowly moving offset.
+/// DC Filter (`module.dc_filter`): removes a slowly moving offset. The window is how much
+/// offset it takes out, the decay how quickly it lets a real change through; two pills,
+/// channels from the header.
 pub(crate) fn show_dc_filter_body(
     node_id: NodeId,
-    inputs: &[InPin],
-    outputs: &[OutPin],
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
-    w: f32,
+    view_salt: u64,
 ) {
-    let mut window = param_f32(snarl, node_id, "window_ms", 500.0);
-    let mut decay = param_f32(snarl, node_id, "decay_ms", 200.0);
-    kit::body(ui, w, |ui, k| {
-        fn drag(v: &mut f32) -> egui::DragValue<'_> {
-            egui::DragValue::new(v).speed(10.0).range(10.0..=60_000.0).max_decimals(0).suffix(" ms")
-        }
-        let (c1, r1) = k.slider(ui, "Window", &mut window, 10.0..=60_000.0, true, drag);
-        let (c2, r2) = k.slider(ui, "Decay", &mut decay, 10.0..=60_000.0, true, drag);
-        register_exposable_element(ui, node_id, "window_ms", r1);
-        register_exposable_element(ui, node_id, "decay_ms", r2);
-        if c1 || c2 {
-            set_f32(snarl, node_id, "window_ms", window);
-            set_f32(snarl, node_id, "decay_ms", decay);
-        }
-        channels_row(ui, k, node_id, inputs, outputs, snarl);
-    });
+    use super::simple_bodies::PILL_H;
+    let window = param_f32(snarl, node_id, "window_ms", 500.0);
+    let decay = param_f32(snarl, node_id, "decay_ms", 200.0);
+    const PILL_W: f32 = 72.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2) else { return };
+    let left = egui::pos2(cx - PILL_W * 0.5, top);
+    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "win", &ms_text(window), 10.0..=60_000.0);
+    let r1 = r1.on_hover_text(
+        "How slowly a change has to move to count as offset rather than signal.\nDrag to change it, double-click to type.",
+    );
+    if let Some(v) = t1 {
+        set_f32(snarl, node_id, "window_ms", v as f32);
+    } else if r1.dragged() {
+        set_f32(snarl, node_id, "window_ms", (window + r1.drag_delta().x * 25.0).clamp(10.0, 60_000.0));
+    }
+    let left2 = egui::pos2(left.x, left.y + PILL_H + 4.0);
+    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "dec", &ms_text(decay), 10.0..=60_000.0);
+    let r2 = r2.on_hover_text(
+        "How quickly the filter settles after a real change goes through it.",
+    );
+    if let Some(v) = t2 {
+        set_f32(snarl, node_id, "decay_ms", v as f32);
+    } else if r2.dragged() {
+        set_f32(snarl, node_id, "decay_ms", (decay + r2.drag_delta().x * 25.0).clamp(10.0, 60_000.0));
+    }
+    register_exposable_element(ui, node_id, "window_ms", egui::Rect::from_min_size(left, egui::vec2(PILL_W, PILL_H)));
+    register_exposable_element(ui, node_id, "decay_ms", egui::Rect::from_min_size(left2, egui::vec2(PILL_W, PILL_H)));
 }
 
 /// Inverse (`math.negate`): flips the sign, or mirrors inside `0..max`. Its two settings
