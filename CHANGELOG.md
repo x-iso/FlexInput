@@ -148,6 +148,36 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **A ComboBox, a strip and a pill label each measured themselves wider than the row they were
+  drawn in.** Three ways the same thing went wrong on the screenshots. A ComboBox takes
+  `Spacing::combo_width` - 150 points - as its minimum whatever sits inside it, so the Macro
+  Output's one-letter signal-type button and the Dropdown menu's reading both reached past their
+  row and under the pin labels beside it, and the Dropdown grew with the longest option instead
+  of cutting it at its edge; both ask for their cell's width now, and the popup still sizes
+  itself to its entries. A strip adds its own spacing between its cells on top of the style's,
+  so the Oscillator's fourth shape cell landed on the output label: its rows take a child with
+  no extra spacing and come out exactly as wide as the wave band under them. A pill's label cell
+  was measured in the proportional small font and painted in the monospace the pill uses, so the
+  blue block behind `min`, `max` and `step` on the Counter was narrower than the word standing on
+  it. It's measured in the font it's painted with. A Macro Output's list also stopped being
+  centred on its frame - it has no input pins, so centring left dead margin on the left and
+  pushed the rows into the output labels on the right; the column runs the width the body has.
+- **The Envelope follows the frame its corner grip is dragged to.** It carried a resizable box of
+  its own with a saved size, inside a module that was already resizable, with six stacked rows
+  under it costing the same height whatever the frame looked like. The graph now takes whatever
+  the rows don't need and the whole width, the sustain slider is a row of the graph's width under
+  it, and the four groups of settings - the unit and the length it counts, the three behaviours,
+  the grid divisions and snap, and what the grid shows - fill the width evenly: one band with
+  hairline separators in a wide frame, wrapped into more bands in a narrow one, where the module
+  takes the height for them rather than losing the curve. It starts at the 280 by 308 it was, and
+  every pinned piece keeps the id it was pinned by.
+- **A Knob says what it's set to wherever that costs nothing to drag.** Any frame taller than the
+  two-block floor has a line the round face can't use, so the number goes under the face instead
+  of being left out. At the floor itself - a strip of track one row tall - the number starts at
+  four blocks of width and up, because below that the track left over is short enough to matter.
+  A 56 by 56 knob shows the face and where it points, as before.
+
+
 - **The Auto-Map splitter and collector list their ports the way the port strips do.** Each
   row used to lead with its `×`, so the names started behind a column of buttons and staggered;
   the list also set its own floor at 170 points and asked its dropdown for 150 more. The name
@@ -381,6 +411,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   middle of the body.
 
 ### Fixed
+
+- **A Dropdown menu saved before it had a `shift` pin now gets one.** A node's pins are stored
+  with the patch rather than read back from the module registry, so menus drawn before the pin
+  were added stayed unshiftable - the control was in the registry and nowhere on the canvas. The
+  module gives itself the missing pin the first time it draws.
+
 
 - **A knob narrowed to 84 points lost its reading.** When a fader strip has no room under it,
   its number goes at the end of the track and the track shortens for it — but it only did that

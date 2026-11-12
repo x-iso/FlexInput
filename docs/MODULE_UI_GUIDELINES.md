@@ -682,6 +682,18 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   returns `interact_size.y + 2 * COMBINER_PAD_V` and the body uses the same expression for the
   frame it draws the row in. Neither side can measure the other — the pins are laid out before
   the body — so the arithmetic is shared instead.
+- **A control takes the width it was given, not the width it wants.** Three widgets will
+  otherwise lay themselves out wider than the row: a `ComboBox` uses `Spacing::combo_width`
+  - 150 points - as its minimum whatever is selected in it, so give it `.width(cell)` and
+  let the popup size itself to its entries; a `kit::strip` adds its own spacing between
+  cells on top of the style's, so the child drawing it sets `item_spacing.x = 0.0`; and a
+  pill's label cell is measured in the monospace it is painted with
+  (`simple_bodies::pill_label_width`), not in the proportional text style, or the colour
+  block ends up narrower than the word on it.
+- **A stretchy body reserves its box and draws inside the rect it reserved.** The note takes
+  the leftover after its reservation; the Envelope uses the allocated rect itself, because
+  it has to fill the frame that reservation was worked out from. Mixing the two leaves a
+  body painting a strip of itself.
 - **A move takes the wire with it** (`pins::move_dynamic_pin`): the engine reads these pins
   by position, so reordering without reconnecting silently rewires the patch.
 - **The handle is a handle: grab cursor on hover, and the strip it belongs to picks up an
