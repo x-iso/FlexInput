@@ -794,8 +794,11 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     const SEP_W: f32 = 9.0;
     const MIN_GRAPH_H: f32 = 60.0;
     const MIN_GRAPH_W: f32 = 140.0;
-    // What each group needs to show its controls without cutting a label.
-    let group_min = [132.0f32, 116.0, 116.0, 104.0];
+    // What each group needs to show its controls without cutting a label - and the band rule
+    // that follows from it: a row that cannot get this inside a shared band takes a band to
+    // itself, so the module grows taller rather than ending up with a length squeezed into a
+    // short box. The first is the three unit words plus the room a seven-digit length needs.
+    let group_min = [176.0f32, 116.0, 116.0, 104.0];
     let row_h = ui.spacing().interact_size.y;
     let band_h = row_h + 6.0;
 

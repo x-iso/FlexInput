@@ -3051,9 +3051,10 @@ fn the_envelope_spends_the_width_it_is_given_on_its_length() {
     // given lands on the number being read rather than on the two-letter unit buttons beside
     // it, and it is the wider half of the row. Where the row itself ends up between band
     // wrapping is the layout's business, not the pill's.
-    // How much of the band a row gets moves with the wrapping, so the floor held here is the
-    // one that does not: the number is the wider half of the row it sits in.
-    for (w, least) in [(10.0 * B, 40.0), (14.0 * B, 40.0)] {
+    // The floor is the one the row promises rather than one I can derive from the band
+    // maths: the number is wider than the three unit words beside it, and it runs to the end
+    // of the row it was given. How much of the band a row gets is the layout's business.
+    for (w, least) in [(10.0 * B, 84.0), (14.0 * B, 84.0)] {
         let (frame, pill) = pill_at(&mut rig, w);
         let cell = rig.traced_rect(node, "env_time").unwrap_or(egui::Rect::NOTHING);
         assert!(pill.is_positive(), "no length pill drawn in {frame:?}");
