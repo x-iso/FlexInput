@@ -1224,6 +1224,45 @@ fn the_painted_pills_stay_inside_the_frame() {
 }
 
 #[test]
+fn a_pill_field_opens_with_the_value_you_can_edit() {
+    // The field used to open empty with the current value painted behind it as a hint, so a
+    // pill could be reset but never edited: there was nothing to put a caret into, and the
+    // number you could see wasn't yours to change. It opens holding the value instead.
+    let (mut rig, ids) = Rig::real("logic.delay", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    let time = |rig: &Rig| {
+        rig.canvas
+            .snarl
+            .get_node(node)
+            .and_then(|n| n.params.get("time").and_then(|v| v.as_f64()))
+            .unwrap_or(100.0)
+    };
+    rig.idle(4);
+    assert_eq!(time(&rig), 100.0, "the delay pill's starting time");
+    let pill = rig.traced_rect(node, "delay_time_pill").unwrap_or(egui::Rect::NOTHING);
+    assert!(pill.is_positive(), "no time pill to edit: {pill:?}");
+    rig.double_click(pill.center());
+    rig.idle(3);
+    // One key to move the caret off any selection, then a digit: appended to the value that
+    // was already in the field, that reads 1005 - typed into an empty field, 5.
+    rig.frame(vec![egui::Event::Key {
+        key: egui::Key::ArrowRight,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+        physical_key: None,
+    }]);
+    rig.idle(1);
+    rig.type_text("5");
+    assert_eq!(
+        time(&rig),
+        1005.0,
+        "the pill's field didn't open with 100 in it to edit; arrow to the end and type 5 gave {}",
+        time(&rig),
+    );
+}
+
+#[test]
 fn a_pill_value_can_be_typed_as_well_as_dragged() {
     // A pill answers a drag, but a drag can't land on an exact number - which is what made
     // the Logic Delay's time feel read-only once the box stopped being a DragValue. A
@@ -1482,44 +1521,79 @@ fn a_collapsed_knob_shows_its_number_and_nothing_else() {
 }
 
 #[test]
-fn a_title_is_left_out_when_it_doesnt_fit_and_comes_back_when_it_does() {
+fn a_title_is_cut_to_fit_and_left_out_when_there_is_no_word_to_show() {
+    // One rule on every module: work out the room the name has - to the frame's edge, less
+    // whatever sits there - and if the name fits, draw it; if only part of it fits, draw the
+    // part with dots to say it was cut; if the room is too small for a word that means
+    // anything, draw no name at all. The hover text carries the whole name either way.
     let (mut rig, ids) = Rig::real("module.knob", &[egui::pos2(100.0, 300.0)]);
     let node = ids[0];
+    let name = "Blend amount for the slow filter";
     if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
-        n.display_name = "Blend amount for the slow filter".to_string();
+        n.display_name = name.to_string();
     }
-    rig.idle(6);
-    let at = rig.frame_rect(node);
-    assert_eq!((at.width(), at.height()), (2.0 * MAJOR, 2.0 * MAJOR), "a renamed knob: {at:?}");
-    // The name doesn't fit beside the Uni/Bi switch in a header this narrow, so it isn't
-    // drawn - and it isn't what kept the module wide, either.
-    let title = rig.traced(node, "header_title");
+    let title_at = |rig: &mut Rig, w: f32| -> (egui::Rect, egui::Rect) {
+        rig.canvas
+            .snarl
+            .get_node_mut(node)
+            .unwrap()
+            .params
+            .insert(kit_width_param().into(), serde_json::json!(w));
+        rig.idle(6);
+        rig.ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("module_ctrl_rect", node.0, "header_title")),
+                Xysr([0.0; 4]),
+            )
+        });
+        rig.idle(3);
+        (rig.frame_rect(node), rig.traced_rect(node, "header_title").unwrap_or(egui::Rect::NOTHING))
+    };
+
+    // Three blocks across: room enough for part of the name, so it is drawn cut with dots - and
+    // stops where the Uni/Bi switch begins.
+    let (frame, title) = title_at(&mut rig, 3.0 * MAJOR);
+    assert!(
+        title.is_positive() && title.width() > 20.0,
+        "a {frame:?} header dropped its name instead of cutting it: {title:?}",
+    );
+    assert!(
+        frame.contains_rect(title.expand(0.5)),
+        "the cut name {title:?} isn't inside {frame:?}",
+    );
+    assert!(
+        title.right() <= frame.right() - 24.0 + 1.0,
+        "the cut name {title:?} runs under the 24-point Uni/Bi switch at the right of {frame:?}",
+    );
+    // The cut is what made this rule worth having: the name is never what holds a module open.
+    let cut = title.width();
+
+    // Too little room for a word: no name, and the knob still goes down to its own floor.
+    let (narrow, title) = title_at(&mut rig, MAJOR);
+    assert_eq!(narrow.width(), MAJOR, "the name kept the knob wider than its content needs: {narrow:?}");
     assert!(
         !title.is_positive() || title.width() < 8.0,
-        "a name too long for {at:?} was still drawn at {title:?}",
+        "a {narrow:?} header painted {title:?} where there is no room for a word",
     );
-    // The name isn't what's holding the frame open either: dragged inward, the knob goes
-    // all the way down to its own thinnest - 56 points, its floor rather than the grid's,
-    // which is half that now - name or no name.
-    let at_now = rig.frame_rect(node);
-    rig.drag(at_now.max - egui::vec2(3.0, 3.0), egui::vec2(-3.0 * MAJOR, 0.0));
-    let narrow = rig.frame_rect(node);
-    assert_eq!(narrow.width(), MAJOR, "the name kept the knob wider than its content needs: {at_now:?} -> {narrow:?}");
-    // Widen the frame and the name comes back.
-    rig.canvas
-        .snarl
-        .get_node_mut(node)
-        .unwrap()
-        .params
-        .insert(kit_width_param().into(), serde_json::json!(5.0 * MAJOR));
-    rig.idle(6);
-    let wide = rig.frame_rect(node);
-    let shown = rig.traced(node, "header_title");
+
+    // Wide enough for the whole thing: the name comes back, and widening it further changes
+    // nothing, which is how we know it isn't being cut any more.
+    let (wide, whole) = title_at(&mut rig, 5.0 * MAJOR);
     assert!(
-        wide.width() >= 5.0 * B - 1.0 && shown.width() > 40.0,
-        "the name didn't come back at {wide:?}: {shown:?}",
+        whole.is_positive() && whole.width() > cut,
+        "the name didn't come back whole at {wide:?}: {whole:?} (cut was {cut:.0})",
+    );
+    let (wider, whole_again) = title_at(&mut rig, 7.0 * MAJOR);
+    assert!(
+        (whole_again.width() - whole.width()).abs() < 1.0,
+        "the name was still being cut at {wider:?}: {whole:?} -> {whole_again:?}",
+    );
+    assert!(
+        whole.width() > cut,
+        "the whole name {whole:?} should be wider than the cut one at {frame:?} ({cut:.0})",
     );
 }
+
 
 #[test]
 fn dragging_a_combiner_row_shows_where_it_will_land() {

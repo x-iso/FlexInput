@@ -499,33 +499,129 @@ pub(crate) fn header_plus_button(ui: &mut egui::Ui, hover: &str, row: egui::Rect
     resp.on_hover_text(hover).clicked()
 }
 
-// ── The mark a module is known by ─────────────────────────────────────────────
+/// What a module does, in one line: the second line of a header's tooltip, so a module on
+/// the canvas can be asked what it is for without opening the docs or selecting it.
+/// Generated from the Purpose lines of docs/MODULES_REFERENCE.md, plus the handful the
+/// reference doesn't spell out yet. A module missing here just gets its name and no line.
+const HELP: &[(&str, &str)] = &[
+    ("module.constant", "Outputs a fixed float value"),
+    ("module.switch", "Toggles between on/off states, can be triggered by inputs or UI"),
+    ("module.knob", "User-adjustable float parameter (persistent across patches)"),
+    ("module.selector", "Selects one of N inputs based on a selector value (0.0 to 1.0)"),
+    ("module.dropdown", "Provides discrete selection from a list of options"),
+    ("module.label", "Displays or edits a text label"),
+    ("module.svg", "Renders SVG graphics in node body"),
+    ("module.split", "Splits a signal into multiple outputs based on selector"),
+    ("subpatch", "Contains an inline sub-graph with declared I/O pins"),
+    ("math.add", "Sums multiple signals (Float or Vec2)"),
+    ("math.subtract", "Subtracts subsequent inputs from the first"),
+    ("math.multiply", "Multiplies signals together"),
+    ("math.divide", "Divides first signal by subsequent signals"),
+    ("math.clamp", "Constrains signal to a range"),
+    ("math.abs", "Returns absolute value"),
+    ("math.negate", "Inverts a signal — sign flip, or a unipolar mirror inside `0..max`"),
+    ("math.min_max", "Reports the largest and smallest of all its inputs"),
+    ("math.quantize", "Snaps a signal to a grid"),
+    ("math.map_range", "Remaps value from one range to another"),
+    ("logic.and", "Logical AND of two boolean inputs"),
+    ("logic.or", "Logical OR of two boolean inputs"),
+    ("logic.not", "Logical negation"),
+    ("logic.xor", "Exclusive OR of two boolean inputs"),
+    ("logic.equal", "Compares two signals for equality"),
+    ("logic.not_equal", "Compares two signals for inequality"),
+    ("logic.greater_than", "Tests if first signal is greater than second"),
+    ("logic.less_than", "Tests if first signal is less than second"),
+    ("logic.has_changed", "Detects when input signal changes value"),
+    ("logic.delay", "Delays boolean signal by specified time"),
+    ("logic.counter", "Counts rising edges on increment input"),
+    ("module.delay", "Delays signal by specified time with per-channel buffers"),
+    ("module.average", "Averages signal over a sliding window with optional spike rejection"),
+    ("module.dc_filter", "Removes DC offset from signal using adaptive estimation"),
+    ("module.sample_hold", "Holds a signal of any type, on a trigger or for as long as a gate is high"),
+    ("module.response_curve", "Applies a user-defined curve to signal with bias control"),
+    ("module.vec_response_curve", "Applies response curve to vector magnitude, preserving direction"),
+    ("module.vec_reshape", "Directionally reshapes 2D vectors with boundary and gain curves"),
+    ("module.twoway_response_curve", "Applies different curves for rising vs falling input (hysteresis)"),
+    ("processing.gyro_3dof", "Processes gyroscope data for 3-degree-of-freedom mapping"),
+    ("processing.rws", "Real-World-Sensitivity camera aiming. Scales a rotation-rate Vec2"),
+    ("module.vec_to_deflection", "Cartesian → polar: how far a vector is pushed, and which way"),
+    ("display.readout", "Displays current signal value numerically"),
+    ("display.oscilloscope", "Real-time waveform visualization"),
+    ("display.trigscope", "Oscilloscope with trigger input for stable display of repetitive signals"),
+    ("display.vectorscope", "2D vector visualization (sticks, touchpad)"),
+    ("display.controller3d", "3D model visualization with orientation tracking"),
+    ("generator.oscillator", "Generates periodic waveforms"),
+    ("generator.envelope", "Generates amplitude envelopes with configurable shape"),
+    ("module.automap_split", "Extracts individual pins from an AutoMap bus wire"),
+    ("module.automap_collect", "Injects signals into an AutoMap bus for downstream routing"),
+    ("module.automap_fork", "Duplicates an AutoMap bus to multiple outputs"),
+    ("module.automap_selector", "Selects one of N AutoMap buses based on selector input"),
+    ("module.automap_combiner", "Merges multiple AutoMap buses using configurable policy per pin"),
+    ("module.automap_response_curve", "Response Curve on one signal of an AutoMap bus. The header's **Signal**"),
+    ("module.automap_twoway_response_curve", "Two-way Response Curve on one signal of an AutoMap bus — same pick and"),
+    ("module.stick_rotation", "Turning the pad turns one stick of an AutoMap bus that is already"),
+    ("module.area_mapper", "Lays one XY pair of an AutoMap bus (the header's **Input**: left stick,"),
+    ("module.touch_zones", "Divides touchpad into configurable zones with typed outputs"),
+    ("module.menu", "A summoned on-screen radial/grid menu whose zones are pointed at with an"),
+    ("module.remapper", "Maps AutoMap signals to other AutoMap signals with per-mapping overrides"),
+    ("module.map_action", "Evaluates mapping cards and outputs gate/analog signals"),
+    ("module.feedback_control", "Drives the upstream physical pad's feedback (rumble, light bar,"),
+    ("module.jsm", "Applies a JoyShockMapper config text to the bus with JSM's own"),
+    ("module.audio_stream_haptics", "Routes audio loopback to haptic feedback without HIDMaestro driver"),
+    ("subpatch.inlet", "Bridge from outer graph to inner sub-patch"),
+    ("subpatch.outlet", "Bridge from inner sub-patch to outer graph"),
+    ("module.network_send", "Transmits AutoMap bus to remote instance over network"),
+    ("module.network_recv", "Receives AutoMap bus from remote instance and injects into graph"),
+    ("module.macro", "Reads from macro namespace published by mapping evaluators"),
+    ("logic.nand", "False only when both inputs are true"),
+    ("logic.nor", "True only when neither input is true"),
+    ("logic.xnor", "True when the two inputs agree"),
+    ("module.axis_to_vec", "Turns two axes into a vector"),
+    ("module.input_viewer", "Shows what an input is sending, as the patch sees it"),
+    ("module.vec_to_axis", "Splits a vector into two axes"),
+];
 
-/// Whether a header's title fits `room` points, once `extra` of them are held back for
-/// what sits at the header's right edge (`uni`/`bi` on the Knob, the stepper on the
-/// variadic operations).
-///
-/// `room` is the node's frame width less its margins - measured from the node's layout
-/// state, because the header's own UI is laid out in a box the size of its contents, so
-/// its `available_width` says nothing about the frame the title has to live in.
-///
-/// A title that doesn't fit is left out rather than cropped in half: the header then
-/// reports only what it actually holds, so the module's narrowest frame comes from its
-/// pins and its controls instead of from a word that was once drawn there. Widen the
-/// module and the name comes back. The alternative - letting the name set the floor - is
-/// what makes a small module wider than anything in it needs.
-pub(crate) fn title_fits(ui: &egui::Ui, title: &str, extra: f32, room: f32) -> bool {
-    if title.is_empty() {
-        return true;
-    }
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let w = ui
-        .painter()
-        .layout_no_wrap(title.to_string(), font, egui::Color32::PLACEHOLDER)
-        .size()
-        .x;
-    w + extra <= room
+pub(crate) fn module_help(module_id: &str) -> Option<&'static str> {
+    HELP.iter()
+        .find(|(id, _)| *id == module_id)
+        .map(|(_, help)| *help)
 }
+
+/// The name as it should be painted in a header with `room` points left for it: whole when
+/// it fits, cut with a dot-dot-dot when it doesn't, and nothing at all when the room can't
+/// hold a word worth reading. The same rule on every module - painting as much of the name
+/// as happens to fit leaves half a letter under whatever sits at the right edge.
+pub(crate) fn title_galley(
+    ui: &egui::Ui,
+    title: &str,
+    room: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    const MIN_TITLE_W: f32 = 40.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let colour = ui.visuals().text_color();
+    let whole = ui.painter().layout_no_wrap(title.to_owned(), font.clone(), colour);
+    if whole.size().x <= room {
+        return Some(whole);
+    }
+    if room < MIN_TITLE_W {
+        return None;
+    }
+    let mut chars: Vec<char> = title.chars().collect();
+    loop {
+        if chars.is_empty() {
+            return None;
+        }
+        chars.pop();
+        let cut: String = chars.iter().collect();
+        let galley = ui
+            .painter()
+            .layout_no_wrap(format!("{cut}\u{2026}"), font.clone(), colour);
+        if galley.size().x <= room {
+            return Some(galley);
+        }
+    }
+}
+
 
 /// Modules that read better as a symbol than as a word: (module id, the name it
 /// ships with, the mark). A header shows the mark where that name would be, and the

@@ -463,6 +463,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         ui.label(egui::RichText::new("●").color(color).small());
                     }
                     // The mark or the name, never both.
+                    let header_module =
+                        snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
                     let knob_collapsed = is_knob
                         && snarl.get_node_info(node).map_or(true, |i| !i.open);
                     let reserved = if is_knob && !knob_collapsed {
@@ -485,52 +487,71 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let folded = snarl.get_node_info(node).map_or(true, |i| !i.open);
                     let used = ui.min_rect().width();
                     header_room_before_name = used;
-                    let room = node_frame_size(node, ui, snarl, self.snarl_id, self.node_margin_x, self.node_margin_y)
-                        .map_or(0.0, |s| s.0)
-                        - self.node_margin_x
-                        - used
-                        - if folded { ui.spacing().interact_size.y + 6.0 } else { 4.0 };
+                    // What the header's tooltip says: the name the patch calls this module by,
+                    // and under a line what the module does. Both arms of the match get it, so
+                    // a module known by its mark is as explainable as one known by its name.
+                    let help = kit::module_help(&header_module);
+                    let tip_name = title.clone();
+                    let tooltip = move |ui: &mut egui::Ui| {
+                        ui.set_max_width(260.0);
+                        ui.label(egui::RichText::new(tip_name.as_str()).strong());
+                        if let Some(help) = help {
+                            ui.separator();
+                            ui.label(egui::RichText::new(help).weak().small());
+                        }
+                    };
                     match mark {
                         Some(mark) => {
                             let r = ui.label(egui::RichText::new(mark).strong());
                             simple_bodies::trace_rect(ui, node, "header_title", r.rect);
-                            r.on_hover_text(title.as_str())
+                            r.on_hover_ui(tooltip)
                         }
-                        None if kit::title_fits(ui, &title, reserved, room) => {
-                            // Painted, not laid out. A name added to the flow adds its own
-                            // width to the header row, and the header row is one of the things
-                            // the node's width is measured against: that is why "DC Filter"
-                            // needed a 168-point module for one number where "Average" manages
-                            // with 140. The row keeps its height, the name is drawn where the
-                            // chevron leaves off, and `title_fits` - which knows about the
-                            // control at the right edge - decides whether it is drawn at all.
+                        None => {
+                            // Painted, not laid out. A name added to the flow adds its own width
+                            // to the header row, and the header row is one of the things the
+                            // node's width is measured against: that is why "DC Filter" needed a
+                            // 168-point module for one number where "Average" manages with 140.
+                            // The row keeps its height and the name is drawn where the chevron
+                            // leaves off. What it does with the room it's given is the same on
+                            // every module: whole if it fits, cut with dots if it nearly does,
+                            // and left out entirely when the room is too small for a word that
+                            // means anything - half a letter under the control at the right edge
+                            // says less than nothing.
                             let (slot, resp) = ui.allocate_exact_size(
                                 egui::vec2(0.0, ui.spacing().interact_size.y),
                                 egui::Sense::hover(),
                             );
-                            let font = egui::TextStyle::Body.resolve(ui.style());
-                            let galley = ui
-                                .painter()
-                                .layout_no_wrap(title.clone(), font, ui.visuals().text_color());
-                            let size = galley.size();
-                            let top = slot.center().y - size.y * 0.5;
-                            let at = egui::pos2(slot.left(), top);
-                            ui.painter().galley(at, galley, ui.visuals().text_color());
-                            simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::from_min_size(at, size));
-                            resp
-                        }
-                        // Too narrow for the word: leave it out rather than draw half of
-                        // it. The row keeps its height, and the module keeps its identity
-                        // in its shape, its mark in the body and its hover text; widen the
-                        // frame and the name comes back.
-                        None => {
-                            let r = ui.label(egui::RichText::new("").strong());
-                            // Traced empty so a test can tell "hidden" from "not drawn
-                            // at all", and so the header's height is on record.
-                            simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::NOTHING);
-                            r
+                            // The room is measured from where the name will actually be painted -
+                            // after the fold chevron and anything else the row has taken - to the
+                            // frame's right edge, less what the control at that edge will need, and
+                            // less the socket a folded module draws at the end of its header.
+                            let room = (ui.max_rect().right()
+                                - reserved
+                                - if folded { ui.spacing().interact_size.y + 6.0 } else { 0.0 }
+                                - slot.left())
+                                .max(0.0);
+                            match kit::title_galley(ui, &title, room) {
+                                Some(galley) => {
+                                    let size = galley.size();
+                                    let at = egui::pos2(slot.left(), slot.center().y - size.y * 0.5);
+                                    ui.painter().galley(at, galley, ui.visuals().text_color());
+                                    simple_bodies::trace_rect(
+                                        ui,
+                                        node,
+                                        "header_title",
+                                        egui::Rect::from_min_size(at, size),
+                                    );
+                                }
+                                None => {
+                                    // Traced empty so a test can tell "hidden" from "not drawn
+                                    // at all", and so the header's height is on record.
+                                    simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::NOTHING);
+                                }
+                            }
+                            resp.on_hover_ui(tooltip)
                         }
                     };
+
                 }
 
                 // The `− +` for a module whose pins are its content, at the right of

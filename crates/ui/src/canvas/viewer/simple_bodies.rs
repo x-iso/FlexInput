@@ -1338,6 +1338,10 @@ struct PillEdit {
     /// The frame the edit opened needs to hand the field focus on the frame after, since
     /// the field doesn't exist yet when the click that opened it lands.
     focus: bool,
+    /// And one frame after that, the contents are selected. egui gives a field that has
+    /// just taken focus a caret at the end, and a field you can only type in front of -
+    /// or behind - is a reset button rather than an editor.
+    select: bool,
 }
 
 fn pill_edit_key(node: NodeId, salt: &str) -> egui::Id {
@@ -1384,6 +1388,21 @@ pub(crate) fn value_pill(
         if edit.focus {
             field.request_focus();
             edit.focus = false;
+            edit.select = true;
+        } else if edit.select {
+            // Focus has landed by now, so the selection survives this frame's write-back.
+            edit.select = false;
+            let id = field.id;
+            let end = buf.chars().count();
+            ui.ctx().data_mut(|d| {
+                if let Some(mut st) = d.get_temp::<egui::widgets::text_edit::TextEditState>(id) {
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(end),
+                    )));
+                    d.insert_temp(id, st);
+                }
+            });
         }
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
         let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1404,13 +1423,14 @@ pub(crate) fn value_pill(
     }
     let typing = ui.input(|i| i.modifiers.command);
     if resp.double_clicked() || (typing && resp.clicked()) {
-        // The field opens empty with the current value as its hint, so what you type is
-        // what you get: egui has no select-all-on-focus here, and a field prefilled with
-        // `4` that you then type `7` into reads as 7 but commits 47.
+        // The field opens with the value in it, selected on the frame after focus lands, so
+        // you can edit it in place or type over all of it. Opening it empty with the old
+        // value painted behind as a hint meant a pill could only ever be reset, not edited.
         edit = PillEdit {
             editing: true,
-            buf: String::new(),
+            buf: shown.to_owned(),
             focus: true,
+            select: false,
         };
         ui.ctx().data_mut(|d| d.insert_temp(key, edit));
     }
