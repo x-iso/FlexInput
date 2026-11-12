@@ -1500,6 +1500,32 @@ fn a_title_is_left_out_when_it_doesnt_fit_and_comes_back_when_it_does() {
 }
 
 #[test]
+fn every_mark_body_keeps_its_four_blocks_of_height() {
+    // The mark bodies - a glyph and a pill or two - reserve nothing of their own, so their
+    // height is whatever the grid leaves them. At the old 56-point step that was never under
+    // 112 points; at 28 it can be 84, and the body pass tops them up (kit::mark_body) to
+    // stop that. This is the guard for the mechanism: a module that joins the mark family
+    // without being in that list settles a quarter shorter than its siblings, and nothing
+    // else would notice.
+    let marks: Vec<&str> = flexinput_modules::all_modules()
+        .into_iter()
+        .map(|r| r.descriptor.id)
+        .filter(|id| crate::canvas::viewer::kit::mark_body(id))
+        .collect();
+    assert!(marks.len() >= 20, "the mark family went missing: {marks:?}");
+    for id in marks {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(100.0, 300.0)]);
+        rig.idle(6);
+        let f = rig.frame_rect(ids[0]);
+        assert!(
+            f.height() >= 4.0 * B - 0.5,
+            "{id}: only {f:?} tall - under the four blocks (112) the old grid gave it",
+        );
+        assert!(whole_blocks(f.height()), "{id}: {f:?} left the grid");
+    }
+}
+
+#[test]
 fn a_port_list_lands_on_the_block_grid() {
     // A strip row is 28 points - a 25-point strip and the pin column's 3-point spacing -
     // which at this grid is exactly one block. So the empty band under the last strip is the
