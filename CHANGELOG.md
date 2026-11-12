@@ -39,6 +39,372 @@ All notable changes to FlexInput are documented here. This project adheres to
   control per row, value boxes on a shared right edge) and get a width grip on
   their corner. The rules are in `docs/MODULE_UI_GUIDELINES.md`; the other
   modules follow.
+- **The small operations wear their symbol, and carry their `+`/`−` in the header.**
+  Add, Subtract, Multiply, Divide and Min/Max show `+ − × ÷ ↕` where their name was —
+  the name moves to the hover text, and a module the user renamed keeps its name — and
+  the row of buttons they used to carry under the header is gone: the pair sits at the
+  header's right edge, and the module is its header and its pins and nothing in
+  between. Every one of them, gates included, stays two blocks square; five inputs fit
+  inside the second block, a sixth takes a third and hands it back when it goes.
+  Greater / Less Than show `>` and `<` (`≥` and `≤` while or-equal is on), their
+  "Equal — counts too" row is a single `or equal` button in the Switch module's style —
+  filled, its text in the middle — and they lose the corner grip they had as kit
+  modules: nothing inside them has room to stretch into.
+- **The same modules are drawn with a glyph.** The gates' — AND, NAND, NOR, NOT, OR,
+  XNOR, XOR — are the drawings now kept in `app/assets/modules/`; the arithmetic
+  (`+ − × ÷ ↕`) and the comparisons (`> < ≥ ≤ = ≠`) were cut to the same idiom: a 59×59
+  box, a 4-point stroke with round tips, no fill, the mark filling the band the gate
+  shapes fill. Each is painted into whatever band the module's pin rows leave under them,
+  centred on the module rather than on the column between its pin labels — that column
+  isn't the middle of the module, since `a` and `b` are one letter and `out` is three —
+  up to one block wide, and not at all once the band is too small to read. Painted,
+  never allocated: a glyph can't grow a module or take a row from its pins, so the inputs
+  that fit before the frame grows a block are the same with a glyph as without one. The
+  `or equal` button is centred the same way, and the comparison glyph follows or-equal
+  like the header mark does. A test holds every asset to the style and the box the set
+  shares, and a rig test clicks across the toggle's row to check it answers on the
+  module's centre.
+- **The range modules and the converters are drawn with a glyph too.** Clamp shows the
+  transfer it performs — flat, ramp, flat — Map Range a diagonal between two corner
+  brackets, Axis to Vec two leads merging into one, Vec to Axis one splitting into two,
+  all in the same 59×59 box and 4-point stroke as the gates. They sit in the column
+  between the pin labels, which runs the height of the pin rows rather than under them,
+  so a five-input Map Range gets a mark as large as Add's: 56 points, one block. None of
+  these modules changed size — they were already two blocks square, and a glyph takes no
+  room of its own.
+- **Constant is one number box that sizes itself to the number.** No grip and no width
+  setting: the box is as wide as the digits it holds (30 points tall, monospace 12), with
+  a floor built around `9999.99` — that value still sits inside a module two blocks wide,
+  while `10000.00` takes the frame a block wider and hands the block back when the value
+  shrinks again. The box sits centred on the module, and because the width comes from the
+  value's own text rather than from the module's size, it can grow and shrink without
+  ever sticking. A rig test walks it out to three blocks and home.
+- **NAND, NOR and XNOR are modules now.** The three gated pairs the AND / OR / XOR set
+  was missing: two Bool inputs, one Bool out, each its sibling with the output negated —
+  the same relationship the gate glyphs already drew with a bubble. They come out of the
+  palette like the other gates, two blocks square, wearing their glyph, and a test holds
+  each one to being exactly its sibling's opposite across all four input pairs.
+- **Abs and NOT are square, and Abs has a mark.** Both have a single pin row between them,
+  which left them a block shorter than every other module with a mark and gave the mark
+  nowhere to sit; they keep a band for it now, so `|x|` and the inverter read at the same
+  size as the rest.
+
+- **A Constant can be read to a resolution.** Under the number sits one divided pill:
+  `res` on the left, the digits it keeps after the dot on the right — `int`, then `1`, `2`,
+  `3`, `4` — and the value cell is dragged across its width to set it, whole numbers at the
+  left and four digits at the right, rather than clicked one step at a time. It's written as
+  the count of digits rather than the step (`0.0001`) so the pill never has to grow. The
+  resolution is also how far a drag of the number moves it: a box reading tenths moves in
+  tenths. It isn't decoration either: the value snaps to it, in the box and in the engine
+  alike, so `3.7` read at whole numbers drives `4` downstream — while the number itself is
+  left alone in storage, so stepping away and back gives `3.7` again rather than the `4`
+  that was on screen. The box is measured against the text as actually displayed — trailing
+  zeros trimmed — so a whole number doesn't pay for a dot and two zeros it never shows, and
+  `9999.99` still fits two blocks. It carries no outline: outlined things inside a module
+  read as waiting to be pressed, and this one isn't a button.
+
+- **Sample and Hold, and what it does.** It has a mark now: the stepped curve of a signal
+  sampled and held, drawn in the same idiom as Clamp's and Map Range's transfer curves, in
+  the room its own pins leave over. Its mode — Sample or Hold — is one button in the house
+  shape, the same control `or equal` uses, labelled with whichever mode is current, and
+  clicking it renames the second pin between "Trigger" and "Gate" as before. It's the same
+  size it was, three blocks by two.
+
+- **The Readout reads.** Its number is centred on the module and set a size larger, and the
+  box it sits in is a constant rather than whatever the current reading happens to need — a
+  display that measured its own content would widen the module every time a value ticked
+  past a thousand and give the block back a frame later. What adapts instead is the text:
+  it steps down in size until it fits, and a number too large for four meaningful decimals
+  is written in scientific notation, which keeps readings about the width the box was sized
+  for. A test pushes 0, a five-digit value, 1e30 and 1e-30 through it and checks the frame
+  never moves.
+
+- **Settings have two shapes, and they're the same everywhere.** A two-value setting is the
+  Switch module's button; a short list is a divided pill — label on the left, current value
+  on the right — that answers a drag across the value cell, so the list is scrubbed rather
+  than clicked through one at a time. Sample and Hold's mode started life as a pill and had
+  to become a button: measured across a body column about 56 points wide, `mode` plus
+  `sample` is 96 points, and the module went from three blocks to four.
+
+- **A Text note takes its size from the module's corner, not from a grip floating at the
+  bottom of the writing.** The module's own corner grip — the one the row-based modules
+  already had — now drags both ways, in blocks, and the text field fills whatever frame it
+  gets: the width is what the text wraps to, the height is a floor the text overruns by
+  growing the note another whole block, and back down to the floor when the lines go away.
+  Its settings — font size and colour — moved to the right edge of the header, so the body
+  is nothing but the text. Notes open three blocks wide rather than four: the old body
+  reserved its 160-point box *inside* the frame's own margin, and the canvas rounded that
+  up, so the frame was wider than anything in it asked for. A note saved before any of this
+  keeps the width it had set for itself.
+
+### Changed
+
+- **The grid's block is 28 points instead of 56, and the modules are the same size.** The
+  finer step is for the port lists: a strip row - a 25-point strip and the pin column's
+  3-point spacing - is now exactly one block, so a Selector's rows land on the grid at every
+  port count and the body left under the last strip is the same 26 points whether it has
+  three ports or seven. On the old block that space alternated between 26 and 55 depending
+  on whether the port count was odd. Nothing else moves: the floors and starting sizes that
+  were written as two blocks are four of these now, so a small module still starts 112
+  points square, a knob 112 wide, a note 168 by 112, and a small module's minimum had to be
+  written down where before the coarse grid supplied it for free. What does get finer is the
+  fit between those: a long number in a Constant now costs a 140-point width instead of
+  jumping to 168, and a sixth input on an Add takes a fifth block rather than a third. The
+  grid looks the same as it did - the brighter line now falls on every second block, where
+  the old block used to be, so the 28-point lines read as subdivisions of it (a patch saved
+  with the old setting keeps its "brighter every 8"; the canvas grid menu changes it).
+- **Six modules came down to two blocks square: Switch, Knob, Inverse, Logic Delay, Has
+  Changed and Vec to Deflection.** They were two, three, five and six blocks wide, and in
+  every case the extra was a label rather than a control: rows that spelled out "Delay",
+  "Time", "Hysteresis" or "Angle" beside their values, or a name in the header wider than
+  the pins underneath. Inverse is `±` with a small sign/range button and a max pill; Logic
+  Delay is three rows in a box as wide as two blocks allow; Has Changed has its hysteresis
+  pill between the pin labels; Vec to Deflection is `∠` with one pill for the angle unit;
+  Switch's button is painted across the bottom of the frame instead of widening the column
+  between its pins; Knob is a dial filling the body, with no output label, its number in the
+  middle of the face and the Uni/Bi range switch in the header.
+- **Pin labels are short on the canvas and full on hover.** `out_0` and `in_11` come down
+  to their number, the kit's common words have fixed short forms (`dir`, `lat`, `sel`,
+  `chg`, `inc`, `dec`, `def`, `ang`…), and anything else longer than four letters loses its
+  tail — with the real name in the hover text. Only modules small enough for a block to
+  matter do this; a Remapper keeps its labels spelled out. The names stored in a patch are
+  untouched, so nothing that is already wired breaks.
+- **Quantize went from four blocks to two, and took the staircase mark.** Its body was a
+  Factor drag box and a Rounding choice with four words spelled out, one per row, which made
+  it wider than most modules that do far more. The mark now sits across the pin rows as it
+  does on every other operation, and the two settings are pills in the empty band under the
+  rows: a `÷` pill (the number counts subdivisions per unit, and the word "step" barely
+  fitted its own cell) dragged through doublings (1, 2, 4 … 1k), and the rounding word,
+  which opens a short list when clicked rather than being dragged through four words. The
+  corner grip is gone from it too: a body that allocates nothing has no room to ask for, so
+  the handle was a thing to grab that did nothing. Nothing in the body is allocated, so the
+  module's width is its pins' business; a factor coming down a wire shows on the pill and
+  the pill stops pretending to control it, and exact factors that aren't doublings are still
+  typed in the pinned field.
+- **Sample and Hold shows its numbers instead of a drawing.** The body now carries two
+  readings: what the wire is bringing in, in the header's strong colour, and what the
+  module is handing out — dim while the trigger or gate is idle, amber while it's doing
+  something, so *holding* and *following* look different without reading a tooltip. The
+  stepped curve that was there went to Quantize, which is what it always described. The mode stays a body
+  control, at the smaller size of the two-state button — this module's pins take 47 of the
+  98 points a two-block frame has inside its margins, and the house 52-point size would cost
+  it a third block — and the header's name gives way to an `S/H` mark for the same sums. The
+  second pin is `Trig`. The module is two blocks square, and a nine-figure value doesn't
+  change that: the readings fit themselves to the space rather than asking the module to grow.
+- **The Readout starts at two blocks and makes its number fill whatever it's given.** Three
+  was wider than any ordinary value needed. The type is what flexes, from 34 points down to
+  ten, and a value too large for four meaningful decimals is written in scientific notation,
+  so a reading keeps roughly the width the box was sized for; the box's floor is that
+  reading at the smallest size worth showing, so a long number asks for a wider module
+  instead of a squint. It takes the corner grip, in both directions, and comes back to its
+  floor when the grip is dragged in.
+- **A note's text field covers the body it was given.** No inner border a few points inside
+  the module's own frame, no padding that shifts with how much happens to be written: the
+  field spans what's inside the frame, and its height floor is filled in points rather than
+  in a guessed number of rows. More lines than fit still take the module another block.
+- **Selector and Split are columns of port strips.** Their ports are a list, so they are
+  drawn as one: a strip per port, each carrying the port's name — the field edits the pin's
+  own name, which is what the patch stores — a handle that drags the port up or down the
+  list, taking its wire with it because the engine reads these by position, and a `×` that
+  appears once there are more than two to choose between. `+` lives in the header at the
+  right of the name, the same square the `−`/`+` pair uses. A strip is drawn at the pitch
+  the pin rows are laid out at, and a numbered port draws no label beside its socket, so a
+  socket and the strip naming it are one row: adding a port moves the module by one row on
+  both sides, and a longer name takes the width it needs and hands it back when it goes. The
+  strips are one width, and they end at the edge their sockets are on — flush right for a
+  Split's outputs, flush left for a Selector's inputs — so the list fills the column instead
+  of leaving a gutter beside it. The one setting, interpolate, sits on the row its own pin is
+  on — alone above the strips for a Selector, at the left of the first strip for a Split,
+  whose strips own the top row and start after it. The port the selection is pointing at
+  wears a glowing edge; interpolating splits the glow between the two ports the value sits
+  between, so the light slides along the list instead of jumping. The
+  AutoMap Combiner's port rows wear the same strip, and its `+ input` moved to the header
+  with the others. Dropping a port leaves its neighbours' names as they were (`in_0`, `in_2`),
+  because that is what the patch stores; the strip shows it instead of renumbering behind
+  your back, and says the name in full on hover.
+- **A module's title no longer decides how wide it is.** A name too long for the frame is
+  left out rather than cut in half, and the header then reports only what it actually holds.
+  That used to matter only in theory: Quantize, Axis to Vec and their siblings reached their
+  two blocks because the word in their header was wide, not because anything in them was, so
+  those bodies now reserve a constant box and ask for their two blocks out of their own
+  content. Measured with the grid's sizing switched off, where nothing rounds anything up.
+- **The Knob fills whatever frame its corner grip gives it.** The face was a fixed 56-point
+  dial in a module that could not be resized at all: two blocks square, the rest of the frame
+  empty, and its name cropped by an edge it couldn't move away from. It takes the corner grip
+  in both directions now, like a note or a Readout, and the face takes the body: dragged wide
+  it becomes a horizontal fader, dragged tall a vertical one. The reading sits in the middle
+  of a dial and under a fader with a line to spare, so the control keeps all the room it can.
+  It draws in the same layout as every other module;
+  the stacked one it used is what let its body's height feed back into its own size.
+- **Settings you can drag can now be typed into.** The Inverse max, the Logic Delay time, the
+  Has Changed hysteresis and the Quantize `÷` answered a drag and nothing else: a drag can't
+  land on 250 ms or on 7 subdivisions, and the pinned field was the only way to get there. A
+  double-click — or Ctrl-click — opens a text field in the pill's own value cell, which
+  starts empty with the current value as its hint so what you type is what you get; Enter
+  commits, Escape drops it. The drag still works, and the hover text now says both.
+- **Vec to Deflection has a mark of its own:** a vector bent away from straight ahead with
+  the arc that says by how much, on the same lead stub as its Converters siblings. It also
+  holds its two blocks by its own content now; it was coming out one block wide, too narrow
+  to paint its unit pill in, so it showed nothing but pins.
+- **Four controls moved to the middle line.** Inverse's mode button and max, Logic Delay's
+  three rows, Has Changed's hysteresis pill and Switch's button were anchored to the top or
+  the bottom of the space under the header, which reads as off-centre however the arithmetic
+  comes out. They are centred in that space, and on the module, as the Constant's value and
+  resolution already were. The modules whose mark fills the frame keep their pill row along
+  its bottom: centring the pill there leaves the mark too short a band to read.
+- **The Switch makes room for the label you give it.** Its caption and icon are set from the
+  module's context menu, and the button was a fixed 64 points with the caption shrunk to fit
+  inside them — a two-word label came out at eight points. The button is now measured from
+  the stored caption at the size it's painted at, with the icon taking a square beside it or
+  above it wherever it was put, and that width is what the module reserves: a long caption
+  takes another block and hands it back.
+- **A knob shows its number, and goes slim.** A dial keeps its reading in its middle and
+  takes the whole body for itself — giving a dial up a line of frame for the text just makes
+  the thing you drag smaller — and its indicator now stops short of the middle so the two
+  don't cross. A fader with height to spare writes the number under its track; a strip a block
+  tall has nothing under, and takes it at the end of the track. A fader is thin by design, so
+  the grip can take a knob to one block in either direction; a knob starts two blocks square.
+  **Collapsed, a knob draws no face and shows just its number** in the band under its header,
+  which the frame keeps: collapsing one is how the user keeps it from being nudged while
+  moving other things about it, and a folded knob that still reads is worth having.
+- **Inverse wears its name again.** `±` reads as arithmetic rather than as "negate", and the
+  word fits the two blocks its pins need anyway.
+- **The Combiner's port rows are one strip wide.** Each row carries a port name, a device
+  label and a dropdown; with different devices attached the rows came out at different widths
+  and the list read as a stack of separate controls. Every row is now as wide as the longest
+  name and label in the list, and the resolution dropdown is pinned to the strip's right edge
+  instead of trailing wherever the port name happened to end. Its drag handle gives the same
+  grab cursor the Selector's and Split's handles give.
+- **A port row is half a block tall.** A strip is 25 points and the pin column adds its
+  row spacing, so a row advances exactly 28: two rows to a 56-point block with nothing left
+  over. At 27 the list gained two points on the block every two ports, which is why the empty
+  band under the last strip slid around — 28 points of margin at one port count, 36 at another
+  — instead of being the same margin every time. It is now the same margin at every count:
+  about 26 points under an even number of rows, about 55 under an odd one, because the header
+  band the list starts under isn't a whole number of rows deep. Closing that last step is a
+  decision about the header's margins, not about the strips.
+- **A port list fills its module, and its module stops at three blocks.** The handle and the
+  `×` are 13 and 14 points rather than 16 and 18, and a name cell opens at 28 instead of 40, so
+  a list of short names — a Split out to `1`, `3`, `5`, `6` — asks for three blocks wide at any
+  number of ports. The ask is content: the parts of a row plus the longest name. The strips are
+  then drawn as wide as the column the frame leaves, which is what stops them ending in the
+  middle of the body.
+
+### Fixed
+
+- **The strips and their sockets were on two grids again, three points apart per row.** The
+  body placed its strips at one pitch while the pin column advanced its rows by another: in a
+  `Coil` layout the column adds its own row spacing, and takes row heights from the other side,
+  so asking both sides for the same number doesn't make them advance the same amount. Each port
+  moved a socket a little further off the strip naming it, and the pins' column — taller than
+  the list the body had reserved — set the module's height, so the empty band under the last
+  strip grew with every port added. One pitch, two numbers: a row is allocated `STRIP_H`, the
+  strips are painted at `STRIP_H + spacing`, and what's left under the last strip is the
+  frame's margin at every port count.
+- **A port list stopped short of its own sockets.** A strip was as wide as its longest label,
+  so a Split with short names left a gutter between the list and the output sockets and the
+  module looked twice as wide as anything in it. The list now spans the body column, flush with
+  the edge the sockets are on; the name's width is only the floor, which is what steps the
+  module a block wider when a name runs out of room.
+- **A knob stopped showing its number at most sizes.** The number was painted — with a painter
+  made for the control's own rect, and such a painter clips to that rect, so a number written
+  under a track fell outside it and was cut away. The reading gets a painter clipped to the
+  body column instead.
+- **A collapsed knob drew a slice of its dial across the header.** A collapsed node's body
+  still runs, and the fork shifts it up under the header's clip. Folded, the knob now paints
+  no face at all and writes its number in the band under the header — with a painter clipped
+  to the frame, since a collapsed body is nothing to clip against.
+- **A folded module's name sat on top of its sockets.** With no body to hang them on, a
+  collapsed node draws its sockets at the ends of the header row, while the name was measured
+  against the frame alone. The sockets' room now comes off the name's room.
+- **A long name still decided how narrow a module could be.** The header reported the name as
+  part of what it held, so the node's `max(header, pins)` width kept the frame at the name's
+  width and the name was never given the chance to hide. The header reports only its controls.
+
+- **A Sample and Hold body showed a dash where its incoming value should be, and its output
+  never changed colour with the trigger or gate.** The engine mirrors a node's input signals
+  to the display only for a named list of modules — and Sample and Hold wasn't on it, in
+  either of the two places that list is kept (top-level nodes, and nodes inside a sub-patch).
+  The output reading looked fine because a node's *outputs* are mirrored for every module,
+  so half the body was right and the other half was stuck at a dash and a resting grey. A
+  test now ticks a graph and asserts the module's two inputs reach the display.
+- **Its two readings were painted up among the pin labels.** They were divided through the
+  body column, which is only as tall as the pin rows, so the input line landed next to the
+  header like a stray mark. They are anchored to the bottom of the frame now, the part a
+  two-block Sample and Hold has nothing else in.
+- **A note could be dragged wider but never narrower.** Its header puts the font size and
+  colour against its right edge, and a block laid out right-to-left draws against the
+  frame's edge — so the header's used rect spanned the whole node, and the node's width
+  formula, `max(header, pins)`, kept it at whatever width it already had. The viewer now
+  reports what its header actually holds, and the grip's floor comes from what the body
+  needs rather than from the frame as it stands; both were ratchets, and the note goes back
+  to the size it opened at.
+
+- **Abs and NOT have their marks back.** They came out the right size — two blocks, square
+  like their siblings — with nothing painted on them. Making room for a mark and then
+  telling it to start below the room it was just given leaves six points of band and no
+  glyph, which is what happened. A test now checks the mark was drawn, not only that the
+  frame is the right shape, and it covers all 21 modules with a mark: a module can measure
+  perfectly and still show an empty body, and only one of those two facts was being
+  checked.
+
+- **A Constant stops rounding, and starts answering the drag again.** The box read its
+  value through a 32-bit float, which is what the wire carries — about seven exact digits
+  — so an eight- or nine-digit number was rounded on the way in, and then looked frozen:
+  at that size the gap between neighbouring 32-bit floats is wider than the drag step, so
+  every drag computed a change, stored nothing, and only typing a smaller value brought the
+  box back to life. The box now keeps the number as it is stored, moves it in whole
+  resolution steps — tenths where it reads tenths — and clamps at ±1e12, far inside what
+  the wire can carry, with the limit and the 32-bit reality spelled out in the hover text
+  instead of being discovered by watching digits misbehave. A test puts in a nine-digit
+  number, checks it comes back unchanged, drags the box and checks the value moved, and
+  checks a hundred-digit one is clamped.
+
+- **The value and resolution pair sits where it should.** They were centred on the module,
+  which includes its header, so the stack hung high with all the empty space beneath it and
+  read as off-centre no matter how the arithmetic came out. They're centred in the space
+  under the header now, horizontally on the module as before.
+
+- **Four values that had become drag-only.** The Inverse max, the Logic Delay time, the Has
+  Changed hysteresis and the Quantize factor were moved from a value box into a pill when
+  those bodies came down to two blocks, and the pill only answered a drag: no click, no
+  typing, no way to set an exact number from the canvas. It does all three now, and a test
+  types `250` into one and `7` into another and reads them back.
+
+- **Quantize's `÷` pill was cut off by its own frame.** The two pills measured 102 points
+  across a body 100 wide, so each side ran a point past the clip and the division sign lost
+  its edge. The label cell is 14 points instead of 18 and the pills are 44 and 40, which
+  leaves six points of air either side with both values still legible.
+
+- **The value pills in the small modules had a square left end.** A pill is painted as two
+  cells, the label with its left corners rounded and the value with its right ones. When the
+  label is empty — which is how Inverse, Logic Delay, Has Changed and Vec to Deflection paint
+  theirs now — nothing rounded the pill's left side, so it looked clipped by the frame edge.
+  An empty label cell isn't painted at all now, and the value cell takes all four corners.
+
+- **The AutoMap Combiner's port rows and its sockets were on two different grids.** The rows
+  are laid out in the body and the sockets in the pin column, and the column was told to use
+  a fixed 28-point row while the rows themselves came out whatever the dropdowns happened to
+  measure. They now share one expression — the style's widget height plus the frame's padding
+  — which each side computes from the same style, since the pins are laid out before the body
+  and neither can measure the other.
+
+- **A Split's first port was set in from the others, and its name ran out of the strip.** The
+  interpolate toggle was sharing the first strip's band, which made that strip narrower than
+  the ones under it and left its name no room, so the column looked like a ladder and the text
+  hung past the edge. The toggle has its own band now, above the strips, as it does on the
+  Selector; every strip is the same width from the same edge, and a name too long for its cell
+  is cut with an ellipsis with the whole name in the hover text.
+
+- **A port name the user typed could outgrow the strip that shows it.** The strip's width is
+  measured from the name and capped, so a name past the cap painted over the strip's right
+  edge. It is cut to fit, and the full name is in the hover text.
+
+- **Has Changed's and Vec to Deflection's pills sat under their own pin labels.** The pill is
+  painted across the frame rather than into the column between the labels, which is what keeps
+  those modules two blocks wide — but the label column (`chg`/`inc`/`dec`) is wide, and a
+  56-point pill centred on the module ran into it. The drawn width is now capped to the space
+  between the labels; the module's size is unchanged.
 
 ## [0.17.1] - 2026-11-10
 

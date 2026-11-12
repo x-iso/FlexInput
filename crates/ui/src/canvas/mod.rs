@@ -2133,6 +2133,9 @@ impl Canvas {
             view_salt: self.view_salt,
             snarl_id,
             node_margin_x: self.style.node_frame.map_or(0.0, |f| f.total_margin().sum().x),
+            node_margin_y: self.style.node_frame.map_or(0.0, |f| f.total_margin().sum().y),
+            size_floors: std::collections::HashMap::new(),
+            header_content: std::collections::HashMap::new(),
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
         // (zoom / pan) from the zoom-control overlay below. The salt is

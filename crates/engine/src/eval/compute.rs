@@ -223,7 +223,16 @@ pub(crate) fn compute_node(
                 macro_port_value(ty, scalar, vec2)
             }).collect()
         }
-        "module.constant" | "module.knob" => {
+        "module.constant" => {
+            let v = snap.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            // The resolution the box is set to: digits after the dot, `0` for whole
+            // numbers. Snapped here as well as in the UI, so a value that arrived some
+            // other way - an older scene, a preset, a pasted node - still answers to it.
+            let res = snap.params.get("res").and_then(|v| v.as_f64()).unwrap_or(4.0).clamp(0.0, 4.0) as i32;
+            let scale = 10f64.powi(res);
+            vec![Some(Signal::Float(((v * scale).round() / scale) as f32))]
+        }
+        "module.knob" => {
             let v = snap.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             vec![Some(Signal::Float(v))]
         }
@@ -558,6 +567,11 @@ pub fn eval_pure(
         "logic.or"        => Some(Signal::Bool(get_b(inputs, 0, false) || get_b(inputs, 1, false))),
         "logic.not"       => Some(Signal::Bool(!get_b(inputs, 0, false))),
         "logic.xor"       => Some(Signal::Bool(get_b(inputs, 0, false) ^ get_b(inputs, 1, false))),
+        // The inverted pairs: each is its sibling with the output negated, matching the
+        // bubble the gate glyph carries.
+        "logic.nand"      => Some(Signal::Bool(!(get_b(inputs, 0, false) && get_b(inputs, 1, false)))),
+        "logic.nor"       => Some(Signal::Bool(!(get_b(inputs, 0, false) || get_b(inputs, 1, false)))),
+        "logic.xnor"      => Some(Signal::Bool(!(get_b(inputs, 0, false) ^ get_b(inputs, 1, false)))),
         "logic.equal"     => Some(Signal::Bool(get_f(inputs, 0, 0.0) == get_f(inputs, 1, 0.0))),
         "logic.not_equal" => Some(Signal::Bool(get_f(inputs, 0, 0.0) != get_f(inputs, 1, 0.0))),
         "logic.greater_than" => {

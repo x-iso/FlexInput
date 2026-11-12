@@ -285,20 +285,44 @@ pub trait SnarlViewer<T> {
     }
 
     /// FLEXINPUT PATCH: whether the node has a grip on its frame's bottom-right corner
-    /// for setting its width (see [`Self::resize_node`]). Off by default.
+    /// for setting its size (see [`Self::resize_node`]). Off by default.
     #[inline]
     fn node_resizable(&mut self, node: NodeId, snarl: &Snarl<T>) -> bool {
         let _ = (node, snarl);
         false
     }
 
-    /// FLEXINPUT PATCH: the node's width grip was dragged to make its frame
-    /// `frame_width` wide: whole blocks on the layout grid, unless Alt is held. The node
-    /// is the viewer's to lay out at that width; it can't get narrower than what it
-    /// holds, and the grip starts from the frame's actual width each time.
+    /// FLEXINPUT PATCH: how much width the node's header is entitled to. `None` uses the
+    /// rect the header drew into. A viewer that places anything at its header's right
+    /// edge draws into the full frame width, and the node would then keep that width no
+    /// matter what its body asks for — so such a viewer reports what its header actually
+    /// holds: the name, and whatever sits beside it.
     #[inline]
-    fn resize_node(&mut self, node: NodeId, frame_width: f32, snarl: &mut Snarl<T>) {
-        let _ = (node, frame_width, snarl);
+    fn node_header_width(&mut self, node: NodeId, snarl: &Snarl<T>) -> Option<f32> {
+        let _ = (node, snarl);
+        None
+    }
+
+    /// FLEXINPUT PATCH: the narrowest a resizable node's frame may be, as the viewer
+    /// measures it. `None` falls back to the header's width, which works for a node whose
+    /// header is a row of its own contents — but a node that fills its header to the
+    /// frame's width (a title centred across a note) would then set its own floor, and
+    /// the grip could never bring it back. Such a viewer says how narrow it can go.
+    #[inline]
+    fn node_narrowest(&mut self, node: NodeId, snarl: &Snarl<T>) -> Option<f32> {
+        let _ = (node, snarl);
+        None
+    }
+
+    /// FLEXINPUT PATCH: the node's corner grip was dragged to make its frame
+    /// `frame_width` by `frame_height`: whole blocks on the layout grid, unless Alt is
+    /// held. The node is the viewer's to lay out at that size; it can't get narrower
+    /// than what it holds, and the grip starts from the frame's actual size each time.
+    /// The height is a floor rather than a bound — content always wins — which is what
+    /// lets a body grow itself a block when it needs one without the grip fighting it.
+    #[inline]
+    fn resize_node(&mut self, node: NodeId, frame_width: f32, frame_height: f32, snarl: &mut Snarl<T>) {
+        let _ = (node, frame_width, frame_height, snarl);
     }
 
     /// Checks if the node has something to show in context menu if right-clicked or long-touched on the node.

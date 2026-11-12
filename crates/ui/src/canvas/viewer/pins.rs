@@ -99,6 +99,45 @@ pub(crate) fn remove_dynamic_pin<S: PinSide>(
     }
 }
 
+/// Move pin `from` to `to` within one side, carrying its wires. The ports of a Selector,
+/// a Split or a Combiner are an ordered list the user drags about, and the engine reads
+/// them by position - so a move has to move the wires with the pin, not leave them behind
+/// on whatever now sits in that slot.
+pub(crate) fn move_dynamic_pin<S: PinSide>(
+    node_id: NodeId,
+    from: usize,
+    to: usize,
+    pins: &[S::Pin],
+    snarl: &mut Snarl<NodeData>,
+) {
+    if from == to || from >= pins.len() || to >= pins.len() {
+        return;
+    }
+    let (lo, hi) = (from.min(to), from.max(to));
+    // Where each old index of the span ends up once `from` is lifted out and put back at
+    // `to`. Everything outside the span keeps its place.
+    let mut order: Vec<usize> = (lo..=hi).collect();
+    let moved = order.remove(from - lo);
+    order.insert(to - lo, moved);
+    // Wires per old index of the span, and the descriptors themselves.
+    let remotes: Vec<Vec<S::Remote>> = pins[lo..=hi].iter().map(|p| S::remotes(p).to_vec()).collect();
+    for i in lo..=hi {
+        S::drop_at(snarl, node_id, i);
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        let descs: Vec<PinDescriptor> = {
+            let all = S::pins_mut(node);
+            order.iter().map(|&old| all[old].clone()).collect()
+        };
+        S::pins_mut(node).splice(lo..=hi, descs);
+    }
+    for (k, &old) in order.iter().enumerate() {
+        for remote in &remotes[old - lo] {
+            S::connect(snarl, node_id, lo + k, *remote);
+        }
+    }
+}
+
 /// Keep only pins that have at least one wire, compacting the rest away. An
 /// AutoMap port is never "unused" — it is the node's bus port, not a
 /// user-added pin — so it is always kept.
@@ -147,6 +186,33 @@ pub(crate) fn clear_unused_dynamic_pins<S: PinSide>(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// A pin's label in a row `h` tall: laid out once, painted centred in the row, and the row
+/// is what the node measures. Snarl centres the socket in that same row, so a label drawn
+/// this way and the port strip beside it agree on where the row is - which is what keeps a
+/// Selector's or a Split's sockets level with the ports they belong to.
+pub(crate) fn pin_label_at_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: Option<Color32>,
+    h: f32,
+    shortened: bool,
+    full: &str,
+) {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let default = ui.visuals().widgets.inactive.fg_stroke.color;
+    let color = color.unwrap_or(default);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x, h), egui::Sense::hover());
+    ui.painter().galley(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    if shortened {
+        resp.on_hover_text(full);
+    }
+}
 
 pub(crate) fn pin_info(t: SignalType) -> PinInfo {
     let [r, g, b] = t.color_rgb();

@@ -1904,10 +1904,10 @@ where
 }
 
 /// FLEXINPUT PATCH: the grip on a resizable node's bottom-right corner. Dragging it
-/// asks the viewer for a frame that wide: whole blocks on the grid (Alt for any width),
-/// counted from the frame's actual width when the drag began.
+/// asks the viewer for a frame that size: whole blocks on the grid (Alt for any size),
+/// counted from the frame's actual size when the drag began.
 #[allow(clippy::too_many_arguments)]
-fn width_grip<T, V>(
+fn size_grip<T, V>(
     ui: &mut Ui,
     node: NodeId,
     node_id: Id,
@@ -1924,30 +1924,41 @@ fn width_grip<T, V>(
     const GRIP: f32 = 12.0;
     let rect = Rect::from_min_max(frame.max - vec2(GRIP, GRIP), frame.max);
     let resp = ui
-        .interact(rect, node_id.with("width_grip"), Sense::drag())
-        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-    let key = node_id.with("width_grip_from");
+        .interact(rect, node_id.with("size_grip"), Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeNwSe)
+        .on_hover_text("Drag to resize, in blocks");
+    let key = node_id.with("size_grip_from");
     if resp.drag_started() {
-        ui.ctx().data_mut(|d| d.insert_temp(key, (frame.width(), 0.0_f32)));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(key, (frame.width(), 0.0_f32, frame.height(), 0.0_f32)));
     }
     if resp.dragged() {
         snarl_state.mark_chrome_dragged();
-        let (from, moved) = ui
+        let (from_w, moved_x, from_h, moved_y) = ui
             .ctx()
-            .data(|d| d.get_temp::<(f32, f32)>(key))
-            .unwrap_or((frame.width(), 0.0));
-        let moved = moved + resp.drag_delta().x;
-        ui.ctx().data_mut(|d| d.insert_temp(key, (from, moved)));
-        let free = (from + moved).max(narrowest).max(ui.spacing().interact_size.x);
-        let width = match grid {
-            Some(g) if !modifiers.alt => ((free / g.block).round() * g.block).max(g.snap_len(narrowest)),
-            _ => free,
+            .data(|d| d.get_temp::<(f32, f32, f32, f32)>(key))
+            .unwrap_or((frame.width(), 0.0, frame.height(), 0.0));
+        let moved_x = moved_x + resp.drag_delta().x;
+        let moved_y = moved_y + resp.drag_delta().y;
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(key, (from_w, moved_x, from_h, moved_y)));
+        let free_w = (from_w + moved_x).max(narrowest).max(ui.spacing().interact_size.x);
+        // The height is a floor the viewer may exceed, so the only bound here is one
+        // block: content decides what a node actually needs, and a body that runs out of
+        // room grows itself another block without the grip having to know.
+        let free_h = (from_h + moved_y).max(ui.spacing().interact_size.y);
+        let (width, height) = match grid {
+            Some(g) if !modifiers.alt => (
+                ((free_w / g.block).round() * g.block).max(g.snap_len(narrowest)),
+                (free_h / g.block).round() * g.block,
+            ),
+            _ => (free_w, free_h),
         };
-        viewer.resize_node(node, width, snarl);
+        viewer.resize_node(node, width, height, snarl);
         ui.ctx().request_repaint();
     }
     if resp.drag_stopped() {
-        ui.ctx().data_mut(|d| d.remove::<(f32, f32)>(key));
+        ui.ctx().data_mut(|d| d.remove::<(f32, f32, f32, f32)>(key));
     }
 
     // Three short diagonal strokes in the corner, brighter under the pointer.
@@ -3024,7 +3035,13 @@ where
                     let body_rect = r.final_rect;
 
                     new_pins_size.x = f32::max(new_pins_size.x, body_rect.width());
-                    new_pins_size.y += body_rect.height() + ui.spacing().item_spacing.y;
+                    // FLEXINPUT PATCH: a body that drew nothing — one that paints a
+                    // glyph into the room its pins leave over, taking no space of its
+                    // own — shouldn't pay for the gap between rows either. Without
+                    // this, giving a node such a body makes it a row taller for
+                    // nothing, and a node already short of room grows a block.
+                    new_pins_size.y += body_rect.height()
+                        + if body_rect.height() > 0.0 { ui.spacing().item_spacing.y } else { 0.0 };
 
                     if !snarl.nodes.contains(node.0) {
                         // If removed
@@ -3148,7 +3165,13 @@ where
                     let body_rect = r.final_rect;
 
                     new_pins_size.x = f32::max(new_pins_size.x, body_rect.width());
-                    new_pins_size.y += body_rect.height() + ui.spacing().item_spacing.y;
+                    // FLEXINPUT PATCH: a body that drew nothing — one that paints a
+                    // glyph into the room its pins leave over, taking no space of its
+                    // own — shouldn't pay for the gap between rows either. Without
+                    // this, giving a node such a body makes it a row taller for
+                    // nothing, and a node already short of room grows a block.
+                    new_pins_size.y += body_rect.height()
+                        + if body_rect.height() > 0.0 { ui.spacing().item_spacing.y } else { 0.0 };
 
                     if !snarl.nodes.contains(node.0) {
                         // If removed
@@ -3290,11 +3313,16 @@ where
 
         ui.expand_to_include_rect(header_rect);
         let header_size = header_rect.size();
-        header_w = header_size.x;
+        // FLEXINPUT PATCH: what the header contributes to the node's width. Its used rect
+        // spans the frame whenever the viewer puts a control against the header's right
+        // edge, which is what we do for a note's font size — and then the node's width
+        // formula keeps it at the width it already has, so it can be dragged wider and
+        // never narrower. A viewer that knows its header's real content says so here.
+        header_w = viewer.node_header_width(node, snarl).unwrap_or(header_size.x);
         node_state.set_header_height(header_size.y);
 
         let mut size = vec2(
-            f32::max(header_size.x, new_pins_size.x),
+            f32::max(header_w, new_pins_size.x),
             header_size.y
                 + header_frame.total_margin().bottom
                 + ui.spacing().item_spacing.y
@@ -3320,10 +3348,12 @@ where
 
     viewer.final_node_rect(node, r.response.rect, ui, snarl);
 
-    // FLEXINPUT PATCH: the width grip, over everything else in the node.
+    // FLEXINPUT PATCH: the corner grip, over everything else in the node. The viewer's
+    // own floor wins where it has one: the header's laid-out width can be the frame's
+    // width, which would let the grip grow a node and never bring it back.
     if viewer.node_resizable(node, snarl) {
-        let narrowest = header_w + margins.x;
-        width_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl);
+        let narrowest = viewer.node_narrowest(node, snarl).unwrap_or(header_w + margins.x);
+        size_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl);
     }
 
     node_state.store(ui.ctx());

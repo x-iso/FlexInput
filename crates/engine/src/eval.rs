@@ -406,6 +406,18 @@ fn eval_subgraph(
             "display.controller3d" => {
                 if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
+            // Sample and Hold writes its two readings in its body: the value the wire is
+            // carrying in, and whether the trigger or gate is engaged right now. Both come
+            // from the mirrored inputs; without this the body shows a dash and the output
+            // never changes colour no matter what the gate pin says.
+            "module.sample_hold" => {
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
+            }
+            // A Selector's and Split's body lights the port the selection is on right now,
+            // which needs the value sitting on their `select` pin.
+            "module.selector" | "module.split" => {
+                if display { last_inputs.insert(ns_uid, inputs.clone()); }
+            }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
                 if display { last_inputs.insert(ns_uid, inputs.clone()); }
             }
@@ -1183,6 +1195,18 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
             // The 3D controller viewer reads its Orientation quaternion (input
             // pin 1, a Vec4) from the mirrored inputs.
             "display.controller3d" => {
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
+            }
+            // Sample and Hold writes two readings in its body: the value the wire is
+            // carrying in, and whether the trigger or gate is engaged right now. Both come
+            // from the mirrored inputs; left out, the body shows a dash and the output
+            // never changes colour no matter what the gate pin says.
+            "module.sample_hold" => {
+                if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
+            }
+            // A Selector's and Split's body lights the port the selection is on right now,
+            // which needs the value sitting on their `select` pin.
+            "module.selector" | "module.split" => {
                 if display { last_inputs.insert(snap.node_uid, inputs.clone()); }
             }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {

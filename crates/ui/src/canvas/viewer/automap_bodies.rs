@@ -1124,6 +1124,7 @@ pub(crate) fn show_automap_combiner_body(
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     parent: Option<&AutomapGlowParent<'_>>,
+    pinned: bool,
 ) {
     let _ = live_signals; // no longer used: structural overlap is connection-based
     let n = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(0);
@@ -1155,6 +1156,41 @@ pub(crate) fn show_automap_combiner_body(
             .and_then(|node| node.params.get("combiner_port_default"))
             .and_then(|v| v.as_object()).cloned().unwrap_or_default();
         let mut next_port_default: Vec<(usize, &'static str)> = Vec::new();
+        // The strip fill, so a port row reads as one object the handle, the `×` and the
+        // dropdowns sit on - the same fill the Selector's and Split's strips wear.
+        let strip_fill = ui.visuals().widgets.inactive.weak_bg_fill;
+
+        // Every row the same width, sized by the longest port name and device label in the
+        // list: strips ending at ragged widths read as several controls rather than one
+        // list. Measured from the text the rows are going to hold, never from the frame the
+        // module has, so it doesn't ratchet.
+        let small_font = egui::TextStyle::Small.resolve(ui.style());
+        let measure = |s: &str| -> f32 {
+            if s.is_empty() {
+                return 0.0;
+            }
+            ui.painter()
+                .layout_no_wrap(s.to_string(), small_font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        };
+        let widest = (0..n)
+            .map(|i| {
+                let dev = infos.get(i).map(|info| info.label.as_str()).unwrap_or("");
+                let gap = if dev.is_empty() { 0.0 } else { ui.spacing().item_spacing.x };
+                measure(&format!("in_{i}")) + gap + measure(dev)
+            })
+            .fold(0.0f32, f32::max);
+        let combo_w = 58.0; // the width the policy dropdown is given below
+        let remove_w = (measure("×") + 2.0 * ui.spacing().button_padding.x)
+            .max(ui.spacing().interact_size.x * 0.6);
+        let row_min_w = measure("⠿")
+            + remove_w
+            + widest
+            + combo_w
+            + 6.0 * ui.spacing().item_spacing.x
+            + 2.0 * super::kit::COMBINER_PAD_V
+            + 8.0;
 
         for i in 0..n {
             // A port "is in conflict" if any pin it offers is offered by ≥2 ports.
@@ -1165,14 +1201,26 @@ pub(crate) fn show_automap_combiner_body(
             // Each row is a drop zone (egui draws a hover-highlight frame
             // automatically while a compatible payload is in flight). Inside it,
             // the drag handle glyph is the actual drag source so × stays clickable.
+            // The row is exactly the height a Combiner strip is - its widgets are set to
+            // what's left inside the frame's padding - and the pin row beside it is
+            // allocated the same (`kit::strip_pitch`), which is the only way the socket and
+            // the strip naming that port stay level: the pins are laid out before the body.
+            let row_h = super::kit::strip_min_pitch("module.automap_combiner", ui).unwrap_or(28.0);
+            let pad = super::kit::COMBINER_PAD_V;
             let drop_frame = egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(2, 1));
-            let (_, dropped) = ui.dnd_drop_zone::<usize, _>(drop_frame, |ui| {
+                .fill(strip_fill)
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(2, pad as i8));
+            let (zone, dropped) = ui.dnd_drop_zone::<usize, _>(drop_frame, |ui| {
+                ui.spacing_mut().interact_size.y = row_h - 2.0 * pad;
+                ui.set_min_width(row_min_w - 2.0 * pad);
                 ui.horizontal(|ui| {
                     let handle_id = egui::Id::new(("automap_combiner_handle", node_id, i));
                     ui.dnd_drag_source(handle_id, i, |ui| {
                         ui.label(egui::RichText::new("⠿").weak().small());
-                    });
+                    })
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::Grab);
                     if n > 2 {
                         if ui.small_button("×").clicked() { to_remove = Some(i); }
                     } else {
@@ -1188,6 +1236,12 @@ pub(crate) fn show_automap_combiner_body(
                         ui.label(egui::RichText::new(dev_label).small().weak());
                     }
                     // Per-port default policy dropdown (SORT default).
+                    // Pinned to the strip's right edge: following the end of the port name
+                    // left the dropdowns wandering to a different place in every row.
+                    let row_inner_w = row_min_w - 2.0 * pad;
+                    let combo_box_w = 58.0 + 2.0 * ui.spacing().button_padding.x;
+                    let spare = row_inner_w - ui.min_rect().width() - combo_box_w;
+                    ui.add_space(spare.max(0.0));
                     let cur_default = port_default_map.get(&i.to_string())
                         .and_then(|v| v.as_str()).unwrap_or("SORT");
                     let pd_id = egui::Id::new(("automap_combiner_port_default", node_id, i));
@@ -1205,6 +1259,8 @@ pub(crate) fn show_automap_combiner_body(
                         });
                 });
             });
+            // Traced so a test can hold the rows to one width.
+            super::simple_bodies::trace_rect(ui, node_id, &format!("combiner_row_{i}"), zone.response.rect);
             if let Some(dragged_idx) = dropped {
                 let from = *dragged_idx;
                 if from != i { to_move = Some((from, i)); }
@@ -1235,11 +1291,17 @@ pub(crate) fn show_automap_combiner_body(
             }
         }
 
-        ui.add_space(2.0);
-        if ui.small_button("+ input").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len();
-                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::AutoMap));
+        // The `+` for another port lives in the header, like the Selector's and Split's.
+        // A whole-module pin (a Combiner pinned inside a Controller3D layout) is drawn
+        // without the node's header, so that one keeps the button in the body - otherwise
+        // there is no way at all to add a port to it.
+        if pinned {
+            if ui
+                .small_button("+ input")
+                .on_hover_text("Add another input port")
+                .clicked()
+            {
+                super::simple_bodies::add_port(node_id, "module.automap_combiner", snarl);
             }
         }
 

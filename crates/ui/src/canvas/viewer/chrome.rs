@@ -145,7 +145,7 @@ pub(crate) fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32>
         "display.trigscope" => if ch == 0 { None } else { Some(MULTI_COLORS[(ch - 1) % MULTI_COLORS.len()]) },
         // selector: ch 0 is "select" (no color), ch 1+ are the value inputs
         "module.selector" => if ch == 0 { None } else { Some(MULTI_COLORS[(ch - 1) % MULTI_COLORS.len()]) },
-        "module.split" | "module.delay" | "module.average" | "module.dc_filter" => {
+        "module.delay" | "module.average" | "module.dc_filter" => {
             Some(MULTI_COLORS[ch % MULTI_COLORS.len()])
         }
         _ => None,

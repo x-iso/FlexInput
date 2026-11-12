@@ -6,6 +6,7 @@ use crate::util::{get_bool, get_float};
 pub fn registrations() -> Vec<ModuleRegistration> {
     vec![
         reg::<And>(), reg::<Or>(), reg::<Not>(), reg::<Xor>(),
+        reg::<Nand>(), reg::<Nor>(), reg::<Xnor>(),
         reg::<Equal>(), reg::<NotEqual>(), reg::<GreaterThan>(), reg::<LessThan>(),
         reg::<HasChanged>(), reg::<LogicDelay>(), reg::<Counter>(),
     ]
@@ -95,6 +96,66 @@ impl Module for Xor {
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         out_b(get_bool(inputs, 0, false) ^ get_bool(inputs, 1, false))
+    }
+}
+
+// ── Nand / Nor / Xnor ─────────────────────────────────────────────────────────
+//
+// The three gated pairs the AND / OR / XOR set was missing. Each is its sibling with
+// the output inverted, and the inverter is drawn as the little bubble the gate glyphs
+// in `app/assets/modules/` already carry — the module and the mark have to agree.
+
+#[derive(Default)]
+pub struct Nand;
+impl Module for Nand {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "logic.nand", display_name: "NAND", category: "Logic",
+            inputs: vec![
+                PinDescriptor::new("a", SignalType::Bool),
+                PinDescriptor::new("b", SignalType::Bool),
+            ],
+            outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        out_b(!(get_bool(inputs, 0, false) && get_bool(inputs, 1, false)))
+    }
+}
+
+#[derive(Default)]
+pub struct Nor;
+impl Module for Nor {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "logic.nor", display_name: "NOR", category: "Logic",
+            inputs: vec![
+                PinDescriptor::new("a", SignalType::Bool),
+                PinDescriptor::new("b", SignalType::Bool),
+            ],
+            outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        out_b(!(get_bool(inputs, 0, false) || get_bool(inputs, 1, false)))
+    }
+}
+
+#[derive(Default)]
+pub struct Xnor;
+impl Module for Xnor {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "logic.xnor", display_name: "XNOR", category: "Logic",
+            inputs: vec![
+                PinDescriptor::new("a", SignalType::Bool),
+                PinDescriptor::new("b", SignalType::Bool),
+            ],
+            outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        out_b(!(get_bool(inputs, 0, false) ^ get_bool(inputs, 1, false)))
     }
 }
 
@@ -236,4 +297,46 @@ impl Module for Counter {
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn two(a: bool, b: bool) -> Vec<Option<Signal>> {
+        vec![Some(Signal::Bool(a)), Some(Signal::Bool(b))]
+    }
+
+    fn one(module: &mut dyn Module, a: bool, b: bool) -> bool {
+        matches!(module.process(&two(a, b))[0], Signal::Bool(true))
+    }
+
+    // Each inverted gate is its sibling with the output negated: same four input pairs,
+    // opposite answers. The glyphs in `app/assets/modules/` draw the same relationship
+    // with a bubble, so the two have to stay in step.
+    #[test]
+    fn the_inverted_gates_are_their_siblings_negated() {
+        let mut and = And;
+        let mut or = Or;
+        let mut xor = Xor;
+        let mut nand = Nand;
+        let mut nor = Nor;
+        let mut xnor = Xnor;
+        for (a, b) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(!one(&mut nand, a, b) == one(&mut and, a, b), "NAND vs AND at {a},{b}");
+            assert!(!one(&mut nor, a, b) == one(&mut or, a, b), "NOR vs OR at {a},{b}");
+            assert!(!one(&mut xnor, a, b) == one(&mut xor, a, b), "XNOR vs XOR at {a},{b}");
+        }
+    }
+
+    #[test]
+    fn the_inverted_gates_have_their_sibling_s_pins() {
+        for (id, plain) in [("logic.nand", "logic.and"), ("logic.nor", "logic.or"), ("logic.xnor", "logic.xor")] {
+            let n = crate::all_modules().into_iter().find(|m| m.descriptor.id == id).expect(id).descriptor;
+            let p = crate::all_modules().into_iter().find(|m| m.descriptor.id == plain).expect(plain).descriptor;
+            assert_eq!(n.inputs.len(), p.inputs.len(), "{id} input count");
+            assert_eq!(n.outputs.len(), 1, "{id} output count");
+            assert_eq!(n.category, "Logic", "{id} category");
+        }
+    }
 }

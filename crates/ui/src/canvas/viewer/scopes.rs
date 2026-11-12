@@ -157,25 +157,63 @@ pub(crate) fn render_vectorscope_display(
 
 
 
-pub(crate) fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+/// The Readout: the number a wire is carrying, written as large as the module's space
+/// allows. It takes the corner grip like a note does, and its floor is set by the reading
+/// at the smallest size worth showing — so it opens small (two blocks for an ordinary
+/// number) and a long value demands the width it needs rather than turning into a squint.
+const READOUT_MIN_FONT: f32 = 10.0;
+const READOUT_MAX_FONT: f32 = 34.0;
+/// A monospace digit is about this much of its point size wide, which is how the fit is
+/// worked out without laying the text out at every candidate size.
+const MONO_RATIO: f32 = 0.62;
+
+/// The reading this frame, and how wide the body has to be to hold it at the smallest
+/// size. Asked by `show_body` before the body runs, because it's the body's floor.
+pub(crate) fn readout_floor_w(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {
+    let text = snarl
+        .get_node(node_id)
+        .and_then(|n| n.extra.last_signals.first().copied().flatten())
+        .map(|s| super::simple_bodies::signal_text(Some(&s)))
+        .unwrap_or_default();
+    text.chars().count().max(6) as f32 * MONO_RATIO * READOUT_MIN_FONT + 8.0
+}
+
+pub(crate) fn show_readout_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    view_salt: u64,
+    body_w: f32,
+    body_h: f32,
+) {
     let sig = snarl
         .get_node(node_id)
         .and_then(|n| n.extra.last_signals.first().copied().flatten());
-
-    use flexinput_core::Signal;
-    let text = match sig {
-        Some(Signal::Float(f)) => format!("{f:.4}"),
-        Some(Signal::Bool(b))  => if b { "true".into() } else { "false".into() },
-        Some(Signal::Vec2(v))  => format!("({:.3}, {:.3})", v.x, v.y),
-        Some(Signal::Vec4(v))  => format!("({:.3}, {:.3}, {:.3}, {:.3})", v.x, v.y, v.z, v.w),
-        Some(Signal::Int(i))   => format!("{i}"),
-        None                   => "—".into(),
-    };
-    let resp = ui.add_sized(
-        [120.0, 24.0],
-        egui::Label::new(egui::RichText::new(text).monospace().size(14.0)),
+    let text = super::simple_bodies::signal_text(sig.as_ref());
+    // Reserve the box the viewer worked out, then paint into it: the reading never decides
+    // the module's size beyond the floor it sets for itself, and the type is what gives
+    // way when the space does. Taking `available_height()` as a minimum here would be the
+    // ratchet in disguise - the body would keep whatever height the last frame gave it.
+    let reserved = egui::vec2(body_w, body_h);
+    ui.allocate_exact_size(reserved, egui::Sense::hover());
+    let inner = super::module_icons::module_inner(ui, view_salt, node_id);
+    let column = ui.max_rect();
+    let centre_x = inner.map(|r| r.center().x).unwrap_or_else(|| column.center().x);
+    let rect = egui::Rect::from_center_size(egui::pos2(centre_x, column.center().y), reserved);
+    // The largest size the reading fits at in this box, both ways.
+    let chars = text.chars().count().max(1) as f32;
+    let size = ((rect.width() - 8.0) / (chars * MONO_RATIO))
+        .min((rect.height() - 6.0) / 1.25)
+        .clamp(READOUT_MIN_FONT, READOUT_MAX_FONT);
+    let color = ui.visuals().strong_text_color();
+    ui.painter_at(rect).text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        &text,
+        egui::FontId::monospace(size),
+        color,
     );
-    register_exposable_element(ui, node_id, "value", resp.rect);
+    register_exposable_element(ui, node_id, "value", rect);
 }
 
 /// Decide whether a scope-like module should bypass the user's base

@@ -864,7 +864,7 @@ impl Default for CanvasGrid {
         Self {
             show: true,
             style: egui_snarl::ui::GridStyle::Crosses,
-            accent_every: 8,
+            accent_every: 2,
             brightness: 1.0,
             snap: true,
             push: true,
@@ -881,7 +881,18 @@ impl Default for CanvasGrid {
 impl CanvasGrid {
     /// The one block size modules are laid out in, in canvas points: modules
     /// are designed in multiples of it, so it isn't a setting.
-    pub const BLOCK: f32 = 56.0;
+    ///
+    /// Half of what it was. The finer step is what makes a column of port rows come out
+    /// even: a row is 28 points (a 25-point strip plus the pin column's 3-point spacing), so
+    /// a row is exactly one block and the empty band under the last strip is the same size at
+    /// every port count - measured, 26 points at three ports and at seven, where the 56-point
+    /// block alternated between 26 and 55 depending on whether the port count was odd. It
+    /// buys granularity, not size: the floors and defaults that were stated in old blocks are
+    /// now stated in twice as many of these, so a module that started two blocks square still
+    /// starts 112 points square. The default grid keeps the old look the same way: a brighter
+    /// line every two, so the 56-point grid is still what stands out and the 28-point lines
+    /// read as its subdivisions.
+    pub const BLOCK: f32 = 28.0;
 
     /// The snarl style's grid for these settings, `None` when it does nothing.
     pub fn layout(self) -> Option<egui_snarl::ui::GridLayout> {

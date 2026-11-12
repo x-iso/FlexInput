@@ -1057,7 +1057,7 @@ pub(crate) fn render_combiner_whole_module(
         live_signals, panic_shortcut, automap_parent, is_layout_mode,
         "Combiner",
         |id, ins, ui, sn, sigs, _panic, am| {
-            show_automap_combiner_body(id, ins, ui, sn, sigs, am);
+            show_automap_combiner_body(id, ins, ui, sn, sigs, am, true);
         },
         combiner_hash_config,
         combiner_hash_config,

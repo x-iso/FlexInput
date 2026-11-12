@@ -95,6 +95,39 @@ mod trigger_tests {
         n
     }
 
+    // A Constant's `res` is the digits it keeps after the dot, `0` being whole numbers.
+    // The engine snaps to it as well as the box does, so what the module shows is what
+    // downstream gets, however the value got into the node.
+    #[test]
+    fn a_constant_emits_at_its_resolution() {
+        let emit = |value: f64, res: Option<f64>| -> Option<Signal> {
+            let mut k = empty_node(1, "module.constant");
+            k.n_outputs = 1;
+            k.params.insert("value".into(), Value::from(value));
+            if let Some(r) = res {
+                k.params.insert("res".into(), Value::from(r));
+            }
+            let graph = ProcessingGraph { nodes: vec![k], ..Default::default() };
+            let no_signals: std::collections::HashMap<(String, String), Signal> = HashMap::new();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &no_signals, 0.016, &mut out);
+            out.outputs.get(&(1, 0)).copied().flatten()
+        };
+        let float_of = |s: Option<Signal>| -> f32 {
+            match s {
+                Some(Signal::Float(v)) => v,
+                other => panic!("a Constant should emit a float, got {other:?}"),
+            }
+        };
+
+        assert_eq!(float_of(emit(3.7, None)), 3.7, "unset resolution keeps four digits");
+        assert_eq!(float_of(emit(3.7, Some(0.0))), 4.0, "whole numbers");
+        assert_eq!(float_of(emit(3.7, Some(1.0))), 3.7, "tenths");
+        assert_eq!(float_of(emit(3.14159, Some(2.0))), 3.14, "hundredths");
+        assert_eq!(float_of(emit(-0.5, Some(0.0))), -1.0, "whole numbers, rounding away from zero on the half");
+        assert_eq!(float_of(emit(123456.789, Some(4.0))), 123456.79, "the wire is 32-bit, four digits is all it carries");
+    }
+
     // A digital Remapper mapping targeting a macro pin drives the macro node's
     // Bool port (same tick — the macro node evaluates after the remapper), the
     // unmapped port emits its typed off value, and the macro pin never leaks
@@ -8690,6 +8723,44 @@ mod sample_hold_tests {
     fn sh_tick(n: &NodeSnap, ns: &mut NodeState, input: Option<Signal>, gate: bool) -> Option<Signal> {
         let inputs = [input, Some(Signal::Bool(gate))];
         compute_node(n, &inputs, ns, &BusMap::default(), &BusMap::default(), 0.001)[0]
+    }
+
+    #[test]
+    fn the_display_sees_what_the_wires_carry_into_it() {
+        // The body paints the value coming in, and colours the output amber while the
+        // trigger or gate is engaged. Both readings come from the mirrored inputs, so a
+        // module left out of that list shows a dash and stays grey no matter what its
+        // wires say - which is exactly how this module looked for a whole round.
+        let constant = |uid: usize, v: f64| NodeSnap {
+            node_uid: uid,
+            module_id: "module.constant".to_string(),
+            params: [("value".to_string(), serde_json::json!(v))].into_iter().collect(),
+            n_outputs: 1,
+            input_sources: vec![],
+            device_id: None,
+            output_pin_ids: vec![],
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        };
+        let mut hold = bare_node();
+        hold.node_uid = 4;
+        hold.params.insert("mode".to_string(), serde_json::json!("hold"));
+        // `input_sources` name the *index* of the node feeding each pin, so the two
+        // constants above are 0 and 1.
+        hold.input_sources = vec![Some((0, 0)), Some((1, 0))];
+        let graph = ProcessingGraph {
+            nodes: vec![constant(1, 7.5), constant(2, 1.0), hold],
+            ..Default::default()
+        };
+        let no_signals: HashMap<(String, String), Signal> = HashMap::new();
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &no_signals, 0.016, &mut out);
+        assert_eq!(
+            out.last_inputs.get(&4),
+            Some(&vec![Some(Signal::Float(7.5)), Some(Signal::Float(1.0))]),
+            "the body's two readings both come from here",
+        );
     }
 
     #[test]

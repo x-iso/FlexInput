@@ -1,6 +1,6 @@
 use egui::Color32;
 use egui_snarl::{
-    ui::{AnyPin, AnyPins, NodeLayout, PinInfo, SnarlViewer},
+    ui::{AnyPin, AnyPins, PinInfo, SnarlViewer},
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
 };
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType, automap as am_canon};
@@ -43,8 +43,9 @@ pub(crate) use jsm_widgets::knob_name_of as jsm_knob_name_of;
 // The pad drives the command list by asking it to move, not by index: see
 // `CommandList`.
 pub(crate) use jsm_widgets::{command_list_state, set_command_list_state};
-mod kit;
+pub(crate) mod kit; // the grid tests read the pin-label rules off it
 mod kit_bodies;
+mod module_icons;
 pub(crate) use kit_bodies::*;
 mod layout_edit;
 mod midi;
@@ -67,7 +68,7 @@ pub(crate) use card_options::CardOptions;
 mod reshape;
 mod rws;
 mod scale;
-mod simple_bodies;
+pub(crate) mod simple_bodies; // `Xysr` is read back by the grid tests
 mod stick_rotation;
 mod subpatch_body;
 mod touch_zones;
@@ -190,6 +191,20 @@ pub struct FlexViewer<'a> {
     pub snarl_id: egui::Id,
     /// Left plus right margin of a node's frame around its contents.
     pub node_margin_x: f32,
+    /// The node frame's own vertical margin, so a body can work out how much of its
+    /// node's height is actually its to fill (see [`Self::show_body`]).
+    pub node_margin_y: f32,
+    /// How narrow each resizable node's body says its frame may be, written as the body
+    /// is laid out and read back by the corner grip in the same frame. The grip needs a
+    /// floor that comes from the content: its own fallback is the header's width, and a
+    /// header that spans the frame would otherwise set the floor to the size the node
+    /// happens to be — which grows and never comes back.
+    pub size_floors: std::collections::HashMap<usize, f32>,
+    /// How much width each header actually holds, measured as it is drawn, for the nodes
+    /// whose header puts something against its right edge. Read back by snarl as
+    /// [`SnarlViewer::node_header_width`]; without it those nodes' headers would claim
+    /// the whole frame and the node could never be dragged narrower.
+    pub header_content: std::collections::HashMap<usize, f32>,
 }
 
 /// egui temp-data key for this canvas's measured node rects, in CANVAS space.
@@ -201,30 +216,32 @@ pub fn node_rects_id(view_salt: u64) -> egui::Id {
 /// The measured node-rect map: NodeId.0 → canvas-space [x, y, w, h].
 pub type NodeRectMap = std::collections::HashMap<usize, [f32; 4]>;
 
+/// What the node measures this frame: the frame as it is laid out now, not the one the
+/// canvas last drew. A body that sized itself off last frame's rect would overshoot
+/// every other frame, so this reads the layout state for the current one.
+fn node_frame_size(
+    node_id: NodeId,
+    ui: &egui::Ui,
+    snarl: &Snarl<NodeData>,
+    snarl_id: egui::Id,
+    margin_x: f32,
+    margin_y: f32,
+) -> Option<(f32, f32)> {
+    let info = snarl.get_node_info(node_id)?;
+    let state = egui_snarl::ui::NodeState::load(ui.ctx(), snarl_id.with(("snarl-node", node_id)), &ui.style().spacing);
+    let rect = state.node_rect(info.pos, 1.0);
+    Some((rect.width() + margin_x, rect.height() + margin_y))
+}
+
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     fn title(&mut self, node: &NodeData) -> String {
         node.display_name.clone()
     }
 
-    fn node_layout(
-        &mut self,
-        default: NodeLayout,
-        node_id: NodeId,
-        _inputs: &[InPin],
-        _outputs: &[OutPin],
-        snarl: &Snarl<NodeData>,
-    ) -> NodeLayout {
-        if snarl.get_node(node_id).map(|n| n.module_id == "module.knob").unwrap_or(false) {
-            NodeLayout::flipped_sandwich()
-        } else {
-            default
-        }
-    }
-
     fn show_header(
         &mut self,
         node: NodeId,
-        _inputs: &[egui_snarl::InPin],
+        inputs: &[egui_snarl::InPin],
         _outputs: &[egui_snarl::OutPin],
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
@@ -232,6 +249,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // Extract what we need before any UI calls so the borrow of snarl is released.
         let data = &snarl[node];
         let title = data.display_name.clone();
+        // A module the kit knows by a symbol wears that mark instead of its name, and
+        // the name goes to the hover text. A renamed module keeps what it's called.
+        let mark = kit::node_mark(data);
+        // What the header row had taken before the name was drawn - the fold chevron and a
+        // status dot. That, not the name, is what the header *contributes* to the node's
+        // width: a name that fits is drawn, a name that doesn't is left out, and neither is
+        // allowed to be the reason the module can't be dragged narrower.
+        let mut header_room_before_name = 0.0f32;
         let status_dot = if matches!(data.module_id.as_str(), "device.source" | "device.sink") {
             let live = data.params.get("device_id")
                 .and_then(|v| v.as_str())
@@ -300,6 +325,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             (0, false, false)
         };
         let is_label          = snarl.get_node(node).map(|n| n.module_id == "module.label").unwrap_or(false);
+        let is_knob           = snarl.get_node(node).map(|n| n.module_id == "module.knob").unwrap_or(false);
         let is_svg            = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
         let is_remapper       = snarl.get_node(node).map(|n| n.module_id == "module.remapper").unwrap_or(false);
         let is_map_action     = snarl.get_node(node).map(|n| n.module_id == "module.map_action").unwrap_or(false);
@@ -314,6 +340,17 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let is_rws            = snarl.get_node(node).map(|n| n.module_id == "processing.rws").unwrap_or(false);
         let is_feedback_control = snarl.get_node(node).map(|n| n.module_id == "module.feedback_control").unwrap_or(false);
         let is_jsm            = snarl.get_node(node).map(|n| n.module_id == "module.jsm").unwrap_or(false);
+        // Math operations whose input count is the user's to change. Their `− +` goes
+        // at the right of this header and they draw no body at all (see
+        // `kit::variadic_inputs`), so their height is just this header plus their
+        // pins and a pin row is what the stepper adds and takes away.
+        let pin_count = snarl
+            .get_node(node)
+            .and_then(|n| kit::variadic_inputs(&n.module_id).map(|range| (n.inputs.len(), range)));
+        // A module whose ports are a list of strips in its body adds them from here: one
+        // `+` at the header's right edge. Dropping one is the `×` on its own strip.
+        let port_noun = snarl.get_node(node).and_then(|n| kit::header_plus(&n.module_id));
+        let port_module = snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -410,7 +447,99 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
                         ui.label(egui::RichText::new("●").color(color).small());
                     }
-                    ui.label(&title);
+                    // The mark or the name, never both.
+                    let knob_collapsed = is_knob
+                        && snarl.get_node_info(node).map_or(true, |i| !i.open);
+                    let reserved = if is_knob && !knob_collapsed {
+                        // The Uni/Bi switch that will sit at the header's right edge.
+                        crate::canvas::viewer::kit_bodies::KNOB_TOGGLE.x + ui.spacing().item_spacing.x
+                    } else {
+                        0.0
+                    };
+                    // What the row has already taken - the fold chevron, a status dot - is
+                    // off the room too: the name has to fit what's left, not what the frame
+                    // is, or it gets painted under the control at the right edge. A folded
+                    // module pays for its sockets again: with no body to hang them on, they
+                    // are drawn at the ends of the header row itself.
+                    let folded = snarl.get_node_info(node).map_or(true, |i| !i.open);
+                    let used = ui.min_rect().width();
+                    header_room_before_name = used;
+                    let room = node_frame_size(node, ui, snarl, self.snarl_id, self.node_margin_x, self.node_margin_y)
+                        .map_or(0.0, |s| s.0)
+                        - self.node_margin_x
+                        - used
+                        - if folded { ui.spacing().interact_size.y + 6.0 } else { 4.0 };
+                    match mark {
+                        Some(mark) => {
+                            let r = ui.label(egui::RichText::new(mark).strong());
+                            simple_bodies::trace_rect(ui, node, "header_title", r.rect);
+                            r.on_hover_text(title.as_str())
+                        }
+                        None if kit::title_fits(ui, &title, reserved, room) => {
+                            let r = ui.label(&title);
+                            simple_bodies::trace_rect(ui, node, "header_title", r.rect);
+                            r
+                        }
+                        // Too narrow for the word: leave it out rather than draw half of
+                        // it. The row keeps its height, and the module keeps its identity
+                        // in its shape, its mark in the body and its hover text; widen the
+                        // frame and the name comes back.
+                        None => {
+                            let r = ui.label(egui::RichText::new("").strong());
+                            // Traced empty so a test can tell "hidden" from "not drawn
+                            // at all", and so the header's height is on record.
+                            simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::NOTHING);
+                            r
+                        }
+                    };
+                }
+
+                // The `− +` for a module whose pins are its content, at the right of
+                // the header row. The row first reserves the box the stepper takes, so
+                // the title and the buttons can't run into each other and the header
+                // reports the width those two need — a width worked out from its own
+                // contents, never from the width the node happens to have. Then the
+                // stepper draws against the row's right edge, which is where it reads
+                // as right-aligned however wide the node turns out to be.
+                if let Some((n, range)) = pin_count {
+                    let (fewest, most) = (*range.start(), *range.end());
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(kit::stepper_w(ui), kit::stepper_h(ui)),
+                        egui::Sense::hover(),
+                    );
+                    let right = ui.max_rect().right();
+                    let step = kit::header_stepper(
+                        ui,
+                        n,
+                        fewest..=most,
+                        ("Remove the last input", "Add an input"),
+                        row,
+                        right,
+                    );
+                    match step {
+                        Some(1) => {
+                            if let Some(node) = snarl.get_node_mut(node) {
+                                let name = pin_letter(node.inputs.len());
+                                node.inputs.push(PinDescriptor::new(name, SignalType::Any));
+                            }
+                        }
+                        Some(-1) if n > fewest => {
+                            remove_input_pin(node, n - 1, inputs, snarl);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // The `+` for a module whose ports are a column of strips, and the box it
+                // reserves beside the title - same shape and size as the stepper's squares,
+                // so the header reads the same wherever it appears.
+                if let Some(noun) = port_noun {
+                    let h = kit::stepper_h(ui);
+                    let (row, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                    let right = ui.max_rect().right();
+                    if kit::header_plus_button(ui, &format!("Add a {noun}"), row, right) {
+                        add_port(node, &port_module, snarl);
+                    }
                 }
 
                 if is_subpatch {
@@ -675,6 +804,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
                 // Label module: font size + text color in the header so they
                 // don't compete with the text edit area.
+                // Label module: its settings live at the right edge of the header, the
+                // way the other header controls do, so the body is nothing but the text
+                // itself - the field the corner grip sizes.
                 if is_label {
                     let (mut size, mut col) = snarl.get_node(node).map(|n| {
                         let sz = n.params.get("font_size").and_then(|v| v.as_f64()).unwrap_or(14.0) as f32;
@@ -690,22 +822,101 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         };
                         (sz, c)
                     }).unwrap_or((14.0, [220, 220, 220, 255]));
-                    let mut changed = false;
-                    if ui.add(egui::DragValue::new(&mut size).speed(0.25).range(8.0..=72.0).suffix("px"))
-                        .on_hover_text("Font size").changed()
-                    {
-                        changed = true;
-                    }
-                    if fxi_color_swatch(ui, &mut col, "Text colour", true) {
-                        changed = true;
-                    }
-                    if changed {
+                    // What the header is entitled to, measured rather than guessed:
+                    // everything laid out before the right-edge block, plus what that
+                    // block consumed. A block placed right-to-left draws against the
+                    // frame's right edge, so the header's used rect spans the whole
+                    // node - and the node's width formula would then hold it at whatever
+                    // width it already has, which is a ratchet with a title on it.
+                    let left_w = ui.min_rect().width();
+                    let (size_changed, colour_changed, controls_w) = ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let from = ui.cursor().min.x;
+                            // Right-to-left, so the size reads as the rightmost thing:
+                            // the first control added is the one nearest the corner.
+                            let s = ui
+                                .add(
+                                    egui::DragValue::new(&mut size)
+                                        .speed(0.25)
+                                        .range(8.0..=72.0)
+                                        .suffix("px"),
+                                )
+                                .on_hover_text("Font size")
+                                .changed();
+                            let c = fxi_color_swatch(ui, &mut col, "Text colour", true);
+                            (s, c, (from - ui.cursor().min.x).max(0.0))
+                        },
+                    )
+                    .inner;
+                    self.header_content.insert(
+                        node.0,
+                        left_w + controls_w + ui.spacing().item_spacing.x,
+                    );
+                    if size_changed || colour_changed {
                         if let Some(n) = snarl.get_node_mut(node) {
                             if let Some(num) = Number::from_f64(size as f64) {
                                 n.params.insert("font_size".into(), Value::Number(num));
                             }
                             let arr = serde_json::json!([col[0] as u64, col[1] as u64, col[2] as u64, col[3] as u64]);
                             n.params.insert("color".into(), arr);
+                        }
+                    }
+                }
+
+                // Knob: the Uni/Bi range switch sits at the header's right edge so the
+                // dial and its reading have the body to themselves - at two blocks there
+                // is no row to spare under the face. It's the width of its two words: the
+                // house button reached over the fold chevron at one block wide. A collapsed
+                // knob has no switch - collapsing one is how you stop it being nudged while
+                // you're moving other things about it - and shows its number where the
+                // switch was, which is the one thing worth reading off a folded knob.
+                if is_knob {
+                    let collapsed = snarl.get_node_info(node).map_or(true, |i| !i.open);
+                    let bipolar = snarl
+                        .get_node(node)
+                        .and_then(|n| n.params.get("bipolar").and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                    let flipped = ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let from = ui.cursor().min.x;
+                            // Nothing at the right edge while the knob is folded: its number
+                            // is written in the body band under the header, which a folded
+                            // node still has.
+                            let resp = if collapsed {
+                                ui.label("")
+                            } else {
+                                crate::canvas::viewer::kit_bodies::toggle_button(
+                                    ui,
+                                    bipolar,
+                                    if bipolar { "bi" } else { "uni" },
+                                    crate::canvas::viewer::kit_bodies::KNOB_TOGGLE,
+                                )
+                                .on_hover_text(
+                                    "Uni: the dial turns across 0..1.\nBi: it turns across -1..1, centred on 0.",
+                                )
+                            };
+                            self.header_content.insert(
+                                node.0,
+                                // The chevron and the switch - the name is drawn if it fits,
+                                // but it is not what sets the module's narrowest width.
+                                header_room_before_name
+                                    + (from - ui.cursor().min.x).max(0.0)
+                                    + ui.spacing().item_spacing.x,
+                            );
+                            resp.clicked()
+                        },
+                    )
+                    .inner;
+                    if flipped {
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            let next = !bipolar;
+                            n.params.insert("bipolar".into(), Value::Bool(next));
+                            // Changing the range pulls the value back inside it.
+                            let lo = if next { -1.0f64 } else { 0.0 };
+                            let cur = n.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            n.params.insert("value".into(), Value::from(cur.clamp(lo, 1.0)));
                         }
                     }
                 }
@@ -754,7 +965,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 ui.ctx().data_mut(|d| d.insert_temp(midi_header_w_key(node), w));
             }
             if is_device_sink && dev_id_str.starts_with("midi_out:") {
-                show_midi_out_header_controls(node, _inputs, ui, snarl);
+                show_midi_out_header_controls(node, inputs, ui, snarl);
             }
 
             // Mouse-sensitivity slider for the virtual keyboard+mouse sink.
@@ -1077,29 +1288,55 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             && desc.signal_type == SignalType::AutoMap
             && desc.name == "Auto-Map";
         ui.spacing_mut().item_spacing.y = 0.0;
-        if !is_relocated_automap {
+        // A module drawn as a column of port strips (Selector, Split, Combiner): the strip
+        // carries the name of a numbered port, so the socket beside it draws no label twice,
+        // and every row - named or not - is drawn at the strips' pitch, which is what keeps
+        // a socket level with the strip that names the same port.
+        let pitch = kit::strip_pitch(
+            &node.module_id,
+            kit::strip_bands(&node.module_id, node.inputs.len(), node.outputs.len()),
+            ui,
+        );
+        let strip_pin = kit::strip_pin(&node.module_id, true, pin.id.input);
+        if !is_relocated_automap && !strip_pin {
             let name = if node.module_id == "module.sample_hold" && pin.id.input == 1 {
                 sample_hold_gate_label(node)
             } else {
                 desc.name.as_str()
             };
-            let text = egui::RichText::new(name).small();
-            let text = match channel_label_color(&node.module_id, pin.id.input) {
-                Some(col) => text.color(col),
+            let (shown, shortened) = if kit::pin_abbreviates(&node.module_id) {
+                kit::pin_short(name)
+            } else {
+                (name.to_string(), false)
+            };
+            let col = channel_label_color(&node.module_id, pin.id.input).or_else(|| {
                 // A device inlet says what drives it: the Auto-Map bus's own
                 // orange when the bus covers it, the brighter plain text colour
                 // when you have wired it by hand (a wire beats the bus in the
                 // engine, so the orange drops the moment one lands), and the
                 // default dim label when nothing reaches it at all.
-                None => match device_inlet_drive(
-                    self.sink_bus, node, pin.id.input, !pin.remotes.is_empty())
-                {
-                    InletDrive::AutoMap => text.color(AUTOMAP_INLET_LABEL),
-                    InletDrive::Wired   => text.color(ui.visuals().widgets.inactive.fg_stroke.color),
-                    InletDrive::Idle    => text,
-                },
-            };
-            ui.label(text);
+                match device_inlet_drive(self.sink_bus, node, pin.id.input, !pin.remotes.is_empty()) {
+                    InletDrive::AutoMap => Some(AUTOMAP_INLET_LABEL),
+                    InletDrive::Wired   => Some(ui.visuals().widgets.inactive.fg_stroke.color),
+                    InletDrive::Idle    => None,
+                }
+            });
+            if let Some(p) = pitch {
+                pin_label_at_row(ui, &shown, col, p, shortened, name);
+            } else {
+                let text = egui::RichText::new(shown.as_str()).small();
+                let text = match col {
+                    Some(c) => text.color(c),
+                    None => text,
+                };
+                let resp = ui.label(text);
+                // The label is short so the module can be; the name it stands for is here.
+                if shortened {
+                    resp.on_hover_text(name);
+                }
+            }
+        } else if let Some(p) = pitch {
+            ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
         }
         let header_y = if is_relocated_automap {
             // Dual-stash delta recovery. Snarl runs show_input BEFORE
@@ -1150,13 +1387,38 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             && desc.signal_type == SignalType::AutoMap
             && desc.name == "Auto-Map";
         ui.spacing_mut().item_spacing.y = 0.0;
-        if !is_relocated_automap {
-            let text = egui::RichText::new(&desc.name).small();
-            let text = match channel_label_color(&node.module_id, pin.id.output) {
-                Some(col) => text.color(col),
-                None      => text,
+        let pitch = kit::strip_pitch(
+            &node.module_id,
+            kit::strip_bands(&node.module_id, node.inputs.len(), node.outputs.len()),
+            ui,
+        );
+        let strip_pin = kit::strip_pin(&node.module_id, false, pin.id.output);
+        if strip_pin {
+            // The port's own row: no label (the strip says the same word), but the pitch
+            // the strips are drawn at.
+            if let Some(p) = pitch {
+                ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
+            }
+        } else if !is_relocated_automap && !kit::pin_hides_outputs(&node.module_id) {
+            let (shown, shortened) = if kit::pin_abbreviates(&node.module_id) {
+                kit::pin_short(&desc.name)
+            } else {
+                (desc.name.clone(), false)
             };
-            ui.label(text);
+            let col = channel_label_color(&node.module_id, pin.id.output);
+            if let Some(p) = pitch {
+                pin_label_at_row(ui, &shown, col, p, shortened, desc.name.as_str());
+            } else {
+                let text = egui::RichText::new(shown.as_str()).small();
+                let text = match col {
+                    Some(c) => text.color(c),
+                    None => text,
+                };
+                let resp = ui.label(text);
+                if shortened {
+                    resp.on_hover_text(desc.name.as_str());
+                }
+            }
         }
         let header_y = if is_relocated_automap {
             let cur_pin_y = automap_chevron_y(ui);
@@ -1212,13 +1474,39 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     // ── Node bodies ──────────────────────────────────────────────────────────
 
     fn node_resizable(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
-        snarl.get_node(node).is_some_and(|n| kit::uses_kit(&n.module_id))
+        snarl.get_node(node).is_some_and(|n| kit::uses_kit(&n.module_id) || kit::stretchy(&n.module_id))
     }
 
-    fn resize_node(&mut self, node: NodeId, frame_width: f32, snarl: &mut Snarl<NodeData>) {
-        if let (Some(n), Some(w)) = (snarl.get_node_mut(node), Number::from_f64(frame_width.round() as f64)) {
+    /// What the header actually holds, for the nodes that put a control against its right
+    /// edge (the Text module's font size and colour). Measured in `show_header`.
+    fn node_header_width(&mut self, node: NodeId, _snarl: &Snarl<NodeData>) -> Option<f32> {
+        self.header_content.get(&node.0).copied()
+    }
+
+    /// The floor the corner grip is held to, for a body that measured one this frame
+    /// (`kit::body_width`'s second value). Stretchy bodies and kit rows both do; nothing
+    /// else asks, and the grip keeps its header-width fallback for those.
+    fn node_narrowest(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> Option<f32> {
+        let id = snarl.get_node(node)?;
+        if kit::uses_kit(&id.module_id) || kit::stretchy(&id.module_id) {
+            self.size_floors.get(&node.0).copied()
+        } else {
+            None
+        }
+    }
+
+    fn resize_node(&mut self, node: NodeId, frame_width: f32, frame_height: f32, snarl: &mut Snarl<NodeData>) {
+        let Some(n) = snarl.get_node_mut(node) else { return };
+        if let Some(w) = Number::from_f64(frame_width.round() as f64) {
             if n.params.get(kit::WIDTH_PARAM) != Some(&Value::Number(w.clone())) {
                 n.params.insert(kit::WIDTH_PARAM.into(), Value::Number(w));
+            }
+        }
+        if kit::stretchy(&n.module_id.clone()) {
+            if let Some(h) = Number::from_f64(frame_height.round() as f64) {
+                if n.params.get(kit::HEIGHT_PARAM) != Some(&Value::Number(h.clone())) {
+                    n.params.insert(kit::HEIGHT_PARAM.into(), Value::Number(h));
+                }
             }
         }
     }
@@ -1261,31 +1549,97 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             return;
         }
 
-        // Kit bodies are handed their width (see `kit::body_width`).
+        // Kit bodies are handed their width (see `kit::body_width`), and stretchy ones
+        // their height as well (see `kit::body_height`).
+        let frame_size = node_frame_size(node_id, ui, snarl, self.snarl_id, self.node_margin_x, self.node_margin_y);
         let kit_w = if kit::uses_kit(&module_id) {
-            // The frame's width as the node is laid out this frame: the same size the
-            // body's available width comes from (the frame last drawn is a frame
-            // behind it, and correcting against that overshoots every other frame).
-            let frame_w = snarl.get_node_info(node_id).map(|info| {
-                let id = self.snarl_id.with(("snarl-node", node_id));
-                let state = egui_snarl::ui::NodeState::load(ui.ctx(), id, &ui.style().spacing);
-                state.node_rect(info.pos, 1.0).width() + self.node_margin_x
-            });
             let avail = ui.available_width();
             snarl.get_node(node_id).map_or(kit::MIN_W, |n| {
                 let block = crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block);
-                kit::body_width(n, avail, frame_w, kit_min_width(&module_id), block)
+                let (w, floor) = kit::body_width(n, avail, frame_size.map(|s| s.0), kit_min_width(&module_id), block, None);
+                self.size_floors.insert(node_id.0, floor);
+                w
             })
         } else {
             0.0
         };
+        // A stretchy body is one surface that fills the frame it's given, so it takes
+        // both axes: the width the text wraps to, and the height as a floor the text can
+        // overrun by growing the module another block.
+        let (body_w, body_h) = if kit::stretchy(&module_id) {
+            let block = crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block);
+            snarl.get_node(node_id).map_or((0.0, 0.0), |n| {
+                // How wide the surface has to be whatever the grip asks for. A note is
+                // useless below a field that can hold a word; a readout's floor is its
+                // own reading at the smallest size worth showing, so a long number asks
+                // for a wider module instead of becoming a squint.
+                let min_w = match module_id.as_str() {
+                    "module.label" => 96.0,
+                    "display.readout" => crate::canvas::viewer::scopes::readout_floor_w(snarl, node_id),
+                    // A fader's thin way: a knob dragged to one block in one direction is a
+                    // strip of track, which is what a slim slider is. The dial itself won't
+                    // go this small (`simple_bodies::show_knob_body`), but the frame can.
+                    "module.knob" => 20.0,
+                    _ => 0.0,
+                };
+                // Both need room for more than one line to be worth the module: a display
+                // for the number to be large in, a note for the two lines it opens with.
+                // A knob's floor is a track - a wide fader squeezed to one block tall is
+                // still a usable slider - and what it starts at is a block of body. The
+                // other stretchy bodies are held at their old floors in points: their type
+                // sizes follow the body they're given, so a floor raised to the module's
+                // four-block minimum asks for bigger type, which asks for a wider floor,
+                // and the readout runs away across the canvas. The minimum height those
+                // modules used to get from the grid is topped up elsewhere instead, in the
+                // body pass (`module_id != "module.knob"` below), which doesn't reach back
+                // into their own arithmetic.
+                let min_h = match module_id.as_str() {
+                    "module.knob" => 12.0,
+                    // What a two-old-block frame leaves under the header and the frame's
+                    // margins: the body floor that used to come for free from a 56-point
+                    // grid. Stated in body points, not frame blocks - asking for the frame
+                    // here (112) asks the body for 112, which makes the frame 168, which
+                    // makes a readout's type bigger, which makes its width floor bigger,
+                    // and it runs away sideways.
+                    _ => 72.0,
+                };
+                // The default is a *frame* size, like what the grip writes: a knob starts
+                // 112 points tall - two of the old blocks, four of these - and the floor
+                // above lets it come down to one.
+                let default_h = (module_id == "module.knob").then(|| 4.0 * block.unwrap_or(28.0));
+                let legacy = n
+                    .params
+                    .get("box_width")
+                    .and_then(|v| v.as_f64())
+                    .map(|w| w as f32);
+                // Only a note has a starting size: an untouched readout sits at its own
+                // floor, which is two blocks for an ordinary number. A knob starts at two
+                // blocks too - one block of dial isn't worth dragging - but its floor is a
+                // fader's thin way, so the grip can take it there.
+                let default_w = match module_id.as_str() {
+                    "module.label" => legacy.or(Some(160.0)),
+                    // A knob starts 112 points wide for the same reason: one old block of
+                    // dial isn't worth dragging.
+                    "module.knob" => Some(4.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
+                    _ => None,
+                };
+                let (w, floor) = kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w);
+                self.size_floors.insert(node_id.0, floor);
+                (
+                    w,
+                    kit::body_height(n, ui.available_height(), frame_size.map(|s| s.1), min_h, block, default_h),
+                )
+            })
+        } else {
+            (0.0, 0.0)
+        };
 
         match module_id.as_str() {
             "device.sink"          => show_sink_body(node_id, inputs, ui, snarl),
-            "module.constant"      => show_constant_body(node_id, ui, snarl),
-            "module.switch"        => show_switch_body(node_id, ui, snarl),
-            "module.knob"          => show_knob_body(node_id, ui, snarl),
-            "display.readout"       => show_readout_body(node_id, ui, snarl),
+            "module.constant"      => show_constant_body(node_id, ui, snarl, self.view_salt),
+            "module.switch"        => show_switch_body(node_id, ui, snarl, self.view_salt),
+            "module.knob"          => show_knob_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
+            "display.readout"       => show_readout_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
             "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
             "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
@@ -1294,7 +1648,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, kit_w),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, kit_w),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, kit_w),
-            "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl),
+            "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl, self.view_salt),
             "module.response_curve" => {
                 if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {
                     self.push_undo_request = true;
@@ -1320,21 +1674,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     self.push_undo_request = true;
                 }
             }
-            "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.min_max" => {
-                show_math_variadic_body(node_id, inputs, ui, snarl);
-            }
-            "math.negate" => show_inverse_body(node_id, ui, snarl, kit_w),
-            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl, kit_w),
-            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w),
-            "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
-            "module.split"    => show_split_body(node_id, outputs, ui, snarl),
+            "math.negate" => show_inverse_body(node_id, ui, snarl, kit_w, self.view_salt),
+            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl, kit_w, self.view_salt),
+            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, self.view_salt),
+            "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
+            "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
             "module.dropdown" => show_dropdown_body(node_id, ui, snarl),
             "module.macro"    => show_macro_body(node_id, outputs, ui, snarl),
-            "module.label"    => show_label_body(node_id, ui, snarl),
+            "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
-            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, kit_w),
-            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w),
-            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w),
+            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, self.view_salt),
+            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w, self.view_salt),
+            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w, self.view_salt),
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
             "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl),
@@ -1346,7 +1697,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
             "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
-            "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals, self.automap_parent.as_ref(), false),
             "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.jsm" => show_jsm_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(),
@@ -1381,7 +1732,49 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             }
             "subpatch.inlet" | "subpatch.outlet" => show_inlet_outlet_body(node_id, ui, snarl),
+            // Last, so a module with a body of its own keeps it: an operation or gate
+            // drawn with its glyph and nothing else in the body.
+            m if module_icons::has_icon(m) => show_glyph_body(node_id, ui, snarl, self.view_salt),
             _ => {}
+        }
+
+        // The minimum height, said out loud. A module that paints a mark and a couple of
+        // pills - Quantize, Sample and Hold, the small operations and gates - reserves
+        // nothing of its own, and asked for nothing; the grid's 56-point step happened to
+        // put every one of them at 112 tall whatever its content was. Halving the block for
+        // finer snapping lets the same content settle at 84, so each of them quietly loses a
+        // quarter of its height. This tops the frame up to four blocks - the same 112 points
+        // - and does it *after* the body has laid itself out, so the body saw the same room
+        // it always did: a constant that puts its box and its pill side by side when it has
+        // room doesn't suddenly decide to, because a reservation asked for more.
+        // `frame − available` now counts the body's own height, so the top-up is only ever
+        // what's missing, and a module with more to show is untouched. The knob is exempt:
+        // going slim is the point of it.
+        // The minimum height, said out loud, for the bodies that paint a mark and reserve
+        // nothing of their own - the small operations and gates, Quantize, Sample and Hold,
+        // Vec to Deflection. They asked for nothing; the grid's 56-point step put every one
+        // of them at 112 tall whatever their content was. Halving the step lets the same
+        // content settle at 84, so each quietly loses a quarter of its height, and this tops
+        // the frame back up to four blocks - the same 112 points.
+        //
+        // It is deliberately only for the mark bodies. A body that lays its own rows out
+        // against the room it is given reacts to the extra height: a Constant moves its box
+        // and pill into one row, a kit module's rows unwrap and take the width with them, and
+        // the width then feeds the frame and the frame feeds the layout - measured, a fresh
+        // Delay walked from 112 to 420 points wide across a twenty-frame idle. A mark has
+        // nothing to reflow, so the top-up lands and stops.
+        if kit::mark_body(&module_id) {
+            if let (Some(b), Some(frame_h)) = (
+                crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block),
+                frame_size.map(|s| s.1),
+            ) {
+                let want = 4.0 * b - (frame_h - ui.available_height());
+                if want > 0.0 {
+                    // Height only. Asking for the width too hands the width machinery a body
+                    // as wide as everything left on the canvas, and it grows.
+                    ui.allocate_exact_size(egui::vec2(0.0, want), egui::Sense::hover());
+                }
+            }
         }
     }
 
@@ -1643,18 +2036,21 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 /// Which modules draw a body under their header. A module missing from this
 /// list renders as a bare header however complete its body renderer is — the
 /// gate is easy to forget when adding one, so it lives on its own and is tested.
+///
+/// Everything `module_icons` knows is in it by construction: those modules' bodies
+/// are their glyphs, painted into the room the pins leave over, allocating nothing.
 pub(crate) fn module_has_body(module_id: &str) -> bool {
-    matches!(
-        module_id,
-        "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
-        | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
-        | "display.controller3d"
-        | "module.delay" | "module.average" | "module.dc_filter" | "module.sample_hold" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
-        | "module.automap_response_curve" | "module.automap_twoway_response_curve"
-        | "module.area_mapper" | "module.stick_rotation"
-        | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
-        | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
-        | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
+    module_icons::has_icon(module_id)
+        || matches!(
+            module_id,
+            "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
+            | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
+            | "display.controller3d"
+            | "module.delay" | "module.average" | "module.dc_filter" | "module.sample_hold" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
+            | "module.automap_response_curve" | "module.automap_twoway_response_curve"
+            | "module.area_mapper" | "module.stick_rotation"
+            | "math.negate" | "math.quantize" | "module.vec_to_deflection"
+            | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
         | "logic.greater_than" | "logic.less_than" | "logic.has_changed" | "logic.delay" | "logic.counter"
         | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
         | "processing.rws"
@@ -1670,7 +2066,9 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
 
 #[cfg(test)]
 mod body_gate_tests {
+    use super::kit::variadic_inputs;
     use super::module_has_body;
+    use super::module_icons;
 
     // A module whose body renderer exists but which is missing from this gate
     // draws a bare header — the JSM node shipped that way once.
@@ -1684,6 +2082,40 @@ mod body_gate_tests {
             assert!(module_has_body(m), "{m} draws a body");
         }
         assert!(!module_has_body("module.feedback_control"), "a pins-only module draws none");
-        assert!(!module_has_body("math.abs"));
+        // Abs draws its mark now, and reserves the band for it, where it used to be a
+        // bare header a block shorter than its siblings.
+        assert!(module_has_body("math.abs"), "Abs draws its mark");
+    }
+
+    // The small operations are described in three places that have to agree: the
+    // header's stepper (`kit::variadic_inputs`), the glyph (`module_icons::ICONS`)
+    // and this gate — a module with a glyph but no body has no room to paint one in.
+    #[test]
+    fn the_small_operations_agree_across_stepper_glyph_and_gate() {
+        let registered: Vec<&str> = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor.id)
+            .collect();
+        // Everything the glyph table names is a real module, and gets a body for it.
+        for (id, _) in module_icons::ICONS {
+            assert!(registered.contains(id), "{id} is not a registered module");
+            assert!(module_has_body(id), "{id} has the body its glyph is painted into");
+        }
+        for m in ["math.add", "math.subtract", "math.multiply", "math.divide", "math.min_max"] {
+            assert!(variadic_inputs(m).is_some(), "{m} counts its inputs in the header");
+        }
+        // The gates keep their fixed pair — the engine reads two inputs, so there is
+        // no count for a stepper to set — but they take a glyph like the rest.
+        for m in ["logic.and", "logic.or", "logic.not", "logic.xor", "logic.nand", "logic.nor", "logic.xnor",
+                  "logic.equal", "logic.not_equal"] {
+            assert!(variadic_inputs(m).is_none(), "{m} has a fixed input count");
+            assert!(module_icons::has_icon(m), "{m} is drawn with a glyph");
+        }
+        // The comparisons have a glyph, a toggle of their own, and no stepper.
+        for m in ["logic.greater_than", "logic.less_than"] {
+            assert!(variadic_inputs(m).is_none(), "{m} has a fixed input count");
+            assert!(module_icons::has_icon(m), "{m} is drawn with a glyph");
+            assert!(module_has_body(m), "{m} draws its toggle");
+        }
     }
 }

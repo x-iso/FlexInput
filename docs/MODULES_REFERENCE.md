@@ -62,6 +62,11 @@ pub struct ModuleDescriptor {
 - **Outputs:** Float (selected signal)
 - **Parameters:**
   - `interpolate: bool` - Enable smooth interpolation between inputs
+- **On the canvas:** one strip per signal input, in selection order. Drag a strip's handle
+  to move the port (its wire moves with it), double-click its name to rename the port, `×`
+  to drop it and `+` in the header to add one. The `interp` toggle sits on the `select` row.
+  The strip the selection is pointing at glows; with `interpolate` on, the glow splits
+  between the two ports the value sits between.
 
 #### Dropdown
 - **ID:** `module.dropdown`
@@ -99,6 +104,11 @@ pub struct ModuleDescriptor {
 - **Outputs:** N signals (one per output pin)
 - **Parameters:**
   - `interpolate: bool` - Enable smooth interpolation between outputs
+- **On the canvas:** one strip per output, each socket level with its strip. Drag a strip's
+  handle to reorder (wires follow), double-click the name to rename the port, `×` to drop
+  it, `+` in the header to add one. The `interp` toggle shares the top strip's row, which is
+  the row the `select` pin is on. The strip the selection is pointing at glows; with
+  `interpolate` on, the glow splits between the two outputs the value sits between.
 
 #### Sub-patch
 - **ID:** `subpatch`
