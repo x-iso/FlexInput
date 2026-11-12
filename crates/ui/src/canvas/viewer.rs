@@ -460,6 +460,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let reserved = if is_knob && !knob_collapsed {
                         // The Uni/Bi switch that will sit at the header's right edge.
                         crate::canvas::viewer::kit_bodies::KNOB_TOGGLE.x + ui.spacing().item_spacing.x
+                    } else if channel_count.is_some() {
+                        // The `− n +` that will sit at the header's right edge. It is also
+                        // reserved in the flow after the name, but the name is painted rather
+                        // than laid out, so this is where its room comes off the name instead.
+                        kit::stepper_w(ui) + ui.spacing().item_spacing.x
                     } else {
                         0.0
                     };
@@ -483,9 +488,27 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             r.on_hover_text(title.as_str())
                         }
                         None if kit::title_fits(ui, &title, reserved, room) => {
-                            let r = ui.label(&title);
-                            simple_bodies::trace_rect(ui, node, "header_title", r.rect);
-                            r
+                            // Painted, not laid out. A name added to the flow adds its own
+                            // width to the header row, and the header row is one of the things
+                            // the node's width is measured against: that is why "DC Filter"
+                            // needed a 168-point module for one number where "Average" manages
+                            // with 140. The row keeps its height, the name is drawn where the
+                            // chevron leaves off, and `title_fits` - which knows about the
+                            // control at the right edge - decides whether it is drawn at all.
+                            let (slot, resp) = ui.allocate_exact_size(
+                                egui::vec2(0.0, ui.spacing().interact_size.y),
+                                egui::Sense::hover(),
+                            );
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let galley = ui
+                                .painter()
+                                .layout_no_wrap(title.clone(), font, ui.visuals().text_color());
+                            let size = galley.size();
+                            let top = slot.center().y - size.y * 0.5;
+                            let at = egui::pos2(slot.left(), top);
+                            ui.painter().galley(at, galley, ui.visuals().text_color());
+                            simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::from_min_size(at, size));
+                            resp
                         }
                         // Too narrow for the word: leave it out rather than draw half of
                         // it. The row keeps its height, and the module keeps its identity
@@ -1663,6 +1686,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // A knob starts 112 points wide for the same reason: one old block of
                     // dial isn't worth dragging.
                     "module.knob" => Some(4.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
+                    // An empty readout used to be held at two blocks by the word "Readout" in
+                    // its header, which is the same accident as the Counter's handed-out width:
+                    // a name is painted now, so nothing in an untouched readout asked for the
+                    // room. Ask for it by name - two blocks, like the knob's dial - and the
+                    // floor below still lets the grip take it down to what the number needs.
+                    "display.readout" => Some(4.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                     _ => None,
                 };
                 let (w, floor) = kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w);

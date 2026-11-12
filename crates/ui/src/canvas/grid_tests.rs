@@ -1728,11 +1728,10 @@ fn the_per_channel_filters_are_pills_with_their_channels_in_the_header() {
             whole_blocks(f.width()) && whole_blocks(f.height()),
             "{module}: {f:?} off the grid",
         );
-        // Six blocks, not five: "DC Filter" spelled out in the header - which is what the
-        // module is called, so it stays - is the widest thing in the row, and at a 28-point
-        // step the next room is a whole block up.
+        // Five blocks: the pills are what they are and the name in the header is painted over
+        // the space rather than added to the row, so "DC Filter" costs nothing over "Delay".
         assert!(
-            f.width() <= 6.0 * B,
+            f.width() <= 5.0 * B,
             "{module}: {f:?} is still as wide as the label rows it used to be",
         );
         assert!(
@@ -2281,6 +2280,31 @@ fn a_title_does_not_hold_a_module_wide() {
     // The body's controls still fit inside it, which is what the size is actually for.
     let group = rig.traced(node, "delay_group");
     assert!(f.contains_rect(group.expand(-1.0)), "the controls {group:?} don't fit {f:?}");
+    // And the name is painted rather than laid out, so two modules with the same controls are
+    // the same width whatever they're called. This one is called "DC Filter", which is three
+    // letters longer than "Average" and used to cost it a whole 28-point block.
+    let mut widths = Vec::new();
+    for name in ["DC", "DC Filter", "DC Filter, which removes the slowly moving offset"] {
+        let (mut rig, ids) = Rig::real("module.dc_filter", &[egui::pos2(100.0, 300.0)]);
+        if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+            n.display_name = name.to_string();
+        }
+        rig.idle(6);
+        let f = rig.frame_rect(ids[0]);
+        widths.push(f.width());
+        assert_eq!(f.width(), 5.0 * B, "{name:?}: the name decided the width ({f:?})");
+        if name == "DC Filter" {
+            let title = rig.traced_rect(ids[0], "header_title").unwrap_or(egui::Rect::NOTHING);
+            assert!(
+                title.is_positive() && f.contains_rect(title.expand(1.0)),
+                "{name:?}: its name isn't drawn inside {f:?} ({title:?})",
+            );
+        }
+    }
+    assert!(
+        widths.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5),
+        "the same module at the same settings came out different widths: {widths:?}",
+    );
     // A module the user *can* widen - one with a corner grip - still takes the width it's
     // asked for, name or no name. The Counter is the one that still lays its settings out in
     // kit rows; the per-channel filters are pills now and size themselves.

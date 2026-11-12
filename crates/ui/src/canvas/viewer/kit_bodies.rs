@@ -70,8 +70,9 @@ const CAP_H: f32 = 14.0;
 /// middle of it. Reserving a constant - not what the text happens to measure - is what keeps
 /// a body from feeding its own width back into the frame, and it is the only way a module
 /// gets to be narrower than a stack of label rows: the labels were the width, not the
-/// controls. The pills are painted against the module's centre line rather than the column's,
-/// because the pin columns are different widths (`In` one letter, `Out` three).
+/// controls. Horizontally the pills sit on the module's centre line rather than the column's,
+/// because the pin columns are different widths (`In` one letter, `Out` three); vertically they
+/// sit on the body column's, because the frame's middle includes the header and reads as high.
 ///
 /// `captioned` gives every row a line of its own above the pill — the setting's word, which
 /// is what the three-letter cell inside a pill used to stand in for. That read as a puzzle
@@ -90,19 +91,21 @@ fn pill_group(
     use super::simple_bodies::PILL_H;
     const ROW: f32 = 4.0;
     let row_h = if captioned { CAP_H + PILL_H } else { PILL_H };
+    let content_h = rows as f32 * row_h + (rows.saturating_sub(1)) as f32 * ROW;
     // At least two rows of height whatever the module actually has, so one setting doesn't
     // make a module shallower than its neighbours: the body floor that a coarse grid used to
     // supply has to be asked for by name.
-    let h = (rows as f32 * row_h + (rows.saturating_sub(1)) as f32 * ROW).max(48.0);
+    let h = content_h.max(48.0);
     ui.allocate_exact_size(egui::vec2(pill_w, h), egui::Sense::hover());
     let inner = super::module_icons::module_inner(ui, view_salt, node_id)?;
     let column = ui.max_rect();
     // Traced so a test can hold the pills to the module's centre, not just to its size.
     simple_bodies::trace_rect(ui, node_id, "body_column", column);
-    // Centred in the frame, not at the top of the body column: a single pill under a header
-    // and a pin row sits low if it follows the column's middle, which is where its *rows*
-    // start rather than where the frame's room is.
-    Some((inner.center().x, inner.center().y - h * 0.5))
+    // The floor decides the module's *size*; where the controls sit is a separate question, and
+    // answering it from the floored box left Delay's one pill against the header with all the
+    // room below it. Centre what is actually drawn, in the body column - the space under the
+    // header - since the frame's middle is 24 points higher again and reads as high.
+    Some((inner.center().x, column.center().y - content_h * 0.5))
 }
 
 /// The word above a pill, painted in the row's caption line. Painted rather than allocated,
@@ -201,7 +204,7 @@ pub(crate) fn show_average_body(
         .get_node(node_id)
         .map_or(5.0, |n| flexinput_engine::eval::average_window_ms(&n.params) as f32);
     let mad = param_f32(snarl, node_id, "spike_mad", 0.0);
-    const PILL_W: f32 = 76.0;
+    const PILL_W: f32 = 72.0;
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
@@ -244,7 +247,7 @@ pub(crate) fn show_dc_filter_body(
     use super::simple_bodies::PILL_H;
     let window = param_f32(snarl, node_id, "window_ms", 500.0);
     let decay = param_f32(snarl, node_id, "decay_ms", 200.0);
-    const PILL_W: f32 = 76.0;
+    const PILL_W: f32 = 72.0;
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
