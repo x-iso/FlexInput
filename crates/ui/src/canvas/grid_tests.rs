@@ -418,12 +418,12 @@ fn hovering_a_module_focuses_its_wires() {
 }
 
 // The basic operations: their content is their pins, so they pay no body row for
-// them. `в€’ +` sits in the header, the frame stays the smallest the grid allows, and
+// them. `− +` sits in the header, the frame stays the smallest the grid allows, and
 // it grows by a block only when the pins need one.
 
-/// Where a node's header `в€’ +` sits: the stepper's two buttons are
-/// `interact_size.y` on a side, `+` is the rightmost, `в€’` is a stepper's width in
-/// from there, and the header band starts under the header frame's top margin вЂ” the
+/// Where a node's header `− +` sits: the stepper's two buttons are
+/// `interact_size.y` on a side, `+` is the rightmost, `−` is a stepper's width in
+/// from there, and the header band starts under the header frame's top margin — the
 /// 4 px `Canvas::new` gives it (see the same note in `viewer::glow`).
 fn stepper_points(rig: &Rig, node: NodeId) -> (egui::Pos2, egui::Pos2) {
     let h = rig.ctx.style().spacing.interact_size.y;
@@ -435,7 +435,7 @@ fn stepper_points(rig: &Rig, node: NodeId) -> (egui::Pos2, egui::Pos2) {
 
 #[test]
 fn an_operation_is_two_blocks_square() {
-    // The five variadic operations (their mark and their `в€’ +` in the header), the
+    // The five variadic operations (their mark and their `− +` in the header), the
     // two comparisons (their mark, and one toggle under it) and the gates: a header
     // and pin rows, nothing else.
     for module in ["math.add", "math.subtract", "math.multiply", "math.divide", "math.min_max",
@@ -471,7 +471,7 @@ fn an_operation_is_two_blocks_square() {
 fn five_inputs_fit_the_two_blocks_and_the_sixth_takes_a_third() {
     // Measured, so the trade is on the record: the stepper in the header costs no
     // height at all, the second block has room for five inputs, and the sixth is what
-    // takes a third вЂ” and the third block comes back when the sixth pin goes.
+    // takes a third — and the third block comes back when the sixth pin goes.
     for n in 2..=5 {
         let (mut rig, ids) = Rig::real("math.add", &[egui::pos2(100.0, 300.0)]);
         rig.set_inputs(ids[0], n);
@@ -500,11 +500,11 @@ fn the_header_stepper_adds_a_pin_row_and_gives_it_back() {
     let grown = rig.frame_rect(ids[0]).size();
     assert!(whole_blocks(grown.x) && whole_blocks(grown.y), "{grown:?} after a pin");
 
-    // And the other way: the same control takes it back, and the frame with it вЂ” a
+    // And the other way: the same control takes it back, and the frame with it — a
     // frame that only ever grows is the failure this is guarding.
     let (minus, _) = stepper_points(&rig, ids[0]);
     rig.click(minus);
-    assert_eq!(rig.inputs(ids[0]), 2, "the в€’ took no pin off");
+    assert_eq!(rig.inputs(ids[0]), 2, "the − took no pin off");
     rig.idle(6);
     assert_eq!(rig.frame_rect(ids[0]).size(), at_start, "the frame never gave the room back");
 
@@ -712,7 +712,7 @@ fn a_sample_hold_shows_in_and_out_in_two_blocks() {
     rig.click(egui::pos2(h.center().x, y));
     assert_eq!(mode_of(&rig), "sample", "and didn't switch it back");
 
-    // The two readings land in the space under the pin rows, not up among the labels вЂ”
+    // The two readings land in the space under the pin rows, not up among the labels —
     // that is what made the input look like a stray dash next to the header.
     let lines = rig
         .ctx
@@ -1780,7 +1780,7 @@ fn a_title_does_not_hold_a_module_wide() {
 
 #[test]
 fn the_port_strips_add_remove_rename_and_reorder_their_pins() {
-    // Selector and Split: `+` in the header adds a port, the `Г—` on a strip drops one, a
+    // Selector and Split: `+` in the header adds a port, the `×` on a strip drops one, a
     // double-click renames the port (which is the pin's own name), and the handle moves it
     // - taking its wire with it, because the engine reads these by position.
     // - no snap: the last part of this test is that the room a port needed comes back when
@@ -1831,12 +1831,12 @@ fn the_port_strips_add_remove_rename_and_reorder_their_pins() {
     rig.type_text("kick");
     assert_eq!(names(&rig)[1], "kick", "the strip's name field didn't rename the pin");
 
-    // The `Г—` only shows once there are more than two ports to choose between; it drops
+    // The `×` only shows once there are more than two ports to choose between; it drops
     // the port it's on and the module shrinks back with it.
     let tall = rig.frame_rect(sel);
     let strip1 = rig.traced(sel, "strip_1");
     rig.click(egui::pos2(strip1.left() + 26.0, strip1.center().y));
-    assert_eq!(names(&rig).len(), 3, "the strip's Г— didn't drop the port: {:?}", names(&rig));
+    assert_eq!(names(&rig).len(), 3, "the strip's × didn't drop the port: {:?}", names(&rig));
     rig.idle(4);
     assert!(rig.frame_rect(sel).height() < tall.height(), "the module kept the room the port needed: {tall:?} -> {:?}", rig.frame_rect(sel));
 }

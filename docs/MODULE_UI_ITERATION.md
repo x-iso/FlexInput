@@ -79,10 +79,12 @@ Greying out: wrap the row, `ui.add_enabled_ui(enabled, |ui| k.value(...)).inner`
 - Label cell 64 points, value box 50, gap between cells 4, between rows 4, a
   row is about 18 tall. A body is at least 174 wide (label, a 52-point rail, a
   value box).
-- The canvas lays modules out in blocks of 56 points; a module's width and
-  height round up to whole blocks. The body gets the module's width less its
-  pin label columns and about 30 points of frame and spacing. A body 174 to
-  about 210 wide usually makes a 5-block (280) module.
+- The canvas lays modules out in blocks of 28 points; a module's width and
+  height round up to whole blocks. (Every second block is the 56-point major
+  line, and the sizes in these notes are written against that.) The body gets
+  the module's width less its pin label columns and about 30 points of frame
+  and spacing. A body 174 to about 210 wide therefore lands somewhere within
+  28 points above what it asks for rather than on a 56-point step.
 - Fit is your job: count characters. A label of 10 characters is about the
   most a 64-point label cell holds. An option cell needs roughly 7 points per
   character plus 10, so four options of 6 to 9 characters need about 240

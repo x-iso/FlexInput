@@ -209,7 +209,7 @@ module and change it.
    so they take no corner grip. Their button is 52 wide rather than the Switch's 64 for
    the reason under **the body is a column** below: in this layout the body is a third
    thing squeezed between the two pin columns and its width *adds* to theirs, so a
-   two-block module leaves the middle column about 56 points.
+   112-point module leaves the middle column about 56 points.
 - **Reserve, then draw in a child.** A header control reserves its box in the header's
   own row — that's what keeps the mark and the buttons from overlapping — and draws in
   a *child* of that row, against its right edge. Reserving keeps the header reporting a
@@ -246,8 +246,8 @@ draw one mark in the room their pins leave over — a glyph, not a widget.
 - The glyph is **painted, never allocated** (`module_icons::paint_glyph`): it fits the
    band from under the module's last control down to the frame, at most one block
    (`MAX_SIDE` 56), and isn't drawn at all under 16. That is why adding inputs makes the
-   glyph smaller rather than pushing the module out to a third block — the two blocks the
-   rig measures for these modules stay two blocks with a glyph on them.
+   glyph smaller rather than pushing the module out to a third block — the 112 points
+   rig measures for these modules stay 112 with a glyph on them.
 - In the sandwich layout the body column runs the **height** of the pin rows, beside
    them rather than under them, so a module with five inputs still has a full column of
    mark in it: Map Range and Clamp draw a 56-point glyph like Add does. What shortens
@@ -266,7 +266,7 @@ draw one mark in the room their pins leave over — a glyph, not a widget.
    `cursor().top().max(min_rect().bottom())` after a control.
 - A painted mark leaves a trace: `paint_glyph` stores the side it drew at under
    `("module_glyph_side", node)` in ctx data. Nothing reads it at runtime; the rig does,
-   because a module can measure two blocks square and still show an empty body, and a
+   because a module can measure 112 square and still show an empty body, and a
    size test alone won't notice.
 - **Centred on the module, not on the body.** A node in this layout puts its inputs in a
    column on the left and its outputs in a column on the right, and the body is a third
@@ -306,8 +306,8 @@ All in `crates/ui/src/canvas/viewer/kit.rs`.
 | `WIDTH_PARAM` | `"ui_w"` | Node param: the frame width the user dragged the node to |
 | `stepper_w(ui)` | 2 × `interact_size.y` + GAP | The header's `− +`: two square buttons and the gap between |
 | `MARKS` | (id, shipped name, symbol) | Modules whose header shows a mark instead of that name |
-| `MAX_SIDE` / `MIN_SIDE` / `PAD` | 56 / 16 / 6 | In `module_icons`: how big a glyph may get (one block), when it stops being drawn, the air round it |
-| `TOGGLE` | 52 × 20 | A boolean setting's Switch-style button; 52 because the body column of a two-block module is ~56 wide |
+| `MAX_SIDE` / `MIN_SIDE` / `PAD` | 56 / 16 / 6 | In `module_icons`: how big a glyph may get (56 points, two blocks of the current grid), when it stops being drawn, the air round it |
+| `TOGGLE` | 52 × 20 | A boolean setting's Switch-style button; 52 because the body column of a 112-point module is ~56 wide |
 | `PILL_H` / `PILL_FONT` | 20 / 12 | In `simple_bodies`: the setting pill's height and text, so a setting row reads the same wherever it sits |
 | `MIN_FIELD_W` | 96 | In `show_body`: the narrowest a Text note's field gets, whatever the grip asks for |
 | `WIDTH_PARAM` / `HEIGHT_PARAM` | `"ui_w"` / `"ui_h"` | Node params: the frame size the user dragged the node to |
@@ -324,7 +324,7 @@ walks the node out a block.
   and `sample` / `hold` on Sample and Hold are both this, and they're drawn by the same
   `kit_bodies::setting_button`, which also returns where the glyph's band starts under it.
   A pill was tried for the mode first: at `mode` + `sample` it measured 96 points across a
-  body column that fits about 56, and the module went from three blocks to four.
+  body column that fits about 56, and the module went from 168 points to 224.
 - **A setting with a short list is a pill**: one filled shape, `label` cell on the left in
   the selection colour, the current value on the right, and the value cell answering the
   pointer across its whole width — the place picks the setting, so the list is scrubbed
@@ -380,13 +380,13 @@ Changed, Vec to Deflection, Switch, Sample and Hold, Greater / Less Than.
 
 **Constant has no grip and no width param.** Its whole body is one number, and the box is
 as wide as the digits it holds — `30` tall, monospace 12, 8 of air each side — with a
-floor set by `9999.99`: that number sits inside a module two blocks wide, and a longer one
+floor set by `9999.99`: that number sits inside a module 112 points wide, and a longer one
 (`10000.00`) takes the frame a block wider, handing the block back when the value shrinks.
 The width is measured from the value's own text, never from the module's current width, so
 it grows and shrinks on demand and can't stick. The box is drawn centred on the module —
 in both directions — in a child, with a constant box reserved in the body's flow: wrapping
 it in a style scope instead folded the centred child's rect back into the measured width
-and walked the module out to three blocks.
+and walked the module out to 168 points.
 
 **Its number stays 64-bit in the box.** The wire is `Signal::Float(f32)` — about seven
 exact digits — but reading the param through `f32` in the UI rounded eight-digit values on
@@ -426,7 +426,7 @@ wide as the box and the pair reads as one object, not two controls that happen t
   going `int` and back to four gives `3.7` again rather than the `4` that was on screen.
 - The box's width is measured against the text as displayed — trailing zeros trimmed — so a
   whole number doesn't pay for a dot and two zeros it never shows. `9999.99` is the floor
-  the box is built around, and it still fits two blocks.
+  the box is built around, and it still fits 112 points.
 - **Centred horizontally on the module, vertically in the body column.** The module's
   centre includes its header, so a pair centred on it hangs high: the empty space all ends
   up below the controls, and it reads as uncentred even though the arithmetic is symmetric.
@@ -454,13 +454,13 @@ look broken. Concretely:
 - More lines than fit → the writing is measured at the field's width, that height is
   reserved, and the note takes whole blocks. One line again → it comes back to the floor,
   not to the tallest it ever was.
-- An unnudged note opens three blocks wide, sized from a 160-point field. It used to be
+- An unnudged note opens 168 points wide, sized from a 160-point field. It used to be
   four: the old body reserved 160 *inside* the frame's own margin and the canvas rounded
   that up, so the frame was wider than anything in it asked for.
 - A patch saved before the grid took over keeps the width it had: the legacy `box_width`
   param is read as the default when `ui_w` was never set.
 
-**A Readout is a stretchy display, and it starts small.** Two blocks by two, because three
+**A Readout is a stretchy display, and it starts small.** 112 points by 112, because three
 was wider than any ordinary number needed: the type fills the space instead (`READOUT_MAX_FONT`
 down to `READOUT_MIN_FONT`), the reading is written in scientific notation once four decimals
 stop meaning anything, and the width floor is the current reading at the smallest size worth
@@ -471,16 +471,16 @@ wire never resizes the module on its own.
 space at the **bottom** of the frame — the input in the header's strong colour, the output
 dim while the trigger or gate is idle and amber while it's doing something, so *holding* and
 *following* look different. Nothing there is allocated: the pair shrinks to fit, so a
-nine-figure value doesn't walk the module out a block, and it is two blocks square. The mode
+nine-figure value doesn't walk the module out a block, and it is 112 square. The mode
 is the house two-state button in the body at `TOGGLE_SMALL` — this module's pins take 47 of
-the 98 points a two-block frame has inside its margins, and the 52-point size costs it a
+the 98 points a 112-point frame has inside its margins, and the 52-point size costs it a
 third block — and the name gives way to an `S/H` mark in the header for the same arithmetic.
 The readings are anchored to the bottom rather than divided through whatever is left: the
 pin labels own the rows above, and centring the pair in the body column put the input among
 them, where it read as a stray dash by the header. The stepped curve that used to sit in the
 body went to Quantize, the module it actually describes.
 
-**Quantize is a mark and two pills, in two blocks.** It was four blocks wide: a Factor drag
+**Quantize is a mark and two pills, in 112 square.** It was 224 points wide: a Factor drag
 box and a Rounding choice spelling out four words, each on its own kit row. The staircase
 mark goes across the pin rows like every other operation's; the two settings sit in the
 slack under them — a `÷` pill (the number is subdivisions per unit, and the word "step"
@@ -517,9 +517,9 @@ The pin labels are usually the widest thing in a small module — "increased", "
   from its pins and controls rather than from a word that was once drawn there; widen the
   frame and the name comes back. This only works because the small modules ask for their
   size out of their own content — see the next section. Measured: a Logic Delay renamed to a
-  50-character name is still two blocks square.
+  50-character name is still 112 square.
   - Inverse is deliberately *not* in `MARKS`: `±` reads as arithmetic, not as negate, and
-    its name fits the two blocks its pins need.
+    its name fits the 112 points its pins need.
 
 ## What a body is allowed to reserve
 
@@ -531,19 +531,19 @@ both measured:
 - A body that allocates **nothing** makes the module as narrow as its pins — Sample and
   Hold's 112 — but a control painted across that frame then hangs outside it. Inverse came
   out 56 wide (a block at the old grid, two now) carrying 82-point pills.
-- A body that allocates its controls **in the column** pays their width: Inverse at 66 was
-  three blocks.
+- A body that allocates its controls **in the column** pays their width: Inverse at 66 came out
+  168 points wide — three of the old blocks.
 
-The working shape: reserve a **constant box** sized to what the two blocks leave over
+The working shape: reserve a **constant box** sized to what 112 points leave over
 (Inverse and Logic Delay reserve 48), and paint the controls into it. Split for the
 modules whose pins are already wide (Quantize, Vec to Deflection, Switch, Has Changed):
 they reserve a token box and paint the control across the frame, which is inside the
 module and outside the column. Two details that only show up when something else moves:
 
-- **The token box has to be wide enough to carry two blocks on its own**
+- **The token box has to be wide enough to hold 112 points on its own**
   (`module_icons::MIN_BODY_W`, 40). Quantize, Axis to Vec and the other glyph modules were
   reaching 112 wide because the *word in their header* was wide; the moment a title that
-  doesn't fit is dropped, they fall to one block — and a one-block frame is too narrow to
+  doesn't fit is dropped, they fall to 56 points — and a 56-point frame is too narrow to
   paint their pills or their mark in, so they stay empty and narrow with nothing left to ask
   for the room back. `a_small_module_holds_its_two_blocks_without_the_grid` measures it with
   the grid's sizing off, where no rounding covers it over.
@@ -596,7 +596,7 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   `need_w` — the handle, the `×` when there are more than two ports, the gaps, and the longest
   name clamped to `STRIP_NAME_MIN..STRIP_NAME_MAX` (28..140), plus the toggle's room when it
   shares a band — and that reservation is the floor the grip can be dragged down to: short
-  names keep a Selector or Split at **three blocks wide** whatever the port count. The strips
+  names keep a Selector or Split at **three major blocks wide** (168 points) whatever the port count. The strips
   are then painted as wide as the column the frame leaves, ending flush with the side the
   sockets are on. Tie the *ask* to the column instead and the module can never be dragged
   narrower than it already is.
@@ -671,7 +671,7 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   output label, and the Uni/Bi range switch in the header. **The reading is part of the
   body, at every size**: in the middle of a dial — the dial's indicator stops short of the
   middle so the two don't cross — under the track for a fader with a line to spare, and at
-  the end of the track for a fader one block tall. A dial never gives up a line of frame for
+  the end of the track for a fader 56 points tall. A dial never gives up a line of frame for
   the text: the thing you drag is what the body is for. Collapsed it draws **no face** and
   writes the number in the band under the header, which a folded frame still has; the
   `!open` early return exists because snarl runs a collapsed node's body and shifts it up
