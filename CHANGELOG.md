@@ -140,6 +140,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **The Auto-Map splitter and collector list their ports the way the port strips do.** Each
+  row used to lead with its `×`, so the names started behind a column of buttons and staggered;
+  the list also set its own floor at 170 points and asked its dropdown for 150 more. The name
+  comes first now, cut short at the row's edge with the whole of it on hover, the `×` sits at
+  the right edge like every other list's, and adding one is a `+` whose dropdown can be as wide
+  as it likes because it's a popup. Their pins abbreviate on the canvas like the small modules'
+  ("Left Stick Horizontal…" shows as "Left", full name on hover), which is what these two were
+  really being wide for: 280 points down to 224.
 - **The Counter's settings are cells, not a column of labelled rows.** Its four settings were
   a mode strip, an "Output" row, a "Step" row and a "Range" row with two captioned boxes: 336
   points across, most of that the words "Output", "Step" and "Range" sitting beside the things

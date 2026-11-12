@@ -574,6 +574,48 @@ pub(crate) fn automap_curve_pin_picker(
     true
 }
 
+/// One row of an Auto-Map port list: the port's name on the left, cut short rather than
+/// widening the module, and the `×` at the row's right edge - where the port strips put it, so
+/// the names line up down the list instead of staggering behind a column of buttons. Returns
+/// true when the row was asked to be removed.
+fn automap_port_row(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    salt: &str,
+    list_w: f32,
+    name: &str,
+    index: usize,
+) -> bool {
+    const LIST_PAD: f32 = 4.0;
+    let row_h = ui.spacing().interact_size.y;
+    let (row, _) = ui.allocate_exact_size(egui::vec2(list_w, row_h), egui::Sense::hover());
+    // Traced so a test can hold the rows to the list's width and see where the buttons are.
+    super::simple_bodies::trace_rect(ui, node_id, &format!("{salt}_row_{index}"), row);
+    let btn = row_h + 4.0;
+    ui.interact(row, ui.id().with((salt, node_id, index)), egui::Sense::hover())
+        .on_hover_text(name);
+    let mut label_child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                row.min,
+                egui::pos2(row.right() - btn - LIST_PAD, row.bottom()),
+            ))
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt((salt, "label", node_id, index)),
+    );
+    label_child.add(egui::Label::new(egui::RichText::new(name).small()).truncate());
+    drop(label_child);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(egui::pos2(row.right() - btn, row.top()), row.max))
+            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown))
+            .id_salt((salt, "remove", node_id, index)),
+    );
+    let clicked = child.small_button("×").clicked();
+    drop(child);
+    clicked
+}
+
 pub(crate) fn show_automap_split_body(
     node_id: NodeId,
     outputs: &[OutPin],
@@ -598,18 +640,24 @@ pub(crate) fn show_automap_split_body(
         .flat_map(|d| crate::raw_learn::extra_pins_of(d))
         .collect();
 
+    // The list's width is this constant, not the longest pin name on show: a splitter pointed
+    // at a pad with long learned names was 263 points wide, wider than most of the modules it
+    // feeds. A name that doesn't fit is cut with an ellipsis and the whole of it is on hover -
+    // the same deal the port strips make.
+    const LIST_W: f32 = 132.0;
     ui.vertical(|ui| {
-        ui.set_min_width(170.0);
+        ui.set_min_width(LIST_W);
 
-        // Existing individual outputs with remove buttons.
+        // Existing individual outputs, the name first and the `×` at the row's right edge -
+        // which is where the strips put it too, so the names line up down the list instead of
+        // staggering behind a column of buttons.
         let mut to_remove: Option<usize> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
             let neutral = bus_pin_neutral_label(pin_id);
             let display = splitter_pin_label(pin_id, &neutral, family_ref);
-            ui.horizontal(|ui| {
-                if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
-                ui.label(egui::RichText::new(&display).small());
-            });
+            if automap_port_row(ui, node_id, "am_split", LIST_W, &display, i) {
+                to_remove = Some(i + 1);
+            }
         }
         if let Some(rm_idx) = to_remove {
             remove_automap_split_output(node_id, rm_idx, outputs, snarl);
@@ -617,9 +665,10 @@ pub(crate) fn show_automap_split_body(
 
         ui.add_space(4.0);
 
+        // The `+` at the end of the list, opening the same choice of pins. The dropdown is a
+        // popup, so it can be as wide as the names need without the module paying for it.
         egui::ComboBox::from_id_salt((node_id, "add_am_split"))
-            .selected_text(egui::RichText::new("+ Add output").small())
-            .width(150.0)
+            .selected_text(egui::RichText::new("+").small())
             .show_ui(ui, |ui| {
                 for ap in am_canon::ALL_PINS {
                     if current_ids.iter().any(|id| id == ap.id) { continue; }
@@ -723,10 +772,12 @@ pub(crate) fn show_automap_collect_body(
 
     let family_ref = collector_downstream_family(snarl, node_id);
 
+    // Same list as the splitter's: a constant width, names cut short, the `×` at the right.
+    const LIST_W: f32 = 132.0;
     ui.vertical(|ui| {
-        ui.set_min_width(170.0);
+        ui.set_min_width(LIST_W);
 
-        // Existing individual inputs with remove buttons.
+        // Existing individual inputs, with their remove button at the row's right edge.
         let mut to_remove: Option<usize> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
             // Resolve display name: canonical list, then MIDI, otherwise the raw
@@ -734,10 +785,9 @@ pub(crate) fn show_automap_collect_body(
             // and display).
             let neutral = bus_pin_neutral_label(pin_id);
             let display = splitter_pin_label(pin_id, &neutral, family_ref);
-            ui.horizontal(|ui| {
-                if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
-                ui.label(egui::RichText::new(&display).small());
-            });
+            if automap_port_row(ui, node_id, "am_collect", LIST_W, &display, i) {
+                to_remove = Some(i + 1);
+            }
         }
         if let Some(rm_idx) = to_remove {
             remove_automap_collect_input(node_id, rm_idx, inputs, snarl);
@@ -747,8 +797,7 @@ pub(crate) fn show_automap_collect_body(
 
         // ── Add-input dropdown (canonical ALL_PINS) ───────────────────────────
         egui::ComboBox::from_id_salt((node_id, "add_am_collect"))
-            .selected_text(egui::RichText::new("+ Add input").small())
-            .width(150.0)
+            .selected_text(egui::RichText::new("+").small())
             .show_ui(ui, |ui| {
                 for ap in am_canon::ALL_PINS {
                     if current_ids.iter().any(|id| id == ap.id) { continue; }

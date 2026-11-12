@@ -156,6 +156,10 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
             | "module.delay"
             | "module.average"
             | "module.dc_filter"
+            // Their pins are named for what came off the bus ("Left Stick", a learned key),
+            // and a name written out in full is the one thing that holds these two past 280.
+            | "module.automap_split"
+            | "module.automap_collect"
     )
 }
 

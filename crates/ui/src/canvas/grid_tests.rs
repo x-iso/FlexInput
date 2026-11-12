@@ -1807,6 +1807,68 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
 }
 
 #[test]
+fn the_automap_port_lists_hold_their_width_and_line_the_names_up() {
+    // The Auto-Map splitter and collector list the ports they've taken off a bus, with a `×`
+    // to drop each one. The list used to lead with the button and set its own floor at 170
+    // points, so the names started at a column of buttons and a long learned name pushed the
+    // module out past 280. The rows are one constant width now, the name first, the `×` at the
+    // right edge like the port strips, and a name that doesn't fit is cut with the whole of it
+    // on hover.
+    for (module, pin_key, param_key, salt, extra) in [
+        ("module.automap_split", "outputs", "output_pin_ids", "am_split", true),
+        ("module.automap_collect", "inputs", "collect_input_pin_ids", "am_collect", false),
+    ] {
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            let long = "Left Stick Horizontal, learned from the raw pad";
+            for name in [long, "Right Stick"] {
+                if pin_key == "outputs" {
+                    n.outputs.push(PinDescriptor::new(name, SignalType::Any));
+                } else {
+                    n.inputs.push(PinDescriptor::new(name, SignalType::Any));
+                }
+            }
+            let ids_param: Vec<String> = if extra {
+                // The splitter's first output is the passthrough the list doesn't show.
+                vec!["automap_pass".into(), "left_stick".into(), "right_stick".into()]
+            } else {
+                vec!["left_stick".into(), "right_stick".into()]
+            };
+            n.params.insert(param_key.into(), serde_json::Value::Array(
+                ids_param.into_iter().map(serde_json::Value::String).collect(),
+            ));
+        }
+        rig.idle(8);
+        let f = rig.frame_rect(node);
+        assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "{module}: {f:?} off the grid");
+        assert!(
+            f.width() <= 9.0 * B,
+            "{module}: {f:?} is wider than the module it lists names for",
+        );
+        let rows: Vec<egui::Rect> = (0..2)
+            .map(|i| rig.traced_rect(node, &format!("{salt}_row_{i}")).unwrap_or(egui::Rect::NOTHING))
+            .collect();
+        for (i, r) in rows.iter().enumerate() {
+            assert!(
+                r.is_positive() && f.contains_rect(r.expand(1.0)),
+                "{module}: list row {i} {r:?} isn't inside {f:?}",
+            );
+            assert!(
+                (r.width() - rows[0].width()).abs() < 0.5,
+                "{module}: list row {i} {r:?} is a different width from row 0 {:?}",
+                rows[0],
+            );
+        }
+        // A long name doesn't make the row - or the module - any wider than the list's floor.
+        assert!(
+            rows[0].width() < f.width(),
+            "{module}: the list {rows:?} fills the whole frame {f:?}, so a name is holding it",
+        );
+    }
+}
+
+#[test]
 fn a_long_port_list_still_lands_on_the_grid_and_stays_readable() {
     // Nine ports is the case where a column of strips runs out of the module: the frame has to
     // keep growing a block per port, the empty band under the last strip has to stay the same
