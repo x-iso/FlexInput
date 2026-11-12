@@ -53,10 +53,12 @@ pub(crate) fn kit_width_param() -> &'static str {
 /// allocates nothing at all, so its width is its pins' business like the other marks.
 pub(crate) fn kit_min_width(module_id: &str) -> f32 {
     match module_id {
-        // The cells two across: two 72-point cells and the gap between. The old floor was
-        // 240 because a row was a label cell, a control and a value box, and the labels
-        // ("Output", "Step", "Range") were most of it.
-        "logic.counter" => 148.0,
+        // The cells two across: two 56-point cells and the gap between. 56 is where the
+        // longest mode word ("Unlimited") still reads whole, so it is what the module settles
+        // at rather than a room it was handed. The old floor was 240 because a row was a label
+        // cell, a control and a value box, and the labels ("Output", "Step", "Range") were most
+        // of it.
+        "logic.counter" => 116.0,
         _ => kit::MIN_W,
     }
 }
@@ -669,10 +671,16 @@ pub(crate) fn show_counter_body(
     let (step_wired, min_wired, max_wired) = (wired(inputs, 3), wired(inputs, 4), wired(inputs, 5));
     // Cells two across, sized from the width the body was given rather than from what any of
     // them happens to say: the grip can still take this module wider, and the cells use it.
-    const MIN_CELL: f32 = 72.0;
+    // Cells two across, with a floor of 56 - the point where the longest mode word
+    // ("Unlimited") still reads whole - which is what the module settles at. It stretches to
+    // fill a wider frame the grip has asked for, but the floor is worked out from the cells,
+    // never from the frame as it stands (`kit::body_width`), so the module no longer starts at
+    // whatever width it happened to be handed: it was 252 points for a strip of words and
+    // three numbers.
+    const CELL: f32 = 56.0;
     const ROW: f32 = 4.0;
     const ROWS: usize = 5;
-    let cell_w = ((w - ROW) * 0.5).max(MIN_CELL);
+    let cell_w = ((w - ROW) * 0.5).max(CELL);
     let col_w = 2.0 * cell_w + ROW;
     let group_h = ROWS as f32 * PILL_H + (ROWS as f32 - 1.0) * ROW;
     ui.allocate_exact_size(egui::vec2(col_w, group_h), egui::Sense::hover());

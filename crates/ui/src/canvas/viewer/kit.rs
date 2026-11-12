@@ -145,6 +145,9 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
             | "logic.less_than"
             | "logic.delay"
             | "logic.has_changed"
+            // Six functional pin words, fixed by the module and the same on every canvas:
+            // spelled out, "increase" and "decrease" are what hold this module wide.
+            | "logic.counter"
             | "module.switch"
             | "module.split"
             | "module.selector"
@@ -180,6 +183,11 @@ pub(crate) fn pin_short(name: &str) -> (String, bool) {
         ("changed", "chg"),
         ("increased", "inc"),
         ("decreased", "dec"),
+        // The Counter's inputs are verbs, and they are the widest thing in it: at 252 points
+        // the module is mostly the words "increase" and "decrease" standing beside six pins.
+        ("increase", "inc"),
+        ("decrease", "dec"),
+        ("reset", "rst"),
         ("deflection", "def"),
         ("angle", "ang"),
         ("factor", "fac"),
@@ -240,7 +248,13 @@ pub(crate) fn body_width(
         .and_then(|v| v.as_f64())
         .map(|w| whole(w as f32))
         .or_else(|| default.map(whole));
-    let frame = wanted.unwrap_or(frame_w).max(narrowest);
+    // A kit module nobody has dragged starts at its own floor, not at the frame size it was
+    // handed. The body reports back the width it's given, so a body born into a default frame
+    // keeps that frame for ever: the Counter came out 252 points wide for a strip of words and
+    // three numbers because that is what an untouched node starts with, not because anything
+    // in it asked. What the cells need is the answer (`narrowest`), and the grip above still
+    // overrules it.
+    let frame = wanted.unwrap_or(narrowest).max(narrowest);
     // The second value is the floor the *grip* is held to. It's worked out from what the
     // body needs, never from the frame as it stands — a floor that follows the current
     // size is a ratchet: the node grows and can never come back.

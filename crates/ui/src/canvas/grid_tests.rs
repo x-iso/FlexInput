@@ -1773,8 +1773,16 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
     rig.idle(8);
     let f = rig.frame_rect(node);
     assert!(
-        f.width() <= 9.0 * B,
+        f.width() <= 7.0 * B,
         "the counter is still as wide as its label rows were: {f:?}",
+    );
+    // Two things pay for that: the cells ask for a constant rather than half the width the
+    // frame handed them (asking for a share of the handout is how it stayed wide), and its six
+    // fixed functional pin words are drawn short - `increase` and `decrease` beside six pins is
+    // most of a block of module. The names the patch stores are untouched.
+    assert!(
+        crate::canvas::viewer::kit::pin_abbreviates("logic.counter"),
+        "the counter's pin words are being spelled out again",
     );
     for what in ["counter_mode_0", "counter_mode_1", "counter_out", "step_pill"] {
         let r = rig.traced_rect(node, what).unwrap_or(egui::Rect::NOTHING);
