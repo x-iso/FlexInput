@@ -145,6 +145,10 @@ All notable changes to FlexInput are documented here. This project adheres to
   the base, so the option you click is the option you get. The list it drops down also asks for
   the height its options need: it was egui's default of about four rows, so a menu of eight made
   you scroll in the middle of an empty canvas.
+- **A module's header says what the module is.** Hovering its name, or the symbol it wears
+  instead of a name, opens the name the patch calls it by and, under a rule, what the module
+  does - in the words of `docs/MODULES_REFERENCE.md`'s Purpose lines, 75 of them, plus the six
+  modules the reference leaves unsaid.
 
 ### Changed
 
@@ -409,6 +413,34 @@ All notable changes to FlexInput are documented here. This project adheres to
   number of ports. The ask is content: the parts of a row plus the longest name. The strips are
   then drawn as wide as the column the frame leaves, which is what stops them ending in the
   middle of the body.
+- **Header names are cut to fit instead of vanishing.** One rule on every module: measure the
+  room between where the name starts and whatever sits at the frame's edge, draw the name whole
+  if it fits, the start of it with dots if only part of it does, and nothing at all if the room
+  is smaller than a word worth reading. It used to be all-or-nothing; and on the modules with a
+  control against the header's right edge the room was estimated from the frame's width rather
+  than measured from where the name lands, which is how half a letter came to stand under a
+  stepper.
+- **The Counter lost its corner grip.** Its cells ask for one size - a count, a pill, two
+  buttons - and a grip let the same module stand at four sizes in one patch with nothing between
+  the cells to show for it. It stays 196x168, and a width an older patch wrote into it is
+  ignored.
+- **A dial says its value once.** A knob with height to spare under its face wrote the number
+  both in the middle of the dial and under it. Now it goes under, and inside the face only when
+  there is nowhere else for it.
+- **A Macro Output spells its port types out** - Bool, Float, Vec2, Any - rather than a letter
+  you had to open a menu to read, on the one module whose rows are its pins. The module pays a
+  block of width for the row: 224x84 becomes 252x84.
+- **A Dropdown's choice is green.** The `shift` inlet is drawn green rather than the blue a
+  Float pin wears, and so is the option currently coming out of the module - which with that
+  pin wired is not necessarily the one the module was set to. Type colours say what kind of
+  number a pin carries; this one says which pin is deciding.
+- **The grid's brighter line starts off, and the choices are odd.** A bright line every second
+  block was the old 56-point grid showing through a 28-point one. It isn't needed, and an even
+  step puts the bright lines through a module four blocks across rather than around it: the menu
+  offers no highlight - what ships - or every 3, 5, 7 or 9 blocks, and 5 brackets a 4x4 module.
+- **The grid stays when you zoom out.** Past the point where 28-point blocks crowd together it
+  draws those same lines every second, fourth, eighth block, at a floor of brightness, so a
+  zoomed-out patch still says how big a module is. It used to fade to nothing by about 50%.
 
 ### Fixed
 
@@ -542,6 +574,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   those modules two blocks wide — but the label column (`chg`/`inc`/`dec`) is wide, and a
   56-point pill centred on the module ran into it. The drawn width is now capped to the space
   between the labels; the module's size is unchanged.
+- **A value pill opened empty.** The field a pill opens painted the current number behind it in
+  grey and gave the caret nowhere to go, so a pill could be reset but never edited: a new value
+  could be typed, a digit in the old one could not. It opens holding the value with all of it
+  selected, so typing replaces it and Backspace and the arrows do what they say. The grey hint
+  stays for the case where the field has been cleared, and committing an empty field still
+  leaves the value alone.
 
 ## [0.17.1] - 2026-11-10
 

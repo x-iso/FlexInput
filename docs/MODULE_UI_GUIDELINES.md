@@ -118,6 +118,10 @@ router and lanes), both marked `FLEXINPUT PATCH`.
     base, and picking an entry moves the base so the entry picked is the one that
     lands. Greying it out (rule 9) would be wrong: the pin and the module are both
     doing work.
+    A pin that *decides* rather than carries - that `shift` - wears `pins::CHOICE_GREEN`,
+    and so does the row showing the effective value. Pin colours otherwise follow the signal
+    type and say what kind of number arrives; nothing else on the module could say which pin
+    is making the choice.
 
 ## Width and height
 
@@ -136,6 +140,10 @@ creep wider, stick, or flicker. It is handed its width instead.
   content needs gets the content's frame, filled, not a body squeezed inside a
   frame that can't shrink.
 - The grip itself stops at the header's width and at that narrowest frame.
+- A body that is a fixed grid of cells has **no grip at all** (`kit::fixed_size` - the
+  Counter): its cells ask for one size, and being dragged wider only puts air between them,
+  which is how one module ends up at four sizes in a single patch. A width an older patch
+  stored in it is ignored.
 - The body reports exactly that width to the node whatever its rows draw, so a
   value or option too long for its cell can't tip the node over a block and back
   every other frame.
@@ -235,17 +243,22 @@ module and change it.
   of that measurement, so a node is never locked at a width it once happened to have.
 - **The name is decoration, not structure.** What the header reports as its width
   (`header_content`, read back by the fork through `SnarlViewer::node_header_width`, which
-  feeds `max(header, pins)`) is its **controls only**. A name folded into that number sets
-  the module's narrowest width — and then the frame is never small enough for the name to
-  hide, so the grip stops short and the title is what gets blamed. The name is drawn when it
-  fits and dropped whole when it doesn't, never cropped.
-- **A name's room is the frame minus what the row already took**: the fold chevron and the
-  fork's drag space, read as `ui.min_rect().width()` before the label is added, then the
-  right-edge control (the Uni/Bi switch) if one is coming, then the sockets' room when the
-  node is **folded** — a collapsed node has no body to hang them on and draws them at the
-  ends of the header row itself. Measuring against `ui.available_width()` in that row returns
-  almost nothing and hides every title; measuring against nothing at all paints names under
-  the controls.
+- **A name's room is measured where the name will actually be painted**: from the slot egui
+  has already given it - past the fold chevron and anything else the row took - to the frame's
+  right edge, less the control sitting there (a Uni/Bi switch, a stepper), less the socket room
+  a **folded** node spends at the ends of its own header row. Estimating the room from the
+  frame's width less `ui.min_rect().width()` is how half a letter came to stand under a
+  stepper; measuring against `ui.available_width()` in that row returns almost nothing and
+  hides every title, and measuring against nothing paints names over the controls.
+- **Three outcomes, in this order:** the name whole if it fits; its start with `…` on the end
+  if the room holds less than the name but at least `kit::MIN_TITLE_W` (40 points, about the
+  shortest word worth reading); nothing at all below that. Never half a word, and never a name
+  that widens the module. `kit::title_galley` does the measuring and the cutting - egui's own
+  truncate mode drops characters and never adds the dots, so the dots have to be part of the
+  string that gets laid out.
+- **The header's hover text carries the whole name either way**, with what the module does
+  under a rule (`kit::module_help`, taken from `docs/MODULES_REFERENCE.md`'s Purpose lines),
+  so leaving a long name off a small module costs nothing the user had to have.
 
 ## The body glyph
 
