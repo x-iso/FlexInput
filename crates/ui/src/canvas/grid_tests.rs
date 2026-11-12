@@ -229,6 +229,28 @@ impl Rig {
         }
         self.idle(6);
     }
+
+    fn outputs(&self, node: NodeId) -> usize {
+        self.canvas.snarl.get_node(node).map_or(0, |n| n.outputs.len())
+    }
+
+    /// Give a node `n` outputs, named `out_0, out_1, …` as adding one from the menu would.
+    fn set_outputs(&mut self, node: NodeId, n: usize) {
+        while self.outputs(node) < n {
+            let name = format!("out_{}", self.outputs(node));
+            if let Some(node) = self.canvas.snarl.get_node_mut(node) {
+                node.outputs.push(PinDescriptor::new(name, SignalType::Any));
+            }
+        }
+        while self.outputs(node) > n {
+            let last = self.outputs(node) - 1;
+            self.canvas.snarl.drop_outputs(egui_snarl::OutPinId { node, output: last });
+            if let Some(node) = self.canvas.snarl.get_node_mut(node) {
+                node.outputs.remove(last);
+            }
+        }
+        self.idle(6);
+    }
 }
 
 fn whole_blocks(v: f32) -> bool {
@@ -1595,6 +1617,19 @@ fn a_combiner_row_move_takes_its_settings_with_it() {
 }
 
 #[test]
+fn the_grid_default_keeps_the_old_visual_density() {
+    // The block halved for finer snapping; the brighter line is what keeps the canvas reading
+    // as it did - sitting where the old block used to be, so the new lines look like its
+    // subdivisions rather than a second grid laid over the first.
+    let g = crate::settings::CanvasGrid::default();
+    assert_eq!(
+        crate::settings::CanvasGrid::BLOCK * g.accent_every as f32,
+        56.0,
+        "the brighter line moved off the 56-point major",
+    );
+}
+
+#[test]
 fn every_mark_body_keeps_its_four_blocks_of_height() {
     // The mark bodies - a glyph and a pill or two - reserve nothing of their own, so their
     // height is whatever the grid leaves them. At the old 56-point step that was never under
@@ -1627,36 +1662,48 @@ fn a_port_list_lands_on_the_block_grid() {
     // same size whatever the port count: measured, 26 points from three ports to seven. At
     // the old 56-point block the same list alternated between 26 and 55 depending on whether
     // the number of rows was odd, and a 27-point row slid two points further off the block
-    // with every pair of ports.
-    let (mut rig, ids) = Rig::real("module.selector", &[egui::pos2(100.0, 300.0)]);
-    let node = ids[0];
-    let mut left = std::collections::BTreeMap::new();
-    for ports in 3..=7usize {
-        while rig.inputs(node) < ports + 1 {
-            rig.set_inputs(node, rig.inputs(node) + 1);
+    // with every pair of ports. The Split is measured too: its bands are shared between its
+    // one input and its outputs, and its interpolate toggle sits on the first band, so it is
+    // the case where the count on one side doesn't match the count on the other.
+    for module in ["module.selector", "module.split"] {
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        let mut left = std::collections::BTreeMap::new();
+        for ports in 3..=7usize {
+            if module == "module.selector" {
+                // A Selector keeps its `select` pin above the list: the ports are its inputs
+                // less one.
+                while rig.inputs(node) < ports + 1 {
+                    rig.set_inputs(node, rig.inputs(node) + 1);
+                }
+            } else {
+                while rig.outputs(node) < ports {
+                    rig.set_outputs(node, rig.outputs(node) + 1);
+                }
+            }
+            rig.idle(5);
+            let f = rig.frame_rect(node);
+            let (a, b) = (rig.traced(node, "strip_0"), rig.traced(node, "strip_1"));
+            let last = rig.traced(node, &format!("strip_{}", ports - 1));
+            let pitch = b.top() - a.top();
+            assert!(
+                (pitch - B).abs() < 0.5,
+                "{module}, {ports} ports: a row of {pitch:.1} isn't one block ({B})",
+            );
+            assert!(
+                (f.height().rem_euclid(pitch)).abs() < 1.5,
+                "{module}, {ports} ports: a row of {pitch:.1} doesn't divide the frame's {:.1}",
+                f.height(),
+            );
+            left.insert(ports, f.bottom() - last.bottom());
         }
-        rig.idle(5);
-        let f = rig.frame_rect(node);
-        let (a, b) = (rig.traced(node, "strip_0"), rig.traced(node, "strip_1"));
-        let last = rig.traced(node, &format!("strip_{}", ports - 1));
-        let pitch = b.top() - a.top();
+        let vals: Vec<f32> = left.values().copied().collect();
+        let spread = vals.iter().fold(0.0f32, |m, v| m.max((v - vals[0]).abs()));
         assert!(
-            (pitch - B).abs() < 0.5,
-            "{ports} ports: a row of {pitch:.1} isn't one block ({B})",
+            spread < 1.5,
+            "{module}: the space under the last strip changes with the port count: {left:?}",
         );
-        assert!(
-            (f.height().rem_euclid(pitch)).abs() < 1.5,
-            "{ports} ports: a row of {pitch:.1} doesn't divide the frame's {:.1}",
-            f.height(),
-        );
-        left.insert(ports, f.bottom() - last.bottom());
     }
-    let vals: Vec<f32> = left.values().copied().collect();
-    let spread = vals.iter().fold(0.0f32, |m, v| m.max((v - vals[0]).abs()));
-    assert!(
-        spread < 1.5,
-        "the space under the last strip changes with the port count: {left:?}",
-    );
 }
 
 #[test]
