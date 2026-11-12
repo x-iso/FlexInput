@@ -671,7 +671,12 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   output label, and the Uni/Bi range switch in the header. **The reading is part of the
   body, at every size**: in the middle of a dial — the dial's indicator stops short of the
   middle so the two don't cross — under the track for a fader with a line to spare, and at
-  the end of the track for a fader 56 points tall. A dial never gives up a line of frame for
+  the end of the track for a fader 56 points tall — and there the **track gives way to the
+number, not the other way round**: the track shortens to whatever is left, down to 24 points,
+which is still something to aim at, because a knob that dropped its reading shows nothing.
+(An 84-point-wide knob is a step the finer grid makes reachable and leaves 27 points of track
+after its reading; the rule used to want 36 and drew no number at that size.)
+A dial never gives up a line of frame for
   the text: the thing you drag is what the body is for. Collapsed it draws **no face** and
   writes the number in the band under the header, which a folded frame still has; the
   `!open` early return exists because snarl runs a collapsed node's body and shifts it up

@@ -13,7 +13,8 @@ All notable changes to FlexInput are documented here. This project adheres to
   dropped onto others, or grown into them, pushes them aside; so does one added
   from the menu, pasted (at the pointer) or inserted on a wire, which stays where
   it was put. The grid is drawn as faint crosses on the block corners (or lines,
-  or dashed lines), a little brighter every 8 blocks, with a brightness slider
+  or dashed lines), a little brighter every second block - the 56-point major
+  line - with a brightness slider
   for low-contrast themes. The I/O nodes Easy mode places around its sub-patch
   sit on the grid too.
 - **Wires that go around modules.** By default a wire is a plain curve where its
@@ -297,6 +298,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A knob narrowed to 84 points lost its reading.** When a fader strip has no room under it,
+  its number goes at the end of the track and the track shortens for it — but it only did that
+  while at least 36 points of track were left, and below that the reading was simply not drawn.
+  The finer grid makes an 84-point-wide knob reachable, where 27 points of track remain: the
+  track now gives way to 24 points rather than the number giving way altogether.
 - **Dragging a Combiner's row moved the port but left its settings behind.** Two of the
   Combiner's settings are stored by port number — the merge policy a port's pins follow unless
   a pin says otherwise, and a pin pinned to one particular port. The engine reads ports by

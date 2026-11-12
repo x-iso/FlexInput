@@ -2834,9 +2834,12 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     match shape {
         Shape::HFader if !number_under => {
             // A strip a block tall has nothing under it, so the number goes at the end of
-            // the track and the track is shortened for it.
-            let track_w = rect.width() - galley.size().x - 10.0;
-            if track_w >= 36.0 {
+            // the track and the track is shortened for it. The track gives up as much as it
+            // can while still being something to aim at - a knob 84 wide (a step the finer
+            // grid makes reachable) has 27 points of track left after its reading, and a
+            // track that thin is still draggable; what it must not do is drop the reading.
+            let track_w = rect.width() - galley.size().x - 4.0;
+            if track_w >= 24.0 {
                 let track = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + track_w, rect.bottom()));
                 draw_knob_h_fader(&painter, track, t, bipolar, active);
                 let at = egui::pos2(rect.right() - galley.size().x, rect.center().y - galley.size().y * 0.5);

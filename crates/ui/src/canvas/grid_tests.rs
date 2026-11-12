@@ -1617,6 +1617,98 @@ fn a_combiner_row_move_takes_its_settings_with_it() {
 }
 
 #[test]
+fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
+    // The 28-point step makes sizes reachable that the old grid skipped over: 140 wide over 84
+    // tall, 84 over 112, a 56-wide fader strip with a 140-tall body. The dial, the track and
+    // the reading are all drawn from the room they're given, so each of those shapes is one the
+    // drawing has to have thought about - and a shape it hasn't thought about shows up as the
+    // face or the number hanging outside the frame.
+    let (mut rig, ids) = Rig::real("module.knob", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    for w in [56.0f32, 84.0, 112.0, 140.0, 168.0] {
+        for h in [56.0f32, 84.0, 112.0, 140.0] {
+            if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+                n.params.insert(kit_width_param().into(), serde_json::json!(w));
+                n.params.insert("ui_h".into(), serde_json::json!(h));
+            }
+            // Traces are written when a body draws and stay otherwise, so a measurement at a
+            // new size has to start from nothing: without this the number read back would be
+            // the one from the previous, larger frame.
+            for what in ["knob_face", "knob_number", "body_column"] {
+                rig.ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new(("module_ctrl_rect", node.0, what)),
+                        Xysr([0.0; 4]),
+                    )
+                });
+            }
+            rig.idle(6);
+            let f = rig.frame_rect(node);
+            assert!(
+                f.width() >= MAJOR && f.height() >= MAJOR,
+                "a knob asked for {w}x{h} and the frame went under its 56-point floor: {f:?}",
+            );
+            let face = rig.traced_rect(node, "knob_face").unwrap_or(egui::Rect::NOTHING);
+            if !face.is_positive() {
+                continue; // collapsed, or a shape that draws no face
+            }
+            assert!(
+                f.contains_rect(face.shrink(-0.5)),
+                "a {f:?} knob puts its face {face:?} outside the frame (asked {w}x{h})",
+            );
+            // The body only draws a reading where there is a face wide enough to carry it, so
+            // the promise is checked at those sizes: below that the number is deliberately not
+            // drawn, and there is nothing to place.
+            if face.width() >= 44.0 {
+                let num = rig
+                    .traced_rect(node, "knob_number")
+                    .unwrap_or(egui::Rect::NOTHING);
+                assert!(
+                    num.is_positive() && f.contains_rect(num.expand(0.5)),
+                    "a {f:?} knob with a {face:?} face has no reading inside the frame (asked {w}x{h})",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_switch_at_any_step_of_the_finer_grid_keeps_its_button_inside() {
+    // The other body that reflows with the frame. Its button is the whole control, so a size
+    // where the button no longer fits is a module that stopped working, not one that merely
+    // looks slightly off.
+    let (mut rig, ids) = Rig::real("module.switch", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    for w in [56.0f32, 84.0, 112.0, 140.0] {
+        for h in [56.0f32, 84.0, 112.0] {
+            if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+                n.params.insert(kit_width_param().into(), serde_json::json!(w));
+                n.params.insert("ui_h".into(), serde_json::json!(h));
+            }
+            for what in ["switch_button", "body_column"] {
+                rig.ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new(("module_ctrl_rect", node.0, what)),
+                        Xysr([0.0; 4]),
+                    )
+                });
+            }
+            rig.idle(6);
+            let f = rig.frame_rect(node);
+            let button = rig
+                .traced_rect(node, "switch_button")
+                .unwrap_or(egui::Rect::NOTHING);
+            assert!(
+                button.is_positive() && f.contains_rect(button.shrink(-0.5)),
+                "a {f:?} switch puts its button {button:?} outside the frame (asked {w}x{h})",
+            );
+        }
+    }
+}
+
+#[test]
 fn the_grid_default_keeps_the_old_visual_density() {
     // The block halved for finer snapping; the brighter line is what keeps the canvas reading
     // as it did - sitting where the old block used to be, so the new lines look like its
