@@ -1683,6 +1683,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // strip of track, which is what a slim slider is. The dial itself won't
                     // go this small (`simple_bodies::show_knob_body`), but the frame can.
                     "module.knob" => 20.0,
+                    // The narrowest curve worth putting points on: the envelope's own body
+                    // adds the rows it needs on top of this.
+                    "generator.envelope" => 140.0,
                     _ => 0.0,
                 };
                 // Both need room for more than one line to be worth the module: a display
@@ -1698,6 +1701,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 // into their own arithmetic.
                 let min_h = match module_id.as_str() {
                     "module.knob" => 12.0,
+                    // The envelope asks for its own height in its body - the rows it needs
+                    // plus a graph worth editing - so the floor here is only what stops the
+                    // grip taking the frame to nothing.
+                    "generator.envelope" => 40.0,
                     // What a two-old-block frame leaves under the header and the frame's
                     // margins: the body floor that used to come for free from a 56-point
                     // grid. Stated in body points, not frame blocks - asking for the frame
@@ -1709,7 +1716,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 // The default is a *frame* size, like what the grip writes: a knob starts
                 // 112 points tall - two of the old blocks, four of these - and the floor
                 // above lets it come down to one.
-                let default_h = (module_id == "module.knob").then(|| 4.0 * block.unwrap_or(28.0));
+                let default_h = match module_id.as_str() {
+                    "module.knob" => Some(4.0 * block.unwrap_or(28.0)),
+                    // Where an envelope starts is what it drew before it followed its frame:
+                    // a curve of about 180 by 150 plus six stacked rows, which is ten blocks
+                    // and change. Nothing about the module's use asks for more or less.
+                    "generator.envelope" => Some(11.0 * block.unwrap_or(28.0)),
+                    _ => None,
+                };
                 let legacy = n
                     .params
                     .get("box_width")
@@ -1730,6 +1744,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // room. Ask for it by name - two blocks, like the knob's dial - and the
                     // floor below still lets the grip take it down to what the number needs.
                     "display.readout" => Some(4.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
+                    "generator.envelope" => Some(10.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                     _ => None,
                 };
                 let (w, floor) = kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w);
@@ -1797,7 +1812,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w, self.view_salt),
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w, self.view_salt),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl, self.view_salt),
-            "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl),
+            "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl, body_w, body_h),
             "processing.gyro_3dof"  => show_gyro_3dof_body(
                 node_id, inputs, ui, snarl, self.live_signals,
                 self.panic_shortcut, self.automap_parent.as_ref(),

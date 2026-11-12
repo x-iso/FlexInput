@@ -2822,3 +2822,111 @@ fn the_strips_sit_on_the_rows_of_their_sockets() {
     }
 }
 
+#[test]
+fn the_envelope_follows_the_frame_it_is_given() {
+    // The curve editor used to carry a `Resize` box of its own: dragging the module's corner
+    // moved a border inside the body, and the six stacked rows under it cost the same height
+    // whatever the frame looked like. Now the graph is what's left after the rows, the sustain
+    // slider is a row of the graph's width, and the four groups of settings fill the width
+    // evenly - side by side in one band in a wide frame, wrapped into more bands in a narrow
+    // one, where the module takes the height for them rather than losing the graph.
+    let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(100.0, 100.0)]);
+    let node = ids[0];
+    let measure = |rig: &mut Rig, w: f32, h: f32| -> (egui::Rect, Vec<egui::Rect>, egui::Rect, egui::Rect) {
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(kit_width_param().into(), serde_json::json!(w));
+            if h > 0.0 {
+                n.params.insert("ui_h".into(), serde_json::json!(h));
+            }
+        }
+        rig.idle(6);
+        for what in ["body_column", "env_curve", "env_sustain", "env_time", "env_mode", "env_grid", "env_opts"] {
+            rig.ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new(("module_ctrl_rect", node.0, what)), Xysr([0.0; 4]))
+            });
+        }
+        rig.idle(4);
+        let graph = rig.traced_rect(node, "env_curve").unwrap_or(egui::Rect::NOTHING);
+        let sustain = rig.traced_rect(node, "env_sustain").unwrap_or(egui::Rect::NOTHING);
+        let rows: Vec<egui::Rect> = ["env_time", "env_mode", "env_grid", "env_opts"]
+            .into_iter()
+            .map(|k| rig.traced_rect(node, k).unwrap_or(egui::Rect::NOTHING))
+            .collect();
+        (rig.frame_rect(node), rows, graph, sustain)
+    };
+
+    // Wide: one band of four groups, and the graph spanning the body with the sustain slider
+    // of the same width under it.
+    let (wide_frame, wide_rows, wide_graph, wide_sustain) = measure(&mut rig, 700.0, 0.0);
+    let wide_column = rig
+        .traced_rect(node, "body_column")
+        .unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        whole_blocks(wide_frame.width()) && whole_blocks(wide_frame.height()),
+        "generator.envelope: {wide_frame:?} off the grid",
+    );
+    assert!(
+        (wide_graph.width() - wide_column.width()).abs() < 1.0,
+        "generator.envelope: the graph {wide_graph:?} doesn't span the body {wide_column:?}",
+    );
+    assert!(
+        (wide_sustain.width() - wide_graph.width()).abs() < 1.0,
+        "generator.envelope: the sustain row {wide_sustain:?} isn't the graph's width {wide_graph:?}",
+    );
+    assert!(
+        wide_sustain.top() > wide_graph.bottom(),
+        "generator.envelope: the sustain row {wide_sustain:?} isn't under the graph {wide_graph:?}",
+    );
+    for r in &wide_rows {
+        assert!(
+            r.is_positive() && wide_frame.contains_rect(r.shrink(-0.5)),
+            "generator.envelope: a setting row {r:?} isn't inside {wide_frame:?}",
+        );
+        assert!(
+            (r.top() - wide_rows[0].top()).abs() < 1.0,
+            "generator.envelope: a wide frame should hold its groups in one band: {wide_rows:?}",
+        );
+    }
+
+    // Narrow: the groups wrap into more bands and take height off the graph, but nothing
+    // leaves the frame and the graph stays something worth drawing points on.
+    let (narrow_frame, narrow_rows, narrow_graph, narrow_sustain) = measure(&mut rig, 196.0, 0.0);
+    for r in narrow_rows.iter().chain([narrow_graph, narrow_sustain].iter()) {
+        assert!(
+            r.is_positive() && narrow_frame.contains_rect(r.shrink(-0.5)),
+            "generator.envelope: {r:?} is outside {narrow_frame:?} once the rows wrapped",
+        );
+    }
+    let bands = {
+        let mut tops: Vec<f32> = narrow_rows.iter().map(|r| r.top()).collect();
+        tops.sort_by(|a, b| a.total_cmp(b));
+        tops.dedup();
+        tops.len()
+    };
+    assert!(
+        bands > 1,
+        "generator.envelope: the groups didn't wrap into more bands at {narrow_frame:?}: {narrow_rows:?}",
+    );
+    assert!(
+        narrow_graph.height() >= 60.0,
+        "generator.envelope: the graph {narrow_graph:?} was squeezed out by the rows of {narrow_frame:?}",
+    );
+
+    // A frame too short for its rows: the module takes the height it needs rather than letting
+    // the graph go to nothing, which is what the old `Resize` box did.
+    let (squat_frame, squat_rows, squat_graph, _s) = measure(&mut rig, 252.0, 112.0);
+    assert!(
+        squat_frame.height() > 112.0,
+        "generator.envelope: a 112-tall frame lost its rows to the graph: {squat_frame:?}",
+    );
+    for r in squat_rows.iter().chain([squat_graph].iter()) {
+        assert!(
+            r.is_positive() && squat_frame.contains_rect(r.shrink(-0.5)),
+            "generator.envelope: {r:?} is outside the {squat_frame:?} it was squeezed into",
+        );
+    }
+    assert!(
+        squat_graph.height() >= 60.0,
+        "generator.envelope: the graph {squat_graph:?} vanished in {squat_frame:?}",
+    );
+}

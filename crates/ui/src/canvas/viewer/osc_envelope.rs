@@ -693,7 +693,7 @@ pub(crate) fn paint_envelope_curve_graph(
     }
 }
 
-pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, body_w: f32, body_h: f32) {
     if let Some(node) = snarl.get_node_mut(node_id) { envelope_init_params(node); }
 
     let (flags, timebase, time_mul, sustain, grid_x, grid_y, snap, show_grid, show_grid_labels) =
@@ -728,12 +728,10 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let mut changed  = false;
     let mut sustain_changed = false;
 
-    let mut curve_rect:      Option<egui::Rect> = None;
-    let mut time_rect:       Option<egui::Rect> = None;
-    let mut mode_rect:       Option<egui::Rect> = None;
-    let mut sustain_rect:    Option<egui::Rect> = None;
-    let mut grid_rect:       Option<egui::Rect> = None;
-    let mut grid_opts_rect:  Option<egui::Rect> = None;
+    // The parts of this body the Properties shelf can pin, gathered as they are laid out.
+    // The ids are the ones the pinned renderers look up, the same as when each of these
+    // had a row of its own.
+    let mut exposable: Vec<(&'static str, egui::Rect)> = Vec::new();
 
     let pts_x: Vec<f32> = snarl.get_node(node_id)
         .and_then(|n| n.params.get("points").and_then(|v| v.as_array()).map(|arr| {
@@ -744,131 +742,333 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
         }))
         .unwrap_or_default();
 
-    ui.vertical(|ui| {
-        // Curve graph (resizable)
-        egui::Resize::default()
-            .id_salt(("env_crv", node_id))
-            .default_size([180.0, 150.0])
-            .min_size([80.0, 60.0])
-            .show(ui, |ui| {
-                let (rect, bg_resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
-                curve_rect = Some(rect);
-                paint_envelope_curve_graph(node_id, ui, snarl, rect, bg_resp.clone(), None);
-                crate::touch::context_menu(&bg_resp, |ui| {
-                    curve_context_menu(ui, node_id, snarl, None);
-                });
-            });
+    use super::simple_bodies::trace_rect;
+    // One surface that follows the frame. The graph takes whatever height the rows don't need
+    // and the whole width; the sustain slider is a row of the same width under it; and the four
+    // groups of settings - the unit and the time it counts, the behaviour toggles, the grid
+    // divisions, and what the grid shows - fill the width evenly, side by side in one band when
+    // the frame is wide enough for them and wrapped into more bands as it narrows. It used to be
+    // a `Resize` box with its own saved size on top of six stacked rows: the module didn't
+    // follow its frame, and the rows cost height whether the frame had it or not.
+    const GAP: f32 = 8.0;
+    const SEP_W: f32 = 9.0;
+    const MIN_GRAPH_H: f32 = 60.0;
+    const MIN_GRAPH_W: f32 = 140.0;
+    // What each group needs to show its controls without cutting a label.
+    let group_min = [132.0f32, 116.0, 116.0, 104.0];
+    let row_h = ui.spacing().interact_size.y;
+    let band_h = row_h + 6.0;
 
-        // The painter auto-snaps sustain to the nearest control point and may
-        // have rewritten the param this frame; re-read so the slider thumb tracks
-        // the orange line exactly.
-        if let Some(s) = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("sustain").and_then(|v| v.as_f64()))
-        { sustain = s as f32; }
+    let column_width = body_w.max(MIN_GRAPH_W);
 
-        // Sustain row — directly under the graph. Snaps to the nearest control
-        // point; relevant only when Hold is enabled.
-        let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Sustain").small().weak());
-            let sustain_active = hold;
-            let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
-                .show_value(false)
-                .clamping(egui::SliderClamping::Always);
-            let sr = ui.add_enabled(sustain_active, slider);
-            if sr.changed() {
-                if !pts_x.is_empty() {
-                    sustain = pts_x.iter().copied()
-                        .min_by(|a, b| (a - sustain).abs().partial_cmp(&(b - sustain).abs()).unwrap())
-                        .unwrap_or(sustain);
-                }
-                sustain_changed = true;
+    // How many bands the four groups need: fill them in order and grow the count until every
+    // band fits the column.
+    let mut bands = 1usize;
+    let band_widths = |bands: usize| -> Vec<f32> {
+        let per = (group_min.len() + bands - 1) / bands;
+        let mut out = vec![0.0f32; bands];
+        let mut b = 0usize;
+        let mut used = 0usize;
+        for g in group_min.iter() {
+            if used == per {
+                b += 1;
+                used = 0;
             }
-            ui.label(egui::RichText::new(format!("{:.0}%", sustain * 100.0)).small().weak());
-        });
-        sustain_rect = Some(r.response.rect);
+            out[b] += g + if used > 0 { SEP_W + GAP } else { 0.0 };
+            used += 1;
+        }
+        out
+    };
+    while bands < group_min.len() && band_widths(bands).iter().any(|w| *w > column_width + 0.5) {
+        bands += 1;
+    }
+    let per_band = (group_min.len() + bands - 1) / bands;
 
-        // Time row: timebase selector + time_mul drag; changing unit auto-converts value
-        let r = ui.horizontal(|ui| {
-            let old_tb = timebase.clone();
-            let tb_r_ms = ui.selectable_value(&mut timebase, "ms".into(), egui::RichText::new("ms").small());
-            let tb_r_s  = ui.selectable_value(&mut timebase, "s".into(),  egui::RichText::new("s").small());
-            let tb_r_hz = ui.selectable_value(&mut timebase, "hz".into(), egui::RichText::new("Hz").small());
-            if tb_r_ms.changed() || tb_r_s.changed() || tb_r_hz.changed() {
-                let period_ms: f32 = match old_tb.as_str() {
-                    "s"  => time_mul * 1000.0,
-                    "hz" => if time_mul > 0.0 { 1000.0 / time_mul } else { 1000.0 },
-                    _    => time_mul,
-                };
-                time_mul = match timebase.as_str() {
-                    "s"  => (period_ms / 1000.0).clamp(0.001, 2000.0),
-                    "hz" => (1000.0 / period_ms.max(0.001)).clamp(0.001, 2000.0),
-                    _    => period_ms.clamp(0.001, 2000.0),
-                };
-                changed = true;
-            }
-            let (lo, hi, spd) = match timebase.as_str() {
-                "s"  => (0.001f32, 2000.0, 0.001),
-                "hz" => (0.001,    2000.0, 0.001),
-                _    => (0.001,    2000.0, 1.0),
-            };
-            // When Time is wired the box is disabled and shows the live applied
-            // value (last_signals[3]); otherwise it edits the manual time_mul.
-            let live_time = snarl.get_node(node_id)
-                .and_then(|n| n.extra.last_signals.get(3))
-                .and_then(|s| if let Some(Signal::Float(f)) = s { Some(*f) } else { None });
-            let mut shown = if time_wired { live_time.unwrap_or(time_mul) } else { time_mul };
-            let resp = ui.add_enabled(!time_wired,
-                egui::DragValue::new(&mut shown).speed(spd).range(lo..=hi).max_decimals(3));
-            if !time_wired { time_mul = shown; changed |= resp.changed(); }
-        });
-        time_rect = Some(r.response.rect);
+    // Rows from the bottom up, so the graph gets what's left: it's the thing being edited, and
+    // a frame that runs out of height loses graph, not controls.
+    let rows_h = row_h + bands as f32 * band_h + (bands as f32 + 1.0) * GAP;
+    // The body asks for at least the rows plus a graph worth editing, whatever the grip set:
+    // narrow frames wrap the groups into more bands, and the module gets taller for them
+    // rather than losing the graph.
+    let want = egui::vec2(column_width, body_h.max(rows_h + MIN_GRAPH_H));
+    let (flow, _) = ui.allocate_exact_size(want, egui::Sense::hover());
+    let column = flow;
+    trace_rect(ui, node_id, "body_column", column);
+    let graph_bottom = column.bottom() - rows_h;
+    let graph_h = (graph_bottom - column.top()).max(MIN_GRAPH_H.min(column.height()));
+    let graph = egui::Rect::from_min_size(column.min, egui::vec2(column.width(), graph_h));
+    let sustain_top = graph.bottom() + GAP;
+    let sustain_row = egui::Rect::from_min_size(egui::pos2(column.left(), sustain_top), egui::vec2(column.width(), row_h));
 
-        // Behavior row: combinable Hold / Bounce / Loop checkboxes.
-        // Off = one-shot.
-        let r = ui.horizontal(|ui| {
-            let b0 = hold;
-            ui.checkbox(&mut hold, egui::RichText::new("Hold").small())
-                .on_hover_text("Run to the sustain point and hold there while the trigger is held");
-            changed |= hold != b0;
-            let b1 = bounce;
-            ui.checkbox(&mut bounce, egui::RichText::new("Bounce").small())
-                .on_hover_text("Ping-pong: forward while held, reverse back to the start on release");
-            changed |= bounce != b1;
-            let b2 = loopf;
-            ui.checkbox(&mut loopf, egui::RichText::new("Loop").small())
-                .on_hover_text("Repeat the active segment while the trigger is held");
-            changed |= loopf != b2;
-        });
-        mode_rect = Some(r.response.rect);
-
-        // Grid row: H / V divisions + Snap
-        let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut gx_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("H ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut gy_f).speed(0.25)
-                .range(1.0..=20.0).max_decimals(0).prefix("V ")).changed();
-            ui.separator();
-            let snap_before = snap_on;
-            ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small())
-                .on_hover_text("Snap dragged points to grid intersections");
-            changed |= snap_on != snap_before;
-        });
-        grid_rect = Some(r.response.rect);
-
-        // Grid options row: show grid + labels
-        let r = ui.horizontal(|ui| {
-            let sg_before = show_grid;
-            ui.checkbox(&mut show_grid, egui::RichText::new("Grid").small())
-                .on_hover_text("Show grid lines");
-            changed |= show_grid != sg_before;
-            let sl_before = show_labels;
-            ui.checkbox(&mut show_labels, egui::RichText::new("Labels").small())
-                .on_hover_text("Show time (X) and value (Y) labels on grid lines");
-            changed |= show_labels != sl_before;
-        });
-        grid_opts_rect = Some(r.response.rect);
+    // ── The graph ──
+    let bg_resp = ui.allocate_rect(graph, egui::Sense::click());
+    paint_envelope_curve_graph(node_id, ui, snarl, graph, bg_resp.clone(), None);
+    crate::touch::context_menu(&bg_resp, |ui| {
+        curve_context_menu(ui, node_id, snarl, None);
     });
+    exposable.push(("curve", graph));
+    exposable.push(("sustain_row", sustain_row));
+    trace_rect(ui, node_id, "env_curve", graph);
+
+    // ── Sustain: the level the curve holds at, across the graph's width ──
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(sustain_row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt("env_sustain"),
+        );
+        child.spacing_mut().item_spacing.x = 4.0;
+        child.label(egui::RichText::new("Sustain").small().weak());
+        // Snaps to the nearest control point: the level is one of the curve's points, not a
+        // free value, and the painter may have rewritten it this frame.
+        let slider_w = (sustain_row.width() - 8.0 - 62.0 - 58.0).max(40.0);
+        let (slider_rect, _) = child.allocate_exact_size(egui::vec2(slider_w, row_h), egui::Sense::hover());
+        let sustain_active = hold;
+        let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always);
+        let sr = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(slider_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt("env_sustain_slider"),
+        )
+        .add_enabled(sustain_active, slider);
+        if sr.changed() {
+            if !pts_x.is_empty() {
+                sustain = pts_x.iter().copied()
+                    .min_by(|a, b| (a - sustain).abs().partial_cmp(&(b - sustain).abs()).unwrap())
+                    .unwrap_or(sustain);
+            }
+            sustain_changed = true;
+        }
+        ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(sustain_row.right() - 58.0, sustain_row.top()),
+                    egui::vec2(58.0, row_h),
+                ))
+                .layout(egui::Layout::right_to_left(egui::Align::Center))
+                .id_salt("env_sustain_value"),
+        )
+        .label(egui::RichText::new(format!("{:.0}%", sustain * 100.0)).small().weak());
+        let _ = sr.on_hover_text(if sustain_active {
+            "Where the curve holds while the trigger is held. It sits on one of the curve's points."
+        } else {
+            "Hold is off, so the curve runs through this point instead of stopping at it."
+        });
+    }
+    trace_rect(ui, node_id, "env_sustain", sustain_row);
+
+    // ── The setting bands ──
+    let painter = ui.painter_at(column);
+    let visuals = ui.visuals().clone();
+    let sep_colour = visuals.widgets.inactive.bg_fill;
+    for b in 0..bands {
+        let top = sustain_row.bottom() + GAP + b as f32 * (band_h + GAP);
+        let band = egui::Rect::from_min_size(egui::pos2(column.left(), top), egui::vec2(column.width(), band_h));
+        let first = b * per_band;
+        let last = (first + per_band).min(group_min.len());
+        let n = last - first;
+        let sep_total = if n > 1 { (n as f32 - 1.0) * (SEP_W + GAP) } else { 0.0 };
+        let each = ((band.width() - sep_total) / n as f32).max(48.0);
+        let mut x = band.left();
+        for (slot, gi) in (first..last).enumerate() {
+            let cell = egui::Rect::from_min_size(egui::pos2(x, band.top()), egui::vec2(each, band_h));
+            match gi {
+                // The time the envelope takes, and the unit it's counted in: a length in ms or
+                // seconds, or how often it repeats in hertz. Switching unit keeps the length the
+                // same rather than the number.
+                0 => {
+                    let strip_w = 3.0 * 30.0 + 2.0 * 4.0;
+                    let strip = egui::Rect::from_min_size(cell.min, egui::vec2(strip_w, band_h));
+                    let old_tb = timebase.clone();
+                    {
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(strip)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                .id_salt("env_timebase"),
+                        );
+                        child.spacing_mut().item_spacing.x = 0.0;
+                        changed |= kit::strip(
+                            &mut child,
+                            strip_w,
+                            &mut timebase,
+                            &[
+                                ("ms".to_string(), "ms", "The length of one pass, in milliseconds"),
+                                ("s".to_string(), "s", "In seconds"),
+                                ("hz".to_string(), "Hz", "How often it repeats, in hertz"),
+                            ],
+                        );
+                    }
+                    if timebase != old_tb {
+                        let period_ms: f32 = match old_tb.as_str() {
+                            "s" => time_mul * 1000.0,
+                            "hz" => if time_mul > 0.0 { 1000.0 / time_mul } else { 1000.0 },
+                            _ => time_mul,
+                        };
+                        time_mul = match timebase.as_str() {
+                            "s" => (period_ms / 1000.0).clamp(0.001, 2000.0),
+                            "hz" => (1000.0 / period_ms.max(0.001)).clamp(0.001, 2000.0),
+                            _ => period_ms.clamp(0.001, 2000.0),
+                        };
+                        changed = true;
+                    }
+                    let (lo, hi, spd) = match timebase.as_str() {
+                        "s" => (0.001f32, 2000.0, 0.001),
+                        "hz" => (0.001, 2000.0, 0.001),
+                        _ => (0.001, 2000.0, 1.0),
+                    };
+                    let value = egui::Rect::from_min_max(
+                        egui::pos2(strip.right() + 4.0, cell.top()),
+                        cell.max,
+                    );
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(value)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center))
+                            .id_salt("env_time_value"),
+                    );
+                    // When the Time pin is wired the box is disabled and shows the value the
+                    // wire is driving: a drag here would be a lie.
+                    let live_time = snarl
+                        .get_node(node_id)
+                        .and_then(|n| n.extra.last_signals.get(3))
+                        .and_then(|s| match s {
+                            Some(Signal::Float(f)) => Some(*f),
+                            _ => None,
+                        });
+                    let mut shown = if time_wired { live_time.unwrap_or(time_mul) } else { time_mul };
+                    let resp = child.add_enabled(
+                        !time_wired,
+                        egui::DragValue::new(&mut shown).speed(spd).range(lo..=hi).max_decimals(3),
+                    );
+                    if !time_wired {
+                        time_mul = shown;
+                        changed |= resp.changed();
+                    }
+                    resp.on_hover_text(if time_wired {
+                        "The Time pin is driving this - unplug it to set the length here."
+                    } else {
+                        "How long the pass takes, in the unit chosen beside it."
+                    });
+                    exposable.push(("time_row", cell));
+                    trace_rect(ui, node_id, "env_time", cell);
+                }
+                // The three behaviours, which combine: run to the sustain point and wait,
+                // ping-pong, or repeat the segment. None of them checked is a one-shot.
+                1 => {
+                    let labels = [
+                        ("Hold", &mut hold as &mut bool, "Run to the sustain point and hold there while the trigger is held"),
+                        ("Bounce", &mut bounce, "Ping-pong: forward while held, reverse back to the start on release"),
+                        ("Loop", &mut loopf, "Repeat the active segment while the trigger is held"),
+                    ];
+                    let cell_w = (cell.width() - 2.0 * 4.0) / 3.0;
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(cell)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .id_salt("env_modes"),
+                    );
+                    child.spacing_mut().item_spacing.x = 0.0;
+                    for (i, (text, flag, hover)) in labels.into_iter().enumerate() {
+                        if i > 0 {
+                            child.add_space(4.0);
+                        }
+                        let before = *flag;
+                        let on = *flag;
+                        let resp = child.add_sized(
+                            [cell_w, band_h],
+                            egui::Button::selectable(on, egui::RichText::new(text).small()),
+                        );
+                        let clicked = resp.on_hover_text(hover).clicked();
+                        if clicked {
+                            *flag = !before;
+                            changed = true;
+                        }
+                    }
+                exposable.push(("mode_row", cell));
+                trace_rect(ui, node_id, "env_mode", cell);
+                }
+                // The grid the points snap to: divisions across time and across value.
+                2 => {
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(cell)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .id_salt("env_grid"),
+                    );
+                    child.spacing_mut().item_spacing.x = 4.0;
+                    changed |= child
+                        .add(egui::DragValue::new(&mut gx_f).speed(0.25).range(1.0..=20.0).max_decimals(0).suffix(" H"))
+                        .changed();
+                    changed |= child
+                        .add(egui::DragValue::new(&mut gy_f).speed(0.25).range(1.0..=20.0).max_decimals(0).suffix(" V"))
+                        .changed();
+                    let before = snap_on;
+                    let snap_resp = child.add_sized(
+                        [(cell.width() - 2.0 * 4.0 - 96.0).max(44.0), band_h],
+                        egui::Button::selectable(snap_on, egui::RichText::new("Snap").small()),
+                    );
+                    let clicked = snap_resp
+                        .on_hover_text("Snap dragged points to grid intersections")
+                        .clicked();
+                    if clicked {
+                        snap_on = !before;
+                        changed = true;
+                    }
+                exposable.push(("grid_row", cell));
+                trace_rect(ui, node_id, "env_grid", cell);
+                }
+                // What the grid itself shows: the lines, and the time/value numbers on them.
+                _ => {
+                    let cell_w = (cell.width() - 4.0) / 2.0;
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(cell)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .id_salt("env_grid_show"),
+                    );
+                    child.spacing_mut().item_spacing.x = 0.0;
+                    let before_g = show_grid;
+                    let g = child.add_sized(
+                        [cell_w, band_h],
+                        egui::Button::selectable(show_grid, egui::RichText::new("Lines").small()),
+                    );
+                    let clicked = g.on_hover_text("Show the grid lines in the graph").clicked();
+                    if clicked {
+                        show_grid = !before_g;
+                        changed = true;
+                    }
+                    child.add_space(4.0);
+                    let before_l = show_labels;
+                    let l = child.add_sized(
+                        [cell_w, band_h],
+                        egui::Button::selectable(show_labels, egui::RichText::new("Labels").small()),
+                    );
+                    let clicked = l
+                        .on_hover_text("Show time (X) and value (Y) labels on the grid lines")
+                        .clicked();
+                    if clicked {
+                        show_labels = !before_l;
+                        changed = true;
+                    }
+                exposable.push(("grid_options_row", cell));
+                trace_rect(ui, node_id, "env_opts", cell);
+                }
+            }
+            x = cell.right() + SEP_W + GAP;
+            if slot + 1 < n {
+                let sx = x - (SEP_W + GAP) * 0.5;
+                painter.line_segment(
+                    [egui::pos2(sx, band.top() + 4.0), egui::pos2(sx, band.bottom() - 4.0)],
+                    egui::Stroke::new(1.0_f32, sep_colour),
+                );
+            }
+        }
+    }
 
     if changed || sustain_changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -896,12 +1096,9 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
         }
     }
 
-    if let Some(r) = curve_rect      { register_exposable_element(ui, node_id, "curve",            r); }
-    if let Some(r) = time_rect       { register_exposable_element(ui, node_id, "time_row",         r); }
-    if let Some(r) = mode_rect       { register_exposable_element(ui, node_id, "mode_row",         r); }
-    if let Some(r) = sustain_rect    { register_exposable_element(ui, node_id, "sustain_row",      r); }
-    if let Some(r) = grid_rect       { register_exposable_element(ui, node_id, "grid_row",         r); }
-    if let Some(r) = grid_opts_rect  { register_exposable_element(ui, node_id, "grid_options_row", r); }
+    for (id, r) in exposable {
+        register_exposable_element(ui, node_id, id, r);
+    }
 }
 
 // ── Envelope layout-pinned widget renderers ───────────────────────────────────

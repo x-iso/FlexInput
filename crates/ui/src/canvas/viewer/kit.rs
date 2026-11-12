@@ -40,11 +40,14 @@ pub(crate) const WIDTH_PARAM: &str = "ui_w";
 pub(crate) const HEIGHT_PARAM: &str = "ui_h";
 
 /// Modules that take the corner grip but aren't built from kit rows: their body is one
-/// surface that fills whatever frame it's given — a Text module's field — rather than a
-/// stack of rows wanting a wider label column. Same grip, same block snapping, and the
-/// height is theirs to use as well as the width.
+/// surface that fills whatever frame it's given — a Text module's field, an Envelope's
+/// graph — rather than a stack of rows wanting a wider label column. Same grip, same block
+/// snapping, and the height is theirs to use as well as the width.
 pub(crate) fn stretchy(module_id: &str) -> bool {
-    matches!(module_id, "module.label" | "display.readout" | "module.knob")
+    matches!(
+        module_id,
+        "module.label" | "display.readout" | "module.knob" | "generator.envelope"
+    )
 }
 
 /// How tall a stretchy body is this frame. The mirror of [`body_width`] with one
