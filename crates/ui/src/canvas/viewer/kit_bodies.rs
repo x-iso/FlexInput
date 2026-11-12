@@ -137,7 +137,19 @@ fn pill_at(
 ) -> (egui::Response, Option<f64>) {
     use super::simple_bodies::{value_pill_number, PILL_H};
     let rect = egui::Rect::from_min_size(left, egui::vec2(w, PILL_H));
-    let label_w = if label.is_empty() { 0.0 } else { 26.0 };
+    // The label cell is the word plus a little air, measured. At a fixed 26 the Counter's
+    // "step" ran into its own number while the number's box, taking what was left of a 116-point
+    // row, was three times as wide as any number in it.
+    let label_w = if label.is_empty() {
+        0.0
+    } else {
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), font, ui.visuals().text_color())
+            .size()
+            .x
+            + 8.0
+    };
     simple_bodies::trace_rect(ui, node_id, &format!("{salt}_pill"), rect);
     value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range)
 }
@@ -726,13 +738,10 @@ pub(crate) fn show_counter_body(
         register_exposable_element(ui, node_id, "mode", r);
     }
     // The output: the count itself, or the count across min..max as 0..1. "Output" was the row's
-    // label; the two cells say it, and the reset button sits at the end of the row rather than
-    // taking a row of its own.
+    // label; the two cells say it, and the row is theirs - the reset button that used to share
+    // it crowded the second cell, so it sits at the end of the step row instead.
     let out_y = row_top(2);
-    let out_rect = egui::Rect::from_min_size(
-        egui::pos2(left, out_y),
-        egui::vec2(col_w - PILL_H - ROW, PILL_H),
-    );
+    let out_rect = egui::Rect::from_min_size(egui::pos2(left, out_y), egui::vec2(col_w, PILL_H));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(out_rect)
@@ -745,7 +754,7 @@ pub(crate) fn show_counter_body(
     ]);
     drop(child);
     let reset_rect = egui::Rect::from_min_size(
-        egui::pos2(cx + col_w * 0.5 - PILL_H, out_y),
+        egui::pos2(cx + col_w * 0.5 - PILL_H, row_top(4)),
         egui::vec2(PILL_H, PILL_H),
     );
     let mut child = ui.new_child(
@@ -756,8 +765,9 @@ pub(crate) fn show_counter_body(
     );
     let reset = child.add(egui::Button::new("↺")).on_hover_text("Reset the count").clicked();
     drop(child);
-    simple_bodies::trace_rect(ui, node_id, "counter_out", out_rect.union(reset_rect));
-    register_exposable_element(ui, node_id, "range_mode", out_rect.union(reset_rect));
+    simple_bodies::trace_rect(ui, node_id, "counter_out", out_rect);
+    register_exposable_element(ui, node_id, "range_mode", out_rect);
+    simple_bodies::trace_rect(ui, node_id, "counter_reset", reset_rect);
     // A value that arrives down a wire shows what the wire says, and a drag would be a lie, so
     // the pill doesn't take one. `max` is out of use in the Unlimited mode.
     let wired_value = |idx: usize| -> Option<String> {
@@ -775,7 +785,16 @@ pub(crate) fn show_counter_body(
     let shown_step = if step_wired { wired_value(3).unwrap_or_else(|| trim_num(step)) } else { trim_num(step) };
     let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, -1e6..=1e6);
     let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, -1e6..=1e6);
-    let (r_step, t_step) = pill_at(ui, node_id, "step", egui::pos2(left, row_top(4)), col_w, "step", &shown_step, 0.001..=10_000.0);
+    let (r_step, t_step) = pill_at(
+        ui,
+        node_id,
+        "step",
+        egui::pos2(left, row_top(4)),
+        col_w - PILL_H - ROW,
+        "step",
+        &shown_step,
+        0.001..=10_000.0,
+    );
     let r_min = r_min.on_hover_text("The bottom of the count: it stops, loops or turns here, depending on the mode.");
     let r_max = r_max.on_hover_text(if max_off {
         "The top of the count - not used while the mode is Unlimited."

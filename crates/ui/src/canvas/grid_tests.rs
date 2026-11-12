@@ -1783,7 +1783,7 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
         crate::canvas::viewer::kit::pin_abbreviates("logic.counter"),
         "the counter's pin words are being spelled out again",
     );
-    for what in ["counter_mode_0", "counter_mode_1", "counter_out", "step_pill"] {
+    for what in ["counter_mode_0", "counter_mode_1", "counter_out"] {
         let r = rig.traced_rect(node, what).unwrap_or(egui::Rect::NOTHING);
         assert!(
             r.is_positive() && f.contains_rect(r.shrink(-0.5)),
@@ -1794,6 +1794,38 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
             "the counter's {what} {r:?} isn't on the module's centre line ({f:?})",
         );
     }
+    // The step and the reset share the last row: the pair is what sits on the centre line, and
+    // they don't overlap - the reset used to be at the end of the output row, where it stood on
+    // top of the `0..1` cell.
+    let (r_step, r_reset) = (
+        rig.traced_rect(node, "step_pill").unwrap_or(egui::Rect::NOTHING),
+        rig.traced_rect(node, "counter_reset").unwrap_or(egui::Rect::NOTHING),
+    );
+    let step_row = r_step.union(r_reset);
+    assert!(
+        r_step.is_positive()
+            && r_reset.is_positive()
+            && f.contains_rect(step_row.shrink(-0.5))
+            && !r_step.intersects(r_reset),
+        "the counter's step row {r_step:?} {r_reset:?} isn't two controls inside {f:?}",
+    );
+    assert!(
+        (step_row.center().x - f.center().x).abs() < 1.0,
+        "the counter's step row {step_row:?} isn't on the module's centre line ({f:?})",
+    );
+    assert!(
+        (r_step.top() - r_reset.top()).abs() < 1.0,
+        "the step pill and its reset aren't on one row: {r_step:?} {r_reset:?}",
+    );
+    let r_out = rig.traced(node, "counter_out");
+    assert!(
+        !r_out.intersects(r_reset),
+        "the reset {r_reset:?} sits on the output row {r_out:?}",
+    );
+    assert!(
+        (r_out.width() - rig.traced(node, "counter_mode_0").width()).abs() < 0.5,
+        "the output row {r_out:?} isn't the width the mode rows are",
+    );
     // The range is two cells across, so it's the pair that sits on the centre line.
     let (r_min, r_max) = (
         rig.traced_rect(node, "min_pill").unwrap_or(egui::Rect::NOTHING),
