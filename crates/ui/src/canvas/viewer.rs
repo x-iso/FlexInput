@@ -1496,7 +1496,16 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // utility modules (Splitter / Collector / Fork / Selector / Combiner
         // / Remapper / Inlet) get the same visual language as device chips.
         let half = Some(HalfSide::Right);
-        MaybeHeaderPin { inner: pin_info(desc.signal_type), glow, half, header_y }
+        let mut info = pin_info(desc.signal_type);
+        // A Dropdown menu's shift inlet is green rather than Float-blue, because what it's for
+        // is not carrying a number: it picks which of the menu's options comes out, and the
+        // option it picks is painted the same green in the body.
+        if node.module_id == "module.dropdown" && pin.id.input == 0 {
+            info.fill = Some(pins::CHOICE_GREEN);
+            info.stroke = Some(egui::Stroke::new(info.stroke.map_or(1.0, |s| s.width), pins::CHOICE_GREEN));
+            info.wire_color = Some(pins::CHOICE_GREEN);
+        }
+        MaybeHeaderPin { inner: info, glow, half, header_y }
     }
 
     fn show_output(

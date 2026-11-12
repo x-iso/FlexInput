@@ -214,6 +214,11 @@ pub(crate) fn pin_label_at_row(
     }
 }
 
+/// The green that marks a choice rather than a signal: the Dropdown menu's shift inlet
+/// and the option that inlet is currently pointing at. Type colours say what kind of number
+/// a pin carries; this one says what the module is using to decide what it sends.
+pub(crate) const CHOICE_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 100);
+
 pub(crate) fn pin_info(t: SignalType) -> PinInfo {
     let [r, g, b] = t.color_rgb();
     let outline = Color32::from_rgb(r, g, b);

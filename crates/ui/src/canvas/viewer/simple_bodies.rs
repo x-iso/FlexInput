@@ -831,11 +831,11 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         child.spacing_mut().item_spacing.x = 0.0;
         if i == effective {
             // The option coming out of the module, which with a shift pin wired is not
-            // necessarily the one this module was set to. The row takes the same fill a
-            // selected strip or a chosen option wears, so the list shows the answer rather
-            // than the setting.
-            let fill = ui.visuals().selection.bg_fill;
-            child.painter().rect_filled(row, 4.0, fill);
+            // necessarily the one this module was set to. It wears the same green as the shift
+            // inlet, because what is marked is the module's choice rather than something the
+            // pointer left behind - the blue a selected strip wears would read as the cursor's.
+            let bg = ui.visuals().widgets.inactive.bg_fill;
+            child.painter().rect_filled(row, 4.0, egui::ecolor::tint_color_towards(bg, super::pins::CHOICE_GREEN));
             trace_rect(ui, node_id, "dropdown_effective", row);
         }
         // Drag handle: the same grab the port strips and the Auto-Map lists give. Dragging
@@ -894,7 +894,11 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
             };
             let label = child.add_sized(
                 [name_w, PILL_H],
-                egui::Label::new(egui::RichText::new(label_text).small())
+                egui::Label::new(egui::RichText::new(label_text).small().color(if i == effective {
+                    super::pins::CHOICE_GREEN
+                } else {
+                    ui.visuals().text_color()
+                }))
                     .truncate()
                     .sense(egui::Sense::click()),
             );
