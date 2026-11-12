@@ -1997,6 +1997,80 @@ fn a_dropdown_shift_pin_moves_the_option_it_shows() {
 }
 
 #[test]
+fn the_oscillator_is_a_shape_a_wave_and_two_numbers() {
+    // The generator used to be three rows of small controls with a separator in one of them:
+    // shape buttons, a unit toggle and a DragValue, a "Phase" label with a DragValue and a
+    // Bi/Uni pair, then a waveform stretched across whatever width that left. The settings are
+    // cells now, in a column of a constant width centred on the module, and the wave is a band
+    // of painted line between the shape and the numbers - it costs nothing in width.
+    let (mut rig, ids) = Rig::real("generator.oscillator", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    assert!(whole_blocks(f.width()) && whole_blocks(f.height()), "generator.oscillator: {f:?} off the grid");
+    assert!(f.width() <= 7.0 * B, "generator.oscillator: {f:?} is wider than its cells ask for");
+    let rows: Vec<(&str, egui::Rect)> = [
+        "osc_shape",
+        "osc_preview",
+        "osc_freq_pill",
+        "osc_unit",
+        "osc_phase_pill",
+        "osc_bipolar",
+    ]
+    .into_iter()
+    .map(|k| (k, rig.traced_rect(node, k).unwrap_or(egui::Rect::NOTHING)))
+    .collect();
+    for (k, r) in &rows {
+        assert!(
+            r.is_positive() && f.contains_rect(r.shrink(-0.5)),
+            "generator.oscillator: {k} {r:?} isn't inside {f:?}",
+        );
+    }
+    // Each row's pair is centred on the module: the body column is fenced by pin labels of
+    // different widths, so the column's middle isn't the module's.
+    for (a, b) in [
+        ("osc_shape", "osc_preview"),
+        ("osc_freq_pill", "osc_unit"),
+        ("osc_phase_pill", "osc_bipolar"),
+    ] {
+        let ra = rows.iter().find(|(k, _)| *k == a).map(|(_, r)| *r).unwrap();
+        let rb = rows.iter().find(|(k, _)| *k == b).map(|(_, r)| *r).unwrap();
+        let pair = ra.union(rb);
+        assert!(
+            (pair.center().x - f.center().x).abs() < 1.0,
+            "generator.oscillator: {a} + {b} {pair:?} isn't on the module's centre line ({f:?})",
+        );
+    }
+    // The rows start at one edge.
+    let left = rows[0].1.left();
+    for (k, r) in rows.iter().skip(1) {
+        if *k != "osc_unit" && *k != "osc_bipolar" {
+            assert!(
+                (r.left() - left).abs() < 0.5,
+                "generator.oscillator: {k} {r:?} doesn't start where the shape strip does {left:?}",
+            );
+        }
+    }
+    // The wave sits between the shape it belongs to and the frequency beside it.
+    let shape = rows.iter().find(|(k, _)| *k == "osc_shape").map(|(_, r)| *r).unwrap();
+    let preview = rows.iter().find(|(k, _)| *k == "osc_preview").map(|(_, r)| *r).unwrap();
+    let freq = rows.iter().find(|(k, _)| *k == "osc_freq_pill").map(|(_, r)| *r).unwrap();
+    assert!(
+        preview.top() > shape.bottom() && preview.bottom() < freq.top(),
+        "generator.oscillator: the wave {preview:?} isn't between the shape {shape:?} and the frequency {freq:?}",
+    );
+    // And the strip's last cell is the square wave, which is what the band then shows.
+    rig.click(egui::pos2(shape.right() - 26.0, shape.center().y));
+    rig.idle(4);
+    let shape_now = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("shape").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    assert_eq!(shape_now, "saw", "generator.oscillator: the shape strip's third cell isn't the saw wave");
+}
+#[test]
 fn the_automap_port_lists_show_their_names_in_full_and_can_be_reordered() {
     // The Auto-Map splitter and collector list the ports they've taken off a bus. Those names
     // are the whole reason the module is on the canvas - which port feeds what, at a glance -

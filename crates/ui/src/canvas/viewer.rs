@@ -1787,7 +1787,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w, self.view_salt),
             "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w, self.view_salt),
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w, self.view_salt),
-            "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
+            "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl, self.view_salt),
             "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl),
             "processing.gyro_3dof"  => show_gyro_3dof_body(
                 node_id, inputs, ui, snarl, self.live_signals,

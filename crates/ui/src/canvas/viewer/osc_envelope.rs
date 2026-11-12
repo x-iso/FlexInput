@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, view_salt: u64) {
     let (shape, freq_unit, freq_p, phase_p, bipolar) = snarl.get_node(node_id).map(|n| {
         let shape      = n.params.get("shape")     .and_then(|v| v.as_str()) .unwrap_or("sine").to_string();
         let freq_unit  = n.params.get("freq_unit") .and_then(|v| v.as_str()) .unwrap_or("hz").to_string();
@@ -22,79 +22,216 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
     let mut bipolar   = bipolar;
     let mut changed   = false;
 
-    let mut shape_rect:   Option<egui::Rect> = None;
-    let mut freq_rect:    Option<egui::Rect> = None;
-    let mut phase_rect:   Option<egui::Rect> = None;
-    let mut preview_rect: Option<egui::Rect> = None;
-    ui.vertical(|ui| {
-        // Row 1: shape selector
-        let r = ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut shape, "sine".into(),     egui::RichText::new("Sine").small()).changed();
-            changed |= ui.selectable_value(&mut shape, "triangle".into(), egui::RichText::new("Tri").small()).changed();
-            changed |= ui.selectable_value(&mut shape, "saw".into(),      egui::RichText::new("Saw").small()).changed();
-            changed |= ui.selectable_value(&mut shape, "square".into(),   egui::RichText::new("Sqr").small()).changed();
-        });
-        shape_rect = Some(r.response.rect);
+    // The settings sit in a column of a constant width, centred on the module: the shape strip,
+    // the wave it makes, then the frequency and the phase - each with the small toggle that says
+    // how to read it - on rows of their own. The column is a constant rather than what the rows
+    // measure, because that is what lets this be narrower than a label, a DragValue and a
+    // separator per setting: it was 224 points of module to hold a shape and two numbers.
+    const COL: f32 = 128.0;
+    const ROW: f32 = 4.0;
+    const PREVIEW_H: f32 = 26.0;
+    const PILL_W: f32 = 62.0;
+    use super::simple_bodies::{trace_rect, value_pill_number, PILL_H};
+    let group_h = 3.0 * PILL_H + PREVIEW_H + 3.0 * ROW;
+    ui.allocate_exact_size(egui::vec2(COL, group_h), egui::Sense::hover());
+    let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
+        Some(r) => r,
+        None => return,
+    };
+    let column = ui.max_rect();
+    trace_rect(ui, node_id, "body_column", column);
+    let cx = inner.center().x;
+    let left = cx - COL * 0.5;
+    // Vertically on the body column, like the Counter's cells: this group nearly fills it, so
+    // the module's middle and the column's are the same answer to within a few points.
+    let top = kit::group_top(column, group_h);
+    let row_at = |i: usize| -> f32 {
+        match i {
+            0 => top,
+            1 => top + PILL_H + ROW,
+            2 => top + PILL_H + ROW + PREVIEW_H + ROW,
+            _ => top + 2.0 * (PILL_H + ROW) + PREVIEW_H + ROW,
+        }
+    };
 
-        // Row 2: frequency unit toggle + value
-        let r = ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut freq_unit, "hz".into(), egui::RichText::new("Hz").small()).changed();
-            changed |= ui.selectable_value(&mut freq_unit, "ms".into(), egui::RichText::new("ms").small()).changed();
-            let (lo, hi, spd) = if freq_unit == "hz" { (0.01, 200.0, 0.1) } else { (1.0, 60_000.0, 10.0) };
-            changed |= ui.add_enabled(!freq_wired, egui::DragValue::new(&mut freq_p).speed(spd).range(lo..=hi)).changed();
-        });
-        freq_rect = Some(r.response.rect);
+    // The shape: four cells the way the Counter's mode is, so the words are the control.
+    let shape_rect = egui::Rect::from_min_size(egui::pos2(left, row_at(0)), egui::vec2(COL, PILL_H));
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(shape_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt("osc_shape"),
+        );
+        changed |= kit::strip(
+            &mut child,
+            COL,
+            &mut shape,
+            &[
+                ("sine".to_string(), "Sine", "Smooth, no harmonics"),
+                ("triangle".to_string(), "Tri", "Soft edges, odd harmonics"),
+                ("saw".to_string(), "Saw", "Ramps up, drops at once"),
+                ("square".to_string(), "Sqr", "Halves the signal, odd harmonics"),
+            ],
+        );
+        drop(child);
+    }
+    trace_rect(ui, node_id, "osc_shape", shape_rect);
 
-        // Row 3: phase offset
-        let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Phase").small().weak());
-            changed |= ui.add_enabled(!phase_wired, egui::DragValue::new(&mut phase_p).speed(0.01).range(0.0..=1.0)).changed();
-            // Bi/Uni toggle
-            ui.separator();
-            changed |= ui.selectable_value(&mut bipolar, true,  egui::RichText::new("Bi").small()).changed();
-            changed |= ui.selectable_value(&mut bipolar, false, egui::RichText::new("Uni").small()).changed();
-        });
-        phase_rect = Some(r.response.rect);
-
-        // Row 4: waveform preview
-        let preview_size = egui::vec2(ui.available_width().max(80.0), 36.0);
-        let (rect, _) = ui.allocate_exact_size(preview_size, egui::Sense::hover());
-        preview_rect = Some(rect);
-        if ui.is_rect_visible(rect) {
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
-
-            // Zero / baseline grid line
-            let zero_y = if bipolar {
-                rect.center().y
-            } else {
-                rect.bottom()
-            };
-            painter.line_segment(
-                [egui::pos2(rect.left(), zero_y), egui::pos2(rect.right(), zero_y)],
-                egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
-            );
-
-            // Waveform
-            let n = 128usize;
-            let pts: Vec<egui::Pos2> = (0..=n).map(|i| {
+    // The wave itself: what the shape and the phase actually make, and how bi/unipolar changes
+    // it. Painted across the column, so it costs nothing in width.
+    let preview_rect = egui::Rect::from_min_size(egui::pos2(left, row_at(1)), egui::vec2(COL, PREVIEW_H));
+    trace_rect(ui, node_id, "osc_preview", preview_rect);
+    if ui.is_rect_visible(preview_rect) {
+        let painter = ui.painter_at(preview_rect);
+        painter.rect_filled(preview_rect, 4.0, egui::Color32::from_gray(18));
+        let zero_y = if bipolar {
+            preview_rect.center().y
+        } else {
+            preview_rect.bottom()
+        };
+        painter.line_segment(
+            [egui::pos2(preview_rect.left(), zero_y), egui::pos2(preview_rect.right(), zero_y)],
+            egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
+        );
+        let n = 128usize;
+        let pts: Vec<egui::Pos2> = (0..=n)
+            .map(|i| {
                 let t = i as f32 / n as f32;
                 let phase = (t + phase_p).rem_euclid(1.0);
-                let v = {
-                    let raw = flexinput_engine::osc_sample(&shape, phase);
-                    if bipolar { raw } else { (raw + 1.0) * 0.5 }
-                };
-                let x = rect.left() + t * rect.width();
+                let raw = flexinput_engine::osc_sample(&shape, phase);
+                let v = if bipolar { raw } else { (raw + 1.0) * 0.5 };
+                let x = preview_rect.left() + t * preview_rect.width();
                 let y = if bipolar {
-                    rect.center().y - v * rect.height() * 0.45
+                    preview_rect.center().y - v * preview_rect.height() * 0.42
                 } else {
-                    rect.bottom() - v * rect.height() * 0.9
+                    preview_rect.bottom() - v * preview_rect.height() * 0.84
                 };
-                egui::pos2(x, y.clamp(rect.top(), rect.bottom()))
-            }).collect();
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 180, 255))));
-        }
+                egui::pos2(x, y.clamp(preview_rect.top(), preview_rect.bottom()))
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 180, 255))));
+    }
+
+    // The frequency: a pill you drag across or double-click to type into, with the unit beside
+    // it - hertz or the period in milliseconds, which is how a rhythm rather than a pitch is
+    // counted. A value coming down the `freq` pin wins, so the pill takes no drags.
+    let (lo, hi, step_per_pt) = if freq_unit == "hz" {
+        (0.01f64, 200.0f64, 0.5f32)
+    } else {
+        (1.0, 60_000.0, 25.0)
+    };
+    let freq_rect = egui::Rect::from_min_size(egui::pos2(left, row_at(2)), egui::vec2(PILL_W, PILL_H));
+    trace_rect(ui, node_id, "osc_freq_pill", freq_rect);
+    let (freq_resp, typed) = value_pill_number(
+        ui,
+        node_id,
+        "freq_param",
+        freq_rect,
+        "",
+        &if freq_p.abs() >= 10.0 {
+            format!("{}", freq_p.round() as i64)
+        } else {
+            format!("{freq_p:.2}")
+        },
+        0.0,
+        lo as f64..=hi as f64,
+    );
+    let freq_resp = freq_resp.on_hover_text(if freq_wired {
+        "The frequency the wire is driving - unplug it to set this here."
+    } else {
+        "How fast the wave repeats, in the unit next to it.\nDrag across the pill to change it, double-click to type."
     });
+    if freq_wired {
+        // The wire's value is what the module shows, and a drag would be a lie.
+    } else {
+        if let Some(v) = typed {
+            freq_p = (v as f32).clamp(lo as f32, hi as f32);
+            changed = true;
+        }
+        if freq_resp.dragged() {
+            freq_p = (freq_p + freq_resp.drag_delta().x * step_per_pt).clamp(lo as f32, hi as f32);
+            changed = true;
+        }
+    }
+    let unit_rect = egui::Rect::from_min_size(
+        egui::pos2(left + PILL_W + ROW, row_at(2)),
+        egui::vec2(COL - PILL_W - ROW, PILL_H),
+    );
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(unit_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt("osc_unit"),
+        );
+        changed |= kit::strip(
+            &mut child,
+            unit_rect.width(),
+            &mut freq_unit,
+            &[
+                ("hz".to_string(), "Hz", "Cycles per second"),
+                ("ms".to_string(), "ms", "One cycle's length in milliseconds"),
+            ],
+        );
+        drop(child);
+    }
+    trace_rect(ui, node_id, "osc_unit", unit_rect);
+
+    // The phase, and whether the wave swings -1..1 or 0..1.
+    let phase_rect = egui::Rect::from_min_size(egui::pos2(left, row_at(3)), egui::vec2(PILL_W, PILL_H));
+    trace_rect(ui, node_id, "osc_phase_pill", phase_rect);
+    let (phase_resp, typed) = value_pill_number(
+        ui,
+        node_id,
+        "phase_param",
+        phase_rect,
+        "",
+        &format!("{phase_p:.2}"),
+        0.0,
+        0.0..=1.0,
+    );
+    let phase_resp = phase_resp.on_hover_text(if phase_wired {
+        "The offset the wire is driving - unplug it to set this here."
+    } else {
+        "Where in the cycle the wave starts, as a fraction of a turn."
+    });
+    if !phase_wired {
+        if let Some(v) = typed {
+            phase_p = (v as f32).rem_euclid(1.0);
+            changed = true;
+        }
+        if phase_resp.dragged() {
+            phase_p = (phase_p + phase_resp.drag_delta().x * 0.01).rem_euclid(1.0);
+            changed = true;
+        }
+    }
+    let bi_rect = egui::Rect::from_min_size(
+        egui::pos2(left + PILL_W + ROW, row_at(3)),
+        egui::vec2(COL - PILL_W - ROW, PILL_H),
+    );
+    {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bi_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt("osc_bipolar"),
+        );
+        changed |= kit::strip(
+            &mut child,
+            bi_rect.width(),
+            &mut bipolar,
+            &[
+                (true, "Bi", "-1..1, centred on 0"),
+                (false, "Uni", "0..1, one-sided"),
+            ],
+        );
+        drop(child);
+    }
+    trace_rect(ui, node_id, "osc_bipolar", bi_rect);
+    let freq_area = freq_rect.union(unit_rect);
+    let phase_area = phase_rect.union(bi_rect);
+
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -105,10 +242,10 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
             if let Some(n) = Number::from_f64(phase_p as f64) { node.params.insert("phase_param".into(), Value::Number(n)); }
         }
     }
-    if let Some(r) = shape_rect   { register_exposable_element(ui, node_id, "shape",   r); }
-    if let Some(r) = freq_rect    { register_exposable_element(ui, node_id, "freq",    r); }
-    if let Some(r) = phase_rect   { register_exposable_element(ui, node_id, "phase",   r); }
-    if let Some(r) = preview_rect { register_exposable_element(ui, node_id, "preview", r); }
+    register_exposable_element(ui, node_id, "shape", shape_rect);
+    register_exposable_element(ui, node_id, "freq", freq_area);
+    register_exposable_element(ui, node_id, "phase", phase_area);
+    register_exposable_element(ui, node_id, "preview", preview_rect);
 }
 
 // ── Envelope Generator ────────────────────────────────────────────────────────
