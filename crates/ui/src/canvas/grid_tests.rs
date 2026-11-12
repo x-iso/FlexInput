@@ -1617,6 +1617,64 @@ fn a_combiner_row_move_takes_its_settings_with_it() {
 }
 
 #[test]
+fn a_knob_shows_its_value_once_the_frame_has_room_for_it() {
+    // The smallest knob is a face and a pointer: at 56 by 56 there's nowhere to put the number
+    // without covering the arc or shrinking what you drag, so it shows none. Any frame taller
+    // than that floor has a line the round face can't use, and the number goes under it. At the
+    // floor itself - one row of face - the number only starts at four blocks of width, where
+    // there's still a track worth aiming at beside it.
+    let (mut rig, ids) = Rig::real("module.knob", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    let measure = |rig: &mut Rig, w: f32, h: f32| -> (egui::Rect, egui::Rect, egui::Rect) {
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(kit_width_param().into(), serde_json::json!(w));
+            n.params.insert("ui_h".into(), serde_json::json!(h));
+        }
+        rig.idle(6);
+        for what in ["knob_face", "knob_number", "body_column"] {
+            rig.ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new(("module_ctrl_rect", node.0, what)), Xysr([0.0; 4]))
+            });
+        }
+        rig.idle(4);
+        (
+            rig.frame_rect(node),
+            rig.traced_rect(node, "knob_face").unwrap_or(egui::Rect::NOTHING),
+            rig.traced_rect(node, "knob_number").unwrap_or(egui::Rect::NOTHING),
+        )
+    };
+
+    let (f, face, number) = measure(&mut rig, 56.0, 56.0);
+    assert!(face.is_positive(), "a 56x56 knob lost its face: {f:?}");
+    assert!(!number.is_positive(), "a 56x56 knob draws {number:?} it has no room for");
+
+    let (f, _face, number) = measure(&mut rig, 84.0, 56.0);
+    assert!(!number.is_positive(), "a {f:?} knob at the two-block floor crowds a reading {number:?} beside a 3-block track");
+
+    let (f, _face, number) = measure(&mut rig, 112.0, 56.0);
+    assert!(
+        number.is_positive() && f.contains_rect(number.expand(0.5)),
+        "a {f:?} knob four blocks across at the floor should read its value, got {number:?}",
+    );
+
+    let (f, face, number) = measure(&mut rig, 56.0, 84.0);
+    assert!(
+        number.is_positive() && f.contains_rect(number.expand(0.5)),
+        "a {f:?} knob taller than the floor should read its value, got {number:?}",
+    );
+    assert!(
+        number.top() >= face.bottom() - 1.0,
+        "the reading {number:?} isn't under the face {face:?} it shares {f:?} with",
+    );
+
+    let (_f, face, number) = measure(&mut rig, 112.0, 112.0);
+    assert!(
+        face.contains(number.center()),
+        "a dial's reading {number:?} should sit inside the face {face:?}",
+    );
+}
+#[test]
 fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
     // The 28-point step makes sizes reachable that the old grid skipped over: 140 wide over 84
     // tall, 84 over 112, a 56-wide fader strip with a 140-tall body. The dial, the track and
@@ -1644,6 +1702,18 @@ fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
                 });
             }
             rig.idle(6);
+            // A frame the grip has just resized is laid out at its old size for a frame or two
+            // on the way to the new one. Clear the traces once the size has arrived, so what's
+            // read back is what a settled frame of this size actually draws.
+            for what in ["knob_face", "knob_number", "body_column"] {
+                rig.ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new(("module_ctrl_rect", node.0, what)),
+                        Xysr([0.0; 4]),
+                    )
+                });
+            }
+            rig.idle(4);
             let f = rig.frame_rect(node);
             assert!(
                 f.width() >= MAJOR && f.height() >= MAJOR,
@@ -1657,16 +1727,24 @@ fn a_knob_at_any_step_of_the_finer_grid_keeps_its_dial_inside() {
                 f.contains_rect(face.shrink(-0.5)),
                 "a {f:?} knob puts its face {face:?} outside the frame (asked {w}x{h})",
             );
-            // The body only draws a reading where there is a face wide enough to carry it, so
-            // the promise is checked at those sizes: below that the number is deliberately not
-            // drawn, and there is nothing to place.
-            if face.width() >= 44.0 {
-                let num = rig
-                    .traced_rect(node, "knob_number")
-                    .unwrap_or(egui::Rect::NOTHING);
+            // A reading is drawn where it costs nothing to drag: any frame taller than the
+            // two-block floor has a line the round face can't use, so it shows the number; at
+            // the floor itself only four blocks of width and more do, because below that the
+            // track left beside the number is too short to aim at.
+            let at_floor = f.height() <= MAJOR + 0.5;
+            let shows = !at_floor || f.width() >= 2.0 * MAJOR;
+            let num = rig
+                .traced_rect(node, "knob_number")
+                .unwrap_or(egui::Rect::NOTHING);
+            if shows {
                 assert!(
                     num.is_positive() && f.contains_rect(num.expand(0.5)),
                     "a {f:?} knob with a {face:?} face has no reading inside the frame (asked {w}x{h})",
+                );
+            } else {
+                assert!(
+                    !num.is_positive(),
+                    "a {f:?} knob at its two-block floor draws a reading {num:?} it has no room for (asked {w}x{h})",
                 );
             }
         }
@@ -1947,6 +2025,19 @@ fn a_dropdown_shift_pin_moves_the_option_it_shows() {
     // while the pin holds it somewhere else moves the base, so the option clicked is the one
     // that lands.
     let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
+    // A patch saved before the pin existed has no input at all: the module gives itself the
+    // missing pin the first time it draws, rather than going on unshiftable.
+    if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+        n.inputs.clear();
+    }
+    rig.idle(4);
+    let pin_names: Vec<String> = rig
+        .canvas
+        .snarl
+        .get_node(ids[0])
+        .map(|n| n.inputs.iter().map(|d| d.name.clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(pin_names, ["shift"], "a dropdown saved without the shift pin didn't gain it");
     let node = ids[0];
     if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
         n.params.insert(
@@ -2060,7 +2151,19 @@ fn the_oscillator_is_a_shape_a_wave_and_two_numbers() {
         "generator.oscillator: the wave {preview:?} isn't between the shape {shape:?} and the frequency {freq:?}",
     );
     // And the strip's last cell is the square wave, which is what the band then shows.
-    rig.click(egui::pos2(shape.right() - 26.0, shape.center().y));
+    // The strip is the width of the wave band under it, and stops where the output pin's label
+    // begins: a strip laid out with the style's extra spacing between its cells reached into it.
+    assert!(
+        (shape.width() - preview.width()).abs() < 0.5,
+        "generator.oscillator: the shape strip {shape:?} is a different width from the wave band {preview:?}",
+    );
+    assert!(
+        shape.right() < f.right() - 20.0,
+        "generator.oscillator: the shape strip reaches to {right:.0} of a frame ending at {fr:.0}",
+        right = shape.right(),
+        fr = f.right(),
+    );
+    rig.click(egui::pos2(shape.right() - 8.0, shape.center().y));
     rig.idle(4);
     let shape_now = rig
         .canvas
@@ -2068,7 +2171,7 @@ fn the_oscillator_is_a_shape_a_wave_and_two_numbers() {
         .get_node(node)
         .and_then(|n| n.params.get("shape").and_then(|v| v.as_str()).map(str::to_string))
         .unwrap_or_default();
-    assert_eq!(shape_now, "saw", "generator.oscillator: the shape strip's third cell isn't the saw wave");
+    assert_eq!(shape_now, "square", "generator.oscillator: the shape strip's last cell isn't the square wave");
 }
 #[test]
 fn the_macro_lists_its_ports_like_every_other_list() {
@@ -2718,3 +2821,4 @@ fn the_strips_sit_on_the_rows_of_their_sockets() {
         }
     }
 }
+

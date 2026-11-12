@@ -140,16 +140,7 @@ fn pill_at(
     // The label cell is the word plus a little air, measured. At a fixed 26 the Counter's
     // "step" ran into its own number while the number's box, taking what was left of a 116-point
     // row, was three times as wide as any number in it.
-    let label_w = if label.is_empty() {
-        0.0
-    } else {
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), font, ui.visuals().text_color())
-            .size()
-            .x
-            + 8.0
-    };
+    let label_w = super::simple_bodies::pill_label_width(ui, label);
     simple_bodies::trace_rect(ui, node_id, &format!("{salt}_pill"), rect);
     value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range)
 }

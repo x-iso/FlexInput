@@ -63,6 +63,10 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
                 .layout(egui::Layout::left_to_right(egui::Align::Center))
                 .id_salt("osc_shape"),
         );
+        // A strip lays its cells out end to end and adds its own spacing between them; the row
+        // it is drawn in already asked for a fixed width, so the style's inter-widget spacing is
+        // extra and the last cell lands past the row - into the pin labels beside it.
+        child.spacing_mut().item_spacing.x = 0.0;
         changed |= kit::strip(
             &mut child,
             COL,
@@ -165,6 +169,10 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
                 .layout(egui::Layout::left_to_right(egui::Align::Center))
                 .id_salt("osc_unit"),
         );
+        // A strip lays its cells out end to end and adds its own spacing between them; the row
+        // it is drawn in already asked for a fixed width, so the style's inter-widget spacing is
+        // extra and the last cell lands past the row - into the pin labels beside it.
+        child.spacing_mut().item_spacing.x = 0.0;
         changed |= kit::strip(
             &mut child,
             unit_rect.width(),
@@ -217,6 +225,10 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
                 .layout(egui::Layout::left_to_right(egui::Align::Center))
                 .id_salt("osc_bipolar"),
         );
+        // A strip lays its cells out end to end and adds its own spacing between them; the row
+        // it is drawn in already asked for a fixed width, so the style's inter-widget spacing is
+        // extra and the last cell lands past the row - into the pin labels beside it.
+        child.spacing_mut().item_spacing.x = 0.0;
         changed |= kit::strip(
             &mut child,
             bi_rect.width(),

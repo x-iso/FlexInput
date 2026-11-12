@@ -699,6 +699,16 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
     let mut options_changed = false;
     let mut selected_changed = false;
 
+    // A patch saved before this module took a `shift` input has no pin for it: a node's pins are
+    // stored with it rather than read back from the registry, so an existing Dropdown would go on
+    // without one. The first frame it draws gives it the pin it's missing, the way a fresh Macro
+    // Output seeds its first port.
+    if snarl.get_node(node_id).is_some_and(|n| n.inputs.is_empty()) {
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            n.inputs.push(PinDescriptor::new("shift", SignalType::Float).optional());
+        }
+    }
+
     // The list column, and the reading above it, at constants - not a `box_width` param the
     // user could dial to 600 and not the frame the module was handed. A row is a handle, the
     // option's text cut at the column's edge with the whole of it on hover, and the `×` at the
@@ -775,6 +785,11 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
             .selected_text(if current.is_empty() { "—".to_string() } else { current })
             .width(READ_W)
             .height(want)
+            // The same ComboBox minimum as above: without a width the button is 150 points or
+            // the length of the option's text, whichever is longer, so a long option widened the
+            // module instead of being cut at its edge. The popup still sizes itself to its rows.
+            .width(READ_W)
+            .truncate()
             .show_ui(&mut child, |ui| {
                 for (i, opt) in options.iter().enumerate() {
                     let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
@@ -1216,6 +1231,25 @@ const PILL_FONT: f32 = 12.0;
 /// The value cell of a pill drawn across `rect`: everything right of the `label_w`-wide
 /// label cell. That's the half that answers the pointer, and what a caller maps a pointer
 /// position onto - so it comes from the same arithmetic the pill is painted with.
+/// How wide a pill's label cell has to be to sit behind `label`: measured in the monospace the
+/// pill is painted with, not in the proportional text style. Measuring with the style's small
+/// font made the blue backdrop narrower than the word it stands behind - "min" and "step" both
+/// ran out of their own colour block.
+pub(crate) fn pill_label_width(ui: &egui::Ui, label: &str) -> f32 {
+    if label.is_empty() {
+        0.0
+    } else {
+        ui.painter()
+            .layout_no_wrap(
+                label.to_owned(),
+                egui::FontId::monospace(PILL_FONT),
+                ui.visuals().text_color(),
+            )
+            .size()
+            .x
+            + 8.0
+    }
+}
 pub(crate) fn pill_value_cell(rect: egui::Rect, label_w: f32) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(rect.left() + label_w, rect.top()), rect.max)
 }
@@ -2286,7 +2320,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     const ICON_W: f32 = 24.0;
     const TYPE_W: f32 = 22.0;
     const RM_W: f32 = 22.0;
-    const NAME_W: f32 = LIST_W - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW;
+
     let row_h = ui.spacing().interact_size.y.max(PILL_H);
     let list_h = ports.len() as f32 * row_h;
     ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
@@ -2294,12 +2328,20 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         Some(r) => r,
         None => return,
     };
-    let cx = inner.center().x;
-    let top = kit::group_top(ui.max_rect(), list_h);
+    // The column runs the width the body has, from its left edge up to where the pins' labels
+    // begin. Centring it on the frame instead - as a module with pins on both sides is centred -
+    // left a strip of dead margin on the left, where this module has no input pins at all, and
+    // pushed the rows out under the output labels on the right.
+    let column = ui.max_rect();
+    trace_rect(ui, node_id, "body_column", column);
+    let list_w = column.width().max(120.0);
+    let list_left = column.left().max(inner.left());
+    let name_w = (list_w - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW).max(28.0);
+    let top = kit::group_top(column, list_h);
     let row_rect = |i: usize| {
         egui::Rect::from_min_size(
-            egui::pos2(cx - LIST_W * 0.5, top + i as f32 * row_h),
-            egui::vec2(LIST_W, row_h),
+            egui::pos2(list_left, top + i as f32 * row_h),
+            egui::vec2(list_w, row_h),
         )
     };
     let drag_key = egui::Id::new(("fxi_macro_drag", node_id.0));
@@ -2354,7 +2396,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         }
         child.add_space(ROW);
         let name_resp = child.add(
-            egui::TextEdit::singleline(&mut port.name).desired_width(NAME_W),
+            egui::TextEdit::singleline(&mut port.name).desired_width(name_w),
         );
         if name_resp.changed() {
             changed = true;
@@ -2364,8 +2406,12 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         // The signal type: one letter in the row, the names in the popup. The word in the row
         // was the third of four things making every port row wider than the port it names.
         let short = macro_type_short(port.signal_type);
+        // `.width` because a ComboBox takes `Spacing::combo_width` - 150 points - as its minimum
+        // otherwise, whatever the one letter in it is: the button reached past the row and under
+        // the output labels. The popup is not held to that width; its entries size it.
         egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
             .selected_text(egui::RichText::new(short).small())
+            .width(TYPE_W)
             .show_ui(&mut child, |ui| {
                 for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
                     if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
@@ -2970,16 +3016,38 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     let text_col = ui.visuals().strong_text_color();
     let galley = ui.painter().layout_no_wrap(format!("{:.2}", v), font.clone(), text_col);
     let text_h = galley.size().y;
-    // The number goes *under* the control whenever the column has a line to spare for it -
-    // a dial with room beneath it, a fader in a body two blocks tall. Only a strip that is
-    // a block or less tall has nothing under, and then a wide fader takes the number at the
-    // end of its track.
-    // The number goes under the control for a **fader** with a line to spare - a tall body
-    // has empty space below the track and the track should have the width. A dial keeps its
-    // reading in its middle and takes the whole body: giving a dial up a line of the frame
-    // for the text makes the thing you drag smaller for nothing.
-    let number_under = shape != Shape::Dial && column.height() >= 58.0 + text_h;
-    let text_band = if number_under { text_h + 8.0 } else { 0.0 };
+    // The number goes under the control for a **fader** with a line to spare - a tall body has
+    // empty space below the track and the track should have the width. A dial's face is round,
+    // so when the column is taller than it is wide the spare height is height the face cannot
+    // use at all: the reading goes under that face too, and a knob 56 wide and three blocks
+    // tall says what it's set to. Where the face already fills the column both ways - the two-
+    // block minimum - a line for the text would shrink the thing you drag, so the number stays
+    // in the middle if it fits there, and isn't drawn at all when it doesn't.
+    let band = text_h + 8.0;
+    let face_in = |a: egui::Rect| -> egui::Vec2 {
+        let (p_x, p_y, min_side) = match shape {
+            Shape::Dial => (PAD, PAD, MIN_FACE),
+            _ => (PAD * 0.5, PAD * 0.5, MIN_TRACK),
+        };
+        let mut f = egui::vec2(
+            (a.width() - 2.0 * p_x).max(min_side.min(a.width())),
+            (a.height() - 2.0 * p_y).max(min_side.min(a.height())),
+        );
+        if shape == Shape::Dial {
+            let side = f.x.min(f.y);
+            f = egui::vec2(side, side);
+        }
+        f
+    };
+    let number_under = if shape == Shape::Dial {
+        let full = face_in(column);
+        let with_text = face_in(egui::Rect::from_min_max(column.min, egui::pos2(column.right(), column.bottom() - band)));
+        // Giving up the line costs nothing when the face is limited by the width.
+        with_text.x >= full.x - 0.5 && column.height() >= band + MIN_FACE
+    } else {
+        column.height() >= 58.0 + text_h
+    };
+    let text_band = if number_under { band } else { 0.0 };
     let area = egui::Rect::from_min_max(column.min, egui::pos2(column.right(), column.bottom() - text_band));
     let (pad_x, pad_y, min_side) = match shape {
         Shape::Dial => (PAD, PAD, MIN_FACE),
@@ -2994,6 +3062,7 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
         let side = face.x.min(face.y);
         face = egui::vec2(side, side);
     }
+
     let rect = egui::Rect::from_center_size(egui::pos2(inner.center().x, area.center().y), face);
     let resp = ui.interact(rect, ui.id().with(("knob_face", node_id)), egui::Sense::click_and_drag());
     trace_rect(ui, node_id, "body_column", column);
@@ -3037,7 +3106,15 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
             // grid makes reachable) has 27 points of track left after its reading, and a
             // track that thin is still draggable; what it must not do is drop the reading.
             let track_w = rect.width() - galley.size().x - 4.0;
-            if track_w >= 24.0 {
+            // A strip one block tall puts the number at the end of its track, but only once the
+            // frame is four blocks across: at three the track left over is so short that the
+            // reading and the thing you drag crowd each other out.
+            let block = crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block);
+            // The frame's width, not the body column's: the column is what's left after the
+            // pin's label, and it's the module the user counts blocks on. 14 points is the
+            // frame's own margin, which `inner` has already given back.
+            let roomy_enough = inner.width() + 14.0 >= 4.0 * block;
+            if track_w >= 24.0 && roomy_enough {
                 let track = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + track_w, rect.bottom()));
                 draw_knob_h_fader(&painter, track, t, bipolar, active);
                 let at = egui::pos2(rect.right() - galley.size().x, rect.center().y - galley.size().y * 0.5);
@@ -3053,7 +3130,14 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
             draw_knob_rotary(&painter, rect, t, bipolar, active);
             // A dial keeps its reading in its middle - and its indicator stops short of the
             // middle, so the two don't cross.
-            if rect.width() >= 44.0 && galley.size().x <= rect.width() * 0.6 {
+            // The middle reading has to sit inside the dial without reaching the indicator that
+            // stops short of the middle. The smallest face has neither, and draws no number at
+            // all: the face and where it points are the value.
+            // The number spans most of a small dial rather than not appearing at all: a
+            // three-block knob has a 33-point face and a 27-point reading, and the value being
+            // legible matters more here than the margin around the arc. Below that - the two-
+            // block minimum - it genuinely doesn't fit, and the face's pointer is the value.
+            if galley.size().x <= rect.width() * 0.85 {
                 let at = egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
                 trace_rect(ui, node_id, "knob_number", egui::Rect::from_min_size(at, galley.size()));
                 text_painter.galley(at, galley.clone(), text_col);
