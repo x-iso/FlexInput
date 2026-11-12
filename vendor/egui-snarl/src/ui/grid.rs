@@ -158,11 +158,22 @@ pub fn draw_grid(grid: &GridLayout, painter: &Painter, viewport: &Rect, scale: f
         return;
     }
     let px = 1.0 / scale.max(0.01);
-    // The accent counts blocks, not drawn lines: a stepped grid still brightens the same
-    // positions it would have at full zoom.
-    let accent = |k: i64| {
-        grid.accent_every > 1 && (k * step).rem_euclid(i64::from(grid.accent_every)) == 0
+    // A bright line has to fall on a line the stepped grid actually draws, and it stays an
+    // odd number of blocks away so it keeps bracketing a four-block module: an odd multiple
+    // of the step, the first one at least as wide as what was asked for.
+    let every = {
+        let want = i64::from(grid.accent_every.max(2));
+        if step == 1 {
+            want
+        } else {
+            let mut m = ((want + step - 1) / step).max(1);
+            if m % 2 == 0 {
+                m += 1;
+            }
+            step * m
+        }
     };
+    let accent = |k: i64| grid.accent_every > 1 && (k * step).rem_euclid(every) == 0;
     let bright = grid.brightness.max(0.0);
     let minor = Stroke::new(px, color.gamma_multiply((0.045 * bright).min(1.0) * fade));
     let major = Stroke::new(px, color.gamma_multiply((0.11 * bright).min(1.0) * fade));
