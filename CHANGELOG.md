@@ -292,6 +292,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Dragging a Combiner's row moved the port but left its settings behind.** Two of the
+  Combiner's settings are stored by port number — the merge policy a port's pins follow unless
+  a pin says otherwise, and a pin pinned to one particular port. The engine reads ports by
+  position, the lowest one offering a pin wins, so after a row was dragged down the device
+  that moved kept the policy belonging to the slot it landed in, and a stick pinned to a
+  controller was suddenly pinned to whatever took its place. Both now follow the port.
 - **The strips and their sockets were on two grids again, three points apart per row.** The
   body placed its strips at one pitch while the pin column advanced its rows by another: in a
   `Coil` layout the column adds its own row spacing, and takes row heights from the other side,

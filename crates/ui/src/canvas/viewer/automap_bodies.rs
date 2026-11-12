@@ -1115,6 +1115,65 @@ pub(crate) fn combiner_move_input(
             snarl.connect(src, new_in);
         }
     }
+    // Two settings are stored by port NUMBER, so they have to follow the ports they
+    // describe: `combiner_port_default` (how that port's pins merge unless a pin says
+    // otherwise) and `combiner_pin_port` (a pin resolved against one particular port). The
+    // engine reads ports by position - the lowest one offering a pin wins - so leaving these
+    // keyed to the position rather than the port silently hands a device's merge policy to
+    // whichever device lands in its slot, and unpins a pin from the controller it was set on.
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        // Keys that are port indices: the entry at the old index belongs at the new one.
+        for key in ["combiner_port_default"] {
+            let moved: serde_json::Map<String, Value> = node
+                .params
+                .get(key)
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            if moved.is_empty() {
+                continue;
+            }
+            let mut next = serde_json::Map::new();
+            for (new_idx, &old_idx) in order.iter().enumerate() {
+                if let Some(v) = moved.get(&old_idx.to_string()) {
+                    next.insert(new_idx.to_string(), v.clone());
+                }
+            }
+            for (k, v) in moved {
+                if k.parse::<usize>().is_err() {
+                    next.insert(k, v); // not a port index: leave it be
+                }
+            }
+            node.params.insert(key.to_string(), Value::Object(next));
+        }
+        // Values that are port indices: the pin keeps pointing at the same port, which now
+        // sits somewhere else.
+        let pinned: serde_json::Map<String, Value> = node
+            .params
+            .get("combiner_pin_port")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if !pinned.is_empty() {
+            // `where_new[old]` - the position an old port index lands at.
+            let mut where_new = vec![usize::MAX; n];
+            for (new_idx, &old_idx) in order.iter().enumerate() {
+                where_new[old_idx] = new_idx;
+            }
+            let mut next = pinned.clone();
+            for (_, v) in next.iter_mut() {
+                let old = match v {
+                    Value::Number(num) => num.as_u64().map(|x| x as usize),
+                    Value::String(s) => s.parse::<usize>().ok(),
+                    _ => None,
+                };
+                if let Some(new) = old.and_then(|o| where_new.get(o).copied()) {
+                    *v = Value::Number(serde_json::Number::from(new));
+                }
+            }
+            node.params.insert("combiner_pin_port".to_string(), Value::Object(next));
+        }
+    }
 }
 
 pub(crate) fn show_automap_combiner_body(

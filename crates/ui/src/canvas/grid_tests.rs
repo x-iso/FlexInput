@@ -1500,6 +1500,54 @@ fn a_title_is_left_out_when_it_doesnt_fit_and_comes_back_when_it_does() {
 }
 
 #[test]
+fn a_combiner_row_move_takes_its_settings_with_it() {
+    // The Combiner's rows are ports and the engine reads them by position - the lowest port
+    // that offers a pin wins - so two of its settings are stored by port number: the port's
+    // default merge policy, and a pin pinned to a particular port. Dragging a row down has
+    // to carry both, or the port that moved keeps a policy belonging to the row it jumped
+    // over, and a pin pinned to a device is suddenly pinned to whatever landed there.
+    let (mut rig, ids) = Rig::real("module.automap_combiner", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(
+            "combiner_port_default".into(),
+            serde_json::json!({ "0": "ADD", "1": "MULT" }),
+        );
+        n.params
+            .insert("combiner_pin_port".into(), serde_json::json!({ "left_stick": 0 }));
+    }
+    rig.idle(4);
+    let (row0, row1) = (rig.traced(node, "combiner_row_0"), rig.traced(node, "combiner_row_1"));
+    assert!(
+        row0.is_positive() && row1.is_positive(),
+        "no Combiner rows to drag: {row0:?} {row1:?}",
+    );
+    rig.drag(egui::pos2(row0.left() + 8.0, row0.center().y), egui::vec2(0.0, row1.top() - row0.top()));
+    rig.idle(4);
+    let n = rig.canvas.snarl.get_node(node).unwrap();
+    let pd = n.params.get("combiner_port_default").and_then(|v| v.as_object());
+    let pd = pd.unwrap_or_else(|| panic!("the port policies vanished after the move: {:?}", n.params));
+    assert_eq!(
+        pd.get("1").and_then(|v| v.as_str()),
+        Some("ADD"),
+        "the moved port lost its merge policy: {pd:?}",
+    );
+    assert_eq!(
+        pd.get("0").and_then(|v| v.as_str()),
+        Some("MULT"),
+        "the port it passed took the wrong policy: {pd:?}",
+    );
+    let pp = n.params.get("combiner_pin_port").and_then(|v| v.as_object());
+    let pp = pp.unwrap_or_else(|| panic!("the pin pins vanished: {:?}", n.params));
+    assert_eq!(
+        pp.get("left_stick").and_then(|v| v.as_u64()),
+        Some(1),
+        "a pin pinned to the moved port followed the position, not the port: {pp:?}",
+    );
+}
+
+#[test]
 fn every_mark_body_keeps_its_four_blocks_of_height() {
     // The mark bodies - a glyph and a pill or two - reserve nothing of their own, so their
     // height is whatever the grid leaves them. At the old 56-point step that was never under
