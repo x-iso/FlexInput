@@ -137,6 +137,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   reserved its 160-point box *inside* the frame's own margin, and the canvas rounded that
   up, so the frame was wider than anything in it asked for. A note saved before any of this
   keeps the width it had set for itself.
+- **A Dropdown menu can be walked from outside it.** It takes an optional `shift` input now:
+  whatever that pin says is added to the option chosen on the module - not replaced by it - and
+  wraps in both directions, so a dial, a stepping switch or a comparator moves through the menu
+  from wherever it was left. The module marks the option that is actually coming out rather than
+  the one it was set to, and choosing an option while the pin is holding it somewhere else moves
+  the base, so the option you click is the option you get. The list it drops down also asks for
+  the height its options need: it was egui's default of about four rows, so a menu of eight made
+  you scroll in the middle of an empty canvas.
 
 ### Changed
 
@@ -159,25 +167,40 @@ All notable changes to FlexInput are documented here. This project adheres to
   narrower than the first cut of this redesign, which was still being held open by the width it
   happened to be handed at birth rather than the one its cells ask for. Its six pin words are
   drawn short on the canvas like the other small modules' (`inc`, `dec`, `rst`, `step`, `min`,
-  `max`): they're fixed by the module and the same on every patch. With it the body-kit's
+  `max`): they're fixed by the module and the same on every patch. Its reset button is at the end
+  of the step row now - on the output row it stood on top of the `0..1` cell - and a pill's label
+  cell is the word plus a little air, measured, where a fixed 26 points cut into `step` while
+  the number's box took three times the room any count needs. With it the body-kit's
   labelled rows are gone from the app entirely; what's left of the kit is the option strip and
   the width and height a grip can set.
 - **Delay, Average and DC Filter are pills now.** Each one was a label, a slider rail and a
   value box per setting, with a "Channels" row across the body on top: 252 points of module to
   hold one or two numbers, of which most was the words beside them. The settings are pills you
   drag across or double-click to type into, each with its word written above it - Window, Spikes,
-  Decay - rather than three letters inside it (`win`, `spk`, `dec`), the group centred on the
-  module both ways, and a channel - always an In and its matching Out - is added from the
-  header's `− +` the way the variadic operations add a pin. Delay and Average sit at 140 by 112;
-  DC Filter at 168 by 112, because "DC Filter" spelled out in its header - it keeps its name -
-  is the widest thing in it, and at a 28-point step the room after 140 is a whole block up.
+  Decay - rather than three letters inside it (`win`, `spk`, `dec`), and a channel - always an In
+  and its matching Out - is added from the header's `− +` the way the variadic operations add a
+  pin. The group is centred in the space under the header: the box it sits in carries a two-row
+  floor so one setting doesn't make a module shallower than its neighbours, and centring the
+  floor rather than the controls left Delay's single pill against the header with all the room
+  below it. Delay is 112 by 112; Average and DC Filter 140 by 112.
+- **A module's name no longer decides how wide it is.** The name in a header was laid out in the
+  row like a control, so it added its own width to the module: "DC Filter" needed a 168-point
+  module for two numbers where the same module called "Average" managed with 140, and at a
+  28-point step three letters cost a whole block. It's painted where the fold chevron leaves off
+  now, the room the control at the right edge needs comes off what it has to fit in, and it is
+  still left out rather than cropped when it doesn't fit - the module keeps its identity in its
+  shape and its hover text, and widening the frame brings the name back. Delay came down to 112
+  by 112 with it. An empty Readout was being held at two blocks by the word "Readout" the same
+  way, so it asks for that size by name, as a knob's dial does, and its floor is still whatever
+  its number needs.
 - **The Dropdown menu is a column of its options under its reading.** It sized itself from a
   `box_width` parameter the user could dial up to 600 points, wrapped its reading in a resize
   frame, led every row with its own `×`, and drew its handle as a monospace `≡` that nothing
   else in the app uses. One constant column centred on the module decides its width now: the
   current option as the reading on top, then a row per option - handle, the option's text cut at
   the column's edge with the whole of it on hover, the `×` at the right edge - and the `+` that
-  adds one in that same column, so the two columns of buttons line up down the module. 196 by
+  adds one at the right of the header with the other lists' controls, where it can't be read as
+  one more option. 196 by
   140. A patch that had set `box_width` keeps the parameter, which no longer moves anything, and
   a dropdown pinned into a sub-patch layout still fills its container. Dragging a handle two
   rows used to bounce the option back where it started, because the second step was counted from

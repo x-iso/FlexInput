@@ -112,6 +112,12 @@ router and lanes), both marked `FLEXINPUT PATCH`.
    setting overrides it) is **greyed** with `add_enabled_ui`, and its label says
    why when there's room: `Factor (wired)`.
 10. **Explanations go in hover text**, not on the canvas.
+11. A control an input pin moves **additively** - a Dropdown menu's `shift`, where
+    the pin adds to what the module was set to instead of replacing it - shows the
+    **effective** value: the option coming out of the module rather than the stored
+    base, and picking an entry moves the base so the entry picked is the one that
+    lands. Greying it out (rule 9) would be wrong: the pin and the module are both
+    doing work.
 
 ## Width and height
 
@@ -543,6 +549,16 @@ The pin labels are usually the widest thing in a small module — "increased", "
   (`increase`, `deflection`) carry no information the user is scanning for, so those do shorten.
 - A module whose body says what comes out may hide its output labels entirely
   (`kit::pin_hides_outputs` — Knob today). The socket stays; the label doesn't.
+- **A name that is shown is painted, never laid out.** A header label added to the row contributes
+  its width to the row, and the row is one of the things the node's width is measured against:
+  "DC Filter" was needing a 168-point module where the same module called "Average" managed with
+  140. So the name is drawn where the fold chevron leaves off, `title_fits` (which knows the room
+  the control at the right edge needs) decides whether it's drawn at all, and a module that wants
+  a size it no longer gets from its word asks for it by name - an empty Readout starts at two
+  blocks because it says so, not because "Readout" is long.
+- **A list's `+` lives in the header**, at the right edge, the same square as the `− n +` and the
+  other header controls: at the end of the list it reads as one more entry, and it puts a button
+  where the rows' remove buttons line up.
 - The header does the same job with names: `kit::MARKS` gives a module a symbol in place of
   its name (`Δ` for Has Changed, `∠` for Vec to Deflection, `S/H` for Sample and Hold), and
   the name moves to the hover text.
