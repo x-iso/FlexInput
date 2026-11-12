@@ -358,6 +358,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let channel_count = snarl
             .get_node(node)
             .and_then(|n| kit::channel_range(&n.module_id).map(|range| (n.inputs.len(), range)));
+        // The Dropdown's options are a list it edits in its body. The `+` that adds one sits
+        // in the header with the other list controls: at the end of the list it read as one
+        // more option, and it made the list's last row a button rather than a port.
+        let option_add = snarl.get_node(node).map_or(false, |n| n.module_id == "module.dropdown");
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -460,11 +464,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let reserved = if is_knob && !knob_collapsed {
                         // The Uni/Bi switch that will sit at the header's right edge.
                         crate::canvas::viewer::kit_bodies::KNOB_TOGGLE.x + ui.spacing().item_spacing.x
-                    } else if channel_count.is_some() {
-                        // The `− n +` that will sit at the header's right edge. It is also
-                        // reserved in the flow after the name, but the name is painted rather
-                        // than laid out, so this is where its room comes off the name instead.
-                        kit::stepper_w(ui) + ui.spacing().item_spacing.x
+                    } else if channel_count.is_some() || option_add {
+                        // The `− n +` or the `+` that will sit at the header's right edge. It
+                        // is also reserved in the flow after the name, but the name is painted
+                        // rather than laid out, so this is where its room comes off the name.
+                        (if channel_count.is_some() { kit::stepper_w(ui) } else { kit::stepper_h(ui) })
+                            + ui.spacing().item_spacing.x
                     } else {
                         0.0
                     };
@@ -605,6 +610,30 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     if kit::header_plus_button(ui, &format!("Add a {noun}"), row, right) {
                         add_port(node, &port_module, snarl);
                     }
+                }
+
+                if option_add {
+                    let h = kit::stepper_h(ui);
+                    let (row, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                    let right = ui.max_rect().right();
+                    if kit::header_plus_button(ui, "Add an option", row, right) {
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            let mut opts: Vec<Value> = n
+                                .params
+                                .get("options")
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
+                            let next = opts.len() + 1;
+                            opts.push(Value::String(format!("Option {next}")));
+                            n.params.insert("options".into(), Value::Array(opts));
+                        }
+                    }
+                    simple_bodies::trace_rect(
+                        ui,
+                        node,
+                        "header_add",
+                        egui::Rect::from_min_max(egui::pos2(right - h, row.top()), egui::pos2(right, row.bottom())),
+                    );
                 }
 
                 if is_subpatch {

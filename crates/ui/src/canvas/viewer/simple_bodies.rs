@@ -702,8 +702,9 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
     // The list column, and the reading above it, at constants - not a `box_width` param the
     // user could dial to 600 and not the frame the module was handed. A row is a handle, the
     // option's text cut at the column's edge with the whole of it on hover, and the `×` at the
-    // right where every other list puts its remove button; the `+` that adds an option sits in
-    // that same column, at the end of the list.
+    // right where every other list puts its remove button. The `+` that adds an option is in
+    // the header, with the other lists' controls, rather than at the end of the list where it
+    // read as one more option.
     // 120 rather than the 140 the old `box_width` default gave it: an option's name is cut at
     // the column's edge and reads whole on hover and in the popup, so the column is sized to
     // the module's two blocks, not to the longest name someone might type.
@@ -713,8 +714,8 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
     const BTN_W: f32 = 24.0;
     const READ_W: f32 = LIST_W;
     let name_w = (LIST_W - HANDLE_W - BTN_W - 2.0 * ROW).max(40.0);
-    // The reading, one row per option, and the `+` row.
-    let rows = options.len() + 2;
+    // The reading, and one row per option.
+    let rows = options.len() + 1;
     let list_h = rows as f32 * PILL_H + (rows as f32 - 1.0) * ROW;
 
     // Reserved once, so none of the text in it can reach back into the frame's width.
@@ -730,7 +731,32 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         egui::Rect::from_min_size(egui::pos2(cx - LIST_W * 0.5, row_top(row)), egui::vec2(LIST_W, PILL_H))
     };
 
-    // ── The reading (pinnable): what the module is outputting right now ──
+    // The `shift` pin, if anyone wired it: what it says is *added* to the option chosen here
+    // rather than replacing it, so the module keeps being the starting point and a dial or a
+    // comparator walks the list from there. Wrapped both ways, exactly as the engine does it, so
+    // what the module shows is the option that is actually coming out of it.
+    let n_opts = options.len();
+    let shift = snarl
+        .get_node(node_id)
+        .and_then(|nd| nd.extra.last_signals.first().copied().flatten())
+        .map(|s| match s {
+            flexinput_core::Signal::Float(v) => v.round() as i64,
+            flexinput_core::Signal::Int(v) => v as i64,
+            flexinput_core::Signal::Bool(b) => i64::from(b),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let wrap = |i: i64| -> usize {
+        if n_opts == 0 {
+            0
+        } else {
+            let m = n_opts as i64;
+            (((i % m) + m) % m) as usize
+        }
+    };
+    let effective = if shift == 0 { selected } else { wrap(selected as i64 + shift) };
+
+    // ── The reading (pinnable): the option coming out of the module, shift included ──
     let reading = row_rect(0);
     {
         let mut child = ui.new_child(
@@ -739,15 +765,25 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                 .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight))
                 .id_salt(("dropdown_combo", node_id)),
         );
-        let current = options.get(selected).cloned().unwrap_or_default();
+        let current = options.get(effective).cloned().unwrap_or_default();
+        // The whole list when there's room for it: egui caps a menu at `combo_height`, about
+        // four rows, so a menu of eight made you scroll in the middle of an empty canvas.
+        let want = (n_opts as f32 * (child.spacing().interact_size.y + 4.0) + 12.0)
+            .max(80.0)
+            .min((ui.ctx().content_rect().bottom() - reading.bottom() - 16.0).max(80.0));
         egui::ComboBox::from_id_salt(("dropdown_combo_sel", node_id.0))
             .selected_text(if current.is_empty() { "—".to_string() } else { current })
             .width(READ_W)
+            .height(want)
             .show_ui(&mut child, |ui| {
                 for (i, opt) in options.iter().enumerate() {
                     let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
-                    if ui.selectable_label(i == selected, label).clicked() {
-                        new_selected = i;
+                    if ui.selectable_label(i == effective, label).clicked() {
+                        // The base is what this module stores, so choosing an option while a
+                        // shift pin is holding it somewhere else means choosing where that
+                        // addition should land: the option you clicked is the one that comes
+                        // out, and the menu doesn't fight the pin.
+                        new_selected = wrap(i as i64 - shift);
                         selected_changed = true;
                     }
                 }
@@ -778,6 +814,15 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                 .id_salt(("dropdown_row", node_id, i)),
         );
         child.spacing_mut().item_spacing.x = 0.0;
+        if i == effective {
+            // The option coming out of the module, which with a shift pin wired is not
+            // necessarily the one this module was set to. The row takes the same fill a
+            // selected strip or a chosen option wears, so the list shows the answer rather
+            // than the setting.
+            let fill = ui.visuals().selection.bg_fill;
+            child.painter().rect_filled(row, 4.0, fill);
+            trace_rect(ui, node_id, "dropdown_effective", row);
+        }
         // Drag handle: the same grab the port strips and the Auto-Map lists give. Dragging
         // past half a row moves the option, and the selection follows the option, not the slot.
         let handle = child.add_sized(
@@ -843,9 +888,10 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                 edit_state.buf = options[i].clone();
                 edit_state.request_focus = true;
             }
-            // Single click (no Alt) → select this entry.
+            // Single click (no Alt) → choose this entry, undoing the shift pin's step so the
+            // option clicked is the option that comes out.
             if label.clicked() && !alt && !label.double_clicked() {
-                new_selected = i;
+                new_selected = wrap(i as i64 - shift);
                 selected_changed = true;
             }
             // Right-click context menu.
@@ -893,23 +939,6 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
         if row_move != 0 { to_move = Some((row_from, row_move)); }
     }
 
-    // The `+` that adds an option, in the same column as the `×`es, at the end of the list.
-    {
-        let add = row_rect(options.len() + 1);
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(add)
-                .layout(egui::Layout::right_to_left(egui::Align::Center))
-                .id_salt(("dropdown_add", node_id)),
-        );
-        if child.small_button("+").clicked() {
-            let next_n = options.len() + 1;
-            options.push(format!("Option {next_n}"));
-            options_changed = true;
-        }
-        drop(child);
-        trace_rect(ui, node_id, "dropdown_add", add);
-    }
 
     // ── Apply mutations ─────────────────────────────────────────────────
     if let Some((i, dir)) = to_move {

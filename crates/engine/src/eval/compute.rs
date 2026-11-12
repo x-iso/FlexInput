@@ -305,7 +305,29 @@ pub(crate) fn compute_node(
             if n == 0 {
                 vec![Some(Signal::Float(0.0)), Some(Signal::Int(0))]
             } else {
-                let idx = idx.min(n - 1);
+                let base = idx.min(n - 1);
+                // The optional `shift` pin adds to the selection rather than replacing it, so
+                // the option chosen on the module stays the starting point and a dial or a
+                // stepping input walks the list from there. It wraps in both directions:
+                // stepping off the end of a menu comes back at the other end, which is what a
+                // rotary control does and what a `0..1`-scaled selector downstream expects to
+                // keep receiving once it wraps.
+                let shift = inputs
+                    .first()
+                    .and_then(|s| *s)
+                    .map(|s| match s {
+                        Signal::Float(v) => v.round() as i64,
+                        Signal::Int(v) => v as i64,
+                        Signal::Bool(b) => i64::from(b),
+                        _ => 0,
+                    })
+                    .unwrap_or(0);
+                let idx = (if shift == 0 {
+                    base as i64
+                } else {
+                    let m = n as i64;
+                    (((base as i64 + shift) % m) + m) % m
+                }) as usize;
                 // Centre-of-bucket quantisation: matches the inverse mapping
                 // used by `Selector`/`Split` ((sel*N).floor()), so wiring the
                 // float output into a Selector with N inputs selects bucket

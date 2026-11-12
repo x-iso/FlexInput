@@ -199,7 +199,12 @@ impl Module for DropdownModule {
             id: "module.dropdown",
             display_name: "Dropdown",
             category: "Utility",
-            inputs: vec![],
+            inputs: vec![
+                // Optional: what the pin says is added to the option picked on the module, so
+                // an encoder, a stepping switch or a comparator walks the menu without anyone
+                // clicking it. Unwired, the module is the whole control.
+                PinDescriptor::new("shift", SignalType::Float).optional(),
+            ],
             outputs: vec![
                 PinDescriptor::new("value", SignalType::Float),
                 PinDescriptor::new("index", SignalType::Int),

@@ -4292,6 +4292,55 @@ mod trigger_tests {
         let v = pad_value(&out, FB_DS, "hd_l_amp");
         assert!((v - 0.4).abs() < 0.01, "gate: audio 0.5 × game 0.8, got {v}");
     }
+    #[test]
+    fn a_dropdown_shift_adds_to_the_option_and_wraps() {
+        // The option is chosen on the module; the optional `shift` pin adds to it, so a dial or
+        // a stepping input walks the menu from wherever it was left rather than replacing it.
+        // Negative steps come back round the other end.
+        let run = |wired: bool, value: f64| -> (f32, i32) {
+            let mut src = empty_node(1, "module.constant");
+            src.n_outputs = 1;
+            src.params.insert("value".into(), Value::from(value));
+            let mut dd = empty_node(2, "module.dropdown");
+            dd.n_outputs = 2;
+            dd.params.insert(
+                "options".into(),
+                Value::Array(
+                    ["a", "b", "c", "d"]
+                        .into_iter()
+                        .map(|s| Value::String(s.to_string()))
+                        .collect(),
+                ),
+            );
+            dd.params.insert("selected_index".into(), Value::from(1_u64));
+            dd.input_sources = if wired { vec![Some((0, 0))] } else { vec![] };
+            let graph = ProcessingGraph { nodes: vec![src, dd], ..Default::default() };
+            let no_signals: HashMap<(String, String), Signal> = HashMap::new();
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &no_signals, 0.016, &mut out);
+            let f = match out.outputs.get(&(2, 0)).copied().flatten() {
+                Some(Signal::Float(v)) => v,
+                other => panic!("the value output should be a float, got {other:?}"),
+            };
+            let i = match out.outputs.get(&(2, 1)).copied().flatten() {
+                Some(Signal::Int(v)) => v,
+                other => panic!("the index output should be an int, got {other:?}"),
+            };
+            (f, i)
+        };
+        // Four options, the second one ("b") chosen on the module.
+        assert_eq!(run(false, 9.0).1, 1, "unwired, the module is the whole control");
+        assert_eq!(run(true, 0.0).1, 1, "a shift of nothing changes nothing");
+        assert_eq!(run(true, 0.4).1, 1, "most of a step isn't a step");
+        assert_eq!(run(true, 1.0).1, 2, "one step moves to the next option");
+        assert_eq!(run(true, 3.0).1, 0, "stepping off the end comes back at the start");
+        assert_eq!(run(true, -2.0).1, 3, "and stepping off the start comes back at the end");
+        // The float output is the same choice, in the bucket form a Selector downstream reads.
+        let (f, i) = run(true, -2.0);
+        assert_eq!(i, 3);
+        assert!((f - (3.0 + 0.5) / 4.0).abs() < 1e-6, "the value output tracks the index: {f}");
+    }
+
 }
 
 #[cfg(test)]
@@ -9082,4 +9131,5 @@ mod bound_flick_tests {
         assert!(!is_bus_out_pin(FLICK));
         assert!(is_bus_out_pin("mouse_left"), "and a plain pin is untouched");
     }
+
 }

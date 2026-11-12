@@ -1896,31 +1896,36 @@ fn the_dropdown_is_a_column_of_its_options_under_its_reading() {
             );
         }
     }
-    let add = rig.traced_rect(node, "dropdown_add").unwrap_or(egui::Rect::NOTHING);
+    // The `+` that adds an option lives in the header, like the other lists' controls, not at
+    // the end of the list where it read as one more option.
+    let add = rig.traced_rect(node, "header_add").unwrap_or(egui::Rect::NOTHING);
     assert!(
-        add.is_positive() && f.contains_rect(add.expand(1.0)) && add.top() > rows[2].bottom(),
-        "module.dropdown: the `+` row {add:?} isn't at the end of the list inside {f:?}",
+        add.is_positive()
+            && f.contains_rect(add.expand(1.0))
+            && add.top() < f.top() + 2.0 * B
+            && add.right() > f.right() - B,
+        "module.dropdown: the header `+` {add:?} isn't at the top right of {f:?}",
     );
     assert!(
-        (add.width() - rows[0].width()).abs() < 0.5,
-        "module.dropdown: the `+` row {add:?} isn't the list's width {:?}",
-        rows[0],
+        rig.traced_rect(node, "dropdown_add").is_none(),
+        "module.dropdown: the list still ends in its own `+` button",
     );
     // Drag the first option's handle down two rows.
     let handle = egui::pos2(rows[0].left() + 6.0, rows[0].center().y);
     let two = 2.0 * (rows[1].top() - rows[0].top());
     rig.drag(handle, egui::vec2(0.0, two));
     rig.idle(6);
-    let opts: Vec<String> = rig
-        .canvas
-        .snarl
-        .get_node(node)
-        .and_then(|n| n.params.get("options").and_then(|v| v.as_array().cloned()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|v| v.as_str().unwrap_or("").to_string())
-        .collect();
-    assert_eq!(opts, ["Beta", "Gamma", "Alpha"], "module.dropdown: the handle didn't move the option");
+    let opts = |r: &Rig| -> Vec<String> {
+        r.canvas
+            .snarl
+            .get_node(node)
+            .and_then(|n| n.params.get("options").and_then(|v| v.as_array().cloned()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    assert_eq!(opts(&rig), ["Beta", "Gamma", "Alpha"], "module.dropdown: the handle didn't move the option");
     let sel = rig
         .canvas
         .snarl
@@ -1928,6 +1933,67 @@ fn the_dropdown_is_a_column_of_its_options_under_its_reading() {
         .and_then(|n| n.params.get("selected_index").and_then(|v| v.as_u64()))
         .unwrap_or(0);
     assert_eq!(sel, 2, "module.dropdown: the selection stayed on the slot instead of the option");
+    // And the header's `+` adds an option.
+    rig.click(egui::pos2(add.center().x, add.center().y));
+    rig.idle(4);
+    assert_eq!(opts(&rig).len(), 4, "module.dropdown: the header `+` didn't add an option");
+}
+
+#[test]
+fn a_dropdown_shift_pin_moves_the_option_it_shows() {
+    // The menu module takes an optional input that adds to the option chosen on it, so a dial
+    // or a comparator can walk the list without anyone clicking it. The module shows the option
+    // that is actually coming out rather than the one it was left set to, and picking an option
+    // while the pin holds it somewhere else moves the base, so the option clicked is the one
+    // that lands.
+    let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(
+            "options".into(),
+            serde_json::Value::Array(
+                ["Alpha", "Beta", "Gamma"]
+                    .into_iter()
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+        n.params.insert("selected_index".into(), serde_json::Value::from(0_u64));
+    }
+    rig.idle(8);
+    let rows: Vec<egui::Rect> = (0..3)
+        .map(|i| rig.traced_rect(node, &format!("dropdown_row_{i}")).unwrap_or(egui::Rect::NOTHING))
+        .collect();
+    // With nothing wired, the option chosen on the module is the one marked as coming out.
+    let lit0 = rig.traced_rect(node, "dropdown_effective").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        lit0.is_positive() && (lit0.top() - rows[0].top()).abs() < 0.5,
+        "module.dropdown: with nothing wired it should mark the option it was set to: {lit0:?}",
+    );
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.extra.last_signals = vec![Some(flexinput_core::Signal::Float(1.0))];
+    }
+    rig.idle(4);
+    let lit = rig.traced_rect(node, "dropdown_effective").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        lit.is_positive()
+            && (lit.left() - rows[1].left()).abs() < 0.5
+            && (lit.top() - rows[1].top()).abs() < 0.5
+            && (lit.width() - rows[1].width()).abs() < 0.5,
+        "module.dropdown: +1 on the shift pin should mark option 2: {lit:?} vs {:?}",
+        rows[1],
+    );
+    // Clicking the first option while the pin is at +1 stores the base a step before it, so the
+    // option clicked is the option that comes out.
+    rig.click(egui::pos2(rows[0].center().x, rows[0].center().y));
+    rig.idle(4);
+    let sel = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .and_then(|n| n.params.get("selected_index").and_then(|v| v.as_u64()))
+        .unwrap_or(9);
+    assert_eq!(sel, 2, "module.dropdown: clicking an option ignored the shift pin");
 }
 
 #[test]
