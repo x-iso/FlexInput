@@ -193,6 +193,23 @@ All notable changes to FlexInput are documented here. This project adheres to
   by 112 with it. An empty Readout was being held at two blocks by the word "Readout" the same
   way, so it asks for that size by name, as a knob's dial does, and its floor is still whatever
   its number needs.
+- **The Oscillator is a shape, a wave and two numbers.** It was three rows of small controls -
+  four shape buttons, a unit toggle and a DragValue, a "Phase" label with a DragValue and a
+  Bi/Uni pair split by a separator - and then a waveform stretched across whatever width that
+  left: 224 points of module for a shape and two numbers, most of it words and separators. The
+  shape is one strip of four cells, the wave a painted band between the shape and the numbers
+  (painting it costs no width), and the frequency and the phase are pills you drag across or
+  double-click to type into, each with the toggle that says how to read it beside it - hertz or
+  the period in milliseconds, -1..1 or 0..1. A pill whose pin is wired takes no drags: the wire's
+  value is what the module shows. 196 by 140.
+- **A Macro Output lists its ports like every other list.** Each port row used to measure itself
+  out as an icon button, a 96-point name field, a 58-point dropdown spelling out Bool / Float /
+  Vec2 / Any, a `✕`, and a button named "+ Add output" underneath: 308 points of module to name a
+  pin. It's handle, icon, name, the type as one letter with the names in the popup, and the `×` at
+  the right edge - in a column of a constant width centred on the module - with the `+` at the
+  right of the header beside the other lists'. Dragging a port past half a row moves it, and its
+  wires and its entry in `output_pin_ids` move with it, because the row order is the node's pin
+  order. 224 by 84.
 - **The Dropdown menu is a column of its options under its reading.** It sized itself from a
   `box_width` parameter the user could dial up to 600 points, wrapped its reading in a resize
   frame, led every row with its own `×`, and drew its handle as a monospace `≡` that nothing
