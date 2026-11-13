@@ -247,6 +247,22 @@ impl Rig {
             _ => None,
         })
     }
+    /// Every painted word starting with this text, in the graph's own coordinates: what a list
+    /// actually drew per row, rather than what it says it drew.
+    fn painted_all(&self, starts_with: &str) -> Vec<(String, egui::Rect)> {
+        let back = self.to_global.inverse();
+        self.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let says: &str = &t.galley.text()[..];
+                    (says.starts_with(starts_with))
+                        .then(|| (says.to_string(), back * t.galley.rect.translate(t.pos.to_vec2())))
+                }
+                _ => None,
+            })
+            .collect()
+    }
     fn inputs(&self, node: NodeId) -> usize {
         self.canvas.snarl.get_node(node).map_or(0, |n| n.inputs.len())
     }
@@ -3542,6 +3558,47 @@ fn the_envelope_rows_spend_their_width_on_controls_not_planks() {
 }
 
 #[test]
+#[ignore]
+fn a_long_macro_list_keeps_every_rows_controls() {
+    // Not fixed: `docs/LAYOUT_FAULTS.md` holds the measurements and what was tried. A Macro with
+    // more ports than the node's own rect can hold loses every row that falls in the grid's
+    // rounding of the frame: the rows are laid out and take a trace, but egui clips them away, so
+    // their icon, their signal type and their `×` neither paint nor answer a click - while the
+    // handle and the name, painted by the body rather than by widgets, are still seen. Eight
+    // ports is where it starts at the module's default width.
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    {
+        use flexinput_core::macros as mac;
+        let ports: Vec<mac::MacroPortDef> = (0..9)
+            .map(|i| mac::MacroPortDef {
+                id: format!("{:08x}", 0xbb00_0000u32 + i as u32),
+                name: format!("P{i}"),
+                icon: String::new(),
+                icon_svg: String::new(),
+                signal_type: flexinput_core::SignalType::Bool,
+            })
+            .collect();
+        if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+            nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+            nd.outputs = ports
+                .iter()
+                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                .collect();
+        }
+    }
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    let crosses = rig.painted_all("×");
+    assert_eq!(crosses.len(), 9, "a nine-port Macro drew {} `×`s: {crosses:?}", crosses.len());
+    let lefts: Vec<f32> = crosses.iter().map(|(_, r)| r.left() - f.left()).collect();
+    let spread = lefts.iter().fold(0.0f32, |m, x| m.max((x - lefts[0]).abs()));
+    assert!(spread < 1.0, "the column of `×`s is a column only by accident: {lefts:?}");
+    let types = rig.painted_all("Bool");
+    assert_eq!(types.len(), 9, "a nine-port Macro drew {} type words: {types:?}", types.len());
+}
+
+#[test]
 fn a_folded_module_keeps_its_frame_and_paints_nothing_over_its_name() {
     // Snarl runs the body of a collapsed node and shifts it up under the header's clip. The
     // bodies that draw rows paid for that: a folded Macro put its port - icon, name, type, `×` -
@@ -3716,7 +3773,7 @@ fn audit_the_macro_and_generator_bodies() {
         for (text, l, r) in clips {
             println!("  OUTSIDE FRAME: \"{text}\" at {l:.1}..{r:.1} against {:.1}..{:.1}", f.left(), f.right());
         }
-        for what in ["body_column", "env_curve", "env_sustain", "env_time", "env_mode", "env_grid", "strip_0", "strip_1", "strip_2", "osc_shape", "osc_preview", "osc_freq_pill", "osc_unit", "osc_phase_pill", "osc_bipolar", "macro_row_0", "macro_row_1"] {
+        for what in ["body_column", "env_curve", "env_sustain", "env_time", "env_mode", "env_grid", "strip_0", "strip_1", "strip_2", "strip_8", "osc_shape", "osc_preview", "osc_freq_pill", "osc_unit", "osc_phase_pill", "osc_bipolar", "macro_row_0", "macro_row_1", "macro_row_8", "macro_type_0", "macro_type_8", "macro_remove_0", "macro_remove_8", "macro_name_8", "macro_icon_8"] {
             if let Some(r) = rig.traced_rect(node, what) {
                 println!(
                     "  trace {what:<16} x {:.1}..{:.1} (frame {:.1}..{:.1})  y {:.1}..{:.1}",
@@ -3861,6 +3918,38 @@ fn audit_the_macro_and_generator_bodies() {
         audit(&rig, node, &format!("{id}, open"), false);
         rig.canvas.snarl.open_node(node, false);
         rig.idle(6);
-        audit(&rig, node, &format!("{id}, folded"), true);
+        audit(&rig, node, &format!("{id}, folded"), false);
     }
+}
+
+#[test]
+#[ignore]
+fn audit_which_folded_bodies_paint_over_their_header() {
+    // A census, like the sizing one: which bodies still lay themselves out above a collapsed
+    // node's frame, where the clip hides them and the pointer does not. `simple_bodies::node_open`
+    // is the guard; this says which bodies still don't have it.
+    let mut worst: Vec<(String, usize, f32, f32, String)> = Vec::new();
+    let mut total = 0usize;
+    for r in flexinput_modules::all_modules() {
+        let desc = r.descriptor;
+        total += 1;
+        let (mut rig, ids) = Rig::build(desc, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        rig.idle(8);
+        rig.canvas.snarl.open_node(node, false);
+        rig.idle(8);
+        let f = rig.frame_rect(node);
+        let strays = rig.painted_above(f);
+        if !strays.is_empty() {
+            let id = rig.canvas.snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
+            let says: Vec<String> = strays.iter().take(4).map(|(s, _)| s.clone()).collect();
+            worst.push((id, strays.len(), f.width(), f.height(), says.join(" | ")));
+        }
+    }
+    worst.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("{:<32} {:>6} {:>9}  words above the frame", "module", "words", "folded to");
+    for w in &worst {
+        println!("{:<32} {:>6} {:>4.0}x{:<4.0}  {}", w.0, w.1, w.2, w.3, w.4);
+    }
+    println!("{} of {} modules still paint over their own header when folded", worst.len(), total);
 }
