@@ -693,7 +693,13 @@ pub(crate) fn dropdown_set_edit_state(ctx: &egui::Context, node_id: NodeId, st: 
     ));
 }
 
-pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, view_salt: u64) {
+pub(crate) fn show_dropdown_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    view_salt: u64,
+) {
     // Snapshot params up-front.
     let mut options = snarl.get_node(node_id).map(dropdown_read_options).unwrap_or_default();
     let selected = snarl.get_node(node_id).map(|n| dropdown_read_selected(n, options.len())).unwrap_or(0);
@@ -749,6 +755,10 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
     // comparator walks the list from there. Wrapped both ways, exactly as the engine does it, so
     // what the module shows is the option that is actually coming out of it.
     let n_opts = options.len();
+    // Wired or not matters to the marks below: with nothing on the pin, the
+    // option this module was set to is the option that comes out, and there is nothing extra
+    // to say about it.
+    let shift_wired = inputs.first().is_some_and(|p| !p.remotes.is_empty());
     let shift = snarl
         .get_node(node_id)
         .and_then(|nd| nd.extra.last_signals.first().copied().flatten())
@@ -856,13 +866,25 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
                 .id_salt(("dropdown_row", node_id, i)),
         );
         child.spacing_mut().item_spacing.x = 0.0;
+        // Two marks that mean different things. The option this module was set to wears
+        // the fill a chosen strip cell wears. The option actually coming out of the module -
+        // with a `shift` pin wired, not necessarily that one - is outlined in green, the colour
+        // the pin's label wears; an outline rather than a fill so both can be read at once when
+        // the pin is holding the list at its starting point. With no pin wired there is nothing
+        // to outline.
+        if i == selected {
+            let fill = ui.visuals().selection.bg_fill;
+            child.painter().rect_filled(row, 4.0, fill);
+        }
         if i == effective {
-            // The option coming out of the module, which with a shift pin wired is not
-            // necessarily the one this module was set to. It wears the same green as the shift
-            // inlet, because what is marked is the module's choice rather than something the
-            // pointer left behind - the blue a selected strip wears would read as the cursor's.
-            let bg = ui.visuals().widgets.inactive.bg_fill;
-            child.painter().rect_filled(row, 4.0, egui::ecolor::tint_color_towards(bg, super::pins::CHOICE_GREEN));
+            if shift_wired {
+                child.painter().rect_stroke(
+                    row,
+                    4.0_f32,
+                    egui::Stroke::new(1.5_f32, super::pins::CHOICE_GREEN),
+                    egui::StrokeKind::Inside,
+                );
+            }
             trace_rect(ui, node_id, "dropdown_effective", row);
         }
         // The dots say that a row can be picked up. They are a grab in their own right, and
@@ -911,11 +933,7 @@ pub(crate) fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut
             };
             let label = child.add_sized(
                 [name_w, PILL_H],
-                egui::Label::new(egui::RichText::new(label_text).small().color(if i == effective {
-                    super::pins::CHOICE_GREEN
-                } else {
-                    ui.visuals().text_color()
-                }))
+                egui::Label::new(egui::RichText::new(label_text).small())
                 .truncate()
                 .sense(egui::Sense::click_and_drag()),
             );

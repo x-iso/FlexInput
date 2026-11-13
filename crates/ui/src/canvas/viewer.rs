@@ -1445,6 +1445,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     InletDrive::Idle    => None,
                 }
             });
+            // A Dropdown menu's shift label is green while a wire drives it: that pin is the
+            // one deciding which option comes out. The colour belongs on the word, not on the
+            // socket - the socket's colour is the signal type's, and green there would read as
+            // a Vec2 arriving where a float does.
+            let col = if node.module_id == "module.dropdown"
+                && name == "shift"
+                && !pin.remotes.is_empty()
+            {
+                Some(pins::CHOICE_GREEN)
+            } else {
+                col
+            };
             if let Some(p) = pitch {
                 pin_label_at_row(ui, &shown, col, p, shortened, name);
             } else {
@@ -1496,16 +1508,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // utility modules (Splitter / Collector / Fork / Selector / Combiner
         // / Remapper / Inlet) get the same visual language as device chips.
         let half = Some(HalfSide::Right);
-        let mut info = pin_info(desc.signal_type);
-        // A Dropdown menu's shift inlet is green rather than Float-blue, because what it's for
-        // is not carrying a number: it picks which of the menu's options comes out, and the
-        // option it picks is painted the same green in the body.
-        if node.module_id == "module.dropdown" && pin.id.input == 0 {
-            info.fill = Some(pins::CHOICE_GREEN);
-            info.stroke = Some(egui::Stroke::new(info.stroke.map_or(1.0, |s| s.width), pins::CHOICE_GREEN));
-            info.wire_color = Some(pins::CHOICE_GREEN);
-        }
-        MaybeHeaderPin { inner: info, glow, half, header_y }
+        MaybeHeaderPin { inner: pin_info(desc.signal_type), glow, half, header_y }
     }
 
     fn show_output(
@@ -1843,7 +1846,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, self.view_salt),
             "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
             "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
-            "module.dropdown" => show_dropdown_body(node_id, ui, snarl, self.view_salt),
+            "module.dropdown" => show_dropdown_body(node_id, inputs, ui, snarl, self.view_salt),
             "module.macro"    => show_macro_body(node_id, outputs, ui, snarl, self.view_salt),
             "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
