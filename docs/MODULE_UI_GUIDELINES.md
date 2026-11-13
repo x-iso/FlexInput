@@ -142,6 +142,10 @@ creep wider, stick, or flicker. It is handed its width instead.
 - The grip itself stops at the header's width and at that narrowest frame.
 - A body that is a fixed grid of cells has **no grip at all** (`kit::fixed_size` - the
 - A row of a stack of settings is **one block of the grid tall**, and the control inside it a
+- A switch whose meaning is a shape gets the shape **painted** (`viewer::glyphs`: a magnet
+  for snapping, a ring for looping), never a Unicode character - the fonts a build happens to
+  carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The word
+  goes in the tooltip, next to the sentence that says what the switch does.
   little shorter than the row. That is what makes the corner grip mean something: every block
   the frame gains goes to the part that is actually being edited, and the rows land on block
   lines at any height. A minimum that is one block short of the next size is a minimum that is
@@ -627,10 +631,16 @@ module and outside the column. Two details that only show up when something else
   whose control *is* its body centres the control in the body column (Switch, Inverse, Logic
   Delay, Has Changed, Constant).
 
-## Port strips: Selector, Split, AutoMap Combiner
+## Port strips: Selector, Split, Macro, AutoMap Combiner
 
 Modules whose ports are a list the user counts out are drawn as a list, in the body:
 
+
+- A module whose body rows **are** its port rows takes `kit::strip_pitch` as its row height
+  rather than a height of its own, and traces its rows as `strip_0..` like the others: the test
+  that a socket sits level with the strip naming it then covers it too. The Macro is one - its
+  rows name the ports in a field that renames them, so the sockets draw no label beside them,
+  and the list runs the body's whole width.
 - One **strip per port**: a drag handle, a `×` that appears only once there are more than
   two to choose between, and the port's name. The name field edits the **pin's own name** —
   what the patch stores — rather than a display string kept beside it, so the strip, the

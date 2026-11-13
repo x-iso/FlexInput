@@ -3179,3 +3179,66 @@ fn a_dragged_macro_port_travels_past_its_neighbour() {
         "the dragged port did not travel the length of the drag: {names:?}",
     );
 }
+
+
+#[test]
+fn the_macro_ports_line_up_with_the_strips_that_name_them() {
+    // The rows were a list of their own, at a pitch of the body's choosing, with the port's
+    // name written twice - once in the row's field, once beside the socket. They are a strip
+    // column now, like a Split's: one row per port at the pitch the pin column allocates, the
+    // row naming the port so the socket needs no label, and the rows running the body's width.
+    let (mut rig, ids) = Rig::real_no_snap("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    {
+        use flexinput_core::macros as mac;
+        let mk = |id: &str, name: &str| mac::MacroPortDef {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: flexinput_core::SignalType::Float,
+        };
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(
+                mac::MACRO_PORTS_PARAM.to_string(),
+                mac::ports_to_value(&[mk("aa11bb22", "Left"), mk("cc33dd44", "Right"), mk("ee55ff66", "Up")]),
+            );
+            n.outputs = vec![
+                PinDescriptor::new("Left", flexinput_core::SignalType::Float),
+                PinDescriptor::new("Right", flexinput_core::SignalType::Float),
+                PinDescriptor::new("Up", flexinput_core::SignalType::Float),
+            ];
+        }
+    }
+    rig.idle(6);
+    let frame = rig.frame_rect(node);
+    let rows = [
+        rig.traced(node, "strip_0"),
+        rig.traced(node, "strip_1"),
+        rig.traced(node, "strip_2"),
+    ];
+    for i in 0..2 {
+        let (a, b) = (rows[i], rows[i + 1]);
+        let pitch = b.top() - a.top();
+        assert!(
+            pitch > 20.0 && pitch < 34.0,
+            "Macro rows {a:?} {b:?} aren't one row apart: {pitch:.1}"
+        );
+        assert!(
+            (a.left() - b.left()).abs() < 0.6 && (a.right() - b.right()).abs() < 0.6,
+            "Macro rows aren't flush: {a:?} {b:?}"
+        );
+    }
+    // The row runs the whole body: the socket hangs off the end of the strip that names the
+    // port, instead of a label beside it holding a column of dead margin open.
+    let column = rig.traced_rect(node, "body_column").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        column.is_positive() && (rows[2].right() - column.right()).abs() < 1.5,
+        "the last Macro row {:?} stops short of the body {column:?}",
+        rows[2],
+    );
+    assert!(
+        frame.width() < 240.0,
+        "a three-port Macro is {frame:?} wide: something besides its rows is holding it out"
+    );
+}

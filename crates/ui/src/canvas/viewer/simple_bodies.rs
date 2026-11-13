@@ -2445,17 +2445,22 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     const TYPE_W: f32 = 46.0;
     const RM_W: f32 = 22.0;
 
-    let row_h = ui.spacing().interact_size.y.max(PILL_H);
+    // The rows sit on the pitch the output pins are allocated, which is what keeps each
+    // socket level with the strip that names it: the pins are laid out before the body is
+    // drawn, so neither side can measure the other. Nothing is added between rows - this
+    // module has no input column, and the output column sets its own row spacing to nothing.
+    let row_h = kit::strip_pitch("module.macro", ports.len(), ui)
+        .unwrap_or_else(|| ui.spacing().interact_size.y.max(PILL_H));
     let list_h = ports.len() as f32 * row_h;
     ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
     let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
         Some(r) => r,
         None => return,
     };
-    // The column runs the width the body has, from its left edge up to where the pins' labels
-    // begin. Centring it on the frame instead - as a module with pins on both sides is centred -
-    // left a strip of dead margin on the left, where this module has no input pins at all, and
-    // pushed the rows out under the output labels on the right.
+    // The column runs the width the body has, from its left edge to the body's right edge: the
+    // strip is what names the port, so the sockets hang off the end of the row it sits level
+    // with. Centring it on the frame instead - as a module with pins on both sides is centred -
+    // left a strip of dead margin on the left, where this module has no input pins at all.
     let column = ui.max_rect();
     trace_rect(ui, node_id, "body_column", column);
     let list_w = column.width().max(120.0);
@@ -2505,9 +2510,6 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         );
         child.spacing_mut().item_spacing.x = 0.0;
         // The handle: dragging a port past half a row moves it, counted from where the port
-        // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
-        // it back. The pins and their wires move with it further down.
-
         // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
         // it back. The pins and their wires move with it further down.
         let handle = child.add_sized(
@@ -2594,6 +2596,9 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         }
         drop(child);
         trace_rect(ui, node_id, &format!("macro_row_{i}"), row);
+        // The same trace name a Split or Selector gives its port rows: a Macro row is one of
+        // these, sitting on its socket's row and naming the port by itself.
+        trace_rect(ui, node_id, &format!("strip_{i}"), row);
     }
 
     // A drag is over when the finger leaves, not when a frame stops reporting the row as

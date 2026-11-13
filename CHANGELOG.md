@@ -445,6 +445,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   pass takes sat in a box that never grew while the `ms | s | Hz` buttons beside it did. It is
   a pill like every other setting now - the rest of its row, dragging and taking typing - and
   the unit buttons went down to the three two-letter words they are. A row's share of a band
+- **The Envelope's behaviour switches are drawn, not written.** A magnet for snapping to the
+  grid, the flat-topped shape the curve makes while it holds, an arrow out and one back for
+  bouncing, a ring with its head at the gap for looping (`viewer/glyphs.rs`, for the response-
+  curve family to borrow too). Unicode characters were not an option: the fonts a build happens
+  to carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The
+  words are in the tooltip, each next to the sentence that says what the switch does.
+- **A Macro's ports are a strip column, like a Split's.** The rows sit on the pitch its
+  sockets are laid out at, so a port's socket is level with the row that names it and adding a
+  port moves the module by one row on both sides. The name beside the socket is gone - it was
+  the same word twice, and it was what held the module wide - and the rows run the body's full
+  width, so three ports take 224 points rather than 252.
 - **A Readout is no longer a big module.** It starts three blocks across by two down rather than
   four by four, and the corner grip takes it down to one block by two - enough for a row of
   readings along a patch, each showing its number as large as the box allows. A long value at

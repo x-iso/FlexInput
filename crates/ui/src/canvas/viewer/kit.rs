@@ -423,7 +423,7 @@ pub(crate) const COMBINER_PAD_V: f32 = 3.0;
 /// The smallest pitch a strip - and the pin row beside it - is drawn at.
 pub(crate) fn strip_min_pitch(module_id: &str, ui: &egui::Ui) -> Option<f32> {
     match module_id {
-        "module.selector" | "module.split" => Some(super::simple_bodies::STRIP_H),
+        "module.selector" | "module.split" | "module.macro" => Some(super::simple_bodies::STRIP_H),
         "module.automap_combiner" => Some(ui.spacing().interact_size.y + 2.0 * COMBINER_PAD_V),
         _ => None,
     }
@@ -436,6 +436,9 @@ pub(crate) fn strip_bands(module_id: &str, inputs: usize, outputs: usize) -> usi
     match module_id {
         "module.selector" | "module.automap_combiner" => inputs,
         "module.split" => outputs.max(inputs),
+        // A Macro's ports are its outputs, one strip each; the body adds no band of its own,
+        // the `+` being in the header.
+        "module.macro" => outputs,
         _ => 0,
     }
 }
@@ -479,6 +482,8 @@ pub(crate) fn strip_pin(module_id: &str, input: bool, index: usize) -> bool {
         ("module.selector", true) => index >= 1,
         ("module.split", false) => true,
         ("module.automap_combiner", true) => true,
+        // The row already carries the port's name in a field that renames it.
+        ("module.macro", false) => true,
         _ => false,
     }
 }
