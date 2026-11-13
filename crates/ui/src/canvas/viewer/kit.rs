@@ -170,6 +170,9 @@ pub(crate) fn pin_abbreviates(module_id: &str) -> bool {
             | "module.delay"
             | "module.average"
             | "module.dc_filter"
+            // Trigger / Time / Out: at three blocks wide the full words are what push the
+            // pin columns apart, and the shorter form is the one used everywhere else.
+            | "generator.envelope"
     )
 }
 
@@ -495,6 +498,31 @@ pub(crate) fn header_plus(module_id: &str) -> Option<&'static str> {
 /// One square at the header's right edge, in a child for the reason [`header_stepper`]
 /// gives: the clicks are taken in the child, the header still reports only what its
 /// contents need. Returns whether it was clicked.
+/// A small word button against a header's right edge, in the same squares as the stepper's
+/// and the `+`'s: filled while the switch it stands for is on. Returns whether it was
+/// clicked. Options that belong to a module's one big control - an Envelope graph's grid, its
+/// labels - go here rather than in a row of the body, where two full-size buttons cost a
+/// quarter of the module's height.
+pub(crate) fn header_toggle(ui: &mut egui::Ui, label: &str, on: bool, rect: egui::Rect, id_salt: impl std::hash::Hash) -> bool {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .id_salt(("header_toggle", id_salt))
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight))
+    );
+    let btn = egui::Button::selectable(on, egui::RichText::new(label).small())
+        .min_size(egui::vec2(rect.width(), rect.height()));
+    child.put(rect, btn).clicked()
+}
+
+/// One of the Envelope's header switches, and what both of them plus the gap between them
+/// take off the header's room for a name.
+pub(crate) const HEADER_TOGGLE_W: f32 = 54.0;
+
+pub(crate) fn header_toggles_w(ui: &egui::Ui) -> f32 {
+    2.0 * HEADER_TOGGLE_W + 6.0 + ui.spacing().item_spacing.x
+}
+
 pub(crate) fn header_plus_button(ui: &mut egui::Ui, hover: &str, row: egui::Rect, right: f32) -> bool {
     let h = stepper_h(ui);
     let mut child = ui.new_child(

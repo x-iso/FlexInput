@@ -275,6 +275,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         };
         let is_device_source = data.module_id == "device.source";
         let is_device_sink   = data.module_id == "device.sink";
+        // The Envelope puts two switches at its header's right edge; both the name's room and
+        // the row below have to know about them.
+        let env_header_switches = data.module_id == "generator.envelope";
         // Index of the AutoMap input pin on a device.sink (always last per
         // crates/virtual/src/layouts.rs, but locate it by type so we don't
         // hard-code the position).
@@ -476,6 +479,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         // rather than laid out, so this is where its room comes off the name.
                         (if channel_count.is_some() { kit::stepper_w(ui) } else { kit::stepper_h(ui) })
                             + ui.spacing().item_spacing.x
+                    } else if env_header_switches {
+                        // The two graph switches that will sit at the header's right edge.
+                        kit::header_toggles_w(ui)
                     } else {
                         0.0
                     };
@@ -664,6 +670,53 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         "header_add",
                         egui::Rect::from_min_max(egui::pos2(right - h, row.top()), egui::pos2(right, row.bottom())),
                     );
+                }
+                // The Envelope's graph switches, in its header: the graph is the module, and a
+                // row of two body-sized buttons under it cost a quarter of the module's height
+                // for two switches about how that graph is drawn.
+                if env_header_switches {
+                    let w = kit::HEADER_TOGGLE_W;
+                    let h = kit::stepper_h(ui);
+                    let (row, _) =
+                        ui.allocate_exact_size(egui::vec2(2.0 * w + 6.0, h), egui::Sense::hover());
+                    let right = ui.max_rect().right();
+                    let labels = egui::Rect::from_min_max(egui::pos2(right - w, row.top()), egui::pos2(right, row.bottom()));
+                    let grid = egui::Rect::from_min_max(
+                        egui::pos2(right - 2.0 * w - 6.0, row.top()),
+                        egui::pos2(right - w - 6.0, row.bottom()),
+                    );
+                    let (mut sg, mut sl) = snarl
+                        .get_node(node)
+                        .map(|n| {
+                            (
+                                n.params
+                                    .get("show_grid")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true),
+                                n.params
+                                    .get("show_grid_labels")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            )
+                        })
+                        .unwrap_or((true, false));
+                    if kit::header_toggle(ui, "grid", sg, grid, ("env_grid", node)) {
+                        sg = !sg;
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("show_grid".into(), Value::Bool(sg));
+                        }
+                    }
+                    if kit::header_toggle(ui, "labels", sl, labels, ("env_labels", node)) {
+                        sl = !sl;
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("show_grid_labels".into(), Value::Bool(sl));
+                        }
+                    }
+                    // The pinned element these switches used to be a row of keeps its id: the
+                    // controls moved; the thing the Properties shelf can pin did not go away.
+                    let both = egui::Rect::from_min_max(grid.min, labels.max);
+                    register_exposable_element(ui, node, "grid_options_row", both);
+                    simple_bodies::trace_rect(ui, node, "env_opts", both);
                 }
 
                 if is_subpatch {
@@ -1764,7 +1817,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // Where an envelope starts is what it drew before it followed its frame:
                     // a curve of about 180 by 150 plus six stacked rows, which is ten blocks
                     // and change. Nothing about the module's use asks for more or less.
-                    "generator.envelope" => Some(11.0 * block.unwrap_or(28.0)),
+                    "generator.envelope" => Some(9.0 * block.unwrap_or(28.0)),
                     _ => None,
                 };
                 let legacy = n

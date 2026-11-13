@@ -792,15 +792,21 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     // follow its frame, and the rows cost height whether the frame had it or not.
     const GAP: f32 = 8.0;
     const SEP_W: f32 = 9.0;
-    const MIN_GRAPH_H: f32 = 60.0;
+    const MIN_GRAPH_H: f32 = 56.0;
     const MIN_GRAPH_W: f32 = 140.0;
     // What each group needs to show its controls without cutting a label - and the band rule
-    // that follows from it: a row that cannot get this inside a shared band takes a band to
+    // that follows from it: a group that cannot get this inside a shared band takes a band to
     // itself, so the module grows taller rather than ending up with a length squeezed into a
     // short box. The first is the three unit words plus the room a seven-digit length needs.
-    let group_min = [176.0f32, 116.0, 116.0, 104.0];
-    let row_h = ui.spacing().interact_size.y;
-    let band_h = row_h + 6.0;
+    // The two graph switches are no longer here: they are in the header.
+    let group_min = [148.0f32, 124.0, 136.0];
+    // A row is exactly one block of the layout grid, and the controls inside it are a little
+    // shorter than the row. That is what makes resizing mean something: every block the grip
+    // gives the module goes to the graph, and the rows land on block lines at any height.
+    let block = crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block);
+    let row_h = block;
+    let band_h = block;
+    let ctrl_h = block - 4.0;
 
     let column_width = body_w.max(MIN_GRAPH_W);
 
@@ -829,7 +835,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
 
     // Rows from the bottom up, so the graph gets what's left: it's the thing being edited, and
     // a frame that runs out of height loses graph, not controls.
-    let rows_h = row_h + bands as f32 * band_h + (bands as f32 + 1.0) * GAP;
+    let rows_h = (bands as f32 + 1.0) * row_h;
     // The body asks for at least the rows plus a graph worth editing, whatever the grip set:
     // narrow frames wrap the groups into more bands, and the module gets taller for them
     // rather than losing the graph.
@@ -840,7 +846,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let graph_bottom = column.bottom() - rows_h;
     let graph_h = (graph_bottom - column.top()).max(MIN_GRAPH_H.min(column.height()));
     let graph = egui::Rect::from_min_size(column.min, egui::vec2(column.width(), graph_h));
-    let sustain_top = graph.bottom() + GAP;
+    let sustain_top = graph.bottom();
     let sustain_row = egui::Rect::from_min_size(egui::pos2(column.left(), sustain_top), egui::vec2(column.width(), row_h));
 
     // ── The graph ──
@@ -871,13 +877,16 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
         let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
             .show_value(false)
             .clamping(egui::SliderClamping::Always);
-        let sr = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(slider_rect)
-                .layout(egui::Layout::left_to_right(egui::Align::Center))
-                .id_salt("env_sustain_slider"),
-        )
-        .add_enabled(sustain_active, slider);
+        let sr = {
+            let mut sc = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(slider_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt("env_sustain_slider"),
+            );
+            sc.spacing_mut().slider_width = slider_w;
+            sc.add_enabled(sustain_active, slider)
+        };
         if sr.changed() {
             if !pts_x.is_empty() {
                 sustain = pts_x.iter().copied()
@@ -909,7 +918,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let visuals = ui.visuals().clone();
     let sep_colour = visuals.widgets.inactive.bg_fill;
     for b in 0..bands {
-        let top = sustain_row.bottom() + GAP + b as f32 * (band_h + GAP);
+        let top = sustain_row.bottom() + b as f32 * band_h;
         let band = egui::Rect::from_min_size(egui::pos2(column.left(), top), egui::vec2(column.width(), band_h));
         let first = b * per_band;
         let last = (first + per_band).min(group_min.len());
@@ -1057,7 +1066,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         let before = *flag;
                         let on = *flag;
                         let resp = child.add_sized(
-                            [cell_w, band_h],
+                            [cell_w, ctrl_h],
                             egui::Button::selectable(on, egui::RichText::new(text).small()),
                         );
                         let clicked = resp.on_hover_text(hover).clicked();
@@ -1086,7 +1095,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         .changed();
                     let before = snap_on;
                     let snap_resp = child.add_sized(
-                        [(cell.width() - 2.0 * 4.0 - 96.0).max(44.0), band_h],
+                        [(cell.width() - 2.0 * 4.0 - 96.0).max(44.0), ctrl_h],
                         egui::Button::selectable(snap_on, egui::RichText::new("Snap").small()),
                     );
                     let clicked = snap_resp
@@ -1111,7 +1120,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     child.spacing_mut().item_spacing.x = 0.0;
                     let before_g = show_grid;
                     let g = child.add_sized(
-                        [cell_w, band_h],
+                        [cell_w, ctrl_h],
                         egui::Button::selectable(show_grid, egui::RichText::new("Lines").small()),
                     );
                     let clicked = g.on_hover_text("Show the grid lines in the graph").clicked();
@@ -1122,7 +1131,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     child.add_space(4.0);
                     let before_l = show_labels;
                     let l = child.add_sized(
-                        [cell_w, band_h],
+                        [cell_w, ctrl_h],
                         egui::Button::selectable(show_labels, egui::RichText::new("Labels").small()),
                     );
                     let clicked = l

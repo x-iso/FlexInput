@@ -446,6 +446,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   a pill like every other setting now - the rest of its row, dragging and taking typing - and
   the unit buttons went down to the three two-letter words they are. A row's share of a band
   is now what it asks for rather than an equal split, so the row carrying a strip and a number
+- **The Envelope got compact, and its graph switches moved up.** Its rows are one block of the
+  grid tall, so every block the corner grip hands the module goes to the graph; the default is
+  280x252 instead of 280x308, and a frame too short for its rows grows taller rather than
+  eating the curve. `grid` and `labels` are two small switches against the header's right edge,
+  where the pin stepper and the `+` live - they were a row of two full-size buttons costing a
+  quarter of the module's height for two switches - and the element the Properties shelf can
+  pin keeps its id. The sustain rail takes the row it is given instead of egui's 96 points, so
+  widening the module buys a level you can set precisely. Its pins are drawn short on the
+  canvas - Trig, the full word on hover - as the other small modules' are.
   is not left shorter than the row carrying two grid numbers.
 - **An Envelope's curve says what its points are.** Each point paints its level beside the
   dot, the way the Response Curve's points do, and hovering one gives the level and where

@@ -2915,9 +2915,10 @@ fn the_envelope_follows_the_frame_it_is_given() {
     // The curve editor used to carry a `Resize` box of its own: dragging the module's corner
     // moved a border inside the body, and the six stacked rows under it cost the same height
     // whatever the frame looked like. Now the graph is what's left after the rows, the sustain
-    // slider is a row of the graph's width, and the four groups of settings fill the width
+    // slider is a row of the graph's width, and the three groups of settings fill the width
     // evenly - side by side in one band in a wide frame, wrapped into more bands in a narrow
-    // one, where the module takes the height for them rather than losing the graph.
+    // one, where the module takes the height for them rather than losing the graph. The two
+    // switches over how the graph is drawn live in the header, not in a row of the body.
     let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(100.0, 100.0)]);
     let node = ids[0];
     let measure = |rig: &mut Rig, w: f32, h: f32| -> (egui::Rect, Vec<egui::Rect>, egui::Rect, egui::Rect) {
@@ -2936,7 +2937,7 @@ fn the_envelope_follows_the_frame_it_is_given() {
         rig.idle(4);
         let graph = rig.traced_rect(node, "env_curve").unwrap_or(egui::Rect::NOTHING);
         let sustain = rig.traced_rect(node, "env_sustain").unwrap_or(egui::Rect::NOTHING);
-        let rows: Vec<egui::Rect> = ["env_time", "env_mode", "env_grid", "env_opts"]
+        let rows: Vec<egui::Rect> = ["env_time", "env_mode", "env_grid"]
             .into_iter()
             .map(|k| rig.traced_rect(node, k).unwrap_or(egui::Rect::NOTHING))
             .collect();
@@ -2962,8 +2963,13 @@ fn the_envelope_follows_the_frame_it_is_given() {
         "generator.envelope: the sustain row {wide_sustain:?} isn't the graph's width {wide_graph:?}",
     );
     assert!(
-        wide_sustain.top() > wide_graph.bottom(),
+        wide_sustain.top() >= wide_graph.bottom() - 0.5,
         "generator.envelope: the sustain row {wide_sustain:?} isn't under the graph {wide_graph:?}",
+    );
+    let switches = rig.traced_rect(node, "env_opts").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        switches.is_positive() && switches.bottom() <= wide_graph.top() + 1.0,
+        "generator.envelope: the graph switches {switches:?} are not in the header above {wide_graph:?}",
     );
     for r in &wide_rows {
         assert!(
@@ -2972,7 +2978,7 @@ fn the_envelope_follows_the_frame_it_is_given() {
         );
         assert!(
             (r.top() - wide_rows[0].top()).abs() < 1.0,
-            "generator.envelope: a wide frame should hold its groups in one band: {wide_rows:?}",
+            "generator.envelope: a wide frame should hold its setting groups in one band: {wide_rows:?}",
         );
     }
 
@@ -3014,7 +3020,7 @@ fn the_envelope_follows_the_frame_it_is_given() {
         );
     }
     assert!(
-        squat_graph.height() >= 60.0,
+        squat_graph.height() >= 55.5,
         "generator.envelope: the graph {squat_graph:?} vanished in {squat_frame:?}",
     );
 }
@@ -3054,7 +3060,7 @@ fn the_envelope_spends_the_width_it_is_given_on_its_length() {
     // The floor is the one the row promises rather than one I can derive from the band
     // maths: the number is wider than the three unit words beside it, and it runs to the end
     // of the row it was given. How much of the band a row gets is the layout's business.
-    for (w, least) in [(10.0 * B, 84.0), (14.0 * B, 84.0)] {
+    for (w, least) in [(10.0 * B, 76.0), (14.0 * B, 76.0)] {
         let (frame, pill) = pill_at(&mut rig, w);
         let cell = rig.traced_rect(node, "env_time").unwrap_or(egui::Rect::NOTHING);
         assert!(pill.is_positive(), "no length pill drawn in {frame:?}");
