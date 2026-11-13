@@ -445,6 +445,8 @@ All notable changes to FlexInput are documented here. This project adheres to
   pass takes sat in a box that never grew while the `ms | s | Hz` buttons beside it did. It is
   a pill like every other setting now - the rest of its row, dragging and taking typing - and
   the unit buttons went down to the three two-letter words they are. A row's share of a band
+  is now what it asks for rather than an equal split, so the row carrying a strip and a number
+  is not left shorter than the row carrying two grid numbers.
 - **The Envelope's behaviour switches are drawn, not written.** A magnet for snapping to the
   grid, the flat-topped shape the curve makes while it holds, an arrow out and one back for
   bouncing, a ring with its head at the gap for looping (`viewer/glyphs.rs`, for the response-
@@ -457,17 +459,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   the same word twice, and it was what held the module wide - and the rows run the body's full
   width, so three ports take 224 points rather than 252.
 - **A Readout is no longer a big module.** It starts three blocks across by two down rather than
+  four by four, and the corner grip takes it down to one block by two - enough for a row of
+  readings along a patch, each showing its number as large as the box allows. A long value at
+  that size is cut at the edge rather than widening the module, which is the same bargain the
+  type already made: the reading gives way, the module does not.
 - **A pinned Envelope graph can be drawn differently from the module it came from.** The overlay
   inspector's graph row - the one that already carries a copy's colours - now also offers
   `grid`, `labels` and `snap`, each with `module` (follow the module on the canvas), `on` and
   `off`. `module` is the default, so every copy saved until now looks exactly as it did. The
   switches are no longer something to pin: the module keeps them in its header, and a copy sets
   its own in the inspector, which is where a widget's settings were always going to live.
-  four by four, and the corner grip takes it down to one block by two - enough for a row of
-  readings along a patch, each showing its number as large as the box allows. A long value at
-  that size is cut at the edge rather than widening the module, which is the same bargain the
-  type already made: the reading gives way, the module does not.
-  is now what it asks for rather than an equal split, so the row carrying a strip and a number
 - **The Envelope got compact, and its graph switches moved up.** Its rows are one block of the
   grid tall, so every block the corner grip hands the module goes to the graph; the default is
   280x252 instead of 280x308, and a frame too short for its rows grows taller rather than
@@ -477,7 +478,6 @@ All notable changes to FlexInput are documented here. This project adheres to
   pin keeps its id. The sustain rail takes the row it is given instead of egui's 96 points, so
   widening the module buys a level you can set precisely. Its pins are drawn short on the
   canvas - Trig, the full word on hover - as the other small modules' are.
-  is not left shorter than the row carrying two grid numbers.
 - **An Envelope's curve says what its points are.** Each point paints its level beside the
   dot, the way the Response Curve's points do, and hovering one gives the level and where
   along the envelope's length it falls, in the unit the module is timed in. Until now the
@@ -488,6 +488,7 @@ All notable changes to FlexInput are documented here. This project adheres to
   and the rows it passes step aside a row, the way the Split and Selector strips do; the
   distance travelled is carried while the button is down rather than only while egui still
   reports that row as dragged, which is what made a long drag land somewhere other than where
+  it was picked up; and a drag is never also a click, so passing an option no longer chooses it.
 - **A drag of a Dropdown option or a Macro port stopped at its neighbour and flickered on the
   way.** The move was committed a row at a time while the same move was also being drawn as an
   offset from the row's slot, so the list jumped back and forth under the finger; the grip was
@@ -495,16 +496,40 @@ All notable changes to FlexInput are documented here. This project adheres to
   drag - the picked row follows the finger, the rows it passes slide aside - and the move lands
   as one move, to wherever the row was held, when the finger leaves. The grip is painted, and
   brightens only for the row being held.
-  it was picked up; and a drag is never also a click, so passing an option no longer chooses it.
 
 ### Fixed
 
+- **A Macro Output port with a long name painted over its own row.** The name was a text field
+  open in every row, and an open field lays itself out at whatever width its text wants: a port
+  called "Right Trigger, half pressed" drew across the signal-type dropdown, the `×` and the
+  module's own edge, while the row's clamp only ever bounded what the row *asked for*. The name
+  is painted now, cut with an ellipsis at the cell's edge and the whole name in the hover text;
+  a click opens the field in place, empty with the old name as its hint - egui has no
+  select-all-on-focus, so a prefilled field is a field that appends, and typing `Kick` at a port
+  called `Left` used to leave it called `LeftKick`. The word is a grab as much as the dots
+  beside it are, so a finger that lands on a port's name reorders it, wires and all.
+- **A Macro row's type dropdown and `×` trailed its name.** They sat wherever the row's flow
+  left the cursor, so the column of `×`s was a column only by accident and stopped some fifteen
+  points short of the edge its sockets hang off. Both are pinned to the row's right edge, and
+  the names of all the rows start at the same x whatever they say.
+- **An Envelope's setting rows spent their width on planks.** The grid divisions across time and
+  value were bare drag boxes with " H" and " V" stuck on the end - widgets in a style nothing
+  else on the module wears, hugging the left of a row often twice as wide as they were - and the
+  snap button took whatever was left over, 111 points of it at the widest frame measured. The
+  behaviour buttons divided their cell by three, which made a default-width row carry three
+  69-point buttons with a 16-point glyph lost in the middle of each. The divisions are two pills
+  and a square at the row's right edge now, the behaviour switches stay squares the height of
+  the row, and what a wider row buys them is air between them, capped so each group still reads
+  as one control.
+- **An Envelope's sustain rail stopped 79 points short of its own number.** The rail's width was
+  worked out from a guessed 62 points of label and a guessed 58 points of reading; the label is
+  28 points in the font it's painted in and the reading is 18, so the track ended in the middle
+  of the row with the percentage at its far edge. The row measures what it paints now and the
+  rail runs up to the number it sets.
 - **A Dropdown menu saved before it had a `shift` pin now gets one.** A node's pins are stored
   with the patch rather than read back from the module registry, so menus drawn before the pin
   were added stayed unshiftable - the control was in the registry and nowhere on the canvas. The
   module gives itself the missing pin the first time it draws.
-
-
 - **A knob narrowed to 84 points lost its reading.** When a fader strip has no room under it,
   its number goes at the end of the track and the track shortens for it — but it only did that
   while at least 36 points of track were left, and below that the reading was simply not drawn.

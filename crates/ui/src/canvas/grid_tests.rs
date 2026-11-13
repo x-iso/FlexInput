@@ -23,6 +23,9 @@ struct Rig {
     to_global: TSTransform,
     snarl_id: egui::Id,
     grid: GridLayout,
+    /// What the last frame painted, so an audit can read the drawing itself rather than the
+    /// rects a body chose to report about itself.
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl Rig {
@@ -82,6 +85,7 @@ impl Rig {
             to_global: TSTransform::IDENTITY,
             snarl_id: egui::Id::NULL,
             grid: GridLayout { block: B, ..GridLayout::default() },
+            shapes: Vec::new(),
         };
         rig.idle(6);
         (rig, ids)
@@ -91,9 +95,9 @@ impl Rig {
         self.time += 1.0 / 30.0;
         let mut raw = input(self.time, events);
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
-        let Rig { ctx, canvas, descriptors, to_global, snarl_id, grid, .. } = self;
+        let Rig { ctx, canvas, descriptors, to_global, snarl_id, grid, shapes, .. } = self;
         let (ids, signals) = (HashSet::new(), HashMap::new());
-        let _ = ctx.run(raw, |ctx| {
+        let out = ctx.run(raw, |ctx| {
             set_canvas_grid(ctx, Some(*grid));
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
@@ -107,6 +111,7 @@ impl Rig {
                 *snarl_id = id;
             });
         });
+        *shapes = out.shapes;
     }
 
     fn idle(&mut self, frames: usize) {
@@ -207,6 +212,21 @@ impl Rig {
     fn traced_rect(&self, node: NodeId, what: &str) -> Option<egui::Rect> {
         crate::canvas::viewer::simple_bodies::traced_rect(&self.ctx, node, what)
     }
+
+    /// Where a bit of text was actually painted, in graph points, found by what it starts with
+    /// (a cut name ends in an ellipsis the test shouldn't have to guess the spacing of). A
+    /// body's own traces bound the cell a control was given; this is about the glyphs inside
+    /// it, which is where a centred word in a left-aligned column shows up.
+    fn painted_text(&self, starts_with: &str) -> Option<(String, egui::Rect)> {
+        let back = self.to_global.inverse();
+        self.shapes.iter().find_map(|cs| match &cs.shape {
+            egui::epaint::Shape::Text(t) => {
+                let says: &str = &t.galley.text()[..];
+                (says.starts_with(starts_with)).then(|| (says.to_string(), back * t.galley.rect.translate(t.pos.to_vec2())))
+            }
+            _ => None,
+        })
+    }
     fn inputs(&self, node: NodeId) -> usize {
         self.canvas.snarl.get_node(node).map_or(0, |n| n.inputs.len())
     }
@@ -234,7 +254,7 @@ impl Rig {
         self.canvas.snarl.get_node(node).map_or(0, |n| n.outputs.len())
     }
 
-    /// Give a node `n` outputs, named `out_0, out_1, …` as adding one from the menu would.
+    /// Give a node `n` outputs, named `out_0, out_1, вЂ¦` as adding one from the menu would.
     fn set_outputs(&mut self, node: NodeId, n: usize) {
         while self.outputs(node) < n {
             let name = format!("out_{}", self.outputs(node));
@@ -446,12 +466,12 @@ fn hovering_a_module_focuses_its_wires() {
 }
 
 // The basic operations: their content is their pins, so they pay no body row for
-// them. `− +` sits in the header, the frame stays the smallest the grid allows, and
+// them. `в€’ +` sits in the header, the frame stays the smallest the grid allows, and
 // it grows by a block only when the pins need one.
 
-/// Where a node's header `− +` sits: the stepper's two buttons are
-/// `interact_size.y` on a side, `+` is the rightmost, `−` is a stepper's width in
-/// from there, and the header band starts under the header frame's top margin — the
+/// Where a node's header `в€’ +` sits: the stepper's two buttons are
+/// `interact_size.y` on a side, `+` is the rightmost, `в€’` is a stepper's width in
+/// from there, and the header band starts under the header frame's top margin вЂ” the
 /// 4 px `Canvas::new` gives it (see the same note in `viewer::glow`).
 fn stepper_points(rig: &Rig, node: NodeId) -> (egui::Pos2, egui::Pos2) {
     let h = rig.ctx.style().spacing.interact_size.y;
@@ -463,7 +483,7 @@ fn stepper_points(rig: &Rig, node: NodeId) -> (egui::Pos2, egui::Pos2) {
 
 #[test]
 fn an_operation_is_two_blocks_square() {
-    // The five variadic operations (their mark and their `− +` in the header), the
+    // The five variadic operations (their mark and their `в€’ +` in the header), the
     // two comparisons (their mark, and one toggle under it) and the gates: a header
     // and pin rows, nothing else.
     for module in ["math.add", "math.subtract", "math.multiply", "math.divide", "math.min_max",
@@ -499,7 +519,7 @@ fn an_operation_is_two_blocks_square() {
 fn five_inputs_fit_the_two_blocks_and_the_sixth_takes_a_third() {
     // Measured, so the trade is on the record: the stepper in the header costs no
     // height at all, the second block has room for five inputs, and the sixth is what
-    // takes a third — and the third block comes back when the sixth pin goes.
+    // takes a third вЂ” and the third block comes back when the sixth pin goes.
     for n in 2..=5 {
         let (mut rig, ids) = Rig::real("math.add", &[egui::pos2(100.0, 300.0)]);
         rig.set_inputs(ids[0], n);
@@ -528,11 +548,11 @@ fn the_header_stepper_adds_a_pin_row_and_gives_it_back() {
     let grown = rig.frame_rect(ids[0]).size();
     assert!(whole_blocks(grown.x) && whole_blocks(grown.y), "{grown:?} after a pin");
 
-    // And the other way: the same control takes it back, and the frame with it — a
+    // And the other way: the same control takes it back, and the frame with it вЂ” a
     // frame that only ever grows is the failure this is guarding.
     let (minus, _) = stepper_points(&rig, ids[0]);
     rig.click(minus);
-    assert_eq!(rig.inputs(ids[0]), 2, "the − took no pin off");
+    assert_eq!(rig.inputs(ids[0]), 2, "the в€’ took no pin off");
     rig.idle(6);
     assert_eq!(rig.frame_rect(ids[0]).size(), at_start, "the frame never gave the room back");
 
@@ -740,7 +760,7 @@ fn a_sample_hold_shows_in_and_out_in_two_blocks() {
     rig.click(egui::pos2(h.center().x, y));
     assert_eq!(mode_of(&rig), "sample", "and didn't switch it back");
 
-    // The two readings land in the space under the pin rows, not up among the labels —
+    // The two readings land in the space under the pin rows, not up among the labels вЂ”
     // that is what made the input look like a stray dash next to the header.
     let lines = rig
         .ctx
@@ -2009,10 +2029,10 @@ fn the_counter_is_a_stack_of_cells_not_four_labelled_rows() {
 #[test]
 fn the_dropdown_is_a_column_of_its_options_under_its_reading() {
     // The menu module sized itself from a `box_width` parameter the user could dial to 600,
-    // its rows led with their own `×`, and its handle was a monospace `≡` nothing else in the
+    // its rows led with their own `Г—`, and its handle was a monospace `в‰Ў` nothing else in the
     // app uses. It wears the list idiom now: one constant column centred on the module, the
     // current option as the reading at the top, then a row per option - handle, the name cut at
-    // the column's edge with the whole of it on hover, the `×` at the right - and the `+` that
+    // the column's edge with the whole of it on hover, the `Г—` at the right - and the `+` that
     // adds one in that same column. Reordering moves the option and keeps the selection on it,
     // because the engine outputs whatever sits at the selected index.
     let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
@@ -2256,9 +2276,9 @@ fn the_oscillator_is_a_shape_a_wave_and_two_numbers() {
 #[test]
 fn the_macro_lists_its_ports_like_every_other_list() {
     // A Macro Output's rows used to measure themselves out as an icon button, a 96-point name
-    // field, a 58-point type dropdown, a `✕`, and a button named "+ Add output" under them: 308
+    // field, a 58-point type dropdown, a `вњ•`, and a button named "+ Add output" under them: 308
     // points of module for a port. It's the list idiom now - handle, icon, name, the type as one
-    // letter with the names in the popup, and the `×` at the right edge - and the `+` is in the
+    // letter with the names in the popup, and the `Г—` at the right edge - and the `+` is in the
     // header with the other lists'. A moved port takes its wires with it, because its row order
     // is the node's output-pin order.
     let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0), egui::pos2(900.0, 300.0)]);
@@ -2363,7 +2383,7 @@ fn the_automap_port_lists_show_their_names_in_full_and_can_be_reordered() {
     // are the whole reason the module is on the canvas - which port feeds what, at a glance -
     // so they are never abbreviated the way a small module's `in_2` is, and a long learned name
     // makes the module wide instead. What the rows do share with the port strips is the shape:
-    // handle, name, `×` at the right edge, all one width. And the handle moves a port, taking
+    // handle, name, `Г—` at the right edge, all one width. And the handle moves a port, taking
     // its wire and its entry in the parallel id list with it, because the engine reads these
     // pins by position.
     for (module, side, param_key, salt) in [
@@ -2794,7 +2814,7 @@ fn a_title_does_not_hold_a_module_wide() {
 
 #[test]
 fn the_port_strips_add_remove_rename_and_reorder_their_pins() {
-    // Selector and Split: `+` in the header adds a port, the `×` on a strip drops one, a
+    // Selector and Split: `+` in the header adds a port, the `Г—` on a strip drops one, a
     // double-click renames the port (which is the pin's own name), and the handle moves it
     // - taking its wire with it, because the engine reads these by position.
     // - no snap: the last part of this test is that the room a port needed comes back when
@@ -2845,12 +2865,12 @@ fn the_port_strips_add_remove_rename_and_reorder_their_pins() {
     rig.type_text("kick");
     assert_eq!(names(&rig)[1], "kick", "the strip's name field didn't rename the pin");
 
-    // The `×` only shows once there are more than two ports to choose between; it drops
+    // The `Г—` only shows once there are more than two ports to choose between; it drops
     // the port it's on and the module shrinks back with it.
     let tall = rig.frame_rect(sel);
     let strip1 = rig.traced(sel, "strip_1");
     rig.click(egui::pos2(strip1.left() + 26.0, strip1.center().y));
-    assert_eq!(names(&rig).len(), 3, "the strip's × didn't drop the port: {:?}", names(&rig));
+    assert_eq!(names(&rig).len(), 3, "the strip's Г— didn't drop the port: {:?}", names(&rig));
     rig.idle(4);
     assert!(rig.frame_rect(sel).height() < tall.height(), "the module kept the room the port needed: {tall:?} -> {:?}", rig.frame_rect(sel));
 }
@@ -3241,4 +3261,424 @@ fn the_macro_ports_line_up_with_the_strips_that_name_them() {
         frame.width() < 240.0,
         "a three-port Macro is {frame:?} wide: something besides its rows is holding it out"
     );
+}
+
+#[test]
+fn a_macro_port_name_stays_in_the_cell_it_was_given() {
+    // The name used to be a text field open in every row, and an open field lays its text out
+    // at whatever width the text wants: a port called "Right Trigger, half pressed" painted
+    // across the type dropdown, the `×` and the module's own edge. The cell's clamp only ever
+    // bounded what the row *asked for*, never what was drawn inside it.
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    {
+        use flexinput_core::macros as mac;
+        let mk = |id: &str, name: &str| mac::MacroPortDef {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: flexinput_core::SignalType::Float,
+        };
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            let ports = vec![mk("aa11bb22", "Aim down"), mk("cc33dd44", "Right Trigger, half pressed")];
+            n.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+            n.outputs = ports
+                .iter()
+                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                .collect();
+        }
+    }
+    rig.idle(8);
+    let frame = rig.frame_rect(node);
+    for i in 0..2 {
+        let row = rig.traced(node, &format!("strip_{i}"));
+        let name = rig.traced(node, &format!("macro_name_{i}"));
+        let ty = rig.traced(node, &format!("macro_type_{i}"));
+        let rm = rig.traced(node, &format!("macro_remove_{i}"));
+        assert!(
+            name.right() <= ty.left() + 0.5,
+            "port {i}'s name {name:?} runs into its type dropdown {ty:?}"
+        );
+        assert!(
+            ty.right() <= rm.left() + 0.5,
+            "port {i}'s type {ty:?} runs into its remove button {rm:?}"
+        );
+        assert!(
+            rm.right() <= row.right() + 0.5 && rm.right() > row.right() - 8.0,
+            "port {i}'s `×` {rm:?} is not at the right edge of its row {row:?}"
+        );
+        assert!(
+            frame.contains_rect(name.expand(1.0)),
+            "port {i}'s name {name:?} is outside {frame:?}"
+        );
+    }
+    // The cells of a column line up whatever their names say: the short port's cell is the
+    // same box as the long one's, not a measurement of its own word.
+    let n0 = rig.traced(node, "macro_name_0");
+    let n1 = rig.traced(node, "macro_name_1");
+    assert!(
+        (n0.left() - n1.left()).abs() < 0.6 && (n0.width() - n1.width()).abs() < 0.6,
+        "the two name cells disagree: {n0:?} {n1:?}"
+    );
+    // And so do the words inside them. The first attempt at this put a centred `Label` in each
+    // cell, which is what a left-to-right row with `Align::Center` does to whatever it is
+    // handed - a short name started a dozen points right of a long one, and the list stopped
+    // reading as a column.
+    let (short_s, short) = rig
+        .painted_text("Aim down")
+        .expect("the short port's name was never painted");
+    let (long_s, long) = rig
+        .painted_text("Right Trigger")
+        .expect("the long port's name never appeared at all");
+    assert!(
+        (short.left() - long.left()).abs() < 1.0,
+        "the two names start at different places: {short:?} {long:?}"
+    );
+    assert!(
+        long.right() <= n1.right() + 0.5,
+        "the name {long_s:?} {long:?} reaches past its cell {n1:?}"
+    );
+    assert!(
+        long_s.ends_with('\u{2026}'),
+        "a name twice its cell's width was drawn whole rather than cut: {long_s:?}"
+    );
+    let _ = short_s;
+}
+
+#[test]
+fn a_macro_port_renames_from_its_word_and_is_grabbed_by_it() {
+    // Two things the always-open field stood in for: a name is a grab like the dots beside it,
+    // and a click on the word opens the field in place - so a finger that lands on the name
+    // reorders the port instead of doing nothing, and a finger that means to rename still can.
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    {
+        use flexinput_core::macros as mac;
+        let mk = |id: &str, name: &str| mac::MacroPortDef {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: flexinput_core::SignalType::Bool,
+        };
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            let ports = vec![mk("aa11bb22", "Left"), mk("cc33dd44", "Right")];
+            n.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+            n.outputs = ports
+                .iter()
+                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                .collect();
+        }
+    }
+    rig.idle(8);
+    let names = |r: &Rig| -> Vec<String> {
+        r.canvas
+            .snarl
+            .get_node(node)
+            .map(|n| n.outputs.iter().map(|d| d.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(names(&rig), ["Left", "Right"], "the ports as listed");
+    rig.click(rig.traced(node, "macro_name_0").center());
+    rig.type_text("Kick");
+    rig.idle(4);
+    assert_eq!(
+        names(&rig),
+        ["Kick", "Right"],
+        "clicking the name and typing didn't rename the port"
+    );
+    let up = rig.traced(node, "strip_0").center().y - rig.traced(node, "strip_1").center().y;
+    rig.drag(rig.traced(node, "macro_name_1").center(), egui::vec2(0.0, up));
+    assert_eq!(
+        names(&rig),
+        ["Right", "Kick"],
+        "dragging a port by its name didn't move it"
+    );
+}
+
+#[test]
+fn the_envelope_rows_spend_their_width_on_controls_not_planks() {
+    // A setting row that spans the module is right; a control stretched to fill it is not. The
+    // mode buttons used to divide their cell by three (69 points of button around a 16-point
+    // glyph), the snap took whatever was left over (111 points of plank at the widest frame
+    // measured here), and the sustain rail stopped 79 points short of the reading at its own
+    // row's end because its width came from a guessed label width.
+    let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    let check = |rig: &Rig, at: &str| {
+        let ctrl = B - 4.0;
+        for i in 0..3 {
+            let b = rig.traced(node, &format!("env_mode_{i}"));
+            assert!(
+                (b.width() - ctrl).abs() < 0.6 && (b.height() - ctrl).abs() < 0.6,
+                "the {at} mode button {i} is {b:?}, not a {ctrl:.0}-point square"
+            );
+        }
+        let row = rig.traced(node, "env_mode");
+        let first = rig.traced(node, "env_mode_0");
+        let last = rig.traced(node, "env_mode_2");
+        assert!(
+            first.left() >= row.left() - 0.5 && last.right() <= row.right() + 0.5,
+            "the {at} mode buttons {first:?} {last:?} left their row {row:?}"
+        );
+        let grid = rig.traced(node, "env_grid");
+        let snap = rig.traced(node, "env_snap");
+        assert!(
+            (snap.width() - ctrl).abs() < 0.6 && (snap.height() - ctrl).abs() < 0.6,
+            "the {at} snap button is {snap:?}, not a {ctrl:.0}-point square"
+        );
+        assert!(
+            (snap.right() - grid.right()).abs() < 0.6,
+            "the {at} snap square {snap:?} isn't at the right edge of its row {grid:?}"
+        );
+        let hx = rig.traced(node, "env_grid_x");
+        let vy = rig.traced(node, "env_grid_y");
+        assert!(
+            hx.right() <= vy.left() + 0.5 && vy.right() <= snap.left() + 0.5,
+            "the {at} grid pills are out of order: {hx:?} {vy:?} {snap:?}"
+        );
+        assert!(
+            hx.width() >= 40.0 && vy.width() >= 40.0,
+            "the {at} grid pills were squeezed to nothing: {hx:?} {vy:?}"
+        );
+        let rail = rig.traced(node, "env_sustain_slider");
+        let value = rig.traced(node, "env_sustain_value");
+        let srow = rig.traced(node, "env_sustain");
+        assert!(
+            value.right() <= srow.right() + 1.0,
+            "the {at} sustain reading {value:?} is past its row {srow:?}"
+        );
+        assert!(
+            rail.right() >= value.left() - 10.0,
+            "the {at} sustain rail {rail:?} stops short of its own reading {value:?}"
+        );
+    };
+    rig.idle(6);
+    check(&rig, "default frame");
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(kit_width_param().into(), serde_json::json!(700.0f32));
+    }
+    rig.idle(6);
+    check(&rig, "700-point frame");
+}
+
+/// What a body paints, read off the paint list instead of off the rects the body chose to
+/// report about itself: every bit of text in the frame, where it landed, whether it crosses
+/// the frame's edge, whether the clip cuts it off anyway, and whether it sits on top of
+/// another word. A layout audit, not an assertion вЂ” run with `-- --ignored --nocapture`.
+#[test]
+#[ignore = "prints a layout audit of the Macro and Generator batch"]
+fn audit_the_macro_and_generator_bodies() {
+    struct Bit {
+        top: f32,
+        left: f32,
+        right: f32,
+        bottom: f32,
+        text: String,
+    }
+    fn audit(rig: &Rig, node: NodeId, label: &str, raw: bool) {
+        let f = rig.frame_rect(node);
+        println!(
+            "\n=== {label}: {:.0} x {:.0} ({:.1} x {:.1} blocks), frame x {:.1}..{:.1} y {:.1}..{:.1}",
+            f.width(),
+            f.height(),
+            f.width() / B,
+            f.height() / B,
+            f.left(),
+            f.right(),
+            f.top(),
+            f.bottom()
+        );
+        let mut bits: Vec<Bit> = Vec::new();
+        let mut clips: Vec<(String, f32, f32)> = Vec::new();
+        // The paint list is in screen points; the frame and the traces are in graph points.
+        let back = rig.to_global.inverse();
+        for cs in &rig.shapes {
+            let clip = back * cs.clip_rect;
+            if !raw && !clip.intersects(f) {
+                continue;
+            }
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                let r = back * t.galley.rect.translate(t.pos.to_vec2());
+                if !raw
+                    && (r.right() < f.left() || r.left() > f.right() || r.bottom() < f.top() || r.top() > f.bottom())
+                {
+                    continue;
+                }
+                let text: String = t.galley.text().chars().filter(|c| *c != '\n').collect();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                bits.push(Bit { top: r.top(), left: r.left(), right: r.right(), bottom: r.bottom(), text });
+            }
+        }
+        // Anything painted wider than its own clip is cut off: on screen it reads as a word
+        // that stops mid-glyph, and nothing in the layout reports it.
+        for b in &bits {
+            if b.right > f.right() + 0.5 || b.left < f.left() - 0.5 {
+                clips.push((b.text.clone(), b.left, b.right));
+            }
+        }
+        bits.sort_by(|a, b| {
+            a.top
+                .partial_cmp(&b.top)
+                .unwrap()
+                .then(a.left.partial_cmp(&b.left).unwrap())
+        });
+        // Rows: bits whose vertical extent overlaps are one line of the layout.
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        for (i, b) in bits.iter().enumerate() {
+            let hit = rows.iter().position(|row| {
+                row.iter().any(|&j| {
+                    let o = &bits[j];
+                    b.top < o.bottom - 0.5 && b.bottom > o.top + 0.5
+                })
+            });
+            match hit {
+                Some(r) => rows[r].push(i),
+                None => rows.push(vec![i]),
+            }
+        }
+        for row in &rows {
+            let tops: Vec<String> = row
+                .iter()
+                .map(|&i| {
+                    let b = &bits[i];
+                    let outside = if b.right > f.right() + 0.5 {
+                        "В«past edge"
+                    } else if b.left < f.left() - 0.5 {
+                        "В«before edge"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "\"{}\" [{:.1}..{:.1}]{}",
+                        b.text,
+                        b.left - f.left(),
+                        b.right - f.left(),
+                        outside
+                    )
+                })
+                .collect();
+            let y = bits[row[0]].top - f.top();
+            println!("  y{y:>5.1}  {}", tops.join("  "));
+        }
+        // Words sitting on one another.
+        for (i, a) in bits.iter().enumerate() {
+            for b in bits.iter().skip(i + 1) {
+                if a.left < b.right - 0.5
+                    && a.right > b.left + 0.5
+                    && a.top < b.bottom - 0.5
+                    && a.bottom > b.top + 0.5
+                {
+                    println!(
+                        "  OVERLAP: \"{}\" [{:.1}..{:.1}] y{:.1}..{:.1}  vs  \"{}\" [{:.1}..{:.1}] y{:.1}..{:.1}",
+                        a.text,
+                        a.left - f.left(),
+                        a.right - f.left(),
+                        a.top - f.top(),
+                        a.bottom - f.top(),
+                        b.text,
+                        b.left - f.left(),
+                        b.right - f.left(),
+                        b.top - f.top(),
+                        b.bottom - f.top()
+                    );
+                }
+            }
+        }
+        for (text, l, r) in clips {
+            println!("  OUTSIDE FRAME: \"{text}\" at {l:.1}..{r:.1} against {:.1}..{:.1}", f.left(), f.right());
+        }
+        for what in ["body_column", "env_curve", "env_sustain", "env_time", "env_mode", "env_grid", "strip_0", "strip_1", "strip_2", "osc_shape", "osc_preview", "osc_freq_pill", "osc_unit", "osc_phase_pill", "osc_bipolar", "macro_row_0", "macro_row_1"] {
+            if let Some(r) = rig.traced_rect(node, what) {
+                println!(
+                    "  trace {what:<16} x {:.1}..{:.1} (frame {:.1}..{:.1})  y {:.1}..{:.1}",
+                    r.left() - f.left(),
+                    r.right() - f.left(),
+                    0.0,
+                    f.width(),
+                    r.top() - f.top(),
+                    r.bottom() - f.top()
+                );
+            }
+        }
+    }
+
+    // Macro: one port, three ports, and a long name вЂ” the list is what decides the width.
+    for n in [1usize, 3, 5] {
+        let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(200.0, 200.0)]);
+        let node = ids[0];
+        {
+            use flexinput_core::macros as mac;
+            if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+                let mk = |i: usize| mac::MacroPortDef {
+                    id: format!("{:08x}", 0xaa000000 + i),
+                    name: format!("Port {i}"),
+                    icon: String::new(),
+                    icon_svg: String::new(),
+                    signal_type: [
+                        flexinput_core::SignalType::Bool,
+                        flexinput_core::SignalType::Float,
+                        flexinput_core::SignalType::Vec2,
+                        flexinput_core::SignalType::Any,
+                    ][i % 4],
+                };
+                let ports: Vec<_> = (0..n).map(mk).collect();
+                nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+                nd.outputs = ports.iter().map(|p| PinDescriptor::new(p.name.clone(), p.signal_type)).collect();
+            }
+        }
+        rig.idle(8);
+        audit(&rig, node, &format!("module.macro, {n} ports, default frame"), false);
+    }
+    {
+        let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(200.0, 200.0)]);
+        let node = ids[0];
+        {
+            use flexinput_core::macros as mac;
+            if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+                let mk = |name: &str| mac::MacroPortDef {
+                    id: format!("{:08x}", name.len()),
+                    name: name.to_string(),
+                    icon: String::new(),
+                    icon_svg: String::new(),
+                    signal_type: flexinput_core::SignalType::Float,
+                };
+                let ports = vec![mk("Aim down"), mk("Right Trigger, half pressed")];
+                nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+                nd.outputs = ports.iter().map(|p| PinDescriptor::new(p.name.clone(), p.signal_type)).collect();
+            }
+        }
+        rig.idle(8);
+        audit(&rig, node, "module.macro, a long port name", false);
+    }
+
+    // Envelope: its default frame, a wide one, a narrow one and a short one.
+    let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(200.0, 200.0)]);
+    let node = ids[0];
+    audit(&rig, node, "generator.envelope, as spawned", false);
+    for (w, h) in [(700.0, 0.0f32), (196.0, 0.0), (252.0, 112.0), (140.0, 0.0)] {
+        if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+            nd.params.insert(kit_width_param().into(), serde_json::json!(w));
+            if h > 0.0 {
+                nd.params.insert("ui_h".into(), serde_json::json!(h));
+            }
+        }
+        rig.idle(6);
+        audit(&rig, node, &format!("generator.envelope, asked {w:.0} x {h:.0}"), w > 500.0);
+    }
+
+    // Oscillator, as spawned and at its narrowest.
+    let (rig, ids) = Rig::real("generator.oscillator", &[egui::pos2(200.0, 200.0)]);
+    let node = ids[0];
+    audit(&rig, node, "generator.oscillator, as spawned", false);
+    let (mut rig, ids) = Rig::real("generator.oscillator", &[egui::pos2(700.0, 200.0)]);
+    let node = ids[0];
+    if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+        nd.params.insert(kit_width_param().into(), serde_json::json!(112.0f32));
+    }
+    rig.idle(6);
+    audit(&rig, node, "generator.oscillator, asked 112 wide", false);
 }

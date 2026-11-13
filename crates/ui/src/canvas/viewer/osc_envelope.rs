@@ -760,7 +760,7 @@ pub(crate) fn paint_envelope_curve_graph(
 pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, body_w: f32, body_h: f32) {
     if let Some(node) = snarl.get_node_mut(node_id) { envelope_init_params(node); }
 
-    let (flags, timebase, time_mul, sustain, grid_x, grid_y, snap, show_grid, show_grid_labels) =
+    let (flags, timebase, time_mul, sustain, grid_x, grid_y, snap) =
         snarl.get_node(node_id).map(|n| {
             let fl  = flexinput_engine::envelope_flags(&n.params);
             let tb  = n.params.get("timebase").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
@@ -769,10 +769,12 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
             let gx  = n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1);
             let gy  = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1);
             let sn  = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sg  = n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true);
-            let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
-            (fl, tb, tm, su, gx, gy, sn, sg, sgl)
-        }).unwrap_or_else(|| ((false, false, false), "ms".into(), 500.0, 0.3, 4, 4, false, true, false));
+            // What the graph *shows* - its lines and their numbers - is not read here. Those
+            // two switches live in the header, which writes the params itself; a body that read
+            // them and wrote them back would be one frame of ordering away from undoing a click
+            // on them.
+            (fl, tb, tm, su, gx, gy, sn)
+        }).unwrap_or_else(|| ((false, false, false), "ms".into(), 500.0, 0.3, 4, 4, false));
 
     // Detect Time-input wiring from the snarl directly (input pin 1) rather than
     // the passed `inputs` slice — the sub-patch inner body is rendered with an
@@ -787,8 +789,6 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let mut gx_f     = grid_x as f64;
     let mut gy_f     = grid_y as f64;
     let mut snap_on  = snap;
-    let mut show_grid = show_grid;
-    let mut show_labels = show_grid_labels;
     let mut changed  = false;
     let mut sustain_changed = false;
 
@@ -816,14 +816,9 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     // follow its frame, and the rows cost height whether the frame had it or not.
     const GAP: f32 = 8.0;
     const SEP_W: f32 = 9.0;
+    const CELL_GAP: f32 = 4.0;
     const MIN_GRAPH_H: f32 = 56.0;
     const MIN_GRAPH_W: f32 = 140.0;
-    // What each group needs to show its controls without cutting a label - and the band rule
-    // that follows from it: a group that cannot get this inside a shared band takes a band to
-    // itself, so the module grows taller rather than ending up with a length squeezed into a
-    // short box. The first is the three unit words plus the room a seven-digit length needs.
-    // The two graph switches are no longer here: they are in the header.
-    let group_min = [148.0f32, 112.0, 124.0];
     // A row is exactly one block of the layout grid, and the controls inside it are a little
     // shorter than the row. That is what makes resizing mean something: every block the grip
     // gives the module goes to the graph, and the rows land on block lines at any height.
@@ -831,10 +826,26 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     let row_h = block;
     let band_h = block;
     let ctrl_h = block - 4.0;
+    // What each group needs to show its controls without cutting a label - and the band rule
+    // that follows from it: a group that cannot get this inside a shared band takes a band to
+    // itself, so the module grows taller rather than ending up with a length squeezed into a
+    // short box. The first is the three unit words plus the room a seven-digit length needs;
+    // the second is three squares and the air between them; the third is two number pills, that
+    // air, and a square for the snap. The two graph switches are no longer here: they are in
+    // the header.
+    let group_min = [
+        148.0f32,
+        3.0 * ctrl_h + 2.0 * CELL_GAP,
+        2.0 * 46.0 + 2.0 * CELL_GAP + ctrl_h,
+    ];
+    // Only the length group is written to want much: it holds the number the module is read
+    // for, so a wider frame gives it away to nothing else. The other two ask for the size
+    // their controls are, and a row that ends up wider than that spends it on air rather than
+    // on a fatter button - see the mode squares and the grid pills.
 
     let column_width = body_w.max(MIN_GRAPH_W);
 
-    // How many bands the four groups need: fill them in order and grow the count until every
+    // How many bands the three groups need: fill them in order and grow the count until every
     // band fits the column.
     let mut bands = 1usize;
     let band_widths = |bands: usize| -> Vec<f32> {
@@ -892,11 +903,26 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                 .id_salt("env_sustain"),
         );
         child.spacing_mut().item_spacing.x = 4.0;
-        child.label(egui::RichText::new("Sustain").small().weak());
+        let label = child.label(egui::RichText::new("Sustain").small().weak());
         // Snaps to the nearest control point: the level is one of the curve's points, not a
         // free value, and the painter may have rewritten it this frame.
-        let slider_w = (sustain_row.width() - 8.0 - 62.0 - 58.0).max(40.0);
-        let (slider_rect, _) = child.allocate_exact_size(egui::vec2(slider_w, row_h), egui::Sense::hover());
+        //
+        // The rail runs up to its own number. Its width used to be worked out from a guessed
+        // 62 points of label and a guessed 58 of reading: "Sustain" is 28 points in the font it
+        // is painted in and the reading is 18, so the track stopped 79 points short of the `30%`
+        // at the row's right edge - a strip of bare frame in the middle of the one control the
+        // width was bought for. Measured off what is actually on the row now.
+        const SUSTAIN_VALUE_W: f32 = 34.0;
+        let slider_w = (sustain_row.width()
+            - label.rect.width()
+            - 3.0 * child.spacing().item_spacing.x
+            - SUSTAIN_VALUE_W)
+            .max(40.0);
+        let (slider_rect, _) = child.allocate_exact_size(egui::vec2(
+            slider_w,
+            row_h,
+        ), egui::Sense::hover());
+        trace_rect(ui, node_id, "env_sustain_slider", slider_rect);
         let sustain_active = hold;
         let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
             .show_value(false)
@@ -919,16 +945,18 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
             }
             sustain_changed = true;
         }
+        let value_rect = egui::Rect::from_min_size(
+            egui::pos2(sustain_row.right() - SUSTAIN_VALUE_W, sustain_row.top()),
+            egui::vec2(SUSTAIN_VALUE_W, row_h),
+        );
         ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_size(
-                    egui::pos2(sustain_row.right() - 58.0, sustain_row.top()),
-                    egui::vec2(58.0, row_h),
-                ))
+                .max_rect(value_rect)
                 .layout(egui::Layout::right_to_left(egui::Align::Center))
                 .id_salt("env_sustain_value"),
         )
         .label(egui::RichText::new(format!("{:.0}%", sustain * 100.0)).small().weak());
+        trace_rect(ui, node_id, "env_sustain_value", value_rect);
         let _ = sr.on_hover_text(if sustain_active {
             "Where the curve holds while the trigger is held. It sits on one of the curve's points."
         } else {
@@ -948,10 +976,11 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
         let last = (first + per_band).min(group_min.len());
         let n = last - first;
         let sep_total = if n > 1 { (n as f32 - 1.0) * (SEP_W + GAP) } else { 0.0 };
-        // Shared in proportion to what each row needs, not equally: the row with the unit
-        // buttons and a length in it asks for more than the row of two grid numbers, and an
-        // equal split left the first with less than it asked and the others with slack they
-        // spend on nothing.
+        // Shared in proportion to what each row asks for, and a row always spans the band: a
+        // group alone in one gets the whole width, because the graph, the sustain rail and the
+        // length all span the module and a row that stops short reads as broken. What a group
+        // spends the width on is its own business: the length pill and the two grid numbers
+        // take it, the squares between them do not.
         let wants: Vec<f32> = (first..last).map(|gi| group_min[gi]).collect();
         let want_sum: f32 = wants.iter().sum::<f32>().max(1.0);
         let avail = (band.width() - sep_total).max(0.0);
@@ -1026,10 +1055,10 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     // digits in the same space. It is a pill like every other setting, so it
                     // drags and takes typing.
                     let shown = envelope_time_text(time_mul, &timebase);
-                    let band = egui::Rect::from_center_size(cell.center(), egui::vec2(super::simple_bodies::PILL_H, super::simple_bodies::PILL_H));
+                    let pill_band = egui::Rect::from_center_size(cell.center(), egui::vec2(ctrl_h, ctrl_h));
                     let pill = egui::Rect::from_min_max(
-                        egui::pos2(strip.right() + 4.0, band.top()),
-                        egui::pos2(cell.right() - 4.0, band.bottom()),
+                        egui::pos2(strip.right() + 4.0, pill_band.top()),
+                        egui::pos2(cell.right() - 4.0, pill_band.bottom()),
                     );
                     trace_rect(ui, node_id, "env_time_pill", pill);
                     if time_wired {
@@ -1086,21 +1115,32 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         ),
                         (super::glyphs::Glyph::Loop, &mut loopf, "Loop: repeat the active segment while the trigger is held"),
                     ];
-                    let cell_w = (cell.width() - 2.0 * 4.0) / 3.0;
+                    // Three squares, not three planks. The cell used to be divided by three, so
+                    // in a default-width Envelope each button came out 69 points across with a
+                    // 16-point glyph lost in the middle of it. The squares stay the height of
+                    // the row; what a wider row buys them is air, capped so the three still read
+                    // as one control, and the group sits in the middle of its cell.
+                    let gap = ((cell.width() - 3.0 * ctrl_h) / 2.0).clamp(CELL_GAP, 24.0);
+                    let group_w = (3.0 * ctrl_h + 2.0 * gap).min(cell.width());
+                    let box_rect = egui::Rect::from_min_size(
+                        egui::pos2(cell.center().x - group_w * 0.5, cell.top()),
+                        egui::vec2(group_w, band_h),
+                    );
                     let mut child = ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(cell)
+                            .max_rect(box_rect)
                             .layout(egui::Layout::left_to_right(egui::Align::Center))
                             .id_salt("env_modes"),
                     );
                     child.spacing_mut().item_spacing.x = 0.0;
                     for (i, (glyph, flag, hover)) in labels.into_iter().enumerate() {
                         if i > 0 {
-                            child.add_space(4.0);
+                            child.add_space(gap);
                         }
                         let before = *flag;
                         let on = *flag;
-                        let resp = child.add_sized([cell_w, ctrl_h], egui::Button::selectable(on, ""));
+                        let resp = child.add_sized([ctrl_h, ctrl_h], egui::Button::selectable(on, ""));
+                        trace_rect(ui, node_id, &format!("env_mode_{i}"), resp.rect);
                         super::glyphs::paint(
                             child.painter(),
                             resp.rect,
@@ -1120,25 +1160,75 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                 exposable.push(("mode_row", cell));
                 trace_rect(ui, node_id, "env_mode", cell);
                 }
-                // The grid the points snap to: divisions across time and across value.
-                2 => {
+                // The grid the points snap to: divisions across time and across value, as two
+                // pills - the letter on the left, the count on the right, dragged or typed -
+                // with the snap's magnet as a square at the row's right edge. These were bare
+                // `DragValue`s with " H" and " V" stuck on the end: two widgets in a style
+                // nothing else on the module wears, hugging the left of a row that was often
+                // twice as wide as they were, and a snap button handed whatever was left over -
+                // 111 points of plank at the widest frame measured here.
+                _ => {
                     let mut child = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(cell)
                             .layout(egui::Layout::left_to_right(egui::Align::Center))
                             .id_salt("env_grid"),
                     );
-                    child.spacing_mut().item_spacing.x = 4.0;
-                    changed |= child
-                        .add(egui::DragValue::new(&mut gx_f).speed(0.25).range(1.0..=20.0).max_decimals(0).suffix(" H"))
-                        .changed();
-                    changed |= child
-                        .add(egui::DragValue::new(&mut gy_f).speed(0.25).range(1.0..=20.0).max_decimals(0).suffix(" V"))
-                        .changed();
+                    let pill_w = ((cell.width() - ctrl_h - 2.0 * CELL_GAP) / 2.0).max(46.0);
+                    let top = cell.center().y - ctrl_h * 0.5;
+                    let rect_x = egui::Rect::from_min_size(
+                        egui::pos2(cell.left(), top),
+                        egui::vec2(pill_w, ctrl_h),
+                    );
+                    let rect_v = egui::Rect::from_min_size(
+                        egui::pos2(cell.left() + pill_w + CELL_GAP, top),
+                        egui::vec2(pill_w, ctrl_h),
+                    );
+                    let mag = egui::Rect::from_min_size(
+                        egui::pos2(cell.right() - ctrl_h, top),
+                        egui::vec2(ctrl_h, ctrl_h),
+                    );
+                    let rows = [
+                        (
+                            &mut gx_f as &mut f64,
+                            rect_x,
+                            "env_grid_x",
+                            "H",
+                            "Grid divisions across the envelope's time. A dragged point settles on one of these when Snap is on.",
+                        ),
+                        (
+                            &mut gy_f,
+                            rect_v,
+                            "env_grid_y",
+                            "V",
+                            "Grid divisions across the envelope's value, from silence to full.",
+                        ),
+                    ];
+                    for (value, rect, salt, letter, hover) in rows {
+                        let shown = format!("{}", value.round() as i64);
+                        let (resp, typed) = super::simple_bodies::value_pill_number(
+                            &mut child,
+                            node_id,
+                            salt,
+                            rect,
+                            letter,
+                            &shown,
+                            16.0,
+                            1.0..=20.0,
+                        );
+                        if let Some(v) = typed {
+                            *value = v.round().clamp(1.0, 20.0);
+                            changed = true;
+                        } else if resp.dragged() {
+                            *value = (*value + f64::from(resp.drag_delta().x) * 0.2).round().clamp(1.0, 20.0);
+                            changed = true;
+                        }
+                        resp.on_hover_text(hover);
+                    }
                     let before = snap_on;
-                    let snap_resp = child.add_sized(
-                        [(cell.width() - 2.0 * 4.0 - 96.0).max(34.0), ctrl_h],
-                        egui::Button::selectable(snap_on, ""),
+                    let snap_resp = child.put(
+                        mag,
+                        egui::Button::selectable(snap_on, "").min_size(egui::vec2(ctrl_h, ctrl_h)),
                     );
                     super::glyphs::paint(
                         child.painter(),
@@ -1159,42 +1249,12 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     }
                 exposable.push(("grid_row", cell));
                 trace_rect(ui, node_id, "env_grid", cell);
-                }
-                // What the grid itself shows: the lines, and the time/value numbers on them.
-                _ => {
-                    let cell_w = (cell.width() - 4.0) / 2.0;
-                    let mut child = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(cell)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .id_salt("env_grid_show"),
-                    );
-                    child.spacing_mut().item_spacing.x = 0.0;
-                    let before_g = show_grid;
-                    let g = child.add_sized(
-                        [cell_w, ctrl_h],
-                        egui::Button::selectable(show_grid, egui::RichText::new("Lines").small()),
-                    );
-                    let clicked = g.on_hover_text("Show the grid lines in the graph").clicked();
-                    if clicked {
-                        show_grid = !before_g;
-                        changed = true;
-                    }
-                    child.add_space(4.0);
-                    let before_l = show_labels;
-                    let l = child.add_sized(
-                        [cell_w, ctrl_h],
-                        egui::Button::selectable(show_labels, egui::RichText::new("Labels").small()),
-                    );
-                    let clicked = l
-                        .on_hover_text("Show time (X) and value (Y) labels on the grid lines")
-                        .clicked();
-                    if clicked {
-                        show_labels = !before_l;
-                        changed = true;
-                    }
-                exposable.push(("grid_options_row", cell));
-                trace_rect(ui, node_id, "env_opts", cell);
+                // The two number pills and the snap square, traced for the rig: whether a row
+                // of settings spends its width on its controls or on air between them is
+                // invisible to a size test, and these rects are what make it an assertion.
+                trace_rect(ui, node_id, "env_grid_x", rect_x);
+                trace_rect(ui, node_id, "env_grid_y", rect_v);
+                trace_rect(ui, node_id, "env_snap", mag);
                 }
             }
             x = cell.right() + SEP_W + GAP;
@@ -1229,8 +1289,6 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
             node.params.insert("grid_x".into(), serde_json::json!(gx_f as i64));
             node.params.insert("grid_y".into(), serde_json::json!(gy_f as i64));
             node.params.insert("snap".into(),   Value::Bool(snap_on));
-            node.params.insert("show_grid".into(),        Value::Bool(show_grid));
-            node.params.insert("show_grid_labels".into(), Value::Bool(show_labels));
         }
     }
 

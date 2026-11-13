@@ -2404,8 +2404,38 @@ pub(crate) fn show_svg_body_sized(
 
 // ── Macro Output body ─────────────────────────────────────────────────────────
 
+/// A name too long for its cell, cut with an ellipsis instead of painted over whatever
+/// sits beside it. The whole word stays in the hover text, so cutting costs nothing the
+/// user has to have on the canvas. Laid out in the font and colour it will be painted in,
+/// because the cut has to land where the glyphs do.
+pub(crate) fn elide_to_width(ui: &egui::Ui, text: &str, font: egui::FontId, colour: egui::Color32, avail: f32) -> String {
+    let painter = ui.painter();
+    if painter.layout_no_wrap(text.to_string(), font.clone(), colour).size().x <= avail {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for k in (1..chars.len()).rev() {
+        let trial: String = chars[..k].iter().collect::<String>();
+        let g = painter.layout_no_wrap(format!("{trial}\u{2026}"), font.clone(), colour);
+        if g.size().x <= avail {
+            return g.text().to_string();
+        }
+    }
+    "\u{2026}".to_string()
+}
+
+/// Which Macro Output row's name is being edited, and what has been typed so far. Kept
+/// between frames like the row's drag: the field has to survive the frame that opened it.
+#[derive(Default, Clone)]
+struct MacroEdit {
+    editing: Option<String>,
+    buf: String,
+    focus: bool,
+}
+
 /// Body for the Macro Output node: the list of user-defined ports, edited
-/// inline — icon (menu of the embedded macro icon set), name, type (Bool /
+/// inline — icon (menu of the embedded macro icon set), name (painted, and edited in
+/// place where it stands), type (Bool /
 /// Float / Vec2 / Any), remove. Every change rewrites the `macro_ports`
 /// param, the node's dynamic output pins, and `output_pin_ids` together so
 /// the three can never drift. Removal drops the port's wires and shifts the
@@ -2475,6 +2505,16 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     };
     let drag_key = egui::Id::new(("fxi_macro_drag", node_id.0));
     let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
+    // Which port's name is being edited - by its id, so a row that moved under a drag keeps
+    // the field it had open.
+    let edit_key = egui::Id::new(("fxi_macro_edit", node_id.0));
+    let mut edit = ui.ctx().data(|d| d.get_temp::<MacroEdit>(edit_key)).unwrap_or_default();
+    let name_font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Small)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(12.0));
 
     let n_ports = ports.len();
     // A port picked up follows the finger, and the ports the gap has travelled through step
@@ -2529,24 +2569,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
                 ui.visuals().weak_text_color()
             },
         );
-        if handle.dragged() {
-            if !drag.active || drag.held != i {
-                drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
-            }
-            let d = handle.drag_delta().y;
-            drag.acc += d;
-            drag.lift += d;
-            let steps = (drag.acc / row_h).round() as isize;
-            if steps != 0 {
-                // The port's target moves; the pin list does not, until the finger lets go.
-                // Moving it in both places at once is what made a row flicker, and stepping
-                // the commit made a long drag stop at the neighbour.
-                let target = (drag.current as isize + steps).clamp(0, n_ports as isize - 1) as usize;
-                drag.current = target;
-                drag.acc -= steps as f32 * row_h;
-            }
-        }
-        handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
+        handle.clone().on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to reorder");
         child.add_space(ROW);
         // Icon button + picker (shared with the Virtual Menu module): the
         // custom-SVG loader, category dropdown, name search, and the
@@ -2562,36 +2585,173 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
             changed = true;
         }
         child.add_space(ROW);
-        let name_resp = child.add(
-            egui::TextEdit::singleline(&mut port.name).desired_width(name_w),
+        // The name's cell is placed rather than flowed into. A row laid out left-to-right with
+        // `Align::Center` centres whatever it is handed across the box it asked for, so a short
+        // port name started a dozen points right of a long one and the column of names read as
+        // a scatter. Painted, cut with an ellipsis, whole name in the hover text - the same
+        // bargain a port strip's name makes.
+        //
+        // It is not a field that is open every frame either: an open `TextEdit` lays its text
+        // out at whatever width the text wants, so a port named "Right Trigger, half pressed"
+        // ran across the type dropdown, the `×` and the module's own edge - the cell's clamp
+        // bounded what the row asked for and never what was drawn inside it. A click opens the
+        // field in the cell.
+        let name_left = child.cursor().min.x;
+        let name_rect = egui::Rect::from_min_size(
+            egui::pos2(name_left, row.center().y - row_h * 0.5),
+            egui::vec2(name_w, row_h),
         );
-        if name_resp.changed() {
-            changed = true;
+        let editing_here = edit.editing.as_deref() == Some(port.id.as_str());
+        let name_resp = if editing_here {
+            let mut buf = edit.buf.clone();
+            let resp = ui.put(
+                name_rect,
+                egui::TextEdit::singleline(&mut buf)
+                    .hint_text(if port.name.is_empty() { "name" } else { port.name.as_str() })
+                    .desired_width((name_rect.width() - 8.0).max(8.0)),
+            );
+            if edit.focus {
+                resp.request_focus();
+                edit.focus = false;
+            }
+            let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+            let esc = ui.input(|inp| inp.key_pressed(egui::Key::Escape));
+            if esc {
+                edit.editing = None;
+                edit.buf.clear();
+            } else if enter || resp.lost_focus() {
+                let typed = buf.trim().to_string();
+                // Typing nothing means "never mind", not "this port has no name".
+                if !typed.is_empty() && typed != port.name {
+                    port.name = typed;
+                    changed = true;
+                }
+                edit.editing = None;
+                edit.buf.clear();
+            } else {
+                edit.buf = buf;
+            }
+            resp
+        } else {
+            let empty = port.name.is_empty();
+            let shown = if empty {
+                "—".to_string()
+            } else {
+                elide_to_width(
+                    &child,
+                    &port.name,
+                    name_font.clone(),
+                    ui.visuals().text_color(),
+                    name_rect.width() - 4.0,
+                )
+            };
+            let resp = ui.interact(
+                name_rect,
+                egui::Id::new(("macro_name", node_id.0, i)),
+                egui::Sense::click_and_drag(),
+            );
+            ui.painter().text(
+                egui::pos2(name_rect.left() + 2.0, name_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                shown,
+                name_font.clone(),
+                if empty {
+                    ui.visuals().weak_text_color()
+                } else {
+                    ui.visuals().text_color()
+                },
+            );
+            resp.clone()
+                .on_hover_cursor(egui::CursorIcon::Text)
+                .on_hover_text(format!("{} - click to rename, drag to reorder", port.name));
+            if resp.clicked() {
+                edit.editing = Some(port.id.clone());
+                // Open **empty**, with the current name as the hint: egui 0.33 has no
+                // select-all-on-focus, so a prefilled field is a field that appends - typing
+                // `Kick` over a port called `Left` used to leave it called `LeftKick`.
+                edit.buf = String::new();
+                edit.focus = true;
+            }
+            resp
+        };
+        trace_rect(ui, node_id, &format!("macro_name_{i}"), name_resp.rect);
+        // Dragging a port past half a row moves it, counted from where the port stands now
+        // rather than the row the finger grabbed, so a two-row drag doesn't bounce it back.
+        // The grab is the handle *or* the word - a finger lands on the name, not on the column
+        // of dots beside it - and egui stops reporting a click once the pointer has travelled,
+        // which is what keeps a reorder from also opening the field it dragged. The pins and
+        // their wires move with the port further down.
+        if handle.dragged() || (!editing_here && name_resp.dragged()) {
+            if !drag.active || drag.held != i {
+                drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
+            }
+            let d = if !editing_here && name_resp.dragged() {
+                name_resp.drag_delta().y
+            } else {
+                handle.drag_delta().y
+            };
+            drag.acc += d;
+            drag.lift += d;
+            let steps = (drag.acc / row_h).round() as isize;
+            if steps != 0 {
+                // The port's target moves; the pin list does not, until the finger lets go.
+                // Moving it in both places at once is what made a row flicker, and stepping
+                // the commit made a long drag stop at the neighbour.
+                let target = (drag.current as isize + steps).clamp(0, n_ports as isize - 1) as usize;
+                drag.current = target;
+                drag.acc -= steps as f32 * row_h;
+            }
         }
-        name_resp.on_hover_text(&port.name);
-        child.add_space(ROW);
+        // The type dropdown and the `×` are pinned to the row's right edge rather than trailing
+        // the name. In a flow each one lands wherever the previous widget's own width left the
+        // cursor, so the column of `×`s was a column only by accident - and it stopped some
+        // fifteen points short of the edge its sockets hang off.
+        let btn_h = (row_h - 5.0).max(PILL_H);
+        let rm_rect = egui::Rect::from_min_size(
+            egui::pos2(row.right() - RM_W, row.center().y - btn_h * 0.5),
+            egui::vec2(RM_W, btn_h),
+        );
+        let ty_rect = egui::Rect::from_min_size(
+            egui::pos2(rm_rect.left() - ROW - TYPE_W, row.center().y - btn_h * 0.5),
+            egui::vec2(TYPE_W, btn_h),
+        );
         // The signal type, spelled out. An abbreviation there saves 24 points by making you
         // open a menu to read what the row could already have said, on the one module whose
         // ports are its pins - so the module pays a block of width instead.
-
+        //
         // `.width` because a ComboBox takes `Spacing::combo_width` - 150 points - as its minimum
         // otherwise, whatever the one letter in it is: the button reached past the row and under
         // the output labels. The popup is not held to that width; its entries size it.
-        egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
-            .selected_text(egui::RichText::new(port.signal_type.display_name()).small())
-            .width(TYPE_W)
-            .show_ui(&mut child, |ui| {
-                for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
-                    if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
-                        && port.signal_type != ty
-                    {
-                        port.signal_type = ty;
-                        changed = true;
+        {
+            let mut tc = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(ty_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt(("macro_ty_cell", node_id, i)),
+            );
+            let ty_resp = egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
+                .selected_text(egui::RichText::new(port.signal_type.display_name()).small())
+                .width(TYPE_W)
+                .show_ui(&mut tc, |ui| {
+                    for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
+                        if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
+                            && port.signal_type != ty
+                        {
+                            port.signal_type = ty;
+                            changed = true;
+                        }
                     }
-                }
-            });
-        child.add_space(ROW);
-        if child.small_button("×").on_hover_text("Remove port (drops its wires)").clicked() {
+                });
+            trace_rect(ui, node_id, &format!("macro_type_{i}"), ty_resp.response.rect);
+        }
+        let rm = child.put(
+            rm_rect,
+            egui::Button::new(egui::RichText::new("×").size(14.0))
+                .min_size(egui::vec2(RM_W, btn_h)),
+        )
+        .on_hover_text("Remove port (drops its wires)");
+        trace_rect(ui, node_id, &format!("macro_remove_{i}"), rm.rect);
+        if rm.clicked() {
             remove_idx = Some(i);
         }
         drop(child);
@@ -2611,6 +2771,13 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         if moved.is_none() && drag.active && drag.held != drag.current {
             moved = Some((drag.held, drag.current as isize - drag.held as isize));
         }
+    }
+    // An open name field has to survive the frame that opened it and every frame the typing
+    // arrives in; the body is rebuilt from the params on each of them.
+    if edit.editing.is_some() {
+        ui.ctx().data_mut(|d| d.insert_temp(edit_key, edit));
+    } else {
+        ui.ctx().data_mut(|d| d.remove_temp::<MacroEdit>(edit_key));
     }
 
     if let Some((from, dir)) = moved {

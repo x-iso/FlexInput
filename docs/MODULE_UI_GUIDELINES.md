@@ -149,6 +149,15 @@ creep wider, stick, or flicker. It is handed its width instead.
   the frame gains goes to the part that is actually being edited, and the rows land on block
   lines at any height. A minimum that is one block short of the next size is a minimum that is
   never used.
+- **A row that spans the frame doesn't oblige its controls to.** A setting row is as wide as the
+  body, because the graph, the rail and the number above it are - a row that stops short reads as
+  broken. What it spends the width on is a separate decision: the thing being read or dragged
+  takes it (a length pill, a number pill - more width is more drag travel and more digits), and a
+  button whose whole content is a 16-point glyph keeps its square and gets air beside it.
+  Dividing a row by the number of buttons in it is how an Envelope came to carry three 69-point
+  planks and a snap button 111 points across; the squares stay the height of the row, the gap
+  between them is capped (24 points) and the group is centred in its cell, so it still reads as
+  one control.
 - A switch whose meaning is a shape gets the shape **painted** (`viewer::glyphs`: a magnet
   for snapping, a ring for looping), never a Unicode character - the fonts a build happens to
   carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The word
@@ -694,6 +703,23 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   that sits beside it is no narrower than the rest. (A strip narrowed to make room was the
   first attempt: the column turned into a ladder and the squeezed strip's name ran past its
   edge.) A name longer than the cell is cut with an ellipsis, the whole name in hover text.
+- **A list's name is painted into a cell that was placed, never flowed into one.** Two ways this
+  goes wrong. A widget in a `left_to_right(Align::Center)` row is *centred across* the box it is
+  given, so a short name starts a dozen points right of a long one and the column reads as a
+  scatter; and a `TextEdit` that is open every frame lays its text out at whatever width the text
+  wants, so a Macro port called "Right Trigger, half pressed" painted over the row's type
+  dropdown, its `×` and the module's edge - the cell's clamp bounded what the row asked for and
+  never what was drawn inside it. The working shape, which the port strips and the Macro rows
+  both use now: work out the cell's rect, `ui.interact` it with `Sense::click_and_drag` (a click
+  opens the field, a drag reorders the row, and egui stops reporting the click once the pointer
+  has travelled), and paint the name into it at `Align2::LEFT_CENTER` through
+  `simple_bodies::elide_to_width`, which measures in the font and colour it will be painted in.
+  The field that opens is empty with the old name as its `hint_text` - see the `TextEdit` note at
+  the end of this section.
+- **The cells at a row's end are pinned to the row's end.** A type dropdown and a `×` left to the
+  flow land wherever the previous widget's own width happened to leave the cursor, so the column
+  of `×`s is a column by accident and stops fifteen points short of the edge its sockets hang
+  off. Work their rects out from `row.right()` and `put` them.
 - **A move is previewed, then applied.** While the handle is held the dragged strip rides
   under the finger and the strips it will pass ease aside, one row each; the pins don't
   change until the drag ends, and when they do the painted offsets are re-keyed to the new
