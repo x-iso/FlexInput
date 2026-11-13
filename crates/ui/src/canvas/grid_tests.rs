@@ -3281,7 +3281,10 @@ fn a_macro_port_name_stays_in_the_cell_it_was_given() {
             signal_type: flexinput_core::SignalType::Float,
         };
         if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
-            let ports = vec![mk("aa11bb22", "Aim down"), mk("cc33dd44", "Right Trigger, half pressed")];
+            let ports = vec![
+                mk("aa11bb22", "Aim down"),
+                mk("cc33dd44", "Right Trigger, half pressed, learned from the raw pad"),
+            ];
             n.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
             n.outputs = ports
                 .iter()
@@ -3344,6 +3347,61 @@ fn a_macro_port_name_stays_in_the_cell_it_was_given() {
         "a name twice its cell's width was drawn whole rather than cut: {long_s:?}"
     );
     let _ = short_s;
+}
+
+#[test]
+fn a_macro_pays_width_for_its_port_names_up_to_a_point() {
+    // A Macro's rows *are* its pins, so a name the user typed is worth a block of module: the
+    // list asks for the widest name it has rather than cutting at a constant cell. The other
+    // half of the rule is the clamp - past a point a name is not worth an unbounded module, and
+    // the list stops growing and cuts it the way every other list does.
+    let widths = |names: &[&str]| -> f32 {
+        let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        {
+            use flexinput_core::macros as mac;
+            let ports: Vec<mac::MacroPortDef> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| mac::MacroPortDef {
+                    id: format!("{:08x}", 0xaa000000 + i),
+                    name: n.to_string(),
+                    icon: String::new(),
+                    icon_svg: String::new(),
+                    signal_type: flexinput_core::SignalType::Bool,
+                })
+                .collect();
+            if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+                nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+                nd.outputs = ports
+                    .iter()
+                    .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                    .collect();
+            }
+        }
+        rig.idle(8);
+        rig.frame_rect(node).width()
+    };
+    let short = widths(&["On", "Off"]);
+    let long = widths(&["Aim down", "Right Trigger, half pressed"]);
+    let absurd = widths(&["Right Trigger, half pressed, learned from the raw pad and held a while"]);
+    let more = widths(&[
+        "Right Trigger, half pressed, learned from the raw pad and held a while, with a suffix",
+        "and another name longer than anyone would ever call a port",
+    ]);
+    assert!(
+        whole_blocks(short) && whole_blocks(long) && whole_blocks(absurd) && whole_blocks(more),
+        "off the grid: {short}, {long}, {absurd}, {more}"
+    );
+    assert!(
+        short <= 7.0 * B + 0.5,
+        "an ordinary two-port Macro is {short} wide: its rows ask for less than that"
+    );
+    assert!(long > short, "a long port name didn't widen the module: {short} -> {long}");
+    assert!(
+        more <= absurd + 0.5,
+        "a name past the clamp kept widening the module: {absurd} -> {more}"
+    );
 }
 
 #[test]

@@ -715,7 +715,9 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   has travelled), and paint the name into it at `Align2::LEFT_CENTER` through
   `simple_bodies::elide_to_width`, which measures in the font and colour it will be painted in.
   The field that opens is empty with the old name as its `hint_text` - see the `TextEdit` note at
-  the end of this section.
+  the end of this section. The cell's width is the widest name in the list, clamped to the same
+  28..140 the port strips clamp to (`simple_bodies::show_macro_body`): the module pays for a name
+  the user typed rather than cutting it, and stops paying past the clamp.
 - **The cells at a row's end are pinned to the row's end.** A type dropdown and a `×` left to the
   flow land wherever the previous widget's own width happened to leave the cursor, so the column
   of `×`s is a column by accident and stops fifteen points short of the edge its sockets hang

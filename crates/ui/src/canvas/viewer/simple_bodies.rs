@@ -2464,16 +2464,34 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     let mut moved: Option<(usize, isize)> = None;
 
     // The rows are a list like every other list on the canvas: a handle to move the port, the
-    // icon, the name, the signal type as a dropdown that shows a letter and lists the names, and
-    // the `×` at the right edge. The column is a constant - the module was 308 points wide
-    // because each row measured itself out as an icon button, a 96-point field, a 58-point
-    // dropdown and a button labelled "+ Add output".
-    const LIST_W: f32 = 180.0;
+    // icon, the name, the signal type, and the `×` at the right edge. The column's *ask* comes
+    // from its content - the module was 308 points wide once because every row measured itself
+    // out as an icon button, a 96-point field, a 58-point dropdown and a button labelled
+    // "+ Add output" - but the name's share of it is measured rather than fixed: the widest name
+    // in the list, clamped to the 28..140 a port strip clamps to. A Macro's rows *are* its pins,
+    // so past that clamp the module pays a block of width rather than the name being cut: reading
+    // which port carries what is the only reason the module is on the canvas.
     const ROW: f32 = 4.0;
     const HANDLE_W: f32 = 18.0;
     const ICON_W: f32 = 24.0;
     const TYPE_W: f32 = 46.0;
     const RM_W: f32 = 22.0;
+    const NAME_MIN: f32 = 28.0;
+    const NAME_MAX: f32 = 140.0;
+    let name_font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Small)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(12.0));
+    let name_colour = ui.visuals().text_color();
+    let ask_name_w = ports
+        .iter()
+        .map(|p| if p.name.is_empty() { "—" } else { p.name.as_str() })
+        .map(|n| ui.painter().layout_no_wrap(n.to_string(), name_font.clone(), name_colour).size().x)
+        .fold(NAME_MIN, |widest, w| widest.max(w))
+        .clamp(NAME_MIN, NAME_MAX);
+    let list_w_ask = HANDLE_W + ICON_W + ask_name_w + TYPE_W + RM_W + 4.0 * ROW;
 
     // The rows sit on the pitch the output pins are allocated, which is what keeps each
     // socket level with the strip that names it: the pins are laid out before the body is
@@ -2482,7 +2500,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     let row_h = kit::strip_pitch("module.macro", ports.len(), ui)
         .unwrap_or_else(|| ui.spacing().interact_size.y.max(PILL_H));
     let list_h = ports.len() as f32 * row_h;
-    ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
+    ui.allocate_exact_size(egui::vec2(list_w_ask, list_h), egui::Sense::hover());
     let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
         Some(r) => r,
         None => return,
@@ -2493,9 +2511,9 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     // left a strip of dead margin on the left, where this module has no input pins at all.
     let column = ui.max_rect();
     trace_rect(ui, node_id, "body_column", column);
-    let list_w = column.width().max(120.0);
+    let list_w = column.width().max(list_w_ask);
     let list_left = column.left().max(inner.left());
-    let name_w = (list_w - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW).max(28.0);
+    let name_w = (list_w - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW).max(NAME_MIN);
     let top = kit::group_top(column, list_h);
     let row_rect = |i: usize| {
         egui::Rect::from_min_size(
@@ -2509,12 +2527,6 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     // the field it had open.
     let edit_key = egui::Id::new(("fxi_macro_edit", node_id.0));
     let mut edit = ui.ctx().data(|d| d.get_temp::<MacroEdit>(edit_key)).unwrap_or_default();
-    let name_font = ui
-        .style()
-        .text_styles
-        .get(&egui::TextStyle::Small)
-        .cloned()
-        .unwrap_or_else(|| egui::FontId::proportional(12.0));
 
     let n_ports = ports.len();
     // A port picked up follows the finger, and the ports the gap has travelled through step

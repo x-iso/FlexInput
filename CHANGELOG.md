@@ -457,7 +457,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   sockets are laid out at, so a port's socket is level with the row that names it and adding a
   port moves the module by one row on both sides. The name beside the socket is gone - it was
   the same word twice, and it was what held the module wide - and the rows run the body's full
-  width, so three ports take 224 points rather than 252.
+  width, so three ordinary ports take 196 points rather than 252.
+- **A Macro Output's rows are as wide as the names on them.** The list asked for a constant 180
+  points whatever its ports were called: an ordinary two-port Macro stood a block wider than its
+  rows needed, and a port with a real name was cut at a 68-point cell. The name's share is
+  measured now, clamped to the same 28..140 a port strip clamps to, so `On` and `Off` come out
+  seven blocks across and a port called "Right Trigger, half pressed" takes the width it costs to
+  read it - which is the point of the module, since these rows are its pins.
 - **A Readout is no longer a big module.** It starts three blocks across by two down rather than
   four by four, and the corner grip takes it down to one block by two - enough for a row of
   readings along a patch, each showing its number as large as the box allows. A long value at
