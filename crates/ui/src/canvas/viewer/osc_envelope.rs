@@ -799,7 +799,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     // itself, so the module grows taller rather than ending up with a length squeezed into a
     // short box. The first is the three unit words plus the room a seven-digit length needs.
     // The two graph switches are no longer here: they are in the header.
-    let group_min = [148.0f32, 124.0, 136.0];
+    let group_min = [148.0f32, 112.0, 124.0];
     // A row is exactly one block of the layout grid, and the controls inside it are a little
     // shorter than the row. That is what makes resizing mean something: every block the grip
     // gives the module goes to the graph, and the rows land on block lines at any height.
@@ -1046,10 +1046,21 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                 // The three behaviours, which combine: run to the sustain point and wait,
                 // ping-pong, or repeat the segment. None of them checked is a one-shot.
                 1 => {
+                    // Drawn rather than spelled: at one block per row the words are what holds
+                    // this group wide, and each shape is the thing the switch does. The word is
+                    // in the tooltip, with the sentence that explains it.
                     let labels = [
-                        ("Hold", &mut hold as &mut bool, "Run to the sustain point and hold there while the trigger is held"),
-                        ("Bounce", &mut bounce, "Ping-pong: forward while held, reverse back to the start on release"),
-                        ("Loop", &mut loopf, "Repeat the active segment while the trigger is held"),
+                        (
+                            super::glyphs::Glyph::Hold,
+                            &mut hold as &mut bool,
+                            "Hold: run to the sustain point and hold there while the trigger is held",
+                        ),
+                        (
+                            super::glyphs::Glyph::Bounce,
+                            &mut bounce,
+                            "Bounce: forward while held, back to the start on release",
+                        ),
+                        (super::glyphs::Glyph::Loop, &mut loopf, "Loop: repeat the active segment while the trigger is held"),
                     ];
                     let cell_w = (cell.width() - 2.0 * 4.0) / 3.0;
                     let mut child = ui.new_child(
@@ -1059,15 +1070,22 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             .id_salt("env_modes"),
                     );
                     child.spacing_mut().item_spacing.x = 0.0;
-                    for (i, (text, flag, hover)) in labels.into_iter().enumerate() {
+                    for (i, (glyph, flag, hover)) in labels.into_iter().enumerate() {
                         if i > 0 {
                             child.add_space(4.0);
                         }
                         let before = *flag;
                         let on = *flag;
-                        let resp = child.add_sized(
-                            [cell_w, ctrl_h],
-                            egui::Button::selectable(on, egui::RichText::new(text).small()),
+                        let resp = child.add_sized([cell_w, ctrl_h], egui::Button::selectable(on, ""));
+                        super::glyphs::paint(
+                            child.painter(),
+                            resp.rect,
+                            glyph,
+                            if on {
+                                ui.visuals().strong_text_color()
+                            } else {
+                                ui.visuals().text_color().linear_multiply(0.75)
+                            },
                         );
                         let clicked = resp.on_hover_text(hover).clicked();
                         if clicked {
@@ -1095,11 +1113,21 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         .changed();
                     let before = snap_on;
                     let snap_resp = child.add_sized(
-                        [(cell.width() - 2.0 * 4.0 - 96.0).max(44.0), ctrl_h],
-                        egui::Button::selectable(snap_on, egui::RichText::new("Snap").small()),
+                        [(cell.width() - 2.0 * 4.0 - 96.0).max(34.0), ctrl_h],
+                        egui::Button::selectable(snap_on, ""),
+                    );
+                    super::glyphs::paint(
+                        child.painter(),
+                        snap_resp.rect,
+                        super::glyphs::Glyph::Magnet,
+                        if snap_on {
+                            ui.visuals().strong_text_color()
+                        } else {
+                            ui.visuals().text_color().linear_multiply(0.75)
+                        },
                     );
                     let clicked = snap_resp
-                        .on_hover_text("Snap dragged points to grid intersections")
+                        .on_hover_text("Snap: dragged points settle on the nearest grid intersection")
                         .clicked();
                     if clicked {
                         snap_on = !before;

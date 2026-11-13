@@ -27,6 +27,7 @@ mod conflicts;
 mod controller3d;
 mod expose;
 mod glow;
+mod glyphs;
 mod gyro_body;
 mod jsm;
 mod jsm_cal;
