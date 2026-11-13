@@ -213,6 +213,26 @@ impl Rig {
         crate::canvas::viewer::simple_bodies::traced_rect(&self.ctx, node, what)
     }
 
+    /// Text painted above a frame's top edge that overlaps it sideways: where a collapsed
+    /// node's body ends up, since snarl shifts the body cursor up under the header's clip.
+    fn painted_above(&self, frame: egui::Rect) -> Vec<(String, egui::Rect)> {
+        let back = self.to_global.inverse();
+        self.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let r = back * t.galley.rect.translate(t.pos.to_vec2());
+                    (r.bottom() < frame.top() + 2.0
+                        && r.right() > frame.left()
+                        && r.left() < frame.right()
+                        && !t.galley.text().is_empty())
+                        .then(|| (t.galley.text().to_string(), r))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Where a bit of text was actually painted, in graph points, found by what it starts with
     /// (a cut name ends in an ellipsis the test shouldn't have to guess the spacing of). A
     /// body's own traces bound the cell a control was given; this is about the glyphs inside
@@ -3521,6 +3541,53 @@ fn the_envelope_rows_spend_their_width_on_controls_not_planks() {
     check(&rig, "700-point frame");
 }
 
+#[test]
+fn a_folded_module_keeps_its_frame_and_paints_nothing_over_its_name() {
+    // Snarl runs the body of a collapsed node and shifts it up under the header's clip. The
+    // bodies that draw rows paid for that: a folded Macro put its port - icon, name, type, `×` -
+    // across the header's own name, a folded Oscillator put its phase number under "Oscillator",
+    // and a folded Dropdown an option over "Dropdown". Anything drawn is also clicked, so the
+    // handles of a folded Envelope's graph sat in the space above the frame and answered the
+    // pointer there. A folded module keeps the blocks it had and draws nothing but its header.
+    for (id, title) in [
+        ("module.macro", "Macro Output"),
+        ("generator.envelope", "Envelope"),
+        ("generator.oscillator", "Oscillator"),
+        ("module.selector", "Selector"),
+        ("module.split", "Split"),
+        ("module.dropdown", "Dropdown"),
+    ] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        rig.idle(6);
+        let open = rig.frame_rect(node);
+        rig.canvas.snarl.open_node(node, false);
+        rig.idle(6);
+        let f = rig.frame_rect(node);
+        assert!(
+            whole_blocks(f.width()) && whole_blocks(f.height()),
+            "{id} folded is off the grid: {f:?}"
+        );
+        // The open module's width is its rows plus the words beside its sockets. Folded, the
+        // words go - they were painted in a column clipped away above the header - so a frame may
+        // lose that one block and no more. It is the body's ask, reserved before the fold guard,
+        // that keeps a folded module as wide as its own name instead of shrunk to its controls.
+        assert!(
+            open.width() - f.width() <= B + 0.5,
+            "{id} folded lost more than the width of its pin labels: {open:?} -> {f:?}"
+        );
+        let strays = rig.painted_above(f);
+        assert!(strays.is_empty(), "{id} folded painted over its own header: {strays:?}");
+        let (says, at) = rig
+            .painted_text(&title.chars().take(5).collect::<String>())
+            .unwrap_or_else(|| panic!("{id} folded lost its name in {f:?}"));
+        assert!(
+            f.contains_rect(at),
+            "{id} folded drew its name {says:?} at {at:?}, outside {f:?}"
+        );
+    }
+}
+
 /// What a body paints, read off the paint list instead of off the rects the body chose to
 /// report about itself: every bit of text in the frame, where it landed, whether it crosses
 /// the frame's edge, whether the clip cuts it off anyway, and whether it sits on top of
@@ -3739,4 +3806,61 @@ fn audit_the_macro_and_generator_bodies() {
     }
     rig.idle(6);
     audit(&rig, node, "generator.oscillator, asked 112 wide", false);
+
+    // A tall frame: every block the grip gives goes to the graph, and the rows stay one block.
+    {
+        let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(200.0, 200.0)]);
+        let node = ids[0];
+        if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+            nd.params.insert(kit_width_param().into(), serde_json::json!(420.0f32));
+            nd.params.insert("ui_h".into(), serde_json::json!(560.0f32));
+        }
+        rig.idle(6);
+        audit(&rig, node, "generator.envelope, 420 x 560", false);
+    }
+    // Many ports: the list is what sets the height.
+    {
+        let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(200.0, 200.0)]);
+        let node = ids[0];
+        {
+            use flexinput_core::macros as mac;
+            if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+                let ports: Vec<mac::MacroPortDef> = (0..9)
+                    .map(|i| mac::MacroPortDef {
+                        id: format!("{:08x}", 0xbb00_0000u32 + i as u32),
+                        name: format!("P{i}"),
+                        icon: String::new(),
+                        icon_svg: String::new(),
+                        signal_type: flexinput_core::SignalType::Bool,
+                    })
+                    .collect();
+                nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+                nd.outputs = ports
+                    .iter()
+                    .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                    .collect();
+            }
+        }
+        rig.idle(8);
+        audit(&rig, node, "module.macro, nine ports", false);
+    }
+    // Folded: the sockets come up onto the header row, which is where the `+` and the Envelope's
+    // two graph switches already live.
+    for id in [
+        "module.macro",
+        "generator.envelope",
+        "generator.oscillator",
+        "module.selector",
+        "module.split",
+        "module.dropdown",
+        "module.automap_combiner",
+    ] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(200.0, 200.0)]);
+        let node = ids[0];
+        rig.idle(4);
+        audit(&rig, node, &format!("{id}, open"), false);
+        rig.canvas.snarl.open_node(node, false);
+        rig.idle(6);
+        audit(&rig, node, &format!("{id}, folded"), true);
+    }
 }

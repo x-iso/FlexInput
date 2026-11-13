@@ -1339,6 +1339,17 @@ pub(crate) fn show_automap_combiner_body(
     pinned: bool,
 ) {
     let _ = live_signals; // no longer used: structural overlap is connection-based
+    // Folded, no row is drawn, but the frame keeps the width the rows would ask for: a collapsed
+    // node whose body is skipped would otherwise shrink to its header alone, and a module three
+    // blocks across has no room left for its own name. Snarl runs a collapsed node's body and
+    // shifts it up under the header's clip, which is how these rows came to sit in the space
+    // above the frame - out of sight, and still taking the pointer there. A pinned copy has no
+    // folded state of its own to answer for.
+    if !pinned && !super::simple_bodies::node_open(snarl, node_id) {
+        const COMBINER_W: f32 = 194.0; // handle, port name, resolution dropdown, `×` and pads
+        ui.allocate_exact_size(egui::vec2(COMBINER_W, 0.0), egui::Sense::hover());
+        return;
+    }
     let n = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(0);
     let infos = combiner_inputs_info(snarl, node_id, parent);
 

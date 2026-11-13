@@ -1474,8 +1474,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             kit::strip_bands(&node.module_id, node.inputs.len(), node.outputs.len()),
             ui,
         );
+        // Folded, the strips are gone but their labels stay gone too: a collapsed node's pin
+        // column is laid out above the header and clipped there, so a name drawn in it is
+        // invisible while the socket it belongs to is drawn on the header row.
         let strip_pin = kit::strip_pin(&node.module_id, true, pin.id.input);
-        if !is_relocated_automap && !strip_pin {
+        // Folded, no word is drawn beside the socket: see the output side.
+        let folded = !simple_bodies::node_open(snarl, pin.id.node);
+        if !is_relocated_automap && !strip_pin && !folded {
             let name = if node.module_id == "module.sample_hold" && pin.id.input == 1 {
                 sample_hold_gate_label(node)
             } else {
@@ -1582,7 +1587,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ui,
         );
         let strip_pin = kit::strip_pin(&node.module_id, false, pin.id.output);
-        if strip_pin {
+        // Folded, the word is not drawn: a collapsed node's pin column is laid out above the
+        // header and clipped there, so the label is painted where nothing can see it while the
+        // socket it belongs to is drawn on the header row - and the invisible word is what kept
+        // the folded module as wide as its open self.
+        let folded = !simple_bodies::node_open(snarl, pin.id.node);
+        if strip_pin || folded {
             // The port's own row: no label (the strip says the same word), but the pitch
             // the strips are drawn at.
             if let Some(p) = pitch {

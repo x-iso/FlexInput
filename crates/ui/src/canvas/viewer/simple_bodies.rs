@@ -127,6 +127,16 @@ pub(crate) struct InterpRow(usize);
 /// The body of a Selector (its value inputs) or a Split (its outputs): `pin_from` is the
 /// index in that side where the listed ports start - a Selector's `select` pin is not a
 /// strip - and `interp_row` is the band the interpolate toggle sits on.
+/// Whether a node's body should be drawn at all. Snarl runs the body of a **collapsed** node
+/// anyway and shifts its cursor up under the header's clip, which is how a folded Macro came
+/// to paint its port row - icon, name, `×` - straight across the header's own name, a folded
+/// Dropdown painted an option over the word "Dropdown", and a folded Oscillator put its phase
+/// pill under "Oscillator". Anything below the frame that is still drawn is also still clicked:
+/// the strips of a folded Selector sat in nothing and answered the pointer there.
+pub(crate) fn node_open(snarl: &Snarl<NodeData>, node: NodeId) -> bool {
+    snarl.get_node_info(node).map(|i| i.open).unwrap_or(true)
+}
+
 pub(crate) fn show_port_strips(
     node_id: NodeId,
     inputs: &[InPin],
@@ -205,6 +215,14 @@ pub(crate) fn show_port_strips(
     let list_w = alloc_w;
     let list_h = (rows as f32 * pitch).max(pitch);
     ui.allocate_exact_size(egui::vec2(list_w, list_h), egui::Sense::hover());
+    // Folded, the list keeps the frame's blocks and draws none of itself. Snarl runs a collapsed
+    // node's body and shifts it up under the header's clip: the strips were painted above the
+    // frame, out of sight, and their handles and name fields still answered the pointer there.
+    // The sockets stay on the header row; their names can't come back beside them, because the
+    // pin column of a collapsed node is laid out above the header and clipped there.
+    if !node_open(snarl, node_id) {
+        return;
+    }
 
     let mut to_remove: Option<usize> = None;
     let mut to_move: Option<(usize, usize)> = None;
@@ -739,6 +757,11 @@ pub(crate) fn show_dropdown_body(
 
     // Reserved once, so none of the text in it can reach back into the frame's width.
     ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
+    // Folded, the column is still reserved and nothing in it is drawn: a collapsed node's body
+    // runs under the header's clip, and an option row painted itself across the word "Dropdown".
+    if !node_open(snarl, node_id) {
+        return;
+    }
     let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
         Some(r) => r,
         None => return,
@@ -2501,6 +2524,14 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         .unwrap_or_else(|| ui.spacing().interact_size.y.max(PILL_H));
     let list_h = ports.len() as f32 * row_h;
     ui.allocate_exact_size(egui::vec2(list_w_ask, list_h), egui::Sense::hover());
+    // Folded, the column is still asked for - the frame keeps its blocks - but no row is drawn:
+    // snarl runs a collapsed node's body and shifts it under the header's clip, which is how a
+    // folded Macro painted its first port - icon, name, type, `×` - straight across the header's
+    // own name. The sockets stay; their names don't come back beside them, because a collapsed
+    // node's pin column is laid out above the header and clipped there.
+    if !node_open(snarl, node_id) {
+        return;
+    }
     let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
         Some(r) => r,
         None => return,

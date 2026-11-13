@@ -645,6 +645,19 @@ module and outside the column. Two details that only show up when something else
   whose control *is* its body centres the control in the body column (Switch, Inverse, Logic
   Delay, Has Changed, Constant).
 
+- **A folded node reserves its ask and then draws nothing.** Snarl runs a collapsed node's body
+  anyway and shifts its cursor up under the header's clip, so a body that keeps laying out its
+  rows paints them above the frame — where they are clipped away but still take the pointer. The
+  Knob had the `!open` return for this since its rim was drawn across the header row; every body
+  with rows now does the same (`simple_bodies::node_open`): **allocate the ask first, then
+  return**, so the frame keeps the blocks its rows need and only the header is painted. Returning
+  before the reservation instead folds the module to its header alone — 84 points, which is under
+  the 40 points a title needs, so a folded Macro had no name at all. The same rule covers the pin
+  labels: `show_input`/`show_output` skip the word when the node is folded, because the pin
+  column of a collapsed node is the clipped one, and the invisible words were what made a folded
+  module a block wider than the header it had become. `a_folded_module_keeps_its_frame_and_paints_nothing_over_its_name`
+  reads the paint list for it.
+
 ## Port strips: Selector, Split, Macro, AutoMap Combiner
 
 Modules whose ports are a list the user counts out are drawn as a list, in the body:

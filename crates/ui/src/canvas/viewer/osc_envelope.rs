@@ -34,6 +34,13 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
     use super::simple_bodies::{trace_rect, value_pill_number, PILL_H};
     let group_h = 3.0 * PILL_H + PREVIEW_H + 3.0 * ROW;
     ui.allocate_exact_size(egui::vec2(COL, group_h), egui::Sense::hover());
+    // Folded, the column is still asked for - the frame keeps its blocks when a node folds - but
+    // nothing in it is drawn. Snarl runs a collapsed node's body and shifts it up under the
+    // header's clip, which is how the phase row's number came to paint itself across the word
+    // "Oscillator".
+    if !super::simple_bodies::node_open(snarl, node_id) {
+        return;
+    }
     let inner = match super::module_icons::module_inner(ui, view_salt, node_id) {
         Some(r) => r,
         None => return,
@@ -876,6 +883,13 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
     // rather than losing the graph.
     let want = egui::vec2(column_width, body_h.max(rows_h + MIN_GRAPH_H));
     let (flow, _) = ui.allocate_exact_size(want, egui::Sense::hover());
+    // Folded, the frame is still asked for - a module keeps its blocks when it folds - and
+    // nothing inside it is drawn: snarl runs a collapsed node's body and shifts it up under the
+    // header's clip, where the graph and its point handles were laid out and still answered the
+    // pointer.
+    if !super::simple_bodies::node_open(snarl, node_id) {
+        return;
+    }
     let column = flow;
     trace_rect(ui, node_id, "body_column", column);
     let graph_bottom = column.bottom() - rows_h;

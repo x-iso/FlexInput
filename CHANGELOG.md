@@ -532,6 +532,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   28 points in the font it's painted in and the reading is 18, so the track ended in the middle
   of the row with the percentage at its far edge. The row measures what it paints now and the
   rail runs up to the number it sets.
+- **A folded module drew its own body across its name.** Snarl runs the body of a collapsed node
+  and shifts it up under the header's clip, so a folded Macro Output painted its first port -
+  icon, name, signal type, `×` - straight over the words "Macro Output", a folded Dropdown put an
+  option over "Dropdown", a folded Oscillator its phase number over "Oscillator". Worse, what is
+  drawn is also clicked: a folded Envelope's graph handles and a folded Selector's strip rows sat
+  in the space above the frame, out of sight, and answered the pointer there. A folded module
+  reserves the width its rows ask for and then paints nothing but its header. The words beside its
+  sockets go with the body - they were already being painted in the clipped column, and were what
+  made a folded module a block wider than the header it had become.
 - **A Dropdown menu saved before it had a `shift` pin now gets one.** A node's pins are stored
   with the patch rather than read back from the module registry, so menus drawn before the pin
   were added stayed unshiftable - the control was in the registry and nowhere on the canvas. The
