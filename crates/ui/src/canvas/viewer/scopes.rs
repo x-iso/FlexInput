@@ -169,13 +169,12 @@ const MONO_RATIO: f32 = 0.62;
 
 /// The reading this frame, and how wide the body has to be to hold it at the smallest
 /// size. Asked by `show_body` before the body runs, because it's the body's floor.
-pub(crate) fn readout_floor_w(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {
-    let text = snarl
-        .get_node(node_id)
-        .and_then(|n| n.extra.last_signals.first().copied().flatten())
-        .map(|s| super::simple_bodies::signal_text(Some(&s)))
-        .unwrap_or_default();
-    text.chars().count().max(6) as f32 * MONO_RATIO * READOUT_MIN_FONT + 8.0
+/// How narrow a Readout may be dragged: one block. The reading is drawn as large as
+/// the box allows, so a short value (`0.5`) is perfectly legible at a block across; a long one
+/// is cut at the edge until the module is widened, which is the bargain the size is for - a
+/// shelf of four readings across a patch, each showing enough to tell them apart.
+pub(crate) fn readout_floor_w(_snarl: &Snarl<NodeData>, _node_id: NodeId) -> f32 {
+    crate::settings::CanvasGrid::BLOCK
 }
 
 pub(crate) fn show_readout_body(

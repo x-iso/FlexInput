@@ -1801,6 +1801,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // plus a graph worth editing - so the floor here is only what stops the
                     // grip taking the frame to nothing.
                     "generator.envelope" => 40.0,
+                    // A Readout's body is one number that shrinks to fit, so the only floor
+                    // worth stating is the knob's: the frame is held together by its header, and
+                    // the grip should be able to take the module to one block across by two down.
+                    "display.readout" => 12.0,
                     // What a two-old-block frame leaves under the header and the frame's
                     // margins: the body floor that used to come for free from a 56-point
                     // grid. Stated in body points, not frame blocks - asking for the frame
@@ -1839,7 +1843,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // a name is painted now, so nothing in an untouched readout asked for the
                     // room. Ask for it by name - two blocks, like the knob's dial - and the
                     // floor below still lets the grip take it down to what the number needs.
-                    "display.readout" => Some(4.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
+                    // Three blocks of a number is the point of the module: big enough to read
+                    // off the patch, small enough to stand a row of them side by side. The grip
+                    // takes it from there in either direction, down to one block across.
+                    "display.readout" => Some(3.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                     "generator.envelope" => Some(10.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                     _ => None,
                 };

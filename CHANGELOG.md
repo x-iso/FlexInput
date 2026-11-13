@@ -445,6 +445,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   pass takes sat in a box that never grew while the `ms | s | Hz` buttons beside it did. It is
   a pill like every other setting now - the rest of its row, dragging and taking typing - and
   the unit buttons went down to the three two-letter words they are. A row's share of a band
+- **A Readout is no longer a big module.** It starts three blocks across by two down rather than
+  four by four, and the corner grip takes it down to one block by two - enough for a row of
+  readings along a patch, each showing its number as large as the box allows. A long value at
+  that size is cut at the edge rather than widening the module, which is the same bargain the
+  type already made: the reading gives way, the module does not.
   is now what it asks for rather than an equal split, so the row carrying a strip and a number
 - **The Envelope got compact, and its graph switches moved up.** Its rows are one block of the
   grid tall, so every block the corner grip hands the module goes to the graph; the default is

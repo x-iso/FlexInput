@@ -841,15 +841,15 @@ fn a_text_field_covers_the_body_it_is_given() {
 }
 
 #[test]
-fn a_readout_is_two_blocks_and_its_type_fills_the_space() {
-    // Two blocks to start with - the old three were wider than any ordinary reading -
-    // and the grip works both ways, including back down to the floor.
+fn a_readout_starts_three_blocks_by_two_and_comes_down_to_one_by_two() {
+    // Three blocks across and two down: big enough to read off the patch, small enough to
+    // stand a row of them beside each other. The grip works both ways, down to one block by
     let (mut rig, ids) = Rig::real("display.readout", &[egui::pos2(100.0, 300.0)]);
     rig.idle(6);
     let open = rig.frame_rect(ids[0]);
     assert_eq!(
         (open.width(), open.height()),
-        (2.0 * MAJOR, 2.0 * MAJOR),
+        (3.0 * B, 2.0 * B),
         "a readout with no value on it: {open:?}",
     );
     if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
