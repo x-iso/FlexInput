@@ -3111,3 +3111,65 @@ fn a_dropdown_row_can_be_reordered_from_its_name_not_only_the_dots() {
         "the drag did not land the grabbed option where it was dragged to: {options:?}",
     );
 }
+
+#[test]
+fn a_dragged_macro_port_travels_past_its_neighbour() {
+    // A port could only ever trade places with the one next to it: the move was committed a
+    // row at a time while the row was also being drawn offset from its slot, so the list
+    // flickered under the finger and a long drag stopped short. A drag now carries the port to
+    // wherever it is held and lands it when the finger leaves, pins and wires going with it.
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    {
+        use flexinput_core::macros as mac;
+        let mk = |id: &str, name: &str, ty: flexinput_core::SignalType| mac::MacroPortDef {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: ty,
+        };
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(
+                mac::MACRO_PORTS_PARAM.to_string(),
+                mac::ports_to_value(&[
+                    mk("aa11bb22", "Left", flexinput_core::SignalType::Bool),
+                    mk("cc33dd44", "Right", flexinput_core::SignalType::Float),
+                    mk("ee55ff66", "Up", flexinput_core::SignalType::Vec2),
+                ]),
+            );
+            n.outputs = vec![
+                PinDescriptor::new("Left", flexinput_core::SignalType::Bool),
+                PinDescriptor::new("Right", flexinput_core::SignalType::Float),
+                PinDescriptor::new("Up", flexinput_core::SignalType::Vec2),
+            ];
+            n.params.insert(
+                "output_pin_ids".into(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::String("macro:aa11bb22".into()),
+                    serde_json::Value::String("macro:cc33dd44".into()),
+                    serde_json::Value::String("macro:ee55ff66".into()),
+                ]),
+            );
+        }
+    }
+    rig.idle(8);
+    let row = |rig: &Rig, i: usize| -> egui::Rect {
+        rig.traced_rect(node, &format!("macro_row_{i}")).unwrap_or(egui::Rect::NOTHING)
+    };
+    let (top, second) = (row(&rig, 0), row(&rig, 1));
+    assert!(top.is_positive() && second.is_positive(), "the port list drew no rows: {top:?} {second:?}");
+    let pitch = second.top() - top.top();
+    rig.drag(egui::pos2(top.left() + 12.0, top.center().y), egui::vec2(0.0, 2.5 * pitch));
+    let names: Vec<String> = rig
+        .canvas
+        .snarl
+        .get_node(node)
+        .map(|n| n.outputs.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        &names[..],
+        &["Right".to_string(), "Up".to_string(), "Left".to_string()],
+        "the dragged port did not travel the length of the drag: {names:?}",
+    );
+}

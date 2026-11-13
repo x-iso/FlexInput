@@ -855,7 +855,7 @@ pub(crate) fn show_dropdown_body(
     for i in 0..options.len() {
         let mut row_remove = false;
         let mut row_move: isize = 0;
-        let mut row_from = i;
+        let row_from = i;
         let mut commit_edit: Option<String> = None;
         let mut cancel_edit = false;
         let row = row_rect(i + 1).translate(egui::vec2(0.0, lifts[i]));
@@ -893,19 +893,25 @@ pub(crate) fn show_dropdown_body(
         // list's own selection.
         let handle = child.add_sized(
             [HANDLE_W, PILL_H],
-            egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
+            egui::Label::new("").sense(egui::Sense::drag()),
+        );
+        // The dots are painted rather than being a widget of their own: as a label they picked
+        // up the list's selection colours whenever a drag was open, which read as the grip
+        // lighting up for no reason. They brighten only for the row being held.
+        child.painter().text(
+            handle.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⠿",
+            egui::FontId::proportional(12.0),
+            if drag.active && drag.held == i {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().weak_text_color()
+            },
         );
         handle.clone().on_hover_cursor(egui::CursorIcon::Grab);
         handle.clone().on_hover_text("Drag to reorder");
-        if drag.active && drag.held == i {
-            // The row travelling under the finger sits above the ones it has passed. Painted
-            // before the row's own parts, so it is a floor rather than a cover.
-            let lifted = egui::ecolor::tint_color_towards(
-                ui.visuals().widgets.inactive.weak_bg_fill,
-                ui.visuals().strong_text_color(),
-            );
-            child.painter().rect_filled(row, 4.0, lifted);
-        }
+
         let mut name: Option<egui::Response> = None;
         child.add_space(ROW);
         let is_editing = edit_state.editing == Some(i);
@@ -1010,11 +1016,10 @@ pub(crate) fn show_dropdown_body(
             // a row, and a truncated quotient only moves after a whole one.
             let steps = (drag.acc / pitch).round() as isize;
             if steps != 0 {
-                // Counted from where the option stands now, which is no longer the row the
-                // finger grabbed it on once it has been moved: the row ids are fixed, so a
-                // second step measured from that row would bounce it back where it started.
-                row_from = drag.current;
-                row_move = steps;
+                // Only the row's target moves here. The list itself is left alone until the
+                // finger lets go: moving the option and drawing the same move as an offset in
+                // the same frame is what made a row flicker back and forth under the finger,
+                // and committing a step at a time is what stopped a long drag at its neighbour.
                 let target = (drag.current as isize + steps).clamp(0, options.len() as isize - 1) as usize;
                 drag.current = target;
                 drag.acc -= steps as f32 * pitch;
@@ -1042,18 +1047,30 @@ pub(crate) fn show_dropdown_body(
     }
 
 
+    // The move lands when the finger leaves, at wherever the held row was being held.
+    if drag.active && !ui.input(|i| i.pointer.any_down()) && drag.held != drag.current {
+        let (from, to) = (drag.held, drag.current);
+        to_move = Some((from, to as isize - from as isize));
+    }
+
     // ── Apply mutations ─────────────────────────────────────────────────
     if let Some((i, dir)) = to_move {
         let target = (i as isize + dir).clamp(0, options.len() as isize - 1) as usize;
         if target != i {
-            options.swap(i, target);
+            // A dragged option travels: everything it passed steps up one, rather than the
+            // two ends trading places, which is what a drag looks like while it is happening.
+            let moved_option = options.remove(i);
+            options.insert(target, moved_option);
             options_changed = true;
             // Keep selection pointing at the same logical entry.
             if new_selected == i {
                 new_selected = target;
                 selected_changed = true;
-            } else if new_selected == target {
-                new_selected = i;
+            } else if i < target && new_selected > i && new_selected <= target {
+                new_selected -= 1;
+                selected_changed = true;
+            } else if target < i && new_selected >= target && new_selected < i {
+                new_selected += 1;
                 selected_changed = true;
             }
         }
@@ -2453,7 +2470,6 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     };
     let drag_key = egui::Id::new(("fxi_macro_drag", node_id.0));
     let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
-    let mut drag_seen = false;
 
     let n_ports = ports.len();
     // A port picked up follows the finger, and the ports the gap has travelled through step
@@ -2491,23 +2507,27 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         // The handle: dragging a port past half a row moves it, counted from where the port
         // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
         // it back. The pins and their wires move with it further down.
-        if drag.active && drag.held == i {
-            // The port travelling under the finger sits above the ones it has passed, so the
-            // gap opening in the list is visible where it is rather than only at the end.
-            let lifted = egui::ecolor::tint_color_towards(
-                ui.visuals().widgets.inactive.weak_bg_fill,
-                ui.visuals().strong_text_color(),
-            );
-            child.painter().rect_filled(row, 4.0, lifted);
-        }
+
         // stands now rather than the row the finger grabbed, so a two-row drag doesn't bounce
         // it back. The pins and their wires move with it further down.
         let handle = child.add_sized(
             [HANDLE_W, row_h],
-            egui::Label::new(egui::RichText::new("⠿").weak().small()).sense(egui::Sense::drag()),
+            egui::Label::new("").sense(egui::Sense::drag()),
+        );
+        // Painted dots, for the reason the Dropdown rows now have them: a label grip took on
+        // the list's colours mid-drag. Only the held row's grip brightens.
+        child.painter().text(
+            handle.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⠿",
+            egui::FontId::proportional(12.0),
+            if drag.active && drag.held == i {
+                ui.visuals().strong_text_color()
+            } else {
+                ui.visuals().weak_text_color()
+            },
         );
         if handle.dragged() {
-            drag_seen = true;
             if !drag.active || drag.held != i {
                 drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
             }
@@ -2516,7 +2536,9 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
             drag.lift += d;
             let steps = (drag.acc / row_h).round() as isize;
             if steps != 0 {
-                moved = Some((drag.current, steps));
+                // The port's target moves; the pin list does not, until the finger lets go.
+                // Moving it in both places at once is what made a row flicker, and stepping
+                // the commit made a long drag stop at the neighbour.
                 let target = (drag.current as isize + steps).clamp(0, n_ports as isize - 1) as usize;
                 drag.current = target;
                 drag.acc -= steps as f32 * row_h;
@@ -2574,10 +2596,16 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         trace_rect(ui, node_id, &format!("macro_row_{i}"), row);
     }
 
-    if drag_seen && drag.active && moved.is_none() && remove_idx.is_none() {
+    // A drag is over when the finger leaves, not when a frame stops reporting the row as
+    // dragged. The move lands at that moment, at wherever the row was being held - so one long
+    // drag can cross several rows, and nothing on the list moves until the finger says so.
+    if drag.active && ui.input(|i| i.pointer.any_down()) && remove_idx.is_none() {
         ui.ctx().data_mut(|d| d.insert_temp(drag_key, drag));
     } else {
         ui.ctx().data_mut(|d| d.remove_temp::<OptionDrag>(drag_key));
+        if moved.is_none() && drag.active && drag.held != drag.current {
+            moved = Some((drag.held, drag.current as isize - drag.held as isize));
+        }
     }
 
     if let Some((from, dir)) = moved {

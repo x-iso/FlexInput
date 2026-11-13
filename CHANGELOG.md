@@ -457,6 +457,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   and the rows it passes step aside a row, the way the Split and Selector strips do; the
   distance travelled is carried while the button is down rather than only while egui still
   reports that row as dragged, which is what made a long drag land somewhere other than where
+- **A drag of a Dropdown option or a Macro port stopped at its neighbour and flickered on the
+  way.** The move was committed a row at a time while the same move was also being drawn as an
+  offset from the row's slot, so the list jumped back and forth under the finger; the grip was
+  a label, so it took on the list's selection colours mid-drag. The list holds still while you
+  drag - the picked row follows the finger, the rows it passes slide aside - and the move lands
+  as one move, to wherever the row was held, when the finger leaves. The grip is painted, and
+  brightens only for the row being held.
   it was picked up; and a drag is never also a click, so passing an option no longer chooses it.
 
 ### Fixed
