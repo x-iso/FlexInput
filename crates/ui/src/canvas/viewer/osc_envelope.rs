@@ -313,6 +313,19 @@ fn envelope_point_help(x: f32, y: f32, period_ms: f32) -> String {
     };
     format!("{:.2} level at {when}", y)
 }
+/// The module's own snap setting, for the reason [`graph_shown`] gives.
+fn snap_on_param(n: &crate::canvas::node::NodeData) -> bool {
+    n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// What one of the graph's three switches means for a particular copy of it: the pinned
+/// copy's own choice when it has one, otherwise whatever the module on the canvas is set to.
+/// The default is the module, so a copy drawn before these overrides existed - or one nobody
+/// touched - looks exactly as it did.
+fn graph_shown(ov: Option<bool>, on_module: bool) -> bool {
+    ov.unwrap_or(on_module)
+}
+
 pub(crate) fn paint_envelope_curve_graph(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -338,10 +351,21 @@ pub(crate) fn paint_envelope_curve_graph(
                 .unwrap_or_default();
             let gx   = n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let gy   = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
-            let sn   = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
+            // A pinned copy of this curve can be told to draw its grid differently from the
+            // module on the canvas; with no override on a field the copy follows the module.
+            let sn = graph_shown(graph_ov.and_then(|o| o.snap), snap_on_param(n));
             let sus  = n.params.get("sustain").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
-            let sg   = n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true);
-            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sg = graph_shown(
+                graph_ov.and_then(|o| o.show_grid),
+                n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true),
+            );
+            let sgl = graph_shown(
+                graph_ov.and_then(|o| o.show_labels),
+                n.params
+                    .get("show_grid_labels")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            );
             let tmul = n.params.get("time_mul").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
             let tb   = n.params.get("timebase").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
             let (hold, bounce, loopf) = flexinput_engine::envelope_flags(&n.params);
@@ -1450,42 +1474,22 @@ pub(crate) fn render_envelope_grid_row(
         }
     }
 }
+#[cfg(test)]
+mod a_pinned_graph_copy_follows_the_module_it_came_from {
+    use super::graph_shown;
 
-pub(crate) fn render_envelope_grid_options_row(
-    inner_id: NodeId,
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
-    container: egui::Vec2,
-) {
-    ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
+    // The three display switches of a pinned graph are per copy and optional. Unset, the copy
+    // looks exactly like the module on the canvas - which is what a copy saved before these
+    // switches existed, or one nobody touched, has to keep doing. Set, it wins both ways.
+    #[test]
+    fn unset_follows_the_module() {
+        assert!(graph_shown(None, true));
+        assert!(!graph_shown(None, false));
+    }
 
-    let (show_grid, show_labels) = snarl.get_node(inner_id).map(|n| {
-        let sg  = n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true);
-        let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
-        (sg, sgl)
-    }).unwrap_or((true, false));
-
-    let mut show_grid   = show_grid;
-    let mut show_labels = show_labels;
-    let mut changed     = false;
-
-    let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
-    ui.horizontal(|ui| {
-        let sg_before = show_grid;
-        let r = ui.checkbox(&mut show_grid, egui::RichText::new("Grid").small());
-        fr.push(r.rect);
-        changed |= show_grid != sg_before;
-        let sl_before = show_labels;
-        let r = ui.checkbox(&mut show_labels, egui::RichText::new("Labels").small());
-        fr.push(r.rect);
-        changed |= show_labels != sl_before;
-    });
-    publish_nav_field_rects(ui, inner_id, &fr);
-    if changed {
-        if let Some(node) = snarl.get_node_mut(inner_id) {
-            node.params.insert("show_grid".into(),        Value::Bool(show_grid));
-            node.params.insert("show_grid_labels".into(), Value::Bool(show_labels));
-        }
+    #[test]
+    fn a_copy_can_force_it_either_way() {
+        assert!(graph_shown(Some(true), false));
+        assert!(!graph_shown(Some(false), true));
     }
 }

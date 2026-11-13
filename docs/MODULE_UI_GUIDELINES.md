@@ -141,23 +141,23 @@ creep wider, stick, or flicker. It is handed its width instead.
   frame that can't shrink.
 - The grip itself stops at the header's width and at that narrowest frame.
 - A body that is a fixed grid of cells has **no grip at all** (`kit::fixed_size` - the
+  Counter): its cells ask for one size, and being dragged wider only puts air between them,
+  which is how one module ends up at four sizes in a single patch. A width an older patch
+  stored in it is ignored.
 - A row of a stack of settings is **one block of the grid tall**, and the control inside it a
-- A switch whose meaning is a shape gets the shape **painted** (`viewer::glyphs`: a magnet
-  for snapping, a ring for looping), never a Unicode character - the fonts a build happens to
-  carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The word
-  goes in the tooltip, next to the sentence that says what the switch does.
   little shorter than the row. That is what makes the corner grip mean something: every block
   the frame gains goes to the part that is actually being edited, and the rows land on block
   lines at any height. A minimum that is one block short of the next size is a minimum that is
   never used.
+- A switch whose meaning is a shape gets the shape **painted** (`viewer::glyphs`: a magnet
+  for snapping, a ring for looping), never a Unicode character - the fonts a build happens to
+  carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The word
+  goes in the tooltip, next to the sentence that says what the switch does.
 - Switches about **how a module's one big control is drawn** - an Envelope graph's grid, its
   labels - belong at the header's right edge with the stepper and the `+` (`kit::header_toggle`,
   same squares), not in a row of the body: two full-size buttons there cost a quarter of a
-  four-block module for two switches. The row's exposable id moves with them, so a shelf that
-  pinned the old row still finds it.
-  Counter): its cells ask for one size, and being dragged wider only puts air between them,
-  which is how one module ends up at four sizes in a single patch. A width an older patch
-  stored in it is ignored.
+  four-block module for two switches. Nothing beside the header is a pin target either: a
+  pinned copy of that graph sets the same things on itself, in the inspector.
 - The body reports exactly that width to the node whatever its rows draw, so a
   value or option too long for its cell can't tip the node over a block and back
   every other frame.
@@ -427,6 +427,11 @@ rules come with it:
    call with the **same element ids**: pinned widgets, and their own renderers in
    `pinned.rs`, look elements up by id.
 6. Delete the old body.
+7. What a **pinned copy** of the control may want to have different is an override in the
+   layout inspector, alongside its colours, with `module` (follow the module on the canvas) as
+   one of the choices - not a second element to expose. A copy has no header of its own, and
+   the module's switches stay where they are: an Envelope graph copy is told `grid`, `labels`
+   and `snap` there, and an unset field keeps every copy saved so far looking exactly as it did.
 
 Bodies that fill a frame the grip widened: Counter (its cells stretch from a 56-point floor)
 and the port lists — Selector, Split, the Auto-Map splitter and collector, the Dropdown menu.

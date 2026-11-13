@@ -713,11 +713,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             n.params.insert("show_grid_labels".into(), Value::Bool(sl));
                         }
                     }
-                    // The pinned element these switches used to be a row of keeps its id: the
-                    // controls moved; the thing the Properties shelf can pin did not go away.
-                    let both = egui::Rect::from_min_max(grid.min, labels.max);
-                    register_exposable_element(ui, node, "grid_options_row", both);
-                    simple_bodies::trace_rect(ui, node, "env_opts", both);
+                    // Not something the Properties shelf can pin: what a pinned copy of the
+                    // graph shows is set on that copy, beside its colours, and by default it
+                    // follows what is set here.
+                    simple_bodies::trace_rect(ui, node, "env_opts", egui::Rect::from_min_max(grid.min, labels.max));
                 }
 
                 if is_subpatch {

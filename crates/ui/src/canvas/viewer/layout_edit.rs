@@ -460,7 +460,13 @@ pub(crate) fn layout_inspector_strip_core(
                 controller3d_pin_inspector_strip_item(ui, state.items, idx);
             }
             LayoutItem::Module(_) if is_graph_pin => {
-                graph_pin_inspector_strip_item(ui, state.items, idx, graph_channels);
+                graph_pin_inspector_strip_item(
+                    ui,
+                    state.items,
+                    idx,
+                    graph_channels,
+                    inner_mid == Some("generator.envelope"),
+                );
             }
             _ => {}
         }
@@ -1259,6 +1265,7 @@ pub(crate) fn graph_pin_inspector_strip_item(
     items: &mut Vec<LayoutItem>,
     idx: usize,
     n_channels: usize,
+    envelope: bool,
 ) {
     use crate::canvas::node::PinGraphOverride;
     if idx >= items.len() { return; }
@@ -1292,6 +1299,32 @@ pub(crate) fn graph_pin_inspector_strip_item(
         // (unmultiplied 180,180,180,160 == GRAPH_GRID_DEFAULT premultiplied).
         let mut grid = ov.gridline.unwrap_or([180, 180, 180, 160]);
         if color_button(ui, "grid", &mut grid) { ov.gridline = Some(grid); }
+        // An Envelope graph also carries the three switches its module keeps in its header, here
+        // as per-copy choices: `module` follows the module on the canvas, `on` and `off` force
+        // it for this copy alone. A pinned copy has no header to set them on, and a plain curve
+        // on an overlay is often what is wanted even while the module shows its grid.
+        if envelope {
+            for (name, hover, field) in [
+                ("grid", "The lines a dragged point sits on", &mut ov.show_grid),
+                ("labels", "The time and value numbers along those lines", &mut ov.show_labels),
+                ("snap", "Dragged points settle on the nearest intersection", &mut ov.snap),
+            ] {
+                ui.label(egui::RichText::new(name).small());
+                let mut v = *field;
+                if super::kit::strip(
+                    ui,
+                    104.0,
+                    &mut v,
+                    &[
+                        (None, "module", "Follow what the module on the canvas shows"),
+                        (Some(true), "on", hover),
+                        (Some(false), "off", "Not drawn in this copy"),
+                    ],
+                ) {
+                    *field = v;
+                }
+            }
+        }
 
         ui.separator();
 
@@ -1319,6 +1352,9 @@ pub(crate) fn graph_pin_inspector_strip_item(
             || ov.outline.is_some()
             || ov.outline_px.is_some()
             || ov.gridline.is_some()
+            || ov.show_grid.is_some()
+            || ov.show_labels.is_some()
+            || ov.snap.is_some()
             || ov.channel_colors.iter().any(|c| c.is_some());
         // Drop trailing None channel slots so we don't serialize empty tails.
         while matches!(ov.channel_colors.last(), Some(None)) { ov.channel_colors.pop(); }

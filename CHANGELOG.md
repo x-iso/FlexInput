@@ -457,6 +457,12 @@ All notable changes to FlexInput are documented here. This project adheres to
   the same word twice, and it was what held the module wide - and the rows run the body's full
   width, so three ports take 224 points rather than 252.
 - **A Readout is no longer a big module.** It starts three blocks across by two down rather than
+- **A pinned Envelope graph can be drawn differently from the module it came from.** The overlay
+  inspector's graph row - the one that already carries a copy's colours - now also offers
+  `grid`, `labels` and `snap`, each with `module` (follow the module on the canvas), `on` and
+  `off`. `module` is the default, so every copy saved until now looks exactly as it did. The
+  switches are no longer something to pin: the module keeps them in its header, and a copy sets
+  its own in the inspector, which is where a widget's settings were always going to live.
   four by four, and the corner grip takes it down to one block by two - enough for a row of
   readings along a patch, each showing its number as large as the box allows. A long value at
   that size is cut at the edge rather than widening the module, which is the same bargain the

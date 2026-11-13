@@ -359,6 +359,14 @@ pub struct PinGraphOverride {
     /// Per-channel line/dot color, indexed by channel. A `None` (or missing
     /// trailing) entry falls back to the default palette for that channel.
     #[serde(default)] pub channel_colors: Vec<Option<[u8; 4]>>,
+    /// What the graph draws besides its curve, for an Envelope: the grid the points sit on,
+    /// the time and value numbers along it, and whether a dragged point snaps to the nearest
+    /// intersection. `None` follows the module on the canvas - a pinned copy has no header of
+    /// its own to set these on, and the same copy may want a plainer drawing than the module it
+    /// came from.
+    #[serde(default)] pub show_grid: Option<bool>,
+    #[serde(default)] pub show_labels: Option<bool>,
+    #[serde(default)] pub snap: Option<bool>,
 }
 
 /// Text horizontal alignment for layout-decoration Text items.

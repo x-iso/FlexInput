@@ -742,10 +742,6 @@ pub(crate) fn render_pinned_element_impl(
             render_envelope_grid_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
-        ("generator.envelope", "grid_options_row") => {
-            render_envelope_grid_options_row(inner_id, ui, inner_snarl, container_size);
-            return;
-        }
         // Audio Stream Haptics — the scope widget, or any single calibration row.
         ("module.audio_stream_haptics", "asth_scope") => {
             render_asth_pinned_scope(inner_id, ui, inner_snarl, container_size, bridged_parent, graph_ov_ref);
