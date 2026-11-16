@@ -318,7 +318,7 @@ pub fn set_user_models_dir(dir: Option<PathBuf>) {
     crate::model::material::clear_scheme_cache();
 }
 
-fn user_models_dir() -> Option<PathBuf> {
+pub(crate) fn user_models_dir() -> Option<PathBuf> {
     user_models_lock().read().ok()?.clone()
 }
 

@@ -38,6 +38,7 @@ pub(crate) fn eval_rws_node(
     snap: &NodeSnap,
     uid: usize,
     inputs: &[Option<Signal>],
+    dev_sigs: &BusMap,
     collector_sigs: &mut BusMap,
     state: &mut HashMap<usize, NodeState>,
     dt: f32,
@@ -93,6 +94,7 @@ pub(crate) fn eval_rws_node(
     start_bound_turns(snap, uid, state);
     let node_state = state.entry(uid).or_default();
     let out = rws_fit_outputs(compute_rws(&corrected, node_state, &snap.params, dt), snap.n_outputs);
+    publish_native_gyro(snap, uid, dev_sigs, collector_sigs);
 
     // Publish the source-block for the flick stick (drained into `source_block`
     // at tick end, applied next tick — one tick stale, imperceptible at kHz).
@@ -295,20 +297,62 @@ const GESTURE_OUT: f32 = 0.1;
 const TURN_STICK_CARRY: usize = 19;
 
 /// Where RWS Aim's display-only measured angle lands in `last_out`: right after
-/// the node's pins. Nodes saved before the Flick pin have two pins, newer ones
-/// three, and the engine trims its output to match (see [`rws_fit_outputs`]).
+/// the node's pins. Nodes saved before the Flick pin have two pins, before the
+/// Gyro pin three, newer ones four, and the engine trims its output to match (see
+/// [`rws_fit_outputs`]).
 pub fn rws_cal_deg_out(n_outputs: usize) -> usize {
-    n_outputs.clamp(2, 3)
+    n_outputs.clamp(2, 4)
 }
 /// Where the sweep's peak unclamped stick deflection lands: after the angle.
 pub fn rws_cal_peak_out(n_outputs: usize) -> usize {
     rws_cal_deg_out(n_outputs) + 1
 }
 
+/// The gains the Map output puts on the Device bus's gyro axes: `(roll and yaw, pitch)`.
+/// `gyro_scale` is the calibrated constant - one pad degree, one game degree through the
+/// game's own gyro aim - and Real World Scale (`rws`) the feel on top of it, as it is for
+/// the mouse; the gyro V/H bias scales pitch. A calibration sweep drives the game at the
+/// base scale through the output being calibrated only: the gyro at `gyro_scale` alone for
+/// a Gyro sweep, and held still for a Mouse or Stick one.
+pub fn rws_native_gyro_gain(params: &HashMap<String, Value>) -> (f32, f32) {
+    let pf = |k: &str, d: f32| params.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+    let gs = pf("gyro_scale", 1.0).max(0.0);
+    let measuring = matches!(params.get("cal_measure").and_then(|v| v.as_str()), Some("pitch" | "yaw"));
+    if measuring {
+        let gyro = params.get("cal_output").and_then(|v| v.as_str()) == Some("gyro");
+        return if gyro { (gs, gs) } else { (0.0, 0.0) };
+    }
+    let k = gs * pf("rws", 1.0);
+    (k, k * pf("gyro_vh_ratio", 1.0).max(0.0))
+}
+
+/// The Map output: the Device input's bus handed on under `collector:{uid}`, its gyro
+/// scaled by [`rws_native_gyro_gain`] - for a game that aims with the pad's own gyro. Does
+/// nothing while the Device input is unwired (nothing to hand on).
+fn publish_native_gyro(snap: &NodeSnap, uid: usize, dev_sigs: &BusMap, collector_sigs: &mut BusMap) {
+    let wired = ["_automap_device_id", "_automap_collector_id"]
+        .iter()
+        .any(|k| snap.params.get(*k).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()));
+    if !wired {
+        return;
+    }
+    republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
+    let (roll_yaw, pitch) = rws_native_gyro_gain(&snap.params);
+    let key = format!("collector:{uid}");
+    for (pin, k) in [("gyro_x", roll_yaw), ("gyro_y", pitch), ("gyro_z", roll_yaw)] {
+        if let Some(v) = collector_sigs.get_pin(&key, &pin).map(|s| s.as_float()) {
+            collector_sigs.set_pin(&key, &pin, Signal::Float(v * k));
+        }
+    }
+}
+
 /// Fit [`compute_rws`]'s full output to the node's pins: a node from before the
-/// Flick pin has no slot for it, so it is dropped and the display-only entries
-/// move up to sit right after the pins it does have.
+/// Gyro pin (or the Flick pin) has no slot for it, so it is dropped and the
+/// display-only entries move up to sit right after the pins it does have.
 pub(crate) fn rws_fit_outputs(mut out: Vec<Option<Signal>>, n_outputs: usize) -> Vec<Option<Signal>> {
+    if n_outputs < 4 && out.len() > 3 {
+        out.remove(3);
+    }
     if n_outputs < 3 && out.len() > 2 {
         out.remove(2);
     }
@@ -318,7 +362,9 @@ pub(crate) fn rws_fit_outputs(mut out: Vec<Option<Signal>>, n_outputs: usize) ->
 /// Compute one tick of the RWS module.
 /// Outputs: [Mouse Vec2 (per-tick displacement), Stick Vec2 (right-stick
 /// deflection, unit range), Flick Vec2 (the flick alone, when `flick_output`
-/// sends it there — mouse counts or stick deflection), then two DISPLAY-ONLY
+/// sends it there — mouse counts or stick deflection), the Map slot (an AutoMap
+/// pin: its bus rides in `collector_sigs`, see [`publish_native_gyro`]), then two
+/// DISPLAY-ONLY
 /// trailing entries no wire reads (wiring indexes by pin): measured calibration
 /// degrees (Float), and the sweep's peak unclamped stick deflection (Float). The
 /// UI reads them from `last_out` (same pattern as the Virtual Menu's open/hover
@@ -505,7 +551,7 @@ pub(crate) fn compute_rws(
     // Right-stick output: the desired turn RATE (rws applied) normalized by the
     // game's full-deflection turn rate, clamped below to the unit range. Both
     // accumulate the primary source first, then the optional stick-aim.
-    let mut dx = yaw_dps * dt * scale * rws + (flick_to_mouse + turn_to_mouse) * scale;
+    let mut dx = (yaw_dps * dt * rws + flick_to_mouse + turn_to_mouse) * scale;
     let mut dy = pitch_dps * dt * scale * rws;
     let mut sx = yaw_dps * rws / stick_max + flick_to_stick;
     let mut sy = pitch_dps * rws / stick_max;
@@ -587,13 +633,15 @@ pub(crate) fn compute_rws(
     }
 
     // While MEASURING, drive ONLY the output being calibrated (`cal_output`) so a
-    // patch that wires BOTH outputs (with selectors deciding which is live) can't
-    // move the game via the wrong one and skew the back-solve.
+    // patch that wires several outputs (with selectors deciding which is live)
+    // can't move the game via the wrong one and skew the back-solve.
     if measuring {
-        if ps("cal_output", "mouse") == "stick" {
+        let keep = ps("cal_output", "mouse");
+        if keep != "mouse" {
             dx = 0.0;
             dy = 0.0;
-        } else {
+        }
+        if keep != "stick" {
             sx = 0.0;
             sy = 0.0;
         }
@@ -603,6 +651,8 @@ pub(crate) fn compute_rws(
         Some(Signal::Vec2(glam::Vec2::new(dx, dy))),
         Some(Signal::Vec2(glam::Vec2::new(sx, sy))),
         Some(Signal::Vec2(flick_pin)),
+        // The Map pin: an AutoMap bus, carried in `collector_sigs`.
+        None,
         // Display-only (not a pin): see the doc comment above.
         Some(Signal::Float(state.aux_f32[MEAS_DEG])),
         Some(Signal::Float(state.aux_f32[MEAS_PEAK_DEFL])),

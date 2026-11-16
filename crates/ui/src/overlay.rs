@@ -299,6 +299,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     menu_style_override: None,
                     keep_aspect: false,
                     anchor: Default::default(),
+                    pin_style: Some(2),
                 },
             ));
             let idx = overlay_layout.items.len() - 1;

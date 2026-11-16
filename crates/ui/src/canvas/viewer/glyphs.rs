@@ -1,123 +1,243 @@
-//! Small vector marks for switches whose meaning is a shape rather than a word: a magnet for
-//! snapping to a grid, a plateau for holding at the sustain level, a turnaround for bouncing, a
-//! ring for looping. They are drawn, not typed: the fonts a build happens to carry have no
-//! reliable magnet, and a word at the size a compact row allows is what holds a module wide.
+//! Small marks for switches whose meaning is a shape rather than a word: a magnet for
+//! snapping to a grid, a plateau for holding at the sustain level, a there-and-back for
+//! bouncing, a ring for looping. The word stays in the tooltip.
 //!
-//! Every mark lives in a square at the centre of whatever it is handed, sized off the shorter
-//! side, so it reads the same at one block tall as at three. The word stays where it belongs -
-//! in the tooltip, next to what the switch actually does.
+//! The marks are drawings - `app/assets/{hold_env,bounce,loop,magnet}.svg` - in the idiom of
+//! the module glyphs (see [`super::module_icons`]): a 3-unit stroke, round caps, no fill. Each
+//! is rasterized white, once per size, and tinted where it is painted, so a switch changing
+//! colour costs no new texture.
+
+use egui::{Color32, Rect};
+
+const HOLD: &str = include_str!("../../../../../app/assets/hold_env.svg");
+const BOUNCE: &str = include_str!("../../../../../app/assets/bounce.svg");
+const LOOP: &str = include_str!("../../../../../app/assets/loop.svg");
+const MAGNET: &str = include_str!("../../../../../app/assets/magnet.svg");
+const STOPWATCH: &str = include_str!("../../../../../app/assets/stopwatch.svg");
+const SAVE: &str = include_str!("../../../../../app/assets/save.svg");
+const LOAD: &str = include_str!("../../../../../app/assets/load.svg");
+const RESET: &str = include_str!("../../../../../app/assets/reset.svg");
+const ABS: &str = include_str!("../../../../../app/assets/modules/ABS.svg");
+const GAMEPAD: &str = include_str!("../../../../../app/assets/gamepad_flat_front.svg");
 
 /// A switch mark. Named for what the shape stands for, not for what it looks like.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub(crate) enum Glyph {
-    /// A horseshoe magnet: dragged points settle on what is near them.
+    /// Dragged points settle on what is near them.
     Magnet,
-    /// Up, flat, along: run to the sustain level and wait there.
+    /// Run to the sustain level and wait there.
     Hold,
-    /// Out one way and back the other: forward while held, reverse on release.
+    /// Forward while held, back on release.
     Bounce,
-    /// A ring with an arrowhead on it: repeat the segment.
+    /// Repeat the segment.
     Loop,
+    /// Time held back: the Delay module, where its name doesn't fit.
+    Stopwatch,
+    /// Write this to a file / read it from one / put it back as it shipped: header buttons
+    /// that were words, where three words left the module's name no room.
+    Save,
+    Load,
+    Reset,
+    /// Magnitude: a curve's Abs switch wears the Abs module's own mark.
+    Abs,
 }
 
-/// How thick a mark's strokes are, whatever size it is drawn at. Thin enough not to fill a
-/// 20-point square, thick enough to survive the canvas being zoomed out.
-const STROKE: f32 = 1.6;
+impl Glyph {
+    fn svg(self) -> &'static str {
+        match self {
+            Glyph::Magnet => MAGNET,
+            Glyph::Hold => HOLD,
+            Glyph::Bounce => BOUNCE,
+            Glyph::Loop => LOOP,
+            Glyph::Stopwatch => STOPWATCH,
+            Glyph::Save => SAVE,
+            Glyph::Load => LOAD,
+            Glyph::Reset => RESET,
+            Glyph::Abs => ABS,
+        }
+    }
 
-/// Draw `glyph` in the middle of `rect`. `colour` is the mark itself; the square it sits in is
-/// the button's, already painted by egui.
-pub(crate) fn paint(painter: &egui::Painter, rect: egui::Rect, glyph: Glyph, colour: egui::Color32) {
-    // Leave a little air at the edges so the mark doesn't touch the button's frame, and never
-    // grow past a size where the strokes start reading as a blob.
-    let side = rect.height().min(rect.width()).min(20.0) - 2.0;
-    if side < 6.0 {
-        // Too little room for anything to be recognisable: draw nothing rather than a smudge.
+    /// The side of the square cut out of the drawing, in the drawing's own units, centred on
+    /// what is drawn rather than on the page: the pages are mostly margin (a 25-unit mark on a
+    /// 59-unit sheet), and a mark shown page and all comes out the size of a full stop.
+    ///
+    /// Hold, Bounce and Loop sit side by side, so they share one window - the same scale, the
+    /// same stroke weight. The magnet is drawn on its own, finer sheet.
+    fn window(self) -> f32 {
+        match self {
+            Glyph::Magnet => 48.0,
+            Glyph::Hold | Glyph::Bounce | Glyph::Loop | Glyph::Stopwatch => 34.0,
+            Glyph::Save | Glyph::Load | Glyph::Reset | Glyph::Abs => 34.0,
+        }
+    }
+}
+
+/// Air between a mark and the edge of the button it is on.
+const MARGIN: f32 = 2.0;
+/// The largest a mark is drawn, and the smallest worth drawing.
+const MAX_SIDE: f32 = 24.0;
+const MIN_SIDE: f32 = 8.0;
+
+/// Draw `glyph` in the middle of `rect`, in `colour`. The button under it is the caller's.
+pub(crate) fn paint(painter: &egui::Painter, rect: Rect, glyph: Glyph, colour: Color32) {
+    let side = (rect.height().min(rect.width()) - 2.0 * MARGIN).min(MAX_SIDE);
+    if side < MIN_SIDE {
         return;
     }
-    let c = rect.center();
-    let r = side * 0.5;
-    let stroke = egui::Stroke::new(STROKE, colour);
-    match glyph {
-        Glyph::Magnet => {
-            // The horseshoe: legs down the sides joined over the top, with the poles marked by a
-            // heavier tick at each foot - the part that does the pulling.
-            let legs = r * 0.62;
-            let top = c.y - r * 0.18;
-            let foot = c.y + r * 0.82;
-            painter.add(egui::Shape::line(
-                ring_points(egui::pos2(c.x, top), legs, std::f32::consts::PI, 0.0),
-                stroke,
-            ));
-            painter.line_segment([egui::pos2(c.x - legs, top), egui::pos2(c.x - legs, foot)], stroke);
-            painter.line_segment([egui::pos2(c.x + legs, top), egui::pos2(c.x + legs, foot)], stroke);
-            let pole = egui::Stroke::new(STROKE + 0.9, colour);
-            painter.line_segment([egui::pos2(c.x - legs - 1.6, foot), egui::pos2(c.x - legs + 1.6, foot)], pole);
-            painter.line_segment([egui::pos2(c.x + legs - 1.6, foot), egui::pos2(c.x + legs + 1.6, foot)], pole);
-        }
-        Glyph::Hold => {
-            // Attack, the flat top the level waits on, release: the shape the curve makes when
-            // this switch is on, which is why it needs no word beside it.
-            let (left, right) = (c.x - r, c.x + r);
-            let (bottom, plateau) = (c.y + r * 0.6, c.y - r * 0.5);
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(left, bottom),
-                    egui::pos2(left + 0.22 * side, plateau),
-                    egui::pos2(right - 0.34 * side, plateau),
-                    egui::pos2(right, bottom),
-                ],
-                stroke,
-            ));
-        }
-        Glyph::Bounce => {
-            // There and back: one arrow each way on two lines. Reads as ping-pong at any size and
-            // can't be mistaken for the loop ring.
-            let (left, right) = (c.x - r * 0.78, c.x + r * 0.78);
-            let out = c.y - r * 0.32;
-            let back = c.y + r * 0.42;
-            painter.line_segment([egui::pos2(left, out), egui::pos2(right, out)], stroke);
-            head(painter, egui::pos2(right, out), egui::vec2(-1.0, 0.0), r * 0.4, stroke);
-            painter.line_segment([egui::pos2(right, back), egui::pos2(left, back)], stroke);
-            head(painter, egui::pos2(left, back), egui::vec2(1.0, 0.0), r * 0.4, stroke);
-        }
-        Glyph::Loop => {
-            // Almost a ring, with the gap where the head is so it reads as going round again
-            // rather than as a circle sitting there.
-            let rad = r * 0.72;
-            let gap = 0.6;
-            let from = -std::f32::consts::FRAC_PI_2 + gap;
-            let to = -std::f32::consts::FRAC_PI_2 + 2.0 * std::f32::consts::PI - gap;
-            let ring = ring_points(c, rad, from, to);
-            painter.add(egui::Shape::line(ring.clone(), stroke));
-            // The head sits at the end of the ring and points the way the ring is travelling,
-            // which is what separates this mark from a circle.
-            let tip = ring[ring.len() - 1];
-            let step = tip - ring[ring.len() - 2];
-            let dir = if step.length_sq() > 1.0e-6 { step.normalized() } else { egui::vec2(1.0, 0.0) };
-            head(painter, tip, dir, rad * 0.5, stroke);
-        }
-    }
+    let ctx = painter.ctx();
+    // Twice the size it is drawn at, so the canvas zoomed to its 2x limit still lands on
+    // pixels. Cached per size step.
+    let px = ((side * 2.0 * ctx.pixels_per_point()).round() as u32).clamp(16, 256);
+    let key = egui::Id::new(("switch_mark", glyph, px));
+    let tex = crate::widgets::tex_cache::get(ctx, key).or_else(|| {
+        let handle = ctx.load_texture(
+            format!("switch_mark_{glyph:?}_{px}"),
+            rasterize(glyph, px)?,
+            egui::TextureOptions::LINEAR,
+        );
+        crate::widgets::tex_cache::put(ctx, key, handle.clone());
+        Some(handle)
+    });
+    let Some(tex) = tex else { return };
+    painter.image(
+        tex.id(),
+        Rect::from_center_size(rect.center(), egui::Vec2::splat(side)),
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        colour,
+    );
 }
 
-/// Two strokes making a head at `tip`, opening back along `dir` (the direction the line is
-/// travelling). A filled head would need a polygon shape; at these sizes a chevron reads the same.
-fn head(painter: &egui::Painter, tip: egui::Pos2, dir: egui::Vec2, len: f32, stroke: egui::Stroke) {
-    let back = -dir;
-    let perp = egui::vec2(-back.y, back.x);
-    for s in [-1.0f32, 1.0] {
-        painter.line_segment([tip, tip + back * len + perp * len * 0.72 * s], stroke);
+/// A device icon (one of the device cards' / node headers' SVGs), white, cropped to what is
+/// drawn, and how wide it is for its height - filled as drawn, or (`outline`) as just the
+/// edge of its silhouette, a line three texels in from it. For drawing a pad flat on a plane
+/// (the 3DOF preview lays it in the pad's own frame). Cached per icon and look.
+pub(crate) fn svg_icon(ctx: &egui::Context, svg: &'static [u8], outline: bool) -> Option<(egui::TextureId, f32)> {
+    let key = egui::Id::new(("fxi_device_icon", svg.as_ptr() as usize, outline));
+    let aspect_key = key.with("aspect");
+    if let (Some(tex), Some(aspect)) = (crate::widgets::tex_cache::get(ctx, key), ctx.data(|d| d.get_temp::<f32>(aspect_key))) {
+        return Some((tex.id(), aspect));
     }
+    let tree = usvg::Tree::from_data(svg, &usvg::Options::default()).ok()?;
+    let (cx, cy, w, h) = drawn(&tree);
+    // Drawn small - a pad in a preview a few hundred points across - and there is no mipmap
+    // on every backend, so the texture is sized near what it is drawn at: an edge a few
+    // texels wide at 256 shrank to a fraction of a pixel and broke up into dots.
+    let scale = 128.0 / w.max(h).max(1.0);
+    let (pw, ph) = ((w * scale).ceil().max(1.0) as u32, (h * scale).ceil().max(1.0) as u32);
+    let transform = tiny_skia::Transform::from_translate(w * 0.5 - cx, h * 0.5 - cy).post_scale(scale, scale);
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let (pw, ph) = (pw as usize, ph as usize);
+    let alpha: Vec<u8> = pixmap.data().chunks_exact(4).map(|p| p[3]).collect();
+    let rgba: Vec<u8> = if outline {
+        // White where the silhouette is and something within three texels isn't: the edge
+        // of the shape, everything inside it left out.
+        const R: isize = 3;
+        let inside = |x: isize, y: isize| {
+            x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph && alpha[y as usize * pw + x as usize] > 96
+        };
+        let mut out = vec![0u8; pw * ph * 4];
+        for y in 0..ph as isize {
+            for x in 0..pw as isize {
+                if !inside(x, y) {
+                    continue;
+                }
+                let edge = (-R..=R).any(|dy| (-R..=R).any(|dx| dx * dx + dy * dy <= R * R && !inside(x + dx, y + dy)));
+                if edge {
+                    let i = (y as usize * pw + x as usize) * 4;
+                    out[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        out
+    } else {
+        // The art keeps its shape; drawn white so the caller's tint decides its colour.
+        alpha.iter().flat_map(|&a| [a, a, a, a]).collect()
+    };
+    let image = egui::ColorImage::from_rgba_premultiplied([pw, ph], &rgba);
+    let handle = ctx.load_texture(format!("fxi_device_icon_{}", outline), image, egui::TextureOptions::LINEAR);
+    let id = handle.id();
+    crate::widgets::tex_cache::put(ctx, key, handle);
+    let aspect = w / h.max(1e-3);
+    ctx.data_mut(|d| d.insert_temp(aspect_key, aspect));
+    Some((id, aspect))
 }
 
-/// Points along an arc, from `out_angle` to `in_angle`, as a polyline: no dependency on whether
-/// the egui build in use has an arc shape, and at these radii the facets don't show.
-fn ring_points(center: egui::Pos2, radius: f32, out_angle: f32, in_angle: f32) -> Vec<egui::Pos2> {
-    let steps = 18;
-    (0..=steps)
-        .map(|i| {
-            let t = i as f32 / steps as f32;
-            let a = out_angle + (in_angle - out_angle) * t;
-            center + egui::vec2(a.cos(), a.sin()) * radius
-        })
-        .collect()
+/// The generic gamepad, for a pad whose own icon isn't known.
+pub(crate) fn gamepad_svg() -> &'static [u8] {
+    GAMEPAD.as_bytes()
+}
+
+/// What is drawn on the sheet, strokes included, as (centre x, centre y, width, height).
+fn drawn(tree: &usvg::Tree) -> (f32, f32, f32, f32) {
+    let b = tree.root().abs_stroke_bounding_box();
+    (b.x() + b.width() * 0.5, b.y() + b.height() * 0.5, b.width(), b.height())
+}
+
+/// The mark at `px` pixels square, as drawn (white), premultiplied.
+fn rasterize(glyph: Glyph, px: u32) -> Option<egui::ColorImage> {
+    let tree = usvg::Tree::from_str(glyph.svg(), &usvg::Options::default()).ok()?;
+    let (cx, cy, _, _) = drawn(&tree);
+    let window = glyph.window();
+    let scale = px as f32 / window;
+    let transform = tiny_skia::Transform::from_translate(window * 0.5 - cx, window * 0.5 - cy).post_scale(scale, scale);
+    let mut pixmap = tiny_skia::Pixmap::new(px, px)?;
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some(egui::ColorImage::from_rgba_premultiplied([px as usize; 2], pixmap.data()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [Glyph; 9] = [
+        Glyph::Abs,
+        Glyph::Magnet,
+        Glyph::Hold,
+        Glyph::Bounce,
+        Glyph::Loop,
+        Glyph::Stopwatch,
+        Glyph::Save,
+        Glyph::Load,
+        Glyph::Reset,
+    ];
+
+    // A drawing edited to be bigger than its window would be cut off at the button's edge,
+    // and nothing else would say so.
+    #[test]
+    fn every_mark_fits_the_window_it_is_cut_from() {
+        for g in ALL {
+            let tree = usvg::Tree::from_str(g.svg(), &usvg::Options::default()).expect("the drawing parses");
+            let (_, _, w, h) = drawn(&tree);
+            assert!(w > 8.0 && h > 8.0, "{g:?}: nothing much is drawn ({w} x {h})");
+            assert!(
+                w <= g.window() && h <= g.window(),
+                "{g:?}: the drawing is {w} x {h}, its window {}",
+                g.window()
+            );
+        }
+    }
+
+    #[test]
+    fn every_mark_rasterizes_centred_and_clear_of_the_edge() {
+        for g in ALL {
+            let px = 64usize;
+            let img = rasterize(g, px as u32).expect("the mark rasterizes");
+            let (mut x0, mut y0, mut x1, mut y1) = (px, px, 0usize, 0usize);
+            for (i, p) in img.pixels.iter().enumerate() {
+                if p.a() > 40 {
+                    let (x, y) = (i % px, i / px);
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+            assert!(x1 > x0 && y1 > y0, "{g:?}: nothing was drawn");
+            assert!(x0 > 0 && y0 > 0 && x1 < px - 1 && y1 < px - 1, "{g:?}: cut off at the edge");
+            let off_x = (x0 + x1) as f32 * 0.5 - (px - 1) as f32 * 0.5;
+            let off_y = (y0 + y1) as f32 * 0.5 - (px - 1) as f32 * 0.5;
+            assert!(off_x.abs() <= 1.5 && off_y.abs() <= 1.5, "{g:?}: off centre by ({off_x}, {off_y})");
+        }
+    }
 }

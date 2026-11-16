@@ -8,105 +8,38 @@ blocks.
 
 ---
 
-## 1. A Macro list past eight ports loses its bottom rows
+## 1. A Macro list past eight ports loses its bottom rows - settled: it never did
 
-**Symptom.** With nine ports at the module's default width, the last row draws its drag dots and
-its name and nothing else: no icon, no signal-type ComboBox, no `×`. They are not merely hidden -
-they do not answer the pointer either. Clicking where the `×` of port 8 is traced removes nothing,
-while the same click on port 2 removes the port.
+This one was the test rig, not the module. The rig's screen is 1600 x 1000 points and the canvas
+in it is zoomed to 2x, so it shows 500 graph points of height; a nine-port Macro is taller than
+what is left under it, and the "clip that stops 49.5 points short" was the bottom edge of the
+screen. Widgets past it are culled and can't be clicked, exactly as measured - in the rig only.
+`a_long_macro_list_keeps_every_rows_controls` now runs (not ignored) with the list in view, and
+finds every row's handle, type and `×`.
 
-**What is measured.** Counting words actually in the paint list, by port count (`Rig::painted_all`):
-
-| ports | handles seen | `×` seen | type words seen | frame |
-|------:|-------------:|---------:|----------------:|------:|
-| 1..8  | as many as ports | as many as ports | as many as ports | 196 x 84…280 |
-| 9     | 9 | 8 | 8 | 196 x 308 |
-| 10    | 10 | 8 | 8 | 196 x 336 |
-| 11    | 11 | 8 | 8 | 196 x 364 |
-| 12    | 12 | 8 | 8 | 196 x 392 |
-
-The rows themselves are laid out where they should be - the body traces `macro_row_8`,
-`macro_name_8`, `macro_type_8` and `macro_remove_8` at correct rects inside the frame - and the
-widgets report `child.is_visible() == true`, `enabled == true` and no pending discard. The gap is
-the clip:
-
-```
-row 8:  rm rect  [252.0 549.5] - [274.0 569.5]
-        child_clip / parent_clip  [[100.0 300.0] - [282.0 544.5]]
-        parent_max_rect           [[108.0 325.0] - [274.0 594.0]]
-```
-
-so the body's **column runs 49.5 points below the area it is clipped to**, and everything a widget
-paints there has an empty intersection with the clip: egui emits the shape with a degenerate clip
-and the pass throws it away, and the hit test drops it with it. The handle's dots and the name are
-painted by the body with `painter.text` at a point inside the clip's *x*-range, so their shapes
-survive the cull and the fault looks selective - it is not.
-
-**Why the clip is short.** snarl clips the body to the node's own rect
-(`vendor/egui-snarl/src/ui.rs:2847`, `payload_clip_rect`, applied at 2593), and it expands that
-rect with `final_rect.intersect(payload_clip_rect)` (2598) - the body can only grow the node as far
-as the *previous* frame's clip, while FlexInput's grid rounds the drawn frame out to whole blocks
-from the pin band. For nine ports the pins make the frame eleven blocks tall (308) and the node
-rect snarl measures is roughly nine of them; the list is centred on the column, so its tail lands
-in the rounding.
-
-**What was tried.**
-
-1. Reserve the band the rows actually occupy (`list_h` plus the centring offset) rather than
-   `list_h` from the cursor - **no change**, the counts stayed 8/8/8.
-2. Centre the list in `ui.max_rect().intersect(ui.clip_rect())` instead of in `ui.max_rect()` -
-   **helps**: nine and ten ports came out complete, eleven and twelve still lost their last row,
-   because the node rect itself cannot hold eleven rows.
-3. Ask for one row of slack (`list_h + row_h`) so the node grows - **wrong fix**: the ask drives
-   the height, so the short lists grew too (one port 84 → 140, three ports 140 → 168) while eleven
-   and twelve were still short.
-
-**Where the real fix sits.** Either the body clip in vendored snarl has to be the node rect *after*
-the pins have been laid out (not the previous frame's), or the grid has to size a list module from
-its pin band and hand that same rect to the body as its clip. Both are wider than this batch: the
-first touches every node on the canvas, the second changes how `kit::strip_pitch` consumers are
-measured. Until then a Macro past eight ports has a dead zone at the bottom of its list.
-
-**Reproducing it.** `a_long_macro_list_keeps_every_rows_controls` (ignored) asserts nine painted
-`×`s and nine type words for a nine-port Macro and fails with eight of each.
+What it leaves behind is a rule for reading the rig, now in `docs/MODULE_UI_GUIDELINES.md`
+("Pitfalls"): before a missing shape is blamed on a clip, check that the thing is on the rig's
+screen at all.
 
 ---
 
-## 2. Twenty-one modules still paint their body over their own header when folded
+## 2. Twenty-one modules paint their body over their own header when folded - fixed, in one place
 
-The fold guard is `simple_bodies::node_open(snarl, node)` - reserve what the rows ask for, then
-draw nothing. The batch's three modules have it, as do the Selector, Split, Macro, Dropdown and
-AutoMap Combiner strip bodies and the Knob had it already. The rest of these still lay their bodies
-out in the clipped space above a collapsed header, where they are out of sight and **still take the
-pointer**:
+The guard used to be a line each body had to remember (`simple_bodies::node_open`: reserve the
+ask, then return), and twenty-one of seventy-five had not. It is now in `show_body`
+(`crates/ui/src/canvas/viewer.rs`), ahead of every body: a folded node's body is still laid out,
+so the folded frame keeps the width it had, but its painter is switched off and its clip is
+emptied, so nothing is drawn and nothing can be hit. Every module folds to exactly the size it
+did before (compared for all 75), and `no_folded_module_draws_its_body` holds all of them to it.
 
-| module | words above the frame | folded to |
-|---|---:|---|
-| `module.audio_stream_haptics` | 7 | 280 x 56 |
-| `module.area_mapper` | 5 | 504 x 56 |
-| `module.touch_zones` | 4 | 476 x 56 |
-| `module.menu` | 4 | 616 x 56 |
-| `module.vec_reshape` | 3 | 308 x 56 |
-| `module.average` | 2 | 112 x 56 |
-| `module.dc_filter` | 2 | 112 x 56 |
-| `module.switch` | 1 | 112 x 56 |
-| `module.label` | 1 | 168 x 56 |
-| `module.svg` | 1 | 196 x 56 |
-| `module.delay` | 1 | 112 x 56 |
-| `module.twoway_response_curve` | 1 | 336 x 56 |
-| `module.automap_twoway_response_curve` | 1 | 336 x 56 |
-| `module.stick_rotation` | 1 | 252 x 56 |
-| `module.input_viewer` | 1 | 532 x 56 |
+The per-body `node_open` returns that were already there still work and are now redundant; they
+can go when those bodies are next touched. `module.label` falls under the same rule: folded, a
+note shows its header and not its text.
 
-`module.delay`, `module.average`, `module.dc_filter`, `module.switch`, `module.vec_reshape` and
-`module.stick_rotation` are pill bodies from earlier batches on this branch, so the omission is
-this project's own: the pills reserve their ask (the folded frame keeps its width) but the pill
-widgets are still added above it. `module.label` is a different question - its text *is* its body,
-and a folded label showing nothing may be right; it needs a decision, not a guard.
-
-**Reproducing it.** `audit_which_folded_bodies_paint_over_their_header` (ignored) prints that
-table for all 75 modules:
-`cargo test -p flexinput-ui --lib audit_which_folded_bodies -- --ignored --nocapture`.
+One thing a folded module does still draw, on purpose: a Knob, a Constant and a Readout write
+their number in the band a folded frame keeps under its header (`simple_bodies::folded_reading`,
+painted by `show_body` itself). The first cut of this guard took the Knob's number away with
+everything else; `a_folded_knob_constant_and_readout_still_show_their_number` keeps it.
 
 ---
 

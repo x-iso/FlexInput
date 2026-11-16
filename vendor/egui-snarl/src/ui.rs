@@ -1147,9 +1147,22 @@ where
     // FLEXINPUT PATCH: each node's frame offset, for snapping it while it's dragged.
     let mut frame_offsets: HashMap<NodeId, Vec2> = HashMap::new();
 
+    // FLEXINPUT PATCH: the nodes out of focus are drawn part-way transparent. Which they are
+    // was worked out at the end of the last frame (it needs every node's rect), so this is
+    // one frame behind the pointer, under a fade that takes five.
+    let (lit, focus_amount): (Vec<NodeId>, f32) = ui
+        .ctx()
+        .data(|d| d.get_temp(snarl_id.with("focus-lit")))
+        .unwrap_or_default();
+
     for node_idx in draw_order {
         if !snarl.nodes.contains(node_idx.0) {
             continue;
+        }
+
+        let faded = focus_amount > 0.0 && !lit.contains(&node_idx);
+        if faded {
+            ui.set_opacity(1.0 - FOCUS_FADE * focus_amount);
         }
 
         // show_node(node_idx);
@@ -1165,6 +1178,10 @@ where
             modifiers,
             &mut output_info,
         );
+
+        if faded {
+            ui.set_opacity(1.0);
+        }
 
         if let Some(response) = response {
             if let Some(v) = response.node_to_top {
@@ -1357,7 +1374,7 @@ where
                 draw_width *= 1.0 + FOCUS_THICKEN * focus.amount;
                 color = color.lerp_to_gamma(Color32::WHITE, FOCUS_BRIGHTEN * focus.amount);
             } else {
-                color = color.gamma_multiply((1.0 - FOCUS_DIM * focus.amount).max(FOCUS_DIM_FLOOR));
+                color = color.gamma_multiply(1.0 - FOCUS_FADE * focus.amount);
             }
         }
         if moved_from.is_some_and(on_pin) {
@@ -1650,14 +1667,11 @@ where
         }
     }
 
-    // FLEXINPUT PATCH: the nodes neither in focus nor wired to it dim with the wires.
-    if focus.amount > 0.0 {
-        let shade = ui.visuals().extreme_bg_color.gamma_multiply(FOCUS_SHADE * focus.amount);
-        for &(node, rect) in &node_rects {
-            if !focus.nodes.contains(&node) && !focus.neighbors.contains(&node) {
-                ui.painter().rect_filled(rect, CornerRadius::same(6), shade);
-            }
-        }
+    // FLEXINPUT PATCH: the nodes neither in focus nor wired to it go part-way transparent
+    // with the wires - next frame, when they are drawn (see the node loop).
+    {
+        let lit: Vec<NodeId> = focus.nodes.iter().chain(focus.neighbors.iter()).copied().collect();
+        ui.ctx().data_mut(|d| d.insert_temp(snarl_id.with("focus-lit"), (lit, focus.amount)));
     }
 
     match wire_shape_idx {
@@ -1918,6 +1932,7 @@ fn size_grip<T, V>(
     snarl_state: &mut SnarlState,
     viewer: &mut V,
     snarl: &mut Snarl<T>,
+    uniform: bool,
 ) where
     V: SnarlViewer<T>,
 {
@@ -1942,6 +1957,14 @@ fn size_grip<T, V>(
         let moved_y = moved_y + resp.drag_delta().y;
         ui.ctx()
             .data_mut(|d| d.insert_temp(key, (from_w, moved_x, from_h, moved_y)));
+        // FLEXINPUT PATCH: a node that keeps its shape grows by one amount both ways -
+        // whichever way the grip has been pulled further since it was picked up.
+        let (moved_x, moved_y) = if uniform {
+            let d = if moved_y.abs() > moved_x.abs() { moved_y } else { moved_x };
+            (d, d)
+        } else {
+            (moved_x, moved_y)
+        };
         let free_w = (from_w + moved_x).max(narrowest).max(ui.spacing().interact_size.x);
         // The height is a floor the viewer may exceed, so the only bound here is one
         // block: content decides what a node actually needs, and a body that runs out of
@@ -1980,12 +2003,10 @@ fn size_grip<T, V>(
 /// much thicker than usual, and lightened this far toward white…
 const FOCUS_THICKEN: f32 = 0.9;
 const FOCUS_BRIGHTEN: f32 = 0.2;
-/// …the other wires fade this much (but never below the floor, so they can still be
-/// made out)…
-const FOCUS_DIM: f32 = 1.17;
-const FOCUS_DIM_FLOOR: f32 = 0.06;
-/// …and the nodes neither in focus nor wired to it are shaded over this much.
-const FOCUS_SHADE: f32 = 0.8;
+/// …and everything else - the other wires, and the nodes neither in focus nor wired to it -
+/// goes this far transparent. Transparent rather than darker: a shaded module reads as
+/// switched off, a see-through one as set back. Half at most, so it can all still be read.
+const FOCUS_FADE: f32 = 0.5;
 
 /// FLEXINPUT PATCH: which nodes' wires stand out this frame, the nodes at their other
 /// ends, and how far along the fade in or out the emphasis is (times its strength).
@@ -2828,6 +2849,16 @@ where
             ui.ctx().request_repaint();
         }
 
+        // FLEXINPUT PATCH: half of what the grid's rounding added to the height last frame
+        // goes above the pins and body of a node that asks to be centred. The size is
+        // measured from the content's own heights, so the pad never feeds back into it.
+        let payload_pad = if grid_snap.is_some() && open && viewer.node_centers_payload(node, snarl) {
+            let slack: f32 = ui.ctx().data(|d| d.get_temp(node_id.with("grid-slack-y"))).unwrap_or(0.0);
+            (slack * 0.5).floor().max(0.0)
+        } else {
+            0.0
+        };
+
         // Pins are placed under the header and must not go outside of the header frame.
         let payload_rect = Rect::from_min_max(
             pos2(
@@ -2836,6 +2867,7 @@ where
                     + node_state.header_height()
                     + header_frame.total_margin().bottom
                     + ui.spacing().item_spacing.y
+                    + payload_pad
                     - node_state.payload_offset(openness),
             ),
             node_rect.max,
@@ -3319,6 +3351,10 @@ where
         // formula keeps it at the width it already has, so it can be dragged wider and
         // never narrower. A viewer that knows its header's real content says so here.
         header_w = viewer.node_header_width(node, snarl).unwrap_or(header_size.x);
+        // FLEXINPUT PATCH: left where the viewer's bodies can read it next frame. A body
+        // sized from what the grip asked for has to know when the header is what holds the
+        // frame wider than that, or it sits narrow inside a frame that can't shrink.
+        ui.ctx().data_mut(|d| d.insert_temp(node_id.with("header-w"), header_w));
         node_state.set_header_height(header_size.y);
 
         let mut size = vec2(
@@ -3330,7 +3366,10 @@ where
         );
         // FLEXINPUT PATCH: see the top of this function.
         if let Some(g) = grid_snap {
+            let raw_h = size.y;
             size = g.snap_inner_size(size, margins);
+            // What the rounding added, for `payload_pad` next frame.
+            ui.ctx().data_mut(|d| d.insert_temp(node_id.with("grid-slack-y"), (size.y - raw_h).max(0.0)));
         }
         node_state.set_size(size);
         if grid_snap.is_some() {
@@ -3352,8 +3391,13 @@ where
     // own floor wins where it has one: the header's laid-out width can be the frame's
     // width, which would let the grip grow a node and never bring it back.
     if viewer.node_resizable(node, snarl) {
-        let narrowest = viewer.node_narrowest(node, snarl).unwrap_or(header_w + margins.x);
-        size_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl);
+        // Never narrower than the header either: the grip would go on writing widths the
+        // frame can't take, and the body would follow them down inside it.
+        let narrowest = viewer
+            .node_narrowest(node, snarl)
+            .map_or(header_w + margins.x, |n| n.max(header_w + margins.x));
+        let uniform = viewer.node_resize_uniform(node, snarl);
+        size_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl, uniform);
     }
 
     node_state.store(ui.ctx());

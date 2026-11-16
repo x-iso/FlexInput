@@ -1685,7 +1685,7 @@ pub(crate) fn build_processing_graph_rec(
             | "module.touch_zones" | "module.menu" | "module.jsm"
             | "module.network_send"
             | "module.automap_response_curve" | "module.automap_twoway_response_curve"
-            | "module.area_mapper" | "module.stick_rotation")
+            | "module.area_mapper" | "module.stick_rotation" | "processing.rws")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {

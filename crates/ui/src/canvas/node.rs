@@ -227,6 +227,12 @@ pub struct ExposedModule {
     /// body layouts.
     #[serde(default, skip_serializing_if = "Anchor::is_auto")]
     pub anchor: Anchor,
+    /// Which look a pinned row wears, for the elements that have two: `1` the look it had
+    /// before the module redesign, `2` the module's own look (value pills, joined
+    /// segments). Absent reads as 1, so a layout saved before this keeps its look; new pins
+    /// are made as 2. Ignored by elements with one look. See `viewer::pin_style2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_style: Option<u8>,
 }
 
 /// Per-pin style for a pinned Touch Zones / Virtual Menu field pad. Colour
@@ -1166,6 +1172,39 @@ pub fn materialize_subpatch_overlays(
     }
 }
 
+/// The largest a pinned item's frame can be either way, and twice that for where it sits, in
+/// layout points: more than any monitor, so no layout anyone made is touched.
+pub(crate) const LAYOUT_ITEM_MAX: f32 = 8192.0;
+
+/// Bring back pinned items whose frame ran away: a size or position past
+/// [`LAYOUT_ITEM_MAX`], negative, or not a number at all. A Style 2 row in a build that
+/// measured itself into a feedback loop saved a `scale_row` 9 699 328 points wide, and a
+/// layout fitted round that is unusable - every other item shrinks to a speck - with the
+/// item's corner grip out of reach. A runaway height becomes one row's; a runaway width
+/// becomes ten times the height, within reason. Returns whether anything changed.
+pub(crate) fn repair_runaway_items(items: &mut [LayoutItem]) -> bool {
+    let sane = |v: f32, max: f32| v.is_finite() && (0.0..=max).contains(&v);
+    let mut fixed = false;
+    for it in items.iter_mut() {
+        let LayoutItem::Module(m) = it else { continue };
+        if !sane(m.size[1], LAYOUT_ITEM_MAX) {
+            m.size[1] = 40.0;
+            fixed = true;
+        }
+        if !sane(m.size[0], LAYOUT_ITEM_MAX) {
+            m.size[0] = (m.size[1] * 10.0).max(120.0).min(1200.0);
+            fixed = true;
+        }
+        for p in m.pos.iter_mut() {
+            if !sane(*p, 2.0 * LAYOUT_ITEM_MAX) {
+                *p = 0.0;
+                fixed = true;
+            }
+        }
+    }
+    fixed
+}
+
 /// Re-anchor every item from the overlay size `from` to `to`, baking the
 /// resolved rects/decorations back into the items. All items resolve against
 /// the same pre-bake snapshot, so anchor-to followers see un-baked targets.
@@ -1487,6 +1526,7 @@ mod tests {
                     menu_style_override: None,
                     keep_aspect: false,
                     anchor: Anchor { x: AnchorAxis::End, y: AnchorAxis::Start, stretch_x: true, ..Default::default() },
+                    pin_style: None,
                 }),
                 LayoutItem::Deco(LayoutDecoration::Rect {
                     pos: [5.0, 6.0],
@@ -1682,6 +1722,7 @@ mod tests {
             menu_style_override: None,
             keep_aspect: false,
             anchor: Anchor::default(),
+            pin_style: None,
         })
     }
 

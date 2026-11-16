@@ -14,6 +14,7 @@ mod kwin;
 mod licenses;
 mod guide_watcher;
 mod gyro_cal_overlay;
+mod rws_cal;
 mod macro_icons;
 mod main_pin;
 mod module_ui_info;

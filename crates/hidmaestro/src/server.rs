@@ -728,6 +728,13 @@ fn handle_hidhide_apply(
         return Response::HidHideState { present: false, active: false, hidden: vec![] };
     };
     let was_active = hh.is_active();
+    // What was already hidden before this apply: a device hidden only now may be open in
+    // another program, which the hide alone doesn't close (see `replug_devnode`).
+    let hidden_before: std::collections::HashSet<String> = if was_active {
+        hh.blacklist().into_iter().map(|s| s.to_uppercase()).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     // Keep FlexInput (+ the helper) able to see the pads it hides.
     if !whitelist.is_empty() {
         hh.ensure_whitelisted(&whitelist);
@@ -772,6 +779,19 @@ fn handle_hidhide_apply(
     }
     let hidden = hh.blacklist();
     let active_now = hh.is_active();
+    // Replug each device this apply hid for the first time, so a program that already had
+    // it open - Steam, with a Steam Controller - lets go of it. Only physical HID nodes
+    // (the ids are the HID instances HidHide masks), and only once: a device already
+    // hidden is never cycled again, and the replug itself changes nothing in the list.
+    if active_now {
+        for id in blacklist.iter().filter(|id| !hidden_before.contains(&id.to_uppercase())) {
+            if !id.to_uppercase().starts_with("HID\\") {
+                continue;
+            }
+            let cycled = crate::orchestrator::replug_devnode(id);
+            diag_log(&format!("[helper] hidhide: replugged newly hidden {id}: {cycled}"));
+        }
+    }
     diag_log(&format!(
         "[helper] hidhide apply: active={active_now} hidden={} (was_active={was_active})",
         hidden.len()

@@ -90,6 +90,61 @@ pub(crate) fn pad_hint_inline(ui: &mut egui::Ui, hint: &str) {
     }
 }
 
+/// The same, large, for a prompt drawn over the game: text at `size` points in `colour`,
+/// glyphs a little taller than the text.
+pub(crate) fn pad_hint_big(ui: &mut egui::Ui, hint: &str, size: f32, colour: egui::Color32) {
+    ui.spacing_mut().item_spacing.x = size * 0.25;
+    for part in parts(hint) {
+        match part {
+            Part::Text(t) => {
+                if !t.trim().is_empty() {
+                    ui.label(egui::RichText::new(t.trim()).size(size).color(colour));
+                }
+            }
+            Part::Pin(p) => match glyph(ui.ctx(), p, size * 1.2) {
+                Some(tex) => {
+                    ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(size * 1.3, size * 1.3)).tint(egui::Color32::WHITE));
+                }
+                None => {
+                    ui.label(egui::RichText::new(fallback(p)).size(size).strong().color(colour));
+                }
+            },
+        }
+    }
+}
+
+/// How wide [`pad_hint_big`] draws `hint` at `size`: the runs of text, a glyph's square
+/// for each pin, and the spacing between them. For centring one - an egui row starts at its
+/// left edge whatever its alignment says.
+pub(crate) fn pad_hint_big_width(ui: &egui::Ui, hint: &str, size: f32) -> f32 {
+    let items: Vec<f32> = parts(hint)
+        .into_iter()
+        .filter_map(|part| match part {
+            Part::Text(t) if t.trim().is_empty() => None,
+            Part::Text(t) => Some(
+                ui.painter()
+                    .layout_no_wrap(t.trim().to_string(), egui::FontId::proportional(size), egui::Color32::PLACEHOLDER)
+                    .size()
+                    .x,
+            ),
+            Part::Pin(_) => Some(size * 1.3),
+        })
+        .collect();
+    items.iter().sum::<f32>() + size * 0.25 * (items.len().max(1) - 1) as f32
+}
+
+/// [`pad_hint_big`] centred on `center`.
+pub(crate) fn pad_hint_big_centered(ui: &mut egui::Ui, center: egui::Pos2, hint: &str, size: f32, colour: egui::Color32) {
+    let w = pad_hint_big_width(ui, hint, size) + 2.0;
+    let rect = egui::Rect::from_center_size(center, egui::vec2(w, size * 1.6));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    pad_hint_big(&mut child, hint, size, colour);
+}
+
 #[derive(PartialEq, Debug)]
 enum Part<'a> {
     Text(&'a str),

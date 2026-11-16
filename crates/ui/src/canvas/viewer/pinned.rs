@@ -25,17 +25,24 @@ pub(crate) fn render_pinned_element(
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
+    pin_style: u8,
 ) {
     // Stable identity for this pin's natural-size cache: (viewport, outer node,
     // inner node, element) — see `pin_ws_nat_key` for why the viewport.
     let ws_key = pin_ws_nat_key(ui.ctx(), outer_id.0, inner_id.0, element_id);
     ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), ws_key));
+    // A Style 2 row fits any frame by itself (`pin_style2::fit`) and measures nothing; a
+    // measurement left from when the same pin wore Style 1 would hold the frame to the old
+    // row's proportions while it is resized (`clamp_pin_frame_to_content`).
+    if pin_style == 2 && super::pin_style2::supported(module_id, element_id) {
+        ui.ctx().data_mut(|d| d.remove::<egui::Vec2>(ws_key));
+    }
 
     render_pinned_element_impl(
         inner_id, module_id, element_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, outer_snapshot,
         outer_id, is_layout_mode, graph_override, iv_style_override,
-        menu_style_override,
+        menu_style_override, pin_style,
     );
 
     // `applied` is only present when the renderer routed through
@@ -77,6 +84,7 @@ pub(crate) fn render_pinned_element_impl(
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
+    pin_style: u8,
 ) {
     let cap_w = container_size.x.max(20.0);
     // Whole-module pinned renderers manage their own width/clip; don't cap
@@ -123,6 +131,10 @@ pub(crate) fn render_pinned_element_impl(
         .map(|n| curve_ui_module_id(n).to_string());
     let module_id = alias.as_deref().unwrap_or(module_id);
     match (module_id, element_id) {
+        // The module's own look, for a pin set to it.
+        _ if pin_style == 2 && super::pin_style2::supported(module_id, element_id) => {
+            super::pin_style2::render(inner_id, module_id, element_id, ui, inner_snarl, container_size);
+        }
         ("module.remapper", "whole_module") => {
             render_remapper_whole_module(
                 inner_id, ui, inner_snarl, container_size,
@@ -297,6 +309,11 @@ pub(crate) fn render_pinned_element_impl(
         // list's whole-module renderer, as Touch Zones and the menu use).
         // Gyro to Stick Rotation: the live circle (whole-container) and its
         // settings rows.
+        // 3DOF to 2D's preview: the sphere the pose projects onto, filling the frame.
+        ("processing.gyro_3dof", "preview") => {
+            super::gyro_body::render_gyro_preview_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("module.stick_rotation", "field") => {
             let _ = render_stick_rotation_field(inner_id, ui, inner_snarl, container_size);
             return;
@@ -399,11 +416,21 @@ pub(crate) fn render_pinned_element_impl(
                 "Stick °/s", "stick_out_dps", 360.0, 5.0, 1.0..=100_000.0, Some(0));
             return;
         }
+        ("processing.rws", "gyro_scale") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "Gyro scale", "gyro_scale", 1.0, 0.005, 0.0..=1000.0, Some(3));
+            return;
+        }
         ("processing.rws", "vh") => {
             render_rws_vh(inner_id, ui, inner_snarl, container_size);
             return;
         }
         // Measure-based auto-calibration (turn 180°/360° → back-solve Scale).
+        // Real World Calibration: one button that starts the guided calibration.
+        ("processing.rws", "rws_cal") | ("module.jsm", "rws_cal") => {
+            render_rws_cal_widget(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("processing.rws", "measure") => {
             render_rws_measure(inner_id, ui, inner_snarl, container_size);
             return;
@@ -1361,6 +1388,16 @@ where
         body_h = inner.inner;
     } else {
         let body_layer = remap_layer_id(ui, inner_id, tag);
+        // The card list on a layer of its own, scrolled under a top part that stays put -
+        // the status, the drafts and the Learn / Choose / Add row - when the body asked for
+        // one last frame (`mapping_list_ui`). A body that doesn't scrolls whole, as before.
+        let split_id = state_key.with("split_list");
+        let split = ui.ctx().data(|d| d.get_temp::<bool>(split_id)).unwrap_or(false);
+        let list_layer = egui::LayerId::new(
+            ui.layer_id().order,
+            egui::Id::new(("fxi_remap_list_layer", pin_host_scope(ui), inner_id.0, tag)),
+        );
+        let top_scroll = if split { 0.0 } else { render_scroll };
         let body_max_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(REMAP_DESIGN_W, 100_000.0),
@@ -1371,7 +1408,7 @@ where
                 .max_rect(body_max_rect),
         );
         let visible_band = egui::Rect::from_min_size(
-            egui::pos2(0.0, render_scroll),
+            egui::pos2(0.0, top_scroll),
             egui::vec2(REMAP_DESIGN_W, container_h / scale),
         );
         // Intersect with the parent UI's clip rect mapped into body-local
@@ -1389,7 +1426,7 @@ where
         // anything else is what let content and clip drift apart.
         let parent_clip_local = ui.clip_rect();
         let local_translation = container_rect.min.to_vec2()
-            - egui::vec2(0.0, render_scroll * scale);
+            - egui::vec2(0.0, top_scroll * scale);
         let local_xform = egui::emath::TSTransform::new(local_translation, scale);
         let inv_local = local_xform.inverse();
         // Installed BEFORE the body renders, so the global rects its cards publish
@@ -1409,6 +1446,23 @@ where
         );
         let final_clip = visible_band.intersect(parent_clip_body);
         body_ui.set_clip_rect(final_clip);
+        // Offered every frame - a body takes it or doesn't - while `split` (whether it
+        // was taken last frame) says whether the top part stays put.
+        {
+            let hook = ListHook {
+                pass: band_pass,
+                layer: list_layer,
+                parent_layer: ui.layer_id(),
+                container_min: container_rect.min,
+                scale,
+                scroll: render_scroll,
+                parent_to_global,
+                parent_clip: parent_clip_local,
+                band_h: container_h / scale,
+                design_w,
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(list_hook_id(inner_id), hook));
+        }
 
         body_fn(
             inner_id,
@@ -1419,7 +1473,22 @@ where
             panic_shortcut,
             automap_parent,
         );
-        body_h = body_ui.min_rect().height().max(1.0);
+        // A hook the body didn't take is not left for a body drawn later.
+        ui.ctx().data_mut(|d| d.remove::<ListHook>(list_hook_id(inner_id)));
+        // Where the scrolled list went, if the body asked for one: from where the top part
+        // ended to the list's last card, in body coordinates.
+        let extent: Option<(f32, f32)> = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<(u64, f32, f32)>(list_extent_id(inner_id)))
+            .filter(|(pass, _, _)| *pass == band_pass)
+            .map(|(_, top, bottom)| (top, bottom));
+        ui.ctx().data_mut(|d| d.insert_temp(split_id, extent.is_some()));
+        let list_top = extent.filter(|_| split).map_or(0.0, |(top, _)| top);
+        body_h = match extent.filter(|_| split) {
+            // The list scrolls under the top part: it can go as far as its bottom.
+            Some((_, bottom)) => bottom.max(1.0),
+            None => body_ui.min_rect().height().max(1.0),
+        };
 
         // Now that the real body height is known, work out where the offset
         // SHOULD settle. This never feeds back into this frame's clip or
@@ -1435,8 +1504,9 @@ where
         if max_offset_body > 0.5 {
             // Visible band in body coords — must match the clip band above,
             // so it uses `render_scroll`, not the settled `new_scroll`.
-            let band_top = render_scroll;
-            let band_h_body = container_h / scale;
+            // Split, the track runs down the list's own band, under the top part.
+            let band_top = render_scroll + list_top;
+            let band_h_body = container_h / scale - list_top;
             // Scrollbar geometry, all in body-coords. Convert pixel sizes to
             // body-coords by dividing by `scale` so the on-screen size stays
             // constant regardless of the user's zoom on the widget.
@@ -1451,7 +1521,7 @@ where
                 egui::pos2(track_x_min + sb_w_body, track_y_max),
             );
 
-            let visible_frac = (band_h_body / body_h).clamp(0.05, 1.0);
+            let visible_frac = (band_h_body / (body_h - list_top).max(1.0)).clamp(0.05, 1.0);
             let min_thumb_body = 14.0 / scale;
             let thumb_h = (track_h * visible_frac).max(min_thumb_body);
             let scroll_frac = (render_scroll / max_offset_body).clamp(0.0, 1.0);
@@ -1466,6 +1536,30 @@ where
             // the NEXT frame — same-frame application would move the body out
             // from under the clip band this frame's shapes were tessellated to.
             let drag_id = egui::Id::new(("fxi_remap_sb_drag", body_layer, inner_id.0));
+            let mut list_bar_ui = (split && extent.is_some()).then(|| {
+                let mut u = ui.new_child(
+                    egui::UiBuilder::new()
+                        .layer_id(list_layer)
+                        .max_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(design_w, 100_000.0))),
+                );
+                // The list band, cut by whatever hosts the pin (the Easy body scrolls
+                // it away), mapped through the list layer's own transform.
+                let inv_list = egui::emath::TSTransform::new(
+                    container_rect.min.to_vec2() - egui::vec2(0.0, render_scroll * scale),
+                    scale,
+                )
+                .inverse();
+                let host = egui::Rect::from_min_max(inv_list * parent_clip_local.min, inv_list * parent_clip_local.max);
+                u.set_clip_rect(
+                    egui::Rect::from_min_max(egui::pos2(0.0, band_top), egui::pos2(design_w, band_top + band_h_body))
+                        .intersect(host),
+                );
+                u
+            });
+            let body_ui: &mut egui::Ui = match list_bar_ui.as_mut() {
+                Some(u) => u,
+                None => &mut body_ui,
+            };
             let thumb_resp = body_ui.interact(thumb_rect, drag_id, egui::Sense::click_and_drag());
             if thumb_resp.drag_started() {
                 body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (render_scroll, 0.0f32)));
@@ -1517,6 +1611,105 @@ where
     });
 }
 
+
+/// Where a pinned mapping body's card list goes this frame: set by
+/// `render_remap_whole_module_impl` before it draws the body, taken by the body's
+/// [`mapping_list_ui`] call. Everything needed to put the list on its own scrolled layer.
+#[derive(Clone, Copy)]
+struct ListHook {
+    pass: u64,
+    layer: egui::LayerId,
+    parent_layer: egui::LayerId,
+    container_min: egui::Pos2,
+    scale: f32,
+    scroll: f32,
+    parent_to_global: egui::emath::TSTransform,
+    /// The host's clip, in its own layer's coordinates.
+    parent_clip: egui::Rect,
+    /// The pin's height, in body coordinates.
+    band_h: f32,
+    design_w: f32,
+}
+
+fn list_hook_id(node: NodeId) -> egui::Id {
+    egui::Id::new(("fxi_remap_list_hook", node.0))
+}
+
+fn list_extent_id(node: NodeId) -> egui::Id {
+    egui::Id::new(("fxi_remap_list_extent", node.0))
+}
+
+/// A mapping body's card list, on the layer the pin scrolls (see [`mapping_list_ui`]).
+/// Derefs to its `Ui`; dropped, it tells the renderer how far down the list went.
+pub(crate) struct ScrolledList {
+    ui: egui::Ui,
+    node: NodeId,
+    top: f32,
+    pass: u64,
+}
+
+impl std::ops::Deref for ScrolledList {
+    type Target = egui::Ui;
+    fn deref(&self) -> &egui::Ui {
+        &self.ui
+    }
+}
+
+impl std::ops::DerefMut for ScrolledList {
+    fn deref_mut(&mut self) -> &mut egui::Ui {
+        &mut self.ui
+    }
+}
+
+impl Drop for ScrolledList {
+    fn drop(&mut self) {
+        let bottom = self.ui.min_rect().bottom().max(self.top);
+        let (key, pass, top) = (list_extent_id(self.node), self.pass, self.top);
+        self.ui.ctx().data_mut(|d| d.insert_temp(key, (pass, top, bottom)));
+    }
+}
+
+/// The `Ui` a mapping body draws its card list in. Pinned, that is a layer of its own that
+/// scrolls under the part of the body drawn before this call - the status, the drafts and
+/// the Learn / Choose / Add row stay at the top of the pin, in view, while the cards scroll.
+/// Anywhere else (a module on the canvas, a body not pinned whole) there is nothing to
+/// split and this is `None`: the body goes on drawing in the `ui` it has.
+///
+/// Call it where the list starts, whether or not there are cards yet, so the split holds.
+pub(crate) fn mapping_list_ui(ui: &mut egui::Ui, node: NodeId) -> Option<ScrolledList> {
+    let hook: ListHook = ui.ctx().data(|d| d.get_temp(list_hook_id(node)))?;
+    ui.ctx().data_mut(|d| d.remove::<ListHook>(list_hook_id(node)));
+    let pass = ui.ctx().cumulative_pass_nr();
+    if hook.pass != pass {
+        return None;
+    }
+    let top = ui.cursor().min.y;
+    let left = ui.cursor().min.x;
+    let width = ui.available_width();
+    // The list's own transform: scaled as the body is, and scrolled.
+    let local = egui::emath::TSTransform::new(
+        hook.container_min.to_vec2() - egui::vec2(0.0, hook.scroll * hook.scale),
+        hook.scale,
+    );
+    ui.ctx().set_transform_layer(hook.layer, hook.parent_to_global * local);
+    ui.ctx().set_sublayer(hook.parent_layer, hook.layer);
+    // What of it is in view: under the top part, down to the bottom of the pin.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(0.0, top + hook.scroll),
+        egui::pos2(hook.design_w, hook.band_h + hook.scroll),
+    );
+    let inv = local.inverse();
+    let host = egui::Rect::from_min_max(inv * hook.parent_clip.min, inv * hook.parent_clip.max);
+    ui.ctx().data_mut(|d| d.insert_temp(nav_band_id(hook.layer), (pass, band)));
+    let mut list = ui.new_child(
+        egui::UiBuilder::new()
+            .layer_id(hook.layer)
+            .max_rect(egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, 100_000.0)))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    list.set_clip_rect(band.intersect(host));
+    Some(ScrolledList { ui: list, node, top, pass })
+}
 
 // ── Per-element pinned renderers ──────────────────────────────────────────────
 //
@@ -2144,7 +2337,7 @@ pub(crate) fn render_gyro_edge_rows(
     apply_widget_scale(ui, container, egui::vec2(300.0, 92.0));
     let mut fr = [egui::Rect::NOTHING; 9];
     let changed = ui
-        .add_enabled_ui(pointer, |ui| ui.vertical(|ui| edge.ui_rects(ui, false, &mut fr)).inner)
+        .add_enabled_ui(pointer, |ui| ui.vertical(|ui| edge.ui_rects(ui, inner_id, container.x, false, &mut fr)).inner)
         .inner;
     publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
@@ -2745,12 +2938,45 @@ mod scroll_ownership_tests {
                     );
                     let key = remap_pin_state_id(ui, *id, "remapper");
                     render_remapper_whole_module(
-                        *id, ui, snarl, vec2(400.0, 200.0), &signals, &panic, None, false,
+                        // Tall enough for one card under the action row, so `Rig::new(1)` is
+                        // a list with nothing to scroll.
+                        *id, ui, snarl, vec2(400.0, 260.0), &signals, &panic, None, false,
                     );
                     *list_offset = ui.ctx().data(|d| d.get_temp::<RemapPinState>(key))
                         .map_or(0.0, |state| state.0);
                 });
             });
+        }
+    }
+
+    /// The action row's rects (global), as the body published them last frame.
+    fn action_rects(r: &Rig) -> Vec<egui::Rect> {
+        let vp = r.ctx.viewport_id();
+        r.ctx
+            .data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", vp, r.id.0, "mappings"))))
+            .map(|(_, rects)| rects)
+            .unwrap_or_default()
+    }
+
+    // Pinned whole, the Learn / MIDI / Choose / Add row stays at the top of the pin while
+    // the cards scroll under it: a list scrolled to its end has moved, the row hasn't.
+    #[test]
+    fn the_action_row_stays_put_while_the_cards_scroll() {
+        let mut r = Rig::new(40);
+        let before = action_rects(&r);
+        assert!(!before.is_empty(), "the action row published its buttons");
+        for _ in 0..30 {
+            r.frame(vec![Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -120.0),
+                modifiers: Default::default(),
+            }, Event::PointerMoved(ON_LIST)]);
+        }
+        assert!(r.list_offset > 200.0, "the list scrolled: {}", r.list_offset);
+        let after = action_rects(&r);
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b.top() - a.top()).abs() < 0.5, "the row moved: {b:?} -> {a:?}");
         }
     }
 

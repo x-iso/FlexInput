@@ -251,6 +251,39 @@ fn ensure_devnode_enabled(instance_id: &str) -> bool {
     false
 }
 
+/// Replug a device in software: disable its devnode, then re-enable it, insistently.
+///
+/// HidHide only stops a program OPENING a hidden device; one that opened it before the hide
+/// keeps reading it. Steam opens a Steam Controller Puck the moment it can see it - so once
+/// FlexInput had unhidden it at exit, the next start's hide left Steam's handle alive and the
+/// pad drove the game twice, until the Puck was unplugged and plugged back in. This is that
+/// replug: the disable closes every handle, HidHide then refuses the reopen to everyone but
+/// FlexInput, which reconnects to the re-enabled device as it would to a plugged one.
+///
+/// The disable is transient (flags 0, gone at reboot) and the node is written to the
+/// reorder watchdog first, so a helper that dies mid-cycle re-enables it on its next start
+/// (`recover_xinput_reorder`) - a controller left disabled is the one outcome never allowed.
+/// Returns whether the device was cycled; a node that isn't present is left alone.
+pub fn replug_devnode(instance_id: &str) -> bool {
+    unsafe {
+        let mut dev_inst = 0u32;
+        let wide: Vec<u16> = instance_id.encode_utf16().chain(std::iter::once(0)).collect();
+        if CM_Locate_DevNodeW(&mut dev_inst, wide.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
+            return false;
+        }
+    }
+    write_reorder_watchdog(&[instance_id.to_string()]);
+    let disabled = set_devnode_enabled(instance_id, false).is_ok();
+    if disabled {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let enabled = ensure_devnode_enabled(instance_id);
+    if enabled {
+        clear_reorder_watchdog();
+    }
+    disabled && enabled
+}
+
 /// Path of the reorder watchdog file. Holds one devnode instance id per line — the
 /// set of XInput devnodes a reorder disabled. Written BEFORE the disable sequence
 /// and deleted only once every node is confirmed re-enabled. On helper startup

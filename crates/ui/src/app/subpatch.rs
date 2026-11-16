@@ -778,6 +778,7 @@ pub(crate) fn show_subpatch_editors(
                             menu_style_override: None,
                             keep_aspect: false,
                             anchor: Default::default(),
+                            pin_style: Some(2),
                         });
                     }
                 }

@@ -439,6 +439,25 @@ pub(crate) fn layout_inspector_strip_core(
         state.items.get(idx).map(item_style_of)
     } else { None };
 
+    // A redesigned row can be drawn the way it was (Style 1) or the way the module now is
+    // (Style 2): an overlay built round the old rows' proportions keeps them.
+    if let (Some(mid), Some(LayoutItem::Module(m))) = (inner_mid, state.items.get_mut(idx)) {
+        if super::pin_style2::supported(mid, &m.element_id) {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("look").small().weak()).on_hover_text(
+                    "Style 1: the row as it was before the module redesign.
+                     Style 2: the module's own look - value pills and joined switches.",
+                );
+                let cur = m.pin_style.unwrap_or(1);
+                for (v, lbl) in [(1u8, "style 1"), (2u8, "style 2")] {
+                    if ui.selectable_label(cur == v, egui::RichText::new(lbl).small()).clicked() {
+                        m.pin_style = Some(v);
+                    }
+                }
+            });
+        }
+    }
+
     if idx < state.items.len() {
         match &mut state.items[idx] {
             LayoutItem::Deco(_) => {
@@ -465,7 +484,19 @@ pub(crate) fn layout_inspector_strip_core(
                     state.items,
                     idx,
                     graph_channels,
-                    inner_mid == Some("generator.envelope"),
+                    // Which of the module's graph switches a pinned copy can set for itself.
+                    match inner_mid {
+                        Some("generator.envelope") => 3,
+                        Some(
+                            "module.response_curve"
+                            | "module.vec_response_curve"
+                            | "module.twoway_response_curve"
+                            | "module.automap_response_curve"
+                            | "module.automap_vec_response_curve"
+                            | "module.automap_twoway_response_curve",
+                        ) => 2,
+                        _ => 0,
+                    },
                 );
             }
             _ => {}
@@ -1034,7 +1065,7 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
         _ => return,
     };
     let mut ov = exp.iv_style_override.clone().unwrap_or(IvStyleOverride {
-        bg: [18, 18, 22, 255],
+        bg: [0, 0, 0, 0],
         accent: C3D_DEFAULT_ACCENT,
         tint: [255, 255, 255, 255],
         outline: [70, 70, 75, 255],
@@ -1265,7 +1296,7 @@ pub(crate) fn graph_pin_inspector_strip_item(
     items: &mut Vec<LayoutItem>,
     idx: usize,
     n_channels: usize,
-    envelope: bool,
+    graph_switches: usize,
 ) {
     use crate::canvas::node::PinGraphOverride;
     if idx >= items.len() { return; }
@@ -1299,16 +1330,20 @@ pub(crate) fn graph_pin_inspector_strip_item(
         // (unmultiplied 180,180,180,160 == GRAPH_GRID_DEFAULT premultiplied).
         let mut grid = ov.gridline.unwrap_or([180, 180, 180, 160]);
         if color_button(ui, "grid", &mut grid) { ov.gridline = Some(grid); }
-        // An Envelope graph also carries the three switches its module keeps in its header, here
-        // as per-copy choices: `module` follows the module on the canvas, `on` and `off` force
-        // it for this copy alone. A pinned copy has no header to set them on, and a plain curve
-        // on an overlay is often what is wanted even while the module shows its grid.
-        if envelope {
+        // An Envelope or Response Curve graph also carries the switches its module keeps in its
+        // header, here as per-copy choices: `module` follows the module on the canvas, `on` and
+        // `off` force it for this copy alone. A pinned copy has no header to set them on, and a
+        // plain curve on an overlay is often what is wanted even while the module shows its
+        // grid. An Envelope has three (snap is one of its header's); a curve the first two.
+        if graph_switches > 0 {
             for (name, hover, field) in [
                 ("grid", "The lines a dragged point sits on", &mut ov.show_grid),
-                ("labels", "The time and value numbers along those lines", &mut ov.show_labels),
+                ("labels", "The numbers along those lines", &mut ov.show_labels),
                 ("snap", "Dragged points settle on the nearest intersection", &mut ov.snap),
-            ] {
+            ]
+            .into_iter()
+            .take(graph_switches)
+            {
                 ui.label(egui::RichText::new(name).small());
                 let mut v = *field;
                 if super::kit::strip(

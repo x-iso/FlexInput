@@ -308,10 +308,43 @@ pub fn migrate_steam_pad_pins(snarl: &mut Snarl<NodeData>, device_id: &str, fed_
 ///   Position in the list is unchanged, so wires stay on their pins.
 ///
 /// Recurses into sub-patches.
+/// An AutoMap Fork's `select` is its first input now, as on a Split; it was its second.
+/// A patch saved the old way has the bus first: the two pins change places and each keeps
+/// the wires it had. Told apart by type, so a patch already turned round is left alone.
+fn migrate_automap_fork_pin_order(snarl: &mut Snarl<NodeData>) {
+    use egui_snarl::InPinId;
+    let old: Vec<NodeId> = snarl
+        .nodes_ids_data()
+        .filter(|(_, n)| {
+            n.value.module_id == "module.automap_fork"
+                && n.value.inputs.len() >= 2
+                && n.value.inputs[0].signal_type == SignalType::AutoMap
+        })
+        .map(|(id, _)| id)
+        .collect();
+    for id in old {
+        let (bus, select) = (InPinId { node: id, input: 0 }, InPinId { node: id, input: 1 });
+        let bus_wires = snarl.in_pin(bus).remotes.clone();
+        let select_wires = snarl.in_pin(select).remotes.clone();
+        snarl.drop_inputs(bus);
+        snarl.drop_inputs(select);
+        if let Some(n) = snarl.get_node_mut(id) {
+            n.inputs.swap(0, 1);
+        }
+        for from in bus_wires {
+            snarl.connect(from, select);
+        }
+        for from in select_wires {
+            snarl.connect(from, bus);
+        }
+    }
+}
+
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
     // A no-op on a tab canvas (no ports there); the work happens on the inner
     // snarl of every sub-patch, reached by the recursion at the bottom.
     renumber_subpatch_ports(snarl);
+    migrate_automap_fork_pin_order(snarl);
     for (_, node) in snarl.nodes_ids_data_mut() {
         // A measure calibration is a thing you are DOING, not a setting. Saved
         // mid-sweep it would come back running — driving the mouse from the gyro
@@ -324,6 +357,13 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         {
             node.value.params.insert("cal_measure".to_string(), Value::from("off"));
             node.value.params.insert("cal_finish".to_string(), Value::Bool(false));
+        }
+        // Real World Calibration's session (choose / guided) likewise: saved mid-way it would
+        // come back with its prompts up over the game.
+        if node.value.module_id == "processing.rws"
+            && node.value.params.get("cal_session").and_then(|v| v.as_str()).is_some_and(|s| s != "off")
+        {
+            node.value.params.insert("cal_session".to_string(), Value::from("off"));
         }
         // Average's window was a tick count, so what it meant followed the
         // Sample rate. It is milliseconds now; a saved count is read at the
@@ -385,6 +425,19 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 node.value.params.insert("rumble_exp".into(), Value::from(RUMBLE_LEGACY_EXP as f64));
             }
         }
+        // 3DOF to 2D's gyro inputs are named by the turn each axis is, and its Orientation
+        // output is "Orient" - the long name widened the module. Pin names persist with the
+        // node; same positions, so wires stay. Idempotent.
+        if node.value.module_id == "processing.gyro_3dof" {
+            for (pin, name) in node.value.inputs.iter_mut().zip(["", "", "Roll", "Pitch", "Yaw"]) {
+                if !name.is_empty() && pin.name.starts_with("Gyro ") {
+                    pin.name = name.to_string();
+                }
+            }
+            if let Some(pin) = node.value.outputs.get_mut(5).filter(|p| p.name == "Orientation") {
+                pin.name = "Orient".to_string();
+            }
+        }
         // "Negate" was renamed to "Inverse" (module id unchanged). Only rewrite
         // the stock title — a node the user renamed keeps their name.
         if node.value.module_id == "math.negate" && node.value.display_name == "Negate" {
@@ -404,12 +457,28 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                     SignalType::Vec2,
                 ));
             }
+            // The Map output (an AutoMap bus with the gyro scaled) came after Flick,
+            // appended the same way. A node from the builds that had a Vec2 "Gyro" there
+            // instead gets the Map pin in its place.
+            let map = || PinDescriptor::new(flexinput_modules::processing::RWS_MAP_OUT_NAME, SignalType::AutoMap);
+            if node.value.outputs.len() == 3 {
+                node.value.outputs.push(map());
+            } else if let Some(pin) = node.value.outputs.get_mut(3).filter(|p| p.signal_type != SignalType::AutoMap) {
+                *pin = map();
+            }
             // The Flick On control input came later still, after Rotation and
             // Flick.
             if node.value.inputs.len() == 2 {
                 node.value.inputs.push(PinDescriptor::new(
                     flexinput_modules::processing::RWS_FLICK_ON_IN_NAME,
                     SignalType::Bool,
+                ).optional());
+            }
+            // And the Device input, the bus the Map output hands on.
+            if node.value.inputs.len() == 3 {
+                node.value.inputs.push(PinDescriptor::new(
+                    flexinput_modules::processing::RWS_DEVICE_IN_NAME,
+                    SignalType::AutoMap,
                 ).optional());
             }
             viewer::migrate_rws_flick_params(&mut node.value.params);
@@ -430,6 +499,9 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         migrate_mapping_cards(&mut node.value);
         extend_feedback_control_inlets(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
+            crate::canvas::node::repair_runaway_items(&mut sp.items);
+            crate::canvas::node::repair_runaway_items(&mut sp.overlay_items);
+            crate::canvas::node::repair_runaway_items(&mut sp.config_items);
             migrate_loaded_snarl(&mut sp.snarl);
         }
     }
@@ -782,7 +854,7 @@ mod migration_tests {
     /// mode; a second pass is a no-op.
     #[test]
     fn migrate_renames_rws_mouse_output() {
-        use flexinput_modules::processing::{RWS_FLICK_ON_IN_NAME, RWS_FLICK_OUT_NAME, RWS_MOUSE_OUT_NAME};
+        use flexinput_modules::processing::{RWS_DEVICE_IN_NAME, RWS_FLICK_ON_IN_NAME, RWS_FLICK_OUT_NAME, RWS_MAP_OUT_NAME, RWS_MOUSE_OUT_NAME};
         let rws = |flick: Option<bool>, out: Option<&str>| NodeData {
             module_id: "processing.rws".to_string(),
             display_name: "RWS Aim".to_string(),
@@ -812,8 +884,8 @@ mod migration_tests {
         for _ in 0..2 {
             migrate_loaded_snarl(&mut snarl);
             let (ins, outs) = names(&snarl);
-            assert_eq!(outs, [RWS_MOUSE_OUT_NAME, "Stick", RWS_FLICK_OUT_NAME]);
-            assert_eq!(ins, ["Rotation", "Flick", RWS_FLICK_ON_IN_NAME]);
+            assert_eq!(outs, [RWS_MOUSE_OUT_NAME, "Stick", RWS_FLICK_OUT_NAME, RWS_MAP_OUT_NAME]);
+            assert_eq!(ins, ["Rotation", "Flick", RWS_FLICK_ON_IN_NAME, RWS_DEVICE_IN_NAME]);
         }
 
         // The old flick checkbox becomes an output mode: ticked with the merged
@@ -4186,6 +4258,8 @@ mod usb_audio_switch_tests {
 
 #[cfg(test)]
 mod grid_tests;
+#[cfg(test)]
+pub(crate) mod shot;
 
 /// A finger held on a wire, through the real canvas and its real menu.
 #[cfg(test)]

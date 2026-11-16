@@ -2333,12 +2333,30 @@ fn tz_note_pad_press(
     has
 }
 
+/// The node body: the field is what the module's corner grip sizes (`kit::Surface`) - the
+/// frame it was dragged to, less the rows around the field. It had a grip of its own in its
+/// corner and a size of its own in the patch.
 pub(crate) fn show_touch_zones_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
+    body_h: f32,
+) {
+    let surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(200.0, 120.0));
+    touch_zones_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
+    surface.end(ui);
+}
+
+fn touch_zones_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    field: egui::Vec2,
 ) {
     // The zones' output chips are drawn as the device they send to.
     let out_skin = remapper_out_skin(snarl, node_id, automap_parent);
@@ -2426,13 +2444,6 @@ pub(crate) fn show_touch_zones_body(
         }
     }
 
-    let field_w = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_w").and_then(|v| v.as_f64()))
-        .unwrap_or(420.0) as f32;
-    let field_h = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_h").and_then(|v| v.as_f64()))
-        .unwrap_or(260.0) as f32;
-
     ui.vertical(|ui| {
         // ── Mode toggles ─────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -2483,22 +2494,27 @@ pub(crate) fn show_touch_zones_body(
         let mapping = snarl.get_node(node_id)
             .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
 
+        // Two pads share the surface's width, with the gap between them.
+        const PAD_GAP: f32 = 16.0;
+        let two = tz_n_fields(snarl, node_id) == 2;
+        let field_w = if two { ((field.x - PAD_GAP) * 0.5).max(100.0) } else { field.x };
+        let field_h = field.y;
         // Field area(s); the union is registered as the pinnable "field" element.
-        let field_area = if tz_n_fields(snarl, node_id) == 2 {
+        let field_area = if two {
             // Split: two pads side by side with a gap. Only the RIGHT pad shows the
             // resize grip; it writes the shared size so both resize symmetrically.
             ui.horizontal_top(|ui| {
                 let a = ui.vertical(|ui| {
                     render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
                 }).inner;
-                ui.add_space(16.0);
+                ui.add_space(PAD_GAP - ui.spacing().item_spacing.x);
                 let b = ui.vertical(|ui| {
-                    render_touch_field(node_id, 1, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
+                    render_touch_field(node_id, 1, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
                 }).inner;
                 a.union(b)
             }).inner
         } else {
-            render_touch_field(node_id, 0, single, true, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
+            render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
         };
 
         // Pinnable to a sub-patch/Easy-mode layout (ports mode = move-only field).
@@ -3177,6 +3193,13 @@ pub(crate) fn render_touch_zone_cards(
     publish_nav_action_rects_scoped(ui, node_id, "zone_maps", &act_rects);
     // Keep polling live input while a capture is in flight.
     if phase != "idle" { ui.ctx().request_repaint(); }
+    // Pinned, the cards go on a layer of their own that scrolls under the rows above
+    // (`mapping_list_ui`): the zone's actions stay in view.
+    let mut list_holder = mapping_list_ui(ui, node_id);
+    let ui: &mut egui::Ui = match list_holder.as_mut() {
+        Some(list) => list,
+        None => ui,
+    };
 
     // ── Existing cards for the selected zone (display + press-mode + delete +
     // drag-to-reorder). The list is a FILTERED subset of `zone_maps` (this zone

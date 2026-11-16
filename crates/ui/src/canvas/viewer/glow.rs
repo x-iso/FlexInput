@@ -673,23 +673,6 @@ pub(crate) fn input_pin_glow(
     Some(glow_of(sig))
 }
 
-/// Derive the screen-space Y at which a header-relocated AutoMap pin should
-/// be drawn, given the `pin_ui` passed into `show_input` / `show_output` for
-/// the AutoMap column slot.
-///
-/// `pin_ui.clip_rect().top()` equals `node_rect.min.y` (snarl shrinks the
-/// payload clip to start at the node's top edge), so the chevron's Y center
-/// is `node_top + header_frame_margin.top + chevron_height/2`. Using this
-/// snarl-stable, per-frame screen Y avoids cross-frame caching entirely —
-/// the pin tracks the node's Y exactly during drag and never jumps on
-/// collapse/expand transitions.
-pub(crate) fn automap_chevron_y(pin_ui: &egui::Ui) -> f32 {
-    // Header frame margin top — must match Canvas::new's header_frame config
-    // (egui::Margin::symmetric(6, 4)).
-    const HEADER_MARGIN_TOP: f32 = 4.0;
-    let chevron_half = pin_ui.spacing().icon_width * 0.5;
-    pin_ui.clip_rect().top() + HEADER_MARGIN_TOP + chevron_half
-}
 
 /// Per-node cache key holding the absolute screen Y of the AutoMap header
 /// label center, stashed by `show_header`. Read one frame stale by the

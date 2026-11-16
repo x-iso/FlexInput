@@ -720,7 +720,19 @@ impl FlexInputApp {
             return;
         }
 
-        let new_cur = match step_dir {
+        // LB / RB jump between the action row - which stays at the top while the cards
+        // scroll under it - and the cards: to the card you were last on, and back up.
+        let last_card_id = egui::Id::new(("gp_nav_remap_last_card", inner.0));
+        let bump = (nav.is_rising("btn_lb") || nav.is_rising("btn_rb")) && n_actions > 0 && count > 0;
+        let new_cur = if bump {
+            if on_actions {
+                let last: usize = ctx.data(|d| d.get_temp(last_card_id)).unwrap_or(n_actions);
+                last.max(n_actions).min(total - 1)
+            } else {
+                ctx.data_mut(|d| d.insert_temp(last_card_id, cur));
+                0
+            }
+        } else { match step_dir {
             Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
             Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
             // Down: from the action row → first card; within cards → next card.
@@ -735,7 +747,7 @@ impl FlexInputApp {
                 else { cur - 1 }
             }
             _ => cur,
-        };
+        } };
         self.gamepad_nav.card_index = new_cur;
         let sel = new_cur;
 

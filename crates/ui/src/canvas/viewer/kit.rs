@@ -55,7 +55,116 @@ pub(crate) fn stretchy(module_id: &str) -> bool {
     matches!(
         module_id,
         "module.label" | "display.readout" | "module.knob" | "generator.envelope"
-    )
+    ) || surface_spec(module_id).is_some()
+}
+
+/// A module whose body is one big surface - a graph, a scope, a picture - with rows of
+/// settings around it. The surface is sized by the module's corner grip like everything
+/// else on the canvas: these each used to carry a grip of their own in the surface's corner,
+/// so a module had two sizes, one of them not on the grid and not in the patch.
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceSpec {
+    /// The smallest the surface is drawn, whatever the grip says.
+    pub min: egui::Vec2,
+    /// The frame a new module opens at, in blocks.
+    pub default_blocks: (f32, f32),
+}
+
+pub(crate) fn surface_spec(module_id: &str) -> Option<SurfaceSpec> {
+    let spec = |min: (f32, f32), default_blocks: (f32, f32)| {
+        Some(SurfaceSpec { min: egui::vec2(min.0, min.1), default_blocks })
+    };
+    match module_id {
+        "display.oscilloscope" | "display.trigscope" => spec((160.0, 80.0), (15.0, 11.0)),
+        "display.vectorscope" => spec((56.0, 56.0), (7.0, 7.0)),
+        "module.response_curve"
+        | "module.vec_response_curve"
+        | "module.twoway_response_curve"
+        | "module.automap_response_curve"
+        | "module.automap_twoway_response_curve" => spec((120.0, 100.0), (12.0, 13.0)),
+        "module.vec_reshape" => spec((140.0, 160.0), (11.0, 15.0)),
+        "display.controller3d" => spec((80.0, 60.0), (11.0, 14.0)),
+        // The 3DOF module's viewport: the gimbal and the output plane. Its rows of settings
+        // and its two Lean card lists are what the surface shares the frame with.
+        "processing.gyro_3dof" => spec((112.0, 84.0), (18.0, 26.0)),
+        "module.audio_stream_haptics" => spec((180.0, 90.0), (12.0, 17.0)),
+        "module.jsm" => spec((200.0, 120.0), (16.0, 12.0)),
+        "module.touch_zones" => spec((200.0, 120.0), (17.0, 12.0)),
+        // The calibration view: a ruler, a room, or both.
+        "processing.rws" => spec((236.0, 80.0), (14.0, 4.0)),
+        "module.menu" => spec((160.0, 100.0), (14.0, 11.0)),
+        "module.area_mapper" => spec((140.0, 140.0), (18.0, 20.0)),
+        // Gyro to Stick Rotation's live circle.
+        "module.stick_rotation" => spec((208.0, 96.0), (9.0, 14.0)),
+        // The card lists: the width is the scale of the cards (380 points of body at 1:1),
+        // the height the window onto the list.
+        "module.remapper" | "module.map_action" => spec((150.0, 56.0), (16.0, 9.0)),
+        _ => None,
+    }
+}
+
+/// Modules whose surface has one shape whatever the frame: their width is their size.
+pub(crate) fn keeps_aspect(module_id: &str) -> bool {
+    matches!(module_id, "display.vectorscope")
+}
+
+/// The surface of a [`surface_spec`] module, this frame: as wide as the body it was handed
+/// (never narrower than the rows beside it), and as tall as what the frame leaves once those
+/// rows have had their height. The rows are flow widgets, so their size is only known once
+/// they are laid out: it is measured each frame and used the next, and since no row's size
+/// depends on the surface's it settles in one.
+///
+/// [`Surface::begin`] before anything is laid out, [`Surface::row`] with each row's rect,
+/// [`Surface::end`] after the last row, with the same `ui`.
+pub(crate) struct Surface {
+    key: egui::Id,
+    pub size: egui::Vec2,
+    top: f32,
+    rows_w: f32,
+}
+
+impl Surface {
+    pub(crate) fn begin(ui: &egui::Ui, node: NodeId, body_w: f32, body_h: f32, min: egui::Vec2) -> Self {
+        // Scoped to where it is drawn: node ids repeat between tabs and sub-patch editors.
+        let key = egui::Id::new(("kit_surface", ui.ctx().viewport_id(), ui.layer_id(), node.0));
+        let rows: egui::Vec2 = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_default();
+        Self {
+            key,
+            size: egui::vec2(body_w.max(rows.x).max(min.x), (body_h - rows.y).max(min.y)),
+            top: ui.cursor().top(),
+            rows_w: 0.0,
+        }
+    }
+
+    /// A row of settings laid out beside the surface: its width is the narrowest the
+    /// surface is drawn, so the two always end at the same edge.
+    pub(crate) fn row(&mut self, rect: egui::Rect) {
+        if rect.is_positive() {
+            self.rows_w = self.rows_w.max(rect.width());
+        }
+    }
+
+    /// The same, for rows that fill whatever width they are given: what they need, since
+    /// what they drew is the surface's own width and would hold it there.
+    pub(crate) fn need(&mut self, width: f32) {
+        self.rows_w = self.rows_w.max(width);
+    }
+
+    /// End a frame in which the surface was folded away and not drawn: what the body drew
+    /// is all rows, so the surface gets the rest of the frame when it is unfolded again.
+    pub(crate) fn end_folded(self, ui: &egui::Ui) {
+        let bottom = ui.cursor().top().max(ui.min_rect().bottom());
+        let rows_h = (bottom - self.top).max(0.0);
+        ui.ctx().data_mut(|d| d.insert_temp(self.key, egui::vec2(self.rows_w, rows_h)));
+    }
+
+    pub(crate) fn end(self, ui: &egui::Ui) {
+        // How far down the body got: the cursor in a column, the lowest thing drawn in a row
+        // (a node's body is a row, and some bodies put a column of their own in it).
+        let bottom = ui.cursor().top().max(ui.min_rect().bottom());
+        let rows_h = (bottom - self.top - self.size.y).max(0.0);
+        ui.ctx().data_mut(|d| d.insert_temp(self.key, egui::vec2(self.rows_w, rows_h)));
+    }
 }
 
 /// How tall a stretchy body is this frame. The mirror of [`body_width`] with one
@@ -123,7 +232,39 @@ pub(crate) fn uses_kit(module_id: &str) -> bool {
 pub(crate) fn channel_range(module_id: &str) -> Option<std::ops::RangeInclusive<usize>> {
     match module_id {
         "module.delay" | "module.average" | "module.dc_filter" => Some(1..=64),
+        // The curves and the scopes: their "Ch + -" was a row at the bottom of the body.
+        "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => Some(1..=16),
+        "display.oscilloscope" | "display.vectorscope" => Some(1..=16),
+        // A Trigger Scope's first input is its trigger, which is not a channel.
+        "display.trigscope" => Some(2..=17),
         _ => None,
+    }
+}
+
+/// The pins one more channel adds to a [`channel_range`] module that has `n_inputs` inputs
+/// already: an input, and for a module that passes its channels through, the output beside
+/// it. The names and types are the ones each module's own `+` gave them, since a patch
+/// stores them.
+pub(crate) fn channel_pins(node: &NodeData) -> (PinDescriptor, Option<PinDescriptor>) {
+    let next = node.inputs.len() + 1;
+    let pair = |ty: SignalType| {
+        (
+            PinDescriptor::new(format!("In {next}"), ty),
+            Some(PinDescriptor::new(format!("Out {next}"), ty)),
+        )
+    };
+    match node.module_id.as_str() {
+        "display.oscilloscope" => (PinDescriptor::new(format!("ch{next}"), SignalType::Float), None),
+        // Counted without the trigger.
+        "display.trigscope" => (PinDescriptor::new(format!("ch{}", next - 1), SignalType::Float), None),
+        "display.vectorscope" => (PinDescriptor::new(format!("ch{next}"), SignalType::Vec2), None),
+        "module.vec_response_curve" => pair(SignalType::Vec2),
+        "module.twoway_response_curve"
+            if node.params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false) =>
+        {
+            pair(SignalType::Vec2)
+        }
+        _ => pair(SignalType::Float),
     }
 }
 
@@ -213,6 +354,12 @@ pub(crate) fn pin_short(name: &str) -> (String, bool) {
         ("velocity", "vel"),
         ("strength", "str"),
         ("duration", "dur"),
+        // Map Range's four bounds: cut to four letters they were `in_m`, `in_m`, `out_`,
+        // `out_` - two pairs of twins. An arrow says which end of which range.
+        ("in_min", "in↓"),
+        ("in_max", "in↑"),
+        ("out_min", "out↓"),
+        ("out_max", "out↑"),
     ];
     if let Some((_, short)) = SHORT.iter().find(|(word, _)| word.eq_ignore_ascii_case(name)) {
         return (short.to_string(), true);
@@ -222,6 +369,164 @@ pub(crate) fn pin_short(name: &str) -> (String, bool) {
         return (keep, true);
     }
     (name.to_string(), false)
+}
+
+/// What a pin's label says on the canvas, and whether that is short for its name. The
+/// Response Curve family's channels are `i1 o1 i2 o2`: `In 1` and `Out 1` are different
+/// widths, so the two columns either side of the graph never matched, and a curve's pins
+/// need no more than which channel they are. The small modules take [`pin_short`]; the
+/// rest keep their names.
+pub(crate) fn pin_label(module_id: &str, name: &str) -> (String, bool) {
+    let curve = matches!(
+        module_id,
+        "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
+    );
+    if curve {
+        let (word, n) = name.split_once(' ').unwrap_or((name, "1"));
+        let digits = !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+        match (word, digits) {
+            ("In", true) => return (format!("i{n}"), true),
+            ("Out", true) => return (format!("o{n}"), true),
+            _ => {}
+        }
+    }
+    if pin_abbreviates(module_id) {
+        pin_short(name)
+    } else {
+        (name.to_string(), false)
+    }
+}
+
+/// An Auto-Map pin with no word beside it. The bus's socket is its own shape and colour, and
+/// the words on it - `Device`, `AutoMap`, `in`, `out` - are different lengths on the two
+/// sides of a module, which is all they added. The device nodes keep theirs (the word is
+/// the device's side of the bus), and so does a sub-patch, whose ports the user names.
+pub(crate) fn unlabelled_bus_pin(module_id: &str, ty: SignalType) -> bool {
+    ty == SignalType::AutoMap && !module_id.starts_with("device.") && !module_id.starts_with("subpatch")
+}
+
+/// A bar across `rect` that resizes what is next to it: drag it up or down (or left and
+/// right, with `vertical_drag` off), double-click to put it back. Returns the drag this
+/// frame along its axis, and whether it was double-clicked.
+pub(crate) fn resize_bar(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: impl std::hash::Hash,
+    vertical_drag: bool,
+    hover: &str,
+) -> (f32, bool) {
+    let resp = ui
+        .interact(rect, egui::Id::new(("kit_resize_bar", id, ui.layer_id())), egui::Sense::click_and_drag())
+        .on_hover_cursor(if vertical_drag { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal })
+        .on_hover_text(hover);
+    let col = if resp.hovered() || resp.dragged() {
+        ui.visuals().widgets.hovered.fg_stroke.color
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    let c = rect.center();
+    let half = if vertical_drag { egui::vec2(16.0, 0.0) } else { egui::vec2(0.0, 16.0) };
+    ui.painter().line_segment([c - half, c + half], egui::Stroke::new(2.0_f32, col));
+    let d = resp.drag_delta();
+    (if resp.dragged() { if vertical_drag { d.y } else { d.x } } else { 0.0 }, resp.double_clicked())
+}
+
+/// Grow (or, negative, shrink) a surface module's frame by `dy` points, as its corner grip
+/// would: what one part of the body is given then comes out of the frame, not out of the
+/// surface. A frame never dragged starts from the module's default size in `block`s.
+pub(crate) fn grow_frame(node: &mut NodeData, block: f32, dy: f32) {
+    let current = node
+        .params
+        .get(HEIGHT_PARAM)
+        .and_then(|v| v.as_f64())
+        .map(|h| h as f32)
+        .or_else(|| surface_spec(&node.module_id).map(|s| s.default_blocks.1 * block))
+        .unwrap_or(0.0);
+    if let Some(n) = serde_json::Number::from_f64(f64::from((current + dy).max(block))) {
+        node.params.insert(HEIGHT_PARAM.into(), serde_json::Value::Number(n));
+    }
+}
+
+/// Whether a bus socket is drawn on the header row: an unlabelled one ([`unlabelled_bus_pin`])
+/// that is the only bus pin on its side, and not one of a strip module's numbered ports -
+/// those stay level with the strip that names them. With no word beside it, a socket in the
+/// pin column was a dot halfway down one side; on the header it is where it is when the
+/// module is folded, and the input and output line up with each other. `side` is the
+/// signal types of every pin on that side.
+pub(crate) fn bus_pin_on_header(
+    module_id: &str,
+    strip_pin: bool,
+    ty: SignalType,
+    side: impl Iterator<Item = SignalType>,
+) -> bool {
+    unlabelled_bus_pin(module_id, ty) && !strip_pin && side.filter(|t| *t == SignalType::AutoMap).count() == 1
+}
+
+/// Two switches that belong together, as the two halves of one pill at `rect`: the left
+/// half `left_w` wide, a hairline between them, each lit while its switch is on. Returns
+/// whether each was clicked.
+pub(crate) fn header_toggle_pair(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    left_w: f32,
+    a: (&str, bool, &str),
+    b: (&str, bool, &str),
+    id_salt: impl std::hash::Hash + Copy,
+) -> (bool, bool) {
+    let split = rect.left() + left_w;
+    let halves = [
+        (egui::Rect::from_min_max(rect.min, egui::pos2(split, rect.bottom())), a, true),
+        (egui::Rect::from_min_max(egui::pos2(split, rect.top()), rect.max), b, false),
+    ];
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let mut clicked = [false, false];
+    for (i, (half, (label, on, hover), left)) in halves.into_iter().enumerate() {
+        let resp = ui
+            .interact(half, egui::Id::new(("header_toggle_pair", id_salt, i)), egui::Sense::click())
+            .on_hover_text(hover);
+        let v = ui.visuals();
+        let (fill, text) = if on {
+            (v.selection.bg_fill, v.strong_text_color())
+        } else if resp.hovered() {
+            (v.widgets.hovered.weak_bg_fill, v.text_color())
+        } else {
+            (v.widgets.inactive.weak_bg_fill, v.text_color())
+        };
+        let r = 3u8;
+        let corners = if left {
+            egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 }
+        } else {
+            egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }
+        };
+        ui.painter().rect_filled(half, corners, fill);
+        ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, label, font.clone(), text);
+        clicked[i] = resp.clicked();
+    }
+    ui.painter().line_segment(
+        [egui::pos2(split, rect.top() + 2.0), egui::pos2(split, rect.bottom() - 2.0)],
+        egui::Stroke::new(1.0_f32, ui.visuals().extreme_bg_color),
+    );
+    (clicked[0], clicked[1])
+}
+
+/// What hovering a pin's label says: the name it is short for, and the module at the other
+/// end of each wire on it (`from` / `to`) with the pin there. Nothing when the label is the
+/// whole name and nothing is wired.
+pub(crate) fn pin_hover<'a>(
+    name: &str,
+    shortened: bool,
+    way: &str,
+    ends: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (module, pin) in ends {
+        lines.push(if pin.is_empty() { format!("{way} {module}") } else { format!("{way} {module} · {pin}") });
+    }
+    if !shortened && lines.is_empty() {
+        return None;
+    }
+    lines.insert(0, name.to_string());
+    Some(lines.join("\n"))
 }
 
 /// Modules whose output labels are not drawn at all: the body says what comes out.
@@ -410,21 +715,19 @@ pub(crate) fn header_stepper(
     step
 }
 
-/// The vertical padding of a Combiner port row's drop frame. The row's height is its
-/// widgets plus twice this, on both sides of the arithmetic: the body sets its widgets to
-/// that height and the pin row is allocated the same, which is the only way they stay level
-/// - the pins are laid out before the body is drawn, so neither can measure the other.
-pub(crate) const COMBINER_PAD_V: f32 = 3.0;
-
 /// The modules whose ports are a column of strips in the body, and the height of a strip -
 /// which is also the height a pin row is drawn at, so each socket sits level with the strip
 /// that names it. Their numbered pins drop the label beside the socket: the strip says the
 /// same word, and a word twice over is what made these modules wide for nothing.
 /// The smallest pitch a strip - and the pin row beside it - is drawn at.
-pub(crate) fn strip_min_pitch(module_id: &str, ui: &egui::Ui) -> Option<f32> {
+pub(crate) fn strip_min_pitch(module_id: &str, _ui: &egui::Ui) -> Option<f32> {
     match module_id {
-        "module.selector" | "module.split" | "module.macro" => Some(super::simple_bodies::STRIP_H),
-        "module.automap_combiner" => Some(ui.spacing().interact_size.y + 2.0 * COMBINER_PAD_V),
+        "module.selector"
+        | "module.split"
+        | "module.macro"
+        | "module.automap_combiner"
+        | "module.automap_fork"
+        | "module.automap_selector" => Some(super::simple_bodies::STRIP_H),
         _ => None,
     }
 }
@@ -434,8 +737,8 @@ pub(crate) fn strip_min_pitch(module_id: &str, ui: &egui::Ui) -> Option<f32> {
 /// strip band, so it costs no band). Both sides need this number to agree on the pitch.
 pub(crate) fn strip_bands(module_id: &str, inputs: usize, outputs: usize) -> usize {
     match module_id {
-        "module.selector" | "module.automap_combiner" => inputs,
-        "module.split" => outputs.max(inputs),
+        "module.selector" | "module.automap_combiner" | "module.automap_selector" => inputs,
+        "module.split" | "module.automap_fork" => outputs.max(inputs),
         // A Macro's ports are its outputs, one strip each; the body adds no band of its own,
         // the `+` being in the header.
         "module.macro" => outputs,
@@ -466,10 +769,51 @@ pub(crate) fn strip_pitch(module_id: &str, _bands: usize, ui: &egui::Ui) -> Opti
     strip_min_pitch(module_id, ui)
 }
 
-/// The pitch the strips are painted at: a row and the spacing the pin column adds between
-/// rows. See [`strip_pitch`].
-pub(crate) fn strip_advance(module_id: &str, ui: &egui::Ui) -> Option<f32> {
-    Some(strip_min_pitch(module_id, ui)? + ui.style().spacing.item_spacing.y)
+/// Where a port list's rows are, for the body that draws them: the one place that knows how
+/// the pin column lays its sockets out, so a list can't drift off the sockets it names.
+///
+/// The pin column starts at the body's top, gives each socket a row [`strip_pitch`] tall and
+/// puts the column's spacing *after* it. So row `i` is the band from `top + i * advance`,
+/// `row_h` tall, and the socket is at that band's centre - not at the centre of the whole
+/// advance, and not wherever a list centred in the body would put it.
+#[derive(Clone, Copy)]
+pub(crate) struct StripRows {
+    top: f32,
+    /// From one row's top to the next: a row and the spacing under it.
+    pub advance: f32,
+    /// The height of a row itself - what its socket is centred in.
+    pub row_h: f32,
+}
+
+impl StripRows {
+    /// The rows starting at the body's cursor. Take this **before** the body allocates its
+    /// list, while the cursor is still at the body's top.
+    pub(crate) fn at_cursor(module_id: &str, ui: &egui::Ui) -> Self {
+        let row_h = strip_min_pitch(module_id, ui).unwrap_or(super::simple_bodies::STRIP_H);
+        Self {
+            top: ui.cursor().top(),
+            advance: row_h + ui.style().spacing.item_spacing.y,
+            row_h,
+        }
+    }
+
+    /// The height `rows` of them reserve in the body.
+    pub(crate) fn height(&self, rows: usize) -> f32 {
+        rows.max(1) as f32 * self.advance
+    }
+
+    /// The y of row `i`'s socket.
+    pub(crate) fn center_y(&self, row: usize) -> f32 {
+        self.top + row as f32 * self.advance + self.row_h * 0.5
+    }
+
+    /// Row `i`'s band, between `left` and `left + width`.
+    pub(crate) fn band(&self, row: usize, left: f32, width: f32) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(left, self.top + row as f32 * self.advance),
+            egui::vec2(width, self.row_h),
+        )
+    }
 }
 
 /// Whether this pin is one the module draws as a strip in its body, and therefore draws
@@ -479,8 +823,8 @@ pub(crate) fn strip_advance(module_id: &str, ui: &egui::Ui) -> Option<f32> {
 pub(crate) fn strip_pin(module_id: &str, input: bool, index: usize) -> bool {
     match (module_id, input) {
         // A Selector's first input is its `select` pin, which has a row of its own.
-        ("module.selector", true) => index >= 1,
-        ("module.split", false) => true,
+        ("module.selector" | "module.automap_selector", true) => index >= 1,
+        ("module.split" | "module.automap_fork", false) => true,
         ("module.automap_combiner", true) => true,
         // The row already carries the port's name in a field that renames it.
         ("module.macro", false) => true,
@@ -495,7 +839,8 @@ pub(crate) fn header_plus(module_id: &str) -> Option<&'static str> {
     match module_id {
         "module.selector" => Some("input"),
         "module.split" => Some("output"),
-        "module.automap_combiner" => Some("input"),
+        "module.automap_combiner" | "module.automap_selector" => Some("input"),
+        "module.automap_fork" => Some("output"),
         _ => None,
     }
 }
@@ -526,6 +871,37 @@ pub(crate) const HEADER_TOGGLE_W: f32 = 54.0;
 
 pub(crate) fn header_toggles_w(ui: &egui::Ui) -> f32 {
     2.0 * HEADER_TOGGLE_W + 6.0 + ui.spacing().item_spacing.x
+}
+
+/// A square button with a drawing on it, at a place in a header: the stepper's square, the
+/// drawing tinted like a button's text. Returns whether it was clicked.
+pub(crate) fn header_icon_button(
+    ui: &mut egui::Ui,
+    glyph: super::glyphs::Glyph,
+    hover: &str,
+    rect: egui::Rect,
+    id_salt: impl std::hash::Hash,
+) -> bool {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .id_salt(("header_icon", id_salt))
+            .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+    );
+    let resp = child.put(rect, egui::Button::new("").min_size(rect.size())).on_hover_text(hover);
+    let colour = child.style().interact(&resp).text_color();
+    super::glyphs::paint(child.painter(), rect.expand(1.0), glyph, colour);
+    resp.clicked()
+}
+
+/// A Response Curve's header controls, right to left: Reset, Load, Save as drawings, then
+/// the `labels` and `grid` switches - narrower than the Envelope's pair, because this header
+/// has three buttons to fit beside them.
+pub(crate) const CURVE_TOGGLE_W: [f32; 3] = [34.0, 42.0, 44.0];
+pub(crate) const CURVE_HEADER_GAP: f32 = 3.0;
+
+pub(crate) fn curve_header_w(ui: &egui::Ui) -> f32 {
+    CURVE_TOGGLE_W.iter().sum::<f32>() + 3.0 * stepper_h(ui) + 5.0 * CURVE_HEADER_GAP + 4.0
 }
 
 pub(crate) fn header_plus_button(ui: &mut egui::Ui, hover: &str, row: egui::Rect, right: f32) -> bool {
@@ -622,6 +998,22 @@ const HELP: &[(&str, &str)] = &[
     ("module.vec_to_axis", "Splits a vector into two axes"),
 ];
 
+/// The name a module ships under, by its id: what a header's tooltip puts after the name
+/// the user gave a module, so a node called "Aim curve" still says it is a Response Curve.
+pub(crate) fn shipped_name(module_id: &str) -> Option<&'static str> {
+    static NAMES: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| (r.descriptor.id, r.descriptor.display_name))
+                .collect()
+        })
+        .get(module_id)
+        .copied()
+}
+
 pub(crate) fn module_help(module_id: &str) -> Option<&'static str> {
     HELP.iter()
         .find(|(id, _)| *id == module_id)
@@ -693,6 +1085,18 @@ pub(crate) const MARKS: &[(&str, &str, &str)] = &[
     ("module.vec_to_deflection", "Vec to Deflection", "∠"),
     ("logic.has_changed", "Has Changed", "Δ"),
 ];
+
+/// The drawing a node's header shows where its name would be, or none. For a module whose
+/// name doesn't fit beside its header control and has no symbol a font can be trusted to
+/// carry: Delay is two blocks wide with a `- n +` in its header, which leaves the word no
+/// room, and a clock is not in every font. The name goes over the setting in the body and
+/// into the hover text; a module the user renamed keeps its name, cut to fit as any other.
+pub(crate) fn node_glyph(node: &NodeData) -> Option<super::glyphs::Glyph> {
+    match (node.module_id.as_str(), node.display_name.as_str()) {
+        ("module.delay", "Delay") => Some(super::glyphs::Glyph::Stopwatch),
+        _ => None,
+    }
+}
 
 /// The mark a node's header shows, or none: a module known by a symbol, still under
 /// the name it shipped with. Comparisons fold `or_equal` into the mark, so the

@@ -34,7 +34,7 @@ mod bluetooth_window;
 mod chrome;
 mod config_route;
 mod devices_pool;
-mod fonts;
+pub(crate) mod fonts; // the canvas tests' picture rig draws with the app's fonts
 pub(crate) mod graph;
 mod hidhide_ui;
 mod jsm_ports;
@@ -198,7 +198,7 @@ pub struct EasyState {
 }
 
 impl PatchTab {
-    fn new_untitled(n: u32) -> Self {
+    pub(crate) fn new_untitled(n: u32) -> Self {
         let view_salt = crate::canvas::next_canvas_salt();
         let mut canvas = Canvas::new();
         canvas.set_view_salt(view_salt);
@@ -905,6 +905,8 @@ impl FlexInputApp {
             // preset or an earlier attributed save) back onto the tab.
             let mut overlay = pt.overlay;
             let mut config = pt.config;
+            crate::canvas::node::repair_runaway_items(&mut overlay.items);
+            crate::canvas::node::repair_runaway_items(&mut config.items);
             crate::canvas::node::materialize_subpatch_overlays(
                 &canvas.snarl, &mut overlay, &mut config);
             PatchTab {
@@ -1628,11 +1630,21 @@ impl eframe::App for FlexInputApp {
                     // is what stops e.g. the gyro leaking to the game mouse while
                     // you tweak a stick curve. Empty pin list = whole device.
                     let passthrough = crate::config_overlay::config_passthrough(ctx);
+                    // What the pad is navigating with stays out of the game whatever the
+                    // focused pin passes through (see `config_nav_reserved_pins`).
+                    let reserved = if crate::config_overlay::config_pad_active(ctx) {
+                        self.config_nav_reserved_pins()
+                    } else {
+                        Vec::new()
+                    };
                     self.last_signals
                         .keys()
                         .filter(|(dev, pin)| {
                             if !graph::is_physical_input_device(dev) {
                                 return false;
+                            }
+                            if graph::is_physical_pad_id(dev) && reserved.contains(&pin.as_str()) {
+                                return true;
                             }
                             match &passthrough {
                                 Some((pdev, pins)) if pdev == dev => {
@@ -2337,6 +2349,15 @@ impl eframe::App for FlexInputApp {
             let fps = self.overlay_fps();
             crate::gyro_cal_overlay::show(ctx, &mut self.tabs, self.active_tab, &self.last_signals,
                 &self.spike_filter_settings, fps);
+        }
+        // ── Real World Calibration ────────────────────────────────────────────
+        // RWS Aim's calibration widgets on the config overlay (pinned from the module's
+        // body), and the big prompts of a calibration running over the game.
+        {
+            puffin::profile_scope!("rws_cal");
+            crate::rws_cal::sync(ctx, &mut self.tabs, self.active_tab);
+            let fps = self.overlay_fps();
+            crate::rws_cal::show(ctx, &mut self.tabs, self.active_tab, fps);
         }
         {
             puffin::profile_scope!("show_phase_overlay");
@@ -3197,7 +3218,12 @@ impl FlexInputApp {
             // panes you are about to work in, so they have to belong to it
             // before you commit to one. Move the selection off the editor to get
             // tab switching back.
-            || self.nav_jsm_editor_selected();
+            || self.nav_jsm_editor_selected()
+            // An entered card list (Remapper, Map Action, a Lean list): LB / RB
+            // jump between its action row and its cards.
+            || matches!(self.gamepad_nav.edit_level,
+                crate::gamepad_nav::EditLevel::RemapScroll | crate::gamepad_nav::EditLevel::RemapCard
+                | crate::gamepad_nav::EditLevel::RemapMove);
         if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
             self.set_active_tab(self.active_tab - 1);
         }
@@ -3544,11 +3570,11 @@ impl FlexInputApp {
                 let lt_exits = lt_rising && !self.nav_jsm_editor_selected();
                 // A JSM command list drawn over the editor takes East for
                 // itself: while it is up, "back" means close the list, not
-                // leave the widget you opened it from. The calibration panel is
-                // the same arrangement — East folds it away (or cancels its
-                // sweep) before it means "leave the editor", so the faders
-                // underneath stay reachable without dropping out of the widget.
-                let panel_up = self.nav_jsm_list_open(ctx) || self.nav_jsm_cal_open();
+                // leave the widget you opened it from. (The calibration panel
+                // that used to unfold the same way is gone - calibrating is on the
+                // config overlay now - and a `cal_open` a patch saved from then
+                // must not hold East: it left the pad stuck in the editor.)
+                let panel_up = self.nav_jsm_list_open(ctx);
                 // East / LT / back → exit to widget level, committing the edit
                 // as one undo entry if anything actually changed.
                 if (nav.is_rising("btn_east") && !panel_up) || lt_exits {

@@ -65,32 +65,155 @@ const SMOOTH_TIP: &str = "Stabilise the stick's direction against a shaky thumb 
     sweep is let through with little delay. Only the thumb's direction is\n\
     smoothed — never the stick's length, and never the gyro's turn.";
 
-pub(crate) fn show_stick_rotation_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    let mut changed = false;
+/// The narrowest the rows read at: the stick and mode strips side by side.
+const SR_MIN_W: f32 = 208.0;
+const SR_STICK_W: f32 = 76.0;
+const SR_MODE_W: f32 = 120.0;
+const SR_SENS_W: f32 = 168.0;
+const SR_HOLD_W: f32 = 150.0;
+const SR_RETURN_W: f32 = 116.0;
+const SR_TAKE_W: f32 = 196.0;
+const SR_OUTER_W: f32 = 96.0;
+const SR_DZ_W: f32 = 112.0;
+const SR_SMOOTH_W: f32 = 120.0;
+
+/// The body: the live circle as the module's surface - the corner grip sizes it - and the
+/// settings under it as strips and value pills, in groups that share a band while the width
+/// holds them. Each group is still the element it was, so each pins on its own.
+pub(crate) fn show_stick_rotation_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
+    let Some(node) = snarl.get_node(node_id) else { return false };
+    let stick = stick_rotation_stick(node);
+    let world = node.params.get(STICK_ROT_MODE_PARAM).and_then(|v| v.as_str()) == Some("world");
+    let mut sens = num(node, STICK_ROT_SENS_PARAM, STICK_ROT_SENS_DEFAULT);
+    let mut invert = node.params.get(STICK_ROT_INVERT_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
+    let relative = node.params.get(STICK_ROT_RELATIVE_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut ret = num(node, STICK_ROT_RETURN_PARAM, STICK_ROT_RETURN_DEFAULT_MS);
+    let mut take = node.params.get(STICK_ROT_TAKEOVER_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut speed = num(node, STICK_ROT_TAKEOVER_SPEED_PARAM, STICK_ROT_TAKEOVER_SPEED_DEFAULT);
+    let mut outer = num(node, STICK_ROT_OUTER_PARAM, STICK_ROT_OUTER_DEFAULT);
+    let mut dz = num(node, STICK_ROT_DEADZONE_PARAM, STICK_ROT_DEADZONE_DEFAULT);
+    let mut smooth = num(node, STICK_ROT_SMOOTH_PARAM, 0.0);
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    let number = |k: &'static str, v: f32| serde_json::Number::from_f64(v as f64).map(|n| (k, Value::Number(n)));
+
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        let r = ui.horizontal(|ui| changed |= options_row(node_id, ui, snarl));
-        register_exposable_element(ui, node_id, "options", r.response.rect);
-        ui.horizontal(|ui| {
-            let r = ui.horizontal(|ui| changed |= sens_row(node_id, ui, snarl));
-            register_exposable_element(ui, node_id, "sens", r.response.rect);
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(SR_MIN_W, 96.0));
+        let w = surface.size.x;
+        ui.set_max_width(w);
+        surface.need(SR_MIN_W);
+        let band = super::curve_rows::band_h(ui);
+        let ctrl = band - 4.0;
+        let lay = |ui: &mut egui::Ui, mins: &[f32]| -> Vec<egui::Rect> {
+            let (cells, h) = super::curve_rows::bands(w, mins, band, 3.0 * super::kit::GAP);
+            let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            cells
+                .into_iter()
+                .map(|c| {
+                    let c = c.translate(area.min.to_vec2());
+                    egui::Rect::from_min_size(egui::pos2(c.left(), c.center().y - ctrl * 0.5), egui::vec2(c.width(), ctrl))
+                })
+                .collect()
+        };
+        let word_w = |ui: &egui::Ui, t: &str| {
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            ui.painter().layout_no_wrap(t.to_string(), font, egui::Color32::PLACEHOLDER).size().x + 14.0
+        };
+
+        // The live circle: the stick where the thumb has it and where the gyro turned it to.
+        let (field, _) = ui.allocate_exact_size(surface.size, egui::Sense::hover());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::top_down(egui::Align::Center)));
+        let side = field.width().min(field.height());
+        let circle = render_stick_rotation_field(node_id, &mut child, snarl, egui::vec2(side, side));
+        register_exposable_element(ui, node_id, "field", circle);
+
+        // Which stick, and which turn.
+        let cells = lay(ui, &[SR_STICK_W, SR_MODE_W]);
+        if let Some(p) = super::curve_rows::segmented(ui, cells[0], &stick, &[("left_stick", "L", STICK_TIP), ("right_stick", "R", STICK_TIP)], ("sr_stick", node_id)) {
+            set.push((STICK_ROT_STICK_PARAM, Value::String(p.into())));
+        }
+        if let Some(m) = super::curve_rows::segmented(ui, cells[1], &world, &[(false, "Yaw", MODE_TIP), (true, "World", MODE_TIP)], ("sr_mode", node_id)) {
+            set.push((STICK_ROT_MODE_PARAM, Value::String(if m { "world" } else { "yaw" }.into())));
+        }
+        register_exposable_element(ui, node_id, "options", cells[0].union(cells[1]));
+
+        // Sensitivity and invert; the hold, and Relative's return time.
+        let cells = lay(ui, &[SR_SENS_W, SR_HOLD_W, SR_RETURN_W]);
+        {
+            let r = cells[0];
+            let iw = word_w(ui, "invert");
+            let pr = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - iw - super::kit::GAP, r.bottom()));
+            let tr = egui::Rect::from_min_max(egui::pos2(r.right() - iw, r.top()), r.max);
+            let shown = format!("{sens:.2}×");
+            if super::curve_rows::real_pill(ui, node_id, "sr_sens", pr, "sens|sensitivity", &mut sens, &shown, 0.0..=10.0, 0.01, SENS_TIP) {
+                set.extend(number(STICK_ROT_SENS_PARAM, sens));
+            }
+            if super::curve_rows::word_toggle(ui, tr, &mut invert, "invert", INVERT_TIP, ("sr_invert", node_id)) {
+                set.push((STICK_ROT_INVERT_PARAM, Value::Bool(invert)));
+            }
+            register_exposable_element(ui, node_id, "sens", r);
+        }
+        if let Some(rel) = super::curve_rows::segmented(ui, cells[1], &relative, &[(false, "Absolute", HOLD_TIP), (true, "Relative", HOLD_TIP)], ("sr_hold", node_id)) {
+            set.push((STICK_ROT_RELATIVE_PARAM, Value::Bool(rel)));
+        }
+        ui.add_enabled_ui(relative, |ui| {
+            let shown = format!("{ret:.0} ms");
+            if super::curve_rows::real_pill(ui, node_id, "sr_return", cells[2], "return|return time", &mut ret, &shown, 0.0..=2000.0, 2.0, RETURN_TIP) {
+                set.extend(number(STICK_ROT_RETURN_PARAM, ret));
+            }
         });
-        let r = ui.horizontal(|ui| changed |= hold_row(node_id, ui, snarl));
-        register_exposable_element(ui, node_id, "hold", r.response.rect);
-        let r = ui.horizontal(|ui| changed |= takeover_row(node_id, ui, snarl));
-        register_exposable_element(ui, node_id, "takeover", r.response.rect);
-        ui.horizontal(|ui| {
-            let r = ui.horizontal(|ui| changed |= number_row(node_id, ui, snarl, NumRow::Deadzone));
-            register_exposable_element(ui, node_id, "deadzone", r.response.rect);
-            ui.separator();
-            let r = ui.horizontal(|ui| changed |= number_row(node_id, ui, snarl, NumRow::Smooth));
-            register_exposable_element(ui, node_id, "stabilise", r.response.rect);
-        });
-        let w = ui.available_width().clamp(120.0, 200.0);
-        let rect = render_stick_rotation_field(node_id, ui, snarl, egui::vec2(w, w));
-        register_exposable_element(ui, node_id, "field", rect);
+        register_exposable_element(ui, node_id, "hold", cells[1].union(cells[2]));
+
+        // Takeover, its speed and outer zone; the deadzone and the stabiliser.
+        let cells = lay(ui, &[SR_TAKE_W, SR_OUTER_W, SR_DZ_W, SR_SMOOTH_W]);
+        {
+            let r = cells[0];
+            let tw = word_w(ui, "takeover");
+            let tr = egui::Rect::from_min_size(r.min, egui::vec2(tw, r.height()));
+            let pr = egui::Rect::from_min_max(egui::pos2(r.left() + tw + super::kit::GAP, r.top()), r.max);
+            if super::curve_rows::word_toggle(ui, tr, &mut take, "takeover", TAKEOVER_TIP, ("sr_take", node_id)) {
+                set.push((STICK_ROT_TAKEOVER_PARAM, Value::Bool(take)));
+            }
+            ui.add_enabled_ui(take, |ui| {
+                let shown = format!("{speed:.0} °/s");
+                if super::curve_rows::real_pill(ui, node_id, "sr_take_dps", pr, "above|takes over above", &mut speed, &shown, 0.0..=120.0, 0.5, TAKEOVER_SPEED_TIP) {
+                    set.extend(number(STICK_ROT_TAKEOVER_SPEED_PARAM, speed));
+                }
+                let shown = format!("{outer:.2}");
+                if super::curve_rows::real_pill(ui, node_id, "sr_outer", cells[1], "outer|outer zone", &mut outer, &shown, 0.05..=1.0, 0.005, OUTER_TIP) {
+                    set.extend(number(STICK_ROT_OUTER_PARAM, outer));
+                }
+            });
+            register_exposable_element(ui, node_id, "takeover", r.union(cells[1]));
+        }
+        let shown = format!("{dz:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "sr_dz", cells[2], "dz|deadzone", &mut dz, &shown, 0.0..=0.95, 0.005, DEADZONE_TIP) {
+            set.extend(number(STICK_ROT_DEADZONE_PARAM, dz));
+        }
+        register_exposable_element(ui, node_id, "deadzone", cells[2]);
+        let shown = format!("{smooth:.0} ms");
+        if super::curve_rows::real_pill(ui, node_id, "sr_smooth", cells[3], "stab|stabilise", &mut smooth, &shown, 0.0..=500.0, 1.0, SMOOTH_TIP) {
+            set.extend(number(STICK_ROT_SMOOTH_PARAM, smooth));
+        }
+        register_exposable_element(ui, node_id, "stabilise", cells[3]);
+        surface.end(ui);
     });
-    changed
+
+    if set.is_empty() {
+        return false;
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        for (k, v) in set {
+            node.params.insert(k.to_string(), v);
+        }
+    }
+    true
 }
 
 /// Stick (L / R) and mode (Yaw / World).
@@ -193,42 +316,6 @@ fn takeover_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>)
     let Some((k, v)) = set else { return false };
     if let Some(node) = snarl.get_node_mut(node_id) {
         node.params.insert(k.to_string(), v);
-    }
-    true
-}
-
-#[derive(Clone, Copy)]
-enum NumRow {
-    Deadzone,
-    Smooth,
-}
-
-/// The deadzone or the stabiliser.
-fn number_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, which: NumRow) -> bool {
-    let Some(node) = snarl.get_node(node_id) else { return false };
-    let (label, key, tip) = match which {
-        NumRow::Deadzone => ("Deadzone", STICK_ROT_DEADZONE_PARAM, DEADZONE_TIP),
-        NumRow::Smooth => ("Stabilise", STICK_ROT_SMOOTH_PARAM, SMOOTH_TIP),
-    };
-    ui.label(egui::RichText::new(label).small()).on_hover_text(tip);
-    let r = match which {
-        NumRow::Deadzone => {
-            let mut v = num(node, key, STICK_ROT_DEADZONE_DEFAULT);
-            let r = ui.add(egui::DragValue::new(&mut v).speed(0.005).range(0.0..=0.95).max_decimals(2));
-            (r, v)
-        }
-        NumRow::Smooth => {
-            let mut v = num(node, key, 0.0);
-            let r = ui.add(egui::DragValue::new(&mut v).speed(1.0).range(0.0..=500.0).max_decimals(0).suffix(" ms"));
-            (r, v)
-        }
-    };
-    let (resp, v) = r;
-    if !resp.on_hover_text(tip).changed() {
-        return false;
-    }
-    if let (Some(node), Some(n)) = (snarl.get_node_mut(node_id), serde_json::Number::from_f64(v as f64)) {
-        node.params.insert(key.to_string(), Value::Number(n));
     }
     true
 }

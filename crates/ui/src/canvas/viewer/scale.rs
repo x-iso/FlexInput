@@ -355,7 +355,13 @@ pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natur
         });
     }
     if scale == 1.0 { return 1.0; }
+    scale_ui_style(ui, scale);
+    scale
+}
 
+/// Scale `ui`'s text styles and spacing by `scale`: the part of [`apply_widget_scale`] that
+/// makes flow widgets (labels, buttons, DragValues, sliders, combo boxes) grow together.
+pub(crate) fn scale_ui_style(ui: &mut egui::Ui, scale: f32) {
     // Scale all named text styles uniformly so labels, buttons, and DragValues
     // all grow together. Egui clones the style on edit, so this only affects
     // the current sub-Ui (the allocate_ui_at_rect closure), not the parent.
@@ -371,7 +377,6 @@ pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natur
     sp.icon_width_inner = (sp.icon_width_inner * scale).max(6.0);
     sp.slider_width    *= scale;
     sp.combo_width     *= scale;
-    scale
 }
 
 #[cfg(test)]

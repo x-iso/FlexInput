@@ -719,8 +719,8 @@ pub(crate) fn automap_fork_publish(
 ) {
     let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
     let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-    // inputs[0] = AutoMap (ignored as value), inputs[1] = select
-    let select = match snap.input_sources.get(1)
+    // inputs[0] = select, inputs[1] = AutoMap (ignored as value)
+    let select = match snap.input_sources.get(0)
         .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
     {
         Some(Signal::Float(f)) => {

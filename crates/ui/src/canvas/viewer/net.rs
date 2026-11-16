@@ -1,22 +1,6 @@
-//! Network Send/Receive node bodies + persisted widget-size helpers.
+//! Network Send/Receive node bodies.
 
 use super::*;
-
-/// Read a persisted widget size from node params (e.g. a resizable scope), or the
-/// supplied default when absent.
-pub(crate) fn read_widget_size(snarl: &Snarl<NodeData>, node_id: NodeId, key: &str, default: egui::Vec2) -> egui::Vec2 {
-    snarl.get_node(node_id)
-        .and_then(|n| n.params.get(key).and_then(|v| v.as_array()))
-        .and_then(|a| Some(egui::vec2(a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32)))
-        .unwrap_or(default)
-}
-
-/// Persist a resizable widget's size into node params so it survives reopen.
-pub(crate) fn write_widget_size(snarl: &mut Snarl<NodeData>, node_id: NodeId, key: &str, size: egui::Vec2) {
-    if let Some(n) = snarl.get_node_mut(node_id) {
-        n.params.insert(key.into(), serde_json::json!([size.x, size.y]));
-    }
-}
 
 /// EF oscilloscope for the Audio Stream Haptics node: a rolling time-domain trace
 /// of the captured audio peak (faint) overlaid with the **shaped** haptic
@@ -65,13 +49,39 @@ pub(crate) fn net_transport_of(node_id: NodeId, snarl: &Snarl<NodeData>) -> Stri
 }
 
 /// Transport selector + (PSK tier only) passphrase field. Writes params in place.
+/// How wide the Network modules' rows are, and the cell their words stand in: every row
+/// is a word in that cell and a control that fills the rest, so the controls share a left
+/// edge and a right one. They were label-then-widget rows in the body font, each as wide as
+/// it happened to come out.
+const NET_ROW_W: f32 = 176.0;
+const NET_LABEL_W: f32 = 46.0;
+
+/// A row's word, in its cell.
+fn net_label(ui: &mut egui::Ui, text: &str) {
+    let h = ui.spacing().interact_size.y;
+    let (cell, _) = ui.allocate_exact_size(egui::vec2(NET_LABEL_W, h), egui::Sense::hover());
+    ui.painter().text(
+        cell.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+}
+
+/// What is left of a row after its word.
+fn net_field_w(ui: &egui::Ui) -> f32 {
+    NET_ROW_W - NET_LABEL_W - ui.spacing().item_spacing.x
+}
+
 pub(crate) fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let transport = net_transport_of(node_id, snarl);
 
     ui.horizontal(|ui| {
-        ui.label("Mode:");
+        net_label(ui, "mode");
         egui::ComboBox::from_id_salt(("net_transport", node_id))
-            .selected_text(net_transport_label(&transport))
+            .width(net_field_w(ui))
+            .selected_text(egui::RichText::new(net_transport_label(&transport)).small())
             .show_ui(ui, |ui| {
                 for t in ["udp", "psk", "p2p"] {
                     if ui
@@ -97,11 +107,12 @@ pub(crate) fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: 
             .unwrap_or("")
             .to_string();
         ui.horizontal(|ui| {
-            ui.label("Passphrase:");
+            net_label(ui, "pass");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut psk)
                     .password(true)
-                    .desired_width(110.0),
+                    .font(egui::TextStyle::Small)
+                    .desired_width(net_field_w(ui) - 8.0),
             );
             if resp.changed() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -133,23 +144,22 @@ pub(crate) fn net_num_param(
         .get_node(node_id)
         .and_then(|n| n.params.get(key).and_then(|v| v.as_f64()))
         .unwrap_or(default);
+    // A value pill the width of the row, the word in its label cell: dragged or typed.
     let mut v = val;
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let resp = ui.add(
-            egui::DragValue::new(&mut v)
-                .range(range)
-                .max_decimals(0)
-                .suffix(suffix),
-        );
-        if resp.changed() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                if let Some(n) = Number::from_f64(v.round()) {
-                    node.params.insert(key.to_string(), Value::Number(n));
-                }
+    let word = label.trim_end_matches(':').to_lowercase();
+    let shown = format!("{}{}", v.round() as i64, suffix);
+    let h = super::curve_rows::band_h(ui) - 4.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(NET_ROW_W, h), egui::Sense::hover());
+    // A drag the length of the pill covers a useful part of the range, not all of it: a
+    // port is typed, a rate is nudged.
+    let per_px = (((*range.end() - *range.start()) / 2000.0) as f32).max(0.2);
+    if super::curve_rows::count_pill(ui, node_id, key, rect, &word, &mut v, &shown, range, per_px, label) {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if let Some(n) = Number::from_f64(v.round()) {
+                node.params.insert(key.to_string(), Value::Number(n));
             }
         }
-    });
+    }
 }
 
 /// Live link-status row: colored dot + short state text + traffic counters.
@@ -213,7 +223,7 @@ pub(crate) fn show_net_send_body(
 ) {
     let uid = effective_publish_uid(node_id, automap_parent);
     let body = ui.vertical(|ui| {
-        ui.set_min_width(170.0);
+        ui.set_min_width(NET_ROW_W);
         net_transport_controls(node_id, ui, snarl);
 
         if net_transport_of(node_id, snarl) == "p2p" {
@@ -223,12 +233,17 @@ pub(crate) fn show_net_send_body(
                 .and_then(|n| n.params.get("net_peer").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string();
-            ui.label("Peer code:");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut peer)
-                    .hint_text("paste code")
-                    .desired_width(150.0),
-            );
+            let resp = ui
+                .horizontal(|ui| {
+                    net_label(ui, "peer");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut peer)
+                            .hint_text("paste code")
+                            .font(egui::TextStyle::Small)
+                            .desired_width(net_field_w(ui) - 8.0),
+                    )
+                })
+                .inner;
             if resp.changed() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert("net_peer".to_string(), Value::String(peer.trim().to_string()));
@@ -242,8 +257,12 @@ pub(crate) fn show_net_send_body(
                 .unwrap_or("127.0.0.1")
                 .to_string();
             ui.horizontal(|ui| {
-                ui.label("Host:");
-                let resp = ui.add(egui::TextEdit::singleline(&mut host).desired_width(110.0));
+                net_label(ui, "host");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut host)
+                        .font(egui::TextStyle::Small)
+                        .desired_width(net_field_w(ui) - 8.0),
+                );
                 if resp.changed() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params
@@ -269,7 +288,7 @@ pub(crate) fn show_net_recv_body(
 ) {
     let uid = effective_publish_uid(node_id, automap_parent);
     let body = ui.vertical(|ui| {
-        ui.set_min_width(170.0);
+        ui.set_min_width(NET_ROW_W);
         net_transport_controls(node_id, ui, snarl);
 
         if net_transport_of(node_id, snarl) == "p2p" {
@@ -289,10 +308,10 @@ pub(crate) fn show_net_recv_body(
             // back to whatever the worker published once bound.
             let code = flexinput_net::endpoint_id_for_secret(&secret)
                 .or_else(|| flexinput_net::status(uid).code);
-            ui.label("Your code (share with sender):");
+            ui.label(egui::RichText::new("Your code - share it with the sender").small().weak());
             if let Some(code) = code {
                 ui.horizontal(|ui| {
-                    if ui.button("📋 Copy").clicked() {
+                    if ui.small_button("Copy").clicked() {
                         ui.ctx().copy_text(code.clone());
                     }
                     ui.add(
@@ -305,10 +324,10 @@ pub(crate) fn show_net_recv_body(
             }
             net_keep_checkbox(node_id, ui, snarl);
         } else {
-            net_num_param(node_id, ui, snarl, "Listen port:", "net_bind_port", 46700.0, 1.0..=65535.0, "");
+            net_num_param(node_id, ui, snarl, "Port:", "net_bind_port", 46700.0, 1.0..=65535.0, "");
         }
-        net_num_param(node_id, ui, snarl, "Fail-safe after:", "net_stale_ms", 200.0, 50.0..=5000.0, " ms");
-        net_num_param(node_id, ui, snarl, "Feedback rate:", "net_fb_rate_hz", 200.0, 30.0..=1000.0, " Hz");
+        net_num_param(node_id, ui, snarl, "Failsafe:", "net_stale_ms", 200.0, 50.0..=5000.0, " ms");
+        net_num_param(node_id, ui, snarl, "Feedback:", "net_fb_rate_hz", 200.0, 30.0..=1000.0, " Hz");
         ui.separator();
         net_status_row(uid, ui);
     });

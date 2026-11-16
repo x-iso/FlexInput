@@ -15,18 +15,23 @@ pub(crate) struct JsmTab {
     pub text: String,
 }
 
-const TAB_NAME_W: f32 = 90.0;
 /// Default editor size in a node body — wide enough to read a config in, and
 /// dragged from there by the grip in its bottom-right corner.
-const EDITOR_W: f32 = 380.0;
-const EDITOR_H: f32 = 220.0;
-const MIN_W: f32 = 200.0;
+const MIN_W: f32 = TOOLS_MIN_W;
 const MIN_H: f32 = 80.0;
 /// Beside the editor, the narrowest a tuning strip can be and still show a
 /// setting's name, its value, and a fader worth dragging.
 const MIN_STRIP_W: f32 = 150.0;
+/// The tab tools row: a load and a save icon, the tune word and its dropdown, and the name
+/// field, which takes what is left and is never narrower than `NAME_MIN_W`.
+const ICON: f32 = 20.0;
+const TUNE_W: f32 = 38.0;
+const SIDE_W: f32 = 62.0;
+const NAME_MIN_W: f32 = 64.0;
+const TOOLS_FIXED_W: f32 = 4.0 + 2.0 * (ICON + 3.0) + 5.0 + TUNE_W + SIDE_W;
+const TOOLS_MIN_W: f32 = NAME_MIN_W + TOOLS_FIXED_W;
 /// ...and the narrowest the editor can be and still be one.
-const MIN_EDITOR_W: f32 = 190.0;
+const MIN_EDITOR_W: f32 = TOOLS_MIN_W;
 /// Room the summary row needs under a pinned editor.
 const SUMMARY_H: f32 = 18.0;
 
@@ -58,8 +63,10 @@ pub(crate) fn show_jsm_body(
     snarl: &mut Snarl<NodeData>,
     live: &std::collections::HashMap<(String, String), Signal>,
     parent: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
+    body_h: f32,
 ) {
-    jsm_body(node_id, ui, snarl, None, live, parent, None);
+    jsm_body(node_id, ui, snarl, None, Some((body_w, body_h)), live, parent, None);
 }
 
 /// Where the tuning strip sits relative to the editor.
@@ -194,7 +201,7 @@ pub(crate) fn show_jsm_body_sized(
     parent: Option<&AutomapGlowParent<'_>>,
     paint: super::jsm_widgets::JsmPaint<'_>,
 ) {
-    jsm_body(node_id, ui, snarl, Some(size), live, parent, paint);
+    jsm_body(node_id, ui, snarl, Some(size), None, live, parent, paint);
 }
 
 /// The sensitivity curve on its own, for the config overlay.
@@ -235,6 +242,23 @@ pub(crate) fn show_jsm_curve_sized(
             mark_overlay_param_write(ui.ctx());
         }
     }
+}
+
+/// A Finish the pad asked for on a JSM node, run where the Real World Calibration widget is
+/// drawn: the new number goes into the active tab's text, as the tune panel's own Finish
+/// did. Returns whether anything was written.
+pub(crate) fn jsm_finish_pending(node_id: NodeId, ui: &egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let mut tabs = read_tabs(snarl, node_id);
+    let active = active_tab(snarl, node_id, tabs.len());
+    let Some(tab) = tabs.get(active) else { return false };
+    let edits = super::jsm_cal::finish_pending(node_id, ui, snarl, &tab.text.clone());
+    let wrote = !edits.params.is_empty() || edits.text.is_some();
+    if let Some(text) = edits.text {
+        tabs[active].text = text;
+        write_tabs(snarl, node_id, &tabs, active);
+    }
+    apply_cal_params(snarl, node_id, &edits.params);
+    wrote
 }
 
 /// The calibration panel on its own, for the config overlay — which is where a
@@ -476,14 +500,8 @@ fn active_tab(snarl: &Snarl<NodeData>, node_id: NodeId, count: usize) -> usize {
     if active >= count { 0 } else { active }
 }
 
-/// The editor's size in a node body, from the node's own params. Pinned, the
-/// container decides instead.
-fn editor_size(snarl: &Snarl<NodeData>, node_id: NodeId) -> egui::Vec2 {
-    let p = |k: &str, d: f32| snarl.get_node(node_id)
-        .and_then(|n| n.params.get(k))
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32)
-        .unwrap_or(d);
+/// The smallest the editor is drawn in a node body, whatever the module's grip says.
+fn editor_floor(snarl: &Snarl<NodeData>, node_id: NodeId) -> egui::Vec2 {
     // With the strip beside it the body holds two columns, so the floor is what
     // both of them need rather than the editor's own.
     let min_w = if show_knobs(snarl, node_id)
@@ -493,7 +511,7 @@ fn editor_size(snarl: &Snarl<NodeData>, node_id: NodeId) -> egui::Vec2 {
     } else {
         MIN_W
     };
-    egui::vec2(p("jsm_editor_w", EDITOR_W).max(min_w), p("jsm_editor_h", EDITOR_H).max(MIN_H))
+    egui::vec2(min_w, MIN_H)
 }
 
 fn jsm_body(
@@ -501,6 +519,7 @@ fn jsm_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     pinned: Option<egui::Vec2>,
+    frame: Option<(f32, f32)>,
     live: &std::collections::HashMap<(String, String), Signal>,
     parent: Option<&AutomapGlowParent<'_>>,
     paint: super::jsm_widgets::JsmPaint<'_>,
@@ -509,7 +528,17 @@ fn jsm_body(
     // horizontal layout with no width to inherit: the body picks its own size
     // (stored on the node, dragged by the handle below) and stacks its rows in
     // its own vertical layout. Pinned, the container's size wins.
-    let size = pinned.unwrap_or_else(|| editor_size(snarl, node_id));
+    // In a node body that size is the body the module's corner grip was dragged to: the
+    // rows share it out among themselves (the editor takes what the others leave), so it
+    // is the whole body's size and not one part's. It had a grip of its own under it.
+    let in_node = match (pinned, frame) {
+        (None, Some((w, h))) => {
+            let floor = editor_floor(snarl, node_id);
+            Some(egui::vec2(w.max(floor.x), h.max(floor.y)))
+        }
+        _ => None,
+    };
+    let size = pinned.or(in_node).unwrap_or_else(|| editor_floor(snarl, node_id));
     let side = knob_side(snarl, node_id);
     let knobs_on = show_knobs(snarl, node_id);
     let resizable = pinned.is_none();
@@ -533,30 +562,76 @@ fn jsm_body(
     let plate = super::jsm_widgets::reserve_backdrop(ui, paint);
 
     if beside {
-        let strip_w = (size.x * 0.42).clamp(MIN_STRIP_W, 320.0).min(size.x - MIN_EDITOR_W - gap);
+        // The strip's share of the width: what the bar between the two was dragged to, or
+        // a little under half.
+        let strip_frac = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("jsm_strip_frac"))
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32);
+        // Half each until it is dragged, and a share either way: resizing the module keeps
+        // the bar where it was between the two.
+        let strip_w = (size.x * strip_frac.unwrap_or(0.5)).max(MIN_STRIP_W).min(size.x - MIN_EDITOR_W - gap);
+        let mut editor_col = egui::Rect::NOTHING;
         let col_w = (size.x - strip_w - gap).max(MIN_EDITOR_W);
         ui.horizontal_top(|ui| {
+            if in_node.is_some() {
+                ui.set_max_height(size.y);
+            }
             if side == Side::Left {
                 strip_column(node_id, ui, snarl, strip_w, size.y, live, parent, paint, resizable);
             }
-            ui.vertical(|ui| {
-                ui.set_max_width(col_w);
-                jsm_rows(
-                    node_id, ui, snarl, egui::vec2(col_w, size.y), resizable, live, parent,
-                    paint, false,
-                );
-            });
+            editor_col = ui
+                .vertical(|ui| {
+                    ui.set_max_width(col_w);
+                    jsm_rows(
+                        node_id, ui, snarl, egui::vec2(col_w, size.y), resizable, live, parent,
+                        paint, false,
+                    );
+                })
+                .response
+                .rect;
             if side == Side::Right {
                 strip_column(node_id, ui, snarl, strip_w, size.y, live, parent, paint, resizable);
             }
         });
+        // The bar between the two columns, in the gap the layout left there.
+        if editor_col.is_positive() {
+            let x = if side == Side::Left { editor_col.left() - gap } else { editor_col.left() + col_w };
+            let bar = egui::Rect::from_min_size(egui::pos2(x, editor_col.top()), egui::vec2(gap.max(4.0), size.y));
+            let (dx, reset) = split_bar(ui, bar, node_id, false);
+            if let Some(n) = snarl.get_node_mut(node_id) {
+                if reset {
+                    n.params.remove("jsm_strip_frac");
+                } else if dx != 0.0 {
+                    let grown = if side == Side::Left { strip_w + dx } else { strip_w - dx };
+                    let frac = (grown / size.x.max(1.0)).max(0.1).min(0.9);
+                    n.params.insert("jsm_strip_frac".into(), Value::from(f64::from(frac)));
+                }
+            }
+        }
         super::jsm_widgets::fill_backdrop(ui, plate, paint);
         return;
     }
 
     ui.vertical(|ui| {
         ui.set_max_width(size.x);
+        // In a node the body has the height the grip gave it, and is told so before anything
+        // is laid out: the editor is a scroll area, which takes no more than the room it is
+        // shown - and a node's room is whatever its body used the frame before. The room, not
+        // a minimum: the rows measure what they have used so far to size the editor.
+        if in_node.is_some() {
+            ui.set_max_height(size.y);
+        }
         jsm_rows(node_id, ui, snarl, size, resizable, live, parent, paint, knobs_on);
+        // The editor is a whole number of lines, so the rows can come up a few points short
+        // of the body: the body is still the size the grip gave it.
+        if in_node.is_some() {
+            let short = size.y - ui.min_rect().height() - ui.spacing().item_spacing.y;
+            if short > 0.0 {
+                ui.allocate_exact_size(egui::vec2(0.0, short), egui::Sense::hover());
+            }
+        }
     });
     super::jsm_widgets::fill_backdrop(ui, plate, paint);
 }
@@ -586,7 +661,7 @@ fn strip_column(
     let mut edited = None;
     let mut warp = None;
     let mut cal_params: Vec<(&'static str, Value)> = Vec::new();
-    ui.vertical(|ui| {
+    let column = ui.vertical(|ui| {
         ui.set_max_width(width);
         // Beside the editor the strip owns its column's full height, whether the
         // body is a node (which grows) or a pin (which does not) — either way it
@@ -599,6 +674,7 @@ fn strip_column(
         warp = r.warp;
         cal_params = r.params;
     });
+    mark_pane(ui, node_id, column.response.rect, crate::gamepad_nav::JsmPane::Tune);
     if let Some(w) = warp {
         set_curve_warp(snarl, node_id, w);
         if !resizable {
@@ -679,38 +755,24 @@ fn jsm_rows(
         pending_cal = r.params;
     }
 
-    // ── tab bar ──────────────────────────────────────────────────────────────
-    ui.horizontal_wrapped(|ui| {
-        for i in 0..tabs.len() {
-            let selected = i == active;
-            if ui.selectable_label(selected, egui::RichText::new(&tabs[i].name).small()).clicked() {
-                active = i;
-                changed = true;
-            }
-        }
-        if ui.small_button("+").on_hover_text("Add a config tab").clicked() {
-            tabs.push(JsmTab { name: unique_name(&tabs, "config"), text: String::new() });
-            active = tabs.len() - 1;
-            changed = true;
-        }
-        if tabs.len() > 1
-            && ui.small_button("✕").on_hover_text("Remove this tab").clicked()
-        {
-            tabs.remove(active);
-            active = active.min(tabs.len() - 1);
-            changed = true;
-        }
-    });
-
-    // ── name + load / save for the active tab ────────────────────────────────
-    // Wrapping, not a single row: these controls together are wider than a narrow
-    // editor column, and a row that overflows pushes whatever sits beside it off
-    // the body — which is what clipped the values off a right-hand tuning strip.
-    ui.horizontal_wrapped(|ui| {
+    // ── the active tab's name, file and tune controls, then the tabs ─────────
+    // A row of what acts on the tab in front - its name, load and save, and the tune
+    // panel's switch - and under it the configs as tabs, drawn as the app's own are and
+    // scrolled the same way when there are more than fit, sitting on the editor they
+    // switch. The name takes what the row has spare; the rest are fixed, and their sum is
+    // the narrowest the editor column is ever made (`TOOLS_MIN_W`), so the bar beside a
+    // tune panel can't squeeze the row into clipping.
+    const BAR_H: f32 = 22.0;
+    let tools = ui.allocate_exact_size(egui::vec2(size.x, BAR_H), egui::Sense::hover()).0;
+    {
+        let (top, h) = (tools.top() + 1.0, BAR_H - 2.0);
+        let name_w = (tools.width() - TOOLS_FIXED_W).max(NAME_MIN_W);
+        let mut x = tools.left();
         let mut name = tabs[active].name.clone();
-        let resp = ui.add(
+        let resp = ui.put(
+            egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(name_w, h)),
             egui::TextEdit::singleline(&mut name)
-                .desired_width((size.x * 0.35).clamp(60.0, TAB_NAME_W))
+                .desired_width(name_w - 8.0)
                 .font(egui::TextStyle::Small)
                 .hint_text("name"),
         );
@@ -719,11 +781,12 @@ fn jsm_rows(
             changed = true;
         }
         resp.on_hover_text(
-            "A binding that loads a config by name finds the tab with that name.\n\
+            "The tab's name. A binding that loads a config by name finds the tab with that name.\n\
              Paths and .txt are ignored, so `GyroConfigs/vehicle.txt` is the tab `vehicle`.",
         );
-
-        if ui.small_button("Load").on_hover_text("Read a JSM config file into this tab").clicked() {
+        x += name_w + 4.0;
+        let square = |x: f32| egui::Rect::from_min_size(egui::pos2(x, tools.center().y - ICON * 0.5), egui::Vec2::splat(ICON));
+        if super::kit::header_icon_button(ui, super::glyphs::Glyph::Load, "Read a JSM config file into this tab", square(x), ("jsm_load", node_id)) {
             if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                 rfd::FileDialog::new()
                     .add_filter("JSM config", &["txt"])
@@ -742,7 +805,8 @@ fn jsm_rows(
                 }
             }
         }
-        if ui.small_button("Save").on_hover_text("Write this tab back to a .txt file").clicked() {
+        x += ICON + 3.0;
+        if super::kit::header_icon_button(ui, super::glyphs::Glyph::Save, "Write this tab back to a .txt file", square(x), ("jsm_save", node_id)) {
             if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                 rfd::FileDialog::new()
                     .add_filter("JSM config", &["txt"])
@@ -754,58 +818,102 @@ fn jsm_rows(
                 }
             }
         }
-        // The slider strip is opt-in: a config with a dozen numeric settings would
-        // otherwise double the body's height before anyone asked for it.
-        let mut knobs_on = show_knobs(snarl, node_id);
-        if ui
-            .selectable_label(knobs_on, egui::RichText::new("Tune").small())
+        x += ICON + 8.0;
+
+        // The tune panel: one pill, the word and where the panel goes, the two halves the
+        // same height. The word is lit while the panel is shown and a click on it shows or
+        // hides it; the other half says where it sits, and Hide is one of the places.
+        let knobs_on = show_knobs(snarl, node_id);
+        let tune_r = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(TUNE_W, h));
+        let side_r = egui::Rect::from_min_size(egui::pos2(tune_r.right(), top), egui::vec2(SIDE_W, h));
+        let tune = ui
+            .interact(tune_r, egui::Id::new(("jsm_tune", node_id.0, ui.layer_id())), egui::Sense::click())
             .on_hover_text(
-                "Show the sensitivity curve, and a slider for every numeric setting this                  config sets. A slider rewrites the number on its own line — the text stays                  the config.",
-            )
-            .clicked()
+                "Show the sensitivity curve, and a slider for every numeric setting this \
+                 config sets. A slider rewrites the number on its own line - the text stays \
+                 the config.",
+            );
         {
-            knobs_on = !knobs_on;
-            if let Some(n) = snarl.get_node_mut(node_id) {
-                n.params.insert("jsm_show_knobs".into(), Value::Bool(knobs_on));
-            }
+            let v = ui.visuals();
+            let (fill, text) = if knobs_on {
+                (v.selection.bg_fill, v.strong_text_color())
+            } else if tune.hovered() {
+                (v.widgets.hovered.bg_fill, v.text_color())
+            } else {
+                (v.widgets.inactive.bg_fill, v.text_color())
+            };
+            ui.painter().rect_filled(tune_r, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, fill);
+            ui.painter().text(
+                tune_r.center(),
+                egui::Align2::CENTER_CENTER,
+                "tune",
+                egui::TextStyle::Small.resolve(ui.style()),
+                text,
+            );
         }
-        // Which pane the pad is driving, while it is. Without this the bumpers
-        // would switch between two halves that look identical until you press
-        // something and the wrong one moves.
-        if let Some(pane) = super::scale::jsm_nav_pane(ui, node_id) {
-            let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
-            // While the modifier is held, say what it is waiting for. A held
-            // modifier with nothing on screen is one people press twice.
-            let held = super::scale::jsm_nav_chord(ui, node_id);
-            let text = if held { format!("🎮 {pane} · hold") } else { format!("🎮 {pane}") };
-            ui.label(egui::RichText::new(text).small().color(accent))
-                .on_hover_text(
-                    "LB / RB switch between the config text and the faders.
-                     LT / RT change config tab.
-                     West lists what can stand where the cursor is (South inserts, LT / RT                      jump by heading). North opens the virtual keyboard: one key where a                      binding goes, or typed characters for a comment or a quoted file name.
-                     Hold South and tap West to delete what the cursor is on, left / right                      to open an empty slot beside it, or up / down to open a new line.
-                     Hold South and push the left stick up or down to walk a number,                      one push at a time.",
-                );
-        }
-        // Where the strip goes. Beside the editor suits a wide node; above or
-        // below suits a tall one.
-        if knobs_on {
-            let mut picked = side;
+        let mut pick: Option<Option<Side>> = tune.clicked().then_some(if knobs_on { None } else { Some(side) });
+        {
+            let mut cell = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(side_r)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt(("jsm_side_cell", node_id.0)),
+            );
+            // The box is the cell: as tall as the word beside it, and no wider than its half.
+            cell.spacing_mut().interact_size.y = h;
+            cell.spacing_mut().button_padding.y = 0.0;
+            let pad = cell.spacing().button_padding.x;
+            let shown = if knobs_on { side.label() } else { "Hide" };
             egui::ComboBox::from_id_salt(("jsm_knob_side", node_id.0))
-                .selected_text(egui::RichText::new(side.label()).small())
-                .width(64.0)
-                .show_ui(ui, |ui| {
+                .selected_text(egui::RichText::new(shown).small())
+                .width(SIDE_W - 2.0 * pad)
+                .height(240.0)
+                .show_ui(&mut cell, |ui| {
+                    if ui.selectable_label(!knobs_on, egui::RichText::new("Hide").small()).clicked() {
+                        pick = Some(None);
+                    }
+                    // Beside the editor suits a wide node; above or below suits a tall one.
                     for s in [Side::Bottom, Side::Top, Side::Left, Side::Right] {
-                        ui.selectable_value(&mut picked, s, egui::RichText::new(s.label()).small());
+                        if ui.selectable_label(knobs_on && s == side, egui::RichText::new(s.label()).small()).clicked() {
+                            pick = Some(Some(s));
+                        }
                     }
                 });
-            if picked != side {
-                if let Some(n) = snarl.get_node_mut(node_id) {
-                    n.params.insert("jsm_knob_side".into(), Value::from(picked.as_param()));
+        }
+        if let (Some(pick), Some(n)) = (pick, snarl.get_node_mut(node_id)) {
+            match pick {
+                None => {
+                    n.params.insert("jsm_show_knobs".into(), Value::Bool(false));
+                }
+                Some(s) => {
+                    n.params.insert("jsm_show_knobs".into(), Value::Bool(true));
+                    n.params.insert("jsm_knob_side".into(), Value::from(s.as_param()));
                 }
             }
         }
-    });
+    }
+    // Which pane the pad is driving, and what its buttons do there. The panes themselves
+    // say which (`mark_pane`); this is the line that says how.
+    if let Some(pane) = super::scale::jsm_nav_pane(ui, node_id) {
+        let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
+        // While the modifier is held, say what it is waiting for. A held
+        // modifier with nothing on screen is one people press twice.
+        let held = super::scale::jsm_nav_chord(ui, node_id);
+        let text = if held { format!("🎮 {pane} · hold") } else { format!("🎮 {pane}") };
+        ui.label(egui::RichText::new(text).small().color(accent)).on_hover_text(
+            "LB / RB switch between the config text and the faders.\n\
+             LT / RT change config tab.\n\
+             West lists what can stand where the cursor is (South inserts, LT / RT jump by heading). \
+             North opens the virtual keyboard: one key where a binding goes, or typed characters \
+             for a comment or a quoted file name.\n\
+             Hold South and tap West to delete what the cursor is on, left / right to open an \
+             empty slot beside it, or up / down to open a new line.\n\
+             Hold South and push the left stick up or down to walk a number, one push at a time.",
+        );
+    }
+
+    let strip = ui.allocate_exact_size(egui::vec2(size.x, BAR_H), egui::Sense::hover()).0;
+    changed |= tab_strip(ui, node_id, strip, &mut tabs, &mut active);
 
     // ── the editor, on its own row ───────────────────────────────────────────
     // Compiled against every tab, so a line that switches layers can be checked:
@@ -844,13 +952,30 @@ fn jsm_rows(
         0.0
     };
     let body_left = (size.y - used - SUMMARY_H - list_want).max(0.0);
-    let (rows, strip_h) = split_body(body_left, line_h, strip_want);
+    let (mut rows, mut strip_h) = split_body(body_left, line_h, strip_want);
+    // The bar between the editor and the strip, once it has been dragged: the editor's
+    // share of what the two have between them.
+    let editor_frac = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("jsm_editor_frac"))
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32);
+    let shared = (body_left - SPLIT_BAR).max(1.0);
+    if knobs_on {
+        // Half each until the bar is dragged, and a share either way: resizing the module
+        // keeps the bar where it was between the two.
+        let frac = editor_frac.unwrap_or(0.5);
+        rows = ((shared * frac / line_h.max(1.0)).floor() as i32).max(3) as usize;
+        strip_h = (shared - rows as f32 * line_h).max(56.0);
+    }
     // Pinned, the container's height is all there is — so whatever the editor
     // leaves goes to the tuning strip, and the faders scroll inside it. Without a
     // budget the strip simply ran off the bottom of the widget, which looked like
     // a cap on how many settings a config could have. On the canvas the body grows
     // to fit instead, so there every fader is just drawn.
-    let strip_budget = (!resizable && knobs_on).then_some(strip_h);
+    // The same in a node, now that a node's body has the size its grip gave it rather than
+    // growing to fit: a strip with more faders than room scrolls there too.
+    let strip_budget = knobs_on.then_some(strip_h);
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
     // Where the pad is, if it is driving this editor. A byte range rather than a
     // line, so the highlight covers exactly the token the buttons would act on.
@@ -954,6 +1079,11 @@ fn jsm_rows(
         .with(ui.ctx().viewport_id())
         .with(ui.layer_id());
     let mut tabbed = false;
+    // The editor's plate and frame are drawn here, round the whole scrolling box - text and
+    // scrollbar both - rather than by the text field inside it. The field's own frame is as
+    // tall as the text, so its bottom edge was wherever the scrolling cut it, and its right
+    // edge was under the scrollbar, which stood outside it.
+    let plate_idx = ui.painter().add(egui::Shape::Noop);
     let editor = crate::canvas::wheel::scrolling_body(
         ui,
         wheel_id,
@@ -970,6 +1100,7 @@ fn jsm_rows(
                 .code_editor()
                 .desired_rows(rows)
                 .desired_width(size.x - bar_w)
+                .frame(false)
                 .clip_text(true)
                 .hint_text("Paste or load a JoyShockMapper config")
                 .layouter(&mut layouter)
@@ -1009,6 +1140,19 @@ fn jsm_rows(
     // The box you see, bar included — not the text inside it, which is taller
     // than the box whenever the config is longer than the editor.
     let editor_rect = editor.inner_rect.with_max_x(editor.inner_rect.max.x + bar_w);
+    {
+        let v = ui.visuals();
+        let stroke = if editor.inner.response.has_focus() {
+            egui::Stroke::new(1.0_f32, v.selection.stroke.color)
+        } else {
+            v.widgets.inactive.bg_stroke
+        };
+        ui.painter().set(
+            plate_idx,
+            egui::epaint::RectShape::new(editor_rect, 2.0, v.extreme_bg_color, stroke, egui::StrokeKind::Inside),
+        );
+    }
+    mark_pane(ui, node_id, editor_rect, crate::gamepad_nav::JsmPane::Text);
     let caret = editor.inner.cursor_range.map(|r| r.primary.index);
     let resp = editor.inner.response;
     // While typing, an `@Name` is finished the moment the caret leaves it —
@@ -1172,8 +1316,26 @@ fn jsm_rows(
 
     // ── a slider per numeric setting, and the curve they shape ───────────────
     if knobs_on {
+        // The bar that shares the height between the editor above and the strip below.
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(size.x, SPLIT_BAR), egui::Sense::hover());
+        let (dy, reset) = split_bar(ui, bar, node_id, true);
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            if reset {
+                n.params.remove("jsm_editor_frac");
+            } else if dy != 0.0 {
+                let frac = ((rows as f32 * line_h + dy) / shared).max(0.1).min(0.9);
+                n.params.insert("jsm_editor_frac".into(), Value::from(f64::from(frac)));
+            }
+        }
+        let strip_top = ui.cursor().min;
         let r = knob_rows(
             node_id, ui, snarl, size.x, &tabs[active].text, live, parent, paint, strip_budget,
+        );
+        mark_pane(
+            ui,
+            node_id,
+            egui::Rect::from_min_max(strip_top, egui::pos2(strip_top.x + size.x, ui.min_rect().bottom())),
+            crate::gamepad_nav::JsmPane::Tune,
         );
         if let Some(text) = r.text {
             tabs[active].text = text;
@@ -1183,16 +1345,6 @@ fn jsm_rows(
             pending_warp = Some(w);
         }
         pending_cal = r.params;
-    }
-
-    // ── resize handle (node body only) ───────────────────────────────────────
-    if resizable {
-        if let Some(new_size) = resize_handle(ui, node_id, size) {
-            if let Some(n) = snarl.get_node_mut(node_id) {
-                n.params.insert("jsm_editor_w".into(), Value::from(new_size.x as f64));
-                n.params.insert("jsm_editor_h".into(), Value::from(new_size.y as f64));
-            }
-        }
     }
 
     if apply_cal_params(snarl, node_id, &pending_cal) && !resizable {
@@ -1218,6 +1370,174 @@ fn jsm_rows(
 /// Split the body's height between the editor and the tuning strip, as
 /// `(editor rows, strip height)`.
 ///
+/// The config tabs, drawn the way the app's own tab bar draws its tabs: a rounded top on the
+/// one in front, filled with the editor's own colour so it reads as the top of the editor
+/// under it; a hairline between the others; `+` after the last. When there are more than
+/// fit the strip scrolls, and each end that has more beyond it fades out. Returns whether
+/// the tabs or the choice of tab changed.
+fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Vec<JsmTab>, active: &mut usize) -> bool {
+    let h = rect.height();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let v = ui.visuals().clone();
+    let seen_id = egui::Id::new(("jsm_tab_seen", node_id.0, ui.layer_id()));
+    // The tab in front is brought into view when it changes - the pad's triggers walk the
+    // tabs, and a tab picked that way may be off either end.
+    let follow = ui.ctx().data(|d| d.get_temp::<usize>(seen_id)) != Some(*active);
+    ui.ctx().data_mut(|d| d.insert_temp(seen_id, *active));
+    let (mut switch, mut close, mut add) = (None, None, false);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("jsm_tabs", node_id.0)));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let out = egui::ScrollArea::horizontal()
+        .id_salt(("jsm_tab_scroll", node_id.0))
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(&mut child, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let count = tabs.len();
+                for (i, tab) in tabs.iter().enumerate() {
+                    let front = i == *active;
+                    let colour = if front { v.strong_text_color() } else { v.weak_text_color() };
+                    let name = if tab.name.is_empty() { "untitled" } else { tab.name.as_str() };
+                    let galley = ui.painter().layout_no_wrap(name.to_string(), font.clone(), colour);
+                    let closable = front && count > 1;
+                    let w = galley.size().x + 16.0 + if closable { 14.0 } else { 0.0 };
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+                    let top = egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 };
+                    if front {
+                        ui.painter().rect_filled(r, top, v.extreme_bg_color);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r, top, v.widgets.hovered.bg_fill);
+                    }
+                    ui.painter().galley(
+                        egui::pos2(r.left() + 8.0, r.center().y - galley.size().y * 0.5),
+                        galley,
+                        colour,
+                    );
+                    if closable {
+                        let x = egui::Rect::from_center_size(egui::pos2(r.right() - 11.0, r.center().y), egui::Vec2::splat(12.0));
+                        let xr = ui
+                            .interact(x, egui::Id::new(("jsm_tab_close", node_id.0, i)), egui::Sense::click())
+                            .on_hover_text("Remove this tab");
+                        let c = if xr.hovered() { v.strong_text_color() } else { v.weak_text_color() };
+                        let (m, d) = (x.center(), 3.0);
+                        ui.painter().line_segment([m - egui::vec2(d, d), m + egui::vec2(d, d)], egui::Stroke::new(1.2_f32, c));
+                        ui.painter().line_segment([m + egui::vec2(-d, d), m + egui::vec2(d, -d)], egui::Stroke::new(1.2_f32, c));
+                        if xr.clicked() {
+                            close = Some(i);
+                        }
+                    } else if resp.clicked() {
+                        switch = Some(i);
+                    }
+                    // A hairline between two tabs neither of which is in front.
+                    if !front && i + 1 < count && i + 1 != *active {
+                        ui.painter().line_segment(
+                            [egui::pos2(r.right(), r.top() + 5.0), egui::pos2(r.right(), r.bottom() - 5.0)],
+                            egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color),
+                        );
+                    }
+                    if front && follow {
+                        resp.scroll_to_me(None);
+                    }
+                }
+                let (pr, plus) = ui.allocate_exact_size(egui::vec2(22.0, h), egui::Sense::click());
+                let plus = plus.on_hover_text("Add a config tab");
+                if plus.hovered() {
+                    ui.painter().rect_filled(pr, egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, v.widgets.hovered.bg_fill);
+                }
+                let (c, st) = (pr.center(), egui::Stroke::new(1.3_f32, v.text_color()));
+                ui.painter().line_segment([c - egui::vec2(4.0, 0.0), c + egui::vec2(4.0, 0.0)], st);
+                ui.painter().line_segment([c - egui::vec2(0.0, 4.0), c + egui::vec2(0.0, 4.0)], st);
+                add = plus.clicked();
+            });
+        });
+    // More tabs beyond an end: that end fades into the body's own colour.
+    let hidden = (out.content_size.x - out.inner_rect.width()).max(0.0);
+    let at = out.state.offset.x;
+    let (solid, clear) = (v.window_fill(), v.window_fill().gamma_multiply(0.0));
+    let fade = |x0: f32, x1: f32, left: egui::Color32, right: egui::Color32| {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(egui::pos2(x0, rect.top()), left);
+        mesh.colored_vertex(egui::pos2(x1, rect.top()), right);
+        mesh.colored_vertex(egui::pos2(x1, rect.bottom()), right);
+        mesh.colored_vertex(egui::pos2(x0, rect.bottom()), left);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().with_clip_rect(rect).add(mesh);
+    };
+    const FADE: f32 = 20.0;
+    if at > 0.5 {
+        fade(rect.left(), rect.left() + FADE, solid, clear);
+    }
+    if at < hidden - 0.5 {
+        fade(rect.right() - FADE, rect.right(), clear, solid);
+    }
+
+    let mut changed = false;
+    if let Some(i) = switch {
+        *active = i;
+        changed = true;
+    }
+    if let Some(i) = close {
+        tabs.remove(i);
+        *active = (*active).min(tabs.len() - 1);
+        changed = true;
+    }
+    if add {
+        tabs.push(JsmTab { name: unique_name(tabs, "config"), text: String::new() });
+        *active = tabs.len() - 1;
+        changed = true;
+    }
+    changed
+}
+
+/// The bar between the editor and the tuning strip: this thick, dragged to share the body
+/// between them, double-clicked to hand the sharing back to the body.
+const SPLIT_BAR: f32 = 8.0;
+
+/// Draw the bar at `rect` and return how far it was dragged along its short axis this
+/// frame, and whether it was double-clicked.
+fn split_bar(ui: &mut egui::Ui, rect: egui::Rect, node_id: NodeId, vertical_drag: bool) -> (f32, bool) {
+    let resp = ui
+        .interact(rect, egui::Id::new(("jsm_split_bar", node_id.0, ui.layer_id())), egui::Sense::click_and_drag())
+        .on_hover_cursor(if vertical_drag { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal })
+        .on_hover_text("Drag to share the room between the config and the faders. Double-click to reset.");
+    let col = if resp.hovered() || resp.dragged() {
+        ui.visuals().widgets.hovered.fg_stroke.color
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    let c = rect.center();
+    let half = if vertical_drag { egui::vec2(14.0, 0.0) } else { egui::vec2(0.0, 14.0) };
+    ui.painter().line_segment([c - half, c + half], egui::Stroke::new(2.0_f32, col));
+    let d = resp.drag_delta();
+    (if resp.dragged() { if vertical_drag { d.y } else { d.x } } else { 0.0 }, resp.double_clicked())
+}
+
+/// Say which of the two panes the pad is driving, on the panes themselves: the one it is
+/// in wears the navigation accent as a frame, the other goes back behind a veil. A word in
+/// the toolbar said it before, and the two halves still looked the same - the bumpers
+/// switched between them and nothing on either moved until a button did.
+fn mark_pane(ui: &egui::Ui, node_id: NodeId, rect: egui::Rect, this: crate::gamepad_nav::JsmPane) {
+    let Some(driving) = super::scale::jsm_nav_pane(ui, node_id) else { return };
+    if !rect.is_positive() {
+        return;
+    }
+    let painter = ui.painter();
+    if driving == this.label() {
+        let accent = crate::widgets::NavHighlightStyle::of(ui.ctx()).accent;
+        painter.rect(
+            rect.expand(2.0),
+            3.0,
+            accent.gamma_multiply(0.06),
+            egui::Stroke::new(2.0_f32, accent),
+            egui::StrokeKind::Outside,
+        );
+    } else {
+        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color.gamma_multiply(0.5));
+    }
+}
+
 /// Pinned, the container's height is all there is. The editor gets what the strip
 /// doesn't want, never below three lines; everything left over goes to the strip,
 /// which scrolls — so a config setting thirty numbers is as reachable as one
@@ -1307,17 +1627,17 @@ fn knob_rows(
 
     // Calibration sits directly under the curve and above the faders: it is the
     // thing that decides what the curve's speeds MEAN, and it stays put while the
-    // faders scroll for the same reason the curve does. Pinnable on its own, so a
-    // tuning session can carry just this into the config overlay.
+    // faders scroll for the same reason the curve does. It is a button that pins the
+    // Real World Calibration widget to the config overlay, where the turn is made in
+    // the game - the same procedure, and the same button, as RWS Aim's.
     let cal_start = ui.cursor().min;
-    let (cal_header, cal_edits) =
-        super::jsm_cal::calibrate_block(node_id, ui, snarl, fader_width(ui, width, budget), text, false);
-    register_exposable_element(
-        ui,
-        node_id,
-        "measure",
-        egui::Rect::from_min_max(cal_start, ui.cursor().min + egui::vec2(width, 0.0)),
-    );
+    let cal_header = ui
+        .scope(|ui| {
+            ui.set_max_width(fader_width(ui, width, budget));
+            super::rws::rws_calibrate_button(node_id, ui, snarl, parent)
+        })
+        .inner;
+    let cal_edits = super::jsm_cal::finish_pending(node_id, ui, snarl, text);
     let cal_h = ui.cursor().min.y - cal_start.y;
 
     let knobs = flexinput_engine::eval::jsm_knobs(text);
@@ -1447,36 +1767,6 @@ fn fader_width(ui: &egui::Ui, width: f32, budget: Option<f32>) -> f32 {
     }
 }
 
-/// Bottom-right grip that drags the editor's size, like the 3D viewer's.
-/// Returns the new size while it is being dragged.
-fn resize_handle(ui: &mut egui::Ui, node_id: NodeId, size: egui::Vec2) -> Option<egui::Vec2> {
-    const HS: f32 = 12.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size.x, HS), egui::Sense::hover());
-    let grip = egui::Rect::from_min_size(egui::pos2(rect.right() - HS, rect.top()), egui::vec2(HS, HS));
-    let resp = ui.interact(grip, ui.id().with(("jsm_resize", node_id.0)), egui::Sense::click_and_drag());
-    if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-    }
-    // Three short diagonals, the usual grip.
-    let painter = ui.painter();
-    let color = if resp.hovered() {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    for i in 0..3 {
-        let o = 3.0 * i as f32;
-        painter.line_segment(
-            [egui::pos2(grip.right() - o - 2.0, grip.bottom() - 2.0),
-             egui::pos2(grip.right() - 2.0, grip.bottom() - o - 2.0)],
-            egui::Stroke::new(1.0_f32, color),
-        );
-    }
-    resp.dragged().then(|| {
-        let d = resp.drag_delta();
-        egui::vec2((size.x + d.x).max(MIN_W), (size.y + d.y).max(MIN_H))
-    })
-}
 
 /// The lines worth explaining, with their reason — a few at a time so the body
 /// doesn't grow without limit.
@@ -1539,7 +1829,7 @@ pub(crate) fn read_tabs(snarl: &Snarl<NodeData>, node_id: NodeId) -> Vec<JsmTab>
     }
 }
 
-fn write_tabs(snarl: &mut Snarl<NodeData>, node_id: NodeId, tabs: &[JsmTab], active: usize) {
+pub(crate) fn write_tabs(snarl: &mut Snarl<NodeData>, node_id: NodeId, tabs: &[JsmTab], active: usize) {
     let Some(node) = snarl.get_node_mut(node_id) else { return; };
     let arr: Vec<Value> = tabs.iter()
         .map(|t| serde_json::json!({ "name": t.name, "text": t.text }))

@@ -149,8 +149,243 @@ All notable changes to FlexInput are documented here. This project adheres to
   instead of a name, opens the name the patch calls it by and, under a rule, what the module
   does - in the words of `docs/MODULES_REFERENCE.md`'s Purpose lines, 75 of them, plus the six
   modules the reference leaves unsaid.
+- **RWS Aim is calibrated over the game, from a widget on the config overlay.** The module's
+  body no longer carries the calibration method and output controls: its button pins a Real
+  World Calibration widget to the config overlay of the tab in front, or says it is already
+  there. Each RWS Aim has its own button and widget, labelled with the pad that drives its
+  Rotation input. The widget is one big button and needs gamepad navigation on; pressing it
+  puts large prompts in a click-through window over the game. First choose what to calibrate:
+  South Mouse Scale, West Stick °/s, North Gyro scale, East cancels. Then turn one full
+  360° in game: the flick stick for the bulk of it, the controller to line up exactly with
+  where you started. The snapshot of the starting view is always on, and a ring with a
+  travelling arrow shows the angle measured so far. South finishes, East cancels, and the
+  result (old value → new, or why nothing changed) stays up for four seconds. The choice sits
+  at the bottom of the screen and the turn at the top, so the middle stays clear.
+- **RWS Aim scales a pad's own gyro, for games that aim with it.** It has a Device input
+  and a Map output, both AutoMap: wire the pad in and the Map output on to the virtual pad,
+  and the bus passes through with its gyro axes multiplied by the new `gyro` value - the
+  calibrated scale - times Real World Scale, pitch by the gyro V/H too. Calibrating Gyro sets
+  `gyro` so the game turns as far as the pad does. A patch saved before gets both pins after
+  the ones it has, so its wires stay; the value can be pinned and is saved in `.fxrws`
+  presets.
+- **A redesigned pinned row can wear either look.** Style 1 is the look it had before the
+  redesign, Style 2 the module's own - value pills, joined segments. A layout saved before
+  keeps Style 1, a new pin is made as Style 2, and the layout editor's inspector switches
+  between them. It applies to the Response Curve family's scale, range and grid rows, the
+  Oscilloscope's and Trigger Scope's controls and grid rows, and RWS Aim's view and flick
+  rows. JSM Config has one look. A Style 2 row is one band at the largest size its frame
+  holds both ways, its pills sharing the frame's whole width, centred in a frame taller than
+  that, and never draws outside it.
 
 ### Changed
+
+- **RWS Aim's settings read as two kinds of number.** The first section is "Real world
+  calibration and scale": the calibration values (mouse scale, stick speed, gyro scale) under
+  one caption, the output sensitivity under another - Real World Scale across the whole
+  width with its name in full, and the V/H biases. The view section is "Heading rotation
+  preview", it always draws its degree labels (the switch is gone), and its "both" mode
+  no longer pushes its three pills past the module's edge.
+- **An AutoMap socket with no label sits on the header row,** where it is when the module is
+  folded, on modules with one bus pin on that side - so folding doesn't move it, and the bus
+  in and out line up. Strip modules keep a socket by each numbered port.
+- **Pinned whole, a Remapper's Learn / MIDI / Choose / Add row stays at the top while the
+  cards scroll,** the status and drafts above it with it; so do Map Action's, a Touch Zones
+  zone's and the 3DOF Lean lists'. With a pad, LB and RB jump between the row and the cards,
+  back to the card you were on.
+- **3DOF to 2D's Lean lists look like the Remapper's,** with its full-size action buttons, and
+  a bar under them sets their height - they scroll in what it leaves them, the module growing
+  by the same so nothing else gives way; double-click it to let them be as tall as they are.
+  A bar under the 3D preview makes the preview taller or shorter.
+- **3DOF to 2D's preview shows the projection.** The pad - its own icon, the one its device
+  card shows, lying in its frame; or that icon's outline; or the pad's 3D model, half
+  see-through, picked in the preview's corner - sits in a sphere marked in degrees,
+  seen from behind it the way it is held. A pointer runs from it to where the output lands:
+  the arc along the heading ring from forward is the turn that becomes X, the arc up from
+  there the tilt that becomes Y. With roll let into X - a roll mix in Pitch+Yaw, or Pitch+Roll -
+  the pointer pivots along a yellow arc from a yellow dot, where it would be without roll, to
+  where it lands. An arc under the sphere is Lean, its ticks the threshold, and a legend says
+  which mark is which. The output square beside it is gone - any scope on the outputs is a
+  bigger one. The preview can be pinned to a layout or an overlay on its own.
+- **3DOF to 2D's gyro inputs are Roll, Pitch and Yaw,** the turn each axis is, and its
+  Orientation output is "Orient", which no longer widens the module. Saved patches are
+  renamed when they load; the wires stay.
+- **The 3D viewer's colours are pills that wrap,** each with the part's controller icon (or a
+  word) and its swatch, outlined so it shows on the pill, inside the module's width - the
+  Buttons row of seven swatches widened the module when Colours unfolded. Colours folds by a
+  section heading now, saved with the patch.
+- **Colour presets for the 3D viewer.** A preset picks the model's own colours, a plain grey,
+  or one you saved: Save… opens in the user models folder, under the model's `presets`, and
+  what is saved there is listed. The models' own colours are their launch colourways now -
+  Jet Black DualShock 4, Indigo GameCube, grey WaveBird, neon Joy-Con, black Switch Pro,
+  white Xbox 360, black Xbox One, and the Steam Controller's grey body with a black d-pad,
+  face buttons and sticks - where most were a dark grey stand-in.
+- **The 3D viewer has no background by default,** on the module and on a pin: the pad stands
+  on whatever is behind it. A pin's style can still give it one.
+- **JSM Config is calibrated on the overlay too, the way RWS Aim is.** The tune panel's
+  "Calibrate RWC" section, a smaller copy of the same procedure, is a button now that pins
+  the Real World Calibration widget to the config overlay, or says it is already there. The
+  overlay offers Mouse and Stick, named as the config names them, and a Finish rewrites
+  `REAL_WORLD_CALIBRATION` or `VIRTUAL_STICK_CALIBRATION` in the active tab.
+- **Real World Calibration hands the camera over before the turn.** While you choose what to
+  calibrate, the pad's aim reaches the game - only the four face buttons are held back - and
+  the prompt asks you to aim straight ahead, level with the horizon, so the 360° turn starts
+  from a level view and lines up against a level snapshot.
+- **JSM Config's tabs sit on the editor.** The active tab's name, load and save and the tune
+  switch are a row above them; the name field takes the row's spare width, the tune word and
+  its dropdown are the same height, and the bar beside a tune panel can no longer squeeze
+  that row narrower than it fits.
+- **3DOF to 2D:** the inversions are "Invert Axes", with Gyro and Accel side by side while the
+  width holds them, and the 3D preview folds away like the other sections.
+- **A value pill says its whole name when it has the room.** Pills that abbreviate - `stab`,
+  `fwd±`, `dz`, `ctr`, `mix`, `out` - show `stabilise`, `forward deadzone`, `deadzone`,
+  `recenter`, `roll mix`, `flick output` once the pill is wide enough for the name and its
+  value, and the short name when it isn't. Nothing is sized for the long name, so it only
+  ever fills room that is already there.
+- **Gyro to Stick Rotation was rebuilt in the house style.** Its live circle is the module's
+  surface, sized by the corner grip, and the settings under it are strips and value pills:
+  the stick and the turn as two strips, Absolute and Relative as one, Sens with an `invert`
+  switch, and Takeover's speed and outer zone greyed while it is off. Each group still pins on
+  its own.
+- **AutoMap Splitter and Collector add pins from an `add pin` pill,** the width of their rows,
+  and an Inlet or Outlet sets its type from a `type` pill.
+- **JSM Config's tabs are tabs.** They are drawn the way the app's own tab bar draws its tabs,
+  the one in front joined to the editor under it; when there are more than fit, the strip
+  scrolls and fades out at the end that has more. The config's name and its load and save
+  buttons moved up beside them. The bar between the editor and the tune panel starts in the
+  middle and keeps its share when the module is resized, and the panel's placement is one pill
+  with its dropdown, `Hide` among the choices.
+- **The scopes' setting rows were rebuilt** as value pills and switches in groups that share a
+  row while the width holds them. The time window is a slider that takes the room its group
+  has, and never gets shorter than the length it is set to.
+- **Remapper's and Map Action's Learn, Choose and Add buttons are bigger,** a size a finger or
+  a pad's highlight can find, sharing the row's width between them.
+- **The Two-way curve's interpolation time wears a stopwatch and `⇌`** instead of a word.
+- **AutoMap pins carry no label,** except on the device modules, where the pin is the device.
+  Hovering one still says what it is and what is on the other end.
+- **A device module's header is a whole number of blocks tall,** with its rows centred in it.
+- **RWS Aim's settings are in categories,** each folded and unfolded by its heading:
+  Sensitivity (the constants and the calibrate button), View (the ruler and room view, folded
+  until wanted - it rarely is) and Flick stick. The folds save with the patch.
+- **3DOF to 2D's settings are in categories under its viewport:** Mode (Pointer and Steering,
+  the neutral hold, roll mix, the steering options and Edge turn), Orientation output (pose
+  source, rotation scale, drift and auto re-center), Axes (the gyro and accel inversions) and
+  Lean (the threshold with its live reading, and the Lean Left and Right lists). Orientation
+  output and Axes are set up once and start folded.
+- **3DOF to 2D grew a viewport, and its settings stopped being a pile of boxes.** The viewport
+  is a picture of what the module is doing: the pad's axes on a gimbal of the three rings they
+  sweep, the neutral hold as a ghost under the live outline, the Edge-turn zone as a dashed
+  ring, and beside it the output plane - one arrow per turn rate, pointing where the current
+  mode, roll share and invert flags put it, with the live output drawn over them. The pose is
+  the module's own Orientation output, so it is the same pose a wired 3D model viewer draws.
+  Drag it to look round the pad; double-click puts the view back. The header's `model` switch
+  puts the pad's mesh where the axes are, on the viewer's model, palette and quaternion: the
+  3D viewer stays what it was - a pad to pin to an overlay or a stream - and this is what you
+  look at while setting the module up. The viewport is sized by the module's corner grip like
+  every other surface, and the settings under it are value pills in bands: Pointer/Steering
+  and the axis and pose-source choices as strips of cells, the Edge block rebuilt the same way
+  and greyed rather than hidden when a mode has no use for a number. The live Lean reading, the
+  output numbers in the plane and the pose are painted rather than laid out, so the module
+  doesn't twitch as the pad moves. Its gamepad-navigation elements and their order are
+  unchanged.
+- **The Controller 3D settings stopped taking six rows of slider.** The drawing numbers -
+  view angle, alpha, highlight fade, touch sensors, motion cue and x-ray - are value pills in
+  bands, the model picker sits on a painted caption at the row's width, and the palette fold no
+  longer wears an emoji: `keep colours` is a two-state button, like every other setting with
+  two values. What the rows used to take in height, the pad now has.
+- **RWS Aim's four constants are value pills,** in groups that share a row while the width
+  holds them and take a row each when it doesn't, and its calibration ruler takes the width the
+  module has instead of a width of its own: the grip that makes the module wider makes the ruler
+  longer, and the two labels at the ends of the visible span are anchored inside the edge, where
+  they used to be cut in half by it.
+- **The Response Curve family's settings were rebuilt.** The Log/Exp slider stretches with
+  the graph, with Abs and Snap as icon switches at its right end (the Two-way curve also has
+  a small `vec` button there). Range, grid and trail numbers are value pills like the
+  Envelope's - drag across or double-click to type - in groups that share a row while the
+  width holds them and wrap when it doesn't. In Abs mode only the upper ends of the ranges
+  are shown.
+- **`Scale grid` is in the curve's header:** `grid` and `scaled` are the two halves of one
+  pill, with `labels` a switch of its own beside it.
+- **Moving Log/Exp no longer changes the curve you set.** The slider used to leave the points
+  where they were on the graph, which changed the input/output pair each stood for. Each
+  point now moves on the graph so it keeps the same input and output; only the shape between
+  points follows the scale, and setting the slider back returns them to where they were.
+- **Curve pins read `i1 o1`, `i2 o2`,** the same width on both sides, instead of `In 1` and
+  `Out 1`. Hovering any pin label on any module shows the pin's full name and the module and
+  pin at the other end of each wire on it.
+- **Remapper and Map Action can be resized with the corner grip.** The width sets the scale
+  of the mapping cards. The height is a window onto the list, which is cropped and scrolls
+  with the wheel, touch or gamepad like a pinned Remapper widget.
+- **Vectorscope stays square, with no padding round the scope.** The corner grip scales it,
+  dragged along either edge.
+- **The Oscilloscope's plot can no longer be squeezed narrower than the controls under it,**
+  and it has a `Sync` button next to Freeze: the view starts where the first channel rises
+  through its middle level - taken from the recent signal, so a wave riding on an offset
+  syncs too - and a repeating wave stands still instead of running across the plot.
+- **JSM Config shares its size between the editor and the tune panel.** A bar between them
+  can be dragged to give either more room (double-click it to reset), whether the panel is
+  below or beside the editor. With a gamepad, the pane being driven wears an accent frame and
+  the other is dimmed; only a word in the toolbar said which before. A tune panel with more
+  faders than room scrolls.
+- **Network Send and Receive use compact rows:** small labels in one column, and port, rate,
+  failsafe and feedback as value pills the width of the row.
+- **A module has one resize grip.** The second grip inside Oscilloscope, Trigger Scope,
+  Vectorscope, the Response Curve family (and the AutoMap curves), Vec Reshaper, Controller 3D,
+  Audio Stream Haptics, JSM Config, Touch Zones, Virtual Menu and Area Mapper is gone: the
+  module's own corner grip sizes the graph, scope, pad or editor, which takes whatever the frame
+  leaves after the rows of settings. The size is saved in the patch with the module. Sizes set
+  with the old inner grips are not carried over, so these modules open at a default size.
+- **Vec Reshaper stacks its curve and its preview pad.** They are one surface, one above the
+  other, with a bar between them that can be dragged to share the height.
+- **Vectorscope and the Area Mapper field stay square,** in the middle of the room they have.
+  Touch Zones in split mode shares the width between its two pads.
+- **Scope and curve channels come from the header.** Oscilloscope, Trigger Scope, Vectorscope,
+  Response Curve, Vec Response Curve and Two-way Response Curve use the `- n +` stepper in the
+  header, like Delay, Average and DC Filter. The `Ch + -` row under their graphs is gone.
+- **AutoMap Fork has `select` as its first input,** as on Split and Selector; it was the second.
+  Patches saved before are converted when they load: the two pins change places and each keeps
+  its wires.
+- **Map Range says which end of which range.** Its four range pins read `in↓ in↑ out↓ out↑` on
+  the canvas; cut to four letters they were `in_m in_m out_ out_`. The stored names are unchanged.
+- **The Combiner's Motion "Section" dropdown lines up.** It is as wide as the two dropdowns on
+  the pin rows under it and ends at the same edge. In Correlate mode the noise gate has a row
+  of its own.
+- **Hovering a module's name says what the module is.** The tooltip shows the name - for a
+  renamed module, your name and then the module's own - and under a line what it does. It was
+  written long ago and could never appear: the name is painted, and the area that was meant to
+  be hovered was nothing wide.
+- **Highlighting a module's wires fades the rest instead of darkening it.** The other wires
+  and the modules not wired to it go part-way transparent, half at most, so everything can
+  still be read. Wires used to fade almost to nothing and modules were covered with a shade.
+- **Lists of ports sit in the middle of their module.** A Macro Output, Split, Selector and
+  the AutoMap Combiner, Fork and Selector had a thin margin over their first row and a wide
+  one under the last; the slack is now shared between the two.
+- **An AutoMap Combiner is a block taller per port, always.** Its rows are on the same pitch
+  as every other list (they had their own, and with the Resolution header under them the
+  module grew by one block for some ports and two for others); closed, Resolution is one
+  more row of that height. Inside it, the rule and port dropdowns line up with the right
+  edge of the port strips on every row, and the list of ports offering a pin moved from the
+  end of the row to its hover text.
+- **AutoMap Fork and AutoMap Selector list their ports as strips,** like Split and Selector:
+  a row level with each socket, a handle to reorder, `x` on the row, `+` in the header. They
+  were a stack of labels over a "+ output" / "+ input" button.
+- **A port's name opens for editing with its text in it.** On a Macro Output, Selector or
+  Split, renaming opened an empty field, so changing one letter meant typing the name
+  again. It opens on the current name, selected: type to replace it, or click / arrow into
+  it. The module also widens as a long name is typed (up to ten blocks; it stopped at five).
+- **A folded Constant or Readout shows its number,** in the band under its header, as a
+  folded Knob does.
+- **Delay says what it is.** Its header had no room for its name beside the channel
+  stepper; it wears a stopwatch there and the word "Delay" over its number, the way Average
+  and DC Filter caption theirs.
+- **A module's name never runs under the buttons beside it.** Every header applies one rule:
+  the name is drawn whole if it fits before the control at the header's right edge, cut with
+  an ellipsis if it nearly does, and left out if it doesn't (it is always in the hover
+  text). A Selector's name ended under its `+`, and a Response Curve's sat under Save / Load
+  / Reset.
+- **A Response Curve's graph switches are in its header.** `grid` (new: takes the grid lines
+  off) and `labels` sit at the header's right edge as on the Envelope, with Save, Load and
+  Reset beside them as drawings. A pinned copy of the graph can set grid and labels for
+  itself in the inspector - follow the module, on, or off.
 
 - **A ComboBox, a strip and a pill label each measured themselves wider than the row they were
   drawn in.** Three ways the same thing went wrong on the screenshots. A ComboBox takes
@@ -257,11 +492,11 @@ All notable changes to FlexInput are documented here. This project adheres to
   rows used to bounce the option back where it started, because the second step was counted from
   the row the finger was on rather than from the option; the selection now follows the option,
   not the slot, since the engine outputs whatever sits at the selected index.
-- **Dragging a Combiner's row now shows where it will land.** The row under the finger dims
-  as if lifted out of the list, and a line is drawn along the edge of the row it would
-  displace. The port strips move their neighbours out of the way as you drag, but these rows
-  are live widgets with a socket beside each, so moving one mid-drag would drag the patch's
-  wiring around with it; the mark and the line answer the question without touching either.
+- **Every list of ports moves the same way.** Dragging a row of an AutoMap Combiner or a
+  Macro Output now does what a Selector's or a Split's strip does: the row rides under the
+  finger and the rows it passes slide into the gap it left, before you let go. The Combiner
+  used to stand still and draw a line where the row would land. A row dragged onto its
+  neighbour also moves that neighbour aside straight away - it sat on top of it until release.
 - **The grid's block is 28 points instead of 56, and the modules are the same size.** The
   finer step is for the port lists: a strip row - a 25-point strip and the pin column's
   3-point spacing - is now exactly one block, so a Selector's rows land on the grid at every
@@ -449,10 +684,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   is not left shorter than the row carrying two grid numbers.
 - **The Envelope's behaviour switches are drawn, not written.** A magnet for snapping to the
   grid, the flat-topped shape the curve makes while it holds, an arrow out and one back for
-  bouncing, a ring with its head at the gap for looping (`viewer/glyphs.rs`, for the response-
-  curve family to borrow too). Unicode characters were not an option: the fonts a build happens
-  to carry have no magnet, and an emoji codepoint arrives as a colour bitmap or a box. The
-  words are in the tooltip, each next to the sentence that says what the switch does.
+  bouncing, a ring with its head at the gap for looping - drawings in the module glyphs' idiom
+  (`app/assets/{magnet,hold_env,bounce,loop}.svg`, painted by `viewer/glyphs.rs`, for the
+  response-curve family to borrow too), each on a button plate whether it is on or off. Unicode
+  characters were not an option: the fonts a build happens to carry have no magnet, and an emoji
+  codepoint arrives as a colour bitmap or a box. The words are in the tooltip, each next to the
+  sentence that says what the switch does.
+- **An Envelope's graph reads out under the pointer.** With `labels` on, the pointer (or the
+  gamepad cursor) over the graph shows when that is and the level that comes out then, as on a
+  Response Curve. The times along the grid moved to the bottom edge, where a peak's own number
+  doesn't land on them, and the curve is one joined line that reaches the tip of every point.
 - **A Macro's ports are a strip column, like a Split's.** The rows sit on the pitch its
   sockets are laid out at, so a port's socket is level with the row that names it and adding a
   port moves the module by one row on both sides. The name beside the socket is gone - it was
@@ -505,6 +746,30 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A module scrolled off the canvas left its Auto-Map socket, and the wire, on the canvas
+  edge.** A socket drawn on the header row took its height from the clip, and a node partly
+  out of view has its clip cut to the canvas. The socket now follows the header as laid out.
+- **A Steam Controller hidden by FlexInput reached Steam Input again after a restart.**
+  Hiding a controller stops programs opening it, not ones that already had - and Steam opens
+  a Steam Controller the moment FlexInput's exit unhides it, so the next start's hide left
+  Steam's handle working and the pad drove the game twice until the Puck was replugged.
+  FlexInput now replugs a controller in software the first time it hides it (a disable and
+  re-enable, re-enabled by the helper's watchdog if anything goes wrong in between), which
+  closes every handle; the hide then lets only FlexInput back in.
+- **Navigating the config overlay with a pad sent the navigation to the game as well.** The
+  focused pin's inputs pass through to the game so a tweak can be felt, and a pin that reads
+  the left stick, or one that passes the whole pad, let the d-pad and stick doing the
+  navigating through with them. What the pad is navigating with - the d-pad, the face
+  buttons, the bumpers, Back and Start, and whichever stick is walking or editing - is now
+  kept from the game while it does, passthrough or not. A calibration sweep still lets the
+  stick and the pad's turn through; only its Finish and Cancel are held back.
+- **A module whose header was wider than its body could be narrowed below its own header.**
+  The body took the width the grip asked for and the header stuck out of it; a Response Curve
+  or a Remapper dragged narrow drew its rows across the frame's edge. The body now never goes
+  narrower than its header holds.
+- **A bipolar curve's Log/Exp grid was off-centre with an odd number of lines.** The lines are
+  spaced out from the centre, so the middle one sits on zero whatever the count.
+- **A Vectorscope flickered while it was resized.** It holds still under the grip now.
 - **A Macro Output port with a long name painted over its own row.** The name was a text field
   open in every row, and an open field lays itself out at whatever width its text wants: a port
   called "Right Trigger, half pressed" drew across the signal-type dropdown, the `×` and the
@@ -538,7 +803,8 @@ All notable changes to FlexInput are documented here. This project adheres to
   option over "Dropdown", a folded Oscillator its phase number over "Oscillator". Worse, what is
   drawn is also clicked: a folded Envelope's graph handles and a folded Selector's strip rows sat
   in the space above the frame, out of sight, and answered the pointer there. A folded module
-  reserves the width its rows ask for and then paints nothing but its header. The words beside its
+  keeps the width its rows ask for and paints nothing but its header - every module, from one
+  place, rather than each body remembering to. The words beside its
   sockets go with the body - they were already being painted in the clipped column, and were what
   made a folded module a block wider than the header it had become.
 - **A Dropdown menu saved before it had a `shift` pin now gets one.** A node's pins are stored

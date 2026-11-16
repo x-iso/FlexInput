@@ -103,6 +103,16 @@ pub fn config_nav_targets(ctx: &egui::Context) -> Vec<(usize, egui::Rect)> {
         .unwrap_or_default()
 }
 
+fn pad_active_id() -> egui::Id {
+    egui::Id::new("fxi_config_pad_active")
+}
+
+/// Whether gamepad navigation is driving the config overlay, as it last drew. A pinned
+/// widget that only makes sense from the pad (Real World Calibration) reads it.
+pub(crate) fn config_pad_active(ctx: &egui::Context) -> bool {
+    config_overlay_visible(ctx) && ctx.data(|d| d.get_temp::<bool>(pad_active_id())).unwrap_or(false)
+}
+
 pub fn config_overlay_visible(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(visible_id())).unwrap_or(false)
 }
@@ -142,6 +152,14 @@ pub fn set_config_overlay_edit(ctx: &egui::Context, on: bool) {
 /// see `nav_drive_config_overlay`). They stay blocked from the game while the
 /// rest of the device passes through.
 const RWS_SWEEP_CONTROL_PINS: &[&str] = &["btn_south", "btn_east"];
+/// The buttons Real World Calibration's choose step answers: everything else passes, so
+/// the camera can be aimed while the choice is made.
+const RWS_CHOOSE_CONTROL_PINS: &[&str] = &["btn_south", "btn_east", "btn_west", "btn_north"];
+
+/// Whether a node is at Real World Calibration's choose step (`crate::rws_cal`).
+fn choosing(node: &NodeData) -> bool {
+    runs_measure_sweep(node) && node.params.get("cal_session").and_then(|v| v.as_str()) == Some("choose")
+}
 
 /// Modules that run a measure calibration sweep on the shared `cal_*` params:
 /// RWS Aim's own widget, and the JSM Config tune panel's "Calibrate RWC" row.
@@ -186,11 +204,20 @@ fn rws_measure_passthrough<V>(
             _ => None,
         };
         let Some(node) = node else { continue };
-        if sweep_axis(node).is_some() {
+        // The sweep, and the choice before it: the camera is live for both, so the player
+        // can aim straight ahead - level with the horizon - before the turn starts.
+        let held: &[&str] = if sweep_axis(node).is_some() {
+            RWS_SWEEP_CONTROL_PINS
+        } else if choosing(node) {
+            RWS_CHOOSE_CONTROL_PINS
+        } else {
+            continue;
+        };
+        {
             if let Some(dev) = crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id) {
                 let pins: Vec<String> = live_signals
                     .keys()
-                    .filter(|(d, p)| *d == dev && !RWS_SWEEP_CONTROL_PINS.contains(&p.as_str()))
+                    .filter(|(d, p)| *d == dev && !held.contains(&p.as_str()))
                     .map(|(_, p)| p.clone())
                     .collect();
                 // No pins seen for it (device gone): pass nothing rather than an
@@ -280,6 +307,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let gp_focus = app.config_nav_focus();
     // Gamepad state for the legend: (editing?, a pad is driving?).
     let (gp_editing, gp_pad_active) = app.config_nav_state();
+    ctx.data_mut(|d| d.insert_temp(pad_active_id(), gp_pad_active));
     // Controller-icon legend groups, matching the Easy-mode bottom bar.
     let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
     // For a focused mapping-module pin: the card whose curve is being edited (so
@@ -362,6 +390,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     menu_style_override: None,
                     keep_aspect: false,
                     anchor: Default::default(),
+                    pin_style: Some(2),
                 }));
                 let idx = config_layout.items.len() - 1;
                 config_layout.selected_item = Some(idx);

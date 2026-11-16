@@ -2114,12 +2114,13 @@ mod nav_scroll_tests {
         r.run(Nav::Card(11), 30);
         let last_card = r.pass(Nav::Card(11));
         // On Learn while it sits on screen just above the panel, over the preset
-        // bar: a body held 40 px past the widget's top, as a pass in which nav
-        // has only just asked for it (no focus yet for the auto-scroll to chase).
+        // bar: a body held 64 px past the widget's top (enough to clear the action
+        // row's 26-point buttons), as a pass in which nav has only just asked for it
+        // (no focus yet for the auto-scroll to chase).
         let mut r = Rig::new(12, 700.0);
         r.run(Nav::Widget, 10);
         let scroll_id = r.scroll_id();
-        r.ctx.data_mut(|d| d.insert_temp(scroll_id, PIN_TOP * scale() + 40.0));
+        r.ctx.data_mut(|d| d.insert_temp(scroll_id, PIN_TOP * scale() + 64.0));
         let learn = r.pass(Nav::Action);
         let above = learn.focus.expect("Learn's rect");
         assert!(above.bottom() < PANEL.top() && above.top() > SCREEN.top(),

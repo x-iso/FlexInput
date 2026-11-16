@@ -346,12 +346,30 @@ pub(crate) fn menu_zone_live(node: &NodeData) -> HashMap<(usize, usize), (f32, f
 
 // ── Body ──────────────────────────────────────────────────────────────────────
 
+/// The node body: the field is what the module's corner grip sizes (`kit::Surface`) - the
+/// frame it was dragged to, less the rows around the field. It had a grip of its own in its
+/// corner and a size of its own in the patch.
 pub(crate) fn show_menu_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &LiveSignals,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
+    body_h: f32,
+) {
+    let surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(160.0, 100.0));
+    menu_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
+    surface.end(ui);
+}
+
+fn menu_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    field: egui::Vec2,
 ) {
     // Lazy default init: single-field 2×2 grid, MAPPING mode (the menu's
     // headline use — zones firing outputs without wiring).
@@ -384,10 +402,7 @@ pub(crate) fn show_menu_body(
 
     let zone_live = snarl.get_node(node_id).map(menu_zone_live).unwrap_or_default();
 
-    let field_w = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_w").and_then(|v| v.as_f64())).unwrap_or(300.0) as f32;
-    let field_h = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_h").and_then(|v| v.as_f64())).unwrap_or(180.0) as f32;
+    let (field_w, field_h) = (field.x, field.y);
 
     ui.vertical(|ui| {
         // ── Menu options rows (identity + mode + Suppress/Radial live in the
@@ -409,7 +424,7 @@ pub(crate) fn show_menu_body(
             )
         } else {
             render_touch_field(
-                node_id, 0, true, true, mapping, ui, snarl,
+                node_id, 0, true, false, mapping, ui, snarl,
                 &zone_live, &visuals, accent, field_w, field_h,
                 super::viewer::remapper_out_skin(snarl, node_id, automap_parent),
             )
@@ -1538,41 +1553,6 @@ fn render_radial_field(
         }
     }
 
-    // Painter for the resize grip below (the border editor kept its own).
-    let painter = ui.painter_at(rect.expand(4.0));
-
-    // ── Resize grip (bottom-right corner) — same affordance as the flat
-    // field, writing the shared field size (the ring diameter follows the
-    // smaller side). Registered last so it wins the drag over the border
-    // editor; the corner sits outside the ring, so no border is in reach. ──
-    {
-        let hs = 14.0;
-        let handle = egui::Rect::from_min_max(
-            egui::pos2(rect.right() - hs, rect.bottom() - hs),
-            egui::pos2(rect.right(), rect.bottom()),
-        );
-        let hr = ui.interact(handle, ui.id().with((node_id, "vmresize")), egui::Sense::drag());
-        if hr.hovered() || hr.dragged() {
-            hr.clone().on_hover_cursor(egui::CursorIcon::ResizeNwSe);
-        }
-        let grip = if hr.hovered() || hr.dragged() { accent } else { visuals.weak_text_color() };
-        for k in 1..=3 {
-            let o = k as f32 * 3.5;
-            painter.line_segment(
-                [egui::pos2(rect.right() - o, rect.bottom()), egui::pos2(rect.right(), rect.bottom() - o)],
-                egui::Stroke::new(1.0_f32, grip),
-            );
-        }
-        if hr.dragged() {
-            let d = hr.drag_delta();
-            let nw = (field_w + d.x).clamp(200.0, 900.0);
-            let nh = (field_h + d.y).clamp(120.0, 600.0);
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("field_w".to_string(), serde_json::json!(nw));
-                node.params.insert("field_h".to_string(), serde_json::json!(nh));
-            }
-        }
-    }
     rect
 }
 

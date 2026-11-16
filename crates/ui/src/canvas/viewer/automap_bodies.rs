@@ -268,6 +268,7 @@ fn motion_section_mode(
     next: &mut Option<&'static str>,
     gate: f32,
     next_gate: &mut Option<f32>,
+    strip_right: f32,
 ) {
     const MODES: &[(&str, &str, &str)] = &[
         ("SORT", "Sort (top port)",
@@ -286,11 +287,17 @@ fn motion_section_mode(
           Orientation always comes from the top port."),
     ];
     let label = MODES.iter().find(|(m, _, _)| *m == current).map(|(_, l, _)| *l).unwrap_or("Sort (top port)");
+    // One dropdown as wide as the two on the pin rows below it, ending where they end.
+    let span = 58.0 + 54.0 + ui.spacing().item_spacing.x;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Section").small());
+        let spare = strip_right - ui.cursor().left() - span;
+        if spare > 0.0 {
+            ui.add_space(spare);
+        }
         let resp = egui::ComboBox::from_id_salt(egui::Id::new(("automap_combiner_motion", node_id)))
             .selected_text(egui::RichText::new(label).small())
-            .width(110.0)
+            .width(span)
             .show_ui(ui, |ui| {
                 for &(mode, name, hover) in MODES {
                     if ui.selectable_label(current == mode, egui::RichText::new(name).small())
@@ -302,9 +309,20 @@ fn motion_section_mode(
             });
         resp.response.on_hover_text(
             MODES.iter().find(|(m, _, _)| *m == current).map(|(_, _, h)| *h).unwrap_or(MODES[0].2));
-        if current == "CORRELATE" {
+    });
+    // The noise gate has a row of its own, its number in the right-hand dropdown's column:
+    // after the dropdown it ran the row past the edge every other row keeps.
+    if current != "CORRELATE" {
+        return;
+    }
+    ui.horizontal(|ui| {
+        {
             let mut g = gate;
             ui.label(egui::RichText::new("noise gate ×").small().weak());
+            let spare = strip_right - ui.cursor().left() - 54.0;
+            if spare > 0.0 {
+                ui.add_space(spare);
+            }
             let r = ui.add(egui::DragValue::new(&mut g).speed(0.02).range(0.0..=4.0).fixed_decimals(2))
                 .on_hover_text(
                     "How much measured noise the fused gyro rate sheds.\n\
@@ -752,47 +770,35 @@ pub(crate) fn show_automap_split_body(
 
         ui.add_space(4.0);
 
-        // The `+` at the end of the list, opening the same choice of pins. The dropdown is a
-        // popup, so it can be as wide as the names need without the module paying for it.
-        egui::ComboBox::from_id_salt((node_id, "add_am_split"))
-            .selected_text(egui::RichText::new("+").small())
-            .show_ui(ui, |ui| {
-                for ap in am_canon::ALL_PINS {
-                    if current_ids.iter().any(|id| id == ap.id) { continue; }
-                    let label = splitter_pin_label(ap.id, ap.display_name, family_ref);
-                    if ui.selectable_label(false, egui::RichText::new(&label).small()).clicked() {
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.outputs.push(PinDescriptor::new(ap.display_name, ap.signal_type));
-                            match node.params.get_mut("output_pin_ids") {
-                                Some(Value::Array(ids)) => { ids.push(Value::String(ap.id.to_string())); }
-                                _ => {
-                                    node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
-                                        Value::String("automap_pass".to_string()),
-                                        Value::String(ap.id.to_string()),
-                                    ]));
-                                }
-                            }
-                        }
+        // `add pin` at the end of the list, a pill the width of the rows, opening the same
+        // choice of pins. The dropdown is a popup, so it can be as wide as the names need
+        // without the module paying for it.
+        let mut adds: Vec<(String, String, String, SignalType)> = Vec::new();
+        for ap in am_canon::ALL_PINS {
+            if current_ids.iter().any(|id| id == ap.id) { continue; }
+            adds.push((ap.id.to_string(), splitter_pin_label(ap.id, ap.display_name, family_ref), ap.display_name.to_string(), ap.signal_type));
+        }
+        for (id, name, ty) in &upstream_extras {
+            if current_ids.iter().any(|c| c == id) { continue; }
+            adds.push((id.clone(), name.clone(), name.clone(), *ty));
+        }
+        let opts: Vec<(usize, &str)> = adds.iter().enumerate().map(|(k, a)| (k, a.1.as_str())).collect();
+        let (add_rect, _) = ui.allocate_exact_size(egui::vec2(LIST_W, super::curve_rows::band_h(ui) - 4.0), egui::Sense::hover());
+        if let Some(k) = super::curve_rows::pill_combo(ui, add_rect, "add pin", &usize::MAX, &opts, "Add an output for one pin of the bus.", ("am_split_add", node_id)) {
+            let (id, _, name, ty) = &adds[k];
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.outputs.push(PinDescriptor::new(name.as_str(), *ty));
+                match node.params.get_mut("output_pin_ids") {
+                    Some(Value::Array(ids)) => ids.push(Value::String(id.clone())),
+                    _ => {
+                        node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
+                            Value::String("automap_pass".to_string()),
+                            Value::String(id.clone()),
+                        ]));
                     }
                 }
-                for (id, name, ty) in &upstream_extras {
-                    if current_ids.iter().any(|c| c == id) { continue; }
-                    if ui.selectable_label(false, egui::RichText::new(name).small()).clicked() {
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.outputs.push(PinDescriptor::new(name, *ty));
-                            match node.params.get_mut("output_pin_ids") {
-                                Some(Value::Array(ids)) => ids.push(Value::String(id.clone())),
-                                _ => {
-                                    node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
-                                        Value::String("automap_pass".to_string()),
-                                        Value::String(id.clone()),
-                                    ]));
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            }
+        }
 
         // A note comes with its velocity and aftertouch.
         let picked = automap_midi_section(ui, node_id, "am_split", false);
@@ -893,28 +899,28 @@ pub(crate) fn show_automap_collect_body(
 
         ui.add_space(4.0);
 
-        // ── Add-input dropdown (canonical ALL_PINS) ───────────────────────────
-        egui::ComboBox::from_id_salt((node_id, "add_am_collect"))
-            .selected_text(egui::RichText::new("+").small())
-            .show_ui(ui, |ui| {
-                for ap in am_canon::ALL_PINS {
-                    if current_ids.iter().any(|id| id == ap.id) { continue; }
-                    let label = splitter_pin_label(ap.id, ap.display_name, family_ref);
-                    if ui.selectable_label(false, egui::RichText::new(&label).small()).clicked() {
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.inputs.push(PinDescriptor::new(ap.display_name, ap.signal_type));
-                            match node.params.get_mut("collect_input_pin_ids") {
-                                Some(Value::Array(ids)) => { ids.push(Value::String(ap.id.to_string())); }
-                                _ => {
-                                    node.params.insert("collect_input_pin_ids".to_string(), Value::Array(vec![
-                                        Value::String(ap.id.to_string()),
-                                    ]));
-                                }
-                            }
-                        }
+        // ── `add pin`: one input per canonical pin, as on the Splitter ─────────
+        let adds: Vec<&am_canon::AutoMapPin> = am_canon::ALL_PINS
+            .iter()
+            .filter(|ap| !current_ids.iter().any(|id| id == ap.id))
+            .collect();
+        let labels: Vec<String> = adds.iter().map(|ap| splitter_pin_label(ap.id, ap.display_name, family_ref)).collect();
+        let opts: Vec<(usize, &str)> = labels.iter().enumerate().map(|(k, l)| (k, l.as_str())).collect();
+        let (add_rect, _) = ui.allocate_exact_size(egui::vec2(LIST_W, super::curve_rows::band_h(ui) - 4.0), egui::Sense::hover());
+        if let Some(k) = super::curve_rows::pill_combo(ui, add_rect, "add pin", &usize::MAX, &opts, "Add an input for one pin of the bus.", ("am_collect_add", node_id)) {
+            let ap = adds[k];
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.inputs.push(PinDescriptor::new(ap.display_name, ap.signal_type));
+                match node.params.get_mut("collect_input_pin_ids") {
+                    Some(Value::Array(ids)) => { ids.push(Value::String(ap.id.to_string())); }
+                    _ => {
+                        node.params.insert("collect_input_pin_ids".to_string(), Value::Array(vec![
+                            Value::String(ap.id.to_string()),
+                        ]));
                     }
                 }
-            });
+            }
+        }
 
         // A MIDI pin collected here is PRODUCED: a MIDI Out sink downstream
         // sends it even with Thru off.
@@ -1001,73 +1007,35 @@ pub(crate) fn remove_automap_collect_input(node_id: NodeId, rm_idx: usize, input
 
 // ── AutoMap Fork body ─────────────────────────────────────────────────────────
 
+/// AutoMap Fork (`module.automap_fork`): one bus out of as many sockets as are asked for. Its
+/// outputs are a column of port strips, as a Split's are - the same rows, handles, `×` and
+/// header `+` - where it used to be a stack of `× out_0` labels over a "+ output" button that
+/// lined up with none of its sockets.
 pub(crate) fn show_automap_fork_body(
     node_id: NodeId,
+    inputs: &[InPin],
     outputs: &[OutPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
 ) {
-    let n_out = snarl.get_node(node_id).map(|n| n.outputs.len()).unwrap_or(2);
-    ui.vertical(|ui| {
-        ui.set_min_width(80.0);
-        let mut to_remove: Option<usize> = None;
-        for i in 0..n_out {
-            ui.horizontal(|ui| {
-                if n_out > 2 {
-                    if ui.small_button("×").clicked() { to_remove = Some(i); }
-                } else {
-                    ui.add_space(18.0);
-                }
-                ui.label(egui::RichText::new(format!("out_{i}")).small());
-            });
-        }
-        if let Some(rm) = to_remove {
-            remove_output_pin(node_id, rm, outputs, snarl);
-        }
-        ui.add_space(2.0);
-        if ui.small_button("+ output").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.outputs.len();
-                node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::AutoMap));
-            }
-        }
-    });
+    use super::simple_bodies::{show_port_strips, InterpRow, StripSide};
+    show_port_strips(node_id, inputs, outputs, ui, snarl, "module.automap_fork", StripSide::Outputs, 0, 0, InterpRow::NONE);
 }
 
 // ── AutoMap Selector body ─────────────────────────────────────────────────────
 
+/// AutoMap Selector (`module.automap_selector`): `select` picks which bus goes through. Its
+/// buses are a column of port strips under the `select` pin's row, as a Selector's values are.
 pub(crate) fn show_automap_selector_body(
     node_id: NodeId,
     inputs: &[InPin],
+    outputs: &[OutPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
 ) {
+    use super::simple_bodies::{show_port_strips, InterpRow, StripSide};
     // inputs[0] = select (fixed); inputs[1..] = in_0, in_1, ... (dynamic AutoMap)
-    let n_value = snarl.get_node(node_id).map(|n| n.inputs.len().saturating_sub(1)).unwrap_or(2);
-    ui.vertical(|ui| {
-        ui.set_min_width(80.0);
-        let mut to_remove: Option<usize> = None;
-        for i in 0..n_value {
-            ui.horizontal(|ui| {
-                if n_value > 2 {
-                    if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
-                } else {
-                    ui.add_space(18.0);
-                }
-                ui.label(egui::RichText::new(format!("in_{i}")).small());
-            });
-        }
-        if let Some(rm) = to_remove {
-            remove_input_pin(node_id, rm, inputs, snarl);
-        }
-        ui.add_space(2.0);
-        if ui.small_button("+ input").clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                let next = node.inputs.len() - 1;
-                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::AutoMap));
-            }
-        }
-    });
+    show_port_strips(node_id, inputs, outputs, ui, snarl, "module.automap_selector", StripSide::Inputs, 1, 1, InterpRow::NONE);
 }
 
 // ── AutoMap Combiner body ─────────────────────────────────────────────────────
@@ -1109,6 +1077,7 @@ pub(crate) fn bus_label(module_id: &str) -> Option<&'static str> {
         "module.automap_twoway_response_curve" => "Two-way Curve",
         "module.area_mapper" => "Area Mapper",
         "module.stick_rotation" => "Stick Rotation",
+        "processing.rws" => "RWS Aim",
         _ => return None,
     })
 }
@@ -1323,12 +1292,6 @@ pub(crate) fn combiner_move_input(
     }
 }
 
-/// Which row a Combiner's live drag came from, kept between frames so the row's "lifted"
-/// mark doesn't flicker in the gaps between drop zones.
-fn combiner_drag_key(node: NodeId) -> egui::Id {
-    egui::Id::new(("fxi_combiner_drag", node.0))
-}
-
 pub(crate) fn show_automap_combiner_body(
     node_id: NodeId,
     inputs: &[InPin],
@@ -1371,6 +1334,8 @@ pub(crate) fn show_automap_combiner_body(
 
         let mut to_remove: Option<usize> = None;
         let mut to_move: Option<(usize, usize)> = None;
+        #[allow(unused_assignments)]
+        let mut strip_right = 0.0f32;
 
         // Per-port default merge policy (SORT default). Applies to every pin a
         // port offers that has no per-pin override. Collected here; written
@@ -1379,28 +1344,15 @@ pub(crate) fn show_automap_combiner_body(
             .and_then(|node| node.params.get("combiner_port_default"))
             .and_then(|v| v.as_object()).cloned().unwrap_or_default();
         let mut next_port_default: Vec<(usize, &'static str)> = Vec::new();
-        // The strip fill, so a port row reads as one object the handle, the `×` and the
-        // dropdowns sit on - the same fill the Selector's and Split's strips wear.
-        let strip_fill = ui.visuals().widgets.inactive.weak_bg_fill;
-        // Where the row being dragged would land, if there is one: recorded while the rows
-        // are laid out, drawn once they're all down so nothing paints over it.
-        let mut slot: Option<egui::Rect> = None;
-        let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(n);
-        // Which row the drag in flight came from. egui reports the payload on whatever drop
-        // zone the pointer is over, so between rows it says nothing and the mark would
-        // flicker; the last one seen is kept while the button is still held.
-        let mut drag_from = ui
-            .ctx()
-            .data(|d| d.get_temp::<Option<usize>>(combiner_drag_key(node_id)))
-            .flatten();
-        if !ui.input(|i| i.pointer.any_down()) {
-            drag_from = None;
-        }
-
-        // Every row the same width, sized by the longest port name and device label in the
-        // list: strips ending at ragged widths read as several controls rather than one
-        // list. Measured from the text the rows are going to hold, never from the frame the
-        // module has, so it doesn't ratchet.
+        // The rows are the rows of the input sockets, on the `StripRows` a Selector's strips
+        // stand on, painted and moved the way those are: a strip per port, a handle that
+        // drags it, the rows it passes sliding aside (`StripAnim`). They used to be live
+        // drop zones in a column of their own pitch, which is why this list stepped the
+        // module's height unevenly and was the one list that didn't move under the finger.
+        use super::simple_bodies::{StripAnim, STRIP_GAP, STRIP_HANDLE_W, STRIP_PAD, STRIP_REMOVE_H, STRIP_REMOVE_W};
+        const COMBO_W: f32 = 58.0;
+        let rows_at = super::kit::StripRows::at_cursor("module.automap_combiner", ui);
+        let pitch = rows_at.advance;
         let small_font = egui::TextStyle::Small.resolve(ui.style());
         let measure = |s: &str| -> f32 {
             if s.is_empty() {
@@ -1411,133 +1363,176 @@ pub(crate) fn show_automap_combiner_body(
                 .size()
                 .x
         };
+        // Every row the same width, sized by the longest port name and device label in the
+        // list. Measured from the text the rows are going to hold, never from the frame the
+        // module has, so it doesn't ratchet; painted at the width the column has, so the
+        // strips reach the same right edge whatever they say.
         let widest = (0..n)
             .map(|i| {
                 let dev = infos.get(i).map(|info| info.label.as_str()).unwrap_or("");
-                let gap = if dev.is_empty() { 0.0 } else { ui.spacing().item_spacing.x };
+                let gap = if dev.is_empty() { 0.0 } else { STRIP_GAP };
                 measure(&format!("in_{i}")) + gap + measure(dev)
             })
             .fold(0.0f32, f32::max);
-        let combo_w = 58.0; // the width the policy dropdown is given below
-        let remove_w = (measure("×") + 2.0 * ui.spacing().button_padding.x)
-            .max(ui.spacing().interact_size.x * 0.6);
-        let row_min_w = measure("⠿")
-            + remove_w
+        let need_w = 2.0 * STRIP_PAD
+            + STRIP_HANDLE_W
+            + if n > 2 { STRIP_REMOVE_W + STRIP_GAP } else { 0.0 }
+            + STRIP_GAP
             + widest
-            + combo_w
-            + 6.0 * ui.spacing().item_spacing.x
-            + 2.0 * super::kit::COMBINER_PAD_V
-            + 8.0;
+            + STRIP_GAP
+            + COMBO_W;
+        let left = ui.cursor().left();
+        let strip_w = ui.max_rect().width().max(need_w);
+        // Where the strips end: the resolution rows below put their dropdowns against it.
+        strip_right = left + strip_w;
+        ui.allocate_exact_size(egui::vec2(need_w, rows_at.height(n) - ui.spacing().item_spacing.y), egui::Sense::hover());
 
+        let (fill_active, fill_hovered, fill_idle) = {
+            let v = ui.visuals();
+            (v.widgets.active.bg_fill, v.widgets.hovered.bg_fill, v.widgets.inactive.weak_bg_fill)
+        };
+        let weak = ui.visuals().weak_text_color();
+        let name_color = ui.visuals().text_color();
+        let outline = ui.visuals().widgets.hovered.fg_stroke.color;
+        let anim_key = egui::Id::new(("fxi_combiner_anim", node_id.0));
+        let mut anim = StripAnim::begin(ui.ctx(), anim_key, n, pitch);
         for i in 0..n {
             // A port "is in conflict" if any pin it offers is offered by ≥2 ports.
             let is_conflict_row = infos.get(i).map_or(false, |info| {
                 info.offered.iter().any(|p| is_conflict(p))
             });
+            let strip = rows_at
+                .band(i, left, strip_w)
+                .shrink2(egui::vec2(0.0, 1.0))
+                .translate(egui::vec2(0.0, anim.offset(i)));
+            super::simple_bodies::trace_rect(ui, node_id, &format!("combiner_row_{i}"), strip);
+            super::simple_bodies::trace_rect(ui, node_id, &format!("strip_{i}"), strip);
+            let dragged = anim.dragged(i);
+            let hovered = ui.rect_contains_pointer(strip);
+            let fill = if dragged {
+                fill_active
+            } else if hovered {
+                fill_hovered
+            } else {
+                fill_idle
+            };
+            ui.painter().rect(strip, 4.0, fill, egui::Stroke::NONE, egui::StrokeKind::Inside);
+            if dragged || hovered {
+                ui.painter().rect(
+                    strip,
+                    4.0,
+                    egui::Color32::TRANSPARENT,
+                    egui::Stroke::new(1.0_f32, outline),
+                    egui::StrokeKind::Inside,
+                );
+            }
 
-            // Each row is a drop zone (egui draws a hover-highlight frame
-            // automatically while a compatible payload is in flight). Inside it,
-            // the drag handle glyph is the actual drag source so × stays clickable.
-            // The row is exactly the height a Combiner strip is - its widgets are set to
-            // what's left inside the frame's padding - and the pin row beside it is
-            // allocated the same (`kit::strip_pitch`), which is the only way the socket and
-            // the strip naming that port stay level: the pins are laid out before the body.
-            let row_h = super::kit::strip_min_pitch("module.automap_combiner", ui).unwrap_or(28.0);
-            let pad = super::kit::COMBINER_PAD_V;
-            let drop_frame = egui::Frame::new()
-                .fill(strip_fill)
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(2, pad as i8));
-            let (zone, dropped) = ui.dnd_drop_zone::<usize, _>(drop_frame, |ui| {
-                ui.spacing_mut().interact_size.y = row_h - 2.0 * pad;
-                ui.set_min_width(row_min_w - 2.0 * pad);
-                ui.horizontal(|ui| {
-                    let handle_id = egui::Id::new(("automap_combiner_handle", node_id, i));
-                    let src = ui.dnd_drag_source(handle_id, i, |ui| {
-                        ui.label(egui::RichText::new("⠿").weak().small());
-                    });
-                    src.response.on_hover_cursor(egui::CursorIcon::Grab);
-                    if n > 2 {
-                        if ui.small_button("×").clicked() { to_remove = Some(i); }
-                    } else {
-                        ui.add_space(18.0);
-                    }
-                    let mut label = egui::RichText::new(format!("in_{i}")).small();
-                    if is_conflict_row {
-                        label = label.color(egui::Color32::from_rgb(255, 170, 80));
-                    }
-                    ui.label(label);
-                    let dev_label = infos.get(i).map(|info| info.label.as_str()).unwrap_or("");
-                    if !dev_label.is_empty() {
-                        ui.label(egui::RichText::new(dev_label).small().weak());
-                    }
-                    // Per-port default policy dropdown (SORT default).
-                    // Pinned to the strip's right edge: following the end of the port name
-                    // left the dropdowns wandering to a different place in every row.
-                    let row_inner_w = row_min_w - 2.0 * pad;
-                    let combo_box_w = 58.0 + 2.0 * ui.spacing().button_padding.x;
-                    let spare = row_inner_w - ui.min_rect().width() - combo_box_w;
-                    ui.add_space(spare.max(0.0));
-                    let cur_default = port_default_map.get(&i.to_string())
-                        .and_then(|v| v.as_str()).unwrap_or("SORT");
-                    let pd_id = egui::Id::new(("automap_combiner_port_default", node_id, i));
-                    egui::ComboBox::from_id_salt(pd_id)
-                        .selected_text(egui::RichText::new(cur_default).small())
-                        .width(58.0)
-                        .show_ui(ui, |ui| {
-                            for &mode in &["SORT", "OR", "AND", "XOR", "ADD", "MULT"] {
-                                if ui.selectable_label(cur_default == mode,
-                                    egui::RichText::new(mode).small()).clicked()
-                                {
-                                    next_port_default.push((i, mode));
-                                }
-                            }
-                        });
-                });
-            });
-            // Traced so a test can hold the rows to one width.
-            super::simple_bodies::trace_rect(ui, node_id, &format!("combiner_row_{i}"), zone.response.rect);
-            row_rects.push(zone.response.rect);
-            // Where this row would take the one being dragged: the drop lands on the row
-            // under the pointer, so the line goes below it - the gap the moved row pushes the
-            // rest down into.
-            if let Some(from) = zone.response.dnd_hover_payload::<usize>().map(|p| *p) {
-                drag_from = Some(from);
-                if from != i {
-                    slot = Some(zone.response.rect);
+            let mut cx = strip.left() + STRIP_PAD;
+            let handle = egui::Rect::from_min_size(
+                egui::pos2(cx, strip.center().y - pitch * 0.5),
+                egui::vec2(STRIP_HANDLE_W, pitch),
+            );
+            let hresp = ui
+                .interact(handle, egui::Id::new(("automap_combiner_handle", node_id.0, i)), egui::Sense::drag())
+                .on_hover_cursor(egui::CursorIcon::Grab);
+            ui.painter().text(handle.center(), egui::Align2::CENTER_CENTER, "⠿", small_font.clone(), weak);
+            if let Some(mv) = anim.handle(&hresp, i) {
+                if mv.0 != mv.1 {
+                    to_move = Some(mv);
                 }
             }
-            if let Some(dragged_idx) = dropped {
-                let from = *dragged_idx;
-                if from != i { to_move = Some((from, i)); }
+            hresp.on_hover_text("Drag to move this port up or down the list. Ports higher up win a Sort.");
+            cx += STRIP_HANDLE_W + STRIP_GAP * 0.5;
+
+            if n > 2 {
+                let xrect = egui::Rect::from_min_size(
+                    egui::pos2(cx, strip.center().y - STRIP_REMOVE_H * 0.5),
+                    egui::vec2(STRIP_REMOVE_W, STRIP_REMOVE_H),
+                );
+                let r = ui.put(
+                    xrect,
+                    egui::Button::new(egui::RichText::new("×").size(14.0))
+                        .min_size(egui::vec2(STRIP_REMOVE_W, STRIP_REMOVE_H)),
+                );
+                if r.on_hover_text("Remove this port").clicked() {
+                    to_remove = Some(i);
+                }
+                cx += STRIP_REMOVE_W + STRIP_GAP * 0.5;
             }
-        }
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(combiner_drag_key(node_id), drag_from));
-        // The row under the finger reads as lifted out of the list: egui paints the moving
-        // copy at the cursor, so this is the hole it left behind.
-        if let Some(from) = drag_from {
-            if let Some(r) = row_rects.get(from).copied() {
-                super::simple_bodies::trace_rect(ui, node_id, "combiner_lifted", r);
-                ui.painter()
-                    .rect_filled(r.shrink(1.0), 4.0, strip_fill.gamma_multiply(0.4));
-            }
-        }
-        if let Some(r) = slot {
-            // Where the dragged row would land. The strips' preview slides the rows out of
-            // the way as you drag; this list is live widgets, and moving them mid-frame would
-            // move the sockets beside them, so it says where the gap will open instead.
-            let accent = ui.visuals().selection.bg_fill;
-            let y = r.bottom() + 2.0;
-            super::simple_bodies::trace_rect(
-                ui,
-                node_id,
-                "combiner_slot",
-                egui::Rect::from_min_max(egui::pos2(r.left(), y), egui::pos2(r.right(), y + 2.0)),
+            cx += STRIP_GAP * 0.5;
+
+            // The per-port default policy, against the strip's right edge.
+            let combo = egui::Rect::from_min_size(
+                egui::pos2(strip.right() - STRIP_PAD * 0.5 - COMBO_W, strip.top() + 1.0),
+                egui::vec2(COMBO_W, strip.height() - 2.0),
             );
-            ui.painter()
-                .hline(r.left()..=r.right(), y, egui::Stroke::new(2.0_f32, accent));
+
+            // The port, and after it the device it is fed by - cut short if the two don't
+            // fit before the dropdown; the whole label is in the hover text.
+            let port = format!("in_{i}");
+            let port_col = if is_conflict_row { egui::Color32::from_rgb(255, 170, 80) } else { name_color };
+            let pg = ui.painter().layout_no_wrap(port, small_font.clone(), port_col);
+            let port_w = pg.size().x;
+            ui.painter().galley(egui::pos2(cx, strip.center().y - pg.size().y * 0.5), pg, port_col);
+            let dev_label = infos.get(i).map(|info| info.label.as_str()).unwrap_or("");
+            if !dev_label.is_empty() {
+                let dev_left = cx + port_w + STRIP_GAP;
+                let room = combo.left() - STRIP_GAP - dev_left;
+                if room > 8.0 {
+                    let shown = super::simple_bodies::elide_to_width(ui, dev_label, small_font.clone(), weak, room);
+                    ui.painter().text(
+                        egui::pos2(dev_left, strip.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        shown,
+                        small_font.clone(),
+                        weak,
+                    );
+                }
+            }
+            let words = egui::Rect::from_min_max(egui::pos2(cx, strip.top()), egui::pos2(combo.left() - STRIP_GAP, strip.bottom()));
+            if words.width() > 0.0 {
+                let tip = if dev_label.is_empty() {
+                    format!("in_{i}")
+                } else {
+                    format!("in_{i} - {dev_label}")
+                };
+                let tip = if is_conflict_row {
+                    format!("{tip}\nOffers pins another port offers too: see Resolution below.")
+                } else {
+                    tip
+                };
+                ui.interact(words, egui::Id::new(("automap_combiner_words", node_id.0, i)), egui::Sense::hover())
+                    .on_hover_text(tip);
+            }
+
+            let cur_default = port_default_map.get(&i.to_string())
+                .and_then(|v| v.as_str()).unwrap_or("SORT");
+            let mut cell = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(combo)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt(("automap_combiner_policy_cell", node_id, i)),
+            );
+            let pd_id = egui::Id::new(("automap_combiner_port_default", node_id, i));
+            let cr = egui::ComboBox::from_id_salt(pd_id)
+                .selected_text(egui::RichText::new(cur_default).small())
+                .width(COMBO_W)
+                .show_ui(&mut cell, |ui| {
+                    for &mode in &["SORT", "OR", "AND", "XOR", "ADD", "MULT"] {
+                        if ui.selectable_label(cur_default == mode,
+                            egui::RichText::new(mode).small()).clicked()
+                        {
+                            next_port_default.push((i, mode));
+                        }
+                    }
+                });
+            super::simple_bodies::trace_rect(ui, node_id, &format!("combiner_policy_{i}"), cr.response.rect);
+            cr.response.on_hover_text(
+                "How this port's pins are merged with the same pins from other ports, \
+                 unless a pin is given its own rule under Resolution.",
+            );
         }
+        anim.end(ui.ctx(), anim_key);
         if let Some(rm) = to_remove {
             remove_input_pin(node_id, rm, inputs, snarl);
         }
@@ -1648,18 +1643,49 @@ pub(crate) fn show_automap_combiner_body(
             by_cat.entry(pin_category(pin_id)).or_default().push(pin_id);
         }
 
-        ui.add_space(4.0);
-        let header_id = egui::Id::new(("automap_combiner_resolution", node_id));
+        let header_id = ui.make_persistent_id(("automap_combiner_resolution", node_id));
         let n_conf = overlap.values().filter(|w| w.len() >= 2).count();
         let n_pol = current_policy.values()
             .filter(|v| v.as_str().map_or(false, |s| s != "SORT")).count();
         let n_port = current_port.len();
         let n_over = n_pol + n_port;
-        let header_text = format!("Resolution ({n_over} overrides, {n_conf} pins overlap)");
-        egui::CollapsingHeader::new(egui::RichText::new(header_text).small().weak())
-            .id_salt(header_id)
-            .default_open(false)
-            .show(ui, |ui| {
+        // The header of the tree is one more row of the list: a strip's height on the
+        // strips' pitch, so a closed Combiner is its ports plus one row whatever the count -
+        // egui's own collapsing header is a height of its own, and with the gap above it the
+        // module's height stepped by a block at some port counts and two at others.
+        let mut tree = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, false);
+        let band_h = super::kit::StripRows::at_cursor("module.automap_combiner", ui).row_h;
+        let (band, head) = ui.allocate_exact_size(
+            egui::vec2((strip_right - ui.cursor().left()).max(140.0), band_h),
+            egui::Sense::click(),
+        );
+        if head.clicked() {
+            tree.toggle(ui);
+        }
+        {
+            let weak = ui.visuals().weak_text_color();
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let icon = egui::Rect::from_center_size(
+                egui::pos2(band.left() + 10.0, band.center().y),
+                egui::Vec2::splat(10.0),
+            );
+            let openness = tree.openness(ui.ctx());
+            egui::collapsing_header::paint_default_icon(ui, openness, &head.clone().with_new_rect(icon));
+            let text_left = icon.right() + 6.0;
+            let text = if n_over == 0 && n_conf == 0 {
+                "Resolution".to_string()
+            } else {
+                format!("Resolution  ·  {n_conf} overlap, {n_over} set")
+            };
+            let shown = super::simple_bodies::elide_to_width(ui, &text, font.clone(), weak, band.right() - text_left);
+            ui.painter().text(egui::pos2(text_left, band.center().y), egui::Align2::LEFT_CENTER, shown, font, weak);
+            super::simple_bodies::trace_rect(ui, node_id, "combiner_resolution", band);
+        }
+        let head = head.on_hover_text(
+            "Pins that more than one port offers, and the rule each is merged by. \
+             A pin can be given its own rule, or be taken from one port only.",
+        );
+        tree.show_body_indented(&head, ui, |ui| {
                 if tracked.is_empty() {
                     ui.label(egui::RichText::new("No overlapping inputs or overrides.").small().weak());
                     return;
@@ -1678,7 +1704,7 @@ pub(crate) fn show_automap_combiner_body(
                         .show(ui, |ui| {
                             if cat == "Motion" {
                                 motion_section_mode(ui, node_id, &current_motion, &mut next_motion,
-                                    current_gate, &mut next_gate);
+                                    current_gate, &mut next_gate, strip_right);
                             }
                             for &pin_id in pins {
                                 let neutral = am_canon::ALL_PINS.iter()
@@ -1701,7 +1727,23 @@ pub(crate) fn show_automap_combiner_body(
                                     if has_override {
                                         name = name.color(egui::Color32::from_rgb(255, 170, 80));
                                     }
-                                    ui.label(name);
+                                    // Which ports offer this pin goes in the hover text: at
+                                    // the end of the row it pushed every row to a different
+                                    // length for something the port dropdown already lists.
+                                    let who = overlap.get(pin_id).filter(|w| w.len() >= 2).map(|w| {
+                                        w.iter().map(|i| format!("in_{i}")).collect::<Vec<_>>().join(", ")
+                                    });
+                                    let label = ui.label(name);
+                                    if let Some(who) = who {
+                                        label.on_hover_text(format!("Offered by {who}"));
+                                    }
+                                    // The two dropdowns end where the port strips end, on
+                                    // every row, whatever the pin is called.
+                                    let combos_w = 58.0 + 54.0 + ui.spacing().item_spacing.x;
+                                    let spare = strip_right - ui.cursor().left() - combos_w;
+                                    if spare > 0.0 {
+                                        ui.add_space(spare);
+                                    }
 
                                     // Stick and motion pins only expose
                                     // SORT/ADD/MULT — bitwise OR/AND/XOR don't
@@ -1747,13 +1789,6 @@ pub(crate) fn show_automap_combiner_body(
                                             }
                                         });
 
-                                    if let Some(who) = overlap.get(pin_id) {
-                                        if who.len() >= 2 {
-                                            let parts: Vec<String> = who.iter().map(|i| format!("in_{i}")).collect();
-                                            ui.label(egui::RichText::new(format!("  ({})", parts.join(",")))
-                                                .small().weak());
-                                        }
-                                    }
                                 });
                             }
                         });

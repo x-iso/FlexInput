@@ -65,16 +65,29 @@ pub(crate) const STRIP_H: f32 = 25.0;
 /// The drag handle, the remove button, and the air inside a strip. The `×` is the same
 /// square as the Combiner's `small_button("×")` as near as a 22-point strip allows, so the
 /// two kinds of strip read as the same control.
-const STRIP_HANDLE_W: f32 = 13.0;
-const STRIP_REMOVE_W: f32 = 14.0;
+pub(crate) const STRIP_HANDLE_W: f32 = 13.0;
+pub(crate) const STRIP_REMOVE_W: f32 = 14.0;
 /// The remove button's height, centred on the strip.
-const STRIP_REMOVE_H: f32 = STRIP_H - 4.0;
-const STRIP_GAP: f32 = 4.0;
-const STRIP_PAD: f32 = 5.0;
+pub(crate) const STRIP_REMOVE_H: f32 = STRIP_H - 4.0;
+pub(crate) const STRIP_GAP: f32 = 4.0;
+pub(crate) const STRIP_PAD: f32 = 5.0;
 /// A name cell never shorter than this (a port with no name is still worth clicking) and
 /// never wider than this: past it the module is wider than any patch wants.
 const STRIP_NAME_MIN: f32 = 28.0;
-const STRIP_NAME_MAX: f32 = 140.0;
+/// Ten blocks of name: past that a name is a sentence, and is cut with an ellipsis.
+const STRIP_NAME_MAX: f32 = 280.0;
+
+/// Select everything in a text field that has just been opened on existing text, so typing
+/// replaces it and a click or an arrow key edits it. egui has no select-all-on-focus; this
+/// writes the selection into the field's own state, which it reads on its next frame.
+pub(crate) fn select_all(ctx: &egui::Context, field: egui::Id, text: &str) {
+    let mut state = egui::TextEdit::load_state(ctx, field).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(0),
+        egui::text::CCursor::new(text.chars().count()),
+    )));
+    state.store(ctx, field);
+}
 
 /// Which side of the node the strips list.
 #[derive(Clone, Copy, PartialEq)]
@@ -115,6 +128,15 @@ pub(crate) fn add_port(node_id: NodeId, module_id: &str, snarl: &mut Snarl<NodeD
             format!("out_{}", node.outputs.len()),
             SignalType::Any,
         )),
+        "module.automap_fork" => node.outputs.push(PinDescriptor::new(
+            format!("out_{}", node.outputs.len()),
+            SignalType::AutoMap,
+        )),
+        // Like the Selector: the first input is `select`.
+        "module.automap_selector" => node.inputs.push(PinDescriptor::new(
+            format!("in_{}", node.inputs.len().saturating_sub(1)),
+            SignalType::AutoMap,
+        )),
         _ => {}
     }
 }
@@ -124,19 +146,79 @@ pub(crate) fn add_port(node_id: NodeId, module_id: &str, snarl: &mut Snarl<NodeD
 #[derive(Clone, Copy)]
 pub(crate) struct InterpRow(usize);
 
-/// The body of a Selector (its value inputs) or a Split (its outputs): `pin_from` is the
-/// index in that side where the listed ports start - a Selector's `select` pin is not a
-/// strip - and `interp_row` is the band the interpolate toggle sits on.
-/// Whether a node's body should be drawn at all. Snarl runs the body of a **collapsed** node
-/// anyway and shifts its cursor up under the header's clip, which is how a folded Macro came
-/// to paint its port row - icon, name, `×` - straight across the header's own name, a folded
-/// Dropdown painted an option over the word "Dropdown", and a folded Oscillator put its phase
-/// pill under "Oscillator". Anything below the frame that is still drawn is also still clicked:
-/// the strips of a folded Selector sat in nothing and answered the pointer there.
+impl InterpRow {
+    /// A list with no interpolate toggle: the AutoMap Fork and Selector pass one whole bus or
+    /// another, and there is nothing between two buses to blend.
+    pub(crate) const NONE: InterpRow = InterpRow(usize::MAX);
+
+    fn band(self) -> Option<usize> {
+        (self.0 != usize::MAX).then_some(self.0)
+    }
+}
+
+/// Whether a node is unfolded. A folded node's body is laid out and not drawn - that is
+/// `show_body`'s doing, for every module - so a body only asks when it wants to skip work.
 pub(crate) fn node_open(snarl: &Snarl<NodeData>, node: NodeId) -> bool {
     snarl.get_node_info(node).map(|i| i.open).unwrap_or(true)
 }
 
+/// What a folded module still says under its header: the number it is set to or is showing.
+/// A module with nothing worth reading off it folded says nothing.
+fn folded_reading(node: &NodeData) -> Option<String> {
+    match node.module_id.as_str() {
+        "module.knob" => {
+            let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+            let v = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            Some(format!("{:.2}", v.clamp(if bipolar { -1.0 } else { 0.0 }, 1.0)))
+        }
+        "module.constant" => {
+            let stored = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let res = node
+                .params
+                .get("res")
+                .and_then(|v| v.as_f64())
+                .map(|r| r as i32)
+                .unwrap_or(CONSTANT_RES_DEFAULT)
+                .clamp(0, CONSTANT_RES_MAX);
+            Some(constant_text(constant_snap(stored, res), res))
+        }
+        "display.readout" => Some(signal_text(node.extra.last_signals.first().copied().flatten().as_ref())),
+        _ => None,
+    }
+}
+
+/// Paint a folded module's reading in the band its frame keeps under the header. On the grid
+/// a folded frame is two blocks and the header one, so the band is there and empty. Painted
+/// before the body's painter is switched off, and clipped to the frame rather than to the
+/// body's column, which is nothing while the node is folded.
+pub(crate) fn paint_folded_reading(ui: &egui::Ui, snarl: &Snarl<NodeData>, node_id: NodeId, view_salt: u64) {
+    let Some(text) = snarl.get_node(node_id).and_then(folded_reading) else { return };
+    let Some(inner) = module_icons::module_inner(ui, view_salt, node_id) else { return };
+    let band = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 30.0), inner.max);
+    if band.height() <= 12.0 {
+        return;
+    }
+    let col = ui.visuals().strong_text_color();
+    let p = ui.painter().with_clip_rect(inner);
+    // The size it fits at: a long number gives up size before it gives up digits.
+    let mut font = egui::TextStyle::Body.resolve(ui.style());
+    let mut g = p.layout_no_wrap(text.clone(), font.clone(), col);
+    if g.size().x > band.width() {
+        font.size = (font.size * band.width() / g.size().x).max(8.0);
+        g = p.layout_no_wrap(text, font, col);
+    }
+    let at = egui::pos2(band.center().x - g.size().x * 0.5, band.center().y - g.size().y * 0.5);
+    let rect = egui::Rect::from_min_size(at, g.size());
+    trace_rect(ui, node_id, "folded_reading", rect);
+    if snarl.get_node(node_id).map_or(false, |n| n.module_id == "module.knob") {
+        trace_rect(ui, node_id, "knob_number", rect);
+    }
+    p.galley(at, g, col);
+}
+
+/// The body of a Selector (its value inputs) or a Split (its outputs): `pin_from` is the
+/// index in that side where the listed ports start - a Selector's `select` pin is not a
+/// strip - and `interp_row` is the band the interpolate toggle sits on.
 pub(crate) fn show_port_strips(
     node_id: NodeId,
     inputs: &[InPin],
@@ -149,12 +231,6 @@ pub(crate) fn show_port_strips(
     first_row: usize,
     interp_row: InterpRow,
 ) {
-    // The strips and their sockets are one grid: the pin column adds no spacing of its own
-    // (`item_spacing.y` is zero there), so the strips advance by exactly what a pin row is
-    // allocated. That pitch is a floor rather than a constant - when the column is taller
-    // than the rows need, because the grid rounded the module's height up to a whole block,
-    // the spare is shared out between the bands and the last strip lands near the bottom of
-    // the body instead of leaving a row-sized gap that changes size with every port added.
     // The port names come from the node, up front: the loop can't hold a borrow of snarl
     // while it mutates pins.
     let names: Vec<String> = snarl.get_node(node_id).map_or_else(Vec::new, |n| {
@@ -168,13 +244,19 @@ pub(crate) fn show_port_strips(
     if n == 0 {
         return;
     }
-    let bands = (first_row + n).max(interp_row.0 + 1);
-    let pitch = super::kit::strip_advance(module_id, ui).unwrap_or(STRIP_H);
+    let bands = (first_row + n).max(interp_row.band().map_or(0, |b| b + 1));
+    // The strips and their sockets are one grid, and `StripRows` is what knows where its rows
+    // are: taken here, before anything is allocated, while the cursor is at the body's top.
+    let rows_at = super::kit::StripRows::at_cursor(module_id, ui);
+    let pitch = rows_at.advance;
     let mut edit = ui.ctx().data(|d| d.get_temp::<StripEdit>(strip_edit_key(node_id))).unwrap_or_default();
     let font = egui::TextStyle::Small.resolve(ui.style());
+    // The text being typed into a name is one of the names: the strip widens as it is typed.
     let name_w = names
         .iter()
-        .map(|s| ui.painter().layout_no_wrap(s.clone(), font.clone(), egui::Color32::PLACEHOLDER).size().x)
+        .map(String::as_str)
+        .chain(edit.port.is_some().then_some(edit.buf.as_str()))
+        .map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 6.0)
         .fold(0.0f32, f32::max)
         .clamp(STRIP_NAME_MIN, STRIP_NAME_MAX);
     // The row's parts: handle, optional `×`, and the name - the floor a strip needs to hold
@@ -185,7 +267,6 @@ pub(crate) fn show_port_strips(
         + STRIP_GAP
         + name_w;
     let toggle_w = TOGGLE_SMALL.x;
-    let top = ui.cursor().top();
     let left = ui.cursor().left();
     // The strips hug the side their sockets are on: a Selector's ports are inputs, on the
     // left, so its strips start at the left; a Split's are outputs, on the right, so its
@@ -196,7 +277,7 @@ pub(crate) fn show_port_strips(
     // it shares a band the list pays for it: the toggle has its room at the left and every
     // strip keeps the same width from the same edge, so the setting can make a Split wider
     // than a Selector but never ragged or overlapping.
-    let interp_band = Some(interp_row.0);
+    let interp_band = interp_row.band();
     let shares_first = interp_band == Some(first_row);
     let share_room = if shares_first { toggle_w + STRIP_GAP } else { 0.0 };
     // What the body **asks for** is content: the longest name plus the parts around it, and
@@ -213,7 +294,7 @@ pub(crate) fn show_port_strips(
     // stops being needed.
     let rows = bands;
     let list_w = alloc_w;
-    let list_h = (rows as f32 * pitch).max(pitch);
+    let list_h = rows_at.height(rows);
     ui.allocate_exact_size(egui::vec2(list_w, list_h), egui::Sense::hover());
     // Folded, the list keeps the frame's blocks and draws none of itself. Snarl runs a collapsed
     // node's body and shifts it up under the header's clip: the strips were painted above the
@@ -236,7 +317,7 @@ pub(crate) fn show_port_strips(
     // The interpolate toggle, on the band its own pin sits on.
     if let Some(row) = interp_band {
         let r = egui::Rect::from_min_size(
-            egui::pos2(left, top + row as f32 * pitch + (pitch - TOGGLE_SMALL.y) * 0.5),
+            egui::pos2(left, rows_at.center_y(row) - TOGGLE_SMALL.y * 0.5),
             TOGGLE_SMALL,
         );
         let mut child = ui.new_child(
@@ -264,35 +345,7 @@ pub(crate) fn show_port_strips(
     // under the finger. The pins themselves don't move until the drag ends, and when they
     // do the offsets are re-keyed to the new order - the strips carry on from exactly where
     // they were painted.
-    let mut anim = ui
-        .ctx()
-        .data(|d| d.get_temp::<StripAnim>(strip_anim_key(node_id)))
-        .unwrap_or_default();
-    anim.off.resize(n, 0.0);
-    let mut settling = false;
-    {
-        let d = anim.drag.filter(|d| *d < n);
-        let s = d.map_or(0, |d| {
-            ((anim.acc / pitch).trunc() as isize).clamp(-(d as isize), n as isize - 1 - d as isize)
-        });
-        let (lo, hi) = d.map_or((0, 0), |d| {
-            (
-                (d as isize).min(d as isize + s) as usize,
-                (d as isize).max(d as isize + s) as usize,
-            )
-        });
-        for (i, off) in anim.off.iter_mut().enumerate() {
-            let target = match d {
-                Some(d) if i == d => anim.acc.clamp(-(i as f32) * pitch, ((n - 1 - i) as f32) * pitch),
-                Some(d) if i > lo && i < hi => if i < d { pitch } else { -pitch },
-                _ => 0.0,
-            };
-            *off += (target - *off) * 0.5;
-            if (target - *off).abs() > 0.4 {
-                settling = true;
-            }
-        }
-    }
+    let mut anim = StripAnim::begin(ui.ctx(), strip_anim_key(node_id), n, pitch);
 
     // Read once, before the loop takes the UI mutably for its widgets.
     let (fill_active, fill_hovered, fill_idle) = {
@@ -310,6 +363,7 @@ pub(crate) fn show_port_strips(
     let mut glow = vec![0.0f32; n];
     if let Some(v) = snarl
         .get_node(node_id)
+        .filter(|_| interp_band.is_some())
         .and_then(|nd| nd.extra.last_signals.first())
         .and_then(|s| s.as_ref())
         .and_then(|sig| match sig {
@@ -345,13 +399,12 @@ pub(crate) fn show_port_strips(
         } else {
             left
         };
-        let strip = egui::Rect::from_min_size(
-            egui::pos2(
-                x,
-                top + row as f32 * pitch + (pitch - STRIP_H) * 0.5 + 1.0 + anim.off[i],
-            ),
-            egui::vec2(w, STRIP_H - 2.0),
-        );
+        // A point of air above and below, so two strips are two strips; the strip stays
+        // centred on its socket.
+        let strip = rows_at
+            .band(row, x, w)
+            .shrink2(egui::vec2(0.0, 1.0))
+            .translate(egui::vec2(0.0, anim.off[i]));
         trace_rect(ui, node_id, &format!("strip_{i}"), strip);
         let dragged = anim.drag == Some(i);
         let hovered = n > 2 && ui.rect_contains_pointer(strip);
@@ -408,29 +461,9 @@ pub(crate) fn show_port_strips(
             strip_font.clone(),
             weak,
         );
-        if hresp.drag_started() {
-            anim.drag = Some(i);
-            anim.acc = 0.0;
+        if let Some(mv) = anim.handle(&hresp, i) {
+            to_move = Some(mv);
         }
-        if hresp.dragged() && anim.drag == Some(i) {
-            let floor = -(i as f32) * pitch;
-            let ceil = ((n - 1 - i) as f32) * pitch;
-            anim.acc = (anim.acc + hresp.drag_delta().y).clamp(floor, ceil);
-        }
-        if hresp.drag_stopped() && anim.drag == Some(i) {
-            let steps = (anim.acc / pitch).round() as isize;
-            let to = (i as isize + steps).clamp(0, n as isize - 1) as usize;
-            if to != i {
-                // Carry the painted offsets across the reorder: the strips go on from
-                // exactly where the preview left them rather than snapping back.
-                anim.off = remap_offsets(&anim.off, i, to, pitch);
-                settling = true;
-            }
-            anim.drag = None;
-            anim.acc = 0.0;
-            to_move = Some((i, to));
-        }
-        settling = settling || anim.drag.is_some();
         hresp.on_hover_text("Drag to move this port up or down the list");
         cx += STRIP_HANDLE_W + STRIP_GAP * 0.5;
 
@@ -463,11 +496,12 @@ pub(crate) fn show_port_strips(
                 field,
                 egui::TextEdit::singleline(&mut buf)
                     .font(strip_font.clone())
-                    .hint_text(if name.is_empty() { "name" } else { name.as_str() })
+                    .hint_text("name")
                     .desired_width(field.width()),
             );
             if edit.focus {
                 resp.request_focus();
+                select_all(ui.ctx(), resp.id, &buf);
                 edit.focus = false;
             }
             let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
@@ -516,7 +550,9 @@ pub(crate) fn show_port_strips(
             );
             let mods = ui.input(|inp| inp.modifiers);
             if resp.double_clicked() || (mods.command && resp.clicked()) {
-                edit = StripEdit { port: Some(i), buf: String::new(), focus: true };
+                // Open on the name it has, all of it selected: typing replaces it, a click
+                // or an arrow key puts the cursor in it.
+                edit = StripEdit { port: Some(i), buf: name.clone(), focus: true };
             }
             let hover = if elided {
                 format!("{name}\nDouble-click to rename this port. The name is what the patch stores.")
@@ -528,12 +564,7 @@ pub(crate) fn show_port_strips(
     }
 
     ui.ctx().data_mut(|d| d.insert_temp(strip_edit_key(node_id), edit));
-    ui.ctx().data_mut(|d| d.insert_temp(strip_anim_key(node_id), anim));
-    if settling {
-        // The offsets are eased a step per frame, so the frames have to keep coming until
-        // they've landed.
-        ui.ctx().request_repaint();
-    }
+    anim.end(ui.ctx(), strip_anim_key(node_id));
 
     // Applied after the loop: these change the pins, and the loop is reading them.
     if let Some(i) = to_remove {
@@ -571,13 +602,113 @@ fn strip_anim_key(node: NodeId) -> egui::Id {
     egui::Id::new(("fxi_strip_anim", node.0))
 }
 
-/// The live state of a port list's drag preview: which port is under the finger, how far
-/// it's been pulled, and the offset each strip is currently painted at.
+/// The live state of a list's drag-to-reorder: which row is under the finger, how far it's
+/// been pulled, and the offset each row is currently painted at. One of these drives every
+/// list of strips on the canvas (Selector, Split, Macro Output, AutoMap Combiner), so a row
+/// picked up behaves the same on all of them: it rides under the finger, the rows it passes
+/// slide a pitch aside, and on release they carry on from where they were painted.
+///
+/// A frame of it: [`StripAnim::begin`] before the rows, [`StripAnim::offset`] for where to
+/// paint row `i`, [`StripAnim::handle`] with each response that can drag row `i` (it returns
+/// the move when the finger lets go), [`StripAnim::end`] after the rows.
 #[derive(Clone, Default)]
-struct StripAnim {
+pub(crate) struct StripAnim {
     drag: Option<usize>,
     acc: f32,
     off: Vec<f32>,
+    n: usize,
+    pitch: f32,
+    settling: bool,
+}
+
+impl StripAnim {
+    /// Load the list's state and ease every row a step toward where it belongs this frame.
+    pub(crate) fn begin(ctx: &egui::Context, key: egui::Id, n: usize, pitch: f32) -> Self {
+        let mut anim = ctx.data(|d| d.get_temp::<StripAnim>(key)).unwrap_or_default();
+        anim.off.resize(n, 0.0);
+        anim.n = n;
+        anim.pitch = pitch;
+        anim.settling = false;
+        let d = anim.drag.filter(|d| *d < n);
+        // Where the held row would land if it were let go now - the same rounding the release
+        // uses - and so which rows it has passed: those step a pitch into the gap it left.
+        // (This counted whole pitches and left out the row at the far end, so a row dragged
+        // onto its neighbour sat on top of it until the finger lifted.)
+        let land = d.map(|d| {
+            let s = ((anim.acc / pitch).round() as isize).max(-(d as isize)).min(n as isize - 1 - d as isize);
+            (d as isize + s) as usize
+        });
+        let acc = anim.acc;
+        for (i, off) in anim.off.iter_mut().enumerate() {
+            let target = match (d, land) {
+                (Some(d), _) if i == d => acc.max(-(i as f32) * pitch).min(((n - 1 - i) as f32) * pitch),
+                (Some(d), Some(to)) if i > d && i <= to => -pitch,
+                (Some(d), Some(to)) if i < d && i >= to => pitch,
+                _ => 0.0,
+            };
+            *off += (target - *off) * 0.5;
+            if (target - *off).abs() > 0.4 {
+                anim.settling = true;
+            }
+        }
+        anim
+    }
+
+    /// How far from its own row the row `i` is painted this frame.
+    pub(crate) fn offset(&self, i: usize) -> f32 {
+        self.off.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// Whether row `i` is the one under the finger.
+    pub(crate) fn dragged(&self, i: usize) -> bool {
+        self.drag == Some(i)
+    }
+
+    /// Feed a response that drags row `i` - its handle, or anything else on the row that is
+    /// a grip. Returns `(from, to)` on the frame the finger lets go.
+    pub(crate) fn handle(&mut self, resp: &egui::Response, i: usize) -> Option<(usize, usize)> {
+        let (n, pitch) = (self.n, self.pitch);
+        if resp.drag_started() {
+            self.drag = Some(i);
+            self.acc = 0.0;
+        }
+        if resp.dragged() && self.drag == Some(i) {
+            let floor = -(i as f32) * pitch;
+            let ceil = (n.saturating_sub(1 + i) as f32) * pitch;
+            self.acc = (self.acc + resp.drag_delta().y).max(floor).min(ceil);
+        }
+        let mut moved = None;
+        if resp.drag_stopped() && self.drag == Some(i) {
+            let steps = (self.acc / pitch).round() as isize;
+            let to = (i as isize + steps).max(0).min(n as isize - 1) as usize;
+            if to != i {
+                // Carry the painted offsets across the reorder: the rows go on from exactly
+                // where the preview left them rather than snapping back.
+                self.off = remap_offsets(&self.off, i, to, pitch);
+                self.settling = true;
+            }
+            self.drag = None;
+            self.acc = 0.0;
+            moved = Some((i, to));
+        }
+        self.settling = self.settling || self.drag.is_some();
+        moved
+    }
+
+    /// Keep the state for the next frame, and keep the frames coming while rows are still
+    /// easing: the offsets move a step per frame.
+    pub(crate) fn end(mut self, ctx: &egui::Context, key: egui::Id) {
+        // A finger that left without the handle saying so (the row went away under it).
+        if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+            self.drag = None;
+            self.acc = 0.0;
+        }
+        let settling = self.settling;
+        ctx.data_mut(|d| d.insert_temp(key, self));
+        if settling {
+            ctx.request_repaint();
+        }
+    }
 }
 
 /// Re-key the painted offsets for a list after port `from` was moved to `to`: a strip that
@@ -671,6 +802,42 @@ pub(crate) fn dropdown_read_selected(node: &NodeData, n: usize) -> usize {
 
 pub(crate) fn dropdown_write_selected(node: &mut NodeData, idx: usize) {
     node.params.insert("selected_index".to_string(), Value::from(idx as u64));
+}
+
+/// The option a Dropdown is sending out right now, where `selected` is the one it was set to.
+/// The two differ while a wire on the `shift` pin is stepping the selection.
+///
+/// Read from the module's own `index` output, not worked out again from what is on the pin:
+/// the engine mirrors every node's *outputs* to the UI (`last_out`) and only a handful of
+/// modules' *inputs* (`last_signals`), and a Dropdown is not one of those - so a body that read
+/// the pin always saw nothing on it, and marked the option it was set to whatever the wire was
+/// doing. The output is also simply the truth: no second copy of the engine's wrap to keep in
+/// step. With nothing wired the option set here is the one that comes out, and saying so
+/// directly keeps a click from waiting a tick on the engine to be seen.
+pub(crate) fn dropdown_live_index(snarl: &Snarl<NodeData>, node_id: NodeId, n: usize, selected: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let wired = !snarl.in_pin(InPinId { node: node_id, input: 0 }).remotes.is_empty();
+    if !wired {
+        return selected.min(n - 1);
+    }
+    match snarl.get_node(node_id).and_then(|nd| nd.extra.last_out.get(1).copied().flatten()) {
+        Some(Signal::Int(i)) if i >= 0 => (i as usize).min(n - 1),
+        _ => selected.min(n - 1),
+    }
+}
+
+/// What to store so that option `want` is the one that comes out, while the `shift` pin is
+/// holding the list `live - selected` steps away from where it was set: choosing an option
+/// under a shift moves the base, it doesn't fight the pin.
+pub(crate) fn dropdown_base_for(want: usize, selected: usize, live: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let m = n as i64;
+    let shift = live as i64 - selected as i64;
+    (((want as i64 - shift) % m + m) % m) as usize
 }
 
 /// Per-node editing state held in egui memory: which row is being renamed and
@@ -775,32 +942,13 @@ pub(crate) fn show_dropdown_body(
 
     // The `shift` pin, if anyone wired it: what it says is *added* to the option chosen here
     // rather than replacing it, so the module keeps being the starting point and a dial or a
-    // comparator walks the list from there. Wrapped both ways, exactly as the engine does it, so
-    // what the module shows is the option that is actually coming out of it.
+    // comparator walks the list from there. `effective` is the option actually coming out.
     let n_opts = options.len();
     // Wired or not matters to the marks below: with nothing on the pin, the
     // option this module was set to is the option that comes out, and there is nothing extra
     // to say about it.
     let shift_wired = inputs.first().is_some_and(|p| !p.remotes.is_empty());
-    let shift = snarl
-        .get_node(node_id)
-        .and_then(|nd| nd.extra.last_signals.first().copied().flatten())
-        .map(|s| match s {
-            flexinput_core::Signal::Float(v) => v.round() as i64,
-            flexinput_core::Signal::Int(v) => v as i64,
-            flexinput_core::Signal::Bool(b) => i64::from(b),
-            _ => 0,
-        })
-        .unwrap_or(0);
-    let wrap = |i: i64| -> usize {
-        if n_opts == 0 {
-            0
-        } else {
-            let m = n_opts as i64;
-            (((i % m) + m) % m) as usize
-        }
-    };
-    let effective = if shift == 0 { selected } else { wrap(selected as i64 + shift) };
+    let effective = dropdown_live_index(snarl, node_id, n_opts, selected);
 
     // ── The reading (pinnable): the option coming out of the module, shift included ──
     let reading = row_rect(0);
@@ -834,7 +982,7 @@ pub(crate) fn show_dropdown_body(
                         // shift pin is holding it somewhere else means choosing where that
                         // addition should land: the option you clicked is the one that comes
                         // out, and the menu doesn't fight the pin.
-                        new_selected = wrap(i as i64 - shift);
+                        new_selected = dropdown_base_for(i, selected, effective, n_opts);
                         selected_changed = true;
                     }
                 }
@@ -982,7 +1130,7 @@ pub(crate) fn show_dropdown_body(
             // Single click (no Alt) -> choose this entry, undoing the shift pin's step so the
             // option clicked is the option that comes out.
             if label.clicked() && !alt && !label.double_clicked() {
-                new_selected = wrap(i as i64 - shift);
+                new_selected = dropdown_base_for(i, selected, effective, n_opts);
                 selected_changed = true;
             }
             // Right-click context menu.
@@ -1164,7 +1312,10 @@ pub(crate) fn render_dropdown_selection(
     let selected = inner_snarl.get_node(inner_id)
         .map(|n| dropdown_read_selected(n, options.len()))
         .unwrap_or(0);
-    let current = options.get(selected).cloned().unwrap_or_default();
+    // The pinned box says what the module's own reading says: the option coming out, which a
+    // wire on `shift` may have stepped away from the one stored.
+    let live = dropdown_live_index(inner_snarl, inner_id, options.len(), selected);
+    let current = options.get(live).cloned().unwrap_or_default();
 
     let avail = egui::vec2(container.x.max(40.0), container.y.max(16.0));
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
@@ -1239,8 +1390,8 @@ pub(crate) fn render_dropdown_selection(
             ui.set_min_width(rect.width().max(80.0));
             for (i, opt) in options.iter().enumerate() {
                 let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
-                if ui.selectable_label(i == selected, label).clicked() {
-                    chosen = Some(i);
+                if ui.selectable_label(i == live, label).clicked() {
+                    chosen = Some(dropdown_base_for(i, selected, live, options.len()));
                 }
             }
         },
@@ -1353,7 +1504,12 @@ pub(crate) const PILL_H: f32 = 20.0;
 /// The corner radius, and the font, so the label and value of two different pills
 /// sitting one under the other read as the same kind of thing.
 const PILL_RADIUS: f32 = 4.0;
-const PILL_FONT: f32 = 12.0;
+pub(crate) const PILL_FONT: f32 = 12.0;
+
+/// The pill font at the rows' current zoom (`curve_rows::zoom`: 1 in a body).
+pub(crate) fn pill_font() -> egui::FontId {
+    egui::FontId::monospace(super::scale::quantize_font_size((PILL_FONT * super::curve_rows::zoom()).max(4.0)))
+}
 
 /// The value cell of a pill drawn across `rect`: everything right of the `label_w`-wide
 /// label cell. That's the half that answers the pointer, and what a caller maps a pointer
@@ -1363,18 +1519,45 @@ const PILL_FONT: f32 = 12.0;
 /// font made the blue backdrop narrower than the word it stands behind - "min" and "step" both
 /// ran out of their own colour block.
 pub(crate) fn pill_label_width(ui: &egui::Ui, label: &str) -> f32 {
+    let label = pill_label_parts(label).0;
     if label.is_empty() {
         0.0
     } else {
         ui.painter()
             .layout_no_wrap(
                 label.to_owned(),
-                egui::FontId::monospace(PILL_FONT),
+                pill_font(),
                 ui.visuals().text_color(),
             )
             .size()
             .x
-            + 8.0
+            + 8.0 * super::curve_rows::zoom()
+    }
+}
+
+/// A pill's label as `(short, long)`. A label can be written `short|long` - `stab|stabilise`
+/// - and the pill shows the long one whenever it and the value both fit the pill's width
+/// ([`pill_label_for`]); everything that sizes a pill measures the short one, so the long
+/// name only ever fills room that is there. A label with no `|` is both.
+pub(crate) fn pill_label_parts(label: &str) -> (&str, &str) {
+    label.split_once('|').unwrap_or((label, label))
+}
+
+/// Which of a `short|long` label a pill `width` wide shows beside `value`, and how wide its
+/// label cell is. `short_w` is the short label's cell, as the caller measured it.
+pub(crate) fn pill_label_for<'a>(ui: &egui::Ui, label: &'a str, short_w: f32, value: &str, width: f32) -> (&'a str, f32) {
+    let (short, long) = pill_label_parts(label);
+    if long == short || short_w <= 0.0 {
+        return (short, short_w);
+    }
+    let z = super::curve_rows::zoom();
+    let measure = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), pill_font(), egui::Color32::PLACEHOLDER).size().x;
+    let long_w = measure(long) + 8.0 * z;
+    // The value keeps air either side of it, as it has in a pill sized for the short name.
+    if long_w + measure(value) + 12.0 * z <= width {
+        (long, long_w)
+    } else {
+        (short, short_w)
     }
 }
 pub(crate) fn pill_value_cell(rect: egui::Rect, label_w: f32) -> egui::Rect {
@@ -1391,6 +1574,7 @@ pub(crate) fn setting_pill(
     value: &str,
     label_w: f32,
 ) -> (egui::Response, egui::Rect) {
+    let (label, label_w) = pill_label_for(ui, label, label_w, value, rect.width());
     let label_cell =
         egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + label_w, rect.bottom()));
     let value_cell = pill_value_cell(rect, label_w);
@@ -1442,7 +1626,7 @@ pub(crate) fn setting_pill(
         egui::Stroke::NONE,
         egui::StrokeKind::Inside,
     );
-    let font = egui::FontId::monospace(PILL_FONT);
+    let font = pill_font();
     painter.text(label_cell.center(), egui::Align2::CENTER_CENTER, label, font.clone(), label_text);
     painter.text(value_cell.center(), egui::Align2::CENTER_CENTER, value, font, value_text);
     (resp, value_cell)
@@ -1506,7 +1690,7 @@ pub(crate) fn value_pill(
         let mut buf = edit.buf.clone();
         let field = child.add(
             egui::TextEdit::singleline(&mut buf)
-                .font(egui::FontId::monospace(PILL_FONT))
+                .font(pill_font())
                 .horizontal_align(egui::Align::Center)
                 .margin(egui::Vec2::new(2.0, 1.0))
                 .hint_text(shown)
@@ -2500,7 +2684,15 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     const TYPE_W: f32 = 46.0;
     const RM_W: f32 = 22.0;
     const NAME_MIN: f32 = 28.0;
-    const NAME_MAX: f32 = 140.0;
+    const NAME_MAX: f32 = STRIP_NAME_MAX;
+    // What the strip keeps clear between its right edge and the `×`.
+    const EDGE: f32 = 2.0;
+    // Which port's name is being edited - by its id, so a row that moved under a drag keeps
+    // the field it had open. Loaded before the column is measured: the text being typed is
+    // one of the names the column has to hold, so the module widens as it is typed rather
+    // than when Enter is pressed.
+    let edit_key = egui::Id::new(("fxi_macro_edit", node_id.0));
+    let mut edit = ui.ctx().data(|d| d.get_temp::<MacroEdit>(edit_key)).unwrap_or_default();
     let name_font = ui
         .style()
         .text_styles
@@ -2511,18 +2703,19 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     let ask_name_w = ports
         .iter()
         .map(|p| if p.name.is_empty() { "—" } else { p.name.as_str() })
-        .map(|n| ui.painter().layout_no_wrap(n.to_string(), name_font.clone(), name_colour).size().x)
+        .chain(edit.editing.is_some().then_some(edit.buf.as_str()))
+        .map(|n| ui.painter().layout_no_wrap(n.to_string(), name_font.clone(), name_colour).size().x + 6.0)
         .fold(NAME_MIN, |widest, w| widest.max(w))
         .clamp(NAME_MIN, NAME_MAX);
-    let list_w_ask = HANDLE_W + ICON_W + ask_name_w + TYPE_W + RM_W + 4.0 * ROW;
+    let list_w_ask = HANDLE_W + ICON_W + ask_name_w + TYPE_W + RM_W + 4.0 * ROW + EDGE;
 
-    // The rows sit on the pitch the output pins are allocated, which is what keeps each
-    // socket level with the strip that names it: the pins are laid out before the body is
-    // drawn, so neither side can measure the other. Nothing is added between rows - this
-    // module has no input column, and the output column sets its own row spacing to nothing.
-    let row_h = kit::strip_pitch("module.macro", ports.len(), ui)
-        .unwrap_or_else(|| ui.spacing().interact_size.y.max(PILL_H));
-    let list_h = ports.len() as f32 * row_h;
+    // The rows are the rows of the output sockets, from the body's top down - the same
+    // `StripRows` a Split's strips stand on, so the two can't disagree about where a socket
+    // is. (They did: these rows were laid at the height a pin row is allocated, without the
+    // spacing the pin column puts under each one, and the list was centred in the body.)
+    let rows_at = kit::StripRows::at_cursor("module.macro", ui);
+    let (row_h, pitch) = (rows_at.row_h, rows_at.advance);
+    let list_h = rows_at.height(ports.len());
     ui.allocate_exact_size(egui::vec2(list_w_ask, list_h), egui::Sense::hover());
     // Folded, the column is still asked for - the frame keeps its blocks - but no row is drawn:
     // snarl runs a collapsed node's body and shifts it under the header's clip, which is how a
@@ -2544,47 +2737,29 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
     trace_rect(ui, node_id, "body_column", column);
     let list_w = column.width().max(list_w_ask);
     let list_left = column.left().max(inner.left());
-    let name_w = (list_w - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW).max(NAME_MIN);
-    let top = kit::group_top(column, list_h);
-    let row_rect = |i: usize| {
-        egui::Rect::from_min_size(
-            egui::pos2(list_left, top + i as f32 * row_h),
-            egui::vec2(list_w, row_h),
-        )
+    let name_w = (list_w - HANDLE_W - ICON_W - TYPE_W - RM_W - 4.0 * ROW - EDGE).max(NAME_MIN);
+    let row_rect = |i: usize| rows_at.band(i, list_left, list_w);
+    let (fill_idle, fill_held) = {
+        let v = ui.visuals();
+        (v.widgets.inactive.weak_bg_fill, v.widgets.active.bg_fill)
     };
+    // A port picked up follows the finger and the ports it passes slide a row aside - the
+    // same `StripAnim` the Split and Selector strips move by, so a port you grab behaves
+    // like a pin you grab.
     let drag_key = egui::Id::new(("fxi_macro_drag", node_id.0));
-    let mut drag = ui.ctx().data(|d| d.get_temp::<OptionDrag>(drag_key)).unwrap_or_default();
-    // Which port's name is being edited - by its id, so a row that moved under a drag keeps
-    // the field it had open.
-    let edit_key = egui::Id::new(("fxi_macro_edit", node_id.0));
-    let mut edit = ui.ctx().data(|d| d.get_temp::<MacroEdit>(edit_key)).unwrap_or_default();
-
-    let n_ports = ports.len();
-    // A port picked up follows the finger, and the ports the gap has travelled through step
-    // a row aside: the language the Split and Selector strips use, so a port you grab
-    // behaves like a pin you grab. The lifts read the drag as it stood coming into this
-    // frame, which is what makes the slide continuous rather than a jump at each crossing.
-    let lifts: Vec<f32> = if drag.active {
-        (0..ports.len())
-            .map(|i| {
-                if i == drag.held {
-                    let lo = -(row_h * drag.held as f32);
-                    let hi = row_h * (ports.len() as f32 - 1.0 - drag.held as f32);
-                    drag.lift.clamp(lo, hi)
-                } else if drag.held < drag.current && i > drag.held && i <= drag.current {
-                    -row_h
-                } else if drag.held > drag.current && i < drag.held && i >= drag.current {
-                    row_h
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    } else {
-        vec![0.0; ports.len()]
-    };
+    let mut anim = StripAnim::begin(ui.ctx(), drag_key, ports.len(), pitch);
     for (i, port) in ports.iter_mut().enumerate() {
-        let row = row_rect(i).translate(egui::vec2(0.0, lifts[i]));
+        let row = row_rect(i).translate(egui::vec2(0.0, anim.offset(i)));
+        let held = anim.dragged(i);
+        // The strip a Split's port stands on: the row reads as one thing with its socket at
+        // the end of it, and the buttons on it don't each need a plate of their own.
+        ui.painter().rect(
+            row.shrink2(egui::vec2(0.0, 1.0)),
+            4.0,
+            if held { fill_held } else { fill_idle },
+            egui::Stroke::NONE,
+            egui::StrokeKind::Inside,
+        );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(row)
@@ -2606,7 +2781,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
             egui::Align2::CENTER_CENTER,
             "⠿",
             egui::FontId::proportional(12.0),
-            if drag.active && drag.held == i {
+            if held {
                 ui.visuals().strong_text_color()
             } else {
                 ui.visuals().weak_text_color()
@@ -2650,11 +2825,13 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
             let resp = ui.put(
                 name_rect,
                 egui::TextEdit::singleline(&mut buf)
-                    .hint_text(if port.name.is_empty() { "name" } else { port.name.as_str() })
+                    .font(name_font.clone())
+                    .hint_text("name")
                     .desired_width((name_rect.width() - 8.0).max(8.0)),
             );
             if edit.focus {
                 resp.request_focus();
+                select_all(ui.ctx(), resp.id, &buf);
                 edit.focus = false;
             }
             let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
@@ -2709,40 +2886,25 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
                 .on_hover_text(format!("{} - click to rename, drag to reorder", port.name));
             if resp.clicked() {
                 edit.editing = Some(port.id.clone());
-                // Open **empty**, with the current name as the hint: egui 0.33 has no
-                // select-all-on-focus, so a prefilled field is a field that appends - typing
-                // `Kick` over a port called `Left` used to leave it called `LeftKick`.
-                edit.buf = String::new();
+                // Open on the name it has, all of it selected: typing replaces it, and a
+                // click or an arrow key puts the cursor in it to change a letter.
+                edit.buf = port.name.clone();
                 edit.focus = true;
             }
             resp
         };
         trace_rect(ui, node_id, &format!("macro_name_{i}"), name_resp.rect);
-        // Dragging a port past half a row moves it, counted from where the port stands now
-        // rather than the row the finger grabbed, so a two-row drag doesn't bounce it back.
         // The grab is the handle *or* the word - a finger lands on the name, not on the column
         // of dots beside it - and egui stops reporting a click once the pointer has travelled,
-        // which is what keeps a reorder from also opening the field it dragged. The pins and
-        // their wires move with the port further down.
-        if handle.dragged() || (!editing_here && name_resp.dragged()) {
-            if !drag.active || drag.held != i {
-                drag = OptionDrag { held: i, current: i, acc: 0.0, lift: 0.0, active: true };
-            }
-            let d = if !editing_here && name_resp.dragged() {
-                name_resp.drag_delta().y
-            } else {
-                handle.drag_delta().y
-            };
-            drag.acc += d;
-            drag.lift += d;
-            let steps = (drag.acc / row_h).round() as isize;
-            if steps != 0 {
-                // The port's target moves; the pin list does not, until the finger lets go.
-                // Moving it in both places at once is what made a row flicker, and stepping
-                // the commit made a long drag stop at the neighbour.
-                let target = (drag.current as isize + steps).clamp(0, n_ports as isize - 1) as usize;
-                drag.current = target;
-                drag.acc -= steps as f32 * row_h;
+        // which is what keeps a reorder from also opening the field it dragged. Nothing in
+        // the pin list moves until the finger lets go; the pins and their wires move with the
+        // port further down.
+        if let Some((from, to)) = anim.handle(&handle, i) {
+            moved = Some((from, to as isize - from as isize));
+        }
+        if !editing_here {
+            if let Some((from, to)) = anim.handle(&name_resp, i) {
+                moved = Some((from, to as isize - from as isize));
             }
         }
         // The type dropdown and the `×` are pinned to the row's right edge rather than trailing
@@ -2751,7 +2913,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         // fifteen points short of the edge its sockets hang off.
         let btn_h = (row_h - 5.0).max(PILL_H);
         let rm_rect = egui::Rect::from_min_size(
-            egui::pos2(row.right() - RM_W, row.center().y - btn_h * 0.5),
+            egui::pos2(row.right() - EDGE - RM_W, row.center().y - btn_h * 0.5),
             egui::vec2(RM_W, btn_h),
         );
         let ty_rect = egui::Rect::from_min_size(
@@ -2804,17 +2966,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         trace_rect(ui, node_id, &format!("strip_{i}"), row);
     }
 
-    // A drag is over when the finger leaves, not when a frame stops reporting the row as
-    // dragged. The move lands at that moment, at wherever the row was being held - so one long
-    // drag can cross several rows, and nothing on the list moves until the finger says so.
-    if drag.active && ui.input(|i| i.pointer.any_down()) && remove_idx.is_none() {
-        ui.ctx().data_mut(|d| d.insert_temp(drag_key, drag));
-    } else {
-        ui.ctx().data_mut(|d| d.remove_temp::<OptionDrag>(drag_key));
-        if moved.is_none() && drag.active && drag.held != drag.current {
-            moved = Some((drag.held, drag.current as isize - drag.held as isize));
-        }
-    }
+    anim.end(ui.ctx(), drag_key);
     // An open name field has to survive the frame that opened it and every frame the typing
     // arrives in; the body is rebuilt from the params on each of them.
     if edit.editing.is_some() {
@@ -3350,25 +3502,9 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     let open = snarl.get_node_info(node_id).map(|n| n.open).unwrap_or(true);
     let (flow, _) = ui.allocate_exact_size(egui::vec2(body_w, body_h), egui::Sense::hover());
     if !open {
-        // Nothing of the face is drawn: snarl runs the body of a collapsed node anyway and
-        // shifts it up under the header's clip, which is what painted a slice of the dial's
-        // rim across the header row. What a folded module has room for is its number - the
-        // frame keeps its blocks when a node folds, so the band under the header is there
-        // and empty, and that's where the reading goes.
+        // Nothing of the face is drawn. The number a folded knob shows under its header is
+        // `paint_folded_reading`'s, for every module that has one.
         trace_rect(ui, node_id, "knob_face", egui::Rect::NOTHING);
-        let inner = module_icons::module_inner(ui, view_salt, node_id).unwrap_or(flow);
-        let band = egui::Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 30.0), inner.max);
-        if band.height() > 12.0 {
-            let f = egui::TextStyle::Body.resolve(ui.style());
-            let col = ui.visuals().strong_text_color();
-            // Painted with a painter clipped to the frame: the body column of a collapsed
-            // node is nothing, and the UI's own painter would cut the number off at it.
-            let p = ui.painter_at(inner);
-            let g = p.layout_no_wrap(format!("{v:.2}"), f, col);
-            let at = egui::pos2(band.center().x - g.size().x * 0.5, band.center().y - g.size().y * 0.5);
-            trace_rect(ui, node_id, "knob_number", egui::Rect::from_min_size(at, g.size()));
-            p.galley(at, g, col);
-        }
         return;
     }
     let column = ui.max_rect();

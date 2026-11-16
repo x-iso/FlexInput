@@ -76,7 +76,7 @@ pub(crate) fn render_response_curve_scale_row(
     publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
-            if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
+            super::curve_rows::set_curve_scale(node, sc_t);
             if !is_vec { node.params.insert("absolute".into(), Value::Bool(absolute)); }
             node.params.insert("snap".into(), Value::Bool(snap_on));
         }
@@ -593,6 +593,22 @@ pub(crate) fn render_response_curve_grid_options_row(
     }
 }
 
+/// Whether a curve graph draws its grid lines: a pinned copy's own choice where it has made
+/// one (`PinGraphOverride::show_grid`), otherwise the module's `grid` switch, which is on
+/// until someone turns it off. The lines only - points still snap to where they would be.
+pub(crate) fn curve_grid_shown(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
+) -> bool {
+    graph_ov.and_then(|o| o.show_grid).unwrap_or_else(|| {
+        snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("show_grid").and_then(|v| v.as_bool()))
+            .unwrap_or(true)
+    })
+}
+
 /// Paints just the response-curve graph (background + grid + curve + control
 /// points + bias handles + live-input trails) into `rect`, and writes back any
 /// param changes made via interaction. Shared between the in-editor body
@@ -653,7 +669,9 @@ pub(crate) fn paint_response_curve_graph(
             let sc   = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
             let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, TRAIL_MS_MAX);
             let ssg  = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(n).is_some());
+            let sgl  = graph_ov.and_then(|o| o.show_labels).unwrap_or_else(|| {
+                n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(n).is_some())
+            });
             (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
@@ -722,24 +740,17 @@ pub(crate) fn paint_response_curve_graph(
             }).collect();
             redist(nodes, n)
         } else {
-            // Bidirectional: both halves expand outward from centre.
-            // t=0 is centre, t=1 is edge; same scale formula as abs case.
-            let half_lo = n / 2;
-            let half_hi = n - half_lo;
-            let lo: Vec<f32> = (0..=half_lo).map(|i| {
-                let t = i as f32 / half_lo as f32;
-                let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                0.5 - s * 0.5
+            // Bipolar: every line where its distance from the centre lands under the scale,
+            // on its own side. An odd count has no line on the centre and is still the same
+            // either side of it - split into a short half and a long one, as this was, an odd
+            // grid was scaled as if the graph began at a corner.
+            let mut nodes: Vec<f32> = (0..=n).map(|i| {
+                let v = 2.0 * i as f32 / n as f32 - 1.0;
+                let s = 1.0 - curve_scale_inv(1.0 - v.abs(), scale_t);
+                0.5 + v.signum() * s * 0.5
             }).collect();
-            let hi: Vec<f32> = (0..=half_hi).map(|i| {
-                let t = i as f32 / half_hi as f32;
-                let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                0.5 + s * 0.5
-            }).collect();
-            let mut merged = redist(lo, half_lo);
-            for v in redist(hi, half_hi).iter().skip(1) { merged.push(*v); }
-            merged.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            merged
+            nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            nodes
         }
     };
     let snap_nodes_x = build_grid_nodes(grid_x);
@@ -765,6 +776,7 @@ pub(crate) fn paint_response_curve_graph(
 
     let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
     let gs = egui::Stroke::new(0.5_f32, grid_faint);
+    let gs = if curve_grid_shown(snarl, node_id, graph_ov) { gs } else { egui::Stroke::NONE };
     for &x in &grid_x_positions { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &grid_y_positions { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
     if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) {

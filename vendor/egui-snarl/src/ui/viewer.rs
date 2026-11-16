@@ -303,6 +303,24 @@ pub trait SnarlViewer<T> {
         None
     }
 
+    /// FLEXINPUT PATCH: whether the corner grip scales the node by one amount in both
+    /// directions (a node whose content has one shape), rather than each way on its own.
+    #[inline]
+    fn node_resize_uniform(&mut self, node: NodeId, snarl: &Snarl<T>) -> bool {
+        let _ = (node, snarl);
+        false
+    }
+
+    /// FLEXINPUT PATCH: whether the node's pins and body sit in the middle of the height
+    /// its frame has under the header, rather than at the top of it. On the layout grid a
+    /// frame is rounded up to whole blocks and what the rounding adds lands under the
+    /// content; a node that is a list of rows reads lopsided with all of it at the bottom.
+    #[inline]
+    fn node_centers_payload(&mut self, node: NodeId, snarl: &Snarl<T>) -> bool {
+        let _ = (node, snarl);
+        false
+    }
+
     /// FLEXINPUT PATCH: the narrowest a resizable node's frame may be, as the viewer
     /// measures it. `None` falls back to the header's width, which works for a node whose
     /// header is a row of its own contents — but a node that fills its header to the

@@ -3,6 +3,22 @@
 use super::*;
 
 
+/// How tall the action row's buttons are: a size a finger or a pad's highlight can find
+/// on an overlay, where these are the buttons a mapping is made with. They were the height
+/// of their text.
+const ACTION_H: f32 = 26.0;
+
+/// The width of each of `n` buttons sharing a row `row_w` wide.
+pub(crate) fn action_width(ui: &egui::Ui, row_w: f32, n: usize) -> f32 {
+    let n = n.max(1) as f32;
+    ((row_w - (n - 1.0) * ui.spacing().item_spacing.x) / n).max(44.0)
+}
+
+/// One of the action row's buttons (Learn, MIDI…, Choose…, Clear, Add).
+pub(crate) fn action_button(label: &str, w: f32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label.to_owned()).size(13.0)).min_size(egui::vec2(w, ACTION_H))
+}
+
 pub(crate) fn show_remapper_body(
     node_id: NodeId,
     inputs: &[InPin],
@@ -501,11 +517,13 @@ pub(crate) fn show_remapper_body(
         let mut add_rect = egui::Rect::NOTHING;
         let mut clear_rect = egui::Rect::NOTHING;
         let mut midi_rect = egui::Rect::NOTHING;
+        // The action buttons share the row the cards span, each as wide as the others.
+        let btn_w = action_width(ui, (BODY_W - 18.0).min(358.0), 4 + usize::from(has_draft));
         ui.horizontal(|ui| {
             let learn_label = if in_learning { "Stop" } else { "Learn" };
             let learn_btn = ui.add_enabled(
                 true,
-                egui::Button::new(egui::RichText::new(learn_label).size(13.0)),
+                action_button(learn_label, btn_w),
             );
             learn_rect = learn_btn.rect;
             if learn_btn.clicked() || act_learn {
@@ -584,7 +602,7 @@ pub(crate) fn show_remapper_body(
             // left-to-right walk, and either drew behind the game when opened
             // from the config overlay.
             {
-                let midi_btn = ui.add(egui::Button::new(egui::RichText::new("MIDI…").size(13.0)))
+                let midi_btn = ui.add(action_button("MIDI…", btn_w))
                     .on_hover_text("Add a MIDI message to this mapping by hand.");
                 midi_rect = midi_btn.rect;
                 if midi_btn.clicked() {
@@ -601,8 +619,7 @@ pub(crate) fn show_remapper_body(
             // or the pad's motion as the input; a key, mouse button, pad button
             // or macro as the output. West switches sides inside it.
             {
-                let choose_btn = ui.add(egui::Button::new(
-                    egui::RichText::new("Choose…").size(13.0)))
+                let choose_btn = ui.add(action_button("Choose…", btn_w))
                     .on_hover_text("Pick the input or output from a board instead of pressing it — \
                                     including the pad's motion (gyro, accel, tilt) as an input.");
                 special_rect = choose_btn.rect;
@@ -620,7 +637,7 @@ pub(crate) fn show_remapper_body(
             // over (back to input capturing, drafts emptied). Shown whenever a
             // draft exists so a botched capture can be reset WITHOUT finishing.
             if has_draft {
-                let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
+                let clear_btn = ui.add(action_button("Clear", btn_w));
                 clear_rect = clear_btn.rect;
                 if clear_btn.clicked() || act_clear {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -637,7 +654,7 @@ pub(crate) fn show_remapper_body(
             }
 
             // Add button — appends mapping and resets drafts.
-            let add_btn = ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)));
+            let add_btn = ui.add_enabled(add_enabled, action_button("Add", btn_w));
             add_rect = add_btn.rect;
             if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -681,6 +698,14 @@ pub(crate) fn show_remapper_body(
         remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
             "_nav_capture_armed", "ui_phase", &["capturing", "learning"]);
 
+        // The cards: pinned whole, on a layer of their own that scrolls under the rows above
+        // - the status, the drafts and the action row stay in view (`mapping_list_ui`).
+        // Anywhere else, right here.
+        let mut list_holder = mapping_list_ui(ui, node_id);
+        let ui: &mut egui::Ui = match list_holder.as_mut() {
+            Some(list) => list,
+            None => ui,
+        };
         // Mapping list.
         if !mappings.is_empty() {
             ui.add_space(4.0);
@@ -1169,9 +1194,11 @@ pub(crate) fn show_map_action_body(
         let mut choose_rect = egui::Rect::NOTHING;
         let mut clear_rect = egui::Rect::NOTHING;
         let mut add_rect = egui::Rect::NOTHING;
+        // The action buttons share the row the cards span, each as wide as the others.
+        let btn_w = action_width(ui, (BODY_W - 18.0).min(358.0), 3 + usize::from(has_draft));
         ui.horizontal(|ui| {
             let learn_btn = ui.add_enabled(wired,
-                egui::Button::new(egui::RichText::new("Learn").size(13.0)));
+                action_button("Learn", btn_w));
             learn_rect = learn_btn.rect;
             if (learn_btn.clicked() || act_learn) && wired {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1185,7 +1212,7 @@ pub(crate) fn show_map_action_body(
             // Choose… — pick the input chord from the board instead of pressing
             // it (gamepad: the nav driver opens the same picker).
             let choose_btn = ui.add_enabled(wired,
-                egui::Button::new(egui::RichText::new("Choose…").size(13.0)))
+                action_button("Choose…", btn_w))
                 .on_hover_text("Pick the input from a board instead of pressing it.");
             choose_rect = choose_btn.rect;
             if choose_btn.clicked() {
@@ -1194,7 +1221,7 @@ pub(crate) fn show_map_action_body(
                         node_id, crate::canvas::viewer::subpatch_path(automap_parent)));
             }
             if has_draft {
-                let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
+                let clear_btn = ui.add(action_button("Clear", btn_w));
                 clear_rect = clear_btn.rect;
                 if clear_btn.clicked() || act_clear {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1207,7 +1234,7 @@ pub(crate) fn show_map_action_body(
                     }
                 }
             }
-            let add_btn = ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)));
+            let add_btn = ui.add_enabled(add_enabled, action_button("Add", btn_w));
             add_rect = add_btn.rect;
             if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1235,6 +1262,14 @@ pub(crate) fn show_map_action_body(
         remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
             "_nav_capture_armed", "ui_phase", &["capturing"]);
 
+        // The cards: pinned whole, on a layer of their own that scrolls under the rows above
+        // - the status, the drafts and the action row stay in view (`mapping_list_ui`).
+        // Anywhere else, right here.
+        let mut list_holder = mapping_list_ui(ui, node_id);
+        let ui: &mut egui::Ui = match list_holder.as_mut() {
+            Some(list) => list,
+            None => ui,
+        };
         // Mapping list: each mapping is Array<String> (input chord)
         if !mappings.is_empty() {
             ui.add_space(4.0);

@@ -17,17 +17,18 @@ pub(crate) fn show_inlet_outlet_body(node_id: NodeId, ui: &mut egui::Ui, snarl: 
         })
         .unwrap_or((SignalType::Any, true));
 
-    let mut t = current;
-    egui::ComboBox::from_id_salt(egui::Id::new(("sp_io_type", node_id.0)))
-        .selected_text(format!("{:?}", t))
-        .width(74.0)
-        .show_ui(ui, |ui| {
-            for opt in [SignalType::Float, SignalType::Bool, SignalType::Vec2,
-                        SignalType::Int, SignalType::Any, SignalType::AutoMap]
-            {
-                ui.selectable_value(&mut t, opt, format!("{:?}", opt));
-            }
-        });
+    // The type, as a pill dropdown the width of a two-block module's body.
+    const TYPES: [(SignalType, &str); 6] = [
+        (SignalType::Float, "Float"),
+        (SignalType::Bool, "Bool"),
+        (SignalType::Vec2, "Vec2"),
+        (SignalType::Int, "Int"),
+        (SignalType::Any, "Any"),
+        (SignalType::AutoMap, "AutoMap"),
+    ];
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(104.0, super::curve_rows::band_h(ui) - 4.0), egui::Sense::hover());
+    let tip = if is_inlet { "What the sub-patch takes in here." } else { "What the sub-patch gives out here." };
+    let t = super::curve_rows::pill_combo(ui, rect, "type", &current, &TYPES, tip, ("sp_io_type", node_id.0)).unwrap_or(current);
 
     if t != current {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -64,6 +65,8 @@ pub(crate) fn show_subpatch_body(
     if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
         // Drain legacy exposed_modules / decorations into unified `items` Vec.
         sp.migrate_into_items();
+        // And never fit the face round a frame that ran away (see `repair_runaway_items`).
+        crate::canvas::node::repair_runaway_items(&mut sp.items);
         // Rewrite Remapper / Map Action "default" → "whole_module" element id.
         let module_ids: std::collections::HashMap<usize, String> = sp.snarl
             .nodes_ids_data()
@@ -278,6 +281,7 @@ pub(crate) fn show_subpatch_body(
                 let graph_ov = m.graph_override.clone();
                 let iv_style_ov = m.iv_style_override.clone();
                 let menu_style_ov = m.menu_style_override;
+                let pin_style = m.pin_style.unwrap_or(1);
                 let outer_snap_ref = outer_snapshot.as_ref();
                 let prev_suppressed = ui.ctx().data(|d| {
                     d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
@@ -298,7 +302,7 @@ pub(crate) fn show_subpatch_body(
                                     inner_id, &module_id, &element_id, ui, &mut sp.snarl,
                                     mod_size, live_signals, panic_shortcut, automap_parent,
                                     outer_snap_ref, outer_id, is_unlocked, graph_ov, iv_style_ov,
-                                    menu_style_ov,
+                                    menu_style_ov, pin_style,
                                 );
                             }
                         });

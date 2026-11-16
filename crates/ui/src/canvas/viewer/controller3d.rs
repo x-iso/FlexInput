@@ -223,7 +223,7 @@ pub(crate) fn controller3d_style(
     match ov {
         Some(o) => (c(o.bg), c(o.outline), o.outline_px, hl(o.accent)),
         None => (
-            egui::Color32::from_rgb(18, 18, 22), // bg
+            egui::Color32::TRANSPARENT,          // bg: none, so the pad stands on whatever is behind it
             egui::Color32::from_rgb(70, 70, 75), // outline colour (only if width > 0)
             0.0,                                 // outline width (none by default)
             hl(C3D_DEFAULT_ACCENT),
@@ -738,6 +738,82 @@ mod motion_cue_tests {
     }
 }
 
+/// Where a model's colour presets live: the user models folder, under the model's name -
+/// `<user models>/<model>/presets` - so presets travel with the models they were made for.
+/// `None` without a user models folder set.
+pub(crate) fn c3d_presets_dir(model: &str) -> Option<std::path::PathBuf> {
+    Some(crate::model::callback::user_models_dir()?.join(model).join("presets"))
+}
+
+/// The presets saved for a model, by name (the file's), from [`c3d_presets_dir`] and from a
+/// `presets` folder at the top of the user models folder (presets for any model).
+pub(crate) fn c3d_user_presets(model: &str) -> Vec<(String, std::path::PathBuf)> {
+    let Some(root) = crate::model::callback::user_models_dir() else { return Vec::new() };
+    let mut out = Vec::new();
+    for dir in [root.join(model).join("presets"), root.join("presets")] {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut found: Vec<(String, std::path::PathBuf)> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("fxcol")))
+            .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+            .collect();
+        found.sort();
+        for f in found {
+            if !out.iter().any(|(n, _): &(String, std::path::PathBuf)| *n == f.0) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// A plain grey for every part: lighter for what you press, darker for what you hold.
+pub(crate) fn c3d_gray_preset() -> serde_json::Map<String, serde_json::Value> {
+    let grey = |v: u8| serde_json::json!([v, v, v.saturating_add(4)]);
+    let mut m = serde_json::Map::new();
+    for (k, v) in [
+        ("shell", 120), ("shell_secondary", 96), ("led", 72), ("touchpad", 110),
+        ("face_a", 152), ("face_b", 152), ("face_x", 152), ("face_y", 152), ("dpad", 140),
+        ("menu", 132), ("logo", 104), ("bumper", 106), ("trigger", 106),
+        ("left_dome", 82), ("left_cap", 98), ("left_rim", 90),
+        ("right_dome", 82), ("right_cap", 98), ("right_rim", 90),
+    ] {
+        m.insert(k.to_string(), grey(v));
+    }
+    m
+}
+
+/// What a material's colour pill shows for it: the controller glyph for the part, where the
+/// pad icons have one (the same `gp:` icons the mapping cards draw, in the connected pad's
+/// style), and a word - beside the glyph where one glyph stands for several parts (a stick's
+/// dome, cap and rim), on its own where there is no glyph.
+pub(crate) fn c3d_material_mark(g: crate::model::MaterialGroup) -> (Option<&'static str>, &'static str) {
+    use crate::model::MaterialGroup as M;
+    match g {
+        M::ShellMain => (None, "shell"),
+        M::ShellSecondary => (None, "shell 2"),
+        M::Led => (None, "LED"),
+        M::Touchpad => (None, "touchpad"),
+        M::FaceA => (Some("btn_south"), ""),
+        M::FaceB => (Some("btn_east"), ""),
+        M::FaceX => (Some("btn_west"), ""),
+        M::FaceY => (Some("btn_north"), ""),
+        M::Dpad => (Some("dpad"), ""),
+        M::Menu => (None, "menu"),
+        M::Logo => (None, "logo"),
+        M::Bumper => (Some("btn_lb"), ""),
+        M::Trigger => (Some("left_trigger"), ""),
+        M::LeftDome => (Some("left_stick"), "dome"),
+        M::LeftCap => (Some("left_stick"), "cap"),
+        M::LeftRim => (Some("left_stick"), "rim"),
+        M::RightDome => (Some("right_stick"), "dome"),
+        M::RightCap => (Some("right_stick"), "cap"),
+        M::RightRim => (Some("right_stick"), "rim"),
+        M::Mic => (None, "mic"),
+    }
+}
+
 /// Material colour swatch (RGBA — alpha renders the group as translucent
 /// plastic) with a right-click Copy/Paste menu (app-wide colour clipboard in
 /// egui temp memory; Copy also puts a hex string on the system clipboard).
@@ -751,6 +827,11 @@ pub(crate) fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 4], tooltip: &s
 /// runs on its OWN thread — a blocking dialog on the UI thread starves the
 /// overlay viewport's rendering (white bars, dead hotkeys) until dismissed.
 pub(crate) fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
+    controller3d_scheme_save_in(scheme, None);
+}
+
+/// The same, the file dialog opening in `dir` - a model's presets folder.
+pub(crate) fn controller3d_scheme_save_in(scheme: &crate::model::Scheme, dir: Option<std::path::PathBuf>) {
     let mut map = serde_json::Map::new();
     for (_, groups) in crate::model::material::ROWS {
         for &g in *groups {
@@ -767,10 +848,13 @@ pub(crate) fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
     }
     crate::main_pin::release();
     std::thread::spawn(move || {
-        if let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("FlexInput Colours", &["fxcol"])
-            .set_file_name("controller.fxcol")
-            .save_file()
+            .set_file_name("controller.fxcol");
+        if let Some(dir) = dir.filter(|d| std::fs::create_dir_all(d).is_ok()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.save_file()
         {
             if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
                 let _ = std::fs::write(path, json);
@@ -807,12 +891,26 @@ pub(crate) fn controller3d_scheme_load_async(ctx: &egui::Context, chan: &'static
     });
 }
 
+/// The narrowest each group of drawing settings reads at, and the widest of them: what the
+/// surface is told the rows need, so the viewport is never drawn narrower than a band of
+/// settings and the two always end on the same edge.
+const C3D_VIEW_W: f32 = 84.0;
+const C3D_ALPHA_W: f32 = 96.0;
+const C3D_FADE_W: f32 = 96.0;
+const C3D_TOUCH_W: f32 = 96.0;
+const C3D_MOTION_W: f32 = 104.0;
+const C3D_XRAY_W: f32 = 96.0;
+const C3D_WIDEST_GROUP: f32 = C3D_MOTION_W;
+/// The model picker wants its caption cell and a box that can hold a folder name.
+const C3D_PICKER_W: f32 = 190.0;
 pub(crate) fn show_controller3d_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     parents: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
+    body_h: f32,
 ) {
     use crate::model;
 
@@ -876,22 +974,78 @@ pub(crate) fn show_controller3d_body(
     let orientation = orientation.unwrap_or(glam::Quat::IDENTITY);
 
     ui.vertical(|ui| {
+        // The viewport under the rows is what the module's corner grip sizes (`kit::Surface`).
+        // The viewport under the rows is what the module's corner grip sizes (`kit::Surface`).
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(80.0, 60.0));
         // Model picker: Auto (device) + every available model folder.
         let models = model::available_models();
         let mut sel = if override_name.is_empty() { "auto".to_string() } else { override_name.clone() };
         let mut new_sel: Option<String> = None;
-        egui::ComboBox::from_id_salt(("c3d_model", node_id))
-            .selected_text(if sel == "auto" { "Auto (device)".to_string() } else { sel.clone() })
-            .show_ui(ui, |ui| {
-                if ui.selectable_value(&mut sel, "auto".to_string(), "Auto (device)").changed() {
-                    new_sel = Some(String::new());
-                }
-                for m in &models {
-                    if ui.selectable_value(&mut sel, m.clone(), m).changed() {
-                        new_sel = Some(m.clone());
+        // The drawing settings, read once here and written back as each one changes.
+        let mut pitch_deg = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("cam_pitch").and_then(|v| v.as_f64()))
+            .unwrap_or(C3D_DEFAULT_PITCH_DEG as f64) as f32;
+        let mut opacity = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("overlay_alpha").and_then(|v| v.as_f64()))
+            .unwrap_or(1.0) as f32;
+        let mut tail = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
+            .unwrap_or(0.25) as f32;
+        let mut touch_glow = c3d_capacitive_glow(snarl, node_id);
+        let mut motion = c3d_motion_amount(snarl, node_id);
+        // `xray_visible` is unset on a module that has never had it moved, which means the
+        // renderer's own value: show that number in the pill rather than an empty box.
+        let mut xray_pct =
+            c3d_xray_visible(snarl, node_id).unwrap_or(crate::model::callback::GHOST_VIS_LOW) * 100.0;
+
+        // The rows are drawn at the width the surface was given, so the viewport and the
+        // settings end on the same edge and the corner grip means what it says.
+        let w = surface.size.x;
+        // Bound the flow to that width. A ComboBox, a fold and a grid of swatches each fill
+        // whatever room they are handed, which is the frame as it was the frame before - so
+        // without this the module can be dragged wider and never narrower.
+        ui.set_max_width(w);
+        let band = super::curve_rows::band_h(ui);
+        let ctrl = band - 4.0;
+
+        // Model picker: Auto (device) + every available model folder. The caption is painted
+        // in a fixed cell and the picker takes the rest of the row, so a long model folder
+        // name is the ComboBox's problem rather than the module's.
+        {
+            let (row, _) = ui.allocate_exact_size(egui::vec2(w, band), egui::Sense::hover());
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let weak = ui.visuals().weak_text_color();
+            ui.painter().text(
+                egui::pos2(row.left(), row.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Model",
+                font,
+                weak,
+            );
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_max(egui::pos2(row.left() + 44.0, row.top()), row.max))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt(("c3d_model_row", node_id)),
+            );
+            let sel_text = if sel == "auto" { "Auto (device)".to_string() } else { sel.clone() };
+            egui::ComboBox::from_id_salt(("c3d_model", node_id))
+                .width(child.available_width())
+                .selected_text(sel_text)
+                .show_ui(&mut child, |ui| {
+                    if ui.selectable_value(&mut sel, "auto".to_string(), "Auto (device)").changed() {
+                        new_sel = Some(String::new());
                     }
-                }
-            });
+                    for m in &models {
+                        if ui.selectable_value(&mut sel, m.clone(), m).changed() {
+                            new_sel = Some(m.clone());
+                        }
+                    }
+                });
+        }
         if let Some(val) = new_sel {
             // Unless the user opted to keep custom colours, swapping the model
             // resets the scheme to the new model's defaults.
@@ -909,10 +1063,9 @@ pub(crate) fn show_controller3d_body(
 
         // Per-node colour scheme + overlay opacity. Colours default to the
         // model's tuned palette; overrides persist under `materials`.
-        egui::CollapsingHeader::new("🎨 Colours")
-            .id_salt(("c3d_colors", node_id))
-            .default_open(false)
-            .show(ui, |ui| {
+        // Folded until wanted, by a heading like every other section's - and saved with
+        // the patch, where egui's own fold forgot it.
+        if super::curve_rows::section(ui, snarl, node_id, "colours", "Colours", false) {
                 let defaults = crate::model::default_scheme(&resolved);
                 let mut mats: serde_json::Map<String, serde_json::Value> = snarl
                     .get_node(node_id)
@@ -939,29 +1092,113 @@ pub(crate) fn show_controller3d_body(
                         })
                         .unwrap_or(def)
                 };
-                // One row per general group; multi-material groups (Shell,
-                // Sticks) show their swatches side by side on that row.
-                egui::Grid::new(("c3d_col_grid", node_id))
-                    .num_columns(2)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        for (row_label, groups) in crate::model::material::ROWS {
-                            ui.label(egui::RichText::new(*row_label).small());
-                            ui.horizontal(|ui| {
-                                for &g in *groups {
-                                    let mut col = read_col(&mats, g, defaults[g as usize]);
-                                    if c3d_color_swatch(ui, &mut col, g.label()) {
-                                        mats.insert(
-                                            g.key().to_string(),
-                                            serde_json::json!([col[0], col[1], col[2], col[3]]),
-                                        );
-                                        mats_changed = true;
-                                    }
+                // A pill per material: what it colours - the pad's own icon where there is
+                // one, a word where there isn't - and its swatch, wrapping across as many
+                // rows as the module's width needs. It was a grid of rows whose Buttons row
+                // was seven swatches wide, which set the module's width when it unfolded.
+                // A preset first: the model's own colours as it launched, a plain grey, or one
+                // saved to the user models folder (Save… opens there).
+                {
+                    let presets = c3d_user_presets(&resolved);
+                    let current = snarl
+                        .get_node(node_id)
+                        .and_then(|n| n.params.get("colour_preset").and_then(|v| v.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| if mats.is_empty() { "original".into() } else { "custom".into() });
+                    let mut opts: Vec<(String, String)> = vec![("original".into(), "original".into()), ("gray".into(), "gray".into())];
+                    opts.extend(presets.iter().map(|(name, _)| (format!("user:{name}"), name.clone())));
+                    if current == "custom" {
+                        opts.push(("custom".into(), "custom".into()));
+                    }
+                    let shown: Vec<(String, &str)> = opts.iter().map(|(k, l)| (k.clone(), l.as_str())).collect();
+                    let (pr, _) = ui.allocate_exact_size(egui::vec2(w, band), egui::Sense::hover());
+                    let pr = egui::Rect::from_min_size(egui::pos2(pr.left(), pr.center().y - ctrl * 0.5), egui::vec2(pr.width(), ctrl));
+                    if let Some(pick) = super::curve_rows::pill_combo(ui, pr, "preset", &current, &shown,
+                        "Colour presets: the model's colours as it launched, a plain grey, or one you saved\n\
+                         (Save… puts it in the user models folder, where this list finds it).",
+                        ("c3d_preset", node_id))
+                    {
+                        let map: Option<serde_json::Map<String, serde_json::Value>> = match pick.as_str() {
+                            "original" => None,
+                            "gray" => Some(c3d_gray_preset()),
+                            other => other.strip_prefix("user:").and_then(|name| {
+                                let path = &presets.iter().find(|(n, _)| n == name)?.1;
+                                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?.as_object().cloned()
+                            }),
+                        };
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            match map {
+                                Some(m) => {
+                                    node.params.insert("materials".into(), serde_json::Value::Object(m.clone()));
+                                    mats = m;
                                 }
-                            });
-                            ui.end_row();
+                                None => {
+                                    node.params.remove("materials");
+                                    mats.clear();
+                                }
+                            }
+                            node.params.insert("colour_preset".into(), serde_json::Value::String(pick));
                         }
-                    });
+                    }
+                }
+                let groups: Vec<crate::model::MaterialGroup> = crate::model::material::ROWS
+                    .iter()
+                    .flat_map(|(_, gs)| gs.iter().copied())
+                    .collect();
+                let font = egui::TextStyle::Small.resolve(ui.style());
+                let icon_side = (ctrl - 6.0).max(8.0);
+                const SWATCH_W: f32 = 22.0;
+                let text_w = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+                let pill_w = |g: crate::model::MaterialGroup| {
+                    let (icon, word) = c3d_material_mark(g);
+                    let icon_w = icon.map_or(0.0, |_| icon_side + 3.0);
+                    let word_w = if word.is_empty() { 0.0 } else { text_w(word) + 3.0 };
+                    5.0 + icon_w + word_w + SWATCH_W + 4.0
+                };
+                let mins: Vec<f32> = groups.iter().map(|g| pill_w(*g)).collect();
+                let (cells, h) = super::curve_rows::bands(w, &mins, band, 2.0 * super::kit::GAP);
+                let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                for (g, cell) in groups.iter().zip(cells) {
+                    let cell = cell.translate(area.min.to_vec2());
+                    let r = egui::Rect::from_min_size(egui::pos2(cell.left(), cell.center().y - ctrl * 0.5), egui::vec2(cell.width(), ctrl));
+                    ui.painter().rect_filled(r, 4.0, ui.visuals().widgets.inactive.weak_bg_fill);
+                    let (icon, word) = c3d_material_mark(*g);
+                    let mut x = r.left() + 5.0;
+                    if let Some(pin) = icon {
+                        let tex = crate::macro_icons::macro_port_icon_texture(ui.ctx(), &format!("gp:{pin}"), "", icon_side);
+                        let ir = egui::Rect::from_min_size(egui::pos2(x, r.center().y - icon_side * 0.5), egui::Vec2::splat(icon_side));
+                        match tex {
+                            Some(t) => {
+                                ui.painter().image(t.id(), ir, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                            }
+                            None => {
+                                ui.painter().text(ir.center(), egui::Align2::CENTER_CENTER, "•", font.clone(), ui.visuals().text_color());
+                            }
+                        }
+                        x += icon_side + 3.0;
+                    }
+                    if !word.is_empty() {
+                        ui.painter().text(egui::pos2(x, r.center().y), egui::Align2::LEFT_CENTER, word, font.clone(), ui.visuals().text_color());
+                    }
+                    let sr = egui::Rect::from_min_size(egui::pos2(r.right() - SWATCH_W - 4.0, r.top() + 3.0), egui::vec2(SWATCH_W, ctrl - 6.0));
+                    let mut cell_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(sr)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .id_salt(("c3d_col_pill", node_id.0, g.key())),
+                    );
+                    cell_ui.spacing_mut().interact_size = sr.size();
+                    let mut col = read_col(&mats, *g, defaults[*g as usize]);
+                    if c3d_color_swatch(&mut cell_ui, &mut col, g.label()) {
+                        mats.insert(g.key().to_string(), serde_json::json!([col[0], col[1], col[2], col[3]]));
+                        mats_changed = true;
+                    }
+                    // An edge round the swatch, so a colour near the pill's own grey still
+                    // reads as a swatch.
+                    ui.painter().rect_stroke(sr, 2.0, egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()), egui::StrokeKind::Outside);
+                    // The whole pill says what it colours, not just the swatch.
+                    ui.interact(egui::Rect::from_min_max(r.min, egui::pos2(sr.left(), r.bottom())), egui::Id::new(("c3d_col_pill_hover", node_id.0, g.key())), egui::Sense::hover())
+                        .on_hover_text(g.label());
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .small_button("Reset")
@@ -984,7 +1221,7 @@ pub(crate) fn show_controller3d_body(
                                 eff[g as usize] = read_col(&mats, g, defaults[g as usize]);
                             }
                         }
-                        controller3d_scheme_save(&eff);
+                        controller3d_scheme_save_in(&eff, c3d_presets_dir(&resolved));
                     }
                     if ui
                         .small_button("Load…")
@@ -995,16 +1232,17 @@ pub(crate) fn show_controller3d_body(
                     }
                 });
 
-                // Keep-custom-colours toggle: when off, swapping the model resets
-                // the scheme to the new model's defaults.
+                // Keep-custom-colours switch: when off, swapping the model resets
+                // the scheme to the model's defaults. A word button rather than a
+                // checkbox, because it is a setting with two values and not a tickbox.
                 let mut keep = snarl
                     .get_node(node_id)
                     .and_then(|n| n.params.get("keep_colors").and_then(|v| v.as_bool()))
                     .unwrap_or(false);
-                if ui
-                    .checkbox(&mut keep, "Keep custom colours on model change")
-                    .changed()
-                {
+                let keep_resp = super::kit_bodies::toggle_button(ui, keep, "keep colours", super::kit_bodies::TOGGLE_SMALL)
+                    .on_hover_text("While on, picking another model keeps the colours you set.\nWhile off, a new model starts with its own palette.");
+                if keep_resp.clicked() {
+                    keep = !keep;
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("keep_colors".into(), serde_json::json!(keep));
                     }
@@ -1013,130 +1251,102 @@ pub(crate) fn show_controller3d_body(
                 if mats_changed {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("materials".into(), serde_json::Value::Object(mats));
+                        // A colour changed by hand is no preset's any more.
+                        node.params.insert("colour_preset".into(), serde_json::Value::String("custom".into()));
                     }
                 }
-            });
+        }
 
-        // Camera view angle: elevation above the controller (0° = level/front,
-        // higher = more overhead). Defaults to a 3/4 overhead view.
-        let mut pitch_deg = snarl
-            .get_node(node_id)
-            .and_then(|n| n.params.get("cam_pitch").and_then(|v| v.as_f64()))
-            .unwrap_or(C3D_DEFAULT_PITCH_DEG as f64) as f32;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("View angle").small())
-                .on_hover_text("Camera elevation above the controller.\n0° = front/level, higher = more overhead.");
-            if ui
-                .add(egui::Slider::new(&mut pitch_deg, 0.0..=85.0).suffix("°"))
-                .changed()
+        // ── How the pad is drawn ────────────────────────────────────────────
+        // Six numbers as value pills, in bands that share a row while the width holds them
+        // and take one each when it doesn't. They used to be six rows of caption, slider
+        // rail and value box, which cost the module six rows of height it could have given
+        // the pad, and the rails were only ever a slower way of setting a number.
+        {
+            let (cells, h) = super::curve_rows::bands(
+                w,
+                &[C3D_VIEW_W, C3D_ALPHA_W, C3D_FADE_W, C3D_TOUCH_W, C3D_MOTION_W, C3D_XRAY_W],
+                band,
+                3.0 * super::kit::GAP,
+            );
+            let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            let at = |i: usize| {
+                let c = cells[i].translate(area.min.to_vec2());
+                egui::Rect::from_min_size(egui::pos2(c.left(), c.center().y - ctrl * 0.5), egui::vec2(c.width(), ctrl))
+            };
+            let mut write = |key: &str, v: serde_json::Value| {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert(key.into(), v);
+                }
+            };
+
+            // Camera view angle: elevation above the controller (0° = level/front,
+            // higher = more overhead). Defaults to a 3/4 overhead view.
+            let shown = format!("{pitch_deg:.0}°");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_view", at(0), "view|view angle", &mut pitch_deg, &shown, 0.0..=85.0, 0.4,
+                "Camera elevation above the controller.\n0° = front/level, higher = more overhead.")
             {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("cam_pitch".into(), serde_json::json!(pitch_deg));
-                }
+                write("cam_pitch", serde_json::json!(pitch_deg));
             }
-        });
 
-        // Model opacity: whole-model see-through (per-fragment alpha). Distinct
-        // from the overlay's 2D composite alpha (an Overlay-style option). Kept
-        // here as a module option — useful for seeing activated inputs behind
-        // the shell.
-        let mut opacity = snarl
-            .get_node(node_id)
-            .and_then(|n| n.params.get("overlay_alpha").and_then(|v| v.as_f64()))
-            .unwrap_or(1.0) as f32;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Model opacity").small())
-                .on_hover_text("Whole-model transparency (see-through).");
-            if ui
-                .add(egui::Slider::new(&mut opacity, 0.1..=1.0))
-                .changed()
+            // Model opacity: whole-model see-through (per-fragment alpha). Distinct
+            // from the overlay's 2D composite alpha (an Overlay-style option). Kept
+            // here as a module option — useful for seeing activated inputs behind
+            // the shell.
+            let shown = format!("{opacity:.2}");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_alpha", at(1), "alpha", &mut opacity, &shown, 0.1..=1.0, 0.004,
+                "Whole-model transparency (see-through).")
             {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params
-                        .insert("overlay_alpha".into(), serde_json::json!(opacity));
-                }
+                write("overlay_alpha", serde_json::json!(opacity));
             }
-        });
 
-        // Active-input highlight fade time (how long a press glow lingers).
-        let mut tail = snarl
-            .get_node(node_id)
-            .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
-            .unwrap_or(0.25) as f32;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Highlight fade").small())
-                .on_hover_text("How long the active-input highlight takes to fade out.");
-            if ui
-                .add(egui::Slider::new(&mut tail, 0.05..=2.0).suffix(" s"))
-                .changed()
+            // Active-input highlight fade time (how long a press glow lingers).
+            let shown = format!("{tail:.2} s");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_fade", at(2), "fade|highlight fade", &mut tail, &shown, 0.05..=2.0, 0.008,
+                "How long the active-input highlight takes to fade out.")
             {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params
-                        .insert("highlight_tailoff".into(), serde_json::json!(tail));
-                }
+                write("highlight_tailoff", serde_json::json!(tail));
             }
-        });
 
-        // How brightly touched capacitive sensors light.
-        let mut touch_glow = c3d_capacitive_glow(snarl, node_id);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Touch sensors").small())
-                .on_hover_text(
-                    "How brightly a touched capacitive sensor lights, on pads
-                     that have them: the stick caps and grips of a Steam
-                     Controller. A stick click still lights its cap fully.
-                     0 = not shown.",
-                );
-            if ui
-                .add(egui::Slider::new(&mut touch_glow, 0.0..=1.0))
-                .changed()
+            // How brightly touched capacitive sensors light.
+            let shown = format!("{touch_glow:.2}");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_touch", at(3), "touch|touch sensors", &mut touch_glow, &shown, 0.0..=1.0, 0.004,
+                "How brightly a touched capacitive sensor lights, on pads\nthat have them: the stick caps and grips of a Steam\nController. A stick click still lights its cap fully.\n0 = not shown.")
             {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("capacitive_glow".into(), serde_json::json!(touch_glow));
-                }
+                write("capacitive_glow", serde_json::json!(touch_glow));
             }
-        });
 
-        // Motion cue: how far the model slides when the pad is moved.
-        let mut motion = c3d_motion_amount(snarl, node_id);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Motion cue").small())
-                .on_hover_text(
-                    "Slide the model briefly the way the pad is moved (from\n\
-                     the accelerometer), then let it drift back. 0 = off.\n\
-                     Needs the Orientation input wired: the reading is turned\n\
-                     into world axes with it, so turning the pad doesn't\n\
-                     read as moving it.",
-                );
-            if ui
-                .add(egui::Slider::new(&mut motion, 0.0..=2.0))
-                .changed()
+            // Motion cue: how far the model slides when the pad is moved.
+            let shown = format!("{motion:.2}");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_motion", at(4), "motion|motion cue", &mut motion, &shown, 0.0..=2.0, 0.008,
+                "Slide the model briefly the way the pad is moved (from\n\
+                 the accelerometer), then let it drift back. 0 = off.\n\
+                 Needs the Orientation input wired: the reading is turned\n\
+                 into world axes with it, so turning the pad doesn't\n\
+                 read as moving it.")
             {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("motion_cue".into(), serde_json::json!(motion));
-                }
+                write("motion_cue", serde_json::json!(motion));
             }
-        });
 
-        // X-ray: how hidden a pressed input must be to show through the shell.
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("X-ray under").small())
-                .on_hover_text("A pressed input shows through the shell once less than this much of it is in view.");
-            if let Some(v) = c3d_xray_slider(ui, c3d_xray_visible(snarl, node_id)) {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("xray_visible".into(), serde_json::json!(v));
-                }
+            // X-ray: how hidden a pressed input must be to show through the shell, in
+            // percent of the input's facing surface.
+            let shown = format!("{xray_pct:.0} %");
+            if super::curve_rows::real_pill(ui, node_id, "c3d_xray", at(5), "x-ray", &mut xray_pct, &shown, 0.0..=100.0, 0.5,
+                "When a pressed input shows through the shell: once less than this\n\
+                 much of it is in view. Raise it for inputs that only peek out past\n\
+                 the shell, like a pad's back buttons, which at a small size read as\n\
+                 barely lit. 0 = never.")
+            {
+                write("xray_visible", serde_json::json!(xray_pct / 100.0));
             }
-        });
+            // The picker row and the widest band of pills: what the rows need, not what they drew
+            // at the width the surface was handed.
+            surface.need(C3D_WIDEST_GROUP.max(C3D_PICKER_W));
+        }
 
-        // Resizable rectangular viewport (persisted like the scopes).
-        let size_id = egui::Id::new(("c3d_size", node_id));
-        let mut size = ui
-            .ctx()
-            .data_mut(|d| d.get_persisted::<[f32; 2]>(size_id))
-            .unwrap_or([200.0, 160.0]);
-        size[0] = size[0].max(80.0);
-        size[1] = size[1].max(60.0);
+        // The viewport: what the frame leaves under the rows. It had a grip of its own in
+        // its corner and a size kept in egui's memory rather than in the patch.
+        let size = [surface.size.x, surface.size.y];
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(size[0], size[1]));
         // Reserve the full rect for layout so the node keeps a stable size (the
         // painter/callback don't allocate). The body always renders with default
@@ -1165,21 +1375,6 @@ pub(crate) fn show_controller3d_body(
         // Expose the viewport so it can be pinned to a sub-patch layout / overlay.
         register_exposable_element(ui, node_id, "viewer", rect);
 
-        // Bottom-right resize handle.
-        let hs = 12.0;
-        let handle = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - hs, rect.bottom() - hs),
-            egui::vec2(hs, hs),
-        );
-        let hr = ui.interact(handle, size_id.with("h"), egui::Sense::click_and_drag());
-        if hr.hovered() || hr.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-        }
-        if hr.dragged() {
-            let d = hr.drag_delta();
-            size[0] = (size[0] + d.x).max(80.0);
-            size[1] = (size[1] + d.y).max(60.0);
-            ui.ctx().data_mut(|d2| d2.insert_persisted(size_id, size));
-        }
+        surface.end(ui);
     });
 }

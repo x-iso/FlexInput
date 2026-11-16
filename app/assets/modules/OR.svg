@@ -2,6 +2,6 @@
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
 <svg width="100%" height="100%" viewBox="0 0 59 59" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:affinity="https://www.affinity.studio/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linecap:round;stroke-linejoin:round;">
     <g id="OR" transform="matrix(1,0,0,1,-0.875152,0)">
-        <path d="M20.855,40.5C24.287,33.167 24.404,25.833 20.855,18.5L25.523,18.499C29.303,18.121 40.058,23.249 42.15,29.5C40.452,35.356 29.259,40.922 25.523,40.5L20.855,40.5ZM42.15,29.499L47.395,29.499M13.355,23.332L20.855,23.331M13.355,35.668L20.855,35.667" style="fill:none;stroke:white;stroke-width:4px;"/>
+        <path d="M20.855,40.5C24.287,33.167 24.404,25.833 20.855,18.5L25.523,18.499C29.303,18.121 40.058,23.249 42.15,29.5C40.452,35.356 29.259,40.922 25.523,40.5L20.855,40.5ZM42.15,29.499L47.395,29.499M13.355,23.332L20.855,23.331M13.355,35.668L20.855,35.667" style="fill:none;stroke:white;stroke-width:3px;"/>
     </g>
 </svg>

@@ -228,7 +228,7 @@ fn eval_subgraph(
                     computed.get(si).and_then(|v| v.get(op)).copied().flatten()
                 }))
                 .collect();
-            computed[idx] = eval_rws_node(snap, ns_uid, &inputs, collector_sigs, state, dt);
+            computed[idx] = eval_rws_node(snap, ns_uid, &inputs, dev_sigs, collector_sigs, state, dt);
             if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
         }
@@ -599,7 +599,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                     computed.get(si).and_then(|v| v.get(op)).copied().flatten()
                 }))
                 .collect();
-            computed[idx] = eval_rws_node(snap, snap.node_uid, &inputs, &mut collector_sigs, state, dt);
+            computed[idx] = eval_rws_node(snap, snap.node_uid, &inputs, dev_sigs, &mut collector_sigs, state, dt);
             if display { last_outputs.insert(snap.node_uid, computed[idx].clone()); }
             continue;
         }

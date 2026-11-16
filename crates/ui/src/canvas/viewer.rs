@@ -18,6 +18,8 @@ use crate::app::request_repaint_throttled;
 // keep every pre-split `viewer::item` path resolving unchanged) ──
 mod asth;
 mod curve_bodies;
+mod curve_rows;
+pub(crate) mod pin_style2;
 mod curve_support;
 mod scopes;
 mod waveform;
@@ -25,6 +27,7 @@ mod automap_bodies;
 mod chrome;
 mod conflicts;
 mod controller3d;
+mod gyro_view;
 mod expose;
 mod glow;
 mod glyphs;
@@ -53,6 +56,8 @@ mod midi;
 mod net;
 mod osc_envelope;
 mod pad_hints;
+pub(crate) use pad_hints::{pad_hint_big, pad_hint_big_centered};
+pub(crate) use jsm_cal::{last_result as jsm_cal_last_result, sweep_reading as jsm_sweep_reading};
 mod pins;
 mod raw_motion;
 mod raw_pad;
@@ -247,12 +252,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
+        // Where the header's first row is, laid out rather than clipped, for the sockets
+        // drawn on it (`header_row_y`).
+        let header_mid = ui.max_rect().top() + ui.spacing().icon_width * 0.5;
+        ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), header_mid));
         // Extract what we need before any UI calls so the borrow of snarl is released.
         let data = &snarl[node];
         let title = data.display_name.clone();
         // A module the kit knows by a symbol wears that mark instead of its name, and
         // the name goes to the hover text. A renamed module keeps what it's called.
         let mark = kit::node_mark(data);
+        // Or a drawing, where the name can't fit and no font has the symbol.
+        let glyph = kit::node_glyph(data);
         // What the header row had taken before the name was drawn - the fold chevron and a
         // status dot. That, not the name, is what the header *contributes* to the node's
         // width: a name that fits is drawn, a name that doesn't is left out, and neither is
@@ -353,7 +364,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             .and_then(|n| kit::variadic_inputs(&n.module_id).map(|range| (n.inputs.len(), range)));
         // A module whose ports are a list of strips in its body adds them from here: one
         // `+` at the header's right edge. Dropping one is the `×` on its own strip.
-        let port_noun = snarl.get_node(node).and_then(|n| kit::header_plus(&n.module_id));
+        // A folded list has no `+`: there is no list to see the new port land in, and a folded
+        // header is its name between two sockets - the square was the name's room.
+        let port_noun = snarl
+            .get_node(node)
+            .and_then(|n| kit::header_plus(&n.module_id))
+            .filter(|_| simple_bodies::node_open(snarl, node));
         let port_module = snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
         // A per-channel filter (Delay, Average, DC Filter): its channels are a matched
         // In/Out pair each, and the `− +` for them sits in this header rather than in a row
@@ -371,7 +387,24 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // the things holding every row wide.
         let macro_add = snarl.get_node(node).map_or(false, |n| n.module_id == "module.macro");
 
+        // A device's header is several rows tall, and on the grid it is made a whole number
+        // of blocks with those rows in the middle of it: folded, the frame is rounded up to
+        // blocks anyway, and a header that was its rows' own height sat at the top of that
+        // with the slack under it - and a block line away from where its pins start when it
+        // is opened. The pad is what last frame's rows left of the rounding; half goes above.
+        let header_grid = (is_device_source || is_device_sink)
+            .then(|| crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block))
+            .flatten();
+        let header_pad_id = self.snarl_id.with(("header-grid-pad", node));
+        let pad_above = match header_grid {
+            Some(_) => ui.ctx().data(|d| d.get_temp::<f32>(header_pad_id)).unwrap_or(0.0),
+            None => 0.0,
+        };
+        let frame_margin_y = self.node_margin_y;
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            if pad_above > 0.0 {
+                ui.add_space(pad_above);
+            }
             ui.horizontal(|ui| {
                 if let Some(spec) = &icon_spec {
                     use crate::canvas::remapper_icons::NodeIconSpec;
@@ -474,18 +507,36 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let reserved = if is_knob && !knob_collapsed {
                         // The Uni/Bi switch that will sit at the header's right edge.
                         crate::canvas::viewer::kit_bodies::KNOB_TOGGLE.x + ui.spacing().item_spacing.x
-                    } else if channel_count.is_some() || option_add || macro_add {
-                        // The `− n +` or the `+` that will sit at the header's right edge. It
-                        // is also reserved in the flow after the name, but the name is painted
+                    } else if is_response_curve {
+                        // Its graph switches and file buttons, and the channel stepper
+                        // where it has one.
+                        kit::curve_header_w(ui)
+                            + if channel_count.is_some() { kit::stepper_w(ui) + kit::CURVE_HEADER_GAP + 4.0 } else { 0.0 }
+                    } else if channel_count.is_some() || pin_count.is_some() {
+                        // The `− n +` that will sit at the header's right edge. It is also
+                        // reserved in the flow after the name, but the name is painted
                         // rather than laid out, so this is where its room comes off the name.
-                        (if channel_count.is_some() { kit::stepper_w(ui) } else { kit::stepper_h(ui) })
-                            + ui.spacing().item_spacing.x
+                        kit::stepper_w(ui) + ui.spacing().item_spacing.x
+                    } else if port_noun.is_some() || option_add || macro_add {
+                        // The single `+` of a list module, same place.
+                        kit::stepper_h(ui) + ui.spacing().item_spacing.x
                     } else if env_header_switches {
                         // The two graph switches that will sit at the header's right edge.
                         kit::header_toggles_w(ui)
+                    } else if is_label {
+                        // The font size and colour at the right edge, as wide as they were
+                        // drawn last frame.
+                        ui.ctx().data(|d| d.get_temp::<f32>(ui.id().with("header_right_w"))).unwrap_or(90.0)
+                            + ui.spacing().item_spacing.x
                     } else {
                         0.0
                     };
+                    // Headers whose controls follow the name in a row (Edit… Layout Save…
+                    // Load…, a skin picker) lay the name out with them, whole: those rows
+                    // are the header's content, and the module is as wide as they are. Every
+                    // other header paints its name in the room the frame leaves, so a name
+                    // can never be what makes a small module wide.
+                    let name_in_flow = is_subpatch || is_rws || is_svg || is_remapper || is_map_action || is_input_viewer;
                     // What the row has already taken - the fold chevron, a status dot - is
                     // off the room too: the name has to fit what's left, not what the frame
                     // is, or it gets painted under the control at the right edge. A folded
@@ -497,14 +548,23 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // What the header's tooltip says: the name the patch calls this module by,
                     // and under a line what the module does. Both arms of the match get it, so
                     // a module known by its mark is as explainable as one known by its name.
+                    // The name line is the module's own name - or, for a module the user
+                    // renamed, their name and then what the module is.
                     let help = kit::module_help(&header_module);
                     let tip_name = title.clone();
+                    let shipped = kit::shipped_name(&header_module).filter(|s| *s != title.as_str());
                     let tooltip = move |ui: &mut egui::Ui| {
-                        ui.set_max_width(260.0);
-                        ui.label(egui::RichText::new(tip_name.as_str()).strong());
+                        ui.set_max_width(280.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(tip_name.as_str()).strong());
+                            if let Some(shipped) = shipped {
+                                ui.label(egui::RichText::new("·").weak());
+                                ui.label(egui::RichText::new(shipped).weak());
+                            }
+                        });
                         if let Some(help) = help {
                             ui.separator();
-                            ui.label(egui::RichText::new(help).weak().small());
+                            ui.label(egui::RichText::new(help).small());
                         }
                     };
                     match mark {
@@ -512,6 +572,16 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             let r = ui.label(egui::RichText::new(mark).strong());
                             simple_bodies::trace_rect(ui, node, "header_title", r.rect);
                             r.on_hover_ui(tooltip)
+                        }
+                        None if glyph.is_some() => {
+                            // A drawing where the name would be, for a name that can't fit.
+                            let h = ui.spacing().interact_size.y;
+                            let (slot, resp) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                            if let Some(g) = glyph {
+                                glyphs::paint(ui.painter(), slot.expand(2.0), g, ui.visuals().text_color());
+                            }
+                            simple_bodies::trace_rect(ui, node, "header_title", slot);
+                            resp.on_hover_ui(tooltip)
                         }
                         None => {
                             // Painted, not laid out. A name added to the flow adds its own width
@@ -524,20 +594,29 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             // and left out entirely when the room is too small for a word that
                             // means anything - half a letter under the control at the right edge
                             // says less than nothing.
-                            let (slot, resp) = ui.allocate_exact_size(
-                                egui::vec2(0.0, ui.spacing().interact_size.y),
-                                egui::Sense::hover(),
-                            );
                             // The room is measured from where the name will actually be painted -
                             // after the fold chevron and anything else the row has taken - to the
                             // frame's right edge, less what the control at that edge will need, and
                             // less the socket a folded module draws at the end of its header.
-                            let room = (ui.max_rect().right()
-                                - reserved
-                                - if folded { ui.spacing().interact_size.y + 6.0 } else { 0.0 }
-                                - slot.left())
-                                .max(0.0);
-                            match kit::title_galley(ui, &title, room) {
+                            let room = if name_in_flow {
+                                f32::INFINITY
+                            } else {
+                                (ui.max_rect().right()
+                                    - reserved
+                                    - if folded { ui.spacing().interact_size.y + 6.0 } else { 0.0 }
+                                    - ui.cursor().left())
+                                .max(0.0)
+                            };
+                            let galley = kit::title_galley(ui, &title, room);
+                            let flow_w = match (&galley, name_in_flow) {
+                                (Some(g), true) => g.size().x,
+                                _ => 0.0,
+                            };
+                            let (slot, resp) = ui.allocate_exact_size(
+                                egui::vec2(flow_w, ui.spacing().interact_size.y),
+                                egui::Sense::hover(),
+                            );
+                            match galley {
                                 Some(galley) => {
                                     let size = galley.size();
                                     let at = egui::pos2(slot.left(), slot.center().y - size.y * 0.5);
@@ -555,7 +634,17 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                     simple_bodies::trace_rect(ui, node, "header_title", egui::Rect::NOTHING);
                                 }
                             }
-                            resp.on_hover_ui(tooltip)
+                            // The name is painted, so the slot it was given is nothing wide and
+                            // nothing could hover it: the tooltip never came up. The whole of the
+                            // name's room answers instead - hover only, so the header still drags.
+                            let _ = resp;
+                            let hover = egui::Rect::from_min_max(
+                                slot.left_top(),
+                                egui::pos2((slot.left() + if room.is_finite() { room } else { flow_w }).max(slot.left() + 8.0), slot.bottom()),
+                            );
+                            simple_bodies::trace_rect(ui, node, "header_hover", hover);
+                            ui.interact(hover, ui.id().with("header_name_hover"), egui::Sense::hover())
+                                .on_hover_ui(tooltip)
                         }
                     };
 
@@ -575,6 +664,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         egui::Sense::hover(),
                     );
                     let right = ui.max_rect().right();
+                    simple_bodies::trace_rect(
+                        ui,
+                        node,
+                        "header_ctrl",
+                        egui::Rect::from_min_max(egui::pos2(right - kit::stepper_w(ui), row.top()), egui::pos2(right, row.bottom())),
+                    );
                     let step = kit::header_stepper(
                         ui,
                         n,
@@ -601,13 +696,19 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 // adds or drops the pair of pins together so the two columns never fall out
                 // of step. The names are the ones the body's stepper used to give them,
                 // because a saved patch holds them.
-                if let Some((n, range)) = channel_count {
+                if let Some((n, ref range)) = channel_count {
                     let (fewest, most) = (*range.start(), *range.end());
                     let (row, _) = ui.allocate_exact_size(
                         egui::vec2(kit::stepper_w(ui), kit::stepper_h(ui)),
                         egui::Sense::hover(),
                     );
                     let right = ui.max_rect().right();
+                    simple_bodies::trace_rect(
+                        ui,
+                        node,
+                        "header_ctrl",
+                        egui::Rect::from_min_max(egui::pos2(right - kit::stepper_w(ui), row.top()), egui::pos2(right, row.bottom())),
+                    );
                     let step = kit::header_stepper(
                         ui,
                         n,
@@ -619,14 +720,20 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     match step {
                         Some(1) => {
                             if let Some(node) = snarl.get_node_mut(node) {
-                                let next = node.inputs.len() + 1;
-                                node.inputs.push(PinDescriptor::new(format!("In {next}"), SignalType::Float));
-                                node.outputs.push(PinDescriptor::new(format!("Out {next}"), SignalType::Float));
+                                let (input, output) = kit::channel_pins(node);
+                                node.inputs.push(input);
+                                if let Some(output) = output {
+                                    node.outputs.push(output);
+                                }
                             }
                         }
                         Some(-1) if n > fewest => {
+                            // A scope's channels are inputs only; the others drop the pair.
+                            let paired = snarl.get_node(node).is_some_and(|nd| kit::channel_pins(nd).1.is_some());
                             remove_input_pin(node, n - 1, inputs, snarl);
-                            remove_output_pin(node, n - 1, outputs, snarl);
+                            if paired {
+                                remove_output_pin(node, n - 1, outputs, snarl);
+                            }
                         }
                         _ => {}
                     }
@@ -639,6 +746,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let h = kit::stepper_h(ui);
                     let (row, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
                     let right = ui.max_rect().right();
+                    simple_bodies::trace_rect(
+                        ui,
+                        node,
+                        "header_ctrl",
+                        egui::Rect::from_min_max(egui::pos2(right - h, row.top()), egui::pos2(right, row.bottom())),
+                    );
                     if kit::header_plus_button(ui, &format!("Add a {noun}"), row, right) {
                         add_port(node, &port_module, snarl);
                     }
@@ -665,12 +778,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             simple_bodies::add_macro_port(snarl, node);
                         }
                     }
-                    simple_bodies::trace_rect(
-                        ui,
-                        node,
-                        "header_add",
-                        egui::Rect::from_min_max(egui::pos2(right - h, row.top()), egui::pos2(right, row.bottom())),
-                    );
+                    for what in ["header_add", "header_ctrl"] {
+                        simple_bodies::trace_rect(
+                            ui,
+                            node,
+                            what,
+                            egui::Rect::from_min_max(egui::pos2(right - h, row.top()), egui::pos2(right, row.bottom())),
+                        );
+                    }
                 }
                 // The Envelope's graph switches, in its header: the graph is the module, and a
                 // row of two body-sized buttons under it cost a quarter of the module's height
@@ -717,6 +832,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // graph shows is set on that copy, beside its colours, and by default it
                     // follows what is set here.
                     simple_bodies::trace_rect(ui, node, "env_opts", egui::Rect::from_min_max(grid.min, labels.max));
+                    simple_bodies::trace_rect(ui, node, "header_ctrl", egui::Rect::from_min_max(grid.min, labels.max));
                 }
 
                 if is_subpatch {
@@ -779,29 +895,100 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
 
                 // Response Curve: Save / Load / Reset in the header.
+                // They are placed against the header's right edge like every other header
+                // control, and the name is painted in what room that leaves: three word
+                // buttons in the row after the name sat on top of it. The graph's `grid` and
+                // `labels` switches are here too, as on the Envelope - the graph is the
+                // module - and a pinned copy of the graph sets its own in the inspector.
                 if is_response_curve {
-                    if ui.small_button("Save…").on_hover_text("Save curve to a .fxc file").clicked() {
-                        curve_header_save(node, snarl);
-                    }
-                    if ui.small_button("Load…").on_hover_text("Load curve from a .fxc file").clicked() {
-                        curve_header_load(node, curve_is_float, snarl);
-                    }
-                    if ui.small_button("Reset").on_hover_text("Reset to default (undoable)").clicked() {
+                    let h = kit::stepper_h(ui);
+                    let gap = kit::CURVE_HEADER_GAP;
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(kit::curve_header_w(ui) - ui.spacing().item_spacing.x, h),
+                        egui::Sense::hover(),
+                    );
+                    // Left of the channel stepper, where there is one (an AutoMap curve has
+                    // the one channel its signal makes, and no stepper).
+                    let mut right = ui.max_rect().right()
+                        - if channel_count.is_some() { kit::stepper_w(ui) + gap + 4.0 } else { 0.0 };
+                    let mut take = |w: f32, after: f32| {
+                        let r = egui::Rect::from_min_max(egui::pos2(right - w, row.top()), egui::pos2(right, row.bottom()));
+                        right -= w + after;
+                        r
+                    };
+                    let (reset_r, load_r, save_r) = (take(h, gap), take(h, gap), take(h, gap + 4.0));
+                    let labels_r = take(kit::CURVE_TOGGLE_W[1], gap);
+                    // `grid` and `scaled` are two halves of one pill: whether the lines are
+                    // drawn, and whether they follow the Log/Exp scale.
+                    let pair_r = take(kit::CURVE_TOGGLE_W[0] + kit::CURVE_TOGGLE_W[2], 0.0);
+                    let grid_r = pair_r;
+                    if kit::header_icon_button(ui, glyphs::Glyph::Reset, "Reset the curve to default (undoable)", reset_r, ("curve_reset", node)) {
                         curve_header_reset(node, curve_is_float, snarl);
                         self.push_undo_request = true;
                     }
+                    if kit::header_icon_button(ui, glyphs::Glyph::Load, "Load a curve from a .fxc file", load_r, ("curve_load", node)) {
+                        curve_header_load(node, curve_is_float, snarl);
+                    }
+                    if kit::header_icon_button(ui, glyphs::Glyph::Save, "Save the curve to a .fxc file", save_r, ("curve_save", node)) {
+                        curve_header_save(node, snarl);
+                    }
+                    let (mut sg, mut sl) = snarl.get_node(node).map_or((true, false), |n| {
+                        (
+                            n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true),
+                            n.params
+                                .get("show_grid_labels")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(MotionUnit::of(n).is_some()),
+                        )
+                    });
+                    let scaled = snarl
+                        .get_node(node)
+                        .and_then(|n| n.params.get("show_scaled_grid").and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                    let (grid_clicked, scaled_clicked) = kit::header_toggle_pair(
+                        ui,
+                        pair_r,
+                        kit::CURVE_TOGGLE_W[0],
+                        ("grid", sg, "Draw the grid's lines"),
+                        ("scaled", scaled, "The lines follow the Log/Exp scale instead of standing evenly"),
+                        ("curve_grid_pair", node),
+                    );
+                    if grid_clicked {
+                        sg = !sg;
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("show_grid".into(), Value::Bool(sg));
+                        }
+                    }
+                    if scaled_clicked {
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("show_scaled_grid".into(), Value::Bool(!scaled));
+                        }
+                    }
+                    if kit::header_toggle(ui, "labels", sl, labels_r, ("curve_labels", node)) {
+                        sl = !sl;
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("show_grid_labels".into(), Value::Bool(sl));
+                        }
+                    }
+                    simple_bodies::trace_rect(ui, node, "curve_opts", egui::Rect::from_min_max(grid_r.min, reset_r.max));
+                    simple_bodies::trace_rect(
+                        ui,
+                        node,
+                        "header_ctrl",
+                        egui::Rect::from_min_max(grid_r.min, egui::pos2(ui.max_rect().right(), reset_r.bottom())),
+                    );
                 }
 
                 // RWS Aim: Save/Load preset buttons live in the header so the body
                 // stays clean for the knobs + ruler. The Rotation input is always
                 // read as a gyro rate.
                 if is_rws {
-                    // Save / load the RWS feel set (calibration + sensitivity +
-                    // flick/aim) as a portable .fxrws preset — e.g. one per game.
-                    if ui.small_button("Save…")
-                        .on_hover_text("Save this RWS calibration + feel set to a .fxrws preset")
-                        .clicked()
-                    {
+                    // Save / load the RWS feel set (calibration + sensitivity + flick/aim) as
+                    // a portable .fxrws preset - e.g. one per game - as the drawings the
+                    // curves' file buttons wear, and the Mouse Scale unit as one pill of two.
+                    let h = kit::stepper_h(ui);
+                    let (save_r, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                    if kit::header_icon_button(ui, glyphs::Glyph::Save, "Save this RWS calibration + feel set to a .fxrws preset", save_r, ("rws_save", node)) {
                         if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                             rfd::FileDialog::new()
                                 .add_filter("FlexInput RWS preset", &["fxrws"])
@@ -811,10 +998,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             let _ = rws_save_preset(snarl, node, &path);
                         }
                     }
-                    if ui.small_button("Load…")
-                        .on_hover_text("Load RWS settings from a .fxrws preset")
-                        .clicked()
-                    {
+                    let (load_r, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                    if kit::header_icon_button(ui, glyphs::Glyph::Load, "Load RWS settings from a .fxrws preset", load_r, ("rws_load", node)) {
                         if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                             rfd::FileDialog::new()
                                 .add_filter("FlexInput RWS preset", &["fxrws"])
@@ -823,16 +1008,21 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             let _ = rws_load_preset(snarl, node, &path);
                         }
                     }
-                    // Mouse Scale unit — display only: `scale` stays stored per
-                    // degree, so patches and presets are unaffected.
-                    ui.separator();
+                    // Mouse Scale unit - display only: `scale` stays stored per degree, so
+                    // patches and presets are unaffected.
                     let per_360 = RwsScaleUnit::of(snarl, node).per_360();
                     let tip = "Mouse Scale unit: mouse dots per degree of turn, or per full 360° turn\n(as Steam Input and sensitivity databases list it). Display only — the\nstored value and .fxrws presets don't change.";
-                    for (val, lbl, on) in [("deg", "dots/°", !per_360), ("360", "dots/360°", per_360)] {
-                        if ui.selectable_label(on, egui::RichText::new(lbl).small())
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
+                    let (unit_r, _) = ui.allocate_exact_size(egui::vec2(104.0, h), egui::Sense::hover());
+                    let (deg, full) = kit::header_toggle_pair(
+                        ui,
+                        unit_r,
+                        46.0,
+                        ("dots/°", !per_360, tip),
+                        ("dots/360°", per_360, tip),
+                        ("rws_unit", node),
+                    );
+                    for (clicked, val) in [(deg, "deg"), (full, "360")] {
+                        if clicked {
                             if let Some(n) = snarl.get_node_mut(node) {
                                 n.params.insert("scale_unit".into(), Value::String(val.into()));
                             }
@@ -951,6 +1141,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         current.label().to_string()
                     };
                     let mut new_skin = current;
+                    // What the header holds, said out loud: the block below is laid out
+                    // against the frame's right edge, so the header's used rect spans the
+                    // whole node and the node would keep whatever width it was last dragged
+                    // to. The name, the picker and its word are the content.
+                    self.header_content.insert(node.0, ui.min_rect().width() + 140.0 + 48.0 + 3.0 * ui.spacing().item_spacing.x);
                     // Right-align: build the chip+label as a right-to-left layout
                     // so it pins to the far edge of the header row regardless of
                     // node width.
@@ -1442,6 +1637,19 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             if is_subpatch && is_unlocked {
                 layout_editing_controls(ui, snarl, node);
             }
+            if let Some(block) = header_grid {
+                // What the rows themselves take, without the pad above them.
+                let rows_h = (ui.min_rect().height() - pad_above).max(0.0);
+                let whole = ((rows_h + frame_margin_y - 0.5) / block).ceil().max(1.0) * block - frame_margin_y;
+                let spare = (whole - rows_h).max(0.0);
+                let above = (spare * 0.5).floor();
+                ui.ctx().data_mut(|d| d.insert_temp(header_pad_id, above));
+                // The rest goes under them this frame, so the header is `whole` tall.
+                let below = whole - rows_h - pad_above - ui.spacing().item_spacing.y;
+                if below > 0.0 {
+                    ui.allocate_exact_size(egui::vec2(0.0, below), egui::Sense::hover());
+                }
+            }
         });
     }
 
@@ -1480,17 +1688,25 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let strip_pin = kit::strip_pin(&node.module_id, true, pin.id.input);
         // Folded, no word is drawn beside the socket: see the output side.
         let folded = !simple_bodies::node_open(snarl, pin.id.node);
-        if !is_relocated_automap && !strip_pin && !folded {
+        let bus_pin = kit::unlabelled_bus_pin(&node.module_id, desc.signal_type);
+        if !is_relocated_automap && !strip_pin && !folded && !bus_pin {
             let name = if node.module_id == "module.sample_hold" && pin.id.input == 1 {
                 sample_hold_gate_label(node)
             } else {
                 desc.name.as_str()
             };
-            let (shown, shortened) = if kit::pin_abbreviates(&node.module_id) {
-                kit::pin_short(name)
-            } else {
-                (name.to_string(), false)
-            };
+            let (shown, shortened) = kit::pin_label(&node.module_id, name);
+            // Hovered, a label says what it is short for and where its wire comes from.
+            let hover = kit::pin_hover(
+                name,
+                shortened,
+                "from",
+                pin.remotes.iter().filter_map(|r| {
+                    let n = snarl.get_node(r.node)?;
+                    Some((n.display_name.as_str(), n.outputs.get(r.output).map_or("", |p| p.name.as_str())))
+                }),
+            );
+            let (shortened, name) = (hover.is_some(), hover.as_deref().unwrap_or(name));
             let col = channel_label_color(&node.module_id, pin.id.input).or_else(|| {
                 // A device inlet says what drives it: the Auto-Map bus's own
                 // orange when the bus covers it, the brighter plain text colour
@@ -1530,7 +1746,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             }
         } else if let Some(p) = pitch {
-            ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
+            let (row, _) = ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
+            simple_bodies::trace_rect(ui, pin.id.node, &format!("pin_row_in_{}", pin.id.input), row);
         }
         let header_y = if is_relocated_automap {
             // Dual-stash delta recovery. Snarl runs show_input BEFORE
@@ -1542,7 +1759,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // node). Read the stale pair FIRST, derive the layout
             // delta, then overwrite pin_row_y with this frame's value
             // for the next frame's read.
-            let cur_pin_y = automap_chevron_y(ui);
+            let cur_pin_y = ui.max_rect().top();
             let (prev_label, prev_pin) = ui.ctx().data(|d| (
                 d.get_temp::<f32>(automap_label_abs_y_key(pin.id.node)),
                 d.get_temp::<f32>(automap_pin_row_y_key(pin.id.node)),
@@ -1554,6 +1771,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ui.ctx().data_mut(|d| d.insert_temp(
                 automap_pin_row_y_key(pin.id.node), cur_pin_y));
             Some(cur_pin_y + delta)
+        } else if kit::bus_pin_on_header(&node.module_id, strip_pin, desc.signal_type, node.inputs.iter().map(|p| p.signal_type)) {
+            // An unlabelled bus socket sits on the header row, where it is when the module
+            // is folded - so folding doesn't move it, and the two sides' sockets line up.
+            header_row_y(ui, pin.id.node, ("in", pin.id.input))
         } else {
             None
         };
@@ -1596,17 +1817,27 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // The port's own row: no label (the strip says the same word), but the pitch
             // the strips are drawn at.
             if let Some(p) = pitch {
-                ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
+                let (row, _) = ui.allocate_exact_size(egui::vec2(0.0, p), egui::Sense::hover());
+                simple_bodies::trace_rect(ui, pin.id.node, &format!("pin_row_out_{}", pin.id.output), row);
             }
-        } else if !is_relocated_automap && !kit::pin_hides_outputs(&node.module_id) {
-            let (shown, shortened) = if kit::pin_abbreviates(&node.module_id) {
-                kit::pin_short(&desc.name)
-            } else {
-                (desc.name.clone(), false)
-            };
+        } else if !is_relocated_automap
+            && !kit::pin_hides_outputs(&node.module_id)
+            && !kit::unlabelled_bus_pin(&node.module_id, desc.signal_type)
+        {
+            let (shown, shortened) = kit::pin_label(&node.module_id, &desc.name);
+            // Hovered, a label says what it is short for and where its wires go.
+            let hover = kit::pin_hover(
+                &desc.name,
+                shortened,
+                "to",
+                pin.remotes.iter().filter_map(|r| {
+                    let n = snarl.get_node(r.node)?;
+                    Some((n.display_name.as_str(), n.inputs.get(r.input).map_or("", |p| p.name.as_str())))
+                }),
+            );
             let col = channel_label_color(&node.module_id, pin.id.output);
             if let Some(p) = pitch {
-                pin_label_at_row(ui, &shown, col, p, shortened, desc.name.as_str());
+                pin_label_at_row(ui, &shown, col, p, hover.is_some(), hover.as_deref().unwrap_or(desc.name.as_str()));
             } else {
                 let text = egui::RichText::new(shown.as_str()).small();
                 let text = match col {
@@ -1614,13 +1845,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     None => text,
                 };
                 let resp = ui.label(text);
-                if shortened {
-                    resp.on_hover_text(desc.name.as_str());
+                if let Some(hover) = hover {
+                    resp.on_hover_text(hover);
                 }
             }
         }
         let header_y = if is_relocated_automap {
-            let cur_pin_y = automap_chevron_y(ui);
+            let cur_pin_y = ui.max_rect().top();
             let (prev_label, prev_pin) = ui.ctx().data(|d| (
                 d.get_temp::<f32>(automap_label_abs_y_key(pin.id.node)),
                 d.get_temp::<f32>(automap_pin_row_y_key(pin.id.node)),
@@ -1632,6 +1863,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ui.ctx().data_mut(|d| d.insert_temp(
                 automap_pin_row_y_key(pin.id.node), cur_pin_y));
             Some(cur_pin_y + delta)
+        } else if kit::bus_pin_on_header(&node.module_id, strip_pin, desc.signal_type, node.outputs.iter().map(|p| p.signal_type)) {
+            header_row_y(ui, pin.id.node, ("out", pin.id.output))
         } else {
             None
         };
@@ -1685,6 +1918,28 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         self.header_content.get(&node.0).copied()
     }
 
+    /// A module that keeps its shape (the Vectorscope is a square) is scaled by its grip.
+    fn node_resize_uniform(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
+        snarl.get_node(node).is_some_and(|n| kit::keeps_aspect(&n.module_id))
+    }
+
+    /// A list of port strips sits in the middle of its frame: its rows are a block each and
+    /// the frame's own trim is not, so the grid's rounding adds the same half-block under
+    /// every one of them, and all of it at the bottom reads as a module with a row missing.
+    fn node_centers_payload(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
+        snarl.get_node(node).map_or(false, |n| {
+            matches!(
+                n.module_id.as_str(),
+                "module.selector"
+                    | "module.split"
+                    | "module.macro"
+                    | "module.automap_combiner"
+                    | "module.automap_fork"
+                    | "module.automap_selector"
+            )
+        })
+    }
+
     /// The floor the corner grip is held to, for a body that measured one this frame
     /// (`kit::body_width`'s second value). Stretchy bodies and kit rows both do; nothing
     /// else asks, and the grip keeps its header-width fallback for those.
@@ -1728,6 +1983,23 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
+        // Folded, a body is measured and nothing else. Snarl runs a collapsed node's body
+        // anyway, shifted up under the header, where it was drawn across the header's own
+        // name and still answered the pointer. It is laid out as ever, so the folded frame
+        // keeps the width the open one had - but it paints nothing, and with no clip left
+        // to be hit in it takes no pointer either. Here rather than in each body: a module
+        // can't forget it.
+        //
+        // The one thing a folded module may still show is its number: on the grid a folded
+        // frame is two blocks tall and its header is one, so there is a band under the
+        // header with nothing in it, and a Knob, a Constant or a Readout folded away is
+        // still worth reading. That is painted from here too, into the frame.
+        if !simple_bodies::node_open(snarl, node_id) {
+            simple_bodies::paint_folded_reading(ui, snarl, node_id, self.view_salt);
+            ui.set_clip_rect(egui::Rect::from_min_size(ui.max_rect().min, egui::Vec2::ZERO));
+            ui.set_invisible();
+        }
+
         let module_id = snarl
             .get_node(node_id)
             .map(|n| n.module_id.clone())
@@ -1772,6 +2044,25 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         } else {
             0.0
         };
+        // Whatever the grip asked for, the header can hold the frame wider: its controls are
+        // content too. The body fills that frame rather than standing narrow in it - a
+        // Response Curve dragged down to its graph's floor kept shrinking inside a frame its
+        // header's switches would not let follow.
+        let held_w = {
+            let header_w: Option<f32> = ui
+                .ctx()
+                .data(|d| d.get_temp(self.snarl_id.with(("snarl-node", node_id)).with("header-w")));
+            match (frame_size, header_w) {
+                (Some((frame_w, _)), Some(header_w)) => {
+                    let block = crate::canvas::canvas_grid(ui.ctx()).filter(|g| g.snap).map(|g| g.block);
+                    let whole = |w: f32| block.map_or(w, |b| ((w - 0.5) / b).ceil().max(1.0) * b);
+                    let around = frame_w - ui.available_width();
+                    (whole(header_w + self.node_margin_x) - around).floor()
+                }
+                _ => 0.0,
+            }
+        };
+        let kit_w = if kit::uses_kit(&module_id) && !kit::fixed_size(&module_id) { kit_w.max(held_w) } else { kit_w };
         // A stretchy body is one surface that fills the frame it's given, so it takes
         // both axes: the width the text wraps to, and the height as a floor the text can
         // overrun by growing the module another block.
@@ -1792,7 +2083,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // The narrowest curve worth putting points on: the envelope's own body
                     // adds the rows it needs on top of this.
                     "generator.envelope" => 140.0,
-                    _ => 0.0,
+                    _ => kit::surface_spec(&module_id).map_or(0.0, |s| s.min.x),
                 };
                 // Both need room for more than one line to be worth the module: a display
                 // for the number to be large in, a note for the two lines it opens with.
@@ -1821,7 +2112,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // here (112) asks the body for 112, which makes the frame 168, which
                     // makes a readout's type bigger, which makes its width floor bigger,
                     // and it runs away sideways.
-                    _ => 72.0,
+                    _ => kit::surface_spec(&module_id).map_or(72.0, |s| s.min.y),
                 };
                 // The default is a *frame* size, like what the grip writes: a knob starts
                 // 112 points tall - two of the old blocks, four of these - and the floor
@@ -1832,7 +2123,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // a curve of about 180 by 150 plus six stacked rows, which is ten blocks
                     // and change. Nothing about the module's use asks for more or less.
                     "generator.envelope" => Some(9.0 * block.unwrap_or(28.0)),
-                    _ => None,
+                    _ => kit::surface_spec(&module_id).map(|s| s.default_blocks.1 * block.unwrap_or(28.0)),
                 };
                 let legacy = n
                     .params
@@ -1858,12 +2149,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // takes it from there in either direction, down to one block across.
                     "display.readout" => Some(3.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                     "generator.envelope" => Some(10.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
-                    _ => None,
+                    _ => kit::surface_spec(&module_id)
+                        .map(|s| s.default_blocks.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                 };
                 let (w, floor) = kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w);
                 self.size_floors.insert(node_id.0, floor);
                 (
-                    w,
+                    w.max(held_w),
                     kit::body_height(n, ui.available_height(), frame_size.map(|s| s.1), min_h, block, default_h),
                 )
             })
@@ -1871,43 +2163,52 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             (0.0, 0.0)
         };
 
+        // Where the body starts and how wide it was told to be, for the rig.
+        if body_w > 0.0 || kit_w > 0.0 {
+            simple_bodies::trace_rect(
+                ui,
+                node_id,
+                "body_fill",
+                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(body_w.max(kit_w), 1.0)),
+            );
+        }
         match module_id.as_str() {
             "device.sink"          => show_sink_body(node_id, inputs, ui, snarl),
             "module.constant"      => show_constant_body(node_id, ui, snarl, self.view_salt),
             "module.switch"        => show_switch_body(node_id, ui, snarl, self.view_salt),
             "module.knob"          => show_knob_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
             "display.readout"       => show_readout_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
-            "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
-            "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
-            "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
-            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
-            "processing.rws"   => show_rws_body(node_id, ui, snarl),
+            "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+            "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+            "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
+            "processing.rws"   => show_rws_body(node_id, ui, snarl, body_w, body_h, self.automap_parent.as_ref()),
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
             "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl, self.view_salt),
             "module.response_curve" => {
-                if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                if show_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
             "module.vec_response_curve" => {
-                if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
             "module.vec_reshape" => {
-                if show_vec_reshape_body(node_id, inputs, outputs, ui, snarl) {
+                if show_vec_reshape_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
             "module.twoway_response_curve" => {
-                if show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                if show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
             "module.automap_response_curve" | "module.automap_twoway_response_curve" => {
-                if show_automap_curve_body(node_id, inputs, outputs, ui, snarl) {
+                if show_automap_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
@@ -1928,34 +2229,55 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl, body_w, body_h),
             "processing.gyro_3dof"  => show_gyro_3dof_body(
                 node_id, inputs, ui, snarl, self.live_signals,
-                self.panic_shortcut, self.automap_parent.as_ref(),
+                self.panic_shortcut, self.automap_parent.as_ref(), body_w, body_h,
             ),
             "module.automap_split"     => show_automap_split_body(node_id, outputs, ui, snarl),
             "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
-            "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
-            "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
+            "module.automap_fork"      => show_automap_fork_body(node_id, inputs, outputs, ui, snarl),
+            "module.automap_selector"  => show_automap_selector_body(node_id, inputs, outputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals, self.automap_parent.as_ref(), false),
-            "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
+            "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref(), body_w, body_h),
             "module.jsm" => show_jsm_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(),
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h,
             ),
             "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
-            "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
-            "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
-            "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            // The card modules are drawn the way their pinned copies are, at the size the
+            // module's corner grip gives them: the width sets the scale of the cards, the
+            // height is the window onto the list, which scrolls as it does on a widget.
+            "module.remapper" => pinned::render_remapper_whole_module(
+                node_id,
+                ui,
+                snarl,
+                egui::vec2(body_w, body_h),
+                self.live_signals,
+                self.panic_shortcut,
+                self.automap_parent.as_ref(),
+                false,
+            ),
+            "module.map_action" => pinned::render_map_action_whole_module(
+                node_id,
+                ui,
+                snarl,
+                egui::vec2(body_w, body_h),
+                self.live_signals,
+                self.panic_shortcut,
+                self.automap_parent.as_ref(),
+                false,
+            ),
+            "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
             "module.input_viewer" => super::input_viewer::show_input_viewer_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "module.menu" => super::menu_body::show_menu_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
             "module.stick_rotation" => {
-                if show_stick_rotation_body(node_id, ui, snarl) {
+                if show_stick_rotation_body(node_id, ui, snarl, body_w, body_h) {
                     self.push_undo_request = true;
                 }
             }
             "module.area_mapper" => {
                 if super::area_body::show_area_mapper_body(
-                    node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(),
+                    node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h,
                 ) {
                     self.push_undo_request = true;
                 }
@@ -2299,6 +2621,57 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
         | "module.touch_zones" | "module.input_viewer" | "module.menu"
         | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
     )
+}
+
+/// Where the header's first row is (`show_header` records it), for a socket drawn on it.
+fn header_mid_y_key(node: NodeId) -> egui::Id {
+    egui::Id::new(("fxi_header_mid_y", node.0))
+}
+
+/// The y of the header's first row for a socket in `pin_ui`, from layout rather than from
+/// the clip. A node partly off the canvas has its clip cut to the canvas, so a position read
+/// off the clip pinned its sockets - and their wires - to the canvas edge. `show_header` runs
+/// after the pins in a frame, so its row is last frame's; the gap between it and this pin's
+/// row (also last frame's) is fixed by the layout, so adding it to this frame's row follows
+/// a dragged node without a frame of lag. `None` until both are known: the row's own centre.
+fn header_row_y(pin_ui: &egui::Ui, node: NodeId, pin: (&'static str, usize)) -> Option<f32> {
+    let row_key = egui::Id::new(("fxi_header_pin_row_y", node.0, pin));
+    let row = pin_ui.max_rect().top();
+    let (header, prev_row) = pin_ui.ctx().data(|d| (d.get_temp::<f32>(header_mid_y_key(node)), d.get_temp::<f32>(row_key)));
+    pin_ui.ctx().data_mut(|d| d.insert_temp(row_key, row));
+    Some(row + (header? - prev_row?))
+}
+
+#[cfg(test)]
+mod header_socket_tests {
+    use super::{header_mid_y_key, header_row_y};
+    use egui_snarl::NodeId;
+
+    // A bus socket on the header follows where the header is laid out, not where the canvas
+    // clips it: a node dragged above the top of the canvas has its sockets above it too, not
+    // stuck on the edge with their wires.
+    #[test]
+    fn a_header_socket_follows_the_layout_not_the_clip() {
+        let ctx = egui::Context::default();
+        let node = NodeId(9);
+        let mut got = Vec::new();
+        for frame in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // The header's row, laid out 400 points above the visible canvas.
+                    ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), -400.0_f32));
+                    let row = egui::Rect::from_min_size(egui::pos2(0.0, -360.0), egui::vec2(100.0, 20.0));
+                    let mut pin_ui = ui.new_child(egui::UiBuilder::new().max_rect(row));
+                    pin_ui.set_clip_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)));
+                    got.push((frame, header_row_y(&pin_ui, node, ("in", 0))));
+                });
+            });
+        }
+        assert_eq!(got[0].1, None, "nothing to go on the first time");
+        for (frame, y) in &got[1..] {
+            assert_eq!(*y, Some(-400.0), "frame {frame}: the socket left the header row");
+        }
+    }
 }
 
 #[cfg(test)]

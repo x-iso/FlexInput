@@ -269,7 +269,14 @@ pub(crate) fn scope_should_request_repaint(
 /// (input 1, a Vec4). The model is auto-detected from the connected device
 /// (input 0, AutoMap) unless the `model` param overrides it.
 
-pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn show_vectorscope_body(
+    node_id: NodeId,
+    _inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) {
     // Conditional vsync — see scope_should_request_repaint above.
     let _ = scope_should_request_repaint(node_id, snarl, ui.ctx());
     // Bounded tail clone: we only render the last MAX_VS_TRAIL samples,
@@ -289,40 +296,14 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
 
     let mut display_rect: Option<egui::Rect> = None;
     ui.vertical(|ui| {
-        // Aspect-locked square resize. Stores `side` as persisted egui memory so
-        // it survives app restarts (same id scheme as the prior egui::Resize).
-        let size_id = egui::Id::new(("vs_side", node_id));
-        let mut side = ui
-            .ctx()
-            .data_mut(|d| d.get_persisted::<f32>(size_id))
-            .unwrap_or(140.0)
-            .max(40.0);
-
+        // A square and nothing round it: the scope can only show a square, so the module
+        // keeps that shape - its width is the side, and the corner grip scales it (the
+        // viewer turns a drag in either direction into one size, see `resize_node`). It had
+        // a grip of its own in its corner and a side kept in egui's memory.
+        let _ = body_h;
+        let side = body_w.max(56.0);
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
         display_rect = Some(rect);
-
-        // Drag handle in the bottom-right corner. Drives both axes from a single
-        // delta so the area stays square.
-        let handle_sz = 12.0;
-        let handle_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - handle_sz, rect.bottom() - handle_sz),
-            egui::Vec2::splat(handle_sz),
-        );
-        let handle_resp = ui.interact(
-            handle_rect,
-            size_id.with("handle"),
-            egui::Sense::click_and_drag(),
-        );
-        if handle_resp.hovered() || handle_resp.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-        }
-        if handle_resp.dragged() {
-            let d = handle_resp.drag_delta();
-            // Use the dominant axis so diagonal drags feel natural.
-            let delta = if d.x.abs() >= d.y.abs() { d.x } else { d.y };
-            side = (side + delta).max(40.0);
-            ui.ctx().data_mut(|d| d.insert_persisted(size_id, side));
-        }
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
@@ -393,34 +374,7 @@ pub(crate) fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut 
             }
         }
 
-        // Paint a small diagonal-line resize grip in the bottom-right corner
-        // (mirrors egui's internal `paint_resize_corner_with_style`).
-        {
-            let grip_color = ui.style().interact(&handle_resp).fg_stroke.color;
-            let grip_stroke = egui::Stroke::new(1.0_f32, grip_color);
-            let cp = handle_rect.right_bottom();
-            let mut w = 2.0;
-            while w <= handle_rect.width() && w <= handle_rect.height() {
-                painter.line_segment(
-                    [egui::pos2(cp.x - w, cp.y), egui::pos2(cp.x, cp.y - w)],
-                    grip_stroke,
-                );
-                w += 4.0;
-            }
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Ch").small().weak());
-            if ui.small_button("+").on_hover_text("Add channel").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    let next = node.inputs.len() + 1;
-                    node.inputs.push(PinDescriptor::new(format!("ch{}", next), SignalType::Vec2));
-                }
-            }
-            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove channel").clicked() {
-                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-            }
-        });
+        // The channels are added and dropped from the header's stepper.
     });
     if let Some(r) = display_rect { register_exposable_element(ui, node_id, "display", r); }
 }

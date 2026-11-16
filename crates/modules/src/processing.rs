@@ -413,9 +413,11 @@ impl Module for AutoMapFork {
             id: "module.automap_fork",
             display_name: "AutoMap Fork",
             category: "AutoMap",
+            // `select` first, as on a Split or a Selector. It was second; patches saved
+            // that way are turned round when they load (`migrate_loaded_snarl`).
             inputs: vec![
-                PinDescriptor::new("in", SignalType::AutoMap),
                 PinDescriptor::new("select", SignalType::Float),
+                PinDescriptor::new("in", SignalType::AutoMap),
             ],
             outputs: vec![
                 PinDescriptor::new("out_0", SignalType::AutoMap),
@@ -426,8 +428,8 @@ impl Module for AutoMapFork {
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         // AutoMap bus routing: the eval graph follows wires to the upstream AutoMap source.
         // The select pin controls which output wire is "active" at the UI level.
-        let bus = inputs.get(0).and_then(|s| *s).unwrap_or(Signal::Float(0.0));
-        let select = match inputs.get(1).and_then(|s| *s) {
+        let bus = inputs.get(1).and_then(|s| *s).unwrap_or(Signal::Float(0.0));
+        let select = match inputs.get(0).and_then(|s| *s) {
             Some(Signal::Float(f)) => f > 0.5,
             Some(Signal::Bool(b)) => b,
             _ => false,
@@ -604,9 +606,11 @@ impl Module for Gyro3DOFModule {
             inputs: vec![
                 PinDescriptor::new("Device",  SignalType::AutoMap),
                 PinDescriptor::new("Reset",   SignalType::Bool).optional(),
-                PinDescriptor::new("Gyro X",  SignalType::Float).optional(),
-                PinDescriptor::new("Gyro Y",  SignalType::Float).optional(),
-                PinDescriptor::new("Gyro Z",  SignalType::Float).optional(),
+                // The canonical gyro axes, named by the turn each one is: x is roll, y pitch,
+                // z yaw (see the IMU frame in `flexinput_devices::gyro`).
+                PinDescriptor::new("Roll",    SignalType::Float).optional(),
+                PinDescriptor::new("Pitch",   SignalType::Float).optional(),
+                PinDescriptor::new("Yaw",     SignalType::Float).optional(),
                 PinDescriptor::new("Accel X", SignalType::Float).optional(),
                 PinDescriptor::new("Accel Y", SignalType::Float).optional(),
                 PinDescriptor::new("Accel Z", SignalType::Float).optional(),
@@ -618,7 +622,7 @@ impl Module for Gyro3DOFModule {
                 PinDescriptor::new("Lean",   SignalType::Float),
                 PinDescriptor::new("Lean!",  SignalType::Bool),
                 // Quaternion orientation (x,y,z,w) — continuous 3DOF pose from gyro + gravity alignment.
-                PinDescriptor::new("Orientation", SignalType::Vec4),
+                PinDescriptor::new("Orient", SignalType::Vec4),
                 // AutoMap-out carries downstream per-pin signals produced
                 // by the module's lean_left / lean_right mapping arrays.
                 // Same contract as Remapper: pin injection happens in
@@ -670,6 +674,12 @@ pub const RWS_MOUSE_OUT_NAME: &str = "Mouse Move (XY)";
 /// there ("mouse" / "stick"). Nodes saved before it existed get it appended on
 /// load.
 pub const RWS_FLICK_OUT_NAME: &str = "Flick";
+/// RWS Aim's AutoMap input: the pad's bus, for the native gyro the Map output carries.
+pub const RWS_DEVICE_IN_NAME: &str = "Device";
+/// RWS Aim's AutoMap output: the Device bus handed on with its gyro axes scaled by the
+/// calibrated `gyro_scale` and Real World Scale, for a game that aims with the pad's own
+/// gyro - so the game turns as far as the pad does.
+pub const RWS_MAP_OUT_NAME: &str = "Map";
 
 /// Name of RWS Aim's input 2: a mode-shift control for everything the module
 /// does with the stick on its Flick input (the flick, Stick aim, and the
@@ -687,11 +697,13 @@ impl Module for RwsModule {
                 PinDescriptor::new("Rotation", SignalType::Vec2),
                 PinDescriptor::new("Flick", SignalType::Vec2).optional(),
                 PinDescriptor::new(RWS_FLICK_ON_IN_NAME, SignalType::Bool).optional(),
+                PinDescriptor::new(RWS_DEVICE_IN_NAME, SignalType::AutoMap).optional(),
             ],
             outputs: vec![
                 PinDescriptor::new(RWS_MOUSE_OUT_NAME, SignalType::Vec2),
                 PinDescriptor::new("Stick", SignalType::Vec2),
                 PinDescriptor::new(RWS_FLICK_OUT_NAME, SignalType::Vec2),
+                PinDescriptor::new(RWS_MAP_OUT_NAME, SignalType::AutoMap),
             ],
         }
     }

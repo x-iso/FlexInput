@@ -312,13 +312,16 @@ fn envelope_time_text(v: f32, timebase: &str) -> String {
 /// What an envelope point is: its level, and where along the envelope's length it sits, in the
 /// unit the module is timed in. The graph gives no numbers of its own at a size this small.
 fn envelope_point_help(x: f32, y: f32, period_ms: f32) -> String {
+    format!("{:.2} level at {}", y, envelope_time_at(x, period_ms))
+}
+/// How far into an envelope `period_ms` long the graph position `x` (0..1) is.
+fn envelope_time_at(x: f32, period_ms: f32) -> String {
     let t = x * period_ms;
-    let when = if period_ms >= 1000.0 {
+    if period_ms >= 1000.0 {
         format!("{:.2} s", t / 1000.0)
     } else {
         format!("{:.0} ms", t)
-    };
-    format!("{:.2} level at {when}", y)
+    }
 }
 /// The module's own snap setting, for the reason [`graph_shown`] gives.
 fn snap_on_param(n: &crate::canvas::node::NodeData) -> bool {
@@ -459,7 +462,8 @@ pub(crate) fn paint_envelope_curve_graph(
         for &y in &grid_y_positions  { painter.line_segment([c2s(0.0, y), c2s(1.0, y)], gs); }
     }
 
-    // Grid labels: X = time position, Y = 0-100%
+    // Grid labels: X = time position, Y = 0-100%. Time runs along the bottom edge: an
+    // envelope peaks at the top, and a point's own value there was written over the times.
     if show_grid_labels {
         const MIN_LABEL_PX: f32 = 20.0;
         let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
@@ -475,8 +479,8 @@ pub(crate) fn paint_envelope_curve_graph(
             } else {
                 format!("{:.0}ms", t_ms)
             };
-            painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
-                egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+            painter.text(egui::pos2(sx + 2.0, rect.bottom() - 1.0),
+                egui::Align2::LEFT_BOTTOM, &label, font.clone(), label_col);
         }
         let mut last_sy = f32::INFINITY;
         for &v in &grid_y_positions {
@@ -492,17 +496,27 @@ pub(crate) fn paint_envelope_curve_graph(
     // Curve — mid-gray so the colored trail stands out. In Hold+Bounce the curve
     // after the sustain point is inactive (the value is held flat through the
     // buffer), so dim it and draw the held horizontal path in the active color.
+    //
+    // One joined line per part, sampled at every control point as well as evenly: separate
+    // segments left a notch at each joint, and even steps alone cut the tip off a peak that
+    // fell between two of them.
     if new_points.len() >= 2 {
-        let steps = 120usize;
         let main_col = Color32::from_gray(120);
         let dim_col  = Color32::from_gray(55);
-        for i in 0..steps {
-            let x0 = i as f32 / steps as f32;
-            let x1 = (i + 1) as f32 / steps as f32;
-            let y0 = flexinput_engine::sample_curve(&new_points, x0, &new_biases).clamp(0.0, 1.0);
-            let y1 = flexinput_engine::sample_curve(&new_points, x1, &new_biases).clamp(0.0, 1.0);
-            let col = if buffer_mode && x0 >= sustain_snapped { dim_col } else { main_col };
-            painter.line_segment([c2s(x0, y0), c2s(x1, y1)], egui::Stroke::new(1.5_f32, col));
+        let split = if buffer_mode { sustain_snapped.clamp(0.0, 1.0) } else { 1.0 };
+        let mut xs: Vec<f32> = (0..=120).map(|i| i as f32 / 120.0).collect();
+        xs.extend(new_points.iter().map(|p| p[0].clamp(0.0, 1.0)));
+        xs.push(split);
+        xs.sort_by(f32::total_cmp);
+        xs.dedup();
+        let at = |x: f32| c2s(x, flexinput_engine::sample_curve(&new_points, x, &new_biases).clamp(0.0, 1.0));
+        let rest: Vec<egui::Pos2> = xs.iter().filter(|&&x| x >= split).map(|&x| at(x)).collect();
+        let live: Vec<egui::Pos2> = xs.iter().filter(|&&x| x <= split).map(|&x| at(x)).collect();
+        if rest.len() >= 2 {
+            painter.add(egui::Shape::line(rest, egui::Stroke::new(1.5_f32, dim_col)));
+        }
+        if live.len() >= 2 {
+            painter.add(egui::Shape::line(live, egui::Stroke::new(1.5_f32, main_col)));
         }
         // Hold+Bounce: held horizontal path at the sustain value across the buffer.
         if buffer_mode {
@@ -736,6 +750,17 @@ pub(crate) fn paint_envelope_curve_graph(
             Color32::from_rgba_unmultiplied(dot_col.r(), dot_col.g(), dot_col.b(), 220));
 
         request_repaint_throttled(ui.ctx());
+    }
+
+    // Live reading at the mouse or gamepad cursor, with the labels, as on the Response
+    // Curve: when, and the level that comes out then - which past the sustain point of a
+    // Hold+Bounce is the held level, not the dimmed curve.
+    if show_grid_labels && !ui.input(|i| i.pointer.any_down()) {
+        if let Some(at) = super::curve_support::graph_reading_pos(ui, rect, bg_resp.hover_pos()) {
+            super::curve_support::paint_cursor_reading(&painter, rect, at, (0.0, 1.0, 0.0, 1.0),
+                |x| sample_y(&new_points, &new_biases, x),
+                |gx, gy| format!("{}  →  {:.2}", envelope_time_at(gx, period_ms), gy));
+        }
     }
 
     // Optional override outline frame
@@ -1134,7 +1159,10 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     // 16-point glyph lost in the middle of it. The squares stay the height of
                     // the row; what a wider row buys them is air, capped so the three still read
                     // as one control, and the group sits in the middle of its cell.
-                    let gap = ((cell.width() - 3.0 * ctrl_h) / 2.0).clamp(CELL_GAP, 24.0);
+                    //
+                    // Each wears its plate switched off as well: a word with no plate still
+                    // reads as something to press, a drawing with none reads as decoration.
+                    let gap = ((cell.width() - 3.0 * ctrl_h) / 2.0).clamp(CELL_GAP, 12.0);
                     let group_w = (3.0 * ctrl_h + 2.0 * gap).min(cell.width());
                     let box_rect = egui::Rect::from_min_size(
                         egui::pos2(cell.center().x - group_w * 0.5, cell.top()),
@@ -1153,7 +1181,10 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         }
                         let before = *flag;
                         let on = *flag;
-                        let resp = child.add_sized([ctrl_h, ctrl_h], egui::Button::selectable(on, ""));
+                        let resp = child.add_sized(
+                            [ctrl_h, ctrl_h],
+                            egui::Button::selectable(on, "").frame_when_inactive(true),
+                        );
                         trace_rect(ui, node_id, &format!("env_mode_{i}"), resp.rect);
                         super::glyphs::paint(
                             child.painter(),
@@ -1242,7 +1273,9 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     let before = snap_on;
                     let snap_resp = child.put(
                         mag,
-                        egui::Button::selectable(snap_on, "").min_size(egui::vec2(ctrl_h, ctrl_h)),
+                        egui::Button::selectable(snap_on, "")
+                            .frame_when_inactive(true)
+                            .min_size(egui::vec2(ctrl_h, ctrl_h)),
                     );
                     super::glyphs::paint(
                         child.painter(),

@@ -642,6 +642,10 @@ impl FlexInputApp {
             ("module.area_mapper", "field") | ("module.area_mapper", "cards") => true,
             ("processing.gyro_3dof", "lean_left")
             | ("processing.gyro_3dof", "lean_right") => true,
+            // Real World Calibration: one button, pressed with South (handled before the
+            // editors in `nav_drive_config_overlay`). It has no fields, so without this arm
+            // the pad walked straight past the one widget that needs the pad.
+            ("processing.rws", crate::rws_cal::ELEMENT) | ("module.jsm", crate::rws_cal::ELEMENT) => true,
             // JSM Config: a pinned setting's fader is driven like a Knob. The
             // editor and the curve are not targets — there is nothing on either
             // a pad can usefully do, and a target you cannot act on just makes
@@ -713,7 +717,7 @@ impl FlexInputApp {
             | ("module.area_mapper", "options") | ("module.area_mapper", "border")
             | ("module.area_mapper", "layers") | ("module.area_mapper", "press")
             | ("processing.rws", "scale") | ("processing.rws", "rws")
-            | ("processing.rws", "stick_dps") | ("processing.rws", "vh")
+            | ("processing.rws", "stick_dps") | ("processing.rws", "gyro_scale") | ("processing.rws", "vh")
             | ("processing.rws", "measure")
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
@@ -996,6 +1000,7 @@ impl FlexInputApp {
             ("processing.rws", "scale") => vec![f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step()))],
             ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0)))],
             ("processing.rws", "stick_dps") => vec![f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0)))],
+            ("processing.rws", "gyro_scale") => vec![f!("Gyro scale", v("gyro_scale",0.0,1000.0,1.0,Fixed(0.01)))],
             ("processing.rws", "vh") => vec![
                 f!("Gyro V/H", v("gyro_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
                 f!("Stick V/H", v("stick_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
@@ -1018,7 +1023,6 @@ impl FlexInputApp {
                 f!("FOV", v("field_fov",30.0,140.0,90.0,Fixed(10.0))),
                 f!("BG", v("field_bg_alpha",0.0,1.0,0.0,Linear)),
                 f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Fixed(5.0))),
-                f!("Labels", Toggle{key:"field_labels"}),
             ],
             // Field order = the rects `rws_flick_row` / `rws_flick_opts_row`
             // publish, so the glow lands on the field being edited.
@@ -1844,17 +1848,11 @@ impl crate::app::FlexInputApp {
         }
     }
 
-    /// The calibration panel's gamepad flow, and whether it took the pad.
-    ///
-    /// Deliberately the SAME button map as RWS Aim's measure widget
-    /// (`nav_drive_rws_measure`), on the same param names, because it is the same
-    /// procedure: ◄► pick the method, ▲▼ the output, Y the snapshot reference, A
-    /// start, A finish, B cancel. The only addition is opening and closing, which
-    /// RWS doesn't need — its widget is a pin of its own, while this one is a row
-    /// folded into the tune panel.
-    ///
-    /// Takes the pad whenever the panel is open, so the faders underneath can't
-    /// be walked while their controls are covered.
+    /// The tune panel's calibration row, and whether it took the pad: South on it pins
+    /// the Real World Calibration widget to the config overlay, where the calibration is
+    /// run over the game (`crate::rws_cal`), exactly as RWS Aim's button does. The panel
+    /// that used to unfold under the row - a second, smaller copy of the same procedure -
+    /// is gone.
     fn nav_drive_jsm_calibrate(
         &mut self,
         ctx: &egui::Context,
@@ -1863,69 +1861,15 @@ impl crate::app::FlexInputApp {
         rt_rising: bool,
     ) -> bool {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
-        let open = self.get_subpatch_param_bool(outer_id, inner, "cal_open").unwrap_or(false);
         let south = nav.is_rising("btn_south") || rt_rising;
-
-        if !open {
-            // Shut, the row is an ordinary field the pad walks past — until South
-            // lands on it. Field 0 is the calibration row (see `nav_fields_for`),
-            // and only the fader pane has fields at all.
-            let on_the_row = self.gamepad_nav.jsm_pane == crate::gamepad_nav::JsmPane::Tune
-                && self.gamepad_nav.field_index == 0;
-            if !(south && on_the_row) {
-                return false;
-            }
-            self.set_subpatch_param_bool(outer_id, inner, "cal_open", true);
-            self.nav_jsm_cal_wrote(ctx);
-            return true;
+        // Field 0 is the calibration row (see `nav_fields_for`), and only the fader pane
+        // has fields at all.
+        let on_the_row = self.gamepad_nav.jsm_pane == crate::gamepad_nav::JsmPane::Tune
+            && self.gamepad_nav.field_index == 0;
+        if !(south && on_the_row) {
+            return false;
         }
-
-        let sweeping = self
-            .get_subpatch_param_str(outer_id, inner, "cal_measure")
-            .is_some_and(|a| a == "pitch" || a == "yaw");
-        let east = nav.is_rising("btn_east");
-
-        if sweeping {
-            // A running sweep answers only two buttons, so neither can be
-            // mistaken for the other with the camera mid-turn.
-            if south {
-                self.set_subpatch_param_bool(outer_id, inner, "cal_finish", true);
-            } else if east {
-                self.set_subpatch_param_str(outer_id, inner, "cal_measure", "off");
-            }
-            self.nav_jsm_cal_wrote(ctx);
-            return true;
-        }
-
-        if nav.is_rising("dpad_left") {
-            self.set_subpatch_param_str(outer_id, inner, "cal_pending", "pitch");
-        }
-        if nav.is_rising("dpad_right") {
-            self.set_subpatch_param_str(outer_id, inner, "cal_pending", "yaw");
-        }
-        // Up/Down flips which output gets solved (Mouse ↔ Stick). Edge-triggered
-        // on the dpad, exactly as RWS Aim's does: a held direction repeating
-        // would flip a two-state toggle back and forth under your thumb.
-        if nav.is_rising("dpad_up") || nav.is_rising("dpad_down") {
-            let cur = self.get_subpatch_param_str(outer_id, inner, "cal_output");
-            let next = if cur.as_deref() == Some("stick") { "mouse" } else { "stick" };
-            self.set_subpatch_param_str(outer_id, inner, "cal_output", next);
-        }
-        // Y toggles the snapshot reference (the 360° method's alignment aid).
-        if nav.is_rising("btn_north") {
-            let s = self.get_subpatch_param_bool(outer_id, inner, "cal_ref_shot").unwrap_or(false);
-            self.set_subpatch_param_bool(outer_id, inner, "cal_ref_shot", !s);
-        }
-        if south {
-            let pending = self
-                .get_subpatch_param_str(outer_id, inner, "cal_pending")
-                .filter(|p| p == "pitch" || p == "yaw")
-                .unwrap_or_else(|| "yaw".into());
-            self.set_subpatch_param_str(outer_id, inner, "cal_measure", &pending);
-        } else if east {
-            // Nothing running: East folds the panel away and hands the faders back.
-            self.set_subpatch_param_bool(outer_id, inner, "cal_open", false);
-        }
+        crate::rws_cal::request_pin(ctx, super::nav_path(outer_id), inner.0);
         self.nav_jsm_cal_wrote(ctx);
         true
     }
@@ -2097,21 +2041,6 @@ impl crate::app::FlexInputApp {
     }
 
     /// Is the command list up on the editor nav is driving?
-    /// Is the JSM calibration panel open on the widget the pad is driving?
-    ///
-    /// While it is, East belongs to IT — it folds the panel away, or cancels a
-    /// sweep — rather than backing out of the whole editor. Same arrangement the
-    /// command list has, and for the same reason: a panel drawn over the faders
-    /// owns "back" until it is gone.
-    pub(crate) fn nav_jsm_cal_open(&self) -> bool {
-        self.nav_driving_outer_id()
-            .filter(|o| self.nav_is_jsm_editor(*o))
-            .and_then(|o| self.nav_selected_inner_node(o).map(|inner| (o, inner)))
-            .is_some_and(|(o, inner)| {
-                self.get_subpatch_param_bool(o, inner, "cal_open").unwrap_or(false)
-            })
-    }
-
     pub(crate) fn nav_jsm_list_open(&self, ctx: &egui::Context) -> bool {
         self.nav_driving_outer_id()
             .filter(|o| self.nav_is_jsm_editor(*o))

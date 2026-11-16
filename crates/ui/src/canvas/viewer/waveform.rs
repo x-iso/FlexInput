@@ -98,6 +98,8 @@ struct Keys {
     stats: &'static str,
     peaks: &'static str,
     freeze: &'static str,
+    /// Hold a repeating wave still: start the window on a rising crossing (Oscilloscope).
+    sync: &'static str,
     axis: &'static str,
     /// Which kind `scale` currently belongs to.
     scale_kind: &'static str,
@@ -106,9 +108,6 @@ struct Keys {
     /// Where the view is scrolled, ms: how far back on a frozen Oscilloscope,
     /// how far before the trigger the window starts on a Trigger Scope.
     scroll: &'static str,
-    /// The plot's size, once set by its grip.
-    w: &'static str,
-    h: &'static str,
 }
 
 /// What differs between the two scope modules.
@@ -129,10 +128,10 @@ pub(crate) const OSC: Spec = Spec {
     keys: Keys {
         win: "osc_win_ms", scale: "osc_scale", auto: "osc_auto", uni: "osc_uni",
         grid_x: "osc_grid_x", grid_y: "osc_grid_y", sub: "osc_grid_sub",
-        labels: "osc_labels", stats: "osc_stats", peaks: "osc_peaks", freeze: "osc_freeze",
+        labels: "osc_labels", stats: "osc_stats", peaks: "osc_peaks", freeze: "osc_freeze", sync: "osc_sync",
         axis: "osc_axis", scale_kind: "osc_scale_kind",
         kind_scales: ["osc_scale_gyro", "osc_scale_accel", "osc_scale_value"],
-        scroll: "osc_scroll_ms", w: "osc_w", h: "osc_h",
+        scroll: "osc_scroll_ms",
     },
     col0: 0,
     from_trigger: false,
@@ -144,10 +143,10 @@ pub(crate) const TRIG: Spec = Spec {
     keys: Keys {
         win: "ts_win_ms", scale: "ts_scale", auto: "ts_auto", uni: "ts_uni",
         grid_x: "ts_grid_x", grid_y: "ts_grid_y", sub: "ts_grid_sub",
-        labels: "ts_labels", stats: "ts_stats", peaks: "ts_peaks", freeze: "ts_freeze",
+        labels: "ts_labels", stats: "ts_stats", peaks: "ts_peaks", freeze: "ts_freeze", sync: "ts_sync",
         axis: "ts_axis", scale_kind: "ts_scale_kind",
         kind_scales: ["ts_scale_gyro", "ts_scale_accel", "ts_scale_value"],
-        scroll: "ts_scroll_ms", w: "ts_w", h: "ts_h",
+        scroll: "ts_scroll_ms",
     },
     col0: 1,
     from_trigger: true,
@@ -172,6 +171,8 @@ struct View {
     stats: bool,
     peaks: bool,
     freeze: bool,
+    /// The window starts on a rising crossing of the first channel's middle.
+    sync: bool,
     /// Where the view is scrolled, ms (see [`Keys::scroll`]).
     scroll_ms: f32,
     /// The kind picked for the left axis and the Scale field.
@@ -191,19 +192,16 @@ const MIN_SCALE: f32 = 1e-6;
 const MAX_SCALE: f32 = 100.0;
 /// How often the statistics table takes new numbers, s.
 const STATS_HOLD_S: f64 = 0.25;
-/// The plot's height until its grip sets one, and the floor for both sides.
-const DEFAULT_H: f32 = 220.0;
+/// The floor for the plot's sides.
 const MIN_W: f32 = 120.0;
 const MIN_H: f32 = 60.0;
-/// The plot's width before the control rows have been measured once.
-const FALLBACK_W: f32 = 420.0;
 const SCROLLBAR_H: f32 = 10.0;
 
 impl Spec {
     /// Params and their defaults; written into the node when missing, so
     /// gamepad navigation (which reads a missing toggle as off) agrees with
     /// the body.
-    fn defaults(&self) -> [(&'static str, ParamDefault); 11] {
+    fn defaults(&self) -> [(&'static str, ParamDefault); 12] {
         let k = &self.keys;
         [
             (k.win, ParamDefault::Num(200.0)),
@@ -217,6 +215,7 @@ impl Spec {
             (k.stats, ParamDefault::Flag(true)),
             (k.peaks, ParamDefault::Flag(false)),
             (k.freeze, ParamDefault::Flag(false)),
+            (k.sync, ParamDefault::Flag(false)),
         ]
     }
 
@@ -236,6 +235,8 @@ impl Spec {
             stats: flag(k.stats, true),
             peaks: flag(k.peaks, false),
             freeze: self.freeze && flag(k.freeze, false),
+            // A Trigger Scope is already lined up on its trigger.
+            sync: !self.from_trigger && flag(k.sync, false),
             scroll_ms: num(k.scroll, 0.0) as f32,
             axis: n.params.get(k.axis).and_then(|v| v.as_str()).and_then(Kind::from_key),
             stored: std::array::from_fn(|i| {
@@ -517,6 +518,46 @@ struct Span {
     start: usize,
 }
 
+/// Where a synced window starts: the latest place, no later than `newest`, where the first
+/// channel rises through the middle of what it has been doing lately. A wave that repeats
+/// then starts at the same point of its cycle every frame and stands still, at the price of
+/// showing up to one cycle less than the newest sample. The middle is taken from the last
+/// window rather than fixed at zero, so a wave riding on an offset - a trigger's 0..1, a
+/// stick held off centre - syncs as well. With no crossing in reach (a flat line, or a wave
+/// slower than the window) the view is the newest window, as without sync.
+fn sync_start(h: &std::collections::VecDeque<Vec<Option<f32>>>, col: usize, newest: usize, win: usize) -> usize {
+    let at = |i: usize| h.get(i).and_then(|row| row.get(col).copied().flatten());
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for i in newest..h.len() {
+        if let Some(v) = at(i) {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if !(hi - lo > 1e-4) {
+        return newest;
+    }
+    let mid = (lo + hi) * 0.5;
+    // A little above the middle before it counts as having risen, so noise sitting on the
+    // middle doesn't make every sample a crossing.
+    let rise = mid + (hi - lo) * 0.02;
+    let oldest = newest.saturating_sub(win);
+    let mut i = newest;
+    while i > oldest {
+        if let (Some(before), Some(now)) = (at(i - 1), at(i)) {
+            if before < mid && now >= mid {
+                // Only a real rise: the wave has to get clear of the middle soon after.
+                let clears = (i..(i + win / 8 + 2).min(h.len())).any(|k| at(k).is_some_and(|v| v >= rise));
+                if clears {
+                    return i;
+                }
+            }
+        }
+        i -= 1;
+    }
+    newest
+}
+
 fn view_span(f: &Frame) -> Span {
     let win = window_samples(&f.view);
     let scroll = (f.view.scroll_ms / 1000.0 * current_sample_rate().max(1) as f32).round();
@@ -525,7 +566,12 @@ fn view_span(f: &Frame) -> Span {
             // Only a frozen view scrolls, back from the newest window.
             let newest = h.len().saturating_sub(win);
             let back = if f.view.freeze { (scroll.max(0.0) as usize).min(newest) } else { 0 };
-            Span { total: h.len(), win, start: newest - back }
+            let start = if f.view.sync && !f.view.freeze {
+                sync_start(h, f.spec.col0, newest, win)
+            } else {
+                newest - back
+            };
+            Span { total: h.len(), win, start }
         }
         Rows::Capture(c) => {
             // The window starts `scroll` before the trigger. A capture still
@@ -918,22 +964,6 @@ fn scrollbar(ui: &mut egui::Ui, rect: egui::Rect, f: &Frame, salt: impl std::has
     None
 }
 
-/// The plot's corner grip: drag to size it. Returns the new size.
-fn size_grip(ui: &mut egui::Ui, plot: egui::Rect, salt: impl std::hash::Hash) -> Option<egui::Vec2> {
-    let grip = egui::Rect::from_min_size(plot.right_bottom() - egui::vec2(12.0, 12.0), egui::vec2(12.0, 12.0));
-    let resp = ui.interact(grip, ui.id().with(("scope_grip", salt)), egui::Sense::drag());
-    let col = if resp.hovered() || resp.dragged() { Color32::from_gray(200) } else { Color32::from_gray(120) };
-    let p = ui.painter();
-    for d in [4.0, 8.0, 12.0] {
-        p.line_segment([egui::pos2(grip.right() - d, grip.bottom() - 1.0), egui::pos2(grip.right() - 1.0, grip.bottom() - d)],
-            egui::Stroke::new(1.0_f32, col));
-    }
-    if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-    }
-    resp.dragged().then(|| plot.size() + resp.drag_delta())
-}
-
 /// The kind the Scale field sets now, and the kinds on the scope.
 fn scale_kind(snarl: &Snarl<NodeData>, id: NodeId, spec: &Spec) -> (Kind, Vec<Kind>) {
     let Some(f) = scope_frame(snarl, id, spec) else { return (Kind::Value, Vec::new()) };
@@ -951,6 +981,7 @@ struct Controls {
     auto: bool,
     uni: bool,
     freeze: bool,
+    sync: bool,
     /// The unit button's pick, applied (scales swapped) next frame.
     pick: Option<Kind>,
     scale_edited: bool,
@@ -967,6 +998,7 @@ impl Controls {
             auto: view.auto,
             uni: view.uni,
             freeze: view.freeze,
+            sync: view.sync,
             pick: None,
             scale_edited: false,
         }
@@ -983,6 +1015,7 @@ impl Controls {
         node.params.insert(k.auto.into(), Value::Bool(self.auto));
         node.params.insert(k.uni.into(), Value::Bool(self.uni));
         if spec.freeze {
+            node.params.insert(k.sync.into(), Value::Bool(self.sync));
             node.params.insert(k.freeze.into(), Value::Bool(self.freeze));
             if !self.freeze {
                 node.params.insert(k.scroll.into(), serde_json::json!(0.0));
@@ -1057,6 +1090,11 @@ fn controls_row_ui(ui: &mut egui::Ui, c: &mut Controls, spec: &Spec, small: bool
                 .on_hover_text("Stop taking samples and hold what is shown; a scrollbar then goes back through it");
             fr[5] = r.rect;
             changed |= r.changed();
+            let r = ui.toggle_value(&mut c.sync, rt("Sync")).on_hover_text(
+                "Hold a repeating wave still: the view starts where the first channel rises through \
+                 its middle, so each frame shows the same part of the cycle",
+            );
+            changed |= r.changed();
         }
     });
     (fr, changed)
@@ -1092,6 +1130,198 @@ fn grid_row_ui(ui: &mut egui::Ui, view: &mut View, small: bool) -> ([egui::Rect;
         }
     });
     (fr, changed)
+}
+
+/// The body's settings under the plot: the time window (a slider that takes the room its
+/// group has, never shorter than it was), the scale and its unit and Auto, Bi/Uni, Freeze and
+/// Sync, the guides as count pills and the three overlays as switches - in groups that share
+/// a row while the width holds them. Returns whether the controls changed, whether the
+/// guides did, the rects of the two pinnable elements, and the width the rows need.
+///
+/// `parts` picks the controls and/or the guides (a pinned element draws one); the last value
+/// is the field rects in the order the gamepad walks them - Win, Scale, unit, Auto, Uni,
+/// Freeze, then H, V, Sub, Labels, Stats, Peaks - `NOTHING` for a part not drawn.
+fn body_rows(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    spec: &Spec,
+    c: &mut Controls,
+    view: &mut View,
+    width: f32,
+    parts: (bool, bool),
+) -> (bool, bool, egui::Rect, egui::Rect, f32, [egui::Rect; 12]) {
+    use super::curve_rows::{count_pill, real_pill, segmented, split, word_toggle, Groups};
+    let mut fr = [egui::Rect::NOTHING; 12];
+    let scale_min = if c.present.len() >= 2 { 210.0 } else { 160.0 };
+    let mins = [190.0, scale_min, 84.0, if spec.freeze { 130.0 } else { 0.0 }, 180.0, 190.0];
+    let g = Groups::layout(ui, width, &mins, |k| if k < 4 { parts.0 } else { parts.1 });
+    let mut changed = false;
+    let mut grid_changed = false;
+
+    // The window: a word, the slider, the length it is set to.
+    if let Some(r) = g.get(0) {
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let weak = ui.visuals().weak_text_color();
+        ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, "win", font.clone(), weak);
+        let shown = if c.win_ms >= 1000.0 { format!("{:.1} s", c.win_ms / 1000.0) } else { format!("{:.0} ms", c.win_ms) };
+        ui.painter().text(r.right_center(), egui::Align2::RIGHT_CENTER, shown, font, weak);
+        let slider = egui::Rect::from_min_max(
+            egui::pos2(r.left() + super::curve_rows::zoomed(28.0), r.top()),
+            egui::pos2(r.right() - super::curve_rows::zoomed(46.0), r.bottom()),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(slider)
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("scope_win", spec.salt, node_id)),
+        );
+        child.spacing_mut().slider_width = slider.width();
+        let resp = child
+            .add(egui::Slider::new(&mut c.win_ms, 10.0f32..=10_000.0).logarithmic(true).show_value(false))
+            .on_hover_text("How much time the plot shows across its width");
+        changed |= resp.changed();
+        fr[0] = slider;
+    }
+    // The scale, its unit and Auto.
+    if let Some(r) = g.get(1) {
+        let weights: &[f32] = if c.present.len() >= 2 { &[1.6, 0.9, 0.8] } else { &[1.6, 0.8] };
+        let s = split(r, weights);
+        if c.auto {
+            let mut v = 0.0f32;
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(s[0]).id_salt(("scope_scale_auto", spec.salt, node_id)));
+            child.disable();
+            real_pill(&mut child, node_id, &format!("{}_scale_auto", spec.salt), s[0], "scale", &mut v, "auto", 0.0..=1.0, 0.0,
+                "Auto fits each kind of signal's scale to its peak");
+        } else {
+            let fs = c.kind.full_scale();
+            let shown = format!("{:.3}{}", c.phys, c.kind.suffix());
+            let per_px = (c.phys.abs() * 0.01).max(MIN_SCALE * fs);
+            if real_pill(ui, node_id, &format!("{}_scale", spec.salt), s[0], "scale", &mut c.phys, &shown,
+                MIN_SCALE * fs..=MAX_SCALE * fs, per_px, "The value at the top of the plot (±, in Bi)")
+            {
+                c.scale_edited = true;
+                changed = true;
+            }
+        }
+        fr[1] = s[0];
+        let mut k = 1;
+        if c.present.len() >= 2 {
+            let next = c.present[(c.present.iter().position(|kd| *kd == c.kind).unwrap_or(0) + 1) % c.present.len()];
+            let mut lit = false;
+            let hover = format!(
+                "Scale and left axis in {} — each kind of signal keeps its own scale.\nClick for {}.",
+                c.kind.label(),
+                next.label()
+            );
+            if word_toggle(ui, s[1], &mut lit, &format!("{} ⇄", c.kind.label()), &hover, ("scope_unit", spec.salt, node_id)) {
+                c.pick = Some(next);
+                changed = true;
+            }
+            fr[2] = s[1];
+            k = 2;
+        }
+        changed |= word_toggle(ui, s[k], &mut c.auto, "auto",
+            "Fit each kind of signal's scale to its peak, rounded so the guides land on round values",
+            ("scope_auto", spec.salt, node_id));
+        fr[3] = s[k];
+    }
+    // Bi / Uni.
+    if let Some(r) = g.get(2) {
+        if let Some(u) = segmented(
+            ui,
+            r,
+            &c.uni,
+            &[(false, "bi", "Zero in the middle, the scale up and down"), (true, "uni", "Zero at the bottom, the scale at the top")],
+            ("scope_uni", spec.salt, node_id),
+        ) {
+            c.uni = u;
+            changed = true;
+        }
+        fr[4] = r;
+    }
+    if let Some(r) = g.get(3) {
+        let s = split(r, &[1.0, 1.0]);
+        changed |= word_toggle(ui, s[0], &mut c.freeze, "freeze",
+            "Stop taking samples and hold what is shown; a scrollbar then goes back through it",
+            ("scope_freeze", spec.salt, node_id));
+        changed |= word_toggle(ui, s[1], &mut c.sync, "sync",
+            "Hold a repeating wave still: the view starts where the first channel rises through its middle, \
+             so each frame shows the same part of the cycle", ("scope_sync", spec.salt, node_id));
+        fr[5] = s[0];
+    }
+    let ctrl_rect = (0..4).filter_map(|k| g.get(k)).fold(egui::Rect::NOTHING, |a, r| a.union(r));
+
+    // The guides.
+    if let Some(r) = g.get(4) {
+        let s = split(r, &[1.0, 1.0, 1.1]);
+        for (i, (label, v, lo, hi, hint)) in [
+            ("H|time grid", &mut view.grid_x, 0u32, 20u32, "Time divisions across the window (0 = none)"),
+            ("V|value grid", &mut view.grid_y, 0, 20, "Value divisions across the scale (0 = none)"),
+            ("sub|subdivisions", &mut view.sub, 1, 10, "Minor guides per division (1 = none)"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut f = f64::from(*v);
+            if count_pill(ui, node_id, &format!("{}_grid_{i}", spec.salt), s[i], label, &mut f, &format!("{}", *v),
+                f64::from(lo)..=f64::from(hi), 0.08, hint)
+            {
+                *v = f.round().max(f64::from(lo)).min(f64::from(hi)) as u32;
+                grid_changed = true;
+            }
+            fr[6 + i] = s[i];
+        }
+    }
+    // What is drawn over the plot.
+    if let Some(r) = g.get(5) {
+        let s = split(r, &[1.0, 1.0, 1.0]);
+        for (i, (label, v, hint)) in [
+            ("labels", &mut view.labels, "Values on the guides — in °/s for a gyro, G for an accelerometer — and the time along the bottom"),
+            ("stats", &mut view.stats, "Per channel over the window: now, min, max, mean (a DC offset) and σ (the noise)"),
+            ("peaks", &mut view.peaks, "Dashed lines at each channel's min and max over the window"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            grid_changed |= word_toggle(ui, s[i], v, label, hint, ("scope_over", spec.salt, node_id, i));
+            fr[9 + i] = s[i];
+        }
+    }
+    let grid_rect = (4..6).filter_map(|k| g.get(k)).fold(egui::Rect::NOTHING, |a, r| a.union(r));
+    (changed, grid_changed, ctrl_rect, grid_rect, g.need(), fr)
+}
+
+/// A pinned scope row in the new style: the controls (`controls`) or the guides
+/// (`grid_row`), laid out across the pin's frame. See `pin_style2`.
+pub(crate) fn render_scope_rows_style2(
+    is_trig: bool,
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+    controls: bool,
+) {
+    let spec = if is_trig { &TRIG } else { &OSC };
+    init_params(snarl, inner_id, spec);
+    let Some(mut view) = snarl.get_node(inner_id).map(|n| spec.read(n)) else { return };
+    let mut c = Controls::of(snarl, inner_id, spec, &view);
+    // Drawn inside `pin_style2::fit`, at the zoom it set, the frame's width wide.
+    let _ = container;
+    let width = ui.available_width();
+    let (changed, grid_changed, _, _, _, fr) =
+        body_rows(ui, inner_id, spec, &mut c, &mut view, width, (controls, !controls));
+    let fields: Vec<egui::Rect> = if controls {
+        fr[..if spec.freeze { 6 } else { 5 }].to_vec()
+    } else {
+        fr[6..].to_vec()
+    };
+    publish_nav_field_rects(ui, inner_id, &fields);
+    if changed || grid_changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            c.write(node, spec);
+            write_grid(node, spec, &view);
+        }
+    }
 }
 
 fn write_grid(node: &mut NodeData, spec: &Spec, view: &View) {
@@ -1164,56 +1394,47 @@ fn render_grid_row(spec: &Spec, inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut
 
 /// The node body: the plot (with its grip, and a scrollbar while frozen),
 /// the two control rows, and the channel count.
-fn show_body(spec: &Spec, node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_body(
+    spec: &Spec,
+    node_id: NodeId,
+    _inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) {
     // Request vsync only while the input signal is animating (see
     // `scope_should_request_repaint` for the gate's logic).
     let _ = scope_should_request_repaint(node_id, snarl, ui.ctx());
     init_params(snarl, node_id, spec);
     let Some(frame) = scope_frame(snarl, node_id, spec) else { return };
     let mut view = frame.view;
-    let n_inputs = inputs.len();
 
-    // Size: what the grip set, else as wide as the control rows (measured last
-    // frame) and DEFAULT_H tall. Never narrower than the rows.
-    let rows_w_id = egui::Id::new(("scope_rows_w", spec.salt, node_id));
-    let rows_w = ui.ctx().data(|d| d.get_temp::<f32>(rows_w_id));
-    let stored = snarl.get_node(node_id).map(|n| {
-        let get = |k: &str| n.params.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
-        (get(spec.keys.w), get(spec.keys.h))
-    }).unwrap_or((None, None));
-    let min_w = rows_w.unwrap_or(MIN_W).max(MIN_W);
-    let size = egui::vec2(
-        stored.0.unwrap_or(rows_w.unwrap_or(FALLBACK_W)).max(min_w),
-        stored.1.unwrap_or(DEFAULT_H).max(MIN_H),
-    );
-
+    // The plot is what the module's corner grip sizes: the frame it was dragged to, less
+    // the rows under the plot. It had a grip of its own in its corner, and a size of its
+    // own in the patch (`w`/`h`), which a module on the grid has no use for.
+    let min = super::kit::surface_spec(if spec.from_trigger { "display.trigscope" } else { "display.oscilloscope" }).map_or(egui::vec2(MIN_W, MIN_H), |s| s.min);
     let mut display_rect: Option<egui::Rect> = None;
-    let mut new_size = None;
     let mut scroll_to = None;
     ui.vertical(|ui| {
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, min);
+        let size = surface.size;
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
         display_rect = Some(rect);
         paint_scope(ui, rect, &frame, None, resp.hover_pos());
-        new_size = size_grip(ui, rect, (spec.salt, node_id));
         if scrollable(&frame) {
             let (bar, _) = ui.allocate_exact_size(egui::vec2(size.x, SCROLLBAR_H), egui::Sense::hover());
             scroll_to = scrollbar(ui, bar, &frame, ("body", spec.salt, node_id));
         }
 
-        // ── Controls ─────────────────────────────────────────────────────────
+        // ── Controls, guides, labels ─────────────────────────────────────────
+        // Pill groups under the plot, sharing a row while the width holds them
+        // (`body_rows`). The pinned copies keep `controls_row_ui` / `grid_row_ui`.
         let mut c = Controls::of(snarl, node_id, spec, &view);
-        let (ctrl_fr, changed) = controls_row_ui(ui, &mut c, spec, true, None);
-        let ctrl_rect = ctrl_fr.iter().fold(egui::Rect::NOTHING, |a, r| a.union(*r));
+        let (changed, grid_changed, ctrl_rect, grid_rect, need, _) = body_rows(ui, node_id, spec, &mut c, &mut view, size.x, (true, true));
         register_exposable_element(ui, node_id, "controls", ctrl_rect);
-
-        // ── Guides / labels / statistics ─────────────────────────────────────
-        let (grid_fr, grid_changed) = grid_row_ui(ui, &mut view, true);
-        let grid_rect = grid_fr.iter().fold(egui::Rect::NOTHING, |a, r| a.union(*r));
         register_exposable_element(ui, node_id, "grid_row", grid_rect);
-        let w = (ctrl_rect.right().max(grid_rect.right()) - rect.left()).max(MIN_W);
-        if rows_w.is_none_or(|old| (old - w).abs() > 0.5) {
-            ui.ctx().data_mut(|d| d.insert_temp(rows_w_id, w));
-        }
+        surface.need(need);
 
         if changed || grid_changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1221,27 +1442,10 @@ fn show_body(spec: &Spec, node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
                 write_grid(node, spec, &view);
             }
         }
-
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Ch").small().weak());
-            if ui.small_button("+").on_hover_text("Add channel").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    // Names count data channels: the trigger is not one.
-                    let next = node.inputs.len() + 1 - spec.col0;
-                    node.inputs.push(PinDescriptor::new(format!("ch{}", next), SignalType::Float));
-                }
-            }
-            // At least one data channel (plus the Trigger Scope's trigger).
-            if n_inputs > spec.col0 + 1 && ui.small_button("−").on_hover_text("Remove channel").clicked() {
-                remove_input_pin(node_id, n_inputs - 1, inputs, snarl);
-            }
-        });
+        // The channels are added and dropped from the header's stepper.
+        surface.end(ui);
     });
     if let Some(node) = snarl.get_node_mut(node_id) {
-        if let Some(s) = new_size {
-            node.params.insert(spec.keys.w.into(), serde_json::json!(s.x.max(min_w)));
-            node.params.insert(spec.keys.h.into(), serde_json::json!(s.y.max(MIN_H)));
-        }
         if let Some(ms) = scroll_to {
             node.params.insert(spec.keys.scroll.into(), serde_json::json!(ms));
         }
@@ -1251,8 +1455,15 @@ fn show_body(spec: &Spec, node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
 
 // ── The two modules ──────────────────────────────────────────────────────────
 
-pub(crate) fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    show_body(&OSC, node_id, inputs, ui, snarl);
+pub(crate) fn show_oscilloscope_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) {
+    show_body(&OSC, node_id, inputs, ui, snarl, body_w, body_h);
 }
 
 pub(crate) fn render_oscilloscope_display(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>,
@@ -1268,8 +1479,15 @@ pub(crate) fn render_oscilloscope_grid_row(inner_id: NodeId, ui: &mut egui::Ui, 
     render_grid_row(&OSC, inner_id, ui, snarl, container);
 }
 
-pub(crate) fn show_trigscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    show_body(&TRIG, node_id, inputs, ui, snarl);
+pub(crate) fn show_trigscope_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) {
+    show_body(&TRIG, node_id, inputs, ui, snarl, body_w, body_h);
 }
 
 /// Bare trigger-scope display for sub-patch pinned layouts.
@@ -1294,7 +1512,7 @@ mod tests {
     fn defaults() -> View {
         View {
             win_ms: 200.0, scale: 1.0, auto: false, uni: false,
-            grid_x: 4, grid_y: 4, sub: 1, labels: true, stats: true, peaks: false, freeze: false,
+            grid_x: 4, grid_y: 4, sub: 1, labels: true, stats: true, peaks: false, freeze: false, sync: false,
             scroll_ms: 0.0, axis: None, stored: [None; 3],
         }
     }
@@ -1403,6 +1621,29 @@ mod tests {
         assert_eq!(value_format(Kind::Gyro, 0.2 / 2000.0), (3, 6));   // "+0.112", room for ±2 °/s
         assert_eq!(value_format(Kind::Accel, 0.02 / 8.0).0, 4);
         assert_eq!(value_format(Kind::Gyro, 1.0).0, 0);
+    }
+
+    #[test]
+    fn a_synced_window_starts_on_the_same_part_of_the_wave() {
+        // A wave 37 samples long riding on an offset, seen at five different moments: every
+        // window starts where it rises through its middle, within a cycle of the newest.
+        let (period, win) = (37.0f32, 200usize);
+        let wave = |n: usize| -> std::collections::VecDeque<Vec<Option<f32>>> {
+            (0..n).map(|i| vec![Some(0.5 + 0.4 * (i as f32 / period * std::f32::consts::TAU).sin())]).collect()
+        };
+        for n in [1000usize, 1009, 1018, 1027, 1036] {
+            let h = wave(n);
+            let newest = n - win;
+            let start = sync_start(&h, 0, newest, win);
+            let at = |i: usize| h[i][0].unwrap();
+            assert!(start <= newest && newest - start <= period as usize + 1, "{n}: started at {start}, newest {newest}");
+            assert!(at(start - 1) < 0.5 && at(start) >= 0.5, "{n}: not a rising crossing at {start}");
+        }
+        // Nothing to line up on: the newest window, as without sync.
+        let flat: std::collections::VecDeque<Vec<Option<f32>>> = (0..1000).map(|_| vec![Some(0.25)]).collect();
+        assert_eq!(sync_start(&flat, 0, 800, win), 800);
+        let empty: std::collections::VecDeque<Vec<Option<f32>>> = (0..1000).map(|_| vec![None]).collect();
+        assert_eq!(sync_start(&empty, 0, 800, win), 800);
     }
 
     #[test]

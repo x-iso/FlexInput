@@ -26,6 +26,10 @@ struct Rig {
     /// What the last frame painted, so an audit can read the drawing itself rather than the
     /// rects a body chose to report about itself.
     shapes: Vec<egui::epaint::ClippedShape>,
+    /// The textures handed out so far, for [`Rig::snapshot`].
+    shot: super::shot::Shot,
+    /// The size of the window the canvas is drawn in. The picture rig makes it larger.
+    screen: egui::Vec2,
 }
 
 impl Rig {
@@ -86,6 +90,8 @@ impl Rig {
             snarl_id: egui::Id::NULL,
             grid: GridLayout { block: B, ..GridLayout::default() },
             shapes: Vec::new(),
+            shot: Default::default(),
+            screen: egui::vec2(1600.0, 1000.0),
         };
         rig.idle(6);
         (rig, ids)
@@ -94,8 +100,8 @@ impl Rig {
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.time += 1.0 / 30.0;
         let mut raw = input(self.time, events);
-        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
-        let Rig { ctx, canvas, descriptors, to_global, snarl_id, grid, shapes, .. } = self;
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen));
+        let Rig { ctx, canvas, descriptors, to_global, snarl_id, grid, shapes, shot, .. } = self;
         let (ids, signals) = (HashSet::new(), HashMap::new());
         let out = ctx.run(raw, |ctx| {
             set_canvas_grid(ctx, Some(*grid));
@@ -111,7 +117,21 @@ impl Rig {
                 *snarl_id = id;
             });
         });
+        shot.absorb(&out.textures_delta);
         *shapes = out.shapes;
+    }
+
+    /// Save a picture of `node` as the last frame painted it, with a margin for its wires and
+    /// sockets, to `target/module_shots/<name>.png`. See [`super::shot`].
+    fn snapshot(&self, name: &str, node: NodeId) -> std::path::PathBuf {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen);
+        let margin = std::env::var("SHOOT_MARGIN").ok().and_then(|m| m.parse().ok()).unwrap_or(14.0);
+        let area = (self.to_global * self.frame_rect(node).expand(margin)).intersect(screen);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/module_shots")
+            .join(format!("{name}.png"));
+        self.shot.save(&self.ctx, &self.shapes, area, 1.0, &path).expect("the picture saves");
+        path
     }
 
     fn idle(&mut self, frames: usize) {
@@ -530,6 +550,10 @@ fn an_operation_is_two_blocks_square() {
                    "logic.nand", "logic.nor", "logic.xnor",
                    "logic.equal", "logic.not_equal"] {
         let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 300.0)]);
+        // In the fonts the app draws with: Map Range's pins are `in↓ in↑ out↓ out↑`, and the
+        // stock fonts have no arrows - their fallback box is wide enough to cost a block.
+        crate::app::fonts::setup_fonts(&rig.ctx);
+        rig.idle(6);
         let settled = rig.frame_rect(ids[0]);
         assert_eq!(settled.width(), 2.0 * MAJOR, "{module}: {settled:?} not the two blocks wide it should be");
         assert!(settled.height() <= 2.0 * MAJOR, "{module}: {settled:?} taller than its pins need");
@@ -1658,24 +1682,16 @@ fn a_title_is_cut_to_fit_and_left_out_when_there_is_no_word_to_show() {
 
 
 #[test]
-fn dragging_a_combiner_row_shows_where_it_will_land() {
-    // The port strips slide their neighbours out of the way as you drag one. The Combiner's
-    // rows are live widgets with a socket beside each one, so they can't be moved mid-frame;
-    // what they do instead is mark the row under the finger as lifted and draw the line where
-    // the gap will open. Without that, a drag gives no sign of which of three near-identical
-    // rows it will land on.
+fn a_dragged_combiner_row_rides_the_finger_and_its_neighbour_steps_aside() {
+    // The Combiner's rows move the way every other list's do (`StripAnim`): the row under the
+    // finger follows it, and the row it has passed slides into the gap it left - before the
+    // finger lets go, so a drag says where it will land. They used to be live drop zones that
+    // stood still and drew a line.
     let (mut rig, ids) = Rig::real("module.automap_combiner", &[egui::pos2(100.0, 300.0)]);
     let node = ids[0];
     rig.idle(6);
-    for what in ["combiner_slot", "combiner_lifted"] {
-        rig.ctx.data_mut(|d| {
-            d.insert_temp(
-                egui::Id::new(("module_ctrl_rect", node.0, what)),
-                Xysr([0.0; 4]),
-            )
-        });
-    }
     let (row0, row1) = (rig.traced(node, "combiner_row_0"), rig.traced(node, "combiner_row_1"));
+    let pitch = row1.top() - row0.top();
     let grab = egui::pos2(row0.left() + 8.0, row0.center().y);
     let button = |pos: egui::Pos2, pressed| egui::Event::PointerButton {
         pos,
@@ -1690,18 +1706,27 @@ fn dragging_a_combiner_row_shows_where_it_will_land() {
     for s in 1..=8 {
         rig.frame(vec![egui::Event::PointerMoved(start + (end - start) * (s as f32 / 8.0))]);
     }
-    let lifted = rig.traced_rect(node, "combiner_lifted").unwrap_or(egui::Rect::NOTHING);
-    let slot = rig.traced_rect(node, "combiner_slot").unwrap_or(egui::Rect::NOTHING);
+    // Held there while the rows ease to where they belong.
+    for _ in 0..12 {
+        rig.frame(vec![egui::Event::PointerMoved(end)]);
+    }
+    let (held, passed) = (rig.traced(node, "combiner_row_0"), rig.traced(node, "combiner_row_1"));
     assert!(
-        lifted.is_positive() && lifted.center().y < row1.center().y,
-        "the row being dragged isn't marked: {lifted:?} / slot {slot:?} (rows {row0:?} {row1:?})"
+        (held.top() - row0.top() - pitch).abs() < 2.0,
+        "the held row didn't follow the finger a row down: {held:?} from {row0:?}"
     );
     assert!(
-        slot.is_positive() && (slot.top() - row1.bottom()).abs() < 6.0,
-        "no line showing where the row lands: {slot:?} (over {row1:?})"
+        (passed.top() - row1.top() + pitch).abs() < 2.0,
+        "the row it passed didn't step into the gap: {passed:?} from {row1:?}"
     );
     rig.frame(vec![button(end, false)]);
-    rig.idle(4);
+    rig.idle(12);
+    // Let go: the ports have changed places and every row is back on its own band.
+    let (a, b) = (rig.traced(node, "combiner_row_0"), rig.traced(node, "combiner_row_1"));
+    assert!(
+        (a.top() - row0.top()).abs() < 1.0 && (b.top() - row1.top()).abs() < 1.0,
+        "the rows didn't settle on their bands: {a:?} {b:?}"
+    );
 }
 
 #[test]
@@ -2160,7 +2185,9 @@ fn a_dropdown_shift_pin_moves_the_option_it_shows() {
     // that is actually coming out rather than the one it was left set to, and picking an option
     // while the pin holds it somewhere else moves the base, so the option clicked is the one
     // that lands.
-    let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0)]);
+    // A second module stands to the left only to have something to wire into the pin.
+    let (mut rig, ids) = Rig::real("module.dropdown", &[egui::pos2(100.0, 300.0), egui::pos2(-400.0, 300.0)]);
+    let source = ids[1];
     // A patch saved before the pin existed has no input at all: the module gives itself the
     // missing pin the first time it draws, rather than going on unshiftable.
     if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
@@ -2197,9 +2224,27 @@ fn a_dropdown_shift_pin_moves_the_option_it_shows() {
         lit0.is_positive() && (lit0.top() - rows[0].top()).abs() < 0.5,
         "module.dropdown: with nothing wired it should mark the option it was set to: {lit0:?}",
     );
+    // What the engine hands the UI is the module's *outputs* - it mirrors no Dropdown input -
+    // so the option coming out is read from the `index` output. A reading of the pin itself
+    // always came back empty in the app, and the mark never left the option the module was
+    // set to. A value on the outputs with nothing wired changes nothing either: unwired, the
+    // option set is the option out.
     if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
-        n.extra.last_signals = vec![Some(flexinput_core::Signal::Float(1.0))];
+        n.extra.last_out = vec![
+            Some(flexinput_core::Signal::Float(0.5)),
+            Some(flexinput_core::Signal::Int(1)),
+        ];
     }
+    rig.idle(4);
+    let unwired = rig.traced_rect(node, "dropdown_effective").unwrap_or(egui::Rect::NOTHING);
+    assert!(
+        (unwired.top() - rows[0].top()).abs() < 0.5,
+        "module.dropdown: with nothing wired the option set is the option out: {unwired:?}",
+    );
+    rig.canvas.snarl.connect(
+        egui_snarl::OutPinId { node: source, output: 0 },
+        egui_snarl::InPinId { node, input: 0 },
+    );
     rig.idle(4);
     let lit = rig.traced_rect(node, "dropdown_effective").unwrap_or(egui::Rect::NOTHING);
     assert!(
@@ -3299,6 +3344,70 @@ fn the_macro_ports_line_up_with_the_strips_that_name_them() {
     );
 }
 
+/// Give a Macro Output `n` ports, the way its body writes them: the param, the pins and the
+/// pin ids from one list.
+fn set_macro_ports(rig: &mut Rig, node: NodeId, n: usize) {
+    use flexinput_core::macros as mac;
+    let ports: Vec<mac::MacroPortDef> = (0..n)
+        .map(|i| mac::MacroPortDef {
+            id: format!("{:08x}", 0xbb00_0000u32 + i as u32),
+            name: format!("P{i}"),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: flexinput_core::SignalType::Bool,
+        })
+        .collect();
+    if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+        nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+        nd.outputs = ports.iter().map(|p| PinDescriptor::new(p.name.clone(), p.signal_type)).collect();
+    }
+}
+
+#[test]
+fn every_port_strip_is_level_with_its_socket() {
+    // The row that names a port and the socket that carries it are one row, on every module
+    // that draws its ports as a list, at any length of list and with or without the grid's
+    // rounding of the frame. The Macro once laid its rows at the height a pin row is
+    // *allocated* and centred the list in the body, while the sockets advance by that height
+    // plus the column's spacing from the body's top: by the seventh port the row and its
+    // socket were most of a row apart.
+    for (module, side, pin_from) in [
+        ("module.selector", "in", 1usize),
+        ("module.split", "out", 0),
+        ("module.macro", "out", 0),
+    ] {
+        for snapped in [false, true] {
+            for ports in [2usize, 3, 7, 10] {
+                let at = [egui::pos2(100.0, 300.0)];
+                let (mut rig, ids) = if snapped { Rig::real(module, &at) } else { Rig::real_no_snap(module, &at) };
+                let node = ids[0];
+                if module == "module.macro" {
+                    set_macro_ports(&mut rig, node, ports);
+                } else if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+                    let pins = if side == "in" { &mut n.inputs } else { &mut n.outputs };
+                    while pins.len() < pin_from + ports {
+                        pins.push(PinDescriptor::new(format!("p{}", pins.len()), SignalType::Any));
+                    }
+                }
+                rig.idle(8);
+                let frame = rig.frame_rect(node);
+                for i in 0..ports {
+                    let strip = rig.traced(node, &format!("strip_{i}"));
+                    let socket = rig.traced(node, &format!("pin_row_{side}_{}", pin_from + i));
+                    assert!(
+                        (strip.center().y - socket.center().y).abs() <= 1.0,
+                        "{module} ({ports} ports, snapped {snapped}): row {i} {strip:?} is not level with its socket's row {socket:?}",
+                    );
+                    assert!(
+                        strip.top() >= frame.top() - 0.5 && strip.bottom() <= frame.bottom() + 0.5,
+                        "{module} ({ports} ports, snapped {snapped}): row {i} {strip:?} is outside the frame {frame:?}",
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_macro_port_name_stays_in_the_cell_it_was_given() {
     // The name used to be a text field open in every row, and an open field lays its text out
@@ -3319,7 +3428,7 @@ fn a_macro_port_name_stays_in_the_cell_it_was_given() {
         if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
             let ports = vec![
                 mk("aa11bb22", "Aim down"),
-                mk("cc33dd44", "Right Trigger, half pressed, learned from the raw pad"),
+                mk("cc33dd44", "Right Trigger, half pressed, learned from the raw pad and held there for longer than anyone would"),
             ];
             n.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
             n.outputs = ports
@@ -3492,6 +3601,34 @@ fn a_macro_port_renames_from_its_word_and_is_grabbed_by_it() {
 }
 
 #[test]
+fn the_envelope_graph_reads_out_under_the_pointer_with_its_labels() {
+    // The Response Curve's reading: with the labels on, the pointer over the graph says when
+    // that is and what level comes out then. It goes with the labels, so off means off.
+    let (mut rig, ids) = Rig::real("generator.envelope", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    let graph = rig.traced(node, "env_curve");
+    // The curve it ships with peaks at 30% and falls to nothing: 65% of the way along its
+    // 500 ms is 325 ms, half way down the fall.
+    let over = rig.to_global * egui::pos2(graph.left() + graph.width() * 0.65, graph.center().y);
+    rig.frame(vec![egui::Event::PointerMoved(over)]);
+    rig.idle(2);
+    assert!(rig.painted_all("325 ms").is_empty(), "the reading is drawn with the labels off");
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert("show_grid_labels".into(), serde_json::Value::Bool(true));
+    }
+    rig.idle(3);
+    let read = rig.painted_all("325 ms");
+    assert_eq!(read.len(), 1, "one reading under the pointer: {read:?}");
+    assert!(read[0].0.ends_with("0.50"), "it reads {:?}", read[0].0);
+    assert!(
+        graph.expand(0.5).contains_rect(read[0].1),
+        "the reading {:?} left the graph {graph:?}",
+        read[0].1
+    );
+}
+
+#[test]
 fn the_envelope_rows_spend_their_width_on_controls_not_planks() {
     // A setting row that spans the module is right; a control stretched to fill it is not. The
     // mode buttons used to divide their cell by three (69 points of button around a 16-point
@@ -3558,36 +3695,25 @@ fn the_envelope_rows_spend_their_width_on_controls_not_planks() {
 }
 
 #[test]
-#[ignore]
 fn a_long_macro_list_keeps_every_rows_controls() {
-    // Not fixed: `docs/LAYOUT_FAULTS.md` holds the measurements and what was tried. A Macro with
-    // more ports than the node's own rect can hold loses every row that falls in the grid's
-    // rounding of the frame: the rows are laid out and take a trace, but egui clips them away, so
-    // their icon, their signal type and their `×` neither paint nor answer a click - while the
-    // handle and the name, painted by the body rather than by widgets, are still seen. Eight
-    // ports is where it starts at the module's default width.
+    // A nine-port Macro keeps the icon, the signal type and the `×` of every row. This was
+    // filed as a fault of the module - "past eight ports the bottom rows lose their controls" -
+    // and it was the rig: its canvas opens at twice the size, centred on the node, on a
+    // 1000-pixel screen, so only 250 graph points are visible below the node's top. The ninth
+    // row was off the bottom of the screen, where egui rightly paints no widget (the handle
+    // and the name are painted shapes, which egui doesn't cull, and that is the whole of why
+    // they "survived"). Moved up so the whole module is on screen, nothing is lost.
     let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
     let node = ids[0];
-    {
-        use flexinput_core::macros as mac;
-        let ports: Vec<mac::MacroPortDef> = (0..9)
-            .map(|i| mac::MacroPortDef {
-                id: format!("{:08x}", 0xbb00_0000u32 + i as u32),
-                name: format!("P{i}"),
-                icon: String::new(),
-                icon_svg: String::new(),
-                signal_type: flexinput_core::SignalType::Bool,
-            })
-            .collect();
-        if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
-            nd.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
-            nd.outputs = ports
-                .iter()
-                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
-                .collect();
-        }
-    }
+    rig.drag(rig.header(node), egui::vec2(0.0, -140.0));
+    set_macro_ports(&mut rig, node, 9);
     rig.idle(8);
+    let shown = rig.to_global.inverse() * egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+    assert!(
+        shown.contains_rect(rig.frame_rect(node)),
+        "the rig has to show the whole module to say anything about it: {:?} in {shown:?}",
+        rig.frame_rect(node),
+    );
     let f = rig.frame_rect(node);
     let crosses = rig.painted_all("×");
     assert_eq!(crosses.len(), 9, "a nine-port Macro drew {} `×`s: {crosses:?}", crosses.len());
@@ -3923,33 +4049,553 @@ fn audit_the_macro_and_generator_bodies() {
 }
 
 #[test]
-#[ignore]
-fn audit_which_folded_bodies_paint_over_their_header() {
-    // A census, like the sizing one: which bodies still lay themselves out above a collapsed
-    // node's frame, where the clip hides them and the pointer does not. `simple_bodies::node_open`
-    // is the guard; this says which bodies still don't have it.
-    let mut worst: Vec<(String, usize, f32, f32, String)> = Vec::new();
-    let mut total = 0usize;
+fn no_folded_module_draws_its_body() {
+    // Every module there is, folded: nothing of its body is drawn above the frame, which is
+    // where snarl lays a collapsed node's body out. The guard is in `show_body`, once, for all
+    // of them. With `--nocapture` this also lists what each module folds to.
+    let mut strays: Vec<String> = Vec::new();
     for r in flexinput_modules::all_modules() {
-        let desc = r.descriptor;
-        total += 1;
-        let (mut rig, ids) = Rig::build(desc, &[egui::pos2(100.0, 300.0)]);
+        let (mut rig, ids) = Rig::build(r.descriptor, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        rig.idle(8);
+        rig.canvas.snarl.open_node(node, false);
+        rig.idle(8);
+        let id = rig.canvas.snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
+        let f = rig.frame_rect(node);
+        println!("FOLDED {id} {:.0}x{:.0}", f.width(), f.height());
+        let says: Vec<String> = rig.painted_above(f).into_iter().map(|(s, _)| s).collect();
+        if !says.is_empty() {
+            strays.push(format!("{id}: {}", says.join(" | ")));
+        }
+    }
+    assert!(strays.is_empty(), "folded, these still draw their bodies:\n{}", strays.join("\n"));
+}
+
+#[test]
+fn a_folded_knob_constant_and_readout_still_show_their_number() {
+    // Folded, a frame on the grid is two blocks and its header one: the band under the header
+    // is there and empty, and for these three the number is the reason to keep the module on
+    // the canvas at all. Everything else about a folded body stays undrawn.
+    for id in ["module.knob", "module.constant", "display.readout"] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(100.0, 300.0)]);
         let node = ids[0];
         rig.idle(8);
         rig.canvas.snarl.open_node(node, false);
         rig.idle(8);
         let f = rig.frame_rect(node);
-        let strays = rig.painted_above(f);
-        if !strays.is_empty() {
-            let id = rig.canvas.snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
-            let says: Vec<String> = strays.iter().take(4).map(|(s, _)| s.clone()).collect();
-            worst.push((id, strays.len(), f.width(), f.height(), says.join(" | ")));
+        let number = rig.traced_rect(node, "folded_reading").unwrap_or(egui::Rect::NOTHING);
+        assert!(number.is_positive(), "{id}: folded, it shows no number");
+        assert!(f.contains_rect(number), "{id}: the number {number:?} is outside the frame {f:?}");
+        assert!(
+            number.top() > f.top() + 26.0,
+            "{id}: the number {number:?} is in the header's block of {f:?}"
+        );
+        assert!(rig.painted_above(f).is_empty(), "{id}: folded, it still draws its body");
+    }
+}
+
+#[test]
+fn a_port_list_sits_in_the_middle_of_its_frame_and_steps_a_block_a_port() {
+    // Rows are a block each and the frame's trim is not, so the grid's rounding adds the same
+    // slack under every list. Half of it goes above the rows: all of it at the bottom read as
+    // a module with a row missing. And one more port is one more block, at every count - the
+    // Combiner's rows had a pitch of their own and its height stepped by one block or two.
+    for (id, inputs) in [
+        ("module.selector", true),
+        ("module.split", false),
+        ("module.macro", false),
+        ("module.automap_combiner", true),
+    ] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(100.0, 150.0)]);
+        let node = ids[0];
+        let mut last_h: Option<f32> = None;
+        for n in 2..=6usize {
+            if id == "module.macro" {
+                set_macro_ports(&mut rig, node, n);
+            } else if inputs {
+                let has = rig.inputs(node);
+                rig.set_inputs(node, has.max(n + usize::from(id == "module.selector")));
+            } else {
+                rig.set_outputs(node, n);
+            }
+            rig.idle(10);
+            let f = rig.frame_rect(node);
+            let count = if inputs { rig.inputs(node) } else { rig.outputs(node) };
+            // A Selector's first input is its `select` pin, a row of its own above the strips.
+            let lead = usize::from(id == "module.selector");
+            let first = rig.traced(node, "strip_0").translate(egui::vec2(0.0, -28.0 * lead as f32));
+            let last = rig.traced(node, &format!("strip_{}", count - 1 - lead));
+            // What is under the header: its block, then the rows. The Combiner has one more
+            // row under its ports, the head of its resolution tree.
+            let bottom = rig
+                .traced_rect(node, "combiner_resolution")
+                .map_or(last.bottom(), |r| r.bottom().max(last.bottom()));
+            let above = first.top() - (f.top() + 28.0);
+            let below = f.bottom() - bottom;
+            assert!(
+                (above - below).abs() <= 7.0,
+                "{id} with {count} ports: {above:.1} above its rows, {below:.1} below ({f:?})"
+            );
+            if let Some(prev) = last_h {
+                assert!(
+                    (f.height() - prev - 28.0f32).abs() < 0.5,
+                    "{id}: port {count} took the frame from {prev} to {}",
+                    f.height()
+                );
+            }
+            last_h = Some(f.height());
         }
     }
-    worst.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("{:<32} {:>6} {:>9}  words above the frame", "module", "words", "folded to");
-    for w in &worst {
-        println!("{:<32} {:>6} {:>4.0}x{:<4.0}  {}", w.0, w.1, w.2, w.3, w.4);
+}
+
+#[test]
+fn a_macro_port_name_opens_on_what_it_says() {
+    // Clicking a name opens it on the text it has, selected: typing replaces it, and a key
+    // that moves the cursor leaves the text there to be changed. It used to open empty, so
+    // fixing one letter meant typing the name again.
+    let key = |key: egui::Key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    };
+    let name_of = |rig: &Rig, node: NodeId| {
+        let n = rig.canvas.snarl.get_node(node).expect("the node");
+        flexinput_core::macros::ports_from_params(&n.params)[0].name.clone()
+    };
+    let (mut rig, ids) = Rig::real("module.macro", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    set_macro_ports(&mut rig, node, 2);
+    rig.idle(8);
+    // End, then a letter: the name it had, and the letter after it.
+    rig.click(rig.traced(node, "macro_name_0").center());
+    rig.frame(vec![key(egui::Key::End)]);
+    rig.type_text("x");
+    rig.frame(vec![key(egui::Key::Enter)]);
+    rig.idle(4);
+    assert_eq!(name_of(&rig, node), "P0x", "the open field didn't hold the name to edit");
+    // Straight to typing: the selection goes, the new word stays.
+    rig.click(rig.traced(node, "macro_name_0").center());
+    rig.type_text("Kick");
+    rig.frame(vec![key(egui::Key::Enter)]);
+    rig.idle(4);
+    assert_eq!(name_of(&rig, node), "Kick", "typing over an opened name didn't replace it");
+    // And the module makes room for a long one while it is being typed.
+    let before = rig.frame_rect(node).width();
+    rig.click(rig.traced(node, "macro_name_0").center());
+    rig.type_text("Right trigger, half pressed, then held");
+    rig.idle(6);
+    let during = rig.frame_rect(node).width();
+    assert!(during > before + 27.0, "the module stayed {before} wide while a long name was typed ({during})");
+}
+
+#[test]
+fn no_header_name_runs_under_the_control_beside_it() {
+    // Every module with something at its header's right edge - a stepper, a `+`, switches,
+    // file buttons - keeps its name out from under it: whole if it fits, cut if it nearly
+    // does, gone if it doesn't. Checked for all of them rather than module by module, which
+    // is how the Selector's name came to end under its `+`.
+    let mut seen = 0;
+    for r in flexinput_modules::all_modules() {
+        let (mut rig, ids) = Rig::build(r.descriptor, &[egui::pos2(100.0, 300.0)]);
+        let node = ids[0];
+        rig.idle(8);
+        let id = rig.canvas.snarl.get_node(node).map(|n| n.module_id.clone()).unwrap_or_default();
+        let Some(ctrl) = rig.traced_rect(node, "header_ctrl").filter(|r| r.is_positive()) else { continue };
+        let f = rig.frame_rect(node);
+        assert!(f.expand(0.5).contains_rect(ctrl), "{id}: the header control {ctrl:?} left the frame {f:?}");
+        let Some(name) = rig.traced_rect(node, "header_title").filter(|r| r.is_positive()) else { continue };
+        seen += 1;
+        assert!(
+            name.right() <= ctrl.left() + 0.5,
+            "{id}: the name {name:?} runs under the header control {ctrl:?}"
+        );
     }
-    println!("{} of {} modules still paint over their own header when folded", worst.len(), total);
+    assert!(seen >= 15, "only {seen} headers with a control and a name were measured");
+}
+
+#[test]
+fn a_response_curve_keeps_its_switches_and_file_buttons_in_its_header() {
+    // The `grid` and `labels` switches and Save / Load / Reset sit at the header's right
+    // edge, and `grid` takes the lines off the graph without touching anything else.
+    let (mut rig, ids) = Rig::real("module.response_curve", &[egui::pos2(100.0, 150.0)]);
+    let node = ids[0];
+    rig.idle(8);
+    let f = rig.frame_rect(node);
+    let opts = rig.traced(node, "curve_opts");
+    assert!(
+        // Left of the channel stepper, which has the corner.
+        opts.top() < f.top() + 28.0 && (f.right() - opts.right()) < 70.0,
+        "the controls {opts:?} aren't at the header's right edge of {f:?}"
+    );
+    let param = |rig: &Rig, k: &str| {
+        rig.canvas.snarl.get_node(node).and_then(|n| n.params.get(k).and_then(|v| v.as_bool()))
+    };
+    assert_eq!(param(&rig, "show_grid"), None, "the grid is on until it is turned off");
+    rig.click(egui::pos2(opts.left() + 8.0, opts.center().y));
+    assert_eq!(param(&rig, "show_grid"), Some(false), "the grid switch didn't switch");
+    // `scaled` is the other half of the same pill, `labels` a switch of its own after it.
+    rig.click(egui::pos2(opts.left() + 34.0 + 8.0, opts.center().y));
+    assert_eq!(param(&rig, "show_scaled_grid"), Some(true), "the scaled half didn't switch");
+    rig.click(egui::pos2(opts.left() + 34.0 + 44.0 + 3.0 + 8.0, opts.center().y));
+    assert_eq!(param(&rig, "show_grid_labels"), Some(true), "the labels switch didn't switch");
+}
+
+#[test]
+fn a_surface_module_is_sized_by_the_modules_grip_and_gives_the_room_back() {
+    // The graphs, scopes and pads: one corner grip, the module's. Whatever it is dragged to
+    // is the frame, the surface inside takes what the rows leave, and dragging it back gives
+    // the room back - none of them keeps a size of its own any more, in the patch or out.
+    use crate::canvas::viewer::kit::{surface_spec, HEIGHT_PARAM, WIDTH_PARAM};
+    let mut seen = 0;
+    for r in flexinput_modules::all_modules() {
+        let id = r.descriptor.id;
+        if surface_spec(id).is_none() {
+            continue;
+        }
+        seen += 1;
+        let (mut rig, ids) = Rig::build(r.descriptor, &[egui::pos2(100.0, 120.0)]);
+        let node = ids[0];
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        // RWS Aim opens with its view folded - nothing for the grip's height to go to -
+        // so unfold it: the surface is what this is about.
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert("fold_view".into(), serde_json::json!(false));
+        }
+        rig.idle(10);
+        let opened = rig.frame_rect(node).size();
+        let set = |rig: &mut Rig, w: f32, h: f32| {
+            if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+                n.params.insert(WIDTH_PARAM.into(), serde_json::json!(w));
+                n.params.insert(HEIGHT_PARAM.into(), serde_json::json!(h));
+            }
+            rig.idle(12);
+        };
+        // Dragged large: 26 blocks by 30. Nothing in any of them needs more than that.
+        set(&mut rig, 26.0 * B, 30.0 * B);
+        let large = rig.frame_rect(node).size();
+        if crate::canvas::viewer::kit::keeps_aspect(id) {
+            // One size, set by the width: the height is whatever keeps the shape.
+            assert_eq!(large.x, 26.0 * B, "{id}: the frame didn't take the width the grip gave it");
+            assert!(large.y <= 30.0 * B, "{id}: a square scope padded itself out to {large:?}");
+        } else {
+            assert_eq!(large, egui::vec2(26.0 * B, 30.0 * B), "{id}: the frame didn't go where the grip put it");
+        }
+        for _ in 0..6 {
+            rig.idle(1);
+            assert_eq!(rig.frame_rect(node).size(), large, "{id}: the frame doesn't hold still");
+        }
+        // And back to where it opened.
+        set(&mut rig, opened.x, opened.y);
+        let back = rig.frame_rect(node).size();
+        assert!(
+            back.x <= opened.x + 0.5 && back.y <= opened.y + 0.5,
+            "{id}: opened at {opened:?}, came back from {large:?} to {back:?}"
+        );
+    }
+    assert!(seen >= 12, "only {seen} surface modules were measured");
+}
+
+#[test]
+fn a_scopes_channels_come_from_its_header() {
+    // The `Ch + -` row under a scope's plot is the header's stepper now, as on the filters.
+    let (mut rig, ids) = Rig::real("display.oscilloscope", &[egui::pos2(100.0, 150.0)]);
+    let node = ids[0];
+    // A scope is wider than what the rig's own screen shows to the right of where it is put,
+    // and its stepper is at its right edge.
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    rig.idle(6);
+    let before = rig.inputs(node);
+    let (_, plus) = stepper_points(&rig, node);
+    rig.click(plus);
+    assert_eq!(rig.inputs(node), before + 1, "the + added no channel");
+    assert_eq!(rig.outputs(node), 0, "a scope's channel is an input and nothing else");
+    let name = rig.canvas.snarl.get_node(node).map(|n| n.inputs[before].name.clone()).unwrap_or_default();
+    assert_eq!(name, format!("ch{}", before + 1), "the new channel is misnamed");
+    let (minus, _) = stepper_points(&rig, node);
+    rig.click(minus);
+    assert_eq!(rig.inputs(node), before, "the - dropped no channel");
+}
+
+#[test]
+fn a_header_name_can_be_hovered_for_what_the_module_is() {
+    // The name is painted, not laid out, so the slot it was given is nothing wide: the
+    // tooltip - name, the module's own name if it was renamed, what it does - had nothing
+    // to hover. The name's whole room answers.
+    let (mut rig, ids) = Rig::real("module.average", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    rig.idle(6);
+    let f = rig.frame_rect(node);
+    let hover = rig.traced(node, "header_hover");
+    assert!(hover.width() >= 20.0 && hover.height() >= 12.0, "nothing to hover: {hover:?}");
+    assert!(f.expand(0.5).contains_rect(hover), "the hover area {hover:?} left the frame {f:?}");
+    assert_eq!(crate::canvas::viewer::kit::shipped_name("module.average"), Some("Average"));
+}
+
+#[test]
+fn an_old_automap_fork_is_turned_round_when_it_loads() {
+    // `select` is the Fork's first input now; a patch saved with the bus first has the two
+    // swapped on load, each keeping the wires it had.
+    use egui_snarl::{InPinId, OutPinId};
+    let find = |id: &str| {
+        flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == id).expect("registered")
+    };
+    let fork_desc = find("module.automap_fork");
+    assert_eq!(fork_desc.inputs[0].name, "select", "the Fork ships with select first");
+    let mut snarl: Snarl<NodeData> = Snarl::new();
+    let knob = snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&find("module.knob")));
+    let other = snarl.insert_node(egui::pos2(0.0, 100.0), NodeData::from(&find("module.constant")));
+    let mut old = NodeData::from(&fork_desc);
+    old.inputs.swap(0, 1); // as it was saved: bus, then select
+    let fork = snarl.insert_node(egui::pos2(200.0, 0.0), old);
+    snarl.connect(OutPinId { node: other, output: 0 }, InPinId { node: fork, input: 0 });
+    snarl.connect(OutPinId { node: knob, output: 0 }, InPinId { node: fork, input: 1 });
+    super::migrate_loaded_snarl(&mut snarl);
+    let n = snarl.get_node(fork).expect("the fork");
+    assert_eq!((n.inputs[0].name.as_str(), n.inputs[1].name.as_str()), ("select", "in"));
+    let wired = |snarl: &Snarl<NodeData>, input: usize| {
+        snarl.in_pin(InPinId { node: fork, input }).remotes.first().map(|r| r.node)
+    };
+    assert_eq!(wired(&snarl, 0), Some(knob), "select lost the wire it had");
+    assert_eq!(wired(&snarl, 1), Some(other), "the bus lost the wire it had");
+    // Loaded again, it is left alone.
+    super::migrate_loaded_snarl(&mut snarl);
+    assert_eq!(wired(&snarl, 0), Some(knob), "a Fork already turned round was turned again");
+}
+
+#[test]
+fn map_range_says_which_end_of_which_range() {
+    use crate::canvas::viewer::kit::pin_short;
+    for (name, short) in [("in_min", "in↓"), ("in_max", "in↑"), ("out_min", "out↓"), ("out_max", "out↑")] {
+        assert_eq!(pin_short(name), (short.to_string(), true), "{name}");
+    }
+}
+
+#[test]
+fn a_body_fills_the_frame_its_header_holds() {
+    // A Response Curve's header carries switches and buttons, which hold the frame wider
+    // than the graph's own floor. Asked for less than that, the body used to follow the
+    // number down and stand narrow inside a frame that could not: half a module of graph.
+    use crate::canvas::viewer::kit::WIDTH_PARAM;
+    for id in ["module.response_curve", "module.vec_response_curve", "module.remapper"] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(100.0, 120.0)]);
+        let node = ids[0];
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(WIDTH_PARAM.into(), serde_json::json!(84.0));
+        }
+        rig.idle(12);
+        let f = rig.frame_rect(node);
+        let body = rig.traced_rect(node, "body_fill").unwrap_or(egui::Rect::NOTHING);
+        assert!(body.is_positive(), "{id}: the body's width is not on record");
+        // What is left of the frame once the pin columns have theirs: a block at most.
+        assert!(
+            f.right() - body.right() < 40.0,
+            "{id}: the body ends at {} in a frame that ends at {} ({f:?})",
+            body.right(),
+            f.right()
+        );
+    }
+}
+
+#[test]
+fn an_auto_map_pin_has_no_word_beside_it_except_on_a_device() {
+    use crate::canvas::viewer::kit::unlabelled_bus_pin;
+    use flexinput_core::SignalType;
+    assert!(unlabelled_bus_pin("module.automap_response_curve", SignalType::AutoMap));
+    assert!(unlabelled_bus_pin("module.remapper", SignalType::AutoMap));
+    assert!(!unlabelled_bus_pin("module.remapper", SignalType::Float), "only the bus pins");
+    assert!(!unlabelled_bus_pin("device.source", SignalType::AutoMap), "a device keeps its word");
+    assert!(!unlabelled_bus_pin("subpatch", SignalType::AutoMap), "a sub-patch's ports are named by the user");
+    // And on the canvas: the AutoMap curve draws neither "Device" nor "AutoMap".
+    let (mut rig, _ids) = Rig::real("module.automap_response_curve", &[egui::pos2(100.0, 120.0)]);
+    rig.idle(6);
+    let words: Vec<String> = ["Device", "AutoMap"]
+        .iter()
+        .flat_map(|w| rig.painted_all(w))
+        .map(|(s, _)| s)
+        .filter(|s| s == "Device" || s == "AutoMap")
+        .collect();
+    assert!(words.is_empty(), "a bus pin is still labelled: {words:?}");
+}
+
+/// Pictures of modules, for looking at: `cargo test -p flexinput-ui --lib shoot_modules -- --ignored`
+/// writes one PNG per case to `target/module_shots/`. Not an assertion of anything - the layout
+/// tests measure rects, and this is for what a rect can't say (see [`super::shot`]). With
+/// `SHOOT=<module id>[,<module id>...]` it shoots those modules as they come out of the box
+/// instead of the cases below.
+#[test]
+#[ignore = "writes pictures, asserts nothing"]
+fn shoot_modules() {
+    // With the fonts the app draws with: egui's own have no arrows, grips or crosses, and a
+    // picture full of boxes where those go says nothing about how the module looks.
+    fn pictured(id: &'static str, at: &[egui::Pos2]) -> (Rig, Vec<NodeId>) {
+        let (mut rig, ids) = Rig::real(id, at);
+        crate::app::fonts::setup_fonts(&rig.ctx);
+        // A screen with room under the node: the rig's own shows 500 graph points, and a
+        // scope or a curve is taller than what that leaves below where it is put.
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        rig.idle(4);
+        (rig, ids)
+    }
+    let at = egui::pos2(100.0, 300.0);
+    if let Ok(list) = std::env::var("SHOOT") {
+        // `SHOOT=all` is every module there is; `SHOOT_FOLD=1` shoots them folded.
+        let all: Vec<String> = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor.id.to_string()).collect();
+        let wanted: Vec<String> = if list.trim() == "all" {
+            all
+        } else {
+            list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        };
+        let fold = std::env::var("SHOOT_FOLD").is_ok();
+        let mut shot_paths = Vec::new();
+        for id in wanted {
+            let id: &'static str = Box::leak(id.into_boxed_str());
+            let (mut rig, ids) = pictured(id, &[at]);
+            // `SHOOT_PARAMS={"jsm_show_knobs":true}` merges settings into the module first.
+            if let Some(serde_json::Value::Object(extra)) =
+                std::env::var("SHOOT_PARAMS").ok().and_then(|p| serde_json::from_str(&p).ok())
+            {
+                if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+                    n.params.extend(extra);
+                }
+            }
+            // `SHOOT_INPUTS=5` / `SHOOT_OUTPUTS=5` set how many pins a list module has.
+            if let Some(n) = std::env::var("SHOOT_INPUTS").ok().and_then(|n| n.parse().ok()) {
+                rig.set_inputs(ids[0], n);
+            }
+            if let Some(n) = std::env::var("SHOOT_OUTPUTS").ok().and_then(|n| n.parse().ok()) {
+                rig.set_outputs(ids[0], n);
+            }
+            // A 3DOF module with no Orientation reading draws the emptiest picture it can:
+            // give it a pose and the outputs that go with it, so the viewport can be looked
+            // at as it looks with a pad wired.
+            if id == "processing.gyro_3dof" {
+                if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+                    // `SHOOT_POSE=yaw,pitch,roll` (degrees, right / up / right-grip-down) for
+                    // another pose than the default one.
+                    let pose: Vec<f32> = std::env::var("SHOOT_POSE")
+                        .ok()
+                        .map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                        .unwrap_or_default();
+                    let q = if let [yaw, pitch, roll] = pose[..] {
+                        glam::Quat::from_rotation_z(-yaw.to_radians())
+                            * glam::Quat::from_rotation_y(-pitch.to_radians())
+                            * glam::Quat::from_rotation_x(roll.to_radians())
+                    } else {
+                        glam::Quat::from_rotation_z(35.0f32.to_radians())
+                            * glam::Quat::from_rotation_y(15.0f32.to_radians())
+                    };
+                    let f = |s: f32| Some(flexinput_core::Signal::Float(s));
+                    n.extra.last_out = vec![
+                        None, f(0.42), f(-0.18), f(0.62), None,
+                        Some(flexinput_core::Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w))),
+                    ];
+                }
+            }
+            rig.idle(8);
+            if fold {
+                rig.canvas.snarl.open_node(ids[0], false);
+                rig.idle(8);
+            }
+            let name = format!("{}{}", id.replace('.', "_"), if fold { "_folded" } else { "" });
+            let path = rig.snapshot(&name, ids[0]);
+            println!("{}", path.display());
+            shot_paths.push(path);
+        }
+        // `SHOOT_SHEET=1` also packs them onto contact sheets at half size (one canvas point
+        // to a pixel), for looking over the whole set.
+        if std::env::var("SHOOT_SHEET").is_ok() {
+            for sheet in super::shot::sheets(&shot_paths, 0.5, 1560) {
+                println!("{}", sheet.display());
+            }
+        }
+        return;
+    }
+    // A list of ports, seven long: the rows against their sockets.
+    for (id, n) in [("module.macro", 7usize), ("module.split", 5)] {
+        let (mut rig, ids) = pictured(id, &[at]);
+        if id == "module.macro" {
+            set_macro_ports(&mut rig, ids[0], n);
+        } else {
+            rig.set_outputs(ids[0], n);
+        }
+        rig.idle(8);
+        println!("{}", rig.snapshot(&id.replace('.', "_"), ids[0]).display());
+    }
+    // A Dropdown set to its first option and stepped two along by its pin.
+    {
+        let (mut rig, ids) = pictured("module.dropdown", &[at, egui::pos2(-150.0, 300.0)]);
+        let node = ids[0];
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(
+                "options".into(),
+                serde_json::Value::Array(
+                    ["Alpha", "Beta", "Gamma", "Delta"].into_iter().map(|s| serde_json::Value::String(s.into())).collect(),
+                ),
+            );
+            n.params.insert("selected_index".into(), serde_json::Value::from(0_u64));
+            n.extra.last_out = vec![Some(flexinput_core::Signal::Float(0.625)), Some(flexinput_core::Signal::Int(2))];
+        }
+        rig.canvas.snarl.connect(
+            egui_snarl::OutPinId { node: ids[1], output: 0 },
+            egui_snarl::InPinId { node, input: 0 },
+        );
+        rig.idle(8);
+        println!("{}", rig.snapshot("module_dropdown_shifted", node).display());
+    }
+    // The Envelope as it ships, then with everything switched on and the pointer on its graph.
+    {
+        let (mut rig, ids) = pictured("generator.envelope", &[at]);
+        let node = ids[0];
+        rig.idle(8);
+        println!("{}", rig.snapshot("generator_envelope", node).display());
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            for key in ["hold", "loop", "snap", "show_grid_labels"] {
+                n.params.insert(key.into(), serde_json::Value::Bool(true));
+            }
+        }
+        rig.idle(4);
+        let graph = rig.traced(node, "env_curve");
+        let over = rig.to_global * egui::pos2(graph.left() + graph.width() * 0.62, graph.center().y);
+        rig.frame(vec![egui::Event::PointerMoved(over)]);
+        rig.idle(3);
+        println!("{}", rig.snapshot("generator_envelope_on_hover", node).display());
+    }
+}
+
+// The 3DOF's mode rows answer a click in the module itself: Steering's World cell, clicked,
+// makes the module a Steering one in World mode.
+#[test]
+fn a_3dof_mode_row_answers_a_click_in_the_module() {
+    let (mut rig, ids) = Rig::real("processing.gyro_3dof", &[egui::pos2(100.0, 120.0)]);
+    let node = ids[0];
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    rig.idle(8);
+    let id = egui::Id::new(("segmented", ("gyro_mode_row", "steering", node.0), 3usize));
+    let cell = rig.ctx.read_response(id).expect("the Steering row's World cell was drawn").rect;
+    // A response's rect is in its layer's coordinates: the canvas's graph space here.
+    let at = cell.center();
+    rig.click(at);
+    let p = |k: &str| rig.canvas.snarl.get_node(node).and_then(|n| n.params.get(k).and_then(|v| v.as_str()).map(str::to_string));
+    assert_eq!(p("family").as_deref(), Some("steering"), "the click didn't land (cell {cell:?})");
+    assert_eq!(p("axis").as_deref(), Some("world"));
+}
+
+// Two of them on one canvas: each one's rows are its own. The rows' ids were the same for
+// every 3DOF, so with two on the canvas a click on one went nowhere.
+#[test]
+fn two_3dof_modules_each_answer_their_own_mode_rows() {
+    let (mut rig, ids) = Rig::real("processing.gyro_3dof", &[egui::pos2(100.0, 120.0), egui::pos2(900.0, 120.0)]);
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    rig.idle(8);
+    for &node in &ids {
+        let id = egui::Id::new(("segmented", ("gyro_mode_row", "steering", node.0), 3usize));
+        let resp = rig.ctx.read_response(id);
+        let cell = resp.expect("this module's Steering row was drawn").rect;
+        rig.click(cell.center());
+        let fam = rig.canvas.snarl.get_node(node).and_then(|n| n.params.get("family").and_then(|v| v.as_str()).map(str::to_string));
+        assert_eq!(fam.as_deref(), Some("steering"), "node {node:?}: the click didn't land");
+    }
 }

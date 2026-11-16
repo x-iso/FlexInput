@@ -5,17 +5,32 @@ use flexinput_engine::eval::{TwowayHyst, TWOWAY_HYST_MAX_PCT};
 
 /// AutoMap Response Curve / AutoMap Two-way Curve: the plain curve's body, run
 /// on the signal picked in the header (see `curve_ui_module_id`).
-pub(crate) fn show_automap_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+pub(crate) fn show_automap_curve_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
     let Some(node) = snarl.get_node(node_id) else { return false };
     match curve_ui_module_id(node) {
-        "module.vec_response_curve"    => show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl),
-        "module.twoway_response_curve" => show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl),
-        _                              => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
+        "module.vec_response_curve"    => show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h),
+        "module.twoway_response_curve" => show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h),
+        _                              => show_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h),
     }
 }
 
-pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
+pub(crate) fn show_response_curve_body(
+    node_id: NodeId,
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
     // Curve graphs intentionally do NOT force vsync repaint. The curve
     // itself is static and the only animated element is the input/output
     // tracer dot, which is plenty smooth at the user's chosen base
@@ -98,12 +113,11 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
 
     let mut curve_graph_rect: Option<egui::Rect> = None;
     ui.vertical(|ui| {
+        // The graph is what the module's corner grip sizes (`kit::Surface`): it had a grip
+        // of its own in its corner, and a size kept in egui's memory rather than the patch.
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(120.0, 100.0));
         // ── Graph ─────────────────────────────────────────────────────────────
-        egui::Resize::default()
-            .id_salt(("crv", node_id))
-            .default_size([180.0, 180.0])
-            .min_size([80.0, 80.0])
-            .show(ui, |ui| {
+        ui.allocate_ui(surface.size, |ui| {
                 let (rect, bg_resp) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
                 curve_graph_rect = Some(rect);
@@ -174,27 +188,17 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         }).collect();
                         redistribute(nodes, n)
                     } else {
-                        // Bidirectional: each half is an independent abs-style scale
-                        // expanding outward from the centre (u=0.5, value=0).
-                        // Log→dense near ±max edges; Exp→dense near 0.
-                        let half_lo = n / 2;
-                        let half_hi = n - half_lo;
-                        // lo half: t=0 is centre (u=0.5), t=1 is left edge (u=0).
-                        let lo_nodes: Vec<f32> = (0..=half_lo).map(|i| {
-                            let t = i as f32 / half_lo as f32;
-                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                            0.5 - s * 0.5
+                        // Bipolar: every line where its distance from the centre lands under the scale,
+                        // on its own side. An odd count has no line on the centre and is still the same
+                        // either side of it - split into a short half and a long one, as this was, an odd
+                        // grid was scaled as if the graph began at a corner.
+                        let mut nodes: Vec<f32> = (0..=n).map(|i| {
+                            let v = 2.0 * i as f32 / n as f32 - 1.0;
+                            let s = 1.0 - curve_scale_inv(1.0 - v.abs(), scale_t);
+                            0.5 + v.signum() * s * 0.5
                         }).collect();
-                        // hi half: t=0 is centre (u=0.5), t=1 is right edge (u=1).
-                        let hi_nodes: Vec<f32> = (0..=half_hi).map(|i| {
-                            let t = i as f32 / half_hi as f32;
-                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                            0.5 + s * 0.5
-                        }).collect();
-                        let mut merged = redistribute(lo_nodes, half_lo);
-                        for v in redistribute(hi_nodes, half_hi).iter().skip(1) { merged.push(*v); }
-                        merged.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        merged
+                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        nodes
                     }
                 };
                 let snap_nodes_x = scaled_grid_positions(grid_x);
@@ -226,6 +230,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
 
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
                 let gs = egui::Stroke::new(0.5_f32, grid_faint);
+                let gs = if curve_grid_shown(snarl, node_id, None) { gs } else { egui::Stroke::NONE };
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
@@ -510,84 +515,38 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
         let mut snap_on  = snap;
         let mut sc_t     = scale_t;
         let mut tm       = trail_ms;
-        let mut ssg      = show_scaled_grid;
-        let mut sgl      = show_grid_labels;
         let mut changed  = false;
 
-        // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Absolute + Snap
-        let scale_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Log").small().weak());
-            let slider_id = ui.make_persistent_id(("log_exp", node_id));
-            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
-            ui.label(egui::RichText::new("Exp").small().weak());
-            ui.separator();
-            let abs_before = abs;
-            ui.checkbox(&mut abs, egui::RichText::new("Abs").small());
-            changed |= abs != abs_before;
-            let snap_before = snap_on;
-            ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small());
-            changed |= snap_on != snap_before;
-        });
-        register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
-
-        // Row 2: In/Out range — for a motion pick, how much of the sensor the
-        // graph shows, in its units.
-        let range_resp = ui.scope(|ui| {
-            if let Some(unit) = view.unit {
-                motion_view_range_fields(ui, node_id, snarl, unit, abs);
-                return;
-            }
-            let linked = snarl.get_node(node_id).map_or(true, range_linked);
-            let before = [i0, i1, o0, o1];
-            let mut link_clicked = false;
-            egui::Grid::new(("crv_rng", node_id)).num_columns(5).spacing([4.0, 2.0]).show(ui, |ui| {
-                ui.label(egui::RichText::new("In").small().weak());
-                changed |= ui.add_enabled(!abs, egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2))
-                    .on_disabled_hover_text(ABS_MIN_HOVER).changed();
-                changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).prefix("↑").max_decimals(2)).changed();
-                ui.label(egui::RichText::new("Out").small().weak());
-                changed |= ui.add_enabled(!abs, egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2))
-                    .on_disabled_hover_text(ABS_MIN_HOVER).changed();
-                ui.end_row();
-                ui.label(egui::RichText::new("").small());
-                ui.label(egui::RichText::new("").small());
-                ui.label(egui::RichText::new("").small());
-                link_clicked = range_link_button(ui, linked);
-                changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).prefix("↑").max_decimals(2)).changed();
-                ui.end_row();
-            });
-            if link_clicked { toggle_range_link(snarl, node_id); }
-            if linked {
-                let mut v = [i0, i1, o0, o1];
-                follow_range_link(before, &mut v);
-                [i0, i1, o0, o1] = v;
-            }
-        });
-        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
-
-        // Row 3: Grid + Trail
-        let grid_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= grid_count_fields(ui, node_id, snarl, &mut gx_f, &mut gy_f, 20.0).1;
-            ui.separator();
-            ui.label(egui::RichText::new("Trail").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-                .range(0i64..=TRAIL_MS_MAX).suffix("ms")).changed();
-        });
-        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
-
-        // Row 4: Grid display options
-        let grid_opts_resp = ui.horizontal(|ui| {
-            let ssg_before = ssg;
-            ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small())
-                .on_hover_text("Adapt grid lines to the current Log/Exp scaling (Log compresses toward max, Exp toward min)");
-            changed |= ssg != ssg_before;
-            let sgl_before = sgl;
-            ui.checkbox(&mut sgl, egui::RichText::new("Labels").small())
-                .on_hover_text("Show value labels on grid lines");
-            changed |= sgl != sgl_before;
-        });
-        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+        // The settings, in the family's rows (`curve_rows`).
+        let abs_now = abs;
+        let mut range_v = [i0, i1, o0, o1];
+        let (rows_changed, rows) = super::curve_rows::curve_settings(
+            ui,
+            node_id,
+            snarl,
+            surface.size.x,
+            super::curve_rows::CurveSettings {
+                sc_t: &mut sc_t,
+                abs: Some((&mut abs, true)),
+                vec: None,
+                snap: &mut snap_on,
+                range: match view.unit {
+                    Some(unit) => super::curve_rows::CurveRange::Motion { unit, abs: abs_now },
+                    None => super::curve_rows::CurveRange::Full { v: &mut range_v, abs: abs_now },
+                },
+                gx: &mut gx_f,
+                gy: &mut gy_f,
+                grid_max: 20.0,
+                trail: &mut tm,
+                parts: super::curve_rows::CurveParts::ALL,
+            },
+        );
+        changed |= rows_changed;
+        [i0, i1, o0, o1] = range_v;
+        register_exposable_element(ui, node_id, "scale_row", rows.scale);
+        register_exposable_element(ui, node_id, "range_row", rows.range);
+        register_exposable_element(ui, node_id, "grid_row", rows.grid);
+        surface.need(rows.min_w);
 
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
@@ -601,28 +560,13 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 node.params.insert("grid_x".into(),   serde_json::json!(gx_f as i64));
                 node.params.insert("grid_y".into(),   serde_json::json!(gy_f as i64));
                 node.params.insert("snap".into(),     Value::Bool(snap_on));
-                if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
+                super::curve_rows::set_curve_scale(node, sc_t);
                 node.params.insert("trail_ms".into(),          serde_json::json!(tm));
-                node.params.insert("show_scaled_grid".into(),  Value::Bool(ssg));
-                node.params.insert("show_grid_labels".into(),  Value::Bool(sgl));
             }
         }
 
-        // An AutoMap curve has the one channel its picked signal makes.
-        if !automap { ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Ch").small().weak());
-            if ui.small_button("+").on_hover_text("Add parallel channel").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    let next = node.inputs.len() + 1;
-                    node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
-                    node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
-                }
-            }
-            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-                remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-            }
-        }); }
+        // Channels are added and dropped from the header's stepper.
+        surface.end(ui);
     });
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
@@ -630,8 +574,15 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
     false
 }
 
-pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
+pub(crate) fn show_vec_response_curve_body(
+    node_id: NodeId,
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -699,12 +650,11 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
     let mut curve_graph_rect: Option<egui::Rect> = None;
 
     ui.vertical(|ui| {
+        // The graph is what the module's corner grip sizes (`kit::Surface`): it had a grip
+        // of its own in its corner, and a size kept in egui's memory rather than the patch.
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(120.0, 100.0));
         // ── Graph ─────────────────────────────────────────────────────────────
-        egui::Resize::default()
-            .id_salt(("vcrv", node_id))
-            .default_size([180.0, 180.0])
-            .min_size([80.0, 80.0])
-            .show(ui, |ui| {
+        ui.allocate_ui(surface.size, |ui| {
                 let (rect, bg_resp) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
                 curve_graph_rect = Some(rect);
@@ -776,6 +726,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
 
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
                 let gs = egui::Stroke::new(0.5_f32, grid_faint);
+                let gs = if curve_grid_shown(snarl, node_id, None) { gs } else { egui::Stroke::NONE };
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
@@ -1009,97 +960,50 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
         let mut snap_on = snap;
         let mut sc_t    = scale_t;
         let mut tm      = trail_ms;
-        let mut ssg     = show_scaled_grid;
-        let mut sgl     = show_grid_labels;
         let mut changed = false;
 
-        // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Snap
-        let scale_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Log").small().weak());
-            let slider_id = ui.make_persistent_id(("log_exp", node_id));
-            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
-            ui.label(egui::RichText::new("Exp").small().weak());
-            ui.separator();
-            let snap_before = snap_on;
-            ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small());
-            changed |= snap_on != snap_before;
-        });
-        register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
-
-        // Row 2: In/Out max — for a gyro-fed curve, how much of the sensor the
-        // graph shows, in its units.
-        let range_resp = ui.horizontal(|ui| {
-            if let Some(unit) = view.unit {
-                motion_view_range_fields(ui, node_id, snarl, unit, true);
-                return;
-            }
-            let linked = snarl.get_node(node_id).map_or(true, range_linked);
-            let before = [0.0, i1, 0.0, o1];
-            ui.label(egui::RichText::new("In max").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).max_decimals(2)).changed();
-            if range_link_button(ui, linked) { toggle_range_link(snarl, node_id); }
-            ui.label(egui::RichText::new("Out max").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).max_decimals(2)).changed();
-            if linked {
-                let mut v = [0.0, i1, 0.0, o1];
-                follow_range_link(before, &mut v);
-                (i1, o1) = (v[1], v[3]);
-            }
-        });
-        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
-
-        // Row 3: Grid + Trail
-        let grid_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= grid_count_fields(ui, node_id, snarl, &mut gx_f, &mut gy_f, 20.0).1;
-            ui.separator();
-            ui.label(egui::RichText::new("Trail").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-                .range(0i64..=TRAIL_MS_MAX).suffix("ms")).changed();
-        });
-        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
-
-        // Row 4: Grid display options
-        let grid_opts_resp = ui.horizontal(|ui| {
-            let ssg_before = ssg;
-            ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small())
-                .on_hover_text("Adapt grid lines to the current Log/Exp scaling (Log compresses toward max, Exp toward min)");
-            changed |= ssg != ssg_before;
-            let sgl_before = sgl;
-            ui.checkbox(&mut sgl, egui::RichText::new("Labels").small())
-                .on_hover_text("Show value labels on grid lines");
-            changed |= sgl != sgl_before;
-        });
-        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+        // The settings, in the family's rows (`curve_rows`).
+        let (rows_changed, rows) = super::curve_rows::curve_settings(
+            ui,
+            node_id,
+            snarl,
+            surface.size.x,
+            super::curve_rows::CurveSettings {
+                sc_t: &mut sc_t,
+                abs: None,
+                vec: None,
+                snap: &mut snap_on,
+                range: match view.unit {
+                    Some(unit) => super::curve_rows::CurveRange::Motion { unit, abs: true },
+                    None => super::curve_rows::CurveRange::Max { i1: &mut i1, o1: &mut o1, floor: 0.001 },
+                },
+                gx: &mut gx_f,
+                gy: &mut gy_f,
+                grid_max: 20.0,
+                trail: &mut tm,
+                parts: super::curve_rows::CurveParts::ALL,
+            },
+        );
+        changed |= rows_changed;
+        register_exposable_element(ui, node_id, "scale_row", rows.scale);
+        register_exposable_element(ui, node_id, "range_row", rows.range);
+        register_exposable_element(ui, node_id, "grid_row", rows.grid);
+        surface.need(rows.min_w);
 
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 if let Some(n) = Number::from_f64(i1 as f64)   { node.params.insert("in_max".into(),  Value::Number(n)); }
                 if let Some(n) = Number::from_f64(o1 as f64)   { node.params.insert("out_max".into(), Value::Number(n)); }
-                if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
+                super::curve_rows::set_curve_scale(node, sc_t);
                 node.params.insert("grid_x".into(),            serde_json::json!(gx_f as i64));
                 node.params.insert("grid_y".into(),            serde_json::json!(gy_f as i64));
                 node.params.insert("snap".into(),              Value::Bool(snap_on));
                 node.params.insert("trail_ms".into(),          serde_json::json!(tm));
-                node.params.insert("show_scaled_grid".into(),  Value::Bool(ssg));
-                node.params.insert("show_grid_labels".into(),  Value::Bool(sgl));
             }
         }
 
-        if !automap { ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Ch").small().weak());
-            if ui.small_button("+").on_hover_text("Add Vec2 channel").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    let next = node.inputs.len() + 1;
-                    node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Vec2));
-                    node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Vec2));
-                }
-            }
-            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-                remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-            }
-        }); }
+        // Channels are added and dropped from the header's stepper.
+        surface.end(ui);
     });
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
@@ -1110,7 +1014,15 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
 // ── Two-way Response Curve body ───────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+pub(crate) fn show_twoway_response_curve_body(
+    node_id: NodeId,
+    _inputs: &[InPin],
+    _outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
     let automap = snarl.get_node(node_id).is_some_and(|n| is_automap_curve(&n.module_id));
     // No vsync bypass — same rationale as show_response_curve_body.
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
@@ -1175,7 +1087,6 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let show_scaled_grid = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
     let show_grid_labels = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(&node_data).is_some());
 
-    let n_channels = curve_channels(&node_data);
     let legend = curve_channel_labels(&node_data);
 
     let absolute_eff = absolute || vec_mode;
@@ -1221,12 +1132,15 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
     let mut ph_ms   = node_data.params.get("peak_hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     let mut ph_dir  = node_data.params.get("peak_hold_dir").and_then(|v| v.as_str()).unwrap_or("up").to_string();
     let mut tm      = trail_ms;
-    let mut ssg     = show_scaled_grid;
-    let mut sgl     = show_grid_labels;
+    let ssg     = show_scaled_grid;
+    let sgl     = show_grid_labels;
     let mut lane_sel = active_lane.clone();
     let mut curve_graph_rect: Option<egui::Rect> = None;
 
     ui.vertical(|ui| {
+        // The graph is what the module's corner grip sizes (`kit::Surface`): it had a grip
+        // of its own in its corner, and a size kept in egui's memory rather than the patch.
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(120.0, 100.0));
         // Lane toggle
         let lane_toggle_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Edit:").small().weak());
@@ -1238,12 +1152,9 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
             if ui.selectable_label(hy_sel, egui::RichText::new("Hyst").small()).on_hover_text(HYST_GRAPH_TAB_HINT).clicked() && !hy_sel { lane_sel = "hy".into(); params_changed = true; }
         });
         register_exposable_element(ui, node_id, "lane_toggle", lane_toggle_resp.response.rect);
+        surface.row(lane_toggle_resp.response.rect);
 
-        egui::Resize::default()
-            .id_salt(("twcrv", node_id))
-            .default_size([180.0, 180.0])
-            .min_size([80.0, 80.0])
-            .show(ui, |ui| {
+        ui.allocate_ui(surface.size, |ui| {
                 // bg uses Sense::click only so child interact() calls can capture drags
                 let (rect, bg_resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
                 curve_graph_rect = Some(rect);
@@ -1326,6 +1237,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let gyp: Vec<f32> = (1..gy_f).map(|i| y_lo + sy[i] * y_range).collect();
                 let (grid_faint, grid_axis) = graph_grid_colors(None);
                 let gs = egui::Stroke::new(0.5_f32, grid_faint);
+                let gs = if curve_grid_shown(snarl, node_id, None) { gs } else { egui::Stroke::NONE };
                 for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
                 for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
                 if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); } }
@@ -1564,91 +1476,80 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
 
         // Controls — each row wrapped so it can be registered as a pinnable element
         let mut changed = false;
-        // Scale slider with center notch (double-click resets)
-        let scale_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Log").small().weak());
-            let slider_id = ui.make_persistent_id(("log_exp", node_id));
-            changed |= log_exp_slider(ui, slider_id, egui::vec2(80.0, 14.0), &mut sc_t).1;
-            ui.label(egui::RichText::new("Exp").small().weak());
-            ui.separator();
-            let ab = abs_on;
-            ui.add_enabled_ui(!vm, |ui| { ui.checkbox(&mut abs_on, egui::RichText::new("Abs").small()).on_hover_text("Absolute mode: ignore sign of input"); });
-            if abs_on != ab { changed = true; }
-            let vmb = vm;
-            // On an AutoMap curve the picked signal's type sets Vec mode, and the
-            // pins are AutoMap, so there is nothing to retype.
-            if !automap {
-                ui.checkbox(&mut vm, egui::RichText::new("Vec").small()).on_hover_text("Vec2 mode: process magnitude. Forces Abs on.");
+        // The settings, in the family's rows (`curve_rows`).
+        let vmb = vm;
+        let (mut gxd, mut gyd) = (gx_f as f64, gy_f as f64);
+        let (rows_changed, rows) = super::curve_rows::curve_settings(
+            ui,
+            node_id,
+            snarl,
+            surface.size.x,
+            super::curve_rows::CurveSettings {
+                sc_t: &mut sc_t,
+                abs: Some((&mut abs_on, !vmb)),
+                // On an AutoMap curve the picked signal's type sets Vec mode, and the pins
+                // are AutoMap, so there is nothing to retype.
+                vec: if automap { None } else { Some(&mut vm) },
+                snap: &mut snap_on,
+                range: match view.unit {
+                    Some(unit) => super::curve_rows::CurveRange::Motion { unit, abs: absolute_eff },
+                    None => super::curve_rows::CurveRange::Max { i1: &mut i1, o1: &mut o1, floor: 0.001 },
+                },
+                gx: &mut gxd,
+                gy: &mut gyd,
+                grid_max: 32.0,
+                trail: &mut tm,
+                parts: super::curve_rows::CurveParts::ALL,
+            },
+        );
+        changed |= rows_changed;
+        gx_f = gxd.round() as usize;
+        gy_f = gyd.round() as usize;
+        if vm != vmb {
+            changed = true;
+            let tgt = if vm { SignalType::Vec2 } else { SignalType::Float };
+            let wrg = if vm { SignalType::Float } else { SignalType::Vec2 };
+            let aw: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
+            for (oid, iid) in aw {
+                if iid.node == node_id && snarl.get_node(oid.node).and_then(|n| n.outputs.get(oid.output)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
+                if oid.node == node_id && snarl.get_node(iid.node).and_then(|n| n.inputs.get(iid.input)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
             }
-            if vm != vmb {
-                changed = true;
-                let tgt = if vm { SignalType::Vec2 } else { SignalType::Float };
-                let wrg = if vm { SignalType::Float } else { SignalType::Vec2 };
-                let aw: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
-                for (oid, iid) in aw {
-                    if iid.node == node_id && snarl.get_node(oid.node).and_then(|n| n.outputs.get(oid.output)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
-                    if oid.node == node_id && snarl.get_node(iid.node).and_then(|n| n.inputs.get(iid.input)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
-                }
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    for p in node.inputs.iter_mut()  { p.signal_type = tgt; }
-                    for p in node.outputs.iter_mut() { p.signal_type = tgt; }
-                    if vm { node.params.insert("absolute".into(), Value::Bool(true)); }
-                }
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                for p in node.inputs.iter_mut()  { p.signal_type = tgt; }
+                for p in node.outputs.iter_mut() { p.signal_type = tgt; }
+                if vm { node.params.insert("absolute".into(), Value::Bool(true)); }
             }
-        });
-        register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
-
-        let range_resp = ui.horizontal(|ui| {
-            // A motion pick: how much of the sensor the graph shows, in its units.
-            if let Some(unit) = view.unit {
-                motion_view_range_fields(ui, node_id, snarl, unit, absolute_eff);
-            } else {
-                let linked = snarl.get_node(node_id).map_or(true, range_linked);
-                ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
-                if range_link_button(ui, linked) { toggle_range_link(snarl, node_id); }
-                ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
-                if linked {
-                    let mut v = [0.0, i1, 0.0, o1];
-                    follow_range_link([0.0, i1b, 0.0, o1b], &mut v);
-                    (i1, o1) = (v[1].max(0.001), v[3].max(0.001));
-                }
-            }
-            ui.label(egui::RichText::new("Grid").small().weak());
-            let (mut gxd, mut gyd) = (gx_f as f64, gy_f as f64);
-            if grid_count_fields(ui, node_id, snarl, &mut gxd, &mut gyd, 32.0).1 {
-                gx_f = gxd.round() as usize;
-                gy_f = gyd.round() as usize;
-                changed = true;
-            }
-        });
-        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
-
-        let grid_resp = ui.horizontal(|ui| {
-            let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
-            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).range(0i64..=TRAIL_MS_MAX).suffix("ms")); if tm!=tmb{changed=true;}
-        });
-        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
-
-        let grid_opts_resp = ui.horizontal(|ui| {
-            let ssgb=ssg; ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small()).on_hover_text("Adapt grid lines to Log/Exp scaling"); if ssg!=ssgb{changed=true;}
-            let sglb=sgl; ui.checkbox(&mut sgl, egui::RichText::new("Labels").small()).on_hover_text("Show value labels on grid lines"); if sgl!=sglb{changed=true;}
-        });
-        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+        }
+        register_exposable_element(ui, node_id, "scale_row", rows.scale);
+        register_exposable_element(ui, node_id, "range_row", rows.range);
+        register_exposable_element(ui, node_id, "grid_row", rows.grid);
+        surface.need(rows.min_w);
 
         let hyst_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Hyst").small().weak());
-            let hpb=h_pct;
-            ui.add_enabled(hyst_single, egui::DragValue::new(&mut h_pct).speed(0.01).range(0.0f32..=TWOWAY_HYST_MAX_PCT).suffix("%"))
-                .on_hover_text(HYST_HINT).on_disabled_hover_text(HYST_GRAPH_HINT);
-            if (h_pct-hpb).abs()>1e-5{changed=true;}
+            let shown = format!("{h_pct:.2}%");
+            changed |= super::curve_rows::flow_pill(
+                ui, node_id, "tw_hyst", 84.0, "hyst", &mut h_pct, &shown, 0.0..=TWOWAY_HYST_MAX_PCT, 0.01,
+                if hyst_single { HYST_HINT } else { HYST_GRAPH_HINT }, hyst_single,
+            );
             if twoway_hyst_extras(ui, &mut h_dir, &mut h_start, true).0 { changed = true; }
         });
         register_exposable_element(ui, node_id, "hyst_row", hyst_resp.response.rect);
 
         let interp_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
-            ui.label(egui::RichText::new("Peak hold").small().weak()).on_hover_text(PEAK_HOLD_HINT);
-            let phb=ph_ms; ui.add(egui::DragValue::new(&mut ph_ms).speed(0.5).range(0.0f32..=200.0f32).suffix("ms")).on_hover_text(PEAK_HOLD_HINT); if (ph_ms-phb).abs()>1e-5{changed=true;}
+            {
+                let h = super::curve_rows::band_h(ui) - 4.0;
+                let (icon, _) = ui.allocate_exact_size(egui::vec2(h * 0.8, h), egui::Sense::hover());
+                super::glyphs::paint(ui.painter(), icon, super::glyphs::Glyph::Stopwatch, ui.visuals().weak_text_color());
+            }
+            let shown = format!("{i_ms:.0} ms");
+            changed |= super::curve_rows::flow_pill(
+                ui, node_id, "tw_interp", 84.0, "\u{21CC}", &mut i_ms, &shown, 0.0..=500.0, 1.0,
+                "How long the output takes to cross from one curve to the other when the input turns round.", true,
+            );
+            let shown = format!("{ph_ms:.1} ms");
+            changed |= super::curve_rows::flow_pill(
+                ui, node_id, "tw_peak", 92.0, "peak", &mut ph_ms, &shown, 0.0..=200.0, 0.5, PEAK_HOLD_HINT, true,
+            );
             if twoway_dir_picker(ui, &mut ph_dir, PEAK_DIR_HINTS, true).0 { changed = true; }
         });
         register_exposable_element(ui, node_id, "interp_row", interp_resp.response.rect);
@@ -1657,7 +1558,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
             if let Some(node) = snarl.get_node_mut(node_id) {
                 if let Some(n)=Number::from_f64(i1 as f64){node.params.insert("in_max".into(),Value::Number(n));}
                 if let Some(n)=Number::from_f64(o1 as f64){node.params.insert("out_max".into(),Value::Number(n));}
-                if let Some(n)=Number::from_f64(sc_t as f64){node.params.insert("scale_t".into(),Value::Number(n));}
+                super::curve_rows::set_curve_scale(node, sc_t);
                 if let Some(n)=Number::from_f64(h_pct as f64){node.params.insert("hysteresis_pct".into(),Value::Number(n));}
                 node.params.insert("hyst_dir".into(),Value::String(h_dir.clone()));
                 node.params.insert("hyst_start_up".into(),Value::Bool(h_start));
@@ -1672,26 +1573,11 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 // An AutoMap curve's Vec mode is its picked signal's, not a param.
                 if !automap { node.params.insert("vec_mode".into(),Value::Bool(vm)); }
                 node.params.insert("active_lane".into(),Value::String(lane_sel.clone()));
-                node.params.insert("show_scaled_grid".into(),Value::Bool(ssg));
-                node.params.insert("show_grid_labels".into(),Value::Bool(sgl));
             }
         }
 
-        if !automap { ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Ch").small().weak());
-            if ui.small_button("+").on_hover_text("Add channel").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    let next = node.inputs.len() + 1;
-                    let sig = if vm { SignalType::Vec2 } else { SignalType::Float };
-                    node.inputs.push(PinDescriptor::new(format!("In {}", next), sig));
-                    node.outputs.push(PinDescriptor::new(format!("Out {}", next), sig));
-                }
-            }
-            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
-                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
-                remove_output_pin(node_id, n_channels - 1, outputs, snarl);
-            }
-        }); }
+        // Channels are added and dropped from the header's stepper.
+        surface.end(ui);
     });
 
     if let Some(rect) = curve_graph_rect {
@@ -1800,7 +1686,9 @@ pub(crate) fn paint_twoway_curve_graph(
     // this up/dn-lane renderer yet — the toggle exists and other curve
     // renderers honor it; read kept underscored until the overlay is ported.
     let _ssg       = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
-    let sgl        = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(&node_data).is_some());
+    let sgl        = graph_ov.and_then(|o| o.show_labels).unwrap_or_else(|| {
+        node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(MotionUnit::of(&node_data).is_some())
+    });
 
     let absolute_eff = absolute || vec_mode;
     // A motion pick runs on the whole sensor and shows only its view of it.
@@ -1861,6 +1749,7 @@ pub(crate) fn paint_twoway_curve_graph(
     let gyp: Vec<f32> = (1..grid_y).map(|i| y_lo + i as f32 / grid_y as f32 * y_range).collect();
     let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
     let gs = egui::Stroke::new(0.5_f32, grid_faint);
+    let gs = if curve_grid_shown(snarl, node_id, graph_ov) { gs } else { egui::Stroke::NONE };
     for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
     if !hyst_lane { if let Some((a, b)) = identity_span(x_lo, x_hi, y_lo, y_hi) { painter.line_segment([c2s(a, a), c2s(b, b)], egui::Stroke::new(0.5_f32, grid_axis)); } }

@@ -203,7 +203,15 @@ pub(crate) fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, 
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+pub(crate) fn show_vec_reshape_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
     let _ = (inputs, outputs);
     // ── Init params on first use ──────────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("boundary_pts")).unwrap_or(false);
@@ -247,6 +255,10 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
     let mut graph_rect: Option<egui::Rect> = None;
 
     ui.vertical(|ui| {
+        // The curve and the pad are one surface, sized by the module's corner grip
+        // (`kit::Surface`), with a bar between them that sets how it is shared. Each used to
+        // have a grip of its own, so the module had three sizes and two ragged right edges.
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(140.0, 160.0));
         // ── Edit-target toggle ────────────────────────────────────────────────
         let mut new_target = p.edit_target.clone();
         let tgt_resp = ui.horizontal(|ui| {
@@ -260,6 +272,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
                 .small().weak().color(Color32::from_gray(120)));
         });
         register_exposable_element(ui, node_id, "target_row", tgt_resp.response.rect);
+        surface.row(tgt_resp.response.rect);
         if new_target != p.edit_target {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("edit_target".into(), Value::String(new_target.clone()));
@@ -267,42 +280,59 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
             changed = true;
         }
 
-        // ── Curve editor (direction → radius / gain), grid + snap on BOTH axes ─
-        // The BODY owns the Resize handle; the editor draws into the allocated
-        // rect. (Pinned mirrors skip the Resize and pass their container rect.)
-        let g_size = read_widget_size(snarl, node_id, "vrs_graph_size", egui::vec2(190.0, 130.0));
-        let new_g = egui::Resize::default()
-            .id_salt(("vreshape_graph_rs", node_id))
-            .default_size(g_size)
-            .min_size(egui::vec2(90.0, 70.0))
-            .max_size(egui::vec2(600.0, 420.0))
-            .show(ui, |ui| {
-                let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
-                graph_rect = Some(rect);
-                if draw_reshape_curve_editor(ui, node_id, snarl, &p, editing_gain, y_max, live_vec, rect) {
-                    changed_inner.set(true);
-                }
-                ui.min_rect().size()
-            });
-        if (new_g - g_size).length() > 0.5 { write_widget_size(snarl, node_id, "vrs_graph_size", new_g); }
+        // ── Curve editor (direction → radius / gain) over the live 2D pad ──────
+        // The pad is a square, as large as its share of the surface allows, in the middle of
+        // it. (Pinned mirrors of either are given their own rects by their containers.)
+        const BAR: f32 = 8.0;
+        const MIN_PART: f32 = 56.0;
+        let split_before = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("vrs_split").and_then(|v| v.as_f64()))
+            .map_or(0.45, |v| v as f32);
+        let (area, _) = ui.allocate_exact_size(surface.size, egui::Sense::hover());
+        let room = (area.height() - BAR).max(2.0 * MIN_PART);
+        let top_h = (room * split_before).max(MIN_PART).min(room - MIN_PART);
+        let curve = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), top_h));
+        let bar = egui::Rect::from_min_size(egui::pos2(area.left(), curve.bottom()), egui::vec2(area.width(), BAR));
+        let below = egui::Rect::from_min_max(egui::pos2(area.left(), bar.bottom()), area.max);
+        graph_rect = Some(curve);
+        if draw_reshape_curve_editor(ui, node_id, snarl, &p, editing_gain, y_max, live_vec, curve) {
+            changed_inner.set(true);
+        }
+        // The bar: drag it to give the curve or the pad more of the surface.
+        let bar_resp = ui
+            .interact(bar, egui::Id::new(("vrs_split_bar", node_id.0)), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Drag to share the height between the curve and the pad");
+        {
+            let lit = bar_resp.hovered() || bar_resp.dragged();
+            let col = if lit {
+                ui.visuals().widgets.hovered.fg_stroke.color
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            };
+            let mid = bar.center();
+            ui.painter().line_segment(
+                [egui::pos2(mid.x - 14.0, mid.y), egui::pos2(mid.x + 14.0, mid.y)],
+                egui::Stroke::new(2.0_f32, col),
+            );
+        }
+        super::simple_bodies::trace_rect(ui, node_id, "vrs_split_bar", bar);
+        if bar_resp.dragged() {
+            let next = ((top_h + bar_resp.drag_delta().y) / room).max(MIN_PART / room).min(1.0 - MIN_PART / room);
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("vrs_split".into(), serde_json::json!(next as f64));
+            }
+        }
 
-        // ── Live 2D preview pad (re-read params so edits above show instantly) ─
-        // Square widget, centred in a resizable square frame.
+        // Re-read params so edits above show instantly.
         let p2 = snarl.get_node(node_id).map(ReshapeParams::read).unwrap_or(p);
-        let pad_sz = read_widget_size(snarl, node_id, "vrs_pad_size", egui::vec2(150.0, 150.0));
-        let new_pad = egui::Resize::default()
-            .id_salt(("vreshape_pad_rs", node_id))
-            .default_size(pad_sz)
-            .min_size(egui::vec2(80.0, 80.0))
-            .max_size(egui::vec2(420.0, 420.0))
-            .show(ui, |ui| {
-                let side = ui.available_size().min_elem().max(40.0);
-                let (frame, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-                pad_rect = Some(frame);
-                draw_reshape_pad(ui, egui::Id::new(("vrs_pad", node_id.0)), frame, &p2, live_vec);
-                egui::vec2(side, side)
-            });
-        if (new_pad - pad_sz).length() > 0.5 { write_widget_size(snarl, node_id, "vrs_pad_size", new_pad); }
+        let side = below.width().min(below.height()).max(40.0);
+        let frame = egui::Rect::from_center_size(below.center(), egui::Vec2::splat(side));
+        pad_rect = Some(frame);
+        draw_reshape_pad(ui, egui::Id::new(("vrs_pad", node_id.0)), frame, &p2, live_vec);
+        super::simple_bodies::trace_rect(ui, node_id, "vrs_curve", curve);
+        super::simple_bodies::trace_rect(ui, node_id, "vrs_pad", frame);
 
         // ── Controls ──────────────────────────────────────────────────────────
         let mut sym = p2.symmetry.clone();
@@ -328,6 +358,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
             changed |= rn != rn_before;
         });
         register_exposable_element(ui, node_id, "options_row", opt_resp.response.rect);
+        surface.row(opt_resp.response.rect);
 
         let range_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In max").small().weak());
@@ -337,6 +368,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
             changed |= ui.add(egui::DragValue::new(&mut om).speed(0.01).range(0.05..=2.0).max_decimals(2)).changed();
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
+        surface.row(range_resp.response.rect);
 
         let grid_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Grid").small().weak());
@@ -350,6 +382,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
             changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0).range(0i64..=1000).suffix("ms")).changed();
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
+        surface.row(grid_resp.response.rect);
 
         // Presets.
         let preset_resp = ui.horizontal(|ui| {
@@ -375,6 +408,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
             }
         });
         register_exposable_element(ui, node_id, "preset_row", preset_resp.response.rect);
+        surface.row(preset_resp.response.rect);
 
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
@@ -388,6 +422,7 @@ pub(crate) fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: 
                 node.params.insert("trail_ms".into(), serde_json::json!(tm));
             }
         }
+        surface.end(ui);
     });
 
     changed |= changed_inner.get();

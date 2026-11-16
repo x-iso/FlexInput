@@ -80,6 +80,45 @@ impl FlexInputApp {
         // Only A/B: they're withheld from the game during the sweep, while the
         // rest of the pad (an RT aim button, say) passes through, so RT is not a
         // finish alias here.
+        // Real World Calibration's choose step owns the pad: South the mouse output, West
+        // the stick output, North the gyro output, East cancels. A choice starts the 360°
+        // sweep - with the snapshot to line up against always on - which the handler below
+        // then finishes or cancels like any other. See `crate::rws_cal`.
+        if let Some((path, inner)) = self.config_rws_cal_choosing() {
+            let jsm = self.picker_node(&path, inner).is_some_and(|n| n.module_id == "module.jsm");
+            let pick = if nav.is_rising("btn_south") {
+                Some("mouse")
+            } else if nav.is_rising("btn_west") {
+                Some("stick")
+            } else if nav.is_rising("btn_north") && !jsm {
+                // A JSM config has no gyro output to scale.
+                Some("gyro")
+            } else {
+                None
+            };
+            let cancel = nav.is_rising("btn_east");
+            if pick.is_some() || cancel {
+                if let Some(node) = self.picker_tab_node_mut(&path, inner) {
+                    match pick {
+                        Some(output) => {
+                            node.params.insert("cal_output".into(), serde_json::Value::String(output.into()));
+                            node.params.insert("cal_ref_shot".into(), serde_json::Value::Bool(true));
+                            node.params.insert("cal_pending".into(), serde_json::Value::String("yaw".into()));
+                            node.params.insert("cal_measure".into(), serde_json::Value::String("yaw".into()));
+                            node.params.insert("cal_session".into(), serde_json::Value::String("guided".into()));
+                        }
+                        None => {
+                            node.params.insert("cal_session".into(), serde_json::Value::String("off".into()));
+                        }
+                    }
+                }
+                let canvas = &mut self.tabs[self.active_tab].canvas;
+                canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
         if let Some((path, inner)) = self.config_active_rws_sweep() {
             let finish = nav.is_rising("btn_south");
             let cancel = nav.is_rising("btn_east");
@@ -188,6 +227,17 @@ impl FlexInputApp {
         // South / RT → enter the SAME editor the sub-patch canvas would, chosen
         // by widget kind (mirrors the Widget-level enters in nav_drive_subpatch).
         if nav.is_rising("btn_south") || (nav.rt > 0.5 && !self.gamepad_nav.prev_rt) {
+            // Real World Calibration is one button: South presses it, starting the guided
+            // calibration's choose step rather than entering an editor.
+            if let Some((outer, inner, elem)) = self.gamepad_nav.config_nav_sel.clone() {
+                if elem == crate::rws_cal::ELEMENT {
+                    self.set_subpatch_param_str(outer, inner, "cal_session", "choose");
+                    let canvas = &mut self.tabs[self.active_tab].canvas;
+                    canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+                    ctx.request_repaint();
+                    return;
+                }
+            }
             if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
                 match self.nav_selected_kind(outer) {
                     NavWidgetKind::Curve => {
@@ -386,6 +436,45 @@ impl FlexInputApp {
         }
     }
 
+    /// The pad pins the config overlay's navigation is reading right now, which therefore
+    /// never reach the game - not even as part of the focused pin's passthrough, which is
+    /// how they leaked: a pin that reads the left stick, or one with no pins of its own
+    /// (passthrough = the whole pad), let the stick and d-pad that were walking the overlay
+    /// drive the game too.
+    ///
+    /// The d-pad, the face buttons, the bumpers and Back/Start are the pad's to navigate
+    /// with throughout. The stick that drives the editor does too (`config_control_input`):
+    /// the left at widget level, where it walks between pins, and while editing whichever
+    /// stick the editor took - the other one is the one being felt. The right stick also
+    /// drives the cursor while it is on screen at widget level, and the triggers enter
+    /// editors there. A running calibration sweep reads only South and East: the stick
+    /// and the pad's turn are what it measures, and they have to reach the game.
+    pub(crate) fn config_nav_reserved_pins(&self) -> Vec<&'static str> {
+        use crate::gamepad_nav::EditLevel;
+        let editing = self.gamepad_nav.edit_level != EditLevel::Widget;
+        let control = if editing { self.config_control_input() } else { crate::app::ControlInput::LeftStick };
+        if self.config_rws_cal_choosing().is_some() {
+            return vec!["btn_south", "btn_east", "btn_west", "btn_north"];
+        }
+        nav_reserved_pins(self.config_active_rws_sweep().is_some(), editing, control, self.gamepad_nav.cursor_visible)
+    }
+
+    /// The Real World Calibration pin whose node is choosing what to calibrate
+    /// (`cal_session` = `choose`), as its `(source_path, inner)` address.
+    fn config_rws_cal_choosing(&self) -> Option<(Vec<usize>, egui_snarl::NodeId)> {
+        self.tabs[self.active_tab].config.items.iter().find_map(|it| {
+            let crate::canvas::node::LayoutItem::Module(m) = it else { return None };
+            if m.element_id != crate::rws_cal::ELEMENT {
+                return None;
+            }
+            // RWS Aim's or a JSM Config's: the same procedure on the same params.
+            let inner = egui_snarl::NodeId(m.inner_node_id);
+            let node = self.picker_node(&m.source_path, inner)?;
+            let choosing = node.params.get("cal_session").and_then(|v| v.as_str()) == Some("choose");
+            choosing.then(|| (m.source_path.clone(), inner))
+        })
+    }
+
     /// The config pin whose node is mid measure sweep (`cal_measure` =
     /// pitch/yaw), as its `(source_path, inner)` address. Only one runs at a time.
     ///
@@ -533,4 +622,81 @@ fn nearest_rect_in_dir(
         rects.iter().copied().enumerate().filter(|&(i, _)| i != cur),
         step,
     )
+}
+
+/// The rule behind [`FlexInputApp::config_nav_reserved_pins`], on its inputs: a calibration
+/// sweep running, an editor open, the stick that editor took, and the RS cursor on screen.
+pub(crate) fn nav_reserved_pins(
+    sweep: bool,
+    editing: bool,
+    control: crate::app::ControlInput,
+    cursor_visible: bool,
+) -> Vec<&'static str> {
+    use crate::app::ControlInput;
+    const LS: [&str; 3] = ["left_stick", "left_stick_x", "left_stick_y"];
+    const RS: [&str; 3] = ["right_stick", "right_stick_x", "right_stick_y"];
+    if sweep {
+        return vec!["btn_south", "btn_east"];
+    }
+    let mut r: Vec<&'static str> = vec![
+        "dpad", "dpad_x", "dpad_y", "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+        "btn_south", "btn_east", "btn_north", "btn_west", "btn_lb", "btn_rb", "btn_back", "btn_start",
+    ];
+    match if editing { control } else { ControlInput::LeftStick } {
+        ControlInput::LeftStick => r.extend(LS),
+        ControlInput::RightStick => r.extend(RS),
+        ControlInput::Dpad => {}
+    }
+    if !editing {
+        if cursor_visible {
+            r.extend(RS);
+        }
+        r.extend(["left_trigger", "right_trigger"]);
+    }
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nav_reserved_pins;
+    use crate::app::ControlInput;
+
+    // Walking between pins uses the d-pad, the left stick and the face buttons: none of
+    // them may reach the game, whatever the focused pin passes through. The right stick
+    // is the cursor's while the cursor is up, and free otherwise.
+    #[test]
+    fn walking_the_overlay_keeps_its_own_inputs_from_the_game() {
+        let r = nav_reserved_pins(false, false, ControlInput::LeftStick, false);
+        for pin in ["dpad_up", "dpad", "left_stick", "left_stick_x", "btn_south", "btn_east", "btn_north", "btn_west", "right_trigger"] {
+            assert!(r.contains(&pin), "{pin} leaks while walking");
+        }
+        assert!(!r.contains(&"right_stick"), "no cursor up: the right stick is the game's");
+        assert!(nav_reserved_pins(false, false, ControlInput::RightStick, true).contains(&"right_stick_x"));
+    }
+
+    // Editing with the right stick (the pin is felt on the left one): the left stick is
+    // the game's, the right is the editor's. With both sticks felt, the d-pad edits and
+    // both sticks pass. The triggers are free once an editor is open.
+    #[test]
+    fn an_editor_takes_only_the_stick_it_drives() {
+        let r = nav_reserved_pins(false, true, ControlInput::RightStick, true);
+        assert!(r.contains(&"right_stick") && !r.contains(&"left_stick"));
+        assert!(!r.contains(&"left_trigger"));
+        let r = nav_reserved_pins(false, true, ControlInput::Dpad, false);
+        assert!(!r.contains(&"left_stick") && !r.contains(&"right_stick") && r.contains(&"dpad_left"));
+    }
+
+    // A calibration sweep measures the stick and the pad's turn, so they reach the game;
+    // only its Finish and Cancel are kept back.
+    #[test]
+    fn a_calibration_sweep_keeps_only_finish_and_cancel() {
+        assert_eq!(nav_reserved_pins(true, false, ControlInput::LeftStick, true), vec!["btn_south", "btn_east"]);
+    }
+
+    // The calibration widget is one button with no fields: it has to be a target anyway,
+    // or the pad walks past the one widget that needs it.
+    #[test]
+    fn the_calibration_widget_is_a_pad_target() {
+        assert!(crate::app::FlexInputApp::elem_is_nav_target("processing.rws", crate::rws_cal::ELEMENT));
+    }
 }

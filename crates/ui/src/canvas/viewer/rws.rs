@@ -25,8 +25,9 @@ fn rws_field_style(snarl: &Snarl<NodeData>, node_id: NodeId) -> (f32, f32, bool)
         .map(|n| {
             let a = n.params.get("field_bg_alpha").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let t = n.params.get("field_tick_deg").and_then(|v| v.as_f64()).unwrap_or(15.0) as f32;
-            let l = n.params.get("field_labels").and_then(|v| v.as_bool()).unwrap_or(true);
-            (a.clamp(0.0, 1.0), t.clamp(5.0, 90.0), l)
+            // The degree labels are always drawn: the preview is little use without them,
+            // so the switch that hid them is gone (a saved `field_labels` is ignored).
+            (a.clamp(0.0, 1.0), t.clamp(5.0, 90.0), true)
         })
         .unwrap_or((0.0, 15.0, true))
 }
@@ -78,16 +79,34 @@ impl RwsScaleUnit {
 /// Mouse-sensitivity hint for calibrating without a known value.
 const RWS_LOW_SENS_TIP: &str = "No known value? Calibrate at a low in-game sensitivity — usually finer aim steps";
 
-pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (scale, rws, stick_max) = snarl
+/// The narrowest each constant wants on a band: the label cell and a number that can run to
+/// five digits (`100000 /360°`). `curve_rows::bands` shares the rest of a band between the
+/// groups in it, and moves a group to the next band when even this won't fit beside it.
+const RWS_SCALE_W: f32 = 140.0;
+const RWS_SDPS_W: f32 = 112.0;
+const RWS_RWS_W: f32 = 96.0;
+const RWS_GSC_W: f32 = 112.0;
+const RWS_VH_W: f32 = 200.0;
+/// The narrowest the body is drawn: the widest pill group in it.
+const RWS_MIN_W: f32 = 236.0;
+pub(crate) fn show_rws_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
+    let (scale, rws, stick_max, gyro_scale) = snarl
         .get_node(node_id)
         .map(|n| {
             let scale = n.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32;
             let rws = n.params.get("rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let stick_max = n.params.get("stick_out_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32;
-            (scale, rws, stick_max)
+            let gyro_scale = n.params.get("gyro_scale").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            (scale, rws, stick_max, gyro_scale)
         })
-        .unwrap_or((100.0, 1.0, 360.0));
+        .unwrap_or((100.0, 1.0, 360.0, 1.0));
     let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
     let unit = RwsScaleUnit::of(snarl, node_id);
 
@@ -96,175 +115,158 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     // The snarl body ui is left-to-right by default; wrap so the rows stack.
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        // The calibration view is the module's surface: the corner grip sizes it, and the
+        // rows above and below it are as wide as it is. It was as wide as whatever row
+        // happened to be widest and a fixed height per view.
+        let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(RWS_MIN_W, 80.0));
+        ui.set_max_width(surface.size.x);
+        ui.set_min_width(surface.size.x);
+        surface.need(RWS_MIN_W);
 
-    // Each output's calibrated constant, side by side. Still two elements, so
-    // each pins independently.
-    ui.horizontal(|ui| {
-        // Mouse Scale — mouse dots per degree (or per 360°); the calibrated ground
-        // truth (the value box the calibration viewport edits in the config overlay).
-        let r_scale = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Mouse Scale").small())
-                .on_hover_text("Mouse Move (XY) output: mouse dots per degree of turn, or per 360°\n(unit switch in the header) — the calibrated 1:1 ground truth.\nCalibrate this (RWS 1 then feels like a 1:1 physical rotation).");
-            let mut v = unit.shown(scale);
-            if ui.add(unit.drag_value(&mut v).suffix(unit.suffix())).changed() {
-                if let Some(p) = unit.to_param(v) { set.push(("scale", p)); }
-            }
-        });
-        register_exposable_element(ui, node_id, "scale", r_scale.response.rect);
-        ui.separator();
-        // Stick output scaling (the game's camera turn rate at full stick; the
-        // Stick-output equivalent of Mouse Scale).
-        let r_sdps = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Stick °/s").small())
-                .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.");
-            let mut sm = stick_max;
-            if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s")).changed() {
-                if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
-            }
-        });
-        register_exposable_element(ui, node_id, "stick_dps", r_sdps.response.rect);
-    });
-
-    // RWS multiplier + V/H bias on one row, again as separate elements.
+    // ── Real world calibration and scale ──
+    // The module's settings are in categories, each folded and unfolded by its heading
+    // (`curve_rows::section`); the preview is folded until it is wanted. This one holds two
+    // kinds of number, said apart by a caption each: the calibration values, which say
+    // what one degree of turn is to each output and which a calibration measures, and
+    // the output sensitivity on top of them - Real World Scale and the V/H biases.
+    let sens_open = super::curve_rows::section(ui, snarl, node_id, "sens", "Real world calibration and scale", true);
+    if sens_open {
+    // The four calibrated constants as value pills: groups that share a band while the
+    // width holds them, and a band each when it doesn't. They used to be two rows of caption
+    // plus DragValue plus a separator, which is a lot of height for four numbers and a right
+    // edge none of them lined up with. Still four elements, so each pins on its own.
+    let band = super::curve_rows::band_h(ui);
+    let ctrl = band - 4.0;
     let (gyro_vh, stick_vh) = snarl.get_node(node_id).map(|n| (
         n.params.get("gyro_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         n.params.get("stick_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
     )).unwrap_or((1.0, 1.0));
-    ui.horizontal(|ui| {
-        // RWS multiplier relative to the calibrated ground truth.
-        let r_rws = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("RWS").small())
-                .on_hover_text("Sensitivity as a multiple of the calibrated 1:1 ground truth.\n1.0 = matches your physical rotation; 2.0 = twice as fast.");
-            let mut v = rws;
-            if ui.add(egui::DragValue::new(&mut v).speed(0.01).range(0.01..=50.0)).changed() {
-                if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
-            }
-        });
-        register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
-        ui.separator();
-        // V/H bias — vertical sensitivity relative to horizontal (the calibrated
-        // reference), separately for the gyro source and stick sources. 1.0 = equal.
-        let r_vh = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("V/H").small().weak())
-                .on_hover_text("Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated reference,\nset per source: gyro vs stick.");
-            ui.label(egui::RichText::new("gyro").small().weak());
-            let mut g = gyro_vh;
-            if ui.add(egui::DragValue::new(&mut g).speed(0.01).range(0.0..=8.0)).changed() {
-                if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
-            }
-            ui.label(egui::RichText::new("stick").small().weak());
-            let mut s = stick_vh;
-            if ui.add(egui::DragValue::new(&mut s).speed(0.01).range(0.0..=8.0)).changed() {
-                if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
-            }
-        });
-        register_exposable_element(ui, node_id, "vh", r_vh.response.rect);
-    });
+    {
+        let w = ui.available_width();
+        let caption = |ui: &mut egui::Ui, text: &str| {
+            ui.label(egui::RichText::new(text).small().weak());
+        };
+        let lay = |ui: &mut egui::Ui, mins: &[f32]| -> Vec<egui::Rect> {
+            let (cells, h) = super::curve_rows::bands(w, mins, band, 3.0 * super::kit::GAP);
+            let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            cells
+                .into_iter()
+                .map(|c| {
+                    let c = c.translate(area.min.to_vec2());
+                    egui::Rect::from_min_size(egui::pos2(c.left(), c.center().y - ctrl * 0.5), egui::vec2(c.width(), ctrl))
+                })
+                .collect()
+        };
+        caption(ui, "calibration values");
+        let cal = lay(ui, &[RWS_SCALE_W, RWS_SDPS_W, RWS_GSC_W]);
 
-    // Measure-based auto-calibration (turn a known 180°/360° → back-solve the
-    // constant), above the ruler. Stacked vertically so its guide and result
-    // lines sit on rows of their own instead of widening the controls row.
-    // (Body edits are real input in this window, so the canvas's own edit
-    // tracking syncs them — the returned write flag is only needed for overlays.)
-    let r_meas = ui.vertical(|ui| { let _ = rws_measure_controls(node_id, ui, snarl, true); });
-    register_exposable_element(ui, node_id, "measure", r_meas.response.rect);
+        // Mouse Scale — mouse dots per degree (or per 360°); the calibrated ground truth (the
+        // value box the calibration viewport edits in the config overlay).
+        let mut shown = unit.shown(scale);
+        let text = unit.text(scale);
+        if super::curve_rows::real_pill(ui, node_id, "rws_scale", cal[0], "scale|mouse scale", &mut shown, &text, 0.0..=100_000.0 * unit.factor(), if unit.per_360() { 10.0 } else { 0.05 },
+            "Mouse Move (XY) output: mouse dots per degree of turn, or per 360°\n(the unit switch is in the header) — the calibrated 1:1 ground truth.\nCalibrate this and RWS 1 feels like a 1:1 physical rotation.")
+        {
+            if let Some(p) = unit.to_param(shown) { set.push(("scale", p)); }
+        }
+        register_exposable_element(ui, node_id, "scale", cal[0]);
 
-    // Calibration viewport (own row). Writes `scale` directly via its centre box,
-    // so it must run before the `set` flush below (disjoint params — no conflict).
-    let fw = ui.available_width().clamp(120.0, 260.0);
-    let frect = render_rws_field(node_id, ui, snarl, egui::vec2(fw, 100.0), false);
-    register_exposable_element(ui, node_id, "field", frect);
+        // Stick output scaling (the game's camera turn rate at full stick; the Stick-output
+        // equivalent of Mouse Scale).
+        let mut sm = stick_max;
+        let text = format!("{sm:.0} °/s");
+        if super::curve_rows::real_pill(ui, node_id, "rws_sdps", cal[1], "stick|stick speed", &mut sm, &text, 1.0..=100_000.0, 5.0,
+            "Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.")
+        {
+            if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
+        }
+        register_exposable_element(ui, node_id, "stick_dps", cal[1]);
 
-    // View + style row.
+        // Gyro output scaling (the inverse of the game's own gyro sensitivity; the
+        // Gyro-output equivalent of Mouse Scale).
+        let mut gs = gyro_scale;
+        let text = format!("{gs:.3}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_gsc", cal[2], "gyro|gyro scale", &mut gs, &text, 0.0..=1000.0, 0.005,
+            "Map output: the pad's own gyro, for a game that aims with it. Wire the pad into\nthe Device input and the Map output on to the virtual pad; its gyro axes are\nmultiplied by this (and by Real World Scale). Calibrate it and the game turns\nas far as the pad does.")
+        {
+            if let Some(n) = Number::from_f64(gs as f64) { set.push(("gyro_scale", Value::Number(n))); }
+        }
+        register_exposable_element(ui, node_id, "gyro_scale", cal[2]);
+
+        caption(ui, "output sensitivity");
+        // Real World Scale across the whole width, its name in full: it is the one number
+        // here that is a feel rather than a measurement, and it stands apart from the rest.
+        let out = [lay(ui, &[w.max(RWS_RWS_W)])[0], lay(ui, &[RWS_VH_W])[0]];
+        // Real World Scale: the sensitivity, as a multiple of the calibrated 1:1 turn.
+        let mut v = rws;
+        let text = format!("{v:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_rws", out[0], "rws|real world scale", &mut v, &text, 0.01..=50.0, 0.01,
+            "Real World Scale: the sensitivity, as a multiple of the calibrated 1:1 turn.\n1.0 = the camera turns as far as your hands do; 2.0 = twice as far.\nIt applies to every output, and isn't touched by calibrating.")
+        {
+            if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
+        }
+        register_exposable_element(ui, node_id, "rws", out[0]);
+
+        // V/H bias — vertical sensitivity relative to horizontal (the calibrated reference),
+        // separately for the gyro source and stick sources. 1.0 = equal.
+        let mut g = gyro_vh;
+        let mut s = stick_vh;
+        let (half, gap) = ((out[1].width() - super::kit::GAP) / 2.0, super::kit::GAP);
+        let gy = egui::Rect::from_min_size(out[1].min, egui::vec2(half, ctrl));
+        let st = egui::Rect::from_min_size(egui::pos2(out[1].left() + half + gap, out[1].top()), egui::vec2(half, ctrl));
+        let gt = format!("gy {g:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_gy", gy, "v/h|gyro v/h", &mut g, &gt, 0.0..=8.0, 0.01,
+            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the gyro source.")
+        {
+            if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
+        }
+        let st2 = format!("st {s:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_st", st, "v/h|stick v/h", &mut s, &st2, 0.0..=8.0, 0.01,
+            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the stick sources.")
+        {
+            if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
+        }
+        register_exposable_element(ui, node_id, "vh", out[1]);
+    }
+    rws_calibrate_button(node_id, ui, snarl, automap_parent);
+    }
+
     let mode = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str()))
         .unwrap_or("ruler").to_string();
     let fov = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_fov").and_then(|v| v.as_f64()))
         .unwrap_or(90.0) as f32;
-    let r_style = ui.horizontal(|ui| {
-        for (val, lbl) in [("ruler", "Ruler"), ("room", "Room"), ("both", "Both")] {
-            if ui.selectable_label(mode == val, egui::RichText::new(lbl).small()).clicked() {
-                set.push(("field_mode", Value::String(val.to_string())));
-            }
-        }
-        ui.separator();
-        let mut a = bg_alpha;
-        if ui.add(egui::DragValue::new(&mut a).speed(0.01).range(0.0..=1.0).prefix("BG "))
-            .on_hover_text("Viewport background opacity (0 = transparent).")
-            .changed()
-        {
-            if let Some(n) = Number::from_f64(a as f64) { set.push(("field_bg_alpha", Value::Number(n))); }
-        }
-        if mode != "ruler" {
-            let mut fv = fov;
-            if ui.add(egui::DragValue::new(&mut fv).speed(1.0).range(30.0..=140.0).prefix("FOV ").suffix("°"))
-                .on_hover_text("Horizontal field of view — set this to match your in-game FOV so the turn rate reads 1:1.")
-                .changed()
-            {
-                if let Some(n) = Number::from_f64(fv as f64) { set.push(("field_fov", Value::Number(n))); }
-            }
-        }
-        if mode != "room" {
-            let mut td = tick_deg;
-            if ui.add(egui::DragValue::new(&mut td).speed(1.0).range(5.0..=90.0).suffix("°"))
-                .on_hover_text("Minor tick spacing.")
-                .changed()
-            {
-                if let Some(n) = Number::from_f64(td as f64) { set.push(("field_tick_deg", Value::Number(n))); }
-            }
-            let mut lb = labels;
-            if ui.checkbox(&mut lb, egui::RichText::new("labels").small()).changed() {
-                set.push(("field_labels", Value::Bool(lb)));
-            }
-        }
-    });
-    register_exposable_element(ui, node_id, "style", r_style.response.rect);
 
-    // Flick stick (the stick on the Flick input): push to flick, hold + rotate
-    // to track. On wherever its output goes (see `rws_flick_hint`), and off
-    // while the Flick On control input is.
-    let r_flick = ui.horizontal(|ui| set.extend(rws_flick_row(node_id, ui, snarl).0));
-    register_exposable_element(ui, node_id, "flick", r_flick.response.rect);
-
-    // Flick options (stabilise, forward deadzone, where the flick goes). A row
-    // of its own, and a pinnable element of its own, so a flick row already
-    // pinned keeps the size it was laid out for.
-    let r_opts = ui.horizontal(|ui| set.extend(rws_flick_opts_row(node_id, ui, snarl).0));
-    register_exposable_element(ui, node_id, "flick_opts", r_opts.response.rect);
-    // The speed gate between Stick aim and the flick.
-    let r_speed = ui.horizontal(|ui| set.extend(rws_flick_speed_row(node_id, ui, snarl).0));
-    register_exposable_element(ui, node_id, "flick_speed", r_speed.response.rect);
-    if let Some(hint) = rws_flick_hint(snarl, node_id) {
-        ui.label(egui::RichText::new(hint).small().weak());
+    // ── Heading rotation preview: the ruler / room the turn is drawn in. Folded until
+    // wanted: it is the module's surface (the corner grip sizes it) and little use day to day.
+    let view_open = super::curve_rows::section(ui, snarl, node_id, "view", "Heading rotation preview", false);
+    if view_open {
+        let frect = render_rws_field(node_id, ui, snarl, surface.size, false);
+        register_exposable_element(ui, node_id, "field", frect);
+        set.extend(rws_body_settings(node_id, ui, snarl, mode.as_str(), fov, bg_alpha, tick_deg, labels, Some(&["style"]), true).0);
     }
 
-    // Flick-stick source suppression: the stick wired into Flick is auto-detected
-    // and blocked downstream (so it can't leak to its default mapping, e.g. the
-    // virtual Right Stick), while this module keeps reading it internally.
-    let suppress = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("suppress_source").and_then(|v| v.as_str()))
-        .unwrap_or("off").to_string();
-    let r_sup = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Suppress flick stick").small().weak())
-            .on_hover_text("Block the stick wired into Flick from leaking to its default\nmapping (e.g. the virtual Right Stick). Auto-detected from the wire;\nthis module still reads it (via the pre-block snapshot, like the\nVirtual Menu).\n• Off — no block.\n• Full — always block while Flick or Stick aim is enabled.\n• In deadzone — block only past the Flick deadzone, so small\n  movements inside it still reach the default mapping.\nAn Auto-cal sweep always blocks it, whatever this is set to.");
-        egui::ComboBox::from_id_salt((node_id, "rws_suppress"))
-            .selected_text(match suppress.as_str() {
-                "full" => "Full", "deadzone" => "In deadzone", _ => "Off",
-            })
-            .width(104.0)
-            .show_ui(ui, |ui| {
-                for (val, lbl) in [("off", "Off"), ("full", "Full"), ("deadzone", "In deadzone")] {
-                    if ui.selectable_label(suppress == val, lbl).clicked() {
-                        set.push(("suppress_source", Value::String(val.to_string())));
-                    }
-                }
-            });
-    });
-    register_exposable_element(ui, node_id, "suppress", r_sup.response.rect);
+    // ── Flick stick: the flick, Stick aim, the speed gate, and the stick's block ──
+    // Pill groups that share a row while the width holds them; the pinned copies of these
+    // rows keep their own layout unless set to Style 2.
+    if super::curve_rows::section(ui, snarl, node_id, "flick", "Flick stick", true) {
+        set.extend(
+            rws_body_settings(
+                node_id, ui, snarl, mode.as_str(), fov, bg_alpha, tick_deg, labels,
+                Some(&["flick", "flick_opts", "flick_speed", "suppress"]), true,
+            )
+            .0,
+        );
+    }
 
     ui.label(egui::RichText::new("→ wire Mouse Move (XY) to KB/M “Mouse XY (move)”").small().weak())
         .on_hover_text("RWS drives the mouse via the displacement pin, which ignores the\nKB/M card's mouse sensitivity — so the calibration is portable.");
+    if view_open {
+        surface.end(ui);
+    } else {
+        surface.end_folded(ui);
+    }
     }); // ui.vertical
 
     if !set.is_empty() {
@@ -273,6 +275,428 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
                 node.params.insert(k.to_string(), v);
             }
         }
+    }
+}
+
+/// The body's way to calibrate: a button that pins the Real World Calibration widget to the
+/// config overlay (`crate::rws_cal`), or, once it is there, a line saying so. Labelled with
+/// the pad the module reads, since a patch can have one RWS Aim per pad and each has its own
+/// widget. The calibration itself runs over the game, from the pad.
+pub(crate) fn rws_calibrate_button(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> egui::Rect {
+    let path = super::subpatch_path(automap_parent);
+    let jsm = snarl.get_node(node_id).is_some_and(|n| n.module_id == "module.jsm");
+    let sets = if jsm {
+        "REAL_WORLD_CALIBRATION or VIRTUAL_STICK_CALIBRATION"
+    } else {
+        "Mouse Scale, Stick °/s or the gyro scale"
+    };
+    let pinned = crate::rws_cal::is_pinned(ui.ctx(), &path, node_id.0);
+    let pad = crate::rws_cal::pad_name(snarl, node_id);
+    let ctrl = super::curve_rows::band_h(ui) - 4.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ctrl), egui::Sense::hover());
+    let pad_part = if pad.is_empty() { String::new() } else { format!(" · {pad}") };
+    if pinned {
+        let mut on = true;
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("rws_cal_pinned", node_id)));
+        c.disable();
+        super::curve_rows::word_toggle(
+            &mut c,
+            rect,
+            &mut on,
+            &format!("✓ calibration on the overlay{pad_part}"),
+            "Open the config overlay and press Real World Calibration with the pad.",
+            ("rws_cal_pinned", node_id),
+        );
+        // The hover text of a disabled control is not shown; say it on the row instead.
+        ui.interact(rect, egui::Id::new(("rws_cal_pinned_hover", node_id.0)), egui::Sense::hover())
+            .on_hover_text("Open the config overlay and press Real World Calibration with the pad.\nRemove it there to get this button back.");
+    } else {
+        let mut off = false;
+        if super::curve_rows::word_toggle(
+            ui,
+            rect,
+            &mut off,
+            &format!("calibrate on the overlay{pad_part}"),
+            &format!(
+                "Pin a Real World Calibration button to the config overlay. Pressed with the pad over \
+                 the game, it walks you through turning one full 360° and sets {sets} from it."
+            ),
+            ("rws_cal_pin", node_id),
+        ) {
+            crate::rws_cal::request_pin(ui.ctx(), path, node_id.0);
+        }
+    }
+    rect
+}
+
+/// The last calibration's result message and when it was made, if any.
+pub(crate) fn rws_last_result(ctx: &egui::Context, node_id: NodeId) -> Option<(String, f64)> {
+    ctx.data(|d| d.get_temp::<(String, f64)>(rws_meas_msg_key(node_id)))
+}
+
+/// The Real World Calibration widget, pinned to the config overlay: one big button that
+/// starts the guided calibration (`crate::rws_cal`). It needs gamepad navigation, which runs
+/// the procedure; without it the button says so and does nothing. It is also where a sweep
+/// the pad finished is back-solved, as the old widget did.
+pub(crate) fn render_rws_cal_widget(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    // A finish the pad asked for: back-solve and stop, here as the measure widget did. A
+    // JSM node's answer goes into its config text.
+    let jsm = snarl.get_node(node_id).is_some_and(|n| n.module_id == "module.jsm");
+    let (axis, theta, peak) = rws_measure_state(node_id, snarl);
+    let finish = snarl.get_node(node_id).and_then(|n| n.params.get("cal_finish").and_then(|v| v.as_bool())).unwrap_or(false);
+    if finish && jsm {
+        if super::jsm::jsm_finish_pending(node_id, ui, snarl) {
+            mark_overlay_param_write(ui.ctx());
+        }
+    } else if finish {
+        if axis == "pitch" || axis == "yaw" {
+            rws_finish_measure(node_id, ui, snarl, &axis, theta, peak);
+        } else if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("cal_finish".into(), Value::Bool(false));
+        }
+        mark_overlay_param_write(ui.ctx());
+    }
+    let session = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("cal_session").and_then(|v| v.as_str()))
+        .unwrap_or("off")
+        .to_string();
+    let pad_on = crate::config_overlay::config_pad_active(ui.ctx());
+    let pad = crate::rws_cal::pad_name(snarl, node_id);
+    let (rect, _) = ui.allocate_exact_size(container, egui::Sense::hover());
+    let resp = ui
+        .interact(rect, egui::Id::new(("rws_cal_widget", node_id.0, ui.layer_id())), egui::Sense::click())
+        .on_hover_text(if pad_on {
+            "Calibrate with the pad: choose what to calibrate, turn one full 360°, finish."
+        } else {
+            "Turn on gamepad navigation first: the calibration is done from the pad, over the game."
+        });
+    let v = ui.visuals();
+    let running = session == "choose" || session == "guided";
+    let fill = if running {
+        v.selection.bg_fill
+    } else if resp.hovered() && pad_on {
+        v.widgets.hovered.bg_fill
+    } else {
+        v.widgets.inactive.bg_fill
+    };
+    let text_col = if pad_on || running { v.strong_text_color() } else { v.weak_text_color() };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    let h = rect.height();
+    let title = if running { "Calibrating…" } else { "Real World Calibration" };
+    let sub = if !pad_on && !running {
+        "needs gamepad navigation".to_string()
+    } else if pad.is_empty() {
+        if jsm { "no pad on the input" } else { "no pad on the Rotation input" }.to_string()
+    } else {
+        pad
+    };
+    ui.painter().text(
+        rect.center() - egui::vec2(0.0, h * 0.14),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional((h * 0.34).clamp(10.0, 28.0)),
+        text_col,
+    );
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, h * 0.24),
+        egui::Align2::CENTER_CENTER,
+        sub,
+        egui::FontId::proportional((h * 0.2).clamp(8.0, 16.0)),
+        v.weak_text_color(),
+    );
+    publish_nav_field_rects(ui, node_id, &[rect]);
+    if resp.clicked() && pad_on && !running {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("cal_session".into(), Value::String("choose".into()));
+        }
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
+/// The body's view-style, flick and suppress settings: see [`show_rws_body`].
+#[allow(clippy::too_many_arguments)]
+fn rws_body_settings(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+    mode: &str,
+    fov: f32,
+    bg_alpha: f32,
+    tick_deg: f32,
+    _labels: bool,
+    only: Option<&[&str]>,
+    body: bool,
+) -> (Vec<(&'static str, Value)>, Vec<egui::Rect>) {
+    use super::curve_rows::{real_pill, segmented, word_toggle, pill_combo, Groups};
+    // The field rects in the order the gamepad walks the element `only` names.
+    let mut fields: Vec<egui::Rect> = Vec::new();
+    let mut set: Vec<(&'static str, Value)> = Vec::new();
+    let num = |v: f32| Number::from_f64(f64::from(v)).map(Value::Number);
+    let p = |k: &str, d: f64| snarl.get_node(node_id).and_then(|n| n.params.get(k).and_then(|v| v.as_f64())).unwrap_or(d) as f32;
+    let b = |k: &str| snarl.get_node(node_id).and_then(|n| n.params.get(k).and_then(|v| v.as_bool())).unwrap_or(false);
+    let (dz, smooth, aim_on, aim_x) = (p("flick_deadzone", 0.85), p("flick_smooth_ms", 100.0), b("stick_aim_enabled"), p("stick_aim_rws", 1.0));
+    let (stab, fwd) = (p("flick_stabilise_ms", 0.0), p("flick_fwd_dz_deg", 0.0));
+    let (speed, slow) = (p("flick_speed_ms", 0.0), b("flick_slow_lock"));
+    let out = snarl.get_node(node_id).map_or("mouse", |n| flexinput_engine::eval::rws_flick_mode(&n.params));
+    let suppress = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("suppress_source").and_then(|v| v.as_str()))
+        .unwrap_or("off")
+        .to_string();
+
+    let gap = super::curve_rows::zoomed(super::kit::GAP);
+    let w = ui.available_width();
+    // view | BG FOV tick labels | flick dz smooth | aim | stab fwd | out | within slow | suppress
+    // Sized for their words: a pill needs its label cell (monospace) and its value.
+    // One pill each: the background, and the field of view (room) and tick spacing
+    // (ruler) when the mode draws them - "both" has all three.
+    let view_pills = 1 + usize::from(mode != "ruler") + usize::from(mode != "room");
+    let view_min = view_pills as f32 * 80.0 + (view_pills - 1) as f32 * super::kit::GAP;
+    let mins = [150.0, view_min, 236.0, 180.0, 196.0, 170.0, 216.0, 180.0];
+    const OWNER: [&str; 8] = ["style", "style", "flick", "flick", "flick_opts", "flick_opts", "flick_speed", "suppress"];
+    let g = Groups::layout(ui, w, &mins, |k| only.is_none_or(|o| o.contains(&OWNER[k])));
+    let none = egui::Rect::NOTHING;
+    // A group not drawn is a rect nothing is put in; the drawing below runs either way
+    // only for the groups that are there.
+    let cell = |i: usize| g.get(i).unwrap_or(none);
+    let drawn = |i: usize| g.get(i).is_some();
+    // `n` slots across a cell, in proportion to `weights`.
+    let split = |c: egui::Rect, weights: &[f32]| -> Vec<egui::Rect> {
+        let total: f32 = weights.iter().sum();
+        let room = c.width() - gap * (weights.len() as f32 - 1.0);
+        let mut x = c.left();
+        weights
+            .iter()
+            .map(|wt| {
+                let r = egui::Rect::from_min_size(egui::pos2(x, c.top()), egui::vec2(room * wt / total, c.height()));
+                x = r.right() + gap;
+                r
+            })
+            .collect()
+    };
+
+    // The view.
+    if drawn(0) { if let Some(m) = segmented(
+        ui,
+        cell(0),
+        &mode.to_string(),
+        &[
+            ("ruler".to_string(), "ruler", "A ruler of degrees across the turn"),
+            ("room".to_string(), "room", "A room drawn round you, at the in-game field of view"),
+            ("both".to_string(), "both", "The ruler over the room"),
+        ],
+        ("rws_view", node_id),
+    ) {
+        set.push(("field_mode", Value::String(m)));
+    }
+    fields.push(cell(0)); }
+    if body {
+        register_exposable_element(ui, node_id, "style", cell(0).union(cell(1)));
+    }
+    if drawn(1) {
+        let room = mode != "ruler";
+        let ruler = mode != "room";
+        let mut weights = vec![1.0];
+        if room {
+            weights.push(1.0);
+        }
+        if ruler {
+            weights.push(1.0);
+        }
+        let slots = split(cell(1), &weights);
+        let mut k = 0;
+        let mut a = bg_alpha;
+        let bg_slot = slots[k];
+        if real_pill(ui, node_id, "rws_bg", slots[k], "bg|background", &mut a, &format!("{bg_alpha:.2}"), 0.0..=1.0, 0.01, "Viewport background opacity (0 = transparent).") {
+            if let Some(n) = num(a) { set.push(("field_bg_alpha", n)); }
+        }
+        k += 1;
+        // Gamepad order: View, FOV, BG, Ticks, Labels.
+        fields.push(if room { slots[k] } else { none });
+        fields.push(bg_slot);
+        if room {
+            let mut fv = fov;
+            if real_pill(ui, node_id, "rws_fov", slots[k], "fov|field of view", &mut fv, &format!("{fov:.0}°"), 30.0..=140.0, 0.5,
+                "Horizontal field of view — set this to match your in-game FOV so the turn rate reads 1:1.")
+            {
+                if let Some(n) = num(fv.round()) { set.push(("field_fov", n)); }
+            }
+            k += 1;
+        }
+        if ruler {
+            let mut td = tick_deg;
+            if real_pill(ui, node_id, "rws_tick", slots[k], "tick|tick spacing", &mut td, &format!("{tick_deg:.0}°"), 5.0..=90.0, 0.5, "Minor tick spacing.") {
+                if let Some(n) = num(td.round()) { set.push(("field_tick_deg", n)); }
+            }
+            fields.push(slots[k]);
+        }
+    }
+
+    // The flick: deadzone and smoothing.
+    if drawn(2) {
+        let s = split(cell(2), &[1.0, 1.15]);
+        let mut d = dz;
+        if real_pill(ui, node_id, "rws_fdz", s[0], "flick|flick deadzone", &mut d, &format!("{dz:.2}"), 0.1..=0.99, 0.005,
+            "Flick stick, on the stick wired to the Flick input: push it past this deadzone to snap the camera \
+             to that direction; hold it out and rotate to track. Flicks are 1:1 (RWS does not apply). The \
+             Flick On input turns it off for a mode shift.")
+        {
+            if let Some(n) = num(d) { set.push(("flick_deadzone", n)); }
+        }
+        let mut sm = smooth;
+        if real_pill(ui, node_id, "rws_fsm", s[1], "smooth|smoothing", &mut sm, &format!("{smooth:.0} ms"), 0.0..=500.0, 1.0,
+            "Smoothing window for the initial flick snap (0 = instant).")
+        {
+            if let Some(n) = num(sm.round()) { set.push(("flick_smooth_ms", n)); }
+        }
+        fields.extend([s[0], s[1]]);
+    }
+    // Stick aim and its own multiplier.
+    if drawn(3) {
+        let s = split(cell(3), &[1.0, 1.0]);
+        let mut on = aim_on;
+        if word_toggle(ui, s[0], &mut on, "stick aim",
+            "Use the stick wired to the Flick input as a rate aim feeding BOTH outputs (its own RWS + the \
+             stick V/H bias). With the flick on it acts INSIDE the deadzone (past → flick); with it off it \
+             uses the full stick range. The Flick On input turns it off too.", ("rws_aim", node_id))
+        {
+            set.push(("stick_aim_enabled", Value::Bool(on)));
+        }
+        let mut x = aim_x;
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(s[1]).id_salt(("rws_aim_x", node_id)));
+        if !aim_on {
+            c.disable();
+        }
+        if real_pill(&mut c, node_id, "rws_aimx", s[1], "×|aim ×", &mut x, &format!("{aim_x:.2}"), 0.01..=50.0, 0.01,
+            "Stick-aim RWS multiplier (independent of the main RWS).")
+        {
+            if let Some(n) = num(x) { set.push(("stick_aim_rws", n)); }
+        }
+        fields.extend([s[0], s[1]]);
+    }
+    if body {
+        register_exposable_element(ui, node_id, "flick", cell(2).union(cell(3)));
+    }
+    // Stabilise and forward deadzone.
+    if drawn(4) {
+        let s = split(cell(4), &[1.0, 1.0]);
+        let mut st = stab;
+        if real_pill(ui, node_id, "rws_stab", s[0], "stab|stabilise", &mut st, &format!("{stab:.0} ms"), 0.0..=300.0, 1.0,
+            "Stabilise: hold back a thumb's tremor while the stick is held out and rotated. A deliberate \
+             sweep opens it up; whatever it still holds back when you let go is turned then. 0 = off.")
+        {
+            if let Some(n) = num(st.round()) { set.push(("flick_stabilise_ms", n)); }
+        }
+        let mut f = fwd;
+        if real_pill(ui, node_id, "rws_fwd", s[1], "fwd±|forward deadzone", &mut f, &format!("{fwd:.0}°"), 0.0..=90.0, 0.5,
+            "Forward deadzone: a flick that engages within this many degrees of straight up doesn't snap the \
+             camera - the stick only engages, so rotating it from there turns the camera. 0 = every flick snaps.")
+        {
+            if let Some(n) = num(f.round()) { set.push(("flick_fwd_dz_deg", n)); }
+        }
+        fields.extend([s[0], s[1]]);
+    }
+    // Where the flick goes.
+    let outs: Vec<(String, &str)> = RWS_FLICK_OUT_OPTS.iter().map(|o| (o.to_string(), rws_flick_out_label(o))).collect();
+    if drawn(5) { fields.push(cell(5)); }
+    if !drawn(5) {} else if let Some(o) = pill_combo(ui, cell(5), "out|flick output", &out.to_string(), &outs,
+        "Where the flick goes.\n• Flick pin · mouse — ONLY the Flick output, in mouse counts (Mouse Scale).\n\
+         • Flick pin · stick — ONLY the Flick output, as stick deflection (Stick °/s).\n\
+         • Mouse + Stick — added into BOTH the Mouse Move and Stick outputs.\n\
+         With a Flick pin option and the pin unwired, the flick is off.", ("rws_out", node_id))
+    {
+        set.push(("flick_output", Value::String(o)));
+    }
+    if body {
+        register_exposable_element(ui, node_id, "flick_opts", cell(4).union(cell(5)));
+    }
+    // The speed gate.
+    if drawn(6) {
+        let s = split(cell(6), &[1.0, 1.0]);
+        let mut sp = speed;
+        if real_pill(ui, node_id, "rws_within", s[0], "within|flick within", &mut sp, &format!("{speed:.0} ms"), 0.0..=300.0, 1.0,
+            "Speed gate between Stick aim and the flick: a push out of the centre that reaches the flick \
+             deadzone within this time is a flick, a slower one is steering. 0 = off (the deadzone alone decides).")
+        {
+            if let Some(n) = num(sp.round()) { set.push(("flick_speed_ms", n)); }
+        }
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(s[1]).id_salt(("rws_slow", node_id)));
+        if speed <= 0.0 {
+            c.disable();
+        }
+        let mut sl = slow;
+        if word_toggle(&mut c, s[1], &mut sl, "slow = aim",
+            "A push too slow to flick keeps the flick zone off until the stick is back at the centre: out past \
+             the deadzone it just aims, at full rate.", ("rws_slowlock", node_id))
+        {
+            set.push(("flick_slow_lock", Value::Bool(sl)));
+        }
+        fields.extend([s[0], s[1]]);
+    }
+    if body {
+        register_exposable_element(ui, node_id, "flick_speed", cell(6));
+    }
+    // Suppress the flick stick's default mapping.
+    if drawn(7) { fields.push(cell(7)); }
+    if !drawn(7) {} else if let Some(v) = pill_combo(ui, cell(7), "block|block stick", &suppress,
+        &[("off".to_string(), "Off"), ("full".to_string(), "Full"), ("deadzone".to_string(), "In deadzone")],
+        "Block the stick wired into Flick from leaking to its default mapping (e.g. the virtual Right Stick). \
+         This module still reads it.\n• Off — no block.\n• Full — always while Flick or Stick aim is on.\n\
+         • In deadzone — only past the Flick deadzone.\nAn Auto-cal sweep always blocks it.", ("rws_block", node_id))
+    {
+        set.push(("suppress_source", Value::String(v)));
+    }
+    if body {
+        register_exposable_element(ui, node_id, "suppress", cell(7));
+    }
+    // Under the flick's own rows, not under every call that draws some of the body.
+    if body && drawn(7) {
+        if let Some(hint) = rws_flick_hint(snarl, node_id) {
+            ui.label(egui::RichText::new(hint).small().weak());
+        }
+    }
+    let _ = gap;
+    (set, fields)
+}
+
+/// A pinned RWS row in the new style - `style`, `flick`, `flick_opts`, `flick_speed` or
+/// `suppress` - laid out across the pin's frame. See `pin_style2`.
+pub(crate) fn render_rws_row_style2(
+    node_id: NodeId,
+    element: &str,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
+    let mode = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str()))
+        .unwrap_or("ruler")
+        .to_string();
+    let fov = snarl.get_node(node_id).and_then(|n| n.params.get("field_fov").and_then(|v| v.as_f64())).unwrap_or(90.0) as f32;
+    // Drawn inside `pin_style2::fit`, at the zoom it set, the frame's width wide.
+    let _ = container;
+    let (set, fields) = rws_body_settings(node_id, ui, snarl, &mode, fov, bg_alpha, tick_deg, labels, Some(&[element]), false);
+    publish_nav_field_rects(ui, node_id, &fields);
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set {
+                node.params.insert(k.to_string(), v);
+            }
+        }
+        mark_overlay_param_write(ui.ctx());
     }
 }
 
@@ -612,7 +1036,7 @@ pub(crate) fn render_rws_scale(
 /// calibrated constants plus the sensitivity/flick/aim knobs. Excludes transient
 /// calibration state and the ruler/room view style (which is cosmetic).
 pub(crate) const RWS_PRESET_KEYS: &[&str] = &[
-    "scale", "rws", "stick_out_dps", "max_rate_dps",
+    "scale", "rws", "stick_out_dps", "gyro_scale", "max_rate_dps",
     "gyro_vh_ratio", "stick_vh_ratio",
     "flick_deadzone", "flick_smooth_ms", "flick_fwd_dz_deg", "flick_output",
     "flick_stabilise_ms", "flick_speed_ms", "flick_slow_lock",
@@ -773,6 +1197,7 @@ fn rws_finish_measure(
 ) {
     let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
     let is_stick = rws_cal_output_is_stick(snarl, node_id);
+    let is_gyro = snarl.get_node(node_id).and_then(|n| n.params.get("cal_output").and_then(|v| v.as_str())) == Some("gyro");
     let unit = RwsScaleUnit::of(snarl, node_id);
     let mut msg = String::new();
     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -790,6 +1215,20 @@ fn rws_finish_measure(
                 node.params.insert("stick_out_dps".into(), Value::Number(n));
             }
             msg = format!("✓ Stick °/s {old:.0} → {new:.0}");
+        } else if is_gyro {
+            // The game turned `target` while the Gyro output said `theta` at the old
+            // scale: its gyro sensitivity is target / (theta · old), and the scale
+            // that cancels it - one pad degree, one game degree - is the inverse.
+            let old = param(node, "gyro_scale", 1.0);
+            if old > 0.0 {
+                let new = old * theta.abs() / target;
+                if let Some(n) = Number::from_f64(new as f64) {
+                    node.params.insert("gyro_scale".into(), Value::Number(n));
+                }
+                msg = format!("✓ Gyro scale {old:.3} → {new:.3}");
+            } else {
+                msg = "⚠ Gyro scale is 0 — set a nonzero Gyro scale first".into();
+            }
         } else {
             let old = param(node, "scale", 100.0);
             if old > 0.0 {
@@ -887,6 +1326,83 @@ pub(crate) fn rws_measure_controls(
             (_, true, true) => "Turn one full 360°, steadily — circle the flick stick for the bulk, the pad to line up — then Finish",
         };
         guide(ui, instruction, "{btn_south} Finish · {btn_east} Cancel");
+    } else if split_hints {
+        // In the body: the method and the output as two joined pills, the snapshot as a
+        // switch - the value they set is the pill above, so it isn't repeated here.
+        use super::curve_rows::{bands, segmented, word_toggle, band_h};
+        let band = band_h(ui);
+        let ctrl = band - 4.0;
+        let w = ui.available_width();
+        let mins = [150.0, 130.0, if pending == "yaw" { 90.0 } else { 0.0 }];
+        let mins: Vec<f32> = mins.iter().copied().filter(|m| *m > 0.0).collect();
+        let (cells, h) = bands(w, &mins, band, 3.0 * super::kit::GAP);
+        let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        let cell = |i: usize| {
+            let c = cells[i].translate(area.min.to_vec2());
+            egui::Rect::from_min_size(egui::pos2(c.left(), c.center().y - ctrl * 0.5), egui::vec2(c.width(), ctrl))
+        };
+        // Either method starts its sweep; the one the pad would start is lit.
+        if let Some(m) = segmented(
+            ui,
+            cell(0),
+            &pending,
+            &[
+                ("pitch".to_string(), "cal ↕180°", "Vertical: aim straight DOWN, then turn straight UP (horizontal blocked)."),
+                ("yaw".to_string(), "cal ↔360°", "Horizontal: turn one full 360° (vertical blocked). Circling the stick on the Flick input round its edge turns it too."),
+            ],
+            ("rws_cal_method", node_id),
+        ) {
+            set.push(("cal_measure", Value::String(m)));
+        } else {
+            // A click on the lit one starts it too.
+            let lit = if pending == "pitch" { 0 } else { 1 };
+            let half = cell(0).width() / 2.0;
+            let r = egui::Rect::from_min_size(egui::pos2(cell(0).left() + lit as f32 * half, cell(0).top()), egui::vec2(half, ctrl));
+            if ui.rect_contains_pointer(r) && ui.input(|i| i.pointer.primary_clicked()) {
+                set.push(("cal_measure", Value::String(pending.clone())));
+            }
+        }
+        method_rect = cell(0);
+        if let Some(o) = segmented(
+            ui,
+            cell(1),
+            &cal_output,
+            &[
+                ("mouse".to_string(), "mouse", "Calibrate the Mouse Move (XY) output (Mouse Scale, counts/degree)."),
+                ("stick".to_string(), "stick", "Calibrate the Stick output (°/s at full deflection)."),
+            ],
+            ("rws_cal_out", node_id),
+        ) {
+            set.push(("cal_output", Value::String(o)));
+        }
+        if pending == "yaw" {
+            let mut shot = ref_on;
+            if word_toggle(ui, cell(2), &mut shot, "snapshot",
+                "Freeze the game frame behind the overlay at sweep start and show its left half at 70% as an \
+                 alignment reference for the full 360° turn.", ("rws_cal_shot", node_id))
+            {
+                set.push(("cal_ref_shot", Value::Bool(shot)));
+            }
+        }
+        let _ = (scale, stick_dps, &unit);
+        // Recent result message (a few seconds after a Finish).
+        let msg = ui.ctx().data(|d| d.get_temp::<(String, f64)>(rws_meas_msg_key(node_id)));
+        if let Some((m, t)) = msg {
+            if ui.input(|i| i.time) - t < 5.0 {
+                let col = if m.starts_with('✓') { egui::Color32::from_rgb(150, 220, 150) } else { egui::Color32::from_rgb(230, 180, 120) };
+                ui.label(egui::RichText::new(m).small().color(col));
+            }
+        }
+        if pending == "pitch" {
+            guide(ui, "Aim the camera straight DOWN first",
+                "{btn_south} Start · {dpad_left}{dpad_right} method · {dpad_up}{dpad_down} output");
+        } else {
+            guide(ui, "Aim straight ahead first",
+                "{btn_south} Start · {dpad_left}{dpad_right} method · {dpad_up}{dpad_down} output · {btn_north} snapshot");
+        }
+        if !is_stick {
+            ui.label(egui::RichText::new(RWS_LOW_SENS_TIP).small().weak());
+        }
     } else {
         let r = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Auto-cal").small().weak())
@@ -1035,7 +1551,7 @@ pub(crate) fn render_rws_style(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
+    let (bg_alpha, tick_deg, _) = rws_field_style(snarl, node_id);
     let (mode, fov) = snarl.get_node(node_id).map(|n| {
         (
             n.params.get("field_mode").and_then(|v| v.as_str()).unwrap_or("ruler").to_string(),
@@ -1065,10 +1581,6 @@ pub(crate) fn render_rws_style(
             let mut td = tick_deg;
             if ui.add(egui::DragValue::new(&mut td).speed(1.0).range(5.0..=90.0).suffix("°")).changed() {
                 if let Some(n) = Number::from_f64(td as f64) { set.push(("field_tick_deg", Value::Number(n))); }
-            }
-            let mut lb = labels;
-            if ui.checkbox(&mut lb, egui::RichText::new("labels").small()).changed() {
-                set.push(("field_labels", Value::Bool(lb)));
             }
         }
     });
@@ -1259,9 +1771,20 @@ fn paint_rws_ruler(
         painter.line_segment([egui::pos2(x, cy - major_h), egui::pos2(x, cy + major_h)], major_stroke);
         if labels {
             let deg = (d.rem_euclid(360.0)).round() as i32 % 360;
+            // The first and last labels of the visible span sit on the ruler's own ends:
+            // centred there they are half outside the rect, which is why a wide field used
+            // to read "0°" as "'0°". Near an edge, anchor the number inside it instead.
+            let at_edge = 14.0;
+            let align = if x < rect.left() + at_edge {
+                egui::Align2::LEFT_TOP
+            } else if x > rect.right() - at_edge {
+                egui::Align2::RIGHT_TOP
+            } else {
+                egui::Align2::CENTER_TOP
+            };
             painter.text(
-                egui::pos2(x, cy + major_h + 1.0),
-                egui::Align2::CENTER_TOP,
+                egui::pos2(x.clamp(rect.left(), rect.right()), cy + major_h + 1.0),
+                align,
                 format!("{deg}°"),
                 font.clone(),
                 egui::Color32::from_gray(200),

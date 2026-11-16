@@ -5567,9 +5567,9 @@ mod rws_tests {
         }
     }
 
-    // Where compute_rws's display-only readouts sit (after all three pins).
-    const DEG: usize = 3;
-    const PEAK: usize = 4;
+    // Where compute_rws's display-only readouts sit (after all four pins).
+    const DEG: usize = 4;
+    const PEAK: usize = 5;
 
     fn float_at(out: &[Option<Signal>], i: usize) -> f32 {
         match out.get(i).copied().flatten() {
@@ -5632,6 +5632,55 @@ mod rws_tests {
         }
     }
 
+    // The Map output's gyro gain: the calibrated gyro scale times Real World Scale, the
+    // V/H bias on pitch - and during a sweep, the base scale for a Gyro sweep and
+    // nothing at all for a Mouse or Stick one (the game is driven by one output only).
+    #[test]
+    fn native_gyro_gain_is_scale_times_rws_and_follows_the_sweep() {
+        let p = params(&[
+            ("gyro_scale", serde_json::json!(0.5)),
+            ("rws", serde_json::json!(2.0)),
+            ("gyro_vh_ratio", serde_json::json!(1.5)),
+        ]);
+        assert_eq!(rws_native_gyro_gain(&p), (1.0, 1.5));
+        let gyro_sweep = params(&[
+            ("cal_measure", serde_json::json!("yaw")),
+            ("cal_output", serde_json::json!("gyro")),
+            ("gyro_scale", serde_json::json!(0.5)),
+            ("rws", serde_json::json!(2.0)),
+        ]);
+        assert_eq!(rws_native_gyro_gain(&gyro_sweep), (0.5, 0.5), "base scale, no RWS, no V/H");
+        let mouse_sweep = params(&[("cal_measure", serde_json::json!("yaw")), ("gyro_scale", serde_json::json!(0.5))]);
+        assert_eq!(rws_native_gyro_gain(&mouse_sweep), (0.0, 0.0), "the gyro holds still");
+    }
+
+    // With the Device input wired, the Map output hands the pad's bus on with its gyro
+    // scaled and everything else untouched; unwired, it publishes nothing.
+    #[test]
+    fn the_map_output_hands_the_bus_on_with_the_gyro_scaled() {
+        let mut snap = rws_snap(31, "off");
+        snap.params.insert("gyro_scale".into(), serde_json::json!(0.5));
+        snap.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        let mut dev: BusMap = BusMap::default();
+        for (pin, v) in [("gyro_x", 0.1), ("gyro_y", 0.2), ("gyro_z", 0.4)] {
+            dev.insert(("pad".to_string(), pin.to_string()), Signal::Float(v));
+        }
+        dev.insert(("pad".to_string(), "btn_south".to_string()), Signal::Bool(true));
+        let mut c: BusMap = BusMap::default();
+        let mut state = HashMap::new();
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO))];
+        eval_rws_node(&snap, 31, &inputs, &dev, &mut c, &mut state, 0.01);
+        let pin = |p: &str| c.get_pin("collector:31", &p).copied();
+        assert_eq!(pin("gyro_x"), Some(Signal::Float(0.05)));
+        assert_eq!(pin("gyro_y"), Some(Signal::Float(0.1)));
+        assert_eq!(pin("gyro_z"), Some(Signal::Float(0.2)));
+        assert_eq!(pin("btn_south"), Some(Signal::Bool(true)), "the rest of the bus passes");
+        // Unwired: nothing published under its collector.
+        let bare = rws_snap(32, "off");
+        let mut c: BusMap = BusMap::default();
+        eval_rws_node(&bare, 32, &inputs, &dev, &mut c, &mut state, 0.01);
+        assert!(c.get_pin("collector:32", &"gyro_x").is_none());
+    }
 
     fn flick_params(smooth_ms: f32, scale: f32, rws: f32) -> HashMap<String, serde_json::Value> {
         params(&[
@@ -5899,7 +5948,7 @@ mod rws_tests {
         let run = |ctl: Option<Signal>| {
             let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
-            let out = eval_rws_node(&snap, 27, &[gyro, push, ctl], &mut c, &mut state, 0.01);
+            let out = eval_rws_node(&snap, 27, &[gyro, push, ctl], &BusMap::default(), &mut c, &mut state, 0.01);
             (vec_at(&out, 0), c.is_empty())
         };
         let (on_mouse, on_unblocked) = run(Some(Signal::Bool(true)));
@@ -5939,14 +5988,21 @@ mod rws_tests {
     // entry so the display-only readouts still sit right after its pins.
     #[test]
     fn two_pin_nodes_keep_the_readouts_after_their_pins() {
-        let full: Vec<Option<Signal>> = (0..5).map(|i| Some(Signal::Float(i as f32))).collect();
+        // [mouse, stick, flick, gyro, deg, peak]
+        let full: Vec<Option<Signal>> = (0..6).map(|i| Some(Signal::Float(i as f32))).collect();
         let old = rws_fit_outputs(full.clone(), 2);
         assert_eq!(old.len(), 4);
-        assert_eq!(old[rws_cal_deg_out(2)], Some(Signal::Float(3.0)));
-        assert_eq!(old[rws_cal_peak_out(2)], Some(Signal::Float(4.0)));
-        let new = rws_fit_outputs(full, 3);
-        assert_eq!(new[rws_cal_deg_out(3)], Some(Signal::Float(3.0)));
-        assert_eq!(new[rws_cal_peak_out(3)], Some(Signal::Float(4.0)));
+        assert_eq!(old[rws_cal_deg_out(2)], Some(Signal::Float(4.0)));
+        assert_eq!(old[rws_cal_peak_out(2)], Some(Signal::Float(5.0)));
+        let three = rws_fit_outputs(full.clone(), 3);
+        assert_eq!(three.len(), 5);
+        assert_eq!(three[2], Some(Signal::Float(2.0)), "the Flick pin stays");
+        assert_eq!(three[rws_cal_deg_out(3)], Some(Signal::Float(4.0)));
+        assert_eq!(three[rws_cal_peak_out(3)], Some(Signal::Float(5.0)));
+        let new = rws_fit_outputs(full, 4);
+        assert_eq!(new[3], Some(Signal::Float(3.0)), "the Gyro pin");
+        assert_eq!(new[rws_cal_deg_out(4)], Some(Signal::Float(4.0)));
+        assert_eq!(new[rws_cal_peak_out(4)], Some(Signal::Float(5.0)));
     }
 
     // While engaged, rotating the stick tracks the camera 1:1 by the shortest arc
@@ -6125,7 +6181,7 @@ mod rws_tests {
         let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
-        eval_rws_node(&snap, 21, &inputs, &mut c, &mut state, 0.016);
+        eval_rws_node(&snap, 21, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
         let sk = format!("{SRC_BLOCK_PREFIX}dev");
         for pin in ["right_stick", "right_stick_x", "right_stick_y"] {
             assert_eq!(
@@ -6143,7 +6199,7 @@ mod rws_tests {
         let mut c: BusMap = BusMap::default();
         let mut state = HashMap::new();
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
-        eval_rws_node(&snap, 22, &inputs, &mut c, &mut state, 0.016);
+        eval_rws_node(&snap, 22, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
         assert!(c.is_empty(), "off mode must publish no source-block");
     }
 
@@ -6156,13 +6212,13 @@ mod rws_tests {
         let mut c1: BusMap = BusMap::default();
         let mut s1 = HashMap::new();
         let inside = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
-        eval_rws_node(&snap, 23, &inside, &mut c1, &mut s1, 0.016);
+        eval_rws_node(&snap, 23, &inside, &BusMap::default(), &mut c1, &mut s1, 0.016);
         assert!(c1.get(&(sk.clone(), "right_stick".to_string())).is_none(), "inside deadzone: not blocked");
         // Past the deadzone → blocked.
         let mut c2: BusMap = BusMap::default();
         let mut s2 = HashMap::new();
         let past = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
-        eval_rws_node(&snap, 23, &past, &mut c2, &mut s2, 0.016);
+        eval_rws_node(&snap, 23, &past, &BusMap::default(), &mut c2, &mut s2, 0.016);
         assert_eq!(
             c2.get(&(sk, "right_stick".to_string())).map(|s| s.as_bool()),
             Some(true), "past deadzone: blocked",
@@ -6184,7 +6240,7 @@ mod rws_tests {
         carry.unblocked_src.insert(("dev".into(), "right_stick_x".into()), Signal::Float(1.0));
         carry.unblocked_src.insert(("dev".into(), "right_stick_y".into()), Signal::Float(0.0));
         let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
-        let out = eval_rws_node(&snap, 24, &inputs, &mut c, &mut state, 0.016);
+        let out = eval_rws_node(&snap, 24, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
         // Flick engaged from the snapshot (full right ≈ +90° × scale 1) despite the
         // zeroed resolved input.
         match out[0] {
@@ -6203,7 +6259,7 @@ mod rws_tests {
             let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(v))];
-            eval_rws_node(&snap, 25, &inputs, &mut c, &mut state, 0.016);
+            eval_rws_node(&snap, 25, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
             assert!(c.is_empty(), "stick-aim with suppression off must not block (stick {v:?})");
         }
     }
@@ -6220,7 +6276,7 @@ mod rws_tests {
             let mut c: BusMap = BusMap::default();
             let mut state = HashMap::new();
             let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
-            eval_rws_node(&snap, 26, &inputs, &mut c, &mut state, 0.016);
+            eval_rws_node(&snap, 26, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
             assert_eq!(
                 c.get(&(sk.clone(), "right_stick".to_string())).map(|s| s.as_bool()),
                 Some(true), "{axis} sweep must block the flick stick",
@@ -8927,7 +8983,7 @@ mod bound_flick_tests {
             carry.macro_prev.insert((SIGS_NS.to_string(), pin.to_string()), Signal::Bool(true));
         }
         let mut c = BusMap::default();
-        let out = eval_rws_node(snap, UID, &[], &mut c, state, DT);
+        let out = eval_rws_node(snap, UID, &[], &BusMap::default(), &mut c, state, DT);
         [0, 1, 2].map(|i| match out[i] {
             Some(Signal::Vec2(v)) => v,
             _ => glam::Vec2::ZERO,
@@ -9029,7 +9085,7 @@ mod bound_flick_tests {
         let mut sum = 0.0;
         for _ in 0..1000 {
             let mut c = BusMap::default();
-            let out = eval_rws_node(&snap, UID, &inputs, &mut c, &mut state, DT);
+            let out = eval_rws_node(&snap, UID, &inputs, &BusMap::default(), &mut c, &mut state, DT);
             let Some(Signal::Vec2(v)) = out[1] else { panic!("stick output") };
             assert!(v.x <= 1.0 + 1e-5);
             sum += v.x * 360.0 * DT;
@@ -9070,7 +9126,7 @@ mod bound_flick_tests {
         carry.macro_prev.insert((SIGS_NS.to_string(), FLICK.to_string()), Signal::Bool(true));
         let inputs = [None, None, Some(Signal::Bool(false))];
         let mut c = BusMap::default();
-        let out = eval_rws_node(&snap, UID, &inputs, &mut c, &mut state, DT);
+        let out = eval_rws_node(&snap, UID, &inputs, &BusMap::default(), &mut c, &mut state, DT);
         assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x > 0.0));
     }
 

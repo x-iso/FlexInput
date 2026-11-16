@@ -224,13 +224,23 @@ mod glyph_tests {
 
     // Every asset is read in at build time, so what is worth checking here is that
     // each one is drawn the way the set is drawn: stroked rather than filled, round
-    // tips, a 4-point stroke, and the 59x59 box the rest of the set shares.
+    // tips, a 3-point stroke, and the 59x59 box the rest of the set shares. (A drawing
+    // exported under a stretch carries the stroke that comes out at 3 - DIVIDE's is 2.83 -
+    // so the weight is held to a hair either side rather than to the digit.)
     #[test]
     fn every_glyph_is_stroked_in_the_same_box() {
         for (id, svg) in ICONS {
             assert!(svg.contains("viewBox=\"0 0 59 59\""), "{id}: not the shared 59x59 box");
             assert!(svg.contains("stroke-linecap:round"), "{id}: the tips are not round");
-            assert!(svg.contains("stroke-width:4px"), "{id}: the stroke is not 4 points");
+            let weights: Vec<f32> = svg
+                .split("stroke-width:")
+                .skip(1)
+                .filter_map(|rest| rest.split("px").next().and_then(|n| n.trim().parse().ok()))
+                .collect();
+            assert!(
+                !weights.is_empty() && weights.iter().all(|w| (2.8..=3.2).contains(w)),
+                "{id}: the stroke is not 3 points: {weights:?}"
+            );
             assert!(svg.contains("fill:none"), "{id}: filled rather than stroked");
             assert!(usvg::Tree::from_str(svg, &usvg::Options::default()).is_ok(), "{id}: does not parse");
         }

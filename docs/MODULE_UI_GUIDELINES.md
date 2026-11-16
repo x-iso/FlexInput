@@ -208,6 +208,28 @@ creep wider, stick, or flicker. It is handed its width instead.
 
 ## The header: marks and the pin stepper
 
+**The name rule, for every header.** A name is painted into the room the frame leaves it -
+after the fold chevron, before whatever sits at the header's right edge, and before the
+socket a folded module draws there - whole if it fits, cut with an ellipsis if it nearly
+does, left out when what is left would not be a word (`kit::title_galley`). It is never laid
+out, so it is never the reason a module is wide. `show_header` works out what the right edge
+will take (`reserved`) from the same flags that draw it: a `- n +` stepper, a list's `+`, the
+Knob's `uni/bi`, the Envelope's and the Response Curve's switches, the 3DOF module's `model`
+switch, a note's font size. A new
+header control has to be added to that sum, and traces its rect as `header_ctrl` so
+`no_header_name_runs_under_the_control_beside_it` holds it to the rule along with the rest.
+
+Two exceptions, both deliberate. Headers that are a row of word buttons after the name
+(Sub-patch, RWS Aim, SVG, the Remapper family) lay the name out whole with them: those
+modules are as wide as that row. And a name with no room and no symbol gets a drawing
+(`kit::node_glyph`): Delay wears a stopwatch, and says "Delay" over its number in the body.
+
+**A folded module's body shows one thing at most.** `show_body` switches a folded body's
+painter off; `simple_bodies::folded_reading` is the list of modules that still write their
+number in the band a folded frame keeps under its header - Knob, Constant, Readout. A module
+whose folded state is worth a number goes in that list, not around the guard. A folded list
+module drops its header `+` as well: the square was the name's room.
+
 A small module is its header and its pins. Nothing is built under them unless a
 control needs a row of its own, so the header carries the two things that identify the
 module and change it.
@@ -290,7 +312,7 @@ draw one mark in the room their pins leave over — a glyph, not a widget.
 
 - The assets live in `app/assets/modules/`, named after the module's display name
    (`AND.svg`, `SUBTRACT.svg`, `GREATER_OR_EQUAL.svg`). They share one idiom: a 59×59
-   box, a 4-point stroke with round caps and joins, no fill, and the mark filling the
+   box, a 3-point stroke with round caps and joins, no fill, and the mark filling the
    band the gate bodies fill (x 16.5..41.5, y 18.5..40.5). Gates and converters carry
    lead stubs, because for those the mark *is* a signal path — two leads merging is
    Axis to Vec, one splitting is Vec to Axis. An arithmetic operator doesn't, because a
@@ -645,14 +667,15 @@ module and outside the column. Two details that only show up when something else
   whose control *is* its body centres the control in the body column (Switch, Inverse, Logic
   Delay, Has Changed, Constant).
 
-- **A folded node reserves its ask and then draws nothing.** Snarl runs a collapsed node's body
-  anyway and shifts its cursor up under the header's clip, so a body that keeps laying out its
-  rows paints them above the frame — where they are clipped away but still take the pointer. The
-  Knob had the `!open` return for this since its rim was drawn across the header row; every body
-  with rows now does the same (`simple_bodies::node_open`): **allocate the ask first, then
-  return**, so the frame keeps the blocks its rows need and only the header is painted. Returning
-  before the reservation instead folds the module to its header alone — 84 points, which is under
-  the 40 points a title needs, so a folded Macro had no name at all. The same rule covers the pin
+- **A folded node is measured and not drawn - and a body does nothing for it.** Snarl runs a
+  collapsed node's body anyway and shifts its cursor up under the header's clip, so a body laid
+  out as usual paints its rows above the frame — where they are clipped away but still take the
+  pointer. `show_body` (in `viewer.rs`) handles it for every module before the body runs: the
+  body is laid out, so the frame keeps the blocks its rows need, with its painter off and an
+  empty clip, so only the header is painted and nothing in the body can be hit. A new body needs
+  no guard of its own; the `simple_bodies::node_open` returns in the older ones (allocate the ask
+  first, then return - returning before the reservation folded a Macro to 84 points and no name)
+  are redundant now. `no_folded_module_draws_its_body` checks all of them. The same rule covers the pin
   labels: `show_input`/`show_output` skip the word when the node is folded, because the pin
   column of a collapsed node is the clipped one, and the invisible words were what made a folded
   module a block wider than the header it had become. `a_folded_module_keeps_its_frame_and_paints_nothing_over_its_name`
@@ -741,14 +764,12 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   order (`remap_offsets`) so the strips carry on from exactly where the preview left them.
   The frames have to keep coming while that settles — `request_repaint` while any offset is
   still more than half a point from its target.
-  A Combiner's rows can't do that: they are live widgets with a socket beside each, and
-  moving one mid-frame would move the socket and the pins' column with it. Its preview is
-  the minimum that still answers the question a drag asks — which of three near-identical
-  rows will this land on: the row under the finger is dimmed as lifted (egui paints the
-  moving copy at the cursor), and a line is drawn where the gap will open. Which row is
-  being dragged comes from the drop zones' hover payload; between zones egui says nothing,
-  so the last one seen is kept while the button is held (`combiner_drag_key`) or the mark
-  flickers in the three-point gaps.
+  One implementation, `simple_bodies::StripAnim`, drives every list - Selector, Split, Macro
+  Output, the AutoMap Combiner, Fork and Selector: `begin` before the rows, `offset(i)` for
+  where to paint row `i`, `handle(&response, i)` for anything on the row that is a grip (it
+  returns the move when the finger lets go), `end` after them. A new list uses it; it does
+  not grow a drag of its own. (The Combiner once had one - live drop zones with a line where
+  the row would land - and the Macro another, and the three moved three different ways.)
 - **Anything stored by port number follows the port, not the slot.** The Combiner keeps a
   port's default merge policy (`combiner_port_default`, keyed by port index) and a pin's
   pinned port (`combiner_pin_port`, whose *value* is a port index). The engine reads ports by
@@ -756,38 +777,29 @@ Modules whose ports are a list the user counts out are drawn as a list, in the b
   a device's policy to whichever device lands in its slot and repoints a pinned pin at
   whatever took its place. `combiner_move_input` permutes both; a new index-keyed setting has
   to be added there too, and the test for it drags a row and checks the settings came with it.
-- **A module that draws its rows in the flow — the Combiner — has to be told the height.**
-  Its rows contain dropdowns, so their height is the style's, not a constant: `kit::strip_pitch`
-  returns `interact_size.y + 2 * COMBINER_PAD_V` and the body uses the same expression for the
-  frame it draws the row in. Neither side can measure the other — the pins are laid out before
-  the body — so the arithmetic is shared instead.
-- **A control takes the width it was given, not the width it wants.** Three widgets will
-  otherwise lay themselves out wider than the row: a `ComboBox` uses `Spacing::combo_width`
-  - 150 points - as its minimum whatever is selected in it, so give it `.width(cell)` and
-  let the popup size itself to its entries; a `kit::strip` adds its own spacing between
-  cells on top of the style's, so the child drawing it sets `item_spacing.x = 0.0`; and a
-  pill's label cell is measured in the monospace it is painted with
-  (`simple_bodies::pill_label_width`), not in the proportional text style, or the colour
-  block ends up narrower than the word on it.
-- **A stretchy body reserves its box and draws inside the rect it reserved.** The note takes
-  the leftover after its reservation; the Envelope uses the allocated rect itself, because
-  it has to fill the frame that reservation was worked out from. Mixing the two leaves a
-  body painting a strip of itself.
-- **A move takes the wire with it** (`pins::move_dynamic_pin`): the engine reads these pins
-  by position, so reordering without reconnecting silently rewires the patch.
-- **The handle is a handle: grab cursor on hover, and the strip it belongs to picks up an
-  edge** while it is hovered or dragged — the same reading the Combiner's rows give, so a
-  list of strips and a list of rows behave alike under the pointer.
-- **The port the selection is pointing at glows.** The engine mirrors a Selector's and
-  Split's `select` value into `extra.last_signals` (added to the display list in **both**
-  places it is kept), and the strip paints an outline and a faint fill at
-  `selection.bg_fill` scaled by how much of the selection is on it. Interpolate mode gives
-  the two ports either side their share, so the light fades from one to the next rather than
-  jumping. A body that wants live state needs the engine's say-so: nothing else reaches it.
-- **The Combiner's rows are all as wide as the widest content in the list** — the longest
-  port name plus its device label, measured in the row's own font — and the resolution
-  dropdown is pinned to the strip's right edge rather than trailing the name. Ragged rows
-  read as several controls; a dropdown that wanders can't be scanned.
+- **Every list is on `kit::StripRows`.** A row is `STRIP_H` tall and the pin column puts
+  the item spacing under it, so a row and its gap are one block; `StripRows::at_cursor`
+  taken at the body's top gives each row's band and its socket's centre. The Combiner's rows
+  used to be flow widgets at a pitch of their own, which is why it alone stepped its height
+  unevenly; its dropdown now sits in a rect on the strip (`ui.new_child` at the strip's right
+  edge), like the Macro's type dropdown. Anything under a list that is not a port - the head
+  of the Combiner's Resolution tree - is one more band of the same height, so a closed module
+  is its ports plus a fixed number of rows.
+- **A list sits in the middle of its frame.** The rows are a block each and the frame's own
+  trim is not, so the grid's rounding adds the same slack to every list, and all of it under
+  the last row read as a module with a row missing. `SnarlViewer::node_centers_payload` (a
+  vendored-snarl hook, on for the list modules) puts half of last frame's slack above the
+  pins and the body together - together, because the sockets have to stay level with the
+  strips. The size is still measured from the content alone, so the pad can't feed back.
+- **Rows under a list line up with it.** The Combiner's Resolution rows put their two
+  dropdowns against the strips' right edge on every row, whatever the pin is called; which
+  ports offer a pin is the row's hover text, not a tail that made every row a different
+  length.
+- **A name opens on what it says.** Renaming a port (a strip, a Macro row) opens the field
+  on the current name with all of it selected (`simple_bodies::select_all`), so typing
+  replaces it and a click or an arrow key edits it. The text being typed counts as one of
+  the names the column is measured from, so the module widens while it is typed - up to
+  `STRIP_NAME_MAX`, ten blocks, past which a name is cut with an ellipsis.
 - The size is content-driven and reversible: the body reserves `rows × pitch` and as wide as
   the longest name, so adding a port takes a row and a longer name takes width, both handed
   back when they stop being needed. The module has no corner grip.
@@ -846,8 +858,87 @@ A dial never gives up a line of frame for
   the value cell on a double-click or Ctrl-click. A number the user can only scrub is a
   number they can't set.
 
+## Surfaces: one grip per module
+
+- **A module has one resize grip: its corner grip.** A body never draws a grip of its own and
+  never keeps a size of its own - no `egui::Resize`, no size in egui's memory, no `field_w`-style
+  params. A module with two grips has two sizes, one of them off the grid and out of the patch.
+- **`kit::surface_spec(module_id)`** is the table of modules whose body is one surface - a
+  graph, a scope, a pad, an editor - plus rows of settings: the surface's smallest size and the
+  frame, in blocks, a new module opens at. Being in it makes the module stretchy, so `show_body`
+  hands the body `body_w` and `body_h`.
+- **The protocol:** `kit::Surface::begin(ui, node, body_w, body_h, min)` before anything is
+  laid out; draw the surface at `surface.size`; `surface.row(rect)` for each settings row, so the
+  surface is never narrower than the rows; `surface.end(ui)` after the last one, on the same
+  `ui`. The rows' height is measured each frame and taken off the next. It settles in one frame
+  because no row's size depends on the surface's - which is also the condition for using it.
+- **Not for a body whose size is the whole body.** JSM Config's editor takes what its own rows
+  leave, so there are no "rows" to measure: measuring them fed the size back into itself and the
+  height swung between two values every frame. Such a body is sized from `body_w`/`body_h`
+  directly.
+- **A scroll area takes no more than the room it is shown,** and a node's room is whatever its
+  body used the frame before - so a body built round one never grows. Give it its height with
+  `ui.set_max_height` before laying out (`set_min_height` first made the rows think the room was
+  already used).
+- **A square surface still reserves the full width** (`ui.set_min_width`): the Area Mapper's
+  field is the smaller side, and without it the frame snapped back to the rows' width and the
+  grip seemed not to take.
+- **A node's body ui is a row, not a column.** `Surface::end` reads the lower of the cursor and
+  `min_rect().bottom()` for that reason.
+- **Two surfaces in one module share one `Surface`,** with a bar between them (Vec Reshaper:
+  `vrs_split`, the curve's share of the height).
+- **Channels come from the header:** `kit::channel_range` lists the modules, `kit::channel_pins`
+  says what one more channel adds (a scope adds an input and nothing else).
+- **The Response Curve family's rows are `curve_rows::curve_settings`:** one function for the
+  three bodies, which pass it their values by reference. Its pieces are for other modules to
+  use too - `bands` (groups that share a row while the width holds them), `real_pill` /
+  `count_pill` / `flow_pill` (value pills dragged or typed; the whole-number one keeps the
+  part of a step a slow drag has travelled), `icon_toggle`. Rows that fill the width they
+  are given report what they *need* to the surface (`Surface::need`), not what they drew, or
+  the module can be dragged wider and never back.
+- **A module whose settings are hard to predict can draw what they do** - the 3DOF to 2D
+  module's surface is a picture of its own arithmetic (`viewer/gyro_view.rs`): the gimbal of the
+  pad's axes at the pose on its Orientation output, the neutral hold as a ghost under the live
+  outline, the Edge-turn zone as a ring, and the output plane beside it with one arrow per turn
+  rate - where the mode, the roll share and the invert flags drive the 2D - with the live output
+  drawn over them. It is not a second 3D model viewer: that one is a pad to pin to an overlay or
+  a stream, and this one is what you look at while setting the module up, which is why it draws
+  axes by default (a mesh at 90 points across cannot show which way yaw goes). The header wears
+  the one switch that says how the display is drawn (`view_model`: axes, or the pad's mesh at the
+  same pose on the same palette as the viewer would use). Everything in it is painted, never
+  allocated - a display that reports the width of its own numbers resizes the module every time
+  the pad moves.
+- **A scale that warps the graph moves the points with it** (`curve_rows::set_curve_scale`):
+  a point's place on the graph and the input/output pair it stands for are two things, and
+  it is the pair the user set.
+- **A card list is drawn the way its pinned copy is:** Remapper and Map Action call
+  `pinned::render_*_whole_module` with the body the grip gave them - width is the scale,
+  height the window onto a list that scrolls. A header that puts a control against its right
+  edge has to say what it holds (`header_content`), or it pins the frame at its widest.
+- **A module that has one shape has one size** (`kit::keeps_aspect`): the Vectorscope's width
+  is its side, and `resize_node` turns a drag along either edge into that.
+- `a_surface_module_is_sized_by_the_modules_grip_and_gives_the_room_back` drags every
+  `surface_spec` module to 26 by 30 blocks, checks the frame is exactly that and holds still for
+  six frames, and takes it back.
+
 ## Pitfalls
 
+- **Look at it.** A rect test says where a thing is, not how it looks. `cargo test -p
+  flexinput-ui --lib shoot_modules -- --ignored --nocapture` draws modules to PNGs in
+  `target/module_shots/` with the app's own fonts and no window: `SHOOT=module.macro,module.split`
+  picks modules as they come out of the box, `SHOOT_MARGIN=60` widens the crop, and the cases in
+  the test itself set a module up first (a long list, a wired pin, a pointer over a graph). Shoot
+  before and after a change to a body, and open both.
+- **The test rig is a small window.** Its screen is 1600 x 1000 with the canvas at 2x, centred
+  on the nodes it was given: 800 x 500 graph points. A module taller than that, or two nodes set
+  far apart, puts widgets off the screen, where egui culls them and they can't be clicked - which
+  reads exactly like a clip bug in the module (a "Macro past eight ports loses its rows" was
+  this). And it draws with egui's stock fonts unless `app::fonts::setup_fonts` is called, so
+  arrows, grips and crosses are boxes and their widths are not the app's.
+- **A test has to set up what the app produces.** A body that reads live values gets them from
+  the engine's display channel (`last_out` for every node, `last_signals` for a named few); a
+  test that writes some other field by hand passes while the app shows nothing. The Dropdown's
+  shifted option was tested that way and never lit in the app.
 - Inside a kit body, size things from the width the kit gives (`k.w`, a row's
   `rest`), never from `ui.available_width()`.
 - One flexible part per row. Two rails on a row means two rows.

@@ -377,6 +377,34 @@ pub(crate) fn calibrate_block(
     (header, e)
 }
 
+/// Run a Finish the pad asked for (`cal_finish`) without drawing anything: the Real World
+/// Calibration widget on the config overlay does this, the tune panel being nowhere near
+/// the game. Returns what to write, as [`calibrate_block`] does - nothing when no Finish is
+/// pending.
+pub(crate) fn finish_pending(node_id: NodeId, ui: &egui::Ui, snarl: &Snarl<NodeData>, text: &str) -> CalEdits {
+    let mut e = CalEdits::default();
+    let Some(node) = snarl.get_node(node_id) else { return e };
+    if !node.params.get("cal_finish").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return e;
+    }
+    let stick = node.params.get("cal_output").and_then(|v| v.as_str()) == Some("stick");
+    let axis = measuring(snarl, node_id);
+    let sweeping = axis != "off";
+    let (theta, peak) = measured(snarl, node_id);
+    apply_finish(&mut e, text, &axis, stick, theta, peak, sweeping, ui, node_id);
+    e
+}
+
+/// The last calibration's result message and when it was made, if any.
+pub(crate) fn last_result(ctx: &egui::Context, node_id: NodeId) -> Option<(String, f64)> {
+    ctx.data(|d| d.get_temp::<(String, f64)>(msg_key(node_id)))
+}
+
+/// The degrees the running sweep has measured, and its peak stick deflection.
+pub(crate) fn sweep_reading(snarl: &Snarl<NodeData>, node_id: NodeId) -> (f32, f32) {
+    measured(snarl, node_id)
+}
+
 /// Consume the `cal_finish` flag: solve and rewrite when a sweep is running,
 /// and clear it either way so it can't fire again next frame.
 #[allow(clippy::too_many_arguments)]

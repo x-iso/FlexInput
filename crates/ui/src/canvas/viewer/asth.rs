@@ -577,6 +577,8 @@ pub(crate) fn show_audio_stream_haptics_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    frame_w: f32,
+    frame_h: f32,
 ) {
     // Effective uid for live capture data (raw at top level, namespaced in a
     // sub-patch) — must match what the capture manager + engine use.
@@ -605,7 +607,10 @@ pub(crate) fn show_audio_stream_haptics_body(
     // node's content width: pin the column to it (min == max) so every slider row
     // fills exactly that width and all of them grow/shrink together when the scope
     // is resized. (The scope's own resize handle is the only width control.)
-    let scope_size = read_widget_size(snarl, node_id, "asth_scope_size", egui::vec2(240.0, 150.0));
+    // The scope under the rows is what the module's corner grip sizes (`kit::Surface`); the
+    // rows above it are as wide as it is. It had a grip of its own in its corner.
+    let surface = super::kit::Surface::begin(ui, node_id, frame_w, frame_h, egui::vec2(180.0, 90.0));
+    let scope_size = surface.size;
     let body_w = scope_size.x.clamp(180.0, 900.0);
 
     ui.vertical(|ui| {
@@ -638,12 +643,8 @@ pub(crate) fn show_audio_stream_haptics_body(
         ui.label(egui::RichText::new("Scope — drag EQ pts · dbl-click add · right-click remove").small().weak());
         let scope_top = ui.cursor().top();
         let scope_left = ui.min_rect().left();
-        let new_sc = egui::Resize::default()
-            .id_salt(("asth_scope_resize", node_id))
-            .default_size(scope_size)
-            .min_size(egui::vec2(180.0, 90.0))
-            .max_size(egui::vec2(900.0, 600.0))
-            .show(ui, |ui| {
+        let new_sc = ui
+            .allocate_ui(scope_size, |ui| {
                 // Top ~40% = EF oscilloscope, bottom ~60% = spectrum/EQ.
                 let total_h = ui.available_height().max(80.0);
                 let ef_h = (total_h * 0.4).clamp(28.0, total_h - 50.0);
@@ -654,12 +655,13 @@ pub(crate) fn show_audio_stream_haptics_body(
                 let ch = draw_asth_spectrum_eq(node_id, uid, ui, &mut asth_eq_points, &a);
                 changed_inner.set(changed_inner.get() || ch);
                 ui.min_rect().size()
-            });
-        if (new_sc - scope_size).length() > 0.5 { write_widget_size(snarl, node_id, "asth_scope_size", new_sc); }
+            })
+            .inner;
         // The scope (EF + spectrum/EQ) is pinnable as one element too.
         let scope_rect = egui::Rect::from_min_size(egui::pos2(scope_left, scope_top), new_sc);
         register_exposable_element(ui, node_id, "asth_scope", scope_rect);
     });
+    surface.end(ui);
     changed |= changed_inner.get();
 
     if changed {

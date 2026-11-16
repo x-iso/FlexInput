@@ -168,8 +168,13 @@ pub(crate) fn show_delay_body(
 ) {
     use super::simple_bodies::PILL_H;
     let ms = param_f32(snarl, node_id, "delay_ms", 100.0);
-    const PILL_W: f32 = 56.0;
-    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 1, false) else { return };
+    // The header is too narrow for the word beside its `− n +` and wears a stopwatch
+    // instead (`kit::node_glyph`), so the word is here, over the number it names - the
+    // way Average and DC Filter caption theirs.
+    const PILL_W: f32 = 72.0;
+    let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 1, true) else { return };
+    caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Delay");
+    let top = top + CAP_H;
     let (resp, typed) = pill_at(
         ui,
         node_id,

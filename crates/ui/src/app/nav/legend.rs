@@ -312,6 +312,7 @@ impl FlexInputApp {
                     (vec!["btn_north"], "Reset card"),
                     (vec!["btn_west"], "Delete card"),
                     (vec!["left_trigger", "right_trigger"], "Filter"),
+                    (vec!["btn_lb", "btn_rb"], "Buttons / cards"),
                     (vec!["btn_east"], "Back"),
                 ];
                 self.legend_card_list_extras(&mut v, 2);

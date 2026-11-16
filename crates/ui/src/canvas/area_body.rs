@@ -112,7 +112,6 @@ pub(crate) const KEY_MODES: &[&str] = &["pwm", "taps", "threshold"];
 pub(crate) const PHASES: &[&str] = &["alternate", "independent"];
 
 /// Default field size (px, square).
-const FIELD_DEFAULT: f32 = 240.0;
 const FIELD_MIN: f32 = 140.0;
 const FIELD_MAX: f32 = 640.0;
 /// How close (px) the pointer must be to grab a border.
@@ -2899,21 +2898,42 @@ fn sync_and_colors(snarl: &mut Snarl<NodeData>, node_id: NodeId) -> ZoneColors {
 }
 
 /// The node body. Returns whether an undo step should be pushed.
+/// The node body: the field is what the module's corner grip sizes (`kit::Surface`) - the
+/// frame it was dragged to, less the rows around the field. It had a grip of its own in its
+/// corner and a size of its own in the patch.
+/// The field is a square: the smaller side of what the frame leaves it.
 pub(crate) fn show_area_mapper_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &LiveSignals,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
+    body_h: f32,
+) -> bool {
+    let surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(FIELD_MIN, FIELD_MIN));
+    let changed = area_mapper_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
+    surface.end(ui);
+    changed
+}
+
+fn area_mapper_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    surface: egui::Vec2,
 ) -> bool {
     let colors = sync_and_colors(snarl, node_id);
     let visuals = ui.visuals().clone();
-    let size = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_w").and_then(|v| v.as_f64()))
-        .unwrap_or(FIELD_DEFAULT as f64) as f32;
     let mut changed = false;
+    let size = surface.min_elem();
 
     ui.vertical(|ui| {
+        // The body is as wide as the grip made it even where the square field is not: a
+        // frame that snapped back to the rows' width would be a grip that didn't take.
+        ui.set_min_width(surface.x);
         let opts = ui.vertical(|ui| {
             changed |= show_area_options_row(node_id, ui, snarl, live_signals, automap_parent);
         }).response.rect;
@@ -2922,7 +2942,7 @@ pub(crate) fn show_area_mapper_body(
             changed |= show_area_layer_row(node_id, ui, snarl);
         }).response.rect;
         register_exposable_element(ui, node_id, "layers", layers);
-        let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), true, false);
+        let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), false, false);
         changed |= structural;
         register_exposable_element(ui, node_id, "field", field);
         ui.label(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
