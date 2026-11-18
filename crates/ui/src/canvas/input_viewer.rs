@@ -171,6 +171,7 @@ impl IvStyle {
             c3d_xray: None,
             c3d_materials: None,
             c3d_model: None,
+            gyro_look: None,
         }
     }
 }
@@ -381,7 +382,7 @@ pub(crate) fn paint_viewer_board(
             glyph_chip(ui, &painter, skin, tint, pin, at(px, py), 20.6 * s, glow(pin), accent);
             painter.text(
                 at(px, py), egui::Align2::CENTER_CENTER, label,
-                egui::FontId::proportional(7.0 * s), egui::Color32::from_gray(210),
+                crate::settings::ui_font(7.0 * s), crate::settings::tinted_gray(210),
             );
         }
     }
@@ -392,8 +393,8 @@ pub(crate) fn paint_viewer_board(
         painter.text(
             rect.center(), egui::Align2::CENTER_CENTER,
             "No device — wire an AutoMap source",
-            egui::FontId::proportional(12.0 * s),
-            egui::Color32::from_gray(170),
+            crate::settings::ui_font(12.0 * s),
+            crate::settings::tinted_gray(170),
         );
         return;
     }
@@ -418,12 +419,12 @@ pub(crate) fn letterbox(container: egui::Rect) -> egui::Rect {
 
 fn paint_trigger_bar(painter: &egui::Painter, r: egui::Rect, value: f32, accent: egui::Color32, s: f32) {
     let v = value.clamp(0.0, 1.0);
-    painter.rect_filled(r, 3.0 * s, egui::Color32::from_gray(45));
+    painter.rect_filled(r, 3.0 * s, crate::settings::tinted_gray(45));
     if v > 0.005 {
         let fill = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - r.height() * v), r.max);
         painter.rect_filled(fill, 3.0 * s, accent.gamma_multiply(0.35 + 0.65 * v));
     }
-    painter.rect_stroke(r, 3.0 * s, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+    painter.rect_stroke(r, 3.0 * s, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(90)), egui::StrokeKind::Inside);
 }
 
 fn paint_touchpad_strip(
@@ -435,11 +436,11 @@ fn paint_touchpad_strip(
     accent: egui::Color32,
     s: f32,
 ) {
-    painter.rect_filled(r, 5.0 * s, egui::Color32::from_gray(40));
+    painter.rect_filled(r, 5.0 * s, crate::settings::tinted_gray(40));
     let stroke_col = if click_glow > 0.02 {
         accent.gamma_multiply(0.4 + 0.6 * click_glow)
     } else {
-        egui::Color32::from_gray(90)
+        crate::settings::tinted_gray(90)
     };
     painter.rect_stroke(r, 5.0 * s, egui::Stroke::new(1.0 + click_glow * 1.5, stroke_col), egui::StrokeKind::Inside);
 
@@ -472,8 +473,8 @@ fn paint_stick_scope(
     ui: &egui::Ui,
     accent: egui::Color32,
 ) {
-    let faint = egui::Stroke::new(0.5_f32, egui::Color32::from_gray(70));
-    painter.circle_filled(center, radius, egui::Color32::from_gray(38));
+    let faint = egui::Stroke::new(0.5_f32, crate::settings::tinted_gray(70));
+    painter.circle_filled(center, radius, crate::settings::tinted_gray(38));
     painter.line_segment([center - egui::vec2(radius, 0.0), center + egui::vec2(radius, 0.0)], faint);
     painter.line_segment([center - egui::vec2(0.0, radius), center + egui::vec2(0.0, radius)], faint);
     let ring_col = if click_glow > 0.02 {
@@ -486,7 +487,7 @@ fn paint_stick_scope(
     // Screen-space dot: +y on the stick is UP, screen y grows down.
     let mag = v.length().min(1.0);
     let dot = center + egui::vec2(v.x, -v.y) * (radius - 5.0);
-    let dot_col = if mag > 0.02 { accent } else { egui::Color32::from_gray(140) };
+    let dot_col = if mag > 0.02 { accent } else { crate::settings::tinted_gray(140) };
     painter.circle_filled(dot, 4.0, dot_col);
 }
 
@@ -556,7 +557,7 @@ fn glyph_chip(
         // No glyph mapped: text pill fallback.
         painter.text(
             center, egui::Align2::CENTER_CENTER, pin,
-            egui::FontId::proportional(size * 0.35), egui::Color32::from_gray(160),
+            crate::settings::ui_font(size * 0.35), crate::settings::tinted_gray(160),
         );
         return;
     };

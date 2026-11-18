@@ -193,6 +193,17 @@ pub const LICENSES: &[License] = &[
         text: include_str!("../../../licenses/JoyShockMapper.txt"),
     },
     License {
+        name: "GamepadMotionHelpers",
+        what: "Which way is down, for everything that measures against \
+               gravity - the JSM Config module, 3DOF to 2D's Player, World \
+               and Orient, Gyro to Stick Rotation's World - is the estimate \
+               this library keeps for JoyShockMapper, ported step for step.",
+        spdx: "MIT",
+        url: "https://github.com/JibbSmart/GamepadMotionHelpers",
+        note: Some("By Julian \"Jibb\" Smart."),
+        text: include_str!("../../../licenses/GamepadMotionHelpers.txt"),
+    },
+    License {
         name: "TriggerEffectGenerator",
         what: "The DualSense adaptive-trigger effect byte layouts — in the \
                physical pad's encoder, the virtual DualSense's decoder and the \

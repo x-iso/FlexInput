@@ -23,6 +23,9 @@ const OUTPUT_RATE_OPTS: &[(f32, &str)] = &[
 const OUTPUT_SYNC_OPTS: &[(f32, &str)] = &[(1.0, "1"), (2.0, "2"), (4.0, "4"), (8.0, "8")];
 
 /// The processing rate modes, in the order of [`settings::SampleRateMode`].
+/// The control font's styles.
+const CONTROL_FONT_OPTS: &[(f32, &str)] = &[(1.0, "Console"), (0.0, "Normal")];
+
 const SAMPLE_RATE_MODE_OPTS: &[(f32, &str)] = &[
     (0.0, "Set by hand"), (1.0, "Same as output"), (2.0, "2x output"),
 ];
@@ -60,6 +63,16 @@ impl FlexInputApp {
             GpSettingRow { label: "Contrast".into(),
                 kind: FloatSlider { lo: -1.0, hi: 1.0, step: 0.05,
                     key: GpSettingKey::Contrast }, suffix: "" },
+            GpSettingRow { label: "Grey tint".into(),
+                kind: IntSlider { lo: 0.0, hi: 100.0, step: 5.0,
+                    key: GpSettingKey::GrayTint }, suffix: "%" },
+            GpSettingRow { label: "Control font".into(),
+                kind: Cycle { key: GpSettingKey::ControlFontMono, opts: CONTROL_FONT_OPTS }, suffix: "" },
+            GpSettingRow { label: "Control font bold".into(),
+                kind: Toggle { key: GpSettingKey::ControlFontBold }, suffix: "" },
+            GpSettingRow { label: "Control font size".into(),
+                kind: FloatSlider { lo: settings::CONTROL_FONT_SIZE_MIN, hi: settings::CONTROL_FONT_SIZE_MAX, step: 0.5,
+                    key: GpSettingKey::ControlFontSize }, suffix: " pt" },
             GpSettingRow { label: "Keep tabs on launch".into(),
                 kind: Toggle { key: GpSettingKey::KeepWorkspace }, suffix: "" },
             GpSettingRow { label: "Collapse new device nodes".into(),
@@ -149,6 +162,10 @@ impl FlexInputApp {
             DefMouseSens => self.settings.default_mouse_sensitivity,
             ChordsNavOnly => self.settings.gamepad_chords_nav_only as i32 as f32,
             HomeExclusive => self.settings.gamepad_home_exclusive as i32 as f32,
+            GrayTint => (self.settings.gray_tint_amount * 100.0).round(),
+            ControlFontMono => self.settings.control_font_mono as i32 as f32,
+            ControlFontBold => self.settings.control_font_bold as i32 as f32,
+            ControlFontSize => self.settings.control_font_size,
         }
     }
 
@@ -210,6 +227,10 @@ impl FlexInputApp {
             DefMouseSens => self.settings.default_mouse_sensitivity = val.clamp(0.0, 3000.0),
             ChordsNavOnly => self.settings.gamepad_chords_nav_only = val != 0.0,
             HomeExclusive => self.settings.gamepad_home_exclusive = val != 0.0,
+            GrayTint => self.settings.gray_tint_amount = (val.round() / 100.0).clamp(0.0, 1.0),
+            ControlFontMono => self.settings.control_font_mono = val != 0.0,
+            ControlFontBold => self.settings.control_font_bold = val != 0.0,
+            ControlFontSize => self.settings.control_font_size = val.clamp(settings::CONTROL_FONT_SIZE_MIN, settings::CONTROL_FONT_SIZE_MAX),
         }
         self.settings_dirty = true;
     }
@@ -403,7 +424,7 @@ impl FlexInputApp {
                     ui.label(egui::RichText::new(
                         "D-pad/stick: move   South: edit/toggle   ←/→: adjust   \
                          West: fine   North: clear shortcut   East: close")
-                        .small().color(egui::Color32::from_gray(150)));
+                        .small().color(crate::settings::tinted_gray(150)));
                 }
                 ui.add_space(6.0);
                 ui.separator();
@@ -485,7 +506,7 @@ impl FlexInputApp {
                     // Row label (left). Measure its width so combo glyphs know
                     // how far left they may extend before crowding it.
                     let label_galley = painter.layout_no_wrap(
-                        row.label.clone(), egui::FontId::proportional(13.0),
+                        row.label.clone(), crate::settings::ui_font(13.0),
                         ui.visuals().text_color());
                     let label_right = rect.left() + 10.0 + label_galley.size().x;
                     painter.galley(
@@ -504,7 +525,7 @@ impl FlexInputApp {
                         let mut x = rect.right() - 10.0;
                         let cy = rect.center().y;
                         let icon_col = if learning_row { egui::Color32::from_rgb(230, 185, 95) }
-                            else if is_sel { accent } else { egui::Color32::from_gray(210) };
+                            else if is_sel { accent } else { crate::settings::tinted_gray(210) };
                         let mut trimmed = false;
                         // Walk pins from last to first, placing each icon to the
                         // left of the previous, stopping when we run out of room.
@@ -525,19 +546,19 @@ impl FlexInputApp {
                                     egui::Color32::WHITE);
                             } else {
                                 painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER,
-                                    gp_pin_token(pin), egui::FontId::proportional(11.0), icon_col);
+                                    gp_pin_token(pin), crate::settings::ui_font(11.0), icon_col);
                             }
                             x -= G;
                             if j > 0 {
                                 x -= SEP;
                                 painter.text(egui::pos2(x + SEP * 0.5, cy),
                                     egui::Align2::CENTER_CENTER, "+",
-                                    egui::FontId::proportional(12.0), icon_col);
+                                    crate::settings::ui_font(12.0), icon_col);
                             }
                         }
                         if trimmed {
                             painter.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "…",
-                                egui::FontId::proportional(13.0), icon_col);
+                                crate::settings::ui_font(13.0), icon_col);
                         }
                         // Full combo tooltip (always, since even untrimmed icons
                         // can be ambiguous).
@@ -546,7 +567,7 @@ impl FlexInputApp {
                         painter.text(
                             egui::pos2(rect.right() - 10.0, rect.center().y),
                             egui::Align2::RIGHT_CENTER, &val_str,
-                            egui::FontId::proportional(13.0),
+                            crate::settings::ui_font(13.0),
                             if learning_row { egui::Color32::from_rgb(230, 185, 95) }
                             else if is_sel { accent }
                             else { ui.visuals().weak_text_color() });

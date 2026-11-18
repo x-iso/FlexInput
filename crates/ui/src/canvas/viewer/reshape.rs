@@ -160,7 +160,7 @@ pub(crate) fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, 
     let r = rect.width().min(rect.height()) * 0.5 - 2.0;
     // Map a Vec2 in [-1,1]² (output-normalised) to screen (Y up).
     let v2s = |v: glam::Vec2| egui::pos2(c.x + v.x * r, c.y - v.y * r);
-    painter.rect_filled(rect, 3.0, GRAPH_BG_DEFAULT);
+    painter.rect_filled(rect, 3.0, crate::settings::tinted(GRAPH_BG_DEFAULT));
 
     // ── Gradient stretch field (smooth cached texture, bilinear) ──────────────
     // Blue = accelerate/stretched, red = decelerate/squeezed, transparent at
@@ -259,25 +259,14 @@ pub(crate) fn show_vec_reshape_body(
         // (`kit::Surface`), with a bar between them that sets how it is shared. Each used to
         // have a grip of its own, so the module had three sizes and two ragged right edges.
         let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(140.0, 160.0));
-        // ── Edit-target toggle ────────────────────────────────────────────────
-        let mut new_target = p.edit_target.clone();
-        let tgt_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Edit").small().weak());
-            if ui.selectable_label(editing_gain, egui::RichText::new("Gain").small())
-                .on_hover_text("Redistribute deflection WITHIN the boundary (accelerate / decelerate a direction). Does not change the outer shape.").clicked() { new_target = "gain".into(); }
-            if ui.selectable_label(!editing_gain, egui::RichText::new("Boundary").small())
-                .on_hover_text("Shape the OUTER reach per direction — expand the circle out toward the square's corners (needs Renorm on).").clicked() { new_target = "boundary".into(); }
-            ui.separator();
-            ui.label(egui::RichText::new(if editing_gain { "▲ stretch / ▼ squeeze" } else { "▲ toward square" })
-                .small().weak().color(Color32::from_gray(120)));
-        });
-        register_exposable_element(ui, node_id, "target_row", tgt_resp.response.rect);
-        surface.row(tgt_resp.response.rect);
-        if new_target != p.edit_target {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("edit_target".into(), Value::String(new_target.clone()));
-            }
-            changed = true;
+        surface.need(VRS_ROWS_MIN_W * super::simple_bodies::control_width_factor());
+        let w = surface.size.x.max(VRS_ROWS_MIN_W * super::simple_bodies::control_width_factor());
+        // ── What the curve edits, as one joined pill (what dragging a point up does is
+        // written in the curve's corner) ──
+        {
+            let (ch, r) = vrs_pill_row(node_id, ui, snarl, "target_row", w);
+            changed |= ch;
+            register_exposable_element(ui, node_id, "target_row", r);
         }
 
         // ── Curve editor (direction → radius / gain) over the live 2D pad ──────
@@ -298,6 +287,11 @@ pub(crate) fn show_vec_reshape_body(
         graph_rect = Some(curve);
         if draw_reshape_curve_editor(ui, node_id, snarl, &p, editing_gain, y_max, live_vec, curve) {
             changed_inner.set(true);
+        }
+        {
+            let hint = if editing_gain { "▲ stretch / ▼ squeeze" } else { "▲ toward square" };
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            ui.painter_at(curve).text(curve.right_top() + egui::vec2(-6.0, 4.0), egui::Align2::RIGHT_TOP, hint, font, crate::settings::tinted_gray(120));
         }
         // The bar: drag it to give the curve or the pad more of the surface.
         let bar_resp = ui
@@ -334,93 +328,12 @@ pub(crate) fn show_vec_reshape_body(
         super::simple_bodies::trace_rect(ui, node_id, "vrs_curve", curve);
         super::simple_bodies::trace_rect(ui, node_id, "vrs_pad", frame);
 
-        // ── Controls ──────────────────────────────────────────────────────────
-        let mut sym = p2.symmetry.clone();
-        let mut rn = p2.renorm;
-        let mut im = p2.in_max;
-        let mut om = p2.out_max;
-        let mut gx = p2.grid_x as f64;
-        let mut gy = p2.grid_y as f64;
-        let mut sn = p2.snap;
-        let mut tm = p2.trail_ms;
-
-        let opt_resp = ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt(("vrs_sym", node_id))
-                .width(78.0)
-                .selected_text(match sym.as_str() { "xmirror" => "X-mirror", _ => "4-way" })
-                .show_ui(ui, |ui| {
-                    changed |= ui.selectable_value(&mut sym, "quad4".into(),   "4-way").changed();
-                    changed |= ui.selectable_value(&mut sym, "xmirror".into(), "X-mirror").changed();
-                });
-            let rn_before = rn;
-            ui.checkbox(&mut rn, egui::RichText::new("Renorm").small())
-                .on_hover_text("On: expand output to the boundary shape (circle→square). Off: boundary is a display-only reference; only gain shapes the feel.");
-            changed |= rn != rn_before;
-        });
-        register_exposable_element(ui, node_id, "options_row", opt_resp.response.rect);
-        surface.row(opt_resp.response.rect);
-
-        let range_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("In max").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut im).speed(0.01).range(0.05..=2.0).max_decimals(2)).changed();
-            ui.separator();
-            ui.label(egui::RichText::new("Out max").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut om).speed(0.01).range(0.05..=2.0).max_decimals(2)).changed();
-        });
-        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
-        surface.row(range_resp.response.rect);
-
-        let grid_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Grid").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut gx).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("H ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut gy).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("V ")).changed();
-            let sn_before = sn;
-            ui.checkbox(&mut sn, egui::RichText::new("Snap").small());
-            changed |= sn != sn_before;
-            ui.separator();
-            ui.label(egui::RichText::new("Trail").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0).range(0i64..=1000).suffix("ms")).changed();
-        });
-        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
-        surface.row(grid_resp.response.rect);
-
-        // Presets.
-        let preset_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Preset").small().weak());
-            let mut apply: Option<(&[[f32; 2]], &[[f32; 2]])> = None;
-            if ui.small_button("Circle").on_hover_text("Identity — round gate, unity gain").clicked() {
-                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [1.0, 1.0]]));
-            }
-            if ui.small_button("Square").on_hover_text("Circle→square: the boundary reaches √2 on the diagonal so a round stick fills a square (Renorm on)").clicked() {
-                // Envelope follows sec(θ) across the octant → √2 at the diagonal.
-                apply = Some((&[[0.0, 1.0], [0.5, 1.08], [1.0, std::f32::consts::SQRT_2]], &[[0.0, 1.0], [1.0, 1.0]]));
-            }
-            if ui.small_button("Diag+").on_hover_text("Diagonal boost: accelerate the vector toward the corners to kill diagonal stickiness (gain only)").clicked() {
-                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [0.5, 1.25], [1.0, 1.6]]));
-            }
-            if let Some((b, g)) = apply {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("boundary_pts".into(), serde_json::json!(b.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
-                    node.params.insert("gain_pts".into(),     serde_json::json!(g.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
-                    node.params.insert("gain_biases".into(),  serde_json::json!([0.0]));
-                }
-                changed = true;
-            }
-        });
-        register_exposable_element(ui, node_id, "preset_row", preset_resp.response.rect);
-        surface.row(preset_resp.response.rect);
-
-        if changed {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("symmetry".into(), Value::String(sym.clone()));
-                node.params.insert("renorm".into(),   Value::Bool(rn));
-                if let Some(n) = Number::from_f64(im as f64) { node.params.insert("in_max".into(),  Value::Number(n)); }
-                if let Some(n) = Number::from_f64(om as f64) { node.params.insert("out_max".into(), Value::Number(n)); }
-                node.params.insert("grid_x".into(),   serde_json::json!(gx as i64));
-                node.params.insert("grid_y".into(),   serde_json::json!(gy as i64));
-                node.params.insert("snap".into(),     Value::Bool(sn));
-                node.params.insert("trail_ms".into(), serde_json::json!(tm));
-            }
+        // ── Controls: the settings as value pills in bands, as the other modules' bodies have
+        // them; each band is still the pinnable element it was, and its Style 2 look ──
+        for element in ["options_row", "range_row", "grid_row", "preset_row"] {
+            let (ch, r) = vrs_pill_row(node_id, ui, snarl, element, w);
+            changed |= ch;
+            register_exposable_element(ui, node_id, element, r);
         }
         surface.end(ui);
     });
@@ -430,6 +343,121 @@ pub(crate) fn show_vec_reshape_body(
     if let Some(rect) = pad_rect   { register_exposable_element(ui, node_id, "pad",   rect); }
     changed
 }
+
+/// One of the body's bands of settings - `target_row`, `options_row`, `range_row`,
+/// `grid_row`, `preset_row` - `w` wide at the cursor: the body draws them all, a Style 2
+/// pin one. Writes what changed; returns whether anything did and where the band went. The
+/// fields publish in the order the pinned Style 1 rows publish theirs.
+pub(crate) fn vrs_pill_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, element: &str, w: f32) -> (bool, egui::Rect) {
+    use super::curve_rows::{count_pill, pill_bands, real_pill, segmented, split, word_toggle, word_w};
+    let Some(p) = snarl.get_node(node_id).map(ReshapeParams::read) else { return (false, egui::Rect::NOTHING) };
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    let mut rects: Vec<egui::Rect> = Vec::new();
+    let area;
+    match element {
+        "target_row" => {
+            let cells = pill_bands(ui, w, &[160.0]);
+            const TARGET_TIP: &str = "Gain: redistribute deflection WITHIN the boundary (accelerate / decelerate a direction); it does not change the outer shape. Boundary: shape the OUTER reach per direction — expand the circle out toward the square's corners (needs Renorm on).";
+            let gain = p.edit_target == "gain";
+            if let Some(t) = segmented(ui, cells[0], &gain, &[(true, "gain", TARGET_TIP), (false, "boundary", TARGET_TIP)], ("vrs_target_seg", node_id.0)) {
+                set.push(("edit_target", Value::String(if t { "gain" } else { "boundary" }.into())));
+            }
+            rects.extend(split(cells[0], &[1.0, 1.0]));
+            area = cells[0];
+        }
+        "options_row" => {
+            let cells = pill_bands(ui, w, &[150.0, word_w(ui, "renorm")]);
+            const SYM_TIP: &str = "4-way: one octant's curve mirrored into all eight. X-mirror: left and right mirror each other, up and down are their own.";
+            let sym = p.symmetry.as_str();
+            if let Some(v) = segmented(ui, cells[0], &sym, &[("quad4", "4-way", SYM_TIP), ("xmirror", "x-mirror", SYM_TIP)], ("vrs_sym_seg", node_id.0)) {
+                set.push(("symmetry", Value::String(v.into())));
+            }
+            let mut rn = p.renorm;
+            if word_toggle(ui, cells[1], &mut rn, "renorm",
+                "On: expand output to the boundary shape (circle→square). Off: boundary is a display-only reference; only gain shapes the feel.", ("vrs_renorm", node_id.0))
+            {
+                set.push(("renorm", Value::Bool(rn)));
+            }
+            rects.extend([cells[0], cells[1]]);
+            area = cells[0].union(cells[1]);
+        }
+        "range_row" => {
+            let cells = pill_bands(ui, w, &[110.0, 110.0]);
+            let (mut im, mut om) = (p.in_max as f32, p.out_max as f32);
+            let shown = format!("{im:.2}");
+            if real_pill(ui, node_id, "vrs_in_max", cells[0], "in↑|in max", &mut im, &shown, 0.05..=2.0, 0.01, "The input deflection that reads as full.") {
+                if let Some(n) = Number::from_f64(im as f64) { set.push(("in_max", Value::Number(n))); }
+            }
+            let shown = format!("{om:.2}");
+            if real_pill(ui, node_id, "vrs_out_max", cells[1], "out↑|out max", &mut om, &shown, 0.05..=2.0, 0.01, "The output a full deflection gives.") {
+                if let Some(n) = Number::from_f64(om as f64) { set.push(("out_max", Value::Number(n))); }
+            }
+            rects.extend([cells[0], cells[1]]);
+            area = cells[0].union(cells[1]);
+        }
+        "grid_row" => {
+            let cells = pill_bands(ui, w, &[70.0 + 4.0 + 70.0, word_w(ui, "snap"), 110.0]);
+            let hv = split(cells[0], &[1.0, 1.0]);
+            let (mut gx, mut gy) = (p.grid_x as f64, p.grid_y as f64);
+            let (gx_shown, gy_shown) = (format!("{gx:.0}"), format!("{gy:.0}"));
+            if count_pill(ui, node_id, "vrs_grid_x", hv[0], "H", &mut gx, &gx_shown, 1.0..=16.0, 0.05, "Grid divisions across the curve.") {
+                set.push(("grid_x", serde_json::json!(gx as i64)));
+            }
+            if count_pill(ui, node_id, "vrs_grid_y", hv[1], "V", &mut gy, &gy_shown, 1.0..=16.0, 0.05, "Grid divisions up the curve.") {
+                set.push(("grid_y", serde_json::json!(gy as i64)));
+            }
+            let mut sn = p.snap;
+            if word_toggle(ui, cells[1], &mut sn, "snap", "Snap dragged points to the grid.", ("vrs_snap", node_id.0)) {
+                set.push(("snap", Value::Bool(sn)));
+            }
+            let mut tm = p.trail_ms as f32;
+            let shown = format!("{} ms", p.trail_ms);
+            if real_pill(ui, node_id, "vrs_trail", cells[2], "trail", &mut tm, &shown, 0.0..=1000.0, 2.0, "How long the live point's trail on the pad lasts.") {
+                set.push(("trail_ms", serde_json::json!(tm.round() as i64)));
+            }
+            rects.extend([hv[0], hv[1], cells[1], cells[2]]);
+            area = cells[0].union(cells[2]);
+        }
+        _ => {
+            // The presets.
+            let cells = pill_bands(ui, w, &[220.0]);
+            let slots = split(cells[0], &[1.0, 1.0, 1.0]);
+            let mut apply: Option<(&[[f32; 2]], &[[f32; 2]])> = None;
+            let preset = |ui: &mut egui::Ui, r: egui::Rect, text: &str, tip: &str| {
+                ui.put(r, egui::Button::new(super::simple_bodies::control_text(text))).on_hover_text(tip).clicked()
+            };
+            if preset(ui, slots[0], "circle", "Identity — round gate, unity gain") {
+                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [1.0, 1.0]]));
+            }
+            if preset(ui, slots[1], "square", "Circle→square: the boundary reaches √2 on the diagonal so a round stick fills a square (Renorm on)") {
+                // Envelope follows sec(θ) across the octant → √2 at the diagonal.
+                apply = Some((&[[0.0, 1.0], [0.5, 1.08], [1.0, std::f32::consts::SQRT_2]], &[[0.0, 1.0], [1.0, 1.0]]));
+            }
+            if preset(ui, slots[2], "diag+", "Diagonal boost: accelerate the vector toward the corners to kill diagonal stickiness (gain only)") {
+                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [0.5, 1.25], [1.0, 1.6]]));
+            }
+            if let Some((b, g)) = apply {
+                set.push(("boundary_pts", serde_json::json!(b.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>())));
+                set.push(("gain_pts", serde_json::json!(g.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>())));
+                set.push(("gain_biases", serde_json::json!([0.0])));
+            }
+            area = cells[0];
+        }
+    }
+    if !rects.is_empty() {
+        publish_nav_field_rects(ui, node_id, &rects);
+    }
+    let changed = !set.is_empty();
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        for (k, v) in set {
+            node.params.insert(k.to_string(), v);
+        }
+    }
+    (changed, area)
+}
+
+/// The narrowest the body's rows read at: the widest of their groups.
+const VRS_ROWS_MIN_W: f32 = 230.0;
 
 /// The direction→value curve editor (grid + snap on BOTH axes, draggable points,
 /// Alt-bias on gain, live-direction marker, gamepad-nav geom publish). Draws
@@ -473,7 +501,7 @@ pub(crate) fn draw_reshape_curve_editor(
                 (pos.x - rect.left()) / rect.width(),
                 (rect.bottom() - pos.y) / rect.height(),
             ]};
-            painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
+            painter.rect_filled(rect, 2.0, crate::settings::tinted(GRAPH_BG_DEFAULT));
 
             let (grid_faint, grid_axis) = graph_grid_colors(None);
             let gs = egui::Stroke::new(0.5_f32, grid_faint);
@@ -487,7 +515,7 @@ pub(crate) fn draw_reshape_curve_editor(
 
             // Corner labels: axis↔diagonal (X), and value extremes (Y).
             let lbl = Color32::from_rgba_unmultiplied(170, 170, 170, 150);
-            let f = egui::FontId::proportional(8.5);
+            let f = crate::settings::ui_font(8.5);
             painter.text(egui::pos2(rect.left() + 2.0, rect.bottom() - 1.0), egui::Align2::LEFT_BOTTOM, "axis", f.clone(), lbl);
             painter.text(egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0), egui::Align2::RIGHT_BOTTOM, "diag", f.clone(), lbl);
             painter.text(egui::pos2(rect.left() + 2.0, rect.top() + 1.0), egui::Align2::LEFT_TOP, &format!("{:.2}", y_max), f.clone(), lbl);
@@ -555,9 +583,9 @@ pub(crate) fn draw_reshape_curve_editor(
                 if r.secondary_clicked() && !bends.keeps_point(ui, &r) && pts.len() > 2 && i != 0 && i != pts.len() - 1 {
                     remove_idx = Some(i); pts_changed = true;
                 }
-                let col = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_gray(200) };
+                let col = if r.hovered() || r.dragged() { Color32::WHITE } else { crate::settings::tinted_gray(200) };
                 painter.circle_filled(screen, 4.0, col);
-                painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0_f32, Color32::from_gray(70)));
+                painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(70)));
             }
             // Biases stay on their own segments (boundary has none; its all-zero
             // list is never written back).

@@ -87,7 +87,7 @@ pub(crate) fn draw_remap_card_glow(
             if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
                 let tp = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
                     egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0)), host));
-                let galley = tp.layout(tip, egui::FontId::proportional(12.0),
+                let galley = tp.layout(tip, crate::settings::ui_font(12.0),
                     egui::Color32::WHITE, 320.0);
                 let screen = ctx.content_rect();
                 let mut pos = fr.left_bottom() + egui::vec2(0.0, 8.0);
@@ -1239,6 +1239,7 @@ impl FlexInputApp {
         self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
         self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
         self.gamepad_nav.kbm_picker_touch_zones = req.touch_zones;
+        self.gamepad_nav.kbm_picker_kbm_only = req.kbm_only;
         self.gamepad_nav.kbm_picker_exclude = req.exclude_pin_prefix;
         // Open where the side being chosen is: an input is on the pad, an
         // output most often a key.
@@ -1260,7 +1261,7 @@ impl FlexInputApp {
     /// everything else has the Macros tab — empty or not, so it can be found.
     pub(crate) fn picker_tabs(&self) -> Vec<crate::kbm_picker::PickerTab> {
         use crate::kbm_picker::PickerTab;
-        if self.gamepad_nav.kbm_picker_use == crate::gamepad_nav::PickerUse::Text {
+        if self.gamepad_nav.kbm_picker_use == crate::gamepad_nav::PickerUse::Text || self.gamepad_nav.kbm_picker_kbm_only {
             return vec![PickerTab::Kbm];
         }
         let mut tabs = vec![PickerTab::Kbm];

@@ -46,6 +46,8 @@ mod subpatch;
 mod threads;
 
 pub(crate) use chrome::*;
+/// The pinned elements' field table, for a Style 2 pin to draw them from (`pin_style2`).
+pub(crate) use nav::{element_fields, field_hint};
 pub(crate) use config_route::*;
 // Re-exported at crate level by lib.rs, so it needs to stay `pub` here — the
 // glob above would otherwise narrow it to pub(crate).
@@ -480,6 +482,8 @@ pub struct FlexInputApp {
     /// True while the panic shortcut is engaged. Forces io_bypass for the
     /// active tab regardless of normal bypass state, until the user toggles off.
     panic_active: bool,
+    /// `panic_active` as it was last frame, to catch it changing however it changed.
+    panic_was_active: bool,
     /// True when the shortcut button is in Learn mode (next chord captures).
     panic_learning: bool,
     /// Set by the global hotkey listener when the configured chord fires.
@@ -663,7 +667,7 @@ pub struct FlexInputApp {
     /// avoids walking the entire egui Visuals on every vsync just to
     /// rewrite identical values. `None` means "never applied", which
     /// forces the first frame to push the initial style.
-    theme_applied_for: Option<(crate::settings::Theme, u32, bool, u32)>,
+    theme_applied_for: Option<u64>,
     /// True once the GPU device was lost while FlexInput was NOT the foreground
     /// window. In this state the GUI is stalled (renders nothing) so we don't
     /// thrash relaunches against a game that owns the GPU; the input/engine
@@ -787,6 +791,7 @@ impl FlexInputApp {
         // ── Settings ──────────────────────────────────────────────────────
         // Loaded before threads spawn so the engine starts at the user's rate.
         let mut app_settings = settings::load_settings();
+        crate::monitors::set_chosen(app_settings.overlay_monitor.clone());
         // Seed the HIDMaestro helper's persistence policy *before* any device is
         // created, so the helper's first `Hello` (and its orphan-cleanup
         // decision) reflects the user's setting. Off → helper removes leftovers
@@ -1280,6 +1285,7 @@ impl FlexInputApp {
             midi_refresh_requested,
             panic_shortcut: panic_shortcut.clone(),
             panic_active: false,
+            panic_was_active: false,
             panic_learning: false,
             panic_toggle_requested,
             seethrough_toggle_requested,
@@ -1557,13 +1563,11 @@ impl eframe::App for FlexInputApp {
         // the re-apply entirely.
         {
             puffin::profile_scope!("apply_theme_and_contrast");
-            let key = (
-                self.settings.theme,
-                self.settings.contrast.to_bits(),
-                self.settings.see_through_active,
-                self.settings.see_through_alpha.to_bits(),
-            );
-            if self.theme_applied_for != Some(key) {
+            let key = crate::settings::theme_key(&self.settings);
+            // The first passes too: the fonts (and the bold faces among them) load on the
+            // pass after `set_fonts`, and the control font's faces are measured against them.
+            if self.theme_applied_for != Some(key) || ctx.cumulative_pass_nr() < 3 {
+                crate::canvas::viewer::simple_bodies::calibrate_control_fonts(ctx);
                 crate::settings::apply_theme_and_contrast(ctx, &self.settings);
                 self.theme_applied_for = Some(key);
             }
@@ -1961,6 +1965,11 @@ impl eframe::App for FlexInputApp {
         if self.panic_toggle_requested.swap(false, Ordering::Relaxed) {
             self.panic_active = !self.panic_active;
         }
+        // The overlays' monitor, picked in the header: kept.
+        if let Some(choice) = crate::monitors::take_changed() {
+            self.settings.overlay_monitor = choice;
+            self.settings_dirty = true;
+        }
         // See-through chord (background watcher) flips the same state the eye
         // toggle drives; write the data slot too so the canvas frame agrees.
         if self.seethrough_toggle_requested.swap(false, Ordering::Relaxed) {
@@ -2129,6 +2138,12 @@ impl eframe::App for FlexInputApp {
         // flips green→orange the moment the shortcut fires.
         let active_idx = self.active_tab;
         let panic_active_now = self.panic_active;
+        // Neutral means neutral: 3DOF orientations and steering wheels start over, both
+        // as panic is engaged and as it is released - by its shortcut or its button.
+        if panic_active_now != self.panic_was_active {
+            self.panic_was_active = panic_active_now;
+            flexinput_engine::reset_gyro_modules();
+        }
         let effective_bypass: Vec<bool> = self.tabs.iter().enumerate().map(|(i, tab)| {
             let auto = self.auto_switch
                 && tab.auto_bypass
@@ -2633,6 +2648,10 @@ pub(crate) enum GpSettingKey {
     DefMouseSens,
     ChordsNavOnly,
     HomeExclusive,
+    GrayTint,
+    ControlFontMono,
+    ControlFontBold,
+    ControlFontSize,
 }
 
 /// Stepping model for a generic numeric nav param.
@@ -2695,8 +2714,8 @@ pub(crate) enum NavField {
 #[derive(Clone)]
 pub(crate) struct NavFieldDef {
     /// Borrowed for the fixed tables; owned for fields discovered at runtime.
-    label: std::borrow::Cow<'static, str>,
-    field: NavField,
+    pub(crate) label: std::borrow::Cow<'static, str>,
+    pub(crate) field: NavField,
 }
 
 /// How a gamepad-settings row is edited.
@@ -4155,11 +4174,11 @@ impl FlexInputApp {
                     screen.center(),
                     egui::vec2(card_w, card_h),
                 );
-                painter.rect_filled(card, egui::CornerRadius::same(10), egui::Color32::from_gray(32));
+                painter.rect_filled(card, egui::CornerRadius::same(10), crate::settings::tinted_gray(32));
                 painter.rect_stroke(
                     card,
                     egui::CornerRadius::same(10),
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
+                    egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(70)),
                     egui::StrokeKind::Inside,
                 );
                 // Spinner + text laid out inside the card.
@@ -4173,7 +4192,7 @@ impl FlexInputApp {
                 child.add_space(8.0);
                 child.label(egui::RichText::new(&progress.label).strong());
                 if let Some(detail) = &progress.detail {
-                    child.label(egui::RichText::new(detail).small().color(egui::Color32::from_gray(170)));
+                    child.label(egui::RichText::new(detail).small().color(crate::settings::tinted_gray(170)));
                 }
                 // Keep the spinner animating while visible.
                 ui.ctx().request_repaint();
@@ -4208,7 +4227,7 @@ impl FlexInputApp {
                          for a few seconds. You'll be prompted for admin once.",
                     )
                     .small()
-                    .color(egui::Color32::from_gray(170)),
+                    .color(crate::settings::tinted_gray(170)),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -4294,7 +4313,7 @@ impl FlexInputApp {
                          reinstalls the driver). You'll be prompted for admin once.",
                     )
                     .small()
-                    .color(egui::Color32::from_gray(170)),
+                    .color(crate::settings::tinted_gray(170)),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {

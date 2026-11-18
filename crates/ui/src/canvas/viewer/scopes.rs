@@ -12,21 +12,55 @@ pub(crate) fn render_readout_value(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let sig = snarl.get_node(inner_id)
-        .and_then(|n| n.extra.last_signals.first().copied().flatten());
-    let text = match sig {
-        Some(Signal::Float(f)) => format!("{f:.4}"),
-        Some(Signal::Bool(b))  => if b { "true".into() } else { "false".into() },
-        Some(Signal::Vec2(v))  => format!("({:.3}, {:.3})", v.x, v.y),
-        Some(Signal::Vec4(v))  => format!("({:.3}, {:.3}, {:.3}, {:.3})", v.x, v.y, v.z, v.w),
-        Some(Signal::Int(i))   => format!("{i}"),
-        None                   => "—".into(),
-    };
-    let font = super::quantize_font_size(container.y.clamp(10.0, 64.0) * 0.55);
+    let (text, widest) = snarl.get_node(inner_id).map(|n| readout_text(ui.ctx(), inner_id, n)).unwrap_or_default();
+    // As large as the widest reading fits, not the one now: sized to what it shows this frame,
+    // the type grew and shrank as the digits came and went.
+    let font = super::quantize_font_size(container.y.clamp(10.0, 64.0) * 0.55)
+        .min(super::quantize_font_size((container.x - 8.0) / (widest.chars().count().max(1) as f32 * MONO_RATIO)).max(6.0));
     ui.add_sized(
         [container.x, container.y.max(18.0)],
-        egui::Label::new(egui::RichText::new(text).monospace().size(font)),
+        egui::Label::new(egui::RichText::new(text).monospace().size(crate::settings::ui_size(font))),
     );
+}
+
+/// What a Readout shows, and the widest it shows it - which the type is sized to, so it holds
+/// still while the reading changes. In the units of what it reads when the wiring says (a
+/// motion sensor's °/s or G, a feedback pin's Hz, dB or %), which also give the widest; else
+/// the widest it has shown lately, kept per Readout.
+pub(crate) fn readout_text(ctx: &egui::Context, node_id: NodeId, n: &NodeData) -> (String, String) {
+    let sig = n.extra.last_signals.first().copied().flatten();
+    let unit = n.extra.motion_unit;
+    let target = n.extra.out_target.as_ref().map(|t| t.unit);
+    let one = |v: f32| match (unit, target) {
+        (Some(u), _) => u.format(v * u.full_scale()),
+        (None, Some(t)) => t.text(v),
+        _ => format!("{v:.3}"),
+    };
+    let widest_one = || match (unit, target) {
+        (Some(u), _) => u.format(-u.full_scale()),
+        (None, Some(t)) => t.widest(),
+        _ => String::new(),
+    };
+    let (text, widest) = match sig {
+        Some(Signal::Float(f)) => (one(f), widest_one()),
+        Some(Signal::Vec2(v)) => {
+            let w = widest_one();
+            (format!("({}, {})", one(v.x), one(v.y)), if w.is_empty() { w } else { format!("({w}, {w})") })
+        }
+        _ => (super::simple_bodies::signal_text(sig.as_ref()), String::new()),
+    };
+    // No unit to say how wide: the widest lately, let go of after a few seconds shorter.
+    let key = egui::Id::new(("readout_widest", node_id.0));
+    let now = ctx.input(|i| i.time);
+    let (mut held, mut since): (usize, f64) = ctx.data(|d| d.get_temp(key)).unwrap_or((0, now));
+    let len = text.chars().count().max(widest.chars().count());
+    if len >= held || now - since > 3.0 {
+        held = len;
+        since = now;
+    }
+    ctx.data_mut(|d| d.insert_temp(key, (held, since)));
+    let widest = if widest.chars().count() >= held { widest } else { "0".repeat(held) };
+    (text, widest)
 }
 
 // ── Vectorscope ───────────────────────────────────────────────────────────────
@@ -140,7 +174,7 @@ pub(crate) fn render_vectorscope_display(
             let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
             painter.circle_filled(egui::pos2(px, py), 4.0, col);
             painter.circle_stroke(egui::pos2(px, py), 4.0,
-                egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+                egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(100)));
         }
     }
     // Only force a repaint while the trail still has live samples or
@@ -185,10 +219,7 @@ pub(crate) fn show_readout_body(
     body_w: f32,
     body_h: f32,
 ) {
-    let sig = snarl
-        .get_node(node_id)
-        .and_then(|n| n.extra.last_signals.first().copied().flatten());
-    let text = super::simple_bodies::signal_text(sig.as_ref());
+    let (text, widest) = snarl.get_node(node_id).map(|n| readout_text(ui.ctx(), node_id, n)).unwrap_or_default();
     // Reserve the box the viewer worked out, then paint into it: the reading never decides
     // the module's size beyond the floor it sets for itself, and the type is what gives
     // way when the space does. Taking `available_height()` as a minimum here would be the
@@ -199,8 +230,9 @@ pub(crate) fn show_readout_body(
     let column = ui.max_rect();
     let centre_x = inner.map(|r| r.center().x).unwrap_or_else(|| column.center().x);
     let rect = egui::Rect::from_center_size(egui::pos2(centre_x, column.center().y), reserved);
-    // The largest size the reading fits at in this box, both ways.
-    let chars = text.chars().count().max(1) as f32;
+    // The largest size the widest reading fits at in this box, both ways: sized to the reading
+    // of the moment, the type jumped as a value's digits came and went.
+    let chars = widest.chars().count().max(text.chars().count()).max(1) as f32;
     let size = ((rect.width() - 8.0) / (chars * MONO_RATIO))
         .min((rect.height() - 6.0) / 1.25)
         .clamp(READOUT_MIN_FONT, READOUT_MAX_FONT);
@@ -306,7 +338,7 @@ pub(crate) fn show_vectorscope_body(
         display_rect = Some(rect);
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
+        painter.rect_filled(rect, 2.0, crate::settings::tinted(GRAPH_BG_DEFAULT));
         let (grid_faint, grid_axis) = graph_grid_colors(None);
         painter.line_segment(
             [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
@@ -370,7 +402,7 @@ pub(crate) fn show_vectorscope_body(
                 let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
                 painter.circle_filled(egui::pos2(px, py), 4.0, col);
                 painter.circle_stroke(egui::pos2(px, py), 4.0,
-                    egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+                    egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(100)));
             }
         }
 

@@ -404,6 +404,9 @@ pub(crate) fn layout_inspector_strip_core(
     // The 3D controller viewer shares the Input Viewer's style-override STORAGE
     // but has its own inspector (adds view angle / opacity / highlight fade).
     let is_c3d_pin = inner_mid == Some("display.controller3d");
+    // 3DOF to 2D's 3D preview: its frame and how it draws the pad.
+    let is_gyro_preview_pin = inner_mid == Some("processing.gyro_3dof")
+        && matches!(state.items.get(idx), Some(LayoutItem::Module(m)) if m.element_id == "preview");
     // Touch Zones / Virtual Menu pins: pad colour + visibility overrides. The
     // override only affects the "field" element's render; on cards/options
     // pins the controls are inert.
@@ -477,6 +480,9 @@ pub(crate) fn layout_inspector_strip_core(
             }
             LayoutItem::Module(_) if is_c3d_pin => {
                 controller3d_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_gyro_preview_pin => {
+                gyro_preview_pin_inspector_strip_item(ui, state.items, idx);
             }
             LayoutItem::Module(_) if is_graph_pin => {
                 graph_pin_inspector_strip_item(
@@ -595,6 +601,12 @@ pub(crate) fn clamp_pin_frame_to_content(
 ) -> (f32, f32) {
     let LayoutItem::Module(m) = it else { return (w, h) };
     let ws_key = pin_ws_nat_key(ui.ctx(), outer_id.0, m.inner_node_id, &m.element_id);
+    // A card list pinned whole keeps its top part and one card in view: no shorter than
+    // that at the scale its width draws it at.
+    if let Some(min_body) = ui.ctx().data(|d| d.get_temp::<f32>(super::pinned::pin_min_body_h_id(ws_key))) {
+        let scale = (w.max(40.0) / super::pinned::REMAP_DESIGN_W).clamp(0.25, 4.0);
+        return (w, h.max(min_body * scale));
+    }
     let Some(nat) = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(ws_key)) else { return (w, h) };
     if nat.x < 1.0 || nat.y < 1.0 { return (w, h); }
     // 0.5 is the scale floor in `apply_widget_scale`: any narrower and the
@@ -1053,6 +1065,72 @@ pub(crate) fn input_viewer_pin_inspector_strip_item(
 /// highlight accent / outline) plus per-pin display settings — view angle,
 /// model opacity, and highlight fade — each overriding the module's own params
 /// for THIS pinned instance only. Reset clears the whole override.
+/// The pinned 3DOF preview's own style: its frame's fill (see-through over a game at a low
+/// alpha) and outline, and how it draws the pad - as the module does, or its icon, the icon's
+/// outline, or its 3D model. Kept on the pin (`iv_style_override`), so the module's own
+/// preview and other pins keep theirs.
+pub(crate) fn gyro_preview_pin_inspector_strip_item(ui: &mut egui::Ui, items: &mut [LayoutItem], idx: usize) {
+    use crate::canvas::node::IvStyleOverride;
+    let Some(LayoutItem::Module(exp)) = items.get_mut(idx) else { return };
+    let dark = ui.visuals().extreme_bg_color.to_srgba_unmultiplied();
+    let mut ov = exp.iv_style_override.clone().unwrap_or(IvStyleOverride {
+        bg: dark,
+        accent: C3D_DEFAULT_ACCENT,
+        tint: [255, 255, 255, 255],
+        outline: [70, 70, 75, 255],
+        outline_px: 0.0,
+        c3d_pitch: None,
+        c3d_alpha: None,
+        c3d_fade: None,
+        c3d_composite: None,
+        c3d_xray: None,
+        c3d_materials: None,
+        c3d_model: None,
+        gyro_look: None,
+    });
+    let before = ov.clone();
+    let mut reset = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("3D preview style").small().strong());
+        ui.separator();
+        ui.label(egui::RichText::new("bg").small().weak());
+        fxi_color_swatch(ui, &mut ov.bg, "Frame fill - lower the alpha for a see-through frame over a game.", true);
+        ui.label(egui::RichText::new("outline").small().weak());
+        fxi_color_swatch(ui, &mut ov.outline, "Frame outline colour.", true);
+        ui.add(egui::DragValue::new(&mut ov.outline_px).range(0.0..=6.0).speed(0.05))
+            .on_hover_text("Frame outline width (0 = none).");
+        ui.separator();
+        ui.label(egui::RichText::new("pad").small().weak());
+        for (value, label, tip) in [
+            (None, "module's", "Draw the pad as the module's own preview does."),
+            (Some("icon"), "icon", "The pad's icon."),
+            (Some("outline"), "outline", "The outline of the pad's icon."),
+            (Some("model"), "3D model", "The pad's 3D model, half see-through - the model of the device the module reads."),
+        ] {
+            let on = ov.gyro_look.as_deref() == value;
+            if ui.selectable_label(on, egui::RichText::new(label).small()).on_hover_text(tip).clicked() && !on {
+                ov.gyro_look = value.map(str::to_string);
+            }
+        }
+        ui.label(egui::RichText::new("model opacity").small().weak());
+        let mut a = ov.c3d_composite.unwrap_or(0.5);
+        if ui.add(egui::Slider::new(&mut a, 0.05..=1.0).show_value(false))
+            .on_hover_text("How opaque the pad's 3D model is in this pin (until set, the module's own).")
+            .changed()
+        {
+            ov.c3d_composite = Some(a);
+        }
+        if ui.small_button("Reset").on_hover_text("The pane's own fill, no outline, the pad as the module draws it").clicked() {
+            reset = true;
+        }
+    });
+    if reset {
+        exp.iv_style_override = None;
+    } else if ov != before || exp.iv_style_override.is_some() {
+        exp.iv_style_override = Some(ov);
+    }
+}
+
 pub(crate) fn controller3d_pin_inspector_strip_item(
     ui: &mut egui::Ui,
     items: &mut Vec<LayoutItem>,
@@ -1077,6 +1155,7 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
         c3d_xray: None,
         c3d_materials: None,
         c3d_model: None,
+        gyro_look: None,
     });
     let before = ov.clone();
     let mut reset = false;
@@ -1477,7 +1556,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                     painter.text(
                         egui::pos2(x + dx * *outline_px, y + dy * *outline_px),
                         anchor, text,
-                        egui::FontId::proportional(*font_size),
+                        crate::settings::ui_font(*font_size),
                         ocol,
                     );
                 }
@@ -1485,7 +1564,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
             painter.text(
                 egui::pos2(x, y),
                 anchor, text,
-                egui::FontId::proportional(*font_size),
+                crate::settings::ui_font(*font_size),
                 fcol,
             );
         }
@@ -1518,10 +1597,10 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
             };
             if svg_src.is_empty() {
                 painter.rect_stroke(r, 2.0,
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
+                    egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(80)),
                     egui::StrokeKind::Inside);
                 painter.text(r.center(), egui::Align2::CENTER_CENTER, "SVG",
-                    egui::FontId::proportional(11.0), egui::Color32::from_gray(140));
+                    crate::settings::ui_font(11.0), crate::settings::tinted_gray(140));
                 return;
             }
             let pw = (r.width().round() as u32).max(1);

@@ -13,6 +13,7 @@ pub(crate) fn gyro_resolve_mode(params: &HashMap<String, Value>) -> (&'static st
             "pitch_roll" => "pitch_roll",
             "player"     => "player",
             "world"      => "world",
+            "orient"     => "orient",
             _            => "pitch_yaw",
         };
         return (f, a);
@@ -256,6 +257,22 @@ pub(crate) fn edge_turn(st: &mut [f32], d: glam::Vec2, dt: f32, c: &EdgeCfg) -> 
     EdgeOut { gyro, add_dps: add }
 }
 
+/// Edge turn as the module runs it, for a picture of it (the 3DOF preview): one tick of `dt`
+/// at deflection `d` (degrees off neutral, the X/Y outputs' sign convention) on `state`, the
+/// nine floats [`edge_turn`] keeps, which the caller holds. Returns what the gyro's own share
+/// is scaled by and what is added, in degrees per second - `None` while `params` have Edge
+/// turn off.
+pub fn edge_turn_preview(
+    params: &HashMap<String, Value>,
+    state: &mut [f32; 9],
+    d: glam::Vec2,
+    dt: f32,
+) -> Option<(glam::Vec2, glam::Vec2)> {
+    let cfg = edge_cfg(params)?;
+    let e = edge_turn(state, d, dt, &cfg);
+    Some((e.gyro, e.add_dps))
+}
+
 pub(crate) fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -265,6 +282,8 @@ pub(crate) fn compute_gyro_3dof(
     dt: f32,
 ) -> Vec<Option<Signal>> {
     let (family, axis) = gyro_resolve_mode(params);
+    // Panic mode resets the module, as its Reset input does (`request_gyro_reset`).
+    let forced_reset = std::mem::take(&mut state.reset_request);
 
     let inv = |name: &str| -> f32 {
         if params.get(name).and_then(|v| v.as_bool()).unwrap_or(false) { -1.0 } else { 1.0 }
@@ -318,7 +337,9 @@ pub(crate) fn compute_gyro_3dof(
     let pin_or = |idx: usize, fallback: f32| -> f32 {
         if inputs.get(idx).and_then(|s| *s).is_some() { get_f(inputs, idx, fallback) } else { fallback }
     };
-    let gx = pin_or(2, gx_am) * inv("inv_roll");
+    // The physical roll rate, before its invert: what turns gravity in the pad's frame.
+    let gx_phys = pin_or(2, gx_am);
+    let gx = gx_phys * inv("inv_roll");
     let gy = pin_or(3, gy_am);
     let gz = pin_or(4, gz_am);
     // Accel arrives in the canonical AutoMap frame (see `HidReading`):
@@ -430,8 +451,8 @@ pub(crate) fn compute_gyro_3dof(
     // exactly the extremes of the gesture. The smoothed estimate lags the
     // gesture and keeps the answer about how the pad is being held.
     //
-    // Player/World already needed this to project out yaw; the longer their
-    // taus the more world-anchored they feel, so those keep their own.
+    // (Player, World and Orient read down from JSM's own estimate instead,
+    // below: carried by the gyro, it follows the gesture as it happens.)
     let tau = match axis {
         "world" => 3.0_f32,
         "player" => 1.0_f32,
@@ -450,10 +471,46 @@ pub(crate) fn compute_gyro_3dof(
     let sg_len = sg.length();
     let g_hat = if sg_len > 0.01 { sg / sg_len } else { glam::Vec3::new(0.0, 0.0, 1.0) };
 
+    // `gyro_multiplier` (a device.source calibration knob) is already baked into
+    // the gyro signals by `preprocess_dev_sigs`; divide it back out so the
+    // orientation stays 1:1 no matter what the user sets it to. The multiplier
+    // is stashed per-device under the synthetic pin key "__gyro_mult".
+    let dev_gyro_mult = params
+        .get("_automap_device_id")
+        .and_then(|v| v.as_str())
+        .and_then(|dev| dev_sigs.get_pin(&dev, "__gyro_mult"))
+        .and_then(|s| if let Signal::Float(f) = s { Some(*f) } else { None })
+        .filter(|m| m.abs() > 1e-6)
+        .unwrap_or(1.0);
+
+    // ── Which way is down, as JoyShockMapper knows it ─────────────────────
+    //
+    // Player, World and Orient measure against gravity, and take it from the
+    // estimate JSM's motion library keeps (`GravityFusion`): carried by the
+    // gyro through every turn, pulled in by the accelerometer. Fed the physical
+    // readings; the hold then names which way is "down", as it always has.
+    // Every mode keeps it: Steering centres on it, and the preview rolls the
+    // pad by it.
+    while state.aux_f32.len() < FUSION_AUX + GRAVITY_FUSION_LEN { state.aux_f32.push(0.0); }
+    let gyro_dps = glam::Vec3::new(gx_phys, gy, gz) * (GYRO_REF_DPS / dev_gyro_mult);
+    let (down_held, pad_q, pad_q_before) = {
+        let mut fusion = GravityFusion::load(&state.aux_f32[FUSION_AUX..]);
+        let before = fusion.orientation();
+        let d = fusion.update(gyro_dps, Some(glam::Vec3::new(ax, ay, az)), dt);
+        fusion.store(&mut state.aux_f32[FUSION_AUX..]);
+        (d.map(|d| hold.map_or(d, |q| q * d)), fusion.orientation(), before)
+    };
+    // Orient's pad, in the hold's frame: the orientation itself (the preview's pad).
+    let orient_now = (axis == "orient").then(|| nose_angles(pad_q, hold));
+    while state.aux_f32.len() < ORIENT_AUX + ORIENT_CAMERA_LEN + 1 { state.aux_f32.push(0.0); }
+    // A pad with no accelerometer is taken as held flat.
+    let down = down_held.unwrap_or(glam::Vec3::Z);
+
     // ── Axis selection: decide which gyro components feed X / Y ───────────
     //
-    // For Player/World we project gyro onto the gravity-corrected frame.
-    // For Pitch+Yaw and Pitch+Roll, the X/Y feed is gyro rates as before.
+    // Player and World are JSM's PLAYER_TURN and WORLD_TURN, by JSM's own
+    // maths (the JSM module's, which is JSM's line for line); Orient follows
+    // where the nose points. Pitch+Yaw and Pitch+Roll take the gyro rates.
     //
     // Lean is derived separately below from accel tilt (NOT a gyro rate) so
     // that holding a tilted controller still asserts a steady lean signal
@@ -462,25 +519,47 @@ pub(crate) fn compute_gyro_3dof(
     let (raw_x, raw_y, _raw_lean_unused) = match axis {
         "pitch_roll" => (hgx, hgy, hgz),
         "player" | "world" => {
-            // Down, in the gyro's (forward, right, down) basis: `g_hat` is the
-            // accel's UP in (forward, left, up), so negate it and mirror y and
-            // z — `(-x, y, z)`. A turn right about gravity then reads positive,
-            // as gyro_z does lying flat. Dotting `g_hat` straight in, as this
-            // once did, read a real turn as `cos 2θ` of itself with the pad
-            // tilted θ — nothing at all at 45°.
-            let down = glam::Vec3::new(-g_hat.x, g_hat.y, g_hat.z);
-            let gyro  = glam::Vec3::new(hgx, hgy, hgz);
-            let world_yaw   = gyro.dot(down);
-            let gyro_no_yaw = gyro - world_yaw * down;
-            (world_yaw, gyro_no_yaw.y, 0.0)
+            // Into JSM's frame - (right, up, forward), X the pitch axis, Y the
+            // yaw axis - from the gyro's (forward, right, down). PLAYER_TURN:
+            // the turn about gravity from the yaw and roll axes, relaxed by
+            // JSM's 60° buffer but never more than the pad is turning, and the
+            // pad's own pitch. WORLD_TURN: the turn about gravity, and the pitch
+            // axis laid flat, faded as the pad goes onto its side. JSM's Y counts
+            // down the screen; ours up.
+            let g = JsmGravity { v: glam::Vec3::new(down.y, -down.z, down.x), known: true, ..Default::default() };
+            let r = JsmGyro { x: hgy, y: -hgz, z: hgx };
+            let space = if axis == "player" { JsmSpace::PlayerTurn } else { JsmSpace::WorldTurn };
+            let (mx, my) = jsm_gravity_space(space, g, r);
+            (mx, -my, 0.0)
+        }
+        "orient" => {
+            // A camera kept looking where the nose points (`OrientCamera`): the gyro's own
+            // turn of the pad this tick, taken along the camera's up and its level right.
+            // Over the top the pitch carries on, upside down with the pad; gravity holds
+            // the frame the move is measured in, and never moves the camera itself.
+            let mut cam = OrientCamera::load(&state.aux_f32[ORIENT_AUX..]);
+            let (d_psi, d_theta, fresh) = cam.step(pad_q_before, gyro_dps, dt, hold);
+            cam.store(&mut state.aux_f32[ORIENT_AUX..]);
+            if fresh {
+                // The heading's zero: here, until a Reset.
+                state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN] = cam.world_aim().0;
+            }
+            // In the rates' units: ±1 = GYRO_REF_DPS, with the device's multiplier.
+            let per = dev_gyro_mult / GYRO_REF_DPS / dt.max(1e-6);
+            (d_psi * per, d_theta * per, 0.0)
         }
         // pitch_yaw: gz=yaw→X (plus the roll share), gy=pitch→Y
         _ => (hgz - hgx * roll_share, hgy, 0.0),
     };
 
+    if axis != "orient" {
+        // Back to Orient later, it starts afresh.
+        state.aux_f32[ORIENT_AUX..ORIENT_AUX + ORIENT_CAMERA_LEN].fill(0.0);
+    }
+
     // ── Steering integration + auto-recentering ───────────────────────────
     let reset_now = get_b(inputs, 1, false);
-    let reset_edge = reset_now && state.aux_f32[5] < 0.5;
+    let reset_edge = (reset_now && state.aux_f32[5] < 0.5) || forced_reset;
     state.aux_f32[5] = if reset_now { 1.0 } else { 0.0 };
 
     let (out_x, out_y) = if family == "steering" {
@@ -497,48 +576,63 @@ pub(crate) fn compute_gyro_3dof(
         state.aux_f32[0] += raw_x * dt;
         state.aux_f32[1] += raw_y * dt;
 
-        // X recenter — gated by axis (yaw isn't observable when flat). The
-        // heading is the azimuth of the tilt, in canonical accel components:
-        //   Pitch+Yaw  : tilt in the (forward, side) plane, weight ≈ |sin tilt|
-        //   Pitch+Roll : tilt in the (forward, vertical) plane, weight ≈ cos pitch
-        //   Player/World: skipped (azimuth around gravity unobservable
-        //                  from accel alone).
-        // The `-forward, -side` / `-forward` arguments keep the exact heading
-        // convention this was tuned with (the pre-canonical frame had forward
-        // and side on the negated opposite channels); only the frame notation
-        // changed, not the numbers.
+        // X recenter: where gravity can see the wheel, it says where centre is.
         //
+        // The wheel turns about the pad's own down in Pitch+Yaw - held upright
+        // like a wheel, gravity swings across its face - and about its forward
+        // in Pitch+Roll, held flat and rolled. Gravity seen about that axis,
+        // against where it was at the last Reset, is how far the wheel is
+        // turned, and the turn added up is pulled toward it, at
+        // `recenter_strength` a second, scaled by how squarely gravity crosses
+        // the axis. In Player, World and Orient the wheel turns about gravity
+        // itself, which gravity can't see: only a Reset centres those.
+        //
+        // (This compared an angle in radians with a turn measured in units 35
+        // times smaller, from a reference 90° off for an upright pad: set, it
+        // pulled the wheel to full lock and held it there.)
+        while state.aux_f32.len() < STEER_REF_AUX + 4 { state.aux_f32.push(0.0); }
+        if let Some(g) = down_held {
+            if reset_edge || state.aux_f32[STEER_REF_AUX + 3] < 0.5 {
+                state.aux_f32[STEER_REF_AUX..STEER_REF_AUX + 4].copy_from_slice(&[g.x, g.y, g.z, 1.0]);
+            }
+        }
+        let wheel_axis = match axis {
+            "pitch_yaw" => Some(glam::Vec3::Z),
+            "pitch_roll" => Some(glam::Vec3::X),
+            _ => None,
+        };
+        if let (true, Some(w_axis), Some(g)) = (recenter_strength > 0.0, wheel_axis, down_held) {
+            let r = glam::Vec3::from_slice(&state.aux_f32[STEER_REF_AUX..STEER_REF_AUX + 3]);
+            let (p0, p1) = (r - w_axis * w_axis.dot(r), g - w_axis * w_axis.dot(g));
+            let weight = p0.length().min(p1.length());
+            if weight > 0.05 {
+                // Gravity turns back by the pad's turn.
+                let seen = -(w_axis.dot(p0.cross(p1)).atan2(p0.dot(p1))).to_degrees();
+                // In the integrator's units: rates are ±1 = GYRO_REF_DPS with
+                // the device's multiplier in them, and roll has its invert.
+                let seen = if axis == "pitch_roll" { seen * inv("inv_roll") } else { seen };
+                let per_deg = dev_gyro_mult / GYRO_REF_DPS;
+                let delta = seen - state.aux_f32[0] / per_deg;
+                let alpha = (recenter_strength * weight * dt).clamp(0.0, 1.0);
+                state.aux_f32[0] += alpha * delta * per_deg;
+            }
+        }
+
         // Y recenter is intentionally NOT implemented as an independent atan2 —
         // the per-axis approach couples X and Y badly. The proper fix is a
         // continuous 3DOF pose estimate projecting both axes; pending. Until
         // then, Y centers only via the manual reset (ease_in).
-        if recenter_strength > 0.0 && (axis == "pitch_yaw" || axis == "pitch_roll") {
-            // Measured from the neutral hold, like everything else 2D.
-            let (ax, ay, az) = (hax, hay, haz);
-            let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-            let (heading, weight) = if axis == "pitch_roll" {
-                let w = (ax * ax + az * az).sqrt() / acc_mag;
-                ((-ax).atan2(az), w)
-            } else {
-                // pitch_yaw
-                let w = (ax * ax + ay * ay).sqrt() / acc_mag;
-                ((-ax).atan2(-ay), w)
-            };
-            let two_pi = std::f32::consts::TAU;
-            let mut delta = heading - state.aux_f32[0];
-            // Wrap to (-π, π] without depending on rem_euclid edge cases.
-            delta -= two_pi * ((delta / two_pi) + 0.5).floor();
-            let alpha = (recenter_strength * weight * dt).clamp(0.0, 1.0);
-            state.aux_f32[0] += alpha * delta;
-        }
-
         // Reset edge: start an ease-in toward zero. While ease-in > 0 we
         // blend the steering accumulator toward 0 over `ease_in` seconds.
         if reset_edge { state.aux_f32[6] = 1.0; }
         if state.aux_f32[6] > 0.001 && ease_in > 0.001 {
             let step = (dt / ease_in).clamp(0.0, 1.0);
-            state.aux_f32[0] *= 1.0 - step;
-            state.aux_f32[1] *= 1.0 - step;
+            // This tick's share of what is left of the ease, so the last tick
+            // lands on zero. A fixed `step` of what remained left e⁻¹ - over a
+            // third of the way - when the ease ran out.
+            let k = if state.aux_f32[6] - step <= 0.001 { 1.0 } else { step / state.aux_f32[6] };
+            state.aux_f32[0] *= 1.0 - k;
+            state.aux_f32[1] *= 1.0 - k;
             state.aux_f32[6] = (state.aux_f32[6] - step).max(0.0);
         } else if reset_edge && ease_in <= 0.001 {
             state.aux_f32[0] = 0.0;
@@ -616,7 +710,7 @@ pub(crate) fn compute_gyro_3dof(
     // velocity over time. Uses aux_f32[7..10] for quaternion x,y,z,w.
     // Gravity-based drift correction can be added later if needed.
     let q_reset_now = get_b(inputs, 1, false);
-    let q_reset_edge = q_reset_now && state.aux_f32[11] < 0.5;
+    let q_reset_edge = (q_reset_now && state.aux_f32[11] < 0.5) || forced_reset;
     state.aux_f32[11] = if q_reset_now { 1.0 } else { 0.0 };
 
     // Initialize quaternion to identity on first run or reset
@@ -635,17 +729,6 @@ pub(crate) fn compute_gyro_3dof(
     // the model under-rotates by ~34.9×.
     const GYRO_REF_DPS: f32 = 2000.0;
     let norm_to_rad_s = GYRO_REF_DPS * std::f32::consts::PI / 180.0;
-    // `gyro_multiplier` (a device.source calibration knob) is already baked into
-    // the gyro signals by `preprocess_dev_sigs`; divide it back out so the
-    // orientation stays 1:1 no matter what the user sets it to. The multiplier
-    // is stashed per-device under the synthetic pin key "__gyro_mult".
-    let dev_gyro_mult = params
-        .get("_automap_device_id")
-        .and_then(|v| v.as_str())
-        .and_then(|dev| dev_sigs.get_pin(&dev, "__gyro_mult"))
-        .and_then(|s| if let Signal::Float(f) = s { Some(*f) } else { None })
-        .filter(|m| m.abs() > 1e-6)
-        .unwrap_or(1.0);
     // Orientation display scale, applied to the RATE (before integration) — the
     // only place scaling a full 3D pose stays continuous. Scaling the finished
     // quaternion (viewer-side) flips discontinuously as the rotation passes
@@ -654,6 +737,7 @@ pub(crate) fn compute_gyro_3dof(
     // every family to the same ±2000 dps reference).
     let orient_disp_scale = pf("orient_scale", 1.0);
     let orient_scale = norm_to_rad_s / dev_gyro_mult * orient_disp_scale;
+
     // Polarity comes from the module's EXISTING inv_* toggles — the same ones
     // that orient the 2D output — not hardcoded per-device sign guesses. So a
     // device calibrated once (its inv_yaw/inv_pitch/inv_roll) is correct for
@@ -690,6 +774,8 @@ pub(crate) fn compute_gyro_3dof(
     // Reset edge: fade quaternion toward identity over ease_in period
     let q_ease_in = pf("reset_ease_in", 0.25).clamp(0.0, 2.0);
     if q_reset_edge { state.aux_f32[12] = 1.0; }
+    // Whether the pose is being eased home this tick (its last tick included).
+    let pose_easing = state.aux_f32[12] > 0.001;
     if state.aux_f32[12] > 0.001 && q_ease_in > 0.001 {
         let step = (dt / q_ease_in).clamp(0.0, 1.0);
         let cur_q = glam::Quat::from_xyzw(
@@ -698,8 +784,11 @@ pub(crate) fn compute_gyro_3dof(
             state.aux_f32[9],
             state.aux_f32[10],
         );
-        // Blend toward identity (0,0,0,1)
-        let blend_q = cur_q.slerp(glam::Quat::IDENTITY, step);
+        // Blend toward identity (0,0,0,1), this tick's share of what is left
+        // of the ease, so the last tick lands on it. A fixed `step` of what
+        // remained left e⁻¹ of the turn - a pose Reset from 90° stopped at 33°.
+        let k = if state.aux_f32[12] - step <= 0.001 { 1.0 } else { step / state.aux_f32[12] };
+        let blend_q = cur_q.slerp(glam::Quat::IDENTITY, k);
         state.aux_f32[7] = blend_q.x;
         state.aux_f32[8] = blend_q.y;
         state.aux_f32[9] = blend_q.z;
@@ -913,6 +1002,109 @@ pub(crate) fn compute_gyro_3dof(
     let orientation_signal =
         pose.map(|q| Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)));
 
+    // ── Where the output has got to, for the preview ──────────────────────
+    //
+    // X/Y are turn RATES, and a game adds them up. That sum is not where the
+    // pad points, and can't be: two numbers added tick by tick don't hold a 3D
+    // orientation, and the same turns taken in another order end somewhere
+    // else. Roll 90°, pitch 90° about the pad's own axis, roll back: the pad
+    // lies flat turned 90° to the side, and Pitch+Yaw has the camera looking
+    // at the ceiling (World turns it 90° to the side, as the pad). So the
+    // preview draws the sum as this module adds it - this tick's projection,
+    // hold, gravity, roll share and inverts and all - rather than working it
+    // out again from the pose at the screen's rate. In degrees, in the pose's
+    // frame (a computed pose's 3D rot × on it too); Edge turn's own turn is
+    // left out, the preview shows that as the world turning. It starts, and
+    // starts over, where the pose's nose points as the outputs read it: at a
+    // Reset (and while it or Auto re-center eases the pose home), a Set
+    // Neutral Forward, or a change of pose source or of mode.
+    while state.aux_f32.len() < AIM_AUX + 5 { state.aux_f32.push(0.0); }
+    let kind = match (pose, device_q) {
+        (None, _) => 3.0,
+        (Some(_), Some(_)) => 2.0,
+        (Some(_), None) => 1.0,
+    };
+    let mode = match axis { "pitch_roll" => 2.0, "player" => 3.0, "world" => 4.0, "orient" => 5.0, _ => 1.0 };
+    let inv3 = [inv("inv_yaw"), inv("inv_pitch"), inv("inv_roll")];
+    // Steering puts out an angle of its own - added up, centred, eased home by
+    // a Reset - so the preview shows that, in degrees, as it goes out.
+    // Orient's aim is its camera: heading from where a Reset put it, the pitch as it is
+    // (gravity says where level is; past ±90 over the top), in real degrees. A Reset puts
+    // the camera back where the nose points.
+    let orient_aim = orient_now.map(|_| {
+        let mut cam = OrientCamera::load(&state.aux_f32[ORIENT_AUX..]);
+        if q_reset_edge || neutral_now {
+            cam.aim_at(pad_q, hold);
+            cam.store(&mut state.aux_f32[ORIENT_AUX..]);
+            state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN] = cam.world_aim().0;
+        } else if pb("orient_auto_recenter", false) && state.aux_f32[16] >= 3.0 && dt > 0.0 {
+            // Auto re-center, the pad still a while: the camera eases onto its nose and
+            // the heading back to forward (τ ≈ 1 s, as the Orientation output eases
+            // home), sending nothing - a slow Reset.
+            let step = 1.0 - (-dt / 1.0_f32).exp();
+            cam.ease_onto(pad_q, hold, step);
+            cam.store(&mut state.aux_f32[ORIENT_AUX..]);
+            let r = &mut state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN];
+            *r += step * wrap180(cam.world_aim().0 - *r);
+        }
+        let (psi, theta) = cam.world_aim();
+        (wrap180(psi - state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN]) * inv3[0], theta * inv3[1])
+    });
+    let steer = (family == "steering").then(|| {
+        let k = GYRO_REF_DPS / dev_gyro_mult * if device_q.is_some() { 1.0 } else { orient_disp_scale };
+        let x = state.aux_f32[0] * inv3[0] * k;
+        let y = if pb("steering_exclude_y", false) { 0.0 } else { state.aux_f32[1] * inv3[1] * k };
+        (x, y)
+    });
+    // A Reset eases the pose home (`reset_ease_in`), and so does Auto
+    // re-center once the pad has been still a while: the aim rides it there.
+    let easing = pose_easing || (pb("orient_auto_recenter", false) && state.aux_f32[16] >= 3.0);
+    let a = &mut state.aux_f32[AIM_AUX..AIM_AUX + 5];
+    if let Some((x, y)) = steer.or(orient_aim) {
+        a.copy_from_slice(&[x, y, x, kind, mode]);
+    } else if q_reset_edge || easing || neutral_now || a[3] != kind || a[4] != mode {
+        let (x, y, base) = pose.map_or((0.0, 0.0, 0.0), |q| aim_start(q, axis, roll_share, inv3, device_q.is_some(), hold));
+        a.copy_from_slice(&[x, y, base, kind, mode]);
+    } else {
+        // Degrees this tick: the rates are ±1 = GYRO_REF_DPS with the device's
+        // multiplier in them. A device's pose is physical; a computed one turns
+        // by the 3D rot ×.
+        let k = GYRO_REF_DPS / dev_gyro_mult * dt * if device_q.is_some() { 1.0 } else { orient_disp_scale };
+        let base_rate = match axis { "pitch_roll" => 0.0, "player" | "world" | "orient" => raw_x, _ => hgz };
+        let wrap = |d: f32| (d + 180.0).rem_euclid(360.0) - 180.0;
+        // Over the poles too: past straight up is over the top, where the nose went.
+        a[0] = wrap(a[0] + raw_x * inv3[0] * k);
+        a[1] = wrap(a[1] + raw_y * inv3[1] * k);
+        a[2] = wrap(a[2] + base_rate * inv3[0] * k);
+    }
+    let aim = glam::Vec4::new(a[0], a[1], a[2], kind);
+
+    // ── The pad as the output has it, for the preview ─────────────────────
+    //
+    // Its nose where the aim is, rolled as gravity says: the model the
+    // preview draws, so the pad and the pointer it drives agree in every mode.
+    // A camera has a heading and a pitch and nothing else, and those are the
+    // output's - whatever path the pad took to them, and wherever the
+    // Orientation output, integrated on its own, has wandered. In the hold's
+    // frame, canonical (forward, left, up).
+    // Orient's is the pad's own orientation: no angles rebuilt into one, so nothing
+    // spins as the nose goes over a pole.
+    let roll = down_held.map_or(0.0, |d| d.y.atan2(d.z));
+    let view = {
+        let frd = match orient_now {
+            Some((_, _, v)) if family != "steering" => {
+                glam::Quat::from_rotation_z(-state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN].to_radians()) * v
+            }
+            _ => {
+                glam::Quat::from_rotation_z(aim.x.to_radians())
+                    * glam::Quat::from_rotation_y(aim.y.to_radians())
+                    * glam::Quat::from_rotation_x(roll)
+            }
+        };
+        let flip = glam::Quat::from_rotation_x(std::f32::consts::PI);
+        (flip * frd * flip).normalize()
+    };
+
     // ── Edge turn (Pointer only) ──────────────────────────────────────────
     //
     // Past `edge_zone_deg` from the neutral pose (the Orientation output's
@@ -959,7 +1151,97 @@ pub(crate) fn compute_gyro_3dof(
         // actual per-pin signals are written into collector_sigs under
         // "lean:{uid}" by the dispatch block in `eval_graph_tick`.
         None,
+        // Not pins: the preview's aim, at `GYRO_AIM_OUT`, and the pad as the
+        // output has it, at `GYRO_VIEW_OUT`.
+        Some(Signal::Vec4(aim)),
+        Some(Signal::Vec4(glam::Vec4::new(view.x, view.y, view.z, view.w))),
     ]
+}
+
+/// Index in a 3DOF node's `last_out` of the display-only trailing output with
+/// where the X/Y outputs have got to, added up (see `compute_gyro_3dof`):
+/// `Vec4(x°, y°, x° without roll's share, pose kind)` - kind 1 a computed pose
+/// (already turned by the inverts), 2 the device's own (physical), 3 none.
+pub const GYRO_AIM_OUT: usize = 7;
+
+/// Index in a 3DOF node's `last_out` of the display-only trailing output with
+/// the pad as the output has it: a quaternion, canonical (forward, left, up), in
+/// the hold's frame - its nose on the aim, rolled as gravity says. The preview
+/// draws the pad from it (the hold turned by it).
+pub const GYRO_VIEW_OUT: usize = 8;
+
+/// Where in `aux_f32` the aim is kept: x, y, base x, then the pose kind and
+/// the mode it was started for.
+const AIM_AUX: usize = 30;
+
+/// Where in `aux_f32` JSM's gravity estimate is kept (`GravityFusion`).
+const FUSION_AUX: usize = 35;
+
+/// Where in `aux_f32` Steering keeps gravity as it was at the last Reset (its
+/// centre), and whether it has one.
+const STEER_REF_AUX: usize = 46;
+
+/// Where in `aux_f32` Orient keeps its camera (`OrientCamera`), then the heading
+/// a Reset made zero.
+const ORIENT_AUX: usize = 50;
+
+/// A difference of angles, the short way round: -180..180.
+fn wrap180(d: f32) -> f32 {
+    (d + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Where the nose of the pad at `q` points - body to world in (forward, right,
+/// down), the world's down along +z (`GravityFusion::orientation`) - measured from
+/// the neutral hold: its heading right of the world's forward and its elevation,
+/// in degrees, and the hold's orientation.
+fn nose_angles(q: glam::Quat, hold: Option<glam::Quat>) -> (f32, f32, glam::Quat) {
+    let v = hold.map_or(q, |h| (q * h.inverse()).normalize());
+    let n = v * glam::Vec3::X;
+    (n.y.atan2(n.x).to_degrees(), (-n.z).clamp(-1.0, 1.0).asin().to_degrees(), v)
+}
+
+/// Panic mode: every 3DOF module in `graph`, sub-patches too, resets at its next
+/// tick - its Orientation output, Steering's wheel, the aim - as its Reset input
+/// would. Keys are the engine's (`namespaced_uid` inside a sub-patch).
+pub fn request_gyro_reset(graph: &crate::graph::ProcessingGraph, state: &mut HashMap<usize, NodeState>) {
+    fn walk(g: &crate::graph::ProcessingGraph, outer: Option<usize>, state: &mut HashMap<usize, NodeState>) {
+        for snap in &g.nodes {
+            let uid = outer.map_or(snap.node_uid, |o| crate::eval::namespaced_uid(o, snap.node_uid));
+            if snap.module_id == "processing.gyro_3dof" {
+                state.entry(uid).or_default().reset_request = true;
+            }
+            if let Some(sub) = &snap.inline_subgraph {
+                walk(&sub.graph, Some(uid), state);
+            }
+        }
+    }
+    walk(graph, None, state);
+}
+
+/// Where pose `q`'s nose points as the X/Y outputs read it, in degrees: (x, y,
+/// x without roll's share) - where the aim starts. `inv` is the inverts
+/// (yaw, pitch, roll); `device` says the pose is the device's own, which is
+/// physical, where a computed one already turns with the inverts. Pitch+Yaw
+/// and Pitch+Roll measure the pad about its neutral hold.
+fn aim_start(q: glam::Quat, axis: &str, roll_share: f32, inv: [f32; 3], device: bool, hold: Option<glam::Quat>) -> (f32, f32, f32) {
+    let q = match hold {
+        Some(h) if !matches!(axis, "player" | "world") => {
+            // The hold is written in the gyro's (forward, right, down) basis: a
+            // half turn about forward from the pose's (forward, left, up).
+            let flip = glam::Quat::from_rotation_x(std::f32::consts::PI);
+            let h = flip * h * flip;
+            (h * q * h.inverse()).normalize()
+        }
+        _ => q,
+    };
+    let a = pose_angles(q);
+    let [iy, ip, ir] = inv;
+    let (yaw, pitch, roll) = if device { (a.x * iy, a.y * ip, a.z * ir * iy) } else { (a.x, a.y, a.z * iy) };
+    match axis {
+        "pitch_roll" => (roll, pitch, 0.0),
+        "player" | "world" | "orient" => (yaw, pitch, yaw),
+        _ => (yaw - roll * roll_share, pitch, yaw),
+    }
 }
 
 // ── Curve helpers ─────────────────────────────────────────────────────────────
@@ -991,10 +1273,20 @@ mod hold_offset_tests {
             Some(Signal::Float(accel[1])),
             Some(Signal::Float(accel[2])),
         ];
-        let mut out = Vec::new();
+        // Gravity settles with the pad still, then one tick of the turn: the
+        // projection as it reads a turn. Held for a second, a constant gyro
+        // with a constant accel is a pad turning while gravity doesn't move in
+        // its frame - only true of a turn about gravity itself - and Player and
+        // World now carry gravity with the gyro.
+        let still: Vec<Option<Signal>> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if (2..5).contains(&i) { Some(Signal::Float(0.0)) } else { *s })
+            .collect();
         for _ in 0..250 {
-            out = compute_gyro_3dof(&inputs, &mut state, &p, &dev, &coll, 1.0 / 250.0);
+            compute_gyro_3dof(&still, &mut state, &p, &dev, &coll, 1.0 / 250.0);
         }
+        let out = compute_gyro_3dof(&inputs, &mut state, &p, &dev, &coll, 1.0 / 250.0);
         let f = |i: usize| match out[i] {
             Some(Signal::Float(v)) => v,
             ref other => panic!("slot {i}: {other:?}"),
@@ -1524,5 +1816,441 @@ mod orientation_frame_tests {
             axis.dot(glam::Vec3::Y).abs() > 0.99,
             "a yaw must render about the viewer's up axis, got {axis:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aim_tests {
+    use super::{compute_gyro_3dof, pose_angles, GYRO_AIM_OUT, GYRO_VIEW_OUT};
+    use crate::NodeState;
+    use flexinput_core::{BusMap, Signal};
+    use glam::{Quat, Vec3};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    const DT: f32 = 1.0 / 1000.0;
+    // Turns about the pad's own canonical (forward, left, up) axes, + the way named.
+    const ROLL_RIGHT: Vec3 = Vec3::X;
+    const NOSE_UP: Vec3 = Vec3::NEG_Y;
+    const YAW_RIGHT: Vec3 = Vec3::NEG_Z;
+
+    /// A pad turned through the world for real: its true pose (canonical body
+    /// to world) and the gyro and accel it reads on the way, consistent with
+    /// each other as a real pad's are.
+    struct Pad {
+        q: Quat,
+        st: NodeState,
+        p: HashMap<String, Value>,
+        out: Vec<Option<Signal>>,
+    }
+
+    impl Pad {
+        fn new(params: &[(&str, Value)]) -> Self {
+            let mut p: HashMap<String, Value> = HashMap::new();
+            p.insert("family".into(), json!("pointer"));
+            for (k, v) in params {
+                p.insert((*k).into(), v.clone());
+            }
+            let mut pad = Pad { q: Quat::IDENTITY, st: NodeState::default(), p, out: Vec::new() };
+            pad.hold_still(0.5);
+            pad
+        }
+
+        fn tick(&mut self, w_body_dps: Vec3, reset: bool) {
+            // Gyro: (forward, right, down), ±1 = 2000 °/s. Accel: up, (forward, left, up).
+            let g = Vec3::new(w_body_dps.x, -w_body_dps.y, -w_body_dps.z) / 2000.0;
+            let up = self.q.inverse() * Vec3::Z;
+            let f = |v: f32| Some(Signal::Float(v));
+            let inputs = vec![None, Some(Signal::Bool(reset)), f(g.x), f(g.y), f(g.z), f(up.x), f(up.y), f(up.z)];
+            self.out = compute_gyro_3dof(&inputs, &mut self.st, &self.p, &BusMap::default(), &BusMap::default(), DT);
+        }
+
+        fn hold_still(&mut self, secs: f32) {
+            for _ in 0..(secs / DT) as usize {
+                self.tick(Vec3::ZERO, false);
+            }
+        }
+
+        /// Turn `deg` about the pad's own axis `axis` at `dps`.
+        fn turn(&mut self, axis: Vec3, deg: f32, dps: f32) {
+            let n = ((deg.abs() / dps) / DT).ceil().max(1.0) as usize;
+            let step = deg / n as f32;
+            for _ in 0..n {
+                self.q = (self.q * Quat::from_axis_angle(axis, step.to_radians())).normalize();
+                self.tick(axis * (step / DT), false);
+            }
+        }
+
+        /// Turn `deg` right about the world's up at `dps`.
+        fn turn_world(&mut self, deg: f32, dps: f32) {
+            let axis = self.q.inverse() * Vec3::NEG_Z;
+            self.turn(axis, deg, dps);
+        }
+
+        fn set(&mut self, k: &str, v: Value) {
+            self.p.insert(k.into(), v);
+            self.tick(Vec3::ZERO, false);
+        }
+
+        fn aim(&self) -> (f32, f32) {
+            match self.out[GYRO_AIM_OUT] {
+                Some(Signal::Vec4(v)) => (v.x, v.y),
+                ref other => panic!("aim: {other:?}"),
+            }
+        }
+
+        /// The pad as the output has it (`GYRO_VIEW_OUT`), canonical.
+        fn view(&self) -> Quat {
+            match self.out[GYRO_VIEW_OUT] {
+                Some(Signal::Vec4(v)) => Quat::from_xyzw(v.x, v.y, v.z, v.w),
+                ref other => panic!("view: {other:?}"),
+            }
+        }
+
+        /// Where the pad's nose really points: (right, up) in degrees.
+        fn nose(&self) -> (f32, f32) {
+            let a = pose_angles(self.q);
+            (a.x, a.y)
+        }
+    }
+
+    fn near(a: (f32, f32), b: (f32, f32), tol: f32) -> bool {
+        (a.0 - b.0).abs() < tol && (a.1 - b.1).abs() < tol
+    }
+
+    // Just connected and lying flat, a pad's gyro reads a turn it isn't making until
+    // its calibration settles: the camera follows the gyro, gravity holds the pad
+    // level, and the pointer ends up off the pad's nose. Auto re-center, once the pad
+    // has lain still a while, puts the camera back on the nose and the heading back
+    // to forward, as a Reset would - without sending the move.
+    #[test]
+    fn orient_auto_recenter_puts_the_pointer_back_on_the_pad() {
+        for recenter in [false, true] {
+            let mut pad = Pad::new(&[("axis", json!("orient")), ("orient_auto_recenter", json!(recenter))]);
+            // Two seconds of a phantom 6°/s nose-up and 4°/s right, the pad flat.
+            for _ in 0..(2.0 / DT) as usize {
+                pad.tick(NOSE_UP * 6.0 + YAW_RIGHT * 4.0, false);
+            }
+            let drifted = pad.aim();
+            assert!(drifted.1.abs() > 3.0, "the camera followed the phantom turn: {drifted:?}");
+            // Calibrated now: still.
+            let mut sent = (0.0f32, 0.0f32);
+            for _ in 0..(8.0 / DT) as usize {
+                pad.tick(Vec3::ZERO, false);
+                if let (Some(Signal::Float(x)), Some(Signal::Float(y))) = (&pad.out[1], &pad.out[2]) {
+                    sent = (sent.0 + x.abs(), sent.1 + y.abs());
+                }
+            }
+            let rested = pad.aim();
+            if recenter {
+                assert!(near(rested, (0.0, 0.0), 1.0), "re-centred, the pointer is still off the pad: {rested:?}");
+                assert!(sent.0 < 1e-6 && sent.1 < 1e-6, "re-centring sent a move: {sent:?}");
+            } else {
+                assert!(near(rested, drifted, 0.5), "without it, nothing moves the pointer: {drifted:?} -> {rested:?}");
+            }
+        }
+    }
+
+    // Yawed while tipped up, the nose sweeps a slanted circle - and Pitch+Yaw's
+    // output goes straight across: the aim adds up what the outputs say, not
+    // where the nose is.
+    #[test]
+    fn the_aim_adds_up_the_outputs_not_the_nose() {
+        let mut pad = Pad::new(&[("axis", json!("pitch_yaw"))]);
+        pad.turn(NOSE_UP, 40.0, 200.0);
+        pad.turn(YAW_RIGHT, 30.0, 200.0);
+        assert!(near(pad.aim(), (30.0, 40.0), 0.5), "{:?}", pad.aim());
+        assert!(!near(pad.nose(), (30.0, 40.0), 3.0), "the nose went elsewhere: {:?}", pad.nose());
+    }
+
+    // Roll right 90°, nose up 90° about the pad's own axis, roll back: the pad
+    // lies flat turned 90° right. Pitch+Yaw read the middle turn as pitch - the
+    // camera looks at the ceiling. World reads it as the turn about gravity it
+    // was, and ends where the pad points. Neither is a fault: two added-up
+    // numbers can't follow every path of a 3D turn, and this is how each mode
+    // splits one.
+    #[test]
+    fn the_same_turns_end_where_each_mode_puts_them() {
+        let tumble = |axis: &str| {
+            let mut pad = Pad::new(&[("axis", json!(axis))]);
+            pad.turn(ROLL_RIGHT, 90.0, 300.0);
+            pad.turn(NOSE_UP, 90.0, 300.0);
+            pad.turn(ROLL_RIGHT, -90.0, 300.0);
+            assert!(near(pad.nose(), (90.0, 0.0), 0.5), "the pad: {:?}", pad.nose());
+            pad.aim()
+        };
+        let py = tumble("pitch_yaw");
+        assert!(near(py, (0.0, 90.0), 1.0), "Pitch+Yaw: {py:?}");
+        let world = tumble("world");
+        assert!(near(world, (90.0, 0.0), 1.5), "World: {world:?}");
+    }
+
+    // Tip the nose up 60° in a tenth of a second and turn at once: World's
+    // "down" is carried by the gyro, so the turn reads whole and stays out of
+    // Y. Gravity low-passed alone lagged three seconds behind, and read the
+    // turn at about half.
+    #[test]
+    fn player_and_world_keep_up_with_a_quick_tilt() {
+        for axis in ["player", "world"] {
+            let mut pad = Pad::new(&[("axis", json!(axis))]);
+            pad.turn(NOSE_UP, 60.0, 600.0);
+            pad.turn_world(45.0, 180.0);
+            assert!(near(pad.aim(), (45.0, 60.0), 1.5), "{axis}: {:?}", pad.aim());
+        }
+    }
+
+    // With the inverts on, a computed pose turns with them and so does the
+    // output: the aim added up and the aim started afresh from the pose agree.
+    #[test]
+    fn the_aim_and_where_it_starts_agree_with_the_inverts() {
+        for (iy, ip) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut pad = Pad::new(&[("axis", json!("pitch_yaw")), ("inv_yaw", json!(iy)), ("inv_pitch", json!(ip))]);
+            pad.turn(YAW_RIGHT, 30.0, 200.0);
+            pad.turn(NOSE_UP, 20.0, 200.0);
+            let added = pad.aim();
+            let want = (if iy { -30.0 } else { 30.0 }, if ip { -20.0 } else { 20.0 });
+            assert!(near(added, want, 0.5), "inv {iy}/{ip}: {added:?}");
+            // A change of mode starts it over at the nose; back again, the same.
+            pad.set("axis", json!("world"));
+            pad.set("axis", json!("pitch_yaw"));
+            assert!(near(pad.aim(), want, 0.5), "inv {iy}/{ip}: started at {:?}", pad.aim());
+        }
+    }
+
+    // A Reset eases the pose back to neutral, and the aim rides it home.
+    #[test]
+    fn a_reset_starts_the_aim_over() {
+        let mut pad = Pad::new(&[("axis", json!("pitch_yaw"))]);
+        pad.turn(ROLL_RIGHT, 90.0, 300.0);
+        pad.turn(NOSE_UP, 90.0, 300.0);
+        assert!(!near(pad.aim(), (0.0, 0.0), 10.0));
+        pad.tick(Vec3::ZERO, true);
+        pad.hold_still(0.4);
+        assert!(near(pad.aim(), (0.0, 0.0), 0.01), "{:?}", pad.aim());
+        // And from there it adds up again.
+        pad.turn(YAW_RIGHT, 20.0, 200.0);
+        assert!(near(pad.aim(), (20.0, 0.0), 0.5), "{:?}", pad.aim());
+    }
+
+    // Orient keeps the output on the nose whatever path the pad takes, short of
+    // pointing straight up or down: rolled, pitched about its own tilted axes,
+    // yawed, back and forth - and ends where the nose points. Pitch+Yaw, on the
+    // same path, doesn't.
+    #[test]
+    fn orient_ends_where_the_nose_points_whatever_the_path() {
+        let path = |pad: &mut Pad| {
+            pad.turn(ROLL_RIGHT, 70.0, 250.0);
+            pad.turn(NOSE_UP, 40.0, 250.0);
+            pad.turn(YAW_RIGHT, 40.0, 250.0);
+            pad.turn(ROLL_RIGHT, -120.0, 250.0);
+            pad.turn(NOSE_UP, -25.0, 250.0);
+            pad.turn(YAW_RIGHT, -70.0, 250.0);
+            pad.turn(ROLL_RIGHT, 50.0, 250.0);
+        };
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        path(&mut pad);
+        let nose = pad.nose();
+        assert!(near(pad.aim(), nose, 1.0), "Orient {:?}, the nose {nose:?}", pad.aim());
+        let mut py = Pad::new(&[("axis", json!("pitch_yaw"))]);
+        path(&mut py);
+        assert!(!near(py.aim(), nose, 5.0), "Pitch+Yaw went elsewhere: {:?}", py.aim());
+    }
+
+    // The nose 60° up, twisted a quarter turn about itself: it points where it
+    // did. World turns the camera by the twist's share about gravity (sin 60°),
+    // Player - JSM's PLAYER_TURN, relaxed - by all of it; Orient not at all.
+    #[test]
+    fn a_twist_about_a_raised_nose_turns_world_and_player_but_not_orient() {
+        let twist = |axis: &str| {
+            let mut pad = Pad::new(&[("axis", json!(axis))]);
+            pad.turn(NOSE_UP, 60.0, 300.0);
+            let before = pad.aim().0;
+            pad.turn(ROLL_RIGHT, 90.0, 300.0);
+            (pad.aim().0 - before).abs()
+        };
+        assert!(twist("orient") < 1.0, "Orient: {}", twist("orient"));
+        assert!((twist("world") - 90.0 * 60f32.to_radians().sin()).abs() < 1.5, "World: {}", twist("world"));
+        assert!((twist("player") - 90.0).abs() < 1.5, "Player: {}", twist("player"));
+    }
+
+    // Over the top - the nose up past straight up and down the far side - Orient
+    // carries on pitching, upside down with the pad, as a game with no cap on its
+    // pitch does: the heading doesn't turn round. The aim is still where the nose
+    // points, and the preview's pad is the pad as it is.
+    #[test]
+    fn orient_carries_on_over_the_top() {
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        pad.turn(YAW_RIGHT, 30.0, 200.0);
+        pad.turn(NOSE_UP, 130.0, 300.0);
+        pad.turn(ROLL_RIGHT, 25.0, 200.0);
+        let (x, y) = pad.aim();
+        assert!((x - 30.0).abs() < 1.0 && (y - 130.0).abs() < 1.0, "the heading turned round: {x}, {y}");
+        let dir = Vec3::new(x.to_radians().cos() * y.to_radians().cos(), -x.to_radians().sin() * y.to_radians().cos(), y.to_radians().sin());
+        let nose = pad.q * Vec3::X;
+        assert!(dir.angle_between(nose).to_degrees() < 1.0, "aim {x}, {y} vs the nose {nose:?}");
+        let off = pad.view().angle_between(pad.q).to_degrees();
+        assert!(off < 1.0, "the preview's pad is {off}° off the real one");
+    }
+
+    // Over the top, the pad's up is still up: turned right about its own up and
+    // pitched up about its own right, the outputs go right and up - not mirrored -
+    // and the aim stays on the nose.
+    #[test]
+    fn orient_keeps_the_pads_up_over_the_top() {
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        pad.turn(NOSE_UP, 150.0, 300.0);
+        let xy = |pad: &Pad| match (&pad.out[1], &pad.out[2]) {
+            (Some(Signal::Float(x)), Some(Signal::Float(y))) => (*x, *y),
+            other => panic!("{other:?}"),
+        };
+        pad.turn(YAW_RIGHT, 20.0, 200.0);
+        let (x, y) = xy(&pad);
+        assert!(x > 0.0 && y.abs() < x * 0.2, "turned right about its own up: {x}, {y}");
+        pad.turn(NOSE_UP, 10.0, 200.0);
+        let (x, y) = xy(&pad);
+        assert!(y > 0.0 && x.abs() < y * 0.2, "pitched up about its own right: {x}, {y}");
+        let (ax, ay) = pad.aim();
+        let dir = Vec3::new(ax.to_radians().cos() * ay.to_radians().cos(), -ax.to_radians().sin() * ay.to_radians().cos(), ay.to_radians().sin());
+        let nose = pad.q * Vec3::X;
+        assert!(dir.angle_between(nose).to_degrees() < 1.5, "aim {ax}, {ay} vs the nose {nose:?}");
+    }
+
+    // Over the top, then rolled about the nose until level again and turned back to
+    // face forward - the tumble that left the camera upside down against a level pad
+    // (x +178, y +178 at neutral) and the outputs mirrored. The camera keeps the pad's
+    // up through the twist: level and forward again, a turn right reads right.
+    #[test]
+    fn orient_keeps_the_pads_up_through_a_twist() {
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        pad.turn(NOSE_UP, 150.0, 300.0);
+        pad.turn(ROLL_RIGHT, 180.0, 300.0);
+        pad.turn(NOSE_UP, -30.0, 300.0);
+        pad.turn(YAW_RIGHT, 180.0, 300.0);
+        // The pad's nose: wherever the tumble left it, level and with its up up.
+        let up = pad.q * Vec3::Z;
+        assert!(up.z > 0.9, "the pad came back the right way up: {up:?}");
+        pad.turn(YAW_RIGHT, 20.0, 200.0);
+        let x = match &pad.out[1] {
+            Some(Signal::Float(x)) => *x,
+            other => panic!("{other:?}"),
+        };
+        assert!(x > 0.0, "a turn right about the pad's own up read {x}");
+        let (ax, ay) = pad.aim();
+        assert!(ay.abs() < 90.0, "the camera is upside down against a level pad: {ax}, {ay}");
+    }
+
+    // Round a whole loop and back to where it started, the heading never jumps, and
+    // the aim comes home with the pad.
+    #[test]
+    fn orient_loops() {
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        let mut worst = 0.0_f32;
+        let mut last = pad.aim().0;
+        for _ in 0..360 {
+            pad.turn(NOSE_UP, 1.0, 360.0);
+            let x = pad.aim().0;
+            worst = worst.max((x - last).abs());
+            last = x;
+        }
+        assert!(worst < 0.5, "the heading jumped {worst}° somewhere round the loop");
+        assert!(near(pad.aim(), (0.0, 0.0), 1.0), "{:?}", pad.aim());
+    }
+
+    // The gyro moves the camera and gravity never does: a pad whose gyro drifted, held
+    // still while gravity brings its orientation back, keeps its pointer where it is.
+    #[test]
+    fn orient_ignores_the_drift_fix() {
+        let mut pad = Pad::new(&[("axis", json!("orient"))]);
+        // Half a second of a roll the gyro reports and the pad isn't making, nose up
+        // a little so the tilt it leaves shows in the pitch.
+        pad.turn(NOSE_UP, 20.0, 200.0);
+        for _ in 0..500 {
+            pad.tick(ROLL_RIGHT * 40.0, false);
+        }
+        let at = pad.aim();
+        pad.hold_still(3.0);
+        assert!(near(pad.aim(), at, 0.01), "a still pad's pointer crept: {at:?} -> {:?}", pad.aim());
+    }
+
+    // Held upright like a wheel and turned, Pitch+Yaw steering knows where
+    // centre is from gravity: a gyro that drifts while the wheel is held still
+    // doesn't carry the wheel off. (The old centring pulled an upright wheel to
+    // full lock.) Without centring, the drift is the wheel's.
+    #[test]
+    fn steering_centres_on_gravity_where_it_can_see_the_wheel() {
+        let wheel = |ctr: f32| {
+            let mut pad = Pad::new(&[
+                ("family", json!("steering")),
+                ("axis", json!("pitch_yaw")),
+                ("recenter_strength", json!(ctr)),
+            ]);
+            pad.turn(NOSE_UP, 90.0, 300.0);
+            pad.tick(Vec3::ZERO, true); // centre here
+            pad.hold_still(0.5);
+            assert!(pad.aim().0.abs() < 1.0, "upright at centre, it stays there: {:?}", pad.aim());
+            pad.turn(YAW_RIGHT, 30.0, 200.0);
+            // Four seconds of a gyro reading 5°/s of turn the wheel isn't making.
+            for _ in 0..4000 {
+                pad.tick(YAW_RIGHT * 5.0, false);
+            }
+            pad.aim().0
+        };
+        let held = wheel(2.0);
+        assert!((held - 30.0).abs() < 8.0, "centred on gravity: {held}");
+        let drifted = wheel(0.0);
+        assert!((drifted - 30.0).abs() > 15.0, "without, it drifts: {drifted}");
+    }
+
+    // The preview's pad has its nose on the aim and is rolled as it is held: a
+    // pad rolled 30° right and yawed about its own tilted axes in Pitch+Yaw
+    // points where the output went, not where the nose did, still rolled.
+    #[test]
+    fn the_preview_pad_points_where_the_output_does_rolled_as_held() {
+        let mut pad = Pad::new(&[("axis", json!("pitch_yaw"))]);
+        pad.turn(ROLL_RIGHT, 30.0, 200.0);
+        pad.turn(YAW_RIGHT, 40.0, 200.0);
+        let (x, y) = pad.aim();
+        let v = pad.view();
+        let nose = v * Vec3::X;
+        let want = Vec3::new(x.to_radians().cos() * y.to_radians().cos(), -x.to_radians().sin() * y.to_radians().cos(), y.to_radians().sin());
+        assert!(nose.angle_between(want).to_degrees() < 0.5, "{nose:?} vs the aim {x}, {y}");
+        // Rolled as the pad really is about its nose, against the vertical:
+        // down in the pad's (forward, right, down) is (-up.F, up.L, up.U).
+        let roll = |q: Quat| {
+            let up = q.inverse() * Vec3::Z;
+            up.y.atan2(up.z).to_degrees()
+        };
+        let (shown, real) = (roll(v), roll(pad.q));
+        assert!(real > 15.0, "the pad is rolled: {real}");
+        assert!((shown - real).abs() < 1.0, "shown {shown}, really {real}");
+    }
+
+    // Panic mode's reset (`request_gyro_reset` sets `reset_request`) is a Reset:
+    // a wound-up wheel comes back to centre and the pose to neutral.
+    #[test]
+    fn a_reset_asked_for_from_outside_recentres_the_wheel() {
+        let mut pad = Pad::new(&[("family", json!("steering")), ("axis", json!("world"))]);
+        pad.turn(YAW_RIGHT, 70.0, 200.0);
+        assert!(pad.aim().0 > 60.0, "{:?}", pad.aim());
+        pad.st.reset_request = true;
+        pad.hold_still(0.4);
+        assert!(pad.aim().0.abs() < 1e-3, "{:?}", pad.aim());
+        assert!(!pad.st.reset_request, "taken");
+    }
+
+    // Steering's Reset lands on zero too: its ease took a fixed share of what
+    // was left each tick and stopped with over a third of it still there.
+    #[test]
+    fn a_steering_reset_lands_on_zero() {
+        let mut pad = Pad::new(&[("family", json!("steering")), ("axis", json!("pitch_yaw"))]);
+        pad.turn(YAW_RIGHT, 40.0, 200.0);
+        let x = |pad: &Pad| match pad.out[1] {
+            Some(Signal::Float(v)) => v,
+            ref other => panic!("x: {other:?}"),
+        };
+        assert!(x(&pad).abs() > 0.01, "{}", x(&pad));
+        pad.tick(Vec3::ZERO, true);
+        pad.hold_still(0.4);
+        assert!(x(&pad).abs() < 1e-6, "{}", x(&pad));
     }
 }

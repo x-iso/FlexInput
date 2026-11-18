@@ -1653,7 +1653,8 @@ impl Aiming {
     fn aimed(&mut self) -> super::aim::Aimed {
         // Gravity first, so a gravity-referenced space and the motion stick have
         // something to measure against, then all five sticks.
-        let gravity = self.motion.tick(self.accel, DT);
+        let gyro = glam::Vec3::new(self.gyro.roll, self.gyro.pitch, self.gyro.yaw);
+        let gravity = self.motion.tick(self.accel, gyro, DT);
         self.gravity = gravity;
         self.pad.sticks[super::analog::MOTION] =
             super::motion::motion_stick(gravity, self.cfg.settings.motion);
@@ -3394,7 +3395,7 @@ fn gravity_for(pose: &str) -> super::motion::Gravity {
     // The filter starts on its first reading, so one tick settles it; a few more
     // make sure nothing drifts.
     for _ in 0..40 {
-        g = m.tick(Some(a), DT);
+        g = m.tick(Some(a), glam::Vec3::ZERO, DT);
     }
     g
 }
@@ -3421,7 +3422,7 @@ fn gravity_lands_in_jsms_frame() {
     // And a pad with no accelerometer says so, rather than claiming to be flat —
     // the difference between a motion stick that rests and one that runs away.
     let mut m = super::motion::Motion::default();
-    let g = m.tick(None, DT);
+    let g = m.tick(None, glam::Vec3::ZERO, DT);
     assert!(!g.known, "no accelerometer means no idea which way is down");
 }
 
@@ -3462,14 +3463,14 @@ fn the_motion_stick_can_be_recentred() {
     let a = accel_for("nose up");
     let mut g = super::motion::Gravity::default();
     for _ in 0..40 {
-        g = m.tick(Some(a), DT);
+        g = m.tick(Some(a), glam::Vec3::ZERO, DT);
     }
     let cfg = super::analog::StickCfg::default();
     let (_, before) = super::motion::motion_stick(g, cfg);
     assert!(before.abs() > 0.4, "nose up is a long way off centre: {before}");
 
     m.set_neutral(g);
-    let g = m.tick(Some(a), DT);
+    let g = m.tick(Some(a), glam::Vec3::ZERO, DT);
     let (x, y) = super::motion::motion_stick(g, cfg);
     assert!(
         x.abs() < 0.02 && y.abs() < 0.02,
@@ -3499,7 +3500,7 @@ fn leaning_the_pad_presses_the_lean_buttons() {
         let a = glam::Vec3::new(0.0, rad.sin(), rad.cos());
         let mut g = super::motion::Gravity::default();
         for _ in 0..40 {
-            g = m.tick(Some(a), DT);
+            g = m.tick(Some(a), glam::Vec3::ZERO, DT);
         }
         super::motion::lean(g, &s, o)
     };
@@ -3895,7 +3896,7 @@ fn gravity_from(up: glam::Vec3) -> super::motion::Gravity {
     let a = up.normalize();
     let mut g = super::motion::Gravity::default();
     for _ in 0..40 {
-        g = m.tick(Some(a), DT);
+        g = m.tick(Some(a), glam::Vec3::ZERO, DT);
     }
     g
 }

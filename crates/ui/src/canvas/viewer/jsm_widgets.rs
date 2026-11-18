@@ -280,7 +280,7 @@ pub(crate) fn pinned_fader(
     text.set_clip_rect(rect.expand2(egui::vec2(rect.width(), rect.height() * 0.6 + 14.0)));
     let vis = ui.visuals();
     if label_h > 0.0 {
-        let font = egui::FontId::proportional((label_h * 0.62).clamp(8.0, 20.0));
+        let font = crate::settings::ui_font((label_h * 0.62).clamp(8.0, 20.0));
         text.text(
             egui::pos2(rect.left() + 2.0, rect.top() + label_h * 0.5),
             egui::Align2::LEFT_CENTER,
@@ -296,7 +296,7 @@ pub(crate) fn pinned_fader(
             vis.strong_text_color(),
         );
     } else if !wide {
-        let font = egui::FontId::proportional((avail.y * 0.13).clamp(8.0, 18.0));
+        let font = crate::settings::ui_font((avail.y * 0.13).clamp(8.0, 18.0));
         text.text(
             egui::pos2(rect.center().x, rect.top() - 1.0),
             egui::Align2::CENTER_BOTTOM,
@@ -353,7 +353,7 @@ pub(crate) fn warp_slider(
 ) -> Option<f32> {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(width, WARP_H), egui::Sense::click_and_drag());
-    let small = egui::FontId::proportional(9.0);
+    let small = crate::settings::ui_font(9.0);
     let vis = ui.visuals();
     let painter = ui.painter_at(rect);
     // End labels, with the track between them — one row, because this is a view
@@ -520,7 +520,7 @@ pub(crate) fn curve_graph(
     let output_color = channel(paint, 1).unwrap_or(OUTPUT_COLOR);
     backdrop(&painter, rect, paint, vis.extreme_bg_color);
 
-    let small = egui::FontId::proportional(9.0);
+    let small = crate::settings::ui_font(9.0);
     if points.len() < 2 {
         painter.text(
             rect.center(),

@@ -18,7 +18,6 @@ const SAVE: &str = include_str!("../../../../../app/assets/save.svg");
 const LOAD: &str = include_str!("../../../../../app/assets/load.svg");
 const RESET: &str = include_str!("../../../../../app/assets/reset.svg");
 const ABS: &str = include_str!("../../../../../app/assets/modules/ABS.svg");
-const GAMEPAD: &str = include_str!("../../../../../app/assets/gamepad_flat_front.svg");
 
 /// A switch mark. Named for what the shape stands for, not for what it looks like.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -161,11 +160,6 @@ pub(crate) fn svg_icon(ctx: &egui::Context, svg: &'static [u8], outline: bool) -
     let aspect = w / h.max(1e-3);
     ctx.data_mut(|d| d.insert_temp(aspect_key, aspect));
     Some((id, aspect))
-}
-
-/// The generic gamepad, for a pad whose own icon isn't known.
-pub(crate) fn gamepad_svg() -> &'static [u8] {
-    GAMEPAD.as_bytes()
 }
 
 /// What is drawn on the sheet, strokes included, as (centre x, centre y, width, height).

@@ -6,7 +6,7 @@ use super::*;
 /// How tall the action row's buttons are: a size a finger or a pad's highlight can find
 /// on an overlay, where these are the buttons a mapping is made with. They were the height
 /// of their text.
-const ACTION_H: f32 = 26.0;
+pub(crate) const ACTION_H: f32 = 26.0;
 
 /// The width of each of `n` buttons sharing a row `row_w` wide.
 pub(crate) fn action_width(ui: &egui::Ui, row_w: f32, n: usize) -> f32 {
@@ -16,7 +16,9 @@ pub(crate) fn action_width(ui: &egui::Ui, row_w: f32, n: usize) -> f32 {
 
 /// One of the action row's buttons (Learn, MIDI…, Choose…, Clear, Add).
 pub(crate) fn action_button(label: &str, w: f32) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(label.to_owned()).size(13.0)).min_size(egui::vec2(w, ACTION_H))
+    // In the control font (Settings → Display), a point larger than the pills beside it.
+    let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
+    egui::Button::new(egui::RichText::new(label.to_owned()).font(font)).min_size(egui::vec2(w, ACTION_H))
 }
 
 pub(crate) fn show_remapper_body(
@@ -428,7 +430,7 @@ pub(crate) fn show_remapper_body(
                 |ui| {
                     ui.set_max_width(cards_right - PRESET_ICONS_W);
                     if !status_txt.is_empty() {
-                        ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col));
+                        ui.label(egui::RichText::new(status_txt).size(crate::settings::ui_size(13.0)).color(status_col));
                     }
                 },
             );
@@ -466,7 +468,7 @@ pub(crate) fn show_remapper_body(
             ui.horizontal_wrapped(|ui| {
                 remapper_render_arrow(ui);
                 if new_draft_output.is_empty() && !chord.is_timed() {
-                    ui.label(egui::RichText::new("…").size(13.0).weak().italics());
+                    ui.label(egui::RichText::new("…").size(crate::settings::ui_size(13.0)).weak().italics());
                 } else {
                     remapper_render_timed_chord(ui, &chord, out_skin);
                 }
@@ -573,7 +575,7 @@ pub(crate) fn show_remapper_body(
                         .unwrap_or("All MIDI");
                     let mut chosen: Option<String> = None;
                     egui::ComboBox::from_id_salt((node_id, "midi_learn_ref"))
-                        .selected_text(egui::RichText::new(label).size(12.0))
+                        .selected_text(egui::RichText::new(label).size(crate::settings::ui_size(12.0)))
                         .width(120.0)
                         .show_ui(ui, |ui| {
                             if ui.selectable_label(picked.is_empty(), "All MIDI").clicked() {
@@ -1164,7 +1166,7 @@ pub(crate) fn show_map_action_body(
                 _ => (String::new(), Color32::TRANSPARENT),
             }
         };
-        if !status_txt.is_empty() { ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col)); }
+        if !status_txt.is_empty() { ui.label(egui::RichText::new(status_txt).size(crate::settings::ui_size(13.0)).color(status_col)); }
         let _ = upstream_dev_id;
         let _ = &pressed_now;
 
@@ -1254,7 +1256,7 @@ pub(crate) fn show_map_action_body(
             // user knows to press their chord now.
             if nav_capture_armed && new_draft_input.is_empty() {
                 ui.label(egui::RichText::new("Capturing… press your input")
-                    .size(12.0).color(Color32::from_rgb(106, 167, 255)));
+                    .size(crate::settings::ui_size(12.0)).color(Color32::from_rgb(106, 167, 255)));
             }
         });
         // Map Action action order: Learn, Choose, Clear, Add.

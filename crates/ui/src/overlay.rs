@@ -112,14 +112,15 @@ pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// OS cursor position in the overlay's logical points. The overlay covers the
-/// primary monitor anchored at screen origin, so physical screen pixels divided
-/// by the overlay's scale give overlay-local points directly. Read from the OS
-/// (not egui) because a click-through window receives no pointer events — this
-/// is what lets edit mode decide, each frame, whether the cursor sits over an
-/// interactive region (toolbar / pinned item) and flip passthrough accordingly.
+/// OS cursor position in an overlay's logical points: the desktop's pixels, less
+/// where the overlay sits on the desktop, over its scale. (It took the overlay to
+/// sit at the desktop's corner, so on any other monitor every hit-test - an edit
+/// mode's handles and toolbar - landed on the primary's.) Read from the OS (not
+/// egui) because a click-through window receives no pointer events — this is what
+/// lets edit mode decide, each frame, whether the cursor sits over an interactive
+/// region (toolbar / pinned item) and flip passthrough accordingly.
 #[cfg(windows)]
-pub(crate) fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
+pub(crate) fn os_cursor_in_points(vctx: &egui::Context) -> Option<egui::Pos2> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let mut p = POINT { x: 0, y: 0 };
@@ -127,12 +128,13 @@ pub(crate) fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
     if unsafe { GetCursorPos(&mut p) } == 0 {
         return None;
     }
-    let ppp = pixels_per_point.max(0.1);
-    Some(egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp))
+    let ppp = vctx.pixels_per_point().max(0.1);
+    let origin = vctx.input(|i| i.viewport().inner_rect).map_or(egui::Pos2::ZERO, |r| r.min);
+    Some(egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp) - origin.to_vec2())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub(crate) fn os_cursor_in_points(_pixels_per_point: f32) -> Option<egui::Pos2> {
+pub(crate) fn os_cursor_in_points(_vctx: &egui::Context) -> Option<egui::Pos2> {
     None
 }
 
@@ -145,7 +147,7 @@ pub(crate) fn overlay_cursor(vctx: &egui::Context) -> Option<egui::Pos2> {
     #[cfg(target_os = "linux")]
     return vctx.input(|i| i.pointer.hover_pos());
     #[cfg(not(target_os = "linux"))]
-    os_cursor_in_points(vctx.pixels_per_point())
+    os_cursor_in_points(vctx)
 }
 
 /// Where an overlay takes the pointer on Linux, in its points: everywhere for
@@ -194,7 +196,7 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
 
     let resp = ui.add_sized(
         btn_size,
-        egui::Button::selectable(on, egui::RichText::new("▣").size(14.0)),
+        egui::Button::selectable(on, egui::RichText::new("▣").size(crate::settings::ui_size(14.0))),
     );
     let hover = if on {
         "Overlay: ON — click to hide.\nA transparent, click-through layer over the whole screen.\nWorks over borderless/windowed games (not exclusive fullscreen)."
@@ -209,7 +211,7 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
         let editing = overlay_edit(ui.ctx());
         let resp = ui.add_sized(
             btn_size,
-            egui::Button::selectable(editing, egui::RichText::new("✏").size(13.0)),
+            egui::Button::selectable(editing, egui::RichText::new("✏").size(crate::settings::ui_size(13.0))),
         );
         if resp
             .on_hover_text("Edit the overlay: move/resize pinned elements, add decorations.\nEsc or Done exits back to click-through.")
@@ -225,7 +227,7 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
         if eframe::egui_wgpu::winit::TRANSPARENCY_UNSUPPORTED
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            ui.label(egui::RichText::new("⚠").size(14.0).color(egui::Color32::from_rgb(240, 180, 60)))
+            ui.label(egui::RichText::new("⚠").size(crate::settings::ui_size(14.0)).color(egui::Color32::from_rgb(240, 180, 60)))
                 .on_hover_text(
                     "The active GPU backend doesn't support transparent windows,\n\
                      so the overlay renders as an opaque sheet instead of floating\n\
@@ -243,13 +245,9 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         return;
     }
 
-    // Cover the monitor the main window is on. egui only exposes the monitor
-    // SIZE (points), not its desktop origin, so the overlay is anchored at
-    // (0,0) — the primary monitor. A monitor picker comes later.
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|s| s.x > 1.0 && s.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    // Cover the monitor picked in the header (`crate::monitors`), the primary
+    // until one is; the viewport puts itself exactly there once open.
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
 
     let edit = overlay_edit(ctx);
     // Live repaint cadence — the user's `overlay_fps` setting, NOT the low
@@ -323,7 +321,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
 
     let mut exit_edit = false;
@@ -332,15 +330,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // Self-correct geometry from INSIDE the viewport: the builder size was
         // computed from the parent's monitor before the child window existed
         // (wrong DPI/monitor possible). The child's own input has the truth.
-        let (inner, child_monitor) = vctx.input(|i| {
-            (i.viewport().inner_rect, i.viewport().monitor_size)
-        });
-        if let (Some(inner), Some(want)) = (inner, child_monitor) {
-            if (inner.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
 
         // Mouse passthrough follows the mode; only send the command when the
         // desired state changes (each send is a SetWindowLong round-trip).
@@ -382,7 +372,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 || vctx.is_using_pointer()
         };
         #[cfg(not(target_os = "linux"))]
-        let interactive = edit && !pick && (whole() || match os_cursor_in_points(vctx.pixels_per_point()) {
+        let interactive = edit && !pick && (whole() || match os_cursor_in_points(vctx) {
             // Can't read the cursor → stay interactive (old whole-window
             // behavior); never worse than before.
             None => true,
@@ -439,7 +429,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "Overlay is empty — right-click for decorations,\nor use “Add element” to pin module UI here.",
-                            egui::FontId::proportional(15.0),
+                            crate::settings::ui_font(15.0),
                             egui::Color32::from_rgba_unmultiplied(220, 235, 255, 220),
                         );
                     }
@@ -494,7 +484,7 @@ pub(crate) fn paint_pick_frame(ui: &mut egui::Ui, rect: egui::Rect) {
 
     // Hint chip.
     let hint = "PIN MODE — click an amber-highlighted element in FlexInput to pin it here (Esc cancels)";
-    let font = egui::FontId::proportional(14.0);
+    let font = crate::settings::ui_font(14.0);
     let galley = p.layout_no_wrap(hint.to_string(), font, egui::Color32::from_rgb(255, 225, 170));
     let pad = egui::vec2(14.0, 8.0);
     let chip = egui::Rect::from_center_size(

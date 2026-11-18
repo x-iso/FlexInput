@@ -114,6 +114,18 @@ pub fn current_sample_rate() -> u32 {
 /// each iteration as a rolling EMA. Used as a fallback/global indicator.
 static LIVE_IO_RATE: AtomicU32 = AtomicU32::new(0);
 
+/// Bumped by [`reset_gyro_modules`]; the engine thread resets every 3DOF module
+/// when it sees a new value.
+static GYRO_RESET_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// Reset every 3DOF to 2D module in the running graph - its Orientation output,
+/// Steering's wheel, the aim - as its Reset input would, at the engine's next
+/// wakeup. Panic mode calls it as it is engaged and as it is released, so what
+/// drifted or wound up while it was on starts over from neutral.
+pub fn reset_gyro_modules() {
+    GYRO_RESET_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Read the currently-measured device I/O polling rate (Hz).
 pub fn current_io_rate() -> u32 {
     LIVE_IO_RATE.load(Ordering::Relaxed)
@@ -693,6 +705,7 @@ pub fn spawn_processing_thread(
         // timed wait would round up to ~15.6 ms when the kicks stop.
         let waiter = crate::hr_timer::HrWaiter::new();
         let mut timings = EngineTimingAcc::default();
+        let mut gyro_reset_seen = GYRO_RESET_EPOCH.load(Ordering::Relaxed);
 
         loop {
             puffin::GlobalProfiler::lock().new_frame();
@@ -730,6 +743,12 @@ pub fn spawn_processing_thread(
                     puffin::profile_scope!("graph_load");
                     graph.load_full()
                 };
+                // Panic mode, engaged or released: every 3DOF module resets.
+                let epoch = GYRO_RESET_EPOCH.load(Ordering::Relaxed);
+                if epoch != gyro_reset_seen {
+                    gyro_reset_seen = epoch;
+                    crate::eval::request_gyro_reset(&graph_snap, &mut state);
+                }
                 let dev_sigs = {
                     puffin::profile_scope!("dev_sigs_load");
                     device_signals.load_full()

@@ -500,7 +500,7 @@ pub(crate) const VALUE_WORDS: &[&str] = &[
     "NO_FULL", "NO_SKIP", "NO_SKIP_EXCLUSIVE", "MUST_SKIP", "MAY_SKIP", "MUST_SKIP_R",
     "MAY_SKIP_R", "X_LT", "X_RT", "PS_L2", "PS_R2",
     // Gyro spaces and axes.
-    "LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL",
+    "LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL", "ORIENT",
     "X", "Y", "Z",
     // Flick snapping.
     "FOUR", "EIGHT",
@@ -880,14 +880,14 @@ mod catalogue_tests {
         let cur = cursor_on_value(text);
         assert_eq!(
             value_options(text, cur),
-            ["LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL"]
+            ["LOCAL", "PLAYER_TURN", "PLAYER_LEAN", "WORLD_TURN", "WORLD_LEAN", "YAW_PLUS_ROLL", "ORIENT"]
         );
         let one = cycle_value(text, cur, 1).unwrap();
         assert_eq!(one, "GYRO_SPACE = LOCAL");
         assert_eq!(cycle_value(&one, cur, 1).unwrap(), "GYRO_SPACE = PLAYER_TURN");
         // Back from the first wraps to the last; from a slot, back starts there.
-        assert_eq!(cycle_value(&one, cur, -1).unwrap(), "GYRO_SPACE = YAW_PLUS_ROLL");
-        assert_eq!(cycle_value(text, cur, -1).unwrap(), "GYRO_SPACE = YAW_PLUS_ROLL");
+        assert_eq!(cycle_value(&one, cur, -1).unwrap(), "GYRO_SPACE = ORIENT");
+        assert_eq!(cycle_value(text, cur, -1).unwrap(), "GYRO_SPACE = ORIENT");
     }
 
     #[test]

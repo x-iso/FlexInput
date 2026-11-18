@@ -491,40 +491,40 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
                     crate::macro_icons::paint_menu_target_badge(ui.painter(), rect, pin_id, Color32::WHITE);
                     return rect;
                 } else {
-                    return ui.label(egui::RichText::new(&entry.name).size(13.0).strong())
+                    return ui.label(egui::RichText::new(&entry.name).size(crate::settings::ui_size(13.0)).strong())
                         .on_hover_text(hover).rect;
                 }
             }
             None => {
-                return ui.label(egui::RichText::new("target?").size(13.0).weak().strikethrough())
+                return ui.label(egui::RichText::new("target?").size(crate::settings::ui_size(13.0)).weak().strikethrough())
                     .on_hover_text("This macro port / menu no longer exists").rect;
             }
         }
     }
     if let Some(p) = flexinput_core::midi::parse_pin(pin_id) {
-        return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
+        return ui.label(egui::RichText::new(p.short_label()).size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(p.display_name()).rect;
     }
     if let Some(p) = flexinput_core::flick::FlickPin::parse(pin_id) {
-        return ui.label(egui::RichText::new(p.short_label()).size(13.0).strong())
+        return ui.label(egui::RichText::new(p.short_label()).size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(p.display_name()).rect;
     }
     if flexinput_core::raw_pad::is_extra_pin(pin_id) {
         let name = crate::raw_learn::extra_label(pin_id);
-        return ui.label(egui::RichText::new(&name).size(13.0).strong())
+        return ui.label(egui::RichText::new(&name).size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(format!("{name} — this controller's own port")).rect;
     }
     if let Some(k) = flexinput_core::media::media_key(pin_id) {
-        return ui.label(egui::RichText::new(media_chip_label(k)).size(13.0).strong())
+        return ui.label(egui::RichText::new(media_chip_label(k)).size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(k.name).rect;
     }
     if pin_id == crate::kbm_picker::OPTICAL_CONTACT {
-        return ui.label(egui::RichText::new("Sensor").size(13.0).strong())
+        return ui.label(egui::RichText::new("Sensor").size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(remapper_pin_display(pin_id)).rect;
     }
     let imu = flexinput_core::imu::imu_pin(pin_id);
     if let (Some(p), None) = (imu, remapper_icons::pin_svg(skin, pin_id)) {
-        return ui.label(egui::RichText::new(imu_chip_label(p)).size(13.0).strong())
+        return ui.label(egui::RichText::new(imu_chip_label(p)).size(crate::settings::ui_size(13.0)).strong())
             .on_hover_text(p.name).rect;
     }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
@@ -550,7 +550,7 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
             return resp.rect;
         }
     }
-    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong()).rect
+    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(crate::settings::ui_size(13.0)).strong()).rect
 }
 
 /// The height of a chip in a body's chord row.
@@ -567,7 +567,7 @@ fn gap_text(ms: f32) -> String {
 /// How wide a gap marker for `ms` is in a `chip_h` row.
 pub(crate) fn gap_marker_width(ctx: &egui::Context, chip_h: f32, ms: f32) -> f32 {
     let text_w = ctx.fonts_mut(|f| f.layout_no_wrap(
-        gap_text(ms), egui::FontId::proportional(chip_h * 0.32), GAP_TINT).size().x);
+        gap_text(ms), crate::settings::ui_font(chip_h * 0.32), GAP_TINT).size().x);
     text_w.max(chip_h * 0.66)
 }
 
@@ -591,7 +591,7 @@ pub(crate) fn paint_gap_marker(
         top_left + egui::vec2(w * 0.5, chip_h),
         egui::Align2::CENTER_BOTTOM,
         gap_text(ms),
-        egui::FontId::proportional(chip_h * 0.32),
+        crate::settings::ui_font(chip_h * 0.32),
         GAP_TINT,
     );
     w
@@ -600,7 +600,7 @@ pub(crate) fn paint_gap_marker(
 /// Paint a pick's own duration as a badge in its chip's bottom-right corner.
 pub(crate) fn paint_dur_badge(painter: &egui::Painter, chip: egui::Rect, ms: f32) {
     let galley = painter.layout_no_wrap(
-        format!("{ms:.0}"), egui::FontId::proportional(chip.height() * 0.3), Color32::WHITE);
+        format!("{ms:.0}"), crate::settings::ui_font(chip.height() * 0.3), Color32::WHITE);
     let at = chip.max - galley.size();
     painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand(1.0), 2.0,
         Color32::from_black_alpha(200));
@@ -635,7 +635,7 @@ pub(crate) fn remapper_render_timed_chord(
             }
             ChordElem::Item(i) => {
                 if k > 0 && matches!(elems[k - 1], ChordElem::Item(_)) {
-                    ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
+                    ui.label(egui::RichText::new("+").size(crate::settings::ui_size(14.0)).strong().color(Color32::WHITE));
                 }
                 let rect = remapper_render_chip(ui, &chord.pins[i], skin);
                 if let Some(ms) = chord.durs.get(i).copied().flatten() {
@@ -787,7 +787,7 @@ pub(crate) fn paint_text_pill(
     label: String,
     dim: bool,
 ) -> f32 {
-    let font = egui::FontId::proportional(chip_h * 0.48);
+    let font = crate::settings::ui_font(chip_h * 0.48);
     let text_col = if dim {
         Color32::from_rgba_unmultiplied(255, 255, 255, 160)
     } else {
@@ -832,7 +832,7 @@ pub(crate) fn remapper_render_arrow(ui: &mut egui::Ui) {
             .fit_to_exact_size(egui::vec2(H, H))
             .tint(Color32::WHITE));
     } else {
-        ui.label(egui::RichText::new("→").size(14.0).weak());
+        ui.label(egui::RichText::new("→").size(crate::settings::ui_size(14.0)).weak());
     }
 }
 

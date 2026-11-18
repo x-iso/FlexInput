@@ -92,8 +92,10 @@ pub(crate) fn surface_spec(module_id: &str) -> Option<SurfaceSpec> {
         "module.touch_zones" => spec((200.0, 120.0), (17.0, 12.0)),
         // The calibration view: a ruler, a room, or both.
         "processing.rws" => spec((236.0, 80.0), (14.0, 4.0)),
-        "module.menu" => spec((160.0, 100.0), (14.0, 11.0)),
-        "module.area_mapper" => spec((140.0, 140.0), (18.0, 20.0)),
+        "module.menu" => spec((160.0, 100.0), (17.0, 11.0)),
+        // A picture: as big as the grip makes it, kept to its own shape inside.
+        "module.svg" => spec((32.0, 32.0), (6.0, 7.0)),
+        "module.area_mapper" => spec((140.0, 140.0), (18.0, 27.0)),
         // Gyro to Stick Rotation's live circle.
         "module.stick_rotation" => spec((208.0, 96.0), (9.0, 14.0)),
         // The card lists: the width is the scale of the cards (380 points of body at 1:1),
@@ -114,7 +116,7 @@ pub(crate) fn keeps_aspect(module_id: &str) -> bool {
 /// they are laid out: it is measured each frame and used the next, and since no row's size
 /// depends on the surface's it settles in one.
 ///
-/// [`Surface::begin`] before anything is laid out, [`Surface::row`] with each row's rect,
+/// [`Surface::begin`] before anything is laid out, [`Surface::need`] with the rows' width,
 /// [`Surface::end`] after the last row, with the same `ui`.
 pub(crate) struct Surface {
     key: egui::Id,
@@ -136,15 +138,8 @@ impl Surface {
         }
     }
 
-    /// A row of settings laid out beside the surface: its width is the narrowest the
-    /// surface is drawn, so the two always end at the same edge.
-    pub(crate) fn row(&mut self, rect: egui::Rect) {
-        if rect.is_positive() {
-            self.rows_w = self.rows_w.max(rect.width());
-        }
-    }
-
-    /// The same, for rows that fill whatever width they are given: what they need, since
+    /// Rows of settings laid out beside the surface, which fill whatever width they are
+    /// given: the width they need is the narrowest the surface is drawn, since
     /// what they drew is the surface's own width and would hold it there.
     pub(crate) fn need(&mut self, width: f32) {
         self.rows_w = self.rows_w.max(width);
@@ -478,7 +473,7 @@ pub(crate) fn header_toggle_pair(
         (egui::Rect::from_min_max(rect.min, egui::pos2(split, rect.bottom())), a, true),
         (egui::Rect::from_min_max(egui::pos2(split, rect.top()), rect.max), b, false),
     ];
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    let font = super::simple_bodies::control_font();
     let mut clicked = [false, false];
     for (i, (half, (label, on, hover), left)) in halves.into_iter().enumerate() {
         let resp = ui
@@ -499,7 +494,8 @@ pub(crate) fn header_toggle_pair(
             egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }
         };
         ui.painter().rect_filled(half, corners, fill);
-        ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, label, font.clone(), text);
+        let fitted = super::simple_bodies::fit_font(ui, label, font.clone(), half.width() - 4.0);
+        ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, label, fitted, text);
         clicked[i] = resp.clicked();
     }
     ui.painter().line_segment(
@@ -720,14 +716,28 @@ pub(crate) fn header_stepper(
 /// that names it. Their numbered pins drop the label beside the socket: the strip says the
 /// same word, and a word twice over is what made these modules wide for nothing.
 /// The smallest pitch a strip - and the pin row beside it - is drawn at.
+/// The name the port-strip rules know a node by: its module, or - for a MIDI port's device
+/// node, a `device.source` / `device.sink` like any pad's, told apart by its device -
+/// `device.midi_in` / `device.midi_out`, whose messages are strips.
+pub(crate) fn strip_key(node: &crate::canvas::node::NodeData) -> &str {
+    let dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+    match node.module_id.as_str() {
+        "device.source" if dev.starts_with("midi_in:") => "device.midi_in",
+        "device.sink" if dev.starts_with("midi_out:") => "device.midi_out",
+        m => m,
+    }
+}
+
 pub(crate) fn strip_min_pitch(module_id: &str, _ui: &egui::Ui) -> Option<f32> {
     match module_id {
-        "module.selector"
+        "device.midi_in" | "device.midi_out" | "module.selector"
         | "module.split"
         | "module.macro"
         | "module.automap_combiner"
         | "module.automap_fork"
-        | "module.automap_selector" => Some(super::simple_bodies::STRIP_H),
+        | "module.automap_selector"
+        | "module.automap_split"
+        | "module.automap_collect" => Some(super::simple_bodies::STRIP_H),
         _ => None,
     }
 }
@@ -739,6 +749,12 @@ pub(crate) fn strip_bands(module_id: &str, inputs: usize, outputs: usize) -> usi
     match module_id {
         "module.selector" | "module.automap_combiner" | "module.automap_selector" => inputs,
         "module.split" | "module.automap_fork" => outputs.max(inputs),
+        // The bus pin's row (`add pin`) and one strip per port it took off the bus.
+        "module.automap_split" => outputs,
+        "module.automap_collect" => inputs,
+        // A MIDI port's messages, its Auto-Map port on the header.
+        "device.midi_in" => outputs,
+        "device.midi_out" => inputs,
         // A Macro's ports are its outputs, one strip each; the body adds no band of its own,
         // the `+` being in the header.
         "module.macro" => outputs,
@@ -769,6 +785,13 @@ pub(crate) fn strip_pitch(module_id: &str, _bands: usize, ui: &egui::Ui) -> Opti
     strip_min_pitch(module_id, ui)
 }
 
+/// Whether a module's bus pin, drawn on its header, gives up its row in the pin column: the
+/// AutoMap Splitter and Collector list the ports they take off the bus from the top of the
+/// body, with `add pin` after them, so the bus has no row of its own to hold.
+pub(crate) fn bus_row_collapsed(module_id: &str) -> bool {
+    matches!(module_id, "module.automap_split" | "module.automap_collect")
+}
+
 /// Where a port list's rows are, for the body that draws them: the one place that knows how
 /// the pin column lays its sockets out, so a list can't drift off the sockets it names.
 ///
@@ -795,6 +818,13 @@ impl StripRows {
             advance: row_h + ui.style().spacing.item_spacing.y,
             row_h,
         }
+    }
+
+    /// The rows after a pin whose row was collapsed to nothing ([`bus_row_collapsed`]): the
+    /// column still puts its spacing after it.
+    pub(crate) fn past_empty_row(mut self) -> Self {
+        self.top += self.advance - self.row_h;
+        self
     }
 
     /// The height `rows` of them reserve in the body.
@@ -828,6 +858,12 @@ pub(crate) fn strip_pin(module_id: &str, input: bool, index: usize) -> bool {
         ("module.automap_combiner", true) => true,
         // The row already carries the port's name in a field that renames it.
         ("module.macro", false) => true,
+        // The bus pin first, then the ports taken off it, each named on its strip.
+        ("module.automap_split", false) | ("module.automap_collect", true) => index >= 1,
+        // Every message of a MIDI port: its Auto-Map port is on the header, wherever it is
+        // in the list (first on a node made since, last on one migrated), and the caller
+        // leaves it out.
+        ("device.midi_in", false) | ("device.midi_out", true) => true,
         _ => false,
     }
 }
@@ -860,7 +896,9 @@ pub(crate) fn header_toggle(ui: &mut egui::Ui, label: &str, on: bool, rect: egui
             .id_salt(("header_toggle", id_salt))
             .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight))
     );
-    let btn = egui::Button::selectable(on, egui::RichText::new(label).small())
+    // In the control font, drawn smaller if a large one doesn't fit the switch.
+    let font = super::simple_bodies::fit_font(ui, label, super::simple_bodies::control_font(), rect.width() - 8.0);
+    let btn = egui::Button::selectable(on, egui::RichText::new(label).font(font))
         .min_size(egui::vec2(rect.width(), rect.height()));
     child.put(rect, btn).clicked()
 }
@@ -900,8 +938,32 @@ pub(crate) fn header_icon_button(
 pub(crate) const CURVE_TOGGLE_W: [f32; 3] = [34.0, 42.0, 44.0];
 pub(crate) const CURVE_HEADER_GAP: f32 = 3.0;
 
+/// The SVG module's tint swatch: the header buttons' height, a little wider.
+pub(crate) fn svg_swatch_w(ui: &egui::Ui) -> f32 {
+    (stepper_h(ui) * 1.4).round()
+}
+
+/// The SVG module's header controls, right to left: the tint swatch, Load, Clear - the
+/// room comes off the name, which is painted in what is left (cut with dots), never laid
+/// out beside them, so the module can be as narrow as its controls.
+pub(crate) fn svg_header_w(ui: &egui::Ui) -> f32 {
+    svg_swatch_w(ui) + 2.0 * stepper_h(ui) + 3.0 * CURVE_HEADER_GAP + 4.0
+}
+
 pub(crate) fn curve_header_w(ui: &egui::Ui) -> f32 {
     CURVE_TOGGLE_W.iter().sum::<f32>() + 3.0 * stepper_h(ui) + 5.0 * CURVE_HEADER_GAP + 4.0
+}
+
+/// A button in a module's body, in the house look: an action row's button
+/// (`remapper_bodies::action_button` - the controls' font a point up, as tall as a
+/// Remapper's Learn), as wide as its word. `selected` fills it, for one that stays on (a
+/// Learn listening). egui's own small button was a thin strip in the small font, grey on
+/// grey, beside pills and strips a size up.
+pub(crate) fn body_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
+    let text_w = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER).size().x;
+    let w = (text_w + 2.0 * ui.spacing().button_padding.x + 12.0).max(44.0);
+    ui.add(super::remapper_bodies::action_button(label, w).selected(selected))
 }
 
 pub(crate) fn header_plus_button(ui: &mut egui::Ui, hover: &str, row: egui::Rect, right: f32) -> bool {

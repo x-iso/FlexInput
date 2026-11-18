@@ -865,7 +865,7 @@ fn jsm_rows(
             let pad = cell.spacing().button_padding.x;
             let shown = if knobs_on { side.label() } else { "Hide" };
             egui::ComboBox::from_id_salt(("jsm_knob_side", node_id.0))
-                .selected_text(egui::RichText::new(shown).small())
+                .selected_text(super::simple_bodies::combo_text(ui, shown, SIDE_W - 2.0 * pad))
                 .width(SIDE_W - 2.0 * pad)
                 .height(240.0)
                 .show_ui(&mut cell, |ui| {
@@ -1968,7 +1968,7 @@ mod tests {
         assert_eq!(out.chars().skip(s).take(e - s).collect::<String>(), "PLAYER_TURN");
         // Shift+Tab goes back, wrapping.
         let (back, _, _) = super::tab_cycle(text, 15, -1).unwrap();
-        assert!(back.starts_with("GYRO_SPACE = YAW_PLUS_ROLL\n"), "{back}");
+        assert!(back.starts_with("GYRO_SPACE = ORIENT\n"), "{back}");
         // A trigger effect's numbers are filled in to suit the new mode.
         let at = text.find("RESISTANCE").unwrap() + 2;
         let (out, s, e) = super::tab_cycle(text, at, 1).unwrap();

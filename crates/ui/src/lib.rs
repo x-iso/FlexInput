@@ -19,6 +19,7 @@ mod macro_icons;
 mod main_pin;
 mod module_ui_info;
 mod menu_overlay;
+mod monitors;
 mod config_overlay;
 mod overlay;
 mod phase_overlay;

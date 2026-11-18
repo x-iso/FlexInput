@@ -9,6 +9,7 @@ use super::*;
 
 mod area_mapper;
 mod automap_curve;
+mod gravity;
 mod gyro3dof;
 mod jsm;
 mod lean;
@@ -24,7 +25,10 @@ mod touch_zones;
 // The param names and helpers are read by the UI too.
 pub use area_mapper::*;
 pub(crate) use automap_curve::*;
+// JSM's own gravity estimate, for everything that measures against gravity.
+pub(crate) use gravity::{GravityFusion, OrientCamera, GRAVITY_FUSION_LEN, ORIENT_CAMERA_LEN};
 pub(crate) use gyro3dof::*;
+pub use gyro3dof::{edge_turn_preview, GYRO_AIM_OUT, GYRO_VIEW_OUT};
 pub(crate) use jsm::*;
 // Read by the UI to compile the config text it is showing.
 pub use jsm::{jsm_at_names, jsm_at_name_spans, jsm_bindings, jsm_catalogue, jsm_compile, jsm_compile_full, jsm_fi_tag,

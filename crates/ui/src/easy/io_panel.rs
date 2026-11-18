@@ -285,7 +285,7 @@ fn show_input_section(
 ) {
     ui.add_space(PANEL_PADDING);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("Choose input device").size(15.0).strong());
+        ui.label(egui::RichText::new("Choose input device").size(crate::settings::ui_size(15.0)).strong());
     });
     ui.add_space(SECTION_GAP * 0.5);
 
@@ -485,12 +485,12 @@ fn input_card(
     let stroke_col = if is_active {
         ui.visuals().selection.stroke.color
     } else {
-        CARD_STROKE_INACTIVE
+        crate::settings::tinted(CARD_STROKE_INACTIVE)
     };
     let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
     ui.painter()
         .with_clip_rect(viewport_clip)
-        .rect(card_rect, CARD_ROUND, CARD_FILL_INACTIVE,
+        .rect(card_rect, CARD_ROUND, crate::settings::tinted(CARD_FILL_INACTIVE),
             egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     if is_active {
         let top_band = egui::Rect::from_min_size(
@@ -670,7 +670,7 @@ fn input_card(
     if device_id_is_xinput(&d.id) {
         bot_ui.add_space(3.0);
         bot_ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Player slot").size(11.0).weak());
+            ui.label(egui::RichText::new("Player slot").size(crate::settings::ui_size(11.0)).weak());
             ui.add_space(4.0);
             canvas_node_xinput_slots(ui, &d.id);
         });
@@ -798,9 +798,9 @@ fn midi_input_card(
     } else {
         (CARD_STROKE_INACTIVE, 1.0_f32)
     };
-    let fill = if is_active { active_accent_fill(ui) } else { CARD_FILL_INACTIVE };
+    let fill = if is_active { active_accent_fill(ui) } else { crate::settings::tinted(CARD_FILL_INACTIVE) };
     ui.painter().with_clip_rect(clip).rect(
-        card_rect, CARD_ROUND, CARD_FILL_INACTIVE,
+        card_rect, CARD_ROUND, crate::settings::tinted(CARD_FILL_INACTIVE),
         egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     ui.painter().with_clip_rect(visible).rect_filled(card_rect.shrink(1.0), CARD_ROUND, fill);
     let resp = ui.interact(card_rect, ui.id().with(("easy_midi_card", d.id.as_str())), egui::Sense::click());
@@ -822,7 +822,7 @@ fn midi_input_card(
         .max_rect(text_rect)
         .layout(egui::Layout::top_down(egui::Align::LEFT)));
     text_ui.set_clip_rect(visible);
-    text_ui.label(egui::RichText::new(&d.display_name).size(14.0).strong());
+    text_ui.label(egui::RichText::new(&d.display_name).size(crate::settings::ui_size(14.0)).strong());
     text_ui.label(egui::RichText::new(if is_active {
         "MIDI input — its notes and controls reach the preset"
     } else {
@@ -875,7 +875,7 @@ fn port_row(
     };
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Port").size(11.0).weak());
+        ui.label(egui::RichText::new("Port").size(crate::settings::ui_size(11.0)).weak());
         ui.add_enabled_ui(is_active && !ports.names.is_empty(), |ui| {
             egui::ComboBox::from_id_salt(("easy_input_port", device_id))
                 .selected_text(egui::RichText::new(current).small())
@@ -954,7 +954,7 @@ fn input_slider_rows(
             egui::pos2(label_rect.left(), label_rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(12.0),
+            crate::settings::ui_font(12.0),
             ui.visuals().text_color(),
         );
 
@@ -1051,7 +1051,7 @@ fn digital_trigger_toggle(
         } else {
             "Digital triggers \u{2192} analog"
         };
-        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(11.0));
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(crate::settings::ui_size(11.0)));
         if resp.changed() {
             params.insert("digital_triggers".into(), Value::Bool(checked));
         }
@@ -1076,7 +1076,7 @@ fn touch_misc_toggle(
     let mut checked = touch_misc_suppressed(params);
     ui.add_space(2.0);
     ui.add_enabled_ui(enabled, |ui| {
-        let resp = ui.checkbox(&mut checked, egui::RichText::new(CAPACITIVE_LABEL).size(11.0));
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(CAPACITIVE_LABEL).size(crate::settings::ui_size(11.0)));
         if resp.changed() {
             params.insert("suppress_touch_misc".into(), Value::Bool(checked));
         }
@@ -1310,7 +1310,7 @@ fn show_output_section(
     use crate::gamepad_nav::{LeftNavAction, LeftNavTarget};
     ui.add_space(8.0);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("Choose output devices").size(15.0).strong());
+        ui.label(egui::RichText::new("Choose output devices").size(crate::settings::ui_size(15.0)).strong());
     });
     ui.add_space(CARD_GAP);
 
@@ -1438,10 +1438,10 @@ fn xinput_slot_circles(
             (egui::Color32::from_rgb(80, 200, 130), egui::Color32::from_rgb(170, 255, 200), egui::Color32::WHITE)
         } else if occupied {
             // Occupied by some OTHER XInput device — dark green.
-            (egui::Color32::from_rgb(34, 74, 50), egui::Color32::from_rgb(70, 130, 95), egui::Color32::from_gray(210))
+            (egui::Color32::from_rgb(34, 74, 50), egui::Color32::from_rgb(70, 130, 95), crate::settings::tinted_gray(210))
         } else {
             // Free slot — hollow.
-            (egui::Color32::from_gray(38), egui::Color32::from_gray(85), egui::Color32::from_gray(135))
+            (crate::settings::tinted_gray(38), crate::settings::tinted_gray(85), crate::settings::tinted_gray(135))
         };
         let (stroke_w, stroke_c) = if resp.hovered() {
             (2.0, egui::Color32::from_white_alpha(220))
@@ -1452,7 +1452,7 @@ fn xinput_slot_circles(
         };
         painter.circle(center, dot_d / 2.0, fill, egui::Stroke::new(stroke_w, stroke_c));
         painter.text(center, egui::Align2::CENTER_CENTER, format!("{}", i + 1),
-            egui::FontId::proportional(9.0), text_c);
+            crate::settings::ui_font(9.0), text_c);
 
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1637,7 +1637,7 @@ fn paint_card_name(ui: &egui::Ui, rect: egui::Rect, name: &str, clip: egui::Rect
     let color = ui.visuals().strong_text_color();
     let mut job = egui::text::LayoutJob::single_section(
         name.to_owned(),
-        egui::TextFormat { font_id: egui::FontId::proportional(14.0), color, ..Default::default() },
+        egui::TextFormat { font_id: crate::settings::ui_font(14.0), color, ..Default::default() },
     );
     job.wrap = egui::text::TextWrapping {
         max_width: rect.width(),
@@ -1672,7 +1672,7 @@ fn xinput_slot_row(
         egui::pos2(row_rect.left(), row_rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        crate::settings::ui_font(13.0),
         ui.visuals().strong_text_color(),
     );
     xinput_slot_circles(
@@ -1695,7 +1695,7 @@ fn usb_audio_row(ui: &mut egui::Ui, label: &str, dropdown_w: f32, dev_id: &str) 
         egui::pos2(row_rect.left(), row_rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(13.0),
+        crate::settings::ui_font(13.0),
         ui.visuals().strong_text_color(),
     );
     let right = egui::Rect::from_min_max(
@@ -1727,9 +1727,9 @@ fn gamepad_selector_card(
 
     // ── bg + (if a pad is active) LEFT-half accent fill ──
     let is_active = active.is_some();
-    let stroke_col = if is_active { ui.visuals().selection.stroke.color } else { CARD_STROKE_INACTIVE };
+    let stroke_col = if is_active { ui.visuals().selection.stroke.color } else { crate::settings::tinted(CARD_STROKE_INACTIVE) };
     let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
-    ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
+    ui.painter().rect(rect, CARD_ROUND, crate::settings::tinted(CARD_FILL_INACTIVE),
         egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     if is_active {
         let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(icon_col_w, rect.height()));
@@ -1788,7 +1788,7 @@ fn gamepad_selector_card(
                 crate::canvas::switch_virtual_sink_device(&mut canvas.snarl, node, &id);
             }
         } else {
-            ui.label(egui::RichText::new("Gamepad output").size(13.0).strong());
+            ui.label(egui::RichText::new("Gamepad output").size(crate::settings::ui_size(13.0)).strong());
         }
         ui.add_space(4.0);
 
@@ -1882,7 +1882,7 @@ fn warning_badge(ui: &mut egui::Ui, card_rect: egui::Rect) -> egui::Response {
         center,
         egui::Align2::CENTER_CENTER,
         "⚠",
-        egui::FontId::proportional(BADGE * 0.8),
+        crate::settings::ui_font(BADGE * 0.8),
         glyph_color,
     );
     resp.on_hover_text("HIDMaestro driver unavailable (bundled helper not found)")
@@ -1921,10 +1921,10 @@ fn keymouse_card(
     let stroke_col = if is_active {
         ui.visuals().selection.stroke.color
     } else {
-        CARD_STROKE_INACTIVE
+        crate::settings::tinted(CARD_STROKE_INACTIVE)
     };
     let stroke_w = if is_active { 1.5 } else { 1.0_f32 };
-    ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
+    ui.painter().rect(rect, CARD_ROUND, crate::settings::tinted(CARD_FILL_INACTIVE),
         egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
     if is_active {
         let left_rect = egui::Rect::from_min_size(
@@ -1977,7 +1977,7 @@ fn keymouse_card(
     // Nudge the title slightly down so it sits clear of the card
     // top edge but doesn't dominate the card's vertical space.
     right_ui.add_space(3.0);
-    right_ui.label(egui::RichText::new("Keyboard and Mouse").size(13.0).strong());
+    right_ui.label(egui::RichText::new("Keyboard and Mouse").size(crate::settings::ui_size(13.0)).strong());
     right_ui.add_space(2.0);
     // Explicit content width for the right column so the value box +
     // slider know exactly how much space they have.
@@ -2062,7 +2062,7 @@ fn route_toggle(
     let mut checked = params.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     ui.add_space(2.0);
     ui.add_enabled_ui(enabled, |ui| {
-        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(11.0));
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(crate::settings::ui_size(11.0)));
         if resp.changed() {
             params.insert(key.into(), Value::Bool(checked));
         }
@@ -2086,7 +2086,17 @@ fn mouse_speed_stack(
     let mut ms = params.get("mouse_sensitivity")
         .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let initial = ms;
-    let dv_w = 56.0_f32;
+    // As wide as the widest value it shows, in the font it shows it in, and flush with
+    // the slider's right edge: a fixed 56 points ran its number past the card's edge once
+    // the font was set larger.
+    let dv_font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding;
+    let dv_w = (ui.painter().layout_no_wrap("3000.00".into(), dv_font.clone(), egui::Color32::PLACEHOLDER).size().x
+        + 2.0 * pad.x
+        + 4.0)
+        .max(56.0)
+        .min(content_w * 0.6);
+    // The card's rows are at fixed heights (`KBM_TOUCHPAD_ROW_Y`): this one keeps its 20.
     let row1_h = 20.0_f32;
     let row2_h = 16.0_f32;
 
@@ -2100,7 +2110,7 @@ fn mouse_speed_stack(
         egui::pos2(row1_rect.left(), row1_rect.center().y),
         egui::Align2::LEFT_CENTER,
         "Mouse speed:",
-        egui::FontId::proportional(12.0),
+        crate::settings::ui_font(12.0),
         ui.visuals().text_color(),
     );
     let dv_rect = egui::Rect::from_min_size(

@@ -149,6 +149,9 @@ pub struct SpecialPickerRequest {
     /// session then reads and writes that card's own `in` / `out` (and its
     /// output timing) in place of the draft params, and moves no phase.
     pub card: Option<(String, usize)>,
+    /// Keys and the mouse only: the Virtual Keyboard & Mouse adding inputs to
+    /// itself, where a pad button or a macro means nothing.
+    pub kbm_only: bool,
 }
 
 impl SpecialPickerRequest {
@@ -280,6 +283,7 @@ impl Default for SpecialPickerRequest {
             input_key: None,
             inputs: false,
             card: None,
+            kbm_only: false,
         }
     }
 }

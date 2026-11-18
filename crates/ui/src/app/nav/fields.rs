@@ -71,7 +71,7 @@ pub(crate) fn draw_requested_field_hud(
     }
     let painter = crate::widgets::nav_highlight_painter(
         ctx, egui::Id::new(("gp_nav_field_hud", outer.0)), host, view);
-    let font = egui::FontId::proportional(12.0);
+    let font = crate::settings::ui_font(12.0);
     let galley = painter.layout_no_wrap(req.label.clone(), font.clone(), egui::Color32::WHITE);
     let pad = egui::vec2(6.0, 3.0);
     let size = galley.size() + pad * 2.0;
@@ -231,8 +231,11 @@ impl FlexInputApp {
         // North → reset focused field.
         if nav.is_rising("btn_north") {
             match &def.field {
-                NavField::Value { key, default, .. } =>
-                    self.set_subpatch_param_f32(outer_id, inner, key, *default),
+                NavField::Value { key, default, .. } => {
+                    let before = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(*default);
+                    self.set_subpatch_param_f32(outer_id, inner, key, *default);
+                    self.nav_follow_curve_scale(outer_id, inner, key, before);
+                }
                 NavField::Enum { key, opts } =>
                     self.set_subpatch_param_str(outer_id, inner, key, opts[0]),
                 NavField::Toggle { key } =>
@@ -264,6 +267,7 @@ impl FlexInputApp {
                     self.nav_adjust_field_value(outer_id, inner, *key, *lo, *hi, *default, *step,
                         press, cont, fine, dt);
                     self.nav_follow_grid_link(outer_id, inner, key, before, *hi);
+                    self.nav_follow_curve_scale(outer_id, inner, key, before);
                 }
             }
             NavField::Enum { key, opts } => {
@@ -338,6 +342,21 @@ impl FlexInputApp {
     /// Value-field nudge: decade or linear stepping (shared with the standalone
     /// numeric widgets), per-field bounds.
     #[allow(clippy::too_many_arguments)]
+    /// A Log/Exp scale set from the pad moves the curve's points with it, every lane's, as
+    /// the slider does (`curve_rows::set_curve_scale`): the param on its own left the
+    /// points where they were on the graph, which changed what each one stood for - the
+    /// curve didn't follow the scale.
+    fn nav_follow_curve_scale(&mut self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId, key: &str, before: f32) {
+        if key != "scale_t" {
+            return;
+        }
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = nav_scope_mut(&mut canvas.snarl, outer_id) else { return };
+        let Some(node) = sp.get_node_mut(inner) else { return };
+        let now = node.params.get("scale_t").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        crate::canvas::viewer::curve_rows::rescale_curve_points(node, before, now);
+    }
+
     /// A curve's grid H / V counts — and its In / Out ranges — are linked unless set apart
     /// (`GRID_UNLINKED`): nudging one from the pad moves the other by as much,
     /// as dragging it does in the body.
@@ -716,6 +735,7 @@ impl FlexInputApp {
             | ("module.menu", "options")
             | ("module.area_mapper", "options") | ("module.area_mapper", "border")
             | ("module.area_mapper", "layers") | ("module.area_mapper", "press")
+            | ("module.area_mapper", "analog")
             | ("processing.rws", "scale") | ("processing.rws", "rws")
             | ("processing.rws", "stick_dps") | ("processing.rws", "gyro_scale") | ("processing.rws", "vh")
             | ("processing.rws", "measure")
@@ -823,13 +843,7 @@ impl FlexInputApp {
         }
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        let sel = sp.selected_item?;
-        if let crate::canvas::node::LayoutItem::Module(m) = sp.items.get(sel)? {
-            let mid = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?.module_id.clone();
-            Some((mid, m.element_id.clone()))
-        } else {
-            None
-        }
+        sp_item_element(sp, sp.selected_item?)
     }
 
     /// Numeric-edit descriptor for the selected element, if it edits a single
@@ -901,52 +915,17 @@ impl FlexInputApp {
     /// elements with no nav-editable fields. Verified against the pinned render
     /// functions' param keys.
     pub(crate) fn nav_element_fields(&self, outer_id: egui_snarl::NodeId) -> Vec<NavFieldDef> {
-        use NavField::*;
-        use NavStep::{Decade, Fixed, FixedScaled, Linear};
         let Some((mid, elem)) = self.nav_selected_element(outer_id) else { return vec![]; };
-        // Gyro axis options (family, axis) for the pointer/steering mode rows.
-        const GYRO_PTR: &[(&str, &str, &str)] = &[
-            ("Pitch+Yaw", "pointer", "pitch_yaw"),
-            ("Pitch+Roll", "pointer", "pitch_roll"),
-            ("Player", "pointer", "player"),
-            ("World", "pointer", "world"),
-        ];
-        const GYRO_STEER: &[(&str, &str, &str)] = &[
-            ("Pitch+Yaw", "steering", "pitch_yaw"),
-            ("Pitch+Roll", "steering", "pitch_roll"),
-            ("Player", "steering", "player"),
-            ("World", "steering", "world"),
-        ];
-        let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
-        macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l.into(), field: $field } }; }
-        // RWS Mouse Scale steps in the unit the header shows it in: 1 dot/°
-        // (fine 0.1), or 100 dots/360° (fine 10).
-        let rws_scale_step = || {
-            let per_360 = self.nav_selected_inner_node(outer_id)
-                .and_then(|inner| self.get_subpatch_param_str(outer_id, inner, "scale_unit"))
-                .as_deref() == Some("360");
-            if per_360 { FixedScaled { coarse: 100.0, factor: 360.0 } } else { Fixed(1.0) }
-        };
-        // An AutoMap curve on a motion sensor: its range row is the graph's
-        // view of the sensor, in °/s or G (see `MotionUnit`).
-        if elem == "range_row" {
-            let axes = self.nav_selected_inner_node(outer_id).and_then(|inner| {
-                let canvas = &self.tabs[self.active_tab].canvas;
-                let node = nav_scope(&canvas.snarl, outer_id)?.get_node(inner)?;
-                Some(crate::canvas::viewer::MotionUnit::of(node)?.view_axes(node))
-            });
-            if let Some([i, o]) = axes {
-                let row = |name: &str, a: crate::canvas::viewer::ViewAxis, end: usize, d: f32| {
-                    f!(format!("{name}{}", a.suffix), v(a.keys[end], -a.full_scale, a.full_scale, d, Fixed(a.step)))
-                };
-                return vec![
-                    row("In↓", i, 0, -i.extent),
-                    row("In↑", i, 1, i.extent),
-                    row("Out↓", o, 0, -o.extent),
-                    row("Out↑", o, 1, o.extent),
-                ];
-            }
+        if let Some(fields) = self.nav_jsm_editor_fields(outer_id, &mid, &elem) {
+            return fields;
         }
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let node = self.nav_selected_inner_node(outer_id).and_then(|inner| nav_scope(&canvas.snarl, outer_id)?.get_node(inner));
+        element_fields(&mid, &elem, node)
+    }
+
+    /// JSM Config's editor fields: its knobs come from the config text the app reads.
+    fn nav_jsm_editor_fields(&self, outer_id: egui_snarl::NodeId, mid: &str, elem: &str) -> Option<Vec<NavFieldDef>> {
         // JSM Config's editor pin: one field per numeric setting the config sets,
         // discovered from the TEXT each frame rather than from a table — which is
         // the whole point of the module, and means a setting added while the
@@ -954,7 +933,7 @@ impl FlexInputApp {
         if mid == "module.jsm" && elem == "editor" {
             // The calibration row comes first, matching where the tune panel
             // draws it — under the curve, above the faders.
-            return std::iter::once(NavFieldDef {
+            return Some(std::iter::once(NavFieldDef {
                 label: "Calibrate RWC".into(),
                 field: NavField::JsmCalibrate,
             })
@@ -963,487 +942,9 @@ impl FlexInputApp {
                 // The fader's KEY, not its name: a pair's two halves share a name.
                 field: NavField::JsmValue { name: k.key() },
             }))
-            .collect();
+            .collect());
         }
-        match (mid.as_str(), elem.as_str()) {
-            // ── single-field elements (also driven by the unified editor) ──
-            ("module.delay", "ms")            => vec![f!("ms", v("delay_ms",0.0,60_000.0,100.0,Decade))],
-            ("module.average", "samples")     => vec![f!("Window ms", v("window_ms",0.5,5_000.0,5.0,Decade))],
-            ("module.average", "spike_mad")   => vec![f!("Spike MAD", v("spike_mad",0.0,20.0,0.0,Linear))],
-            ("module.dc_filter", "window_ms") => vec![f!("Window ms", v("window_ms",10.0,60_000.0,500.0,Decade))],
-            ("module.dc_filter", "decay_ms")  => vec![f!("Decay ms", v("decay_ms",10.0,60_000.0,200.0,Decade))],
-            ("logic.delay", "time")           => vec![f!("Time", v("time",0.0,60_000.0,100.0,Decade))],
-            ("logic.delay", "mode")           => vec![f!("Mode", Enum{key:"mode",opts:&["delay_true","delay_false"]})],
-            ("module.sample_hold", "mode")    => vec![f!("Mode", Enum{key:"mode",opts:&["sample","hold"]})],
-            // Steps in the unit its field reads in (see `HysteresisField`).
-            ("logic.has_changed", "hysteresis") => {
-                let Some(field) = self.nav_selected_inner_node(outer_id).and_then(|inner| {
-                    let canvas = &self.tabs[self.active_tab].canvas;
-                    nav_scope(&canvas.snarl, outer_id)
-                        .and_then(|sp| sp.get_node(inner))
-                        .map(crate::canvas::viewer::HysteresisField::of)
-                }) else { return Vec::new() };
-                let step = FixedScaled { coarse: field.nav_step, factor: field.scale };
-                vec![f!(format!("Hysteresis {}", field.suffix.trim()), v("hysteresis_pct",0.0,100.0,0.0,step))]
-            }
-            ("generator.oscillator", "freq")  => vec![f!("Freq", v("freq_param",0.01,200.0,1.0,Decade))],
-            ("generator.oscillator", "phase") => vec![f!("Phase", v("phase_param",0.0,1.0,0.0,Linear))],
-            ("generator.oscillator", "shape") => vec![f!("Shape", Enum{key:"shape",opts:&["sine","triangle","saw","square"]})],
-            ("processing.gyro_3dof", "lean_threshold") => vec![f!("Lean", v("lean_threshold",0.01,4.0,0.3,Linear))],
-            // ── RWS Aim ──
-            // The pinned ruler ("field") carries the full calibration control set
-            // so it can be run AND stopped from the gamepad with only the ruler
-            // pinned (mouse output is busy driving the game during calibration).
-            // Fixed steps → clean stepping: coarse lands on integers, fine on the
-            // 0.1 (or 1) grid. `scale` fine (0.1) matters for calibration; the
-            // °/s fields step by 10 coarse / 1 fine (whole degrees per second).
-            ("processing.rws", "scale") => vec![f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step()))],
-            ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0)))],
-            ("processing.rws", "stick_dps") => vec![f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0)))],
-            ("processing.rws", "gyro_scale") => vec![f!("Gyro scale", v("gyro_scale",0.0,1000.0,1.0,Fixed(0.01)))],
-            ("processing.rws", "vh") => vec![
-                f!("Gyro V/H", v("gyro_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
-                f!("Stick V/H", v("stick_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
-            ],
-            // Measure auto-cal. One nominal field so it classifies as MultiField
-            // (South at the pin ENTERS it); the actual in-widget controls are
-            // handled specially in `nav_drive_rws_measure` (◄► pick method, A
-            // start / A finish, B back / B cancel) because South/East are far
-            // clearer here than field-walking.
-            ("processing.rws", "measure") => vec![
-                f!("Auto-cal", Enum{key:"cal_measure",opts:&["off","pitch","yaw"]}),
-            ],
-            ("processing.rws", "field") => vec![
-                f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step())),
-                f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
-            ],
-            // FOV strictly whole degrees (Fixed(10) → 10 coarse / 1 fine).
-            ("processing.rws", "style") => vec![
-                f!("View", Enum{key:"field_mode",opts:&["ruler","room","both"]}),
-                f!("FOV", v("field_fov",30.0,140.0,90.0,Fixed(10.0))),
-                f!("BG", v("field_bg_alpha",0.0,1.0,0.0,Linear)),
-                f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Fixed(5.0))),
-            ],
-            // Field order = the rects `rws_flick_row` / `rws_flick_opts_row`
-            // publish, so the glow lands on the field being edited.
-            ("processing.rws", "flick") => vec![
-                f!("Flick dz", v("flick_deadzone",0.1,0.99,0.85,Fixed(0.1))),
-                f!("Smooth ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
-                f!("Stick aim", Toggle{key:"stick_aim_enabled"}),
-                f!("Aim ×", v("stick_aim_rws",0.01,50.0,1.0,Fixed(0.1))),
-            ],
-            ("processing.rws", "flick_opts") => vec![
-                f!("Stabilise ms", v("flick_stabilise_ms",0.0,300.0,0.0,Fixed(10.0))),
-                f!("Fwd ±°", v("flick_fwd_dz_deg",0.0,90.0,0.0,Fixed(5.0))),
-                f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
-            ],
-            ("processing.rws", "flick_speed") => vec![
-                f!("Flick within ms", v("flick_speed_ms",0.0,300.0,0.0,Fixed(10.0))),
-                f!("Slow = aim only", Toggle{key:"flick_slow_lock"}),
-            ],
-            ("processing.rws", "suppress") => vec![
-                f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
-            ],
-            // ── Gyro to Stick Rotation ──
-            // Each option lists its default first, so an untouched node shows it.
-            // The pinned circle carries every setting, so it can be tuned from
-            // the pad with nothing else pinned.
-            ("module.stick_rotation", "options") => vec![
-                f!("Stick", Enum{key:"rot_stick",opts:&["right_stick","left_stick"]}),
-                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
-            ],
-            ("module.stick_rotation", "sens") => vec![
-                f!("Sens", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
-                f!("Invert", Toggle{key:"rot_invert"}),
-            ],
-            ("module.stick_rotation", "hold") => vec![
-                f!("Relative", Toggle{key:"rot_relative"}),
-                f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
-            ],
-            ("module.stick_rotation", "takeover") => vec![
-                f!("Takeover", Toggle{key:"rot_takeover"}),
-                f!("Above °/s", v("rot_takeover_dps",0.0,120.0,10.0,Fixed(1.0))),
-                f!("Outer", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
-            ],
-            ("module.stick_rotation", "deadzone") => vec![f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05)))],
-            ("module.stick_rotation", "stabilise") => vec![f!("Stabilise ms", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0)))],
-            ("module.stick_rotation", "field") => vec![
-                f!("Sens", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
-                f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05))),
-                f!("Stabilise ms", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0))),
-                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
-                f!("Relative", Toggle{key:"rot_relative"}),
-                f!("Return ms", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
-                f!("Takeover", Toggle{key:"rot_takeover"}),
-                f!("Outer", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
-            ],
-            // ── multi-field rows ──
-            ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
-            ("math.negate", "unipolar") => vec![
-                f!("Unipolar", Toggle{key:"unipolar"}),
-                f!("Max", v("unipolar_max",0.0,1000.0,1.0,Linear)),
-            ],
-            ("math.quantize", "factor") => vec![f!("Factor", v("factor",0.0,10_000.0,1.0,Decade))],
-            ("math.quantize", "mode")   =>
-                vec![f!("Mode", Enum{key:"mode",opts:&["round","floor","ceil","trunc"]})],
-            ("module.vec_to_deflection", "angle_unit") => vec![f!("Degrees", Toggle{key:"degrees"})],
-            ("logic.counter", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
-            ("logic.counter", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
-            ("logic.counter", "min_max") => vec![
-                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
-                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
-            ],
-            ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode") =>
-                vec![f!("Pointer", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_PTR})],
-            ("processing.gyro_3dof", "steering_mode") =>
-                vec![f!("Steering", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_STEER})],
-            ("processing.gyro_3dof", "steering_opts") => vec![
-                f!("excl. Y", Toggle{key:"steering_exclude_y"}),
-                f!("re-center", v("recenter_strength",0.0,4.0,0.0,Linear)),
-                f!("ease", v("reset_ease_in",0.0,2.0,0.25,Linear)),
-            ],
-            ("processing.gyro_3dof", "roll_mix") =>
-                vec![f!("Roll mix %", v("roll_contribution",-100.0,100.0,0.0,Fixed(5.0)))],
-            ("processing.gyro_3dof", "hold_offset") => vec![
-                f!("Pitch°", v("hold_pitch",-180.0,180.0,0.0,Fixed(5.0))),
-                f!("Yaw°", v("hold_yaw",-180.0,180.0,0.0,Fixed(5.0))),
-                f!("Roll°", v("hold_roll",-180.0,180.0,0.0,Fixed(5.0))),
-            ],
-            // Order matches `GyroEdge::ui_rects`' field rects.
-            ("processing.gyro_3dof", "edge_turn") => vec![
-                f!("Edge turn", Enum{key:"edge_mode",opts:&["off","ramp","momentum","both"]}),
-                f!("X only", Toggle{key:"edge_x_only"}),
-                f!("Zone°", v("edge_zone_deg",0.0,170.0,30.0,Fixed(5.0))),
-                f!("Blend°", v("edge_blend_deg",0.0,170.0,15.0,Fixed(5.0))),
-                f!("Gyro kept", v("edge_gyro_keep",0.0,1.0,1.0,Fixed(0.1))),
-                f!("Ramp°", v("edge_ramp_deg",0.0,170.0,30.0,Fixed(5.0))),
-                f!("Max °/s", v("edge_max_dps",0.0,4000.0,180.0,Fixed(20.0))),
-                f!("Momentum ×", v("edge_momentum",0.0,10.0,1.0,Fixed(0.1))),
-                f!("Fade s", v("edge_decay_s",0.0,30.0,0.0,Fixed(0.1))),
-            ],
-            // A missing key is Auto, so Auto leads (a missing Enum reads as
-            // its first option).
-            ("processing.gyro_3dof", "orient_source") =>
-                vec![f!("3D source", Enum{key:"orient_source",opts:&["auto","computed","device"]})],
-            ("processing.gyro_3dof", "gyro_invert") => vec![
-                f!("yaw", Toggle{key:"inv_yaw"}),
-                f!("pitch", Toggle{key:"inv_pitch"}),
-                f!("roll", Toggle{key:"inv_roll"}),
-            ],
-            ("processing.gyro_3dof", "accel_invert") => vec![
-                f!("accX", Toggle{key:"inv_accel_x"}),
-                f!("accY", Toggle{key:"inv_accel_y"}),
-                f!("accZ", Toggle{key:"inv_accel_z"}),
-            ],
-            // ── curve option rows ──
-            ("module.response_curve", "scale_row") | ("module.twoway_response_curve", "scale_row") => vec![
-                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
-                f!("Abs", Toggle{key:"absolute"}),
-                f!("Snap", Toggle{key:"snap"}),
-            ],
-            ("module.vec_response_curve", "scale_row") => vec![
-                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
-                f!("Snap", Toggle{key:"snap"}),
-            ],
-            // Bounds are ±100 to allow extremes, but tuning happens near ±1 — use a
-            // fixed 0.1 step (fine 0.01) so dpad/stick can fine-tune, not span-scaled.
-            ("module.response_curve", "range_row") | ("module.twoway_response_curve", "range_row") => vec![
-                f!("In↓", v("in_min",-100.0,100.0,-1.0,Fixed(0.1))),
-                f!("In↑", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
-                f!("Out↓", v("out_min",-100.0,100.0,-1.0,Fixed(0.1))),
-                f!("Out↑", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
-            ],
-            ("module.vec_response_curve", "range_row") => vec![
-                f!("In max", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
-                f!("Out max", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
-            ],
-            // ── Vec Reshaper option rows ──
-            ("module.vec_reshape", "target_row") => vec![
-                f!("Edit", Enum{key:"edit_target",opts:&["gain","boundary"]}),
-            ],
-            ("module.vec_reshape", "options_row") => vec![
-                f!("Symmetry", Enum{key:"symmetry",opts:&["quad4","xmirror"]}),
-                f!("Renorm", Toggle{key:"renorm"}),
-            ],
-            ("module.vec_reshape", "range_row") => vec![
-                f!("In max", v("in_max",0.05,2.0,1.0,Linear)),
-                f!("Out max", v("out_max",0.05,2.0,1.0,Linear)),
-            ],
-            ("module.vec_reshape", "grid_row") => vec![
-                f!("Grid H", v("grid_x",1.0,16.0,4.0,Linear)),
-                f!("Grid V", v("grid_y",1.0,16.0,4.0,Linear)),
-                f!("Snap", Toggle{key:"snap"}),
-                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
-            ],
-            ("module.response_curve", "grid_row") | ("module.vec_response_curve", "grid_row")
-            | ("module.twoway_response_curve", "grid_row") => vec![
-                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
-                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
-                f!("Trail ms", v("trail_ms",0.0,3000.0,300.0,Decade)),
-            ],
-            ("module.response_curve", "grid_options_row") | ("module.vec_response_curve", "grid_options_row")
-            | ("module.twoway_response_curve", "grid_options_row") => vec![
-                f!("Scale grid", Toggle{key:"show_scaled_grid"}),
-                f!("Labels", Toggle{key:"show_grid_labels"}),
-            ],
-            // ── Envelope Generator option rows ──
-            // Field order MUST match render_envelope_time_row's published rects:
-            // [unit segment, value box] left→right.
-            ("generator.envelope", "time_row") => vec![
-                f!("Base", Enum{key:"timebase", opts:&["ms","s","hz"]}),
-                f!("Time", v("time_mul", 0.01, 60_000.0, 500.0, Decade)),
-            ],
-            ("generator.envelope", "sustain_row") => vec![
-                f!("Sustain", v("sustain", 0.0, 1.0, 0.3, Fixed(0.02))),
-            ],
-            ("generator.envelope", "mode_row") => vec![
-                f!("Hold", Toggle{key:"hold"}),
-                f!("Bounce", Toggle{key:"bounce"}),
-                f!("Loop", Toggle{key:"loop"}),
-            ],
-            ("generator.envelope", "grid_row") => vec![
-                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
-                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
-                f!("Snap", Toggle{key:"snap"}),
-            ],
-            ("generator.envelope", "grid_options_row") => vec![
-                f!("Grid", Toggle{key:"show_grid"}),
-                f!("Labels", Toggle{key:"show_grid_labels"}),
-            ],
-            // ── Trigger scope rows (the oscilloscope's, without Freeze) ──
-            ("display.trigscope", "controls") => vec![
-                f!("Win ms", v("ts_win_ms",10.0,10_000.0,200.0,Decade)),
-                f!("Scale", v("ts_scale",0.000001,100.0,1.0,Decade)),
-                f!("Scale in", Enum{key:"ts_axis",opts:&["gyro","accel","value"]}),
-                f!("Auto", Toggle{key:"ts_auto"}),
-                f!("Uni", Toggle{key:"ts_uni"}),
-            ],
-            ("display.trigscope", "grid_row") => vec![
-                f!("Grid H", v("ts_grid_x",0.0,20.0,4.0,Linear)),
-                f!("Grid V", v("ts_grid_y",0.0,20.0,4.0,Linear)),
-                f!("Sub", v("ts_grid_sub",1.0,10.0,1.0,Linear)),
-                f!("Labels", Toggle{key:"ts_labels"}),
-                f!("Stats", Toggle{key:"ts_stats"}),
-                f!("Peaks", Toggle{key:"ts_peaks"}),
-            ],
-            ("module.twoway_response_curve", "hyst_row") => vec![
-                f!("Hyst %", v("hysteresis_pct",0.0,10.0,0.5,Linear)),
-                f!("Hyst on", Enum{key:"hyst_dir",opts:&["both","up","down"]}),
-                f!("Start Up", Toggle{key:"hyst_start_up"}),
-            ],
-            ("module.twoway_response_curve", "interp_row") => vec![
-                f!("Interp ms", v("interp_ms",0.0,500.0,50.0,Decade)),
-                f!("Peak hold ms", v("peak_hold_ms",0.0,200.0,0.0,Linear)),
-                f!("Hold on", Enum{key:"peak_hold_dir",opts:&["up","both","down"]}),
-            ],
-            ("module.twoway_response_curve", "lane_toggle") => vec![
-                f!("Lane", Enum{key:"active_lane",opts:&["up","dn","hy"]}),
-            ],
-            // Oscilloscope controls row — order matches the rects
-            // `render_oscilloscope_controls` publishes: Win (log ms) / Scale
-            // (the picked kind's) / its unit / Auto / Bi-Uni / Freeze.
-            ("display.oscilloscope", "controls") => vec![
-                f!("Win ms", v("osc_win_ms",10.0,10_000.0,200.0,Decade)),
-                f!("Scale", v("osc_scale",0.000001,100.0,1.0,Decade)),
-                f!("Scale in", Enum{key:"osc_axis",opts:&["gyro","accel","value"]}),
-                f!("Auto", Toggle{key:"osc_auto"}),
-                f!("Uni", Toggle{key:"osc_uni"}),
-                f!("Freeze", Toggle{key:"osc_freeze"}),
-            ],
-            // Oscilloscope guides row — order matches `osc_grid_row_ui`'s rects.
-            ("display.oscilloscope", "grid_row") => vec![
-                f!("Grid H", v("osc_grid_x",0.0,20.0,4.0,Linear)),
-                f!("Grid V", v("osc_grid_y",0.0,20.0,4.0,Linear)),
-                f!("Sub", v("osc_grid_sub",1.0,10.0,1.0,Linear)),
-                f!("Labels", Toggle{key:"osc_labels"}),
-                f!("Stats", Toggle{key:"osc_stats"}),
-                f!("Peaks", Toggle{key:"osc_peaks"}),
-            ],
-            // Audio Stream Haptics calibration rows + mode block. Ranges/defaults
-            // mirror the sliders in viewer.rs `asth_draw_row` / `asth_draw_mode_block`.
-            ("module.audio_stream_haptics", "asth_mode_row") => vec![
-                f!("Capture", Enum{key:"asth_mode",opts:&["process","focused","system"]}),
-                f!("Children", Toggle{key:"asth_include_tree"}),
-            ],
-            ("module.audio_stream_haptics", "asth_volume") =>
-                vec![f!("Volume", v("asth_volume",0.0,2.0,1.0,Linear))],
-            ("module.audio_stream_haptics", "asth_release") =>
-                vec![f!("Release", v("asth_release",1.0,500.0,30.0,Decade))],
-            ("module.audio_stream_haptics", "asth_crossover") =>
-                vec![f!("Crossover", v("asth_crossover",60.0,800.0,250.0,Decade))],
-            ("module.audio_stream_haptics", "asth_amplitude") => vec![
-                f!("Floor", v("asth_amp_min",0.0,1.0,0.0,Linear)),
-                f!("Ceiling", v("asth_amp_max",0.0,1.0,1.0,Linear)),
-                f!("Curve", v("asth_curve",0.3,3.0,1.0,Linear)),
-            ],
-            ("module.audio_stream_haptics", "asth_balance") =>
-                vec![f!("Balance", v("asth_freq_bias",-1.0,1.0,0.0,Linear))],
-            ("module.audio_stream_haptics", "asth_swap_row") =>
-                vec![f!("Swap", Toggle{key:"asth_swap"})],
-            ("module.audio_stream_haptics", "asth_bands_row") => vec![
-                f!("Split L/R", Toggle{key:"asth_split"}),
-                f!("Pure tones", Toggle{key:"asth_pure"}),
-            ],
-            ("module.audio_stream_haptics", "asth_rumble_mix") =>
-                vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
-            // Selector mirrors counter's controls.
-            ("module.selector", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
-            ("module.selector", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
-            ("module.selector", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
-            ("module.selector", "min_max") => vec![
-                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
-                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
-            ],
-            // ── Virtual Menu "options" element (the TWO-row session block) ──
-            // Field order MUST match `show_menu_options_row`'s published rects,
-            // INCLUDING the conditional touch/gyro sub-fields — both this arm and
-            // the renderer gate on the SAME derived `src_touch`/`src_gyro` (with
-            // the legacy `pointer_source` fallback), so the lists stay in lockstep
-            // however the checkboxes are set. Enum option orders mirror the
-            // renderer's ComboBox value lists exactly.
-            ("module.menu", "options") => {
-                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
-                // Same legacy-derived defaults as the renderer, so a pre-checkbox
-                // patch exposes the same conditional fields the body shows.
-                let legacy = self.get_subpatch_param_str(outer_id, inner, "pointer_source")
-                    .unwrap_or_else(|| "left_stick".to_string());
-                let src_touch = self.get_subpatch_param_bool(outer_id, inner, "ptr_touch")
-                    .unwrap_or(legacy == "touch1" || legacy == "touch2");
-                let src_gyro = self.get_subpatch_param_bool(outer_id, inner, "ptr_gyro")
-                    .unwrap_or(false);
-                let mut fs = vec![
-                    f!("LS", Toggle{key:"ptr_ls"}),
-                    f!("RS", Toggle{key:"ptr_rs"}),
-                    f!("Touch", Toggle{key:"ptr_touch"}),
-                ];
-                if src_touch {
-                    fs.push(f!("Touch#", Enum{key:"ptr_touch_which",opts:&["touch1","touch2"]}));
-                }
-                fs.push(f!("Gyro", Toggle{key:"ptr_gyro"}));
-                if src_gyro {
-                    fs.push(f!("Gyro ax", Enum{key:"ptr_gyro_axes",opts:&["pitch_yaw","pitch_roll"]}));
-                    fs.push(f!("Gyro ×", v("ptr_gyro_sens",0.5,8.0,4.0,Linear)));
-                }
-                fs.push(f!("Show", Enum{key:"activation_mode",opts:&["hold","toggle","touch","never"]}));
-                fs.push(f!("Select", Enum{key:"select_on",opts:&["release","press","click"]}));
-                fs.push(f!("Deadzone", v("pointer_deadzone",0.0,0.9,0.25,Linear)));
-                fs.push(f!("Linger", v("select_linger",0.0,10.0,0.5,Fixed(0.05))));
-                fs.push(f!("Sticky", Toggle{key:"hover_sticky"}));
-                fs
-            }
-            // ── Area Mapper "options" row ── order MUST match
-            // `show_area_options_row`'s published rects, including the stick-only
-            // touch gate and the rectangle-only cell rounding.
-            ("module.area_mapper", "options") => {
-                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
-                let input = self.get_subpatch_param_str(outer_id, inner, "area_input")
-                    .unwrap_or_else(|| "left_stick".to_string());
-                let mut fs = vec![
-                    f!("Input", Enum{key:"area_input",opts:flexinput_engine::eval::AREA_INPUTS}),
-                    f!("Shape", Enum{key:crate::canvas::area_body::AREA_SHAPE_PARAM,opts:&["circle","rect"]}),
-                    f!("Sym", Toggle{key:crate::canvas::area_body::AREA_SYM_PARAM}),
-                    f!("Pass", Toggle{key:"area_pass_source"}),
-                ];
-                if !input.starts_with("touch") {
-                    fs.push(f!("Touched", Toggle{key:crate::canvas::area_body::AREA_CELL_TOUCH}));
-                }
-                if self.get_subpatch_param_str(outer_id, inner, crate::canvas::area_body::AREA_SHAPE_PARAM).as_deref()
-                    == Some("rect")
-                {
-                    fs.push(f!("Round", v(crate::canvas::area_body::AREA_CELL_ROUND, 0.0, 1.0, 0.0,
-                        FixedScaled { coarse: 5.0, factor: 100.0 })));
-                    fs.push(f!("Pressure", v(crate::canvas::area_body::AREA_CELL_PRESSURE, 0.0, 1.0, 0.0,
-                        FixedScaled { coarse: 5.0, factor: 100.0 })));
-                }
-                fs
-            }
-            // ── Area Mapper "layers" row ── order MUST match `show_area_layer_row`:
-            // the tabs as one Layer value, Analog, then its period while analog.
-            ("module.area_mapper", "layers") => {
-                use crate::canvas::area_body as ab;
-                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
-                let canvas = &self.tabs[self.active_tab].canvas;
-                let count = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
-                    .map(ab::layer_count).unwrap_or(1);
-                let mut fs = vec![
-                    f!("Layer", v(ab::AREA_LAYER_PARAM, 0.0, (count - 1) as f32, 0.0, Fixed(1.0))),
-                    f!("Analog", Toggle{key:flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM}),
-                ];
-                if self.get_subpatch_param_bool(outer_id, inner, flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM)
-                    .unwrap_or(false)
-                {
-                    use flexinput_engine::eval as ev;
-                    fs.push(f!("Mix", Enum{key:ev::AREA_LAYER_MIX_PARAM,opts:&["direction","keys"]}));
-                    fs.push(f!("Pulse", Enum{key:ev::AREA_LAYER_PULSE_PARAM,opts:&["smooth","pwm"]}));
-                    let smooth = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner))
-                        .and_then(|n| n.params.get(ev::AREA_LAYER_PULSE_PARAM).and_then(|v| v.as_str()).map(|s| s != "pwm"))
-                        .unwrap_or(true);
-                    if smooth {
-                        fs.push(f!("Min", v(ev::AREA_LAYER_HOLD_PARAM, 1.0, 500.0, 34.0, Fixed(1.0))));
-                        fs.push(f!("Ramp", v(ev::AREA_LAYER_RAMP_PARAM, 0.0, 1000.0, 0.0, Fixed(10.0))));
-                    } else {
-                        fs.push(f!("PWM", v(ev::AREA_LAYER_MS_PARAM, 1.0, 1000.0, 50.0, Fixed(5.0))));
-                    }
-                    fs.push(f!("Half at", v(ev::AREA_LAYER_MID_PARAM, 0.05, 0.95, 0.5, Fixed(0.01))));
-                }
-                fs
-            }
-            // ── Area Mapper "press" row ── order MUST match `show_area_press_row`.
-            ("module.area_mapper", "press") => {
-                use flexinput_engine::eval as ev;
-                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
-                let mut fs = vec![f!("One mode", Toggle{key:ev::AREA_PRESS_LOCK_PARAM})];
-                if self.get_subpatch_param_bool(outer_id, inner, ev::AREA_PRESS_LOCK_PARAM).unwrap_or(false) {
-                    fs.push(f!("Mode", Enum{key:ev::AREA_PRESS_MODE_PARAM,opts:ev::AREA_PRESS_MODES}));
-                    fs.push(f!("Time", v(ev::AREA_PRESS_MS_PARAM, 1.0, 5000.0, 200.0, Fixed(5.0))));
-                    fs.push(f!("Hold", Toggle{key:ev::AREA_PRESS_HOLD_PARAM}));
-                    fs.push(f!("Turbo", Toggle{key:ev::AREA_PRESS_TURBO_PARAM}));
-                }
-                fs
-            }
-            // ── Area Mapper "border" settings ── the selected border's gradient,
-            // through its param mirrors (`area_sync` carries them into the
-            // layout). Order MUST match `border_settings`' published rects:
-            // nothing until a border is selected, Gradient alone while it's hard.
-            ("module.area_mapper", "border") => {
-                use crate::canvas::area_body as ab;
-                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
-                let canvas = &self.tabs[self.active_tab].canvas;
-                let Some(node) = super::nav_scope(&canvas.snarl, outer_id).and_then(|sp| sp.get_node(inner)) else {
-                    return vec![];
-                };
-                let layout = ab::area_layout(node);
-                let Some(r) = ab::selected_border(node, &layout) else { return vec![]; };
-                let mut fs = vec![f!("Gradient", Toggle{key:ab::AREA_G_ON})];
-                if layout.shape == flexinput_core::area::Shape::Circle
-                    && matches!(r, flexinput_core::area::BorderRef::Edge(_))
-                {
-                    fs.push(f!("Square", v(ab::AREA_G_SQ, 0.0, 1.0, 0.0, FixedScaled { coarse: 5.0, factor: 100.0 })));
-                    fs.push(f!("Corners", Toggle{key:ab::AREA_G_RC}));
-                }
-                if !self.get_subpatch_param_bool(outer_id, inner, ab::AREA_G_ON).unwrap_or(false) {
-                    return fs;
-                }
-                fs.push(f!("Width", if ab::border_width_in_degrees(layout.shape, r) {
-                    v(ab::AREA_G_W, 0.01, 1.0 / 3.0, 0.05, FixedScaled { coarse: 1.0, factor: 360.0 })
-                } else {
-                    v(ab::AREA_G_W, 0.01, 1.0, 0.1, FixedScaled { coarse: 1.0, factor: 100.0 })
-                }));
-                fs.push(f!("Curve", Enum{key:ab::AREA_G_CURVE,opts:&["linear","ease_in","ease_out","s_curve"]}));
-                fs.push(f!("Keys", Enum{key:ab::AREA_G_KEYS,opts:ab::KEY_MODES}));
-                let keys = self.get_subpatch_param_str(outer_id, inner, ab::AREA_G_KEYS).unwrap_or_default();
-                if keys == "threshold" {
-                    fs.push(f!("Level", v(ab::AREA_G_THR, 0.0, 1.0, 0.5, Linear)));
-                } else {
-                    fs.push(f!("Period", v(ab::AREA_G_MS, 1.0, 1000.0, 100.0, Fixed(5.0))));
-                }
-                if keys == "pwm" {
-                    fs.push(f!("Phase", Enum{key:ab::AREA_G_PHASE,opts:ab::PHASES}));
-                }
-                fs
-            }
-            _ => vec![],
-        }
+        None
     }
 
     /// Kind of gamepad interaction the selected widget supports.
@@ -1977,6 +1478,7 @@ impl crate::app::FlexInputApp {
         self.gamepad_nav.kbm_picker_node = Some(inner);
         self.gamepad_nav.kbm_picker_path = Vec::new();
         self.gamepad_nav.kbm_picker_touch_zones = false;
+        self.gamepad_nav.kbm_picker_kbm_only = false;
         self.gamepad_nav.kbm_picker_exclude = None;
         // Left over from whatever opened the picker last; they belong to the
         // chord purpose, and a stale one would answer for this session.
@@ -2750,4 +2252,669 @@ mod field_hud_tests {
             }
         }
     }
+}
+
+/// What a field in the gamepad's tables does, by module and param: the tooltip a Style 2 pin
+/// gives the control it draws for it (`pin_style2::render_fields`). The words are the module
+/// body's own where it has them. A field with none here shows its label.
+pub(crate) fn field_hint(module_id: &str, key: &str) -> Option<&'static str> {
+    use crate::canvas::viewer::stick_rotation as sr;
+    Some(match (module_id, key) {
+        ("generator.envelope", "timebase") => "The unit the envelope's time is given in: milliseconds, seconds, or as a rate in hertz.",
+        ("generator.envelope", "time_mul") => "How long one pass through the envelope takes, in the unit chosen beside it.",
+        ("generator.envelope", "hold") => "Hold: run to the sustain point and hold there while the trigger is held.",
+        ("generator.envelope", "bounce") => "Bounce: forward while held, back to the start on release.",
+        ("generator.envelope", "loop") => "Loop: repeat the active segment while the trigger is held.",
+        ("generator.envelope", "sustain") => "Where along the curve Hold waits while the trigger is held.",
+        (_, "grid_x") => "Grid divisions across the input (or time). A dragged point settles on one when Snap is on.",
+        (_, "grid_y") => "Grid divisions across the output (or value).",
+        (_, "snap") => "Snap: dragged points settle on the nearest grid intersection.",
+        (_, "show_grid") => "Show the grid behind the curve.",
+        (_, "show_grid_labels") => "Show value labels on the grid lines.",
+        (_, "show_scaled_grid") => "The grid lines follow the Log/Exp scale instead of standing evenly.",
+        ("generator.oscillator", "freq_param") => "How fast the wave repeats, in the unit next to it.",
+        ("generator.oscillator", "phase_param") => "Where in the cycle the wave starts, as a fraction of a turn.",
+        ("generator.oscillator", "shape") => "The wave's shape: sine, triangle, saw or square.",
+        ("logic.counter", "mode") => "What the count does at its ends. Loop: past the max, start again at the min. Limit: stop at the min and max. Bounce: turn around at them. Unlimited: count on past the max.",
+        ("logic.counter", "normalized") => "Put out the count across min..max as 0..1, instead of the count itself.",
+        ("logic.counter", "step_param") => "How far each step moves the count.",
+        ("logic.counter", "min_param") => "The lowest the count goes.",
+        ("logic.counter", "max_param") => "The highest the count goes (not used when Unlimited).",
+        ("logic.delay", "mode") => "On: turning on waits the delay, turning off is immediate.\nOff: turning off waits the delay, turning on is immediate.",
+        ("logic.delay", "time") => "How long the change waits, in the unit chosen beside it.",
+        ("math.negate", "unipolar") => "Sign: out = -in.\nRange: mirror the value inside 0..max instead of flipping its sign.",
+        ("math.negate", "unipolar_max") => "The top of the range the value is mirrored inside.",
+        ("math.quantize", "factor") => "Steps per unit: 1 = integers, 2 = halves, 4 = quarters.",
+        ("math.quantize", "mode") => "Rounding: round to the nearest step, floor down to the step below, ceil up to the step above, trunc toward zero.",
+        ("module.sample_hold", "mode") => "Sample: each 0->1 on Trig takes In into Out and holds it until the next one.\nHold: Out follows In, and freezes for as long as Gate is 1.",
+        ("module.vec_to_deflection", "degrees") => "The Angle output in degrees (0..360°, wrapping) instead of as a fraction of a full turn (0..1).",
+        ("module.average", "window_ms") => "How much of the recent signal the average runs over.",
+        ("module.average", "spike_mad") => "Outlier threshold in median absolute deviations: a reading further from the middle than this is dropped. 0 = off; try 3.0 to start.",
+        ("module.dc_filter", "window_ms") => "How slowly a change has to move to count as offset rather than signal.",
+        ("module.dc_filter", "decay_ms") => "How quickly the filter settles after a real change goes through it.",
+        ("module.delay", "delay_ms") => "How long every channel is delayed by.",
+        ("module.twoway_response_curve", "hysteresis_pct") => "Band the input must come back by before the lane flips (shaded on the graph). Input noise smaller than this never moves the output, with no lag in the direction of travel.",
+        ("module.twoway_response_curve", "hyst_dir") => "Which flips the band guards: both, only the press (Down to Up), or only the release (Up to Down).",
+        ("module.twoway_response_curve", "hyst_start_up") => "Start on Up: at rest the input sits on the Up curve, so a pull from rest follows it from the first sample with no band to clear.",
+        ("module.twoway_response_curve", "interp_ms") => "How long the output takes to cross from one curve to the other when the input turns round.",
+        ("module.twoway_response_curve", "peak_hold_ms") => "Keep a curve peak up for at least this long (0 = off): a fast pull can step right over a narrow peak between two reports.",
+        ("module.twoway_response_curve", "peak_hold_dir") => "Which curves the peak hold holds on: both, the press (Up curve) only, or the release (Down curve) only.",
+        ("module.twoway_response_curve", "active_lane") => "Which curve the graph edits: Up (the input rising) or Down (falling).",
+        ("module.stick_rotation", "rot_stick") => "Which stick the gyro turns.",
+        ("module.stick_rotation", "rot_mode") => "What counts as turning: Yaw, the pad's own vertical; World, the turn about gravity, however the pad is held.",
+        ("module.stick_rotation", "rot_takeover") => sr::TAKEOVER_TIP,
+        ("module.stick_rotation", "rot_takeover_dps") => sr::TAKEOVER_SPEED_TIP,
+        ("module.stick_rotation", "rot_outer") => sr::OUTER_TIP,
+        ("module.stick_rotation", "rot_relative") => "Relative: the gyro's turn folds back to your thumb's direction once the pad stops; off, it stays until the stick comes back to centre.",
+        ("module.stick_rotation", "rot_return_ms") => sr::RETURN_TIP,
+        ("module.stick_rotation", "rot_sens") => sr::SENS_TIP,
+        ("module.stick_rotation", "rot_invert") => sr::INVERT_TIP,
+        ("module.stick_rotation", "rot_deadzone") => sr::DEADZONE_TIP,
+        ("module.stick_rotation", "rot_smooth_ms") => sr::SMOOTH_TIP,
+        ("processing.gyro_3dof", "family") => "The mode: how the pad's turns become the X and Y outputs. Each mode's tooltip on the module says what it reads.",
+        ("processing.gyro_3dof", "steering_exclude_y") => "Suppress the Y steering output (keeps Y at 0): for a wheel, where pitching the pad shouldn't move Y.",
+        ("processing.gyro_3dof", "recenter_strength") => "Keeps the wheel centred where Reset put it, from gravity, this fast per second. Pitch+Yaw sees the wheel with the pad held upright, Pitch+Roll with it held flat; the other modes turn about gravity itself, which it can't see. 0 is off.",
+        ("processing.gyro_3dof", "reset_ease_in") => "How long a Reset takes to bring steering back to 0, in seconds.",
+        ("processing.gyro_3dof", "lean_threshold") => "How far the pad has to lean, as a share of on its side, for the Lean! output to fire.",
+        ("processing.gyro_3dof", "roll_contribution") => crate::canvas::viewer::gyro_body::GYRO_ROLL_MIX_TIP,
+        ("processing.gyro_3dof", "hold_pitch") => "The neutral hold's pitch: how far the far edge is raised when the pad is held at rest. The 2D outputs and Lean measure from the hold.",
+        ("processing.gyro_3dof", "hold_yaw") => "The neutral hold's yaw: how far the pad is turned when held at rest. The 2D outputs and Lean measure from the hold.",
+        ("processing.gyro_3dof", "hold_roll") => "The neutral hold's roll: how far the pad is rolled when held at rest (lying on your side, say). The 2D outputs and Lean measure from the hold.",
+        ("processing.gyro_3dof", "edge_mode") => crate::canvas::viewer::gyro_body::GYRO_EDGE_TIP,
+        ("processing.gyro_3dof", "edge_x_only") => "Horizontal only: pitch neither counts toward the zone nor turns the camera.",
+        ("processing.gyro_3dof", "edge_zone_deg") => "Where the edge starts, from neutral. Pure gyro inside.",
+        ("processing.gyro_3dof", "edge_blend_deg") => "Degrees past the zone over which momentum and the gyro hand-off ease in (0 = all at once).",
+        ("processing.gyro_3dof", "edge_gyro_keep") => "The gyro's own aim left once past the blend: 100% keeps it (the edge only adds), 0% hands over to the edge entirely, like a stick.",
+        ("processing.gyro_3dof", "edge_ramp_deg") => "Degrees past the zone where Ramp reaches max, eased in (0 = full speed as soon as you leave it).",
+        ("processing.gyro_3dof", "edge_max_dps") => "Ramp's top speed, as a gyro turn rate: downstream sensitivity scales it like the gyro.",
+        ("processing.gyro_3dof", "edge_momentum") => "Share of the turn-out speed kept as the camera's floor (1 = carries on as fast as the pad was turning).",
+        ("processing.gyro_3dof", "edge_decay_s") => "How long momentum takes to fade, in seconds (0 = holds while you stay out).",
+        ("processing.gyro_3dof", "orient_source") => "Where the Orientation output's pose comes from: Auto, the pad's own when it fuses one and this module's otherwise; Computed, always this module's; Device, only the pad's own.",
+        ("processing.gyro_3dof", "inv_yaw") => "Turn the yaw the other way, for the outputs and the pose.",
+        ("processing.gyro_3dof", "inv_pitch") => "Turn the pitch the other way, for the outputs and the pose.",
+        ("processing.gyro_3dof", "inv_roll") => "Turn the roll the other way, for the outputs and the pose.",
+        ("processing.gyro_3dof", "inv_accel_x") => "Read the accelerometer's forward axis the other way, for a pad that reports it reversed.",
+        ("processing.gyro_3dof", "inv_accel_y") => "Read the accelerometer's side axis the other way, for a pad that reports it reversed.",
+        ("processing.gyro_3dof", "inv_accel_z") => "Read the accelerometer's vertical axis the other way: held flat face up it should read +1 g.",
+        ("processing.rws", "scale") => "Mouse Move (XY) output: mouse dots per degree of turn, or per 360° - the calibrated 1:1 ground truth.",
+        ("processing.rws", "rws") => "Real World Scale: the sensitivity, as a multiple of the calibrated 1:1 turn. 1.0 = the camera turns as far as your hands do; 2.0 = twice as far.",
+        ("processing.rws", "stick_out_dps") => "Right-Stick output: the game's camera turn rate at full deflection.",
+        ("processing.rws", "gyro_scale") => "Map output: the pad's own gyro, scaled, for a game that aims with it.",
+        ("processing.rws", "gyro_vh_ratio") => "Vertical sensitivity relative to horizontal, for the gyro (1.0 = equal; above 1 looks up and down faster).",
+        ("processing.rws", "stick_vh_ratio") => "Vertical sensitivity relative to horizontal, for the stick sources (1.0 = equal; above 1 looks up and down faster).",
+        _ => return None,
+    })
+}
+
+/// (module id, element) of a sub-patch layout's item `idx`, as the gamepad navigates it. An
+/// AutoMap curve navigates as the plain curve it runs, as the config overlay's selection does
+/// (`nav_config_override`): under its own id its rows had no fields, so on a layout the pad
+/// reached its graph and none of its rows.
+pub(crate) fn sp_item_element(sp: &crate::canvas::node::UiSubPatch, idx: usize) -> Option<(String, String)> {
+    let crate::canvas::node::LayoutItem::Module(m) = sp.items.get(idx)? else { return None };
+    let node = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?;
+    Some((crate::canvas::viewer::curve_ui_module_id(node).to_string(), m.element_id.clone()))
+}
+
+#[cfg(test)]
+mod sp_item_tests {
+    // Every row a Two-way curve pins is something the pad can edit, the AutoMap one's too:
+    // the rows of an AutoMap Two-way on a layout couldn't be entered, while the same rows on
+    // the config overlay could.
+    #[test]
+    fn an_automap_curves_pinned_rows_have_fields_on_a_layout() {
+        for module in ["module.twoway_response_curve", "module.automap_twoway_response_curve", "module.automap_response_curve"] {
+            let desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == module)
+                .expect("registered");
+            let mut sp = crate::canvas::node::UiSubPatch::default();
+            let inner = sp.snarl.insert_node(egui::Pos2::ZERO, crate::canvas::node::NodeData::from(&desc));
+            let rows: &[&str] = if module.contains("twoway") {
+                &["scale_row", "range_row", "grid_row", "grid_options_row", "hyst_row", "interp_row", "lane_toggle"]
+            } else {
+                &["scale_row", "range_row", "grid_row", "grid_options_row"]
+            };
+            for (i, row) in rows.iter().enumerate() {
+                let pin: crate::canvas::node::ExposedModule = serde_json::from_str(&format!(
+                    r#"{{"inner_node_id":{},"element_id":"{row}","pos":[0,{}],"size":[200,20]}}"#,
+                    inner.0,
+                    24 * i,
+                ))
+                .expect("a pin");
+                sp.items.push(crate::canvas::node::LayoutItem::Module(pin));
+                let (mid, elem) = super::sp_item_element(&sp, i).expect("a module item");
+                let node = sp.snarl.get_node(inner);
+                assert!(
+                    !super::element_fields(&mid, &elem, node).is_empty(),
+                    "{module}'s {row} has nothing for the pad (navigated as {mid})",
+                );
+                assert!(crate::app::FlexInputApp::elem_is_nav_target(&mid, &elem), "{module}'s {row} isn't a target");
+            }
+        }
+    }
+}
+
+/// The fields of a pinned element, as the gamepad walks them and a Style 2 pin draws them
+/// (`pin_style2::render_fields`): label, param, range and step, in order - some depending on
+/// the node's params (a setting shown only while another is on). Empty for elements with no
+/// such fields.
+pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> Vec<NavFieldDef> {
+    use NavField::*;
+    use NavStep::{Decade, Fixed, FixedScaled, Linear};
+    let param_str = |n: &NodeData, k: &str| n.params.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let param_bool = |n: &NodeData, k: &str| n.params.get(k).and_then(|v| v.as_bool());
+        // Gyro axis options (family, axis) for the pointer/steering mode rows.
+        const GYRO_PTR: &[(&str, &str, &str)] = &[
+            ("Pitch+Yaw", "pointer", "pitch_yaw"),
+            ("Pitch+Roll", "pointer", "pitch_roll"),
+            ("Player", "pointer", "player"),
+            ("World", "pointer", "world"),
+            ("Orient", "pointer", "orient"),
+        ];
+        const GYRO_STEER: &[(&str, &str, &str)] = &[
+            ("Pitch+Yaw", "steering", "pitch_yaw"),
+            ("Pitch+Roll", "steering", "pitch_roll"),
+            ("Player", "steering", "player"),
+            ("World", "steering", "world"),
+            ("Orient", "steering", "orient"),
+        ];
+        let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
+        macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l.into(), field: $field } }; }
+        // RWS Mouse Scale steps in the unit the header shows it in: 1 dot/°
+        // (fine 0.1), or 100 dots/360° (fine 10).
+        let rws_scale_step = || {
+            let per_360 = node.and_then(|n| n.params.get("scale_unit").and_then(|v| v.as_str())) == Some("360");
+            if per_360 { FixedScaled { coarse: 100.0, factor: 360.0 } } else { Fixed(1.0) }
+        };
+        // An AutoMap curve on a motion sensor: its range row is the graph's
+        // view of the sensor, in °/s or G (see `MotionUnit`).
+        if elem == "range_row" {
+            let axes = node.and_then(|node| Some(crate::canvas::viewer::MotionUnit::of(node)?.view_axes(node)));
+            if let Some([i, o]) = axes {
+                let row = |name: &str, a: crate::canvas::viewer::ViewAxis, end: usize, d: f32| {
+                    f!(format!("{name}{}", a.suffix), v(a.keys[end], -a.full_scale, a.full_scale, d, Fixed(a.step)))
+                };
+                return vec![
+                    row("In↓", i, 0, -i.extent),
+                    row("In↑", i, 1, i.extent),
+                    row("Out↓", o, 0, -o.extent),
+                    row("Out↑", o, 1, o.extent),
+                ];
+            }
+        }
+        match (mid, elem) {
+            // ── single-field elements (also driven by the unified editor) ──
+            ("module.delay", "ms")            => vec![f!("Delay", v("delay_ms",0.0,60_000.0,100.0,Decade))],
+            ("module.average", "samples")     => vec![f!("Window", v("window_ms",0.5,5_000.0,5.0,Decade))],
+            ("module.average", "spike_mad")   => vec![f!("Spike limit", v("spike_mad",0.0,20.0,0.0,Linear))],
+            ("module.dc_filter", "window_ms") => vec![f!("Window", v("window_ms",10.0,60_000.0,500.0,Decade))],
+            ("module.dc_filter", "decay_ms")  => vec![f!("Settle", v("decay_ms",10.0,60_000.0,200.0,Decade))],
+            ("logic.delay", "time")           => vec![f!("Time", v("time",0.0,60_000.0,100.0,Decade))],
+            ("logic.delay", "mode")           => vec![f!("Mode", Enum{key:"mode",opts:&["delay_true","delay_false"]})],
+            ("module.sample_hold", "mode")    => vec![f!("Mode", Enum{key:"mode",opts:&["sample","hold"]})],
+            // Steps in the unit its field reads in (see `HysteresisField`).
+            ("logic.has_changed", "hysteresis") => {
+                let Some(field) = node.map(crate::canvas::viewer::HysteresisField::of) else { return Vec::new() };
+                let step = FixedScaled { coarse: field.nav_step, factor: field.scale };
+                vec![f!(format!("Hysteresis {}", field.suffix.trim()), v("hysteresis_pct",0.0,100.0,0.0,step))]
+            }
+            ("generator.oscillator", "freq")  => vec![f!("Frequency", v("freq_param",0.01,200.0,1.0,Decade))],
+            ("generator.oscillator", "phase") => vec![f!("Phase", v("phase_param",0.0,1.0,0.0,Linear))],
+            ("generator.oscillator", "shape") => vec![f!("Shape", Enum{key:"shape",opts:&["sine","triangle","saw","square"]})],
+            ("processing.gyro_3dof", "lean_threshold") => vec![f!("Lean threshold", v("lean_threshold",0.01,4.0,0.3,Linear))],
+            // ── RWS Aim ──
+            // The pinned ruler ("field") carries the full calibration control set
+            // so it can be run AND stopped from the gamepad with only the ruler
+            // pinned (mouse output is busy driving the game during calibration).
+            // Fixed steps → clean stepping: coarse lands on integers, fine on the
+            // 0.1 (or 1) grid. `scale` fine (0.1) matters for calibration; the
+            // °/s fields step by 10 coarse / 1 fine (whole degrees per second).
+            ("processing.rws", "scale") => vec![f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step()))],
+            ("processing.rws", "rws")   => vec![f!("Real world scale", v("rws",0.01,50.0,1.0,Fixed(1.0)))],
+            ("processing.rws", "stick_dps") => vec![f!("Stick speed", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0)))],
+            ("processing.rws", "gyro_scale") => vec![f!("Gyro scale", v("gyro_scale",0.0,1000.0,1.0,Fixed(0.01)))],
+            ("processing.rws", "vh") => vec![
+                f!("Gyro V/H", v("gyro_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
+                f!("Stick V/H", v("stick_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
+            ],
+            // Measure auto-cal. One nominal field so it classifies as MultiField
+            // (South at the pin ENTERS it); the actual in-widget controls are
+            // handled specially in `nav_drive_rws_measure` (◄► pick method, A
+            // start / A finish, B back / B cancel) because South/East are far
+            // clearer here than field-walking.
+            ("processing.rws", "measure") => vec![
+                f!("Auto-cal", Enum{key:"cal_measure",opts:&["off","pitch","yaw"]}),
+            ],
+            ("processing.rws", "field") => vec![
+                f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step())),
+                f!("Real world scale", v("rws",0.01,50.0,1.0,Fixed(1.0))),
+            ],
+            // FOV strictly whole degrees (Fixed(10) → 10 coarse / 1 fine).
+            ("processing.rws", "style") => vec![
+                f!("View", Enum{key:"field_mode",opts:&["ruler","room","both"]}),
+                f!("FOV", v("field_fov",30.0,140.0,90.0,Fixed(10.0))),
+                f!("BG", v("field_bg_alpha",0.0,1.0,0.0,Linear)),
+                f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Fixed(5.0))),
+            ],
+            // Field order = the rects `rws_flick_row` / `rws_flick_opts_row`
+            // publish, so the glow lands on the field being edited.
+            ("processing.rws", "flick") => vec![
+                f!("Flick dz", v("flick_deadzone",0.1,0.99,0.85,Fixed(0.1))),
+                f!("Smooth ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
+                f!("Stick aim", Toggle{key:"stick_aim_enabled"}),
+                f!("Aim ×", v("stick_aim_rws",0.01,50.0,1.0,Fixed(0.1))),
+            ],
+            ("processing.rws", "flick_opts") => vec![
+                f!("Stabilise ms", v("flick_stabilise_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Fwd ±°", v("flick_fwd_dz_deg",0.0,90.0,0.0,Fixed(5.0))),
+                f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
+            ],
+            ("processing.rws", "flick_speed") => vec![
+                f!("Flick within ms", v("flick_speed_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Slow = aim only", Toggle{key:"flick_slow_lock"}),
+            ],
+            ("processing.rws", "suppress") => vec![
+                f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
+            ],
+            // ── Gyro to Stick Rotation ──
+            // Each option lists its default first, so an untouched node shows it.
+            // The pinned circle carries every setting, so it can be tuned from
+            // the pad with nothing else pinned.
+            ("module.stick_rotation", "options") => vec![
+                f!("Stick", Enum{key:"rot_stick",opts:&["right_stick","left_stick"]}),
+                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
+            ],
+            ("module.stick_rotation", "sens") => vec![
+                f!("Sensitivity", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Invert", Toggle{key:"rot_invert"}),
+            ],
+            ("module.stick_rotation", "hold") => vec![
+                f!("Relative", Toggle{key:"rot_relative"}),
+                f!("Return time", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
+            ],
+            ("module.stick_rotation", "takeover") => vec![
+                f!("Takeover", Toggle{key:"rot_takeover"}),
+                f!("Takes over above", v("rot_takeover_dps",0.0,120.0,10.0,Fixed(1.0))),
+                f!("Outer zone", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
+            ],
+            ("module.stick_rotation", "deadzone") => vec![f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05)))],
+            ("module.stick_rotation", "stabilise") => vec![f!("Stabilise", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0)))],
+            ("module.stick_rotation", "field") => vec![
+                f!("Sensitivity", v("rot_sens",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Deadzone", v("rot_deadzone",0.0,0.95,0.2,Fixed(0.05))),
+                f!("Stabilise", v("rot_smooth_ms",0.0,500.0,0.0,Fixed(10.0))),
+                f!("Turn", Enum{key:"rot_mode",opts:&["yaw","world"]}),
+                f!("Relative", Toggle{key:"rot_relative"}),
+                f!("Return time", v("rot_return_ms",0.0,2000.0,250.0,Fixed(50.0))),
+                f!("Takeover", Toggle{key:"rot_takeover"}),
+                f!("Outer zone", v("rot_outer",0.05,1.0,0.9,Fixed(0.05))),
+            ],
+            // ── multi-field rows ──
+            ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
+            ("math.negate", "unipolar") => vec![
+                f!("Unipolar", Toggle{key:"unipolar"}),
+                f!("Max", v("unipolar_max",0.0,1000.0,1.0,Linear)),
+            ],
+            ("math.quantize", "factor") => vec![f!("Factor", v("factor",0.0,10_000.0,1.0,Decade))],
+            ("math.quantize", "mode")   =>
+                vec![f!("Mode", Enum{key:"mode",opts:&["round","floor","ceil","trunc"]})],
+            ("module.vec_to_deflection", "angle_unit") => vec![f!("Degrees", Toggle{key:"degrees"})],
+            ("logic.counter", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
+            ("logic.counter", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
+            ("logic.counter", "min_max") => vec![
+                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
+                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
+            ],
+            ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode") =>
+                vec![f!("Pointer", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_PTR})],
+            ("processing.gyro_3dof", "steering_mode") =>
+                vec![f!("Steering", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_STEER})],
+            ("processing.gyro_3dof", "steering_opts") => vec![
+                f!("Exclude Y", Toggle{key:"steering_exclude_y"}),
+                f!("Recenter", v("recenter_strength",0.0,4.0,0.0,Linear)),
+                f!("Reset ease", v("reset_ease_in",0.0,2.0,0.25,Linear)),
+            ],
+            ("processing.gyro_3dof", "roll_mix") =>
+                vec![f!("Roll mix", v("roll_contribution",-100.0,100.0,0.0,Fixed(5.0)))],
+            ("processing.gyro_3dof", "hold_offset") => vec![
+                f!("Hold pitch", v("hold_pitch",-180.0,180.0,0.0,Fixed(5.0))),
+                f!("Hold yaw", v("hold_yaw",-180.0,180.0,0.0,Fixed(5.0))),
+                f!("Hold roll", v("hold_roll",-180.0,180.0,0.0,Fixed(5.0))),
+            ],
+            // Order matches `GyroEdge::ui_rects`' field rects.
+            ("processing.gyro_3dof", "edge_turn") => vec![
+                f!("Edge turn", Enum{key:"edge_mode",opts:&["off","ramp","momentum","both"]}),
+                f!("X only", Toggle{key:"edge_x_only"}),
+                f!("Edge zone", v("edge_zone_deg",0.0,170.0,30.0,Fixed(5.0))),
+                f!("Blend", v("edge_blend_deg",0.0,170.0,15.0,Fixed(5.0))),
+                f!("Gyro kept", v("edge_gyro_keep",0.0,1.0,1.0,Fixed(0.1))),
+                f!("Ramp width", v("edge_ramp_deg",0.0,170.0,30.0,Fixed(5.0))),
+                f!("Max speed", v("edge_max_dps",0.0,4000.0,180.0,Fixed(20.0))),
+                f!("Momentum", v("edge_momentum",0.0,10.0,1.0,Fixed(0.1))),
+                f!("Momentum fade", v("edge_decay_s",0.0,30.0,0.0,Fixed(0.1))),
+            ],
+            // A missing key is Auto, so Auto leads (a missing Enum reads as
+            // its first option).
+            ("processing.gyro_3dof", "orient_source") =>
+                vec![f!("3D source", Enum{key:"orient_source",opts:&["auto","computed","device"]})],
+            ("processing.gyro_3dof", "gyro_invert") => vec![
+                f!("yaw", Toggle{key:"inv_yaw"}),
+                f!("pitch", Toggle{key:"inv_pitch"}),
+                f!("roll", Toggle{key:"inv_roll"}),
+            ],
+            ("processing.gyro_3dof", "accel_invert") => vec![
+                f!("Accel X", Toggle{key:"inv_accel_x"}),
+                f!("Accel Y", Toggle{key:"inv_accel_y"}),
+                f!("Accel Z", Toggle{key:"inv_accel_z"}),
+            ],
+            // ── curve option rows ──
+            ("module.response_curve", "scale_row") | ("module.twoway_response_curve", "scale_row") => vec![
+                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
+                f!("Abs", Toggle{key:"absolute"}),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            ("module.vec_response_curve", "scale_row") => vec![
+                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            // Bounds are ±100 to allow extremes, but tuning happens near ±1 — use a
+            // fixed 0.1 step (fine 0.01) so dpad/stick can fine-tune, not span-scaled.
+            ("module.response_curve", "range_row") | ("module.twoway_response_curve", "range_row") => vec![
+                f!("In↓", v("in_min",-100.0,100.0,-1.0,Fixed(0.1))),
+                f!("In↑", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
+                f!("Out↓", v("out_min",-100.0,100.0,-1.0,Fixed(0.1))),
+                f!("Out↑", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
+            ],
+            ("module.vec_response_curve", "range_row") => vec![
+                f!("In max", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
+                f!("Out max", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
+            ],
+            // ── Vec Reshaper option rows ──
+            ("module.vec_reshape", "target_row") => vec![
+                f!("Edit", Enum{key:"edit_target",opts:&["gain","boundary"]}),
+            ],
+            ("module.vec_reshape", "options_row") => vec![
+                f!("Symmetry", Enum{key:"symmetry",opts:&["quad4","xmirror"]}),
+                f!("Renorm", Toggle{key:"renorm"}),
+            ],
+            ("module.vec_reshape", "range_row") => vec![
+                f!("In max", v("in_max",0.05,2.0,1.0,Linear)),
+                f!("Out max", v("out_max",0.05,2.0,1.0,Linear)),
+            ],
+            ("module.vec_reshape", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,16.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,16.0,4.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
+            ],
+            ("module.response_curve", "grid_row") | ("module.vec_response_curve", "grid_row")
+            | ("module.twoway_response_curve", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
+                f!("Trail ms", v("trail_ms",0.0,3000.0,300.0,Decade)),
+            ],
+            ("module.response_curve", "grid_options_row") | ("module.vec_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "grid_options_row") => vec![
+                f!("Scale grid", Toggle{key:"show_scaled_grid"}),
+                f!("Labels", Toggle{key:"show_grid_labels"}),
+            ],
+            // ── Envelope Generator option rows ──
+            // Field order MUST match render_envelope_time_row's published rects:
+            // [unit segment, value box] left→right.
+            ("generator.envelope", "time_row") => vec![
+                f!("Time unit", Enum{key:"timebase", opts:&["ms","s","hz"]}),
+                f!("Time", v("time_mul", 0.01, 60_000.0, 500.0, Decade)),
+            ],
+            ("generator.envelope", "sustain_row") => vec![
+                f!("Sustain", v("sustain", 0.0, 1.0, 0.3, Fixed(0.02))),
+            ],
+            ("generator.envelope", "mode_row") => vec![
+                f!("Hold", Toggle{key:"hold"}),
+                f!("Bounce", Toggle{key:"bounce"}),
+                f!("Loop", Toggle{key:"loop"}),
+            ],
+            ("generator.envelope", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            ("generator.envelope", "grid_options_row") => vec![
+                f!("Grid", Toggle{key:"show_grid"}),
+                f!("Labels", Toggle{key:"show_grid_labels"}),
+            ],
+            // ── Trigger scope rows (the oscilloscope's, without Freeze) ──
+            ("display.trigscope", "controls") => vec![
+                f!("Win ms", v("ts_win_ms",10.0,10_000.0,200.0,Decade)),
+                f!("Scale", v("ts_scale",0.000001,100.0,1.0,Decade)),
+                f!("Scale in", Enum{key:"ts_axis",opts:&["gyro","accel","value"]}),
+                f!("Auto", Toggle{key:"ts_auto"}),
+                f!("Uni", Toggle{key:"ts_uni"}),
+            ],
+            ("display.trigscope", "grid_row") => vec![
+                f!("Grid H", v("ts_grid_x",0.0,20.0,4.0,Linear)),
+                f!("Grid V", v("ts_grid_y",0.0,20.0,4.0,Linear)),
+                f!("Sub", v("ts_grid_sub",1.0,10.0,1.0,Linear)),
+                f!("Labels", Toggle{key:"ts_labels"}),
+                f!("Stats", Toggle{key:"ts_stats"}),
+                f!("Peaks", Toggle{key:"ts_peaks"}),
+            ],
+            ("module.twoway_response_curve", "hyst_row") => vec![
+                f!("Hysteresis", v("hysteresis_pct",0.0,10.0,0.5,Linear)),
+                f!("Hysteresis on", Enum{key:"hyst_dir",opts:&["both","up","down"]}),
+                f!("Start on up", Toggle{key:"hyst_start_up"}),
+            ],
+            ("module.twoway_response_curve", "interp_row") => vec![
+                f!("Crossover", v("interp_ms",0.0,500.0,50.0,Decade)),
+                f!("Peak hold", v("peak_hold_ms",0.0,200.0,0.0,Linear)),
+                f!("Peak hold on", Enum{key:"peak_hold_dir",opts:&["up","both","down"]}),
+            ],
+            ("module.twoway_response_curve", "lane_toggle") => vec![
+                f!("Lane", Enum{key:"active_lane",opts:&["up","dn","hy"]}),
+            ],
+            // Oscilloscope controls row — order matches the rects
+            // `render_oscilloscope_controls` publishes: Win (log ms) / Scale
+            // (the picked kind's) / its unit / Auto / Bi-Uni / Freeze.
+            ("display.oscilloscope", "controls") => vec![
+                f!("Win ms", v("osc_win_ms",10.0,10_000.0,200.0,Decade)),
+                f!("Scale", v("osc_scale",0.000001,100.0,1.0,Decade)),
+                f!("Scale in", Enum{key:"osc_axis",opts:&["gyro","accel","value"]}),
+                f!("Auto", Toggle{key:"osc_auto"}),
+                f!("Uni", Toggle{key:"osc_uni"}),
+                f!("Freeze", Toggle{key:"osc_freeze"}),
+            ],
+            // Oscilloscope guides row — order matches `osc_grid_row_ui`'s rects.
+            ("display.oscilloscope", "grid_row") => vec![
+                f!("Grid H", v("osc_grid_x",0.0,20.0,4.0,Linear)),
+                f!("Grid V", v("osc_grid_y",0.0,20.0,4.0,Linear)),
+                f!("Sub", v("osc_grid_sub",1.0,10.0,1.0,Linear)),
+                f!("Labels", Toggle{key:"osc_labels"}),
+                f!("Stats", Toggle{key:"osc_stats"}),
+                f!("Peaks", Toggle{key:"osc_peaks"}),
+            ],
+            // Audio Stream Haptics calibration rows + mode block. Ranges/defaults
+            // mirror the sliders in viewer.rs `asth_draw_row` / `asth_draw_mode_block`.
+            ("module.audio_stream_haptics", "asth_mode_row") => vec![
+                f!("Capture", Enum{key:"asth_mode",opts:&["process","focused","system"]}),
+                f!("Children", Toggle{key:"asth_include_tree"}),
+            ],
+            ("module.audio_stream_haptics", "asth_volume") =>
+                vec![f!("Volume", v("asth_volume",0.0,2.0,1.0,Linear))],
+            ("module.audio_stream_haptics", "asth_release") =>
+                vec![f!("Release", v("asth_release",1.0,500.0,30.0,Decade))],
+            ("module.audio_stream_haptics", "asth_crossover") =>
+                vec![f!("Crossover", v("asth_crossover",60.0,800.0,250.0,Decade))],
+            ("module.audio_stream_haptics", "asth_amplitude") => vec![
+                f!("Floor", v("asth_amp_min",0.0,1.0,0.0,Linear)),
+                f!("Ceiling", v("asth_amp_max",0.0,1.0,1.0,Linear)),
+                f!("Curve", v("asth_curve",0.3,3.0,1.0,Linear)),
+            ],
+            ("module.audio_stream_haptics", "asth_balance") =>
+                vec![f!("Balance", v("asth_freq_bias",-1.0,1.0,0.0,Linear))],
+            ("module.audio_stream_haptics", "asth_swap_row") =>
+                vec![f!("Swap", Toggle{key:"asth_swap"})],
+            ("module.audio_stream_haptics", "asth_bands_row") => vec![
+                f!("Split L/R", Toggle{key:"asth_split"}),
+                f!("Pure tones", Toggle{key:"asth_pure"}),
+            ],
+            ("module.audio_stream_haptics", "asth_rumble_mix") =>
+                vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
+            // Selector mirrors counter's controls.
+            ("module.selector", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
+            ("module.selector", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
+            ("module.selector", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
+            ("module.selector", "min_max") => vec![
+                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
+                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
+            ],
+            // ── Virtual Menu "options" element (the TWO-row session block) ──
+            // Field order MUST match `show_menu_options_row`'s published rects,
+            // INCLUDING the conditional touch/gyro sub-fields — both this arm and
+            // the renderer gate on the SAME derived `src_touch`/`src_gyro` (with
+            // the legacy `pointer_source` fallback), so the lists stay in lockstep
+            // however the checkboxes are set. Enum option orders mirror the
+            // renderer's ComboBox value lists exactly.
+            ("module.menu", "options") => {
+                let Some(node) = node else { return vec![]; };
+                // Same legacy-derived defaults as the renderer, so a pre-checkbox
+                // patch exposes the same conditional fields the body shows.
+                let legacy = param_str(node, "pointer_source")
+                    .unwrap_or_else(|| "left_stick".to_string());
+                let src_touch = param_bool(node, "ptr_touch")
+                    .unwrap_or(legacy == "touch1" || legacy == "touch2");
+                let src_gyro = param_bool(node, "ptr_gyro")
+                    .unwrap_or(false);
+                let mut fs = vec![
+                    f!("LS", Toggle{key:"ptr_ls"}),
+                    f!("RS", Toggle{key:"ptr_rs"}),
+                    f!("Touch", Toggle{key:"ptr_touch"}),
+                ];
+                if src_touch {
+                    fs.push(f!("Touch#", Enum{key:"ptr_touch_which",opts:&["touch1","touch2"]}));
+                }
+                fs.push(f!("Gyro", Toggle{key:"ptr_gyro"}));
+                if src_gyro {
+                    fs.push(f!("Gyro ax", Enum{key:"ptr_gyro_axes",opts:&["pitch_yaw","pitch_roll"]}));
+                    fs.push(f!("Gyro ×", v("ptr_gyro_sens",0.5,8.0,4.0,Linear)));
+                }
+                fs.push(f!("Show", Enum{key:"activation_mode",opts:&["hold","toggle","touch","never"]}));
+                fs.push(f!("Select", Enum{key:"select_on",opts:&["release","press","click"]}));
+                fs.push(f!("Deadzone", v("pointer_deadzone",0.0,0.9,0.25,Linear)));
+                fs.push(f!("Linger", v("select_linger",0.0,10.0,0.5,Fixed(0.05))));
+                fs.push(f!("Sticky", Toggle{key:"hover_sticky"}));
+                fs
+            }
+            // ── Area Mapper "options" row ── order MUST match
+            // `show_area_options_row`'s published rects, including the stick-only
+            // touch gate and the rectangle-only cell rounding.
+            ("module.area_mapper", "options") => {
+                let Some(node) = node else { return vec![]; };
+                let input = param_str(node, "area_input")
+                    .unwrap_or_else(|| "left_stick".to_string());
+                let mut fs = vec![
+                    f!("Input", Enum{key:"area_input",opts:flexinput_engine::eval::AREA_INPUTS}),
+                    f!("Shape", Enum{key:crate::canvas::area_body::AREA_SHAPE_PARAM,opts:&["circle","rect"]}),
+                    f!("Sym", Toggle{key:crate::canvas::area_body::AREA_SYM_PARAM}),
+                    f!("Pass", Toggle{key:"area_pass_source"}),
+                ];
+                if !input.starts_with("touch") {
+                    fs.push(f!("Touched", Toggle{key:crate::canvas::area_body::AREA_CELL_TOUCH}));
+                }
+                if param_str(node, crate::canvas::area_body::AREA_SHAPE_PARAM).as_deref()
+                    == Some("rect")
+                {
+                    fs.push(f!("Round", v(crate::canvas::area_body::AREA_CELL_ROUND, 0.0, 1.0, 0.0,
+                        FixedScaled { coarse: 5.0, factor: 100.0 })));
+                    fs.push(f!("Pressure", v(crate::canvas::area_body::AREA_CELL_PRESSURE, 0.0, 1.0, 0.0,
+                        FixedScaled { coarse: 5.0, factor: 100.0 })));
+                }
+                fs
+            }
+            // ── Area Mapper "layers" row ── order MUST match `show_area_layer_row`:
+            // the tabs as one Layer value, Analog, then its period while analog.
+            ("module.area_mapper", "layers") => {
+                use crate::canvas::area_body as ab;
+                let Some(node) = node else { return vec![]; };
+                let count = ab::layer_count(node);
+                vec![f!("Layer", v(ab::AREA_LAYER_PARAM, 0.0, (count - 1) as f32, 0.0, Fixed(1.0)))]
+            }
+            // ── Area Mapper "analog" ── its mode, a widget of its own (`rows::analog`).
+            ("module.area_mapper", "analog") => {
+                let Some(node) = node else { return vec![]; };
+                let mut fs = vec![f!("Analog", Toggle{key:flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM})];
+                if param_bool(node, flexinput_engine::eval::AREA_LAYER_ANALOG_PARAM)
+                    .unwrap_or(false)
+                {
+                    use flexinput_engine::eval as ev;
+                    fs.push(f!("Mix", Enum{key:ev::AREA_LAYER_MIX_PARAM,opts:&["direction","keys"]}));
+                    fs.push(f!("Pulse", Enum{key:ev::AREA_LAYER_PULSE_PARAM,opts:&["smooth","pwm"]}));
+                    let smooth = node.params.get(ev::AREA_LAYER_PULSE_PARAM).and_then(|v| v.as_str()).map(|s| s != "pwm")
+                        .unwrap_or(true);
+                    // In the widget's order: the shortest press (or the period), then the
+                    // ramp - smooth only - then where half is.
+                    if smooth {
+                        fs.push(f!("Min", v(ev::AREA_LAYER_HOLD_PARAM, 1.0, 500.0, 34.0, Fixed(1.0))));
+                    } else {
+                        fs.push(f!("PWM", v(ev::AREA_LAYER_MS_PARAM, 1.0, 1000.0, 50.0, Fixed(5.0))));
+                    }
+                    if smooth {
+                        fs.push(f!("Ramp", v(ev::AREA_LAYER_RAMP_PARAM, 0.0, 1000.0, 0.0, Fixed(10.0))));
+                    }
+                    fs.push(f!("Half at", v(ev::AREA_LAYER_MID_PARAM, 0.05, 0.95, 0.5, Fixed(0.01))));
+                }
+                fs
+            }
+            // ── Area Mapper "press" row ── order MUST match `show_area_press_row`.
+            ("module.area_mapper", "press") => {
+                use flexinput_engine::eval as ev;
+                let Some(node) = node else { return vec![]; };
+                let mut fs = vec![f!("One mode", Toggle{key:ev::AREA_PRESS_LOCK_PARAM})];
+                if param_bool(node, ev::AREA_PRESS_LOCK_PARAM).unwrap_or(false) {
+                    fs.push(f!("Mode", Enum{key:ev::AREA_PRESS_MODE_PARAM,opts:ev::AREA_PRESS_MODES}));
+                    fs.push(f!("Time", v(ev::AREA_PRESS_MS_PARAM, 1.0, 5000.0, 200.0, Fixed(5.0))));
+                    fs.push(f!("Hold", Toggle{key:ev::AREA_PRESS_HOLD_PARAM}));
+                    fs.push(f!("Turbo", Toggle{key:ev::AREA_PRESS_TURBO_PARAM}));
+                }
+                fs
+            }
+            // ── Area Mapper "border" settings ── the selected border's gradient,
+            // through its param mirrors (`area_sync` carries them into the
+            // layout). Order MUST match `border_settings`' published rects:
+            // nothing until a border is selected, Gradient alone while it's hard.
+            ("module.area_mapper", "border") => {
+                use crate::canvas::area_body as ab;
+                let Some(node) = node else { return vec![]; };
+                let layout = ab::area_layout(node);
+                let Some(r) = ab::selected_border(node, &layout) else { return vec![]; };
+                let mut fs = vec![f!("Gradient", Toggle{key:ab::AREA_G_ON})];
+                if layout.shape == flexinput_core::area::Shape::Circle
+                    && matches!(r, flexinput_core::area::BorderRef::Edge(_))
+                {
+                    fs.push(f!("Square", v(ab::AREA_G_SQ, 0.0, 1.0, 0.0, FixedScaled { coarse: 5.0, factor: 100.0 })));
+                    fs.push(f!("Corners", Toggle{key:ab::AREA_G_RC}));
+                }
+                if !param_bool(node, ab::AREA_G_ON).unwrap_or(false) {
+                    return fs;
+                }
+                fs.push(f!("Width", if ab::border_width_in_degrees(layout.shape, r) {
+                    v(ab::AREA_G_W, 0.01, 1.0 / 3.0, 0.05, FixedScaled { coarse: 1.0, factor: 360.0 })
+                } else {
+                    v(ab::AREA_G_W, 0.01, 1.0, 0.1, FixedScaled { coarse: 1.0, factor: 100.0 })
+                }));
+                fs.push(f!("Curve", Enum{key:ab::AREA_G_CURVE,opts:&["linear","ease_in","ease_out","s_curve"]}));
+                fs.push(f!("Keys", Enum{key:ab::AREA_G_KEYS,opts:ab::KEY_MODES}));
+                let keys = param_str(node, ab::AREA_G_KEYS).unwrap_or_default();
+                if keys == "threshold" {
+                    fs.push(f!("Level", v(ab::AREA_G_THR, 0.0, 1.0, 0.5, Linear)));
+                } else {
+                    fs.push(f!("Period", v(ab::AREA_G_MS, 1.0, 1000.0, 100.0, Fixed(5.0))));
+                }
+                if keys == "pwm" {
+                    fs.push(f!("Phase", Enum{key:ab::AREA_G_PHASE,opts:ab::PHASES}));
+                }
+                fs
+            }
+            _ => vec![],
+        }
 }

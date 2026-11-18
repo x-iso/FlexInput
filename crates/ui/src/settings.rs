@@ -139,6 +139,20 @@ fn default_theme() -> Theme { Theme::Dark }
 /// reads better against the text.
 pub const CONTRAST_DEFAULT: f32 = 0.5;
 fn default_contrast() -> f32 { CONTRAST_DEFAULT }
+/// egui's dark-theme selection blue.
+pub const ACCENT_DEFAULT: [u8; 3] = [0, 92, 128];
+fn default_accent() -> [u8; 3] { ACCENT_DEFAULT }
+/// A cool slate, for a tint that is turned up without a colour picked first.
+pub const GRAY_TINT_DEFAULT: [u8; 3] = [110, 130, 170];
+fn default_gray_tint() -> [u8; 3] { GRAY_TINT_DEFAULT }
+/// The control font's size: the normal font at 15 points, as wide as the pills' 12-point
+/// console font was.
+pub const CONTROL_FONT_SIZE_DEFAULT: f32 = 15.0;
+/// The control font's sizes on offer. Under 11 it can't be read on a pill; over 18 it no
+/// longer fits a pill's height (it is drawn at most `CONTROL_FONT_MAX_PX`).
+pub const CONTROL_FONT_SIZE_MIN: f32 = 11.0;
+pub const CONTROL_FONT_SIZE_MAX: f32 = 18.0;
+fn default_control_font_size() -> f32 { CONTROL_FONT_SIZE_DEFAULT }
 fn default_see_through_alpha() -> f32 { 0.55 }
 fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
 fn default_cursor_max_speed() -> f32 { 4000.0 }
@@ -329,6 +343,26 @@ pub struct AppSettings {
     /// egui's stock dark theme; the default is [`CONTRAST_DEFAULT`] (0.5).
     #[serde(default = "default_contrast")]
     pub contrast: f32,
+    /// The accent: selections, lit switches, the pills' label cells. egui's dark blue
+    /// until changed.
+    #[serde(default = "default_accent")]
+    pub accent_color: [u8; 3],
+    /// A colour the greys of panels and widgets lean toward, by [`Self::gray_tint_amount`]
+    /// (0 = the plain greys).
+    #[serde(default = "default_gray_tint")]
+    pub gray_tint: [u8; 3],
+    #[serde(default)]
+    pub gray_tint_amount: f32,
+    /// The font of the controls - value pills, segments, word switches, and every button and
+    /// dropdown: console (monospace) or normal (the default).
+    #[serde(default)]
+    pub control_font_mono: bool,
+    #[serde(default)]
+    pub control_font_bold: bool,
+    /// Its size, in the normal font's points: the other faces are drawn as wide as the normal
+    /// font would be at this size (`simple_bodies::calibrate_control_fonts`).
+    #[serde(default = "default_control_font_size")]
+    pub control_font_size: f32,
     /// Whole-UI scale on top of the OS display scale (egui zoom factor), one of
     /// [`UI_SCALE_STEPS`]. Fonts re-rasterize at the resulting pixels-per-point,
     /// so text stays sharp at any step. Applied at startup and on the Settings
@@ -586,6 +620,10 @@ pub struct AppSettings {
     /// OVERLAY_FPS_MIN..=MAX.
     #[serde(default = "default_overlay_fps")]
     pub overlay_fps: u32,
+    /// The monitor the overlays cover (and a calibration's screenshot is taken of), by
+    /// device name (`DISPLAY2`); `None` = the primary. Picked in the header.
+    #[serde(default)]
+    pub overlay_monitor: Option<String>,
     /// Whether the CONFIG overlay was visible on exit — restored on launch
     /// (mirrors `overlay_visible`; live state lives in a ctx temp slot synced
     /// back by `update()`).
@@ -974,6 +1012,12 @@ impl Default for AppSettings {
             default_rumble_exp: default_rumble_exp(),
             theme: Theme::Dark,
             contrast: CONTRAST_DEFAULT,
+            accent_color: ACCENT_DEFAULT,
+            gray_tint: GRAY_TINT_DEFAULT,
+            gray_tint_amount: 0.0,
+            control_font_mono: false,
+            control_font_bold: false,
+            control_font_size: CONTROL_FONT_SIZE_DEFAULT,
             ui_scale: UI_SCALE_DEFAULT,
             see_through_alpha: 0.55,
             see_through_active: false,
@@ -1027,6 +1071,7 @@ impl Default for AppSettings {
             overlay_shortcut: default_overlay_shortcut(),
             edit_overlay_shortcut: default_edit_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,
+            overlay_monitor: None,
             config_overlay_visible: false,
             config_overlay_shortcut: default_config_overlay_shortcut(),
             config_overlay_passthrough_default: false,
@@ -1077,6 +1122,25 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
         style.visuals.widgets.inactive.bg_fill = adjust(style.visuals.widgets.inactive.bg_fill);
         style.visuals.widgets.inactive.weak_bg_fill = adjust(style.visuals.widgets.inactive.weak_bg_fill);
     }
+    apply_gray_tint(&mut style.visuals, settings.gray_tint, settings.gray_tint_amount);
+    // The accent: what is selected, lit or on.
+    let [r, g, b] = settings.accent_color;
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(r, g, b);
+    // The controls' font: the pills read it from `simple_bodies`, and every egui button and
+    // dropdown from the Button text style - so none is left in the font it had.
+    let size = settings.control_font_size.clamp(CONTROL_FONT_SIZE_MIN, CONTROL_FONT_SIZE_MAX);
+    crate::canvas::viewer::simple_bodies::set_control_font(settings.control_font_mono, settings.control_font_bold, size);
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        crate::canvas::viewer::simple_bodies::control_font_at(size.min(crate::canvas::viewer::simple_bodies::CONTROL_FONT_MAX_PX)),
+    );
+    // And every other text style in it, at egui's sizes scaled by the setting: labels,
+    // hints and headings were left in egui's font. (Monospace stays: it is for code.)
+    for (ts, base) in egui::Style::default().text_styles {
+        if base.family == egui::FontFamily::Proportional && ts != egui::TextStyle::Button {
+            style.text_styles.insert(ts, crate::canvas::viewer::simple_bodies::ui_font(base.size));
+        }
+    }
 
     // See-through mode is NOT applied here on the global style — that
     // would tint sub-windows (Settings, Calibration, Subpatch editors)
@@ -1087,6 +1151,92 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
     ctx.set_style(style);
 }
 
+
+pub(crate) use crate::canvas::viewer::simple_bodies::{ui_font, ui_size};
+
+/// The grey tint's per-channel factors, as [`apply_gray_tint`] last set them (1, 1, 1 =
+/// none), for the greys painted by hand rather than taken from the style: [`tinted`].
+static TINT_K: [std::sync::atomic::AtomicU32; 3] = [
+    std::sync::atomic::AtomicU32::new(0x3F80_0000),
+    std::sync::atomic::AtomicU32::new(0x3F80_0000),
+    std::sync::atomic::AtomicU32::new(0x3F80_0000),
+];
+
+/// Each channel's factor for a tint `amount` (0..1) of `tint`: the channel over the tint's
+/// brightness, so a grey keeps its lightness and takes the tint's hue.
+fn tint_factors(tint: [u8; 3], amount: f32) -> [f32; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    let luma = (0.299 * tint[0] as f32 + 0.587 * tint[1] as f32 + 0.114 * tint[2] as f32).max(1.0);
+    tint.map(|c| 1.0 + (c as f32 / luma - 1.0) * amount)
+}
+
+fn tint_with(col: egui::Color32, k: [f32; 3]) -> egui::Color32 {
+    let f = |c: u8, k: f32| (c as f32 * k).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(f(col.r(), k[0]), f(col.g(), k[1]), f(col.b(), k[2]), col.a())
+}
+
+/// `col` under the grey tint (Settings → Display), for a grey a painter picks itself - a
+/// node's border, a graph's backdrop, a hint's text. The style's own greys take it in
+/// [`apply_gray_tint`]; these didn't, and stood out grey among the tinted ones.
+pub(crate) fn tinted(col: egui::Color32) -> egui::Color32 {
+    let k = TINT_K.each_ref().map(|a| f32::from_bits(a.load(std::sync::atomic::Ordering::Relaxed)));
+    if k == [1.0; 3] {
+        col
+    } else {
+        tint_with(col, k)
+    }
+}
+
+/// A grey of lightness `l`, under the grey tint.
+pub(crate) fn tinted_gray(l: u8) -> egui::Color32 {
+    tinted(egui::Color32::from_gray(l))
+}
+
+/// Lean the greys of panels, widgets and text toward `tint` by `amount` (0..1), keeping their
+/// lightness, and remember it for the greys painted by hand ([`tinted`]).
+pub(crate) fn apply_gray_tint(v: &mut egui::Visuals, tint: [u8; 3], amount: f32) {
+    let k = if amount < 1e-3 { [1.0; 3] } else { tint_factors(tint, amount) };
+    for (a, k) in TINT_K.iter().zip(k) {
+        a.store(k.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    if k == [1.0; 3] {
+        return;
+    }
+    let t = |col: egui::Color32| tint_with(col, k);
+    v.panel_fill = t(v.panel_fill);
+    v.window_fill = t(v.window_fill);
+    v.extreme_bg_color = t(v.extreme_bg_color);
+    v.faint_bg_color = t(v.faint_bg_color);
+    v.code_bg_color = t(v.code_bg_color);
+    v.window_stroke.color = t(v.window_stroke.color);
+    v.window_shadow.color = t(v.window_shadow.color);
+    v.popup_shadow.color = t(v.popup_shadow.color);
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.bg_fill = t(w.bg_fill);
+        w.weak_bg_fill = t(w.weak_bg_fill);
+        w.bg_stroke.color = t(w.bg_stroke.color);
+        // The text greys too: weak and normal text are greys as much as a panel is.
+        w.fg_stroke.color = t(w.fg_stroke.color);
+    }
+}
+
+/// What [`apply_theme_and_contrast`] reads, as one number: the app re-applies the style
+/// when it changes.
+pub(crate) fn theme_key(s: &AppSettings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (s.theme as u8).hash(&mut h);
+    s.contrast.to_bits().hash(&mut h);
+    s.see_through_active.hash(&mut h);
+    s.see_through_alpha.to_bits().hash(&mut h);
+    s.accent_color.hash(&mut h);
+    s.gray_tint.hash(&mut h);
+    s.gray_tint_amount.to_bits().hash(&mut h);
+    s.control_font_mono.hash(&mut h);
+    s.control_font_bold.hash(&mut h);
+    s.control_font_size.to_bits().hash(&mut h);
+    h.finish()
+}
 
 fn settings_path() -> Option<std::path::PathBuf> {
     let mut p = flexinput_core::paths::app_data_dir()?;
@@ -1501,5 +1651,37 @@ mod workspace_resilience_tests {
         let out = parse_workspace_resilient(&bytes, None).unwrap();
         assert_eq!(out.active_tab, 1);
         assert_eq!(out.tabs.iter().map(|t| t.title.clone()).collect::<Vec<_>>(), ["A", "B"]);
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    // The accent is what is selected; the tint at 0 leaves the greys alone, and turned up it
+    // moves their hue toward the tint while keeping them about as light. (The control font is
+    // left at its default: it is process-wide, and other tests measure with it.)
+    #[test]
+    fn the_theme_settings_reach_the_style() {
+        let ctx = egui::Context::default();
+        let mut s = AppSettings::default();
+        apply_theme_and_contrast(&ctx, &s);
+        let plain = ctx.style().visuals.clone();
+        assert_eq!(plain.selection.bg_fill, egui::Color32::from_rgb(0, 92, 128));
+
+        s.accent_color = [200, 60, 30];
+        s.gray_tint = [90, 120, 200];
+        s.gray_tint_amount = 1.0;
+        apply_theme_and_contrast(&ctx, &s);
+        let v = ctx.style().visuals.clone();
+        assert_eq!(v.selection.bg_fill, egui::Color32::from_rgb(200, 60, 30));
+        let (a, b) = (plain.panel_fill, v.panel_fill);
+        assert!(b.b() > b.r(), "the panel didn't take the blue tint: {a:?} -> {b:?}");
+        let luma = |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        assert!((luma(a) - luma(b)).abs() < 4.0, "the tint changed the lightness: {a:?} -> {b:?}");
+
+        let mut zero = plain.clone();
+        apply_gray_tint(&mut zero, [255, 0, 0], 0.0);
+        assert_eq!(zero.panel_fill, plain.panel_fill);
     }
 }

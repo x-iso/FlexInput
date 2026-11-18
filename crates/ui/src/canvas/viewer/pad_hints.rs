@@ -98,7 +98,7 @@ pub(crate) fn pad_hint_big(ui: &mut egui::Ui, hint: &str, size: f32, colour: egu
         match part {
             Part::Text(t) => {
                 if !t.trim().is_empty() {
-                    ui.label(egui::RichText::new(t.trim()).size(size).color(colour));
+                    ui.label(egui::RichText::new(t.trim()).size(crate::settings::ui_size(size)).color(colour));
                 }
             }
             Part::Pin(p) => match glyph(ui.ctx(), p, size * 1.2) {
@@ -106,7 +106,7 @@ pub(crate) fn pad_hint_big(ui: &mut egui::Ui, hint: &str, size: f32, colour: egu
                     ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(size * 1.3, size * 1.3)).tint(egui::Color32::WHITE));
                 }
                 None => {
-                    ui.label(egui::RichText::new(fallback(p)).size(size).strong().color(colour));
+                    ui.label(egui::RichText::new(fallback(p)).size(crate::settings::ui_size(size)).strong().color(colour));
                 }
             },
         }
@@ -123,7 +123,7 @@ pub(crate) fn pad_hint_big_width(ui: &egui::Ui, hint: &str, size: f32) -> f32 {
             Part::Text(t) if t.trim().is_empty() => None,
             Part::Text(t) => Some(
                 ui.painter()
-                    .layout_no_wrap(t.trim().to_string(), egui::FontId::proportional(size), egui::Color32::PLACEHOLDER)
+                    .layout_no_wrap(t.trim().to_string(), crate::settings::ui_font(size), egui::Color32::PLACEHOLDER)
                     .size()
                     .x,
             ),

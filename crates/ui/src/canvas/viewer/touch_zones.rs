@@ -402,14 +402,14 @@ pub(crate) fn tz_pick_banner(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
         egui::vec2(rect.width().min(300.0), 22.0));
     painter.rect_filled(br, 4.0, egui::Color32::from_black_alpha(180));
     painter.text(br.center(), egui::Align2::CENTER_CENTER, msg,
-        egui::FontId::proportional(12.0), accent);
+        crate::settings::ui_font(12.0), accent);
     let cancel = egui::Rect::from_min_size(egui::pos2(rect.right() - 60.0, rect.bottom() - 24.0), egui::vec2(52.0, 18.0));
     if ui.interact(cancel, ui.id().with((node_id, "tzpickcancel")), egui::Sense::click()).clicked() {
         tz_cancel_pick(snarl, node_id);
     }
     painter.rect_filled(cancel, 3.0, egui::Color32::from_black_alpha(180));
     painter.text(cancel.center(), egui::Align2::CENTER_CENTER, "Cancel",
-        egui::FontId::proportional(11.0), egui::Color32::WHITE);
+        crate::settings::ui_font(11.0), egui::Color32::WHITE);
     ui.ctx().request_repaint();
 }
 
@@ -940,7 +940,7 @@ pub(crate) fn mapping_curve_editor(
             g.left_top(),
             egui::Align2::LEFT_TOP,
             format!("{} · struck {:.0}%", n.source, n.vel * 100.0),
-            egui::FontId::proportional(10.0),
+            crate::settings::ui_font(10.0),
             visuals.weak_text_color(),
         );
     }
@@ -1132,7 +1132,7 @@ pub(crate) fn mapping_card_curve_section(
         };
         let tri = if open { "⏷" } else { "⏵" };
         painter.text(row.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER,
-            format!("{tri} Response curve"), egui::FontId::proportional(10.5), col);
+            format!("{tri} Response curve"), crate::settings::ui_font(10.5), col);
         // Accent dot: this card carries a custom curve and/or threshold.
         if has_custom {
             painter.circle_filled(row.left_center() + egui::vec2(96.0, 0.0), 2.5, accent);
@@ -1195,7 +1195,7 @@ pub(crate) fn mapping_card_curve_section(
                     .text("Rel. center").suffix("%").fixed_decimals(0))
                 .on_hover_text(hover);
             if a.driven {
-                ui.label(egui::RichText::new("driven by first card").italics().weak().size(10.0));
+                ui.label(egui::RichText::new("driven by first card").italics().weak().size(crate::settings::ui_size(10.0)));
             }
             if focused {
                 ui.painter().rect_stroke(sl.rect.expand(2.0), 3.0,
@@ -1269,7 +1269,7 @@ fn imu_scale_rows(
             let (lo, hi) = k.range_limits();
             let mut v = working.get(k.range_key()).and_then(|v| v.as_f64())
                 .map(|v| v as f32).unwrap_or(k.default_range());
-            ui.label(egui::RichText::new(format!("{} 100% =", k.label())).size(10.5).weak());
+            ui.label(egui::RichText::new(format!("{} 100% =", k.label())).size(crate::settings::ui_size(10.5)).weak());
             let decimals = if k == ImuKind::Accel { 2 } else { 0 };
             let dv = ui.add(egui::DragValue::new(&mut v)
                     .range(lo..=hi)
@@ -1292,7 +1292,7 @@ fn imu_scale_rows(
             }
         }
         let mut t = working.get(imu::IMU_LOG_KEY).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(0.0);
-        ui.label(egui::RichText::new("Log/Exp").size(10.5).weak());
+        ui.label(egui::RichText::new("Log/Exp").size(crate::settings::ui_size(10.5)).weak());
         let dv = ui.add(egui::DragValue::new(&mut t).range(-1.0..=1.0).speed(0.01).fixed_decimals(2))
             .on_hover_text("Bends the motion before the curve, as the Response Curve module's Log/Exp: \
                             below 0 raises small movements (log), above 0 holds them down (exp).\n\
@@ -1534,7 +1534,7 @@ pub(crate) fn tz_paint_zone_mapping(
     if analog_pins.is_empty() && digital_pins.is_empty() {
         // Unmapped zone: faint index so it's still identifiable as a target.
         painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
-            egui::FontId::proportional(11.0), visuals.weak_text_color().gamma_multiply(0.5));
+            crate::settings::ui_font(11.0), visuals.weak_text_color().gamma_multiply(0.5));
         return;
     }
 
@@ -1729,7 +1729,7 @@ pub(crate) fn tz_draw_field(
             tz_paint_zone_mapping(zp, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals, &zone_meta);
         } else {
             zp.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
-                egui::FontId::proportional(12.0), visuals.weak_text_color());
+                crate::settings::ui_font(12.0), visuals.weak_text_color());
         }
     }
     // Gamepad-nav focused-zone highlight (accent overlay), drawn over the zone
@@ -2153,7 +2153,7 @@ pub(crate) fn render_touch_zones_pinned(
                 let (f, txt) = crate::canvas::menu_body::fit_zone_label(
                     lp, &m.label, 11.0, (x1 - x0) * rect.width() - 6.0);
                 lp.text(egui::pos2(cx, by - 3.0), egui::Align2::CENTER_BOTTOM, txt,
-                    f, egui::Color32::from_gray(210));
+                    f, crate::settings::tinted_gray(210));
             }
         }
     }
@@ -2301,7 +2301,7 @@ pub(crate) fn tz_mini_button(
         center,
         egui::Align2::CENTER_CENTER,
         glyph,
-        egui::FontId::proportional(12.0),
+        crate::settings::ui_font(12.0),
         if hot { egui::Color32::WHITE } else { visuals.text_color() },
     );
     resp.clicked()
@@ -2336,6 +2336,9 @@ fn tz_note_pad_press(
 /// The node body: the field is what the module's corner grip sizes (`kit::Surface`) - the
 /// frame it was dragged to, less the rows around the field. It had a grip of its own in its
 /// corner and a size of its own in the patch.
+/// The narrowest the body's rows read at: the widest of their groups.
+const TZ_ROWS_MIN_W: f32 = 260.0;
+
 pub(crate) fn show_touch_zones_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2345,7 +2348,8 @@ pub(crate) fn show_touch_zones_body(
     body_w: f32,
     body_h: f32,
 ) {
-    let surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(200.0, 120.0));
+    let mut surface = super::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(200.0, 120.0));
+    surface.need(TZ_ROWS_MIN_W * super::simple_bodies::control_width_factor());
     touch_zones_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
     surface.end(ui);
 }
@@ -2445,29 +2449,26 @@ fn touch_zones_body(
     }
 
     ui.vertical(|ui| {
-        // ── Mode toggles ─────────────────────────────────────────
-        ui.horizontal(|ui| {
-            // Ports ⇄ Mapping. Ports = typed per-zone outputs. Mapping = inject
-            // per-zone behaviours onto the AutoMap bus (Remapper-style).
-            let mut want_mapping = mapping;
-            ui.label("Mode:");
-            if ui.selectable_label(!want_mapping, "Ports")
-                .on_hover_text("Expose typed X / Y / Active outputs per zone.").clicked() { want_mapping = false; }
-            if ui.selectable_label(want_mapping, "Mapping")
-                .on_hover_text("Map each zone to gamepad/key/stick inputs on the AutoMap bus.").clicked() { want_mapping = true; }
-            if want_mapping != mapping {
+        // ── Mode, the second pad, the colours: a band of pills, as the other modules'
+        // bodies have their settings ──
+        let rows_w = field.x.max(TZ_ROWS_MIN_W * super::simple_bodies::control_width_factor());
+        {
+            use super::curve_rows::{pill_bands, segmented, word_toggle, word_w};
+            const SWATCHES_W: f32 = 76.0;
+            let cells = pill_bands(ui, rows_w, &[150.0, word_w(ui, "split pads"), SWATCHES_W]);
+            // Ports ⇄ Mapping. Ports = typed per-zone outputs. Mapping = inject per-zone
+            // behaviours onto the AutoMap bus (Remapper-style).
+            const MODE_TIP: &str = "Ports: typed X / Y / Active outputs per zone. Mapping: each zone mapped to gamepad / key / stick inputs on the AutoMap bus.";
+            if let Some(want_mapping) = segmented(ui, cells[0], &mapping, &[(false, "ports", MODE_TIP), (true, "mapping", MODE_TIP)], ("tz_mode_seg", node_id.0)) {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert("zone_mode".to_string(),
                         Value::String(if want_mapping { "mapping" } else { "ports" }.to_string()));
                 }
                 regenerate_touch_zone_ports(node_id, snarl);
             }
-
-            ui.separator();
             let mut split_v = split;
-            if ui.checkbox(&mut split_v, "Split pads")
-                .on_hover_text("Track touch 1 and touch 2 on separate fields, each with its own click (e.g. Steam Controller).")
-                .changed()
+            if word_toggle(ui, cells[1], &mut split_v, "split pads",
+                "Track touch 1 and touch 2 on separate fields, each with its own click (e.g. Steam Controller).", ("tz_split", node_id.0))
             {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert("field_mode".to_string(),
@@ -2480,9 +2481,15 @@ fn touch_zones_body(
                 }
                 regenerate_touch_zone_ports(node_id, snarl);
             }
-            ui.separator();
-            crate::canvas::menu_body::show_zone_color_row(node_id, ui, snarl);
-        });
+            let mut swatches = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(cells[2])
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .id_salt(("tz_colours", node_id.0)),
+            );
+            crate::canvas::menu_body::show_zone_color_row(node_id, &mut swatches, snarl);
+        }
+        ui.add_space(4.0);
 
         // Re-read mode flags AFTER the toggles (regen already ran) so the rest of
         // this frame renders consistently in the new mode — never a mixed frame
@@ -2525,21 +2532,34 @@ fn touch_zones_body(
 
         // ── Mapping mode: per-zone icon/name override + zone-tab card list ──
         if mapping {
-            tz_zone_icon_row(node_id, ui, snarl);
+            tz_zone_icon_row(node_id, ui, snarl, rows_w);
             ui.add_space(6.0);
-            let cards_area = ui.vertical(|ui| {
-                render_touch_zone_cards(node_id, ui, snarl, &visuals, accent, live_signals, automap_parent);
-            }).response.rect;
+            // The zone tabs and Learn row stay put, the cards scroll in a window under them
+            // (`card_window`), as a Remapper's do.
+            let band = super::curve_rows::band_h(ui);
+            let cards_area = super::pinned::card_window(
+                ui, snarl, node_id, "tz_cards", rows_w, "cards_h", band,
+                live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+                |id, _ins, ui, sn, sigs, _panic, am| {
+                    let visuals = ui.visuals().clone();
+                    let accent = visuals.selection.bg_fill;
+                    ui.vertical(|ui| {
+                        render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
+                    });
+                },
+                super::pinned::tz_cards_hash_map,
+                super::pinned::tz_cards_hash_draft,
+            );
             register_exposable_element(ui, node_id, "cards", cards_area);
         }
     });
 }
 
-/// Per-zone icon + name override row for the Touch Zones body — reuses the SAME
+/// Per-zone icon + name override row for the Touch Zones and Virtual Menu bodies — reuses the SAME
 /// `zone_meta` storage + shared picker Virtual Menu zones use, so a TZ zone can
 /// wear a chosen icon (set / Gamepad-input glyph / custom SVG) + name instead of
 /// its raw mapping-output icons. Bound to the current `sel_zone`.
-fn tz_zone_icon_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn tz_zone_icon_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, w: f32) {
     use crate::canvas::menu_body::{icon_picker_button, menu_zone_meta, write_zone_meta_entry, ZoneMeta};
     let (sel_f, sel) = tz_read_selection(snarl, node_id);
     let ids = tz_field_tree(snarl, node_id, sel_f).ids();
@@ -2548,48 +2568,64 @@ fn tz_zone_icon_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDa
     let meta = snarl.get_node(node_id)
         .map(|n| menu_zone_meta(n).get(&zone).cloned().unwrap_or_default())
         .unwrap_or_default();
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Zone").small().weak());
-        let mut z_edit = zone as u64;
-        if ui.add(egui::DragValue::new(&mut z_edit).range(0..=max_id as u64).speed(0.05))
-            .on_hover_text("Which zone the icon/name override applies to.\nClicking a zone in the field selects it too.")
-            .changed()
-        {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("sel_field".into(), serde_json::json!(sel_f as u64));
-                node.params.insert("sel_zone".into(), serde_json::json!(z_edit));
-            }
+    let overridden = !meta.icon.is_empty() || !meta.svg.is_empty() || !meta.label.is_empty();
+    const GAP: f32 = super::kit::GAP;
+    const ICON_W: f32 = 40.0;
+    const X_W: f32 = 24.0;
+    let mut mins = vec![90.0, ICON_W + GAP + 150.0];
+    if overridden {
+        mins[1] += GAP + X_W;
+    }
+    let cells = super::curve_rows::pill_bands(ui, w, &mins);
+    let mut z_edit = zone as f64;
+    if super::curve_rows::count_pill(ui, node_id, "tz_zone_pick", cells[0], "zone", &mut z_edit, &format!("{zone}"),
+        0.0..=max_id as f64, 0.05, "Which zone the icon / name override applies to. Clicking a zone in the field selects it too.")
+    {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("sel_field".into(), serde_json::json!(sel_f as u64));
+            node.params.insert("sel_zone".into(), serde_json::json!(z_edit as u64));
         }
-        ui.label(egui::RichText::new("icon").small().weak())
-            .on_hover_text("Override this zone's shown icon with one picked icon\n(shared set, a Gamepad-input glyph, or a custom SVG embedded into the patch).");
-        if let Some((k, s)) = icon_picker_button(
-            ui, egui::Id::new((node_id, "tz_zone_icon", zone)), &meta.icon, &meta.svg)
-        {
+    }
+    let r = cells[1];
+    let icon = egui::Rect::from_min_size(r.min, egui::vec2(ICON_W, r.height()));
+    {
+        let mut c = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(icon)
+                .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight))
+                .id_salt(("tz_zone_icon_cell", node_id.0, zone)),
+        );
+        c.spacing_mut().interact_size.y = icon.height();
+        if let Some((k, s)) = icon_picker_button(&mut c, egui::Id::new((node_id, "tz_zone_icon", zone)), &meta.icon, &meta.svg) {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 write_zone_meta_entry(node, zone, &ZoneMeta { icon: k, svg: s, label: meta.label.clone() });
             }
         }
-        ui.label(egui::RichText::new("name").small().weak())
-            .on_hover_text("Zone name, drawn on the zone alongside its icon.");
-        let mut label_edit = meta.label.clone();
-        if ui.add(egui::TextEdit::singleline(&mut label_edit)
-            .desired_width(90.0)
-            .id_salt((node_id, "tz_zone_name", zone)))
-            .changed()
-        {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                write_zone_meta_entry(node, zone, &ZoneMeta {
-                    icon: meta.icon.clone(), svg: meta.svg.clone(), label: label_edit });
-            }
+    }
+    let name_right = if overridden { r.right() - X_W - GAP } else { r.right() };
+    let name = egui::Rect::from_min_max(egui::pos2(icon.right() + GAP, r.top()), egui::pos2(name_right, r.bottom()));
+    let mut label_edit = meta.label.clone();
+    if ui
+        .put(name, egui::TextEdit::singleline(&mut label_edit).hint_text("name").id_salt((node_id, "tz_zone_name", zone)))
+        .on_hover_text("This zone's name, drawn on it alongside its icon. The icon beside it overrides the zone's shown icon with one picked icon (the shared set, a Gamepad-input glyph, or a custom SVG embedded into the patch).")
+        .changed()
+    {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            write_zone_meta_entry(node, zone, &ZoneMeta {
+                icon: meta.icon.clone(), svg: meta.svg.clone(), label: label_edit });
         }
-        if (!meta.icon.is_empty() || !meta.svg.is_empty() || !meta.label.is_empty())
-            && ui.small_button("✕").on_hover_text("Remove this zone's icon + name override").clicked()
+    }
+    if overridden {
+        let x = egui::Rect::from_min_max(egui::pos2(r.right() - X_W, r.top()), r.max);
+        if ui.put(x, egui::Button::new(super::simple_bodies::control_text("✕")))
+            .on_hover_text("Remove this zone's icon + name override")
+            .clicked()
         {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 write_zone_meta_entry(node, zone, &ZoneMeta::default());
             }
         }
-    });
+    }
 }
 
 /// Render one touch field (in-canvas / advanced editing): the pad with draggable
@@ -2651,7 +2687,7 @@ fn area_trigger_picker(ui: &mut egui::Ui, salt: impl std::hash::Hash, current: &
     let label = TRIGGERS.iter().find(|t| t.0 == current).map(|t| t.1).unwrap_or("While inside");
     let mut picked = None;
     let r = egui::ComboBox::from_id_salt(("area_trig", egui::Id::new(salt)))
-        .selected_text(egui::RichText::new(label).small())
+        .selected_text(super::simple_bodies::combo_text(ui, label, 96.0))
         .width(96.0)
         .show_ui(ui, |ui| {
             for (tok, name, tip) in TRIGGERS {
@@ -2909,17 +2945,18 @@ pub(crate) fn render_touch_zone_cards(
         // concept, so hidden on menu nodes (a menu pointer just highlights).
         if !implicit_trig {
             let mut hold = tz_zone_held(snarl, node_id, sel_f, sel_z);
-            let cb = ui.checkbox(&mut hold, "Hold")
+            let cb = ui.add(egui::Button::selectable(hold, super::simple_bodies::control_text("hold")))
                 .on_hover_text("Hold zone: a touch that starts in this zone stays bound to it for the whole gesture, even if the finger slides into another zone — so the other zone won't trigger. Gamepad: focus it and press South to toggle.");
             hold_rect = Some(cb.rect);
-            if cb.changed() {
+            if cb.clicked() {
+                hold = !hold;
                 tz_set_zone_held(snarl, node_id, sel_f, sel_z, hold);
             }
         }
         // Migrate: move THIS zone's mappings onto another zone you tap/click next.
         if tz_pick_kind(snarl, node_id).as_deref() == Some("migrate") {
-            if ui.button("✖ Cancel move").clicked() { tz_cancel_pick(snarl, node_id); }
-        } else if ui.button("⇄ Move…")
+            if ui.add(egui::Button::new(super::simple_bodies::control_text("✖ cancel move"))).clicked() { tz_cancel_pick(snarl, node_id); }
+        } else if ui.add(egui::Button::new(super::simple_bodies::control_text("⇄ move…")))
             .on_hover_text("Move this zone's mappings to another zone — click/tap the destination next.")
             .clicked()
         {
@@ -2968,15 +3005,31 @@ pub(crate) fn render_touch_zone_cards(
     let mut act_rects: Vec<egui::Rect> = Vec::new();
     let mut mouse_rect: Option<egui::Rect> = None;
     let mut mode_rect: Option<egui::Rect> = None;
+    // The buttons share the card's width, each as wide as the others - the Remapper's action
+    // row - less what the zone's analog controls at the right end take.
+    let show_speed = has_mouse_card || (has_analog_card && tp_mode == "touchpad");
+    let reserved = if area_mode {
+        104.0
+    } else {
+        (if has_analog_card { 104.0 } else { 0.0 }) + (if show_speed { 70.0 } else { 0.0 })
+    };
+    let buttons = match phase.as_str() {
+        "idle" if implicit_trig => 3,
+        "idle" | "learning" => 1,
+        _ => 5,
+    };
+    let bw = super::remapper_bodies::action_width(ui, TZ_CARD_W - reserved, buttons.max(3));
+    let action = |label: &str| super::remapper_bodies::action_button(label, bw);
     ui.allocate_ui_with_layout(
-        egui::vec2(TZ_CARD_W, ui.spacing().interact_size.y.max(20.0)),
+        egui::vec2(TZ_CARD_W, 26.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
+        ui.spacing_mut().interact_size.y = 26.0;
         match phase.as_str() {
             "idle" if implicit_trig => {
                 // Menu: the trigger is this zone's selection — go straight to
                 // picking the DESTINATION (gamepad learn or the picker).
-                let b = ui.button("Learn")
+                let b = ui.add(action("Learn"))
                     .on_hover_text("Learn a gamepad button or keyboard key as this zone's output — press one.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -2987,7 +3040,7 @@ pub(crate) fn render_touch_zone_cards(
                         for k in ["_tz_draft_out", "_tz_draft_out_gap", "_tz_draft_out_dur", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
-                let b = ui.button("Choose…")
+                let b = ui.add(action("Choose…"))
                     .on_hover_text("Choose keyboard / mouse / gamepad / stick / macro outputs for this zone. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3007,7 +3060,7 @@ pub(crate) fn render_touch_zone_cards(
                         ..Default::default()
                     });
                 }
-                let b = ui.button("MIDI…")
+                let b = ui.add(action("MIDI…"))
                     .on_hover_text("Build a MIDI message for this zone to play.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3021,7 +3074,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             "idle" => {
-                let b = ui.button("Learn")
+                let b = ui.add(action("Learn"))
                     .on_hover_text("Demonstrate a touch, click, or swipe on a zone, then assign an output.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3034,7 +3087,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             "learning" => {
-                let b = ui.button("Cancel");
+                let b = ui.add(action("Cancel"));
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -3043,7 +3096,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             _ => { // captured
-                let b = ui.button("Choose…")
+                let b = ui.add(action("Choose…"))
                     .on_hover_text("Choose keyboard / mouse / mouse-delta / gamepad / stick outputs. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3057,14 +3110,14 @@ pub(crate) fn render_touch_zone_cards(
                         ..Default::default()
                     });
                 }
-                let b = ui.button("MIDI…")
+                let b = ui.add(action("MIDI…"))
                     .on_hover_text("Build a MIDI message for this zone to play.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     tz_request_midi(ui.ctx(), node_id, automap_parent);
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
-                let b = ui.add(egui::Button::new(if armed { "🎮…" } else { "🎮" }))
+                let b = ui.add(action(if armed { "🎮…" } else { "🎮" }).selected(armed))
                     .on_hover_text("Learn a gamepad button or keyboard key as the output — press one now.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3074,13 +3127,12 @@ pub(crate) fn render_touch_zone_cards(
                         node.params.remove("_tz_gp_seen");
                     }
                 }
-                let add = ui.add_enabled(!draft_out.is_empty(),
-                    egui::Button::new(egui::RichText::new("Add").strong()));
+                let add = ui.add_enabled(!draft_out.is_empty(), action("Add"));
                 act_rects.push(add.rect);
                 if add.on_hover_text("Add this zone mapping").clicked() && !draft_out.is_empty() {
                     tz_commit_card(snarl, node_id, sel_f, sel_z, &trigger, &draft_out);
                 }
-                let b = ui.button("Cancel");
+                let b = ui.add(action("Cancel"));
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -3110,7 +3162,6 @@ pub(crate) fn render_touch_zone_cards(
                 // multiplier scales the trackball deflection, so RS/LS can be amplified
                 // too (the user's "mouse scale doesn't apply to RS" report). In non-
                 // touchpad stick modes it wouldn't affect the stick, so it stays hidden.
-                let show_speed = has_mouse_card || (has_analog_card && tp_mode == "touchpad");
                 if show_speed {
                     // Per-zone speed (stored on the selected zone's cards like
                     // tp_mode/adaptive), migrating from the old node-global value.
@@ -3154,7 +3205,7 @@ pub(crate) fn render_touch_zone_cards(
                     };
                     let mut chosen: Option<&str> = None;
                     let cb = egui::ComboBox::from_id_salt(("tz_tp_mode", node_id.0))
-                        .selected_text(egui::RichText::new(label).size(11.0))
+                        .selected_text(egui::RichText::new(label).size(crate::settings::ui_size(11.0)))
                         .width(96.0)
                         .show_ui(ui, |ui| {
                             if ui.selectable_label(tp_mode == "synced", "Synced (top card drives all)").clicked() { chosen = Some("synced"); }

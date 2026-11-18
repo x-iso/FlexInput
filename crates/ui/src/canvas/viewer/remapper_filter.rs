@@ -305,7 +305,7 @@ pub(crate) fn filter_chip(
 ) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
-        egui::FontId::proportional(12.0),
+        crate::settings::ui_font(12.0),
         Color32::WHITE,
     );
     let pad = egui::vec2(8.0, 3.0);

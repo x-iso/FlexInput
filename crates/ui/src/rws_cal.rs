@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use egui::{Align2, Color32, FontId, Stroke};
+use egui::{Align2, Color32, Stroke};
 use egui_snarl::{InPinId, NodeId, Snarl};
 use flexinput_core::Signal;
 use serde_json::Value;
@@ -262,10 +262,7 @@ pub(crate) fn show(ctx: &egui::Context, tabs: &mut [PatchTab], active: usize, ov
         ctx.data_mut(|d| d.remove_temp::<f64>(ended_id()));
     }
 
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|m| m.x > 1.0 && m.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
     let viewport_id = egui::ViewportId::from_hash_of("fxi_rws_cal_overlay");
     let builder = egui::ViewportBuilder::default()
         .with_app_id(crate::APP_ID)
@@ -278,16 +275,10 @@ pub(crate) fn show(ctx: &egui::Context, tabs: &mut [PatchTab], active: usize, ov
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
-        let (inner_rect, child_monitor) = vctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
-        if let (Some(inner_rect), Some(want)) = (inner_rect, child_monitor) {
-            if (inner_rect.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
         if vctx.data(|d| d.get_temp::<bool>(passthrough_id())).is_none() {
             vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             vctx.data_mut(|d| d.insert_temp(passthrough_id(), true));
@@ -330,21 +321,21 @@ fn paint(ui: &mut egui::Ui, screen: egui::Rect, v: &View, now: f64) {
             let rect = egui::Rect::from_center_size(egui::pos2(screen.center().x, screen.bottom() - size.y * 0.5 - 60.0 * s), size);
             panel(ui, rect);
             let p = ui.painter();
-            p.text(rect.center_top() + egui::vec2(0.0, 34.0 * s), Align2::CENTER_CENTER, &title, FontId::proportional(28.0 * s), TEXT);
+            p.text(rect.center_top() + egui::vec2(0.0, 34.0 * s), Align2::CENTER_CENTER, &title, crate::settings::ui_font(28.0 * s), TEXT);
             // The camera is live: aim it now, level, so the turn that follows is a turn
             // about the vertical and the snapshot it is lined up against is level too.
             p.text(
                 rect.center_top() + egui::vec2(0.0, 66.0 * s),
                 Align2::CENTER_CENTER,
                 "The camera is yours: aim straight ahead, level with the horizon",
-                FontId::proportional(18.0 * s),
+                crate::settings::ui_font(18.0 * s),
                 TEXT,
             );
             p.text(
                 rect.center_top() + egui::vec2(0.0, 90.0 * s),
                 Align2::CENTER_CENTER,
                 "then choose what to calibrate - the turn starts from where you are aiming",
-                FontId::proportional(15.0 * s),
+                crate::settings::ui_font(15.0 * s),
                 WEAK,
             );
             let all = [
@@ -369,8 +360,8 @@ fn paint(ui: &mut egui::Ui, screen: egui::Rect, v: &View, now: f64) {
                     TEXT,
                 );
                 let p = ui.painter();
-                p.text(c.center_top() + egui::vec2(0.0, 76.0 * s), Align2::CENTER_CENTER, *what, FontId::proportional(16.0 * s), WEAK);
-                p.text(c.center_top() + egui::vec2(0.0, 104.0 * s), Align2::CENTER_CENTER, format!("sets {sets}"), FontId::proportional(13.0 * s), ACCENT);
+                p.text(c.center_top() + egui::vec2(0.0, 76.0 * s), Align2::CENTER_CENTER, *what, crate::settings::ui_font(16.0 * s), WEAK);
+                p.text(c.center_top() + egui::vec2(0.0, 104.0 * s), Align2::CENTER_CENTER, format!("sets {sets}"), crate::settings::ui_font(13.0 * s), ACCENT);
             }
             crate::canvas::viewer::pad_hint_big_centered(
                 ui,
@@ -420,12 +411,12 @@ fn paint(ui: &mut egui::Ui, screen: egui::Rect, v: &View, now: f64) {
                 Color32::from_white_alpha(200),
                 Stroke::NONE,
             ));
-            p.text(c - egui::vec2(0.0, 8.0 * s), Align2::CENTER_CENTER, format!("{:.0}°", v.theta.abs()), FontId::proportional(34.0 * s), TEXT);
-            p.text(c + egui::vec2(0.0, 24.0 * s), Align2::CENTER_CENTER, "of 360°", FontId::proportional(14.0 * s), WEAK);
+            p.text(c - egui::vec2(0.0, 8.0 * s), Align2::CENTER_CENTER, format!("{:.0}°", v.theta.abs()), crate::settings::ui_font(34.0 * s), TEXT);
+            p.text(c + egui::vec2(0.0, 24.0 * s), Align2::CENTER_CENTER, "of 360°", crate::settings::ui_font(14.0 * s), WEAK);
             // What to do, in the order you do it.
             let x = rect.left() + 220.0 * s;
             let w = rect.right() - x - 24.0 * s;
-            p.text(egui::pos2(x, rect.top() + 34.0 * s), Align2::LEFT_CENTER, format!("Turn one full 360° · {}", output_name(&v.output, v.jsm)), FontId::proportional(24.0 * s), TEXT);
+            p.text(egui::pos2(x, rect.top() + 34.0 * s), Align2::LEFT_CENTER, format!("Turn one full 360° · {}", output_name(&v.output, v.jsm)), crate::settings::ui_font(24.0 * s), TEXT);
             let mut rows = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(egui::Rect::from_min_size(egui::pos2(x, rect.top() + 62.0 * s), egui::vec2(w, 120.0 * s)))
@@ -437,7 +428,7 @@ fn paint(ui: &mut egui::Ui, screen: egui::Rect, v: &View, now: f64) {
             }
             rows.horizontal(|ui| crate::canvas::viewer::pad_hint_big(ui, "Turn the controller to line up exactly with where you started", 18.0 * s, TEXT));
             if v.output == "stick" && v.peak > 1.02 {
-                rows.label(egui::RichText::new(format!("Too fast: the stick maxed out ({:.1}×). Cancel and turn slower.", v.peak)).size(16.0 * s).color(WARN));
+                rows.label(egui::RichText::new(format!("Too fast: the stick maxed out ({:.1}×). Cancel and turn slower.", v.peak)).size(crate::settings::ui_size(16.0 * s)).color(WARN));
             }
             rows.horizontal(|ui| crate::canvas::viewer::pad_hint_big(ui, "{btn_south} Finish   {btn_east} Cancel", 18.0 * s, WEAK));
         }
@@ -447,8 +438,8 @@ fn paint(ui: &mut egui::Ui, screen: egui::Rect, v: &View, now: f64) {
             panel(ui, rect);
             let msg = v.result.clone().unwrap_or_else(|| "Calibration cancelled".to_string());
             let col = if msg.starts_with('✓') { Color32::from_rgb(150, 225, 150) } else { WARN };
-            ui.painter().text(rect.center() - egui::vec2(0.0, 14.0 * s), Align2::CENTER_CENTER, &title, FontId::proportional(18.0 * s), WEAK);
-            ui.painter().text(rect.center() + egui::vec2(0.0, 18.0 * s), Align2::CENTER_CENTER, msg, FontId::proportional(26.0 * s), col);
+            ui.painter().text(rect.center() - egui::vec2(0.0, 14.0 * s), Align2::CENTER_CENTER, &title, crate::settings::ui_font(18.0 * s), WEAK);
+            ui.painter().text(rect.center() + egui::vec2(0.0, 18.0 * s), Align2::CENTER_CENTER, msg, crate::settings::ui_font(26.0 * s), col);
         }
     }
 }

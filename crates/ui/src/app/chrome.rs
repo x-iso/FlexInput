@@ -135,7 +135,7 @@ pub(crate) fn show_tab_bar(
         egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
     };
     let active_fill = darken(panel_fill, 22);
-    let font_id     = egui::FontId::proportional(13.0);
+    let font_id     = crate::settings::ui_font(13.0);
 
     // The bar splits into two regions on one horizontal row:
     //   1. A PINNED left cluster (File menu + Auto toggle + divider) that
@@ -654,7 +654,7 @@ pub(crate) fn show_title_bar(
             // ── Pin (always-on-top) ───────────────────────────────────
             // SelectableLabel so the active state gets the standard egui
             // highlight, matching the see-through eye toggle's look.
-            let pin_label = egui::RichText::new("📌").size(13.0);
+            let pin_label = egui::RichText::new("📌").size(crate::settings::ui_size(13.0));
             let pin_resp = ui.add(egui::Button::selectable(pin_active, pin_label));
             let hover = if pin_active {
                 "Pinned: window stays on top of all others.\nClick to unpin."
@@ -676,6 +676,8 @@ pub(crate) fn show_title_bar(
             // ── Info overlay toggle (spike) ─────────────────────────────
             ui.add_space(4.0);
             crate::overlay::render_overlay_toggle(ui, h);
+            // Which monitor the overlays cover, with more than one.
+            crate::monitors::render_picker(ui, h);
         });
     });
 
@@ -757,7 +759,7 @@ pub(crate) fn show_title_bar(
                 // The button itself engages and releases, so it works by mouse and
                 // touch; Ctrl+click re-binds the shortcut it shows.
                 let btn_text = panic_button_text(*panic_active, *panic_learning, panic_shortcut);
-                let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
                 if *panic_active {
                     btn = btn.fill(egui::Color32::from_rgb(196, 43, 28))
                              .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 80, 60)));
@@ -809,7 +811,7 @@ pub(crate) fn show_title_bar(
                 }
 
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Panic mode:").size(12.0).weak());
+                ui.label(egui::RichText::new("Panic mode:").size(crate::settings::ui_size(12.0)).weak());
             });
         });
     }
@@ -838,7 +840,7 @@ pub(crate) fn show_title_bar(
     let logo_text_gap = 8.0_f32 * TITLE_SCALE;     // gap between tile and text
     let text_pad_right = 12.0_f32 * TITLE_SCALE;   // pill padding after the text
 
-    let font_id = egui::FontId::proportional(text_px);
+    let font_id = crate::settings::ui_font(text_px);
     // Trailing gear marks the title as the Settings button (it opens Settings on
     // click). The glyph ships in egui's bundled emoji font.
     let galley = ui.painter().layout_no_wrap("FlexInput ⚙".to_string(), font_id, base_color);
@@ -949,9 +951,9 @@ pub(crate) fn show_title_bar(
         let hh = side * 0.30; // half-height of the rune
         let w = side * 0.17;
         let col = if bt.hovered() {
-            egui::Color32::from_gray(235)
+            crate::settings::tinted_gray(235)
         } else {
-            egui::Color32::from_gray(170)
+            crate::settings::tinted_gray(170)
         };
         let stroke = egui::Stroke::new((side * 0.075).max(1.0), col);
         let (top, bot) = (egui::pos2(c.x, c.y - hh), egui::pos2(c.x, c.y + hh));
@@ -1053,7 +1055,7 @@ pub(crate) fn render_eye_toggle(ui: &mut egui::Ui, bar_h: f32) {
     let see_through_on: bool = ui.ctx().data(|d| d.get_temp::<bool>(see_through_id))
         .unwrap_or(false);
 
-    let eye_label = egui::RichText::new("👁").size(14.0);
+    let eye_label = egui::RichText::new("👁").size(crate::settings::ui_size(14.0));
     let eye_btn = egui::Button::selectable(see_through_on, eye_label);
     let eye_resp = ui.add_sized(egui::vec2(26.0, (bar_h - 6.0).max(18.0)), eye_btn);
     let hover = if see_through_on {

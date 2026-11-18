@@ -169,7 +169,12 @@ fn folded_reading(node: &NodeData) -> Option<String> {
         "module.knob" => {
             let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
             let v = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-            Some(format!("{:.2}", v.clamp(if bipolar { -1.0 } else { 0.0 }, 1.0)))
+            let v = v.clamp(if bipolar { -1.0 } else { 0.0 }, 1.0);
+            // On a feedback pin, in its units.
+            Some(match node.extra.out_target.as_ref() {
+                Some(t) => t.unit.text(v),
+                None => format!("{v:.2}"),
+            })
         }
         "module.constant" => {
             let stored = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -474,7 +479,7 @@ pub(crate) fn show_port_strips(
             );
             let r = ui.put(
                 xrect,
-                egui::Button::new(egui::RichText::new("×").size(14.0))
+                egui::Button::new(egui::RichText::new("×").size(crate::settings::ui_size(14.0)))
                     .min_size(egui::vec2(STRIP_REMOVE_W, STRIP_REMOVE_H)),
             );
             let r = r.on_hover_text("Remove this port");
@@ -1073,7 +1078,7 @@ pub(crate) fn show_dropdown_body(
             handle.rect.center(),
             egui::Align2::CENTER_CENTER,
             "⠿",
-            egui::FontId::proportional(12.0),
+            crate::settings::ui_font(12.0),
             if drag.active && drag.held == i {
                 ui.visuals().strong_text_color()
             } else {
@@ -1349,7 +1354,7 @@ pub(crate) fn render_dropdown_selection(
     let measure = |size: f32| -> f32 {
         let galley = painter.layout_no_wrap(
             label.clone(),
-            egui::FontId::proportional(size),
+            crate::settings::ui_font(size),
             visuals.text_color(),
         );
         galley.size().x
@@ -1363,7 +1368,7 @@ pub(crate) fn render_dropdown_selection(
         egui::pos2(text_rect.min.x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         &label,
-        egui::FontId::proportional(font_size),
+        crate::settings::ui_font(font_size),
         visuals.text_color(),
     );
 
@@ -1373,7 +1378,7 @@ pub(crate) fn render_dropdown_selection(
         egui::pos2(rect.max.x - caret_w * 0.5, rect.center().y),
         egui::Align2::CENTER_CENTER,
         "▼",
-        egui::FontId::proportional(caret_size),
+        crate::settings::ui_font(caret_size),
         visuals.text_color(),
     );
 
@@ -1410,7 +1415,72 @@ pub(crate) fn render_dropdown_selection(
 // Floor/Max/Curve shape ONLY the game/app rumble forwarded back to a physical
 // pad via AutoMap (see `shape_hd_feedback`); direct rumble wiring is untouched.
 // Defaults (floor 0.35, max 1.0, exp 0.6) match the original tuned boost.
-pub(crate) fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+/// The Choose picker's picks for a Virtual Keyboard & Mouse, while it is open.
+pub(crate) const KBM_CHOOSE_DRAFT: &str = "_kbm_choose";
+
+/// A key or mouse pin's name as Learn names a key (egui's): `key_a` is `A`, `key_space`
+/// `Space`, `key_f1` `F1`. Mouse pins keep their ids.
+fn kbm_pin_name(pin: &str) -> String {
+    match pin.strip_prefix("key_") {
+        Some(rest) => {
+            let mut c = rest.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().chain(c).collect(),
+                None => pin.to_string(),
+            }
+        }
+        None => pin.to_string(),
+    }
+}
+
+/// Whether the keyboard has `pin` among its inputs already, by Learn's name or the
+/// picker's id: the driver reads either (`key_a` and `A` are one key).
+fn kbm_has_pin(node: &NodeData, pin: &str) -> bool {
+    let bare = |s: &str| s.strip_prefix("key_").unwrap_or(s).to_ascii_lowercase();
+    let want = bare(pin);
+    let ids = node.params.get("input_pin_ids").and_then(|v| v.as_array());
+    node.inputs.iter().enumerate().any(|(i, p)| {
+        bare(&p.name) == want || ids.and_then(|a| a.get(i)).and_then(|v| v.as_str()).is_some_and(|id| bare(id) == want)
+    })
+}
+
+#[cfg(test)]
+mod kbm_choose_tests {
+    use super::*;
+
+    // A key the picker hands over is named as Learn names it, and a key the keyboard has
+    // already - by either name - isn't added again.
+    #[test]
+    fn a_chosen_key_is_named_as_learn_names_it_and_added_once() {
+        assert_eq!(kbm_pin_name("key_a"), "A");
+        assert_eq!(kbm_pin_name("key_space"), "Space");
+        assert_eq!(kbm_pin_name("key_f1"), "F1");
+        assert_eq!(kbm_pin_name("mouse_left"), "mouse_left");
+        let mut node = NodeData {
+            module_id: "device.sink".into(),
+            display_name: "Keyboard".into(),
+            category: "Device".into(),
+            inputs: vec![PinDescriptor::new("A", SignalType::Bool)],
+            outputs: vec![],
+            params: std::collections::HashMap::from([("input_pin_ids".to_string(), serde_json::json!(["A"]))]),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        assert!(kbm_has_pin(&node, "key_a"), "learned as A, chosen as key_a: one key");
+        assert!(!kbm_has_pin(&node, "key_b"));
+        node.inputs.push(PinDescriptor::new("B", SignalType::Bool));
+        node.params.insert("input_pin_ids".into(), serde_json::json!(["A", "key_b"]));
+        assert!(kbm_has_pin(&node, "key_b"));
+    }
+}
+
+pub(crate) fn show_sink_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
     let device_id = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("device_id").and_then(|v| v.as_str()))
@@ -1434,8 +1504,61 @@ pub(crate) fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::U
         .and_then(|n| n.params.get("learning").and_then(|v| v.as_bool()))
         .unwrap_or(false);
 
-    if is_learning {
-        ui.label(egui::RichText::new("Press a key… (Esc cancels)").italics().small());
+    // What the Choose picker put in the draft: a key each, added as Learn adds one, the
+    // draft emptied for the next time. The picker writes as it goes, so a pick appears
+    // while the board is still open.
+    let picks: Vec<String> = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get(KBM_CHOOSE_DRAFT).and_then(|v| v.as_array()))
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if !picks.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for pin in &picks {
+                if kbm_has_pin(node, pin) {
+                    continue;
+                }
+                node.inputs.push(PinDescriptor::new(&kbm_pin_name(pin), SignalType::Bool));
+                if let Some(Value::Array(ids)) = node.params.get_mut("input_pin_ids") {
+                    ids.push(Value::String(pin.clone()));
+                }
+            }
+            node.params.insert(KBM_CHOOSE_DRAFT.to_string(), Value::Array(Vec::new()));
+        }
+    }
+
+    // Learn, Choose…, Clear unused: the house buttons, a column of one width beside the
+    // inputs - the body is the strip to the right of them, too narrow for a row.
+    let has_unused_learned = inputs.iter().skip(fixed_count).any(|p| p.remotes.is_empty());
+    let action = super::automap_bodies::automap_action_column(ui, &[
+        ("Learn", true, is_learning, if is_learning { "Press a key… (Esc cancels)" } else { "Add an input for the next key pressed." }),
+        ("Choose…", true, false, "Pick keys from the keyboard instead of pressing them."),
+        ("Clear unused", has_unused_learned, false, "Remove every added key with no wire on it."),
+    ]);
+    match action {
+        Some(0) => {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("learning".to_string(), Value::Bool(!is_learning));
+            }
+        }
+        Some(1) => {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert(KBM_CHOOSE_DRAFT.to_string(), Value::Array(Vec::new()));
+            }
+            super::request_special_picker(ui.ctx(), super::SpecialPickerRequest {
+                inner: node_id,
+                path: super::subpatch_path(automap_parent),
+                draft_key: KBM_CHOOSE_DRAFT.to_string(),
+                kbm_only: true,
+                ..Default::default()
+            });
+        }
+        Some(2) if has_unused_learned => clear_unused_inputs(node_id, inputs, fixed_count, snarl),
+        _ => {}
+    }
+
+    if is_learning && action != Some(0) {
+        ui.label(control_text("Press a key… (Esc cancels)").weak());
 
         let key_pressed = ui.input(|i| {
             i.events.iter().find_map(|e| {
@@ -1470,18 +1593,6 @@ pub(crate) fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::U
                 }
             }
         }
-    } else {
-        ui.horizontal(|ui| {
-            if ui.small_button("+ Learn key").clicked() {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("learning".to_string(), Value::Bool(true));
-                }
-            }
-            let has_unused_learned = inputs.iter().skip(fixed_count).any(|p| p.remotes.is_empty());
-            if has_unused_learned && ui.small_button("Clear unused").clicked() {
-                clear_unused_inputs(node_id, inputs, fixed_count, snarl);
-            }
-        });
     }
 }
 
@@ -1501,14 +1612,173 @@ pub(crate) fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::U
 
 /// The pill's height, shared so a setting row lines up wherever it sits.
 pub(crate) const PILL_H: f32 = 20.0;
-/// The corner radius, and the font, so the label and value of two different pills
-/// sitting one under the other read as the same kind of thing.
+/// The corner radius, so two different pills sitting one under the other read as the
+/// same kind of thing; the font is the control font ([`control_font`]).
 const PILL_RADIUS: f32 = 4.0;
-pub(crate) const PILL_FONT: f32 = 12.0;
 
-/// The pill font at the rows' current zoom (`curve_rows::zoom`: 1 in a body).
+/// The pill font at the rows' current zoom (`curve_rows::zoom`: 1 in a body): the control
+/// font ([`control_font`]) the Display settings pick.
 pub(crate) fn pill_font() -> egui::FontId {
-    egui::FontId::monospace(super::scale::quantize_font_size((PILL_FONT * super::curve_rows::zoom()).max(4.0)))
+    control_font()
+}
+
+// ── The control font ──────────────────────────────────────────────────────────
+//
+// One font for every control a module draws - value pills, joined segments, word switches,
+// the dropdowns and buttons beside them - picked in Settings → Display: console (monospace)
+// or normal (proportional), regular or bold, and its size. The pills were monospace and
+// the buttons and dropdowns beside them the proportional small style, mixed in one row.
+// Kept in statics because the pill painters have no settings to hand; the app sets them
+// when the setting changes (`settings::apply_theme_and_contrast`).
+//
+// The size is in the normal font's points, and the other three faces are drawn at whatever
+// size makes their text as wide as the normal font's would be ([`calibrate_control_fonts`]):
+// a monospace glyph is a fifth wider than the average proportional one, so "15" in console
+// spilled out of pills that "15" in normal fitted. Text that is the same width at the same
+// setting is text the rows can be laid out for once.
+
+/// The normal font's size the rows were laid out for: the pills' 12-point console font, as
+/// wide as normal text at about this size. [`control_width_factor`] grows the rows past it.
+pub(crate) const CONTROL_FONT_BASIS: f32 = 15.0;
+/// The largest a control's text is drawn at 1×: a pill is a band less 4 points tall (24), and
+/// text taller than this sits on its edges.
+pub(crate) const CONTROL_FONT_MAX_PX: f32 = 17.0;
+
+static CONTROL_FONT_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4170_0000); // 15.0
+static CONTROL_FONT_MONO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CONTROL_FONT_BOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Per face (normal, console, normal bold, console bold): the size it is drawn at for one
+/// point of the setting - the normal font's width per point over its own. Measured once the
+/// fonts are loaded; these are egui's stock fonts' until then.
+static CONTROL_FONT_NORM: [std::sync::atomic::AtomicU32; 4] = [
+    std::sync::atomic::AtomicU32::new(0x3F80_0000), // 1.0
+    std::sync::atomic::AtomicU32::new(0x3F48_0000), // 0.78125
+    std::sync::atomic::AtomicU32::new(0x3F6C_0000), // 0.921875
+    std::sync::atomic::AtomicU32::new(0x3F48_0000), // 0.78125
+];
+
+/// The bold faces' font families (`app::fonts` registers them, the bold system face first
+/// and the regular family's fonts after it, so a missing bold face draws regular).
+pub(crate) const BOLD_MONO_FAMILY: &str = "fxi-bold-mono";
+pub(crate) const BOLD_PROP_FAMILY: &str = "fxi-bold-prop";
+
+/// Set the control font: console (`mono`) or normal, `bold` or regular, `size` in the
+/// normal font's points.
+pub(crate) fn set_control_font(mono: bool, bold: bool, size: f32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CONTROL_FONT_MONO.store(mono, Relaxed);
+    CONTROL_FONT_BOLD.store(bold, Relaxed);
+    CONTROL_FONT_SIZE.store(size.clamp(8.0, 24.0).to_bits(), Relaxed);
+}
+
+/// The face, as an index into [`CONTROL_FONT_NORM`], and its family.
+fn control_face() -> (usize, egui::FontFamily) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match (CONTROL_FONT_MONO.load(Relaxed), CONTROL_FONT_BOLD.load(Relaxed)) {
+        (false, false) => (0, egui::FontFamily::Proportional),
+        (true, false) => (1, egui::FontFamily::Monospace),
+        (false, true) => (2, egui::FontFamily::Name(BOLD_PROP_FAMILY.into())),
+        (true, true) => (3, egui::FontFamily::Name(BOLD_MONO_FAMILY.into())),
+    }
+}
+
+/// The text the faces are compared on: the letters and digits a pill shows.
+const CONTROL_FONT_SAMPLE: &str = "deadzone 0.25 ms stick sensitivity 180°";
+
+/// Measure each face against the normal one, so a setting draws them all as wide. Needs the
+/// fonts loaded (a running frame); the app calls it once they are.
+pub(crate) fn calibrate_control_fonts(ctx: &egui::Context) {
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let width = |family: egui::FontFamily| {
+        painter
+            .layout_no_wrap(CONTROL_FONT_SAMPLE.to_string(), egui::FontId::new(40.0, family), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    let normal = width(egui::FontFamily::Proportional).max(1.0);
+    let faces = [
+        egui::FontFamily::Proportional,
+        egui::FontFamily::Monospace,
+        egui::FontFamily::Name(BOLD_PROP_FAMILY.into()),
+        egui::FontFamily::Name(BOLD_MONO_FAMILY.into()),
+    ];
+    let known = ctx.fonts(|f| f.families());
+    for (k, family) in faces.into_iter().enumerate() {
+        if !known.contains(&family) {
+            continue;
+        }
+        let w = width(family).max(1.0);
+        CONTROL_FONT_NORM[k].store((normal / w).clamp(0.5, 1.5).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The control font's size setting, in the normal font's points.
+pub(crate) fn control_font_size() -> f32 {
+    f32::from_bits(CONTROL_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How much wider than the rows were laid out for the control font draws: 1 at
+/// [`CONTROL_FONT_BASIS`] and below, more above it. The rows' group widths are multiplied by
+/// it, so a larger font wraps to more bands instead of spilling out of its pills.
+pub(crate) fn control_width_factor() -> f32 {
+    (control_font_size().min(CONTROL_FONT_MAX_PX + 1.0) / CONTROL_FONT_BASIS).max(1.0)
+}
+
+/// The control font for a setting of `size` (already at whatever zoom the caller wants): the
+/// face picked, at the size that makes it as wide as the normal font at `size`.
+pub(crate) fn control_font_at(size: f32) -> egui::FontId {
+    let (k, family) = control_face();
+    let norm = f32::from_bits(CONTROL_FONT_NORM[k].load(std::sync::atomic::Ordering::Relaxed));
+    egui::FontId::new(super::scale::quantize_font_size((size * norm).max(4.0)), family)
+}
+
+/// How much larger than the app was laid out for the font setting draws text: 1 at
+/// [`CONTROL_FONT_BASIS`] (the default), more or less with the setting.
+pub(crate) fn ui_text_factor() -> f32 {
+    control_font_size() / CONTROL_FONT_BASIS
+}
+
+/// A text size the app sets by hand - a label's `.size(11.0)`, a painter's
+/// `FontId::proportional(10.0)` - as the font setting draws it: in the face it picks, scaled
+/// by [`ui_text_factor`], as wide as the normal font would be. At the default it is the size
+/// it was. Card titles, port names, hints and the like set their own sizes, so they kept
+/// egui's font whatever the setting said.
+pub(crate) fn ui_font(size: f32) -> egui::FontId {
+    let (k, family) = control_face();
+    let norm = f32::from_bits(CONTROL_FONT_NORM[k].load(std::sync::atomic::Ordering::Relaxed));
+    let scaled = size * ui_text_factor() * norm;
+    let scaled = if (scaled - size).abs() < 1e-3 { size } else { super::scale::quantize_font_size(scaled.max(4.0)) };
+    egui::FontId::new(scaled, family)
+}
+
+/// The size [`ui_font`] draws `size` at, for `RichText::size` (whose face is the text
+/// style's, which the font setting sets too).
+pub(crate) fn ui_size(size: f32) -> f32 {
+    ui_font(size).size
+}
+
+/// The control font at the rows' current zoom, no taller than a pill holds.
+pub(crate) fn control_font() -> egui::FontId {
+    control_font_at(control_font_size().min(CONTROL_FONT_MAX_PX) * super::curve_rows::zoom())
+}
+
+/// A dropdown's shown choice in the control font (egui's Button text style, which the
+/// control font sets), drawn smaller if it is wider than a dropdown `width` wide holds -
+/// a ComboBox grows past the width it is given to hold its text, into what is beside it.
+pub(crate) fn combo_text(ui: &egui::Ui, text: impl Into<String>, width: f32) -> egui::RichText {
+    let text: String = text.into();
+    // What a dropdown keeps for itself beside its text: its arrow, the gap to it, and its
+    // padding both sides. 22 points was less than egui's own 26, so the text never fitted
+    // and every dropdown came out wider than it was asked to be.
+    let s = ui.spacing();
+    let overhead = s.icon_width + s.icon_spacing + 2.0 * s.button_padding.x;
+    let font = fit_font(ui, &text, egui::TextStyle::Button.resolve(ui.style()), width - overhead);
+    egui::RichText::new(text).font(font)
+}
+
+/// `text` in the control font, for an egui button or dropdown drawn beside the pills.
+pub(crate) fn control_text(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).font(control_font())
 }
 
 /// The value cell of a pill drawn across `rect`: everything right of the `label_w`-wide
@@ -1537,29 +1807,102 @@ pub(crate) fn pill_label_width(ui: &egui::Ui, label: &str) -> f32 {
 
 /// A pill's label as `(short, long)`. A label can be written `short|long` - `stab|stabilise`
 /// - and the pill shows the long one whenever it and the value both fit the pill's width
-/// ([`pill_label_for`]); everything that sizes a pill measures the short one, so the long
+/// ([`pill_split`]); everything that sizes a pill measures the short one, so the long
 /// name only ever fills room that is there. A label with no `|` is both.
 pub(crate) fn pill_label_parts(label: &str) -> (&str, &str) {
     label.split_once('|').unwrap_or((label, label))
 }
 
-/// Which of a `short|long` label a pill `width` wide shows beside `value`, and how wide its
-/// label cell is. `short_w` is the short label's cell, as the caller measured it.
-pub(crate) fn pill_label_for<'a>(ui: &egui::Ui, label: &'a str, short_w: f32, value: &str, width: f32) -> (&'a str, f32) {
+/// Which of a `short|long` word to put on a control `avail` wide: the long one when it fits
+/// in the control font, the short one when not. For word switches, which take the same
+/// `short|long` labels as the pills ([`pill_label_parts`]) and size by the short one.
+pub(crate) fn fitting_word<'a>(ui: &egui::Ui, label: &'a str, avail: f32) -> &'a str {
     let (short, long) = pill_label_parts(label);
-    if long == short || short_w <= 0.0 {
-        return (short, short_w);
+    if long != short && ui.painter().layout_no_wrap(long.to_owned(), control_font(), egui::Color32::PLACEHOLDER).size().x <= avail {
+        long
+    } else {
+        short
+    }
+}
+
+/// The widest a pill showing `shown` gets across `range`: `shown` with its number written as
+/// the range's ends, to the same decimals and sign - `+0 %` across ±100 is `+100 %`. A value
+/// with no number in it is its own widest.
+pub(crate) fn widest_shown(shown: &str, range: std::ops::RangeInclusive<f64>) -> String {
+    let chars: Vec<char> = shown.chars().collect();
+    let Some(first) = chars.iter().position(|c| c.is_ascii_digit()) else { return shown.to_string() };
+    let mut start = first;
+    if start > 0 && chars[start - 1] == '.' {
+        start -= 1;
+    }
+    let signed = start > 0 && matches!(chars[start - 1], '+' | '-');
+    let plus = signed && chars[start - 1] == '+';
+    if signed {
+        start -= 1;
+    }
+    let mut end = first;
+    let mut decimals = None::<usize>;
+    while end < chars.len() && (chars[end].is_ascii_digit() || (chars[end] == '.' && decimals.is_none())) {
+        if chars[end] == '.' {
+            decimals = Some(0);
+        } else if let Some(d) = decimals.as_mut() {
+            *d += 1;
+        }
+        end += 1;
+    }
+    let prefix: String = chars[..start].iter().collect();
+    let suffix: String = chars[end..].iter().collect();
+    let d = decimals.unwrap_or(0);
+    let write = |v: f64| if plus { format!("{prefix}{v:+.d$}{suffix}") } else { format!("{prefix}{v:.d$}{suffix}") };
+    [shown.to_string(), write(*range.start()), write(*range.end())]
+        .into_iter()
+        .max_by_key(|t| t.chars().count())
+        .unwrap_or_default()
+}
+
+/// How a pill `width` wide shares itself between its label and its value: which of a
+/// `short|long` label it shows, and how wide the label cell is. The value cell gets the room
+/// its widest value (`widest`) needs first, and the label what is left - the long name if it
+/// fits, the short one if not; with room past both, the narrower cell grows until the two are
+/// as wide, and then they grow together. The label only tightens when there's no room to
+/// spare; it was the other way round, the value cell stretching while the name was cut short.
+pub(crate) fn pill_split<'a>(ui: &egui::Ui, label: &'a str, short_w: f32, widest: &str, width: f32) -> (&'a str, f32) {
+    let (short, long) = pill_label_parts(label);
+    if short.is_empty() || short_w <= 0.0 {
+        return (short, 0.0);
     }
     let z = super::curve_rows::zoom();
     let measure = |t: &str| ui.painter().layout_no_wrap(t.to_owned(), pill_font(), egui::Color32::PLACEHOLDER).size().x;
-    let long_w = measure(long) + 8.0 * z;
-    // The value keeps air either side of it, as it has in a pill sized for the short name.
-    if long_w + measure(value) + 12.0 * z <= width {
-        (long, long_w)
+    let value = measure(widest) + 10.0 * z;
+    let long_w = if long == short { short_w } else { measure(long) + 8.0 * z };
+    let (text, natural) = if width >= value + long_w { (long, long_w) } else { (short, short_w) };
+    let label_w = if width >= value + natural {
+        let big = natural.max(value);
+        if width >= 2.0 * big {
+            width * 0.5
+        } else if natural >= value {
+            natural
+        } else {
+            width - value
+        }
     } else {
-        (short, short_w)
-    }
+        natural.min(width * 0.5)
+    };
+    (text, label_w)
 }
+
+/// `font`, made smaller if `text` is wider than `avail` in it - down to 60% of its size -
+/// so a large control font in a narrow control is drawn whole rather than cropped or cut
+/// short. (Below that it is cut short by the caller: [`elide_to_width`].)
+pub(crate) fn fit_font(ui: &egui::Ui, text: &str, font: egui::FontId, avail: f32) -> egui::FontId {
+    let w = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+    if w <= avail || w <= 0.0 || avail <= 0.0 {
+        return font;
+    }
+    let size = (font.size * avail / w).max(font.size * 0.6);
+    egui::FontId::new(super::scale::quantize_font_size(size), font.family)
+}
+
 pub(crate) fn pill_value_cell(rect: egui::Rect, label_w: f32) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(rect.left() + label_w, rect.top()), rect.max)
 }
@@ -1574,7 +1917,20 @@ pub(crate) fn setting_pill(
     value: &str,
     label_w: f32,
 ) -> (egui::Response, egui::Rect) {
-    let (label, label_w) = pill_label_for(ui, label, label_w, value, rect.width());
+    setting_pill_widest(ui, salt, rect, label, value, value, label_w)
+}
+
+/// [`setting_pill`], with the widest value it can show (see [`pill_split`]).
+pub(crate) fn setting_pill_widest(
+    ui: &mut egui::Ui,
+    salt: &str,
+    rect: egui::Rect,
+    label: &str,
+    value: &str,
+    widest: &str,
+    label_w: f32,
+) -> (egui::Response, egui::Rect) {
+    let (label, label_w) = pill_split(ui, label, label_w, widest, rect.width());
     let label_cell =
         egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + label_w, rect.bottom()));
     let value_cell = pill_value_cell(rect, label_w);
@@ -1627,8 +1983,13 @@ pub(crate) fn setting_pill(
         egui::StrokeKind::Inside,
     );
     let font = pill_font();
-    painter.text(label_cell.center(), egui::Align2::CENTER_CENTER, label, font.clone(), label_text);
-    painter.text(value_cell.center(), egui::Align2::CENTER_CENTER, value, font, value_text);
+    // Text wider than its cell - a large control font in a narrow pill - is drawn smaller to
+    // fit (`fit_font`), and only cut short past that.
+    let label_font = fit_font(ui, label, font.clone(), label_cell.width() - 4.0);
+    painter.text(label_cell.center(), egui::Align2::CENTER_CENTER, label, label_font, label_text);
+    let value_font = fit_font(ui, value, font, value_cell.width() - 6.0);
+    let value = elide_to_width(ui, value, value_font.clone(), value_text, value_cell.width() - 4.0);
+    painter.text(value_cell.center(), egui::Align2::CENTER_CENTER, value, value_font, value_text);
     (resp, value_cell)
 }
 
@@ -1672,6 +2033,7 @@ pub(crate) fn value_pill(
     rect: egui::Rect,
     label: &str,
     shown: &str,
+    widest: &str,
     label_w: f32,
 ) -> (egui::Response, Option<String>) {
     let key = pill_edit_key(node, salt);
@@ -1679,7 +2041,7 @@ pub(crate) fn value_pill(
         .ctx()
         .data(|d| d.get_temp::<PillEdit>(key))
         .unwrap_or_default();
-    let (resp, cell) = setting_pill(ui, salt, rect, label, shown, label_w);
+    let (resp, cell) = setting_pill_widest(ui, salt, rect, label, shown, widest, label_w);
     if edit.editing {
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -1762,7 +2124,8 @@ pub(crate) fn value_pill_number(
     label_w: f32,
     range: std::ops::RangeInclusive<f64>,
 ) -> (egui::Response, Option<f64>) {
-    let (resp, typed) = value_pill(ui, node, salt, rect, label, shown, label_w);
+    let widest = widest_shown(shown, range.clone());
+    let (resp, typed) = value_pill(ui, node, salt, rect, label, shown, &widest, label_w);
     let typed = typed
         .map(|t| {
             t.chars()
@@ -2250,7 +2613,7 @@ pub(crate) fn paint_switch_content(
         let measure = |s: f32| -> f32 {
             painter.layout_no_wrap(
                 state.caption.clone(),
-                egui::FontId::proportional(s),
+                crate::settings::ui_font(s),
                 text_col,
             ).size().x
         };
@@ -2263,7 +2626,7 @@ pub(crate) fn paint_switch_content(
             cr.center(),
             egui::Align2::CENTER_CENTER,
             &state.caption,
-            egui::FontId::proportional(size),
+            crate::settings::ui_font(size),
             text_col,
         );
     }
@@ -2312,7 +2675,7 @@ pub(crate) fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
         ui.painter()
             .layout_no_wrap(
                 state.caption.clone(),
-                egui::FontId::proportional(text_size),
+                crate::settings::ui_font(text_size),
                 egui::Color32::PLACEHOLDER,
             )
             .size()
@@ -2411,8 +2774,8 @@ pub(crate) fn show_label_body(
             )
         },
     );
-    let wrapped = egui::WidgetText::from(egui::RichText::new(text_now.as_str()).size(font_now))
-        .into_galley(ui, Some(egui::TextWrapMode::Wrap), (width - 4.0).max(40.0), egui::FontId::proportional(font_now));
+    let wrapped = egui::WidgetText::from(egui::RichText::new(text_now.as_str()).size(crate::settings::ui_size(font_now)))
+        .into_galley(ui, Some(egui::TextWrapMode::Wrap), (width - 4.0).max(40.0), crate::settings::ui_font(font_now));
     let text_h = wrapped.size().y + 6.0;
     let reserved = egui::vec2(width, height.max(text_h));
     let (_, _) = ui.allocate_exact_size(reserved, egui::Sense::hover());
@@ -2473,7 +2836,7 @@ pub(crate) fn show_label_body_sized(
     // No frame of its own: the module's frame is the boundary, and a second border a few
     // points inside it reads as a box that shrank or grew depending on how full it is.
     let mut edit = egui::TextEdit::multiline(&mut text)
-        .font(egui::FontId::proportional(font_size))
+        .font(crate::settings::ui_font(font_size))
         .text_color(col)
         .frame(false)
         .margin(egui::Margin::same(2))
@@ -2521,9 +2884,14 @@ pub(crate) fn read_svg_tint(n: &NodeData) -> egui::Color32 {
     }
 }
 
-pub(crate) fn show_svg_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let outer = ui.allocate_ui(egui::vec2(160.0, 0.0), |ui| {
-        show_svg_body_sized(node_id, ui, snarl, egui::vec2(160.0, 160.0));
+/// The SVG module: the picture, as big as the module's corner grip makes the frame (a
+/// surface, `kit::surface_spec`), kept to the drawing's own shape inside it. It was a fixed
+/// 160-point square with no grip.
+pub(crate) fn show_svg_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, body_w: f32, body_h: f32) {
+    let min = super::kit::surface_spec("module.svg").map_or(egui::vec2(32.0, 32.0), |s| s.min);
+    let size = egui::vec2(body_w.max(min.x), body_h.max(min.y));
+    let outer = ui.allocate_ui(size, |ui| {
+        show_svg_body_sized(node_id, ui, snarl, size);
     });
     register_exposable_element(ui, node_id, "image", outer.response.rect);
 }
@@ -2555,20 +2923,28 @@ pub(crate) fn show_svg_body_sized(
     if data.is_empty() {
         let painter = ui.painter_at(rect);
         painter.rect_stroke(rect, 4.0,
-            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.inactive.bg_stroke.color),
             egui::StrokeKind::Inside);
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "No SVG loaded\nclick Load… in header",
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_gray(150),
+        // In the controls' font, wrapped to the frame: the hint was 11-point grey on grey.
+        let galley = painter.layout(
+            "No picture yet: load an .svg from the header".to_string(),
+            control_font(),
+            ui.visuals().text_color(),
+            (rect.width() - 12.0).max(8.0),
         );
+        let at = rect.center() - galley.size() * 0.5;
+        painter.galley(at, galley, ui.visuals().text_color());
         return;
     }
 
-    let pw = (rect.width().round() as u32).max(1);
-    let ph = (rect.height().round() as u32).max(1);
+    // Drawn at the pixels it covers - the screen's density and the canvas's zoom - in
+    // quarter steps, so a zoom re-draws it now and then rather than every frame. It was
+    // drawn at its size in points, and came out soft on a high-density screen or zoomed in.
+    let zoom = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(1.0, |t| t.scaling);
+    let density = ((zoom * ui.ctx().pixels_per_point()).max(0.25) * 4.0).ceil() / 4.0;
+    let density = density.min(4.0);
+    let pw = ((rect.width() * density).round() as u32).clamp(1, 2048);
+    let ph = ((rect.height() * density).round() as u32).clamp(1, 2048);
     let cache_key = egui::Id::new((
         "svg_tex_cache", node_id.0, rev, pw, ph, mode.as_str(),
         tint.r(), tint.g(), tint.b(), tint.a(),
@@ -2592,7 +2968,7 @@ pub(crate) fn show_svg_body_sized(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "SVG parse failed",
-                        egui::FontId::proportional(11.0),
+                        crate::settings::ui_font(11.0),
                         egui::Color32::from_rgb(220, 80, 80),
                     );
                     return;
@@ -2698,7 +3074,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         .text_styles
         .get(&egui::TextStyle::Small)
         .cloned()
-        .unwrap_or_else(|| egui::FontId::proportional(12.0));
+        .unwrap_or_else(|| crate::settings::ui_font(12.0));
     let name_colour = ui.visuals().text_color();
     let ask_name_w = ports
         .iter()
@@ -2780,7 +3156,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
             handle.rect.center(),
             egui::Align2::CENTER_CENTER,
             "⠿",
-            egui::FontId::proportional(12.0),
+            crate::settings::ui_font(12.0),
             if held {
                 ui.visuals().strong_text_color()
             } else {
@@ -2935,7 +3311,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
                     .id_salt(("macro_ty_cell", node_id, i)),
             );
             let ty_resp = egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
-                .selected_text(egui::RichText::new(port.signal_type.display_name()).small())
+                .selected_text(super::simple_bodies::combo_text(ui, port.signal_type.display_name(), TYPE_W))
                 .width(TYPE_W)
                 .show_ui(&mut tc, |ui| {
                     for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
@@ -2951,7 +3327,7 @@ pub(crate) fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui
         }
         let rm = child.put(
             rm_rect,
-            egui::Button::new(egui::RichText::new("×").size(14.0))
+            egui::Button::new(egui::RichText::new("×").size(crate::settings::ui_size(14.0)))
                 .min_size(egui::vec2(RM_W, btn_h)),
         )
         .on_hover_text("Remove port (drops its wires)");
@@ -3482,6 +3858,17 @@ enum Shape {
 /// down to a block that way; a dial can't go below a size that's worth dragging. Its
 /// reading is painted beside the control when there's room and in the hover text always.
 /// Its output label isn't drawn at all, and the Uni/Bi switch lives in the header.
+/// What a Knob reads as: its value, or - when its output ends on a feedback pin - its value
+/// in that pin's units (a pitch in Hz, a strength in dB). Through a Response Curve on the way
+/// it is still its own value: the curve's In axis reads in the same units, and its Out axis
+/// says what that becomes.
+pub(crate) fn knob_reading(snarl: &Snarl<NodeData>, node_id: NodeId, v: f32) -> String {
+    match snarl.get_node(node_id).and_then(|n| n.extra.out_target.as_ref()) {
+        Some(t) => t.unit.text(v),
+        None => format!("{v:.2}"),
+    }
+}
+
 pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, view_salt: u64, body_w: f32, body_h: f32) {
     let (value, bipolar, name) = snarl.get_node(node_id).map(|n| {
         let v = n.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -3528,7 +3915,7 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     };
     let font = egui::TextStyle::Small.resolve(ui.style());
     let text_col = ui.visuals().strong_text_color();
-    let galley = ui.painter().layout_no_wrap(format!("{:.2}", v), font.clone(), text_col);
+    let galley = ui.painter().layout_no_wrap(knob_reading(snarl, node_id, v), font.clone(), text_col);
     let text_h = galley.size().y;
     // The number goes under the control for a **fader** with a line to spare - a tall body has
     // empty space below the track and the track should have the width. A dial's face is round,
@@ -3717,7 +4104,7 @@ impl KnobPaint {
             Some(c) if active => c,
             Some(c) => c.gamma_multiply(0.8),
             None if active => Color32::WHITE,
-            None => Color32::from_gray(200),
+            None => crate::settings::tinted_gray(200),
         }
     }
 }
@@ -3739,8 +4126,8 @@ pub(crate) fn draw_knob_rotary_styled(
     let track_r = radius * 0.72;
     let n = 64usize;
 
-    painter.circle_filled(center, radius, Color32::from_gray(30));
-    painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, Color32::from_gray(55)));
+    painter.circle_filled(center, radius, crate::settings::tinted_gray(30));
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(55)));
 
     let arc_pts = |t0: f32, t1: f32| -> Vec<egui::Pos2> {
         (0..=n).map(|i| {
@@ -3753,7 +4140,7 @@ pub(crate) fn draw_knob_rotary_styled(
     // Background track
     painter.add(egui::Shape::line(
         arc_pts(0.0, 1.0),
-        egui::Stroke::new(3.0_f32, paint.track.unwrap_or(Color32::from_gray(50))),
+        egui::Stroke::new(3.0_f32, paint.track.unwrap_or(crate::settings::tinted_gray(50))),
     ));
 
     // Value arc
@@ -3773,7 +4160,7 @@ pub(crate) fn draw_knob_rotary_styled(
         ],
         egui::Stroke::new(2.0_f32, paint.handle(active)),
     );
-    painter.circle_filled(center, 2.0, Color32::from_gray(85));
+    painter.circle_filled(center, 2.0, crate::settings::tinted_gray(85));
 }
 
 pub(crate) fn draw_knob_h_fader(painter: &egui::Painter, rect: egui::Rect, t: f32, bipolar: bool, active: bool) {
@@ -3793,7 +4180,7 @@ pub(crate) fn draw_knob_h_fader_styled(
         rect.center(),
         egui::vec2(rect.width() - 2.0 * margin, 6.0),
     );
-    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(Color32::from_gray(40)));
+    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(crate::settings::tinted_gray(40)));
 
     let handle_x = track_rect.left() + t * track_rect.width();
     let accent = paint.accent(bipolar);
@@ -3814,7 +4201,7 @@ pub(crate) fn draw_knob_h_fader_styled(
         let cx = track_rect.center().x;
         painter.line_segment(
             [egui::pos2(cx, track_rect.top() - 2.0), egui::pos2(cx, track_rect.bottom() + 2.0)],
-            egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
+            egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(110)),
         );
     }
 
@@ -3839,7 +4226,7 @@ pub(crate) fn draw_knob_v_fader_styled(
         rect.center(),
         egui::vec2(6.0, rect.height() - 2.0 * margin),
     );
-    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(Color32::from_gray(40)));
+    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(crate::settings::tinted_gray(40)));
 
     // t=1 → top of track, t=0 → bottom
     let handle_y = track_rect.bottom() - t * track_rect.height();
@@ -3861,7 +4248,7 @@ pub(crate) fn draw_knob_v_fader_styled(
         let cy = track_rect.center().y;
         painter.line_segment(
             [egui::pos2(track_rect.left() - 2.0, cy), egui::pos2(track_rect.right() + 2.0, cy)],
-            egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
+            egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(110)),
         );
     }
 

@@ -214,14 +214,16 @@ pub(crate) fn show_rws_body(
         let (half, gap) = ((out[1].width() - super::kit::GAP) / 2.0, super::kit::GAP);
         let gy = egui::Rect::from_min_size(out[1].min, egui::vec2(half, ctrl));
         let st = egui::Rect::from_min_size(egui::pos2(out[1].left() + half + gap, out[1].top()), egui::vec2(half, ctrl));
-        let gt = format!("gy {g:.2}");
-        if super::curve_rows::real_pill(ui, node_id, "rws_gy", gy, "v/h|gyro v/h", &mut g, &gt, 0.0..=8.0, 0.01,
+        // Named for which they are in the label - "gy v/h" short, "gyro v/h" long - where the
+        // value cell said it again ("gy 1.00").
+        let gt = format!("{g:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_gy", gy, "gy v/h|gyro v/h", &mut g, &gt, 0.0..=8.0, 0.01,
             "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the gyro source.")
         {
             if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
         }
-        let st2 = format!("st {s:.2}");
-        if super::curve_rows::real_pill(ui, node_id, "rws_st", st, "v/h|stick v/h", &mut s, &st2, 0.0..=8.0, 0.01,
+        let st2 = format!("{s:.2}");
+        if super::curve_rows::real_pill(ui, node_id, "rws_st", st, "st v/h|stick v/h", &mut s, &st2, 0.0..=8.0, 0.01,
             "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the stick sources.")
         {
             if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
@@ -405,14 +407,14 @@ pub(crate) fn render_rws_cal_widget(
         rect.center() - egui::vec2(0.0, h * 0.14),
         egui::Align2::CENTER_CENTER,
         title,
-        egui::FontId::proportional((h * 0.34).clamp(10.0, 28.0)),
+        crate::settings::ui_font((h * 0.34).clamp(10.0, 28.0)),
         text_col,
     );
     ui.painter().text(
         rect.center() + egui::vec2(0.0, h * 0.24),
         egui::Align2::CENTER_CENTER,
         sub,
-        egui::FontId::proportional((h * 0.2).clamp(8.0, 16.0)),
+        crate::settings::ui_font((h * 0.2).clamp(8.0, 16.0)),
         v.weak_text_color(),
     );
     publish_nav_field_rects(ui, node_id, &[rect]);
@@ -1698,8 +1700,8 @@ pub(crate) fn render_rws_field(
         egui::pos2(rect.left() + 4.0, rect.bottom() - 3.0),
         egui::Align2::LEFT_BOTTOM,
         "live",
-        egui::FontId::proportional(9.0),
-        egui::Color32::from_gray(120),
+        crate::settings::ui_font(9.0),
+        crate::settings::tinted_gray(120),
     );
 
     // Editable Scale box, overlaid top-centre (the "value box in the middle").
@@ -1750,11 +1752,11 @@ fn paint_rws_ruler(
     let (minor_h, major_h) = if compact { (4.0, 8.0) } else { (6.0, 12.0) };
     painter.line_segment(
         [egui::pos2(rect.left(), cy), egui::pos2(rect.right(), cy)],
-        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
+        egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(90)),
     );
 
     // Minor ticks at the chosen spacing.
-    let minor_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(115));
+    let minor_stroke = egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(115));
     let mut d = ((phase - half) / tick_deg).ceil() * tick_deg;
     while d <= phase + half {
         let x = cx + (d - phase) * ppd;
@@ -1763,8 +1765,8 @@ fn paint_rws_ruler(
     }
 
     // Major ticks + labels at each 90° (independent of the minor spacing).
-    let major_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(170));
-    let font = egui::FontId::proportional((rect.height() * 0.16).clamp(7.0, 11.0));
+    let major_stroke = egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(170));
+    let font = crate::settings::ui_font((rect.height() * 0.16).clamp(7.0, 11.0));
     let mut d = ((phase - half) / 90.0).ceil() * 90.0;
     while d <= phase + half {
         let x = cx + (d - phase) * ppd;
@@ -1787,7 +1789,7 @@ fn paint_rws_ruler(
                 align,
                 format!("{deg}°"),
                 font.clone(),
-                egui::Color32::from_gray(200),
+                crate::settings::tinted_gray(200),
             );
         }
         d += 90.0;
@@ -1878,8 +1880,8 @@ fn paint_rws_room(painter: &egui::Painter, rect: egui::Rect, yaw_deg: f32, fov_d
     let back = egui::Color32::from_rgb(80, 130, 210); // z = +r
     let left = egui::Color32::from_rgb(90, 190, 110); // x = −r
     let right = egui::Color32::from_rgb(220, 160, 70); // x = +r
-    let floor = egui::Color32::from_gray(70);
-    let ceil = egui::Color32::from_gray(150);
+    let floor = crate::settings::tinted_gray(70);
+    let ceil = crate::settings::tinted_gray(150);
 
     // Shaded solid fills (opacity = the BG slider). Each face is a grid of small
     // cells, and every cell is shaded by a "headlight" term |view·normal| — the

@@ -67,6 +67,8 @@ use super::NodeData;
 
 type LiveSignals = HashMap<(String, String), Signal>;
 
+mod rows;
+
 /// Symmetric editing param.
 pub(crate) const AREA_SYM_PARAM: &str = "area_sym";
 /// The shape, as a request the layout follows (see the module docs).
@@ -1518,13 +1520,13 @@ fn paint_cell_content(
         }
     } else if label.is_empty() {
         p.text(center, egui::Align2::CENTER_CENTER, format!("{id}"),
-            egui::FontId::proportional((room * 0.3).clamp(10.0, 20.0)),
-            if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) });
+            crate::settings::ui_font((room * 0.3).clamp(10.0, 20.0)),
+            if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(150) });
     }
     if !label.is_empty() {
         let (font, text) = super::menu_body::fit_zone_label(p, label, 11.0, room.max(20.0));
         p.text(egui::pos2(center.x, center.y + ic * 0.45), egui::Align2::CENTER_TOP, text, font,
-            if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(200) });
+            if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(200) });
     }
 }
 
@@ -2149,7 +2151,7 @@ pub(crate) fn show_area_options_row(
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Input").small().weak());
         let r = egui::ComboBox::from_id_salt((node_id, "area_input"))
-            .selected_text(egui::RichText::new(label_of(&current)).small())
+            .selected_text(super::viewer::simple_bodies::combo_text(ui, label_of(&current), 88.0))
             .width(88.0)
             .show_ui(ui, |ui| {
                 for p in &options {
@@ -2162,7 +2164,7 @@ pub(crate) fn show_area_options_row(
             .on_hover_text("The XY pair laid onto the area. It is consumed: the bus carries it on at rest unless Pass is on.");
         rects.push(r.rect);
         let r = egui::ComboBox::from_id_salt((node_id, "area_shape"))
-            .selected_text(egui::RichText::new(if shape == Shape::Circle { "◯ Circle" } else { "▢ Rect" }).small())
+            .selected_text(super::viewer::simple_bodies::combo_text(ui, if shape == Shape::Circle { "◯ Circle" } else { "▢ Rect" }, 72.0))
             .width(72.0)
             .show_ui(ui, |ui| {
                 for (s, name) in [(Shape::Circle, "◯ Circle"), (Shape::Rect, "▢ Rect")] {
@@ -2508,7 +2510,7 @@ fn overlay_controls(
     let mut pick: Option<&str> = None;
     ui.label(egui::RichText::new("Overlay").small().weak());
     egui::ComboBox::from_id_salt((node_id, "area_overlay"))
-        .selected_text(egui::RichText::new(label).small())
+        .selected_text(super::viewer::simple_bodies::combo_text(ui, label, 110.0))
         .width(110.0)
         .show_ui(ui, |ui| {
             for (value, name, tip) in AREA_OVERLAY_MODES {
@@ -2544,7 +2546,7 @@ fn overlay_controls(
 /// loading the whole module as a `.fxarea` file.
 fn presets_menu(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
     let mut changed = false;
-    crate::touch::menu_button(ui, "Presets", |ui| {
+    crate::touch::menu_button(ui, super::viewer::simple_bodies::control_text("presets"), |ui| {
         let mut layout: Option<AreaLayout> = None;
         if ui.button("Circle: 4-way").clicked() { layout = Some(AreaLayout::circle_ways(4)); }
         if ui.button("Circle: 8-way").clicked() { layout = Some(AreaLayout::circle_ways(8)); }
@@ -2779,7 +2781,6 @@ fn border_settings(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
 
 // ── Selected cell ─────────────────────────────────────────────────────────────
 
-/// The selected cell's icon + name override.
 /// A cell's border-cross haptic, or `None` for none.
 fn cell_haptic(node: &NodeData, cell: u32) -> Option<CellHaptic> {
     CellHaptic::from_value(node.params.get(AREA_CELL_HAPTICS_PARAM)?.get(cell.to_string())?)
@@ -2795,94 +2796,6 @@ fn set_cell_haptics(node: &mut NodeData, cells: &[u32], haptic: Option<CellHapti
             None => { map.remove(&cell.to_string()); }
         }
     }
-}
-
-/// The selected cell's border-cross haptic. True when anything changed.
-fn cell_haptic_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    let Some(node) = snarl.get_node(node_id) else { return false };
-    let layout = area_layout(node);
-    let cell = selected_cell(node, &layout);
-    let current = cell_haptic(node, cell);
-    let mut on = current.is_some();
-    let mut pct = current.map_or(1.0, |h| h.strength) * 100.0;
-    let mut tone = current.and_then(|h| h.tone);
-    let mut tone_on = tone.is_some();
-    let (default_hz, default_ms) = if area_input(node).starts_with("touch") {
-        (flexinput_core::automap::PAD_CLICK_HZ, flexinput_core::automap::PAD_CLICK_MS)
-    } else {
-        (flexinput_core::automap::TRIGGER_CLICK_HZ, flexinput_core::automap::TRIGGER_CLICK_MS)
-    };
-    let (mut changed, mut all) = (false, false);
-    ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut on, egui::RichText::new("Haptic").small())
-            .on_hover_text("Play a haptic as the point crosses this cell's border, on the way in \
-                or out: on the trackpad for a touchpad input, on that side's grip motor for a \
-                stick. A pad without those gets a short rumble. Landing or lifting a finger \
-                doesn't count.")
-            .changed();
-        if on {
-            changed |= ui.add(egui::Slider::new(&mut pct, 5.0..=100.0).step_by(1.0).suffix("%")).changed();
-        }
-        all = ui.add(egui::Button::new(egui::RichText::new("All cells in layer").small()))
-            .on_hover_text("Give every cell in this layer this cell's haptic setting.")
-            .clicked();
-    });
-    if on {
-        ui.horizontal_wrapped(|ui| {
-            changed |= ui.checkbox(&mut tone_on, egui::RichText::new("Tone").small())
-                .on_hover_text("Give this cell's click its own pitch, length and softness. Off, it \
-                    plays the pad's plain click. A pad without these actuators gets its short \
-                    rumble either way.")
-                .changed();
-            if tone_on {
-                let mut t = tone.unwrap_or(CellTone { hz: default_hz, ms: default_ms, soft: 0.0 });
-                ui.spacing_mut().slider_width = 64.0;
-                changed |= crate::panels::calibration::click_tone_slider(ui, &mut t.hz, "");
-                changed |= crate::panels::calibration::click_length_slider(ui, &mut t.ms, "");
-                changed |= crate::panels::calibration::click_soft_slider(ui, &mut t.soft);
-                tone = Some(t);
-            } else {
-                tone = None;
-            }
-        });
-    }
-    let haptic = on.then_some(CellHaptic { strength: pct / 100.0, tone });
-    let Some(node) = snarl.get_node_mut(node_id) else { return false };
-    if changed {
-        set_cell_haptics(node, &[cell], haptic);
-    }
-    if all {
-        set_cell_haptics(node, &layout.cell_ids(), haptic);
-    }
-    changed || all
-}
-
-fn cell_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    let Some(node) = snarl.get_node(node_id) else { return false };
-    let layout = area_layout(node);
-    let cell = selected_cell(node, &layout);
-    let meta = menu_zone_meta(node).get(&cell).cloned().unwrap_or_default();
-    let mut new_meta: Option<ZoneMeta> = None;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Cell {cell}")).small().strong());
-        ui.label(egui::RichText::new("icon").small().weak())
-            .on_hover_text("Show one picked icon on this cell instead of its mapping icons.");
-        if let Some((k, s)) = icon_picker_button(ui, egui::Id::new((node_id, "area_cell_icon", cell)), &meta.icon, &meta.svg) {
-            new_meta = Some(ZoneMeta { icon: k, svg: s, label: meta.label.clone() });
-        }
-        ui.label(egui::RichText::new("name").small().weak());
-        let mut label = meta.label.clone();
-        if ui.add(egui::TextEdit::singleline(&mut label).desired_width(80.0)
-            .id_salt((node_id, "area_cell_name", cell))).changed()
-        {
-            new_meta = Some(ZoneMeta { icon: meta.icon.clone(), svg: meta.svg.clone(), label });
-        }
-    });
-    let Some(node) = snarl.get_node_mut(node_id) else { return false };
-    if let Some(m) = &new_meta {
-        write_zone_meta_entry(node, cell, m);
-    }
-    new_meta.is_some()
 }
 
 // ── Body + pins ───────────────────────────────────────────────────────────────
@@ -2911,7 +2824,8 @@ pub(crate) fn show_area_mapper_body(
     body_w: f32,
     body_h: f32,
 ) -> bool {
-    let surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(FIELD_MIN, FIELD_MIN));
+    let mut surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(FIELD_MIN, FIELD_MIN));
+    surface.need(rows::ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
     let changed = area_mapper_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
     surface.end(ui);
     changed
@@ -2930,40 +2844,118 @@ fn area_mapper_body(
     let mut changed = false;
     let size = surface.min_elem();
 
+    // The settings in categories that fold (`curve_rows::section`), as the other modules'
+    // bodies have them: what the area reads and how it shows, its layers, then the field,
+    // and under it what is selected on it - a border, a cell - and the press mode.
+    let w = surface.x.max(rows::ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
     ui.vertical(|ui| {
         // The body is as wide as the grip made it even where the square field is not: a
         // frame that snapped back to the rows' width would be a grip that didn't take.
         ui.set_min_width(surface.x);
-        let opts = ui.vertical(|ui| {
-            changed |= show_area_options_row(node_id, ui, snarl, live_signals, automap_parent);
-        }).response.rect;
-        register_exposable_element(ui, node_id, "options", opts);
-        let layers = ui.vertical(|ui| {
-            changed |= show_area_layer_row(node_id, ui, snarl);
-        }).response.rect;
-        register_exposable_element(ui, node_id, "layers", layers);
+        // And no wider: a heading takes the width it is offered, and a body is offered last
+        // frame's - a frame dragged wide would never come back.
+        ui.set_max_width(w);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "input", "Input and overlay", true) {
+            let opts = ui.vertical(|ui| {
+                changed |= rows::options(node_id, ui, snarl, live_signals, automap_parent, w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "options", opts);
+        }
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "layers", "Layers", true) {
+            let layers = ui.vertical(|ui| {
+                changed |= rows::layers(node_id, ui, snarl, w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "layers", layers);
+            // The layer's analog mode: a widget of its own, pinned on its own.
+            let analog = ui.vertical(|ui| {
+                changed |= rows::analog(node_id, ui, snarl, w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "analog", analog);
+        }
+        ui.add_space(4.0);
         let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), false, false);
         changed |= structural;
         register_exposable_element(ui, node_id, "field", field);
-        ui.label(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
-            .small().weak());
-        let border = egui::Frame::group(ui.style()).show(ui, |ui| {
-            changed |= border_settings(node_id, ui, snarl, colors, true);
-        }).response.rect;
-        register_exposable_element(ui, node_id, "border", border);
-        changed |= cell_row(node_id, ui, snarl);
-        changed |= cell_haptic_row(node_id, ui, snarl);
-        let press = ui.vertical(|ui| {
-            changed |= show_area_press_row(node_id, ui, snarl);
-        }).response.rect;
-        register_exposable_element(ui, node_id, "press", press);
+        ui.add(egui::Label::new(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
+            .small().weak()).wrap());
+        let border_title = rows::border_title(snarl, node_id);
+        let heading = border_title.as_deref().map_or("Border".to_string(), |t| format!("Border: {t}"));
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "border", &heading, true) {
+            let border = ui.vertical(|ui| {
+                changed |= rows::border(node_id, ui, snarl, colors, w, true);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "border", border);
+        }
+        let cell = snarl.get_node(node_id).map_or(0, |n| selected_cell(n, &area_layout(n)));
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "cell", &format!("Cell {cell}"), true) {
+            // Its name and icon and its haptic, pinnable as one widget.
+            let cell_rect = ui.vertical(|ui| {
+                changed |= rows::cell(node_id, ui, snarl, w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "cell", cell_rect);
+        }
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "press", "Press mode", false) {
+            let press = ui.vertical(|ui| {
+                changed |= rows::press(node_id, ui, snarl, w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "press", press);
+        }
         ui.add_space(4.0);
-        let cards = ui.vertical(|ui| {
-            render_touch_zone_cards(node_id, ui, snarl, &visuals, colors.accent, live_signals, automap_parent);
-        }).response.rect;
+        // The cell's tabs and Learn row stay put, the cards scroll in a window under them
+        // (`card_window`), as a Remapper's do.
+        let _ = &visuals;
+        let band = super::viewer::curve_rows::band_h(ui);
+        let cards = super::viewer::card_window(
+            ui, snarl, node_id, "area_cards", w, "cards_h", band,
+            live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+            move |id, _ins, ui, sn, sigs, _panic, am| {
+                let visuals = ui.visuals().clone();
+                ui.vertical(|ui| {
+                    render_touch_zone_cards(id, ui, sn, &visuals, colors.accent, sigs, am);
+                });
+            },
+            super::viewer::tz_cards_hash_map,
+            super::viewer::tz_cards_hash_draft,
+        );
         register_exposable_element(ui, node_id, "cards", cards);
     });
     changed
+}
+
+/// A row's Style 2 look, pinned: the body's own bands (`rows`), drawn inside
+/// `pin_style2::fit` at the frame's width and the zoom it set. The border keeps to its rows;
+/// its curve editor stays in the body.
+pub(crate) fn render_area_row_style2(
+    inner_id: NodeId,
+    element: &str,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
+    let colors = sync_and_colors(snarl, inner_id);
+    let w = ui.available_width();
+    match element {
+        "options" => {
+            rows::options(inner_id, ui, snarl, live_signals, automap_parent, w);
+        }
+        "layers" => {
+            rows::layers(inner_id, ui, snarl, w);
+        }
+        "analog" => {
+            rows::analog(inner_id, ui, snarl, w);
+        }
+        "cell" => {
+            rows::cell(inner_id, ui, snarl, w);
+        }
+        "press" => {
+            rows::press(inner_id, ui, snarl, w);
+        }
+        _ => {
+            rows::border(inner_id, ui, snarl, colors, w, false);
+        }
+    }
 }
 
 /// The area field pinned: the largest square that fits the frame, with the

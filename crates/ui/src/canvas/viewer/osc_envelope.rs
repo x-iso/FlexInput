@@ -95,7 +95,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
     trace_rect(ui, node_id, "osc_preview", preview_rect);
     if ui.is_rect_visible(preview_rect) {
         let painter = ui.painter_at(preview_rect);
-        painter.rect_filled(preview_rect, 4.0, egui::Color32::from_gray(18));
+        painter.rect_filled(preview_rect, 4.0, crate::settings::tinted_gray(18));
         let zero_y = if bipolar {
             preview_rect.center().y
         } else {
@@ -103,7 +103,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
         };
         painter.line_segment(
             [egui::pos2(preview_rect.left(), zero_y), egui::pos2(preview_rect.right(), zero_y)],
-            egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
+            egui::Stroke::new(0.5_f32, crate::settings::tinted_gray(55)),
         );
         let n = 128usize;
         let pts: Vec<egui::Pos2> = (0..=n)
@@ -467,7 +467,7 @@ pub(crate) fn paint_envelope_curve_graph(
     if show_grid_labels {
         const MIN_LABEL_PX: f32 = 20.0;
         let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-        let font = egui::FontId::proportional(9.0);
+        let font = crate::settings::ui_font(9.0);
         let mut last_sx = f32::NEG_INFINITY;
         for &u in &grid_x_positions {
             let sx = c2s(u, 1.0).x;
@@ -501,8 +501,8 @@ pub(crate) fn paint_envelope_curve_graph(
     // segments left a notch at each joint, and even steps alone cut the tip off a peak that
     // fell between two of them.
     if new_points.len() >= 2 {
-        let main_col = Color32::from_gray(120);
-        let dim_col  = Color32::from_gray(55);
+        let main_col = crate::settings::tinted_gray(120);
+        let dim_col  = crate::settings::tinted_gray(55);
         let split = if buffer_mode { sustain_snapped.clamp(0.0, 1.0) } else { 1.0 };
         let mut xs: Vec<f32> = (0..=120).map(|i| i as f32 / 120.0).collect();
         xs.extend(new_points.iter().map(|p| p[0].clamp(0.0, 1.0)));
@@ -554,7 +554,7 @@ pub(crate) fn paint_envelope_curve_graph(
                 Color32::from_rgb(255, 220, 50)
             } else { Color32::from_rgb(180, 140, 20) };
             painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
-            painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+            painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(100)));
         }
     }
 
@@ -602,9 +602,9 @@ pub(crate) fn paint_envelope_curve_graph(
             remove_idx = Some(i);
             pts_changed = true;
         }
-        let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+        let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { crate::settings::tinted_gray(190) };
         painter.circle_filled(screen, 5.0, col);
-        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
+        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(80)));
         // The point's level beside the dot, and on hover where in the envelope's length it
         // falls - the reading the Response Curve's dots give. The number goes with the graph's
         // own labels, or whenever the dot is under the pointer; the time is always available,
@@ -1162,8 +1162,20 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                     //
                     // Each wears its plate switched off as well: a word with no plate still
                     // reads as something to press, a drawing with none reads as decoration.
-                    let gap = ((cell.width() - 3.0 * ctrl_h) / 2.0).clamp(CELL_GAP, 12.0);
-                    let group_w = (3.0 * ctrl_h + 2.0 * gap).min(cell.width());
+                    //
+                    // With room for them, each also says what it is beside its shape: the three
+                    // the same width, the widest word's, so the group still reads as one.
+                    const WORDS: [&str; 3] = ["Hold", "Bounce", "Loop"];
+                    let font = super::simple_bodies::control_font();
+                    let widest_word = WORDS
+                        .iter()
+                        .map(|w| ui.painter().layout_no_wrap(w.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x)
+                        .fold(0.0_f32, f32::max);
+                    let worded_w = ctrl_h + widest_word + 8.0;
+                    let worded = 3.0 * worded_w + 2.0 * CELL_GAP <= cell.width();
+                    let btn_w = if worded { worded_w } else { ctrl_h };
+                    let gap = ((cell.width() - 3.0 * btn_w) / 2.0).clamp(CELL_GAP, 12.0);
+                    let group_w = (3.0 * btn_w + 2.0 * gap).min(cell.width());
                     let box_rect = egui::Rect::from_min_size(
                         egui::pos2(cell.center().x - group_w * 0.5, cell.top()),
                         egui::vec2(group_w, band_h),
@@ -1182,20 +1194,26 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                         let before = *flag;
                         let on = *flag;
                         let resp = child.add_sized(
-                            [ctrl_h, ctrl_h],
+                            [btn_w, ctrl_h],
                             egui::Button::selectable(on, "").frame_when_inactive(true),
                         );
                         trace_rect(ui, node_id, &format!("env_mode_{i}"), resp.rect);
-                        super::glyphs::paint(
-                            child.painter(),
-                            resp.rect,
-                            glyph,
-                            if on {
-                                ui.visuals().strong_text_color()
-                            } else {
-                                ui.visuals().text_color().linear_multiply(0.75)
-                            },
-                        );
+                        let col = if on {
+                            ui.visuals().strong_text_color()
+                        } else {
+                            ui.visuals().text_color().linear_multiply(0.75)
+                        };
+                        let shape = egui::Rect::from_min_size(resp.rect.min, egui::vec2(ctrl_h, ctrl_h));
+                        super::glyphs::paint(child.painter(), shape, glyph, col);
+                        if worded {
+                            child.painter().text(
+                                egui::pos2(shape.right(), resp.rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                WORDS[i],
+                                font.clone(),
+                                col,
+                            );
+                        }
                         let clicked = resp.on_hover_text(hover).clicked();
                         if clicked {
                             *flag = !before;

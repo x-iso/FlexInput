@@ -38,7 +38,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, FontId, Pos2, Stroke};
+use egui::{Align2, Color32, Pos2, Stroke};
 use egui_snarl::Snarl;
 use flexinput_core::Signal;
 use flexinput_devices::gyro::GYRO_REF_DPS;
@@ -647,10 +647,7 @@ pub(crate) fn show(
         .map(|t| s.pads.iter().map(|p| pad_info(&t.canvas.snarl, &p.dev)).collect())
         .unwrap_or_default();
 
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|m| m.x > 1.0 && m.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
     let viewport_id = egui::ViewportId::from_hash_of("fxi_gyro_cal_overlay");
     let builder = egui::ViewportBuilder::default()
         .with_app_id(crate::APP_ID)
@@ -663,20 +660,12 @@ pub(crate) fn show(
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
 
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs).
-        let (inner_rect, child_monitor) = vctx.input(|i| {
-            (i.viewport().inner_rect, i.viewport().monitor_size)
-        });
-        if let (Some(inner_rect), Some(want)) = (inner_rect, child_monitor) {
-            if (inner_rect.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
         if vctx.data(|d| d.get_temp::<bool>(passthrough_id())).is_none() {
             vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             vctx.data_mut(|d| d.insert_temp(passthrough_id(), true));
@@ -703,7 +692,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 pub(crate) fn tuning_summary(t: &Tuning) -> (String, Color32) {
     let found = plural(t.report.bursts, "spike", "spikes");
     match t.setting {
-        None if t.report.spikes == 0 => ("No spikes found".into(), Color32::from_gray(170)),
+        None if t.report.spikes == 0 => ("No spikes found".into(), crate::settings::tinted_gray(170)),
         None => (format!("{found} — the spike filter can't remove them"), ORANGE),
         Some((w, sens)) if t.left == 0 => (format!("{found} · spike filter set to window {w}, {sens:.0}%"), CYAN),
         Some((w, sens)) => (format!("{found} · window {w}, {sens:.0}% removes most"), ORANGE),
@@ -735,7 +724,7 @@ fn pad_status(p: &PadCal, now: f64) -> (String, Color32) {
             (format!("calibrating {pct:.0}%"), ORANGE)
         };
     }
-    ("lay it flat".into(), Color32::from_gray(200))
+    ("lay it flat".into(), crate::settings::tinted_gray(200))
 }
 
 const TOP_H: f32 = 204.0;
@@ -757,7 +746,7 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
     p.rect_filled(card, 14.0, Color32::from_rgba_unmultiplied(18, 20, 24, 228));
     p.rect_stroke(card, 14.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), egui::StrokeKind::Inside);
     p.text(egui::pos2(card.center().x, card.top() + 26.0), Align2::CENTER_CENTER,
-        flexinput_core::imu::GYRO_CAL_NAME, FontId::proportional(19.0), Color32::from_gray(235));
+        flexinput_core::imu::GYRO_CAL_NAME, crate::settings::ui_font(19.0), crate::settings::tinted_gray(235));
 
     let vis = egui::pos2(card.center().x, card.top() + 98.0);
     let t = ui.input(|i| i.time);
@@ -784,29 +773,29 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
             ("Gyro calibrated", GREEN, sub, col)
         }
         Some((_, Outcome::Cancelled)) => {
-            cross(p, vis, Color32::from_gray(170));
-            ("Calibration cancelled", Color32::from_gray(210), String::new(), Color32::GRAY)
+            cross(p, vis, crate::settings::tinted_gray(170));
+            ("Calibration cancelled", crate::settings::tinted_gray(210), String::new(), Color32::GRAY)
         }
         Some((_, Outcome::TimedOut)) => {
             ring(p, vis, progress, share, None);
             cross(p, vis, ORANGE);
             let any = s.pads.iter().any(|p| p.gyro.is_some());
             ("It didn't hold still — calibration stopped", ORANGE,
-             if any { "What finished is kept".into() } else { String::new() }, Color32::from_gray(150))
+             if any { "What finished is kept".into() } else { String::new() }, crate::settings::tinted_gray(150))
         }
         Some((_, Outcome::NoGyro)) => {
-            cross(p, vis, Color32::from_gray(170));
-            ("Nothing to calibrate", Color32::from_gray(210),
-             "This controller doesn't report a gyro".into(), Color32::from_gray(150))
+            cross(p, vis, crate::settings::tinted_gray(170));
+            ("Nothing to calibrate", crate::settings::tinted_gray(210),
+             "This controller doesn't report a gyro".into(), crate::settings::tinted_gray(150))
         }
         None if analysing && !sampling => {
             ring(p, vis, 1.0, share, Some(t));
-            ("Analysing spikes…", Color32::from_gray(230), String::new(), Color32::GRAY)
+            ("Analysing spikes…", crate::settings::tinted_gray(230), String::new(), Color32::GRAY)
         }
         None if sampling => {
             ring(p, vis, progress, share, Some(t));
             p.text(vis, Align2::CENTER_CENTER, format!("{:.0}%", progress * 100.0),
-                FontId::proportional(17.0), Color32::from_gray(230));
+                crate::settings::ui_font(17.0), crate::settings::tinted_gray(230));
             let msg = if !all_down {
                 laid
             } else if spike_phase {
@@ -815,7 +804,7 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
                 "Calibrating gyro — keep it still"
             };
             let sub = if !all_down { "Calibrating the ones lying still" } else { "" };
-            (msg, Color32::from_gray(230), sub.into(), Color32::from_gray(150))
+            (msg, crate::settings::tinted_gray(230), sub.into(), crate::settings::tinted_gray(150))
         }
         None => {
             lay_down(ui, p, vis, t);
@@ -827,14 +816,14 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
             } else {
                 "Starts once it's still · press again to cancel"
             };
-            (laid, Color32::from_gray(230), sub.into(), Color32::from_gray(150))
+            (laid, crate::settings::tinted_gray(230), sub.into(), crate::settings::tinted_gray(150))
         }
     };
     p.text(egui::pos2(card.center().x, card.top() + 164.0), Align2::CENTER_CENTER,
-        msg, FontId::proportional(16.0), msg_col);
+        msg, crate::settings::ui_font(16.0), msg_col);
     if !sub.is_empty() {
         p.text(egui::pos2(card.center().x, card.top() + 187.0), Align2::CENTER_CENTER,
-            sub, FontId::proportional(13.0), sub_col);
+            sub, crate::settings::ui_font(13.0), sub_col);
     }
 
     let mut y = card.top() + TOP_H;
@@ -842,10 +831,10 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
         let (name, offset) = info.get(i).cloned().unwrap_or_else(|| (pad.dev.clone(), [0.0; 3]));
         if multi {
             p.text(egui::pos2(card.left() + 22.0, y + SCOPE_HEAD * 0.5), Align2::LEFT_CENTER,
-                &name, FontId::proportional(13.0), Color32::from_gray(220));
+                &name, crate::settings::ui_font(13.0), crate::settings::tinted_gray(220));
             let (status, col) = pad_status(pad, now);
             p.text(egui::pos2(card.right() - 22.0, y + SCOPE_HEAD * 0.5), Align2::RIGHT_CENTER,
-                status, FontId::proportional(12.0), col);
+                status, crate::settings::ui_font(12.0), col);
             y += SCOPE_HEAD;
         }
         let rect = egui::Rect::from_min_size(egui::pos2(card.left() + 18.0, y), egui::vec2(w - 36.0, SCOPE_H));
@@ -859,22 +848,22 @@ fn paint_prompt(ui: &egui::Ui, screen: egui::Rect, s: &Session, info: &[(String,
 /// capture it is every sample the spike filter is fed, before it — spikes
 /// the filter removes show here too.
 fn scope(p: &egui::Painter, rect: egui::Rect, pad: &PadCal, offset: [f32; 3]) {
-    p.rect_filled(rect, 5.0, Color32::from_gray(12));
-    p.rect_stroke(rect, 5.0, Stroke::new(1.0_f32, Color32::from_gray(48)), egui::StrokeKind::Inside);
+    p.rect_filled(rect, 5.0, crate::settings::tinted_gray(12));
+    p.rect_stroke(rect, 5.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(48)), egui::StrokeKind::Inside);
     let plot = rect.shrink2(egui::vec2(8.0, 9.0));
     let mid = plot.center().y;
     p.line_segment([egui::pos2(plot.left(), mid), egui::pos2(plot.right(), mid)],
-        Stroke::new(1.0_f32, Color32::from_gray(40)));
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(40)));
 
     let n = pad.recent.len();
-    let small = FontId::proportional(10.0);
+    let small = crate::settings::ui_font(10.0);
     let label = match pad.source {
         Source::Capture => "gyro · raw, before the spike filter",
         Source::Signals => "gyro",
         Source::Pending => "gyro · connecting…",
     };
     p.text(egui::pos2(rect.left() + 6.0, rect.bottom() - 3.0), Align2::LEFT_BOTTOM,
-        label, small.clone(), Color32::from_gray(100));
+        label, small.clone(), crate::settings::tinted_gray(100));
     if n < 2 {
         return;
     }
@@ -885,7 +874,7 @@ fn scope(p: &egui::Painter, rect: egui::Rect, pad: &PadCal, offset: [f32; 3]) {
     let range = (peak * 1.15).max(5.0 / GYRO_REF_DPS);
     let k = plot.height() * 0.5 / range;
     p.text(egui::pos2(rect.right() - 6.0, rect.top() + 3.0), Align2::RIGHT_TOP,
-        format!("±{:.0} °/s", range * GYRO_REF_DPS), small, Color32::from_gray(100));
+        format!("±{:.0} °/s", range * GYRO_REF_DPS), small, crate::settings::tinted_gray(100));
 
     let x_of = |i: usize| plot.left() + plot.width() * i as f32 / (n - 1) as f32;
     let y_of = |v: f32| (mid - v * k).clamp(plot.top(), plot.bottom());
@@ -1030,7 +1019,7 @@ fn lay_down(ui: &egui::Ui, p: &egui::Painter, c: Pos2, t: f64) {
         let centre = egui::pos2(c.x, table_y - 2.0 - PAD_ART_SIZE * PAD_ART_BOTTOM - lift);
         let rect = egui::Rect::from_center_size(centre, egui::vec2(PAD_ART_SIZE, PAD_ART_SIZE));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        p.image(tex.id(), rect, uv, Color32::from_gray(225).gamma_multiply(fade_in));
+        p.image(tex.id(), rect, uv, crate::settings::tinted_gray(225).gamma_multiply(fade_in));
     }
 
     // Landed: a ripple along the table.

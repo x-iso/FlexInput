@@ -151,8 +151,9 @@ pub(crate) fn show_subpatch_body(
     // elements learned to read the chain, and pins past it stopped at the inlet
     // — a JSM curve found no pad and drew no live dot, an Input Viewer showed
     // no device.
-    let needs_outer_snapshot = !is_unlocked
-        && items.iter().any(|it| matches!(it, LayoutItem::Module(_)));
+    // In layout editing too: the pins are drawn there as well, and a 3DOF preview traced
+    // nothing without it and drew a pad that wasn't the one wired.
+    let needs_outer_snapshot = items.iter().any(|it| matches!(it, LayoutItem::Module(_)));
     let outer_snapshot: Option<Snarl<NodeData>> = if needs_outer_snapshot {
         Some(snarl.clone())
     } else { None };

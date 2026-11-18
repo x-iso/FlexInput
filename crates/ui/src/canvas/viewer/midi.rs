@@ -200,15 +200,43 @@ fn pick_state_adjust(st: &mut PickerState, field: usize, delta: i32) {
 /// `for_output` hides kinds (and the "any channel" choice) a MIDI output can't
 /// write. Returns the pin when Add is clicked with a valid selection.
 pub(crate) fn midi_pin_picker(ui: &mut egui::Ui, id_salt: impl std::hash::Hash, for_output: bool) -> Option<MidiPin> {
-    let mut added = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let built = midi_pin_picker_fields(ui, id_salt, for_output);
-        if midi_pin_add_button(ui, "Add", built.clone(), true).clicked() {
-            added = built;
-        }
-    });
-    added
+    // Laid out for the width there is: one row when the four fit side by side, else the
+    // type and its channel, then the number and Add, each row the whole width. Wrapped as
+    // they came, they fell into ragged lines of one or two.
+    const GAP: f32 = 4.0;
+    let (type_w, ch_w, num_w) = (150.0, 86.0, 120.0);
+    let h = (super::curve_rows::band_h(ui) - 4.0).max(18.0);
+    let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
+    let add_w = (ui.painter().layout_no_wrap("Add".into(), font, egui::Color32::PLACEHOLDER).size().x
+        + 2.0 * ui.spacing().button_padding.x
+        + 12.0)
+        .max(44.0);
+    let w = ui.available_width().max(type_w);
+    let one_row = type_w + ch_w + num_w + add_w + 3.0 * GAP;
+    let (rects, add_r) = if w >= one_row {
+        let (row, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        // The room past what they need goes to the type and the number.
+        let extra = (w - one_row) * 0.5;
+        let at = |x: f32, cw: f32| egui::Rect::from_min_size(egui::pos2(x, row.top()), egui::vec2(cw, h));
+        let t = at(row.left(), type_w + extra);
+        let c = at(t.right() + GAP, ch_w);
+        let n = at(c.right() + GAP, num_w + extra);
+        ([t, c, n], at(n.right() + GAP, add_w))
+    } else {
+        let (r1, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        ui.add_space(GAP);
+        let (r2, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+        let split = |r: egui::Rect, right_w: f32| {
+            let left = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - right_w - GAP, r.bottom()));
+            (left, egui::Rect::from_min_max(egui::pos2(r.right() - right_w, r.top()), r.max))
+        };
+        let (t, c) = split(r1, ch_w);
+        let (n, a) = split(r2, add_w);
+        ([t, c, n], a)
+    };
+    let built = midi_pin_picker_fields(ui, id_salt, for_output, rects);
+    let mut add_ui = ui.new_child(egui::UiBuilder::new().max_rect(add_r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    (midi_pin_add_button(&mut add_ui, "Add", built.clone(), true).clicked()).then_some(built).flatten()
 }
 
 /// An Add-style button for a picked pin: disabled (with the reason) when the
@@ -221,7 +249,13 @@ pub(crate) fn midi_pin_add_button(
     allowed: bool,
 ) -> egui::Response {
     let usable = allowed && built.is_some();
-    let resp = ui.add_enabled(usable, egui::Button::new(egui::RichText::new(label).small()));
+    // An action button, as the rows of buttons round it are (`kit::body_button`).
+    let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
+    let w = (ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER).size().x
+        + 2.0 * ui.spacing().button_padding.x
+        + 12.0)
+        .max(44.0);
+    let resp = ui.add_enabled(usable, super::remapper_bodies::action_button(label, w));
     match (&built, allowed) {
         (None, _) => resp.on_disabled_hover_text(format!(
             "A complete SysEx message: starts F0, ends F7, at most {} bytes.",
@@ -242,6 +276,7 @@ pub(crate) fn midi_pin_picker_fields(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     for_output: bool,
+    rects: [egui::Rect; 3],
 ) -> Option<MidiPin> {
     let id = egui::Id::new(("midi_pin_picker", id_salt));
     let mut st: PickerState = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_default();
@@ -254,71 +289,64 @@ pub(crate) fn midi_pin_picker_fields(
 
     let built;
     {
-        let kind_rect = egui::ComboBox::from_id_salt(id.with("kind"))
-            .selected_text(egui::RichText::new(st.kind.label()).small())
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                for k in PickKind::ALL {
-                    if for_output && !k.writable() {
-                        continue;
-                    }
-                    if ui.selectable_label(st.kind == k, egui::RichText::new(k.label()).small()).clicked() {
-                        st.kind = k;
-                        if let Some(max) = k.number_range() {
-                            st.number = st.number.min(max);
-                        }
-                    }
-                }
-            })
-            .response.rect;
-        // Where the field after the type starts, from the row's left: a MIDI
-        // node's header lines its Clear unused button up with it.
-        let second_x = kind_rect.width() + ui.spacing().item_spacing.x;
+        // The house pills (`curve_rows::pill_combo`, `count_pill`), a band tall, in the row
+        // the caller lays out: the type, the channel, the number. A type with no channel
+        // or no number shows that field greyed with a dash, rather than the field going.
+        let pill_node = NodeId(id.value() as usize);
+        let [kind_r, ch_r, num_r] = rects;
+        let kind_opts: Vec<(PickKind, &str)> = PickKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| !for_output || k.writable())
+            .map(|k| (k, k.label()))
+            .collect();
+        if let Some(k) = super::curve_rows::pill_combo(ui, kind_r, "type", &st.kind, &kind_opts, "The kind of message.", (id, "kind")) {
+            st.kind = k;
+            if let Some(max) = k.number_range() {
+                st.number = st.number.min(max);
+            }
+        }
+        // Where the field after the type starts, from the row's left.
+        let second_x = kind_r.width() + ui.spacing().item_spacing.x;
         ui.ctx().data_mut(|d| d.insert_temp(id.with("second_x"), second_x));
 
-        // A greyed "—" says plainly that this type has no channel / number,
-        // rather than the field silently vanishing.
-        if !st.kind.has_channel() {
-            ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
-                .on_disabled_hover_text("This message has no channel.");
-        }
+        let dash = |ui: &mut egui::Ui, r: egui::Rect, label: &str, why: &str| {
+            let v = ui.visuals();
+            ui.painter().rect_filled(r, 4.0, v.widgets.inactive.weak_bg_fill.gamma_multiply(0.6));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, format!("{label} —"), super::simple_bodies::control_font(), v.weak_text_color());
+            ui.interact(r, id.with(("dash", label)), egui::Sense::hover()).on_hover_text(why);
+        };
         if st.kind.has_channel() {
-            let ch_text = if st.channel == 0 { "any ch".to_string() } else { format!("ch {}", st.channel) };
-            egui::ComboBox::from_id_salt(id.with("ch"))
-                .selected_text(egui::RichText::new(ch_text).small())
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    if !for_output && ui.selectable_label(st.channel == 0, egui::RichText::new("any ch").small()).clicked() {
-                        st.channel = 0;
-                    }
-                    for c in 1..=16u8 {
-                        if ui.selectable_label(st.channel == c, egui::RichText::new(format!("ch {c}")).small()).clicked() {
-                            st.channel = c;
-                        }
-                    }
-                });
-        }
-
-        if st.kind.number_range().is_none() && st.kind != PickKind::SysEx {
-            ui.add_enabled(false, egui::Button::new(egui::RichText::new("—").small()))
-                .on_disabled_hover_text("This message carries no number.");
-        }
-        if let Some(max) = st.kind.number_range() {
-            let is_note = st.kind.is_note();
-            ui.add(
-                egui::DragValue::new(&mut st.number)
-                    .range(0..=max)
-                    .speed(if max > 127 { 4.0 } else { 0.25 })
-                    .custom_formatter(move |v, _| {
-                        if is_note { format!("{} {}", v as u32, fmidi::note_name(v as u8)) } else { format!("{}", v as u32) }
-                    }),
-            );
+            let mut ch_opts: Vec<(u8, String)> = Vec::new();
+            if !for_output {
+                ch_opts.push((0, "any".into()));
+            }
+            ch_opts.extend((1..=16u8).map(|c| (c, c.to_string())));
+            let opts: Vec<(u8, &str)> = ch_opts.iter().map(|(c, t)| (*c, t.as_str())).collect();
+            if let Some(c) = super::curve_rows::pill_combo(ui, ch_r, "ch", &st.channel, &opts, "The MIDI channel.", (id, "ch")) {
+                st.channel = c;
+            }
+        } else {
+            dash(ui, ch_r, "ch", "This message has no channel.");
         }
 
         if st.kind == PickKind::SysEx {
-            ui.add(egui::TextEdit::singleline(&mut st.sysex).desired_width(110.0).hint_text("F0 … F7"));
+            let r = num_r;
+            ui.put(r, egui::TextEdit::singleline(&mut st.sysex).font(super::simple_bodies::control_font()).hint_text("F0 … F7"));
+        } else if let Some(max) = st.kind.number_range() {
+            let r = num_r;
+            let is_note = st.kind.is_note();
+            let shown = if is_note { format!("{} {}", st.number, fmidi::note_name(st.number as u8)) } else { st.number.to_string() };
+            let mut v = st.number as f64;
+            let label = if is_note { "note" } else { "#" };
+            if super::curve_rows::count_pill(ui, pill_node, "midi_pick_num", r, label, &mut v, &shown, 0.0..=max as f64,
+                if max > 127 { 0.5 } else { 0.1 }, "Which one: the note, controller or parameter number.")
+            {
+                st.number = v.round().clamp(0.0, max as f64) as u32;
+            }
+        } else {
+            dash(ui, num_r, "#", "This message carries no number.");
         }
-
         let ch = if st.channel == 0 { Channel::Any } else { Channel::Ch(st.channel - 1) };
         built = st.kind.build(ch, st.number, &st.sysex);
     }
@@ -618,7 +646,7 @@ pub(crate) fn midi_add_rows_ui(
     rects[0] = ui.horizontal(|ui| {
         label(ui, "Type");
         egui::ComboBox::from_id_salt(id.with("kind"))
-            .selected_text(egui::RichText::new(st.kind.label()).small())
+            .selected_text(super::simple_bodies::combo_text(ui, st.kind.label(), 150.0))
             .width(150.0)
             .show_ui(ui, |ui| {
                 for k in PickKind::ALL {
@@ -638,7 +666,7 @@ pub(crate) fn midi_add_rows_ui(
         if st.kind.has_channel() {
             let ch_text = if st.channel == 0 { "any channel".to_string() } else { format!("ch {}", st.channel) };
             egui::ComboBox::from_id_salt(id.with("ch"))
-                .selected_text(egui::RichText::new(ch_text).small())
+                .selected_text(super::simple_bodies::combo_text(ui, ch_text, 150.0))
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     if ui.selectable_label(st.channel == 0, egui::RichText::new("any channel").small()).clicked() {
@@ -874,53 +902,93 @@ pub(crate) fn add_midi_output_pin(node: &mut NodeData, pin: &MidiPin) {
     push_midi_pin(node, pin, true);
 }
 
-/// The pin list with a remove button per row, shared by both MIDI bodies.
-/// Returns the real index of the pin whose × was clicked.
-fn midi_pin_list(ui: &mut egui::Ui, rows: &[(usize, String)]) -> Option<usize> {
-    let mut to_remove = None;
-    ui.vertical(|ui| {
-        ui.set_min_width(180.0);
-        if rows.is_empty() {
-            ui.label(egui::RichText::new("No messages yet — add them from the header.").small().weak());
-        }
-        for (idx, id) in rows {
-            ui.horizontal(|ui| {
-                if ui.small_button("×").clicked() {
-                    to_remove = Some(*idx);
-                }
-                ui.label(egui::RichText::new(midi_pin_label(id)).small());
-            });
-        }
-    });
-    to_remove
-}
-
-/// Space a header row so its next button starts where the picker below starts
-/// its second field (as laid out last frame) — keeping Clear unused clear of
-/// Learn and Add — and never closer than a finger's width.
-fn space_to_picker_second_field(ui: &mut egui::Ui, picker_salt: impl std::hash::Hash) {
-    let id = egui::Id::new(("midi_pin_picker", picker_salt));
-    let target: f32 = ui.ctx().data(|d| d.get_temp(id.with("second_x"))).unwrap_or(0.0);
-    let used = ui.cursor().min.x - ui.max_rect().left();
-    ui.add_space((target - used).max(12.0));
-}
-
 /// Last frame's width of a MIDI In node's header controls.
 pub(crate) fn midi_header_w_key(node: NodeId) -> egui::Id {
     egui::Id::new(("midi_in_header_controls_w", node.0))
 }
 
-pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let Some(node) = snarl.get_node(node_id) else { return };
-    let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
-    if let Some(rm_idx) = midi_pin_list(ui, &rows) {
-        remove_midi_output(node_id, rm_idx, outputs, snarl);
+/// A MIDI port's messages as strips, each on its own socket's row - a handle that moves it,
+/// its name, its `×` - as an AutoMap Collector's ports are, and what adds and clears them
+/// under the strips. `outputs` says which side the messages are on: a MIDI In's outputs, a
+/// MIDI Out's inputs. Returns (remove, move (from, to)) as pin indices.
+fn midi_port_strips(
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    outputs: bool,
+) -> (Option<usize>, Option<(usize, usize)>) {
+    let Some(node) = snarl.get_node(node_id) else { return (None, None) };
+    let (pins, key, strip_key) = if outputs {
+        (&node.outputs, "output_pin_ids", "device.midi_in")
+    } else {
+        (&node.inputs, "input_pin_ids", "device.midi_out")
+    };
+    let rows = midi_pin_rows(pins, node.params.get(key).and_then(|v| v.as_array()));
+    // The Auto-Map port takes no row of the list: before the messages on a node made since,
+    // after them on one migrated.
+    let bus_first = pins.first().is_some_and(|p| p.signal_type == SignalType::AutoMap);
+    const LIST_W: f32 = 200.0;
+    let mut to_remove = None;
+    let mut moved = None;
+    ui.set_min_width(LIST_W);
+    let mut rows_at = super::kit::StripRows::at_cursor(strip_key, ui);
+    if bus_first {
+        rows_at = rows_at.past_empty_row();
     }
+    let n = rows.len();
+    if n > 0 {
+        ui.allocate_exact_size(egui::vec2(LIST_W, rows_at.height(n) - (rows_at.advance - rows_at.row_h)), egui::Sense::hover());
+    } else {
+        ui.label(super::simple_bodies::control_text("No messages yet: learn them, or pick one below.").weak());
+    }
+    if !super::simple_bodies::node_open(snarl, node_id) {
+        return (None, None);
+    }
+    let (left, list_w) = (ui.max_rect().left(), ui.max_rect().width().max(LIST_W));
+    let salt = if outputs { "midi_in" } else { "midi_out" };
+    let mut bands: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut released: Option<(usize, egui::Pos2)> = None;
+    for (k, (idx, id)) in rows.iter().enumerate() {
+        let band = rows_at.band(k, left, list_w);
+        let (remove, dropped, rect) = super::automap_bodies::automap_port_row(
+            ui, node_id, salt, band, id, &midi_pin_label(id), crate::canvas::remapper_icons::Skin::Auto, k,
+        );
+        if remove {
+            to_remove = Some(*idx);
+        }
+        if let Some(p) = dropped {
+            released = Some((k, p));
+        }
+        bands.push((k, rect));
+    }
+    if let Some((from, p)) = released {
+        let to = bands.iter().find(|(_, r)| r.contains(p)).map_or(from, |(k, _)| *k);
+        if to != from {
+            moved = Some((rows[from].0, rows[to].0));
+        }
+    }
+    (to_remove, moved)
 }
 
-/// A MIDI In node's header controls, under its title row: Learn, Clear
-/// unused, and the picker that adds a message. (Flush sits under the name.)
-pub(crate) fn show_midi_in_header_controls(
+pub(crate) fn show_midi_in_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    ui.vertical(|ui| {
+        let (remove, moved) = midi_port_strips(ui, snarl, node_id, true);
+        if let Some(rm_idx) = remove {
+            remove_midi_output(node_id, rm_idx, outputs, snarl);
+        } else if let Some((from, to)) = moved {
+            super::automap_bodies::move_automap_port::<Outputs>(node_id, from, to, outputs, "output_pin_ids", 0, snarl);
+        }
+        if !super::simple_bodies::node_open(snarl, node_id) {
+            return;
+        }
+        ui.add_space(4.0);
+        show_midi_in_controls(node_id, outputs, ui, snarl);
+    });
+}
+
+/// A MIDI In node's controls, under its strips: the picker that adds a message, then
+/// Learn and Clear unused as an action row. (Flush sits under the name.)
+pub(crate) fn show_midi_in_controls(
     node_id: NodeId,
     outputs: &[OutPin],
     ui: &mut egui::Ui,
@@ -929,57 +997,75 @@ pub(crate) fn show_midi_in_header_controls(
     let Some(node) = snarl.get_node(node_id) else { return };
     let is_learning = node.params.get("learning").and_then(|v| v.as_bool()).unwrap_or(false);
     let rows = midi_pin_rows(&node.outputs, node.params.get("output_pin_ids").and_then(|v| v.as_array()));
-
-    ui.horizontal(|ui| {
-        let learn_label = if is_learning {
-            egui::RichText::new("● Stop").color(Color32::from_rgb(220, 80, 80))
-        } else {
-            egui::RichText::new("Learn")
-        };
-        let resp = ui.small_button(learn_label).on_hover_text(
-            "Add a pin for each note, controller, bend, program change or \
-             transport message this port receives while Learn is on.",
-        );
-        if resp.clicked() {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("learning".to_string(), Value::Bool(!is_learning));
-            }
-        }
-        let has_unused = outputs.iter().enumerate()
-            .any(|(i, o)| o.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
-        if has_unused {
-            space_to_picker_second_field(ui, (node_id, "midi_in_add"));
-        }
-        if has_unused && ui.small_button("Clear unused").clicked() {
-            clear_unused_midi_outputs(node_id, outputs, snarl);
-        }
-    });
     if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_in_add"), false) {
         if let Some(node) = snarl.get_node_mut(node_id) {
             add_midi_output_pin(node, &pin);
         }
     }
-}
-
-pub(crate) fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let Some(node) = snarl.get_node(node_id) else { return };
-    let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
-    if let Some(rm_idx) = midi_pin_list(ui, &rows) {
-        remove_midi_input(node_id, rm_idx, inputs, snarl);
+    ui.add_space(4.0);
+    let has_unused = outputs.iter().enumerate()
+        .any(|(i, o)| o.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
+    let (left, w) = (ui.max_rect().left(), ui.max_rect().width());
+    let action = super::automap_bodies::automap_action_row(ui, left, w, &[
+        ("Learn", true, is_learning, if is_learning {
+            "Listening: every note, controller, bend, program change or transport message this port receives becomes a pin. Click to stop."
+        } else {
+            "Add a pin for each note, controller, bend, program change or transport message this port receives while Learn is on."
+        }),
+        ("Clear unused", has_unused, false, "Remove every message with no wire on it."),
+    ]);
+    match action {
+        Some(0) => {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("learning".to_string(), Value::Bool(!is_learning));
+            }
+        }
+        Some(1) if has_unused => clear_unused_midi_outputs(node_id, outputs, snarl),
+        _ => {}
     }
 }
 
+pub(crate) fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    ui.vertical(|ui| {
+        let (remove, moved) = midi_port_strips(ui, snarl, node_id, false);
+        if let Some(rm_idx) = remove {
+            remove_midi_input(node_id, rm_idx, inputs, snarl);
+        } else if let Some((from, to)) = moved {
+            super::automap_bodies::move_automap_port::<Inputs>(node_id, from, to, inputs, "input_pin_ids", 0, snarl);
+        }
+        if !super::simple_bodies::node_open(snarl, node_id) {
+            return;
+        }
+        ui.add_space(4.0);
+        let Some(node) = snarl.get_node(node_id) else { return };
+        let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
+        if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_out_add"), true) {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                push_midi_pin(node, &pin, false);
+            }
+        }
+        ui.add_space(4.0);
+        let has_unused = inputs.iter().enumerate()
+            .any(|(i, p)| p.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
+        let (left, w) = (ui.max_rect().left(), ui.max_rect().width());
+        let action = super::automap_bodies::automap_action_row(ui, left, w, &[
+            ("Clear unused", has_unused, false, "Remove every message with no wire on it."),
+        ]);
+        if action == Some(0) && has_unused {
+            clear_unused_midi_inputs(node_id, inputs, snarl);
+        }
+    });
+}
+
 /// A MIDI Out node's header controls, under its title: MIDI Thru (with the
-/// loop warning), the loop breaker's mute notice, the picker that adds a
-/// message, and Clear unused.
+/// loop warning) and the loop breaker's mute notice. The picker that adds a
+/// message and Clear unused are under its strips (`show_midi_out_body`).
 pub(crate) fn show_midi_out_header_controls(
     node_id: NodeId,
-    inputs: &[InPin],
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
 ) {
     let Some(node) = snarl.get_node(node_id) else { return };
-    let rows = midi_pin_rows(&node.inputs, node.params.get("input_pin_ids").and_then(|v| v.as_array()));
     let mut thru = node.params.get("midi_thru").and_then(|v| v.as_bool()).unwrap_or(false);
     let out_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -987,14 +1073,15 @@ pub(crate) fn show_midi_out_header_controls(
     let risk = midi_out_loop_risk(snarl, &out_id, thru, &guard);
     let muted = guard.muted.iter().any(|m| *m == out_id);
     ui.horizontal(|ui| {
-        let resp = ui.checkbox(&mut thru, egui::RichText::new("MIDI Thru").small()).on_hover_text(
+        let resp = super::kit::body_button(ui, "MIDI Thru", thru).on_hover_text(
             "Off (default): only MIDI that a mapping or a Collector produces is sent \
              from the Auto-Map input.\n\
              On: raw MIDI arriving on the Auto-Map bus is forwarded too.\n\n\
              Leave it off when this port's MIDI In also feeds the patch: \
              forwarding it back out is a feedback loop.",
         );
-        if resp.changed() {
+        if resp.clicked() {
+            thru = !thru;
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("midi_thru".to_string(), Value::Bool(thru));
             }
@@ -1002,14 +1089,6 @@ pub(crate) fn show_midi_out_header_controls(
         if let Some(why) = &risk {
             ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 170, 60)))
                 .on_hover_text(why);
-        }
-        let has_unused = inputs.iter().enumerate()
-            .any(|(i, p)| p.remotes.is_empty() && rows.iter().any(|(r, _)| *r == i));
-        if has_unused {
-            space_to_picker_second_field(ui, (node_id, "midi_out_add"));
-        }
-        if has_unused && ui.small_button("Clear unused").clicked() {
-            clear_unused_midi_inputs(node_id, inputs, snarl);
         }
     });
     // The breaker muted this port: say so, loudly, with the way back.
@@ -1022,15 +1101,10 @@ pub(crate) fn show_midi_out_header_controls(
                      breaker stopped it. Break the loop (Thru off, or unwire the mapping \
                      that answers itself), then unmute.",
                 );
-            if ui.small_button("Unmute").clicked() {
+            if super::kit::body_button(ui, "Unmute", false).clicked() {
                 request_midi_unmute(ui.ctx(), &out_id);
             }
         });
-    }
-    if let Some(pin) = midi_pin_picker(ui, (node_id, "midi_out_add"), true) {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            push_midi_pin(node, &pin, false);
-        }
     }
 }
 

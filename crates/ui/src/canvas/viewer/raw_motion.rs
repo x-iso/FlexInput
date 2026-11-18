@@ -522,12 +522,12 @@ pub(crate) fn show_motion_section(
                     .small().strong().color(Color32::from_rgb(106, 167, 255)));
                 ui.horizontal(|ui| {
                     ui.add(egui::ProgressBar::new(held).desired_width(120.0).desired_height(6.0));
-                    if is_turn && ui.small_button("Skip").on_hover_text(
+                    if is_turn && super::kit::body_button(ui, "Skip", false).on_hover_text(
                         "No gyro? The turn on the table only shows up on one.").clicked()
                     {
                         wiz.skip_turn();
                     }
-                    if ui.small_button("Cancel").clicked() {
+                    if super::kit::body_button(ui, "Cancel", false).clicked() {
                         cancel = true;
                     }
                 });
@@ -544,15 +544,15 @@ pub(crate) fn show_motion_section(
                     .into_iter().flatten().collect();
                 ui.label(egui::RichText::new(found.join(" · ")).small().color(Color32::from_rgb(127, 201, 127)));
                 ui.horizontal(|ui| {
-                    if ui.small_button("Use it").clicked() {
+                    if super::kit::body_button(ui, "Use it", false).clicked() {
                         accepted = Some(result.clone());
                         cancel = true;
                     }
-                    if ui.small_button("Redo").clicked() {
+                    if super::kit::body_button(ui, "Redo", false).clicked() {
                         let srcs = wiz.srcs().to_vec();
                         wiz = Wizard::start(srcs);
                     }
-                    if ui.small_button("Cancel").clicked() {
+                    if super::kit::body_button(ui, "Cancel", false).clicked() {
                         cancel = true;
                     }
                 });
@@ -560,11 +560,11 @@ pub(crate) fn show_motion_section(
             Some(Err(why)) => {
                 ui.label(egui::RichText::new(why).small().color(Color32::from_rgb(232, 180, 65)));
                 ui.horizontal(|ui| {
-                    if ui.small_button("Try again").clicked() {
+                    if super::kit::body_button(ui, "Try again", false).clicked() {
                         let srcs = wiz.srcs().to_vec();
                         wiz = Wizard::start(srcs);
                     }
-                    if ui.small_button("Cancel").clicked() {
+                    if super::kit::body_button(ui, "Cancel", false).clicked() {
                         cancel = true;
                     }
                 });

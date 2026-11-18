@@ -216,7 +216,7 @@ pub(crate) fn show_overlay_body(
     if edit && anchor_pick_armed(ui.ctx()).is_some() {
         let painter = ui.painter().with_clip_rect(rect);
         let msg = "Click an element to anchor the selection to it — Esc to cancel";
-        let font = egui::FontId::proportional(15.0);
+        let font = crate::settings::ui_font(15.0);
         let galley = painter.layout_no_wrap(msg.to_string(), font, egui::Color32::WHITE);
         let pad = egui::vec2(12.0, 7.0);
         let center = egui::pos2(rect.center().x, rect.min.y + 28.0);
@@ -342,7 +342,7 @@ pub(crate) fn show_overlay_body(
                         );
                         painter.text(
                             item_rect.center(), egui::Align2::CENTER_CENTER,
-                            "missing", egui::FontId::proportional(12.0),
+                            "missing", crate::settings::ui_font(12.0),
                             egui::Color32::from_rgba_unmultiplied(255, 150, 150, 200),
                         );
                     } else {

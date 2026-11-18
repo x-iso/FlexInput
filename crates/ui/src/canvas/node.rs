@@ -31,6 +31,14 @@ pub struct NodeExtra {
     /// axis reads as a share of that range rather than in the sensor's units.
     /// Traced the same way.
     pub(crate) curve_out_deflects: bool,
+    /// For a curve or a Knob: the feedback pin its output ends up on, if it does - a haptic's
+    /// pitch, a rumble motor - so the curve's Out axis and the Knob read in its units, and the
+    /// Knob takes its name. For a Readout: the unit of what it reads. Traced the same way.
+    pub(crate) out_target: Option<crate::canvas::viewer::units::PinTarget>,
+    /// For a curve whose input is a Knob that ends on the same pin: the In axis reads in that
+    /// pin's units too - the Knob shows its value in them, and the curve maps them onto
+    /// themselves. Any other input (a stick, a Constant) keeps its own scale.
+    pub(crate) curve_in_target: Option<crate::canvas::viewer::units::PinUnit>,
     /// For an Oscilloscope or Trigger Scope: what each input's wire carries
     /// (sensor and name), traced the same way, per input.
     pub(crate) scope_channels: Vec<crate::canvas::viewer::ScopeChannel>,
@@ -317,6 +325,10 @@ pub struct IvStyleOverride {
     /// device; `Some(name)` = that model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub c3d_model: Option<String>,
+    /// 3DOF to 2D's preview only - how this pin draws the pad: `icon`, `outline` or `model`.
+    /// `None` = as the module's own preview does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gyro_look: Option<String>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }

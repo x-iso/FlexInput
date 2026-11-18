@@ -350,7 +350,7 @@ fn show_preset_picker(
         // pair after them (right), separated by a small gap.
         ui.add_space(10.0);
         if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("💾").size(14.0)))
+            egui::Button::new(egui::RichText::new("💾").size(crate::settings::ui_size(14.0))))
             .on_hover_text("Save sub-patch to .fxsp")
             .clicked()
         {
@@ -371,7 +371,7 @@ fn show_preset_picker(
             }
         }
         if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("📂").size(14.0)))
+            egui::Button::new(egui::RichText::new("📂").size(crate::settings::ui_size(14.0))))
             .on_hover_text("Load sub-patch from .fxsp")
             .clicked()
         {
@@ -390,7 +390,7 @@ fn show_preset_picker(
             .map(|n| n.extra.layout_unlocked)
             .unwrap_or(false);
         let palette_btn = egui::Button::selectable(
-            layout_unlocked, egui::RichText::new("🎨").size(14.0));
+            layout_unlocked, egui::RichText::new("🎨").size(crate::settings::ui_size(14.0)));
         if ui.add_sized([28.0, 28.0], palette_btn)
             .on_hover_text(if layout_unlocked {
                 "Layout edit: ON — drag, resize, and select elements.\nClick to lock."
@@ -410,7 +410,7 @@ fn show_preset_picker(
             }
         }
         if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("🔧").size(14.0)))
+            egui::Button::new(egui::RichText::new("🔧").size(crate::settings::ui_size(14.0))))
             .on_hover_text("Open the sub-patch editor (add/wire modules)")
             .clicked()
         {
@@ -489,7 +489,7 @@ fn show_preset_picker(
                 ui.painter().set(bg_idx, egui::epaint::RectShape::new(
                     outer_rect,
                     egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 },
-                    egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+                    crate::settings::tinted(egui::Color32::from_rgb(0x1a, 0x1a, 0x1a)),
                     egui::Stroke::new(1.0_f32,
                         ui.visuals().widgets.noninteractive.bg_stroke.color),
                     egui::StrokeKind::Inside,
@@ -550,7 +550,7 @@ fn preset_dropdown_bar(
     // Expanded: rounded TOP corners only, so the body below joins
     // seamlessly as one continuous shape. Bar fill matches the
     // dropdown body fill (#1a1a1a) for visual continuity.
-    let bg = egui::Color32::from_rgb(0x1a, 0x1a, 0x1a);
+    let bg = crate::settings::tinted(egui::Color32::from_rgb(0x1a, 0x1a, 0x1a));
     let stroke = egui::Stroke::new(1.0_f32,
         ui.visuals().widgets.noninteractive.bg_stroke.color);
     if is_open {
@@ -585,7 +585,7 @@ fn preset_dropdown_bar(
         star_rect.center(),
         egui::Align2::CENTER_CENTER,
         star_glyph,
-        egui::FontId::proportional(16.0),
+        crate::settings::ui_font(16.0),
         star_col,
     );
 
@@ -599,7 +599,7 @@ fn preset_dropdown_bar(
         chev_rect.center(),
         egui::Align2::CENTER_CENTER,
         if is_open { "▲" } else { "▼" },
-        egui::FontId::proportional(13.0),
+        crate::settings::ui_font(13.0),
         ui.visuals().text_color(),
     );
 
@@ -639,7 +639,7 @@ fn preset_dropdown_bar(
                 .desired_width(name_rect.width())
                 .frame(false)
                 .horizontal_align(egui::Align::Center)
-                .font(egui::FontId::proportional(15.0))
+                .font(crate::settings::ui_font(15.0))
                 .text_color(ui.visuals().strong_text_color())
                 .hint_text("Preset title"),
         );
@@ -668,7 +668,7 @@ fn preset_dropdown_bar(
             name_rect.center(),
             egui::Align2::CENTER_CENTER,
             &name_text,
-            egui::FontId::proportional(15.0),
+            crate::settings::ui_font(15.0),
             ui.visuals().strong_text_color(),
         );
     }
@@ -764,7 +764,7 @@ fn preset_name_widget(
             display_name.to_string()
         };
         let label_resp = ui.add(egui::Label::new(
-            egui::RichText::new(&name_text).size(18.0).strong(),
+            egui::RichText::new(&name_text).size(crate::settings::ui_size(18.0)).strong(),
         ).sense(egui::Sense::click()))
             .on_hover_text("Double-click or Alt-click to rename");
         let alt_held = ui.input(|i| i.modifiers.alt);
@@ -984,7 +984,7 @@ fn preset_row(
         star_rect.center(),
         egui::Align2::CENTER_CENTER,
         star_glyph,
-        egui::FontId::proportional(15.0),
+        crate::settings::ui_font(15.0),
         star_col,
     );
     if star_resp.clicked() {
@@ -1028,7 +1028,7 @@ fn preset_row(
         egui::pos2(text_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         &name_text,
-        egui::FontId::proportional(13.0),
+        crate::settings::ui_font(13.0),
         ui.visuals().text_color(),
     );
 
@@ -2103,6 +2103,92 @@ mod nav_scroll_tests {
         let (rest, top, bot) = (scrolls[9], 60.0 * scale(), 320.0 * scale());
         assert!(rest > 0.0 && rest <= top && rest + PANEL.height() >= bot,
             "came to rest at {rest}, not showing the widget ({top}..{bot}) whole");
+    }
+
+    /// A Two-Way curve's rows pinned on the layout answer a click in Easy mode, for
+    /// the plain curve and the AutoMap one, in either pin style: its lane toggle,
+    /// clicked, sets the lane it edits.
+    #[test]
+    fn a_two_way_curves_pinned_lane_toggle_answers_a_click() {
+        for module in ["module.twoway_response_curve", "module.automap_twoway_response_curve"] {
+            for style in [1u8, 2] {
+                let desc = flexinput_modules::all_modules()
+                    .into_iter()
+                    .map(|r| r.descriptor)
+                    .find(|d| d.id == module)
+                    .expect("registered");
+                let pins = [
+                    // All in the panel's view (300 high, the body at 1.25x).
+                    ("curve", [8.0, 8.0], [296.0, 60.0]),
+                    ("scale_row", [8.0, 72.0], [296.0, 20.0]),
+                    ("lane_toggle", [8.0, 100.0], [140.0, 18.0]),
+                    ("range_row", [152.0, 100.0], [152.0, 18.0]),
+                    ("hyst_row", [8.0, 124.0], [224.0, 20.7]),
+                    ("grid_row", [8.0, 148.0], [296.0, 20.0]),
+                    ("interp_row", [8.0, 172.0], [296.0, 18.0]),
+                ];
+                let items: Vec<serde_json::Value> = pins
+                    .iter()
+                    .map(|(e, p, s)| serde_json::json!({ "Module": {
+                        "inner_node_id": 0, "element_id": e, "pos": p, "size": s, "pin_style": style } }))
+                    .collect();
+                let mut sp: UiSubPatch = serde_json::from_value(serde_json::json!({
+                    "display_name": "Body", "pins_in": [], "pins_out": [], "items": items,
+                })).expect("sub-patch json");
+                let inner = sp.snarl.insert_node(pos2(0.0, 0.0), NodeData::from(&desc));
+                assert_eq!(inner.0, 0);
+                let mut canvas = Canvas::default();
+                let outer = canvas.snarl.insert_node(pos2(0.0, 0.0), NodeData {
+                    module_id: "subpatch".into(), display_name: String::new(), category: String::new(),
+                    inputs: vec![], outputs: vec![], params: Default::default(),
+                    subpatch: Some(Box::new(sp)), extra: Default::default(),
+                });
+                let ctx = egui::Context::default();
+                let mut t = 0.0;
+                let mut pass = |canvas: &mut Canvas, events: Vec<egui::Event>| {
+                    t += 1.0 / 60.0;
+                    let raw = egui::RawInput { screen_rect: Some(SCREEN), time: Some(t), events, ..Default::default() };
+                    ctx.run(raw, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(PANEL), |ui| {
+                                render_subpatch_body(
+                                    ui, canvas, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
+                                    &HashMap::new(), &PanicShortcut::default(), &HashMap::new(), None,
+                                );
+                            });
+                        });
+                    })
+                };
+                let mut last = None;
+                for _ in 0..6 {
+                    last = Some(pass(&mut canvas, vec![]));
+                }
+                // Where the Down cell is, on screen.
+                let at = if style == 2 {
+                    let r = ctx
+                        .read_response(egui::Id::new(("segmented", ("ps2_field", inner.0, 0usize), 1usize)))
+                        .unwrap_or_else(|| panic!("{module} style {style}: no lane toggle"));
+                    ctx.layer_transform_to_global(r.layer_id).unwrap_or_default() * r.rect.center()
+                } else {
+                    last.as_ref().and_then(|o| o.shapes.iter().find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == "↓ Down" => Some(t.visual_bounding_rect().center()),
+                        _ => None,
+                    })).unwrap_or_else(|| panic!("{module} style {style}: no ↓ Down"))
+                };
+                let button = |pressed| egui::Event::PointerButton {
+                    pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                };
+                pass(&mut canvas, vec![egui::Event::PointerMoved(at)]);
+                pass(&mut canvas, vec![button(true)]);
+                pass(&mut canvas, vec![button(false)]);
+                pass(&mut canvas, vec![]);
+                let lane = canvas.snarl.get_node(outer)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| sp.snarl.get_node(inner))
+                    .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()).map(str::to_string));
+                assert_eq!(lane.as_deref(), Some("dn"), "{module} style {style}: the click at {at:?} didn't set the lane");
+            }
+        }
     }
 
     /// Nothing the body or nav paints for it lands outside the panel: not the

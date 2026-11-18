@@ -15,6 +15,8 @@ const GAP: f32 = 4.0;
 const LINK_W: f32 = 18.0;
 /// The narrowest a range pill reads at: `in↓` and `-1.00`.
 const RANGE_PILL: f32 = 70.0;
+/// A range pill whose number carries a unit (`500 °/s`, `-6.0 dB`, `1253 Hz`).
+const RANGE_PILL_UNIT: f32 = 92.0;
 /// The narrowest a count pill reads at: `H` and `16`.
 const COUNT_PILL: f32 = 42.0;
 const TRAIL_PILL: f32 = 96.0;
@@ -23,6 +25,23 @@ thread_local! {
     static ZOOM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
     static ONE_BAND: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static FITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BANDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static STRETCH: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Run `f` with the bands [`pill_bands`] lays out `stretch` times their height: a Style 2
+/// row in a frame taller than its width lets it be (`pin_style2::fit`), its pills as tall as
+/// the frame has room for - a mode's drawing over its word - where it stood a thin strip in
+/// the middle of it. The previous stretch is back afterwards.
+pub(crate) fn with_stretch<R>(stretch: f32, f: impl FnOnce() -> R) -> R {
+    struct Restore(f32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STRETCH.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(STRETCH.with(|s| s.replace(stretch.max(1.0))));
+    f()
 }
 
 /// Whether the rows are being fitted to a pinned frame ([`with_zoom`]): there a band's
@@ -60,27 +79,32 @@ pub(crate) fn note_one_band(w: f32) {
 }
 
 /// Run `f` with the rows drawn at `zoom`, and return what it returned with how wide one band
-/// of what it drew is at 1× (0 if it said nothing): a number that comes from the rows'
-/// constants rather than from what was drawn, so it doesn't depend on the scale it was drawn
-/// at. The previous zoom is back afterwards, whatever `f` did.
-pub(crate) fn with_zoom<R>(zoom: f32, f: impl FnOnce() -> R) -> (R, f32) {
-    struct Restore(f32, f32, bool);
+/// of what it drew is at 1× (0 if it said nothing) and how many bands it laid out with
+/// [`pill_bands`] (0 for a row that lays itself out otherwise, which is one band): numbers
+/// that come from the rows' constants and calls rather than from what was drawn, so they
+/// don't depend on the scale it was drawn at. The previous zoom is back afterwards,
+/// whatever `f` did.
+pub(crate) fn with_zoom<R>(zoom: f32, f: impl FnOnce() -> R) -> (R, f32, u32) {
+    struct Restore(f32, f32, bool, u32);
     impl Drop for Restore {
         fn drop(&mut self) {
             ZOOM.with(|z| z.set(self.0));
             ONE_BAND.with(|c| c.set(self.1));
             FITTING.with(|f| f.set(self.2));
+            BANDS.with(|b| b.set(self.3));
         }
     }
     let restore = Restore(
         ZOOM.with(|z| z.replace(zoom)),
         ONE_BAND.with(|c| c.replace(0.0)),
         FITTING.with(|f| f.replace(true)),
+        BANDS.with(|b| b.replace(0)),
     );
     let r = f();
     let one = ONE_BAND.with(|c| c.get());
+    let bands = BANDS.with(|b| b.get());
     drop(restore);
-    (r, one)
+    (r, one, bands)
 }
 
 /// The height of a band of settings: one block of the layout grid, so every block the grip
@@ -149,7 +173,11 @@ pub(crate) struct CurveRows {
 /// is shared among its groups in proportion to what they asked for. Relative to (0, 0);
 /// returns the rects and the height of all the bands.
 pub(crate) fn bands(width: f32, mins: &[f32], band: f32, gap: f32) -> (Vec<egui::Rect>, f32) {
-    // `mins` and `gap` are at 1×; `band` and `width` are already at the zoom.
+    // `mins` and `gap` are at 1×, for the control font at its basis size; `band` and `width`
+    // are already at the zoom. A larger control font asks for wider groups
+    // (`control_width_factor`), so its text wraps to another band instead of out of a pill.
+    let grow = simple_bodies::control_width_factor();
+    let mins: Vec<f32> = mins.iter().map(|m| m * grow).collect();
     note_one_band(mins.iter().sum::<f32>() + gap * (mins.len().max(1) - 1) as f32);
     let mins: Vec<f32> = mins.iter().map(|m| z(*m)).collect();
     let mins = mins.as_slice();
@@ -183,6 +211,36 @@ pub(crate) fn bands(width: f32, mins: &[f32], band: f32, gap: f32) -> (Vec<egui:
         }
     }
     (out, rows.len() as f32 * band)
+}
+
+/// Pill groups `mins` wide at 1×, laid out in bands `width` wide at the cursor ([`bands`])
+/// and allocated: each group's rect a pill's height in the middle of its band. For a body
+/// whose rows are drawn one band-set at a time.
+pub(crate) fn pill_bands(ui: &mut egui::Ui, width: f32, mins: &[f32]) -> Vec<egui::Rect> {
+    // Fitted to a pinned frame, each call is one band of the element (`with_zoom`).
+    BANDS.with(|b| b.set(b.get() + 1));
+    let band = band_h(ui) * STRETCH.with(|s| s.get());
+    let ctrl = band - 4.0;
+    let (cells, h) = bands(width, mins, band, 3.0 * GAP);
+    let (area, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    cells
+        .into_iter()
+        .map(|c| {
+            let c = c.translate(area.min.to_vec2());
+            egui::Rect::from_min_size(egui::pos2(c.left(), c.center().y - ctrl * 0.5), egui::vec2(c.width(), ctrl))
+        })
+        .collect()
+}
+
+/// How wide a [`word_toggle`] with `text` on it is, at 1×, in the control font.
+pub(crate) fn word_w(ui: &egui::Ui, text: &str) -> f32 {
+    // A `short|long` word is laid out by its short form; the long one fills room that's there.
+    let text = simple_bodies::pill_label_parts(text).0;
+    // Measured at the basis size or above: a smaller font keeps the room the rows were laid
+    // out with, as `bands` does.
+    let size = simple_bodies::control_font_size().clamp(simple_bodies::CONTROL_FONT_BASIS, simple_bodies::CONTROL_FONT_MAX_PX);
+    let font = simple_bodies::control_font_at(size);
+    ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER).size().x + 14.0
 }
 
 /// A square switch with a drawing on it, at `rect`. Returns whether it was flipped.
@@ -234,7 +292,7 @@ impl Groups {
         let band = band_h(ui);
         let kept: Vec<usize> = (0..mins.len()).filter(|&k| want(k) && mins[k] > 0.0).collect();
         let kept_mins: Vec<f32> = kept.iter().map(|&k| mins[k]).collect();
-        let need = kept_mins.iter().copied().fold(0.0f32, f32::max) * zoom();
+        let need = kept_mins.iter().copied().fold(0.0f32, f32::max) * simple_bodies::control_width_factor() * zoom();
         let width = width.max(need);
         let (rects, h) = if kept.is_empty() { (Vec::new(), 0.0) } else { bands(width, &kept_mins, band, 3.0 * GAP) };
         let (area, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
@@ -325,13 +383,59 @@ pub(crate) fn segmented<T: PartialEq + Clone>(
     options: &[(T, &str, &str)],
     salt: impl std::hash::Hash + Copy,
 ) -> Option<T> {
+    segmented_icons(ui, rect, value, options, &[], salt)
+}
+
+/// [`segmented`] with a drawing in a segment beside its word (`icons[i]`, an SVG drawn
+/// white, tinted the segment's text colour): the drawing and the word while the segment
+/// holds both, the drawing alone when it doesn't - the hover still says the word.
+pub(crate) fn segmented_icons<T: PartialEq + Clone>(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    value: &T,
+    options: &[(T, &str, &str)],
+    icons: &[Option<&'static [u8]>],
+    salt: impl std::hash::Hash + Copy,
+) -> Option<T> {
     let n = options.len().max(1);
     let w = rect.width() / n as f32;
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    let h = rect.height();
+    let font = simple_bodies::control_font();
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
     let mut picked = None;
-    for (i, (option, text, hover)) in options.iter().enumerate() {
+    const GAP: f32 = 4.0;
+    // One size for every word in the row: each would fit at its own, and a row of
+    // options in four sizes read as four kinds of thing. A cell with a drawing takes its
+    // word beside it or under it, whichever room is wider; one whose word can't fit even
+    // at the smallest `fit_font` goes to (six tenths) shows its drawing alone, and doesn't
+    // pull the others down with it.
+    let text_w = |t: &str, f: &egui::FontId| ui.painter().layout_no_wrap(t.to_string(), f.clone(), egui::Color32::PLACEHOLDER).size().x;
+    let line_h = |f: &egui::FontId| ui.painter().layout_no_wrap("Hg".into(), f.clone(), egui::Color32::PLACEHOLDER).size().y;
+    let stack_ok = |f: &egui::FontId| h >= line_h(f) + 18.0;
+    let has_icon = |i: usize| icons.get(i).copied().flatten().is_some();
+    let rooms: Vec<f32> = (0..options.len())
+        .map(|i| {
+            if has_icon(i) {
+                let side = w - (h - 6.0).max(8.0) - GAP - 8.0;
+                if stack_ok(&font) { side.max(w - 8.0) } else { side }
+            } else {
+                w - 6.0
+            }
+        })
+        .collect();
+    let words: Vec<&str> = options.iter().zip(&rooms).map(|((_, t, _), room)| simple_bodies::fitting_word(ui, t, *room)).collect();
+    let smallest = egui::FontId::new(font.size * 0.6, font.family.clone());
+    let size = words
+        .iter()
+        .zip(&rooms)
+        .enumerate()
+        .filter(|(i, (t, room))| !has_icon(*i) || text_w(t, &smallest) <= **room + 4.0)
+        .map(|(_, (t, room))| simple_bodies::fit_font(ui, t, font.clone(), *room).size)
+        .fold(font.size, f32::min);
+    let font = egui::FontId::new(size, font.family.clone());
+    for (i, (option, _, hover)) in options.iter().enumerate() {
+        let text = words[i];
         let r = egui::Rect::from_min_size(egui::pos2(rect.left() + i as f32 * w, rect.top()), egui::vec2(w, rect.height()));
         let mut resp = ui.interact(r, egui::Id::new(("segmented", salt, i)), egui::Sense::click());
         if !hover.is_empty() {
@@ -354,8 +458,36 @@ pub(crate) fn segmented<T: PartialEq + Clone>(
         };
         let (fill, text_col) = if enabled { (fill, text_col) } else { (fill.gamma_multiply(0.6), text_col.gamma_multiply(0.5)) };
         ui.painter().rect_filled(r, corners, fill);
-        let shown = simple_bodies::elide_to_width(ui, text, font.clone(), text_col, w - 4.0);
-        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, shown, font.clone(), text_col);
+        if let Some(bytes) = icons.get(i).copied().flatten() {
+            // Beside the word or above it, whichever leaves the drawing bigger; the
+            // drawing alone when the word fits neither way. A few points of the padding
+            // kept off each room cover the size `fit_font` rounds back up to.
+            let tw = text_w(text, &font);
+            let th = line_h(&font);
+            let side = (tw + GAP + (h - 6.0).max(8.0) + 8.0 <= w + 4.0).then(|| (h - 6.0).max(8.0));
+            let top = (tw <= w - 4.0 && stack_ok(&font)).then(|| (h - th - 8.0).min(w - 8.0));
+            match (side, top) {
+                (Some(s), t) if t.is_none_or(|t| s >= t) => {
+                    let group = s + GAP + tw;
+                    let icon_rect = egui::Rect::from_min_size(egui::pos2(r.center().x - group * 0.5, r.center().y - s * 0.5), egui::vec2(s, s));
+                    paint_tinted_svg(ui, bytes, icon_rect, text_col);
+                    ui.painter().text(egui::pos2(icon_rect.right() + GAP, r.center().y), egui::Align2::LEFT_CENTER, text, font.clone(), text_col);
+                }
+                (_, Some(t)) => {
+                    let top_y = r.center().y - (t + 2.0 + th) * 0.5;
+                    let icon_rect = egui::Rect::from_min_size(egui::pos2(r.center().x - t * 0.5, top_y), egui::vec2(t, t));
+                    paint_tinted_svg(ui, bytes, icon_rect, text_col);
+                    ui.painter().text(egui::pos2(r.center().x, icon_rect.bottom() + 2.0), egui::Align2::CENTER_TOP, text, font.clone(), text_col);
+                }
+                _ => {
+                    let s = (h - 6.0).min(w - 6.0).max(8.0);
+                    paint_tinted_svg(ui, bytes, egui::Rect::from_center_size(r.center(), egui::vec2(s, s)), text_col);
+                }
+            }
+        } else {
+            let shown = simple_bodies::elide_to_width(ui, text, font.clone(), text_col, w - 4.0);
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, shown, font.clone(), text_col);
+        }
         if i > 0 {
             ui.painter().line_segment(
                 [egui::pos2(r.left(), r.top() + 3.0), egui::pos2(r.left(), r.bottom() - 3.0)],
@@ -367,6 +499,15 @@ pub(crate) fn segmented<T: PartialEq + Clone>(
         }
     }
     picked
+}
+
+/// An SVG drawn white (a game-icons glyph, a motion glyph), at `rect`, tinted `tint`.
+pub(crate) fn paint_tinted_svg(ui: &egui::Ui, bytes: &'static [u8], rect: egui::Rect, tint: egui::Color32) {
+    let px = (rect.height() * ui.ctx().pixels_per_point() * 2.0).round().clamp(8.0, 256.0) as u32;
+    if let Some(tex) = simple_bodies::glyph_texture(ui.ctx(), bytes, None, px) {
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, tint);
+    }
 }
 
 /// A switch with a word on it, at `rect`, in the pills' shape: lit while it is on. Returns
@@ -383,8 +524,10 @@ pub(crate) fn word_toggle(ui: &mut egui::Ui, rect: egui::Rect, on: &mut bool, te
         (v.widgets.inactive.weak_bg_fill, v.text_color())
     };
     let (fill, text_col) = if enabled { (fill, text_col) } else { (fill.gamma_multiply(0.6), text_col.gamma_multiply(0.5)) };
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    let font = simple_bodies::control_font();
     ui.painter().rect_filled(rect, 3.0, fill);
+    let text = simple_bodies::fitting_word(ui, text, rect.width() - 8.0);
+    let font = simple_bodies::fit_font(ui, text, font, rect.width() - 6.0);
     let shown = simple_bodies::elide_to_width(ui, text, font.clone(), text_col, rect.width() - 4.0);
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, shown, font, text_col);
     if resp.clicked() && enabled {
@@ -405,19 +548,35 @@ pub(crate) fn pill_combo<T: PartialEq + Clone>(
     hover: &str,
     salt: impl std::hash::Hash + Copy,
 ) -> Option<T> {
+    pill_combo_glyphs(ui, rect, label, value, options, hover, salt, None)
+}
+
+/// What a [`pill_combo_glyphs`] list paints at the start of option `i`'s row (`rect`, the
+/// glyph's square), returning whether it painted anything.
+pub(crate) type RowGlyph<'a> = &'a dyn Fn(&egui::Painter, egui::Rect, usize) -> bool;
+
+/// [`pill_combo`] whose list draws a glyph at the start of each row (`glyph`): a column
+/// as tall as the row, the words after it lined up whether a row has one or not.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pill_combo_glyphs<T: PartialEq + Clone>(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    value: &T,
+    options: &[(T, &str)],
+    hover: &str,
+    salt: impl std::hash::Hash + Copy,
+    glyph: Option<RowGlyph<'_>>,
+) -> Option<T> {
     let shown = options.iter().find(|(o, _)| o == value).map_or("", |(_, t)| *t);
-    let (label, label_w) = simple_bodies::pill_label_for(ui, label, pill_label_w(ui, label), shown, rect.width() - z(20.0));
+    let widest = options.iter().map(|(_, t)| *t).max_by_key(|t| t.chars().count()).unwrap_or(shown);
+    let (label, label_w) = simple_bodies::pill_split(ui, label, pill_label_w(ui, label), widest, rect.width() - z(20.0));
     let v = ui.visuals().clone();
     let label_cell = egui::Rect::from_min_size(rect.min, egui::vec2(label_w, rect.height()));
     if label_w > 0.0 {
         ui.painter().rect_filled(label_cell, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, v.selection.bg_fill);
-        ui.painter().text(
-            label_cell.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            simple_bodies::pill_font(),
-            v.strong_text_color(),
-        );
+        let font = simple_bodies::fit_font(ui, label, simple_bodies::pill_font(), label_w - 4.0);
+        ui.painter().text(label_cell.center(), egui::Align2::CENTER_CENTER, label, font, v.strong_text_color());
     }
     let combo = egui::Rect::from_min_max(egui::pos2(rect.left() + label_w, rect.top()), rect.max);
     let mut cell = ui.new_child(
@@ -429,11 +588,45 @@ pub(crate) fn pill_combo<T: PartialEq + Clone>(
     cell.spacing_mut().interact_size.y = rect.height();
     let mut picked = None;
     egui::ComboBox::from_id_salt(("pill_combo_box", salt))
-        .selected_text(egui::RichText::new(shown).small())
-        .width(combo.width() - 2.0 * cell.spacing().button_padding.x)
+        .selected_text(egui::RichText::new(shown).font(simple_bodies::fit_font(ui, shown, simple_bodies::control_font(), combo.width() - z(26.0))))
+        // The combo's whole width, its padding inside it: taking the padding off again
+        // left every pill combo short of its cell (`add pin` under strips it should
+        // match).
+        .width(combo.width())
         .show_ui(&mut cell, |ui| {
-            for (o, t) in options {
-                if ui.selectable_label(o == value, egui::RichText::new(*t).small()).clicked() && o != value {
+            let Some(glyph) = glyph else {
+                for (o, t) in options {
+                    if ui.selectable_label(o == value, simple_bodies::control_text(*t)).clicked() && o != value {
+                        picked = Some(o.clone());
+                    }
+                }
+                return;
+            };
+            // Rows of their own: the glyph's square, then the word, the whole row the
+            // target and lit as a selectable label is.
+            let font = simple_bodies::control_font();
+            let row_h = (ui.text_style_height(&egui::TextStyle::Body).max(font.size) + 8.0).round();
+            let g = row_h - 4.0;
+            let widest = options
+                .iter()
+                .map(|(_, t)| ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x)
+                .fold(0.0f32, f32::max);
+            let row_w = ui.available_width().max(4.0 + g + 6.0 + widest + 8.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, (o, t)) in options.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::click());
+                let on = o == value;
+                let vis = ui.visuals();
+                if on {
+                    ui.painter().rect_filled(r, 2.0, vis.selection.bg_fill);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, 2.0, vis.widgets.hovered.weak_bg_fill);
+                }
+                let colour = if on || resp.hovered() { vis.strong_text_color() } else { vis.text_color() };
+                let square = egui::Rect::from_min_size(egui::pos2(r.left() + 4.0, r.center().y - g * 0.5), egui::vec2(g, g));
+                glyph(ui.painter(), square, i);
+                ui.painter().text(egui::pos2(square.right() + 6.0, r.center().y), egui::Align2::LEFT_CENTER, *t, font.clone(), colour);
+                if resp.clicked() && !on {
                     picked = Some(o.clone());
                 }
             }
@@ -441,6 +634,36 @@ pub(crate) fn pill_combo<T: PartialEq + Clone>(
         .response
         .on_hover_text(hover);
     picked
+}
+
+/// A range end's pill (`i` of in↓ in↑ out↓ out↑): the bus value, or - where the axis ends on
+/// a feedback pin (`unit`) - its reading in that pin's unit, dragged and typed in it.
+#[allow(clippy::too_many_arguments)]
+fn unit_range_pill(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    i: usize,
+    rect: egui::Rect,
+    label: &str,
+    v: &mut f32,
+    unit: Option<super::units::PinUnit>,
+    bus_range: std::ops::RangeInclusive<f32>,
+    hover: &str,
+) -> bool {
+    let salt = format!("crv_range_{i}");
+    let Some(u) = unit else {
+        let shown = format!("{:.2}", *v);
+        return real_pill(ui, node_id, &salt, rect, label, v, &shown, bus_range, 0.01, hover);
+    };
+    let (lo, hi) = (u.reading(0.0), u.reading(1.0));
+    let mut x = u.reading(*v);
+    let shown = u.text(*v);
+    if real_pill(ui, node_id, &salt, rect, label, &mut x, &shown, lo.min(hi)..=lo.max(hi), u.per_px(), hover) {
+        *v = u.from_reading(x);
+        true
+    } else {
+        false
+    }
 }
 
 /// A value pill for a real number, at `rect`: dragged across (`per_px` a point) or typed.
@@ -624,31 +847,41 @@ pub(crate) fn curve_settings(
                 .id_salt(("curve_scale", node_id)),
         );
         child.spacing_mut().item_spacing.x = z(GAP);
-        let font = egui::TextStyle::Small.resolve(child.style());
-        let exp_w = child.painter().layout_no_wrap("Exp".into(), font, egui::Color32::PLACEHOLDER).size().x;
-        let log = child.label(egui::RichText::new("Log").small().weak());
+        // The words in the controls' font and the slider as tall as the squares beside it:
+        // it was a 14-point strip between two small captions, next to 22-point buttons.
+        let font = simple_bodies::control_font();
+        let exp_w = child.painter().layout_no_wrap("Exp".into(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+        let log = child.label(egui::RichText::new("Log").font(font.clone()).weak());
         let slider_w = (right - row.left() - log.rect.width() - exp_w - 3.0 * z(GAP)).max(z(40.0));
         let slider_id = egui::Id::new(("log_exp", node_id, child.layer_id()));
-        let (slider_r, moved) = log_exp_slider(&mut child, slider_id, egui::vec2(slider_w, z(14.0)), s.sc_t);
+        let (slider_r, moved) = log_exp_slider(&mut child, slider_id, egui::vec2(slider_w, ctrl), s.sc_t);
         changed |= moved;
-        child.label(egui::RichText::new("Exp").small().weak());
+        child.label(egui::RichText::new("Exp").font(font).weak());
         fields.extend([("scale_t", slider_r), ("absolute", abs_r), ("snap", snap_r)]);
     }
 
     // ── The numbers ──
-    // A motion pick's view is the sensor's own fields, on a row to themselves.
+    // In the units the axes read in where they have them - a motion sensor's °/s or G, a
+    // feedback pin's Hz or dB - as value pills like the plain range's. A motion pick's were
+    // bare drag fields on a row of their own, and a feedback pin's said 1.00 for 0 dB.
     let mut range_rect = egui::Rect::NOTHING;
-    if parts.range {
-        if let CurveRange::Motion { unit, abs } = &s.range {
-            let r = ui.horizontal(|ui| motion_view_range_fields(ui, node_id, snarl, *unit, *abs)).response.rect;
-            range_rect = r;
-        }
-    }
-    let range_min = match &s.range {
-        CurveRange::Full { abs: false, .. } => 4.0 * RANGE_PILL + LINK_W + 4.0 * GAP,
-        CurveRange::Full { abs: true, .. } | CurveRange::Max { .. } => 2.0 * RANGE_PILL + LINK_W + 2.0 * GAP,
-        CurveRange::Motion { .. } => 0.0,
+    let (in_unit, out_unit) = snarl.get_node(node_id).map_or((None, None), |n| {
+        (n.extra.curve_in_target, n.extra.out_target.as_ref().map(|t| t.unit))
+    });
+    let unit_pill = if matches!(s.range, CurveRange::Motion { .. }) || in_unit.is_some() || out_unit.is_some() {
+        RANGE_PILL_UNIT
+    } else {
+        RANGE_PILL
     };
+    let range_min = match &s.range {
+        CurveRange::Full { abs: false, .. } | CurveRange::Motion { abs: false, .. } => 4.0 * unit_pill + LINK_W + 4.0 * GAP,
+        CurveRange::Full { abs: true, .. } | CurveRange::Max { .. } | CurveRange::Motion { abs: true, .. } => {
+            2.0 * unit_pill + LINK_W + 2.0 * GAP
+        }
+    };
+    // A value of the In (`k` 0) or Out (1) axis as its pill shows it: the number, its text,
+    // the range and the drag step - in the pin's unit where the axis has one.
+    let pin_unit = |k: usize| if k == 0 { in_unit } else { out_unit };
     let grid_min = 2.0 * COUNT_PILL + LINK_W + 2.0 * GAP;
     let mins = [range_min, grid_min, TRAIL_PILL];
     let groups = Groups::layout(ui, width, &mins, |k| if k == 0 { parts.range } else { parts.grid });
@@ -671,19 +904,8 @@ pub(crate) fn curve_settings(
                 };
                 let (pills, link) = pills_and_link(cell, idx.len(), ctrl);
                 for (k, &i) in idx.iter().enumerate() {
-                    let shown = format!("{:.2}", v[i]);
-                    changed |= real_pill(
-                        ui,
-                        node_id,
-                        &format!("crv_range_{i}"),
-                        pills[k],
-                        labels[k],
-                        &mut v[i],
-                        &shown,
-                        -100_000.0..=100_000.0,
-                        0.01,
-                        if i < 2 { hover_in } else { hover_out },
-                    );
+                    let hover = if i < 2 { hover_in } else { hover_out };
+                    changed |= unit_range_pill(ui, node_id, i, pills[k], labels[k], &mut v[i], pin_unit(i / 2), -100_000.0..=100_000.0, hover);
                     fields.push((NAMES[i], pills[k]));
                 }
                 link_clicked = link_at(ui, link, linked, range_link_hover(linked), ("range", node_id));
@@ -694,10 +916,8 @@ pub(crate) fn curve_settings(
             CurveRange::Max { i1, o1, floor } => {
                 let before = [0.0, *i1, 0.0, *o1];
                 let (pills, link) = pills_and_link(cell, 2, ctrl);
-                let shown = format!("{:.2}", *i1);
-                changed |= real_pill(ui, node_id, "crv_range_1", pills[0], "in↑", i1, &shown, floor..=1000.0, 0.01, hover_in);
-                let shown = format!("{:.2}", *o1);
-                changed |= real_pill(ui, node_id, "crv_range_3", pills[1], "out↑", o1, &shown, floor..=1000.0, 0.01, hover_out);
+                changed |= unit_range_pill(ui, node_id, 1, pills[0], "in↑|in max", i1, pin_unit(0), floor..=1000.0, hover_in);
+                changed |= unit_range_pill(ui, node_id, 3, pills[1], "out↑|out max", o1, pin_unit(1), floor..=1000.0, hover_out);
                 fields.extend([("in_max", pills[0]), ("out_max", pills[1])]);
                 link_clicked = link_at(ui, link, linked, range_link_hover(linked), ("range", node_id));
                 if linked {
@@ -706,7 +926,42 @@ pub(crate) fn curve_settings(
                     (*i1, *o1) = (now[1].max(floor), now[3].max(floor));
                 }
             }
-            CurveRange::Motion { .. } => {}
+            CurveRange::Motion { unit, abs } => {
+                // The graph's view of the sensor, in its units; Out as a share of a stick's or
+                // trigger's range when that is where it goes, and then not linked to In.
+                let read = snarl.get_node(node_id).map(|n| (unit.view_axes(n), unit.view(n), n.extra.curve_out_deflects));
+                if let Some((axes, mut view, deflects)) = read {
+                    let before = view;
+                    let idx: &[usize] = if abs { &[1, 3] } else { &[0, 1, 2, 3] };
+                    let labels = ["in↓|in min", "in↑|in max", "out↓|out min", "out↑|out max"];
+                    let (pills, link) = pills_and_link(cell, idx.len(), ctrl);
+                    let hover = format!(
+                        "How much of the sensor the graph shows ({} full scale). Only the view: \
+                         the curve always runs over the whole range, and nothing is rescaled.",
+                        unit.format(unit.full_scale()),
+                    );
+                    let mut moved = false;
+                    for (k, &i) in idx.iter().enumerate() {
+                        let a = axes[i / 2];
+                        let shown = format!("{:.*}{}", a.decimals, view[i], a.suffix);
+                        moved |= real_pill(ui, node_id, &format!("crv_range_{i}"), pills[k], labels[i], &mut view[i], &shown, -a.full_scale..=a.full_scale, a.step * 0.2, &hover);
+                        fields.push((NAMES[i], pills[k]));
+                    }
+                    let mlinked = !deflects && linked;
+                    if !deflects {
+                        link_clicked = link_at(ui, link, mlinked, range_link_hover(mlinked), ("range", node_id));
+                    }
+                    if moved {
+                        if mlinked {
+                            follow_range_link(before, &mut view);
+                        }
+                        if let Some(n) = snarl.get_node_mut(node_id) {
+                            unit.set_view(n, view);
+                        }
+                        changed = true;
+                    }
+                }
+            }
         }
         if link_clicked {
             toggle_range_link(snarl, node_id);
@@ -780,36 +1035,6 @@ fn range_link_hover(linked: bool) -> &'static str {
     } else {
         "Link In and Out: scale both together"
     }
-}
-
-/// A value pill in a flow row, `w` wide: for the rows that still mix pills with other
-/// widgets (the Two-way curve's hysteresis and interpolation).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn flow_pill(
-    ui: &mut egui::Ui,
-    node: NodeId,
-    salt: &str,
-    w: f32,
-    label: &str,
-    value: &mut f32,
-    shown: &str,
-    range: std::ops::RangeInclusive<f32>,
-    per_px: f32,
-    hover: &str,
-    enabled: bool,
-) -> bool {
-    let ctrl = band_h(ui) - 4.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ctrl), egui::Sense::hover());
-    if !enabled {
-        // A value that is not this field's to set (the Hyst graph has taken it over): shown,
-        // dimmed, and not dragged.
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("curve_flow_pill", salt)));
-        child.disable();
-        let mut v = *value;
-        real_pill(&mut child, node, salt, rect, label, &mut v, shown, range, per_px, hover);
-        return false;
-    }
-    real_pill(ui, node, salt, rect, label, value, shown, range, per_px, hover)
 }
 
 /// A pinned curve row in the new style - `scale_row`, `range_row` or `grid_row` - laid out

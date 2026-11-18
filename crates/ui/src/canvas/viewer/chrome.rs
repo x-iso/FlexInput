@@ -176,7 +176,7 @@ pub(crate) fn graph_channel_color(ov: Option<&crate::canvas::node::PinGraphOverr
 pub(crate) fn graph_chrome(
     ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) -> (Color32, Option<egui::Stroke>) {
-    let bg = ov.and_then(|o| o.background).map(rgba_to_color32).unwrap_or(GRAPH_BG_DEFAULT);
+    let bg = ov.and_then(|o| o.background).map(rgba_to_color32).unwrap_or(crate::settings::tinted(GRAPH_BG_DEFAULT));
     let outline = ov.and_then(|o| {
         let px = o.outline_px.unwrap_or(0.0);
         let col = o.outline.map(rgba_to_color32)?;

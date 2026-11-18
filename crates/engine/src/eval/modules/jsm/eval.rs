@@ -280,7 +280,8 @@ pub(crate) fn jsm_publish(
     // Which way is down, and where the fingers are. Both come before the sticks,
     // because each produces one: the motion stick from gravity, a touch stick per
     // finger from how far it has been dragged.
-    let gravity = st.motion.tick(read_accel(&upstream), dt);
+    let gyro_dps = ["gyro_x", "gyro_y", "gyro_z"].map(|p| upstream.get(p).map_or(0.0, |s| s.as_float()) * GYRO_REF_DPS);
+    let gravity = st.motion.tick(read_accel(&upstream), glam::Vec3::from(gyro_dps), dt);
     let touch_out = st.touch.tick(&res.touch, touch_fingers(&upstream), res.settings.touch);
     let motion_stick = super::motion::motion_stick(gravity, res.settings.motion);
 

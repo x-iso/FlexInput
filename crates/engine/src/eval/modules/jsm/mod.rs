@@ -33,6 +33,9 @@ mod tests;
 pub(crate) use eval::{jsm_publish, JsmState};
 // RWS Aim's 360° sweep follows a circled flick stick the same way.
 pub(crate) use cal::Flick as CalFlick;
+// The 3DOF module's Player and World are JSM's PLAYER_TURN and WORLD_TURN: the
+// same maths, not a copy of it.
+pub(crate) use motion::{gravity_space as jsm_gravity_space, Gravity as JsmGravity, JsmGyro, Space as JsmSpace};
 
 // Read by the calibration widget: where the sweep's measurement lands. And by
 // the Tune panel's graph: where the speed its curve was read at lands.

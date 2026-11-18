@@ -55,7 +55,9 @@ pub(crate) fn render_response_curve_scale_row(
         // labels/checkboxes scale with the frame height while widening the
         // frame lengthens the slider.
         let slider_w = pin_flex_width(ui, container, 60.0);
-        let slider_h = (16.0 * s).max(10.0);
+        // As tall as the row's checkboxes.
+        let slider_h = ui.spacing().interact_size.y.max(10.0);
+        let _ = s;
         let slider_id = ui.make_persistent_id(("log_exp_pin", inner_id));
         let (slider_rect, c) = log_exp_slider(ui, slider_id, egui::vec2(slider_w, slider_h), &mut sc_t);
         fr.push(slider_rect);
@@ -221,17 +223,17 @@ pub(crate) fn log_exp_slider(ui: &mut egui::Ui, id: egui::Id, size: egui::Vec2, 
         changed = true;
     }
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Color32::from_gray(35));
+    painter.rect_filled(rect, 3.0, crate::settings::tinted_gray(35));
     let cx = rect.center().x;
     painter.line_segment(
         [egui::pos2(cx, rect.top() + 2.0), egui::pos2(cx, rect.bottom() - 2.0)],
-        egui::Stroke::new(1.0_f32, Color32::from_gray(70)),
+        egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(70)),
     );
     let knob_x = rect.left() + (*sc_t + 1.0) * 0.5 * rect.width();
     painter.circle_filled(
         egui::pos2(knob_x, rect.center().y),
-        (rect.height() * 0.35).max(3.0),
-        if resp.hovered() || resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
+        (rect.height() * 0.32).clamp(3.0, 7.0),
+        if resp.hovered() || resp.dragged() { Color32::WHITE } else { crate::settings::tinted_gray(190) },
     );
     if resp.dragged() {
         resp.show_tooltip_text(log_exp_text(*sc_t));
@@ -395,7 +397,7 @@ pub(crate) fn snap_point(
 /// where that would run off the graph, on a dark backing.
 pub(crate) fn paint_point_value(painter: &egui::Painter, rect: egui::Rect, at: egui::Pos2, text: String) {
     let col = Color32::from_rgba_unmultiplied(225, 225, 225, 230);
-    let g = painter.layout_no_wrap(text, egui::FontId::proportional(9.0), col);
+    let g = painter.layout_no_wrap(text, crate::settings::ui_font(9.0), col);
     let size = g.size() + egui::vec2(4.0, 2.0);
     let right = at.x + 7.0 + size.x <= rect.right();
     let min = egui::pos2(if right { at.x + 7.0 } else { at.x - 7.0 - size.x }, (at.y - 7.0 - size.y).max(rect.top()));
@@ -445,7 +447,7 @@ pub(crate) fn paint_cursor_reading(
     painter.circle_stroke(on_curve, 4.0, egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 200)));
 
     let col = Color32::from_rgba_unmultiplied(235, 235, 235, 240);
-    let g = painter.layout_no_wrap(text(gx, gy), egui::FontId::proportional(10.0), col);
+    let g = painter.layout_no_wrap(text(gx, gy), crate::settings::ui_font(10.0), col);
     let size = g.size() + egui::vec2(6.0, 3.0);
     let x = if at.x + 12.0 + size.x <= rect.right() { at.x + 12.0 } else { at.x - 12.0 - size.x };
     let y = (at.y + 14.0).min(rect.bottom() - size.y).max(rect.top());
@@ -801,7 +803,7 @@ pub(crate) fn paint_response_curve_graph(
             .collect();
         for w in curve_pts.windows(2) {
             painter.line_segment([w[0], w[1]],
-                egui::Stroke::new(1.5_f32, Color32::from_gray(200)));
+                egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200)));
         }
     }
 
@@ -841,7 +843,7 @@ pub(crate) fn paint_response_curve_graph(
                 Color32::from_rgb(255, 220, 50)
             } else { Color32::from_rgb(180, 140, 20) };
             painter.circle_filled(hpos, bends.dot_radius(4.0), hcol);
-            painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, Color32::from_gray(100)));
+            painter.circle_stroke(hpos, bends.dot_radius(4.0), egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(100)));
         }
     }
 
@@ -896,9 +898,9 @@ pub(crate) fn paint_response_curve_graph(
             remove_idx = Some(i);
             pts_changed = true;
         }
-        let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+        let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { crate::settings::tinted_gray(190) };
         painter.circle_filled(screen, 5.0, col);
-        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, Color32::from_gray(80)));
+        painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(80)));
         if show_grid_labels || pt_resp.hovered() || pt_resp.dragged() {
             paint_point_value(&painter, rect, screen, view.value_out(py));
         }
@@ -1224,7 +1226,7 @@ pub(crate) fn paint_axis_labels(
     const ROW_H: f32 = 10.0;
     const GAP: f32 = 3.0;
     let col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-    let font = egui::FontId::proportional(9.0);
+    let font = crate::settings::ui_font(9.0);
     let mut row_end = [f32::NEG_INFINITY; 2];
     let mut rows_used = 0usize;
     for (sx, text) in xs {
@@ -1260,7 +1262,7 @@ pub(crate) fn paint_curve_legend(
     if labels.is_empty() {
         return;
     }
-    let font = egui::FontId::proportional(10.0);
+    let font = crate::settings::ui_font(10.0);
     let galleys: Vec<_> = labels.iter().enumerate()
         .map(|(ch, l)| painter.layout_no_wrap(l.to_string(), font.clone(), color_of(ch)))
         .collect();
@@ -1432,10 +1434,42 @@ pub(crate) fn refresh_motion_units(snarl: &mut Snarl<NodeData>) {
     let mut found = Vec::new();
     let mut scopes = Vec::new();
     collect_motion_units(snarl, &mut Vec::new(), &mut Vec::new(), &mut found, &mut scopes);
-    for (path, unit, deflects) in found {
+    // A curve fed by a Knob reading in its output's units reads its input in them too.
+    let knob_fed: Vec<Vec<NodeId>> = found
+        .iter()
+        .filter(|(path, unit, _, target)| unit.is_none() && target.is_some() && curve_fed_by_knob(snarl, path))
+        .map(|(path, ..)| path.clone())
+        .collect();
+    for (path, unit, deflects, target) in found {
+        let in_target = if knob_fed.contains(&path) { target.as_ref().map(|t| t.unit) } else { None };
         if let Some(n) = node_at_path_mut(snarl, &path) {
             n.extra.motion_unit = unit;
             n.extra.curve_out_deflects = deflects;
+            if n.extra.curve_in_target != in_target && is_plain_curve(&n.module_id) {
+                n.extra.curve_in_target = in_target;
+            }
+            if n.extra.out_target != target {
+                n.extra.out_target = target;
+            }
+            // A Knob takes its target's name until it is named by hand. The name it took is
+            // kept (`_auto_name`), so a name it took isn't mistaken for one given by hand.
+            if n.module_id == "module.knob" {
+                let auto = n.params.get("_auto_name").and_then(|v| v.as_str()).map(str::to_string);
+                let untouched = n.display_name == "Knob" || auto.as_deref() == Some(n.display_name.as_str());
+                if untouched {
+                    match n.extra.out_target.as_ref().map(|t| t.name.clone()) {
+                        Some(name) if name != n.display_name => {
+                            n.display_name = name.clone();
+                            n.params.insert("_auto_name".into(), Value::String(name));
+                        }
+                        None if auto.is_some() => {
+                            n.display_name = "Knob".into();
+                            n.params.remove("_auto_name");
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
     for (path, channels) in scopes {
@@ -1453,17 +1487,26 @@ fn collect_motion_units<'a>(
     snarl: &'a Snarl<NodeData>,
     path: &mut Vec<NodeId>,
     frames: &mut Frames<'a>,
-    out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>, bool)>,
+    out: &mut Vec<(Vec<NodeId>, Option<MotionUnit>, bool, Option<super::units::PinTarget>)>,
     scopes: &mut Vec<(Vec<NodeId>, Vec<ScopeChannel>)>,
 ) {
     for (id, n) in snarl.nodes_ids_data() {
         let node = &n.value;
-        if is_plain_curve(&node.module_id) || node.module_id == "logic.has_changed" {
-            let unit = curve_inputs_motion_unit(snarl, id, frames);
-            let deflects = unit.is_some() && is_plain_curve(&node.module_id)
-                && curve_feeds_deflection(snarl, id, frames);
+        if is_plain_curve(&node.module_id) || node.module_id == "logic.has_changed" || node.module_id == "module.knob" {
+            let unit = if node.module_id == "module.knob" { None } else { curve_inputs_motion_unit(snarl, id, frames) };
+            let ends = (is_plain_curve(&node.module_id) || node.module_id == "module.knob").then(|| curve_ends(snarl, id, frames));
+            let deflects = unit.is_some() && is_plain_curve(&node.module_id) && ends.as_ref().is_some_and(|e| e.deflection && !e.sensor);
             path.push(id);
-            out.push((path.clone(), unit, deflects));
+            out.push((path.clone(), unit, deflects, ends.and_then(|e| e.target)));
+            path.pop();
+        }
+        // A Readout reads in the units of what it is wired to: a motion sensor's, or a
+        // feedback pin's when it taps one.
+        if node.module_id == "display.readout" {
+            let target = snarl.in_pin(InPinId { node: id, input: 0 }).remotes.first().and_then(|&src| feedback_source(snarl, src));
+            let unit = curve_inputs_motion_unit(snarl, id, frames);
+            path.push(id);
+            out.push((path.clone(), unit, false, target));
             path.pop();
         }
         if matches!(node.module_id.as_str(), "display.oscilloscope" | "display.trigscope") {
@@ -1706,25 +1749,27 @@ fn trace_source<'a>(
 /// Rotation input is a rate). Whichever way a Split or Selector is set counts, so
 /// the graph doesn't change axes when it switches. Anything else on the wire, like a
 /// scope or the mouse, has no 0..1 range of its own and doesn't count either way.
-fn curve_feeds_deflection<'a>(
+fn curve_ends<'a>(
     snarl: &'a Snarl<NodeData>,
     id: NodeId,
     frames: &[(&'a Snarl<NodeData>, NodeId)],
-) -> bool {
-    let Some(node) = snarl.get_node(id) else { return false };
+) -> CurveEnds {
     let mut ends = CurveEnds::default();
+    let Some(node) = snarl.get_node(id) else { return ends };
     let mut steps = 256;
     for output in 0..node.outputs.len() {
         follow_output(snarl, OutPinId { node: id, output }, frames, &mut steps, &mut ends);
     }
-    ends.deflection && !ends.sensor
+    ends
 }
 
-/// What a curve's output ends up driving (see [`curve_feeds_deflection`]).
+/// What a curve's (or a Knob's) output ends up driving: a stick or trigger (`deflection`),
+/// a motion sensor's own pin (`sensor`), or a feedback pin (`target`, the first found).
 #[derive(Default)]
 struct CurveEnds {
     deflection: bool,
     sensor: bool,
+    target: Option<super::units::PinTarget>,
 }
 
 impl CurveEnds {
@@ -1735,6 +1780,58 @@ impl CurveEnds {
             | "left_trigger" | "right_trigger");
         self.sensor |= MotionUnit::of_pin(pin).is_some();
     }
+
+    /// A feedback pin reached: its unit (`hint` the pad's own name for it, `switch` whether
+    /// a Feedback Control's pad is a Switch pad) and the name it shows.
+    fn note_feedback(&mut self, pin: &str, hint: Option<&str>, name: &str, switch: bool) {
+        if self.target.is_none() {
+            if let Some(unit) = super::units::PinUnit::of_feedback_pin(pin, hint, switch) {
+                // The pad's own names carry their ranges in brackets; the name is before them.
+                let name = name.split(" (").next().unwrap_or(name).trim().to_string();
+                self.target = Some(super::units::PinTarget { unit, name });
+            }
+        }
+    }
+}
+
+/// Whether the curve at `path` takes its input straight from a Knob.
+fn curve_fed_by_knob(snarl: &Snarl<NodeData>, path: &[NodeId]) -> bool {
+    let Some((&id, outer)) = path.split_last() else { return false };
+    let mut cur = snarl;
+    for &sp in outer {
+        let Some(inner) = cur.get_node(sp).and_then(|n| n.subpatch.as_ref()) else { return false };
+        cur = &inner.snarl;
+    }
+    let Some(node) = cur.get_node(id) else { return false };
+    if !is_plain_curve(&node.module_id) {
+        return false;
+    }
+    cur.in_pin(InPinId { node: id, input: 0 })
+        .remotes
+        .first()
+        .and_then(|src| cur.get_node(src.node))
+        .is_some_and(|n| n.module_id == "module.knob")
+}
+
+/// Whether a pad (a device node's id) plays a Switch Pro's HD rumble table.
+fn is_switch_pad(device_id: &str) -> bool {
+    crate::model::model_for_devices(&[device_id.to_string()])
+        .is_some_and(|m| m.starts_with("Switch") || m.contains("Joycon"))
+}
+
+/// The feedback pin an output pin is - a Feedback Control's outlet (what the game asks of
+/// the pad), or a pad's own - for a Readout reading it.
+fn feedback_source(snarl: &Snarl<NodeData>, src: OutPinId) -> Option<super::units::PinTarget> {
+    let node = snarl.get_node(src.node)?;
+    let (pin, name) = match node.module_id.as_str() {
+        "module.feedback_control" => {
+            let p = flexinput_core::automap::FEEDBACK_OUTLET_PINS.get(src.output.checked_sub(1)?)?;
+            (p.id, p.display_name.to_string())
+        }
+        _ => return None,
+    };
+    let unit = super::units::PinUnit::of_feedback_pin(pin, None, false)?;
+    Some(super::units::PinTarget { unit, name })
 }
 
 fn follow_output<'a>(
@@ -1774,6 +1871,28 @@ fn follow_input<'a>(
         "device.sink" => {
             if let Some(pin) = pin_id("input_pin_ids", dst.input) {
                 ends.note_pin(pin);
+            }
+        }
+        // A pad's own feedback inputs: its pin names say how they map ("0=80Hz 1=500Hz").
+        "device.source" => {
+            if let Some(pin) = pin_id("input_pin_ids", dst.input) {
+                let name = node.inputs.get(dst.input).map(|p| p.name.as_str()).unwrap_or(pin);
+                let switch = node.params.get("device_id").and_then(|v| v.as_str()).is_some_and(is_switch_pad);
+                ends.note_feedback(pin, Some(name), name, switch);
+            }
+        }
+        // A Feedback Control's inlets, in `FEEDBACK_INLET_PINS` order after its bus input;
+        // the pad they go to is whatever its bus input comes from.
+        "module.feedback_control" => {
+            if let Some(p) = dst.input.checked_sub(1).and_then(|i| flexinput_core::automap::FEEDBACK_INLET_PINS.get(i)) {
+                let switch = snarl
+                    .in_pin(InPinId { node: dst.node, input: 0 })
+                    .remotes
+                    .first()
+                    .and_then(|src| snarl.get_node(src.node))
+                    .and_then(|n| n.params.get("device_id").and_then(|v| v.as_str()))
+                    .is_some_and(is_switch_pad);
+                ends.note_feedback(p.id, None, p.display_name, switch);
             }
         }
         "processing.rws" => ends.sensor |= dst.input == 0,
@@ -1841,6 +1960,10 @@ pub(crate) struct CurveView {
     /// What the Out axis reads in: `unit`, unless the output drives a stick or
     /// trigger, when it reads as a plain share of its range.
     out_unit: Option<MotionUnit>,
+    /// What the Out axis reads in when the output ends on a feedback pin: Hz, dB, ...
+    out_target: Option<super::units::PinUnit>,
+    /// And the In axis, when a Knob reading in those units feeds it.
+    in_target: Option<super::units::PinUnit>,
     absolute: bool,
     scale_t: f32,
 }
@@ -1869,6 +1992,8 @@ impl CurveView {
             in_min: -1.0, in_max: 1.0, out_min: -1.0, out_max: 1.0,
             unit: Some(unit),
             out_unit: (!node.extra.curve_out_deflects).then_some(unit),
+            out_target: None,
+            in_target: None,
             absolute, scale_t,
         }
     }
@@ -1878,7 +2003,12 @@ impl CurveView {
     pub(crate) fn resolve(node: Option<&NodeData>, absolute: bool, scale_t: f32, ranges: [f32; 4]) -> Self {
         match node {
             Some(n) if MotionUnit::of(n).is_some() => Self::of(n, absolute, scale_t),
-            _ => Self::plain(absolute, scale_t, ranges[0], ranges[1], ranges[2], ranges[3]),
+            _ => {
+                let mut v = Self::plain(absolute, scale_t, ranges[0], ranges[1], ranges[2], ranges[3]);
+                v.out_target = node.and_then(|n| n.extra.out_target.as_ref()).map(|t| t.unit);
+                v.in_target = node.and_then(|n| n.extra.curve_in_target);
+                v
+            }
         }
     }
 
@@ -1887,7 +2017,7 @@ impl CurveView {
         Self {
             x_lo: lo, x_hi: hi, y_lo: lo, y_hi: hi,
             in_min, in_max, out_min, out_max,
-            unit: None, out_unit: None, absolute, scale_t,
+            unit: None, out_unit: None, out_target: None, in_target: None, absolute, scale_t,
         }
     }
 
@@ -1920,21 +2050,54 @@ impl CurveView {
 
     /// The input value at graph X `g`, for the cursor reading.
     pub(crate) fn value_in(&self, g: f32) -> String {
+        if let (Some(u), None) = (self.in_target, self.unit) {
+            return u.text(self.bus_in(g));
+        }
         let (scale, suffix) = self.scale_suffix(self.unit, self.in_min, self.in_max);
         value_label(self.real(g, scale), suffix)
     }
 
+    /// The input at graph X `g`, in bus units: `apply_curve`'s input side run backwards.
+    fn bus_in(&self, g: f32) -> f32 {
+        use flexinput_engine::eval::curve_scale_inv;
+        if self.absolute {
+            curve_scale_inv(g.clamp(0.0, 1.0), self.scale_t) * self.in_max.abs()
+        } else {
+            let norm = g.signum() * curve_scale_inv(g.abs().min(1.0), self.scale_t);
+            self.in_min + (norm + 1.0) * 0.5 * (self.in_max - self.in_min)
+        }
+    }
+
+    /// What the curve puts out at graph Y `g`, in bus units.
+    fn bus_out(&self, g: f32) -> f32 {
+        flexinput_engine::eval::curve_y_to_output(g, 1.0, self.absolute, self.out_min, self.out_max, self.scale_t)
+    }
+
     /// The output value at graph Y `g`, for a dot's label.
     pub(crate) fn value_out(&self, g: f32) -> String {
+        if let (Some(u), None) = (self.out_target, self.out_unit) {
+            return u.text(self.bus_out(g));
+        }
         let (scale, suffix) = self.scale_suffix(self.out_unit, self.out_min, self.out_max);
         value_label(self.real(g, scale), suffix)
     }
 
     /// Labels for input grid lines at graph X positions `gs`.
-    pub(crate) fn labels_in(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.unit, self.in_min, self.in_max) }
+    pub(crate) fn labels_in(&self, gs: &[f32]) -> Vec<String> {
+        if let (Some(u), None) = (self.in_target, self.unit) {
+            return gs.iter().map(|&g| u.text(self.bus_in(g))).collect();
+        }
+        self.labels(gs, self.unit, self.in_min, self.in_max)
+    }
 
     /// Labels for output grid lines at graph Y positions `gs`.
-    pub(crate) fn labels_out(&self, gs: &[f32]) -> Vec<String> { self.labels(gs, self.out_unit, self.out_min, self.out_max) }
+    pub(crate) fn labels_out(&self, gs: &[f32]) -> Vec<String> {
+        // On a feedback pin, in its units: a haptic's pitch in Hz, its strength in dB.
+        if let (Some(u), None) = (self.out_target, self.out_unit) {
+            return gs.iter().map(|&g| u.text(self.bus_out(g))).collect();
+        }
+        self.labels(gs, self.out_unit, self.out_min, self.out_max)
+    }
 }
 
 /// The In/Out fields of a motion pick: how much of the sensor the graph shows,

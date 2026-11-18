@@ -622,10 +622,10 @@ impl FlexInputApp {
                     };
                     if let Some(note) = note {
                         ui.label(egui::RichText::new(note)
-                            .small().color(egui::Color32::from_gray(150)));
+                            .small().color(crate::settings::tinted_gray(150)));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("Done").size(13.0 * SCALE)).clicked() { done = true; }
+                        if ui.button(egui::RichText::new("Done").size(crate::settings::ui_size(13.0 * SCALE))).clicked() { done = true; }
                     });
                 });
                 ui.add_space(4.0);
@@ -885,7 +885,7 @@ impl FlexInputApp {
                     // the tabs — only while a pad is driving.
                     let bumper = |ui: &mut egui::Ui, pin: &str, arrow: &str, before: bool| {
                         let Some(skin) = nav_skin else { return };
-                        let arrow = egui::RichText::new(arrow).color(egui::Color32::from_gray(150));
+                        let arrow = egui::RichText::new(arrow).color(crate::settings::tinted_gray(150));
                         if !before { ui.label(arrow.clone()); }
                         if let Some(tex) = kbm_cell_texture(ctx, skin, pin) {
                             ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(22.0, 22.0) * SCALE));
@@ -914,7 +914,7 @@ impl FlexInputApp {
                     ui.painter_at(board).text(
                         board.min + egui::vec2(px * (UNIT + GAP), py * (UNIT + GAP)),
                         egui::Align2::LEFT_TOP, caption,
-                        egui::FontId::proportional(9.0 * SCALE), egui::Color32::from_gray(130));
+                        crate::settings::ui_font(9.0 * SCALE), crate::settings::tinted_gray(130));
                 }
                 // An empty Macros tab stays, and says where macros come from.
                 if tab == PickerTab::Macros && cells.is_empty() {
@@ -922,7 +922,7 @@ impl FlexInputApp {
                         board.left_top() + egui::vec2(4.0, 4.0),
                         egui::Align2::LEFT_TOP,
                         "No macros yet — create macros via the Macro Output module or a JSM @ binding.",
-                        egui::FontId::proportional(11.0 * SCALE), egui::Color32::from_gray(140));
+                        crate::settings::ui_font(11.0 * SCALE), crate::settings::tinted_gray(140));
                 }
                 for (i, cell) in cells.iter().enumerate() {
                     let min = board.min + egui::vec2(
@@ -949,11 +949,11 @@ impl FlexInputApp {
                     let hovered = resp.hovered() && !disabled;
                     let painter = ui.painter_at(rect);
                     let bg = if disabled {
-                        egui::Color32::from_gray(28)
+                        crate::settings::tinted_gray(28)
                     } else if hovered {
-                        egui::Color32::from_gray(60)
+                        crate::settings::tinted_gray(60)
                     } else {
-                        egui::Color32::from_gray(40)
+                        crate::settings::tinted_gray(40)
                     };
                     painter.rect_filled(rect, 4.0, bg);
                     // The focus is the gamepad-nav glow round the cell, not a
@@ -963,7 +963,7 @@ impl FlexInputApp {
                     if focused {
                         focus_rect = Some(rect);
                     }
-                    let tint = if disabled { egui::Color32::from_gray(110) } else { egui::Color32::WHITE };
+                    let tint = if disabled { crate::settings::tinted_gray(110) } else { egui::Color32::WHITE };
                     // Macro cells: the port's icon (custom patch-embedded SVG
                     // or embedded set) or the port name + full-name tooltip.
                     // KBM cells: skin icon or text fallback.
@@ -983,7 +983,7 @@ impl FlexInputApp {
                         } else {
                             let short: String = entry.name.chars().take(4).collect();
                             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                                short, egui::FontId::proportional(10.0 * SCALE), ui.visuals().text_color());
+                                short, crate::settings::ui_font(10.0 * SCALE), ui.visuals().text_color());
                             rect.shrink(2.0)
                         };
                         crate::macro_icons::paint_menu_target_badge(&painter, badge_on, &cell.pin, tint);
@@ -1054,8 +1054,8 @@ impl FlexInputApp {
                         // character in the cell's own background made it vanish
                         // on the focused key — which already has a ring round it
                         // to say where it is.
-                        let glyph = egui::Color32::from_gray(40);
-                        let font = egui::FontId::proportional(UNIT * 0.42);
+                        let glyph = crate::settings::tinted_gray(40);
+                        let font = crate::settings::ui_font(UNIT * 0.42);
                         // There is no bold face in the default font set, so the
                         // weight comes from drawing the glyph over itself a
                         // fraction of a pixel out. Cheap, and it matches the
@@ -1092,7 +1092,7 @@ impl FlexInputApp {
                         // touch and click zones) gets its word under it.
                         if let Some(word) = crate::kbm_picker::cell_caption(&cell.pin, layout.steam) {
                             let at = rect.center_bottom() - egui::vec2(0.0, 1.0);
-                            let font = egui::FontId::proportional(UNIT * 0.26);
+                            let font = crate::settings::ui_font(UNIT * 0.26);
                             for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
                                 painter.text(at + egui::vec2(dx, dy), egui::Align2::CENTER_BOTTOM,
                                     word, font.clone(), egui::Color32::from_black_alpha(220));
@@ -1116,8 +1116,8 @@ impl FlexInputApp {
                         };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                             lbl,
-                            egui::FontId::proportional(11.0 * SCALE),
-                            if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
+                            crate::settings::ui_font(11.0 * SCALE),
+                            if disabled { crate::settings::tinted_gray(110) } else { ui.visuals().text_color() });
                     }
                     // What a cell is when its face doesn't say, and why one is
                     // grey for this side. Hovered by the mouse; shown beside the
@@ -1145,7 +1145,7 @@ impl FlexInputApp {
             let painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
                 egui::Order::Tooltip, egui::Id::new("gp_kbm_picker_focus_tip"), host));
             let galley = painter.layout_no_wrap(
-                tip, egui::FontId::proportional(11.0 * SCALE), egui::Color32::WHITE);
+                tip, crate::settings::ui_font(11.0 * SCALE), egui::Color32::WHITE);
             let pos = rect.center_bottom() + egui::vec2(-galley.size().x * 0.5, 6.0);
             let bg = egui::Rect::from_min_size(pos, galley.size()).expand(4.0);
             painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(230));
@@ -1188,7 +1188,7 @@ impl FlexInputApp {
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(
                     "LS/D-pad: move   South: apply   East: cancel")
-                    .small().color(egui::Color32::from_gray(150)));
+                    .small().color(crate::settings::tinted_gray(150)));
                 ui.add_space(6.0);
                 for (i, mode) in modes.iter().enumerate() {
                     let glyph = crate::canvas::viewer::remapper_press_mode_glyph(mode);
@@ -1207,14 +1207,14 @@ impl FlexInputApp {
                     }
                     painter.text(rect.left_center() + egui::vec2(10.0, 0.0),
                         egui::Align2::LEFT_CENTER, glyph,
-                        egui::FontId::proportional(16.0), ui.visuals().text_color());
+                        crate::settings::ui_font(16.0), ui.visuals().text_color());
                     painter.text(rect.left_center() + egui::vec2(34.0, 0.0),
                         egui::Align2::LEFT_CENTER, label,
-                        egui::FontId::proportional(13.0), ui.visuals().text_color());
+                        crate::settings::ui_font(13.0), ui.visuals().text_color());
                     if is_cur {
                         painter.text(rect.right_center() - egui::vec2(8.0, 0.0),
                             egui::Align2::RIGHT_CENTER, "●",
-                            egui::FontId::proportional(10.0), accent);
+                            crate::settings::ui_font(10.0), accent);
                     }
                 }
             });

@@ -277,12 +277,11 @@ pub(crate) fn show_raw_pad_header_controls(
     }
 
     ui.horizontal(|ui| {
-        let label = if learning {
-            egui::RichText::new("● Stop").color(Color32::from_rgb(220, 80, 80))
-        } else {
-            egui::RichText::new("Learn")
-        };
-        let resp = ui.add_enabled(!in_motion_setup, egui::Button::new(label).small()).on_hover_text(
+        // The house buttons (`kit::body_button`): Learn lit while it listens.
+        let resp = ui
+            .add_enabled_ui(!in_motion_setup, |ui| super::kit::body_button(ui, if learning { "● Stop" } else { "Learn" }, learning))
+            .inner
+            .on_hover_text(
             "Teach FlexInput this controller: with Learn on, press each button and move \
              each stick, trigger and D-pad in turn, and say what it is. The layout is \
              saved for this model and works everywhere it is plugged in.",
@@ -297,7 +296,7 @@ pub(crate) fn show_raw_pad_header_controls(
         let has_unused = outputs.iter().any(|o| o.remotes.is_empty())
             && snarl.get_node(node_id).is_some_and(|n| n.outputs.iter()
                 .any(|p| p.signal_type != SignalType::AutoMap));
-        if has_unused && ui.small_button("Clear unused").clicked() {
+        if has_unused && super::kit::body_button(ui, "Clear unused", false).clicked() {
             clear_unused_dynamic_pins::<Outputs>(node_id, outputs, snarl, "output_pin_ids");
         }
     });
@@ -382,7 +381,7 @@ pub(crate) fn show_raw_pad_header_controls(
             let owner_of = |pin: &str| profile.binds.iter()
                 .find(|b| b.pin == pin).map(|b| elem_label(&dev_id, b.src));
             egui::ComboBox::from_id_salt((node_id, "raw_pad_assign"))
-                .selected_text(egui::RichText::new("Assign to…").small())
+                .selected_text(super::simple_bodies::combo_text(ui, "Assign to…", 230.0))
                 .width(230.0)
                 .height(420.0)
                 .show_ui(ui, |ui| {
@@ -405,7 +404,7 @@ pub(crate) fn show_raw_pad_header_controls(
                     .hint_text(name.clone())
                     .desired_width(110.0)
                     .font(egui::TextStyle::Small));
-                if ui.small_button("Add as its own port")
+                if super::kit::body_button(ui, "Add as its own port", false)
                     .on_hover_text("Not a gamepad control: keep it as a port of its own on this \
                                     node, under this name. It rides the Auto-Map bus too, so a \
                                     Remapper downstream can Learn it.")
@@ -413,7 +412,7 @@ pub(crate) fn show_raw_pad_header_controls(
                 {
                     chosen = Some(own_port_bind(&det, &st.own_name, &name));
                 }
-                if ui.small_button("Skip").clicked() {
+                if super::kit::body_button(ui, "Skip", false).clicked() {
                     skip = true;
                 }
             });

@@ -2680,8 +2680,9 @@ fn motion_setting(
                 "WORLD_TURN" => Space::WorldTurn,
                 "WORLD_LEAN" => Space::WorldLean,
                 "YAW_PLUS_ROLL" => Space::YawPlusRoll,
+                "ORIENT" => Space::Orient,
                 _ => return wants(
-                    "LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN, WORLD_LEAN or YAW_PLUS_ROLL",
+                    "LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN, WORLD_LEAN, YAW_PLUS_ROLL or ORIENT",
                 ),
             };
             let mut info = ok;

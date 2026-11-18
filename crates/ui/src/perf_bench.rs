@@ -479,7 +479,7 @@ fn perf_font_atlas() {
         input.max_texture_side = Some(side);
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label(egui::RichText::new(text).size(size));
+                ui.label(egui::RichText::new(text).size(crate::settings::ui_size(size)));
             });
         });
         sizes_drawn += 1;

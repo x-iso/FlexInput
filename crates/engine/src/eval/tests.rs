@@ -5327,8 +5327,9 @@ mod lean_axis_tests {
     ///
     /// Roll the pad onto its right side (gravity along +Y = side), then rotate
     /// about that same axis (pure pitch gyro = rotation about Y = about
-    /// gravity). That is a world-yaw, so it must land in X alone. With mixed
-    /// frames it would appear in Y instead.
+    /// gravity). That is a world-yaw, so in World it must land in X alone. With
+    /// mixed frames it would appear in Y instead. Player is JSM's PLAYER_TURN,
+    /// whose pitch is always the pad's own: on its side the same turn is pitch.
     #[test]
     fn player_yaw_about_gravity_stays_out_of_the_other_axis() {
         let inputs: Vec<Option<Signal>> = vec![
@@ -5340,21 +5341,27 @@ mod lean_axis_tests {
             Some(Signal::Float(1.0)),  // accel y (side) — gravity, right side down
             Some(Signal::Float(0.0)),  // accel z (vertical)
         ];
-        let mut params = HashMap::new();
-        params.insert("family".to_string(), Value::String("pointer".into()));
-        params.insert("axis".to_string(), Value::String("player".into()));
-        let mut state = NodeState::default();
-        let mut out = Vec::new();
-        for _ in 0..600 {
-            out = compute_gyro_3dof(
-                &inputs, &mut state, &params,
-                &BusMap::default(), &BusMap::default(), 1.0 / 60.0,
-            );
-        }
-        let x = match out.get(1) { Some(Some(Signal::Float(f))) => *f, o => panic!("x: {o:?}") };
-        let y = match out.get(2) { Some(Some(Signal::Float(f))) => *f, o => panic!("y: {o:?}") };
+        let run = |axis: &str| {
+            let mut params = HashMap::new();
+            params.insert("family".to_string(), Value::String("pointer".into()));
+            params.insert("axis".to_string(), Value::String(axis.into()));
+            let mut state = NodeState::default();
+            let mut out = Vec::new();
+            for _ in 0..600 {
+                out = compute_gyro_3dof(
+                    &inputs, &mut state, &params,
+                    &BusMap::default(), &BusMap::default(), 1.0 / 60.0,
+                );
+            }
+            let x = match out.get(1) { Some(Some(Signal::Float(f))) => *f, o => panic!("x: {o:?}") };
+            let y = match out.get(2) { Some(Some(Signal::Float(f))) => *f, o => panic!("y: {o:?}") };
+            (x, y)
+        };
+        let (x, y) = run("world");
         assert!(x.abs() > 0.3, "rotation about gravity must drive X, got {x}");
         assert!(y.abs() < 0.05, "and must NOT leak into Y (the slant), got {y}");
+        let (x, y) = run("player");
+        assert!(x.abs() < 0.05 && (y - 0.6).abs() < 0.05, "Player keeps the pad's own pitch: {x}, {y}");
     }
 
     /// Player and World adapt to however the pad is held, so they lean in both.

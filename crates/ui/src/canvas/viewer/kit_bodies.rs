@@ -516,7 +516,7 @@ pub(crate) fn show_quantize_body(
         let hovered = ui.visuals().widgets.hovered.bg_fill;
         let text = ui.visuals().text_color();
         let strong = ui.visuals().strong_text_color();
-        let font = egui::FontId::proportional(12.0);
+        let font = crate::settings::ui_font(12.0);
         painter.rect_filled(list, 4.0, window);
         let mut picked: Option<String> = None;
         let mut elsewhere = false;
@@ -1019,8 +1019,10 @@ pub(crate) fn toggle_button(ui: &mut egui::Ui, on: bool, label: &str, size: egui
             ui.style().visuals.text_color(),
         )
     };
+    let label = super::simple_bodies::fitting_word(ui, label, size.x - 2.0 * ui.spacing().button_padding.x);
+    let font = super::simple_bodies::fit_font(ui, label, super::simple_bodies::control_font(), size.x - 2.0 * ui.spacing().button_padding.x);
     ui.add(
-        egui::Button::new(egui::RichText::new(label).small().color(text))
+        egui::Button::new(egui::RichText::new(label).font(font).color(text))
             .fill(fill)
             .stroke(egui::Stroke::new(1.0_f32, stroke))
             .corner_radius(4.0)

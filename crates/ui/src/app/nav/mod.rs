@@ -28,7 +28,7 @@ pub(crate) use remap::draw_remap_card_glow;
 pub(crate) use remap::{draw_requested_card_glow, nav_card_focus_rect};
 #[cfg(test)]
 pub(crate) use remap::request_card_glow;
-pub(crate) use fields::{draw_requested_field_hud, nav_field_focus_rect};
+pub(crate) use fields::{draw_requested_field_hud, element_fields, field_hint, nav_field_focus_rect};
 pub(crate) use pickers::PickerInteraction;
 pub(crate) use config::draw_config_field_glow;
 

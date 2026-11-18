@@ -192,7 +192,7 @@ pub(crate) fn render_controller3d_core(
                 full_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 msg,
-                egui::FontId::proportional(12.0),
+                crate::settings::ui_font(12.0),
                 egui::Color32::from_rgb(210, 160, 160),
             );
         }
@@ -954,7 +954,7 @@ pub(crate) fn show_controller3d_body(
         override_name.clone()
     } else {
         model::model_for_devices(&devs)
-            .unwrap_or_else(|| model::available_models().into_iter().next().unwrap_or_default())
+            .unwrap_or_else(model::default_model)
     };
 
     // Orientation quaternion from the Vec4 input (index 1), else identity. The
@@ -1144,7 +1144,7 @@ pub(crate) fn show_controller3d_body(
                     .iter()
                     .flat_map(|(_, gs)| gs.iter().copied())
                     .collect();
-                let font = egui::TextStyle::Small.resolve(ui.style());
+                let font = super::simple_bodies::control_font();
                 let icon_side = (ctrl - 6.0).max(8.0);
                 const SWATCH_W: f32 = 22.0;
                 let text_w = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
@@ -1200,8 +1200,7 @@ pub(crate) fn show_controller3d_body(
                         .on_hover_text(g.label());
                 }
                 ui.horizontal(|ui| {
-                    if ui
-                        .small_button("Reset")
+                    if super::kit::body_button(ui, "Reset", false)
                         .on_hover_text("Reset to this model's default colours")
                         .clicked()
                     {
@@ -1209,8 +1208,7 @@ pub(crate) fn show_controller3d_body(
                             node.params.remove("materials");
                         }
                     }
-                    if ui
-                        .small_button("Save…")
+                    if super::kit::body_button(ui, "Save…", false)
                         .on_hover_text("Save these colours to a .fxcol file")
                         .clicked()
                     {
@@ -1223,8 +1221,7 @@ pub(crate) fn show_controller3d_body(
                         }
                         controller3d_scheme_save_in(&eff, c3d_presets_dir(&resolved));
                     }
-                    if ui
-                        .small_button("Load…")
+                    if super::kit::body_button(ui, "Load…", false)
                         .on_hover_text("Load colours from a .fxcol file")
                         .clicked()
                     {
@@ -1294,7 +1291,7 @@ pub(crate) fn show_controller3d_body(
             // here as a module option — useful for seeing activated inputs behind
             // the shell.
             let shown = format!("{opacity:.2}");
-            if super::curve_rows::real_pill(ui, node_id, "c3d_alpha", at(1), "alpha", &mut opacity, &shown, 0.1..=1.0, 0.004,
+            if super::curve_rows::real_pill(ui, node_id, "c3d_alpha", at(1), "alpha|model opacity", &mut opacity, &shown, 0.1..=1.0, 0.004,
                 "Whole-model transparency (see-through).")
             {
                 write("overlay_alpha", serde_json::json!(opacity));
@@ -1331,7 +1328,7 @@ pub(crate) fn show_controller3d_body(
             // X-ray: how hidden a pressed input must be to show through the shell, in
             // percent of the input's facing surface.
             let shown = format!("{xray_pct:.0} %");
-            if super::curve_rows::real_pill(ui, node_id, "c3d_xray", at(5), "x-ray", &mut xray_pct, &shown, 0.0..=100.0, 0.5,
+            if super::curve_rows::real_pill(ui, node_id, "c3d_xray", at(5), "x-ray|x-ray below", &mut xray_pct, &shown, 0.0..=100.0, 0.5,
                 "When a pressed input shows through the shell: once less than this\n\
                  much of it is in view. Raise it for inputs that only peek out past\n\
                  the shell, like a pad's back buttons, which at a small size read as\n\

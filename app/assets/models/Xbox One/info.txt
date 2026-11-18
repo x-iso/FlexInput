@@ -32,7 +32,7 @@ bottom_shell.obj
 0
 0
 0
-extra.obj
+battery_cover.obj
 0
 0
 0

@@ -335,7 +335,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         let inner = if let Some((hot, intensity)) = self.glow {
             // `pin_info` always sets `fill`, so the unwrap is the live path;
             // the fallback only matters if some other callsite forgets it.
-            let base = self.inner.fill.unwrap_or(Color32::from_gray(20));
+            let base = self.inner.fill.unwrap_or(crate::settings::tinted_gray(20));
             let t = intensity.clamp(0.0, 1.0);
             let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
             let mixed = Color32::from_rgb(
@@ -355,7 +355,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         // only the outward-facing half (flat side flush with the node body).
         if let Some(side) = self.half {
             if inner.shape == Some(egui_snarl::ui::PinShape::Square) {
-                let fill = inner.fill.unwrap_or(Color32::from_gray(20));
+                let fill = inner.fill.unwrap_or(crate::settings::tinted_gray(20));
                 let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5_f32, Color32::WHITE));
                 let size = rect.width().min(rect.height());
                 let center = rect.center();
@@ -406,7 +406,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
                 };
             }
             use egui::epaint::{PathShape, PathStroke};
-            let fill = inner.fill.unwrap_or(Color32::from_gray(20));
+            let fill = inner.fill.unwrap_or(crate::settings::tinted_gray(20));
             let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5_f32, Color32::WHITE));
             let center = rect.center();
             let r = (rect.width().min(rect.height())) * 0.5;

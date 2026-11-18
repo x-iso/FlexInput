@@ -380,7 +380,7 @@ fn stats_table(rows: &[(String, Kind, ChStats, f32)], fit: usize) -> (String, Ve
 /// A label with a dark backing, so it reads over traces and guides. Returns
 /// its width.
 fn backed_text(p: &egui::Painter, pos: egui::Pos2, align: egui::Align2, text: String, size: f32, col: Color32) -> f32 {
-    let galley = p.layout_no_wrap(text, egui::FontId::proportional(size), col);
+    let galley = p.layout_no_wrap(text, crate::settings::ui_font(size), col);
     let rect = align.anchor_size(pos, galley.size());
     p.rect_filled(rect.expand2(egui::vec2(2.0, 0.0)), 2.0, Color32::from_black_alpha(150));
     p.galley(rect.min, galley, col);
@@ -768,7 +768,7 @@ fn paint_scope(
     // Widths of the value-label columns, left and right, for the statistics.
     let (mut left_w, mut right_w) = (0.0f32, 0.0f32);
     let size = 10.0;
-    let label_col = Color32::from_gray(185);
+    let label_col = crate::settings::tinted_gray(185);
     // x → the (fractional) visible sample under it: the inverse of `x_of`.
     let i_at = |x: f32| if f.spec.from_trigger {
         (x - rect.left()) / rect.width() * span
@@ -861,7 +861,7 @@ fn paint_scope(
                     egui::vec2(table_w, (shown + 1) as f32 * (line_h + 1.0)));
                 painter.rect_filled(bg_rect.expand2(egui::vec2(3.0, 1.0)), 2.0, Color32::from_black_alpha(165));
                 let mut y = rect.top() + 3.0;
-                painter.text(egui::pos2(x0, y), egui::Align2::LEFT_TOP, header, font.clone(), Color32::from_gray(130));
+                painter.text(egui::pos2(x0, y), egui::Align2::LEFT_TOP, header, font.clone(), crate::settings::tinted_gray(130));
                 for (line, &ch) in lines.into_iter().zip(&chans).take(shown) {
                     y += line_h + 1.0;
                     painter.text(egui::pos2(x0, y), egui::Align2::LEFT_TOP, line, font.clone(), graph_channel_color(graph_ov, ch));
@@ -885,7 +885,7 @@ fn paint_scope(
             let t_ms = t_of(idx as f32);
             let mut lines: Vec<(String, Color32)> = vec![(
                 if t_ms.abs() >= 1000.0 { fmt_t(t_ms, true, 3) } else { fmt_t(t_ms, false, 1) },
-                Color32::from_gray(200),
+                crate::settings::tinted_gray(200),
             )];
             let name_w = (0..f.n_channels).filter(|ch| f.wired(*ch)).map(|ch| f.name(ch).chars().count()).max().unwrap_or(0);
             for ch in (0..f.n_channels).filter(|ch| f.wired(*ch)) {
@@ -914,7 +914,7 @@ fn paint_scope(
 
     if waiting {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for trigger…",
-            egui::FontId::proportional(11.0), Color32::from_gray(90));
+            crate::settings::ui_font(11.0), crate::settings::tinted_gray(90));
     }
     // Frozen: a blue frame, and the word at the bottom left, clear of the
     // statistics and the value labels.
@@ -937,7 +937,7 @@ fn scrollbar(ui: &mut egui::Ui, rect: egui::Rect, f: &Frame, salt: impl std::has
     let sp = view_span(f);
     let resp = ui.interact(rect, ui.id().with(("scope_scroll", salt)), egui::Sense::click_and_drag());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, 3.0, Color32::from_gray(28));
+    p.rect_filled(rect, 3.0, crate::settings::tinted_gray(28));
     if sp.total <= sp.win {
         return None;
     }
@@ -951,7 +951,7 @@ fn scrollbar(ui: &mut egui::Ui, rect: egui::Rect, f: &Frame, salt: impl std::has
     let x0 = to_x(sp.start as f32).min(rect.right() - thumb_w);
     let thumb = egui::Rect::from_min_max(egui::pos2(x0, rect.top() + 1.0), egui::pos2(x0 + thumb_w, rect.bottom() - 1.0));
     let active = resp.dragged() || resp.hovered();
-    p.rect_filled(thumb, 3.0, if active { Color32::from_gray(150) } else { Color32::from_gray(105) });
+    p.rect_filled(thumb, 3.0, if active { crate::settings::tinted_gray(150) } else { crate::settings::tinted_gray(105) });
     // The pointer's x puts the thumb's centre there.
     let from_pointer = |x: f32| {
         let start = ((x - rect.left()) / rect.width() * sp.total as f32 - sp.win as f32 * 0.5)

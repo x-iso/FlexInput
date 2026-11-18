@@ -2078,11 +2078,11 @@ impl Canvas {
             } else {
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18)
             };
-            let border_color = if is_dark {
+            let border_color = crate::settings::tinted(if is_dark {
                 egui::Color32::from_rgba_unmultiplied(70, 70, 76, 200)
             } else {
                 egui::Color32::from_rgba_unmultiplied(150, 150, 158, 200)
-            };
+            });
             if let Some(f) = self.style.node_frame.as_mut() {
                 f.fill = body_fill;
                 f.stroke = egui::Stroke::new(1.0_f32, border_color);

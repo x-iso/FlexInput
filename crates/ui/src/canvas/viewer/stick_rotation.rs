@@ -32,9 +32,9 @@ const STICK_TIP: &str = "The stick to turn. The pad's turn rotates it once it is
 const MODE_TIP: &str = "Yaw — turning about the pad's own vertical, however it is held.\n\
     World — turning about gravity: held flat it is the yaw, pitched up towards\n\
     you it becomes the roll, and anything in between mixes the two.";
-const SENS_TIP: &str = "Degrees the stick turns per degree the pad turns.\n1.0 = the aim turns exactly as far as your hands.";
-const INVERT_TIP: &str = "Turn the stick the other way.";
-const DEADZONE_TIP: &str = "Inner deadzone, as a fraction of stick travel. While the stick is inside it the\n\
+pub(crate) const SENS_TIP: &str = "Degrees the stick turns per degree the pad turns.\n1.0 = the aim turns exactly as far as your hands.";
+pub(crate) const INVERT_TIP: &str = "Turn the stick the other way.";
+pub(crate) const DEADZONE_TIP: &str = "Inner deadzone, as a fraction of stick travel. While the stick is inside it the\n\
     gyro does nothing and the stick passes through untouched, and the turn the\n\
     gyro added is dropped — the next push starts from your thumb's direction.\n\
     0 = no deadzone: the turn is never dropped, and keeps building and\n\
@@ -45,10 +45,10 @@ const HOLD_TIP: &str = "How the turn behaves once the pad stops turning.\n\
     Relative — it folds back to your thumb's direction over the Return time.\n\
     A quick flick of the wrist registers nearly in full; a steady turn holds\n\
     the stick turned by its speed times the return time.";
-const RETURN_TIP: &str = "Relative: how quickly the stick folds back to your thumb once the pad\n\
+pub(crate) const RETURN_TIP: &str = "Relative: how quickly the stick folds back to your thumb once the pad\n\
     stops turning. After this long about a third of the turn is left, after\n\
     three times as long almost none. Longer feels more like Absolute.";
-const TAKEOVER_TIP: &str = "Let the gyro take the aim over once the pad turns.\n\
+pub(crate) const TAKEOVER_TIP: &str = "Let the gyro take the aim over once the pad turns.\n\
     The thumb aims as usual until the pad turns faster than the speed set here;\n\
     from then the stick's direction is held where your thumb had it and only\n\
     the gyro turns it, so a thumb drifting while your wrist does the fine work\n\
@@ -56,11 +56,11 @@ const TAKEOVER_TIP: &str = "Let the gyro take the aim over once the pad turns.\n
     Push the stick out past the Outer zone and your thumb has the direction\n\
     back; centring the stick or the deadzone ends it too. The next turn takes\n\
     over again.";
-const TAKEOVER_SPEED_TIP: &str = "How fast the aim has to turn (°/s, after Sens) for the gyro to take over.\n\
+pub(crate) const TAKEOVER_SPEED_TIP: &str = "How fast the aim has to turn (°/s, after Sens) for the gyro to take over.\n\
     High enough that a pad held still doesn't trip it.";
-const OUTER_TIP: &str = "The outer zone, as a fraction of stick travel: pushed out past it, the\n\
+pub(crate) const OUTER_TIP: &str = "The outer zone, as a fraction of stick travel: pushed out past it, the\n\
     stick's direction is your thumb's again. Drawn as the outer ring.";
-const SMOOTH_TIP: &str = "Stabilise the stick's direction against a shaky thumb (0 = off).\n\
+pub(crate) const SMOOTH_TIP: &str = "Stabilise the stick's direction against a shaky thumb (0 = off).\n\
     Small back-and-forth wobble is smoothed over about this long; a deliberate\n\
     sweep is let through with little delay. Only the thumb's direction is\n\
     smoothed — never the stick's length, and never the gyro's turn.";
@@ -121,10 +121,7 @@ pub(crate) fn show_stick_rotation_body(
                 })
                 .collect()
         };
-        let word_w = |ui: &egui::Ui, t: &str| {
-            let font = egui::TextStyle::Small.resolve(ui.style());
-            ui.painter().layout_no_wrap(t.to_string(), font, egui::Color32::PLACEHOLDER).size().x + 14.0
-        };
+        let word_w = super::curve_rows::word_w;
 
         // The live circle: the stick where the thumb has it and where the gyro turned it to.
         let (field, _) = ui.allocate_exact_size(surface.size, egui::Sense::hover());
@@ -431,7 +428,7 @@ pub(crate) fn paint_stick_rotation(
         egui::pos2(rect.center().x, rect.bottom() - 2.0),
         egui::Align2::CENTER_BOTTOM,
         text,
-        egui::FontId::proportional(11.0),
+        crate::settings::ui_font(11.0),
         if engaged { visuals.text_color() } else { weak },
     );
     rect

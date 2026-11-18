@@ -432,7 +432,7 @@ impl SpikeRun {
     /// The status line under the spike filter rows.
     fn line(&self) -> Option<(String, Color32)> {
         const CYAN: Color32 = Color32::from_rgb(90, 190, 235);
-        let weak = Color32::from_gray(140);
+        let weak = crate::settings::tinted_gray(140);
         Some(match self {
             SpikeRun::Idle => return None,
             SpikeRun::Recording { started, moved_at, .. } => {
@@ -985,7 +985,7 @@ fn cal_file_status_line(ui: &mut egui::Ui, node_id: NodeId) {
         ui.ctx().data_mut(|d| d.remove::<CalFileStatus>(cal_file_status_id(node_id)));
         return;
     }
-    let text = egui::RichText::new(status.text).size(INSTRUCT_SIZE);
+    let text = egui::RichText::new(status.text).size(crate::settings::ui_size(INSTRUCT_SIZE));
     ui.label(if status.failed { text.color(ORANGE) } else { text.weak() });
 }
 
@@ -1578,7 +1578,7 @@ fn grip_touch_section(
                 ui.label(egui::RichText::new(format!(
                     "Edge L {}/{}  R {}/{}",
                     traced_buckets(&edges[0]), TPAD_MIN_BUCKETS, traced_buckets(&edges[1]), TPAD_MIN_BUCKETS,
-                )).size(INSTRUCT_SIZE).color(ORANGE));
+                )).size(crate::settings::ui_size(INSTRUCT_SIZE)).color(ORANGE));
             }
             ui.add_space(12.0);
             instruct_line(ui, &[
@@ -1604,7 +1604,7 @@ fn grip_touch_section(
             let mut grip_edit = None;
             let mut rows: Vec<(String, f32)> = Vec::new();
             let label_w = ui.painter().layout_no_wrap("Outer deadzone".into(),
-                egui::FontId::proportional(INSTRUCT_SIZE), ORANGE).size().x;
+                crate::settings::ui_font(INSTRUCT_SIZE), ORANGE).size().x;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = lo.scope_gap;
                 for (i, side) in ["l", "r"].into_iter().enumerate() {
@@ -1734,8 +1734,8 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
     let half = side * 0.5;
     let to_screen = |p: [f32; 2]| egui::pos2(pad.center().x + p[0] * half, pad.center().y - p[1] * half);
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)), egui::epaint::StrokeKind::Inside);
+    painter.rect_filled(rect, 4.0, crate::settings::tinted_gray(15));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(50)), egui::epaint::StrokeKind::Inside);
 
     // The pad, the deadzone round its live frame, and the frame crossed at the
     // middle it reads.
@@ -1745,18 +1745,18 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
             let [left, right, bottom, top] = cal.live();
             painter.rect_filled(pad, round(pad), Color32::from_rgb(72, 52, 26));
             let live = egui::Rect::from_min_max(to_screen([left, top]), to_screen([right, bottom]));
-            painter.rect_filled(live, round(live), Color32::from_gray(26));
+            painter.rect_filled(live, round(live), crate::settings::tinted_gray(26));
             live
         }
         None => {
-            painter.rect_filled(pad, round(pad), Color32::from_gray(26));
+            painter.rect_filled(pad, round(pad), crate::settings::tinted_gray(26));
             pad
         }
     };
-    let faint = Stroke::new(1.0_f32, Color32::from_gray(42));
+    let faint = Stroke::new(1.0_f32, crate::settings::tinted_gray(42));
     painter.line_segment([egui::pos2(live.left(), live.center().y), egui::pos2(live.right(), live.center().y)], faint);
     painter.line_segment([egui::pos2(live.center().x, live.top()), egui::pos2(live.center().x, live.bottom())], faint);
-    painter.rect_stroke(pad, round(pad), Stroke::new(1.0_f32, Color32::from_gray(80)), egui::epaint::StrokeKind::Inside);
+    painter.rect_stroke(pad, round(pad), Stroke::new(1.0_f32, crate::settings::tinted_gray(80)), egui::epaint::StrokeKind::Inside);
 
     // The edge trace, broken where a direction is untraced.
     let green = Stroke::new(1.6_f32, Color32::from_rgb(80, 200, 100));
@@ -1789,20 +1789,20 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
         let full = side * PRESS_RING;
         let radius = |f: f32| full * f.clamp(0.0, 1.0);
         let colour = if v.clicked { ORANGE } else { FILL_LIVE };
-        painter.circle_stroke(c, full, Stroke::new(1.0_f32, Color32::from_gray(70)));
+        painter.circle_stroke(c, full, Stroke::new(1.0_f32, crate::settings::tinted_gray(70)));
         painter.circle_filled(c, radius(v.pressure), colour.gamma_multiply(0.3));
         painter.circle_stroke(c, radius(v.pressure), Stroke::new(1.5_f32, colour));
         if let Some(h) = v.hold_at {
-            painter.circle_stroke(c, radius(h), Stroke::new(1.0_f32, Color32::from_gray(130)));
+            painter.circle_stroke(c, radius(h), Stroke::new(1.0_f32, crate::settings::tinted_gray(130)));
         }
         if let Some(f) = v.click_at {
-            painter.circle_stroke(c, radius(f), Stroke::new(2.0_f32, Color32::from_gray(230)));
+            painter.circle_stroke(c, radius(f), Stroke::new(2.0_f32, crate::settings::tinted_gray(230)));
         }
         painter.circle_filled(c, 4.0, if v.clicked { ORANGE } else { Color32::from_rgb(220, 80, 80) });
     }
     // A thumb in the band that doesn't count: where it is, and nothing more.
     if let Some(p) = v.stray {
-        painter.circle_stroke(to_screen(p), 5.0, Stroke::new(1.5_f32, Color32::from_gray(140)));
+        painter.circle_stroke(to_screen(p), 5.0, Stroke::new(1.5_f32, crate::settings::tinted_gray(140)));
     }
 
     // The pad's name in the corner away from its grip, lit while it clicks.
@@ -1811,8 +1811,8 @@ fn trackpad_cell(ui: &mut egui::Ui, v: &PadView, lo: Layout, id: egui::Id) -> Op
     } else {
         (rect.left_top() + egui::vec2(8.0, 4.0), egui::Align2::LEFT_TOP)
     };
-    painter.text(corner, align, v.label, egui::FontId::proportional(20.0),
-        if v.clicked { ORANGE } else { Color32::from_gray(80) });
+    painter.text(corner, align, v.label, crate::settings::ui_font(20.0),
+        if v.clicked { ORANGE } else { crate::settings::tinted_gray(80) });
     resp.on_hover_text("This trackpad as your thumb reaches it. The circle around your thumb is \
         how hard it presses: the bright ring is where the pad clicks (with the pad's own click, \
         learnt from your first click), the faint one where click stabilisation starts holding \
@@ -1834,7 +1834,7 @@ fn grip_strip(ui: &egui::Ui, strip: egui::Rect, id: egui::Id, on: bool, (touch, 
     let painter = ui.painter();
     let r = strip.width() * 0.5;
     let (touch_y, release_y) = (y_of(touch), y_of(release.min(touch)));
-    painter.rect_filled(strip, r, Color32::from_gray(32));
+    painter.rect_filled(strip, r, crate::settings::tinted_gray(32));
     painter.rect_filled(egui::Rect::from_x_y_ranges(strip.x_range(), touch_y..=release_y), 2.0,
         DIGITAL_LABEL_COLOR.gamma_multiply(0.22));
     if on {
@@ -1852,7 +1852,7 @@ fn grip_strip(ui: &egui::Ui, strip: egui::Rect, id: egui::Id, on: bool, (touch, 
     let touch_head = egui::pos2(near + out * 9.0, touch_y);
     painter.line_segment([egui::pos2(far, touch_y), touch_head], Stroke::new(2.0_f32, DIGITAL_LABEL_COLOR));
     painter.circle_filled(touch_head, 4.5, DIGITAL_LABEL_COLOR);
-    painter.circle_stroke(touch_head, 4.5, Stroke::new(1.0_f32, Color32::from_gray(30)));
+    painter.circle_stroke(touch_head, 4.5, Stroke::new(1.0_f32, crate::settings::tinted_gray(30)));
 
     let mut edit = None;
     if resp.dragged() || resp.clicked() {
@@ -1903,7 +1903,7 @@ fn pad_row(
         let h = ui.spacing().interact_size.y;
         let (rect, label) = ui.allocate_exact_size(egui::vec2(label_w, h), Sense::hover());
         ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, name,
-            egui::FontId::proportional(INSTRUCT_SIZE), ORANGE);
+            crate::settings::ui_font(INSTRUCT_SIZE), ORANGE);
         label.on_hover_text(hover);
         let dv_w = 52.0;
         ui.spacing_mut().slider_width = (width - label_w - dv_w - 2.0 * 6.0).max(24.0);
@@ -2043,7 +2043,7 @@ fn pad_click_rows(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, lo: L
         .unwrap_or(false);
     let mut per_pad = split;
     let per_pad_box = |ui: &mut egui::Ui, per_pad: &mut bool| {
-        ui.checkbox(per_pad, egui::RichText::new("Per pad").size(INSTRUCT_SIZE))
+        ui.checkbox(per_pad, egui::RichText::new("Per pad").size(crate::settings::ui_size(INSTRUCT_SIZE)))
             .on_hover_text("Give each trackpad its own click feedback. Each starts from the \
                 shared settings, which come back when this is off.");
     };
@@ -2102,19 +2102,19 @@ fn pad_click_controls(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, s
         Some(0) => "L click feedback",
         Some(_) => "R click feedback",
     };
-    let mut changed = ui.checkbox(&mut on, egui::RichText::new(name).size(INSTRUCT_SIZE))
+    let mut changed = ui.checkbox(&mut on, egui::RichText::new(name).size(crate::settings::ui_size(INSTRUCT_SIZE)))
         .on_hover_text("FlexInput plays a click on the trackpad as you press it. With Steam \
             running and using the pad, Steam may play its own as well.")
         .changed();
     if on {
-        changed |= ui.checkbox(&mut release, egui::RichText::new("Release").size(INSTRUCT_SIZE))
+        changed |= ui.checkbox(&mut release, egui::RichText::new("Release").size(crate::settings::ui_size(INSTRUCT_SIZE)))
             .on_hover_text("A softer click as you let go, too.")
             .changed();
         let shown = if tone { "Tone" } else if strong { "Strong click" } else { "Light click" };
         slot(ui, PAD_COMBO_W, |ui| {
             egui::ComboBox::from_id_salt((node_id, "pad_click_style", side))
                 .width(PAD_COMBO_W - 8.0)
-                .selected_text(egui::RichText::new(shown).size(INSTRUCT_SIZE))
+                .selected_text(egui::RichText::new(shown).size(crate::settings::ui_size(INSTRUCT_SIZE)))
                 .show_ui(ui, |ui| {
                     for (name, s, t) in [("Light click", false, false), ("Strong click", true, false), ("Tone", false, true)] {
                         if ui.selectable_label(tone == t && (t || strong == s), name).clicked() {
@@ -2287,7 +2287,7 @@ fn orientation_section(
         }
         if !enabled {
             ui.label(egui::RichText::new("no orientation signal from this device")
-                .size(INSTRUCT_SIZE).color(ORANGE));
+                .size(crate::settings::ui_size(INSTRUCT_SIZE)).color(ORANGE));
         }
         if done && !st.sampling && ui.button("Clear").clicked() {
             if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
@@ -2352,7 +2352,7 @@ fn section_header(ui: &mut egui::Ui, node_id: NodeId, title: &str, done: bool, b
     });
     let resp = ui.interact(row.response.rect, id.with("toggle"), Sense::click());
     let colour = if busy {
-        Color32::from_gray(70)
+        crate::settings::tinted_gray(70)
     } else if resp.hovered() {
         ui.visuals().strong_text_color()
     } else {
@@ -2379,7 +2379,7 @@ fn section_header(ui: &mut egui::Ui, node_id: NodeId, title: &str, done: bool, b
 
 fn cal_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized([100.0, 30.0], egui::Button::new(
-        egui::RichText::new(label).size(15.0)
+        egui::RichText::new(label).size(crate::settings::ui_size(15.0))
     ))
 }
 
@@ -2494,7 +2494,7 @@ fn instruct_line(ui: &mut egui::Ui, segments: &[(bool, &str)]) {
     for (orange, chunk) in segments {
         let color = if *orange { ORANGE } else { weak };
         text.append(chunk, 0.0, egui::TextFormat {
-            font_id: egui::FontId::proportional(INSTRUCT_SIZE),
+            font_id: crate::settings::ui_font(INSTRUCT_SIZE),
             color,
             ..Default::default()
         });
@@ -2704,7 +2704,7 @@ fn gyro_section(
                 }
                 let mut skip_accel = skip_accel_initial;
                 if ui.checkbox(&mut skip_accel,
-                    egui::RichText::new("skip accelerometer").size(INSTRUCT_SIZE - 1.0))
+                    egui::RichText::new("skip accelerometer").size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)))
                     .changed()
                 {
                     if let Some(n) = canvas.snarl.get_node_mut(node_id) {
@@ -2724,7 +2724,7 @@ fn gyro_section(
                     .and_then(|n| n.params.get("gyro_auto_cal").and_then(|v| v.as_bool()))
                     .unwrap_or(false);
                 if ui.checkbox(&mut auto_on,
-                    egui::RichText::new("auto-calibrate when still").size(INSTRUCT_SIZE - 1.0))
+                    egui::RichText::new("auto-calibrate when still").size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)))
                     .on_hover_text("Recalibrates hands-free after the controller has been lying\n\
                                     flat on a level surface, fully motionless, for 5 seconds —\n\
                                     even while this window is closed. Any movement during the\n\
@@ -2752,9 +2752,9 @@ fn gyro_section(
                 ui.ctx(), egui::Id::new(("cal_axis_align", node_id)), false,
             )
             .show_header(ui, |ui| {
-                ui.label(egui::RichText::new("Axis alignment").size(INSTRUCT_SIZE).strong());
+                ui.label(egui::RichText::new("Axis alignment").size(crate::settings::ui_size(INSTRUCT_SIZE)).strong());
                 if aligned {
-                    ui.label(egui::RichText::new("applied").size(INSTRUCT_SIZE - 2.0).weak());
+                    ui.label(egui::RichText::new("applied").size(crate::settings::ui_size(INSTRUCT_SIZE - 2.0)).weak());
                 }
             })
             .body(|ui| {
@@ -2770,7 +2770,7 @@ fn gyro_section(
                         } else {
                             axis_names[ai].to_string()
                         };
-                        let btn = egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0));
+                        let btn = egui::Button::new(egui::RichText::new(label).size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)));
                         let progress = if active {
                             (or_n as f32 / ORIENT_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
                         } else { 0.0 };
@@ -2801,7 +2801,7 @@ fn gyro_section(
                 ui.horizontal_wrapped(|ui| {
                     let all = or_captured.iter().all(|c| *c);
                     if ui.add_enabled(all && or_sampling_axis.is_none(),
-                        egui::Button::new(egui::RichText::new("solve").size(INSTRUCT_SIZE - 1.0))).clicked()
+                        egui::Button::new(egui::RichText::new("solve").size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)))).clicked()
                     {
                         let (samples, accel_mean) = ui.ctx().data(|d| {
                             let st = d.get_temp::<WindowState>(state_id(node_id));
@@ -2829,7 +2829,7 @@ fn gyro_section(
                             }
                         }
                     }
-                    if ui.button(egui::RichText::new("reset").size(INSTRUCT_SIZE - 1.0)).clicked() {
+                    if ui.button(egui::RichText::new("reset").size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0))).clicked() {
                         if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                             n.params.remove("gyro_orient_matrix");
                         }
@@ -2846,7 +2846,7 @@ fn gyro_section(
                      or you have some IMU misalignment:\n\
                      do pure single-axis rotation per button, then solve")
                     .size(INSTRUCT_SIZE - 2.0)
-                    .color(Color32::from_gray(140)));
+                    .color(crate::settings::tinted_gray(140)));
             });
         });
 
@@ -2898,7 +2898,7 @@ fn gyro_section(
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(egui::RichText::new("Outlier spike filter")
-                    .size(INSTRUCT_SIZE).strong());
+                    .size(crate::settings::ui_size(INSTRUCT_SIZE)).strong());
                 if ui.checkbox(&mut enabled, "")
                     .on_hover_text("Suppress outlier spikes as reports arrive from the pad —\n\
                                     samples that jump off the local trajectory and snap straight\n\
@@ -2929,7 +2929,7 @@ fn gyro_section(
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.add_space(4.0);
                 ui.add_enabled_ui(enabled, |ui| {
-                    ui.label(egui::RichText::new("window").size(INSTRUCT_SIZE).weak());
+                    ui.label(egui::RichText::new("window").size(crate::settings::ui_size(INSTRUCT_SIZE)).weak());
                     for (w, label, hint) in [
                         (3_u8, "3", "Spikes one report long. Lowest latency: the 1 report the\n\
                                      filter always costs — 1 ms at 1000 Hz, 4 ms at 250 Hz,\n\
@@ -2965,7 +2965,7 @@ fn gyro_section(
                 map.insert(dev_id.to_string(), (enabled, sens, window));
             }
             if let Some((text, col)) = spike_line {
-                ui.label(egui::RichText::new(text).size(INSTRUCT_SIZE - 2.0).color(col));
+                ui.label(egui::RichText::new(text).size(crate::settings::ui_size(INSTRUCT_SIZE - 2.0)).color(col));
             }
 
             // Noise-floor deadzone row: zero out readings inside the measured
@@ -2986,7 +2986,7 @@ fn gyro_section(
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(egui::RichText::new("Noise-floor deadzone")
-                        .size(INSTRUCT_SIZE).strong());
+                        .size(crate::settings::ui_size(INSTRUCT_SIZE)).strong());
                     if ui.checkbox(&mut dz_on, "")
                         .on_hover_text("Zero gyro readings whose 3-axis magnitude stays inside the\n\
                                         measured noise band (kills orientation drift and lean bias\n\
@@ -3004,14 +3004,14 @@ fn gyro_section(
                             .changed() { dz_changed = true; }
                         if g_floor > 0.0 {
                             ui.label(egui::RichText::new(format!("±{}", fmt_dps(g_floor * dz_w)))
-                                .size(INSTRUCT_SIZE - 1.0).weak());
+                                .size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)).weak());
                         } else {
                             ui.label(egui::RichText::new("calibrate first")
-                                .size(INSTRUCT_SIZE - 1.0)
-                                .color(Color32::from_gray(120)));
+                                .size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0))
+                                .color(crate::settings::tinted_gray(120)));
                         }
                         if ui.checkbox(&mut dz_view,
-                            egui::RichText::new("view filtered").size(INSTRUCT_SIZE - 2.0))
+                            egui::RichText::new("view filtered").size(crate::settings::ui_size(INSTRUCT_SIZE - 2.0)))
                             .on_hover_text("Show the scope traces AFTER the deadzone (what the\n\
                                             engine outputs) instead of the raw readings.")
                             .changed() { dz_changed = true; }
@@ -3034,17 +3034,17 @@ fn gyro_section(
             let mut g_new = g_inv;
             let mut a_new = a_inv;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Invert axis").size(INSTRUCT_SIZE).strong());
+                ui.label(egui::RichText::new("Invert axis").size(crate::settings::ui_size(INSTRUCT_SIZE)).strong());
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Gyro:").size(INSTRUCT_SIZE).weak());
-                ui.checkbox(&mut g_new[0], egui::RichText::new("X").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut g_new[1], egui::RichText::new("Y").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut g_new[2], egui::RichText::new("Z").size(INSTRUCT_SIZE));
+                ui.label(egui::RichText::new("Gyro:").size(crate::settings::ui_size(INSTRUCT_SIZE)).weak());
+                ui.checkbox(&mut g_new[0], egui::RichText::new("X").size(crate::settings::ui_size(INSTRUCT_SIZE)));
+                ui.checkbox(&mut g_new[1], egui::RichText::new("Y").size(crate::settings::ui_size(INSTRUCT_SIZE)));
+                ui.checkbox(&mut g_new[2], egui::RichText::new("Z").size(crate::settings::ui_size(INSTRUCT_SIZE)));
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("Accel:").size(INSTRUCT_SIZE).weak());
-                ui.checkbox(&mut a_new[0], egui::RichText::new("X").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut a_new[1], egui::RichText::new("Y").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut a_new[2], egui::RichText::new("Z").size(INSTRUCT_SIZE));
+                ui.label(egui::RichText::new("Accel:").size(crate::settings::ui_size(INSTRUCT_SIZE)).weak());
+                ui.checkbox(&mut a_new[0], egui::RichText::new("X").size(crate::settings::ui_size(INSTRUCT_SIZE)));
+                ui.checkbox(&mut a_new[1], egui::RichText::new("Y").size(crate::settings::ui_size(INSTRUCT_SIZE)));
+                ui.checkbox(&mut a_new[2], egui::RichText::new("Z").size(crate::settings::ui_size(INSTRUCT_SIZE)));
             });
             if g_new != g_inv {
                 if let Some(n) = canvas.snarl.get_node_mut(node_id) {
@@ -3200,16 +3200,16 @@ fn click_plot(painter: &egui::Painter, area: egui::Rect, plot: Option<&ClickPlot
     let painter = painter.with_clip_rect(area);
     // Enlarged, the times get a strip of their own: a quiet line runs along the bottom.
     let rect = if zoomed { area.with_max_y(area.bottom() - 14.0) } else { area };
-    painter.rect_filled(rect, 2.0, Color32::from_gray(20));
+    painter.rect_filled(rect, 2.0, crate::settings::tinted_gray(20));
     let span = click_gate::SCOPE_BEFORE_MS + click_gate::SCOPE_AFTER_MS;
     let x = |ms: f32| rect.left() + (ms + click_gate::SCOPE_BEFORE_MS) / span * rect.width();
-    let font = egui::FontId::proportional(11.0);
+    let font = crate::settings::ui_font(11.0);
     let mut ms = 0.0;
     while ms < click_gate::SCOPE_AFTER_MS {
-        painter.vline(x(ms), rect.y_range(), Stroke::new(1.0_f32, Color32::from_gray(if ms == 0.0 { 60 } else { 38 })));
+        painter.vline(x(ms), rect.y_range(), Stroke::new(1.0_f32, crate::settings::tinted_gray(if ms == 0.0 { 60 } else { 38 })));
         if zoomed {
             painter.text(egui::pos2(x(ms), area.bottom()), egui::Align2::CENTER_BOTTOM,
-                format!("{ms:.0} ms"), font.clone(), Color32::from_gray(130));
+                format!("{ms:.0} ms"), font.clone(), crate::settings::tinted_gray(130));
         }
         ms += 50.0;
     }
@@ -3232,7 +3232,7 @@ fn click_plot(painter: &egui::Painter, area: egui::Rect, plot: Option<&ClickPlot
     }
     if zoomed {
         painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP,
-            fmt_dps(top), font, Color32::from_gray(170));
+            fmt_dps(top), font, crate::settings::tinted_gray(170));
     }
 }
 
@@ -3294,14 +3294,14 @@ fn click_jolt_row(
     let mut enabled = cfg.enabled;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(egui::RichText::new("Click-jolt filter").size(INSTRUCT_SIZE).strong());
+        ui.label(egui::RichText::new("Click-jolt filter").size(crate::settings::ui_size(INSTRUCT_SIZE)).strong());
         ui.checkbox(&mut enabled, "")
             .on_hover_text("For microswitches on the same board as the IMU, which knock\n\
                             the sensor every time they click. Holds the gyro and accel\n\
                             through the jolt of a press or release of the buttons you\n\
                             pick. It only acts on those clicks and delays nothing\n\
                             (unless you add look-ahead).");
-        if ui.selectable_label(open, egui::RichText::new("buttons…").size(INSTRUCT_SIZE - 1.0))
+        if ui.selectable_label(open, egui::RichText::new("buttons…").size(crate::settings::ui_size(INSTRUCT_SIZE - 1.0)))
             .on_hover_text("Pick the buttons, or press them and let it measure which\n\
                             ones jolt the gyro, and for how long.")
             .clicked()
@@ -3336,7 +3336,7 @@ fn click_jolt_row(
         };
         format!("{} · held up to {longest:.0} ms, {:.0} ms release{ahead}", names.join(", "), cfg.release_ms)
     };
-    ui.label(egui::RichText::new(summary).size(INSTRUCT_SIZE - 2.0).color(Color32::from_gray(140)));
+    ui.label(egui::RichText::new(summary).size(crate::settings::ui_size(INSTRUCT_SIZE - 2.0)).color(crate::settings::tinted_gray(140)));
     if enabled != cfg.enabled {
         cfg.enabled = enabled;
         write_click_gate(canvas, node_id, &cfg);
@@ -3617,8 +3617,8 @@ fn gyro_scope(
     );
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
+    painter.rect_filled(rect, 4.0, crate::settings::tinted_gray(15));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     // Read raw poll-rate samples directly from the I/O thread's scope-tap rings.
@@ -3775,7 +3775,7 @@ fn gyro_scope(
 
     // Gray crosshair guidelines: vertical zero line + two side rails at the
     // dynamic peak (1.0 magnitude) and a horizontal midline at half-window.
-    let guide = Color32::from_gray(55);
+    let guide = crate::settings::tinted_gray(55);
     painter.line_segment(
         [egui::pos2(center_x, scope_rect.top() + 4.0), egui::pos2(center_x, scope_rect.bottom() - 4.0)],
         Stroke::new(1.0_f32, guide),
@@ -3783,17 +3783,17 @@ fn gyro_scope(
     painter.line_segment(
         [egui::pos2(center_x - half_w * 0.5, scope_rect.top() + 4.0),
          egui::pos2(center_x - half_w * 0.5, scope_rect.bottom() - 4.0)],
-        Stroke::new(1.0_f32, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(38)),
     );
     painter.line_segment(
         [egui::pos2(center_x + half_w * 0.5, scope_rect.top() + 4.0),
          egui::pos2(center_x + half_w * 0.5, scope_rect.bottom() - 4.0)],
-        Stroke::new(1.0_f32, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(38)),
     );
     let mid_y = scope_rect.top() + scope_rect.height() * 0.5;
     painter.line_segment(
         [egui::pos2(scope_rect.left() + 8.0, mid_y), egui::pos2(scope_rect.right() - 8.0, mid_y)],
-        Stroke::new(1.0_f32, Color32::from_gray(38)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(38)),
     );
     // Active channel set. When the user skips accelerometer calibration the
     // accel rows are hidden entirely so the remaining gyro channels can
@@ -3817,8 +3817,8 @@ fn gyro_scope(
     // readout below.
     {
         let rail_txt = fmt_dps(display_peak * 0.5);
-        let rail_font = egui::FontId::proportional(10.0);
-        let rail_col = Color32::from_gray(90);
+        let rail_font = crate::settings::ui_font(10.0);
+        let rail_col = crate::settings::tinted_gray(90);
         for side in [-1.0_f32, 1.0] {
             painter.text(
                 egui::pos2(center_x + side * half_w * 0.5 + side * 4.0,
@@ -3937,7 +3937,7 @@ fn gyro_scope(
     // Channel chips inline on the left, peak readout in the middle, and a
     // clickable time-window indicator on the right that cycles 500 → 1000
     // → 5000 ms.
-    let legend_font  = egui::FontId::proportional(13.0);
+    let legend_font  = crate::settings::ui_font(13.0);
     let legend_y     = legend_rect.center().y;
 
     // Channel chips: small filled circle + label, packed left-to-right.
@@ -3984,7 +3984,7 @@ fn gyro_scope(
             txt
         },
         legend_font.clone(),
-        Color32::from_gray(170),
+        crate::settings::tinted_gray(170),
     );
 
     // Clickable time-window indicator on the right.
@@ -3992,7 +3992,7 @@ fn gyro_scope(
     let win_galley = painter.layout_no_wrap(
         win_text,
         legend_font.clone(),
-        Color32::from_gray(220),
+        crate::settings::tinted_gray(220),
     );
     let win_size = win_galley.size();
     let pad_x = 8.0;
@@ -4010,18 +4010,18 @@ fn gyro_scope(
         Sense::click(),
     );
     let bg = if win_resp.hovered() {
-        Color32::from_gray(45)
+        crate::settings::tinted_gray(45)
     } else {
-        Color32::from_gray(28)
+        crate::settings::tinted_gray(28)
     };
     let painter = ui.painter();
     painter.rect_filled(win_rect, 3.0, bg);
     painter.rect_stroke(
         win_rect, 3.0,
-        Stroke::new(1.0_f32, Color32::from_gray(70)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(70)),
         egui::epaint::StrokeKind::Inside,
     );
-    let text_color = if win_resp.hovered() { Color32::WHITE } else { Color32::from_gray(220) };
+    let text_color = if win_resp.hovered() { Color32::WHITE } else { crate::settings::tinted_gray(220) };
     painter.galley(
         egui::pos2(win_rect.center().x - win_size.x * 0.5,
                    win_rect.center().y - win_size.y * 0.5),
@@ -4045,11 +4045,11 @@ fn gyro_scope(
     let status = ui.ctx().data(|d| d.get_temp::<ExportStatus>(export_status_id(_node_id)));
     let recent = status.as_ref().is_some_and(|s| s.at.elapsed().as_secs_f32() < 3.0);
     let (label, label_col) = match &status {
-        Some(s) if s.busy => ("Saving…", Color32::from_gray(200)),
+        Some(s) if s.busy => ("Saving…", crate::settings::tinted_gray(200)),
         Some(ExportStatus { result: Some(Ok(_)), .. }) if recent => ("Saved", Color32::from_rgb(90, 200, 110)),
         Some(ExportStatus { result: Some(Err(_)), .. }) if recent => ("Failed", ORANGE),
-        _ if chip_x + 120.0 < win_rect.left() => ("Save image", Color32::from_gray(220)),
-        _ => ("PNG", Color32::from_gray(220)),
+        _ if chip_x + 120.0 < win_rect.left() => ("Save image", crate::settings::tinted_gray(220)),
+        _ => ("PNG", crate::settings::tinted_gray(220)),
     };
     let exp_galley = ui.painter().layout_no_wrap(label.to_string(), legend_font.clone(), label_col);
     let exp_size = exp_galley.size();
@@ -4059,8 +4059,8 @@ fn gyro_scope(
     );
     let exp_resp = ui.interact(exp_rect, ui.id().with(("scope_export_btn", _node_id)), Sense::click());
     let painter = ui.painter();
-    painter.rect_filled(exp_rect, 3.0, if exp_resp.hovered() { Color32::from_gray(45) } else { Color32::from_gray(28) });
-    painter.rect_stroke(exp_rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(70)), egui::epaint::StrokeKind::Inside);
+    painter.rect_filled(exp_rect, 3.0, if exp_resp.hovered() { crate::settings::tinted_gray(45) } else { crate::settings::tinted_gray(28) });
+    painter.rect_stroke(exp_rect, 3.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(70)), egui::epaint::StrokeKind::Inside);
     painter.galley(
         egui::pos2(exp_rect.center().x - exp_size.x * 0.5, exp_rect.center().y - exp_size.y * 0.5),
         exp_galley,
@@ -4302,7 +4302,7 @@ fn sticks_section(
             ui.horizontal_wrapped(|ui| {
                 let mut on = rb_on;
                 let toggled = ui.checkbox(&mut on, egui::RichText::new("Rebound filter")
-                    .size(INSTRUCT_SIZE).color(ORANGE))
+                    .size(crate::settings::ui_size(INSTRUCT_SIZE)).color(ORANGE))
                     .on_hover_text("A stick let go from a push springs back fast enough to overshoot\n\
                                     the centre — for a moment it reads as pushed the OTHER way. A flick\n\
                                     stick turns back, a stick → key mapping taps the opposite key.\n\n\
@@ -4405,7 +4405,7 @@ fn deadzone_row(ui: &mut egui::Ui, width: f32, dz: f32, side: &str) -> Option<f3
     let mut out = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let label = ui.label(egui::RichText::new("Deadzone").size(INSTRUCT_SIZE).color(ORANGE));
+        let label = ui.label(egui::RichText::new("Deadzone").size(crate::settings::ui_size(INSTRUCT_SIZE)).color(ORANGE));
         // The value box keeps its width; the slider takes what is left.
         let dv_w = 52.0;
         ui.spacing_mut().slider_width =
@@ -4729,23 +4729,23 @@ fn stick_scope(
 ) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(lo.cell_w, lo.cell_h), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
+    painter.rect_filled(rect, 4.0, crate::settings::tinted_gray(15));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     let center_p = rect.center();
     let r_outer = (rect.width().min(rect.height()) * 0.5) - 8.0;
 
     // Outer unit circle.
-    painter.circle_stroke(center_p, r_outer, Stroke::new(1.0_f32, Color32::from_gray(80)));
+    painter.circle_stroke(center_p, r_outer, Stroke::new(1.0_f32, crate::settings::tinted_gray(80)));
     // Crosshair through the center (no extra grid lines beyond this).
     painter.line_segment(
         [egui::pos2(rect.left() + 8.0, center_p.y), egui::pos2(rect.right() - 8.0, center_p.y)],
-        Stroke::new(1.0_f32, Color32::from_gray(45)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(45)),
     );
     painter.line_segment(
         [egui::pos2(center_p.x, rect.top() + 8.0), egui::pos2(center_p.x, rect.bottom() - 8.0)],
-        Stroke::new(1.0_f32, Color32::from_gray(45)),
+        Stroke::new(1.0_f32, crate::settings::tinted_gray(45)),
     );
     // Inner magnified region indicator (40% of outer = 10% deflection display).
     let r_inner_visible = r_outer * 0.4;
@@ -5184,13 +5184,13 @@ fn trigger_haptics_section(
                     + FX_ROW_GAP + ui.spacing().interact_size.y + 4.0 * (FX_ROW_H + 2.0 * FX_ROW_GAP);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(lo.cell_w, body_h + 12.0), Sense::hover());
                 let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-                painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
+                painter.rect_filled(rect, 4.0, crate::settings::tinted_gray(15));
+                painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(50)),
                     egui::epaint::StrokeKind::Inside);
                 // The trigger's name, lit while it is held.
                 let held = pins.iter().any(|p| read_float(live, dev_id, p) > 0.5);
                 painter.text(rect.right_top() + egui::vec2(-10.0, 6.0), egui::Align2::RIGHT_TOP, *label,
-                    egui::FontId::proportional(22.0), if held { ORANGE } else { Color32::from_gray(80) });
+                    crate::settings::ui_font(22.0), if held { ORANGE } else { crate::settings::tinted_gray(80) });
                 let body = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 6.0),
                     egui::vec2((lo.cell_w - 48.0).max(FX_MIN_W), body_h));
                 let mut edit = TriggerWidgetEdit::default();
@@ -5411,7 +5411,7 @@ fn trigger_click_checkbox(
         ClickActuator::Rumble => "FlexInput plays a pulse on the rumble motor of the trigger's side, \
             on top of the game's. A motor has no pitch, so only strength and length apply.",
     };
-    let toggled = ui.checkbox(on, egui::RichText::new("Trigger click").size(INSTRUCT_SIZE))
+    let toggled = ui.checkbox(on, egui::RichText::new("Trigger click").size(crate::settings::ui_size(INSTRUCT_SIZE)))
         .on_hover_text(hover)
         .changed();
     if toggled {
@@ -5694,7 +5694,7 @@ fn trigger_effect_controls(ui: &mut egui::Ui, rect: egui::Rect, label: &str, fx:
     ui.spacing_mut().item_spacing.y = FX_ROW_GAP;
 
     ui.add(egui::Label::new(egui::RichText::new("Default adaptive mode")
-        .small().color(Color32::from_gray(170))).truncate());
+        .small().color(crate::settings::tinted_gray(170))).truncate());
     let shown = TRIG_EFFECT_MODES.iter()
         .find(|(word, _)| fx.mode.eq_ignore_ascii_case(word))
         .map(|(_, name)| *name)
@@ -5727,7 +5727,7 @@ fn trigger_effect_controls(ui: &mut egui::Ui, rect: egui::Rect, label: &str, fx:
 
     let Some(params) = flexinput_engine::eval::jsm_effect_params(&fx.mode) else { return changed };
     if params.is_empty() {
-        ui.label(egui::RichText::new("Left to the game").small().color(Color32::from_gray(120)));
+        ui.label(egui::RichText::new("Left to the game").small().color(crate::settings::tinted_gray(120)));
         return changed;
     }
     if fx.values.len() != params.len() {
@@ -5783,19 +5783,19 @@ fn fader_input(ui: &mut egui::Ui, width: f32) -> (egui::Rect, egui::Response, Op
 fn fader_paint(ui: &egui::Ui, rect: egui::Rect, resp: &egui::Response, name: &str, t: f32, value: &str) {
     let active = resp.hovered() || resp.dragged();
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Color32::from_gray(if active { 34 } else { 26 }));
+    painter.rect_filled(rect, 3.0, crate::settings::tinted_gray(if active { 34 } else { 26 }));
     if t > 0.0 {
         let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * t.min(1.0), rect.bottom()));
         painter.rect_filled(fill, 3.0, Color32::from_rgb(52, 92, 128));
     }
-    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, Color32::from_gray(if active { 80 } else { 50 })),
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(if active { 80 } else { 50 })),
         egui::epaint::StrokeKind::Inside);
-    let font = egui::FontId::proportional(11.5);
+    let font = crate::settings::ui_font(11.5);
     let dim = !ui.is_enabled();
     painter.text(egui::pos2(rect.left() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER,
-        name, font.clone(), Color32::from_gray(if dim { 110 } else { 200 }));
+        name, font.clone(), crate::settings::tinted_gray(if dim { 110 } else { 200 }));
     painter.text(egui::pos2(rect.right() - 6.0, rect.center().y), egui::Align2::RIGHT_CENTER,
-        value, font, if dim { Color32::from_gray(130) } else { Color32::WHITE });
+        value, font, if dim { crate::settings::tinted_gray(130) } else { Color32::WHITE });
 }
 
 /// A number on a fader of the effect faders' kind: `log` spaces it by ratio,
@@ -5905,8 +5905,8 @@ fn trigger_widget(
     // controls never move them.
     let resp = ui.interact(arc_rect, ui.id().with(("trig_arc", label)), Sense::click_and_drag());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, Color32::from_gray(15));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_gray(50)),
+    painter.rect_filled(rect, 4.0, crate::settings::tinted_gray(15));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, crate::settings::tinted_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     let start = -std::f32::consts::FRAC_PI_2;
@@ -5934,8 +5934,8 @@ fn trigger_widget(
         sil.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(glyph_size),
-        Color32::from_gray(80),
+        crate::settings::ui_font(glyph_size),
+        crate::settings::tinted_gray(80),
     );
 
     // Each mark in raw travel. The digital and click points live on the range.
@@ -5951,7 +5951,7 @@ fn trigger_widget(
     // The track, discarded travel tinted red, each point's band faint in its
     // colour, then the live fill over it.
     arc_stroke(painter, c, r, angle(0.0), angle(mn), w, TRACK_DISCARDED);
-    arc_stroke(painter, c, r, angle(mn), angle(mx), w, Color32::from_gray(44));
+    arc_stroke(painter, c, r, angle(mn), angle(mx), w, crate::settings::tinted_gray(44));
     arc_stroke(painter, c, r, angle(mx), angle(1.0), w, TRACK_DISCARDED);
     let band = |point: f32, color: Color32| {
         let (lo, hi) = automap::trigger_band(point, automap::trigger_band_width(hysteresis, (mn, mx)));
@@ -5968,13 +5968,13 @@ fn trigger_widget(
     // in the rare box too small for both, the line alone.
     let mid = angle(ARC_MIDPOINT_TRAVEL);
     let inner = r - w * 0.5;
-    let font = egui::FontId::proportional((r_in * 0.22).clamp(10.0, 12.0));
-    let galley = painter.layout_no_wrap(format!("{:.0}%", ARC_MIDPOINT_TRAVEL * 100.0), font, Color32::from_gray(140));
+    let font = crate::settings::ui_font((r_in * 0.22).clamp(10.0, 12.0));
+    let galley = painter.layout_no_wrap(format!("{:.0}%", ARC_MIDPOINT_TRAVEL * 100.0), font, crate::settings::tinted_gray(140));
     let at = polar(c, inner - 4.0, mid) - galley.size();
     let from = if at.x >= sil.right() { at.x } else { inner + cx - 8.0 };
-    painter.line_segment([egui::pos2(from, cy), polar(c, inner, mid)], Stroke::new(1.0_f32, Color32::from_gray(110)));
+    painter.line_segment([egui::pos2(from, cy), polar(c, inner, mid)], Stroke::new(1.0_f32, crate::settings::tinted_gray(110)));
     if at.x >= sil.right() {
-        painter.galley(at, galley, Color32::from_gray(140));
+        painter.galley(at, galley, crate::settings::tinted_gray(140));
     }
 
     let flag_min = trigger_flag(painter, c, r, w, angle(mn), -1.0);
@@ -6153,7 +6153,7 @@ fn trigger_pin(painter: &egui::Painter, center: Pos2, r: f32, w: f32, a: f32, re
     let head = polar(center, r + w * 0.5 + reach, a);
     painter.line_segment([polar(center, r - w * 0.5, a), head], Stroke::new(2.0_f32, color));
     painter.circle_filled(head, 4.5, color);
-    painter.circle_stroke(head, 4.5, Stroke::new(1.0_f32, Color32::from_gray(30)));
+    painter.circle_stroke(head, 4.5, Stroke::new(1.0_f32, crate::settings::tinted_gray(30)));
     head
 }
 

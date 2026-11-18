@@ -418,14 +418,14 @@ down — so a sign error fails a test instead of shipping.
 
 ### Gravity, and the four things measured against it
 
-JSM asks its motion library for a fused gravity estimate; our bus carries raw
-sensors, so gravity here is a low-passed accelerometer direction, the way Gyro
-3DOF already does it. Gravity is the only *sustained* acceleration a hand-held pad
-sees, so the filter settles onto "down" while a shake averages out — and the lag
-is the point, since the question is "how is this being held?", not "what is it
-doing this instant?". `GRAVITY_TAU` is 0.5 s. A pad reporting no accelerometer at
-all reads as *don't know*, not as *flat*: the difference between a motion stick
-that rests and one that runs to an edge.
+JSM asks its motion library (GamepadMotionHelpers) for a fused gravity estimate,
+and so does this: `eval/modules/gravity.rs` is that estimate step for step. The
+gyro carries gravity through every turn as it happens, and the accelerometer
+pulls it in - quickly while the pad is still, slowly while it is shaken, barely
+once it is close unless the pad is turning. (A low-passed accelerometer, 0.5 s
+behind, was here first: it read a quick tilt as the pad still held the old way.)
+A pad reporting no accelerometer at all reads as *don't know*, not as *flat*: the
+difference between a motion stick that rests and one that runs to an edge.
 
 - **The motion stick** is how far gravity has swung from straight down, with a
   half-turn reaching full deflection. `MOTION_DEADZONE_INNER` / `_OUTER` are in

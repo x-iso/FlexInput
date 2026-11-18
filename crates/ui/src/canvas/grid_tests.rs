@@ -3409,6 +3409,62 @@ fn every_port_strip_is_level_with_its_socket() {
 }
 
 #[test]
+fn the_automap_splitter_and_collector_ports_sit_on_their_sockets() {
+    // They were a list flowing down the body under the sockets, each socket with its own small
+    // name beside it: the rows and the sockets they named drifted apart, and the name was said
+    // twice. Now they are strips like a Split's: the bus pin's row holds `add pin`, each port
+    // is on its own socket's row, and the socket carries no word.
+    for (module, side, param_key) in [
+        ("module.automap_split", "out", "output_pin_ids"),
+        ("module.automap_collect", "in", "collect_input_pin_ids"),
+    ] {
+        for snapped in [false, true] {
+            for ports in [2usize, 5] {
+                let at = [egui::pos2(100.0, 300.0)];
+                let (mut rig, ids) = if snapped { Rig::real(module, &at) } else { Rig::real_no_snap(module, &at) };
+                let node = ids[0];
+                let names = ["Left Stick", "Right Stick", "South", "East", "West"];
+                let keys = ["left_stick", "right_stick", "south", "east", "west"];
+                if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+                    let mut id_list: Vec<serde_json::Value> = Vec::new();
+                    if side == "out" {
+                        id_list.push(serde_json::Value::String("automap_pass".into()));
+                    }
+                    for k in 0..ports {
+                        if side == "out" {
+                            n.outputs.push(PinDescriptor::new(names[k], SignalType::Any));
+                        } else {
+                            n.inputs.push(PinDescriptor::new(names[k], SignalType::Any));
+                        }
+                        id_list.push(serde_json::Value::String(keys[k].into()));
+                    }
+                    n.params.insert(param_key.into(), serde_json::Value::Array(id_list));
+                }
+                rig.idle(8);
+                let frame = rig.frame_rect(node);
+                for i in 0..ports {
+                    let strip = rig.traced(node, &format!("strip_{i}"));
+                    let socket = rig.traced(node, &format!("pin_row_{side}_{}", i + 1));
+                    assert!(
+                        (strip.center().y - socket.center().y).abs() <= 1.0,
+                        "{module} ({ports} ports, snapped {snapped}): row {i} {strip:?} is not level with its socket's row {socket:?}",
+                    );
+                    assert!(
+                        frame.contains_rect(strip.expand(-0.5)),
+                        "{module} ({ports} ports, snapped {snapped}): row {i} {strip:?} is outside the frame {frame:?}",
+                    );
+                }
+                // No word beside the sockets: the strips say the names, once each.
+                for name in ["Left Stick", "Right Stick"] {
+                    let times = rig.painted_all(name).into_iter().filter(|(t, _)| t == name).count();
+                    assert_eq!(times, 1, "{module}: \"{name}\" painted {times} times - on its strip and again by its socket?");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_macro_port_name_stays_in_the_cell_it_was_given() {
     // The name used to be a text field open in every row, and an open field lays its text out
     // at whatever width the text wants: a port called "Right Trigger, half pressed" painted
@@ -4431,8 +4487,27 @@ fn shoot_modules() {
     // With the fonts the app draws with: egui's own have no arrows, grips or crosses, and a
     // picture full of boxes where those go says nothing about how the module looks.
     fn pictured(id: &'static str, at: &[egui::Pos2]) -> (Rig, Vec<NodeId>) {
+        // The control font is global: back to the plain one before a new rig draws its first
+        // frame, or a bold one set for the last picture names a family this rig's fonts don't
+        // have yet.
+        crate::canvas::viewer::simple_bodies::set_control_font(false, false, 15.0);
         let (mut rig, ids) = Rig::real(id, at);
         crate::app::fonts::setup_fonts(&rig.ctx);
+        // `SHOOT_FONT=console,bold,18` draws the controls in that control font (Settings →
+        // Display) - the face, the weight, the size.
+        if let Ok(f) = std::env::var("SHOOT_FONT") {
+            let parts: Vec<&str> = f.split(',').collect();
+            let size = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(15.0);
+            crate::canvas::viewer::simple_bodies::set_control_font(parts.contains(&"console"), parts.contains(&"bold"), size);
+            rig.idle(2);
+            crate::canvas::viewer::simple_bodies::calibrate_control_fonts(&rig.ctx);
+            let mut style = (*rig.ctx.style()).clone();
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                crate::canvas::viewer::simple_bodies::control_font_at(size.min(crate::canvas::viewer::simple_bodies::CONTROL_FONT_MAX_PX)),
+            );
+            rig.ctx.set_style(style);
+        }
         // A screen with room under the node: the rig's own shows 500 graph points, and a
         // scope or a curve is taller than what that leaves below where it is put.
         rig.screen = egui::vec2(3200.0, 2800.0);
@@ -4467,6 +4542,28 @@ fn shoot_modules() {
             }
             if let Some(n) = std::env::var("SHOOT_OUTPUTS").ok().and_then(|n| n.parse().ok()) {
                 rig.set_outputs(ids[0], n);
+            }
+            // `SHOOT_PINS=left_stick:Left Stick,south:South` - the ports an AutoMap Splitter or
+            // Collector takes off its bus, by pin id and name.
+            if let (Ok(pins), true) = (
+                std::env::var("SHOOT_PINS"),
+                matches!(id, "module.automap_split" | "module.automap_collect"),
+            ) {
+                let split = id == "module.automap_split";
+                if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+                    let mut id_list: Vec<serde_json::Value> = Vec::new();
+                    if split {
+                        id_list.push(serde_json::Value::String("automap_pass".into()));
+                    }
+                    for p in pins.split(',') {
+                        let (key, name) = p.split_once(':').unwrap_or((p, p));
+                        let desc = PinDescriptor::new(name.trim(), SignalType::Any);
+                        if split { n.outputs.push(desc) } else { n.inputs.push(desc) }
+                        id_list.push(serde_json::Value::String(key.trim().into()));
+                    }
+                    let key = if split { "output_pin_ids" } else { "collect_input_pin_ids" };
+                    n.params.insert(key.into(), serde_json::Value::Array(id_list));
+                }
             }
             // A 3DOF module with no Orientation reading draws the emptiest picture it can:
             // give it a pose and the outputs that go with it, so the viewport can be looked
@@ -4583,6 +4680,33 @@ fn a_3dof_mode_row_answers_a_click_in_the_module() {
     assert_eq!(p("axis").as_deref(), Some("world"));
 }
 
+// The Area Mapper, Touch Zones and Virtual Menu bodies draw their settings as joined pills
+// (`curve_rows::segmented`) where they had checkboxes and selectable words: with two of each
+// on one canvas, a click on either module's pill sets that module, and only that one.
+#[test]
+fn the_zone_modules_pills_answer_a_click_each_in_their_own_module() {
+    let cases: [(&str, &str, &str, usize, &str); 3] = [
+        ("module.area_mapper", "area_shape_seg", "area_shape", 1, "rect"),
+        ("module.touch_zones", "tz_mode_seg", "zone_mode", 1, "mapping"),
+        ("module.menu", "vm_mode_seg", "zone_mode", 0, "ports"),
+    ];
+    for (module, salt, key, cell_i, want) in cases {
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 120.0), egui::pos2(1500.0, 120.0)]);
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        rig.idle(8);
+        for (k, &node) in ids.iter().enumerate() {
+            let id = egui::Id::new(("segmented", (salt, node.0), cell_i));
+            let cell = rig.ctx.read_response(id).unwrap_or_else(|| panic!("{module}: node {k}'s {salt} wasn't drawn")).rect;
+            rig.click(cell.center());
+            let p = |rig: &Rig, n: egui_snarl::NodeId| rig.canvas.snarl.get_node(n).and_then(|n| n.params.get(key).and_then(|v| v.as_str()).map(str::to_string));
+            assert_eq!(p(&rig, node).as_deref(), Some(want), "{module}: node {k}'s click didn't land (cell {cell:?})");
+            if k == 0 {
+                assert_ne!(p(&rig, ids[1]).as_deref(), Some(want), "{module}: the click on one module set the other too");
+            }
+        }
+    }
+}
+
 // Two of them on one canvas: each one's rows are its own. The rows' ids were the same for
 // every 3DOF, so with two on the canvas a click on one went nowhere.
 #[test]
@@ -4598,4 +4722,319 @@ fn two_3dof_modules_each_answer_their_own_mode_rows() {
         let fam = rig.canvas.snarl.get_node(node).and_then(|n| n.params.get("family").and_then(|v| v.as_str()).map(str::to_string));
         assert_eq!(fam.as_deref(), Some("steering"), "node {node:?}: the click didn't land");
     }
+}
+
+// A Two-Way curve's rows pinned on a sub-patch's layout answer there as they do on the
+// overlay: the lane toggle, clicked on the layout, sets the lane of the curve inside the
+// sub-patch - for the plain curve and the AutoMap one, in either pin style.
+#[test]
+fn a_two_way_curves_pinned_rows_answer_on_a_sub_patch_layout() {
+    for module in ["module.twoway_response_curve", "module.automap_twoway_response_curve"] {
+        for style in [1u8, 2] {
+            let (mut rig, ids) = Rig::with_pins("subpatch", &[], &[], &[egui::pos2(100.0, 120.0)]);
+            rig.screen = egui::vec2(3200.0, 2800.0);
+            let host = ids[0];
+            let desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == module)
+                .expect("registered");
+            let mut inner: Snarl<NodeData> = Snarl::new();
+            // A sub-patch's nodes are numbered on their own: the curve inside has the same
+            // id as a curve of the same kind on the tab canvas beside the sub-patch. Each
+            // draws its rows; the pinned one's are still its own.
+            inner.insert_node(egui::pos2(-500.0, 0.0), NodeData::from(&ModuleDescriptor {
+                id: "test.module", display_name: "Test", category: "Test", inputs: vec![], outputs: vec![],
+            }));
+            let inner_id = inner.insert_node(egui::Pos2::ZERO, NodeData::from(&desc));
+            let beside = rig.canvas.snarl.insert_node(egui::pos2(1400.0, 120.0), NodeData::from(&desc));
+            assert_eq!(beside, inner_id, "the test needs the two ids equal");
+            let mut sp = crate::canvas::node::UiSubPatch::default();
+            sp.snarl = Box::new(inner);
+            // The layout this was found on: the graph, and its rows packed under it.
+            let pins: [(&str, [f32; 2], [f32; 2]); 8] = [
+                ("curve", [8.0, 392.0], [296.0, 232.0]),
+                ("lane_toggle", [8.0, 656.0], [140.0, 18.0]),
+                ("scale_row", [8.0, 628.0], [296.0, 20.0]),
+                ("hyst_row", [8.0, 680.0], [224.0, 20.7]),
+                ("interp_row", [8.0, 728.0], [296.0, 18.0]),
+                ("range_row", [152.0, 656.0], [152.0, 18.0]),
+                ("grid_row", [8.0, 704.0], [296.0, 20.0]),
+                ("grid_options_row", [176.0, 760.0], [128.0, 18.0]),
+            ];
+            for (element, pos, size) in pins {
+                let pin: crate::canvas::node::ExposedModule = serde_json::from_str(&format!(
+                    r#"{{"inner_node_id":{},"element_id":"{element}","pos":[{},{}],"size":[{},{}],"pin_style":{style}}}"#,
+                    inner_id.0, pos[0], pos[1], size[0], size[1],
+                ))
+                .expect("a pin");
+                sp.items.push(crate::canvas::node::LayoutItem::Module(pin));
+            }
+            rig.canvas.snarl.get_node_mut(host).expect("host").subpatch = Some(Box::new(sp));
+            rig.idle(10);
+            // egui's own warning, painted where two widgets of one pass share an id: the
+            // second takes the clicks meant for the first.
+            let clashes = rig.painted_all("🔥");
+            assert!(clashes.is_empty(), "{module} style {style}: widgets share ids: {clashes:?}");
+            let lane = |rig: &Rig| {
+                rig.canvas.snarl.get_node(host)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| sp.snarl.get_node(inner_id))
+                    .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()).map(str::to_string))
+            };
+            let target = if style == 2 {
+                rig.ctx
+                    .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, 0usize), 1usize)))
+                    .map(|r| r.rect.center())
+            } else {
+                rig.painted_text("↓ Down").map(|(_, r)| r.center())
+            };
+            let at = target.unwrap_or_else(|| panic!("{module} style {style}: the lane toggle wasn't drawn"));
+            rig.click(at);
+            assert_eq!(lane(&rig).as_deref(), Some("dn"), "{module} style {style}: the click at {at:?} on the layout didn't set the lane");
+            if style == 2 {
+                continue;
+            }
+            // The Snap switch of the pinned scale row: the curve beside it has one with the
+            // same node id.
+            let frame = rig.frame_rect(host);
+            let snap_at = rig
+                .painted_all("Snap")
+                .into_iter()
+                .chain(rig.painted_all("snap"))
+                .map(|(_, r)| r)
+                .find(|r| frame.contains(r.center()))
+                .unwrap_or_else(|| panic!("{module} style {style}: no Snap on the layout: {:?}", rig.painted_all("").into_iter().filter(|(_, r)| frame.contains(r.center())).collect::<Vec<_>>()))
+                .center();
+            let snap = |rig: &Rig, sp: bool| {
+                let n = if sp {
+                    rig.canvas.snarl.get_node(host).and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner_id))
+                } else {
+                    rig.canvas.snarl.get_node(beside)
+                };
+                n.and_then(|n| n.params.get("snap").and_then(|v| v.as_bool())).unwrap_or(false)
+            };
+            rig.click(snap_at);
+            assert!(snap(&rig, true), "{module} style {style}: the pinned Snap at {snap_at:?} didn't answer");
+            assert!(!snap(&rig, false), "{module} style {style}: the pinned Snap switched the curve beside the sub-patch");
+        }
+    }
+}
+
+// The Combiner's Resolution tree, open on a category, at a large control font: the module
+// keeps its width. Its rows put their dropdowns against the edge the port strips end at,
+// and that edge followed the frame - a dropdown a little wider than it said (its text past
+// what fits at the font) ended past it, the frame grew to hold it, the edge moved out with
+// the frame, and the row went past it again, every frame, without end.
+#[test]
+fn the_combiners_resolution_tree_keeps_the_modules_width() {
+    // The dropdowns' text is the Button style, which follows the control font's size: set
+    // here on this rig's own context - the control font itself is the whole process's, and
+    // changing it would change it under every other test running beside this one.
+    for size in [15.0f32, 24.0] {
+        let (mut rig, ids) = Rig::real("module.automap_combiner", &[egui::pos2(100.0, 150.0)]);
+        crate::app::fonts::setup_fonts(&rig.ctx);
+        rig.idle(2);
+        let mut style = (*rig.ctx.style()).clone();
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(size));
+        rig.ctx.set_style(style);
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        let node = ids[0];
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            n.params.insert(
+                "combiner_pin_policy".into(),
+                serde_json::json!({ "btn_south": "OR", "left_stick": "ADD", "gyro_x": "ADD", "mouse_move": "ADD" }),
+            );
+        }
+        rig.idle(8);
+        let head = rig.traced(node, "combiner_resolution");
+        rig.click(head.center());
+        for cat in ["Sticks", "Buttons", "Motion", "KB/M"] {
+            let at = rig
+                .painted_text(cat)
+                .unwrap_or_else(|| panic!("at {size}: no {cat} under Resolution"))
+                .1
+                .center();
+            rig.click(at);
+        }
+        rig.idle(6);
+        let settled = rig.frame_rect(node).width();
+        rig.idle(30);
+        let later = rig.frame_rect(node).width();
+        assert!(
+            (later - settled).abs() < 0.5,
+            "at {size}: the Combiner went from {settled} wide to {later} in thirty frames",
+        );
+    }
+}
+
+// The SVG module is a picture its corner grip sizes, down to its header's controls: it
+// wouldn't come smaller than where it opened, and its name was laid out beside the buttons,
+// so a renamed module was as wide as its name. The name is painted in the room the controls
+// leave, cut with dots, as every other module's.
+#[test]
+fn the_svg_module_shrinks_to_its_controls_and_cuts_its_name() {
+    let (mut rig, ids) = Rig::real("module.svg", &[egui::pos2(100.0, 150.0)]);
+    let node = ids[0];
+    if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+        n.params.insert(
+            "svg_data".into(),
+            serde_json::json!(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 20"><rect width="10" height="20" fill="#fff"/></svg>"##),
+        );
+        n.display_name = "A picture with a long name nobody would cut by hand".into();
+    }
+    rig.idle(8);
+    let open = rig.frame_rect(node);
+    rig.drag(open.max - egui::vec2(3.0, 3.0), egui::vec2(-600.0, -600.0));
+    rig.idle(4);
+    let small = rig.frame_rect(node);
+    let ctrl = rig.traced(node, "header_ctrl");
+    assert!(small.width() < open.width(), "the grip didn't narrow it: {open:?} -> {small:?}");
+    assert!(small.height() < open.height(), "the grip didn't shorten it: {open:?} -> {small:?}");
+    assert!(
+        small.width() <= ctrl.width() + 4.0 * B,
+        "at its narrowest it is {} wide for {} of controls",
+        small.width(),
+        ctrl.width(),
+    );
+    assert!(small.contains_rect(ctrl), "the controls {ctrl:?} are outside the frame {small:?}");
+    // The name didn't hold it open: what is painted of it ends before the controls.
+    if let Some((t, r)) = rig.painted_text("A picture") {
+        assert!(r.right() <= ctrl.left() + 1.0, "the name {t:?} at {r:?} runs under the controls {ctrl:?}");
+    }
+}
+
+#[cfg(test)]
+fn midi_rig(source: bool, automap_first: bool) -> (Rig, NodeId) {
+    let (mut rig, _) = Rig::new(&[]);
+    let mut pins = vec![
+        PinDescriptor::new("CC 7", SignalType::Float),
+        PinDescriptor::new("Note C4", SignalType::Bool),
+        PinDescriptor::new("Pitch bend", SignalType::Float),
+    ];
+    let mut ids = vec![
+        serde_json::json!("midi:cc:1:7"),
+        serde_json::json!("midi:note:1:60"),
+        serde_json::json!("midi:pb:1"),
+    ];
+    let am = PinDescriptor::new("Auto-Map", SignalType::AutoMap);
+    let am_id = serde_json::json!(if source { "automap_out" } else { "automap_in" });
+    if automap_first {
+        pins.insert(0, am);
+        ids.insert(0, am_id);
+    } else {
+        pins.push(am);
+        ids.push(am_id);
+    }
+    let mut params = std::collections::HashMap::new();
+    params.insert("device_id".to_string(), serde_json::json!(if source { "midi_in:0" } else { "midi_out:0" }));
+    params.insert(if source { "output_pin_ids" } else { "input_pin_ids" }.to_string(), serde_json::Value::Array(ids));
+    let node = NodeData {
+        module_id: if source { "device.source" } else { "device.sink" }.to_string(),
+        display_name: if source { "MIDI In" } else { "MIDI Out" }.to_string(),
+        category: "Device".to_string(),
+        inputs: if source { vec![] } else { pins.clone() },
+        outputs: if source { pins } else { vec![] },
+        params,
+        subpatch: None,
+        extra: Default::default(),
+    };
+    let id = rig.canvas.snarl.insert_node(egui::pos2(100.0, 150.0), node);
+    rig.idle(8);
+    (rig, id)
+}
+
+// A MIDI port's messages are strips on their sockets' rows, as the AutoMap Collector's
+// ports are, with no second name beside the sockets: on a node made since (its Auto-Map port
+// first) and on one migrated (last).
+#[test]
+fn a_midi_ports_messages_sit_on_their_sockets() {
+    for source in [true, false] {
+        for am_first in [true, false] {
+            let (rig, id) = midi_rig(source, am_first);
+            let side = if source { "out" } else { "in" };
+            for k in 0..3 {
+                let strip = rig.traced(id, &format!("strip_{k}"));
+                let pin = if am_first { k + 1 } else { k };
+                let socket = rig.traced(id, &format!("pin_row_{side}_{pin}"));
+                assert!(
+                    (strip.center().y - socket.center().y).abs() <= 1.0,
+                    "MIDI {} (Auto-Map first {am_first}): message {k} {strip:?} is off its socket {socket:?}",
+                    if source { "In" } else { "Out" },
+                );
+            }
+            let times = rig.painted_all("CC 7").len();
+            assert_eq!(times, 1, "the message's name is painted {times} times - on its strip and by its socket?");
+        }
+    }
+}
+
+// Dragging the Log/Exp slider moves a curve's points with the new scale (so the response
+// they stand for holds): on a Two-way curve's lanes as on a Response Curve's.
+#[test]
+fn the_log_exp_slider_rescales_every_curves_points() {
+    for module in ["module.response_curve", "module.twoway_response_curve", "module.automap_twoway_response_curve"] {
+        let (mut rig, ids) = Rig::real(module, &[egui::pos2(100.0, 150.0)]);
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        let node = ids[0];
+        if let Some(n) = rig.canvas.snarl.get_node_mut(node) {
+            for k in ["points", "points_dn"] {
+                n.params.insert(k.into(), serde_json::json!([[0.0, 0.0], [0.5, 0.2], [1.0, 1.0]]));
+            }
+            n.params.insert("biases".into(), serde_json::json!([0.0, 0.0]));
+            n.params.insert("biases_dn".into(), serde_json::json!([0.0, 0.0]));
+            n.params.insert("scale_t".into(), serde_json::json!(0.0));
+        }
+        rig.idle(8);
+        let slider = rig
+            .ctx
+            .memory(|_| ())
+            .eq(&())
+            .then(|| {
+                // The slider's knob is in the middle of its track at 0.
+                let (_, log) = rig.painted_text("Log").expect("Log");
+                let (_, exp) = rig.painted_text("Exp").expect("Exp");
+                egui::pos2((log.right() + exp.left()) * 0.5, log.center().y)
+            })
+            .unwrap();
+        rig.drag(slider, egui::vec2(40.0, 0.0));
+        let n = rig.canvas.snarl.get_node(node).unwrap();
+        let t = n.params.get("scale_t").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert!(t.abs() > 0.05, "{module}: the drag didn't move the slider ({t})");
+        for k in ["points", "points_dn"] {
+            if module == "module.response_curve" && k == "points_dn" {
+                continue;
+            }
+            let x = n.params[k][1][0].as_f64().unwrap();
+            assert!((x - 0.5).abs() > 0.01, "{module}: {k}'s middle point stayed at {x} under scale {t}");
+        }
+    }
+}
+
+// 3DOF to 2D's Lean lists each scroll in a window of their own: with Lean Left's height
+// set, more cards in it scroll there, and neither the module nor Lean Right under it moves.
+// The two lists shared one scroll, and the first one's cards pushed the second out of view.
+#[test]
+fn a_lean_lists_cards_scroll_in_their_own_window() {
+    let mut heights = Vec::new();
+    for n in [2usize, 8] {
+        let (mut rig, ids) = Rig::real("processing.gyro_3dof", &[egui::pos2(100.0, 120.0)]);
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        let node = ids[0];
+        if let Some(nd) = rig.canvas.snarl.get_node_mut(node) {
+            let cards: Vec<serde_json::Value> = (0..n).map(|k| serde_json::json!({ "out": [format!("key_{}", (b'a' + k as u8) as char)] })).collect();
+            nd.params.insert("lean_left".into(), serde_json::Value::Array(cards));
+            nd.params.insert("lean_right".into(), serde_json::json!([{ "out": ["key_z"] }]));
+            nd.params.insert("lean_l_h".into(), serde_json::json!(170.0));
+        }
+        rig.idle(12);
+        let frame = rig.frame_rect(node);
+        let (_, right) = rig.painted_text("Lean Right").expect("Lean Right's title is drawn");
+        assert!(frame.contains_rect(right), "{n} cards: Lean Right {right:?} is out of the frame {frame:?}");
+        heights.push((frame.height(), right.top()));
+    }
+    assert!(
+        (heights[0].0 - heights[1].0).abs() < 0.5 && (heights[0].1 - heights[1].1).abs() < 0.5,
+        "more cards in Lean Left moved the module or Lean Right: {heights:?}",
+    );
 }

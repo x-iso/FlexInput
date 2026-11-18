@@ -3,13 +3,13 @@
 //!
 //! ## Where gravity comes from
 //!
-//! JSM asks its motion library for a fused gravity estimate. Our bus carries only
-//! raw accelerometer and gyro, so gravity is estimated the way the Gyro 3DOF
-//! module already does it: low-pass the accelerometer direction. Gravity is the
-//! only *sustained* acceleration a hand-held pad sees, so a slow filter settles
-//! onto "down" in the pad's own frame while a shake or a flick averages out. The
-//! lag is the point — it answers "how is this being held?", not "what is it doing
-//! this instant?".
+//! JSM asks its motion library, GamepadMotionHelpers, for a fused gravity
+//! estimate, and so does this: [`GravityFusion`] is that estimate step for step.
+//! The gyro carries gravity through every turn as it happens; the accelerometer
+//! only pulls it in, slower while the pad is shaken. (This low-passed the
+//! accelerometer once, half a second behind, which read a quick tilt as the pad
+//! still held the old way - the split between turning and leaning came apart
+//! exactly when it moved.)
 //!
 //! ## Which way round the axes go
 //!
@@ -47,12 +47,7 @@
 use glam::Vec3;
 
 use super::analog::{Orientation, StickCfg};
-
-/// How long the gravity estimate takes to settle, in seconds. The Gyro 3DOF
-/// module uses 1-3 s depending on how world-anchored its mode wants to feel; the
-/// motion stick wants to follow a deliberate tilt without chasing a flick, and
-/// 0.5 s is the compromise JSM's own fused estimate feels closest to.
-const GRAVITY_TAU: f32 = 0.5;
+use crate::eval::modules::{GravityFusion, OrientCamera};
 
 /// JSM's gyro spaces. The first is phase 3's; the rest are measured against
 /// gravity and are what this file adds.
@@ -71,6 +66,10 @@ pub enum Space {
     /// `YAW_PLUS_ROLL`, from the custom-curve fork: pitch on the vertical and yaw
     /// with a share of roll mixed in. Needs no gravity — see `cc.rs`.
     YawPlusRoll,
+    /// `ORIENT`, FlexInput's own: the camera follows where the pad's nose points
+    /// - how fast its heading and its elevation change, so added up they land
+    /// where it points whatever path it took. The same as 3DOF to 2D's Orient.
+    Orient,
 }
 
 impl Space {
@@ -109,10 +108,10 @@ impl Default for Settings {
 /// The motion side's running state.
 #[derive(Default)]
 pub struct Motion {
-    /// Low-passed accelerometer direction, in our bus's accel basis.
-    smoothed: Vec3,
-    /// Set once the filter has something to say.
-    settled: bool,
+    /// Which way is down, as JSM's motion library keeps it.
+    gravity: GravityFusion,
+    /// `ORIENT`: the camera kept looking where the nose points.
+    camera: OrientCamera,
     /// The orientation `SET_MOTION_STICK_NEUTRAL` captured, as a rotation that
     /// takes the captured "down" back to straight down in JSM's frame.
     neutral: Option<glam::Quat>,
@@ -121,6 +120,9 @@ pub struct Motion {
 /// Gravity for one tick, in JSM's frame, already normalised.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Gravity {
+    /// `ORIENT`: how fast the camera's heading (right +) and pitch (up +) are
+    /// turning to follow the nose, deg/s (`OrientCamera`).
+    pub orient: glam::Vec2,
     pub v: Vec3,
     /// False until the filter has seen any accelerometer reading at all, so a pad
     /// with no accelerometer reads as "no idea which way is down" rather than as
@@ -131,38 +133,25 @@ pub struct Gravity {
 
 impl Motion {
     /// Advance the gravity estimate. `accel` is the bus's raw accelerometer in its
-    /// own basis; `None` when the pad reports none.
-    pub fn tick(&mut self, accel: Option<Vec3>, dt: f32) -> Gravity {
-        if let Some(a) = accel {
-            let len = a.length();
-            if len > 0.01 {
-                let alpha = 1.0 - (-dt / GRAVITY_TAU).exp();
-                let norm = a / len;
-                if self.settled {
-                    self.smoothed += alpha * (norm - self.smoothed);
-                } else {
-                    // Start on the first reading rather than easing up from zero,
-                    // or the first half-second of every session reads as a pad
-                    // held at some angle it never was.
-                    self.smoothed = norm;
-                    self.settled = true;
-                }
-            }
-        }
-        if !self.settled {
-            return Gravity::default();
-        }
-        let len = self.smoothed.length();
-        if len < 0.01 {
-            return Gravity::default();
-        }
-        let up = self.smoothed / len;
-        // Accel reads "up"; gravity is the other way. Then into JSM's (R, U, F).
-        let mut v = Vec3::new(up.y, -up.z, -up.x);
+    /// own basis, `None` when the pad reports none; `gyro_dps` the bus's gyro
+    /// (roll, pitch, yaw) in degrees per second.
+    pub fn tick(&mut self, accel: Option<Vec3>, gyro_dps: Vec3, dt: f32) -> Gravity {
+        // Down in the gyro's (F, R, -U) basis; then into JSM's (R, U, F).
+        let before = self.gravity.orientation();
+        let down = self.gravity.update(gyro_dps, accel, dt);
+        // The camera follows the nose by the gyro's turn alone, in the frame gravity
+        // holds (`OrientCamera`): over the top it carries on, and gravity's own
+        // corrections never move it.
+        let (d_psi, d_theta, _) = self.camera.step(before, gyro_dps, dt, None);
+        let orient = if dt > 0.0 { glam::Vec2::new(d_psi, d_theta) / dt } else { glam::Vec2::ZERO };
+        let Some(d) = down else {
+            return Gravity { orient, ..Gravity::default() };
+        };
+        let mut v = Vec3::new(d.y, -d.z, d.x);
         if let Some(q) = self.neutral {
             v = q * v;
         }
-        Gravity { v, known: true }
+        Gravity { orient, v, known: true }
     }
 
     /// `SET_MOTION_STICK_NEUTRAL`: take however the pad is being held right now as
@@ -339,6 +328,12 @@ pub fn gravity_space(space: Space, g: Gravity, r: JsmGyro) -> (f32, f32) {
                 mx = world_roll.signum() * (world_roll.abs() * 1.41).min(off_pitch);
                 mx *= trust;
             }
+        }
+        Space::Orient => {
+            // The camera kept with the gravity estimate (`Motion::tick`); mouse y
+            // counts down.
+            mx = g.orient.x;
+            my = -g.orient.y;
         }
         Space::WorldTurn | Space::WorldLean => {
             if let Some(pitch) = pitch_axis {

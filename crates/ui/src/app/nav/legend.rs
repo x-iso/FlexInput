@@ -552,9 +552,9 @@ impl FlexInputApp {
                 const LABEL_GAP: f32 = 2.4; // glyph → label
                 const DIV_GAP: f32 = 5.0;   // around the inter-hint divider
                 let div_stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
-                let label_font = egui::FontId::proportional(14.4);
-                let slash_font = egui::FontId::proportional(13.2);
-                let token_font = egui::FontId::proportional(14.4);
+                let label_font = crate::settings::ui_font(14.4);
+                let slash_font = crate::settings::ui_font(13.2);
+                let token_font = crate::settings::ui_font(14.4);
                 let measure = |text: &str, font: &egui::FontId| -> f32 {
                     ui.painter()
                         .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE)
@@ -619,7 +619,7 @@ impl FlexInputApp {
                                 for (j, elem) in s.elems.iter().enumerate() {
                                     if j > 0 {
                                         ui.add_space(ITEM_PAD);
-                                        ui.label(egui::RichText::new("/").size(13.2).weak());
+                                        ui.label(egui::RichText::new("/").size(crate::settings::ui_size(13.2)).weak());
                                         ui.add_space(ITEM_PAD);
                                     }
                                     match elem {
@@ -628,12 +628,12 @@ impl FlexInputApp {
                                                 (tex.id(), egui::vec2(GLYPH, GLYPH))));
                                         }
                                         Elem::Token(tok) => {
-                                            ui.label(egui::RichText::new(tok).strong().size(14.4));
+                                            ui.label(egui::RichText::new(tok).strong().size(crate::settings::ui_size(14.4)));
                                         }
                                     }
                                 }
                                 ui.add_space(LABEL_GAP);
-                                ui.label(egui::RichText::new(&s.label).size(14.4));
+                                ui.label(egui::RichText::new(&s.label).size(crate::settings::ui_size(14.4)));
                             }
                         });
                     }

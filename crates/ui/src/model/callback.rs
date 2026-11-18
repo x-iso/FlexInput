@@ -645,6 +645,13 @@ pub fn model_for_devices(dev_ids: &[String]) -> Option<String> {
     dev_ids.first().map(|d| model_for_device(d))
 }
 
+/// The model drawn for a pad nothing names - nothing wired, or a trace that can't reach
+/// it: the Xbox pad, as a device the skin can't place gets (`model_for_device`). It was
+/// whichever model sorted first, the DualSense.
+pub fn default_model() -> String {
+    pick_available("Xbox One")
+}
+
 fn pick_available(want: &str) -> String {
     let avail = available_models();
     if avail.iter().any(|m| m == want) {

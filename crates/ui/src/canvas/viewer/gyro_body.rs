@@ -17,11 +17,32 @@ pub(crate) fn gyro_read_family_axis(n: &NodeData) -> (String, String) {
     }
 }
 
-pub(crate) const GYRO_AXIS_OPTIONS: [(&str, &str); 4] = [
+/// The drawing on each mode's cell, in the order of `GYRO_AXIS_OPTIONS`: the turn Pitch+Yaw
+/// and Pitch+Roll take X from, a figure for Player (turns about your own up), a globe for
+/// World (turns about the world's), a compass for Orient (where the nose points).
+const GYRO_AXIS_ICONS: [&[u8]; 5] = [
+    include_bytes!("../../../../../app/assets/Motion/gyro_yaw.svg"),
+    include_bytes!("../../../../../app/assets/Motion/gyro_roll.svg"),
+    include_bytes!("../../../../../app/assets/general/UI/human-target.svg"),
+    include_bytes!("../../../../../app/assets/general/UI/wireframe-globe.svg"),
+    include_bytes!("../../../../../app/assets/general/UI/compass.svg"),
+];
+/// The drawing of axis mode `axis` (`pitch_yaw`, `player`, ...), for a row that shows the
+/// modes elsewhere (a pinned Style 2 row).
+pub(crate) fn gyro_axis_icon(axis: &str) -> Option<&'static [u8]> {
+    GYRO_AXIS_OPTIONS.iter().position(|(id, _)| *id == axis).map(|i| GYRO_AXIS_ICONS[i])
+}
+
+/// Beside the two rows' captions: an aim, and a wheel.
+const POINTER_ICON: &[u8] = include_bytes!("../../../../../app/assets/general/UI/crosshair.svg");
+const STEERING_ICON: &[u8] = include_bytes!("../../../../../app/assets/general/UI/steering-wheel.svg");
+
+pub(crate) const GYRO_AXIS_OPTIONS: [(&str, &str); 5] = [
     ("pitch_yaw",  "Pitch+Yaw"),
     ("pitch_roll", "Pitch+Roll"),
     ("player",     "Player"),
     ("world",      "World"),
+    ("orient",     "Orient"),
 ];
 
 pub(crate) fn show_gyro_3dof_body(
@@ -51,6 +72,9 @@ pub(crate) fn show_gyro_3dof_body(
     // Display scale for the 3D Orientation output only (applied to the
     // integration rate so it stays continuous). Does NOT affect the 2D outputs.
     let orient_scale      = snap.and_then(|n| n.params.get("orient_scale").and_then(|v| v.as_f64())).unwrap_or(1.0) as f32;
+    // Edge turn's settings, for the preview to run it as the module does (Pointer only).
+    let edge_params = snap.filter(|_| family == "pointer").and_then(gyro_edge_params);
+    let model_alpha = snap.map_or(GYRO_MODEL_ALPHA, gyro_model_alpha);
     let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
     let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
@@ -71,6 +95,8 @@ pub(crate) fn show_gyro_3dof_body(
     })
     .filter(|v| v.length_squared() > 1e-6)
     .map(|v| glam::Quat::from_xyzw(v.x, v.y, v.z, v.w).normalize());
+    let aim = snap.and_then(gyro_aim);
+    let view_pose = snap.and_then(gyro_view_pose);
     // Whether the viewport wears the pad model instead of its axes. The switch lives in the
     // header, because it says how the module's one display is drawn.
     let look = snap.map(gyro_preview_look).unwrap_or("icon");
@@ -105,11 +131,22 @@ pub(crate) fn show_gyro_3dof_body(
     ];
     /// What each axis family does, in the order of `GYRO_AXIS_OPTIONS`: the hover text of
     /// the cell that chooses it, and the same list the viewport's arrows are drawn from.
-    const GYRO_AXIS_TIPS: [&str; 4] = [
+    const GYRO_AXIS_TIPS: [&str; 5] = [
         "Yaw turns X and pitch turns Y — the plain gyro aim.",
         "Roll turns X and pitch turns Y — for a grip that steers by rolling.",
-        "Turn about gravity is X, pitch about the pad's left edge is Y, and the\naccelerometer holds which way is down.",
-        "As Player, but the level reference is the world's rather than the pad's,\nso it settles more slowly and drifts less.",
+        "JoyShockMapper's PLAYER_TURN: turning about gravity is X, however the pad\nis held (yaw and roll both count, up to how fast the pad is turning), and\nY is the pad's own pitch. Forgiving of how you hold it.",
+        "JoyShockMapper's WORLD_TURN: turning about gravity is X, and Y is pitch\nmeasured level with the world, faded out as the pad goes onto its side.",
+        "Follows where the pad's nose points: X is how fast its heading changes,\nY its elevation, so adding them up lands where it points whatever path it\ntook. Twisting the pad about its nose does nothing. Above 70° up or\ndown the heading stops speeding up (straight up it has none).",
+    ];
+    /// The same choices in the Steering row, which adds the turns up into a wheel's angle.
+    /// JoyShockMapper has nothing like it (its lean steering, LEFT_STEER_X, is a tilt read off
+    /// gravity, not a turn added up); what each reads as turning is the Pointer row's.
+    const GYRO_STEER_TIPS: [&str; 5] = [
+        "The wheel's angle is the pad's yaw, added up: hold it upright like a\nwheel and turn it in its own face. Upright, gravity can see the wheel,\nso ctr keeps it centred where Reset put it.",
+        "The wheel's angle is the pad's roll, added up: hold it flat and roll it.\nFlat, gravity can see the wheel, so ctr keeps it centred where Reset\nput it.",
+        "The wheel's angle is the turn about gravity (as Pointer's Player reads it),\nadded up: turn the pad about the vertical however it is held. Gravity\ncan't see a turn about itself, so only Reset centres it.",
+        "The wheel's angle is the turn about gravity (as Pointer's World reads it),\nadded up, and Y the pitch measured level. Gravity can't see a turn about\nitself, so only Reset centres it.",
+        "X and Y are where the pad's nose points from where Reset put it, as a\nheading and an elevation. Gravity can't see a heading, so only Reset\ncentres X.",
     ];
 
     // The neutral hold as a rotation, for the viewport's ghost pad: the same three angles
@@ -122,6 +159,7 @@ pub(crate) fn show_gyro_3dof_body(
         "pitch_roll" => "pitch_roll",
         "player" => "player",
         "world" => "world",
+        "orient" => "orient",
         _ => "pitch_yaw",
     };
 
@@ -139,7 +177,7 @@ pub(crate) fn show_gyro_3dof_body(
     // A pad the trace can't name still gets a model, as the 3D viewer's Auto does: the first
     // one there is.
     let model = if look == "model" {
-        crate::model::model_for_devices(&devs).or_else(|| crate::model::available_models().into_iter().next())
+        Some(crate::model::model_for_devices(&devs).unwrap_or_else(crate::model::default_model))
     } else {
         None
     };
@@ -181,18 +219,25 @@ pub(crate) fn show_gyro_3dof_body(
         let view = super::gyro_view::GyroView {
             axes: super::gyro_view::GyroAxes::of(ui.visuals()),
             pose,
+            aim,
+            view: view_pose,
             hold: hold_q,
             zone: (family == "pointer" && edge.mode != "off").then_some(edge.zone),
             proj: super::gyro_view::GyroProjection {
                 axis: axis_id,
                 roll_share: roll_mix / 100.0,
                 inv: inv_gyro,
+                physical: aim_physical(aim),
             },
             model: model.as_deref(),
             pad_svg,
             outline: look == "outline",
             lean: lean_v,
             lean_threshold,
+            edge: edge_params.clone(),
+            orient_scale,
+            frame: None,
+            model_alpha,
         };
         // Folded with the rest of the settings when it isn't wanted: the frame then is the
         // rows alone, and the viewport gets the grip's room back when it is unfolded.
@@ -206,9 +251,11 @@ pub(crate) fn show_gyro_3dof_body(
             // How the pad is drawn, in the preview's corner: its icon, the icon's outline,
             // or its 3D model.
             {
-                const LOOK_W: f32 = 84.0;
-                let r = egui::Rect::from_min_size(egui::pos2(vr.right() - LOOK_W - 4.0, vr.top() + 4.0), egui::vec2(LOOK_W, ctrl - 4.0));
+                // As wide as its longest choice in the control font, plus the arrow: a fixed
+                // width spilled out of the preview's corner past 13 points.
                 let opts: [(&str, &str); 3] = [("icon", "icon"), ("outline", "outline"), ("model", "3D model")];
+                let look_w = super::curve_rows::word_w(ui, "3D model") + 26.0;
+                let r = egui::Rect::from_min_size(egui::pos2(vr.right() - look_w - 4.0, vr.top() + 4.0), egui::vec2(look_w, ctrl - 4.0));
                 if let Some(pick) = super::curve_rows::pill_combo(ui, r, "", &look.to_string(), &opts.map(|(k, l)| (k.to_string(), l)),
                     "How the pad is drawn: its icon, the icon's outline, or its 3D model (half see-through).",
                     ("gyro_look", node_id))
@@ -216,6 +263,19 @@ pub(crate) fn show_gyro_3dof_body(
                     if let Some(n) = snarl.get_node_mut(node_id) {
                         n.params.insert("view_look".into(), Value::String(pick));
                         n.params.remove("view_model");
+                    }
+                }
+                // With the model drawn, how opaque it is, under the choice.
+                if look == "model" {
+                    let r = r.translate(egui::vec2(0.0, ctrl));
+                    let mut a = snarl.get_node(node_id).map_or(GYRO_MODEL_ALPHA, gyro_model_alpha);
+                    let shown = format!("{:.0}%", a * 100.0);
+                    if super::curve_rows::real_pill(ui, node_id, "gyro_model_alpha", r, "\u{03b1}|opacity", &mut a, &shown, 0.05..=1.0, 0.005,
+                        "How opaque the pad's model is over the sphere (its neutral hold's ghost fainter in proportion).")
+                    {
+                        if let Some(n) = snarl.get_node_mut(node_id) {
+                            n.params.insert("view_model_alpha".into(), serde_json::json!(a as f64));
+                        }
                     }
                 }
             }
@@ -247,13 +307,14 @@ pub(crate) fn show_gyro_3dof_body(
         // The settings in categories, each folded and unfolded by its heading
         // (`curve_rows::section`): what the module does first, then the Orientation output's
         // own settings and the axis inversions - set up once, folded until wanted - then Lean.
-        if super::curve_rows::section(ui, snarl, node_id, "mode", "Mode", true) {
+        if super::curve_rows::section(ui, snarl, node_id, "mode", "2D Output mode", true) {
         // ── The two mode rows ───────────────────────────────────────────────
         // Four equal cells apiece: the same four choices in both rows, and only the row of
         // the family in use has a cell lit.
         for (caption, want, out) in [("Pointer", "pointer", &mut pointer_rect), ("Steering", "steering", &mut steering_rect)] {
             let (row, _) = ui.allocate_exact_size(egui::vec2(w, band), egui::Sense::hover());
-            if let Some(picked) = mode_row(ui, node_id, row, caption, &family, &axis, want, GYRO_AXIS_TIPS) {
+            let tips = if want == "steering" { GYRO_STEER_TIPS } else { GYRO_AXIS_TIPS };
+            if let Some(picked) = mode_row(ui, node_id, row, caption, &family, &axis, want, tips) {
                 family = want.to_string();
                 axis = picked.to_string();
                 changed = true;
@@ -261,7 +322,10 @@ pub(crate) fn show_gyro_3dof_body(
             *out = Some(row);
         }
 
-        let cells = lay(ui, &[HOLD_W, ROLL_W, STEER_W]);
+        // Steering's own settings straight under the Steering row they belong to, then the
+        // neutral hold and the roll mix.
+        let steer_cell = lay(ui, &[STEER_W])[0];
+        let cells = lay(ui, &[HOLD_W, ROLL_W]);
         let cell = |i: usize| cells[i];
 
         // The neutral hold: how the pad sits at rest, which is what everything else is
@@ -294,23 +358,28 @@ pub(crate) fn show_gyro_3dof_body(
         // The steering accumulators: what pulls them toward a heading, and how fast a Reset
         // lets go.
         {
-            let r = cell(2);
-            let mut right = r.right();
-            let mut take = |pw: f32| {
-                right -= pw;
-                let got = egui::Rect::from_min_size(egui::pos2(right, r.center().y - ctrl * 0.5), egui::vec2(pw, ctrl));
-                right -= super::kit::GAP;
-                got
-            };
-            let ease = take(86.0);
-            let ctr = take(96.0);
-            let excl = take(word_w(ui, "excl. Y"));
-            changed |= word_toggle(ui, excl, steering_on, &mut exclude_y, "excl. Y",
+            let r = steer_cell;
+            // The switch takes what its word needs - the whole word with room to spare - and
+            // the two pills share the rest of the row, so a wide module gives them their names
+            // ("recenter", "reset ease"). They stood at the right edge at a fixed 96 and 86
+            // points, showing "ctr" however much row was left of them.
+            let gap = super::kit::GAP;
+            let whole = word_w(ui, "exclude Y");
+            let excl_w = if r.width() - whole - 2.0 * gap >= 2.0 * 150.0 { whole } else { word_w(ui, "excl. Y") };
+            let pill_w = ((r.width() - excl_w - 2.0 * gap) / 2.0).max(40.0);
+            let at = |x: f32, w: f32| egui::Rect::from_min_size(egui::pos2(x, r.center().y - ctrl * 0.5), egui::vec2(w, ctrl));
+            let excl = at(r.left(), excl_w);
+            let ctr = at(excl.right() + gap, pill_w);
+            let ease = at(ctr.right() + gap, pill_w);
+            changed |= word_toggle(ui, excl, steering_on, &mut exclude_y, "excl. Y|exclude Y",
                 "Suppress the Y steering output (keeps Y at 0).\nUseful when only the X axis matters — e.g. a steering wheel\nwhere pitching the controller shouldn't move Y.",
                 ("gyro_excl_y", node_id));
             let shown = format!("{recenter_strength:.2} /s");
-            changed |= pill_in(ui, steering_on, node_id, "gyro_recenter", ctr, "ctr|recenter", &mut recenter_strength, &shown, 0.0..=4.0, 0.02,
-                "Pulls the steering accumulator toward a tilt-compensated\nheading derived from accel. Strength scales by how observable\nthat heading is — flat controller → no pull, tilted → strong\npull. 0 disables. Units: /s.");
+            // Gravity can see the wheel in Pitch+Yaw (held upright) and Pitch+Roll (held flat);
+            // the other modes turn about gravity itself.
+            let centres = matches!(axis.as_str(), "pitch_yaw" | "pitch_roll");
+            changed |= pill_in(ui, steering_on && centres, node_id, "gyro_recenter", ctr, "ctr|recenter", &mut recenter_strength, &shown, 0.0..=4.0, 0.02,
+                "Keeps the wheel centred where Reset put it, from gravity: how far\ngravity has swung about the wheel's axis since then is how far the\nwheel is turned, and the angle added up is pulled toward it this fast,\nper second. Pitch+Yaw sees it with the pad held upright, Pitch+Roll\nwith it held flat; the other modes turn about gravity itself, which it\ncan't see. 0 is off.");
             let shown = format!("{reset_ease_in:.2} s");
             changed |= pill_in(ui, steering_on, node_id, "gyro_ease", ease, "ease|reset ease", &mut reset_ease_in, &shown, 0.0..=2.0, 0.01,
                 "Reset eases steering toward 0 over this many seconds.");
@@ -318,8 +387,15 @@ pub(crate) fn show_gyro_3dof_body(
         }
 
         // ── Edge turn ───────────────────────────────────────────────────────
-        // Pointer only: past the zone drawn on the viewport, the camera keeps turning.
+        // Pointer only: past the zone drawn on the viewport, the camera keeps turning. A
+        // rule above it, in the section headings' colour: it is a block of its own, not one
+        // more row of the mode's settings.
         if family == "pointer" {
+            let (rule, _) = ui.allocate_exact_size(egui::vec2(w, 9.0), egui::Sense::hover());
+            ui.painter().line_segment(
+                [egui::pos2(rule.left(), rule.center().y), egui::pos2(rule.right(), rule.center().y)],
+                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            );
             let block = ui.scope(|ui| {
                 let mut fr = [egui::Rect::NOTHING; 9];
                 if edge.ui_rects(ui, node_id, w, true, &mut fr) {
@@ -373,11 +449,14 @@ pub(crate) fn show_gyro_3dof_body(
             let tw = word_w(ui, "auto re-center");
             right -= tw;
             let tog = egui::Rect::from_min_size(egui::pos2(right, r.center().y - ctrl * 0.5), egui::vec2(tw, ctrl));
-            changed |= word_toggle(ui, tog, pose_rows_on, &mut yaw_recenter, "auto re-center",
-                "3D Orientation output only: when gyro readings stay under\nthe threshold for 3 s, gradually re-center the whole\norientation (all axes) until it's centered or the\nthreshold is exceeded again.",
+            // Orient's camera re-centres whatever the pose's source: it is measured in the
+            // module's own orientation either way.
+            let recenter_on = pose_rows_on || axis_id == "orient";
+            changed |= word_toggle(ui, tog, recenter_on, &mut yaw_recenter, "auto re-center",
+                "When gyro readings stay under the threshold for 3 s,\ngradually re-center the 3D Orientation output (all axes)\nuntil it's centered or the threshold is exceeded again.\nIn Orient mode it also eases the pointer back onto the\npad's nose and the heading back to forward, as a Reset\nwould, sending no movement: a pad whose gyro read a turn\nit didn't make (just connected, still calibrating) lines\nup with its pointer again once it lies still.",
                 ("gyro_recenter_toggle", node_id));
             let shown = format!("{yaw_thresh:.4}");
-            changed |= pill_in(ui, pose_rows_on && yaw_recenter, node_id, "gyro_thr", thr, "off|still below", &mut yaw_thresh, &shown, 0.0005..=0.2, 0.0005,
+            changed |= pill_in(ui, recenter_on && yaw_recenter, node_id, "gyro_thr", thr, "still|still below", &mut yaw_thresh, &shown, 0.0005..=0.2, 0.0005,
                 "Gyro magnitude (normalized, 1.0 = 2000 dps) that counts\nas \"not moving\". With the noise-floor deadzone armed,\nresting readings are exactly 0, so the default is fine.");
         }
 
@@ -424,7 +503,7 @@ pub(crate) fn show_gyro_3dof_body(
             let pr = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - ctrl * 0.5), egui::vec2((r.width() - 44.0).max(70.0), ctrl));
             let shown = format!("{lean_threshold:.2}");
             changed |= super::curve_rows::real_pill(
-                ui, node_id, "gyro_lean", pr, "lean", &mut lean_threshold, &shown, 0.01..=4.0, 0.01,
+                ui, node_id, "gyro_lean", pr, "lean|lean threshold", &mut lean_threshold, &shown, 0.01..=4.0, 0.01,
                 "|Lean| ≥ threshold triggers the Lean! Bool output.",
             );
             // Painted, not laid out: the reading moves every frame and the module must not.
@@ -432,7 +511,7 @@ pub(crate) fn show_gyro_3dof_body(
                 egui::pos2(pr.right() + 4.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 format!("{lean_v:+.2}"),
-                egui::FontId::monospace(super::simple_bodies::PILL_FONT),
+                super::simple_bodies::control_font(),
                 ui.visuals().weak_text_color(),
             );
             lean_rect = Some(r);
@@ -441,57 +520,28 @@ pub(crate) fn show_gyro_3dof_body(
 
         // ── The Lean mapping lists ──────────────────────────────────────────
         // The shared card renderer: the same cards as a pinned Remapper, one list per lean
-        // direction, each with its own Learn/Choose state machine. Their height is the
-        // bar's under them: drag it and they scroll in what it leaves them, the frame
-        // growing or shrinking by the same so the preview keeps its size. Until the bar is
-        // first dragged they are as tall as they are.
-        let lean_h = snarl
-            .get_node(node_id)
-            .and_then(|n| n.params.get("lean_h"))
-            .and_then(|v| v.as_f64())
-            .map(|h| h as f32);
-        let lists_top = ui.cursor().min.y;
-        let mut draw_lists = |ui: &mut egui::Ui| {
-            let left = ui.scope(|ui| {
-                show_gyro_lean_mapping_section(
-                    node_id, ui, snarl, "left",  inputs, live_signals, panic_shortcut, automap_parent,
-                );
-            });
-            let right = ui.scope(|ui| {
-                show_gyro_lean_mapping_section(
-                    node_id, ui, snarl, "right", inputs, live_signals, panic_shortcut, automap_parent,
-                );
-            });
-            (left.response.rect, right.response.rect)
-        };
-        let (l, r) = match lean_h {
-            Some(h) => egui::ScrollArea::vertical()
-                .id_salt(("gyro_lean_scroll", node_id))
-                .max_height(h)
-                .min_scrolled_height(h)
-                .auto_shrink([false, false])
-                .show(ui, |ui| draw_lists(ui))
-                .inner,
-            None => draw_lists(ui),
-        };
-        lean_left_rect = Some(l);
-        lean_right_rect = Some(r);
-        let lists_h = ui.cursor().min.y - lists_top;
-        let (bar, _) = ui.allocate_exact_size(egui::vec2(w, 8.0), egui::Sense::hover());
-        let (dy, reset) = super::kit::resize_bar(ui, bar, ("gyro_lean_bar", node_id), true,
-            "Drag to make the Lean lists taller or shorter; they scroll in what they have.\n\
-             Double-click to let them be as tall as they are.");
-        if dy != 0.0 || reset {
-            if let Some(n) = snarl.get_node_mut(node_id) {
-                if reset {
-                    n.params.remove("lean_h");
-                } else {
-                    let h = (lean_h.unwrap_or(lists_h) + dy).max(60.0);
-                    n.params.insert("lean_h".into(), serde_json::json!(h));
-                    super::kit::grow_frame(n, band, dy);
-                }
-            }
+        // direction, each with its own Learn/Choose state machine - and each in a card window
+        // of its own (`pinned::card_window`): its title and Learn row stay put, its cards
+        // scroll under them in the height its bar gives it, the frame growing or shrinking by
+        // the same so the preview keeps its size. Until a bar is first dragged its list is as
+        // tall as it is. They shared one scroll, the first list's cards pushing the second's
+        // out of view.
+        for (side, tag, key, out) in [
+            ("left", "lean_l", "lean_l_h", &mut lean_left_rect),
+            ("right", "lean_r", "lean_r_h", &mut lean_right_rect),
+        ] {
+            let rect = super::pinned::card_window(
+                ui, snarl, node_id, tag, LEAN_LIST_W, key, band,
+                live_signals, panic_shortcut, automap_parent,
+                move |id, ins, ui, sn, sigs, panic, am| {
+                    show_gyro_lean_mapping_section(id, ui, sn, side, ins, sigs, panic, am);
+                },
+                move |n: &NodeData| lean_hash(n, if side == "left" { "lean_left" } else { "lean_right" }),
+                move |n: &NodeData| lean_hash(n, if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" }),
+            );
+            *out = Some(rect);
         }
+        let _ = inputs;
         }
         // The lists are a fixed width whatever the grip asks for, so the surface is told the
         // frame has to be at least that wide.
@@ -558,12 +608,17 @@ pub(crate) fn show_gyro_3dof_body(
 }
 
 /// The 3D preview pinned on its own, filling `container`: the same picture as the module's
-/// body, read off the node - and the same orbit, which is kept per node.
+/// body, read off the node - and the same orbit, which is kept per node. `parent` is the
+/// sub-patch the module sits in, so the pad is traced out through its inlet to the device
+/// (the model and icon are that pad's; the pin drew the first model on disk without it), and
+/// `style` the pin's own frame and look (`IvStyleOverride`, set in the layout inspector).
 pub(crate) fn render_gyro_preview_pinned(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &Snarl<NodeData>,
     container: egui::Vec2,
+    parent: Option<&AutomapGlowParent<'_>>,
+    style: Option<&crate::canvas::node::IvStyleOverride>,
 ) {
     let (rect, _) = ui.allocate_exact_size(container, egui::Sense::hover());
     let Some(n) = snarl.get_node(node_id) else { return };
@@ -586,50 +641,98 @@ pub(crate) fn render_gyro_preview_pinned(
         "pitch_roll" => "pitch_roll",
         "player" => "player",
         "world" => "world",
+        "orient" => "orient",
         _ => "pitch_yaw",
     };
     let edge = GyroEdge::read(n);
-    let look = gyro_preview_look(n);
+    let look = match style.and_then(|s| s.gyro_look.as_deref()) {
+        Some("icon") => "icon",
+        Some("outline") => "outline",
+        Some("model") => "model",
+        _ => gyro_preview_look(n),
+    };
     let traced_devs = {
         let traced = snarl
             .in_pin(InPinId { node: node_id, input: 0 })
             .remotes
             .first()
             .copied()
-            .map(|src| controller3d_physical_devices(snarl, src, None))
+            .map(|src| controller3d_physical_devices(snarl, src, parent))
             .unwrap_or_default();
         controller3d_devices_and_deadzone(traced).0
     };
     let model = if look == "model" {
-        let traced = snarl
-            .in_pin(InPinId { node: node_id, input: 0 })
-            .remotes
-            .first()
-            .copied()
-            .map(|src| controller3d_physical_devices(snarl, src, None))
-            .unwrap_or_default();
-        let (devs, _) = controller3d_devices_and_deadzone(traced);
-        crate::model::model_for_devices(&devs).or_else(|| crate::model::available_models().into_iter().next())
+        Some(crate::model::model_for_devices(&traced_devs).unwrap_or_else(crate::model::default_model))
     } else {
         None
     };
+    let rgba = |c: [u8; 4]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+    let frame = style.map(|s| (rgba(s.bg), egui::Stroke::new(s.outline_px, rgba(s.outline))));
     let view = super::gyro_view::GyroView {
         axes: super::gyro_view::GyroAxes::of(ui.visuals()),
         pose,
+        aim: gyro_aim(n),
+        view: gyro_view_pose(n),
         hold: hold_q,
         zone: (family == "pointer" && edge.mode != "off").then_some(edge.zone),
         proj: super::gyro_view::GyroProjection {
             axis: axis_id,
             roll_share: f("roll_contribution", 0.0) / 100.0,
             inv: [b("inv_yaw"), b("inv_pitch"), b("inv_roll")],
+            physical: aim_physical(gyro_aim(n)),
         },
         model: model.as_deref(),
         pad_svg: gyro_pad_svg(&traced_devs),
         outline: look == "outline",
         lean: out(3),
         lean_threshold: f("lean_threshold", 0.3),
+        edge: (family == "pointer").then(|| gyro_edge_params(n)).flatten(),
+        orient_scale: f("orient_scale", 1.0),
+        frame,
+        // The pin's own, else the module's.
+        model_alpha: style.and_then(|s| s.c3d_composite).unwrap_or_else(|| gyro_model_alpha(n)),
     };
     super::gyro_view::draw_gyro_view(ui, node_id, rect, &view);
+}
+
+/// The module's Edge-turn params, for the preview to run Edge turn as the module does - or
+/// `None` while it is off.
+fn gyro_edge_params(n: &NodeData) -> Option<std::collections::HashMap<String, Value>> {
+    let mode = n.params.get("edge_mode").and_then(|v| v.as_str()).unwrap_or("off");
+    if mode == "off" {
+        return None;
+    }
+    Some(n.params.iter().filter(|(k, _)| k.starts_with("edge_")).map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+/// Where the module has added its X/Y outputs up to, as it puts them out: its display-only
+/// trailing output (`GYRO_AIM_OUT`) - x°, y°, x° without roll's share, and the pose's kind.
+fn gyro_aim(n: &NodeData) -> Option<glam::Vec4> {
+    match n.extra.last_out.get(flexinput_engine::eval::GYRO_AIM_OUT) {
+        Some(Some(Signal::Vec4(v))) => Some(*v),
+        _ => None,
+    }
+}
+
+/// The pad as the output has it (`GYRO_VIEW_OUT`), for the preview to draw.
+fn gyro_view_pose(n: &NodeData) -> Option<glam::Quat> {
+    match n.extra.last_out.get(flexinput_engine::eval::GYRO_VIEW_OUT) {
+        Some(Some(Signal::Vec4(v))) if v.length_squared() > 1e-6 => Some(glam::Quat::from_xyzw(v.x, v.y, v.z, v.w).normalize()),
+        _ => None,
+    }
+}
+
+/// Whether the aim says the pose is the device's own (kind 2), which is physical.
+fn aim_physical(aim: Option<glam::Vec4>) -> bool {
+    aim.is_some_and(|a| (a.w - 2.0).abs() < 0.5)
+}
+
+/// How opaque the preview's 3D model is, by default.
+const GYRO_MODEL_ALPHA: f32 = 0.5;
+
+/// How opaque the preview's 3D model is (`view_model_alpha`).
+fn gyro_model_alpha(n: &NodeData) -> f32 {
+    n.params.get("view_model_alpha").and_then(|v| v.as_f64()).map_or(GYRO_MODEL_ALPHA, |v| v as f32).clamp(0.05, 1.0)
 }
 
 /// How the preview draws the pad: `icon`, `outline` or `model`. A patch from before the
@@ -883,7 +986,7 @@ impl GyroEdge {
             let mom_on = matches!(self.mode, "momentum" | "both");
 
             let shown = format!("{:.0}°", self.zone);
-            changed |= pill_in(ui, !off, node, "edge_zone", at(0), "zone", &mut self.zone, &shown, 0.0..=170.0, 0.5,
+            changed |= pill_in(ui, !off, node, "edge_zone", at(0), "zone|edge zone", &mut self.zone, &shown, 0.0..=170.0, 0.5,
                 "Where the edge starts, from neutral. Pure gyro inside.");
             let shown = format!("{:.0}°", self.blend);
             changed |= pill_in(ui, !off, node, "edge_blend", at(1), "blend", &mut self.blend, &shown, 0.0..=170.0, 0.5,
@@ -897,7 +1000,7 @@ impl GyroEdge {
                 changed = true;
             }
             let shown = format!("{:.0}°", self.ramp);
-            changed |= pill_in(ui, ramp_on, node, "edge_ramp", at(3), "ramp", &mut self.ramp, &shown, 0.0..=170.0, 0.5,
+            changed |= pill_in(ui, ramp_on, node, "edge_ramp", at(3), "ramp|ramp width", &mut self.ramp, &shown, 0.0..=170.0, 0.5,
                 "Degrees past the zone where Ramp reaches max, eased in\n(0 = full speed as soon as you leave it).");
             let shown = format!("{:.0} °/s", self.max_dps);
             changed |= pill_in(ui, ramp_on, node, "edge_max", at(4), "max|max speed", &mut self.max_dps, &shown, 0.0..=4000.0, 2.0,
@@ -950,11 +1053,20 @@ const EDGE_FADE_W: f32 = 88.0;
 /// The column the option rows' captions stand in - Pointer, Steering, Edge turn, Gyro,
 /// Accel - so every row's pill starts at the same x whatever its word.
 fn caption_w(ui: &egui::Ui) -> f32 {
-    word_w(ui, "Edge turn")
+    // The mode rows' captions have their drawing before the word.
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let steering = ui.painter().layout_no_wrap("Steering".to_string(), small, egui::Color32::PLACEHOLDER).size().x;
+    word_w(ui, "Edge turn").max(caption_icon_h(ui) + 4.0 + steering + 4.0)
+}
+
+/// How big a mode row's caption drawing is: the small font's line, a little more.
+fn caption_icon_h(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Small) + 4.0
 }
 
 fn word_w(ui: &egui::Ui, label: &str) -> f32 {
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    // In the control font the word buttons are drawn in (`kit_bodies::toggle_button`).
+    let font = super::simple_bodies::control_font();
     let text = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER).size().x;
     (text + 2.0 * ui.spacing().button_padding.x + 2.0).max(28.0)
 }
@@ -1024,24 +1136,38 @@ fn pill_in(
 /// One mode row: the caption, then the four axis choices as equal cells. Picking a cell sets
 /// the family that row stands for as well as the axis, which is the pair the module stores;
 /// the row of the family not in use lights no cell.
-fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, family: &str, axis: &str, want: &str, tips: [&'static str; 4]) -> Option<&'static str> {
+fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, family: &str, axis: &str, want: &str, tips: [&'static str; 5]) -> Option<&'static str> {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let weak = ui.visuals().weak_text_color();
-    ui.painter().text(egui::pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, caption, font, weak);
+    // The row's drawing, then its word.
+    let ih = caption_icon_h(ui);
+    let icon = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - ih * 0.5), egui::vec2(ih, ih));
+    super::curve_rows::paint_tinted_svg(ui, if want == "steering" { STEERING_ICON } else { POINTER_ICON }, icon, weak);
+    ui.painter().text(egui::pos2(icon.right() + 4.0, rect.center().y), egui::Align2::LEFT_CENTER, caption, font, weak);
     let cap_w = caption_w(ui);
     let cells = egui::Rect::from_min_max(egui::pos2(rect.left() + cap_w + 4.0, rect.top()), rect.max);
-    // One joined pill of the four axis pairs, lit only in the row of the family in use.
+    // One joined pill of the axis modes, lit only in the row of the family in use.
     let current = if family == want { axis.to_string() } else { String::new() };
+    // Beside its drawing a cell says its name, or the half of it the drawing doesn't: the
+    // turn X is taken from (`short|long`, `segmented_icons`).
+    let word = |id: &str, lbl: &'static str| -> &'static str {
+        match id {
+            "pitch_yaw" => "Yaw|Pitch+Yaw",
+            "pitch_roll" => "Roll|Pitch+Roll",
+            _ => lbl,
+        }
+    };
     let opts: Vec<(String, &'static str, &'static str)> = GYRO_AXIS_OPTIONS
         .iter()
         .zip(tips)
-        .map(|((id, lbl), tip)| (id.to_string(), *lbl, tip))
+        .map(|((id, lbl), tip)| (id.to_string(), word(id, lbl), tip))
         .collect();
     let ctrl = rect.height() - 4.0;
     let cells = egui::Rect::from_min_size(egui::pos2(cells.left(), rect.center().y - ctrl * 0.5), egui::vec2(cells.width(), ctrl));
     // The node in the id: two 3DOF modules on one canvas had the same rows, and egui gave a
     // click on either to neither.
-    if let Some(picked) = super::curve_rows::segmented(ui, cells, &current, &opts, ("gyro_mode_row", want, node.0)) {
+    let icons = GYRO_AXIS_ICONS.map(Some);
+    if let Some(picked) = super::curve_rows::segmented_icons(ui, cells, &current, &opts, &icons, ("gyro_mode_row", want, node.0)) {
         return Some(GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == picked).map(|(id, _)| *id).unwrap_or("pitch_yaw"));
     }
     if family != want && ui.rect_contains_pointer(cells) && ui.input(|i| i.pointer.primary_clicked()) {
@@ -1050,6 +1176,15 @@ fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, fa
         return Some(GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == axis).map(|(id, _)| *id).unwrap_or("pitch_yaw"));
     }
     None
+}
+
+/// A fingerprint of one of a node's array params (a Lean list's cards, or its draft): what
+/// a card window re-bases its scroll on.
+fn lean_hash(n: &NodeData, key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    n.params.get(key).map(|v| v.to_string()).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 pub(crate) fn gyro_write_hold(node: &mut NodeData, hold: [f32; 3]) {
@@ -1269,14 +1404,14 @@ pub(crate) fn show_gyro_lean_mapping_section(
         if new_phase != "learning" {
             if new_phase == "ready" && !draft.is_empty() {
                 ui.label(egui::RichText::new("Picked — click Add (or Learn to add a chord)")
-                    .size(13.0).color(green));
+                    .size(crate::settings::ui_size(13.0)).color(green));
             } else {
                 let txt = if !wired {
                     "Connect the gyro Device input, then Learn (or Choose… an output)"
                 } else {
                     "Press Learn to capture an output, or Choose… one"
                 };
-                ui.label(egui::RichText::new(txt).size(13.0).color(blue));
+                ui.label(egui::RichText::new(txt).size(crate::settings::ui_size(13.0)).color(blue));
             }
         }
     }
@@ -1435,7 +1570,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // captured/picked chord chips so the user sees what Add will commit.
     if new_phase == "learning" && new_draft.is_empty() {
         ui.label(egui::RichText::new("Press a button or combination")
-            .size(13.0).color(Color32::from_rgb(106, 167, 255)));
+            .size(crate::settings::ui_size(13.0)).color(Color32::from_rgb(106, 167, 255)));
         request_repaint_throttled(ui.ctx());
     } else if (new_phase == "learning" || new_phase == "ready") && !new_draft.is_empty() {
         let chord = draft_timed_chord(snarl.get_node(node_id), draft_key, &new_draft);

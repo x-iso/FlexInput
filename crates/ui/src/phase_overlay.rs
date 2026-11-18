@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke};
+use eframe::egui::{self, Align2, Color32, Pos2, Rect, Stroke};
 use flexinput_core::Signal;
 
 use crate::gamepad_nav::{merge_nav_input, read_nav_input, NavInput};
@@ -187,10 +187,7 @@ pub(crate) fn show(
     }
     ctx.data_mut(|d| d.insert_temp(nav_id(), nav));
 
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|m| m.x > 1.0 && m.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
     let viewport_id = egui::ViewportId::from_hash_of("fxi_phase_overlay");
     let builder = egui::ViewportBuilder::default()
         .with_app_id(crate::APP_ID)
@@ -203,7 +200,7 @@ pub(crate) fn show(
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
 
     let status = sync_status(settings);
@@ -211,13 +208,7 @@ pub(crate) fn show(
     let per_frame = settings::snap_output_sync_per_frame(settings.output_sync_per_frame);
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs).
-        let (inner_rect, child_monitor) = vctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
-        if let (Some(inner_rect), Some(want)) = (inner_rect, child_monitor) {
-            if (inner_rect.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
         if vctx.data(|d| d.get_temp::<bool>(passthrough_id())).is_none() {
             vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             vctx.data_mut(|d| d.insert_temp(passthrough_id(), true));
@@ -262,8 +253,8 @@ pub(crate) fn sync_status(settings: &AppSettings) -> String {
 fn paint(ui: &egui::Ui, screen: Rect, phase: f32, per_frame: u32, synced: bool, status: &str) {
     let p = ui.painter();
     let accent = ui.visuals().selection.stroke.color;
-    let text = Color32::from_gray(230);
-    let dim = Color32::from_gray(160);
+    let text = crate::settings::tinted_gray(230);
+    let dim = crate::settings::tinted_gray(160);
 
     let h = screen.height();
     let track_top = screen.top() + h * 0.25;
@@ -275,12 +266,12 @@ fn paint(ui: &egui::Ui, screen: Rect, phase: f32, per_frame: u32, synced: bool, 
     );
     p.rect_filled(panel, 12.0, Color32::from_rgba_unmultiplied(14, 14, 18, 215));
     p.text(Pos2::new(panel.left() + 20.0, track_top - 45.0), Align2::LEFT_CENTER,
-        "Phase in frame", FontId::proportional(18.0), text);
+        "Phase in frame", crate::settings::ui_font(18.0), text);
 
     // 0 at the bottom, the latest allowed at the top.
     let y_of = |v: f32| track_bottom - (v / settings::OUTPUT_SYNC_PHASE_MAX) * (track_bottom - track_top);
     p.line_segment([Pos2::new(track_x, track_top), Pos2::new(track_x, track_bottom)],
-        Stroke::new(6.0_f32, Color32::from_gray(70)));
+        Stroke::new(6.0_f32, crate::settings::tinted_gray(70)));
     let hy = y_of(phase);
     p.line_segment([Pos2::new(track_x, hy), Pos2::new(track_x, track_bottom)], Stroke::new(6.0_f32, accent));
     for pct in (0..=90).step_by(10) {
@@ -290,12 +281,12 @@ fn paint(ui: &egui::Ui, screen: Rect, phase: f32, per_frame: u32, synced: bool, 
     p.circle_filled(Pos2::new(track_x, hy), 11.0, accent);
     p.circle_stroke(Pos2::new(track_x, hy), 11.0, Stroke::new(2.0_f32, Color32::WHITE));
     p.text(Pos2::new(track_x - 24.0, hy), Align2::RIGHT_CENTER,
-        format!("{:.0}%", phase * 100.0), FontId::proportional(28.0), text);
+        format!("{:.0}%", phase * 100.0), crate::settings::ui_font(28.0), text);
 
     // One frame, vblank to vblank, and where its reports land in it.
     let strip = Rect::from_min_size(Pos2::new(panel.left() + 20.0, track_bottom + 30.0),
         egui::vec2(panel.width() - 40.0, 14.0));
-    p.rect_filled(strip, 4.0, Color32::from_gray(45));
+    p.rect_filled(strip, 4.0, crate::settings::tinted_gray(45));
     p.line_segment([strip.left_top(), strip.left_bottom()], Stroke::new(2.0_f32, Color32::WHITE));
     for k in 0..per_frame {
         let at = (phase + k as f32 / per_frame as f32).fract();
@@ -303,13 +294,13 @@ fn paint(ui: &egui::Ui, screen: Rect, phase: f32, per_frame: u32, synced: bool, 
         p.line_segment([Pos2::new(x, strip.top() - 3.0), Pos2::new(x, strip.bottom() + 3.0)], Stroke::new(3.0_f32, accent));
     }
     p.text(Pos2::new(strip.left(), strip.bottom() + 4.0), Align2::LEFT_TOP,
-        "refresh", FontId::proportional(12.0), dim);
+        "refresh", crate::settings::ui_font(12.0), dim);
 
     let status_color = if synced { dim } else { Color32::from_rgb(230, 170, 80) };
-    let status = p.layout(status.to_string(), FontId::proportional(13.0), status_color, strip.width());
+    let status = p.layout(status.to_string(), crate::settings::ui_font(13.0), status_color, strip.width());
     p.galley(Pos2::new(strip.left(), strip.bottom() + 26.0), status, status_color);
     p.text(Pos2::new(panel.left() + 20.0, panel.bottom() - 16.0), Align2::LEFT_CENTER,
-        "Left stick / D-pad ↕ adjust   ·   East: close", FontId::proportional(13.0), dim);
+        "Left stick / D-pad ↕ adjust   ·   East: close", crate::settings::ui_font(13.0), dim);
 }
 
 #[cfg(test)]

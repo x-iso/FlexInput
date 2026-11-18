@@ -262,7 +262,7 @@ fn rws_reference_frame(
     if active && !prev {
         // Sweep just started — capture the game frame (our overlays are left
         // out: by the plain BitBlt on Windows, by KWin on Linux).
-        let pending = crate::capture::capture_primary_monitor();
+        let pending = crate::capture::capture_overlay_monitor();
         ctx.data_mut(|d| {
             d.insert_temp(tex_key, None::<egui::TextureHandle>);
             d.insert_temp(pending_key, Some(pending));
@@ -338,10 +338,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         pick = false;
     }
 
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|s| s.x > 1.0 && s.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
 
     // Remember the game (whatever non-FlexInput window is foreground) so the
     // overlay can hand foreground back after a click activated it. Cleared on
@@ -421,7 +418,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
 
     let mut exit_edit = false;
@@ -433,15 +430,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs):
         // force the window to fill the monitor if the OS handed us a wrong size.
-        let (inner_rect, child_monitor) = vctx.input(|i| {
-            (i.viewport().inner_rect, i.viewport().monitor_size)
-        });
-        if let (Some(inner_rect), Some(want)) = (inner_rect, child_monitor) {
-            if (inner_rect.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
+        let (inner_rect, child_monitor) = vctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
 
         const HIT_MARGIN: f32 = 14.0;
         let live = !edit && !pick;
@@ -675,7 +665,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "No tweak-pins yet — use “Add element” to pin an\nadjustable control (slider, curve, toggle, numeric row).",
-                            egui::FontId::proportional(15.0),
+                            crate::settings::ui_font(15.0),
                             egui::Color32::from_rgba_unmultiplied(220, 235, 255, 220),
                         );
                     }
@@ -708,7 +698,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                             egui::pos2(left.center().x, rect.min.y + 40.0),
                             egui::Align2::CENTER_CENTER,
                             "Reference — turn until the live view realigns, then Finish",
-                            egui::FontId::proportional(15.0),
+                            crate::settings::ui_font(15.0),
                             egui::Color32::from_rgba_unmultiplied(255, 230, 180, 230),
                         );
                     }
@@ -932,8 +922,8 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
     const LABEL_GAP: f32 = 4.0;
     const SLASH_GAP: f32 = 4.0;
     const DIV_GAP: f32 = 10.0;
-    let label_font = egui::FontId::proportional(14.0);
-    let tok_font = egui::FontId::proportional(14.0);
+    let label_font = crate::settings::ui_font(14.0);
+    let tok_font = crate::settings::ui_font(14.0);
     let p = ui.painter();
     let measure = |s: &str, f: &egui::FontId| {
         p.layout_no_wrap(s.to_string(), f.clone(), egui::Color32::WHITE).size().x
@@ -974,7 +964,7 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
     let cy = bar.center().y;
     let mut x = bar.min.x + pad.x;
     let div_col = ui.visuals().weak_text_color();
-    let label_col = egui::Color32::from_gray(225);
+    let label_col = crate::settings::tinted_gray(225);
     for (gi, (glyphs, label)) in legend.iter().enumerate() {
         if gi > 0 {
             x += DIV_GAP;
@@ -1059,7 +1049,7 @@ fn paint_reject_hint(ui: &mut egui::Ui, rect: egui::Rect) {
     }
     let fade = (1.0 - (age / 2.5)).clamp(0.0, 1.0) as f32;
     let msg = "That element isn't adjustable — pick a slider, curve, toggle, or numeric row.";
-    let font = egui::FontId::proportional(14.0);
+    let font = crate::settings::ui_font(14.0);
     let p = ui.painter();
     let galley = p.layout_no_wrap(msg.to_string(), font, egui::Color32::from_rgb(255, 210, 160));
     let pad = egui::vec2(14.0, 8.0);

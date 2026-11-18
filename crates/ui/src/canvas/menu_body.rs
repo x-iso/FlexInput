@@ -349,6 +349,9 @@ pub(crate) fn menu_zone_live(node: &NodeData) -> HashMap<(usize, usize), (f32, f
 /// The node body: the field is what the module's corner grip sizes (`kit::Surface`) - the
 /// frame it was dragged to, less the rows around the field. It had a grip of its own in its
 /// corner and a size of its own in the patch.
+/// The narrowest the body's rows read at: the widest of their groups.
+const MENU_ROWS_MIN_W: f32 = 300.0;
+
 pub(crate) fn show_menu_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -358,7 +361,8 @@ pub(crate) fn show_menu_body(
     body_w: f32,
     body_h: f32,
 ) {
-    let surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(160.0, 100.0));
+    let mut surface = super::viewer::kit::Surface::begin(ui, node_id, body_w, body_h, egui::vec2(160.0, 100.0));
+    surface.need(MENU_ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
     menu_body(node_id, ui, snarl, live_signals, automap_parent, surface.size);
     surface.end(ui);
 }
@@ -404,13 +408,25 @@ fn menu_body(
 
     let (field_w, field_h) = (field.x, field.y);
 
+    let rows_w = field_w.max(MENU_ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
     ui.vertical(|ui| {
-        // ── Menu options rows (identity + mode + Suppress/Radial live in the
-        //    node HEADER; these two rows are pinnable to layouts / overlay) ──
-        let opts_area = ui.vertical(|ui| {
-            show_menu_options_row(node_id, ui, snarl);
-        }).response.rect;
-        register_exposable_element(ui, node_id, "options", opts_area);
+        // Bounded to the frame: a heading takes the width it is offered, and a body is
+        // offered last frame's - a frame dragged wide would never come back.
+        ui.set_max_width(rows_w);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        // ── What the menu is (its identity is in the header), then how it is pointed at
+        //    and picked from - the pinnable "options" element - in categories that fold,
+        //    as the other modules' bodies have their settings ──
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "menu", "Menu", true) {
+            menu_mode_rows(node_id, ui, snarl, automap_parent, rows_w);
+        }
+        if super::viewer::curve_rows::section(ui, snarl, node_id, "pointer", "Pointer and selection", true) {
+            let opts_area = ui.vertical(|ui| {
+                menu_options_pills(node_id, ui, snarl, rows_w);
+            }).response.rect;
+            register_exposable_element(ui, node_id, "options", opts_area);
+        }
+        ui.add_space(4.0);
 
         // Re-read after header toggles so this frame renders consistently.
         let mapping = snarl.get_node(node_id)
@@ -446,7 +462,7 @@ fn menu_body(
                     let (f, txt) = fit_zone_label(
                         &p, &m.label, 11.0, (x1 - x0) * field_area.width() - 6.0);
                     p.text(egui::pos2(cx, by - 3.0), egui::Align2::CENTER_BOTTOM, txt,
-                        f, egui::Color32::from_gray(210));
+                        f, crate::settings::tinted_gray(210));
                 }
             }
         }
@@ -464,86 +480,34 @@ fn menu_body(
 
         if mapping && !radial { tz_render_merge_popup(ui, snarl, node_id); }
 
-        // ── Per-zone icon + name override: the icon replaces the zone's
-        // mapping icons everywhere it's painted (field, pinned widget, menu
-        // overlay) — keyboard bindings rarely read as "what this zone does";
-        // the name draws alongside whatever icons show. ──
-        {
-            let ids = super::viewer::tz_field_tree(snarl, node_id, 0).ids();
-            let max_id = ids.iter().copied().max().unwrap_or(0);
-            let sel = snarl.get_node(node_id)
-                .and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64()))
-                .unwrap_or(0) as u32;
-            let zone = if ids.contains(&sel) { sel } else { ids.first().copied().unwrap_or(0) };
-            let meta = snarl.get_node(node_id)
-                .map(|n| menu_zone_meta(n).get(&zone).cloned().unwrap_or_default())
-                .unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Zone").small().weak());
-                let mut z_edit = zone as u64;
-                if ui.add(egui::DragValue::new(&mut z_edit).range(0..=max_id as u64).speed(0.05))
-                    .on_hover_text("Which zone the icon/name override applies to.\nClicking a zone in the field selects it too.")
-                    .changed()
-                {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        node.params.insert("sel_field".into(), serde_json::json!(0u64));
-                        node.params.insert("sel_zone".into(), serde_json::json!(z_edit));
-                    }
-                }
-                ui.label(egui::RichText::new("icon").small().weak())
-                    .on_hover_text("Override the icons shown on this zone with one picked icon\n(shared icon set, or a custom SVG embedded into the patch) —\nmapping destinations like keyboard keys rarely read clearly.");
-                if let Some((k, s)) = icon_picker_button(
-                    ui, egui::Id::new((node_id, "vm_zone_icon", zone)), &meta.icon, &meta.svg)
-                {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        write_zone_meta_entry(node, zone, &ZoneMeta {
-                            icon: k, svg: s, label: meta.label.clone(),
-                        });
-                    }
-                }
-                ui.label(egui::RichText::new("name").small().weak())
-                    .on_hover_text("Zone name, drawn on the zone alongside its icons.");
-                let mut label_edit = meta.label.clone();
-                if ui.add(egui::TextEdit::singleline(&mut label_edit)
-                    .desired_width(90.0)
-                    .id_salt((node_id, "vm_zone_name", zone)))
-                    .changed()
-                {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        write_zone_meta_entry(node, zone, &ZoneMeta {
-                            icon: meta.icon.clone(), svg: meta.svg.clone(), label: label_edit,
-                        });
-                    }
-                }
-                if (!meta.icon.is_empty() || !meta.svg.is_empty() || !meta.label.is_empty())
-                    && ui.small_button("✕").on_hover_text("Remove this zone's icon + name override").clicked()
-                {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        write_zone_meta_entry(node, zone, &ZoneMeta::default());
-                    }
-                }
-            });
-        }
+        // ── Per-zone icon + name override: the icon replaces the zone's mapping icons
+        // everywhere it's painted (field, pinned widget, menu overlay) — keyboard bindings
+        // rarely read as "what this zone does"; the name draws alongside whatever icons
+        // show. The Touch Zones row: the menu's one field is its field 0. ──
+        super::viewer::tz_zone_icon_row(node_id, ui, snarl, rows_w);
 
         // ── Mapping mode: zone-tab card list (TZ machinery, separately pinnable) ──
         if mapping {
             ui.add_space(6.0);
-            let cards_area = ui.vertical(|ui| {
-                render_touch_zone_cards(node_id, ui, snarl, &visuals, accent, live_signals, automap_parent);
-            }).response.rect;
+            // The zone tabs and Learn row stay put, the cards scroll in a window under them
+            // (`card_window`), as a Remapper's do.
+            let band = super::viewer::curve_rows::band_h(ui);
+            let cards_area = super::viewer::card_window(
+                ui, snarl, node_id, "menu_cards", rows_w, "cards_h", band,
+                live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+                |id, _ins, ui, sn, sigs, _panic, am| {
+                    let visuals = ui.visuals().clone();
+                    let accent = visuals.selection.bg_fill;
+                    ui.vertical(|ui| {
+                        render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
+                    });
+                },
+                super::viewer::tz_cards_hash_map,
+                super::viewer::tz_cards_hash_draft,
+            );
             register_exposable_element(ui, node_id, "cards", cards_area);
         }
 
-        // Summon the menu overlay in position-edit mode for THIS menu.
-        let outer_uid = super::viewer::root_subpatch_id(automap_parent).map(|n| n.0);
-        let editing = crate::menu_overlay::menu_edit_target(ui.ctx())
-            == Some((outer_uid, node_id.0));
-        if ui.add(egui::Button::selectable(editing, "🖵 Position on screen…"))
-            .on_hover_text("Place/size this menu on the screen: it appears as an editable\noverlay widget — drag to move, corner to resize, Esc/Done saves.")
-            .clicked()
-        {
-            crate::menu_overlay::request_menu_edit(ui.ctx(), outer_uid, node_id.0);
-        }
     });
 }
 
@@ -731,16 +695,16 @@ pub(crate) fn fit_zone_label(
 ) -> (egui::FontId, String) {
     const FLOOR: f32 = 6.0;
     let measure = |s: &str, size: f32| -> f32 {
-        p.layout_no_wrap(s.to_string(), egui::FontId::proportional(size), egui::Color32::WHITE)
+        p.layout_no_wrap(s.to_string(), crate::settings::ui_font(size), egui::Color32::WHITE)
             .size().x
     };
     let w = measure(text, base);
     if w <= max_w || w <= 0.0 {
-        return (egui::FontId::proportional(base), text.to_string());
+        return (crate::settings::ui_font(base), text.to_string());
     }
     let scaled = (base * max_w / w).max(FLOOR);
     if scaled > FLOOR || measure(text, scaled) <= max_w {
-        return (egui::FontId::proportional(scaled), text.to_string());
+        return (crate::settings::ui_font(scaled), text.to_string());
     }
     // Even at the floor it overflows — clip to whatever fits, plus an ellipsis.
     let mut s = String::new();
@@ -749,7 +713,7 @@ pub(crate) fn fit_zone_label(
         s.push(ch);
     }
     let out = if s.is_empty() { "…".to_string() } else { format!("{s}…") };
-    (egui::FontId::proportional(FLOOR), out)
+    (crate::settings::ui_font(FLOOR), out)
 }
 
 /// Zone-name text bent along a ring band: glyphs are laid out one by one with
@@ -776,7 +740,7 @@ fn paint_curved_label(
     let flipped = mid > tau * 0.25 && mid < tau * 0.75;
 
     let widths = |s: f32| -> (Vec<f32>, f32) {
-        let f = egui::FontId::proportional(s);
+        let f = crate::settings::ui_font(s);
         let mut ws = Vec::new();
         let mut total = 0.0;
         for ch in text.chars() {
@@ -803,7 +767,7 @@ fn paint_curved_label(
     };
     let (ws, total) = widths(size);
     let arc_total = total / r_anchor;
-    let font = egui::FontId::proportional(size);
+    let font = crate::settings::ui_font(size);
 
     // Reading order: clockwise (increasing angle) on top, counter-clockwise
     // on the bottom so the flipped run still reads left-to-right.
@@ -917,7 +881,7 @@ pub(crate) fn paint_radial_zone(
     let r_mid = (r0 + r1) * 0.5;
     let meta = zone_meta.get(&zid);
     let label = meta.map(|m| m.label.as_str()).unwrap_or("");
-    let label_col = if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(200) };
+    let label_col = if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(200) };
     let dir_at = |a: f32| egui::vec2(a.sin(), -a.cos());
 
     let has_override = meta.map(|m| !m.icon.is_empty() || !m.svg.is_empty()).unwrap_or(false);
@@ -946,7 +910,7 @@ pub(crate) fn paint_radial_zone(
             let icon_side = (rad * MARGIN).clamp(10.0, 44.0);
             let want = (rad * 0.6).clamp(9.0, 22.0);
             let name_w = p.layout_no_wrap(label.to_string(),
-                egui::FontId::proportional(want), egui::Color32::WHITE).size().x;
+                crate::settings::ui_font(want), egui::Color32::WHITE).size().x;
             if arc_mid >= icon_side + name_w + 14.0 || inner_h < 14.0 {
                 // BESIDE: icon square on the start side, name centred across the
                 // remaining arc, both riding the mid radius.
@@ -1001,14 +965,14 @@ pub(crate) fn paint_radial_zone(
         }
         if truncated {
             p.text(egui::pos2(x, icon_center.y), egui::Align2::LEFT_CENTER, "…",
-                egui::FontId::proportional(ic * 0.6), egui::Color32::from_gray(170));
+                crate::settings::ui_font(ic * 0.6), crate::settings::tinted_gray(170));
         }
     } else if !has_label {
         // Bare zone: faint index at the centre.
         p.text(
             icon_center, egui::Align2::CENTER_CENTER, format!("{zid}"),
-            egui::FontId::proportional((rad * 0.30).clamp(11.0, 22.0)),
-            if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
+            crate::settings::ui_font((rad * 0.30).clamp(11.0, 22.0)),
+            if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(150) },
         );
     }
 
@@ -1044,7 +1008,7 @@ pub(crate) fn paint_grid_zone_cell(
 
     let meta = zone_meta.get(&zid);
     let label = meta.map(|m| m.label.as_str()).unwrap_or("");
-    let label_col = if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(200) };
+    let label_col = if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(200) };
     let mut drew_content = false;
 
     // A named zone reserves a bottom band for its label; icons centre in the
@@ -1079,8 +1043,8 @@ pub(crate) fn paint_grid_zone_cell(
                 // Unmapped zone: faint index so it's still identifiable as a target.
                 p.text(
                     icon_area.center(), egui::Align2::CENTER_CENTER, format!("{zid}"),
-                    egui::FontId::proportional((ic_h * 0.5).clamp(11.0, 26.0)),
-                    if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
+                    crate::settings::ui_font((ic_h * 0.5).clamp(11.0, 26.0)),
+                    if hovered { egui::Color32::WHITE } else { crate::settings::tinted_gray(150) },
                 );
             }
         } else {
@@ -1102,7 +1066,7 @@ pub(crate) fn paint_grid_zone_cell(
             }
             if truncated {
                 p.text(egui::pos2(x, icon_area.center().y), egui::Align2::LEFT_CENTER, "…",
-                    egui::FontId::proportional(ic * 0.6), egui::Color32::from_gray(170));
+                    crate::settings::ui_font(ic * 0.6), crate::settings::tinted_gray(170));
             }
             drew_content = true;
         }
@@ -1579,7 +1543,7 @@ pub(crate) fn icon_picker_button(
             .fit_to_exact_size(egui::vec2(18.0, 18.0))
             .tint(egui::Color32::WHITE))
     } else {
-        egui::Button::new(egui::RichText::new("◌").size(14.0))
+        egui::Button::new(egui::RichText::new("◌").size(crate::settings::ui_size(14.0)))
     };
     use egui::containers::menu::{MenuButton, MenuConfig, SubMenuButton};
     // `CloseOnClickOutside` so typing in the search box or using the category
@@ -1735,9 +1699,9 @@ pub(crate) fn icon_picker_button(
     new_icon
 }
 
-/// Rendered in the node HEADER (viewer.rs dispatches here for module.menu):
-/// icon + editable name (the menu's face in mapping pickers) + the
-/// Ports/Mapping mode switch.
+/// Rendered in the node HEADER (viewer.rs dispatches here for module.menu): icon +
+/// editable name, the menu's face in mapping pickers. What the menu is - Ports / Mapping,
+/// suppression, radial, its colours - is the body's first band ([`menu_mode_rows`]).
 pub(crate) fn show_menu_header(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let (mut name, icon, icon_svg) = {
         let Some(node) = snarl.get_node(node_id) else { return };
@@ -1753,84 +1717,9 @@ pub(crate) fn show_menu_header(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
         new_icon = icon_picker_button(ui, egui::Id::new((node_id, "menu_icon_grid")), &icon, &icon_svg);
         let resp = ui.add(egui::TextEdit::singleline(&mut name)
             .hint_text("Menu name")
-            .desired_width(110.0));
+            .desired_width(160.0));
         if resp.changed() { name_changed = true; }
 
-        // Ports/Mapping mode switch.
-        let mapping = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
-        let mut want_mapping = mapping;
-        if ui.selectable_label(!want_mapping, "Ports")
-            .on_hover_text("Expose typed X / Y / Active outputs per zone + Select.")
-            .clicked() { want_mapping = false; }
-        if ui.selectable_label(want_mapping, "Mapping")
-            .on_hover_text("Map each zone to gamepad/key/stick outputs with internal cards.")
-            .clicked() { want_mapping = true; }
-        if want_mapping != mapping {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("zone_mode".to_string(),
-                    serde_json::json!(if want_mapping { "mapping" } else { "ports" }));
-            }
-            regenerate_menu_ports(node_id, snarl);
-        }
-
-        // Suppression + Radial live in the header with the mode switch — they
-        // shape what the module IS, not how a session behaves. Suppression is
-        // one 3-way choice stored across `suppress_while_open` (off vs on) and
-        // `suppress_mode` (partial vs full), so older patches load unchanged.
-        let (suppress, sup_mode, radial) = snarl.get_node(node_id)
-            .map(|n| (pbool(n, "suppress_while_open", true),
-                      pstr(n, "suppress_mode", "partial").to_string(),
-                      pbool(n, "menu_radial", false)))
-            .unwrap_or((true, "partial".to_string(), false));
-        let cur = if !suppress { "off" }
-            else if sup_mode == "full" { "full" }
-            else if sup_mode == "latch" { "latch" }
-            else { "partial" };
-        let mut sel = cur.to_string();
-        egui::ComboBox::from_id_salt((node_id, "menu_suppress_mode"))
-            .selected_text(match sel.as_str() {
-                "off" => "Passthrough",
-                "full" => "Full suppress",
-                "latch" => "Latch suppress",
-                _ => "Active suppress",
-            })
-            .width(122.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut sel, "off".to_string(), "Passthrough")
-                    .on_hover_text("Menu drivers keep flowing to the rest of the patch\nwhile the menu is open.");
-                ui.selectable_value(&mut sel, "partial".to_string(), "Active suppress")
-                    .on_hover_text("Block a driver AT THE SOURCE only while it's actively\nsteering the menu (stick past deadzone / finger down /\ngyro cursor out of the deadzone), so it reaches only the\nmenu's navigation. Idle enabled drivers still pass; a\nblocked one returns the moment it's back at rest.");
-                ui.selectable_value(&mut sel, "latch".to_string(), "Latch suppress")
-                    .on_hover_text("The FIRST driver to engage owns the menu: it alone\nsteers and is blocked at the source. Every other driver\nis ignored by the menu and keeps flowing to the game,\nuntil the owner disengages (stick back to deadzone /\nfinger up / gyro cursor re-centred) — then the next\nengaged driver can take over.");
-                ui.selectable_value(&mut sel, "full".to_string(), "Full suppress")
-                    .on_hover_text("Block every enabled driver AT THE SOURCE for as long\nas the menu is open — none of them reach a mouse\nmapping, another module, or the virtual pad.");
-            });
-        if sel != cur {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("suppress_while_open".into(), serde_json::json!(sel != "off"));
-                if sel != "off" {
-                    node.params.insert("suppress_mode".into(), serde_json::json!(sel));
-                }
-            }
-        }
-        let mut want_radial = radial;
-        if ui.checkbox(&mut want_radial, "Radial")
-            .on_hover_text("Show the same zones as a sector ring around a dead center\ninstead of a rectangular grid: columns become sectors\n(clockwise from 12 o'clock), rows become concentric rings.\nThe pointer deadzone doubles as the dead-center radius.")
-            .changed()
-        {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("menu_radial".into(), serde_json::json!(want_radial));
-                // Legacy leftovers from when radial forced a synthetic strip.
-                node.params.remove("zone_grid_stash");
-                node.params.remove("radial_count");
-            }
-        }
-
-        // Theme swatches live in the header (compact, self-describing on hover)
-        // so their picker pops away from the zone field they recolour.
-        ui.separator();
-        show_zone_color_row(node_id, ui, snarl);
     });
     if name_changed || new_icon.is_some() {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1840,6 +1729,230 @@ pub(crate) fn show_menu_header(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
             if let Some((key, svg)) = new_icon {
                 node.params.insert("menu_icon".into(), serde_json::Value::String(key));
                 node.params.insert("menu_icon_svg".into(), serde_json::Value::String(svg));
+            }
+        }
+    }
+}
+
+/// The body's first band: Ports / Mapping, how the menu's drivers are suppressed while it is
+/// open, grid or radial, its two colours, and placing it on the screen. They were controls
+/// of every size crammed into the header beside the name.
+fn menu_mode_rows(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    w: f32,
+) {
+    use super::viewer::curve_rows::{pill_bands, pill_combo, segmented, word_toggle, word_w};
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let mapping = pstr(node, "zone_mode", "ports") == "mapping";
+    let suppress = pbool(node, "suppress_while_open", true);
+    let sup_mode = pstr(node, "suppress_mode", "partial").to_string();
+    let mut radial = pbool(node, "menu_radial", false);
+    let cur = if !suppress {
+        "off"
+    } else if sup_mode == "full" {
+        "full"
+    } else if sup_mode == "latch" {
+        "latch"
+    } else {
+        "partial"
+    }
+    .to_string();
+    const SWATCHES_W: f32 = 76.0;
+    let cells = pill_bands(ui, w, &[150.0, 200.0, word_w(ui, "radial"), SWATCHES_W, word_w(ui, "🖵 position on screen…")]);
+
+    const MODE_TIP: &str = "Ports: typed X / Y / Active outputs per zone + Select. Mapping: each zone mapped to gamepad / key / stick outputs with internal cards.";
+    if let Some(want_mapping) = segmented(ui, cells[0], &mapping, &[(false, "ports", MODE_TIP), (true, "mapping", MODE_TIP)], ("vm_mode_seg", node_id.0)) {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("zone_mode".to_string(), serde_json::json!(if want_mapping { "mapping" } else { "ports" }));
+        }
+        regenerate_menu_ports(node_id, snarl);
+    }
+    // Suppression is one 3-way choice stored across `suppress_while_open` (off vs on) and
+    // `suppress_mode` (partial / latch / full), so older patches load unchanged.
+    let modes: [(String, &str); 4] = [
+        ("off".to_string(), "passthrough"),
+        ("partial".to_string(), "active"),
+        ("latch".to_string(), "latch"),
+        ("full".to_string(), "full"),
+    ];
+    if let Some(sel) = pill_combo(ui, cells[1], "suppress|suppress drivers", &cur, &modes,
+        "What the menu's drivers do while it is open.\nPassthrough: they keep flowing to the rest of the patch.\nActive: a driver is blocked at the source only while it is actively steering the menu (stick past deadzone / finger down / gyro cursor out of the deadzone); idle ones pass, and a blocked one returns the moment it is back at rest.\nLatch: the first driver to engage owns the menu and alone is blocked; the others keep flowing to the game until it disengages.\nFull: every enabled driver is blocked at the source for as long as the menu is open.",
+        ("vm_suppress_pill", node_id.0))
+    {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("suppress_while_open".into(), serde_json::json!(sel != "off"));
+            if sel != "off" {
+                node.params.insert("suppress_mode".into(), serde_json::json!(sel));
+            }
+        }
+    }
+    if word_toggle(ui, cells[2], &mut radial, "radial",
+        "Show the same zones as a sector ring around a dead center instead of a rectangular grid: columns become sectors (clockwise from 12 o'clock), rows become concentric rings. The pointer deadzone doubles as the dead-center radius.",
+        ("vm_radial", node_id.0))
+    {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("menu_radial".into(), serde_json::json!(radial));
+            // Legacy leftovers from when radial forced a synthetic strip.
+            node.params.remove("zone_grid_stash");
+            node.params.remove("radial_count");
+        }
+    }
+    {
+        let mut swatches = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(cells[3])
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("vm_colours", node_id.0)),
+        );
+        show_zone_color_row(node_id, &mut swatches, snarl);
+    }
+    // Summon the menu overlay in position-edit mode for THIS menu.
+    let outer_uid = super::viewer::root_subpatch_id(automap_parent).map(|n| n.0);
+    let editing = crate::menu_overlay::menu_edit_target(ui.ctx()) == Some((outer_uid, node_id.0));
+    if ui
+        .put(cells[4], egui::Button::selectable(editing, super::viewer::simple_bodies::control_text("🖵 position on screen…")).frame_when_inactive(true))
+        .on_hover_text("Place / size this menu on the screen: it appears as an editable overlay widget — drag to move, corner to resize, Esc / Done saves.")
+        .clicked()
+    {
+        crate::menu_overlay::request_menu_edit(ui.ctx(), outer_uid, node_id.0);
+    }
+}
+
+/// The pinnable "options" element in the body: what points at the zones (additive sources,
+/// the gyro's axes and sensitivity), then how the menu shows and picks. The fields publish in
+/// `show_menu_options_row`'s order - the nav's field list for the element mirrors it - with
+/// the same touch / gyro gating.
+fn menu_options_pills(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, w: f32) {
+    use super::viewer::curve_rows::{pill_bands, pill_combo, real_pill, segmented, split, word_toggle, word_w};
+    const GAP: f32 = super::viewer::kit::GAP;
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let legacy = pstr(node, "pointer_source", "left_stick").to_string();
+    let mut src_ls = node.params.get("ptr_ls").and_then(|v| v.as_bool()).unwrap_or(legacy == "left_stick");
+    let mut src_rs = node.params.get("ptr_rs").and_then(|v| v.as_bool()).unwrap_or(legacy == "right_stick");
+    let mut src_touch = node.params.get("ptr_touch").and_then(|v| v.as_bool()).unwrap_or(legacy == "touch1" || legacy == "touch2");
+    let touch_which = pstr(node, "ptr_touch_which", if legacy == "touch2" { "touch2" } else { "touch1" }).to_string();
+    let mut src_gyro = node.params.get("ptr_gyro").and_then(|v| v.as_bool()).unwrap_or(false);
+    let gyro_axes = pstr(node, "ptr_gyro_axes", "pitch_yaw").to_string();
+    let mut gyro_sens = pf32(node, "ptr_gyro_sens", 4.0);
+    let act = pstr(node, "activation_mode", "hold").to_string();
+    let sel_on = pstr(node, "select_on", "release").to_string();
+    let mut dz = pf32(node, "pointer_deadzone", 0.25);
+    let mut linger = pf32(node, "select_linger", 0.5);
+    let mut sticky = pbool(node, "hover_sticky", true);
+    let mut set: Vec<(&str, serde_json::Value)> = Vec::new();
+    let mut rects: Vec<egui::Rect> = Vec::new();
+
+    // What points: every lit source ADDS UP, so a stick and the gyro can steer together.
+    let words = ["LS", "RS", "touch", "gyro"];
+    let ww: Vec<f32> = words.iter().map(|t| word_w(ui, t)).collect();
+    // Laid out for the sources as they were when the frame began: a switch flipped below
+    // changes the bands next frame.
+    let (touch_shown, gyro_shown) = (src_touch, src_gyro);
+    let mut mins = vec![ww.iter().sum::<f32>() + GAP * 3.0];
+    if touch_shown {
+        mins.push(130.0);
+    }
+    if gyro_shown {
+        mins.extend([180.0, 90.0]);
+    }
+    let cells = pill_bands(ui, w, &mins);
+    const SRC_TIP: &str = "Which analog inputs point at zones while the menu is open — every lit source ADDS UP, so a stick and the gyro can steer together. The wired Pointer inlet overrides them all.";
+    let s = split(cells[0], &ww);
+    if word_toggle(ui, s[0], &mut src_ls, "LS", SRC_TIP, ("vm_ls", node_id.0)) {
+        set.push(("ptr_ls", serde_json::json!(src_ls)));
+    }
+    rects.push(s[0]);
+    if word_toggle(ui, s[1], &mut src_rs, "RS", SRC_TIP, ("vm_rs", node_id.0)) {
+        set.push(("ptr_rs", serde_json::json!(src_rs)));
+    }
+    rects.push(s[1]);
+    if word_toggle(ui, s[2], &mut src_touch, "touch", SRC_TIP, ("vm_touch", node_id.0)) {
+        set.push(("ptr_touch", serde_json::json!(src_touch)));
+    }
+    rects.push(s[2]);
+    let mut k = 1;
+    if touch_shown {
+        const WHICH_TIP: &str = "Which touchpad points.";
+        if let Some(v) = segmented(ui, cells[k], &touch_which.as_str(), &[("touch1", "touch 1", WHICH_TIP), ("touch2", "touch 2", WHICH_TIP)], ("vm_touch_which", node_id.0)) {
+            set.push(("ptr_touch_which", serde_json::json!(v)));
+        }
+        rects.push(cells[k]);
+        k += 1;
+    }
+    if word_toggle(ui, s[3], &mut src_gyro, "gyro",
+        "Tilt to point: rotation accumulates while the menu is open and resets on every open, so the pointer always starts centered.",
+        ("vm_gyro", node_id.0))
+    {
+        set.push(("ptr_gyro", serde_json::json!(src_gyro)));
+    }
+    rects.push(s[3]);
+    if gyro_shown {
+        const AXES_TIP: &str = "Which two of the pad's rotations move the pointer.";
+        if let Some(v) = segmented(ui, cells[k], &gyro_axes.as_str(), &[("pitch_yaw", "pitch + yaw", AXES_TIP), ("pitch_roll", "pitch + roll", AXES_TIP)], ("vm_gyro_axes", node_id.0)) {
+            set.push(("ptr_gyro_axes", serde_json::json!(v)));
+        }
+        rects.push(cells[k]);
+        let shown = format!("{gyro_sens:.2}");
+        if real_pill(ui, node_id, "vm_gyro_sens", cells[k + 1], "×|gyro ×", &mut gyro_sens, &shown, 0.5..=8.0, 0.02,
+            "Gyro pointer sensitivity. 1 ≈ 10× the raw rotation rate; raise it if the gyro feels too weak to reach the zones.")
+        {
+            set.push(("ptr_gyro_sens", serde_json::json!(gyro_sens)));
+        }
+        rects.push(cells[k + 1]);
+    }
+
+    // How the menu shows and picks.
+    let cells = pill_bands(ui, w, &[130.0, 140.0, 120.0, 110.0, word_w(ui, "sticky")]);
+    let shows: [(String, &str); 4] = [
+        ("hold".to_string(), "hold"),
+        ("toggle".to_string(), "toggle"),
+        ("touch".to_string(), "touch"),
+        ("never".to_string(), "never"),
+    ];
+    if let Some(v) = pill_combo(ui, cells[0], "show", &act, &shows,
+        "How the Show input opens the menu.\nHold: open while held. Toggle: press opens, press closes.\nTouch: open while a finger rests on the touchpad.\nNever: the menu never appears — Next / Previous pick the cells without showing them.",
+        ("vm_show_pill", node_id.0))
+    {
+        set.push(("activation_mode", serde_json::json!(v)));
+    }
+    rects.push(cells[0]);
+    let picks: [(String, &str); 3] = [("release".to_string(), "release"), ("press".to_string(), "press"), ("click".to_string(), "click")];
+    if let Some(v) = pill_combo(ui, cells[1], "select", &sel_on, &picks,
+        "What commits the highlighted zone.\nRelease: letting go of Show / touch. Press: the Select input.\nClick: the touchpad click.",
+        ("vm_select_pill", node_id.0))
+    {
+        set.push(("select_on", serde_json::json!(v)));
+    }
+    rects.push(cells[1]);
+    let shown = format!("{dz:.2}");
+    if real_pill(ui, node_id, "vm_dz", cells[2], "dz|deadzone", &mut dz, &shown, 0.0..=0.9, 0.004,
+        "Pointer deflection below this doesn't move the highlight.")
+    {
+        set.push(("pointer_deadzone", serde_json::json!(dz)));
+    }
+    rects.push(cells[2]);
+    let shown = format!("{linger:.2} s");
+    if real_pill(ui, node_id, "vm_linger", cells[3], "linger", &mut linger, &shown, 0.0..=10.0, 0.02,
+        "After a selection is accepted the menu hides immediately, but the chosen zone cell stays on screen this long, then fades out. 0 = the whole menu disappears at once.")
+    {
+        set.push(("select_linger", serde_json::json!(linger)));
+    }
+    rects.push(cells[3]);
+    if word_toggle(ui, cells[4], &mut sticky, "sticky",
+        "Keep the last highlighted zone when the pointer returns to the deadzone, so flick-and-release selection works. Off: the highlight clears, and releasing inside the deadzone selects nothing.",
+        ("vm_sticky", node_id.0))
+    {
+        set.push(("hover_sticky", serde_json::json!(sticky)));
+    }
+    rects.push(cells[4]);
+    super::viewer::publish_nav_field_rects(ui, node_id, &rects);
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set {
+                node.params.insert(k.to_string(), v);
             }
         }
     }
@@ -2001,6 +2114,12 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
             for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
     }
+}
+
+/// The options' Style 2 look, pinned: the body's two bands, drawn inside `pin_style2::fit`.
+pub(crate) fn render_menu_options_style2(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let w = ui.available_width();
+    menu_options_pills(inner_id, ui, snarl, w);
 }
 
 /// Pinned renderer for the menu options ("options" element, now TWO rows) —

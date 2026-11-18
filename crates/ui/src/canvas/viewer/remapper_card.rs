@@ -222,7 +222,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     painter.rect(
         card_rect,
         outer_cr,
-        C_CARD_BG,
+        crate::settings::tinted(C_CARD_BG),
         egui::Stroke::new(1.0_f32, C_BORDER),
         egui::epaint::StrokeKind::Inside,
     );
@@ -233,13 +233,13 @@ pub(crate) fn remapper_mapping_card_pixel(
         card_origin + egui::vec2(card_w, card_h),
     );
     let body_cr = if has_curve_below { egui::CornerRadius::ZERO } else { egui::CornerRadius::same(radius_i) };
-    painter.rect_filled(body_rect, body_cr, C_BODY_BG);
+    painter.rect_filled(body_rect, body_cr, crate::settings::tinted(C_BODY_BG));
     // Square off the body's top corners by overpainting the top edge with a
     // small rect — the rounded radius lives only on the bottom of the card.
     painter.rect_filled(
         egui::Rect::from_min_size(body_rect.min, egui::vec2(card_w, RADIUS)),
         0.0,
-        C_BODY_BG,
+        crate::settings::tinted(C_BODY_BG),
     );
 
     // Helpers: `at` scales a (Figma x,y) into painter space; `sz` scales a
@@ -281,7 +281,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     // Helper to paint a button background with idle + hover states. Matches
     // the visual weight of the header pills so × and mode read as buttons.
     let paint_button_bg = |painter: &egui::Painter, r: egui::Rect, hovered: bool| {
-        painter.rect_filled(r, 3.0, C_PILL_MID); // idle fill
+        painter.rect_filled(r, 3.0, crate::settings::tinted(C_PILL_MID)); // idle fill
         if hovered {
             painter.rect_filled(r, 3.0, Color32::from_white_alpha(28));
         }
@@ -296,7 +296,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             r.center(),
             egui::Align2::CENTER_CENTER,
             "×",
-            egui::FontId::proportional(16.0 * s),
+            crate::settings::ui_font(16.0 * s),
             C_TEXT,
         );
         if resp.clicked() { delete_clicked = true; }
@@ -316,7 +316,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             r.center(),
             egui::Align2::CENTER_CENTER,
             glyph,
-            egui::FontId::proportional(15.0 * s),
+            crate::settings::ui_font(15.0 * s),
             C_TEXT,
         );
         // Scoped via ui.id() so it inherits the caller's push_id (e.g. each
@@ -400,7 +400,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             at(61.0 + 5.0, 5.0 + 10.0),
             egui::Align2::LEFT_CENTER,
             "time gap",
-            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            crate::settings::ui_font(TEXT_SIZE_HEADER * s),
             mul(C_TEXT),
         );
         let label = egui::Rect::from_min_max(outer.min, egui::pos2(value_box.min.x, outer.max.y));
@@ -448,7 +448,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             at(206.0 + 5.0, 5.0 + 10.0),
             egui::Align2::LEFT_CENTER,
             "hold",
-            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            crate::settings::ui_font(TEXT_SIZE_HEADER * s),
             mul(C_TEXT),
         );
         painter.rect_filled(cb_rect, 3.0, mul(C_CHECK_BG));
@@ -478,7 +478,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             at(274.0 + 5.0, 5.0 + 10.0),
             egui::Align2::LEFT_CENTER,
             "turbo",
-            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            crate::settings::ui_font(TEXT_SIZE_HEADER * s),
             mul(C_TEXT),
         );
         painter.rect_filled(cb_rect, 3.0, mul(C_CHECK_BG));
@@ -505,19 +505,19 @@ pub(crate) fn remapper_mapping_card_pixel(
     // ── in / out label pill (label + arrow) ───────────────────────────────
     let draw_io_pill = |label: &str, ox: f32, oy: f32| {
         let r = egui::Rect::from_min_size(at(ox, oy), sz(48.0, 20.0));
-        painter.rect_filled(r, RADIUS, C_INOUT_BG);
+        painter.rect_filled(r, RADIUS, crate::settings::tinted(C_INOUT_BG));
         painter.text(
             at(ox + 4.0, oy + 10.0),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(TEXT_SIZE_INOUT * s),
+            crate::settings::ui_font(TEXT_SIZE_INOUT * s),
             C_TEXT,
         );
         painter.text(
             at(ox + 29.0, oy + 10.0),
             egui::Align2::LEFT_CENTER,
             "→",
-            egui::FontId::proportional(13.0 * s),
+            crate::settings::ui_font(13.0 * s),
             C_TEXT,
         );
     };
@@ -532,7 +532,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             in_pill_rect.center(),
             egui::Align2::CENTER_CENTER,
             "in order",
-            egui::FontId::proportional(TEXT_SIZE_INOUT * s),
+            crate::settings::ui_font(TEXT_SIZE_INOUT * s),
             C_TEXT,
         );
     } else {
@@ -593,7 +593,7 @@ pub(crate) fn remapper_mapping_card_pixel(
                     card_origin + egui::vec2(cur_x + plus_w * 0.5, row_y + chip_size * 0.5),
                     egui::Align2::CENTER_CENTER,
                     sep,
-                    egui::FontId::proportional(chip_size * 0.5),
+                    crate::settings::ui_font(chip_size * 0.5),
                     Color32::WHITE,
                 );
                 cur_x += plus_w + chord_gap;
@@ -735,18 +735,18 @@ pub(crate) fn remapper_mapping_card_pixel(
             }
             // Held up by the pad: which ways it goes.
             if nav_moving {
-                let font = egui::FontId::proportional(8.0 * s);
+                let font = crate::settings::ui_font(8.0 * s);
                 painter.text(egui::pos2(grip.center().x, grip.top() + 7.0 * s), egui::Align2::CENTER_CENTER,
                     "▲", font.clone(), accent);
                 painter.text(egui::pos2(grip.center().x, grip.bottom() - 7.0 * s), egui::Align2::CENTER_CENTER,
                     "▼", font, accent);
             }
             let dot = if live {
-                Color32::from_gray(230)
+                crate::settings::tinted_gray(230)
             } else if reorder_enabled {
-                Color32::from_gray(150)
+                crate::settings::tinted_gray(150)
             } else {
-                Color32::from_gray(85)
+                crate::settings::tinted_gray(85)
             };
             let pitch = 5.0 * s;
             let rows = ((grip.height() - 10.0 * s) / pitch).floor().clamp(2.0, 6.0) as usize;
@@ -921,7 +921,7 @@ pub(crate) fn remapper_mapping_card_pixel(
             badge_rect.center(),
             egui::Align2::CENTER_CENTER,
             "⚠",
-            egui::FontId::proportional(13.0 * s),
+            crate::settings::ui_font(13.0 * s),
             C_WARN,
         );
         ui.interact(badge_rect, ui.id().with(("conflict", mapping_idx)), egui::Sense::hover())
@@ -951,7 +951,7 @@ pub(crate) fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: cr
     let mut first = true;
     let emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
         if !*first {
-            ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
+            ui.label(egui::RichText::new("+").size(crate::settings::ui_size(14.0)).strong().color(Color32::WHITE));
         }
         *first = false;
     };

@@ -105,7 +105,7 @@ pub fn draw_floating_heading(
                 .corner_radius(cr)
                 .fill(fill)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(text).strong().size(14.0));
+                    ui.label(RichText::new(text).strong().size(crate::settings::ui_size(14.0)));
                 });
 
             // Paint a gray outline on the three canvas-facing sides only —
@@ -207,7 +207,7 @@ pub fn draw_devices_tab(
         .fixed_pos(egui::pos2(left_edge_x, top_y))
         .interactable(true)
         .show(ctx, |ui| {
-            let font = egui::FontId::proportional(14.0);
+            let font = crate::settings::ui_font(14.0);
             let text_w = ui.painter()
                 .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
                 .size().x;

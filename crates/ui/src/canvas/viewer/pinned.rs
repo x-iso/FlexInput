@@ -133,7 +133,7 @@ pub(crate) fn render_pinned_element_impl(
     match (module_id, element_id) {
         // The module's own look, for a pin set to it.
         _ if pin_style == 2 && super::pin_style2::supported(module_id, element_id) => {
-            super::pin_style2::render(inner_id, module_id, element_id, ui, inner_snarl, container_size);
+            super::pin_style2::render_live(inner_id, module_id, element_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
         }
         ("module.remapper", "whole_module") => {
             render_remapper_whole_module(
@@ -203,7 +203,7 @@ pub(crate) fn render_pinned_element_impl(
             // else follow the module's param, else auto-detect.
             let pin_model = iv_style_override.as_ref().and_then(|o| o.c3d_model.clone());
             let auto_resolve = || crate::model::model_for_devices(&devs)
-                .unwrap_or_else(|| crate::model::available_models().into_iter().next().unwrap_or_default());
+                .unwrap_or_else(crate::model::default_model);
             let resolved = match pin_model {
                 Some(m) if !m.is_empty() => m,
                 Some(_) => auto_resolve(),
@@ -311,7 +311,8 @@ pub(crate) fn render_pinned_element_impl(
         // settings rows.
         // 3DOF to 2D's preview: the sphere the pose projects onto, filling the frame.
         ("processing.gyro_3dof", "preview") => {
-            super::gyro_body::render_gyro_preview_pinned(inner_id, ui, inner_snarl, container_size);
+            super::gyro_body::render_gyro_preview_pinned(
+                inner_id, ui, inner_snarl, container_size, bridged_parent, iv_style_override.as_ref());
             return;
         }
         ("module.stick_rotation", "field") => {
@@ -360,6 +361,12 @@ pub(crate) fn render_pinned_element_impl(
         }
         ("module.area_mapper", "press") => {
             crate::canvas::area_body::render_area_press_pinned(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // The analog mode and the selected cell came after the rows had two looks: they
+        // have the one, whichever the pin says.
+        ("module.area_mapper", "analog" | "cell") => {
+            super::pin_style2::render_live(inner_id, module_id, element_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
             return;
         }
         ("module.area_mapper", "border") => {
@@ -1484,6 +1491,17 @@ where
             .map(|(_, top, bottom)| (top, bottom));
         ui.ctx().data_mut(|d| d.insert_temp(split_id, extent.is_some()));
         let list_top = extent.filter(|_| split).map_or(0.0, |(top, _)| top);
+        // Where the part that stays put ends, for a body's card window to keep a card in
+        // view under it at its smallest (`card_window`).
+        ui.ctx().data_mut(|d| d.insert_temp(state_key.with("list_top"), list_top));
+        // Drawn as a pin, the layout keeps the pin at least that tall too - the part that
+        // stays put and one card under it - at whatever scale its width gives it
+        // (`layout_edit::clamp_pin_frame_to_content`).
+        if list_top > 0.0 {
+            if let Some(ws_key) = ui.ctx().data(|d| d.get_temp::<egui::Id>(pin_ws_key_scratch())) {
+                ui.ctx().data_mut(|d| d.insert_temp(pin_min_body_h_id(ws_key), list_top + ONE_CARD_H));
+            }
+        }
         body_h = match extent.filter(|_| split) {
             // The list scrolls under the top part: it can go as far as its bottom.
             Some((_, bottom)) => bottom.max(1.0),
@@ -1611,6 +1629,97 @@ where
     });
 }
 
+
+/// Where a whole-module card pin says how tall it has to stay, in body points at its design
+/// width: its top part and one card (see `render_remap_whole_module_impl`).
+pub(crate) fn pin_min_body_h_id(ws_key: egui::Id) -> egui::Id {
+    ws_key.with("min_body_h")
+}
+
+/// About one mapping card, in body points: what a card window keeps in view under its top
+/// part at the smallest (`card_window`).
+const ONE_CARD_H: f32 = 76.0;
+
+/// A module body's mapping cards the way a Remapper's are on the canvas: the part above the
+/// cards - the zone tabs, the drafts, Learn / Choose / Add - stays put, and the cards scroll
+/// in a window under it (`render_remap_whole_module_impl`, which the body's
+/// `mapping_list_ui` call splits). The bar under the window sets its height, growing or
+/// shrinking the frame by as much, never below the top part and one card; double-clicked,
+/// the window is as tall as what it holds again, which it is until the bar is first
+/// dragged. They were drawn straight into the body, every card making the module taller -
+/// and 3DOF's two Lean lists shared one scroll, the first pushing the second out of view.
+/// Returns the window's rect (the pinnable `cards` element's).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn card_window<BodyFn, MapLenFn, DraftLenFn>(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    tag: &'static str,
+    width: f32,
+    height_key: &str,
+    band: f32,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    body_fn: BodyFn,
+    map_len_fn: MapLenFn,
+    draft_len_fn: DraftLenFn,
+) -> egui::Rect
+where
+    BodyFn: FnOnce(
+        NodeId,
+        &[InPin],
+        &mut egui::Ui,
+        &mut Snarl<NodeData>,
+        &std::collections::HashMap<(String, String), Signal>,
+        &crate::app::PanicShortcut,
+        Option<&AutomapGlowParent<'_>>,
+    ),
+    MapLenFn: Fn(&NodeData) -> u64,
+    DraftLenFn: Fn(&NodeData) -> u64,
+{
+    let scale = (width.max(40.0) / REMAP_DESIGN_W).clamp(0.25, 4.0);
+    let state_key = remap_pin_state_id(ui, node_id, tag);
+    let natural = ui
+        .ctx()
+        .data(|d| d.get_temp::<RemapPinState>(state_key))
+        .map(|s| s.3)
+        .filter(|h| *h > 1.0)
+        .map(|h| h * scale);
+    let list_top = ui.ctx().data(|d| d.get_temp::<f32>(state_key.with("list_top"))).unwrap_or(0.0);
+    let min_h = ((list_top + ONE_CARD_H) * scale).max(40.0);
+    let set_h = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get(height_key))
+        .and_then(|v| v.as_f64())
+        .map(|h| h as f32);
+    let h = match set_h {
+        Some(h) => h.max(min_h),
+        None => natural.unwrap_or(200.0),
+    };
+    let top_left = ui.cursor().min;
+    render_remap_whole_module_impl(
+        tag, REMAP_DESIGN_W, node_id, ui, snarl, egui::vec2(width, h),
+        live_signals, panic_shortcut, automap_parent, false, "",
+        body_fn, map_len_fn, draft_len_fn,
+    );
+    let rect = egui::Rect::from_min_size(top_left, egui::vec2(width, h));
+    let (bar, _) = ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+    let (dy, reset) = super::kit::resize_bar(ui, bar, (tag, "card_window_bar", node_id), true,
+        "Drag to make the card list taller or shorter; the cards scroll in what it has.\n\
+         Double-click to let it be as tall as its cards.");
+    if dy != 0.0 || reset {
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            if reset {
+                n.params.remove(height_key);
+            } else {
+                n.params.insert(height_key.to_string(), serde_json::json!((h + dy).max(min_h)));
+                super::kit::grow_frame(n, band, dy);
+            }
+        }
+    }
+    rect
+}
 
 /// Where a pinned mapping body's card list goes this frame: set by
 /// `render_remap_whole_module_impl` before it draws the body, taken by the body's
@@ -1977,7 +2086,7 @@ pub(crate) fn render_label_text_pinned_scroll(
             let origin = body_ui.cursor().min;
             let galley = body_ui.painter().layout(
                 text.clone(),
-                egui::FontId::proportional(base_font),
+                crate::settings::ui_font(base_font),
                 outline_col,
                 content_w,
             );
@@ -1992,7 +2101,7 @@ pub(crate) fn render_label_text_pinned_scroll(
             }
         }
         let resp = body_ui.label(
-            egui::RichText::new(&text).size(base_font).color(fill_col),
+            egui::RichText::new(&text).size(crate::settings::ui_size(base_font)).color(fill_col),
         );
         resp.rect.height().max(1.0)
     };
@@ -2141,7 +2250,23 @@ pub(crate) fn render_gyro_mode_row(
     let mut axis = cur_axis;
     let mut changed = false;
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    // Sized from the words themselves, at scale 1, every frame - not from last frame's
+    // measurement: font sizes round to half points, so a measured row reads a little
+    // differently at each scale, and with five choices and no slack the frame and the
+    // row chased each other between two sizes.
+    {
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let pad = ui.spacing().button_padding.x;
+        let words: f32 = GYRO_AXIS_OPTIONS
+            .iter()
+            .map(|(_, l)| ui.painter().layout_no_wrap(l.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 2.0 * pad)
+            .sum();
+        let natural = egui::vec2(words + 2.0 * (GYRO_AXIS_OPTIONS.len() - 1) as f32 + 4.0, ui.spacing().interact_size.y.max(18.0));
+        let scale = (container.y / natural.y).min(container.x / natural.x).clamp(0.5, 4.0);
+        if (scale - 1.0).abs() >= 0.02 {
+            super::scale::scale_ui_style(ui, scale);
+        }
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (id, lbl) in GYRO_AXIS_OPTIONS {
@@ -2794,11 +2919,11 @@ pub(crate) fn render_oscillator_preview(
     let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
     if !ui.is_rect_visible(rect) { return; }
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
+    painter.rect_filled(rect, 2.0, crate::settings::tinted_gray(18));
     let zero_y = if bipolar { rect.center().y } else { rect.bottom() };
     painter.line_segment(
         [egui::pos2(rect.left(), zero_y), egui::pos2(rect.right(), zero_y)],
-        egui::Stroke::new(0.5_f32, egui::Color32::from_gray(55)),
+        egui::Stroke::new(0.5_f32, crate::settings::tinted_gray(55)),
     );
     let n = 128usize;
     let pts: Vec<egui::Pos2> = (0..=n).map(|i| {

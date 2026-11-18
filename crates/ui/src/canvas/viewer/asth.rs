@@ -193,6 +193,16 @@ impl AsthRow {
 /// Draw ONE calibration row into the current `ui`, mutating `a`. Returns
 /// `(changed, row_rect)`. `body_w` is the row's content width (slider scales with it).
 /// Shared by the node body (inline) and the pinned-element renderer.
+/// A switch with a word on it, lit while on - the pills' shape, where these rows had
+/// checkboxes - in the row's (possibly scaled) style. Flips `on` when clicked.
+fn word_switch(ui: &mut egui::Ui, on: &mut bool, word: &str) -> egui::Response {
+    let r = ui.add(egui::Button::selectable(*on, super::simple_bodies::control_text(word)).frame_when_inactive(true));
+    if r.clicked() {
+        *on = !*on;
+    }
+    r
+}
+
 pub(crate) fn asth_draw_row(
     ui: &mut egui::Ui,
     row: AsthRow,
@@ -275,36 +285,28 @@ pub(crate) fn asth_draw_row(
         }
         AsthRow::Swap => ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(4.0 * scale);
-            ui.allocate_ui_with_layout(
-                egui::vec2(label_w, 18.0 * scale),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| { ui.label(egui::RichText::new("Swap").size(11.0 * scale)); },
-            );
-            let r = ui.checkbox(&mut a.swap, "HF carrier / LF texture")
+            // Labelled like the slider rows above it.
+            slider_label(ui, "Swap", label_w);
+            let r = word_switch(ui, &mut a.swap, "HF carrier / LF texture")
                 .on_hover_text("Default: LF is the felt carrier, HF flutters it. \
                                 Swap to make HF the carrier and LF the modulator. \
                                 With Split L/R on, it puts HF on the left and LF on the right.");
-            if r.changed() { changed = true; }
+            if r.clicked() { changed = true; }
         }).response.rect,
         AsthRow::Bands => ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(4.0 * scale);
-            ui.allocate_ui_with_layout(
-                egui::vec2(label_w, 18.0 * scale),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| { ui.label(egui::RichText::new("Bands").size(11.0 * scale)); },
-            );
-            changed |= ui.checkbox(&mut a.split, "Split L/R")
+            // Labelled like the slider rows above it.
+            slider_label(ui, "Bands", label_w);
+            changed |= word_switch(ui, &mut a.split, "split L/R")
                 .on_hover_text("Each side plays one band as its own tone: LF on the left, \
                                 HF on the right. A pad that plays one pitch per side then \
                                 plays two at once.")
-                .changed();
-            ui.add_space(8.0 * scale);
-            changed |= ui.checkbox(&mut a.pure, "Pure tones")
+                .clicked();
+            ui.add_space(4.0 * scale);
+            changed |= word_switch(ui, &mut a.pure, "pure tones")
                 .on_hover_text("The bands don't modulate each other: each carrier plays \
                                 clean, with no flutter from the other band.")
-                .changed();
+                .clicked();
         }).response.rect,
         AsthRow::RumbleMix => asth_slider_row(ui, "Rumble mix", label_w, body_w, scale, &mut changed, |ui, _w| {
             ui.add(egui::Slider::new(&mut a.modulator, 0.0..=1.0).show_value(false))
@@ -429,11 +431,19 @@ pub(crate) fn asth_draw_mode_block(
     let mut changed = false;
     let resp = ui.vertical(|ui| {
         ui.set_max_width(body_w);
-        ui.label("Capture from:");
         ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut a.mode, "process".to_string(), "App").changed();
-            changed |= ui.selectable_value(&mut a.mode, "focused".to_string(), "Focused").changed();
-            changed |= ui.selectable_value(&mut a.mode, "system".to_string(), "System").changed();
+            ui.label(egui::RichText::new("Capture from").small().weak());
+            for (mode, word, tip) in [
+                ("process", "app", "One app's audio, picked below."),
+                ("focused", "focused", "Whatever app has the focus."),
+                ("system", "system", "The whole system mix."),
+            ] {
+                let mut on = a.mode == mode;
+                if word_switch(ui, &mut on, word).on_hover_text(tip).clicked() && a.mode != mode {
+                    a.mode = mode.to_string();
+                    changed = true;
+                }
+            }
         });
         if a.mode == "process" {
             let label = if a.target_name.is_empty() { "Pick app…".to_string() } else { a.target_name.clone() };
@@ -453,10 +463,10 @@ pub(crate) fn asth_draw_mode_block(
                         }
                     }
                 });
-            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
+            changed |= word_switch(ui, &mut a.include_tree, "include child processes").clicked();
         }
         if a.mode == "focused" {
-            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
+            changed |= word_switch(ui, &mut a.include_tree, "include child processes").clicked();
         }
         let status = current_capture_status(&a.mode, &a.target_name);
         ui.add_space(2.0);
@@ -747,14 +757,14 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
             for w in hf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, hf_col)); }
         } else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                "no signal", egui::FontId::proportional(11.0), visuals.weak_text_color());
+                "no signal", crate::settings::ui_font(11.0), visuals.weak_text_color());
         }
     }
     #[cfg(not(windows))]
     {
         let _ = points;
         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-            "Windows only", egui::FontId::proportional(11.0), visuals.weak_text_color());
+            "Windows only", crate::settings::ui_font(11.0), visuals.weak_text_color());
     }
 
     // Keep the scope live while the node body is on screen.

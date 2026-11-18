@@ -30,12 +30,12 @@ impl PendingCapture {
     }
 }
 
-/// Capture the primary monitor (on KDE, the active screen) without
-/// FlexInput's overlays on it. Nothing here ever panics; a failure, a black
-/// exclusive-fullscreen game included, is just no image.
-pub fn capture_primary_monitor() -> PendingCapture {
+/// Capture the monitor the overlays cover (`crate::monitors`; on KDE, the
+/// active screen) without FlexInput's overlays on it. Nothing here ever panics;
+/// a failure, a black exclusive-fullscreen game included, is just no image.
+pub fn capture_overlay_monitor() -> PendingCapture {
     #[cfg(windows)]
-    return PendingCapture::new(Some(blit_primary_monitor()));
+    return PendingCapture::new(Some(blit_overlay_monitor()));
 
     #[cfg(target_os = "linux")]
     {
@@ -58,7 +58,7 @@ pub fn capture_primary_monitor() -> PendingCapture {
 }
 
 #[cfg(windows)]
-fn blit_primary_monitor() -> Option<egui::ColorImage> {
+fn blit_overlay_monitor() -> Option<egui::ColorImage> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HDC,
@@ -66,9 +66,14 @@ fn blit_primary_monitor() -> Option<egui::ColorImage> {
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
+    // The monitor the overlays cover, where it sits on the desktop (the screen DC
+    // spans them all, the primary's corner at 0, 0); the primary without a list.
+    let (x, y, w, h) = match crate::monitors::overlay_monitor() {
+        Some(m) => (m.origin[0], m.origin[1], m.size[0], m.size[1]),
+        // SAFETY: plain FFI.
+        None => unsafe { (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) },
+    };
     unsafe {
-        let w = GetSystemMetrics(SM_CXSCREEN);
-        let h = GetSystemMetrics(SM_CYSCREEN);
         if w <= 0 || h <= 0 {
             return None;
         }
@@ -91,7 +96,7 @@ fn blit_primary_monitor() -> Option<egui::ColorImage> {
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
             // Plain SRCCOPY (no CAPTUREBLT) → layered windows (our overlay) are
             // excluded; the composited game shows through.
-            let blt_ok = BitBlt(mem, 0, 0, w, h, Some(screen), 0, 0, SRCCOPY).is_ok();
+            let blt_ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
             let img = if blt_ok { read_bits(mem, bmp.0, w, h) } else { None };
             SelectObject(mem, old);
             let _ = DeleteObject(HGDIOBJ(bmp.0));

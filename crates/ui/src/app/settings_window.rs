@@ -12,12 +12,12 @@ fn shortcut_chord_widget(
 ) -> egui::Response {
     if learning {
         return ui.add(egui::Button::new(
-            egui::RichText::new("Hold combo, release…").size(12.0))
+            egui::RichText::new("Hold combo, release…").size(crate::settings::ui_size(12.0)))
             .fill(egui::Color32::from_rgb(80, 60, 30))
             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80))));
     }
     if combo.is_empty() {
-        return ui.add(egui::Button::new(egui::RichText::new("(none)").size(12.0)));
+        return ui.add(egui::Button::new(egui::RichText::new("(none)").size(crate::settings::ui_size(12.0))));
     }
     let chip_h = 20.0;
     let gap = 4.0;
@@ -30,9 +30,9 @@ fn shortcut_chord_widget(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
         let bg = if resp.hovered() {
-            egui::Color32::from_gray(64)
+            crate::settings::tinted_gray(64)
         } else {
-            egui::Color32::from_gray(46)
+            crate::settings::tinted_gray(46)
         };
         painter.rect_filled(rect, 3.0, bg);
         let mut x = rect.left() + pad;
@@ -784,7 +784,7 @@ impl FlexInputApp {
                             ui.set_width(NAV_W);
                             ui.label(egui::RichText::new("FlexInput").strong());
                             ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .small().color(egui::Color32::from_gray(150)));
+                                .small().color(crate::settings::tinted_gray(150)));
                             ui.add_space(6.0);
                             // A section clicked a moment ago stays lit while the
                             // page scrolls there, instead of the highlight
@@ -798,7 +798,7 @@ impl FlexInputApp {
                                         let flagged = s == SettingsSection::HidHide && hidhide_missing;
                                         let mut text = egui::RichText::new(
                                             if flagged { format!("{}  ⚠", s.label()) } else { s.label().to_string() })
-                                            .size(13.0);
+                                            .size(crate::settings::ui_size(13.0));
                                         if flagged { text = text.color(egui::Color32::from_rgb(230, 170, 80)); }
                                         let resp = ui.selectable_label(lit == s, text);
                                         let resp = if flagged {
@@ -919,7 +919,88 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset to 0.50."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
+
+        // The accent, and a tint the greys lean toward.
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Accent:")
+                .on_hover_text("The colour of what is selected, lit or on: switches, chosen segments, the pills' name cells.");
+            let [r, g, b] = self.settings.accent_color;
+            let mut c = egui::Color32::from_rgb(r, g, b);
+            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                self.settings.accent_color = [c.r(), c.g(), c.b()];
+                *dirty = true;
+            }
+            if ui.add_enabled(self.settings.accent_color != settings::ACCENT_DEFAULT, egui::Button::new("Reset")).clicked() {
+                self.settings.accent_color = settings::ACCENT_DEFAULT;
+                *dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Grey tint:")
+                .on_hover_text("A colour the greys of panels and widgets lean toward, keeping their lightness.");
+            let [r, g, b] = self.settings.gray_tint;
+            let mut c = egui::Color32::from_rgb(r, g, b);
+            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                self.settings.gray_tint = [c.r(), c.g(), c.b()];
+                *dirty = true;
+            }
+            let mut amt = self.settings.gray_tint_amount * 100.0;
+            let resp = ui.add(egui::Slider::new(&mut amt, 0.0_f32..=100.0).show_value(false).clamping(egui::SliderClamping::Always));
+            if slider_double_clicked(&resp) { amt = 0.0; }
+            ui.add(egui::DragValue::new(&mut amt).speed(0.5).range(0.0_f32..=100.0).suffix("%").fixed_decimals(0));
+            if (amt / 100.0 - self.settings.gray_tint_amount).abs() > f32::EPSILON {
+                self.settings.gray_tint_amount = (amt / 100.0).clamp(0.0, 1.0);
+                *dirty = true;
+            }
+        });
+        ui.label(egui::RichText::new(
+            "How strongly the greys take the tint: 0% = plain grey. Double-click the slider to turn it off."
+        ).small().color(crate::settings::tinted_gray(140)));
+
+        // The controls' font: one for every pill, switch, segment and the buttons and
+        // dropdowns beside them.
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Control font:")
+                .on_hover_text("The font of the controls modules draw: value pills, switches, segments, and the buttons and dropdowns beside them.");
+            let mut mono = self.settings.control_font_mono;
+            ui.selectable_value(&mut mono, true, "Console");
+            ui.selectable_value(&mut mono, false, "Normal");
+            let mut bold = self.settings.control_font_bold;
+            ui.separator();
+            ui.selectable_value(&mut bold, false, "Regular");
+            ui.selectable_value(&mut bold, true, "Bold");
+            if mono != self.settings.control_font_mono || bold != self.settings.control_font_bold {
+                self.settings.control_font_mono = mono;
+                self.settings.control_font_bold = bold;
+                *dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Control font size:");
+            // Applied when the drag ends (or the typing does): applied as it moved, every
+            // step resized the text beside the slider and moved the slider under the pointer.
+            let pending_id = egui::Id::new("control_font_size_pending");
+            let mut size = ui.ctx().data(|d| d.get_temp::<f32>(pending_id)).unwrap_or(self.settings.control_font_size);
+            let range = settings::CONTROL_FONT_SIZE_MIN..=settings::CONTROL_FONT_SIZE_MAX;
+            let resp = ui.add(egui::Slider::new(&mut size, range.clone()).step_by(0.5).show_value(false).clamping(egui::SliderClamping::Always));
+            if slider_double_clicked(&resp) { size = settings::CONTROL_FONT_SIZE_DEFAULT; }
+            let dv = ui.add(egui::DragValue::new(&mut size).speed(0.1).range(range).suffix(" pt").fixed_decimals(1));
+            if resp.dragged() || dv.dragged() || dv.has_focus() {
+                ui.ctx().data_mut(|d| d.insert_temp(pending_id, size));
+            } else {
+                ui.ctx().data_mut(|d| d.remove::<f32>(pending_id));
+                if (size - self.settings.control_font_size).abs() > f32::EPSILON {
+                    self.settings.control_font_size = size.clamp(settings::CONTROL_FONT_SIZE_MIN, settings::CONTROL_FONT_SIZE_MAX);
+                    *dirty = true;
+                }
+            }
+        });
+        ui.label(egui::RichText::new(
+            "Every button, dropdown, pill and switch. The size is the normal font's: console and bold are drawn as wide as normal text at that size, so the controls keep their room. It applies when you let go of the slider. Double-click the slider to return to 15 pt."
+        ).small().color(crate::settings::tinted_gray(140)));
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -954,7 +1035,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "50%–300%. Takes effect when you press Apply. Double-click the slider to return to 100%."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         settings_subheading(ui, "Renderer");
         // Backend is fixed at startup (the wgpu instance/surface can't
         // be swapped live), so changes here take effect on restart.
@@ -1004,7 +1085,7 @@ impl FlexInputApp {
         }
         ui.label(egui::RichText::new(
             "When enabled, the current tabs (including unsaved patches) are restored on the next launch."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
         ui.add_space(6.0);
         if ui.checkbox(&mut self.settings.device_nodes_default_collapsed,
@@ -1014,7 +1095,7 @@ impl FlexInputApp {
         }
         ui.label(egui::RichText::new(
             "New physical / virtual device nodes spawn collapsed. The header (icon, status, Auto-Map) stays visible."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("On patch load:");
@@ -1042,7 +1123,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "Behavior when a .fxp is loaded into a tab. 'Off' preserves the current view."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
     }
 
@@ -1136,7 +1217,7 @@ impl FlexInputApp {
             } else {
                 self.settings.pin_shortcut.label()
             };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
             if self.pin_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
                          .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
@@ -1185,7 +1266,7 @@ impl FlexInputApp {
             } else {
                 self.settings.overlay_shortcut.label()
             };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
             if self.overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
                          .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
@@ -1237,7 +1318,7 @@ impl FlexInputApp {
             } else {
                 self.settings.edit_overlay_shortcut.label()
             };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
             if self.edit_overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
                          .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
@@ -1288,7 +1369,7 @@ impl FlexInputApp {
             } else {
                 self.settings.config_overlay_shortcut.label()
             };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
             if self.config_overlay_learning {
                 btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
                          .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
@@ -1357,7 +1438,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "How smoothly pinned elements animate on the overlay. Higher = smoother glow, a bit more CPU/GPU while the overlay is shown."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
     }
 
     fn settings_controllers(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
@@ -1377,7 +1458,7 @@ impl FlexInputApp {
         }
         ui.label(egui::RichText::new(
             "Off by default. Turn on to test patches against your own virtual output (loopback).",
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
     }
 
     /// Warning box at the top of "Hide controllers" while the HidHide driver
@@ -1459,7 +1540,7 @@ impl FlexInputApp {
                  controller open keeps it. The eye button on a device card overrides this per \
                  controller (right-click it to go back to automatic). Joy-Con 2 can't be \
                  hidden.",
-            ).small().color(egui::Color32::from_gray(140)));
+            ).small().color(crate::settings::tinted_gray(140)));
         }
         if hidhide_installed && cfg!(windows) {
             ui.label(egui::RichText::new(
@@ -1470,7 +1551,7 @@ impl FlexInputApp {
                  it to go back to automatic). \u{2014} Note: only HID controllers \
                  (DualShock 4 / DualSense / Switch) can be hidden; the XInput/XUSB face of \
                  Xbox controllers cannot.",
-            ).small().color(egui::Color32::from_gray(140)));
+            ).small().color(crate::settings::tinted_gray(140)));
         }
 
         // ── Sticky masking (rides on the toggle above) ───────────────
@@ -1495,7 +1576,7 @@ impl FlexInputApp {
              hidden \u{2014} is UNHIDDEN for every app until it comes back. With a game running \
              that hands it the physical pad alongside the virtual one, which shows up as button \
              glyphs flickering between controller and keyboard.",
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
         // ── What stays hidden after FlexInput exits ──────────────────
         ui.add_space(4.0);
@@ -1503,7 +1584,7 @@ impl FlexInputApp {
         if !cfg!(windows) {
             ui.label(egui::RichText::new(
                 "Everything FlexInput hid is shown again when it closes.",
-            ).small().color(egui::Color32::from_gray(140)));
+            ).small().color(crate::settings::tinted_gray(140)));
             return;
         }
         ui.add_enabled_ui(hidhide_installed, |ui| {
@@ -1532,7 +1613,7 @@ impl FlexInputApp {
              Always: every controller FlexInput hid stays hidden.\n\
              A kept controller is unhidden on FlexInput's next launch if it's no longer \
              wanted hidden then.",
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
     }
 
     fn settings_virtual_output(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
@@ -1555,7 +1636,7 @@ impl FlexInputApp {
              Does not apply to ViGEm devices (Virtual Xbox / DualShock 4 (ViGEmBus)): \
              ViGEmBus removes those automatically when FlexInput exits and they can't be \
              reclaimed — they're re-created fresh on next launch.",
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Reinstall HIDMaestro drivers").clicked() {
@@ -1571,7 +1652,7 @@ impl FlexInputApp {
              after a Windows or app update. Uninstall: removes the HIDMaestro driver and \
              all its virtual controllers (gamepads will need a reinstall to work again). \
              Both prompt for admin once.",
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         if let Some(err) = &self.last_device_op_error {
             ui.label(egui::RichText::new(format!("Last device error: {err}"))
                 .small().color(egui::Color32::from_rgb(220, 120, 120)));
@@ -1607,7 +1688,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "How long the virtual mouse stays paused after a physical-mouse move. Lower = recovers faster."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
         ui.add_space(8.0);
         if ui.checkbox(&mut self.settings.mixed_braid_enabled,
@@ -1647,7 +1728,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "Gamepad and mouse packets strictly alternate (never coincident). Real-time = fastest/lowest latency; lower rates pace the alternation. Sweep to probe the game."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
     }
 
     fn settings_device_defaults(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
@@ -1656,11 +1737,11 @@ impl FlexInputApp {
         // the affected node, not these defaults.
         ui.label(egui::RichText::new(
             "Applied to newly-added device nodes. Existing nodes keep their own values."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         ui.add_space(4.0);
 
         ui.label(egui::RichText::new("Double-click the slider track to reset to factory default. Double-click the value to type a number.")
-            .small().italics().color(egui::Color32::from_gray(120)));
+            .small().italics().color(crate::settings::tinted_gray(120)));
         ui.add_space(4.0);
 
         // egui Slider widgets only sense drag, so Response::double_clicked()
@@ -1813,7 +1894,7 @@ impl FlexInputApp {
             }
             ui.label(egui::RichText::new(
                 "Opens the phase over the game: left stick or D-pad moves it, East closes it. The game keeps everything else, so aim while you tune."
-            ).small().color(egui::Color32::from_gray(140)));
+            ).small().color(crate::settings::tinted_gray(140)));
             let mut follow = self.settings.output_sync_follow_vrr;
             if ui.checkbox(&mut follow, "Follow variable refresh (VRR)")
                 .on_hover_text("With G-SYNC or FreeSync the display refreshes when the game shows a frame, so the reports follow the frames as they come. Off, they go out at the display's maximum rate as if it were fixed.")
@@ -1823,7 +1904,7 @@ impl FlexInputApp {
                 *dirty = true;
             }
             ui.label(egui::RichText::new(crate::phase_overlay::sync_status(&self.settings))
-                .small().color(egui::Color32::from_gray(170)));
+                .small().color(crate::settings::tinted_gray(170)));
         });
     }
 
@@ -1858,7 +1939,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "How often the I/O thread reads gamepads and MIDI devices."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
         ui.add_space(8.0);
         let synced = self.settings.output_sync().is_some();
@@ -1894,7 +1975,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "How fast the virtual gamepads and virtual mouse report to games."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         self.settings_output_sync(ui, dirty);
         if self.settings.effective_output_hz() > self.settings.effective_sample_rate_hz() {
             ui.label(egui::RichText::new(format!(
@@ -1913,7 +1994,7 @@ impl FlexInputApp {
         ui.label(egui::RichText::new(format!(
             "Now: polling {} Hz · output {output} · virtual mouse {mouse}",
             flexinput_engine::current_io_rate(),
-        )).small().color(egui::Color32::from_gray(170)))
+        )).small().color(crate::settings::tinted_gray(170)))
             .on_hover_text("Measured live. The virtual mouse sends a report only when the pointer moves at least one whole count, so slow motion sends fewer than the output rate.");
         // Inline rather than a tooltip: it's read while a controller moves the
         // pointer, which a hover can't survive.
@@ -2035,7 +2116,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "Engine tick rate. Higher = finer timing, more CPU."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         if let (Some(passes), Some(ticks)) = (live.passes_hz, live.ticks_hz) {
             // Below ~90% of the setting, catch-up ticks are being dropped: the
             // patch costs more per tick than this machine has at this rate.
@@ -2057,7 +2138,7 @@ impl FlexInputApp {
             ui.label(if behind {
                 text.color(egui::Color32::from_rgb(230, 170, 80))
             } else {
-                text.color(egui::Color32::from_gray(170))
+                text.color(crate::settings::tinted_gray(170))
             })
             .on_hover_text("The engine publishes its outputs once per pass, so passes/s is how often outputs can change.");
         }
@@ -2076,7 +2157,7 @@ impl FlexInputApp {
         });
         ui.label(egui::RichText::new(
             "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
 
         ui.add_space(8.0);
         if ui.checkbox(&mut self.settings.freeze_background, "Freeze and dim unused windows")
@@ -2099,7 +2180,7 @@ impl FlexInputApp {
              Auto-scanning is disabled because the Windows MIDI API periodically \
              disrupts the audio stack (stream skips, Bluetooth noise). \
              Click after plugging in or creating a MIDI/loopMIDI port."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         settings_subheading(ui, "Loop guard");
         // What the loop guard knows: which In/Out ports it treats as one
         // port coming back round, and which Out ports its breaker muted.
@@ -2114,7 +2195,7 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new(
                     "No MIDI ports in use are paired. A pair forms when a patch uses a MIDI In \
                      and a MIDI Out that are the same port (same name, or echoes seen coming back).",
-                ).small().color(egui::Color32::from_gray(140)));
+                ).small().color(crate::settings::tinted_gray(140)));
             }
             for (out_id, in_id, status) in &guard.pairs {
                 let (what, tip) = match status {
@@ -2127,7 +2208,7 @@ impl FlexInputApp {
                 };
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("{} → {}", name(out_id), name(in_id))).small());
-                    ui.label(egui::RichText::new(what).small().color(egui::Color32::from_gray(150)))
+                    ui.label(egui::RichText::new(what).small().color(crate::settings::tinted_gray(150)))
                         .on_hover_text(tip);
                 });
             }
@@ -2147,7 +2228,7 @@ impl FlexInputApp {
         settings_subheading(ui, "User presets");
         ui.label(egui::RichText::new(
             "Folder scanned for user-authored .fxsp sub-patch presets, in addition to the factory presets shipped under app/assets/sub-patches/."
-        ).small().color(egui::Color32::from_gray(140)));
+        ).small().color(crate::settings::tinted_gray(140)));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("User presets folder:");
@@ -2181,7 +2262,7 @@ impl FlexInputApp {
             ui.label(
                 egui::RichText::new(if cur.is_empty() { "(none)" } else { &cur })
                     .small()
-                    .color(egui::Color32::from_gray(160)),
+                    .color(crate::settings::tinted_gray(160)),
             );
             if ui.small_button("Browse…").clicked() {
                 if let Some(p) = crate::overlay::with_overlay_not_topmost(|| rfd::FileDialog::new().pick_folder()) {
@@ -2205,7 +2286,7 @@ impl FlexInputApp {
             ui.label(
                 egui::RichText::new(if cur.is_empty() { "(working directory)" } else { &cur })
                     .small()
-                    .color(egui::Color32::from_gray(160)),
+                    .color(crate::settings::tinted_gray(160)),
             )
             .on_hover_text(
                 "Where link keys for controllers paired to FlexInput's own \
@@ -2492,7 +2573,7 @@ impl FlexInputApp {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     ui.add(egui::Label::new(
-                                        egui::RichText::new(entry.text).monospace().size(11.0)
+                                        egui::RichText::new(entry.text).monospace().size(crate::settings::ui_size(11.0))
                                     ).wrap());
                                 });
                         },
@@ -2576,7 +2657,7 @@ struct SettingsNav {
 /// A section's title on the Settings page. The response is what a jump
 /// scrolls to the top of the view.
 fn settings_section_header(ui: &mut egui::Ui, title: &str) -> egui::Response {
-    let resp = ui.label(egui::RichText::new(title).size(17.0).strong());
+    let resp = ui.label(egui::RichText::new(title).size(crate::settings::ui_size(17.0)).strong());
     ui.separator();
     ui.add_space(4.0);
     resp
@@ -2585,13 +2666,13 @@ fn settings_section_header(ui: &mut egui::Ui, title: &str) -> egui::Response {
 /// A group title inside a Settings section.
 fn settings_subheading(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(title).strong().color(egui::Color32::from_gray(200)));
+    ui.label(egui::RichText::new(title).strong().color(crate::settings::tinted_gray(200)));
     ui.add_space(2.0);
 }
 
 /// Small explanatory text under a setting.
 fn settings_note(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).small().color(egui::Color32::from_gray(140)));
+    ui.label(egui::RichText::new(text).small().color(crate::settings::tinted_gray(140)));
 }
 
 /// The Performance section's live readout: per-second rates differenced from

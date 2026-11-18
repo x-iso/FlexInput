@@ -8,6 +8,9 @@ use flexinput_core::{Signal, SigMap};
 /// Replaces the computation fields that were previously in NodeExtra.
 #[derive(Default)]
 pub struct NodeState {
+    /// A Reset asked for from outside the graph - panic mode, as it is engaged or
+    /// released - taken by the next tick of a module that resets (3DOF to 2D).
+    pub reset_request: bool,
     /// Latest computed outputs for stateful nodes (oscillator, delay, etc.).
     pub last_signals: Vec<Option<Signal>>,
     /// JSM Config: the compiled config plus its running button state. Boxed and

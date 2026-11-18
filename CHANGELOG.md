@@ -3,10 +3,144 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.18.0] - 2026-11-18
 
 ### Added
 
+- **3DOF to 2D has an Orient mode: the output follows where the pad's nose points.** It
+  keeps a camera - a heading and a pitch - looking where the nose is: each tick the gyro's
+  own turn of the pad is taken along the camera's up and its level right, so wherever the
+  nose goes below the poles - rolled, pitched about its own tilted axes, turned - the
+  camera ends up there, and twisting the pad about its nose does nothing (World and Player
+  turn the camera with a twist of a raised nose). The pitch has no cap: over the top the
+  vertical the camera turns about turns over with it, so the camera stays upright relative to
+  the pad - its up is the pad's up, its right the pad's right - and a game that lets its
+  camera loop, a spacecraft, loops with it: turned right about its own up the pad turns the
+  camera right, pitched up about its own right it pitches it up, upside down or not, and the
+  heading never turns round. A twist about the nose moves the camera nowhere, but it can
+  turn the pad's up away from the camera's; once they are more than about 107° apart the
+  camera turns over about its own look, so a pad rolled upside down and back level never
+  leaves the camera upside down against it, mirroring the outputs. Which way is down comes
+  from the orientation JoyShockMapper's motion library keeps, held to gravity, but gravity only holds
+  the frame the turns are measured in: bringing it back after the gyro drifted never moves
+  the pointer. Near straight up a nose moved sideways is a big change of heading; past 75°
+  the camera takes it a little at a time instead of spinning on the spot. The camera matches
+  the pad as far as the game lets it: at a 1:1 sensitivity with no acceleration curve, no
+  ratchet and nothing else turning it - a game that stops its pitch at straight up parts
+  from the pad over the top, until a Reset puts the camera back on the nose. The preview
+  draws the pad as that orientation, so it never spins as the nose crosses a pole. The JSM
+  module has it too, as FlexInput's own `GYRO_SPACE = ORIENT`.
+- **Auto re-center puts Orient's pointer back on the pad.** Once the pad has lain still for
+  three seconds, the camera eases onto where its nose points and the heading back to
+  forward, as a Reset would, sending no movement. A pad just connected, its gyro still
+  reading a turn it isn't making until its calibration settles, left the pointer off the
+  pad's nose (x -8°, y +12° for a pad lying flat) until a Reset or a change of mode; gravity
+  takes that turn out of the pad, never out of the pointer. In Orient the switch works
+  whatever the pose's source.
+- **Panic mode resets 3DOF to 2D,** as it is engaged and as it is released: the
+  Orientation output, Steering's wheel and the aim start over from neutral, as a Reset
+  would, so what drifted or wound up while it was on is gone.
+- **Pinned Style 2 controls say what they do.** Their tooltips gave the field's label
+  again ("interp ms"); they now carry the module's own description of each setting, and the
+  labels are names - Crossover, Peak hold, Takes over above, Exclude Y, Lean threshold, Edge
+  zone, Real world scale - where they were abbreviations. On the modules, a pill or switch
+  with a short name now has a long one it shows whenever there is room (`exclude Y`,
+  `recenter`, `reset ease`, `edge zone`, `ramp width`, `in max`, `model opacity`,
+  `symmetric`, `pass through`, `softness`, `crossover`), and 3DOF's Steering row shares its
+  width instead of standing its pills at the right edge at a fixed size, which showed "ctr"
+  however much room was left of them. RWS's V/H pills are named in their labels ("gy v/h",
+  "gyro v/h") where the value said it again ("gy 1.00").
+- **AutoMap Splitter and Collector list their ports as strips, on their sockets,** as Split
+  and Selector do: each port's strip is on the row of its own socket, from the top of the
+  body (the bus pin is on the header), with `add pin` under the last one, and the sockets
+  carry no small name of their own beside them. A strip shows the pin as a mapping card
+  does - its button glyph, in the pad's own family, then its name in the controls' font and
+  the strong text colour - or the name alone for a pin with no glyph, with its handle and
+  `×` centred on the row. Every pin with a drawing anywhere wears it: a stick's or the
+  D-pad's axis, the pad's gyro and accelerometer axes (the Choose picker's motion glyphs),
+  the cursor's move as well as its delta - the name beside it says which. `add pin` is the
+  strips' full width, and MIDI…, Learn (the Collector's) and Clear are one action row in
+  the Remapper's button style, Clear greyed while every port is wired; the MIDI picker opens
+  under the row. `add pin`'s list shows each pin with its glyph, as its strip will. The list
+  ran down the body at its own pitch, in small grey text, under sockets that each said their
+  name again, and its buttons were egui's small ones.
+- **MIDI In and MIDI Out list their messages the same way:** a strip each on its own
+  socket's row - a handle that moves it, its name, its `×` - with no second name beside the
+  socket, then the picker that adds one and an action row under them (Learn and Clear unused
+  on a MIDI In, Clear unused on a MIDI Out). They were small rows of `×` and name under
+  sockets that named themselves again, with Learn, Clear unused and the picker up in the
+  header. MIDI Out's Thru is a switch in the same style, where it was a checkbox. The
+  picker is pills too - the type, the channel, the number (a note with its name) - laid out
+  for the width there is: one row when they fit, else the type and its channel over the
+  number and Add, each row the strips' width. It was egui dropdowns and a bare drag field
+  wrapped into ragged lines.
+- **The Virtual Keyboard & Mouse can Choose its keys** as well as learn them: Choose… opens
+  the picker on its keyboard and mouse alone, and every key picked becomes an input, named
+  as Learn names it (a key it has already, by either name, isn't added twice). Learn,
+  Choose… and Clear unused are the house buttons, a column of one width beside the inputs.
+- **Mapping cards scroll in a window of their own in every module that has them,** as a
+  Remapper's do: Touch Zones', the Virtual Menu's and the Area Mapper's card lists, and each
+  of 3DOF to 2D's two Lean lists. The part above the cards - the zone or cell tabs, the
+  status, Learn / Choose / Add - stays put; the cards scroll under it, in the height the bar
+  under the window gives them (the frame growing or shrinking by as much), never less than
+  that top part and one card; double-click the bar and the window is as tall as its cards
+  again, which it is until the bar is first dragged. They were drawn straight into the
+  body, every card making the module taller - and 3DOF's two Lean lists shared one scroll,
+  where Lean Left's cards pushed Lean Right out of view and the scroll misbehaved. A card
+  list pinned whole keeps the same minimum: the layout won't size it below its top part and
+  one card.
+- **The Area Mapper's analog mode is a widget of its own,** pinned apart from the layer tabs
+  and colour. Its settings always take their room - two bands, the ramp's cell too under
+  fixed PWM, greyed - and while it is off one outlined "enable analog" button covers that
+  room, so turning it on, or switching how it pulses, changes nothing's size: on the layer
+  row, Analog grew a pinned row by its settings every time it was pressed. The selected
+  cell - its icon and name, and its haptic - can be pinned too, and its tone settings are
+  always there, greyed until the haptic is on, for the same reason.
+- **Style 2 mode rows show their drawings and grow into tall frames.** 3DOF to 2D's Pointer
+  and Steering rows, pinned, wear the modes' drawings as the module does; a word takes its
+  capitals once the pill is tall enough for them, and stays lower case in a thin strip. A
+  row of one band, held to its scale by a narrow frame, fills the frame's height (up to
+  three times its own): taller pills, a drawing over its word where there is room above
+  and beside it where there is room across.
+- **A row of joined choices is in one font size.** Each choice was fitted on its own, so a
+  short word came out bigger than its neighbours ("Yaw" over "Player").
+- **3DOF to 2D's Mode section is "2D Output mode",** and a rule sets Edge turn apart from
+  the mode's other settings.
+- **3DOF to 2D's Mode rows have drawings.** Each mode's cell shows one beside its name - the
+  turn Pitch+Yaw and Pitch+Roll take X from, a figure for Player, a globe for World, a
+  compass for Orient - and the Pointer and Steering captions an aim and a wheel. Where the
+  cells are narrow, Pitch+Yaw and Pitch+Roll say the half the drawing doesn't (Yaw, Roll).
+  Steering's own settings (exclude Y, recenter, reset ease) now sit straight under the
+  Steering row, with the neutral hold and roll mix after them.
+- **The SVG module is sized by its corner grip** like every other picture on the canvas, the
+  drawing kept to its own shape inside, and drawn at the pixels it covers - the screen's
+  density and the canvas's zoom - so it stays sharp zoomed in. Load and Clear are drawings
+  in the header and the tint a swatch their height, in one row at the header's right edge;
+  the name is painted in the room they leave, cut with dots, as every module's is, so the
+  grip takes the module down to its controls. With nothing loaded it says so in the
+  controls' font. It was a fixed 160-point square, its name laid out beside egui's small
+  buttons and holding the module as wide as the two.
+- **Buttons in module bodies wear the house style:** MIDI Out's Unmute and the MIDI picker's
+  Add, the 3D viewer's colour Reset / Save… / Load…, Network Receive's Copy, and a raw
+  pad's Learn, Clear unused and motion setup (Skip, Cancel, Use it, Redo, Try again) are
+  action-row buttons in the controls' font, where they were egui's small grey ones.
+- **A Response Curve's In / Out range reads in the units its axes do:** a motion sensor's
+  view in °/s or G as value pills like the plain range's (they were bare drag fields on a
+  row of their own), and an axis that ends on a feedback pin in that pin's own units - a
+  haptic's pitch in Hz, its strength in dB, a rumble's share in % - dragged and typed in
+  them, where it said 1.00 for full strength.
+- **A Response Curve's Log/Exp slider is as tall as the Abs and Snap buttons beside it,** and
+  Log and Exp are in the controls' font; it was a thin strip between two small captions.
+- **The Envelope's Hold, Bounce and Loop say their names** beside their drawings when the
+  module is wide enough for all three.
+- **Overlays can show on any monitor.** With more than one connected, a picker beside the
+  overlay buttons in the header - a monitor with the display's number on it - chooses the
+  monitor every overlay covers - the info and config overlays, menus, the calibration
+  prompts - and so the one a calibration's screenshot is taken of. Each overlay places itself
+  there in that monitor's own pixels, whatever its scale, and edits there: where the cursor
+  is over an overlay is measured from the overlay, not the desktop's corner. They sat at the
+  desktop's corner, on the primary monitor, sized from whichever monitor the main window was
+  on. The choice is kept; a monitor that has been unplugged falls back to the primary.
 - **A layout grid on the canvas.** Modules snap to a grid of blocks as they're
   dragged (Alt drags freely), with their edges in the middle of a block and their
   size in whole blocks, so there's always a block's gap between two. A module
@@ -179,6 +313,105 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **3DOF to 2D's Player and World are JoyShockMapper's PLAYER_TURN and WORLD_TURN,** by
+  the JSM module's maths, which is JSM's line for line. Player keeps the pad's own pitch for
+  Y and takes X from the turn about gravity, yaw and roll both counting, relaxed by JSM's
+  60° buffer but never more than the pad is turning; it was a world-style split before, so
+  it feels different - held on its side, a turn about gravity is pitch, as in JSM. World's Y
+  is the pitch axis laid level and normalised, fading as the pad goes onto its side; it
+  weakened as the pad rolled and never faded. Hold offsets still name which way is down.
+- **The Area Mapper, Touch Zones and Virtual Menu look like the other modules.** Their
+  settings are value pills, joined segments and lit word switches laid out in bands that
+  wrap to the module's width, where they were checkboxes, bare number fields and dropdowns
+  of every size. The Area Mapper's fold under headings - Input and overlay, Layers, the
+  selected border (its name in the heading), the selected cell (its icon, name and haptic,
+  the click tone as pills), Press mode - saved with the patch. The Virtual Menu's header
+  keeps its icon and name; Ports / Mapping, suppression, Radial, its colours and Position
+  on screen are its body's first band, under "Menu", then "Pointer and selection". Touch
+  Zones' mode, Split pads and colours share one band. The mapping cards' Learn / Choose… /
+  MIDI… / Add row on all three has the Remapper's full-size buttons. Pinned rows look as
+  they did.
+- **Theme and control font settings** in Settings → Display: the accent colour (what is
+  selected, lit or on, egui's blue until changed), a tint the greys lean toward with its
+  strength (0% = plain grey, lightness kept), and the control font - normal or console,
+  regular or bold, 11 to 18 points (Normal Regular 15 by default; the size applies when the
+  slider is let go). The control font is every
+  button, dropdown, value pill, segment and switch, which mixed the pills' monospace with
+  the proportional small font. Its size is the normal font's: console and bold are drawn as
+  wide as normal text at that size, so a setting fits the same room whichever face it is,
+  and a larger size widens the rows (they wrap to another band) instead of spilling out of
+  the pills. Text a control can't hold is drawn smaller to fit before anything is cut short,
+  and a dropdown with a set width keeps its text inside it. Bold uses the system's bold face
+  (Segoe UI / Consolas on Windows, DejaVu on Linux), Consolas lowered to sit in the middle
+  of a pill. The tint reaches the greys painted by hand too - node borders, graph
+  backdrops, hint text, the calibration panels, Easy mode's side panel and device cards, the
+  mapping cards - and the text greys. The grey tint and the font are on the gamepad settings
+  panel as well.
+- **The font setting reaches all the text,** not only the controls: labels, hints, headings,
+  Easy mode's cards, the mapping cards, the calibration panels and the overlays take its face
+  and weight, at their own sizes scaled by it (unchanged at the default 15). Monospace text
+  and the canvas's pin labels, which are sized to the layout grid, keep theirs.
+- **Feedback pins read in their units.** A Response Curve whose output ends on a feedback
+  pin - a Feedback Control's inlet or a pad's own - labels its Out axis and its dots in that
+  pin's units: Hz for a haptic's pitch (the Switch Pro's table or 80-500 Hz, as the pad
+  says), dB for its strength, % for a rumble motor, 0-255 for a light bar, zones, forces and
+  effects for an adaptive trigger. A Knob driving one reads its value in those units too and
+  takes the pin's name until it is named by hand, and a curve a Knob feeds reads its In axis
+  in them as well - Hz in, Hz out (fed by a stick or a Constant, In keeps its own scale). A
+  Readout reads in the units of what it is wired to (a motion sensor's °/s or G, a Feedback
+  Control outlet's %), and its type is sized to the widest it reads, so it no longer jumps as
+  a value's digits come and go.
+- **A value pill shares its width between its name and its value fairly.** The value gets the
+  room its widest value takes first (`+100 %` across ±100), and the name what is left - the
+  long name when it fits, the short one when it doesn't; with room past both the narrower
+  half grows until the two are as wide, and then they grow together. The name was squeezed
+  while the value stretched, and values were cut short in narrow pills (`hyst 0....`).
+- **The Two-way curve's last old controls are pills:** Up / Down / Hyst as one joined pill,
+  the hysteresis and peak hold's ↕ ↑ ↓ as joined pills, Start ↑ a word switch, and the
+  crossing time a pill named for it.
+- **Every redesigned row pins with the Style 2 switch:** the Area Mapper's options, layers,
+  press mode and border, the Virtual Menu's options, Vec Reshaper's rows, and now 3DOF to
+  2D's mode, hold, roll mix, steering, Edge turn, orientation and inversion rows, Stick
+  Rotation's six rows, RWS Aim's calibration rows, the Envelope's, the curves' grid options
+  and Two-way rows, the Oscillator's, and the small modules' (Average, Delay, DC Filter,
+  Counter, Logic Delay, Sample & Hold, Has Changed, Inverse, Quantize, Vec to Deflection).
+  The ones that were bare drag fields and checkboxes are drawn from the gamepad's own field
+  list, so the pills are the fields the pad walks, in its order. A pin of several bands
+  shares its frame's height among them.
+- **3DOF to 2D's preview:** the pad's icon and its 3D model are drawn the same size - half
+  the sphere's radius grip to grip, the icon larger and the model smaller than they were -
+  and in model mode the neutral hold is a faint dark grey model. The pad is drawn as it is
+  held: with a neutral hold set, at a Reset it sits on the hold's ghost, tilted as the hold
+  is, while the pointer it drives points straight ahead (it was drawn flat). The output
+  leaves a trail on the sphere for the last 0.6 s, as a vectorscope does. Past the Edge-turn
+  zone a yellow sphere turns against the pointer - the world going by as Edge turn keeps
+  the camera turning, by the module's own Edge-turn step - and fades once the pad is back
+  inside; the pointer stays on the pad throughout, and its trail is drawn on that turning
+  world, so it streams off the pointer with the motion Edge turn gives the 2D output. The
+  pointer is where the module's X/Y outputs have added up to, summed by the module itself
+  as it puts them out - its hold, gravity, roll share and inverts and all, at the engine's
+  rate - rather than worked out again from the pose at the screen's rate (which ignored the
+  hold offsets and read the inverts twice on a computed pose). Yawing a tilted pad moves it
+  straight across, as the output does, and pitching over the top carries it over the pole.
+  The pad is drawn as the output has it: its nose on the pointer, rolled as it is held -
+  the camera's heading and pitch are the output's, whatever path the pad took and wherever
+  the Orientation output, integrated on its own, has wandered - so pad and pointer agree in
+  every mode (after a tumble they parted: two numbers added up can't follow every path a pad
+  turns through). In Steering the pointer is the wheel's own angle, centred and Reset as it
+  goes out. The pointer no longer eases back near neutral on its own, which the output never
+  did. The
+  Edge-turn zone ring has its blend as a band fading out past it, and Ramp's full speed as a
+  dotted ring. Pinned, the preview has a style of its own in the layout inspector - frame
+  fill and outline, and the pad as the module draws it or as its icon, outline or 3D model -
+  and its model is the device the module reads (a pin inside a sub-patch drew the first
+  model on disk). The sphere is drawn in two halves round the pad: what is behind the model
+  is behind it, and what is in front of it in front (every ring was painted across it, and
+  then each half was drawn on the wrong side). The model's opacity is a setting, on the
+  module and per pin. Its look dropdown is as wide as its words.
+- **Vec Reshaper's settings are pills too,** Gain / Boundary and 4-way / X-mirror as joined
+  segments, with what dragging a point does written in the curve's corner; Audio Stream
+  Haptics' capture choice, Swap, Split L/R and Pure tones are word switches where they were
+  checkboxes, and so is Feedback Control's "override game feedback".
 - **RWS Aim's settings read as two kinds of number.** The first section is "Real world
   calibration and scale": the calibration values (mouse scale, stick speed, gyro scale) under
   one caption, the output sensitivity under another - Real World Scale across the whole
@@ -746,6 +979,75 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A Log/Exp scale set with a pad moves the curve's points with it,** every lane's, as the
+  slider does: the pad's field editor wrote the scale alone, which left the points where
+  they were on the graph and changed what each one stood for - most noticeable on a pinned
+  Two-way curve, where the pad is how it is edited. Reset to default (North) does the same.
+- **The Easy panel's mouse speed box stays inside its card** at a larger font: it was a fixed
+  56 points, and its number ran past the card's right edge.
+
+- **An AutoMap Two-way curve's pinned rows can be edited with a pad on a layout.** Nav
+  looked a layout's pin up under the AutoMap curve's own id, which no row table knows, so
+  the pad reached the graph and none of the rows - while on the config overlay, which
+  names it as the plain curve it runs, they worked. The AutoMap Response Curve's rows had
+  the same trouble.
+- **The 3DOF preview draws the Xbox pad when nothing names one**, as an icon and as a model,
+  and so does the 3D viewer's model. It drew the generic gamepad glyph, and the model that sorted
+  first, the DualSense. And a sub-patch's layout traces the pad it is wired to while it is
+  being edited too, where the preview lost it and fell back.
+
+- **The AutoMap Combiner no longer widens without end** with its Resolution tree open on a
+  category. Each row put its two dropdowns against the edge the port strips end at, and that
+  edge followed the module's frame: a dropdown came out wider than it was asked to be (its
+  text more than fitted beside its arrow), ended past the edge, the frame grew to hold it,
+  the edge moved out with it, and so on every frame. The dropdowns now have a cell of their
+  own that can't widen the row, and a dropdown's text is fitted to the room its arrow and
+  padding really leave.
+- **Pill dropdowns fill their cell.** Every `add pin`-style dropdown ended a little short of
+  where it was meant to - under the AutoMap Splitter's strips, beside the pills of a row -
+  having taken its padding off twice.
+
+- **Gravity is JoyShockMapper's own estimate, everywhere it is measured against.** The JSM
+  module (its gravity gyro spaces, motion stick, lean and steering), 3DOF to 2D's Player and
+  World, and Gyro to Stick Rotation's World each low-passed the accelerometer on its own -
+  half a second behind in the JSM module and Stick Rotation, one and three seconds in 3DOF -
+  so after any quick tilt "down" was where the pad used to be: a turn just after tipping the
+  nose up 60° read at half speed, and through a fast turn the split between turning and
+  leaning meant nothing. They now share the estimate JSM reads from its motion library,
+  GamepadMotionHelpers, ported step for step: the gyro carries gravity through every turn as
+  it happens, and the accelerometer pulls it in - quickly while the pad is still, slowly while
+  it is shaken, barely once it is close unless the pad is turning. Credited under Settings →
+  Credits.
+- **3DOF to 2D's Steering centres on gravity, where gravity can see the wheel.** Its
+  centring (`ctr`) compared an angle in radians with a turn measured in units 35 times
+  smaller, from a reference 90° off for a pad held upright: set, it pulled the wheel to full
+  lock and held it there, and Player and World, which never centre, kept whatever the wheel
+  had wound up to - a wheel stuck at full lock in every mode until a Reset. It now measures
+  how far gravity has swung about the wheel's axis since the last Reset: the pad's own down
+  in Pitch+Yaw, held upright and turned in its face like a wheel, its forward in Pitch+Roll,
+  held flat and rolled. Player, World and Orient turn the wheel about gravity itself, which
+  gravity can't see, so only a Reset centres them; `ctr` greys out there. The Steering row's
+  modes have tooltips of their own (they said what the Pointer row's do, JoyShockMapper and
+  all - JoyShockMapper has no added-up steering; its lean steering is a tilt read off
+  gravity).
+- **A pinned 3DOF mode row in Style 1 holds its size.** With Orient's fifth choice it had no
+  slack, and the frame and the row chased each other between two sizes (fonts round to half
+  points, so the row measured differently at each scale); it now sizes from its words.
+- **Feedback Control's override switch** shortens to "override" in a narrow header, where its
+  phrase wrapped onto two lines inside the button.
+- **Pads' 3D models in their stock colours.** The Steam Controller (2026) is black - its one
+  colour, matte, with the Steam Deck's grey-on-black buttons - where its shell, trackpads,
+  bumpers and triggers were light grey. The Xbox One's battery cover was taken for an LED
+  strip and drawn white; it is shell. Its face buttons and the DualShock 4's are black under
+  their coloured letters and symbols (each tinted toward its colour, the letters having no
+  mesh of their own), where they were solid colour. A Joy-Con's SL and SR, and any pad's
+  paddles, are buttons the bumpers' colour; on a neon Joy-Con they came out neon.
+- **3DOF to 2D's Reset goes all the way.** Its ease took a fixed share of what was left each
+  tick and stopped when its time ran out, a third of the way short: a pose Reset from 90°
+  stopped at 33°, and Steering's X and Y kept a third of what they had. Both land on zero.
+- **3DOF to 2D's preview shows the 3D model** when its look is "3D model": the model was
+  rendered and then composited at zero opacity, so the sphere stood empty. It is drawn
+  half see-through now.
 - **A module scrolled off the canvas left its Auto-Map socket, and the wire, on the canvas
   edge.** A socket drawn on the header row took its height from the clip, and a node partly
   out of view has its clip cut to the canvas. The socket now follows the header as laid out.

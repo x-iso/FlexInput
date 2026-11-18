@@ -1096,9 +1096,9 @@ impl FlexInputApp {
                 ).unwrap_or(1.0);
                 let left_fill = if see_through_on {
                     let a = (st_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    egui::Color32::from_rgba_unmultiplied(0x1a, 0x1a, 0x1a, a)
+                    crate::settings::tinted(egui::Color32::from_rgba_unmultiplied(0x1a, 0x1a, 0x1a, a))
                 } else {
-                    egui::Color32::from_rgb(0x1a, 0x1a, 0x1a)
+                    crate::settings::tinted(egui::Color32::from_rgb(0x1a, 0x1a, 0x1a))
                 };
                 if see_through_on {
                     // Fill the FULL surround ring (out to the window edge)

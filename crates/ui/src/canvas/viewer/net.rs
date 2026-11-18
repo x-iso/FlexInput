@@ -81,7 +81,7 @@ pub(crate) fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: 
         net_label(ui, "mode");
         egui::ComboBox::from_id_salt(("net_transport", node_id))
             .width(net_field_w(ui))
-            .selected_text(egui::RichText::new(net_transport_label(&transport)).small())
+            .selected_text(egui::RichText::new(net_transport_label(&transport)).text_style(egui::TextStyle::Button))
             .show_ui(ui, |ui| {
                 for t in ["udp", "psk", "p2p"] {
                     if ui
@@ -311,7 +311,7 @@ pub(crate) fn show_net_recv_body(
             ui.label(egui::RichText::new("Your code - share it with the sender").small().weak());
             if let Some(code) = code {
                 ui.horizontal(|ui| {
-                    if ui.small_button("Copy").clicked() {
+                    if super::kit::body_button(ui, "Copy", false).clicked() {
                         ui.ctx().copy_text(code.clone());
                     }
                     ui.add(

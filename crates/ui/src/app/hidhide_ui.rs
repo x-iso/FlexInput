@@ -237,10 +237,10 @@ impl FlexInputApp {
                                 let top = egui::pos2(text_x, rect.top() + 5.0);
                                 let bot = egui::pos2(text_x, rect.top() + 22.0);
                                 ui.painter().text(top, egui::Align2::LEFT_TOP,
-                                    title, egui::FontId::proportional(13.0),
+                                    title, crate::settings::ui_font(13.0),
                                     ui.visuals().text_color());
                                 ui.painter().text(bot, egui::Align2::LEFT_TOP,
-                                    exe_name, egui::FontId::proportional(11.0),
+                                    exe_name, crate::settings::ui_font(11.0),
                                     ui.visuals().weak_text_color());
 
                                 if resp.clicked() {

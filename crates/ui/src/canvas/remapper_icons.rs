@@ -146,6 +146,8 @@ const XB_DPAD_H:  &[u8] = a!("Xbox/xbox_dpad_horizontal.svg");
 const XB_DPAD_V:  &[u8] = a!("Xbox/xbox_dpad_vertical.svg");
 const XB_LSTICK_H: &[u8] = a!("Xbox/xbox_stick_l_horizontal.svg");
 const XB_LSTICK_V: &[u8] = a!("Xbox/xbox_stick_l_vertical.svg");
+const XB_RSTICK_H: &[u8] = a!("Xbox/xbox_stick_r_horizontal.svg");
+const XB_RSTICK_V: &[u8] = a!("Xbox/xbox_stick_r_vertical.svg");
 const XB_LS:      &[u8] = a!("Xbox/xbox_stick_l_press.svg");
 const XB_RS:      &[u8] = a!("Xbox/xbox_stick_r_press.svg");
 const XB_LSTICK:  &[u8] = a!("Xbox/xbox_stick_l.svg");
@@ -198,6 +200,8 @@ const PS_DPAD_H:   &[u8] = a!("Playstation/playstation_dpad_horizontal.svg");
 const PS_DPAD_V:   &[u8] = a!("Playstation/playstation_dpad_vertical.svg");
 const PS_LSTICK_H: &[u8] = a!("Playstation/playstation_stick_l_horizontal.svg");
 const PS_LSTICK_V: &[u8] = a!("Playstation/playstation_stick_l_vertical.svg");
+const PS_RSTICK_H: &[u8] = a!("Playstation/playstation_stick_r_horizontal.svg");
+const PS_RSTICK_V: &[u8] = a!("Playstation/playstation_stick_r_vertical.svg");
 const PS_LSTICK:   &[u8] = a!("Playstation/playstation_stick_l.svg");
 const PS_RSTICK:   &[u8] = a!("Playstation/playstation_stick_r.svg");
 const PS_LSTICK_U: &[u8] = a!("Playstation/playstation_stick_l_up.svg");
@@ -235,6 +239,8 @@ const SW_DPAD_H:  &[u8] = a!("SwitchPro/switch_dpad_horizontal.svg");
 const SW_DPAD_V:  &[u8] = a!("SwitchPro/switch_dpad_vertical.svg");
 const SW_LSTICK_H: &[u8] = a!("SwitchPro/switch_stick_l_horizontal.svg");
 const SW_LSTICK_V: &[u8] = a!("SwitchPro/switch_stick_l_vertical.svg");
+const SW_RSTICK_H: &[u8] = a!("SwitchPro/switch_stick_r_horizontal.svg");
+const SW_RSTICK_V: &[u8] = a!("SwitchPro/switch_stick_r_vertical.svg");
 const SW_LSTICK:  &[u8] = a!("SwitchPro/switch_stick_l.svg");
 const SW_RSTICK:  &[u8] = a!("SwitchPro/switch_stick_r.svg");
 const SW_LSTICK_U: &[u8] = a!("SwitchPro/switch_stick_l_up.svg");
@@ -600,6 +606,10 @@ pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
 /// device chip + any other single-icon call site.
 pub fn keymouse_svg() -> &'static [u8] { DEV_KBM }
 
+/// The pad drawn for one nothing names, as a model is drawn for it (`model::default_model`):
+/// the Xbox pad's card.
+pub fn default_pad_svg() -> &'static [u8] { DEV_XBOX }
+
 /// The SVG to render in a canvas device-node header. (Historically also
 /// carried a two-glyph `Pair` for `virtual.keymouse`, now a combined glyph.)
 pub enum NodeIconSpec {
@@ -651,6 +661,37 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
 /// Returns None when no icon is mapped (caller renders the text label).
 /// KBM-family pins (`key_*`, `mouse_*`, `scroll_*`) always resolve from the
 /// KBM folder regardless of the requested skin.
+/// The id a bus pin's glyph is drawn under, where the AutoMap bus names a pin other than
+/// the pickers do: a stick's or the D-pad's axis is the picker's horizontal / vertical, the
+/// pad's motion axes are the Choose picker's motion glyphs (gamepad-agnostic, as there),
+/// the cursor's move the mouse's movement glyphs - the bus's own name, under it, says which
+/// it is (move or delta). Any other pin is its own.
+pub fn bus_glyph_pin(pin_id: &str) -> &str {
+    match pin_id {
+        "left_stick_x" => "left_stick_horizontal",
+        "left_stick_y" => "left_stick_vertical",
+        "right_stick_x" => "right_stick_horizontal",
+        "right_stick_y" => "right_stick_vertical",
+        "dpad_x" => "dpad_horizontal",
+        "dpad_y" => "dpad_vertical",
+        // Gyro: (roll, pitch, yaw); accel: (forward, side, vertical).
+        "gyro_x" => "imu_gyro_roll",
+        "gyro_y" => "imu_gyro_pitch",
+        "gyro_z" => "imu_gyro_yaw",
+        "accel_x" => "imu_accel_fb",
+        "accel_y" => "imu_accel_lr",
+        "accel_z" => "imu_accel_ud",
+        "mouse_move" | "optical_motion" => "mouse",
+        "mouse_move_x" | "optical_x" => "mouse_x",
+        "mouse_move_y" | "optical_y" => "mouse_y",
+        "touch1_x" => "touch1_swipe_x",
+        "touch1_y" => "touch1_swipe_y",
+        "touch2_x" => "touch2_swipe_x",
+        "touch2_y" => "touch2_swipe_y",
+        other => other,
+    }
+}
+
 pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
     if skin == Skin::Steam {
         if let Some(b) = steam_pin_svg(pin_id) {
@@ -850,6 +891,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::Xbox, "dpad_vertical")     => Some(XB_DPAD_V),
         (Skin::Xbox, "left_stick_horizontal") => Some(XB_LSTICK_H),
         (Skin::Xbox, "left_stick_vertical")   => Some(XB_LSTICK_V),
+        (Skin::Xbox, "right_stick_horizontal") => Some(XB_RSTICK_H),
+        (Skin::Xbox, "right_stick_vertical")   => Some(XB_RSTICK_V),
         (Skin::Xbox, "btn_ls")        => Some(XB_LS),
         (Skin::Xbox, "btn_rs")        => Some(XB_RS),
         (Skin::Xbox, "left_stick")    => Some(XB_LSTICK),
@@ -902,6 +945,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::Playstation, "dpad_vertical")     => Some(PS_DPAD_V),
         (Skin::Playstation, "left_stick_horizontal") => Some(PS_LSTICK_H),
         (Skin::Playstation, "left_stick_vertical")   => Some(PS_LSTICK_V),
+        (Skin::Playstation, "right_stick_horizontal") => Some(PS_RSTICK_H),
+        (Skin::Playstation, "right_stick_vertical")   => Some(PS_RSTICK_V),
         (Skin::Playstation, "left_stick")    => Some(PS_LSTICK),
         (Skin::Playstation, "right_stick")   => Some(PS_RSTICK),
         (Skin::Playstation, "left_stick_up")     => Some(PS_LSTICK_U),
@@ -936,6 +981,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::SwitchPro, "dpad_vertical")     => Some(SW_DPAD_V),
         (Skin::SwitchPro, "left_stick_horizontal") => Some(SW_LSTICK_H),
         (Skin::SwitchPro, "left_stick_vertical")   => Some(SW_LSTICK_V),
+        (Skin::SwitchPro, "right_stick_horizontal") => Some(SW_RSTICK_H),
+        (Skin::SwitchPro, "right_stick_vertical")   => Some(SW_RSTICK_V),
         (Skin::SwitchPro, "btn_ls")        => Some(SW_LS),
         (Skin::SwitchPro, "btn_rs")        => Some(SW_RS),
         (Skin::SwitchPro, "left_stick")    => Some(SW_LSTICK),
@@ -1078,9 +1125,9 @@ pub fn paint_pad_side_badge(
     let r = (icon.width().min(icon.height()) * 0.23).clamp(5.0, 10.0);
     let c = egui::pos2(icon.left() + r, icon.top() + r);
     painter.circle(c, r, egui::Color32::from_black_alpha(225),
-        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150)));
+        egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(150)));
     painter.text(c, egui::Align2::CENTER_CENTER, side,
-        egui::FontId::proportional(r * 1.3), tint);
+        crate::settings::ui_font(r * 1.3), tint);
 }
 
 #[cfg(test)]
@@ -1268,5 +1315,26 @@ mod prefix_tests {
             assert_eq!(pin_pad_side(Skin::Xbox, pin), None, "{pin}");
         }
         assert_eq!(pin_pad_side(Skin::SwitchPro, "btn_south"), None);
+    }
+}
+
+#[cfg(test)]
+mod bus_glyph_tests {
+    // Every pin of the bus wears a glyph where one is drawn for it anywhere - a stick's
+    // axis, the pad's motion, the cursor's move - not only the ones named as the pickers
+    // name them. The few with none are a plain name.
+    #[test]
+    fn every_bus_pin_with_a_drawing_shows_it() {
+        use super::{bus_glyph_pin, pin_svg, Skin};
+        let without: Vec<&str> = flexinput_core::automap::ALL_PINS
+            .iter()
+            .map(|p| p.id)
+            .filter(|id| {
+                ![Skin::Xbox, Skin::Playstation, Skin::SwitchPro, Skin::Steam, Skin::Kbm]
+                    .iter()
+                    .any(|s| pin_svg(*s, bus_glyph_pin(id)).is_some())
+            })
+            .collect();
+        assert_eq!(without, ["orientation", "optical_contact", "optical_distance", "btn_c"]);
     }
 }

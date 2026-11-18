@@ -191,7 +191,9 @@ pub fn group_for_part(name: &str) -> MaterialGroup {
     if n.ends_with("_stick") {
         return if right { RightDome } else { LeftDome };
     }
-    if n.contains("bumper") {
+    // Paddles (a Joy-Con's SL/SR on its rail, rear grip buttons) are buttons the
+    // bumpers' colour, not shell: on a neon Joy-Con they came out neon.
+    if n.contains("bumper") || n.contains("paddle") {
         return Bumper;
     }
     if n.contains("trigger") {
@@ -219,7 +221,7 @@ pub fn group_for_part(name: &str) -> MaterialGroup {
     if n.contains("bottom") {
         return ShellSecondary;
     }
-    // top/mid shells, paddles, anything else → main shell.
+    // top/mid shells, a battery cover, anything else → main shell.
     ShellMain
 }
 
@@ -461,6 +463,9 @@ mod tests {
         assert_eq!(group_for_part("touchpad"), MaterialGroup::Touchpad);
         assert_eq!(group_for_part("left_trigger"), MaterialGroup::Trigger);
         assert_eq!(group_for_part("left_bumper"), MaterialGroup::Bumper);
+        assert_eq!(group_for_part("paddle1"), MaterialGroup::Bumper);
+        assert_eq!(group_for_part("paddle_l2"), MaterialGroup::Bumper);
+        assert_eq!(group_for_part("battery_cover"), MaterialGroup::ShellMain);
     }
 
     #[test]

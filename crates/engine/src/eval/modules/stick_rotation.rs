@@ -89,9 +89,6 @@ pub const STICK_ROT_OUT_COUNT: usize = 5;
 const STABILISE_BETA: f32 = 2.0;
 /// The cutoff the turning speed is itself filtered at (the one-euro default).
 const STABILISE_D_CUTOFF: f32 = 1.0;
-/// Gravity settles over this long — the JSM module's figure, for the same reason:
-/// follow a change of grip, not a flick.
-const GRAVITY_TAU: f32 = 0.5;
 /// The turn rate takeover watches is smoothed over this long against sample
 /// noise — short, so it falls away soon after a turn stops…
 const TAKEOVER_SPEED_TAU: f32 = 0.01;
@@ -344,44 +341,26 @@ fn alpha(cutoff: f32, dt: f32) -> f32 {
     1.0 / (1.0 + tau / dt)
 }
 
-/// Which way is down, from the accelerometer, low-passed.
+/// Which way is down: JSM's own estimate ([`crate::eval::modules::GravityFusion`]),
+/// carried by the gyro and pulled in by the accelerometer.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct GravityLp {
-    /// The accelerometer's direction, in its own basis.
-    up: Vec3,
-    settled: bool,
+pub struct DownTracker {
+    fusion: crate::eval::modules::GravityFusion,
 }
 
-impl GravityLp {
+impl DownTracker {
     /// Advance with this tick's accelerometer (`None` when the pad has none) and
-    /// say which way is DOWN, in the GYRO's basis — the two differ on our bus
-    /// (accel is `(F, -R, U)`, gyro `(F, R, -U)`), so a dot product of the gyro
-    /// with this is a true turn rate about gravity. `None` while nothing is known.
-    pub fn tick(&mut self, accel: Option<Vec3>, dt: f32) -> Option<Vec3> {
-        if let Some(a) = accel {
-            let len = a.length();
-            if len > 0.01 {
-                let n = a / len;
-                if self.settled {
-                    self.up += (1.0 - (-dt / GRAVITY_TAU).exp()) * (n - self.up);
-                } else {
-                    // Start on the first reading, not by easing up from zero.
-                    self.up = n;
-                    self.settled = true;
-                }
-            }
-        }
-        if !self.settled || self.up.length() < 0.01 {
-            return None;
-        }
-        let up = self.up.normalize();
-        // Down, the accel's up negated, with the basis flip diag(1, -1, -1).
-        Some(Vec3::new(-up.x, up.y, up.z))
+    /// gyro (roll, pitch, yaw in deg/s), and say which way is DOWN, in the GYRO's
+    /// basis — the two differ on our bus (accel is `(F, -R, U)`, gyro
+    /// `(F, R, -U)`), so a dot product of the gyro with this is a true turn rate
+    /// about gravity. `None` while nothing is known.
+    pub fn tick(&mut self, accel: Option<Vec3>, gyro_dps: Vec3, dt: f32) -> Option<Vec3> {
+        self.fusion.update(gyro_dps, accel, dt)
     }
 }
 
 /// The pad's turn rate in deg/s, clockwise seen from above positive. `gyro` is
-/// the bus's (roll, pitch, yaw) in deg/s; `down` what [`GravityLp`] says, used
+/// the bus's (roll, pitch, yaw) in deg/s; `down` what [`DownTracker`] says, used
 /// only by `world` — which falls back to the pad's own yaw while it is unknown.
 pub fn turn_rate(gyro: Vec3, down: Option<Vec3>, world: bool) -> f32 {
     match (world, down) {
@@ -394,7 +373,7 @@ pub fn turn_rate(gyro: Vec3, down: Option<Vec3>, world: bool) -> f32 {
 #[derive(Clone, Debug, Default)]
 pub struct StickRotationState {
     rot: StickRotation,
-    gravity: GravityLp,
+    gravity: DownTracker,
 }
 
 /// Evaluate one Gyro to Stick Rotation node: hand the bus on under
@@ -449,7 +428,7 @@ pub(crate) fn eval_stick_rotation_node(
     });
 
     let st = state.entry(uid).or_default().stick_rotation.get_or_insert_with(Default::default);
-    let down = st.gravity.tick(accel, dt);
+    let down = st.gravity.tick(accel, gyro, dt);
     let sign = if invert { -1.0 } else { 1.0 };
     let turn = turn_rate(gyro, down, world) * sens * sign;
     let r = st.rot.tick(stick, turn, dt, &settings);
@@ -850,14 +829,14 @@ mod tests {
     fn yaw_is_the_pads_own_vertical_and_world_is_about_gravity() {
         let gyro = Vec3::new(30.0, 0.0, 50.0); // rolling and yawing
         // Flat, face up: accel reads +z. Both modes see the yaw.
-        let mut g = GravityLp::default();
-        let flat = g.tick(Some(Vec3::new(0.0, 0.0, 1.0)), DT);
+        let mut g = DownTracker::default();
+        let flat = g.tick(Some(Vec3::new(0.0, 0.0, 1.0)), Vec3::ZERO, DT);
         assert!((turn_rate(gyro, flat, false) - 50.0).abs() < 1e-3);
         assert!((turn_rate(gyro, flat, true) - 50.0).abs() < 1e-3);
         // Nose up 90°: accel reads +x. A right turn about the sky is now a roll
         // the negative way about the pad's forward (which points at the sky).
-        let mut g = GravityLp::default();
-        let nose_up = g.tick(Some(Vec3::new(1.0, 0.0, 0.0)), DT);
+        let mut g = DownTracker::default();
+        let nose_up = g.tick(Some(Vec3::new(1.0, 0.0, 0.0)), Vec3::ZERO, DT);
         assert!((turn_rate(gyro, nose_up, false) - 50.0).abs() < 1e-3, "yaw ignores the hold");
         assert!((turn_rate(gyro, nose_up, true) + 30.0).abs() < 1e-3, "world takes the roll");
         assert!((turn_rate(Vec3::new(-40.0, 0.0, 0.0), nose_up, true) - 40.0).abs() < 1e-3);
@@ -869,16 +848,16 @@ mod tests {
         // turn about the world's vertical, ω = 60°/s, shows on the pad as
         // (-s, 0, c)·60 — and must read back as 60.
         let (s, c) = (45f32.to_radians().sin(), 45f32.to_radians().cos());
-        let mut g = GravityLp::default();
-        let down = g.tick(Some(Vec3::new(s, 0.0, c)), DT);
+        let mut g = DownTracker::default();
+        let down = g.tick(Some(Vec3::new(s, 0.0, c)), Vec3::ZERO, DT);
         let gyro = Vec3::new(-s, 0.0, c) * 60.0;
         assert!((turn_rate(gyro, down, true) - 60.0).abs() < 1e-3);
         // A pure pitch, about the pad's side, is no turn at all.
         assert!(turn_rate(Vec3::new(0.0, 80.0, 0.0), down, true).abs() < 1e-3);
         // Right grip dropped: the accel reads +y, which is the pad's LEFT (up),
         // so down is along the pad's right — the gyro's +y, the pitch axis.
-        let mut g = GravityLp::default();
-        let side = g.tick(Some(Vec3::new(0.0, 1.0, 0.0)), DT);
+        let mut g = DownTracker::default();
+        let side = g.tick(Some(Vec3::new(0.0, 1.0, 0.0)), Vec3::ZERO, DT);
         assert!((turn_rate(Vec3::new(0.0, 25.0, 0.0), side, true) - 25.0).abs() < 1e-3);
     }
 
@@ -1059,8 +1038,8 @@ mod tests {
 
     #[test]
     fn world_without_an_accelerometer_falls_back_to_yaw() {
-        let mut g = GravityLp::default();
-        let down = g.tick(None, DT);
+        let mut g = DownTracker::default();
+        let down = g.tick(None, Vec3::ZERO, DT);
         assert!(down.is_none());
         assert!((turn_rate(Vec3::new(30.0, 0.0, 50.0), down, true) - 50.0).abs() < 1e-3);
     }

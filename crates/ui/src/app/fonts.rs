@@ -42,7 +42,77 @@ pub(crate) fn font_definitions() -> egui::FontDefinitions {
         data.index = face.index;
         push(&face.key, data);
     }
+    add_bold_families(&mut fonts);
     fonts
+}
+
+/// The control font's bold faces (Settings → Display), as two families of their own: the
+/// system's bold face first, then every font of the regular family it stands in for, so
+/// what the bold face lacks - or a system without one - draws in the regular fonts.
+fn add_bold_families(fonts: &mut egui::FontDefinitions) {
+    use crate::canvas::viewer::simple_bodies::{BOLD_MONO_FAMILY, BOLD_PROP_FAMILY};
+    for (name, regular, files) in [
+        (BOLD_PROP_FAMILY, egui::FontFamily::Proportional, bold_face_files(false)),
+        (BOLD_MONO_FAMILY, egui::FontFamily::Monospace, bold_face_files(true)),
+    ] {
+        let mut list: Vec<String> = Vec::new();
+        if let Some((path, bytes)) = files.iter().find_map(|p| std::fs::read(p).ok().map(|b| (p, b))) {
+            let key = format!("{name}-face");
+            let mut data = egui::FontData::from_owned(bytes);
+            data.tweak.y_offset_factor = bold_face_drop(path);
+            fonts.font_data.insert(key.clone(), std::sync::Arc::new(data));
+            list.push(key);
+        }
+        list.extend(fonts.families.get(&regular).cloned().unwrap_or_default());
+        fonts.families.insert(egui::FontFamily::Name(name.into()), list);
+    }
+}
+
+/// How far a bold face's glyphs are moved down, as a share of the size, to sit in a pill
+/// where the regular face of its family sits. Consolas carries its glyphs higher in the line
+/// than egui's Hack does: in a pill its words sat a point above the middle (looked at in
+/// `pin_style2`'s `shoot_control_fonts` picture).
+fn bold_face_drop(path: &std::path::Path) -> f32 {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    if name.starts_with("consola") {
+        0.07
+    } else {
+        0.0
+    }
+}
+
+/// Where the system keeps a bold sans (`mono` false) or bold monospace face.
+fn bold_face_files(mono: bool) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    {
+        let dir = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("Fonts");
+        let names: &[&str] = if mono { &["consolab.ttf", "courbd.ttf"] } else { &["segoeuib.ttf", "arialbd.ttf"] };
+        out.extend(names.iter().map(|n| dir.join(n)));
+    }
+    #[cfg(not(windows))]
+    {
+        let names: &[&str] = if mono {
+            &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+                "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSansMono-Bold.ttf",
+            ]
+        } else {
+            &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            ]
+        };
+        out.extend(names.iter().map(std::path::PathBuf::from));
+    }
+    out
 }
 
 /// Code points that are never drawn themselves: variation selectors (they

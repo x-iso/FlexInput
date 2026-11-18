@@ -419,10 +419,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         return; // viewport not declared → eframe destroys the OS window
     }
 
-    let monitor_size = ctx
-        .input(|i| i.viewport().monitor_size)
-        .filter(|s| s.x > 1.0 && s.y > 1.0)
-        .unwrap_or(egui::vec2(1920.0, 1080.0));
+    let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
 
     let viewport_id = egui::ViewportId::from_hash_of("fxi_menu_overlay");
     let builder = egui::ViewportBuilder::default()
@@ -436,7 +433,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .with_active(false)
         .with_resizable(false)
         .with_has_shadow(false)
-        .with_position(egui::pos2(0.0, 0.0))
+        .with_position(overlay_pos)
         .with_inner_size(monitor_size);
 
     let mut exit_edit = false;
@@ -444,15 +441,7 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs).
-        let (inner_rect, child_monitor) = vctx.input(|i| {
-            (i.viewport().inner_rect, i.viewport().monitor_size)
-        });
-        if let (Some(inner_rect), Some(want)) = (inner_rect, child_monitor) {
-            if (inner_rect.size() - want).length() > 1.0 {
-                vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-                vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-            }
-        }
+        crate::monitors::keep_overlay_on_monitor(vctx);
 
         // Click-through while live; interactive while positioning.
         let pt_id = egui::Id::new("fxi_menu_passthrough_applied");
@@ -654,8 +643,8 @@ fn paint_menu_linger(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst, zone: u32,
 fn paint_menu_chip(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst) {
     let p = ui.painter();
     let label = if m.name.is_empty() { "Menu".to_string() } else { m.name.clone() };
-    let font = egui::FontId::proportional(13.0);
-    let galley = p.layout_no_wrap(label, font, egui::Color32::from_gray(230));
+    let font = crate::settings::ui_font(13.0);
+    let galley = p.layout_no_wrap(label, font, crate::settings::tinted_gray(230));
     let icon_tex = crate::macro_icons::macro_port_icon_texture(ui.ctx(), &m.icon, &m.icon_svg, 16.0);
     let icon_w = if icon_tex.is_some() { 20.0 } else { 0.0 };
     let pad = egui::vec2(10.0, 5.0);
@@ -672,7 +661,7 @@ fn paint_menu_chip(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst) {
             egui::Color32::WHITE);
     }
     p.galley(egui::pos2(chip.left() + pad.x + icon_w, chip.top() + pad.y), galley,
-        egui::Color32::from_gray(230));
+        crate::settings::tinted_gray(230));
 }
 
 /// Edit-mode chrome: a Done chip + hint, top-center.

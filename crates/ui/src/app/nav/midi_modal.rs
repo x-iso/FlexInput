@@ -285,9 +285,9 @@ impl FlexInputApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(hint)
-                        .small().color(egui::Color32::from_gray(150)));
+                        .small().color(crate::settings::tinted_gray(150)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("Done").size(13.0)).clicked() {
+                        if ui.button(egui::RichText::new("Done").size(crate::settings::ui_size(13.0))).clicked() {
                             out.close = true;
                         }
                     });
@@ -322,7 +322,7 @@ impl FlexInputApp {
         let out_capable = built.as_ref().is_some_and(|p| p.is_output_capable());
         ui.horizontal(|ui| {
             let resp = ui.add_enabled(in_ok && built.is_some(),
-                egui::Button::new(egui::RichText::new("Add as input").size(13.0)))
+                egui::Button::new(egui::RichText::new("Add as input").size(crate::settings::ui_size(13.0))))
                 .on_disabled_hover_text(if !in_ok {
                     "The output is being learned — the input is settled."
                 } else {
@@ -332,7 +332,7 @@ impl FlexInputApp {
             if resp.clicked() { out.add_input = true; }
 
             let resp = ui.add_enabled(out_ok && out_capable,
-                egui::Button::new(egui::RichText::new("Add as output").size(13.0)))
+                egui::Button::new(egui::RichText::new("Add as output").size(crate::settings::ui_size(13.0))))
                 .on_disabled_hover_text(if !out_ok {
                     "Latch an input first: learn it, or add one here."
                 } else {
@@ -363,7 +363,7 @@ impl FlexInputApp {
             .and_then(|p| flexinput_engine::eval::jsm_midi_tag(&p.to_id()));
         ui.horizontal(|ui| {
             let resp = ui.add_enabled(problem.is_none() && tag.is_some(),
-                egui::Button::new(egui::RichText::new("Insert").size(13.0)))
+                egui::Button::new(egui::RichText::new("Insert").size(crate::settings::ui_size(13.0))))
                 .on_disabled_hover_text(problem.unwrap_or("Nothing a config can name."));
             if m.row == BUTTON_ROW { ring_row(ui, resp.rect); }
             if resp.clicked() { out.insert = true; }
@@ -388,7 +388,7 @@ impl FlexInputApp {
             _ => "",
         });
         ui.horizontal(|ui| {
-            let resp = ui.add_enabled(sendable, egui::Button::new(egui::RichText::new("Add").size(13.0)))
+            let resp = ui.add_enabled(sendable, egui::Button::new(egui::RichText::new("Add").size(crate::settings::ui_size(13.0))))
                 .on_disabled_hover_text(
                     "An output has to name one channel, and be a message that can be sent.");
             if m.row == BUTTON_ROW { ring_row(ui, resp.rect); }

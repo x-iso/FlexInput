@@ -346,7 +346,7 @@ fn add_svg_button(ui: &mut egui::Ui, menu_body: impl FnOnce(&mut egui::Ui, &mut 
 
 #[allow(dead_code)]
 fn circular_ghost_button(ui: &mut egui::Ui, glyph: &str, size: f32) -> egui::Response {
-    let btn = egui::Button::new(RichText::new(glyph).size(size * 0.65))
+    let btn = egui::Button::new(RichText::new(glyph).size(crate::settings::ui_size(size * 0.65)))
         .corner_radius(size * 0.5)
         .min_size(egui::vec2(size, size))
         .fill(Color32::TRANSPARENT)

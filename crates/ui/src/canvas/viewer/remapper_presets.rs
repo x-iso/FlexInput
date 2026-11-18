@@ -82,7 +82,7 @@ pub(crate) fn remapper_preset_icons(
     let n_cards = snarl.get_node(node_id)
         .and_then(|n| n.params.get("mappings").and_then(|v| v.as_array()).map(|a| a.len()))
         .unwrap_or(0);
-    let icon = |glyph: &str| egui::Button::new(egui::RichText::new(glyph).size(12.0)).small();
+    let icon = |glyph: &str| egui::Button::new(egui::RichText::new(glyph).size(crate::settings::ui_size(12.0))).small();
     let mut changed = false;
 
     // Right to left: Load sits in the corner, Save beside it.
@@ -151,7 +151,7 @@ pub(crate) fn remapper_preset_status(
         ui.ctx().data_mut(|d| d.remove::<PresetStatus>(id));
         return;
     }
-    let text = egui::RichText::new(status.text).size(12.0);
+    let text = egui::RichText::new(status.text).size(crate::settings::ui_size(12.0));
     ui.label(if status.failed { text.color(Color32::from_rgb(232, 150, 65)) } else { text.weak() });
     // Come back to take it down when its time is up.
     ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(STATUS_SECS - age + 0.05));

@@ -2682,6 +2682,64 @@ mod subpatch_bus_tests {
         assert_eq!(unit(&s, vec_curve), None);
     }
 
+    /// A Knob wired through a Response Curve to a Feedback Control's HD-rumble pitch: the
+    /// curve's Out axis reads in Hz, and the Knob takes the pin's name and reads its value
+    /// through the curve in Hz - until it is named by hand. A Readout on a Feedback Control's
+    /// rumble outlet reads in %.
+    #[test]
+    fn a_knob_and_a_curve_on_a_feedback_pin_read_in_its_units() {
+        use crate::canvas::viewer::refresh_motion_units;
+        use crate::canvas::viewer::units::PinUnit;
+        const F: SignalType = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let knob = s.insert_node(p, {
+            let mut n = node("module.knob", &[], &[F]);
+            n.display_name = "Knob".into();
+            n
+        });
+        let curve = s.insert_node(p, node("module.response_curve", &[F], &[F]));
+        let n_in = flexinput_core::automap::FEEDBACK_INLET_PINS.len();
+        let fb = s.insert_node(p, node("module.feedback_control", &vec![F; n_in + 1], &[SignalType::AutoMap, F, F, F, F, F]));
+        let hd_l_freq = flexinput_core::automap::FEEDBACK_INLET_PINS.iter().position(|p| p.id == "hd_l_freq").unwrap() + 1;
+        wire(&mut s, knob, 0, curve, 0);
+        wire(&mut s, curve, 0, fb, hd_l_freq);
+        let readout = s.insert_node(p, node("display.readout", &[F], &[]));
+        wire(&mut s, fb, 1, readout, 0); // Rumble (strong), as the game asks it
+
+        refresh_motion_units(&mut s);
+        let k = s.get_node(knob).unwrap();
+        let t = k.extra.out_target.clone().expect("the knob found the pin");
+        assert!(matches!(t.unit, PinUnit::Hz(_)), "{t:?}");
+        assert_eq!(k.display_name, "HD Rumble L: Frequency", "it takes the pin's name");
+        assert!(matches!(s.get_node(curve).unwrap().extra.out_target.as_ref().map(|t| t.unit), Some(PinUnit::Hz(_))));
+        assert_eq!(s.get_node(readout).unwrap().extra.out_target.as_ref().map(|t| t.unit), Some(PinUnit::Percent));
+        // The knob reads its own value in Hz, and the curve it feeds reads its In axis in Hz
+        // too; a curve fed by something else keeps its own In scale.
+        let reading = crate::canvas::viewer::knob_reading(&s, knob, 0.5);
+        assert!(reading.ends_with(" Hz"), "{reading}");
+        assert!(matches!(s.get_node(curve).unwrap().extra.curve_in_target, Some(PinUnit::Hz(_))));
+        let constant = s.insert_node(p, node("module.constant", &[], &[F]));
+        s.disconnect(OutPinId { node: knob, output: 0 }, InPinId { node: curve, input: 0 });
+        wire(&mut s, constant, 0, curve, 0);
+        refresh_motion_units(&mut s);
+        assert!(s.get_node(curve).unwrap().extra.curve_in_target.is_none(), "a Constant keeps its own scale");
+        assert!(s.get_node(curve).unwrap().extra.out_target.is_some(), "the Out axis still reads in Hz");
+        s.disconnect(OutPinId { node: constant, output: 0 }, InPinId { node: curve, input: 0 });
+        wire(&mut s, knob, 0, curve, 0);
+        refresh_motion_units(&mut s);
+
+        // Named by hand, it keeps the name; unwired, a name it took goes back to "Knob".
+        s.get_node_mut(knob).unwrap().display_name = "Pitch".into();
+        refresh_motion_units(&mut s);
+        assert_eq!(s.get_node(knob).unwrap().display_name, "Pitch");
+        s.get_node_mut(knob).unwrap().display_name = "HD Rumble L: Frequency".into();
+        s.disconnect(OutPinId { node: curve, output: 0 }, InPinId { node: fb, input: hd_l_freq });
+        refresh_motion_units(&mut s);
+        assert_eq!(s.get_node(knob).unwrap().display_name, "Knob");
+        assert!(s.get_node(curve).unwrap().extra.out_target.is_none());
+    }
+
     /// A signal's source survives the modules that only shape it, in curves and
     /// scope channels alike, and what's on the way decides how they combine.
     #[test]

@@ -326,7 +326,7 @@ fn transport_status(ui: &mut egui::Ui) {
     let (text, colour) = match pair_control().status() {
         Status::Disabled => (
             "Classic controllers: starting…".to_string(),
-            egui::Color32::from_gray(150),
+            crate::settings::tinted_gray(150),
         ),
         Status::NoRadio(why) => (
             format!("Classic controllers: no usable adapter — {why}"),
@@ -334,7 +334,7 @@ fn transport_status(ui: &mut egui::Ui) {
         ),
         Status::Idle => (
             "Classic controllers: ready, nothing paired yet.".to_string(),
-            egui::Color32::from_gray(180),
+            crate::settings::tinted_gray(180),
         ),
         // ⭐ "Connected" and "sending input" reported separately, because they
         // came apart on hardware and one number hid it: the panel said
@@ -346,7 +346,7 @@ fn transport_status(ui: &mut egui::Ui) {
                     if streaming > 0 {
                         egui::Color32::from_rgb(120, 200, 120)
                     } else {
-                        egui::Color32::from_gray(180)
+                        crate::settings::tinted_gray(180)
                     },
                 )
             } else {
@@ -378,7 +378,7 @@ fn pair_row(ui: &mut egui::Ui) {
                  beside one above.",
             )
             .small()
-            .color(egui::Color32::from_gray(150)),
+            .color(crate::settings::tinted_gray(150)),
         );
         return;
     }
@@ -489,7 +489,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
         ui.label(
             egui::RichText::new("No USB Bluetooth adapter.")
                 .small()
-                .color(egui::Color32::from_gray(160)),
+                .color(crate::settings::tinted_gray(160)),
         );
     }
     handover_status(ui, st);
@@ -522,7 +522,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                 let colour = if matches!(a.system, SystemUse::Active { .. }) {
                     egui::Color32::from_rgb(110, 160, 230)
                 } else {
-                    egui::Color32::from_gray(150)
+                    crate::settings::tinted_gray(150)
                 };
                 ("●", colour, system.as_str())
             } else if let Some(why) = &a.problem {
@@ -536,7 +536,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             } else if a.available {
                 (
                     "○",
-                    egui::Color32::from_gray(150),
+                    crate::settings::tinted_gray(150),
                     "idle — not in use",
                 )
             } else {
@@ -554,12 +554,12 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             ui.label(
                 egui::RichText::new(format!("{} · bus {}", a.ids(), a.bus))
                     .small()
-                    .color(egui::Color32::from_gray(140)),
+                    .color(crate::settings::tinted_gray(140)),
             );
             ui.label(
                 egui::RichText::new(what)
                     .small()
-                    .color(egui::Color32::from_gray(150)),
+                    .color(crate::settings::tinted_gray(150)),
             );
             if let Some(to_flexinput) = handover_button(ui, st.handover.is_some(), a) {
                 start_handover = Some((a.clone(), to_flexinput));
@@ -591,7 +591,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
              works on another machine, as long as the key file goes with it.",
         )
         .small()
-        .color(egui::Color32::from_gray(150)),
+        .color(crate::settings::tinted_gray(150)),
     );
     ui.add_space(4.0);
 
@@ -601,7 +601,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
         ui.label(
             egui::RichText::new("Nothing paired yet.")
                 .small()
-                .color(egui::Color32::from_gray(160)),
+                .color(crate::settings::tinted_gray(160)),
         );
     }
     let mut forget: Option<[u8; 6]> = None;
@@ -614,14 +614,14 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                 None => ui.label(
                     egui::RichText::new("(name not recorded)")
                         .italics()
-                        .color(egui::Color32::from_gray(150)),
+                        .color(crate::settings::tinted_gray(150)),
                 ),
             };
             ui.label(
                 egui::RichText::new(addr)
                     .small()
                     .monospace()
-                    .color(egui::Color32::from_gray(140)),
+                    .color(crate::settings::tinted_gray(140)),
             );
             // What it said it is, once it has (see `keystore::DeviceInfo`).
             let info = devices.get(addr);
@@ -630,7 +630,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                     egui::RichText::new(format!("{:04x}:{:04x}", d.vid, d.pid))
                         .small()
                         .monospace()
-                        .color(egui::Color32::from_gray(140)),
+                        .color(crate::settings::tinted_gray(140)),
                 );
             }
             if let Some(why) = flexinput_devices::classic_bt::unusable_reason(info) {
@@ -647,7 +647,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             ui.label(
                 egui::RichText::new(format!("key {head}…"))
                     .small()
-                    .color(egui::Color32::from_gray(140)),
+                    .color(crate::settings::tinted_gray(140)),
             );
             if ui
                 .small_button("Forget")
@@ -684,7 +684,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             egui::RichText::new(p.display().to_string())
                 .small()
                 .monospace()
-                .color(egui::Color32::from_gray(170)),
+                .color(crate::settings::tinted_gray(170)),
         );
         if ui.small_button("Copy").clicked() {
             ui.ctx().copy_text(p.display().to_string());
@@ -709,7 +709,7 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
                  follows the dongle to any PC with nothing to copy by hand.",
             )
             .small()
-            .color(egui::Color32::from_gray(150)),
+            .color(crate::settings::tinted_gray(150)),
         );
     }
 
