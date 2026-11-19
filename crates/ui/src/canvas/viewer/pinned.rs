@@ -1961,11 +1961,7 @@ pub(crate) fn render_switch_toggle(
     } else {
         ui.style().visuals.widgets.inactive.bg_fill
     };
-    let theme_stroke = if active {
-        ui.style().visuals.selection.stroke.color
-    } else {
-        ui.style().visuals.widgets.inactive.bg_stroke.color
-    };
+    let theme_stroke = super::kit::toggle_outline(&ui.style().visuals, active, false).color;
     let theme_text = if active {
         ui.style().visuals.strong_text_color()
     } else {

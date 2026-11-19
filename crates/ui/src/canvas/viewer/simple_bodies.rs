@@ -1907,6 +1907,36 @@ pub(crate) fn fit_font(ui: &egui::Ui, text: &str, font: egui::FontId, avail: f32
     egui::FontId::new(super::scale::quantize_font_size(size), font.family)
 }
 
+/// What a pill's value cell shows while it's dragged, over a dark field: the value's place
+/// along its range in a darker shade of the accent (`Span`, from where its zero is - the
+/// middle of a bipolar range - or the end nearer it), or that shade across the whole cell
+/// (`Whole`) for a value with no top that means anything: a Constant, a time, a count with a
+/// limit only to stop typing nonsense. It used to fill with the label's own accent, the same
+/// whatever the value was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PillFill {
+    Whole,
+    Span { at: f32, from: f32 },
+}
+
+impl PillFill {
+    /// `value`'s place along `range` (`Whole` where the range isn't one: see
+    /// `egui::widgets::value_span`).
+    pub(crate) fn span(value: f64, range: std::ops::RangeInclusive<f64>) -> Self {
+        match egui::widgets::value_span(value, &range) {
+            Some((at, from)) => Self::Span { at, from },
+            None => Self::Whole,
+        }
+    }
+
+    fn as_span(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Whole => None,
+            Self::Span { at, from } => Some((at, from)),
+        }
+    }
+}
+
 pub(crate) fn pill_value_cell(rect: egui::Rect, label_w: f32) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(rect.left() + label_w, rect.top()), rect.max)
 }
@@ -1921,10 +1951,12 @@ pub(crate) fn setting_pill(
     value: &str,
     label_w: f32,
 ) -> (egui::Response, egui::Rect) {
-    setting_pill_widest(ui, salt, rect, label, value, value, label_w)
+    setting_pill_widest(ui, salt, rect, label, value, value, label_w, PillFill::Whole)
 }
 
-/// [`setting_pill`], with the widest value it can show (see [`pill_split`]).
+/// [`setting_pill`], with the widest value it can show (see [`pill_split`]) and what its value
+/// cell shows while it's dragged ([`PillFill`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn setting_pill_widest(
     ui: &mut egui::Ui,
     salt: &str,
@@ -1933,6 +1965,7 @@ pub(crate) fn setting_pill_widest(
     value: &str,
     widest: &str,
     label_w: f32,
+    dragged_fill: PillFill,
 ) -> (egui::Response, egui::Rect) {
     let (label, label_w) = pill_split(ui, label, label_w, widest, rect.width());
     let label_cell =
@@ -1953,13 +1986,7 @@ pub(crate) fn setting_pill_widest(
         )
         .allocate_rect(value_cell, egui::Sense::click_and_drag());
     // Feedback from the fill, not from an edge.
-    let fill = if resp.dragged() {
-        label_fill
-    } else if resp.hovered() {
-        hovered_fill
-    } else {
-        inactive
-    };
+    let fill = if resp.hovered() { hovered_fill } else { inactive };
     let painter = ui.painter_at(rect);
     // A pill with no label cell is one rounded shape. Splitting the corners on the label
     // cell's width instead gave it square left corners, which read as the pill being cut
@@ -1975,17 +2002,16 @@ pub(crate) fn setting_pill_widest(
             egui::StrokeKind::Inside,
         );
     }
-    painter.rect(
-        value_cell,
-        if has_label {
-            egui::CornerRadius { nw: 0, sw: 0, ne: PILL_RADIUS as u8, se: PILL_RADIUS as u8 }
-        } else {
-            egui::CornerRadius::same(PILL_RADIUS as u8)
-        },
-        fill,
-        egui::Stroke::NONE,
-        egui::StrokeKind::Inside,
-    );
+    let value_corners = if has_label {
+        egui::CornerRadius { nw: 0, sw: 0, ne: PILL_RADIUS as u8, se: PILL_RADIUS as u8 }
+    } else {
+        egui::CornerRadius::same(PILL_RADIUS as u8)
+    };
+    if resp.dragged() {
+        painter.add(egui::widgets::drag_fill_shape(ui.visuals(), value_cell, value_corners, dragged_fill.as_span()));
+    } else {
+        painter.rect(value_cell, value_corners, fill, egui::Stroke::NONE, egui::StrokeKind::Inside);
+    }
     let font = pill_font();
     // Text wider than its cell - a large control font in a narrow pill - is drawn smaller to
     // fit (`fit_font`), and only cut short past that.
@@ -2026,10 +2052,12 @@ fn pill_edit_key(node: NodeId, salt: &str) -> egui::Id {
 
 /// The house value pill: [`setting_pill`]'s painted shape, dragged across its value cell
 /// or typed into it. Returns the response - the caller maps a drag onto its own units -
-/// and the text the user committed, which the caller parses, clamps and stores.
+/// and the text the user committed, which the caller parses, clamps and stores. `fill` is
+/// what it shows while dragged.
 ///
 /// While the field is open the response can't drag: the caller's scrub and the field would
 /// both answer the same pointer, and typing a digit would nudge the value.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn value_pill(
     ui: &mut egui::Ui,
     node: NodeId,
@@ -2039,13 +2067,14 @@ pub(crate) fn value_pill(
     shown: &str,
     widest: &str,
     label_w: f32,
+    fill: PillFill,
 ) -> (egui::Response, Option<String>) {
     let key = pill_edit_key(node, salt);
     let mut edit = ui
         .ctx()
         .data(|d| d.get_temp::<PillEdit>(key))
         .unwrap_or_default();
-    let (resp, cell) = setting_pill_widest(ui, salt, rect, label, shown, widest, label_w);
+    let (resp, cell) = setting_pill_widest(ui, salt, rect, label, shown, widest, label_w, fill);
     if edit.editing {
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -2117,7 +2146,8 @@ pub(crate) fn value_pill(
 /// The same pill for a number, with the two halves of the work in one place: the text
 /// committed is read back as a number - a unit suffix rides along in the field, so anything
 /// that isn't part of a number is dropped - and clamped to `range`. Returns the response and
-/// the new value, if the user typed one.
+/// the new value, if the user typed one. `fill` is what it shows while dragged ([`PillFill`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn value_pill_number(
     ui: &mut egui::Ui,
     node: NodeId,
@@ -2127,9 +2157,10 @@ pub(crate) fn value_pill_number(
     shown: &str,
     label_w: f32,
     range: std::ops::RangeInclusive<f64>,
+    fill: PillFill,
 ) -> (egui::Response, Option<f64>) {
     let widest = widest_shown(shown, range.clone());
-    let (resp, typed) = value_pill(ui, node, salt, rect, label, shown, &widest, label_w);
+    let (resp, typed) = value_pill(ui, node, salt, rect, label, shown, &widest, label_w, fill);
     let typed = typed
         .map(|t| {
             t.chars()
@@ -2334,13 +2365,16 @@ pub(crate) fn show_constant_body(
 
     // The resolution pill, as wide as the number box above it: `res` and the digits it
     // keeps. Dragging across the value cell scrubs whole numbers -> 1 -> 2 -> 3 -> 4.
-    let (pill, value_cell) = setting_pill(
+    let res_label = constant_res_label(res);
+    let (pill, value_cell) = setting_pill_widest(
         ui,
         "constant_res",
         pill_rect,
         "res",
-        &constant_res_label(res),
+        &res_label,
+        &res_label,
         CONSTANT_PILL_LABEL_W,
+        PillFill::span(f64::from(res), 0.0..=f64::from(CONSTANT_RES_MAX)),
     );
     let pill = pill.on_hover_text(format!(
         "Digits kept after the dot. Drag across to set it: whole numbers, then 1 to {}.\n\
@@ -2726,11 +2760,7 @@ pub(crate) fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
     } else {
         ui.style().visuals.widgets.inactive.bg_fill
     };
-    let stroke_col = if active {
-        ui.style().visuals.selection.stroke.color
-    } else {
-        ui.style().visuals.widgets.inactive.bg_stroke.color
-    };
+    let stroke_col = super::kit::toggle_outline(&ui.style().visuals, active, resp.hovered()).color;
     let text_col = if active {
         ui.style().visuals.strong_text_color()
     } else {

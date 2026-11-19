@@ -842,7 +842,15 @@ fn jsm_rows(
             } else {
                 (v.widgets.inactive.bg_fill, v.text_color())
             };
-            ui.painter().rect_filled(tune_r, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, fill);
+            let corners = egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 };
+            ui.painter().rect_filled(tune_r, corners, fill);
+            // A switch, outlined as every switch is: the side picker beside it is a selector.
+            ui.painter().rect_stroke(
+                tune_r,
+                corners,
+                super::kit::toggle_outline(v, knobs_on, tune.hovered()),
+                egui::StrokeKind::Inside,
+            );
             ui.painter().text(
                 tune_r.center(),
                 egui::Align2::CENTER_CENTER,

@@ -462,9 +462,25 @@ pub(crate) fn bus_pin_on_header(
     unlabelled_bus_pin(module_id, ty) && !strip_pin && side.filter(|t| *t == SignalType::AutoMap).count() == 1
 }
 
+/// The outline every on/off toggle wears, on or off: what tells a switch from a button (no
+/// outline), a one-of-several selector or a value pill, which otherwise wear the same fills.
+/// On, the selection's own stroke; off, a quiet line in the controls' colour, a little
+/// brighter under the pointer. It used to be only the house toggle that had one, and only
+/// while on - off, it was the theme's inactive border, which this theme draws in nothing.
+pub(crate) fn toggle_outline(v: &egui::Visuals, on: bool, hovered: bool) -> egui::Stroke {
+    let color = if on {
+        v.selection.stroke.color
+    } else if hovered {
+        v.widgets.hovered.fg_stroke.color.gamma_multiply(0.6)
+    } else {
+        v.widgets.inactive.fg_stroke.color.gamma_multiply(0.4)
+    };
+    egui::Stroke::new(1.0_f32, color)
+}
+
 /// Two switches that belong together, as the two halves of one pill at `rect`: the left
-/// half `left_w` wide, a hairline between them, each lit while its switch is on. Returns
-/// whether each was clicked.
+/// half `left_w` wide, each lit while its switch is on and each outlined as a toggle is
+/// ([`toggle_outline`]). Returns whether each was clicked.
 pub(crate) fn header_toggle_pair(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -499,14 +515,11 @@ pub(crate) fn header_toggle_pair(
             egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r }
         };
         ui.painter().rect_filled(half, corners, fill);
+        ui.painter().rect_stroke(half, corners, toggle_outline(v, on, resp.hovered()), egui::StrokeKind::Inside);
         let fitted = super::simple_bodies::fit_font(ui, label, font.clone(), half.width() - 4.0);
         ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, label, fitted, text);
         clicked[i] = resp.clicked();
     }
-    ui.painter().line_segment(
-        [egui::pos2(split, rect.top() + 2.0), egui::pos2(split, rect.bottom() - 2.0)],
-        egui::Stroke::new(1.0_f32, ui.visuals().extreme_bg_color),
-    );
     (clicked[0], clicked[1])
 }
 

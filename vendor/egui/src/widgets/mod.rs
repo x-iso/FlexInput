@@ -29,6 +29,8 @@ pub use self::{
     button::Button,
     checkbox::Checkbox,
     drag_value::DragValue,
+    // FLEXINPUT PATCH: how a value box shows its value while it's dragged.
+    drag_value::{drag_fill_colors, drag_fill_shape, value_span},
     hyperlink::{Hyperlink, Link},
     image::{
         FrameDurations, Image, ImageFit, ImageOptions, ImageSize, ImageSource,

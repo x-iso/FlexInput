@@ -325,66 +325,71 @@ pub(crate) fn paint_viewer_board(
     glyph_chip(ui, &painter, skin, tint, "btn_lb", at(24.4, 24.8), 36.5 * s, glow("btn_lb"), accent);
     glyph_chip(ui, &painter, skin, tint, "btn_rb", at(395.6, 24.8), 36.5 * s, glow("btn_rb"), accent);
 
-    // ── Touchpad strip (layout slot + device presence) ──
-    if has_touch {
-        if let Some((tx, ty, tw, th)) = layout.touchpad {
-            let pad = egui::Rect::from_min_max(at(tx, ty), at(tx + tw, ty + th));
-            paint_touchpad_strip(&painter, pad, dev, live_signals, glow("btn_touchpad"), accent, s);
+    if skin == Skin::Steam {
+        paint_steam_layout(ui, &painter, &at, s, skin, tint, accent, dev, live_signals, &has, &glow);
+    } else {
+        // ── Touchpad strip (layout slot + device presence) ──
+        if has_touch {
+            if let Some((tx, ty, tw, th)) = layout.touchpad {
+                let pad = egui::Rect::from_min_max(at(tx, ty), at(tx + tw, ty + th));
+                paint_touch_surface(&painter, pad, dev, live_signals, &[0, 1], glow("btn_touchpad"), accent, s);
+            }
         }
-    }
 
-    // ── Menu chips ──
-    let (bx, by, bs) = layout.back;
-    glyph_chip(ui, &painter, skin, tint, "btn_back", at(bx, by), bs * s, glow("btn_back"), accent);
-    let (sx, sy, ss) = layout.start;
-    glyph_chip(ui, &painter, skin, tint, "btn_start", at(sx, sy), ss * s, glow("btn_start"), accent);
+        // ── Menu chips ──
+        let (bx, by, bs) = layout.back;
+        glyph_chip(ui, &painter, skin, tint, "btn_back", at(bx, by), bs * s, glow("btn_back"), accent);
+        let (sx, sy, ss) = layout.start;
+        glyph_chip(ui, &painter, skin, tint, "btn_start", at(sx, sy), ss * s, glow("btn_start"), accent);
 
-    // ── Guide cluster ──
-    let (gx, gy, gs) = layout.guide;
-    glyph_chip(ui, &painter, skin, tint, "btn_guide", at(gx, gy), gs * s, glow("btn_guide"), accent);
-    if has("btn_capture") {
-        let (cx, cy, cs) = layout.capture;
-        glyph_chip(ui, &painter, skin, tint, "btn_capture", at(cx, cy), cs * s, glow("btn_capture"), accent);
-    }
-    if let Some((mx, my, ms)) = layout.mute {
-        if has("btn_mute") {
-            glyph_chip(ui, &painter, skin, tint, "btn_mute", at(mx, my), ms * s, glow("btn_mute"), accent);
+        // ── Guide cluster ──
+        let (gx, gy, gs) = layout.guide;
+        glyph_chip(ui, &painter, skin, tint, "btn_guide", at(gx, gy), gs * s, glow("btn_guide"), accent);
+        if has("btn_capture") {
+            let (cx, cy, cs) = layout.capture;
+            glyph_chip(ui, &painter, skin, tint, "btn_capture", at(cx, cy), cs * s, glow("btn_capture"), accent);
         }
-    }
-
-    // ── D-pad: neutral base + per-direction highlight layers (the direction
-    // art ships as base-white paths + one colored path per pressed arm, so
-    // compositing the colored layers covers diagonals with no extra SVGs) ──
-    {
-        let (dx, dy, ds) = layout.dpad;
-        paint_dpad(ui, &painter, skin, tint, at(dx, dy), ds * s, accent, &glow);
-    }
-
-    // ── Face diamond (right) ──
-    glyph_chip(ui, &painter, skin, tint, "btn_north", at(327.5, 41.0), 24.0 * s, glow("btn_north"), accent);
-    glyph_chip(ui, &painter, skin, tint, "btn_south", at(327.5, 100.8), 24.0 * s, glow("btn_south"), accent);
-    glyph_chip(ui, &painter, skin, tint, "btn_west",  at(293.9, 70.9),  24.0 * s, glow("btn_west"), accent);
-    glyph_chip(ui, &painter, skin, tint, "btn_east",  at(361.1, 70.9),  24.0 * s, glow("btn_east"), accent);
-
-    // ── Stick scopes ──
-    let ls = stick_vec(live_signals, dev, "left_stick", "left_stick_x", "left_stick_y");
-    let rs = stick_vec(live_signals, dev, "right_stick", "right_stick_x", "right_stick_y");
-    let (lx, ly) = layout.left_stick;
-    paint_stick_scope(&painter, at(lx, ly), 36.0 * s, ls, glow("btn_ls"), ui, accent);
-    paint_stick_scope(&painter, at(275.1, 150.0), 36.0 * s, rs, glow("btn_rs"), ui, accent);
-
-    // ── Rear paddles (when present): vertical pairs on the side edges ──
-    for (pin, px, py, label) in [
-        ("btn_paddle_l1", 34.7, 143.9, "P1"), ("btn_paddle_l2", 34.7, 182.5, "P2"),
-        ("btn_paddle_r1", 385.3, 143.9, "P1"), ("btn_paddle_r2", 385.3, 182.5, "P2"),
-    ] {
-        if has(pin) {
-            glyph_chip(ui, &painter, skin, tint, pin, at(px, py), 20.6 * s, glow(pin), accent);
-            painter.text(
-                at(px, py), egui::Align2::CENTER_CENTER, label,
-                crate::settings::ui_font(7.0 * s), crate::settings::tinted_gray(210),
-            );
+        if let Some((mx, my, ms)) = layout.mute {
+            if has("btn_mute") {
+                glyph_chip(ui, &painter, skin, tint, "btn_mute", at(mx, my), ms * s, glow("btn_mute"), accent);
+            }
         }
+
+        // ── D-pad: neutral base + per-direction highlight layers (the direction
+        // art ships as base-white paths + one colored path per pressed arm, so
+        // compositing the colored layers covers diagonals with no extra SVGs) ──
+        {
+            let (dx, dy, ds) = layout.dpad;
+            paint_dpad(ui, &painter, skin, tint, at(dx, dy), ds * s, accent, &glow);
+        }
+
+        // ── Face diamond (right) ──
+        glyph_chip(ui, &painter, skin, tint, "btn_north", at(327.5, 41.0), 24.0 * s, glow("btn_north"), accent);
+        glyph_chip(ui, &painter, skin, tint, "btn_south", at(327.5, 100.8), 24.0 * s, glow("btn_south"), accent);
+        glyph_chip(ui, &painter, skin, tint, "btn_west",  at(293.9, 70.9),  24.0 * s, glow("btn_west"), accent);
+        glyph_chip(ui, &painter, skin, tint, "btn_east",  at(361.1, 70.9),  24.0 * s, glow("btn_east"), accent);
+
+        // ── Stick scopes ──
+        let ls = stick_vec(live_signals, dev, "left_stick", "left_stick_x", "left_stick_y");
+        let rs = stick_vec(live_signals, dev, "right_stick", "right_stick_x", "right_stick_y");
+        let (lx, ly) = layout.left_stick;
+        paint_stick_scope(&painter, at(lx, ly), 36.0 * s, ls, glow("btn_ls"), ui, accent);
+        paint_stick_scope(&painter, at(275.1, 150.0), 36.0 * s, rs, glow("btn_rs"), ui, accent);
+
+        // ── Rear paddles (when present): vertical pairs on the side edges ──
+        for (pin, px, py, label) in [
+            ("btn_paddle_l1", 34.7, 143.9, "P1"), ("btn_paddle_l2", 34.7, 182.5, "P2"),
+            ("btn_paddle_r1", 385.3, 143.9, "P1"), ("btn_paddle_r2", 385.3, 182.5, "P2"),
+        ] {
+            if has(pin) {
+                glyph_chip(ui, &painter, skin, tint, pin, at(px, py), 20.6 * s, glow(pin), accent);
+                painter.text(
+                    at(px, py), egui::Align2::CENTER_CENTER, label,
+                    crate::settings::ui_font(7.0 * s), crate::settings::tinted_gray(210),
+                );
+            }
+        }
+
     }
 
     // ── No-device dim + hint ──
@@ -415,6 +420,94 @@ pub(crate) fn letterbox(container: egui::Rect) -> egui::Rect {
     egui::Rect::from_center_size(container.center(), egui::vec2(w, h))
 }
 
+// ── Steam Controller ──────────────────────────────────────────────────────────
+
+/// The Steam Controller's board, in design px of the same 420x201 plate, beside the shared
+/// triggers and bumpers: the Steam Deck's arrangement. The d-pad and the face buttons sit
+/// outboard at the top, View and Menu up between them and the sticks, the two sticks level
+/// and symmetrical either side of the Steam button, a square trackpad under each stick with
+/// the aux button between the pads, and the back buttons low on the sides - L4 over L5, R4
+/// over R5 - on a plate that lights while that side's grip is held. Touching a stick's cap lights its ring
+/// a little, clicking the stick all of it. The pads and back buttons are part of the pad, so
+/// they are drawn whether or not they're reporting.
+#[allow(clippy::too_many_arguments)]
+fn paint_steam_layout(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    at: &dyn Fn(f32, f32) -> egui::Pos2,
+    s: f32,
+    skin: Skin,
+    tint: egui::Color32,
+    accent: egui::Color32,
+    dev: &str,
+    live_signals: &LiveSignals,
+    has: &dyn Fn(&str) -> bool,
+    glow: &dyn Fn(&str) -> f32,
+) {
+    // D-pad left, face buttons right, mirrored about the middle.
+    paint_dpad(ui, painter, skin, tint, at(STEAM_OUTBOARD_X, STEAM_TOP_Y), STEAM_DPAD * s, accent, glow);
+    let fx = BOARD_W - STEAM_OUTBOARD_X;
+    for (pin, dx, dy) in [("btn_north", 0.0, -1.0), ("btn_south", 0.0, 1.0), ("btn_west", -1.0, 0.0), ("btn_east", 1.0, 0.0)] {
+        let c = at(fx + dx * STEAM_FACE_SPREAD, STEAM_TOP_Y + dy * STEAM_FACE_SPREAD);
+        glyph_chip(ui, painter, skin, tint, pin, c, 22.0 * s, glow(pin), accent);
+    }
+
+    // The sticks, symmetrical about the Steam button.
+    let ls = stick_vec(live_signals, dev, "left_stick", "left_stick_x", "left_stick_y");
+    let rs = stick_vec(live_signals, dev, "right_stick", "right_stick_x", "right_stick_y");
+    let ring = |click: &str, cap: &str| glow(click).max(0.4 * glow(cap));
+    let r = STEAM_STICK_R * s;
+    paint_stick_scope(painter, at(STEAM_STICK_X, STEAM_STICK_Y), r, ls, ring("btn_ls", "btn_cap_l"), ui, accent);
+    paint_stick_scope(painter, at(BOARD_W - STEAM_STICK_X, STEAM_STICK_Y), r, rs, ring("btn_rs", "btn_cap_r"), ui, accent);
+    glyph_chip(ui, painter, skin, tint, "btn_guide", at(BOARD_W * 0.5, 34.0), 26.0 * s, glow("btn_guide"), accent);
+    // View and Menu up top, between the d-pad and the face buttons and the sticks.
+    glyph_chip(ui, painter, skin, tint, "btn_back", at(STEAM_MENU_X, STEAM_MENU_Y), 18.0 * s, glow("btn_back"), accent);
+    glyph_chip(ui, painter, skin, tint, "btn_start", at(BOARD_W - STEAM_MENU_X, STEAM_MENU_Y), 18.0 * s, glow("btn_start"), accent);
+
+    // A square trackpad under each stick, one finger each; the aux button between them.
+    for (finger, x, click) in [(0, STEAM_PAD_X, "btn_touchpad"), (1, BOARD_W - STEAM_PAD_X - STEAM_PAD, "btn_touchpad2")] {
+        let pad = egui::Rect::from_min_max(at(x, STEAM_PAD_Y), at(x + STEAM_PAD, STEAM_PAD_Y + STEAM_PAD));
+        paint_touch_surface(painter, pad, dev, live_signals, &[finger], glow(click), accent, s);
+    }
+    if has("btn_capture") {
+        glyph_chip(ui, painter, skin, tint, "btn_capture", at(BOARD_W * 0.5, STEAM_AUX_Y), 20.0 * s, glow("btn_capture"), accent);
+    }
+
+    // The back buttons low on each side, on a plate the grip lights.
+    for (grip, x, pins) in [
+        ("btn_grip_l", STEAM_BACK_X, ["btn_paddle_l1", "btn_paddle_l2"]),
+        ("btn_grip_r", BOARD_W - STEAM_BACK_X, ["btn_paddle_r1", "btn_paddle_r2"]),
+    ] {
+        let plate = egui::Rect::from_min_max(at(x - 14.0, 128.0), at(x + 14.0, 197.0));
+        painter.rect_filled(plate, 8.0 * s, crate::settings::tinted_gray(32));
+        let g = glow(grip);
+        if g > 0.02 {
+            painter.rect_filled(plate, 8.0 * s, accent.gamma_multiply(0.18 * g));
+            painter.rect_stroke(plate, 8.0 * s, egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.7 * g)), egui::StrokeKind::Inside);
+        }
+        for (pin, y) in pins.into_iter().zip([143.9, 182.5]) {
+            glyph_chip(ui, painter, skin, tint, pin, at(x, y), 20.6 * s, glow(pin), accent);
+        }
+    }
+}
+
+/// Where the Steam board's pieces sit, in design px (see [`paint_steam_layout`]). Each pair
+/// is mirrored about the board's middle.
+const STEAM_OUTBOARD_X: f32 = 78.0; // the d-pad's centre; the face buttons' is mirrored
+const STEAM_TOP_Y: f32 = 58.0;
+const STEAM_DPAD: f32 = 58.0;
+const STEAM_FACE_SPREAD: f32 = 24.0;
+const STEAM_MENU_X: f32 = 120.0; // View's centre; Menu's is mirrored
+const STEAM_MENU_Y: f32 = 22.0;
+const STEAM_AUX_Y: f32 = 144.0; // between the pads
+const STEAM_STICK_X: f32 = 160.0;
+const STEAM_STICK_Y: f32 = 56.0;
+const STEAM_STICK_R: f32 = 30.0;
+const STEAM_PAD_X: f32 = 78.0; // the left pad's left edge
+const STEAM_PAD_Y: f32 = 100.0;
+const STEAM_PAD: f32 = 88.0; // a pad's side: square
+const STEAM_BACK_X: f32 = 34.7;
+
 // ── Element painters ──────────────────────────────────────────────────────────
 
 fn paint_trigger_bar(painter: &egui::Painter, r: egui::Rect, value: f32, accent: egui::Color32, s: f32) {
@@ -427,11 +520,16 @@ fn paint_trigger_bar(painter: &egui::Painter, r: egui::Rect, value: f32, accent:
     painter.rect_stroke(r, 3.0 * s, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(90)), egui::StrokeKind::Inside);
 }
 
-fn paint_touchpad_strip(
+/// A touch surface at `r`: the outline lit by its click (`click_glow`), and a dot for each of
+/// the `fingers` touching it (0 the first touch, 1 the second) - both on a PlayStation's one
+/// pad, one each on a Steam Controller's two.
+#[allow(clippy::too_many_arguments)]
+fn paint_touch_surface(
     painter: &egui::Painter,
     r: egui::Rect,
     dev: &str,
     live_signals: &LiveSignals,
+    fingers: &[usize],
     click_glow: f32,
     accent: egui::Color32,
     s: f32,
@@ -456,7 +554,7 @@ fn paint_touchpad_strip(
     for (k, (px, py, pa)) in [("touch1_x", "touch1_y", "touch1_active"), ("touch2_x", "touch2_y", "touch2_active")]
         .into_iter().enumerate()
     {
-        if !readb(pa) { continue; }
+        if !fingers.contains(&k) || !readb(pa) { continue; }
         let (ux, uy) = flexinput_core::touchzones::pad_point_to_unit(readf(px), readf(py));
         let dot = egui::pos2(r.left() + ux * r.width(), r.top() + uy * r.height());
         let press = live_signals.get(&(dev.to_string(), pressure[k].to_string())).map(|s| s.as_float());
@@ -638,4 +736,114 @@ fn glow_smoothed(ctx: &egui::Context, node_uid: usize, pin: &str, target: f32) -
     let smoothed = prev + (target - prev) * (1.0 - (-rate * dt).exp());
     ctx.data_mut(|d| d.insert_temp(key, smoothed));
     smoothed
+}
+
+#[cfg(test)]
+mod steam_board_tests {
+    use super::*;
+
+    // Nothing on the Steam board sits on anything else - a button's halo when it lights
+    // included, which is the size it takes up then - and all of it is on the board.
+    #[test]
+    fn the_steam_board_pieces_keep_apart() {
+        #[derive(Debug, Clone, Copy)]
+        enum Piece {
+            Round(egui::Pos2, f32),
+            Square(egui::Rect),
+        }
+        use Piece::{Round, Square};
+        let near = |p: egui::Pos2, r: egui::Rect| (p - r.clamp(p)).length();
+        let apart = |a: Piece, b: Piece| match (a, b) {
+            (Round(c1, r1), Round(c2, r2)) => (c1 - c2).length() >= r1 + r2 - 0.25,
+            (Round(c, r), Square(q)) | (Square(q), Round(c, r)) => near(c, q) >= r - 0.25,
+            (Square(q1), Square(q2)) => !q1.shrink(0.25).intersects(q2.shrink(0.25)),
+        };
+        let bounds = |p: Piece| match p {
+            Round(c, r) => egui::Rect::from_center_size(c, egui::Vec2::splat(2.0 * r)),
+            Square(q) => q,
+        };
+        // A chip lit: its halo reaches 0.72 of its size from its centre; the d-pad's 0.62.
+        let chip = |x: f32, y: f32, size: f32| Round(egui::pos2(x, y), size * 0.72);
+        let (mid, fx, spread) = (BOARD_W * 0.5, BOARD_W - STEAM_OUTBOARD_X, STEAM_FACE_SPREAD);
+        let pad = |x: f32| Square(egui::Rect::from_min_size(egui::pos2(x, STEAM_PAD_Y), egui::Vec2::splat(STEAM_PAD)));
+        let back = |x: f32| Square(egui::Rect::from_min_max(egui::pos2(x - 14.0, 128.0), egui::pos2(x + 14.0, 197.0)));
+        let pieces = [
+            ("d-pad", Round(egui::pos2(STEAM_OUTBOARD_X, STEAM_TOP_Y), STEAM_DPAD * 0.62)),
+            ("north", chip(fx, STEAM_TOP_Y - spread, 22.0)),
+            ("south", chip(fx, STEAM_TOP_Y + spread, 22.0)),
+            ("west", chip(fx - spread, STEAM_TOP_Y, 22.0)),
+            ("east", chip(fx + spread, STEAM_TOP_Y, 22.0)),
+            ("left stick", Round(egui::pos2(STEAM_STICK_X, STEAM_STICK_Y), STEAM_STICK_R)),
+            ("right stick", Round(egui::pos2(BOARD_W - STEAM_STICK_X, STEAM_STICK_Y), STEAM_STICK_R)),
+            ("steam", chip(mid, 34.0, 26.0)),
+            ("aux", chip(mid, STEAM_AUX_Y, 20.0)),
+            ("left pad", pad(STEAM_PAD_X)),
+            ("right pad", pad(BOARD_W - STEAM_PAD_X - STEAM_PAD)),
+            ("view", chip(STEAM_MENU_X, STEAM_MENU_Y, 18.0)),
+            ("menu", chip(BOARD_W - STEAM_MENU_X, STEAM_MENU_Y, 18.0)),
+            ("left back", back(STEAM_BACK_X)),
+            ("right back", back(BOARD_W - STEAM_BACK_X)),
+            ("LB", Square(egui::Rect::from_center_size(egui::pos2(24.4, 24.8), egui::Vec2::splat(36.5)))),
+            ("RB", Square(egui::Rect::from_center_size(egui::pos2(395.6, 24.8), egui::Vec2::splat(36.5)))),
+            ("LT", Square(egui::Rect::from_min_max(egui::pos2(11.8, 48.1), egui::pos2(37.0, 110.5)))),
+            ("RT", Square(egui::Rect::from_min_max(egui::pos2(383.0, 48.1), egui::pos2(408.2, 110.5)))),
+        ];
+        let board = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(BOARD_W, BOARD_H));
+        for (i, (a, pa)) in pieces.iter().enumerate() {
+            assert!(board.contains_rect(bounds(*pa)), "{a} is off the board: {pa:?}");
+            for (b, pb) in &pieces[i + 1..] {
+                assert!(apart(*pa, *pb), "{a} sits on {b}: {pa:?} {pb:?}");
+            }
+        }
+    }
+
+    /// A Steam Controller's board mid-use: the left stick over, a finger on each pad, A held,
+    /// L5 and Menu pressed, the right grip held and the left stick's cap touched. Painted directly (the
+    /// canvas would want a pad wired) and saved to `target/module_shots/input_viewer_steam.png`.
+    #[test]
+    #[ignore = "writes a picture; run with --ignored to look at the Steam board"]
+    fn shoot_steam_board() {
+        let dev = "steam_dev";
+        let mut live: LiveSignals = HashMap::new();
+        let mut put = |pin: &str, s: Signal| {
+            live.insert((dev.to_string(), pin.to_string()), s);
+        };
+        put("left_stick_x", Signal::Float(0.6));
+        put("left_stick_y", Signal::Float(0.35));
+        put("right_stick_x", Signal::Float(0.0));
+        put("right_stick_y", Signal::Float(0.0));
+        put("touch1_active", Signal::Bool(true));
+        put("touch1_x", Signal::Float(-0.4));
+        put("touch1_y", Signal::Float(0.5));
+        put("touch2_active", Signal::Bool(true));
+        put("touch2_x", Signal::Float(0.3));
+        put("touch2_y", Signal::Float(-0.3));
+        put("btn_south", Signal::Bool(true));
+        put("btn_paddle_l2", Signal::Bool(true));
+        put("btn_grip_r", Signal::Bool(true));
+        put("btn_cap_l", Signal::Bool(true));
+        put("btn_capture", Signal::Bool(false));
+        put("btn_start", Signal::Bool(true));
+        put("right_trigger", Signal::Float(0.7));
+        let ctx = egui::Context::default();
+        let mut shot = crate::canvas::shot::Shot::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(BOARD_W, BOARD_H) * 2.0);
+        let mut shapes = Vec::new();
+        for _ in 0..30 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 440.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    paint_viewer_board(ui, rect, 1, Some(dev), Skin::Steam, &IvStyle::default(), &live);
+                });
+            });
+            shot.absorb(&out.textures_delta);
+            shapes = out.shapes;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots/input_viewer_steam.png");
+        shot.save(&ctx, &shapes, rect.expand(4.0), 1.0, &path).expect("the picture saves");
+        println!("{}", path.display());
+    }
 }

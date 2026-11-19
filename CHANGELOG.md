@@ -7,6 +7,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **The Input Viewer draws a Steam Controller as one.** It used to get the Xbox board. Now
+  the Steam Deck's arrangement: the d-pad and face buttons outboard at the top with View and
+  Menu up between them and the sticks, two sticks level either side of the Steam button, a
+  square trackpad under each stick with its own finger and click, the aux button between
+  the pads, and the back buttons low on the sides, L4 over L5 and R4 over R5, on a plate
+  that lights while that grip is held. Touching a stick's cap lights its ring a little.
 - **A wire dropped onto an input that already has one asks what to do with the two:**
   Cancel, Replace the wire, or merge them through a module that combines them in a way that
   means something for what they carry - Add, Max, Min, Multiply or a Selector for numbers and
@@ -375,6 +381,19 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **A switch is outlined, on and off.** Every on/off toggle in a module - the house
+  two-state button, the word toggles, the paired switches in a header, the Switch module,
+  JSM's `tune` - wears an outline in both states, in the selection's colour while on, so a
+  switch reads apart from a button, a one-of-several selector or a value pill. Only the
+  house toggle had one, and only while on (off, it was drawn in nothing).
+- **A value box being dragged shows where its value is.** A dark field with a darker shade of
+  the accent filling it from the start of the range to the value - from the middle for a
+  range either side of zero - in place of the label's accent across the whole box, with a
+  label or without (Delay, Average, DC Filter). A range across orders of magnitude (a time up
+  to a minute, a frequency up to 200 Hz) is measured on a log scale, so 100 ms of a minute is
+  plainly there; a value whose range is a million wide or more (a Constant, a Counter's
+  limits) fills the whole box in that shade. The same for every number box egui draws, in
+  modules and windows alike.
 - **Around wires are tidier.** A wire whose route kept to its pin's row and then turned once
   stayed square - level, a hard corner, straight up, a hard corner - because only what lay
   between its first and last runs was pulled taut; now it flows round what is in its way like

@@ -526,6 +526,9 @@ pub(crate) fn word_toggle(ui: &mut egui::Ui, rect: egui::Rect, on: &mut bool, te
     let (fill, text_col) = if enabled { (fill, text_col) } else { (fill.gamma_multiply(0.6), text_col.gamma_multiply(0.5)) };
     let font = simple_bodies::control_font();
     ui.painter().rect_filled(rect, 3.0, fill);
+    let outline = super::kit::toggle_outline(v, *on, resp.hovered() && enabled);
+    let outline = if enabled { outline } else { egui::Stroke::new(outline.width, outline.color.gamma_multiply(0.6)) };
+    ui.painter().rect_stroke(rect, 3.0, outline, egui::StrokeKind::Inside);
     let text = simple_bodies::fitting_word(ui, text, rect.width() - 8.0);
     let font = simple_bodies::fit_font(ui, text, font, rect.width() - 6.0);
     let shown = simple_bodies::elide_to_width(ui, text, font.clone(), text_col, rect.width() - 4.0);
@@ -690,6 +693,7 @@ pub(crate) fn real_pill(
         shown,
         label_w,
         f64::from(*range.start())..=f64::from(*range.end()),
+        simple_bodies::PillFill::span(f64::from(*value), f64::from(*range.start())..=f64::from(*range.end())),
     );
     let before = *value;
     if let Some(v) = typed {
@@ -717,7 +721,8 @@ pub(crate) fn count_pill(
     hover: &str,
 ) -> bool {
     let label_w = pill_label_w(ui, label);
-    let (resp, typed) = simple_bodies::value_pill_number(ui, node, salt, rect, label, shown, label_w, range.clone());
+    let fill = simple_bodies::PillFill::span(*value, range.clone());
+    let (resp, typed) = simple_bodies::value_pill_number(ui, node, salt, rect, label, shown, label_w, range.clone(), fill);
     let before = *value;
     let acc_id = egui::Id::new(("curve_pill_acc", node.0, salt));
     if let Some(v) = typed {

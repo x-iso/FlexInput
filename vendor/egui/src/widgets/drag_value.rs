@@ -18,6 +18,72 @@ type NumParser<'a> = Box<dyn 'a + Fn(&str) -> Option<f64>>;
 /// for the borrow checker.
 type GetSetValue<'a> = Box<dyn 'a + FnMut(Option<f64>) -> f64>;
 
+// ----------------------------------------------------------------------------
+
+/// FLEXINPUT PATCH: the two colours of a value box being dragged - the field, dark, and the
+/// darker shade of the accent the value fills it with.
+pub fn drag_fill_colors(visuals: &crate::Visuals) -> (crate::Color32, crate::Color32) {
+    let field = visuals.extreme_bg_color;
+    (field, field.lerp_to_gamma(visuals.selection.bg_fill, 0.6))
+}
+
+/// FLEXINPUT PATCH: how far along `range` `value` is, and where in it the fill starts from -
+/// its zero, where the range has one inside it (a bipolar value fills from the middle), else
+/// the end nearer zero. `None` where no range means anything: none given, or one a million
+/// wide and more, there only to stop typing nonsense (a Counter's limits, a Constant).
+///
+/// A positive range across more than two orders of magnitude - a time from 0 to a minute, a
+/// frequency from 0.01 to 200 Hz - is measured on a log scale: along it straight, 100 ms of a
+/// minute was a sliver no one could see, and so was every value it's ever set to.
+pub fn value_span(value: f64, range: &RangeInclusive<f64>) -> Option<(f32, f32)> {
+    let (lo, hi) = (*range.start(), *range.end());
+    if !(lo.is_finite() && hi.is_finite() && value.is_finite()) || hi <= lo || hi - lo >= 1.0e6 {
+        return None;
+    }
+    // The unit a log scale counts from: the range's own start, or one where it starts at 0.
+    let unit = if lo > 0.0 { lo } else { 1.0 };
+    let wide = lo >= 0.0 && (hi - lo) / unit > 100.0;
+    let at = |x: f64| {
+        let t = if wide {
+            (1.0 + (x - lo).max(0.0) / unit).ln() / (1.0 + (hi - lo) / unit).ln()
+        } else {
+            (x - lo) / (hi - lo)
+        };
+        t.clamp(0.0, 1.0) as f32
+    };
+    Some((at(value), at(0.0)))
+}
+
+/// FLEXINPUT PATCH: a value box being dragged: the dark field `rect`, rounded `radius`, and
+/// over it the accent from where `span` starts to where the value is - or across all of it,
+/// with no span to measure (see [`value_span`]).
+pub fn drag_fill_shape(
+    visuals: &crate::Visuals,
+    rect: crate::Rect,
+    radius: crate::CornerRadius,
+    span: Option<(f32, f32)>,
+) -> crate::epaint::Shape {
+    use crate::epaint::Shape;
+    let (field, accent) = drag_fill_colors(visuals);
+    let Some((at, from)) = span else {
+        return Shape::rect_filled(rect, radius, accent);
+    };
+    let (a, b) = (at.min(from), at.max(from));
+    let x = |t: f32| emath::lerp(rect.left()..=rect.right(), t);
+    // Rounded where the bar meets an end of the field, square where it stops inside it.
+    let mut bar_radius = crate::CornerRadius::ZERO;
+    if a <= 0.0 {
+        bar_radius.nw = radius.nw;
+        bar_radius.sw = radius.sw;
+    }
+    if b >= 1.0 {
+        bar_radius.ne = radius.ne;
+        bar_radius.se = radius.se;
+    }
+    let bar = crate::Rect::from_x_y_ranges(x(a)..=x(b), rect.y_range());
+    Shape::Vec(vec![Shape::rect_filled(rect, radius, field), Shape::rect_filled(bar, bar_radius, accent)])
+}
+
 fn get(get_set_value: &mut GetSetValue<'_>) -> f64 {
     (get_set_value)(None)
 }
@@ -608,6 +674,12 @@ impl Widget for DragValue<'_> {
                 CursorIcon::ResizeWest
             };
 
+            // FLEXINPUT PATCH: while it's dragged, the box shows where the value is along its
+            // range (`drag_fill_shape`, painted under the button) rather than filling with the
+            // active colour; with no range that means anything, all of it in the dark accent.
+            let dragging = ui.ctx().is_being_dragged(id);
+            let backdrop = ui.painter().add(crate::epaint::Shape::Noop);
+            let button = if dragging { button.fill(crate::Color32::TRANSPARENT) } else { button };
             let response = ui.add(button);
             let mut response = response.on_hover_cursor(cursor_icon);
 
@@ -658,6 +730,14 @@ impl Widget for DragValue<'_> {
 
                     ui.data_mut(|data| data.insert_temp::<f64>(id, precise_value));
                 }
+            }
+
+            if dragging {
+                let now = get(&mut get_set_value);
+                let active = &ui.visuals().widgets.active;
+                let rect = response.rect.expand(active.expansion);
+                let shape = drag_fill_shape(ui.visuals(), rect, active.corner_radius, value_span(now, &range));
+                ui.painter().set(backdrop, shape);
             }
 
             response

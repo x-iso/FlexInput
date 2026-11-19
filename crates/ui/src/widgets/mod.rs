@@ -676,6 +676,100 @@ pub(crate) fn raster_ppp(ctx: &egui::Context, layer: egui::LayerId) -> f32 {
 }
 
 #[cfg(test)]
+mod drag_value_fill_tests {
+    /// Every filled rect painted in the frame a `DragValue` is being dragged, and the box's own
+    /// rect. `range` none: egui's default, which has no ends.
+    fn dragged(range: Option<std::ops::RangeInclusive<f64>>, value: f64) -> (egui::Rect, Vec<(egui::Rect, egui::Color32)>) {
+        let ctx = egui::Context::default();
+        let mut v = value;
+        let mut rect = egui::Rect::NOTHING;
+        let run = |events: Vec<egui::Event>, rect: &mut egui::Rect, v: &mut f64| {
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                ..Default::default()
+            };
+            ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // No speed: the value stays where it is while the pointer moves.
+                    let dv = egui::DragValue::new(v).speed(0.0);
+                    let dv = match &range {
+                        Some(r) => dv.range(r.clone()),
+                        None => dv,
+                    };
+                    *rect = ui.add_sized([120.0, 24.0], dv).rect;
+                });
+            })
+        };
+        run(vec![], &mut rect, &mut v);
+        let at = rect.center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        run(vec![egui::Event::PointerMoved(at)], &mut rect, &mut v);
+        run(vec![button(at, true)], &mut rect, &mut v);
+        let mut out = None;
+        for step in 1..=6 {
+            out = Some(run(vec![egui::Event::PointerMoved(at + egui::vec2(step as f32 * 4.0, 0.0))], &mut rect, &mut v));
+        }
+        fn walk(s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut fills = Vec::new();
+        out.expect("ran").shapes.iter().for_each(|cs| walk(&cs.shape, &mut fills));
+        (rect, fills)
+    }
+
+    // A value box being dragged shows where the value is along its range - a darker shade of
+    // the accent over a dark field, half of it at the middle of the range, from the middle
+    // for a range either side of zero - and with no ends to its range, all of it in that
+    // shade. It used to fill with the active colour whatever the value.
+    #[test]
+    fn a_dragged_value_box_fills_to_its_place_in_the_range() {
+        let visuals = egui::Visuals::dark();
+        let (field, accent) = egui::widgets::drag_fill_colors(&visuals);
+        let width_of = |fills: &[(egui::Rect, egui::Color32)], c: egui::Color32| {
+            fills.iter().filter(|(_, f)| *f == c).map(|(r, _)| r.width()).fold(0.0f32, f32::max)
+        };
+        let (rect, fills) = dragged(Some(0.0..=10.0), 5.0);
+        let (bar, whole) = (width_of(&fills, accent), width_of(&fills, field));
+        assert!(whole >= rect.width() - 1.0, "no dark field under the bar: {fills:?}");
+        assert!((bar - whole * 0.5).abs() < 2.0, "half way along, half full: {bar} of {whole}");
+
+        let (_, fills) = dragged(Some(-1.0..=1.0), 0.5);
+        let bar = fills.iter().find(|(_, f)| *f == accent).map(|(r, _)| *r).expect("a bar");
+        let field_rect = fills.iter().find(|(_, f)| *f == field).map(|(r, _)| *r).expect("a field");
+        assert!((bar.left() - field_rect.center().x).abs() < 1.0, "a bipolar value fills from the middle: {bar:?} in {field_rect:?}");
+
+        let (rect, fills) = dragged(None, 3.0);
+        assert!(width_of(&fills, accent) >= rect.width() - 1.0, "no range: the whole box in the accent: {fills:?}");
+    }
+
+    // Where a value is along its range: straight along an ordinary one; on a log scale along
+    // a positive one across orders of magnitude, so a 100 ms delay of a minute is plainly
+    // there and not a sliver; and nowhere along one a million wide, which is no range.
+    #[test]
+    fn a_value_is_placed_along_its_range_as_it_reads() {
+        use egui::widgets::value_span;
+        let at = |v: f64, r: std::ops::RangeInclusive<f64>| value_span(v, &r).map(|(at, _)| at);
+        assert_eq!(at(5.0, 0.0..=20.0), Some(0.25));
+        let delay = at(100.0, 0.0..=60_000.0).expect("a range");
+        assert!(delay > 0.3 && delay < 0.6, "100 ms of a minute: {delay}");
+        assert!(at(1000.0, 0.0..=60_000.0) > Some(delay), "and a second further along");
+        assert_eq!(at(60_000.0, 0.0..=60_000.0), Some(1.0));
+        assert_eq!(at(0.0, -1e6..=1e6), None, "a Counter's limits are no range");
+        assert_eq!(value_span(0.5, &(-1.0..=1.0)), Some((0.75, 0.5)), "bipolar: from the middle");
+    }
+}
+
+#[cfg(test)]
 mod scaled_text_tests {
     /// On-screen pixels per atlas texel, for the tallest glyph of text painted in a layer
     /// scaled by `scale`.

@@ -147,6 +147,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
         },
         0.0,
         lo as f64..=hi as f64,
+        super::simple_bodies::PillFill::span(f64::from(freq_p), lo as f64..=hi as f64),
     );
     let freq_resp = freq_resp.on_hover_text(if freq_wired {
         "The frequency the wire is driving - unplug it to set this here."
@@ -205,6 +206,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
         &format!("{phase_p:.2}"),
         0.0,
         0.0..=1.0,
+        super::simple_bodies::PillFill::span(f64::from(phase_p), 0.0..=1.0),
     );
     let phase_resp = phase_resp.on_hover_text(if phase_wired {
         "The offset the wire is driving - unplug it to set this here."
@@ -1122,6 +1124,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             &shown,
                             0.0,
                             lo as f64..=hi as f64,
+                            super::simple_bodies::PillFill::span(f64::from(time_mul), lo as f64..=hi as f64),
                         );
                         if let Some(v) = typed {
                             time_mul = v as f32;
@@ -1278,6 +1281,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             &shown,
                             16.0,
                             1.0..=20.0,
+                            super::simple_bodies::PillFill::span(*value, 1.0..=20.0),
                         );
                         if let Some(v) = typed {
                             *value = v.round().clamp(1.0, 20.0);

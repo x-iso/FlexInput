@@ -126,7 +126,9 @@ fn caption_at(ui: &mut egui::Ui, left: egui::Pos2, w: f32, title: &str) {
 
 /// One value pill at `left`, painted rather than allocated (the rect is given, so nothing it
 /// measures folds back into the body's size). Traced under `{salt}_pill` so a test can hold
-/// the placement, and returns the response plus a number the user typed into it.
+/// the placement, and returns the response plus a number the user typed into it. `value` is
+/// what it shows, for where it fills to while dragged (`PillFill::span`).
+#[allow(clippy::too_many_arguments)]
 fn pill_at(
     ui: &mut egui::Ui,
     node_id: NodeId,
@@ -135,6 +137,7 @@ fn pill_at(
     w: f32,
     label: &str,
     shown: &str,
+    value: f64,
     range: std::ops::RangeInclusive<f64>,
 ) -> (egui::Response, Option<f64>) {
     use super::simple_bodies::{value_pill_number, PILL_H};
@@ -144,7 +147,8 @@ fn pill_at(
     // row, was three times as wide as any number in it.
     let label_w = super::simple_bodies::pill_label_width(ui, label);
     simple_bodies::trace_rect(ui, node_id, &format!("{salt}_pill"), rect);
-    value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range)
+    let fill = simple_bodies::PillFill::span(value, range.clone());
+    value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range, fill)
 }
 
 /// Milliseconds written compactly: a delay of a second is `1000 ms`, a window of five
@@ -185,6 +189,7 @@ pub(crate) fn show_delay_body(
         PILL_W,
         "",
         &ms_text(ms),
+        f64::from(ms),
         0.0..=60_000.0,
     );
     let resp = resp.on_hover_text(
@@ -218,7 +223,7 @@ pub(crate) fn show_average_body(
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
-    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "", &ms_text(ms), 0.5..=5_000.0);
+    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "", &ms_text(ms), f64::from(ms), 0.5..=5_000.0);
     let r1 = r1.on_hover_text(
         "How much of the recent signal the average runs over.\nDrag to change it, double-click to type.",
     );
@@ -230,7 +235,7 @@ pub(crate) fn show_average_body(
     let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
     caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Spikes");
     let shown2 = if mad > 0.0 { format!("{mad:.1}") } else { "off".into() };
-    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "", &shown2, 0.0..=20.0);
+    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "", &shown2, f64::from(mad), 0.0..=20.0);
     let r2 = r2.on_hover_text(
         "Outlier threshold in median absolute deviations: a reading further from the middle than this is dropped.\n0 = off. Try 3.0 to start.",
     );
@@ -261,7 +266,7 @@ pub(crate) fn show_dc_filter_body(
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
-    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "", &ms_text(window), 10.0..=60_000.0);
+    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "", &ms_text(window), f64::from(window), 10.0..=60_000.0);
     let r1 = r1.on_hover_text(
         "How slowly a change has to move to count as offset rather than signal.\nDrag to change it, double-click to type.",
     );
@@ -272,7 +277,7 @@ pub(crate) fn show_dc_filter_body(
     }
     let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
     caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Decay");
-    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "", &ms_text(decay), 10.0..=60_000.0);
+    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "", &ms_text(decay), f64::from(decay), 10.0..=60_000.0);
     let r2 = r2.on_hover_text(
         "How quickly the filter settles after a real change goes through it.",
     );
@@ -345,7 +350,8 @@ pub(crate) fn show_inverse_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut 
         );
         let shown = format!("{max:.2}");
         simple_bodies::trace_rect(ui, node_id, "inverse_max_pill", r_max);
-        let (resp, typed) = value_pill_number(ui, node_id, "inverse_max", r_max, "", &shown, 0.0, 0.0..=1000.0);
+        let (resp, typed) =
+            value_pill_number(ui, node_id, "inverse_max", r_max, "", &shown, 0.0, 0.0..=1000.0, simple_bodies::PillFill::span(f64::from(max), 0.0..=1000.0));
         let resp = resp.on_hover_text(
             "The top of the range the value is mirrored inside. Drag to change, double-click to type.",
         );
@@ -463,6 +469,7 @@ pub(crate) fn show_quantize_body(
         &quantize_step_label(factor),
         14.0,
         1.0..=1_000_000.0,
+        simple_bodies::PillFill::span(f64::from(factor), 1.0..=1_000_000.0),
     );
     let resp = resp.on_hover_text(if factor_wired {
         "Steps per unit, from the wire: 1 = integers, 2 = halves, 4 = quarters.\nUnwire it to set it here."
@@ -620,7 +627,8 @@ pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     );
     let shown = format!("{}", time.round() as i32);
     simple_bodies::trace_rect(ui, node_id, "delay_time_pill", r_time);
-    let (resp, typed) = value_pill_number(ui, node_id, "delay_time", r_time, "", &shown, 0.0, 0.0..=limit as f64);
+    let (resp, typed) =
+        value_pill_number(ui, node_id, "delay_time", r_time, "", &shown, 0.0, 0.0..=limit as f64, simple_bodies::PillFill::span(f64::from(time), 0.0..=limit as f64));
     let resp = resp.on_hover_text(if ms {
         "How long, in milliseconds. Drag to change, double-click to type, or use the pinned field."
     } else {
@@ -781,8 +789,8 @@ pub(crate) fn show_counter_body(
     let shown_min = if min_wired { wired_value(4).unwrap_or_else(|| trim_num(min)) } else { trim_num(min) };
     let shown_max = if max_wired { wired_value(5).unwrap_or_else(|| trim_num(max)) } else { trim_num(max) };
     let shown_step = if step_wired { wired_value(3).unwrap_or_else(|| trim_num(step)) } else { trim_num(step) };
-    let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, -1e6..=1e6);
-    let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, -1e6..=1e6);
+    let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, f64::from(min), -1e6..=1e6);
+    let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, f64::from(max), -1e6..=1e6);
     let (r_step, t_step) = pill_at(
         ui,
         node_id,
@@ -791,6 +799,7 @@ pub(crate) fn show_counter_body(
         col_w - PILL_H - ROW,
         "step",
         &shown_step,
+        f64::from(step),
         0.001..=10_000.0,
     );
     let r_min = r_min.on_hover_text("The bottom of the count: it stops, loops or turns here, depending on the mode.");
@@ -901,6 +910,7 @@ pub(crate) fn show_has_changed_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
         &field.text(shown),
         0.0,
         0.0..=(100.0 * field.scale) as f64,
+        simple_bodies::PillFill::span(f64::from(shown), 0.0..=(100.0 * field.scale) as f64),
     );
     let resp = resp.on_hover_text(
         "Ignores movement smaller than this, like noise or a shaky hand: it reacts once the input \
@@ -1008,25 +1018,18 @@ pub(crate) const TOGGLE: egui::Vec2 = egui::Vec2::new(52.0, 20.0);
 /// wears, in a body or in a header. `setting_button` places it inside a reserved box; a
 /// header adds it to its own row.
 pub(crate) fn toggle_button(ui: &mut egui::Ui, on: bool, label: &str, size: egui::Vec2) -> egui::Response {
-    let (fill, stroke, text) = if on {
-        (
-            ui.style().visuals.selection.bg_fill,
-            ui.style().visuals.selection.stroke.color,
-            ui.style().visuals.strong_text_color(),
-        )
+    let (fill, text) = if on {
+        (ui.style().visuals.selection.bg_fill, ui.style().visuals.strong_text_color())
     } else {
-        (
-            ui.style().visuals.widgets.inactive.bg_fill,
-            ui.style().visuals.widgets.inactive.bg_stroke.color,
-            ui.style().visuals.text_color(),
-        )
+        (ui.style().visuals.widgets.inactive.bg_fill, ui.style().visuals.text_color())
     };
+    let stroke = super::kit::toggle_outline(&ui.style().visuals, on, false);
     let label = super::simple_bodies::fitting_word(ui, label, size.x - 2.0 * ui.spacing().button_padding.x);
     let font = super::simple_bodies::fit_font(ui, label, super::simple_bodies::control_font(), size.x - 2.0 * ui.spacing().button_padding.x);
     ui.add(
         egui::Button::new(egui::RichText::new(label).font(font).color(text))
             .fill(fill)
-            .stroke(egui::Stroke::new(1.0_f32, stroke))
+            .stroke(stroke)
             .corner_radius(4.0)
             .min_size(size),
     )

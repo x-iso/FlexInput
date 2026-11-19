@@ -5578,3 +5578,73 @@ fn the_wheel_over_the_jsm_tabs_scrolls_them() {
         rig.idle(6);
     }
 }
+
+/// Every rect painted last frame, in graph space: its rect, fill and outline colour.
+fn painted_rects(rig: &Rig) -> Vec<(egui::Rect, egui::Color32, egui::Color32)> {
+    fn walk(s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32, egui::Color32)>) {
+        match s {
+            egui::Shape::Rect(r) => out.push((r.rect, r.fill, r.stroke.color)),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let back = rig.to_global.inverse();
+    let mut out = Vec::new();
+    rig.shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
+    out.into_iter().map(|(r, f, s)| (back * r, f, s)).collect()
+}
+
+/// A switch wears an outline on or off - what tells it from a button, a selector or a value
+/// pill - and a different one each way. Off, it used to have none to see.
+#[test]
+fn a_switch_is_outlined_on_and_off() {
+    let (mut rig, _) = Rig::real("logic.greater_than", &[egui::pos2(40.0, 40.0)]);
+    let v = rig.ctx.style().visuals.clone();
+    let off = crate::canvas::viewer::kit::toggle_outline(&v, false, false).color;
+    let on = crate::canvas::viewer::kit::toggle_outline(&v, true, false).color;
+    assert!(off.a() > 40 && on.a() > 40 && off != on, "both visible, and told apart: {off:?} {on:?}");
+    let outlined = |rig: &Rig, c: egui::Color32| painted_rects(rig).into_iter().find(|(_, _, s)| *s == c).map(|(r, _, _)| r);
+    let button = outlined(&rig, off).expect("the off switch is outlined");
+    rig.click(button.center());
+    rig.idle(3);
+    assert!(outlined(&rig, on).is_some(), "the on switch is outlined in the selection's colour");
+}
+
+/// How much of its value cell a pill's accent fills while it's being dragged (a short way,
+/// so the value hardly moves): the module `id`, its pill traced as `trace`, with `params` set
+/// first. Also that the bar starts at the field's left.
+fn dragged_pill_share(id: &'static str, trace: &str, params: serde_json::Value) -> f32 {
+    let (mut rig, ids) = Rig::real(id, &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    if let (Some(node), serde_json::Value::Object(extra)) = (rig.canvas.snarl.get_node_mut(n), params) {
+        node.params.extend(extra);
+    }
+    rig.idle(3);
+    let pill = rig.traced(n, trace);
+    let (field, accent) = egui::widgets::drag_fill_colors(&rig.ctx.style().visuals);
+    let start = rig.to_global * pill.center();
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    rig.frame(vec![egui::Event::PointerMoved(start)]);
+    rig.frame(vec![button(start, true)]);
+    for step in 1..=4 {
+        rig.frame(vec![egui::Event::PointerMoved(start + egui::vec2(step as f32 * 2.0, 0.0))]);
+    }
+    let rects: Vec<_> = painted_rects(&rig).into_iter().filter(|(r, _, _)| pill.expand(1.0).contains_rect(*r)).collect();
+    let biggest = |c: egui::Color32| rects.iter().filter(|(_, f, _)| *f == c).map(|(r, _, _)| *r).max_by(|a, b| a.area().total_cmp(&b.area()));
+    let (cell, bar) = (biggest(field).expect("a dark field while dragged"), biggest(accent).expect("an accent bar while dragged"));
+    assert!((bar.left() - cell.left()).abs() < 1.0, "{id}: from the left: {bar:?} in {cell:?}");
+    rig.frame(vec![button(start + egui::vec2(8.0, 0.0), false)]);
+    bar.width() / cell.width()
+}
+
+/// A value pill being dragged shows where its value is along its range: the darker accent
+/// from the left of a dark field to the value, not the label's accent across the whole cell -
+/// a pill with no label as much as one with (Delay's time, a minute long, on a log scale so
+/// its 100 ms is plainly there).
+#[test]
+fn a_dragged_pill_fills_to_its_value() {
+    let share = dragged_pill_share("logic.has_changed", "hysteresis_pill", serde_json::json!({ "hysteresis_pct": 40.0 }));
+    assert!(share > 0.3 && share < 0.6, "about two fifths of the way: {share}");
+    let share = dragged_pill_share("module.delay", "delay_ms_pill", serde_json::json!({ "delay_ms": 100.0 }));
+    assert!(share > 0.3 && share < 0.6, "100 ms of a minute, on a log scale: {share}");
+}
