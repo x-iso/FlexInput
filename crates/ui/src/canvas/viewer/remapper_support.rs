@@ -528,7 +528,7 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
             .on_hover_text(p.name).rect;
     }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
-        let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
+        let size_px = (CHIP_H * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round() as u32;
         // A glyph that stands for more than one control (the generic paddle,
         // a Steam Controller's trackpads) has its label cut out of it.
         let label = remapper_icons::extra_button_label(skin, pin_id);
@@ -582,7 +582,9 @@ pub(crate) fn paint_gap_marker(
 ) -> f32 {
     let w = gap_marker_width(ctx, chip_h, ms);
     let icon = chip_h * 0.62;
-    if let Some(tex) = crate::macro_icons::macro_icon_texture(ctx, "stopwatch", icon) {
+    // Rasterized for the canvas's zoom too (`raster_scale`); drawn at `icon` points.
+    let raster = crate::widgets::raster_scale(ctx, painter.layer_id());
+    if let Some(tex) = crate::macro_icons::macro_icon_texture(ctx, "stopwatch", icon * raster) {
         let rect = egui::Rect::from_min_size(top_left + egui::vec2((w - icon) * 0.5, 0.0), egui::vec2(icon, icon));
         painter.image(tex.id(), rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), GAP_TINT);
@@ -757,7 +759,7 @@ pub(crate) fn paint_chord_chip_tinted(
     }
 
     if let Some((bytes, dim, from)) = found {
-        let size_px = (chip_h * ctx.pixels_per_point()).round() as u32;
+        let size_px = (chip_h * crate::widgets::raster_ppp(ctx, painter.layer_id())).round() as u32;
         // A glyph that stands for more than one control has its label cut out.
         let label = remapper_icons::extra_button_label(from, pin_id);
         if let Some(tex) = glyph_texture(&ctx, bytes, label, size_px) {
@@ -813,7 +815,7 @@ pub(crate) fn paint_text_pill(
 pub(crate) fn remapper_render_arrow(ui: &mut egui::Ui) {
     use crate::canvas::remapper_icons;
     const H: f32 = 22.0;
-    let size_px = (H * ui.ctx().pixels_per_point()).round() as u32;
+    let size_px = (H * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round() as u32;
     let cache_key = egui::Id::new(("remapper_arrow_svg", size_px));
     let tex = crate::widgets::tex_cache::get(ui.ctx(), cache_key)
         .or_else(|| {

@@ -1869,7 +1869,7 @@ pub(crate) fn render_knob_value(
         value_changed = true;
     }
     if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = crate::canvas::wheel::value_wheel(ui);
         if scroll != 0.0 {
             v = (v + scroll * 0.005 * (hi - lo)).clamp(lo, hi);
             value_changed = true;

@@ -503,7 +503,7 @@ pub(crate) fn segmented_icons<T: PartialEq + Clone>(
 
 /// An SVG drawn white (a game-icons glyph, a motion glyph), at `rect`, tinted `tint`.
 pub(crate) fn paint_tinted_svg(ui: &egui::Ui, bytes: &'static [u8], rect: egui::Rect, tint: egui::Color32) {
-    let px = (rect.height() * ui.ctx().pixels_per_point() * 2.0).round().clamp(8.0, 256.0) as u32;
+    let px = (rect.height() * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round().clamp(8.0, 512.0) as u32;
     if let Some(tex) = simple_bodies::glyph_texture(ui.ctx(), bytes, None, px) {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         ui.painter().image(tex.id(), rect, uv, tint);

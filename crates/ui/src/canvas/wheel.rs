@@ -83,6 +83,18 @@ pub(crate) fn scrolling_body<R>(
     out
 }
 
+/// How far the wheel turned this frame, for a value under the pointer (a knob, a fader) to
+/// change by: the wheel itself only. A touchpad pinch comes as the wheel with the zoom
+/// modifier held - Ctrl, which is how Windows sends one - and zooms the canvas; read as a turn
+/// of the wheel too, it also changed whatever the pointer happened to be over.
+pub(crate) fn value_wheel(ui: &Ui) -> f32 {
+    let zoom = ui.ctx().options(|o| o.input_options.zoom_modifier);
+    ui.input(|i| {
+        let zooming = i.modifiers.matches_any(zoom) || i.zoom_delta() != 1.0;
+        if zooming { 0.0 } else { i.raw_scroll_delta.y }
+    })
+}
+
 fn page_wheel_key(ctx: &Context) -> Id {
     Id::new("fxi_widget_has_wheel").with(ctx.viewport_id())
 }
@@ -307,5 +319,40 @@ mod tests {
         };
         no_body(&ctx);
         assert_ne!(no_body(&ctx), Vec2::ZERO, "a stale claim lets the canvas pan again");
+    }
+}
+
+
+#[cfg(test)]
+mod value_wheel_tests {
+    use super::value_wheel;
+
+    fn turned(modifiers: egui::Modifiers) -> f32 {
+        let ctx = egui::Context::default();
+        let mut got = f32::NAN;
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 12.0),
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| got = value_wheel(ui));
+            });
+        }
+        got
+    }
+
+    // The wheel turns a knob; a touchpad pinch, the wheel with Ctrl held, zooms and leaves the
+    // knob alone.
+    #[test]
+    fn a_pinch_is_not_a_turn_of_the_wheel() {
+        assert_eq!(turned(egui::Modifiers::NONE), 12.0);
+        assert_eq!(turned(egui::Modifiers::CTRL), 0.0);
+        assert_eq!(turned(egui::Modifiers::COMMAND), 0.0);
     }
 }

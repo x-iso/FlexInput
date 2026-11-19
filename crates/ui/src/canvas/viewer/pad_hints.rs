@@ -67,7 +67,8 @@ pub(crate) fn pad_hint_inline(ui: &mut egui::Ui, hint: &str) {
                     ui.label(egui::RichText::new(t.trim()).small().weak());
                 }
             }
-            Part::Pin(p) => match glyph(ui.ctx(), p, h) {
+            // Rasterized for the canvas's zoom too (`raster_scale`); drawn at `h` points.
+            Part::Pin(p) => match glyph(ui.ctx(), p, h * crate::widgets::raster_scale(ui.ctx(), ui.layer_id())) {
                 Some(tex) => {
                     // WHITE is the identity for a tint multiply: the glyph keeps
                     // its own colours at full opacity. Dimming it to the weak

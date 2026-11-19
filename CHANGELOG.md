@@ -1065,6 +1065,22 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Zoomed-in text and icons are sharp.** Easy mode draws its layout bigger to fill the panel
+  and the canvas zooms by scaling what's drawn, and both stretched text and icons rasterized
+  for their size in points: twice the size was twice as blurry, worst on a 1080p screen at
+  100% (a high-DPI screen rasterizes finer to begin with). Text in a scaled-up layer is now
+  rasterized for the size it's drawn at, in steps of an eighth of an octave up to four times,
+  and so are the button glyphs, module marks, icons and Switch pictures (a Switch's picture
+  was rasterized at its size in points even at 100%).
+- **Pinching a touchpad over a knob or fader zooms the canvas and leaves the knob alone.**
+  Windows sends a touchpad pinch as the mouse wheel with Ctrl held, and a knob or fader under
+  the pointer took it as a turn of the wheel.
+- **Pinching a touchpad zooms the canvas on Linux (Wayland).** Only two-finger scrolling came
+  through before; the pinch is now read from the compositor's pointer gestures.
+- **The grid doesn't go out between its zoom steps.** Zoomed out, it draws every second,
+  fourth, eighth line, but it used to fade the whole grid to nothing just before each step,
+  so at some zooms there was next to no grid. Now the lines a step keeps stay as they are and
+  only the ones it drops fade out, all the way by the time it's taken.
 - **3DOF to 2D's preview draws a Joy-Con at a pad's size.** The pad was sized by its width
   across the grips, and a single Joy-Con is narrow across and long nose to back: its icon came
   out over twice the sphere's size and its model nearly the sphere's. Both are now sized by

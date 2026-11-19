@@ -2598,7 +2598,9 @@ pub(crate) fn paint_switch_content(
         // Square the icon within its slot.
         let side_px = ir.width().min(ir.height()).round().max(1.0);
         let icon_box = egui::Rect::from_center_size(ir.center(), egui::vec2(side_px, side_px));
-        let tex_px = (side_px as u32).max(8);
+        // Rasterized at the pixels it covers - the screen's density and the canvas's zoom
+        // (`raster_ppp`) - where it was its size in points, soft on any screen above 100%.
+        let tex_px = ((side_px * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round() as u32).max(8);
         let side_id = if on { "on" } else { "off" };
         if let Some(tex) = switch_icon_texture(ui, node_uid, side_id, &state.svg_data, state.svg_rev, tex_px) {
             ui.painter().image(
@@ -3989,7 +3991,7 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
         value_changed = true;
     }
     if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = crate::canvas::wheel::value_wheel(ui);
         if scroll != 0.0 {
             v = (v + scroll * 0.005 * (hi - lo)).clamp(lo, hi);
             value_changed = true;

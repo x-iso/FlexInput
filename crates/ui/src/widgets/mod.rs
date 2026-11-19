@@ -658,6 +658,88 @@ mod tests {
     }
 }
 
+/// How much finer than the screen to rasterize a picture (an SVG) drawn in `layer`: how much
+/// the layer is scaled up - a zoomed-in canvas, Easy mode's layout drawn bigger to fill its
+/// panel - in the steps text is rasterized in (`egui::layers::text_raster_scale`), 1 where it
+/// isn't scaled up. A picture rasterized for its size in points was stretched there, and came
+/// out blurry (worst on a screen at 100%). The steps keep a zoom in progress from making a new
+/// texture every frame.
+pub(crate) fn raster_scale(ctx: &egui::Context, layer: egui::LayerId) -> f32 {
+    let scaling = ctx.layer_transform_to_global(layer).map_or(1.0, |t| t.scaling);
+    egui::layers::text_raster_scale(scaling).unwrap_or(1.0)
+}
+
+/// Pixels per point to rasterize a picture drawn in `layer` at: the screen's, times
+/// [`raster_scale`].
+pub(crate) fn raster_ppp(ctx: &egui::Context, layer: egui::LayerId) -> f32 {
+    ctx.pixels_per_point() * raster_scale(ctx, layer)
+}
+
+#[cfg(test)]
+mod scaled_text_tests {
+    /// On-screen pixels per atlas texel, for the tallest glyph of text painted in a layer
+    /// scaled by `scale`.
+    fn pixels_per_texel(scale: f32) -> (f32, egui::Rect) {
+        let ctx = egui::Context::default();
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("scaled_text"));
+        let mut out = None;
+        for _ in 0..3 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                ctx.set_transform_layer(layer, egui::emath::TSTransform::from_scaling(scale));
+                ctx.layer_painter(layer).text(
+                    egui::pos2(10.0, 10.0),
+                    egui::Align2::LEFT_TOP,
+                    "Hamburgefonts",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                );
+            }));
+        }
+        let out = out.expect("ran");
+        let ppp = out.pixels_per_point;
+        let atlas = ctx.fonts(|f| f.font_image_size());
+        let mut most = 0.0f32;
+        let mut bounds = egui::Rect::NOTHING;
+        for prim in ctx.tessellate(out.shapes, ppp) {
+            let egui::epaint::Primitive::Mesh(mesh) = prim.primitive else { continue };
+            if mesh.texture_id != egui::TextureId::default() {
+                continue;
+            }
+            for quad in mesh.indices.chunks(6) {
+                let vs: Vec<_> = quad.iter().map(|&i| mesh.vertices[i as usize]).collect();
+                let span = |f: &dyn Fn(&egui::epaint::Vertex) -> f32| {
+                    let (lo, hi) = vs.iter().map(f).fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+                    hi - lo
+                };
+                let pixels = span(&|v| v.pos.y) * ppp;
+                let texels = span(&|v| v.uv.y) * atlas[1] as f32;
+                if texels > 4.0 {
+                    most = most.max(pixels / texels);
+                    vs.iter().for_each(|v| bounds.extend_with(v.pos));
+                }
+            }
+        }
+        (most, bounds)
+    }
+
+    // Text in a layer drawn bigger - a zoomed-in canvas, Easy mode's layout filling its panel -
+    // is rasterized for the size it's drawn at: a texel to a pixel, where the glyphs used to be
+    // the screen's, stretched (two pixels a texel at twice the size: blurry).
+    #[test]
+    fn text_in_a_scaled_layer_is_rasterized_at_its_drawn_size() {
+        let (_, at_one) = pixels_per_texel(1.0);
+        for scale in [1.0f32, 1.5, 2.0, 3.0] {
+            let (r, bounds) = pixels_per_texel(scale);
+            assert!(r > 0.7 && r < 1.2, "scale {scale}: {r} pixels a texel");
+            // Where it was and as big, in points: only the rasterizing changed.
+            let back = egui::Rect::from_min_max((bounds.min.to_vec2() / scale).to_pos2(), (bounds.max.to_vec2() / scale).to_pos2());
+            for (a, b) in [(back.min, at_one.min), (back.max, at_one.max)] {
+                assert!((a - b).length() < 1.5, "scale {scale}: the text moved, {back:?} vs {at_one:?}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod big_tooltip_tests {
     // A tooltip too big to fit beside its widget is pushed back over it, and then the widget

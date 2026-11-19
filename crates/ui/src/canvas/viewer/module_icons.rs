@@ -194,9 +194,9 @@ pub(crate) fn paint_glyph(
     // Identity rather than content: the glyph is the weakest thing in the module, so
     // the header and the pin labels stay the parts you read.
     let tint = ui.visuals().weak_text_color();
-    // Rasterized at twice the size it's drawn at, so zooming in to the canvas's 2x
-    // limit still lands on pixels rather than an upscaled blur. Cached per size step.
-    let px = ((rect.width() * 2.0 * ui.ctx().pixels_per_point()) as u32).clamp(32, 512);
+    // Rasterized at the pixels it covers, the canvas's zoom included (`raster_ppp`), rather
+    // than stretched into a blur. Cached per size step.
+    let px = ((rect.width() * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())) as u32).clamp(32, 1024);
     let key = egui::Id::new(("module_glyph", svg.as_ptr() as usize, px, tint.to_array()));
     let tex = crate::widgets::tex_cache::get(ui.ctx(), key).or_else(|| {
         let img = rasterize_svg_recolored(svg, px, px, "override", tint)?;

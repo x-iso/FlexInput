@@ -84,9 +84,8 @@ pub(crate) fn paint(painter: &egui::Painter, rect: Rect, glyph: Glyph, colour: C
         return;
     }
     let ctx = painter.ctx();
-    // Twice the size it is drawn at, so the canvas zoomed to its 2x limit still lands on
-    // pixels. Cached per size step.
-    let px = ((side * 2.0 * ctx.pixels_per_point()).round() as u32).clamp(16, 256);
+    // At the pixels it covers, the canvas's zoom included (`raster_ppp`). Cached per size step.
+    let px = ((side * crate::widgets::raster_ppp(ctx, painter.layer_id())).round() as u32).clamp(16, 512);
     let key = egui::Id::new(("switch_mark", glyph, px));
     let tex = crate::widgets::tex_cache::get(ctx, key).or_else(|| {
         let handle = ctx.load_texture(

@@ -2485,6 +2485,12 @@ impl ContextImpl {
 
         self.memory.end_pass(&viewport.this_pass.used_ids);
 
+        // FLEXINPUT PATCH: text in layers scaled up, rasterized for the size it's drawn at -
+        // before the atlas's delta is taken below, so its glyphs go up this frame.
+        if let Some(fonts) = self.fonts.as_mut() {
+            viewport.graphics.relayout_scaled_text(&self.memory.to_global, fonts, pixels_per_point);
+        }
+
         if let Some(fonts) = self.fonts.as_mut() {
             let tex_mngr = &mut self.tex_manager.0.write();
             if let Some(font_image_delta) = fonts.font_image_delta() {

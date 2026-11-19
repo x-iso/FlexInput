@@ -1616,7 +1616,7 @@ fn nav_toggle_parts(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
 
 /// Rasterize a square SVG at `side` points (native colours) and cache the texture.
 fn nav_svg_texture(ui: &egui::Ui, name: &str, svg: &str, side: f32) -> Option<egui::TextureHandle> {
-    let px = (side * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32;
+    let px = (side * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).ceil().max(1.0) as u32;
     let key = egui::Id::new(("nav_toggle_svg", name, px));
     if let Some(t) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(t);

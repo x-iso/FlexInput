@@ -241,7 +241,7 @@ pub(crate) fn pinned_fader(
             out = Some(knob.at(t + step));
         }
     } else if resp.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        let scroll = crate::canvas::wheel::value_wheel(ui);
         if scroll != 0.0 {
             out = Some(knob.at(t + scroll * 0.002));
         }

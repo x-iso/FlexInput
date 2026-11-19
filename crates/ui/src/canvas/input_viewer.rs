@@ -573,7 +573,7 @@ fn glyph_chip(
 /// Rasterize + cache a pin glyph at the given logical size (keyed by physical
 /// px so DPI changes re-rasterize). Preserves the SVG's own colors.
 pub(crate) fn glyph_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Option<egui::TextureHandle> {
-    let px = (logical_size * ui.ctx().pixels_per_point()).round().max(4.0) as u32;
+    let px = (logical_size * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round().max(4.0) as u32;
     let key = egui::Id::new(("iv_glyph", skin.as_str(), pin, px));
     if let Some(tex) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(tex);
@@ -590,7 +590,7 @@ pub(crate) fn glyph_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: 
 /// base-white paths stripped so only the highlighted arm remains. Cached like
 /// [`glyph_texture`].
 fn dpad_highlight_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Option<egui::TextureHandle> {
-    let px = (logical_size * ui.ctx().pixels_per_point()).round().max(4.0) as u32;
+    let px = (logical_size * crate::widgets::raster_ppp(ui.ctx(), ui.layer_id())).round().max(4.0) as u32;
     let key = egui::Id::new(("iv_dpad_hl", skin.as_str(), pin, px));
     if let Some(tex) = crate::widgets::tex_cache::get(ui.ctx(), key) {
         return Some(tex);

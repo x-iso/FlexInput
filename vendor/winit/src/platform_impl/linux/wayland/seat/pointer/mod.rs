@@ -33,6 +33,7 @@ use crate::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, Wind
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId, WindowId};
 
+pub mod pointer_gestures;
 pub mod relative_pointer;
 
 impl PointerHandler for WinitState {
